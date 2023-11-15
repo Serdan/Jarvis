@@ -1,0 +1,49 @@
+# Directories
+**/bin/
+**/obj/
+**/out/
+**/packages/
+**/[Bb]uild/
+**/[Ll]ogs/
+**/[Tt]est[Rr]esult*/
+
+# Visual Studio files
+*.user
+*.userosscache
+*.suo
+*.userprefs
+*.sln.docstates
+*.cache
+*.vsw
+*.vspscc
+*_i.c
+*_p.c
+*.ncb
+*.sdf
+*.opensdf
+*.unsuccessfulbuild
+ipch/
+*.dbmdl
+*.jfm
+*.tlog
+*.vs/
+.vscode/
+
+# JetBrains Rider
+.idea/
+*.sln.DotSettings
+*.sln.DotSettings.user
+*.sln.iml
+
+# Project files
+*.pidb
+*.log
+*.bak
+*.tmp
+*.mdf
+*.ldf
+*.kproj
+
+# Misc
+.DS_Store
+Thumbs.db

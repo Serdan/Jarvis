@@ -1,0 +1,201 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Userfiles",
+    "description": "Browse and read userfiles. All queries require a key. Request it from the user if needed.",
+    "version": "v1.0.1"
+  },
+  "servers": [
+    {
+      "url": "https://relay.kehlet.dev/hub"
+    }
+  ],
+  "paths": {
+    "/listprojects": {
+      "post": {
+        "description": "Gets a list of projects",
+        "operationId": "ListProjects",
+        "parameters": [],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ListProjectsSchema"
+              }
+            }
+          },
+          "required": true
+        },
+        "deprecated": false
+      }
+    },
+    "/getprojectdetails": {
+      "post": {
+        "description": "Get the details of the given project.",
+        "operationId": "GetProjectDetails",
+        "parameters": [],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GetProjectDetailsSchema"
+              }
+            }
+          },
+          "required": true
+        },
+        "deprecated": false
+      }
+    },
+    "/listprojectdirectory": {
+      "post": {
+        "description": "Get the items in the given directory",
+        "operationId": "ListProjectDirectory",
+        "parameters": [],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ListProjectDirectorySchema"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/openfile": {
+      "post": {
+        "description": "Get file content",
+        "operationId": "OpenFile",
+        "parameters": [],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OpenFileSchema"
+              }
+            }
+          },
+          "required": true
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "ListProjectsSchema": {
+        "properties": {
+          "key": {
+            "type": "string",
+            "title": "key",
+            "description": "Key provided by the user."
+          }
+        },
+        "type": "object",
+        "required": [
+          "key"
+        ],
+        "title": "ListProjectsSchema"
+      },
+      "GetProjectDetailsSchema": {
+        "properties": {
+          "key": {
+            "type": "string",
+            "title": "key",
+            "description": "Key provided by the user."
+          },
+          "command": {
+            "type": "object",
+            "title": "Command details",
+            "required": [
+              "project_name"
+            ],
+            "properties": {
+              "project_name": {
+                "type": "string",
+                "title": "project_name",
+                "description": "Name of the project."
+              }
+            }
+          }
+        },
+        "type": "object",
+        "required": [
+          "key",
+          "command"
+        ],
+        "title": "GetProjectDetailsSchema"
+      },
+      "ListProjectDirectorySchema": {
+        "properties": {
+          "key": {
+            "type": "string",
+            "title": "key",
+            "description": "Key provided by the user."
+          },
+          "command": {
+            "type": "object",
+            "title": "Command details",
+            "properties": {
+              "project_name": {
+                "type": "string",
+                "title": "project_name",
+                "description": "Name of the project."
+              },
+              "path": {
+                "type": "string",
+                "title": "path",
+                "description": "The path to list the items of."
+              }
+            },
+            "required": [
+              "project_name",
+              "path"
+            ]
+          }
+        },
+        "type": "object",
+        "required": [
+          "key",
+          "command"
+        ],
+        "title": "ListProjectDirectorySchema"
+      },
+      "OpenFileSchema": {
+        "properties": {
+          "key": {
+            "type": "string",
+            "title": "key",
+            "description": "Key provided by the user."
+          },
+          "command": {
+            "type": "object",
+            "title": "Command details",
+            "properties": {
+              "project_name": {
+                "type": "string",
+                "title": "project_name",
+                "description": "Name of the project."
+              },
+              "path": {
+                "type": "string",
+                "title": "path",
+                "description": "The path to the file."
+              }
+            },
+            "required": [
+              "project_name",
+              "path"
+            ]
+          }
+        },
+        "type": "object",
+        "required": [
+          "key",
+          "command"
+        ],
+        "title": "OpenFileSchema"
+      }
+    }
+  }
+}

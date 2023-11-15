@@ -1,0 +1,10 @@
+- ListProjects: Names only.
+- GetProjectDetails: Include project name, readme, todo.
+- ListProjectDirectory: Folder and file names with some metadata.
+- OpenFile: Load entire file? Code files are generally small enough that it shouldn't be an issue.
+- OpenFiles: Could be faster. Depends on whether GPT can make reasonable decisions based on file sizes.
+- Add size info to file data: See above.
+- WriteFile: Overwrite? Add to? Both?
+- Read todo: The agent can modify todo, so it should be able to read it as well.
+- Add todo: Add todo bullet point.
+- Remove todo: Remove todo bullet point. Match everything on line before semicolon.

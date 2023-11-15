@@ -1,0 +1,28 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "JarvisServer", "JarvisServer\JarvisServer.csproj", "{479F6B61-8360-44D3-8D13-14A77B2B7E37}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "JarvisClient", "JarvisClient\JarvisClient.csproj", "{1ABC76B5-6498-4255-948B-30C9084E0AB8}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Shared", "Shared\Shared.csproj", "{0C7C32C3-05BC-47B2-815A-833C18C1FD0A}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{479F6B61-8360-44D3-8D13-14A77B2B7E37}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{479F6B61-8360-44D3-8D13-14A77B2B7E37}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{479F6B61-8360-44D3-8D13-14A77B2B7E37}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{479F6B61-8360-44D3-8D13-14A77B2B7E37}.Release|Any CPU.Build.0 = Release|Any CPU
+		{1ABC76B5-6498-4255-948B-30C9084E0AB8}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{1ABC76B5-6498-4255-948B-30C9084E0AB8}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{1ABC76B5-6498-4255-948B-30C9084E0AB8}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{1ABC76B5-6498-4255-948B-30C9084E0AB8}.Release|Any CPU.Build.0 = Release|Any CPU
+		{0C7C32C3-05BC-47B2-815A-833C18C1FD0A}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{0C7C32C3-05BC-47B2-815A-833C18C1FD0A}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{0C7C32C3-05BC-47B2-815A-833C18C1FD0A}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{0C7C32C3-05BC-47B2-815A-833C18C1FD0A}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+EndGlobal

@@ -9,7 +9,7 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services
        .AddSignalR()
        .AddJsonProtocol()
-       .AddHubOptions<GptHub>(x => x.EnableDetailedErrors = true);
+       .AddHubOptions<JarvisHub>(x => x.EnableDetailedErrors = true);
 
 builder.Services.AddSingleton<UserService>();
 builder.Services.AddSingleton<ClientResponseTracker>();
@@ -35,7 +35,7 @@ if (app.Environment.IsDevelopment() is false)
 
 app.MapGet("/version", () => "1.4");
 app.MapGet("/", () => "ok");
-app.MapHub<GptHub>("/hub");
+app.MapHub<JarvisHub>("/hub");
 
 app.MapPost("/hub/listprojects", Endpoints.ListProjects);
 app.MapPost("/hub/getprojectdetails", Endpoints.OpenProject);

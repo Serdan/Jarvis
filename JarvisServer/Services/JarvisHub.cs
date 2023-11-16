@@ -1,10 +1,9 @@
-﻿using JarvisServer.Services;
-using Microsoft.AspNetCore.SignalR;
+﻿using Microsoft.AspNetCore.SignalR;
 using Shared;
 
-namespace JarvisServer;
+namespace JarvisServer.Services;
 
-public class GptHub(UserService service, ClientResponseTracker tracker) : Hub<IUserClient>, IGptHub
+public class JarvisHub(UserService service, ClientResponseTracker tracker) : Hub<IUserClient>, IGptHub
 {
     public Task Connect(string userId)
     {

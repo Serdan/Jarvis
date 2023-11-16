@@ -1,4 +1,5 @@
-﻿namespace Shared;
+﻿// ReSharper disable InconsistentNaming
+namespace Shared;
 
 public readonly struct Option<TValue>
 {
@@ -20,29 +21,29 @@ public readonly struct Option<TValue>
 
     public Option<TResult> Select<TResult>(Func<TValue, TResult> f) =>
         IsSome
-            ? Some(f(value))
-            : None;
+            ? some(f(value))
+            : none;
 
     public Option<TResult> Select<TResult>(Func<TValue, Option<TResult>> f) =>
         IsSome
             ? f(value)
-            : None;
+            : none;
 
     public Option<TResult> SelectMany<TInner, TResult>(Func<TValue, Option<TInner>> selector, Func<TValue, TInner, TResult> resultSelector)
     {
         if (IsNone)
         {
-            return None;
+            return none;
         }
 
         var inner = selector(value);
 
         if (inner.IsNone)
         {
-            return None;
+            return none;
         }
 
-        return Some(resultSelector(value, inner.value));
+        return some(resultSelector(value, inner.value));
     }
 
     public Result<TValue> ToResult(string error) =>
@@ -57,8 +58,8 @@ public readonly record struct NoneOption;
 
 public static partial class Prelude
 {
-    public static Option<TValue> Some<TValue>(TValue value) => new(value);
-    public static NoneOption None => default;
+    public static Option<TValue> some<TValue>(TValue value) => new(value);
+    public static NoneOption none => default;
 
     public static IEnumerable<TValue> filter<TValue>(IEnumerable<Option<TValue>> values)
     {

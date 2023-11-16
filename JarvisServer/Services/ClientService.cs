@@ -1,11 +1,10 @@
-﻿using JarvisServer.Services;
-using Microsoft.AspNetCore.SignalR;
+﻿using Microsoft.AspNetCore.SignalR;
 using Shared;
 using Shared.Messages;
 
-namespace JarvisServer;
+namespace JarvisServer.Services;
 
-public class ClientService(IHubContext<GptHub, IUserClient> hub, UserService users, ClientResponseTracker tracker)
+public class ClientService(IHubContext<JarvisHub, IUserClient> hub, UserService users, ClientResponseTracker tracker)
 {
     public Task SendMessageToAll(string message) =>
         hub.Clients.All.ReceiveMessage(message);

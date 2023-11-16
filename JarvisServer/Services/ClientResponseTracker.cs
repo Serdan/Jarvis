@@ -1,6 +1,6 @@
 ﻿using System.Collections.Concurrent;
 
-namespace JarvisServer;
+namespace JarvisServer.Services;
 
 public class ClientResponseTracker
 {

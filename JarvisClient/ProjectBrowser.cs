@@ -32,8 +32,10 @@ public class ProjectBrowser(string projectDirectory)
         from project in ParseProjectName(projectName)
         from fullPath in ParseDirectory(project)
         let infos = from path in fullPath
-                    select ProjectFiles.Select(x => Combine(path, x)).Select(GetFile).Apply(filter)
-        let items = from item in infos
+                    select from file in ProjectFiles
+                           let filePath = Combine(path, file)
+                           select GetFile(filePath)
+        let items = from item in filter(infos)
                     select new KeyValuePair<string, string>(item.Name, FileIO.ReadAllText(item.FullName))
         select items.ToFrozenDictionary();
 
@@ -117,8 +119,6 @@ public class ProjectBrowser(string projectDirectory)
     private static readonly ImmutableArray<string> ProjectFiles =
         ImmutableArray.Create<string>(["readme.md", "notes.md", "todo.md"]);
 
-    private static string Combine(string left, string right)
-    {
-        return left.TrimEnd('/', '\\') + "/" + right.TrimStart('/', '\\', '.');
-    }
+    private static string Combine(string left, string right) => 
+        left.TrimEnd('/', '\\') + "/" + right.TrimStart('/', '\\', '.');
 }

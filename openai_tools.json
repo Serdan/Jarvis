@@ -31,7 +31,7 @@
     },
     "/getprojectdetails": {
       "post": {
-        "description": "Get the details of the given project.",
+        "description": "Get the details of the given project. Includes readme, todo, and notes.",
         "operationId": "GetProjectDetails",
         "parameters": [],
         "requestBody": {

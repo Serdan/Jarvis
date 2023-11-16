@@ -8,3 +8,6 @@
 - Read todo: The agent can modify todo, so it should be able to read it as well.
 - Add todo: Add todo bullet point.
 - Remove todo: Remove todo bullet point. Match everything on line before semicolon.
+- Run Unit Tests: Run all tests and return the result to the agent.
+- Git: Consider exposing a limited set of git commands.
+- 

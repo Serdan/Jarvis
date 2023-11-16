@@ -56,7 +56,19 @@ public class ProjectBrowser(string projectDirectory)
         from folders in GetDirectoryNames(path)
         let folderItems = folders.Select(Folder)
         from files in GetFileNames(path)
-        let fileItems = files.Select(File)
+        let fileItems = files.Select(fileName =>
+        {
+            var fileInfo = GetFile(Path.Combine(path, fileName));
+            return fileInfo.Match<ProjectItemKind.File>(
+                some: info => new(fileName)
+                {
+                    FileSize = info.Length,
+                    CreationDate = info.CreationTime,
+                    ModificationDate = info.LastWriteTime
+                },
+                none: () => new(fileName)
+            );
+        })
         select ImmutableArray.Create<ProjectItemKind>([..folderItems, ..fileItems]);
 
     private Result<ImmutableArray<string>> GetDirectoryNames(string path = "") =>
@@ -69,6 +81,11 @@ public class ProjectBrowser(string projectDirectory)
         let files = Directory.GetFiles(fullPath).Select(Path.GetFileName)
         select ImmutableArray.Create(files.ToArray());
 
+    /// <summary>
+    /// Returns the full path. It's important this isn't leaked to the agent.
+    /// </summary>
+    /// <param name="path"></param>
+    /// <returns></returns>
     private Result<string> ParseDirectory(string path) =>
         from fullPath in Ok(Combine(projectDirectory, path))
         let exists = Directory.Exists(fullPath)
@@ -76,6 +93,11 @@ public class ProjectBrowser(string projectDirectory)
             ? Ok(fullPath)
             : Error($"Directory does not exist: {path}");
 
+    /// <summary>
+    /// Returns FileInfo containing the full path. It's important this isn't leaked to the agent.
+    /// </summary>
+    /// <param name="path"></param>
+    /// <returns></returns>
     private Option<FileInfo> GetFile(string path) =>
         from fullPath in Some(Path.Combine(projectDirectory, path))
         let exists = FileIO.Exists(fullPath)

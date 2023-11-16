@@ -10,7 +10,11 @@ public abstract partial record ProjectItemKind
     public sealed partial record File(string Name)
     {
         public string Kind { get; } = nameof(File);
+        public long FileSize { get; init; }
+        public DateTimeOffset CreationDate { get; init; }
+        public DateTimeOffset ModificationDate { get; init; }
     }
+
 
     public sealed partial record Folder(string Name)
     {

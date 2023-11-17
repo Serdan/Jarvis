@@ -7,34 +7,34 @@ namespace Shared.Messages;
 
 [AutoClosed]
 [JsonConverter(typeof(AgentCommandJsonConverter))]
-public abstract partial record AgentCommand
+public partial record AgentCommand
 {
-    public sealed partial record ListProjectsCommand
+    partial record ListProjectsCommand
     {
         public string Kind { get; } = nameof(ListProjectsCommand);
     }
 
-    public sealed partial record GetProjectDetailsCommand(string ProjectName)
+    partial record GetProjectDetailsCommand(string ProjectName)
     {
         public string Kind { get; } = nameof(GetProjectDetailsCommand);
     }
 
-    public sealed partial record ListProjectDirectoryCommand(string ProjectName, string Path)
+    partial record ListProjectDirectoryCommand(string ProjectName, string Path)
     {
         public string Kind { get; } = nameof(ListProjectDirectoryCommand);
     }
 
-    public sealed partial record OpenFileCommand(string ProjectName, string Path)
+    partial record OpenFileCommand(string ProjectName, string Path)
     {
         public string Kind { get; } = nameof(OpenFileCommand);
     }
 
-    public sealed partial record WriteFileCommand(string ProjectName, string FilePath, string Content, FileWriteMode Mode)
+    partial record WriteFileCommand(string ProjectName, string FilePath, string Content, FileWriteMode Mode)
     {
         public string Kind { get; } = nameof(WriteFileCommand);
     }
 
-    public sealed partial record SectionReplaceCommand(string FilePath, SectionIdentifiers SectionIdentifiers, string ReplacementContent, bool BackupOption)
+    partial record SectionReplaceCommand(string FilePath, SectionIdentifiers SectionIdentifiers, string ReplacementContent, bool BackupOption)
     {
         public string Kind { get; } = nameof(SectionReplaceCommand);
     }

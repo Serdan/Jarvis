@@ -2,4 +2,30 @@ Initial note creation for Bob's personal use.
 
 Timestamp: 2023-11-17
 
-This file is intended for Bob to keep notes and updates regarding tasks, observations, and any relevant information for assisting with project-related activities. The format and structure of these notes do not need to be human-readable and are for Bob's reference only.
+This file is intended for Bob to keep notes and updates regarding tasks, observations, and any relevant information for assisting with project-related activities. The format and structure of these notes do not need to be human-readable and are for Bob's reference only.# Guide for Implementing a New Feature
+
+## Steps:
+1. **Understand the Requirement**: Clarify the feature's purpose, scope, and how it integrates with the existing system.
+2. **Plan the Implementation**: Outline the steps, identify where changes are needed, and determine the impact on existing code.
+3. **Update Shared Messages**: If the feature involves new commands, update the shared messages library.
+4. **Server Logic**: Implement the core logic in the server or client, depending on where the feature needs to operate.
+5. **Integrate with Endpoints**: If it's a server-side feature, integrate it with the relevant API endpoints.
+6. **Error Handling**: Implement robust error handling and consider edge cases.
+7. **Testing**: Thoroughly test the feature to ensure it works as expected.
+8. **Documentation**: Document the feature, including how to use it and any relevant examples.
+9. **Review and Refine**: Revisit the implementation to optimize and clean up the code.
+
+## Notes:
+- Keep the code structure and style consistent with the existing project.
+- Regularly communicate progress and challenges.
+- Stay aware of the project's broader goals to ensure alignment.
+
+## Specifics on Typical Files Involved:
+- **Shared Messages**: Modify `AgentCommand.cs` in `Shared/Messages` for new command types.
+- **Server Logic**: Implement logic in `JarvisServer` project, typically within service classes or directly in `Endpoints.cs`.
+- **Client Logic**: For client-side features, update `UserClient.cs` in `JarvisClient` and possibly `ProjectBrowser.cs` for specific actions.
+- **API Endpoints**: Add or modify endpoints in `Endpoints.cs` in the `JarvisServer` project.
+- **Error Handling and Validation**: Implement in the respective server or client method where the feature's logic resides.
+- **Testing**: Create test cases in relevant project directories, considering both unit and integration tests.
+
+Remember to reference specific project structure and paths for accuracy.

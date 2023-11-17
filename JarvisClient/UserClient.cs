@@ -1,4 +1,4 @@
-﻿using System.Text.Json;
+using System.Text.Json;
 using System.Text.Json.Serialization;
 using JarvisClient.Extensions;
 using Microsoft.AspNetCore.SignalR.Client;
@@ -33,6 +33,7 @@ public class UserClient(HubConnection hub, ProjectBrowser browser) : IUserClient
                 ListProjectDirectoryCommand(var projectName, var path) => browser.ListProjectDirectory(projectName, path).Select(Serialize),
                 OpenFileCommand(var projectName, var path) => browser.OpenFile(projectName, path),
                 WriteFileCommand(var projectName, var filePath, var content, var mode) => browser.WriteFile(projectName, filePath, content, mode),
+                SectionReplaceCommand(var filePath, var sectionIdentifiers, var replacementContent, var backupOption) => browser.ReplaceSection(filePath, sectionIdentifiers, replacementContent, backupOption),
                 _ => Error("Unknown command")
             };
 

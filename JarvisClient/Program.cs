@@ -14,7 +14,8 @@ await using var connection = new HubConnectionBuilder()
                              .WithUrl("https://jarvis.kehlet.dev/hub")
                              .Build();
 
-var browser = ProjectBrowser.Create("z:\\repos");
+var file = new FileSystem();
+var browser = ProjectBrowser.Create(file, "z:\\repos");
 var client = new UserClient(connection, browser);
 
 connection.On(client, x => x.ReceiveMessage);

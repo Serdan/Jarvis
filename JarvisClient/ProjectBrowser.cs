@@ -8,11 +8,10 @@ using Shared.Messages;
 namespace JarvisClient;
 
 using static ProjectItemKind.Cons;
-using FileIO = File;
 
-public class ProjectBrowser(string projectDirectory)
+public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
 {
-    public static ProjectBrowser Create(string? directory = null)
+    public static ProjectBrowser Create(IFileSystem fileSystem, string? directory = null)
     {
         while (string.IsNullOrEmpty(directory) || !Directory.Exists(directory))
         {
@@ -20,7 +19,7 @@ public class ProjectBrowser(string projectDirectory)
             directory = Console.ReadLine()!;
         }
 
-        return new(directory);
+        return new(fileSystem, directory);
     }
 
     public ImmutableArray<string> ListProjects() =>
@@ -36,7 +35,7 @@ public class ProjectBrowser(string projectDirectory)
                            let filePath = Combine(path, file)
                            select GetFile(project, filePath)
         let items = from item in filter(infos)
-                    select new KeyValuePair<string, string>(item.Name, FileIO.ReadAllText(item.FullName))
+                    select new KeyValuePair<string, string>(item.Name, fileSystem.ReadAllText(item.FullName))
         select items.ToFrozenDictionary();
 
     public Result<ImmutableArray<ProjectItemKind>> ListProjectDirectory(string projectName, string directoryPath) =>
@@ -47,7 +46,7 @@ public class ProjectBrowser(string projectDirectory)
     public Result<string> OpenFile(string projectName, string filePath) =>
         from project in ParseProjectName(projectName)
         from file in GetFile(project, filePath)
-        select FileIO.ReadAllText(file.FullName);
+        select fileSystem.ReadAllText(file.FullName);
 
     public Result<string> WriteFile(string projectName, string filePath, string content, FileWriteMode mode) =>
         from project in ParseProjectName(projectName)
@@ -55,8 +54,8 @@ public class ProjectBrowser(string projectDirectory)
         let message = file.Exists ? "existing file" : "new file"
         from result in mode switch
         {
-            FileWriteMode.Append => @try(() => FileIO.AppendAllText(file.FullName, content), $"Appended content to {message}: {file.Name}"),
-            FileWriteMode.Write => @try(() => FileIO.WriteAllText(file.FullName, content), $"Wrote content to {message}: {file.Name}"),
+            FileWriteMode.Append => @try(() => fileSystem.AppendAllText(file.FullName, content), $"Appended content to {message}: {file.Name}"),
+            FileWriteMode.Write => @try(() => fileSystem.WriteAllText(file.FullName, content), $"Wrote content to {message}: {file.Name}"),
             _ => Error($"Unsupported mode: {mode}")
         }
         select result;
@@ -65,7 +64,7 @@ public class ProjectBrowser(string projectDirectory)
     {
         try
         {
-            var fileContent = FileIO.ReadAllText(filePath);
+            var fileContent = fileSystem.ReadAllText(filePath);
             var startIndex = fileContent.IndexOf(sectionIdentifiers.Start, StringComparison.Ordinal);
             var endIndex = fileContent.IndexOf(sectionIdentifiers.End, startIndex, StringComparison.Ordinal);
 
@@ -76,14 +75,14 @@ public class ProjectBrowser(string projectDirectory)
 
             if (backupOption)
             {
-                FileIO.Copy(filePath, filePath + ".bak", true);
+                fileSystem.Copy(filePath, filePath + ".bak", true);
             }
 
-            var newContent = fileContent.Substring(0, startIndex)
+            var newContent = fileContent[..startIndex]
                 + replacementContent
-                + fileContent.Substring(endIndex + sectionIdentifiers.End.Length);
+                + fileContent[(endIndex + sectionIdentifiers.End.Length)..];
 
-            FileIO.WriteAllText(filePath, newContent);
+            fileSystem.WriteAllText(filePath, newContent);
             return Ok("Section replaced successfully.");
         }
         catch (Exception ex)
@@ -146,7 +145,7 @@ public class ProjectBrowser(string projectDirectory)
     /// <returns></returns>
     private Result<FileInfo> GetFile(ProjectName projectName, string path) =>
         from fullPath in Combine(projectDirectory, projectName.Name, path)
-        let exists = FileIO.Exists(fullPath)
+        let exists = fileSystem.FileExists(fullPath)
         select exists
             ? Ok(new FileInfo(fullPath))
             : Error("File does not exist");

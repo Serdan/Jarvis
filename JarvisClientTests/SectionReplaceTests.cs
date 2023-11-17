@@ -1,7 +1,6 @@
 using JarvisClient;
 using Moq;
 using Shared;
-using Shared.AlgebraicTypes;
 using Shared.Messages;
 
 namespace JarvisClientTests

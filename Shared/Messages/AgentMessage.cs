@@ -6,13 +6,14 @@ public record AgentMessage<T>
     public AgentMessage(string Key, T Command)
     {
         this.Key = Key;
+        // ReSharper disable once ConditionIsAlwaysTrueOrFalseAccordingToNullableAPIContract
         if (Command is null && typeof(T) == typeof(AgentCommand.ListProjectsCommand))
         {
             this.Command = (new AgentCommand.ListProjectsCommand() as T)!;
         }
         else
         {
-            this.Command = Command;
+            this.Command = Command!;
         }
     }
 

@@ -1,5 +1,4 @@
 ﻿using System.Collections.Concurrent;
-using Shared;
 using Shared.AlgebraicTypes;
 
 namespace JarvisServer.Services;

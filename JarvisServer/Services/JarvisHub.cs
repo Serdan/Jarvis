@@ -1,5 +1,4 @@
 ﻿using Microsoft.AspNetCore.SignalR;
-using Shared;
 using Shared.SignalR;
 
 namespace JarvisServer.Services;

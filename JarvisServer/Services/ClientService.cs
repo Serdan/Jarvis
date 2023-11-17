@@ -1,5 +1,4 @@
 ﻿using Microsoft.AspNetCore.SignalR;
-using Shared;
 using Shared.AlgebraicTypes;
 using Shared.Messages;
 using Shared.SignalR;
@@ -16,11 +15,11 @@ public class ClientService(IHubContext<JarvisHub, IUserClient> hub, UserService 
     {
         try
         {
-            Result<string> query = await from id in users.GetConnectionId(message.Key)
-                                         let tracking = tracker.Register()
-                                         let client = hub.Clients.Client(id)
-                                         let task = client.ReceiveCommand(tracking.Id, message.Command)
-                                         select task.Select(() => tracking.Task);
+            Result<string> query = await (from id in users.GetConnectionId(message.Key)
+                                          let tracking = tracker.Register()
+                                          let client = hub.Clients.Client(id)
+                                          let task = client.ReceiveCommand(tracking.Id, message.Command)
+                                          select task.Select(() => tracking.Task));
 
             return query.IfError(x => x.Message);
         }

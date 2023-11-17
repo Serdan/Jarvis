@@ -7,5 +7,5 @@ public partial record ResultUnion<T>
 {
     partial record Ok(T Value);
     
-    partial record Error(AggregateException Exception);
+    partial record Error(Exception Exception);
 }

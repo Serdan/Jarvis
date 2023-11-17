@@ -8,5 +8,7 @@ public interface IFileSystem
     void CopyFile(string source, string destination, bool overwrite);
     // Add other necessary file system operations
     void AppendAllText(string path, string contents);
-    void Copy(string sourceFileName, string destFileName, bool overwrite);
+    bool DirectoryExists(string path);
+    string[] GetFiles(string path);
+    string[] GetDirectories(string path);
 }

@@ -13,7 +13,7 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
 {
     public static ProjectBrowser Create(IFileSystem fileSystem, string? directory = null)
     {
-        while (string.IsNullOrEmpty(directory) || !Directory.Exists(directory))
+        while (string.IsNullOrEmpty(directory) || fileSystem.DirectoryExists(directory) is false)
         {
             Console.WriteLine("Input project directory");
             directory = Console.ReadLine()!;
@@ -32,8 +32,7 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
         from fullPath in ParseDirectory(project, project.Name)
         let infos = from path in fullPath
                     select from file in ProjectFiles
-                           let filePath = Combine(path, file)
-                           select GetFile(project, filePath)
+                           select GetFile(project, path, file)
         let items = from item in filter(infos)
                     select new KeyValuePair<string, string>(item.Name, fileSystem.ReadAllText(item.FullName))
         select items.ToFrozenDictionary();
@@ -75,7 +74,7 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
 
             if (backupOption)
             {
-                fileSystem.Copy(filePath, filePath + ".bak", true);
+                fileSystem.CopyFile(filePath, filePath + ".bak", true);
             }
 
             var newContent = fileContent[..startIndex]
@@ -103,7 +102,7 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
         let folderItems = folderNames.Select(ProjectFolder)
         from fileNames in GetFileNames(projectName, path)
         let fileItems = from fileName in fileNames
-                        let fileInfo = GetFile(projectName, Combine(path, fileName))
+                        let fileInfo = GetFile(projectName, path, fileName)
                         select fileInfo.Match(
                             ok: ProjectItemKind.ProjectFile.From,
                             error: error => ProjectFileError(fileName, error.Message)
@@ -113,14 +112,14 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
     private Result<ImmutableArray<string>> GetDirectoryNames(ProjectName projectName, string directoryPath = "") =>
         from fullPath in ParseDirectory(projectName, directoryPath)
         let folders = from path in fullPath
-                      select from folder in Directory.GetDirectories(path)
+                      select from folder in fileSystem.GetDirectories(path)
                              select Path.GetFileName(folder)
         select ImmutableArray.Create(folders.ToArray());
 
     private Result<ImmutableArray<string>> GetFileNames(ProjectName projectName, string directoryPath) =>
         from fullPath in ParseDirectory(projectName, directoryPath)
         let files = from path in fullPath
-                    select from file in Directory.GetFiles(path)
+                    select from file in fileSystem.GetFiles(path)
                            select Path.GetFileName(file)
         select ImmutableArray.Create(files.ToArray());
 
@@ -130,12 +129,12 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
     /// <param name="projectName"></param>
     /// <param name="directoryPath"></param>
     /// <returns></returns>
-    private Result<HiddenString> ParseDirectory(ProjectName projectName, string directoryPath) =>
-        from fullPath in Combine(projectDirectory, projectName.Name, directoryPath)
-        let exists = Directory.Exists(fullPath)
+    private Result<HiddenString> ParseDirectory(ProjectName projectName, params string[] directoryPath) =>
+        from fullPath in Combine(projectDirectory, [projectName.Name, ..directoryPath])
+        let exists = fileSystem.DirectoryExists(fullPath)
         select exists
             ? Ok(new HiddenString(fullPath))
-            : Error($"Directory does not exist: {directoryPath}");
+            : Error($"Directory does not exist: {directoryPath.Last()}");
 
     /// <summary>
     /// Returns FileInfo containing the full path. It's important this isn't leaked to the agent.
@@ -143,30 +142,27 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
     /// <param name="projectName"></param>
     /// <param name="path"></param>
     /// <returns></returns>
-    private Result<FileInfo> GetFile(ProjectName projectName, string path) =>
-        from fullPath in Combine(projectDirectory, projectName.Name, path)
+    private Result<FileInfo> GetFile(ProjectName projectName, params string[] path) =>
+        from fullPath in Combine(projectDirectory, [projectName.Name, ..path])
         let exists = fileSystem.FileExists(fullPath)
         select exists
             ? Ok(new FileInfo(fullPath))
-            : Error("File does not exist");
+            : Error($"File does not exist: {path.Last()}");
 
     private Result<FilePath> ParseFilePath(ProjectName projectName, string filePath) =>
         from fullPath in Combine(projectDirectory, projectName.Name, filePath)
         from info in @try(() => new FileInfo(fullPath))
-        select Directory.Exists(info.FullName) is false
+        select fileSystem.DirectoryExists(info.FullName) is false
             ? Ok(new FilePath(info.Name, info.FullName, info.Exists))
             : Error("Path is a directory");
 
     private static readonly ImmutableArray<string> ProjectFiles =
-        ImmutableArray.Create<string>(["readme.md", "notes.md", "todo.md"]);
+        ImmutableArray.Create<string>(["readme.md", "notes.md", "todo.md", "bob_notes.txt"]);
 
-    private static string Combine(string left, string path) =>
-        left.TrimEnd('/', '\\') + "/" + path.TrimStart('/', '\\', '.');
-
-    private Result<string> Combine(params string[] paths)
-    {
-        var path = string.Join(Path.DirectorySeparatorChar, paths);
-        var fullPath = Path.GetFullPath(path);
-        return fullPath.StartsWith(projectDirectory) ? Ok(fullPath) : Error("Invalid path");
-    }
+    private static Result<string> Combine(string projectDirectory, params string[] paths) =>
+        from path in @try(() => string.Join(Path.DirectorySeparatorChar, projectDirectory, paths))
+        from fullPath in @try(() => Path.GetFullPath(path))
+        select fullPath.StartsWith(projectDirectory)
+            ? Ok(fullPath)
+            : Error("Invalid path");
 }

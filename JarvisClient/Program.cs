@@ -4,21 +4,22 @@ using System.Security.Cryptography;
 using JarvisClient;
 using Microsoft.AspNetCore.SignalR.Client;
 using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Logging;
 using Shared;
 
-var connection = new HubConnectionBuilder()
-                 .ConfigureLogging(logging => logging.SetMinimumLevel(LogLevel.Debug))
-                 .AddJsonProtocol()
-                 // .WithUrl("http://localhost:5271/hub")
-                 .WithUrl("https://jarvis.kehlet.dev/hub")
-                 .Build();
+await using var connection = new HubConnectionBuilder()
+                             .AddJsonProtocol()
+                             .WithUrl("https://jarvis.kehlet.dev/hub")
+                             .Build();
 
 var browser = ProjectBrowser.Create("z:\\repos");
 var client = new UserClient(connection, browser);
 
 connection.On(client, x => x.ReceiveMessage);
 connection.On(client, x => x.ReceiveCommand);
+
+var loop = true;
+
+Console.CancelKeyPress += (_, _) => loop = false;
 
 try
 {
@@ -32,7 +33,7 @@ try
 
     await connection.InvokeAsync<IJarvisHub>(x => x.Connect(key));
 
-    while (true)
+    while (loop)
     {
         Console.ReadLine();
         Console.WriteLine(connection.State);
@@ -49,5 +50,6 @@ catch (Exception e)
 }
 finally
 {
+    await connection.InvokeAsync<IJarvisHub>(x => x.Disconnect());
     await connection.StopAsync();
 }

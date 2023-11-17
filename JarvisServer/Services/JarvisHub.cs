@@ -18,8 +18,6 @@ public class JarvisHub(UserService service, ClientResponseTracker tracker) : Hub
         service.Remove(id);
         await Clients.Client(id)
                      .ReceiveMessage("Disconnected");
-
-        Context.Abort();
     }
 
     public Task SendClientResponse(string correlationId, string result)

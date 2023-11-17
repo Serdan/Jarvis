@@ -1,13 +1,13 @@
 {
   "openapi": "3.1.0",
   "info": {
-    "title": "Userfiles",
-    "description": "Browse and read userfiles. All queries require a key. Request it from the user if needed.",
-    "version": "v1.0.1"
+    "title": "User Files",
+    "description": "Browse and read user files. All queries require a key. Request it from the user if needed.",
+    "version": "v1.0.2"
   },
   "servers": [
     {
-      "url": "https://relay.kehlet.dev/hub"
+      "url": "https://jarvis.kehlet.dev/hub"
     }
   ],
   "paths": {
@@ -73,6 +73,23 @@
             "application/json": {
               "schema": {
                 "$ref": "#/components/schemas/OpenFileSchema"
+              }
+            }
+          },
+          "required": true
+        }
+      }
+    },
+    "/writefile": {
+      "post": {
+        "description": "Write file content",
+        "operationId": "WriteFile",
+        "parameters": [],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WriteFileSchema"
               }
             }
           },
@@ -186,6 +203,53 @@
             "required": [
               "project_name",
               "path"
+            ]
+          }
+        },
+        "type": "object",
+        "required": [
+          "key",
+          "command"
+        ],
+        "title": "OpenFileSchema"
+      },
+      "WriteFileSchema": {
+        "properties": {
+          "key": {
+            "type": "string",
+            "title": "key",
+            "description": "Key provided by the user."
+          },
+          "command": {
+            "type": "object",
+            "title": "Command details",
+            "properties": {
+              "project_name": {
+                "type": "string",
+                "title": "project_name",
+                "description": "Name of the project."
+              },
+              "file_path": {
+                "type": "string",
+                "title": "file_path",
+                "description": "The path to the file."
+              },
+              "content": {
+                "type": "string",
+                "title": "content",
+                "description": "The content that will be written"
+              },
+              "mode": {
+                "type": "string",
+                "title": "mode",
+                "description": "The write mode. append/write"
+              }
+            },
+            "required": [
+              "project_name",
+              "file_path",
+              "content",
+              "mode"
             ]
           }
         },

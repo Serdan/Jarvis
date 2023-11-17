@@ -3,7 +3,7 @@ using Shared;
 
 namespace JarvisServer.Services;
 
-public class JarvisHub(UserService service, ClientResponseTracker tracker) : Hub<IUserClient>, IGptHub
+public class JarvisHub(UserService service, ClientResponseTracker tracker) : Hub<IUserClient>, IJarvisHub
 {
     public Task Connect(string userId)
     {

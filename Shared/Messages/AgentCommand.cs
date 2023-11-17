@@ -28,6 +28,11 @@ public abstract partial record AgentCommand
     {
         public string Kind { get; } = nameof(OpenFileCommand);
     }
+
+    public sealed partial record WriteFileCommand(string ProjectName, string FilePath, string Content, FileWriteMode Mode)
+    {
+        public string Kind { get; } = nameof(WriteFileCommand);
+    }
 }
 
 file class AgentCommandJsonConverter : JsonConverter<AgentCommand>
@@ -53,6 +58,7 @@ file class AgentCommandJsonConverter : JsonConverter<AgentCommand>
             nameof(GetProjectDetailsCommand) => JsonSerializer.Deserialize<GetProjectDetailsCommand>(root.GetRawText(), options)!,
             nameof(ListProjectDirectoryCommand) => JsonSerializer.Deserialize<ListProjectDirectoryCommand>(root.GetRawText(), options)!,
             nameof(OpenFileCommand) => JsonSerializer.Deserialize<OpenFileCommand>(root.GetRawText(), options)!,
+            nameof(WriteFileCommand) => JsonSerializer.Deserialize<WriteFileCommand>(root.GetRawText(), options)!,
             _ => throw new JsonException($"Unknown CommandType: {commandType}")
         };
     }

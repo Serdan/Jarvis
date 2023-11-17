@@ -6,33 +6,40 @@ public static partial class Prelude
 {
     public static Unit unit { get; } = new();
 
-    public static Unions.Result union<T>(Result<T> result) =>
-        result.Match<Unions.Result>(
-            x => new Unions.Result.Ok(x!),
-            x => new Unions.Result.Error(x)
+    public static ResultUnion<TValue> union<TValue>(Result<TValue> result) =>
+        result.Match<ResultUnion<TValue>>(
+            x => new ResultUnion<TValue>.Ok(x),
+            x => new ResultUnion<TValue>.Error(x)
         );
 
-    public static Unions.Result<TValue> union2<TValue>(Result<TValue> result) =>
-        result.Match<Unions.Result<TValue>>(
-            x => new Unions.Result<TValue>.Ok(x),
-            x => new Unions.Result<TValue>.Error(x)
-        );
-
-    public static Unions.Option union<T>(Option<T> result) =>
-        result.Match<Unions.Option>(
-            x => new Unions.Option.Some(x!),
-            () => new Unions.Option.None()
-        );
-
-    public static OptionUnion<T> union2<T>(Option<T> result) =>
+    public static OptionUnion<T> union<T>(Option<T> result) =>
         result.Match<OptionUnion<T>>(
             x => new OptionUnion<T>.Some(x!),
             () => new OptionUnion<T>.None()
         );
 
-    public static Unit call(Action action)
+    public static Result<T> @try<T>(Action f, T success)
     {
-        action();
-        return unit;
+        try
+        {
+            f();
+            return Ok(success);
+        }
+        catch (Exception e)
+        {
+            return Error(e);
+        }
+    }
+
+    public static Result<T> @try<T>(Func<T> f)
+    {
+        try
+        {
+            return Ok(f());
+        }
+        catch (Exception e)
+        {
+            return Error(e);
+        }
     }
 }

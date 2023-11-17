@@ -71,4 +71,15 @@ public static partial class Prelude
             }
         }
     }
+
+    public static IEnumerable<TValue> filter<TValue>(IEnumerable<Result<TValue>> values)
+    {
+        foreach (var value in values)
+        {
+            if (value.IsOk)
+            {
+                yield return value.value;
+            }
+        }
+    }
 }

@@ -2,49 +2,18 @@
 
 namespace Shared;
 
-public static class Unions
+[AutoClosed]
+public partial record OptionUnion<TValue>
 {
-    public abstract record Result<T>
-    {
-        private Result()
-        {
-        }
+    partial record Some(TValue Value);
 
-        public sealed record Ok(T Value) : Result<T>;
-
-        public sealed record Error(AggregateException Exception) : Result<T>;
-    }
-
-    public abstract record Result
-    {
-        private Result()
-        {
-        }
-
-        public sealed record Ok(object Value) : Result;
-
-        public sealed record Error(AggregateException Exception) : Result;
-    }
-
-    public abstract record Option
-    {
-        private Option()
-        {
-        }
-
-        public sealed record Some(object Value) : Option;
-
-        public sealed record None : Option;
-    }
+    partial record None;
 }
 
-public abstract partial record OptionUnion<TValue>
+[AutoClosed]
+public partial record ResultUnion<T>
 {
-    private OptionUnion()
-    {
-    }
-
-    public sealed partial record Some(TValue Value) : OptionUnion<TValue>;
-
-    public sealed partial record None : OptionUnion<TValue>;
+    partial record Ok(T Value);
+    
+    partial record Error(AggregateException Exception);
 }

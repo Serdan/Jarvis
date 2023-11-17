@@ -25,4 +25,8 @@ public static class Endpoints
     public static Task<string> OpenFile(ClientService client, [FromBody] AgentMessage<OpenFileCommand> message) =>
         client.SendCommandToUser(message)
               .Select(WriteLine);
+
+    public static Task<string> WriteFile(ClientService client, [FromBody] AgentMessage<WriteFileCommand> message) =>
+        client.SendCommandToUser(message)
+              .Select(WriteLine);
 }

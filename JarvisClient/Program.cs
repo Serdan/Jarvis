@@ -1,7 +1,6 @@
 ﻿// See https://aka.ms/new-console-template for more information
 
 using System.Security.Cryptography;
-using System.Text.Json;
 using JarvisClient;
 using Microsoft.AspNetCore.SignalR.Client;
 using Microsoft.Extensions.DependencyInjection;
@@ -12,7 +11,7 @@ var connection = new HubConnectionBuilder()
                  .ConfigureLogging(logging => logging.SetMinimumLevel(LogLevel.Debug))
                  .AddJsonProtocol()
                  // .WithUrl("http://localhost:5271/hub")
-                 .WithUrl("https://relay.kehlet.dev/hub")
+                 .WithUrl("https://jarvis.kehlet.dev/hub")
                  .Build();
 
 var browser = ProjectBrowser.Create("z:\\repos");
@@ -31,7 +30,7 @@ try
     Console.WriteLine("Key:");
     Console.WriteLine(key);
 
-    await connection.InvokeAsync<IGptHub>(x => x.Connect(key));
+    await connection.InvokeAsync<IJarvisHub>(x => x.Connect(key));
 
     while (true)
     {
@@ -39,7 +38,7 @@ try
         Console.WriteLine(connection.State);
         if (connection.State is HubConnectionState.Disconnected)
         {
-            await connection.InvokeAsync<IGptHub>(x => x.Connect(key));
+            await connection.InvokeAsync<IJarvisHub>(x => x.Connect(key));
         }
     }
 }
@@ -47,4 +46,8 @@ catch (Exception e)
 {
     Console.WriteLine(e);
     throw;
+}
+finally
+{
+    await connection.StopAsync();
 }

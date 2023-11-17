@@ -33,7 +33,7 @@ if (app.Environment.IsDevelopment() is false)
 }
 
 
-app.MapGet("/version", () => "1.4");
+app.MapGet("/version", () => "1.5");
 app.MapGet("/", () => "ok");
 app.MapHub<JarvisHub>("/hub");
 
@@ -41,5 +41,6 @@ app.MapPost("/hub/listprojects", Endpoints.ListProjects);
 app.MapPost("/hub/getprojectdetails", Endpoints.OpenProject);
 app.MapPost("/hub/listprojectdirectory", Endpoints.ListProjectDirectory);
 app.MapPost("/hub/openfile", Endpoints.OpenFile);
+app.MapPost("/hub/writefile", Endpoints.WriteFile);
 
 app.Run();

@@ -1,6 +1,6 @@
 ﻿namespace Shared;
 
-public interface IGptHub
+public interface IJarvisHub
 {
     Task Connect(string userId);
     Task Disconnect();

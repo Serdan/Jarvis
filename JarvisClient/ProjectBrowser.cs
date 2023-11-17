@@ -2,14 +2,12 @@
 using System.Collections.Immutable;
 using Shared;
 
-#pragma warning disable CS8509 // The switch expression does not handle all possible values of its input type (it is not exhaustive).
-
 namespace JarvisClient;
 
-using static OptionUnion<FileInfo>;
+using fi_Ok = ResultUnion<FileInfo>.Ok;
+using fi_Error = ResultUnion<FileInfo>.Error;
 using static ProjectItemKind.Cons;
 using static ProjectItemKind;
-using static Unions.Result;
 using FileIO = File;
 
 public class ProjectBrowser(string projectDirectory)
@@ -25,68 +23,78 @@ public class ProjectBrowser(string projectDirectory)
         return new(directory);
     }
 
-    public Result<ImmutableArray<string>> ListProjects() =>
-        GetDirectoryNames();
+    public ImmutableArray<string> ListProjects() =>
+        Directory.GetDirectories(projectDirectory)
+                 .Select(Path.GetFileName)
+                 .ToImmutableArray()!;
 
     public Result<FrozenDictionary<string, string>> GetProjectDetails(string projectName) =>
         from project in ParseProjectName(projectName)
-        from fullPath in ParseDirectory(project)
+        from fullPath in ParseDirectory(project, project.Name)
         let infos = from path in fullPath
                     select from file in ProjectFiles
                            let filePath = Combine(path, file)
-                           select GetFile(filePath)
+                           select GetFile(project, filePath)
         let items = from item in filter(infos)
                     select new KeyValuePair<string, string>(item.Name, FileIO.ReadAllText(item.FullName))
         select items.ToFrozenDictionary();
 
-    public Result<ImmutableArray<ProjectItemKind>> ListProjectDirectory(string projectName, string path) =>
+    public Result<ImmutableArray<ProjectItemKind>> ListProjectDirectory(string projectName, string directoryPath) =>
         from project in ParseProjectName(projectName)
-        from items in GetItems(Combine(project, path))
+        from items in GetItems(project, directoryPath)
         select items;
 
-    public Result<string> OpenFile(string projectName, string path) =>
+    public Result<string> OpenFile(string projectName, string filePath) =>
         from project in ParseProjectName(projectName)
-        from file in GetFile(Combine(project, path)).ToResult("File not found")
-        select file.OpenText().ReadToEnd();
+        from file in GetFile(project, filePath)
+        select FileIO.ReadAllText(file.FullName);
 
-    private Result<string> ParseProjectName(string projectName) =>
-        union(GetDirectoryNames()) switch
+    public Result<string> WriteFile(string projectName, string filePath, string content, FileWriteMode mode) =>
+        from project in ParseProjectName(projectName)
+        from file in ParseFilePath(project, filePath)
+        let message = file.Exists ? "existing file" : "new file"
+        from result in mode switch
         {
-            Ok(ImmutableArray<string> projects) =>
-                projects.Contains(projectName)
-                    ? Ok(projectName)
-                    : Error("Unknown project name"),
-            Error(var error) => Error(error),
-            _ => Error($"Unknown error while parsing project name: {projectName}")
-        };
+            FileWriteMode.Append => @try(() => FileIO.AppendAllText(file.FullName, content), $"Appended content to {message}: {file.Name}"),
+            FileWriteMode.Write => @try(() => FileIO.WriteAllText(file.FullName, content), $"Wrote content to {message}: {file.Name}"),
+            _ => Error($"Unsupported mode: {mode}")
+        }
+        select result;
 
-    private Result<ImmutableArray<ProjectItemKind>> GetItems(string path) =>
-        from folderNames in GetDirectoryNames(path)
+    private Result<ProjectName> ParseProjectName(string projectName) =>
+        from projects in Ok(ListProjects())
+        let exists = projects.Contains(projectName)
+        select exists
+            ? Ok(new ProjectName(projectName))
+            : Error($"Unknown project name: {projectName}");
+
+    private Result<ImmutableArray<ProjectItemKind>> GetItems(ProjectName projectName, string path) =>
+        from folderNames in GetDirectoryNames(projectName, path)
         let folderItems = folderNames.Select(Folder)
-        from fileNames in GetFileNames(path)
+        from fileNames in GetFileNames(projectName, path)
         let fileItems = from fileName in fileNames
-                        let fileInfo = GetFile(Combine(path, fileName))
-                        select union2(fileInfo) switch
+                        let fileInfo = GetFile(projectName, Combine(path, fileName))
+                        select union(fileInfo) switch
                         {
-                            Some(var info) => new File(fileName)
+                            fi_Ok(var info) => new File(fileName)
                             {
                                 FileSize = info.Length,
                                 CreationDate = info.CreationTime,
                                 ModificationDate = info.LastWriteTime
                             },
-                            None => new File(fileName)
+                            fi_Error(var error) => new File(fileName)
                         }
         select ImmutableArray.Create<ProjectItemKind>([..folderItems, ..fileItems]);
 
-    private Result<ImmutableArray<string>> GetDirectoryNames(string directoryPath = "") =>
-        from fullPath in ParseDirectory(directoryPath)
+    private Result<ImmutableArray<string>> GetDirectoryNames(ProjectName projectName, string directoryPath = "") =>
+        from fullPath in ParseDirectory(projectName, directoryPath)
         let folders = from path in fullPath
                       select from folder in Directory.GetDirectories(path)
                              select Path.GetFileName(folder)
         select ImmutableArray.Create(folders.ToArray());
 
-    private Result<ImmutableArray<string>> GetFileNames(string directoryPath) =>
-        from fullPath in ParseDirectory(directoryPath)
+    private Result<ImmutableArray<string>> GetFileNames(ProjectName projectName, string directoryPath) =>
+        from fullPath in ParseDirectory(projectName, directoryPath)
         let files = from path in fullPath
                     select from file in Directory.GetFiles(path)
                            select Path.GetFileName(file)
@@ -95,10 +103,11 @@ public class ProjectBrowser(string projectDirectory)
     /// <summary>
     /// Returns the full path. It's important this isn't leaked to the agent.
     /// </summary>
+    /// <param name="projectName"></param>
     /// <param name="directoryPath"></param>
     /// <returns></returns>
-    private Result<HiddenString> ParseDirectory(string directoryPath) =>
-        from fullPath in Ok(Combine(projectDirectory, directoryPath))
+    private Result<HiddenString> ParseDirectory(ProjectName projectName, string directoryPath) =>
+        from fullPath in Combine(projectDirectory, projectName.Name, directoryPath)
         let exists = Directory.Exists(fullPath)
         select exists
             ? Ok(new HiddenString(fullPath))
@@ -107,18 +116,40 @@ public class ProjectBrowser(string projectDirectory)
     /// <summary>
     /// Returns FileInfo containing the full path. It's important this isn't leaked to the agent.
     /// </summary>
+    /// <param name="projectName"></param>
     /// <param name="path"></param>
     /// <returns></returns>
-    private Option<FileInfo> GetFile(string path) =>
-        from fullPath in some(Path.Combine(projectDirectory, path))
+    private Result<FileInfo> GetFile(ProjectName projectName, string path) =>
+        from fullPath in Combine(projectDirectory, projectName.Name, path)
         let exists = FileIO.Exists(fullPath)
         select exists
-            ? some(new FileInfo(fullPath))
-            : none;
+            ? Ok(new FileInfo(fullPath))
+            : Error("File does not exist");
+
+    private Result<FilePath> ParseFilePath(ProjectName projectName, string filePath) =>
+        from fullPath in Combine(projectDirectory, projectName.Name, filePath)
+        from info in @try(() => new FileInfo(fullPath))
+        select Directory.Exists(info.FullName) is false
+            ? Ok(new FilePath(info.Name, info.FullName, info.Exists))
+            : Error("Path is a directory");
 
     private static readonly ImmutableArray<string> ProjectFiles =
         ImmutableArray.Create<string>(["readme.md", "notes.md", "todo.md"]);
 
-    private static string Combine(string left, string right) => 
-        left.TrimEnd('/', '\\') + "/" + right.TrimStart('/', '\\', '.');
+    private static string Combine(string left, string path) =>
+        left.TrimEnd('/', '\\') + "/" + path.TrimStart('/', '\\', '.');
+
+    private Result<string> Combine(params string[] paths)
+    {
+        var path = string.Join(Path.DirectorySeparatorChar, paths);
+        var fullPath = Path.GetFullPath(path);
+        return fullPath.StartsWith(projectDirectory) ? Ok(fullPath) : Error("Invalid path");
+    }
+}
+
+public record FilePath(string Name, string FullName, bool Exists);
+
+public record ProjectName(string Name)
+{
+    public override string ToString() => Name;
 }

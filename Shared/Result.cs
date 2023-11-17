@@ -2,7 +2,7 @@
 
 public readonly struct Result<TValue>
 {
-    private readonly TValue value;
+    internal readonly TValue value;
     private readonly AggregateException error;
 
     public bool IsOk { get; }
@@ -52,6 +52,23 @@ public readonly struct Result<TValue>
         }
 
         return Ok(resultSelector(value, inner.value));
+    }
+
+    public Result<TResult> SelectMany<TInner, TResult>(Func<TValue, Result<TInner>> selector, Func<TValue, TInner, Result<TResult>> resultSelector)
+    {
+        if (IsError)
+        {
+            return Error(error);
+        }
+
+        var inner = selector(value);
+
+        if (inner.IsError)
+        {
+            return Error(inner.error);
+        }
+
+        return resultSelector(value, inner.value);
     }
 
     public async Task<Result<TResult>> Select<TResult>(Func<TValue, Task<TResult>> f) =>

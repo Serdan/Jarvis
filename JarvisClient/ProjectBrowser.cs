@@ -29,10 +29,10 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
 
     public Result<FrozenDictionary<string, string>> GetProjectDetails(string projectName) =>
         from project in ParseProjectName(projectName)
-        from fullPath in ParseDirectory(project, project.Name)
+        from fullPath in ParseDirectory(project)
         let infos = from path in fullPath
                     select from file in ProjectFiles
-                           select GetFile(project, path, file)
+                           select GetFile(project, file)
         let items = from item in filter(infos)
                     select new KeyValuePair<string, string>(item.Name, fileSystem.ReadAllText(item.FullName))
         select items.ToFrozenDictionary();
@@ -113,7 +113,9 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
         from fullPath in ParseDirectory(projectName, directoryPath)
         let folders = from path in fullPath
                       select from folder in fileSystem.GetDirectories(path)
-                             select Path.GetFileName(folder)
+                             let folderName = Path.GetFileName(folder)
+                             where FolderFilters.All(predicate => predicate(folderName))
+                             select folderName
         select ImmutableArray.Create(folders.ToArray());
 
     private Result<ImmutableArray<string>> GetFileNames(ProjectName projectName, string directoryPath) =>
@@ -130,7 +132,7 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
     /// <param name="directoryPath"></param>
     /// <returns></returns>
     private Result<HiddenString> ParseDirectory(ProjectName projectName, params string[] directoryPath) =>
-        from fullPath in Combine(projectDirectory, [projectName.Name, ..directoryPath])
+        from fullPath in Combine(projectDirectory, [projectName.Name, ..directoryPath]).Select(FunctionalConsole.WriteLine)
         let exists = fileSystem.DirectoryExists(fullPath)
         select exists
             ? Ok(new HiddenString(fullPath))
@@ -156,13 +158,20 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
             ? Ok(new FilePath(info.Name, info.FullName, info.Exists))
             : Error("Path is a directory");
 
-    private static readonly ImmutableArray<string> ProjectFiles =
-        ImmutableArray.Create<string>(["readme.md", "notes.md", "todo.md", "bob_notes.txt"]);
-
     private static Result<string> Combine(string projectDirectory, params string[] paths) =>
-        from path in @try(() => string.Join(Path.DirectorySeparatorChar, projectDirectory, paths))
+        from path in @try(() => string.Join(Path.DirectorySeparatorChar, [projectDirectory, ..paths]))
         from fullPath in @try(() => Path.GetFullPath(path))
         select fullPath.StartsWith(projectDirectory)
             ? Ok(fullPath)
             : Error("Invalid path");
+
+    private static readonly ImmutableArray<string> ProjectFiles =
+        ImmutableArray.Create<string>(["readme.md", "notes.md", "todo.md", "bob_notes.txt"]);
+
+    private static readonly ImmutableArray<Func<string, bool>> FolderFilters =
+        ImmutableArray.Create<Func<string, bool>>([
+            s => s.StartsWith('.'),
+            s => s == "bin",
+            s => s == "obj"
+        ]);
 }

@@ -1,6 +1,8 @@
 ﻿using Microsoft.AspNetCore.SignalR;
 using Shared;
+using Shared.AlgebraicTypes;
 using Shared.Messages;
+using Shared.SignalR;
 
 namespace JarvisServer.Services;
 

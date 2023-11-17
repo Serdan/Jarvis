@@ -1,6 +1,6 @@
 ﻿using Shared.Messages;
 
-namespace Shared;
+namespace Shared.SignalR;
 
 public interface IUserClient
 {

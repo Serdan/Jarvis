@@ -1,6 +1,7 @@
-﻿using JarvisServer.Services;
+using JarvisServer.Services;
 using Microsoft.AspNetCore.Mvc;
 using Shared;
+using Shared.Extensions;
 using Shared.Messages;
 using static Shared.Messages.AgentCommand;
 
@@ -27,6 +28,10 @@ public static class Endpoints
               .Select(WriteLine);
 
     public static Task<string> WriteFile(ClientService client, [FromBody] AgentMessage<WriteFileCommand> message) =>
+        client.SendCommandToUser(message)
+              .Select(WriteLine);
+
+    public static Task<string> ReplaceSection(ClientService client, [FromBody] AgentMessage<SectionReplaceCommand> message) =>
         client.SendCommandToUser(message)
               .Select(WriteLine);
 }

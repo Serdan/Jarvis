@@ -96,6 +96,24 @@
           "required": true
         }
       }
+    },
+    "/sectionreplace": {
+      "post": {
+        "description": "Replace a specific section within a file.",
+        "operationId": "SectionReplace",
+        "parameters": [],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SectionReplaceSchema"
+              }
+            }
+          },
+          "required": true
+        },
+        "deprecated": false
+      }
     }
   },
   "components": {
@@ -259,6 +277,65 @@
           "command"
         ],
         "title": "OpenFileSchema"
+      },
+      "SectionReplaceSchema": {
+        "properties": {
+          "key": {
+            "type": "string",
+            "title": "key",
+            "description": "Key provided by the user."
+          },
+          "command": {
+            "type": "object",
+            "title": "Command details",
+            "properties": {
+              "file_path": {
+                "type": "string",
+                "title": "file_path",
+                "description": "The path to the file."
+              },
+              "section_identifiers": {
+                "type": "object",
+                "title": "section_identifiers",
+                "description": "Markers or identifiers for the start and end of the section.",
+                "properties": {
+                  "start": {
+                    "type": "string",
+                    "title": "start",
+                    "description": "The identifier or marker for the start of the section."
+                  },
+                  "end": {
+                    "type": "string",
+                    "title": "end",
+                    "description": "The identifier or marker for the end of the section."
+                  }
+                },
+                "required": ["start", "end"]
+              },
+              "replacement_content": {
+                "type": "string",
+                "title": "replacement_content",
+                "description": "The new content to replace the identified section."
+              },
+              "backup_option": {
+                "type": "boolean",
+                "title": "backup_option",
+                "description": "Flag to create a backup of the original file before replacement."
+              }
+            },
+            "required": [
+              "file_path",
+              "section_identifiers",
+              "replacement_content"
+            ]
+          }
+        },
+        "type": "object",
+        "required": [
+          "key",
+          "command"
+        ],
+        "title": "SectionReplaceSchema"
       }
     }
   }

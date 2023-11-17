@@ -1,6 +1,6 @@
 ﻿// ReSharper disable InconsistentNaming
 
-namespace Shared;
+namespace Shared.AlgebraicTypes;
 
 public static partial class Prelude
 {

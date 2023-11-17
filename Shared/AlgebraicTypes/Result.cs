@@ -1,4 +1,4 @@
-﻿namespace Shared;
+﻿namespace Shared.AlgebraicTypes;
 
 public readonly struct Result<TValue>
 {
@@ -81,7 +81,7 @@ public readonly struct Result<TValue>
         if (IsOk)
         {
             await f(value);
-            return Ok(unit);
+            return Ok(Prelude.unit);
         }
         else
         {

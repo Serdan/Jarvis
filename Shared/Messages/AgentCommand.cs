@@ -1,4 +1,4 @@
-﻿using System.Text.Json;
+using System.Text.Json;
 using System.Text.Json.Serialization;
 using ExhaustiveMatching;
 using static Shared.Messages.AgentCommand;
@@ -33,6 +33,11 @@ public abstract partial record AgentCommand
     {
         public string Kind { get; } = nameof(WriteFileCommand);
     }
+
+    public sealed partial record SectionReplaceCommand(string FilePath, SectionIdentifiers SectionIdentifiers, string ReplacementContent, bool BackupOption)
+    {
+        public string Kind { get; } = nameof(SectionReplaceCommand);
+    }
 }
 
 file class AgentCommandJsonConverter : JsonConverter<AgentCommand>
@@ -59,6 +64,7 @@ file class AgentCommandJsonConverter : JsonConverter<AgentCommand>
             nameof(ListProjectDirectoryCommand) => JsonSerializer.Deserialize<ListProjectDirectoryCommand>(root.GetRawText(), options)!,
             nameof(OpenFileCommand) => JsonSerializer.Deserialize<OpenFileCommand>(root.GetRawText(), options)!,
             nameof(WriteFileCommand) => JsonSerializer.Deserialize<WriteFileCommand>(root.GetRawText(), options)!,
+            nameof(SectionReplaceCommand) => JsonSerializer.Deserialize<SectionReplaceCommand>(root.GetRawText(), options)!,
             _ => throw new JsonException($"Unknown CommandType: {commandType}")
         };
     }

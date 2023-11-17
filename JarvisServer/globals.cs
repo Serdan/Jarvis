@@ -1,1 +1,1 @@
-﻿global using static Shared.Prelude;
+﻿global using static Shared.AlgebraicTypes.Prelude;

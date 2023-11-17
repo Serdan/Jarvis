@@ -1,24 +1,28 @@
 ﻿using System.Text.Json;
 using System.Text.Json.Serialization;
 
-namespace JarvisClient;
+namespace JarvisClient.Models;
 
 [AutoClosed]
 [JsonConverter(typeof(ProjectItemKindJsonConverter))]
-public abstract partial record ProjectItemKind
+public partial record ProjectItemKind
 {
-    public sealed partial record File(string Name)
+    partial record ProjectFile(string Name, long FileSize, DateTimeOffset CreationDate, DateTimeOffset ModificationDate)
     {
-        public string Kind { get; } = nameof(File);
-        public long FileSize { get; init; }
-        public DateTimeOffset CreationDate { get; init; }
-        public DateTimeOffset ModificationDate { get; init; }
+        public string Kind { get; } = nameof(ProjectFile);
+
+        public static ProjectFile From(FileInfo fileInfo) =>
+            new(fileInfo.Name, fileInfo.Length, fileInfo.CreationTime, fileInfo.LastWriteTime);
     }
 
-
-    public sealed partial record Folder(string Name)
+    partial record ProjectFolder(string Name)
     {
-        public string Kind { get; } = nameof(Folder);
+        public string Kind { get; } = nameof(ProjectFolder);
+    }
+
+    partial record ProjectFileError(string Name, string ErrorMessage)
+    {
+        public string Kind { get; } = nameof(ProjectFileError);
     }
 }
 
@@ -40,8 +44,8 @@ public class ProjectItemKindJsonConverter : JsonConverter<ProjectItemKind>
         // Deserialize to the specific type based on CommandType
         return commandType switch
         {
-            nameof(ProjectItemKind.File) => JsonSerializer.Deserialize<ProjectItemKind.File>(root.GetRawText(), options)!,
-            nameof(ProjectItemKind.Folder) => JsonSerializer.Deserialize<ProjectItemKind.Folder>(root.GetRawText(), options)!,
+            nameof(ProjectItemKind.ProjectFile) => JsonSerializer.Deserialize<ProjectItemKind.ProjectFile>(root.GetRawText(), options)!,
+            nameof(ProjectItemKind.ProjectFolder) => JsonSerializer.Deserialize<ProjectItemKind.ProjectFolder>(root.GetRawText(), options)!,
             _ => throw new JsonException($"Unknown CommandType: {commandType}")
         };
     }

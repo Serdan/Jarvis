@@ -2,9 +2,12 @@
 
 using System.Security.Cryptography;
 using JarvisClient;
+using JarvisClient.Extensions;
 using Microsoft.AspNetCore.SignalR.Client;
 using Microsoft.Extensions.DependencyInjection;
 using Shared;
+using Shared.Extensions;
+using Shared.SignalR;
 
 await using var connection = new HubConnectionBuilder()
                              .AddJsonProtocol()

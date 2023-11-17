@@ -1,5 +1,5 @@
 ﻿// ReSharper disable InconsistentNaming
-namespace Shared;
+namespace Shared.AlgebraicTypes;
 
 public readonly struct Option<TValue>
 {

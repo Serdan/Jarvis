@@ -1,13 +1,13 @@
-﻿using System.Collections.Frozen;
+using System.Collections.Frozen;
 using System.Collections.Immutable;
+using JarvisClient.Models;
 using Shared;
+using Shared.AlgebraicTypes;
+using Shared.Messages;
 
 namespace JarvisClient;
 
-using fi_Ok = ResultUnion<FileInfo>.Ok;
-using fi_Error = ResultUnion<FileInfo>.Error;
 using static ProjectItemKind.Cons;
-using static ProjectItemKind;
 using FileIO = File;
 
 public class ProjectBrowser(string projectDirectory)
@@ -61,6 +61,37 @@ public class ProjectBrowser(string projectDirectory)
         }
         select result;
 
+    public Result<string> ReplaceSection(string filePath, SectionIdentifiers sectionIdentifiers, string replacementContent, bool backupOption)
+    {
+        try
+        {
+            var fileContent = FileIO.ReadAllText(filePath);
+            var startIndex = fileContent.IndexOf(sectionIdentifiers.Start, StringComparison.Ordinal);
+            var endIndex = fileContent.IndexOf(sectionIdentifiers.End, startIndex, StringComparison.Ordinal);
+
+            if (startIndex == -1 || endIndex == -1)
+            {
+                return Error("Section identifiers not found in file.");
+            }
+
+            if (backupOption)
+            {
+                FileIO.Copy(filePath, filePath + ".bak", true);
+            }
+
+            var newContent = fileContent.Substring(0, startIndex)
+                + replacementContent
+                + fileContent.Substring(endIndex + sectionIdentifiers.End.Length);
+
+            FileIO.WriteAllText(filePath, newContent);
+            return Ok("Section replaced successfully.");
+        }
+        catch (Exception ex)
+        {
+            return Error(ex.Message);
+        }
+    }
+
     private Result<ProjectName> ParseProjectName(string projectName) =>
         from projects in Ok(ListProjects())
         let exists = projects.Contains(projectName)
@@ -70,20 +101,14 @@ public class ProjectBrowser(string projectDirectory)
 
     private Result<ImmutableArray<ProjectItemKind>> GetItems(ProjectName projectName, string path) =>
         from folderNames in GetDirectoryNames(projectName, path)
-        let folderItems = folderNames.Select(Folder)
+        let folderItems = folderNames.Select(ProjectFolder)
         from fileNames in GetFileNames(projectName, path)
         let fileItems = from fileName in fileNames
                         let fileInfo = GetFile(projectName, Combine(path, fileName))
-                        select union(fileInfo) switch
-                        {
-                            fi_Ok(var info) => new File(fileName)
-                            {
-                                FileSize = info.Length,
-                                CreationDate = info.CreationTime,
-                                ModificationDate = info.LastWriteTime
-                            },
-                            fi_Error(var error) => new File(fileName)
-                        }
+                        select fileInfo.Match(
+                            ok: ProjectItemKind.ProjectFile.From,
+                            error: error => ProjectFileError(fileName, error.Message)
+                        )
         select ImmutableArray.Create<ProjectItemKind>([..folderItems, ..fileItems]);
 
     private Result<ImmutableArray<string>> GetDirectoryNames(ProjectName projectName, string directoryPath = "") =>
@@ -145,11 +170,4 @@ public class ProjectBrowser(string projectDirectory)
         var fullPath = Path.GetFullPath(path);
         return fullPath.StartsWith(projectDirectory) ? Ok(fullPath) : Error("Invalid path");
     }
-}
-
-public record FilePath(string Name, string FullName, bool Exists);
-
-public record ProjectName(string Name)
-{
-    public override string ToString() => Name;
 }

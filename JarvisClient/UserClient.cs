@@ -1,8 +1,11 @@
 ﻿using System.Text.Json;
 using System.Text.Json.Serialization;
+using JarvisClient.Extensions;
 using Microsoft.AspNetCore.SignalR.Client;
-using Shared;
+using Shared.AlgebraicTypes;
+using Shared.Extensions;
 using Shared.Messages;
+using Shared.SignalR;
 using static Shared.FunctionalConsole;
 using static Shared.Messages.AgentCommand;
 

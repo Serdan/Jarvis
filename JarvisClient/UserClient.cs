@@ -2,8 +2,6 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using JarvisClient.Extensions;
 using Microsoft.AspNetCore.SignalR.Client;
-using Shared.AlgebraicTypes;
-using Shared.Extensions;
 using Shared.Messages;
 using Shared.SignalR;
 using static Shared.FunctionalConsole;
@@ -34,7 +32,7 @@ public class UserClient(HubConnection hub, ProjectBrowser browser) : IUserClient
                 OpenFileCommand(var projectName, var path) => browser.OpenFile(projectName, path),
                 WriteFileCommand(var projectName, var filePath, var content, var mode) => browser.WriteFile(projectName, filePath, content, mode),
                 SectionReplaceCommand(var filePath, var sectionIdentifiers, var replacementContent, var backupOption) => browser.ReplaceSection(filePath, sectionIdentifiers, replacementContent, backupOption),
-                _ => Error("Unknown command")
+                _ => error("Unknown command")
             };
 
             response = result.IfError(x => x.Message.Apply(WriteLine));
@@ -53,11 +51,11 @@ public class UserClient(HubConnection hub, ProjectBrowser browser) : IUserClient
     {
         try
         {
-            return Ok(JsonSerializer.Serialize(value, Options()));
+            return ok(JsonSerializer.Serialize(value, Options()));
         }
         catch (Exception e)
         {
-            return Error(e);
+            return error(e);
         }
     }
 

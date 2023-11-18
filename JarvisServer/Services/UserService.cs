@@ -1,5 +1,4 @@
 ﻿using System.Collections.Concurrent;
-using Shared.AlgebraicTypes;
 
 namespace JarvisServer.Services;
 
@@ -23,6 +22,6 @@ public class UserService
 
     public Result<string> GetConnectionId(string key) =>
         users.TryGetValue(key, out var value)
-            ? Ok(value)
-            : Error($"User not found with key: {key}");
+            ? ok(value)
+            : error($"User not found with key: {key}");
 }

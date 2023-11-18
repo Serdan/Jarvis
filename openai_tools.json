@@ -7,7 +7,7 @@
   },
   "servers": [
     {
-      "url": "https://jarvis.kehlet.dev/hub"
+      "url": "https://jarvis.kehlet.dev/agent"
     }
   ],
   "paths": {
@@ -16,6 +16,11 @@
         "description": "Gets a list of projects",
         "operationId": "ListProjects",
         "parameters": [],
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -310,7 +315,10 @@
                     "description": "The identifier or marker for the end of the section."
                   }
                 },
-                "required": ["start", "end"]
+                "required": [
+                  "start",
+                  "end"
+                ]
               },
               "replacement_content": {
                 "type": "string",
@@ -336,6 +344,13 @@
           "command"
         ],
         "title": "SectionReplaceSchema"
+      }
+    },
+    "securitySchemes": {
+      "ApiKeyAuth": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-API-KEY"
       }
     }
   }

@@ -1,5 +1,4 @@
 ﻿using Microsoft.AspNetCore.SignalR;
-using Shared.AlgebraicTypes;
 using Shared.Messages;
 using Shared.SignalR;
 

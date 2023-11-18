@@ -8,8 +8,8 @@
     </PropertyGroup>
 
     <ItemGroup>
-      <PackageReference Include="AutoClosedUnionGenerator" Version="1.0.4" />
-      <PackageReference Include="ExhaustiveMatching.Analyzer" Version="0.5.0" />
+      <PackageReference Include="AutoClosedUnionGenerator" Version="1.0.6" />
+      <PackageReference Include="Kehlet.Functional" Version="1.0.0" />
     </ItemGroup>
 
 </Project>

@@ -1,7 +1,6 @@
 using JarvisServer.Services;
 using Microsoft.AspNetCore.Mvc;
 using Shared;
-using Shared.Extensions;
 using Shared.Messages;
 using static Shared.Messages.AgentCommand;
 

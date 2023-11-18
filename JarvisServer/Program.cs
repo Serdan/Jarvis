@@ -1,8 +1,11 @@
-﻿using System.Text.Json;
+﻿using System.Globalization;
+using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Threading.RateLimiting;
 using JarvisServer;
 using JarvisServer.Services;
 using Microsoft.AspNetCore.HttpOverrides;
+using Microsoft.AspNetCore.RateLimiting;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -20,7 +23,33 @@ builder.Services.ConfigureHttpJsonOptions(options =>
     options.SerializerOptions.PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower;
 });
 
+const string rateLimiterPolicy = "Fixed";
+builder.Services.AddRateLimiter(options =>
+{
+    options.OnRejected += (context, _) =>
+    {
+        if (context.Lease.TryGetMetadata(MetadataName.RetryAfter, out var retryAfter))
+        {
+            context.HttpContext.Response.Headers.RetryAfter =
+                ((int) retryAfter.TotalSeconds).ToString(NumberFormatInfo.InvariantInfo);
+        }
+
+        context.HttpContext.Response.StatusCode = StatusCodes.Status429TooManyRequests;
+
+        return ValueTask.CompletedTask;
+    };
+    options.AddFixedWindowLimiter(rateLimiterPolicy, opt =>
+    {
+        opt.PermitLimit = 3;
+        opt.Window = TimeSpan.FromSeconds(10);
+        opt.QueueProcessingOrder = QueueProcessingOrder.OldestFirst;
+        opt.QueueLimit = 1;
+    });
+});
+
 var app = builder.Build();
+
+app.UseRateLimiter();
 
 if (app.Environment.IsDevelopment() is false)
 {
@@ -33,14 +62,23 @@ if (app.Environment.IsDevelopment() is false)
 }
 
 
-app.MapGet("/version", () => "1.5");
+app.MapGet("/version", () => "1.7");
 app.MapGet("/", () => "ok");
-app.MapHub<JarvisHub>("/hub");
+app.MapHub<JarvisHub>("/client").RequireRateLimiting(rateLimiterPolicy);
 
-app.MapPost("/hub/listprojects", Endpoints.ListProjects);
-app.MapPost("/hub/getprojectdetails", Endpoints.OpenProject);
-app.MapPost("/hub/listprojectdirectory", Endpoints.ListProjectDirectory);
-app.MapPost("/hub/openfile", Endpoints.OpenFile);
-app.MapPost("/hub/writefile", Endpoints.WriteFile);
+app.MapGroup("/agent")
+   .Apply(group =>
+   {
+       group.MapPost("/listprojects", Endpoints.ListProjects);
+       group.MapPost("/getprojectdetails", Endpoints.OpenProject);
+       group.MapPost("/listprojectdirectory", Endpoints.ListProjectDirectory);
+       group.MapPost("/openfile", Endpoints.OpenFile);
+       group.MapPost("/writefile", Endpoints.WriteFile);
+       group.MapPost("/sectionreplace", Endpoints.ReplaceSection);
+
+       return group;
+   })
+   .RequireRateLimiting(rateLimiterPolicy);
+
 
 app.Run();

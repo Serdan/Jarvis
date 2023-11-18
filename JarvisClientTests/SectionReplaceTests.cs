@@ -25,7 +25,7 @@ namespace JarvisClientTests
             var result = browser.ReplaceSection(filePath, sectionIdentifiers, replacementContent, backupOption);
 
             // Assert
-            Assert.AreEqual("Section replaced successfully.", result.value);
+            Assert.AreEqual("Section replaced successfully.", result.IfError(x => x.Message));
         }
     }
 }

@@ -22,9 +22,9 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
     }
 
     public ImmutableArray<string> ListProjects() =>
-        Directory.GetDirectories(projectDirectory)
-                 .Select(Path.GetFileName)
-                 .ToImmutableArray()!;
+        fileSystem.GetDirectories(projectDirectory)
+                  .Select(Path.GetFileName)
+                  .ToImmutableArray()!;
 
     public Result<FrozenDictionary<string, string>> GetProjectDetails(string projectName) =>
         from project in ParseProjectName(projectName)
@@ -58,36 +58,28 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
         }
         select result;
 
-    public Result<string> ReplaceSection(string filePath, SectionIdentifiers sectionIdentifiers, string replacementContent, bool backupOption)
-    {
-        try
-        {
-            var fileContent = fileSystem.ReadAllText(filePath);
-            var startIndex = fileContent.IndexOf(sectionIdentifiers.Start, StringComparison.Ordinal);
-            var endIndex = fileContent.IndexOf(sectionIdentifiers.End, startIndex, StringComparison.Ordinal);
-
-            if (startIndex == -1 || endIndex == -1)
-            {
-                return error("Section identifiers not found in file.");
-            }
-
-            if (backupOption)
-            {
-                fileSystem.CopyFile(filePath, filePath + ".bak", true);
-            }
-
-            var newContent = fileContent[..startIndex]
-                + replacementContent
-                + fileContent[(endIndex + sectionIdentifiers.End.Length)..];
-
-            fileSystem.WriteAllText(filePath, newContent);
-            return ok("Section replaced successfully.");
-        }
-        catch (Exception ex)
-        {
-            return error(ex.Message);
-        }
-    }
+    public Result<string> ReplaceSection(string projectName, string filePath, SectionIdentifiers sectionIdentifiers, string replacementContent, bool backupOption) =>
+        from project in ParseProjectName(projectName)
+        from file in ParseFilePath(project, filePath)
+        //
+        let content = fileSystem.ReadAllText(file.FullName)
+        let startIndex = content.IndexOf(sectionIdentifiers.Start, StringComparison.Ordinal)
+        let endIndex = content.IndexOf(sectionIdentifiers.End, StringComparison.Ordinal)
+        //
+        from foundSection in startIndex >= 0 && endIndex >= 0
+            ? ok(unit)
+            : error("Section identifiers not found in file.")
+        //
+        let backup = backupOption
+            ? fileSystem.CopyFile(file.FullName, file.FullName + ".bak", true)
+            : unit
+        //
+        let newContent = content[..startIndex]
+            + replacementContent
+            + content[(endIndex + sectionIdentifiers.End.Length)..]
+        let write = fileSystem.WriteAllText(file.FullName, newContent)
+        //
+        select ok("Section replaced successfully.");
 
     private Result<ProjectName> ParseProjectName(string projectName) =>
         from projects in ok(ListProjects())

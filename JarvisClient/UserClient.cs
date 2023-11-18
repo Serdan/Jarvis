@@ -31,7 +31,8 @@ public class UserClient(HubConnection hub, ProjectBrowser browser) : IUserClient
                 ListProjectDirectoryCommand(var projectName, var path) => browser.ListProjectDirectory(projectName, path).Select(Serialize),
                 OpenFileCommand(var projectName, var path) => browser.OpenFile(projectName, path),
                 WriteFileCommand(var projectName, var filePath, var content, var mode) => browser.WriteFile(projectName, filePath, content, mode),
-                SectionReplaceCommand(var filePath, var sectionIdentifiers, var replacementContent, var backupOption) => browser.ReplaceSection(filePath, sectionIdentifiers, replacementContent, backupOption),
+                SectionReplaceCommand(var projectName, var filePath, var sectionIdentifiers, var replacementContent, var backupOption) =>
+                    browser.ReplaceSection(projectName, filePath, sectionIdentifiers, replacementContent, backupOption),
                 _ => error("Unknown command")
             };
 

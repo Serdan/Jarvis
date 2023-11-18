@@ -1,31 +1,45 @@
 using JarvisClient;
-using Moq;
-using Shared;
+using JarvisClientTests.Impl;
 using Shared.Messages;
 
-namespace JarvisClientTests
+namespace JarvisClientTests;
+
+[TestClass]
+public class SectionReplaceTests
 {
-    [TestClass]
-    public class SectionReplaceTests
+    [TestMethod]
+    public void TestSectionReplace()
     {
-        [TestMethod]
-        public void TestSectionReplace()
-        {
-            var mockFileSystem = new Mock<IFileSystem>();
-            mockFileSystem.Setup(fs => fs.ReadAllText(It.IsAny<string>())).Returns("file content");
+        const string projectName = "Test Project";
+        const string fileName = "testFile.txt";
+        const string filePath = $@"C:\repos\{projectName}\{fileName}";
+        const string originalContent = """
+            THIS IS A TEST
+                <!-- START -->THIS SHOULD BE REPLACED<!-- END -->
+            END TEST CONTENT
+            """;
 
-            // Arrange
-            var browser = new ProjectBrowser(mockFileSystem.Object, "testDirectory");
-            const string filePath = "testFile.txt";
-            var sectionIdentifiers = new SectionIdentifiers("<!-- START -->", "<!-- END -->");
-            const string replacementContent = "New content";
-            const bool backupOption = true;
+        const string replacedContent = """
+            THIS IS A TEST
+                NEW CONTENT
+            END TEST CONTENT
+            """;
 
-            // Act
-            var result = browser.ReplaceSection(filePath, sectionIdentifiers, replacementContent, backupOption);
+        var fileSystem = new FakeFileSystem();
+        fileSystem.AddFolder(@"C:\repos", projectName);
+        fileSystem.AddFile(filePath, originalContent);
 
-            // Assert
-            Assert.AreEqual("Section replaced successfully.", result.IfError(x => x.Message));
-        }
+        // Arrange
+        var browser = new ProjectBrowser(fileSystem, @"C:\repos");
+        var sectionIdentifiers = new SectionIdentifiers("<!-- START -->", "<!-- END -->");
+        const string replacementContent = "NEW CONTENT";
+        const bool backupOption = false;
+
+        // Act
+        var result = browser.ReplaceSection(projectName, fileName, sectionIdentifiers, replacementContent, backupOption);
+
+        // Assert
+        Assert.AreEqual("Section replaced successfully.", result.IfError(x => x.Message));
+        Assert.AreEqual(replacedContent, fileSystem.ReadAllText(filePath));
     }
 }

@@ -34,7 +34,7 @@ public partial record AgentCommand
         public string Kind { get; } = nameof(WriteFileCommand);
     }
 
-    partial record SectionReplaceCommand(string FilePath, SectionIdentifiers SectionIdentifiers, string ReplacementContent, bool BackupOption)
+    partial record SectionReplaceCommand(string ProjectName, string FilePath, SectionIdentifiers SectionIdentifiers, string ReplacementContent, bool BackupOption)
     {
         public string Kind { get; } = nameof(SectionReplaceCommand);
     }

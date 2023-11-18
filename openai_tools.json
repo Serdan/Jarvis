@@ -119,6 +119,24 @@
         },
         "deprecated": false
       }
+    },
+    "/textreplace": {
+      "post": {
+        "description": "Replace a section of a file identified by a search string.",
+        "operationId": "Replace",
+        "parameters": [],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SearchReplaceSchema"
+              }
+            }
+          },
+          "required": true
+        },
+        "deprecated": false
+      }
     }
   },
   "components": {
@@ -345,6 +363,53 @@
           "command"
         ],
         "title": "SectionReplaceSchema"
+      },
+      "SearchReplaceSchema": {
+        "properties": {
+          "key": {
+            "type": "string",
+            "title": "key",
+            "description": "Key provided by the user."
+          },
+          "command": {
+            "type": "object",
+            "title": "Command details",
+            "properties": {
+              "project_name": {
+                "type":"string",
+                "title": "project_name",
+                "description": "The project name"
+              },
+              "file_path": {
+                "type": "string",
+                "title": "file_path",
+                "description": "The path to the file."
+              },
+              "search": {
+                "type": "string",
+                "title": "search",
+                "description": "Search string to be replaced."
+              },
+              "replacement": {
+                "type": "string",
+                "title": "replacement",
+                "description": "The new content to replace the search string."
+              }
+            },
+            "required": [
+              "project_name",
+              "file_path",
+              "search",
+              "replacement"
+            ]
+          }
+        },
+        "type": "object",
+        "required": [
+          "key",
+          "command"
+        ],
+        "title": "SearchReplaceSchema"
       }
     },
     "securitySchemes": {

@@ -21,7 +21,7 @@ public class SectionReplaceTests
 
         const string replacedContent = """
             THIS IS A TEST
-                NEW CONTENT
+                NEW CONTENT<!-- END -->
             END TEST CONTENT
             """;
 

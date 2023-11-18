@@ -33,6 +33,7 @@ public class UserClient(HubConnection hub, ProjectBrowser browser) : IUserClient
                 WriteFileCommand(var projectName, var filePath, var content, var mode) => browser.WriteFile(projectName, filePath, content, mode),
                 SectionReplaceCommand(var projectName, var filePath, var sectionIdentifiers, var replacementContent) =>
                     browser.ReplaceSection(projectName, filePath, sectionIdentifiers, replacementContent),
+                TextReplaceCommand(var projectName, var filePath, var search, var replacement) => browser.Replace(projectName, filePath, search, replacement),
                 _ => error("Unknown command")
             };
 

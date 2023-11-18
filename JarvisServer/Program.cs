@@ -75,6 +75,7 @@ app.MapGroup("/agent")
        group.MapPost("/openfile", Endpoints.OpenFile);
        group.MapPost("/writefile", Endpoints.WriteFile);
        group.MapPost("/sectionreplace", Endpoints.ReplaceSection);
+       group.MapPost("/textreplace", Endpoints.TextReplace);
 
        return group;
    })

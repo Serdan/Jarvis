@@ -38,6 +38,11 @@ public partial record AgentCommand
     {
         public string Kind { get; } = nameof(SectionReplaceCommand);
     }
+
+    partial record TextReplaceCommand(string ProjectName, string FilePath, string Search, string Replacement)
+    {
+        public string Kind { get; } = nameof(TextReplaceCommand);
+    }
 }
 
 file class AgentCommandJsonConverter : JsonConverter<AgentCommand>
@@ -65,6 +70,7 @@ file class AgentCommandJsonConverter : JsonConverter<AgentCommand>
             nameof(OpenFileCommand) => JsonSerializer.Deserialize<OpenFileCommand>(root.GetRawText(), options)!,
             nameof(WriteFileCommand) => JsonSerializer.Deserialize<WriteFileCommand>(root.GetRawText(), options)!,
             nameof(SectionReplaceCommand) => JsonSerializer.Deserialize<SectionReplaceCommand>(root.GetRawText(), options)!,
+            nameof(TextReplaceCommand) => JsonSerializer.Deserialize<TextReplaceCommand>(root.GetRawText(), options)!,
             _ => throw new JsonException($"Unknown CommandType: {commandType}")
         };
     }

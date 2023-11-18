@@ -33,4 +33,8 @@ public static class Endpoints
     public static Task<string> ReplaceSection(ClientService client, [FromBody] AgentMessage<SectionReplaceCommand> message) =>
         client.SendCommandToUser(message)
               .Select(WriteLine);
+
+    public static Task<string> TextReplace(ClientService client, [FromBody] AgentMessage<TextReplaceCommand> message) =>
+        client.SendCommandToUser(message)
+              .Select(WriteLine);
 }

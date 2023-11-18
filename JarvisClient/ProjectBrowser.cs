@@ -8,8 +8,19 @@ namespace JarvisClient;
 
 using static ProjectItemKind.Cons;
 
+/// <summary>
+/// Manages project file and directory operations within the Jarvis project.
+/// Provides functionalities for listing projects, getting project details, listing directory contents, 
+/// opening files, writing to files, and replacing specific sections within files.
+/// </summary>
 public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
 {
+    /// <summary>
+    /// Creates an instance of the ProjectBrowser class with a specified file system and directory.
+    /// </summary>
+    /// <param name="fileSystem">The file system interface used for file operations.</param>
+    /// <param name="directory">The directory path to the project. If null, the user will be prompted to input a path.</param>
+    /// <returns>A new instance of the ProjectBrowser class.</returns>
     public static ProjectBrowser Create(IFileSystem fileSystem, string? directory = null)
     {
         while (string.IsNullOrEmpty(directory) || fileSystem.DirectoryExists(directory) is false)
@@ -21,11 +32,20 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
         return new(fileSystem, directory);
     }
 
+    /// <summary>
+    /// Retrieves a list of project names in the current project directory.
+    /// </summary>
+    /// <returns>An immutable array of project names.</returns>
     public ImmutableArray<string> ListProjects() =>
         fileSystem.GetDirectories(projectDirectory)
                   .Select(Path.GetFileName)
                   .ToImmutableArray()!;
 
+    /// <summary>
+    /// Retrieves detailed information about a specified project.
+    /// </summary>
+    /// <param name="projectName">The name of the project for which details are requested.</param>
+    /// <returns>A Result containing a FrozenDictionary with project details, or an error message.</returns>
     public Result<FrozenDictionary<string, string>> GetProjectDetails(string projectName) =>
         from project in ParseProjectName(projectName)
         from fullPath in ParseDirectory(project)
@@ -72,10 +92,25 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
         //
         let newContent = content[..startIndex]
             + replacementContent
-            + content[(endIndex + sectionIdentifiers.End.Length)..]
+            + content[endIndex..]
         let write = fileSystem.WriteAllText(file.FullName, newContent)
         //
         select ok("Section replaced successfully.");
+
+    public Result<string> Replace(string projectName, string filePath, string search, string replacement) =>
+        from project in ParseProjectName(projectName)
+        from file in ParseFilePath(project, filePath)
+        //
+        let content = fileSystem.ReadAllText(file.FullName)
+        let index = content.IndexOf(search, StringComparison.Ordinal)
+        //
+        from found in index >= 0
+            ? ok(unit)
+            : error("Search string not found in file.")
+        //
+        let newContent = content[..index] + replacement + content[(index + replacement.Length)..]
+        let write = fileSystem.WriteAllText(file.FullName, newContent)
+        select ok("Search string replaced successfully.");
 
     private Result<ProjectName> ParseProjectName(string projectName) =>
         from projects in ok(ListProjects())

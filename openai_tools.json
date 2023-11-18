@@ -294,6 +294,11 @@
             "type": "object",
             "title": "Command details",
             "properties": {
+              "project_name": {
+                "type":"string",
+                "title": "project_name",
+                "description": "The project name"
+              },
               "file_path": {
                 "type": "string",
                 "title": "file_path",
@@ -324,14 +329,10 @@
                 "type": "string",
                 "title": "replacement_content",
                 "description": "The new content to replace the identified section."
-              },
-              "backup_option": {
-                "type": "boolean",
-                "title": "backup_option",
-                "description": "Flag to create a backup of the original file before replacement."
               }
             },
             "required": [
+              "project_name",
               "file_path",
               "section_identifiers",
               "replacement_content"

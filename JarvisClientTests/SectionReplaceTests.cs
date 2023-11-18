@@ -33,10 +33,9 @@ public class SectionReplaceTests
         var browser = new ProjectBrowser(fileSystem, @"C:\repos");
         var sectionIdentifiers = new SectionIdentifiers("<!-- START -->", "<!-- END -->");
         const string replacementContent = "NEW CONTENT";
-        const bool backupOption = false;
 
         // Act
-        var result = browser.ReplaceSection(projectName, fileName, sectionIdentifiers, replacementContent, backupOption);
+        var result = browser.ReplaceSection(projectName, fileName, sectionIdentifiers, replacementContent);
 
         // Assert
         Assert.AreEqual("Section replaced successfully.", result.IfError(x => x.Message));

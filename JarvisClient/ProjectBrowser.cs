@@ -58,7 +58,7 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
         }
         select result;
 
-    public Result<string> ReplaceSection(string projectName, string filePath, SectionIdentifiers sectionIdentifiers, string replacementContent, bool backupOption) =>
+    public Result<string> ReplaceSection(string projectName, string filePath, SectionIdentifiers sectionIdentifiers, string replacementContent) =>
         from project in ParseProjectName(projectName)
         from file in ParseFilePath(project, filePath)
         //
@@ -69,10 +69,6 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
         from foundSection in startIndex >= 0 && endIndex >= 0
             ? ok(unit)
             : error("Section identifiers not found in file.")
-        //
-        let backup = backupOption
-            ? fileSystem.CopyFile(file.FullName, file.FullName + ".bak", true)
-            : unit
         //
         let newContent = content[..startIndex]
             + replacementContent

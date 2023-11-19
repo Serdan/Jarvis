@@ -56,6 +56,12 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
                     select new KeyValuePair<string, string>(item.Name, fileSystem.ReadAllText(item.FullName))
         select items.ToFrozenDictionary();
 
+    /// <summary>
+    /// Lists the items in a specified directory within a project.
+    /// </summary>
+    /// <param name="projectName">The name of the project.</param>
+    /// <param name="directoryPath">The path of the directory to list items from.</param>
+    /// <returns>An immutable array of ProjectItemKind, representing the contents of the directory.</returns>
     public Result<ImmutableArray<ProjectItemKind>> ListProjectDirectory(string projectName, string directoryPath) =>
         from project in ParseProjectName(projectName)
         from items in GetItems(project, directoryPath)

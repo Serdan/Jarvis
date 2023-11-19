@@ -11,7 +11,7 @@ using static FunctionalConsole;
 public static class Endpoints
 {
     public static Task<string> ListProjects(ClientService client, [FromBody] AgentMessage<ListProjectsCommand> message) =>
-        client.SendCommandToUser(message.Apply(WriteLine))
+        client.SendCommandToUser(message with { Command = new() })
               .Select(WriteLine);
 
     public static Task<string> OpenProject(ClientService client, [FromBody] AgentMessage<GetProjectDetailsCommand> message) =>

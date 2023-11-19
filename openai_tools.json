@@ -147,11 +147,16 @@
             "type": "string",
             "title": "key",
             "description": "Key provided by the user."
+          },
+          "command": {
+            "type": "object",
+            "title": "Command details"
           }
         },
         "type": "object",
         "required": [
-          "key"
+          "key",
+          "command"
         ],
         "title": "ListProjectsSchema"
       },

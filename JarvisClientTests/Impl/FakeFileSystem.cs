@@ -12,12 +12,12 @@ public class FakeFileSystem : IFileSystem
 
     private static (ProjectItemKind Name, string Content) CreateFile(string path, string content)
     {
-        return (ProjectFile(Path.GetFileName(path), 1, DateTimeOffset.Now, DateTimeOffset.Now), content);
+        return (NewProjectFile(Path.GetFileName(path), 1, DateTimeOffset.Now, DateTimeOffset.Now), content);
     }
 
     private static (ProjectItemKind Item, string) CreateDirectory(string name)
     {
-        return (ProjectFolder(name), "");
+        return (NewProjectFolder(name), "");
     }
 
     public void AddFile(string path, string content)

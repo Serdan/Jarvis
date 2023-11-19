@@ -3,6 +3,8 @@ using System.Collections.Immutable;
 using JarvisClient.Models;
 using Shared;
 using Shared.Messages;
+using static Kehlet.Functional.ResultUnion<System.IO.FileInfo>;
+#pragma warning disable CS8509 // The switch expression does not handle all possible values of its input type (it is not exhaustive).
 
 namespace JarvisClient;
 
@@ -168,14 +170,15 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
     /// <returns>An ImmutableArray of ProjectItemKind representing the items in the specified path.</returns>
     private Result<ImmutableArray<ProjectItemKind>> GetItems(ProjectName projectName, string path) =>
         from folderNames in GetDirectoryNames(projectName, path)
-        let folderItems = folderNames.Select(ProjectFolder)
+        let folderItems = folderNames.Select(NewProjectFolder)
         from fileNames in GetFileNames(projectName, path)
         let fileItems = from fileName in fileNames
                         let fileInfo = GetFile(projectName, path, fileName)
-                        select fileInfo.Match(
-                            ok: ProjectItemKind.ProjectFile.From,
-                            error: error => ProjectFileError(fileName, error.Message)
-                        )
+                        select union(fileInfo) switch
+                        {
+                            Ok(var info) => NewProjectFile(info),
+                            Error(var error) => NewProjectFileError(fileName, error.Message)
+                        }
         select ImmutableArray.Create<ProjectItemKind>([..folderItems, ..fileItems]);
 
     /// <summary>

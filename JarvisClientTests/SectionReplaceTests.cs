@@ -13,15 +13,19 @@ public class SectionReplaceTests
         const string projectName = "Test Project";
         const string fileName = "testFile.txt";
         const string filePath = $@"C:\repos\{projectName}\{fileName}";
-        const string originalContent = """
+
+        const string start = "<!-- START -->";
+        const string end = "<!-- END -->";
+        const string replacementContent = "NEW CONTENT";
+        const string originalContent = $"""
             THIS IS A TEST
-                <!-- START -->THIS SHOULD BE REPLACED<!-- END -->
+                {start}THIS SHOULD BE REPLACED{end}
             END TEST CONTENT
             """;
 
-        const string replacedContent = """
+        const string replacedContent = $"""
             THIS IS A TEST
-                NEW CONTENT<!-- END -->
+                {replacementContent}
             END TEST CONTENT
             """;
 
@@ -31,8 +35,45 @@ public class SectionReplaceTests
 
         // Arrange
         var browser = new ProjectBrowser(fileSystem, @"C:\repos");
-        var sectionIdentifiers = new SectionIdentifiers("<!-- START -->", "<!-- END -->");
+        var sectionIdentifiers = new SectionIdentifiers(start, end);
+
+        // Act
+        var result = browser.ReplaceSection(projectName, fileName, sectionIdentifiers, replacementContent);
+
+        // Assert
+        Assert.AreEqual("Section replaced successfully.", result.IfError(x => x.Message));
+        Assert.AreEqual(replacedContent, fileSystem.ReadAllText(filePath));
+    }
+
+    [TestMethod]
+    public void TestSectionReplaceEqualIdentifiers()
+    {
+        const string projectName = "Test Project";
+        const string fileName = "testFile.txt";
+        const string filePath = $@"C:\repos\{projectName}\{fileName}";
+
+        const string identifier = "<!-- START -->THIS SHOULD BE REPLACED<!-- END -->";
         const string replacementContent = "NEW CONTENT";
+        const string originalContent = $"""
+            THIS IS A TEST
+                {identifier}
+            END TEST CONTENT
+            """;
+
+        const string replacedContent = $"""
+            THIS IS A TEST
+                {replacementContent}
+            END TEST CONTENT
+            """;
+
+        var fileSystem = new FakeFileSystem();
+        fileSystem.AddFolder(@"C:\repos", projectName);
+        fileSystem.AddFile(filePath, originalContent);
+
+        // Arrange
+        var browser = new ProjectBrowser(fileSystem, @"C:\repos");
+        var sectionIdentifiers = new SectionIdentifiers(identifier, identifier);
+        
 
         // Act
         var result = browser.ReplaceSection(projectName, fileName, sectionIdentifiers, replacementContent);

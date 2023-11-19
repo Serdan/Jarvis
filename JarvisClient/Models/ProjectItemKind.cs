@@ -1,6 +1,6 @@
 ﻿namespace JarvisClient.Models;
 
-[AutoClosed]
+[AutoClosed(true)]
 public partial record ProjectItemKind
 {
     partial record ProjectFile(string Name, long FileSize, DateTimeOffset CreationDate, DateTimeOffset ModificationDate);

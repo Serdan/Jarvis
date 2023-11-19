@@ -29,3 +29,10 @@ This file is intended for Bob to keep notes and updates regarding tasks, observa
 - **Testing**: Create test cases in relevant project directories, considering both unit and integration tests.
 
 Remember to reference specific project structure and paths for accuracy.
+
+
+### Updated Understanding of the Jarvis System:
+- The Jarvis system operates through server-client interactions, where the server acts as an intermediary, receiving requests from an agent via an endpoint and forwarding these commands to a connected client through a SignalR hub.
+- The SignalR hub is essential for real-time communication between the server and clients. This hub plays a crucial role in the execution of commands, as it ensures that commands sent by the agent are received and processed by the appropriate client.
+- In the context of implementing new features such as the 'dotnet test' command, understanding this server-client dynamic is vital. The server will forward the command to the client, which will then execute the command and return the results back to the server, and subsequently to the agent.
+- This workflow necessitates a careful consideration of both the server and client-side logic, especially in how they handle command transmission and execution via the SignalR hub.

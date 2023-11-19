@@ -120,7 +120,7 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
         //
         let newContent = content[..startIndex]
             + replacementContent
-            + content[endIndex..]
+            + content[(endIndex + sectionIdentifiers.End.Length)..]
         let write = fileSystem.WriteAllText(file.FullName, newContent)
         //
         select ok("Section replaced successfully.");
@@ -218,7 +218,7 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
         select exists
             ? ok(new HiddenString(fullPath))
             : error($"Directory does not exist: {directoryPath.Last()}");
-    
+
     /// <summary>
     /// Retrieves file information for a specified file path within a project.
     /// </summary>
@@ -252,7 +252,7 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
     /// <param name="paths">An array of path segments to be combined.</param>
     /// <returns>A Result containing the combined full path or an error message if the path is invalid.</returns>
     private static Result<string> Combine(string projectDirectory, params string[] paths) =>
-        from path in @try(() => string.Join(Path.DirectorySeparatorChar, [projectDirectory, ..paths]))
+        from path in @try(() => string.Join(Path.DirectorySeparatorChar, [projectDirectory, ..paths.Where(x => !string.IsNullOrEmpty(x))]))
         from fullPath in @try(() => Path.GetFullPath(path))
         select fullPath.StartsWith(projectDirectory)
             ? ok(fullPath)
@@ -263,8 +263,8 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
 
     private static readonly ImmutableArray<Func<string, bool>> FolderFilters =
         ImmutableArray.Create<Func<string, bool>>([
-            s => s.StartsWith('.'),
-            s => s == "bin",
-            s => s == "obj"
+            s => !s.StartsWith('.'),
+            s => s != "bin",
+            s => s != "obj"
         ]);
 }

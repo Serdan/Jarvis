@@ -67,11 +67,25 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
         from items in GetItems(project, directoryPath)
         select items;
 
+    /// <summary>
+    /// Opens and reads the content of a specified file in a project.
+    /// </summary>
+    /// <param name="projectName">The name of the project containing the file.</param>
+    /// <param name="filePath">The path to the file to be opened.</param>
+    /// <returns>The content of the file as a string.</returns>
     public Result<string> OpenFile(string projectName, string filePath) =>
         from project in ParseProjectName(projectName)
         from file in GetFile(project, filePath)
         select fileSystem.ReadAllText(file.FullName);
 
+    /// <summary>
+    /// Writes content to a specified file within a project, with a specified mode (append or overwrite).
+    /// </summary>
+    /// <param name="projectName">The name of the project containing the file.</param>
+    /// <param name="filePath">The path to the file where content will be written.</param>
+    /// <param name="content">The content to be written to the file.</param>
+    /// <param name="mode">The file writing mode (append or overwrite).</param>
+    /// <returns>A message indicating the success of the operation.</returns>
     public Result<string> WriteFile(string projectName, string filePath, string content, FileWriteMode mode) =>
         from project in ParseProjectName(projectName)
         from file in ParseFilePath(project, filePath)
@@ -84,6 +98,14 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
         }
         select result;
 
+    /// <summary>
+    /// Replaces a specific section within a file in a project based on provided section identifiers.
+    /// </summary>
+    /// <param name="projectName">The name of the project containing the file.</param>
+    /// <param name="filePath">The path to the file to be modified.</param>
+    /// <param name="sectionIdentifiers">Identifiers defining the start and end of the section to be replaced.</param>
+    /// <param name="replacementContent">The content to replace the identified section with.</param>
+    /// <returns>A message indicating the success of the section replacement.</returns>
     public Result<string> ReplaceSection(string projectName, string filePath, SectionIdentifiers sectionIdentifiers, string replacementContent) =>
         from project in ParseProjectName(projectName)
         from file in ParseFilePath(project, filePath)
@@ -103,6 +125,14 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
         //
         select ok("Section replaced successfully.");
 
+    /// <summary>
+    /// Replaces a specific string within a file in a project.
+    /// </summary>
+    /// <param name="projectName">The name of the project containing the file.</param>
+    /// <param name="filePath">The path to the file to be modified.</param>
+    /// <param name="search">The string to search for within the file.</param>
+    /// <param name="replacement">The string to replace the search string with.</param>
+    /// <returns>A message indicating the success of the string replacement.</returns>
     public Result<string> Replace(string projectName, string filePath, string search, string replacement) =>
         from project in ParseProjectName(projectName)
         from file in ParseFilePath(project, filePath)
@@ -118,6 +148,11 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
         let write = fileSystem.WriteAllText(file.FullName, newContent)
         select ok("Search string replaced successfully.");
 
+    /// <summary>
+    /// Parses the project name and verifies its existence within the current project directory.
+    /// </summary>
+    /// <param name="projectName">The name of the project to be parsed.</param>
+    /// <returns>A Result containing the parsed ProjectName or an error message if the project does not exist.</returns>
     private Result<ProjectName> ParseProjectName(string projectName) =>
         from projects in ok(ListProjects())
         let exists = projects.Contains(projectName)
@@ -125,6 +160,12 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
             ? ok(new ProjectName(projectName))
             : error($"Unknown project name: {projectName}");
 
+    /// <summary>
+    /// Retrieves the items (folders and files) from a specified path within a project.
+    /// </summary>
+    /// <param name="projectName">The project name as a ProjectName object.</param>
+    /// <param name="path">The directory path from which items are to be retrieved.</param>
+    /// <returns>An ImmutableArray of ProjectItemKind representing the items in the specified path.</returns>
     private Result<ImmutableArray<ProjectItemKind>> GetItems(ProjectName projectName, string path) =>
         from folderNames in GetDirectoryNames(projectName, path)
         let folderItems = folderNames.Select(ProjectFolder)
@@ -137,6 +178,12 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
                         )
         select ImmutableArray.Create<ProjectItemKind>([..folderItems, ..fileItems]);
 
+    /// <summary>
+    /// Retrieves the names of directories from a specified path within a project.
+    /// </summary>
+    /// <param name="projectName">The project name as a ProjectName object.</param>
+    /// <param name="directoryPath">The directory path from which directory names are to be retrieved.</param>
+    /// <returns>An ImmutableArray of strings representing the names of directories in the specified path.</returns>
     private Result<ImmutableArray<string>> GetDirectoryNames(ProjectName projectName, string directoryPath = "") =>
         from fullPath in ParseDirectory(projectName, directoryPath)
         let folders = from path in fullPath
@@ -146,6 +193,12 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
                              select folderName
         select ImmutableArray.Create(folders.ToArray());
 
+    /// <summary>
+    /// Retrieves the names of files from a specified directory path within a project.
+    /// </summary>
+    /// <param name="projectName">The project name as a ProjectName object.</param>
+    /// <param name="directoryPath">The directory path from which file names are to be retrieved.</param>
+    /// <returns>An ImmutableArray of strings representing the names of files in the specified directory path.</returns>
     private Result<ImmutableArray<string>> GetFileNames(ProjectName projectName, string directoryPath) =>
         from fullPath in ParseDirectory(projectName, directoryPath)
         let files = from path in fullPath
@@ -154,24 +207,24 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
         select ImmutableArray.Create(files.ToArray());
 
     /// <summary>
-    /// Returns the full path. It's important this isn't leaked to the agent.
+    /// Parses the directory path within a project and ensures its existence.
     /// </summary>
-    /// <param name="projectName"></param>
-    /// <param name="directoryPath"></param>
-    /// <returns></returns>
+    /// <param name="projectName">The project name as a ProjectName object.</param>
+    /// <param name="directoryPath">The directory path(s) to be parsed and verified.</param>
+    /// <returns>A Result containing a HiddenString representing the full path, or an error message if the directory does not exist.</returns>
     private Result<HiddenString> ParseDirectory(ProjectName projectName, params string[] directoryPath) =>
         from fullPath in Combine(projectDirectory, [projectName.Name, ..directoryPath]).Select(FunctionalConsole.WriteLine)
         let exists = fileSystem.DirectoryExists(fullPath)
         select exists
             ? ok(new HiddenString(fullPath))
             : error($"Directory does not exist: {directoryPath.Last()}");
-
+    
     /// <summary>
-    /// Returns FileInfo containing the full path. It's important this isn't leaked to the agent.
+    /// Retrieves file information for a specified file path within a project.
     /// </summary>
-    /// <param name="projectName"></param>
-    /// <param name="path"></param>
-    /// <returns></returns>
+    /// <param name="projectName">The project name as a ProjectName object.</param>
+    /// <param name="path">The file path(s) for which information is to be retrieved.</param>
+    /// <returns>A Result containing FileInfo or an error message if the file does not exist.</returns>
     private Result<FileInfo> GetFile(ProjectName projectName, params string[] path) =>
         from fullPath in Combine(projectDirectory, [projectName.Name, ..path])
         let exists = fileSystem.FileExists(fullPath)
@@ -179,6 +232,12 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
             ? ok(new FileInfo(fullPath))
             : error($"File does not exist: {path.Last()}");
 
+    /// <summary>
+    /// Parses a file path within a project and verifies its existence.
+    /// </summary>
+    /// <param name="projectName">The project name as a ProjectName object.</param>
+    /// <param name="filePath">The file path to be parsed and verified.</param>
+    /// <returns>A Result containing a FilePath object or an error message if the file path is invalid or does not exist.</returns>
     private Result<FilePath> ParseFilePath(ProjectName projectName, string filePath) =>
         from fullPath in Combine(projectDirectory, projectName.Name, filePath)
         from info in @try(() => new FileInfo(fullPath))
@@ -186,6 +245,12 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
             ? ok(new FilePath(info.Name, info.FullName, info.Exists))
             : error("Path is a directory");
 
+    /// <summary>
+    /// Combines multiple string paths into a single path, ensuring it is a valid path within the project directory.
+    /// </summary>
+    /// <param name="projectDirectory">The base directory of the project.</param>
+    /// <param name="paths">An array of path segments to be combined.</param>
+    /// <returns>A Result containing the combined full path or an error message if the path is invalid.</returns>
     private static Result<string> Combine(string projectDirectory, params string[] paths) =>
         from path in @try(() => string.Join(Path.DirectorySeparatorChar, [projectDirectory, ..paths]))
         from fullPath in @try(() => Path.GetFullPath(path))

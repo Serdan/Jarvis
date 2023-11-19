@@ -114,7 +114,7 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
             ? ok(unit)
             : error("Search string not found in file.")
         //
-        let newContent = content[..index] + replacement + content[(index + replacement.Length)..]
+        let newContent = content[..index] + replacement + content[(index + search.Length)..]
         let write = fileSystem.WriteAllText(file.FullName, newContent)
         select ok("Search string replaced successfully.");
 

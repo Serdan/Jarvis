@@ -85,7 +85,7 @@ public class FakeFileSystem : IFileSystem
 
     public bool DirectoryExists(string path)
     {
-        return files.Any(x => x.Key.StartsWith(path));
+        return files.Any(x => x.Value.Item is ProjectItemKind.ProjectFolder && x.Key.StartsWith(path));
     }
 
     public string[] GetFiles(string path)

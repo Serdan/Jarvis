@@ -1,6 +1,5 @@
 ﻿using JarvisClient;
 using JarvisClientTests.Impl;
-using Shared.Messages;
 
 namespace JarvisClientTests;
 
@@ -10,9 +9,10 @@ public class ReplaceTests
     [TestMethod]
     public void TestReplace()
     {
+        const string root = @"C:\repos";
         const string projectName = "Test Project";
         const string fileName = "testFile.txt";
-        const string filePath = $@"C:\repos\{projectName}\{fileName}";
+        const string filePath = $@"{root}\{projectName}\{fileName}";
         const string originalContent = """
             THIS IS A TEST
                 <!-- START -->THIS SHOULD BE REPLACED<!-- END -->
@@ -26,11 +26,11 @@ public class ReplaceTests
             """;
 
         var fileSystem = new FakeFileSystem();
-        fileSystem.AddFolder(@"C:\repos", projectName);
+        fileSystem.AddFolder(root, projectName);
         fileSystem.AddFile(filePath, originalContent);
 
         // Arrange
-        var browser = new ProjectBrowser(fileSystem, @"C:\repos");
+        var browser = new ProjectBrowser(fileSystem, root);
         const string replacementContent = "NEW CONTENT";
 
         // Act

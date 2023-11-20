@@ -72,7 +72,7 @@ app.MapGroup("/agent")
        group.MapPost("/listprojectdirectory", Endpoints.ListProjectDirectory);
        group.MapPost("/openfile", Endpoints.OpenFile);
        group.MapPost("/writefile", Endpoints.WriteFile);
-       group.MapPost("/sectionreplace", Endpoints.ReplaceSection);
+       group.MapPost("/textreplacesection", Endpoints.TextReplaceSection);
        group.MapPost("/textreplace", Endpoints.TextReplace);
        group.MapPost("/textinsertbefore", Endpoints.TextInsertBefore);
        group.MapPost("/textinsertafter", Endpoints.TextInsertAfter);

@@ -13,6 +13,7 @@
   "paths": {
     "/listprojects": {
       "post": {
+        "x-openai-isConsequential": false,
         "description": "Gets a list of projects",
         "operationId": "ListProjects",
         "parameters": [],
@@ -36,6 +37,7 @@
     },
     "/getprojectdetails": {
       "post": {
+        "x-openai-isConsequential": false,
         "description": "Get the details of the given project. Includes readme, todo, and notes.",
         "operationId": "GetProjectDetails",
         "parameters": [],
@@ -54,6 +56,7 @@
     },
     "/listprojectdirectory": {
       "post": {
+        "x-openai-isConsequential": false,
         "description": "Get the items in the given directory",
         "operationId": "ListProjectDirectory",
         "parameters": [],
@@ -70,6 +73,7 @@
     },
     "/openfile": {
       "post": {
+        "x-openai-isConsequential": false,
         "description": "Get file content",
         "operationId": "OpenFile",
         "parameters": [],
@@ -87,6 +91,7 @@
     },
     "/writefile": {
       "post": {
+        "x-openai-isConsequential": false,
         "description": "Write file content",
         "operationId": "WriteFile",
         "parameters": [],
@@ -102,10 +107,11 @@
         }
       }
     },
-    "/sectionreplace": {
+    "/textreplacesection": {
       "post": {
+        "x-openai-isConsequential": false,
         "description": "Replace a specific section within a file.",
-        "operationId": "SectionReplace",
+        "operationId": "TextReplaceSection",
         "parameters": [],
         "requestBody": {
           "content": {
@@ -117,11 +123,12 @@
           },
           "required": true
         },
-        "deprecated": true
+        "deprecated": false
       }
     },
     "/textreplace": {
       "post": {
+        "x-openai-isConsequential": false,
         "description": "Replace a section of a file identified by a search string.",
         "operationId": "TextReplace",
         "parameters": [],
@@ -140,6 +147,7 @@
     },
     "/textinsertbefore": {
       "post": {
+        "x-openai-isConsequential": false,
         "description": "Insert content before search string.",
         "operationId": "TextInsertBefore",
         "parameters": [],
@@ -158,6 +166,7 @@
     },
     "/textinsertafter": {
       "post": {
+        "x-openai-isConsequential": false,
         "description": "Insert content after search string.",
         "operationId": "TextInsertAfter",
         "parameters": [],
@@ -354,7 +363,7 @@
             "title": "Command details",
             "properties": {
               "project_name": {
-                "type":"string",
+                "type": "string",
                 "title": "project_name",
                 "description": "The project name"
               },
@@ -417,7 +426,7 @@
             "title": "Command details",
             "properties": {
               "project_name": {
-                "type":"string",
+                "type": "string",
                 "title": "project_name",
                 "description": "The project name"
               },

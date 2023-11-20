@@ -7,7 +7,7 @@ namespace JarvisClient.Extensions;
 
 public static class HubConnectionExtensions
 {
-    public static IDisposable On<TClient>(this SignalRClient.HubConnection hub, TClient client, Expression<Func<TClient, Delegate>> handler)
+    public static IDisposable On<TClient>(this HubConnection hub, TClient client, Expression<Func<TClient, Delegate>> handler)
     {
         if (handler.Body is not UnaryExpression unaryExpression)
         {
@@ -62,7 +62,7 @@ public static class HubConnectionExtensions
         var parameters = method.GetParameters();
 
         if (parameters.Length != 3 ||
-            parameters[0].ParameterType != typeof(SignalRClient.HubConnection) ||
+            parameters[0].ParameterType != typeof(HubConnection) ||
             parameters[1].ParameterType != typeof(string))
         {
             return false;
@@ -93,7 +93,7 @@ public static class HubConnectionExtensions
         return false;
     }
     
-    public static Task InvokeAsync<THub>(this SignalRClient.HubConnection hub, Expression<Func<THub, Task>> f)
+    public static Task InvokeAsync<THub>(this HubConnection hub, Expression<Func<THub, Task>> f)
     {
         if (f.Body is not MethodCallExpression methodCall)
         {

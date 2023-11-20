@@ -17,7 +17,7 @@ public partial record AgentCommand
 
     partial record WriteFileCommand(string ProjectName, string FilePath, string Content, FileWriteMode Mode);
 
-    partial record SectionReplaceCommand(string ProjectName, string FilePath, SectionIdentifiers SectionIdentifiers, string ReplacementContent);
+    partial record TextReplaceSectionCommand(string ProjectName, string FilePath, SectionIdentifiers SectionIdentifiers, string ReplacementContent);
 
     partial record TextReplaceCommand(string ProjectName, string FilePath, string Search, string Content);
 

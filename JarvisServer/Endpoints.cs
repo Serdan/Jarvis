@@ -28,7 +28,7 @@ public static class Endpoints
         from result in client.SendCommandToUser(message)
         select Json(result);
 
-    public static Task<IResult> ReplaceSection(ClientService client, [FromBody] AgentMessage<SectionReplaceCommand> message) =>
+    public static Task<IResult> TextReplaceSection(ClientService client, [FromBody] AgentMessage<TextReplaceSectionCommand> message) =>
         from result in client.SendCommandToUser(message)
         select Json(result);
 

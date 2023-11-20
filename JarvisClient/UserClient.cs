@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using JarvisClient.Extensions;
@@ -47,12 +48,12 @@ public class UserClient(HubConnection hub, ProjectBrowser browser) : IUserClient
                 ListProjectDirectoryCommand(var projectName, var path) => browser.ListProjectDirectory(projectName, path).Select(Serialize),
                 OpenFileCommand(var projectName, var path) => browser.OpenFile(projectName, path),
                 WriteFileCommand(var projectName, var filePath, var content, var mode) => browser.WriteFile(projectName, filePath, content, mode),
-                // SectionReplaceCommand(var projectName, var filePath, var sectionIdentifiers, var replacementContent) =>
-                //     browser.ReplaceSection(projectName, filePath, sectionIdentifiers, replacementContent),
+                TextReplaceSectionCommand(var projectName, var filePath, var sectionIdentifiers, var replacementContent) =>
+                    browser.ReplaceSection(projectName, filePath, sectionIdentifiers, replacementContent),
                 TextReplaceCommand(var projectName, var filePath, var search, var content) => browser.Replace(projectName, filePath, search, content),
                 TextInsertBeforeCommand(var projectName, var filePath, var search, var content) => browser.InsertBefore(projectName, filePath, search, content),
                 TextInsertAfterCommand(var projectName, var filePath, var search, var content) => browser.InsertAfter(projectName, filePath, search, content),
-                RunUnitTestsCommand(var projectName) => error("Not implemented"),
+                RunUnitTestsCommand(var projectName) => RunUnitTests(projectName).Apply(Serialize),
                 _ => error("Unknown command")
             };
 
@@ -98,5 +99,47 @@ public class UserClient(HubConnection hub, ProjectBrowser browser) : IUserClient
         options.Converters.Add(new JsonStringEnumConverter());
 
         return options;
+    }
+
+    /// <summary>
+    /// Executes unit tests for a given project and returns the results.
+    /// </summary>
+    /// <param name="projectName">The name of the project for which to run tests.</param>
+    /// <returns>A Result containing the test results or an error message if the test execution fails.</returns>
+    private Result<string> RunUnitTests(string projectName)
+    {
+        try
+        {
+            
+            // Running unit tests using ProcessStartInfo
+            var processInfo = new ProcessStartInfo
+            {
+                FileName = "dotnet",
+                Arguments = $"test {projectName}",
+                RedirectStandardOutput = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+
+            using (var process = Process.Start(processInfo))
+            {
+                if (process == null) throw new InvalidOperationException("Failed to start process.");
+
+                var output = process.StandardOutput.ReadToEnd();
+                process.WaitForExit();
+
+                if (process.ExitCode != 0)
+                    throw new InvalidOperationException($"Tests failed with exit code {process.ExitCode}.\nOutput: {output}");
+
+                return ok(output);
+            }
+
+            var testResults = "[Sample Test Results]"; // Placeholder for actual test results
+            return ok(JsonSerializer.Serialize(testResults, Options()));
+        }
+        catch (Exception e)
+        {
+            return error(e.Message);
+        }
     }
 }

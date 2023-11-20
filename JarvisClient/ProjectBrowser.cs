@@ -17,6 +17,12 @@ using static ProjectItemKind.Cons;
 /// </summary>
 public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
 {
+    public string ProjectDirectory
+    {
+        get => projectDirectory;
+        set => projectDirectory = value;
+    }
+    
     /// <summary>
     /// Creates an instance of the ProjectBrowser class with a specified file system and directory.
     /// </summary>

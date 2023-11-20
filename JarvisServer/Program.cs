@@ -61,7 +61,7 @@ if (app.Environment.IsDevelopment() is false)
     app.UseHttpsRedirection();
 }
 
-app.MapGet("/", () => "ok").RequireRateLimiting(rateLimiterPolicy);
+app.MapGet("/", () => "the future is tomorrow").RequireRateLimiting(rateLimiterPolicy);
 app.MapHub<JarvisHub>("/client").RequireRateLimiting(rateLimiterPolicy);
 
 app.MapGroup("/agent")

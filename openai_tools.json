@@ -182,6 +182,9 @@
         },
         "deprecated": false
       }
+    },
+    "/rununittests": {
+      
     }
   },
   "components": {

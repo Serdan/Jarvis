@@ -1,4 +1,5 @@
 using Kehlet.Functional;
+// ReSharper disable ClassNeverInstantiated.Global
 
 namespace Shared.Messages;
 

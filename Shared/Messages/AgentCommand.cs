@@ -18,4 +18,6 @@ public partial record AgentCommand
     partial record SectionReplaceCommand(string ProjectName, string FilePath, SectionIdentifiers SectionIdentifiers, string ReplacementContent);
 
     partial record TextReplaceCommand(string ProjectName, string FilePath, string Search, string Replacement);
+
+    partial record RunDotnetTestCommand(string ProjectName);
 }

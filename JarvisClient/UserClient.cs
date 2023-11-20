@@ -106,11 +106,10 @@ public class UserClient(HubConnection hub, ProjectBrowser browser) : IUserClient
     /// </summary>
     /// <param name="projectName">The name of the project for which to run tests.</param>
     /// <returns>A Result containing the test results or an error message if the test execution fails.</returns>
-    private Result<string> RunUnitTests(string projectName)
+    private static Result<string> RunUnitTests(string projectName)
     {
         try
         {
-            
             // Running unit tests using ProcessStartInfo
             var processInfo = new ProcessStartInfo
             {
@@ -121,25 +120,25 @@ public class UserClient(HubConnection hub, ProjectBrowser browser) : IUserClient
                 CreateNoWindow = true
             };
 
-            using (var process = Process.Start(processInfo))
+            using var process = Process.Start(processInfo);
+            if (process is null)
             {
-                if (process == null) throw new InvalidOperationException("Failed to start process.");
-
-                var output = process.StandardOutput.ReadToEnd();
-                process.WaitForExit();
-
-                if (process.ExitCode != 0)
-                    throw new InvalidOperationException($"Tests failed with exit code {process.ExitCode}.\nOutput: {output}");
-
-                return ok(output);
+                throw new InvalidOperationException("Failed to start process.");
             }
 
-            var testResults = "[Sample Test Results]"; // Placeholder for actual test results
-            return ok(JsonSerializer.Serialize(testResults, Options()));
+            var output = process.StandardOutput.ReadToEnd();
+            process.WaitForExit();
+
+            if (process.ExitCode is not 0)
+            {
+                throw new InvalidOperationException($"Tests failed with exit code {process.ExitCode}.\nOutput: {output}");
+            }
+
+            return ok(output);
         }
         catch (Exception e)
         {
-            return error(e.Message);
+            return error(e);
         }
     }
 }

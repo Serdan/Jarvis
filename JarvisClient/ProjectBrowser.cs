@@ -4,6 +4,7 @@ using JarvisClient.Models;
 using Shared;
 using Shared.Messages;
 using static Kehlet.Functional.ResultUnion<System.IO.FileInfo>;
+
 #pragma warning disable CS8509 // The switch expression does not handle all possible values of its input type (it is not exhaustive).
 
 namespace JarvisClient;
@@ -17,12 +18,13 @@ using static ProjectItemKind.Cons;
 /// </summary>
 public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
 {
+    private ProjectDirectory projectDirectory = new(projectDirectory);
+
     public string ProjectDirectory
     {
-        get => projectDirectory;
-        set => projectDirectory = value;
+        set => projectDirectory = new(value);
     }
-    
+
     /// <summary>
     /// Creates an instance of the ProjectBrowser class with a specified file system and directory.
     /// </summary>
@@ -45,9 +47,9 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
     /// </summary>
     /// <returns>An immutable array of project names.</returns>
     public ImmutableArray<string> ListProjects() =>
-        fileSystem.GetDirectories(projectDirectory)
-                  .Select(Path.GetFileName)
-                  .ToImmutableArray()!;
+        projectDirectory.GetDirectories(fileSystem)
+                        .Select(Path.GetFileName)
+                        .ToImmutableArray()!;
 
     /// <summary>
     /// Retrieves detailed information about a specified project.
@@ -222,7 +224,7 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
     /// <param name="directoryPath">The directory path(s) to be parsed and verified.</param>
     /// <returns>A Result containing a HiddenString representing the full path, or an error message if the directory does not exist.</returns>
     private Result<HiddenString> ParseDirectory(ProjectName projectName, params string[] directoryPath) =>
-        from fullPath in Combine(projectDirectory, [projectName.Name, ..directoryPath]).Select(FunctionalConsole.WriteLine)
+        from fullPath in projectDirectory.Join([projectName.Name, ..directoryPath])
         let exists = fileSystem.DirectoryExists(fullPath)
         select exists
             ? ok(new HiddenString(fullPath))
@@ -235,7 +237,7 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
     /// <param name="path">The file path(s) for which information is to be retrieved.</param>
     /// <returns>A Result containing FileInfo or an error message if the file does not exist.</returns>
     private Result<FileInfo> GetFile(ProjectName projectName, params string[] path) =>
-        from fullPath in Combine(projectDirectory, [projectName.Name, ..path])
+        from fullPath in projectDirectory.Join([projectName.Name, ..path])
         let exists = fileSystem.FileExists(fullPath)
         select exists
             ? ok(new FileInfo(fullPath))
@@ -248,24 +250,11 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
     /// <param name="filePath">The file path to be parsed and verified.</param>
     /// <returns>A Result containing a FilePath object or an error message if the file path is invalid or does not exist.</returns>
     private Result<FilePath> ParseFilePath(ProjectName projectName, string filePath) =>
-        from fullPath in Combine(projectDirectory, projectName.Name, filePath)
+        from fullPath in projectDirectory.Join(projectName.Name, filePath)
         from info in @try(() => new FileInfo(fullPath))
         select fileSystem.DirectoryExists(info.FullName) is false
             ? ok(new FilePath(info.Name, info.FullName, info.Exists))
             : error("Path is a directory");
-
-    /// <summary>
-    /// Combines multiple string paths into a single path, ensuring it is a valid path within the project directory.
-    /// </summary>
-    /// <param name="projectDirectory">The base directory of the project.</param>
-    /// <param name="paths">An array of path segments to be combined.</param>
-    /// <returns>A Result containing the combined full path or an error message if the path is invalid.</returns>
-    private static Result<string> Combine(string projectDirectory, params string[] paths) =>
-        from path in @try(() => string.Join(Path.DirectorySeparatorChar, [projectDirectory, ..paths.Where(x => !string.IsNullOrEmpty(x))]))
-        from fullPath in @try(() => Path.GetFullPath(path))
-        select fullPath.StartsWith(projectDirectory)
-            ? ok(fullPath)
-            : error("Invalid path");
 
     private static readonly ImmutableArray<string> ProjectFiles =
         ImmutableArray.Create<string>(["readme.md", "notes.md", "todo.md", "bob_notes.txt"]);

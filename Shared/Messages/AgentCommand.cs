@@ -1,4 +1,5 @@
 using Kehlet.Functional;
+
 // ReSharper disable ClassNeverInstantiated.Global
 
 namespace Shared.Messages;
@@ -18,7 +19,11 @@ public partial record AgentCommand
 
     partial record SectionReplaceCommand(string ProjectName, string FilePath, SectionIdentifiers SectionIdentifiers, string ReplacementContent);
 
-    partial record TextReplaceCommand(string ProjectName, string FilePath, string Search, string Replacement);
+    partial record TextReplaceCommand(string ProjectName, string FilePath, string Search, string Content);
 
-    partial record RunDotnetTestCommand(string ProjectName);
+    partial record TextInsertBeforeCommand(string ProjectName, string FilePath, string Search, string Content);
+
+    partial record TextInsertAfterCommand(string ProjectName, string FilePath, string Search, string Content);
+
+    partial record RunUnitTestsCommand(string ProjectName);
 }

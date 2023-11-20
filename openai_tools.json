@@ -117,19 +117,55 @@
           },
           "required": true
         },
-        "deprecated": false
+        "deprecated": true
       }
     },
     "/textreplace": {
       "post": {
         "description": "Replace a section of a file identified by a search string.",
-        "operationId": "Replace",
+        "operationId": "TextReplace",
         "parameters": [],
         "requestBody": {
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/SearchReplaceSchema"
+                "$ref": "#/components/schemas/TextInsertSchema"
+              }
+            }
+          },
+          "required": true
+        },
+        "deprecated": false
+      }
+    },
+    "/textinsertbefore": {
+      "post": {
+        "description": "Insert content before search string.",
+        "operationId": "TextInsertBefore",
+        "parameters": [],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TextInsertSchema"
+              }
+            }
+          },
+          "required": true
+        },
+        "deprecated": false
+      }
+    },
+    "/textinsertafter": {
+      "post": {
+        "description": "Insert content after search string.",
+        "operationId": "TextInsertAfter",
+        "parameters": [],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TextInsertSchema"
               }
             }
           },
@@ -369,7 +405,7 @@
         ],
         "title": "SectionReplaceSchema"
       },
-      "SearchReplaceSchema": {
+      "TextInsertSchema": {
         "properties": {
           "key": {
             "type": "string",
@@ -393,19 +429,19 @@
               "search": {
                 "type": "string",
                 "title": "search",
-                "description": "Search string to be replaced."
+                "description": "Search string."
               },
-              "replacement": {
+              "content": {
                 "type": "string",
-                "title": "replacement",
-                "description": "The new content to replace the search string."
+                "title": "content",
+                "description": "The new content."
               }
             },
             "required": [
               "project_name",
               "file_path",
               "search",
-              "replacement"
+              "content"
             ]
           }
         },
@@ -414,7 +450,7 @@
           "key",
           "command"
         ],
-        "title": "SearchReplaceSchema"
+        "title": "TextInsertSchema"
       }
     },
     "securitySchemes": {

@@ -61,9 +61,7 @@ if (app.Environment.IsDevelopment() is false)
     app.UseHttpsRedirection();
 }
 
-
-app.MapGet("/version", () => "1.7");
-app.MapGet("/", () => "ok");
+app.MapGet("/", () => "ok").RequireRateLimiting(rateLimiterPolicy);
 app.MapHub<JarvisHub>("/client").RequireRateLimiting(rateLimiterPolicy);
 
 app.MapGroup("/agent")
@@ -76,6 +74,9 @@ app.MapGroup("/agent")
        group.MapPost("/writefile", Endpoints.WriteFile);
        group.MapPost("/sectionreplace", Endpoints.ReplaceSection);
        group.MapPost("/textreplace", Endpoints.TextReplace);
+       group.MapPost("/textinsertbefore", Endpoints.TextInsertBefore);
+       group.MapPost("/textinsertafter", Endpoints.TextInsertAfter);
+       group.MapPost("/rununittests", Endpoints.RunUnitTests);
 
        return group;
    })

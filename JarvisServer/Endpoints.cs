@@ -1,40 +1,50 @@
 using JarvisServer.Services;
 using Microsoft.AspNetCore.Mvc;
-using Shared;
 using Shared.Messages;
+using static Microsoft.AspNetCore.Http.Results;
 using static Shared.Messages.AgentCommand;
 
 namespace JarvisServer;
 
-using static FunctionalConsole;
-
 public static class Endpoints
 {
-    public static Task<string> ListProjects(ClientService client, [FromBody] AgentMessage<ListProjectsCommand> message) =>
-        client.SendCommandToUser(message with { Command = new() })
-              .Select(WriteLine);
+    public static Task<IResult> ListProjects(ClientService client, [FromBody] AgentMessage<ListProjectsCommand> message) =>
+        from result in client.SendCommandToUser(message with { Command = new() })
+        select Json(result);
 
-    public static Task<string> OpenProject(ClientService client, [FromBody] AgentMessage<GetProjectDetailsCommand> message) =>
-        client.SendCommandToUser(message.Apply(WriteLine))
-              .Select(WriteLine);
+    public static Task<IResult> OpenProject(ClientService client, [FromBody] AgentMessage<GetProjectDetailsCommand> message) =>
+        from result in client.SendCommandToUser(message)
+        select Json(result);
 
-    public static Task<string> ListProjectDirectory(ClientService client, [FromBody] AgentMessage<ListProjectDirectoryCommand> message) =>
-        client.SendCommandToUser(message)
-              .Select(WriteLine);
+    public static Task<IResult> ListProjectDirectory(ClientService client, [FromBody] AgentMessage<ListProjectDirectoryCommand> message) =>
+        from result in client.SendCommandToUser(message)
+        select Json(result);
 
-    public static Task<string> OpenFile(ClientService client, [FromBody] AgentMessage<OpenFileCommand> message) =>
-        client.SendCommandToUser(message)
-              .Select(WriteLine);
+    public static Task<IResult> OpenFile(ClientService client, [FromBody] AgentMessage<OpenFileCommand> message) =>
+        from result in client.SendCommandToUser(message)
+        select Json(result);
 
-    public static Task<string> WriteFile(ClientService client, [FromBody] AgentMessage<WriteFileCommand> message) =>
-        client.SendCommandToUser(message)
-              .Select(WriteLine);
+    public static Task<IResult> WriteFile(ClientService client, [FromBody] AgentMessage<WriteFileCommand> message) =>
+        from result in client.SendCommandToUser(message)
+        select Json(result);
 
-    public static Task<string> ReplaceSection(ClientService client, [FromBody] AgentMessage<SectionReplaceCommand> message) =>
-        client.SendCommandToUser(message)
-              .Select(WriteLine);
+    public static Task<IResult> ReplaceSection(ClientService client, [FromBody] AgentMessage<SectionReplaceCommand> message) =>
+        from result in client.SendCommandToUser(message)
+        select Json(result);
 
-    public static Task<string> TextReplace(ClientService client, [FromBody] AgentMessage<TextReplaceCommand> message) =>
-        client.SendCommandToUser(message)
-              .Select(WriteLine);
+    public static Task<IResult> TextReplace(ClientService client, [FromBody] AgentMessage<TextReplaceCommand> message) =>
+        from result in client.SendCommandToUser(message)
+        select Json(result);
+
+    public static Task<IResult> TextInsertBefore(ClientService client, [FromBody] AgentMessage<TextInsertBeforeCommand> message) =>
+        from result in client.SendCommandToUser(message)
+        select Json(result);
+
+    public static Task<IResult> TextInsertAfter(ClientService client, [FromBody] AgentMessage<TextInsertAfterCommand> message) =>
+        from result in client.SendCommandToUser(message)
+        select Json(result);
+
+    public static Task<IResult> RunUnitTests(ClientService client, [FromBody] AgentMessage<RunUnitTestsCommand> message) =>
+        from result in client.SendCommandToUser(message)
+        select Json(result);
 }

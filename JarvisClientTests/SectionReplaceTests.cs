@@ -41,8 +41,7 @@ public class SectionReplaceTests
         var result = browser.ReplaceSection(projectName, fileName, sectionIdentifiers, replacementContent);
 
         // Assert
-        Assert.AreEqual("Section replaced successfully.", result.IfError(x => x.Message));
-        Assert.AreEqual(replacedContent, fileSystem.ReadAllText(filePath));
+        Assert.AreEqual(replacedContent, result.IfError(x => x.Message));
     }
 
     [TestMethod]
@@ -79,7 +78,6 @@ public class SectionReplaceTests
         var result = browser.ReplaceSection(projectName, fileName, sectionIdentifiers, replacementContent);
 
         // Assert
-        Assert.AreEqual("Section replaced successfully.", result.IfError(x => x.Message));
-        Assert.AreEqual(replacedContent, fileSystem.ReadAllText(filePath));
+        Assert.AreEqual(replacedContent, result.IfError(x => x.Message));
     }
 }

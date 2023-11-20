@@ -4,24 +4,25 @@ using JarvisClientTests.Impl;
 namespace JarvisClientTests;
 
 [TestClass]
-public class ReplaceTests
+public class InsertBeforeTests
 {
     [TestMethod]
-    public void TestReplace()
+    public void Test()
     {
         const string root = @"C:\repos";
         const string projectName = "Test Project";
         const string fileName = "testFile.txt";
         const string filePath = $@"{root}\{projectName}\{fileName}";
+        const string replacementContent = " NEW CONTENT ";
         const string originalContent = """
             THIS IS A TEST
-                <!-- START -->THIS SHOULD BE REPLACED<!-- END -->
+                INSERT AFTERINSERT BEFORE
             END TEST CONTENT
             """;
 
-        const string replacedContent = """
+        const string replacedContent = $"""
             THIS IS A TEST
-                <!-- START -->NEW CONTENT<!-- END -->
+                INSERT AFTER{replacementContent}INSERT BEFORE
             END TEST CONTENT
             """;
 
@@ -31,10 +32,9 @@ public class ReplaceTests
 
         // Arrange
         var browser = new ProjectBrowser(fileSystem, root);
-        const string replacementContent = "NEW CONTENT";
 
         // Act
-        var result = browser.Replace(projectName, fileName, "THIS SHOULD BE REPLACED", replacementContent);
+        var result = browser.InsertBefore(projectName, fileName, "INSERT BEFORE", replacementContent);
 
         // Assert
         Assert.AreEqual(replacedContent, result.IfError(x => x.Message));

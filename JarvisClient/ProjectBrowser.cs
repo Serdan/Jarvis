@@ -133,7 +133,7 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
             + content[(endIndex + sectionIdentifiers.End.Length)..]
         let write = fileSystem.WriteAllText(file.FullName, newContent)
         //
-        select ok("Section replaced successfully.");
+        select ok(newContent);
 
     /// <summary>
     /// Replaces a specific string within a file in a project.
@@ -156,7 +156,36 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
         //
         let newContent = content[..index] + replacement + content[(index + search.Length)..]
         let write = fileSystem.WriteAllText(file.FullName, newContent)
-        select ok("Search string replaced successfully.");
+        select ok(newContent);
+
+    public Result<string> InsertBefore(string projectName, string filePath, string search, string content) =>
+        from project in ParseProjectName(projectName)
+        from file in ParseFilePath(project, filePath)
+        //
+        let existing = fileSystem.ReadAllText(file.FullName)
+        let index = existing.IndexOf(search, StringComparison.Ordinal)
+        //
+        from found in index >= 0
+            ? ok(unit)
+            : error("Search string not found in file.")
+        //
+        let newContent = existing[..index] + content + existing[index..]
+        let write = fileSystem.WriteAllText(file.FullName, newContent)
+        select ok(newContent);
+
+    public Result<string> InsertAfter(string projectName, string filePath, string search, string content) =>
+        from project in ParseProjectName(projectName)
+        from file in ParseFilePath(project, filePath)
+        //
+        let existing = fileSystem.ReadAllText(file.FullName)
+        let index = existing.IndexOf(search, StringComparison.Ordinal)
+        //
+        from found in index >= 0
+            ? ok(unit)
+            : error("Search string not found in file.")
+        let newContent = existing[..(index + search.Length)] + content + existing[(index + search.Length)..]
+        let write = fileSystem.WriteAllText(file.FullName, newContent)
+        select ok(newContent);
 
     /// <summary>
     /// Parses the project name and verifies its existence within the current project directory.

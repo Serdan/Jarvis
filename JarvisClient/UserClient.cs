@@ -47,9 +47,12 @@ public class UserClient(HubConnection hub, ProjectBrowser browser) : IUserClient
                 ListProjectDirectoryCommand(var projectName, var path) => browser.ListProjectDirectory(projectName, path).Select(Serialize),
                 OpenFileCommand(var projectName, var path) => browser.OpenFile(projectName, path),
                 WriteFileCommand(var projectName, var filePath, var content, var mode) => browser.WriteFile(projectName, filePath, content, mode),
-                SectionReplaceCommand(var projectName, var filePath, var sectionIdentifiers, var replacementContent) =>
-                    browser.ReplaceSection(projectName, filePath, sectionIdentifiers, replacementContent),
-                TextReplaceCommand(var projectName, var filePath, var search, var replacement) => browser.Replace(projectName, filePath, search, replacement),
+                // SectionReplaceCommand(var projectName, var filePath, var sectionIdentifiers, var replacementContent) =>
+                //     browser.ReplaceSection(projectName, filePath, sectionIdentifiers, replacementContent),
+                TextReplaceCommand(var projectName, var filePath, var search, var content) => browser.Replace(projectName, filePath, search, content),
+                TextInsertBeforeCommand(var projectName, var filePath, var search, var content) => browser.InsertBefore(projectName, filePath, search, content),
+                TextInsertAfterCommand(var projectName, var filePath, var search, var content) => browser.InsertAfter(projectName, filePath, search, content),
+                RunUnitTestsCommand(var projectName) => error("Not implemented"),
                 _ => error("Unknown command")
             };
 

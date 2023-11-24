@@ -184,7 +184,55 @@
       }
     },
     "/rununittests": {
-      
+      "post": {
+        "x-openai-isConsequential": false,
+        "description": "Run unit tests for a specified project and return the results.",
+        "operationId": "RunUnitTests",
+        "parameters": [],
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OpenFileSchema"
+              }
+            }
+          },
+          "required": true
+        },
+        "deprecated": false
+      }
+    },
+    "/rolldie": {
+      "get": {
+        "x-openai-isConsequential": false,
+        "description": "Roll x number of n sided die.",
+        "operationId": "RollDie",
+        "parameters": [
+          {
+            "name": "count",
+            "in": "query",
+            "schema": {
+              "type": "integer"
+            },
+            "required": true,
+            "description": "The number of die to roll."
+          },
+          {
+            "name": "sides",
+            "in": "query",
+            "schema": {
+              "type": "integer"
+            },
+            "required": true,
+            "description": "The number of sides on each die"
+          }
+        ]
+      }
     }
   },
   "components": {
@@ -288,15 +336,15 @@
                 "title": "project_name",
                 "description": "Name of the project."
               },
-              "path": {
+              "file_path": {
                 "type": "string",
-                "title": "path",
+                "title": "file_path",
                 "description": "The path to the file."
               }
             },
             "required": [
               "project_name",
-              "path"
+              "file_path"
             ]
           }
         },

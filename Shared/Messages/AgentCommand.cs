@@ -13,7 +13,7 @@ public partial record AgentCommand
 
     partial record ListProjectDirectoryCommand(string ProjectName, string Path);
 
-    partial record OpenFileCommand(string ProjectName, string Path);
+    partial record OpenFileCommand(string ProjectName, string FilePath);
 
     partial record WriteFileCommand(string ProjectName, string FilePath, string Content, FileWriteMode Mode);
 
@@ -25,5 +25,5 @@ public partial record AgentCommand
 
     partial record TextInsertAfterCommand(string ProjectName, string FilePath, string Search, string Content);
 
-    partial record RunUnitTestsCommand(string ProjectName);
+    partial record RunUnitTestsCommand(string ProjectName, string FilePath);
 }

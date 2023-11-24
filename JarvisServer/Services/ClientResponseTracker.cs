@@ -11,7 +11,7 @@ public class ClientResponseTracker
         var correlationId = Guid.NewGuid().ToString();
         var tcs = new TaskCompletionSource<string>();
 
-        var cts = new CancellationTokenSource(2000);
+        var cts = new CancellationTokenSource(60000);
         cts.Token.Register(() =>
         {
             if (messages.TryRemove(correlationId, out var source))

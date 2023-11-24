@@ -1,5 +1,7 @@
 using System.Collections.Frozen;
 using System.Collections.Immutable;
+using System.Diagnostics;
+using System.Numerics;
 using JarvisClient.Models;
 using Shared;
 using Shared.Messages;
@@ -186,6 +188,30 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
         let newContent = existing[..(index + search.Length)] + content + existing[(index + search.Length)..]
         let write = fileSystem.WriteAllText(file.FullName, newContent)
         select ok(newContent);
+
+    /// <summary>
+    /// Executes unit tests for a given project and returns the results.
+    /// </summary>
+    /// <param name="projectName">The name of the project for which to run tests.</param>
+    /// <param name="filePath"></param>
+    /// <returns>A Result containing the test results or an error message if the test execution fails.</returns>
+    public Result<string> RunUnitTests(string projectName, string filePath) =>
+        from project in ParseProjectName(projectName)
+        from file in ParseFilePath(project, filePath)
+        from processInfo in ok(new ProcessStartInfo
+        {
+            FileName = "dotnet",
+            Arguments = $"test {file.FullName}",
+            RedirectStandardOutput = true,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        })
+        from process in @try(() => Process.Start(processInfo))
+        from output in @try(() => process.StandardOutput.ReadToEnd())
+        from _ in @try(process.WaitForExit, unit)
+        select process.ExitCode is 0
+            ? ok(output)
+            : error($"Tests failed with exit code {process.ExitCode}.\nOutput: {output}");
 
     /// <summary>
     /// Parses the project name and verifies its existence within the current project directory.

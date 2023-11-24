@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using JarvisClient.Extensions;
@@ -53,7 +52,7 @@ public class UserClient(HubConnection hub, ProjectBrowser browser) : IUserClient
                 TextReplaceCommand(var projectName, var filePath, var search, var content) => browser.Replace(projectName, filePath, search, content),
                 TextInsertBeforeCommand(var projectName, var filePath, var search, var content) => browser.InsertBefore(projectName, filePath, search, content),
                 TextInsertAfterCommand(var projectName, var filePath, var search, var content) => browser.InsertAfter(projectName, filePath, search, content),
-                RunUnitTestsCommand(var projectName) => RunUnitTests(projectName).Apply(Serialize),
+                RunUnitTestsCommand(var projectName, var filePath) => browser.RunUnitTests(projectName, filePath),
                 _ => error("Unknown command")
             };
 
@@ -99,46 +98,5 @@ public class UserClient(HubConnection hub, ProjectBrowser browser) : IUserClient
         options.Converters.Add(new JsonStringEnumConverter());
 
         return options;
-    }
-
-    /// <summary>
-    /// Executes unit tests for a given project and returns the results.
-    /// </summary>
-    /// <param name="projectName">The name of the project for which to run tests.</param>
-    /// <returns>A Result containing the test results or an error message if the test execution fails.</returns>
-    private static Result<string> RunUnitTests(string projectName)
-    {
-        try
-        {
-            // Running unit tests using ProcessStartInfo
-            var processInfo = new ProcessStartInfo
-            {
-                FileName = "dotnet",
-                Arguments = $"test {projectName}",
-                RedirectStandardOutput = true,
-                UseShellExecute = false,
-                CreateNoWindow = true
-            };
-
-            using var process = Process.Start(processInfo);
-            if (process is null)
-            {
-                throw new InvalidOperationException("Failed to start process.");
-            }
-
-            var output = process.StandardOutput.ReadToEnd();
-            process.WaitForExit();
-
-            if (process.ExitCode is not 0)
-            {
-                throw new InvalidOperationException($"Tests failed with exit code {process.ExitCode}.\nOutput: {output}");
-            }
-
-            return ok(output);
-        }
-        catch (Exception e)
-        {
-            return error(e);
-        }
     }
 }

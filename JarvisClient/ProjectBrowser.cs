@@ -1,7 +1,6 @@
 using System.Collections.Frozen;
 using System.Collections.Immutable;
 using System.Diagnostics;
-using System.Numerics;
 using JarvisClient.Models;
 using Shared;
 using Shared.Messages;
@@ -206,7 +205,9 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
             UseShellExecute = false,
             CreateNoWindow = true
         })
-        from process in @try(() => Process.Start(processInfo))
+        from process in @try(() => Process.Start(processInfo) is var value && value is not null 
+                                 ? ok(value) 
+                                 : error("Starting process failed"))
         from output in @try(() => process.StandardOutput.ReadToEnd())
         from _ in @try(process.WaitForExit, unit)
         select process.ExitCode is 0

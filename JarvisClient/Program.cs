@@ -1,6 +1,4 @@
-﻿// See https://aka.ms/new-console-template for more information
-
-using System.Security.Cryptography;
+﻿using System.Security.Cryptography;
 using JarvisClient;
 using JarvisClient.Extensions;
 using Microsoft.AspNetCore.SignalR.Client;
@@ -8,13 +6,22 @@ using Microsoft.Extensions.DependencyInjection;
 using Shared;
 using Shared.SignalR;
 
+var clientOptions = new ClientOptions
+{
+    Path = args switch
+    {
+        ["--path", { } path] => path,
+        _ => ""
+    }
+};
+
 await using var connection = new HubConnectionBuilder()
                              .AddJsonProtocol()
                              .WithUrl("https://jarvis.kehlet.dev/client")
                              .Build();
 
 var file = new FileSystem();
-var browser = ProjectBrowser.Create(file, "z:\\repos");
+var browser = ProjectBrowser.Create(file, clientOptions.Path);
 var client = new UserClient(connection, browser);
 
 connection.On(client, x => x.ReceiveMessage);
@@ -31,8 +38,9 @@ try
     var key = RandomNumberGenerator.GetBytes(18)
                                    .Apply(Convert.ToBase64String);
 
-    Console.WriteLine("Key:");
+    Console.WriteLine("Provide this key to the agent:");
     Console.WriteLine(key);
+    Console.WriteLine();
 
     await connection.InvokeAsync<IJarvisHub>(x => x.Connect(key));
 

@@ -36,7 +36,7 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
     {
         while (string.IsNullOrEmpty(directory) || fileSystem.DirectoryExists(directory) is false)
         {
-            Console.WriteLine("Input project directory");
+            Console.Write("Workspace directory: ");
             directory = Console.ReadLine()!;
         }
 

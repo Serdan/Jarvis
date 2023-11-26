@@ -10,6 +10,11 @@
       "url": "https://jarvis.kehlet.dev/agent"
     }
   ],
+  "security": [
+    {
+      "ApiKeyAuth": []
+    }
+  ],
   "paths": {
     "/listprojects": {
       "post": {
@@ -17,11 +22,6 @@
         "description": "Gets a list of projects",
         "operationId": "ListProjects",
         "parameters": [],
-        "security": [
-          {
-            "ApiKeyAuth": []
-          }
-        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -205,33 +205,6 @@
           "required": true
         },
         "deprecated": false
-      }
-    },
-    "/rolldie": {
-      "get": {
-        "x-openai-isConsequential": false,
-        "description": "Roll x number of n sided die.",
-        "operationId": "RollDie",
-        "parameters": [
-          {
-            "name": "count",
-            "in": "query",
-            "schema": {
-              "type": "integer"
-            },
-            "required": true,
-            "description": "The number of die to roll."
-          },
-          {
-            "name": "sides",
-            "in": "query",
-            "schema": {
-              "type": "integer"
-            },
-            "required": true,
-            "description": "The number of sides on each die"
-          }
-        ]
       }
     }
   },
@@ -517,7 +490,7 @@
       "ApiKeyAuth": {
         "type": "apiKey",
         "in": "header",
-        "name": "X-API-KEY"
+        "name": "X-Api-Key"
       }
     }
   }

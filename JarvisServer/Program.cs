@@ -3,11 +3,15 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Threading.RateLimiting;
 using JarvisServer;
+using JarvisServer.Middleware;
 using JarvisServer.Services;
 using Microsoft.AspNetCore.HttpOverrides;
 using Microsoft.AspNetCore.RateLimiting;
 
 var builder = WebApplication.CreateBuilder(args);
+
+builder.Configuration.AddEnvironmentVariables("Jarvis");
+builder.Services.Configure<JarvisOptions>(builder.Configuration);
 
 builder.Services
        .AddSignalR()
@@ -61,6 +65,8 @@ if (app.Environment.IsDevelopment() is false)
     app.UseHttpsRedirection();
 }
 
+app.UseMiddleware<ApiKeyMiddleware>();
+
 app.MapGet("/", () => "the future is tomorrow").RequireRateLimiting(rateLimiterPolicy);
 app.MapHub<JarvisHub>("/client").RequireRateLimiting(rateLimiterPolicy);
 
@@ -81,6 +87,5 @@ app.MapGroup("/agent")
        return group;
    })
    .RequireRateLimiting(rateLimiterPolicy);
-
 
 app.Run();

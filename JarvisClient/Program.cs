@@ -28,7 +28,7 @@ try
 {
     await connection.StartAsync();
 
-    var key = RandomNumberGenerator.GetBytes(16)
+    var key = RandomNumberGenerator.GetBytes(18)
                                    .Apply(Convert.ToBase64String);
 
     Console.WriteLine("Key:");

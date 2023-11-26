@@ -5,10 +5,11 @@
 - OpenFiles: Could be faster. Depends on whether GPT can make reasonable decisions based on file sizes.
 - ✅Add size info to file data: See above.
 - ✅WriteFile: Append and overwrite
-- Read todo: The agent can modify todo, so it should be able to read it as well.
+- OpenTodo: Implement functionality to read and display todo lists.
 - Add todo: Add todo bullet point.
 - Remove todo: Remove todo bullet point. Match everything on line before semicolon.
 - dotnet test: Run all tests and return the result to the agent.
 - Git: Consider exposing a limited set of git commands.
 - dotnet new: Allow the agent to create new projects in a solution. 
-- MoveFile: Could be useful. Not high priority.
+- MoveFile: Could be useful.
+- MakeDirectory: Create a new directory within a project. Not high priority.

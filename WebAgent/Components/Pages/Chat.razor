@@ -1,0 +1,73 @@
+@page "/"
+@rendermode InteractiveServer
+<style>
+    .input-button-container {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+    }
+
+    .chat-container {
+        display: flex;
+        flex-direction: column;
+        flex-grow: 1;
+        min-height: 0;
+        
+        border: 1px solid #ccc;
+        padding: 10px;
+        margin-bottom: 20px;
+        background-color: #f9f9f9;
+        height: calc(100vh - 150px);
+        overflow-y: auto;
+    }
+    .chat-input {
+        width: 100%;
+        padding: 10px;
+        border: 1px solid #ccc;
+        border-radius: 4px;
+    }
+    .chat-send {
+        background-color: #4CAF50;
+        color: white;
+        padding: 10px 20px;
+        border: none;
+        border-radius: 4px;
+        cursor: pointer;
+    }
+    .chat-send:hover {
+        background-color: #45a049;
+    }
+</style>
+
+<PageTitle>Chat</PageTitle>
+
+<div class="chat-container">
+    @foreach (var message in messages)
+    {
+        <p>@message</p>
+    }
+</div>
+
+<div class="input-button-container">
+    <input class="chat-input" type="text" @bind="userInput" />
+    <button class="chat-send" @onclick="SendMessage">Send</button>
+</div>
+
+@code {
+    private readonly List<string> messages = [];
+
+    private string userInput = "";
+
+    private void SendMessage()
+    {
+        if (!string.IsNullOrWhiteSpace(userInput))
+        {
+            messages.Add("User: " + userInput);
+            // Add logic to send message to AI agent and get response
+            // Example: var response = AI.SendMessage(userInput);
+            // messages.Add("AI: " + response);
+            userInput = string.Empty;
+        }
+    }
+
+}

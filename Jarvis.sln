@@ -12,6 +12,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "JarvisServerTests", "Jarvis
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "JarvisGuiClient", "JarvisGuiClient\JarvisGuiClient.csproj", "{78088054-90B2-436A-B620-67C58DB5D8DB}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "WebAgent", "WebAgent\WebAgent.csproj", "{F25CBA03-003E-48C9-85D4-2D251B26432C}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -42,5 +44,9 @@ Global
 		{78088054-90B2-436A-B620-67C58DB5D8DB}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{78088054-90B2-436A-B620-67C58DB5D8DB}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{78088054-90B2-436A-B620-67C58DB5D8DB}.Release|Any CPU.Build.0 = Release|Any CPU
+		{F25CBA03-003E-48C9-85D4-2D251B26432C}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{F25CBA03-003E-48C9-85D4-2D251B26432C}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{F25CBA03-003E-48C9-85D4-2D251B26432C}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{F25CBA03-003E-48C9-85D4-2D251B26432C}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 EndGlobal

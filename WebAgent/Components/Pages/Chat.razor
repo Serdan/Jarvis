@@ -1,10 +1,20 @@
 @page "/"
+@using OpenAI.Threads
+@using OpenAI.Models
+@using OpenAI
+@using Kehlet.Functional
+@using Markdig
+@using System.Collections
 @rendermode InteractiveServer
 <style>
     .input-button-container {
         display: flex;
         align-items: center;
         gap: 10px;
+    }
+    
+    * > p:last-child {
+        margin-bottom: 0;
     }
 
     .chat-container {
@@ -13,19 +23,28 @@
         flex-grow: 1;
         min-height: 0;
         
-        border: 1px solid #ccc;
-        padding: 10px;
+        /*border: 1px solid #ccc;*/
+        /*padding: 10px;*/
         margin-bottom: 20px;
-        background-color: #f9f9f9;
+        /*background-color: #f9f9f9;*/
         height: calc(100vh - 150px);
         overflow-y: auto;
     }
+    
+    .message-container {
+        border: 1px solid #ccc;
+        background-color: #f9f9f9;
+        padding: 10px;
+        margin-bottom: 20px;
+    }
+    
     .chat-input {
         width: 100%;
         padding: 10px;
         border: 1px solid #ccc;
         border-radius: 4px;
     }
+    
     .chat-send {
         background-color: #4CAF50;
         color: white;
@@ -34,40 +53,202 @@
         border-radius: 4px;
         cursor: pointer;
     }
+    
     .chat-send:hover {
         background-color: #45a049;
+    }
+    
+    code {
+        color: #d63384;
+        background-color: #f8f9fa;
+        border-radius: 4px;
+        padding: 2px 4px;
+        font-family: monospace;
     }
 </style>
 
 <PageTitle>Chat</PageTitle>
 
 <div class="chat-container">
-    @foreach (var message in messages)
-    {
-        <p>@message</p>
-    }
+    <Virtualize Context="message" Items="@messages">
+        <div class="message-container">@((MarkupString) message.Content)</div>
+    </Virtualize>
 </div>
 
-<div class="input-button-container">
-    <input class="chat-input" type="text" @bind="userInput" />
-    <button class="chat-send" @onclick="SendMessage">Send</button>
+<div class="input-button-container" @onkeydown="HandleKeyPress">
+    <input class="chat-input" type="text" value="@userInput" @oninput="@(e => userInput = e.Value?.ToString() ?? "")" @onkeydown="HandleKeyPress" disabled="@thinking" />
+    <button class="chat-send" @onclick="SendMessage" disabled="@thinking">Send</button>
 </div>
 
 @code {
-    private readonly List<string> messages = [];
-
+    private MessageList messages = [];
+    private Agent agent = null!;
     private string userInput = "";
+    private bool thinking;
 
-    private void SendMessage()
+    protected override async Task OnInitializedAsync()
     {
-        if (!string.IsNullOrWhiteSpace(userInput))
+        agent = await Agent.Create();
+
+        await base.OnInitializedAsync();
+    }
+
+    private async Task HandleKeyPress(KeyboardEventArgs e)
+    {
+        if (e.Code == "Enter" || e.Key == "Enter")
         {
-            messages.Add("User: " + userInput);
-            // Add logic to send message to AI agent and get response
-            // Example: var response = AI.SendMessage(userInput);
-            // messages.Add("AI: " + response);
-            userInput = string.Empty;
+            await SendMessage();
         }
     }
+
+    private async Task SendMessage()
+    {
+        if (string.IsNullOrWhiteSpace(userInput))
+        {
+            return;
+        }
+
+        thinking = true;
+        var message = userInput;
+        userInput = "";
+
+        messages = await agent.Ask(message);
+        thinking = false;
+    }
+
+    class Agent
+    {
+        public required OpenAIClient Client { get; init; }
+        public required ThreadResponse Thread { get; init; }
+
+        public readonly MessageList messages = [];
+
+        public async Task<MessageList> Ask(string message)
+        {
+            var m = await Thread.CreateMessageAsync(message);
+            var run = await Thread.CreateRunAsync("asst_2pJVbotHVeQJRKKLOR1DyMmf");
+            var response = await run.WaitForStatusChangeAsync(500, 60_000);
+            if (response.Status is not RunStatus.Completed)
+            {
+                return messages;
+            }
+
+            await GetMessages();
+
+            return messages;
+        }
+
+        public async Task GetMessages()
+        {
+            var last = messages.Last();
+            var list = await last.Match(
+                some: x => Thread.ListMessagesAsync(new(before: x.Key)),
+                none: () => Thread.ListMessagesAsync()
+            );
+
+            messages.Add(list.Items.Reverse());
+        }
+
+        public static async Task<Agent> Create()
+        {
+            var key = "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";
+            var client = new OpenAIClient(key);
+            var assistant = await client.AssistantsEndpoint.RetrieveAssistantAsync("asst_2pJVbotHVeQJRKKLOR1DyMmf");
+
+            return new()
+            {
+                Client = client,
+                Thread = await client.ThreadsEndpoint.CreateThreadAsync()
+            };
+        }
+    }
+
+    class MessageList : IEnumerable<Message>, ICollection<Message>
+    {
+        private readonly Dictionary<string, Message> messageDictionary = [];
+        private readonly List<string> keys = [];
+
+        public Option<Message> this[string key] =>
+            messageDictionary.TryGetValue(key, out var value)
+                ? some(value)
+                : none;
+
+        public void Add(Message item)
+        {
+            throw new NotImplementedException();
+        }
+
+        public void Add(MessageResponse message)
+        {
+            var content = message.PrintContent();
+            if (messageDictionary.TryAdd(message.Id, new(message.Id, Markdown.ToHtml(content), content)))
+            {
+                keys.Add(message.Id);
+            }
+        }
+
+        public void Add(IEnumerable<MessageResponse> messages)
+        {
+            foreach (var message in messages)
+            {
+                Add(message);
+            }
+        }
+
+        public Option<Message> Last()
+        {
+            if (keys.Count is 0)
+            {
+                return none;
+            }
+
+            return this[keys.Last()];
+        }
+
+        public IEnumerator<Message> GetEnumerator()
+        {
+            foreach (var key in keys)
+            {
+                yield return union(this[key]) switch
+                {
+                    OptionUnion<Message>.Some(var value) => value,
+                    _ => throw new Exception()
+                };
+            }
+        }
+
+        IEnumerator IEnumerable.GetEnumerator() =>
+            GetEnumerator();
+
+        public void Clear()
+        {
+            messageDictionary.Clear();
+            keys.Clear();
+        }
+
+        public bool Contains(Message item)
+        {
+            return messageDictionary.ContainsValue(item);
+        }
+
+        public void CopyTo(Message[] array, int arrayIndex)
+        {
+            for (var i = arrayIndex; i < keys.Count; i++)
+            {
+                array[i] = messageDictionary[keys[i]];
+            }
+        }
+
+        public bool Remove(Message item)
+        {
+            throw new Exception();
+        }
+
+        public int Count => keys.Count;
+
+        public bool IsReadOnly => false;
+    }
+
+    readonly record struct Message(string Key, string Content, string RawContent);
 
 }

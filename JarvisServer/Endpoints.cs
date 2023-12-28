@@ -47,4 +47,8 @@ public static class Endpoints
     public static Task<IResult> RunUnitTests(ClientService client, [FromBody] AgentMessage<RunUnitTestsCommand> message) =>
         from result in client.SendCommandToUser(message)
         select Json(result);
+
+    public static Task<IResult> OpenTodo(ClientService client, [FromBody] AgentMessage<OpenTodoCommand> message) =>
+        from result in client.SendCommandToUser(message)
+        select Json(result);
 }

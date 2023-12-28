@@ -30,11 +30,11 @@ public class FakeFileSystem : IFileSystem
         files[path] = CreateDirectory(name);
     }
 
-    public string ReadAllText(string path)
+    public Result<string> ReadAllText(string path)
     {
         if (files.TryGetValue(path, out var contents))
         {
-            return contents.Content;
+            return ok(contents.Content);
         }
         else
         {
@@ -42,10 +42,10 @@ public class FakeFileSystem : IFileSystem
         }
     }
 
-    public Unit WriteAllText(string path, string contents)
+    public Result<Unit> WriteAllText(string path, string contents)
     {
         files[path] = CreateFile(path, contents);
-        return unit;
+        return ok(unit);
     }
 
     public bool FileExists(string path)
@@ -53,24 +53,24 @@ public class FakeFileSystem : IFileSystem
         return files.ContainsKey(path);
     }
 
-    public Unit CopyFile(string source, string destination, bool overwrite)
+    public Result<Unit> CopyFile(string source, string destination, bool overwrite)
     {
         if (files.TryGetValue(source, out var sourceContent) is false)
         {
-            throw new FileNotFoundException("File not found", source);
+            return error($"File not found: {source}");
         }
 
         var destExists = files.ContainsKey(destination);
         if (overwrite is false && destExists)
         {
-            return unit;
+            return ok(unit);
         }
 
         files[destination] = sourceContent;
-        return unit;
+        return ok(unit);
     }
 
-    public Unit AppendAllText(string path, string contents)
+    public Result<Unit> AppendAllText(string path, string contents)
     {
         if (files.TryGetValue(path, out var content) is false)
         {
@@ -80,7 +80,7 @@ public class FakeFileSystem : IFileSystem
         var file = files[path];
         files[path] = file with { Content = content.Content + contents };
 
-        return unit;
+        return ok(unit);
     }
 
     public bool DirectoryExists(string path)

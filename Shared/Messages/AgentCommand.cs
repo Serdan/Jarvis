@@ -4,7 +4,7 @@ using Kehlet.Functional;
 
 namespace Shared.Messages;
 
-[AutoClosed(true)]
+[Union(true)]
 public partial record AgentCommand
 {
     partial record ListProjectsCommand;
@@ -26,4 +26,6 @@ public partial record AgentCommand
     partial record TextInsertAfterCommand(string ProjectName, string FilePath, string Search, string Content);
 
     partial record RunUnitTestsCommand(string ProjectName, string FilePath);
+
+    partial record OpenTodoCommand(string ProjectName);
 }

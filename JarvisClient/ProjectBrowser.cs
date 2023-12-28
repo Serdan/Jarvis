@@ -60,11 +60,16 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
     public Result<FrozenDictionary<string, string>> GetProjectDetails(string projectName) =>
         from project in ParseProjectName(projectName)
         from fullPath in ParseDirectory(project)
-        let infos = from path in fullPath
-                    select from file in ProjectFiles
-                           select GetFile(project, file)
-        let items = from item in filter(infos)
-                    select new KeyValuePair<string, string>(item.Name, fileSystem.ReadAllText(item.FullName))
+        let fileInfoResults = from path in fullPath
+                              select from file in ProjectFiles
+                                     select GetFile(project, file)
+        let items = from item in filter(
+                        from result in fileInfoResults
+                        select from info in result
+                               from content in fileSystem.ReadAllText(info.FullName)
+                               select (info.Name, Content: content)
+                    )
+                    select new KeyValuePair<string, string>(item.Name, item.Content)
         select items.ToFrozenDictionary();
 
     /// <summary>
@@ -101,13 +106,12 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
         from project in ParseProjectName(projectName)
         from file in ParseFilePath(project, filePath)
         let message = file.Exists ? "existing file" : "new file"
-        from result in mode switch
+        select mode switch
         {
-            FileWriteMode.Append => @try(() => fileSystem.AppendAllText(file.FullName, content), $"Appended content to {message}: {file.Name}"),
-            FileWriteMode.Write => @try(() => fileSystem.WriteAllText(file.FullName, content), $"Wrote content to {message}: {file.Name}"),
+            FileWriteMode.Append => from result in fileSystem.AppendAllText(file.FullName, content) select $"Appended content to {message}: {file.Name}",
+            FileWriteMode.Write => from result in fileSystem.WriteAllText(file.FullName, content) select $"Wrote content to {message}: {file.Name}",
             _ => error($"Unsupported mode: {mode}")
-        }
-        select result;
+        };
 
     /// <summary>
     /// Replaces a specific section within a file in a project based on provided section identifiers.
@@ -121,7 +125,7 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
         from project in ParseProjectName(projectName)
         from file in ParseFilePath(project, filePath)
         //
-        let content = fileSystem.ReadAllText(file.FullName)
+        from content in fileSystem.ReadAllText(file.FullName)
         let startIndex = content.IndexOf(sectionIdentifiers.Start, StringComparison.Ordinal)
         let endIndex = content.IndexOf(sectionIdentifiers.End, StringComparison.Ordinal)
         //
@@ -148,7 +152,7 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
         from project in ParseProjectName(projectName)
         from file in ParseFilePath(project, filePath)
         //
-        let content = fileSystem.ReadAllText(file.FullName)
+        from content in fileSystem.ReadAllText(file.FullName)
         let index = content.IndexOf(search, StringComparison.Ordinal)
         //
         from found in index >= 0
@@ -163,7 +167,7 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
         from project in ParseProjectName(projectName)
         from file in ParseFilePath(project, filePath)
         //
-        let existing = fileSystem.ReadAllText(file.FullName)
+        from existing in fileSystem.ReadAllText(file.FullName)
         let index = existing.IndexOf(search, StringComparison.Ordinal)
         //
         from found in index >= 0
@@ -178,7 +182,7 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
         from project in ParseProjectName(projectName)
         from file in ParseFilePath(project, filePath)
         //
-        let existing = fileSystem.ReadAllText(file.FullName)
+        from existing in fileSystem.ReadAllText(file.FullName)
         let index = existing.IndexOf(search, StringComparison.Ordinal)
         //
         from found in index >= 0
@@ -205,8 +209,8 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
             UseShellExecute = false,
             CreateNoWindow = true
         })
-        from process in @try(() => Process.Start(processInfo) is var value && value is not null 
-                                 ? ok(value) 
+        from process in @try(() => Process.Start(processInfo) is var value && value is not null
+                                 ? ok(value)
                                  : error("Starting process failed"))
         from output in @try(() => process.StandardOutput.ReadToEnd())
         from _ in @try(process.WaitForExit, unit)
@@ -220,9 +224,7 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
     /// <param name="projectName">The name of the project to be parsed.</param>
     /// <returns>A Result containing the parsed ProjectName or an error message if the project does not exist.</returns>
     private Result<ProjectName> ParseProjectName(string projectName) =>
-        from projects in ok(ListProjects())
-        let exists = projects.Contains(projectName)
-        select exists
+        ListProjects().Contains(projectName)
             ? ok(new ProjectName(projectName))
             : error($"Unknown project name: {projectName}");
 

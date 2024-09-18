@@ -13,12 +13,22 @@ namespace JarvisClient;
 using static ProjectItemKind.Cons;
 
 /// <summary>
-/// Manages project file and directory operations within the Jarvis project.
-/// Provides functionalities for listing projects, getting project details, listing directory contents, 
-/// opening files, writing to files, and replacing specific sections within files.
+///     Manages project file and directory operations within the Jarvis project.
+///     Provides functionalities for listing projects, getting project details, listing directory contents,
+///     opening files, writing to files, and replacing specific sections within files.
 /// </summary>
 public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
 {
+    private static readonly ImmutableArray<string> ProjectFiles =
+        ["readme.md", "notes.md", "todo.md", "bob_notes.txt"];
+
+    private static readonly ImmutableArray<Func<string, bool>> FolderFilters =
+    [
+        s => !s.StartsWith('.'),
+        s => s != "bin",
+        s => s != "obj"
+    ];
+
     private ProjectDirectory projectDirectory = new(projectDirectory);
 
     public string ProjectDirectory
@@ -27,7 +37,7 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
     }
 
     /// <summary>
-    /// Creates an instance of the ProjectBrowser class with a specified file system and directory.
+    ///     Creates an instance of the ProjectBrowser class with a specified file system and directory.
     /// </summary>
     /// <param name="fileSystem">The file system interface used for file operations.</param>
     /// <param name="directory">The directory path to the project. If null, the user will be prompted to input a path.</param>
@@ -44,7 +54,7 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
     }
 
     /// <summary>
-    /// Retrieves a list of project names in the current project directory.
+    ///     Retrieves a list of project names in the current project directory.
     /// </summary>
     /// <returns>An immutable array of project names.</returns>
     public ImmutableArray<string> ListProjects() =>
@@ -53,7 +63,7 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
                         .ToImmutableArray()!;
 
     /// <summary>
-    /// Retrieves detailed information about a specified project.
+    ///     Retrieves detailed information about a specified project.
     /// </summary>
     /// <param name="projectName">The name of the project for which details are requested.</param>
     /// <returns>A Result containing a FrozenDictionary with project details, or an error message.</returns>
@@ -61,19 +71,19 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
         from project in ParseProjectName(projectName)
         from fullPath in ParseDirectory(project)
         let fileInfoResults = from path in fullPath
-                              select from file in ProjectFiles
-                                     select GetFile(project, file)
+            select from file in ProjectFiles
+                select GetFile(project, file)
         let items = from item in filter(
-                        from result in fileInfoResults
-                        select from info in result
-                               from content in fileSystem.ReadAllText(info.FullName)
-                               select (info.Name, Content: content)
-                    )
-                    select new KeyValuePair<string, string>(item.Name, item.Content)
+                from result in fileInfoResults
+                select from info in result
+                    from content in fileSystem.ReadAllText(info.FullName)
+                    select (info.Name, Content: content)
+            )
+            select new KeyValuePair<string, string>(item.Name, item.Content)
         select items.ToFrozenDictionary();
 
     /// <summary>
-    /// Lists the items in a specified directory within a project.
+    ///     Lists the items in a specified directory within a project.
     /// </summary>
     /// <param name="projectName">The name of the project.</param>
     /// <param name="directoryPath">The path of the directory to list items from.</param>
@@ -84,7 +94,7 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
         select items;
 
     /// <summary>
-    /// Opens and reads the content of a specified file in a project.
+    ///     Opens and reads the content of a specified file in a project.
     /// </summary>
     /// <param name="projectName">The name of the project containing the file.</param>
     /// <param name="filePath">The path to the file to be opened.</param>
@@ -95,7 +105,7 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
         select fileSystem.ReadAllText(file.FullName);
 
     /// <summary>
-    /// Writes content to a specified file within a project, with a specified mode (append or overwrite).
+    ///     Writes content to a specified file within a project, with a specified mode (append or overwrite).
     /// </summary>
     /// <param name="projectName">The name of the project containing the file.</param>
     /// <param name="filePath">The path to the file where content will be written.</param>
@@ -114,7 +124,7 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
         };
 
     /// <summary>
-    /// Replaces a specific section within a file in a project based on provided section identifiers.
+    ///     Replaces a specific section within a file in a project based on provided section identifiers.
     /// </summary>
     /// <param name="projectName">The name of the project containing the file.</param>
     /// <param name="filePath">The path to the file to be modified.</param>
@@ -134,14 +144,14 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
             : error("Section identifiers not found in file.")
         //
         let newContent = content[..startIndex]
-            + replacementContent
-            + content[(endIndex + sectionIdentifiers.End.Length)..]
+                         + replacementContent
+                         + content[(endIndex + sectionIdentifiers.End.Length)..]
         let write = fileSystem.WriteAllText(file.FullName, newContent)
         //
         select ok(newContent);
 
     /// <summary>
-    /// Replaces a specific string within a file in a project.
+    ///     Replaces a specific string within a file in a project.
     /// </summary>
     /// <param name="projectName">The name of the project containing the file.</param>
     /// <param name="filePath">The path to the file to be modified.</param>
@@ -193,7 +203,7 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
         select ok(newContent);
 
     /// <summary>
-    /// Executes unit tests for a given project and returns the results.
+    ///     Executes unit tests for a given project and returns the results.
     /// </summary>
     /// <param name="projectName">The name of the project for which to run tests.</param>
     /// <param name="filePath"></param>
@@ -210,8 +220,8 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
             CreateNoWindow = true
         })
         from process in @try(() => Process.Start(processInfo) is var value && value is not null
-                                 ? ok(value)
-                                 : error("Starting process failed"))
+            ? ok(value)
+            : error("Starting process failed"))
         from output in @try(() => process.StandardOutput.ReadToEnd())
         from _ in @try(process.WaitForExit, unit)
         select process.ExitCode is 0
@@ -219,7 +229,7 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
             : error($"Tests failed with exit code {process.ExitCode}.\nOutput: {output}");
 
     /// <summary>
-    /// Parses the project name and verifies its existence within the current project directory.
+    ///     Parses the project name and verifies its existence within the current project directory.
     /// </summary>
     /// <param name="projectName">The name of the project to be parsed.</param>
     /// <returns>A Result containing the parsed ProjectName or an error message if the project does not exist.</returns>
@@ -229,7 +239,7 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
             : error($"Unknown project name: {projectName}");
 
     /// <summary>
-    /// Retrieves the items (folders and files) from a specified path within a project.
+    ///     Retrieves the items (folders and files) from a specified path within a project.
     /// </summary>
     /// <param name="projectName">The project name as a ProjectName object.</param>
     /// <param name="path">The directory path from which items are to be retrieved.</param>
@@ -239,16 +249,16 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
         let folderItems = folderNames.Select(NewProjectFolder)
         from fileNames in GetFileNames(projectName, path)
         let fileItems = from fileName in fileNames
-                        let fileInfo = GetFile(projectName, path, fileName)
-                        select union(fileInfo) switch
-                        {
-                            Ok(var info) => NewProjectFile(info),
-                            Error(var error) => NewProjectFileError(fileName, error.Message)
-                        }
+            let fileInfo = GetFile(projectName, path, fileName)
+            select union(fileInfo) switch
+            {
+                Ok(var info) => NewProjectFile(info),
+                Error(var error) => NewProjectFileError(fileName, error.Message)
+            }
         select ImmutableArray.Create<ProjectItemKind>([..folderItems, ..fileItems]);
 
     /// <summary>
-    /// Retrieves the names of directories from a specified path within a project.
+    ///     Retrieves the names of directories from a specified path within a project.
     /// </summary>
     /// <param name="projectName">The project name as a ProjectName object.</param>
     /// <param name="directoryPath">The directory path from which directory names are to be retrieved.</param>
@@ -256,14 +266,14 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
     private Result<ImmutableArray<string>> GetDirectoryNames(ProjectName projectName, string directoryPath = "") =>
         from fullPath in ParseDirectory(projectName, directoryPath)
         let folders = from path in fullPath
-                      select from folder in fileSystem.GetDirectories(path)
-                             let folderName = Path.GetFileName(folder)
-                             where FolderFilters.All(predicate => predicate(folderName))
-                             select folderName
+            select from folder in fileSystem.GetDirectories(path)
+                let folderName = Path.GetFileName(folder)
+                where FolderFilters.All(predicate => predicate(folderName))
+                select folderName
         select ImmutableArray.Create(folders.ToArray());
 
     /// <summary>
-    /// Retrieves the names of files from a specified directory path within a project.
+    ///     Retrieves the names of files from a specified directory path within a project.
     /// </summary>
     /// <param name="projectName">The project name as a ProjectName object.</param>
     /// <param name="directoryPath">The directory path from which file names are to be retrieved.</param>
@@ -271,16 +281,19 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
     private Result<ImmutableArray<string>> GetFileNames(ProjectName projectName, string directoryPath) =>
         from fullPath in ParseDirectory(projectName, directoryPath)
         let files = from path in fullPath
-                    select from file in fileSystem.GetFiles(path)
-                           select Path.GetFileName(file)
+            select from file in fileSystem.GetFiles(path)
+                select Path.GetFileName(file)
         select ImmutableArray.Create(files.ToArray());
 
     /// <summary>
-    /// Parses the directory path within a project and ensures its existence.
+    ///     Parses the directory path within a project and ensures its existence.
     /// </summary>
     /// <param name="projectName">The project name as a ProjectName object.</param>
     /// <param name="directoryPath">The directory path(s) to be parsed and verified.</param>
-    /// <returns>A Result containing a HiddenString representing the full path, or an error message if the directory does not exist.</returns>
+    /// <returns>
+    ///     A Result containing a HiddenString representing the full path, or an error message if the directory does not
+    ///     exist.
+    /// </returns>
     private Result<HiddenString> ParseDirectory(ProjectName projectName, params string[] directoryPath) =>
         from fullPath in projectDirectory.Join([projectName.Name, ..directoryPath])
         let exists = fileSystem.DirectoryExists(fullPath)
@@ -289,7 +302,7 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
             : error($"Directory does not exist: {directoryPath.Last()}");
 
     /// <summary>
-    /// Retrieves file information for a specified file path within a project.
+    ///     Retrieves file information for a specified file path within a project.
     /// </summary>
     /// <param name="projectName">The project name as a ProjectName object.</param>
     /// <param name="path">The file path(s) for which information is to be retrieved.</param>
@@ -302,7 +315,7 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
             : error($"File does not exist: {path.Last()}");
 
     /// <summary>
-    /// Parses a file path within a project and verifies its existence.
+    ///     Parses a file path within a project and verifies its existence.
     /// </summary>
     /// <param name="projectName">The project name as a ProjectName object.</param>
     /// <param name="filePath">The file path to be parsed and verified.</param>
@@ -313,14 +326,4 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
         select fileSystem.DirectoryExists(info.FullName) is false
             ? ok(new FilePath(info.Name, info.FullName, info.Exists))
             : error("Path is a directory");
-
-    private static readonly ImmutableArray<string> ProjectFiles =
-        ImmutableArray.Create<string>(["readme.md", "notes.md", "todo.md", "bob_notes.txt"]);
-
-    private static readonly ImmutableArray<Func<string, bool>> FolderFilters =
-        ImmutableArray.Create<Func<string, bool>>([
-            s => !s.StartsWith('.'),
-            s => s != "bin",
-            s => s != "obj"
-        ]);
 }

@@ -12,12 +12,13 @@ public class ApiKeyMiddleware(RequestDelegate next)
 
     public Task InvokeAsync(HttpContext context, IOptions<JarvisOptions> options)
     {
-        var result = from headerValue in context.Request.Headers
-                                                .Get(ApiKeyHeaderName)
-                                                .ToResult("API Key is missing")
-                     select options.Value.ApiKey.Equals(headerValue)
-                         ? ok(unit)
-                         : error("Unauthorized client");
+        var result =
+            from headerValue in context.Request.Headers
+                                       .Get(ApiKeyHeaderName)
+                                       .ToResult("API Key is missing")
+            select options.Value.ApiKey.Equals(headerValue)
+                ? ok(unit)
+                : error("Unauthorized client");
 
         return union(result) switch
         {

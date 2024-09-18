@@ -51,4 +51,11 @@ public static class Endpoints
     public static Task<IResult> OpenTodo(ClientService client, [FromBody] AgentMessage<OpenTodoCommand> message) =>
         from result in client.SendCommandToUser(message)
         select Json(result);
+
+    public static async Task<IResult> LoadPage([FromBody] AgentMessage<LoadPageCommand> message)
+    {
+        using var client = new HttpClient();
+        var result = await client.GetStringAsync(message.Command.Url);
+        return Text(result);
+    }
 }

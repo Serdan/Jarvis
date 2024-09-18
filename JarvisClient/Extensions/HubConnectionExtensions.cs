@@ -43,13 +43,13 @@ public static class HubConnectionExtensions
         {
             throw new InvalidOperationException("Method 'On' not found.");
         }
-        
+
         var delegateType = Expression.GetDelegateType(parameterTypes.Concat([methodInfo.ReturnType]).ToArray());
         var handlerDelegate = methodInfo.CreateDelegate(delegateType, client);
 
         var genericOnMethod = onMethod.MakeGenericMethod(parameterTypes);
 
-        return (IDisposable) genericOnMethod.Invoke(null, new object[] { hub, methodName, handlerDelegate })!;
+        return (IDisposable) genericOnMethod.Invoke(null, [hub, methodName, handlerDelegate])!;
     }
 
     private static bool IsCorrectOnMethod(MethodInfo method, int parameterCount, Type returnType)
@@ -67,7 +67,7 @@ public static class HubConnectionExtensions
         {
             return false;
         }
-        
+
         var del = parameters[2];
         var delType = del.ParameterType;
 
@@ -92,16 +92,16 @@ public static class HubConnectionExtensions
 
         return false;
     }
-    
+
     public static Task InvokeAsync<THub>(this HubConnection hub, Expression<Func<THub, Task>> f)
     {
         if (f.Body is not MethodCallExpression methodCall)
         {
             throw new InvalidOperationException("Invalid expression");
         }
-        
+
         var args = methodCall.Arguments;
-        var argValues = new List<object?>(args.Count);   
+        var argValues = new List<object?>(args.Count);
 
         foreach (var arg in args)
         {
@@ -111,10 +111,8 @@ public static class HubConnectionExtensions
                     argValues.Add(constant.Value);
                     break;
                 case MemberExpression member:
-                {
                     argValues.Add(GetValue(member));
                     break;
-                }
             }
         }
 

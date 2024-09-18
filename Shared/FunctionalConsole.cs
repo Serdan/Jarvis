@@ -1,6 +1,11 @@
 ﻿using System.Collections;
+using Kehlet.Functional;
+using Kehlet.Generators;
 
 namespace Shared;
+
+[FromStaticMembers(typeof(Console), implement: true, voidType: typeof(Unit))]
+public partial interface IConsole;
 
 public static class FunctionalConsole
 {
@@ -10,7 +15,7 @@ public static class FunctionalConsole
         Console.Write(value);
         return value;
     }
-    
+
     public static T WriteLine<T>(T value)
     {
         Console.Write(DateTimeOffset.Now + ": ");

@@ -28,4 +28,6 @@ public partial record AgentCommand
     partial record RunUnitTestsCommand(string ProjectName, string FilePath);
 
     partial record OpenTodoCommand(string ProjectName);
+
+    partial record LoadPageCommand(string Url);
 }

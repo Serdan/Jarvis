@@ -83,6 +83,7 @@ app.MapGroup("/agent")
        group.MapPost("/textinsertbefore", Endpoints.TextInsertBefore);
        group.MapPost("/textinsertafter", Endpoints.TextInsertAfter);
        group.MapPost("/rununittests", Endpoints.RunUnitTests);
+       group.MapPost("/loadpage", Endpoints.LoadPage);
 
        return group;
    })

@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+    <PropertyGroup>
+        <TargetFramework>net9.0</TargetFramework>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <Compile Include="Services\ClientResponseTracker.fs"/>
+        <Compile Include="Services\UserService.fs"/>
+        <Compile Include="Services\HubService.fs"/>
+        <Compile Include="Services\ClientService.fs"/>
+        <Compile Include="JarvisOptions.fs"/>
+        <Compile Include="Endpoints.fs"/>
+        <Compile Include="Program.fs"/>
+    </ItemGroup>
+
+    <ItemGroup>
+        <PackageReference Include="Giraffe" Version="7.0.2"/>
+        <PackageReference Include="Microsoft.AspNetCore.SignalR.Common" Version="9.0.0"/>
+    </ItemGroup>
+
+    <ItemGroup>
+        <ProjectReference Include="..\Common\Common.fsproj"/>
+    </ItemGroup>
+
+</Project>

@@ -31,7 +31,7 @@ builder.Services.ConfigureHttpJsonOptions(options =>
 const string rateLimiterPolicy = "Fixed";
 builder.Services.AddRateLimiter(options =>
 {
-    options.OnRejected += (context, _) =>
+    options.OnRejected = (context, _) =>
     {
         if (context.Lease.TryGetMetadata(MetadataName.RetryAfter, out var retryAfter))
         {

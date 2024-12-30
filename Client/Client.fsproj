@@ -7,29 +7,37 @@
         <PublishSingleFile>true</PublishSingleFile>
         <SelfContained>true</SelfContained>
         <RuntimeIdentifier>win-x64</RuntimeIdentifier>
-<!--        <PublishTrimmed>true</PublishTrimmed>-->
+        <!--        <PublishTrimmed>true</PublishTrimmed>-->
     </PropertyGroup>
 
     <ItemGroup>
         <Compile Include="Lib\Result.fs"/>
-        <Compile Include="Lib\Path.fs" />
-        <Compile Include="Lib\String.fs" />
-        <Compile Include="Lib\Seq.fs" />
-        <Compile Include="Lib\OptionBuilder.fs" />
+        <Compile Include="Lib\Path.fs"/>
+        <Compile Include="Lib\String.fs"/>
+        <Compile Include="Lib\Seq.fs"/>
+        <Compile Include="Lib\OptionBuilder.fs"/>
+        <Compile Include="Lib\ResultBuilder.fs"/>
+        <Compile Include="Lib\IgnoreBuilder.fs"/>
+        <Compile Include="Lib\Misc.fs"/>
+        <Compile Include="Effect.fs"/>
         <Compile Include="Types.fs"/>
-        <Compile Include="Context.fs" />
-        <Compile Include="AgentCommand.fs"/>
-        <Compile Include="ClientOptions.fs"/>
-        <Compile Include="UserClient.fs"/>
+        <Compile Include="SignalR\HubConnection.fs"/>
+        <Compile Include="IO\FileOperations.fs"/>
+        <Compile Include="IO\Web.fs"/>
         <Compile Include="ProjectItemKind.fs"/>
         <Compile Include="ProjectBrowser.fs"/>
+        <Compile Include="UserClient.fs"/>
         <Compile Include="Program.fs"/>
     </ItemGroup>
 
     <ItemGroup>
-        <PackageReference Update="FSharp.Core" Version="8.0.300"/>
-        <PackageReference Include="FsCodec.SystemTextJson" Version="3.0.2" />
-        <PackageReference Include="Microsoft.AspNetCore.SignalR.Client" Version="8.0.8"/>
+        <PackageReference Update="FSharp.Core" Version="9.0.100" />
+        <PackageReference Include="Microsoft.AspNetCore.SignalR.Client" Version="9.0.0" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <ProjectReference Include="..\Common\Common.fsproj"/>
+        <ProjectReference Include="..\Kehlet.SignalR\Kehlet.SignalR.csproj"/>
     </ItemGroup>
 
 </Project>

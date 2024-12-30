@@ -3,6 +3,7 @@ module ProjectBrowserTests
 open System
 open System.IO
 open Client
+open Client.Effect
 open Client.ProjectBrowser
 open NUnit.Framework
 open FsUnitTyped
@@ -14,10 +15,10 @@ let fakeFileOperations =
             match filePath with
             | "/fake/projects/Project1/readme.md" -> Ok(Content "Project 1 Readme")
             | "/fake/projects/Project1/todo.md" -> Ok(Content "Project 1 Todo")
-            | _ -> Error(Exception "File not found")
+            | _ -> Error(NotFoundError "File not found")
 
       WriteAllText =
-        fun (FilePath filePath) (Content content) ->
+        fun (FilePath filePath) (Content _) ->
             printfn $"Writing content to %s{filePath}"
             Ok()
 
@@ -26,7 +27,7 @@ let fakeFileOperations =
             if path = "/fake/projects/Project1/readme.md" then
                 Ok(FilePath path)
             else
-                Error(Exception $"File does not exist: {path}")
+                Error(NotFoundError $"File does not exist: {path}")
 
       CopyFile =
         fun (FilePath source) (FilePath destination) (overwrite: bool) ->
@@ -34,7 +35,7 @@ let fakeFileOperations =
             Ok()
 
       AppendAllText =
-        fun (FilePath filePath) (Content content) ->
+        fun (FilePath filePath) (Content _) ->
             printfn $"Appending content to %s{filePath}"
             Ok()
 
@@ -43,7 +44,7 @@ let fakeFileOperations =
             match path with
             | "/fake/projects/Project1" -> Ok(FolderPath path)
             | "/fake/projects" -> Ok(FolderPath path)
-            | _ -> Error(Exception "Folder does not exist: {path}")
+            | _ -> Error(NotFoundError "Folder does not exist: {path}")
 
       GetFiles =
         fun (FolderPath folderPath) ->
@@ -54,20 +55,20 @@ let fakeFileOperations =
                         [ FilePath "/fake/projects/Project1/readme.md"
                           FilePath "/fake/projects/Project1/todo.md" ]
                 )
-            | _ -> Error(Exception "Folder not found")
+            | _ -> Error(NotFoundError "Folder not found")
 
       getChildFolders =
         fun (FolderPath folderPath) ->
             match folderPath with
             | "/fake/projects" ->
                 Ok(Seq.ofList [ FolderPath "/fake/projects/Project1"; FolderPath "/fake/projects/Project2" ])
-            | _ -> Error(Exception "Folder not found")
+            | _ -> Error(NotFoundError "Folder not found")
 
       GetFileInfo =
         fun (FilePath filePath) ->
             match filePath with
             | "/fake/projects/Project1/readme.md" -> Ok(FileInfo filePath)
-            | _ -> Error(Exception "File not found")
+            | _ -> Error(NotFoundError "File not found")
 
       GetFolderName = fun (FolderPath folderPath) -> Path.GetFileName folderPath
       getFileName = fun (FilePath filePath) -> Path.GetFileName filePath }
@@ -121,7 +122,7 @@ let ``ReadAllText should fail for non-existing file`` () =
 
         match result with
         | Ok _ -> failwith "Expected error, but got success"
-        | Error ex -> raise ex)
+        | Error _ -> raise (Exception()))
     |> shouldFail<Exception>
 
 [<Test>]
@@ -137,7 +138,7 @@ let ``parseFile should return error for non-existing file`` () =
 
         match result with
         | Ok _ -> failwith "Expected error, but got success"
-        | Error ex -> raise ex)
+        | Error _ -> raise (Exception()))
     |> shouldFail<Exception>
 
 [<Test>]
@@ -146,7 +147,7 @@ let ``parseFolder should return folder path for existing folder`` () =
 
     match result with
     | Ok(FolderPath path) -> path |> shouldEqual "/fake/projects/Project1"
-    | Error e -> Assert.Fail($"Expected Ok, but got Error: {e.Message}")
+    | Error e -> Assert.Fail($"Expected Ok, but got Error: {e}")
 
 [<Test>]
 let ``parseFolder should return error for non-existing folder`` () =
@@ -155,7 +156,7 @@ let ``parseFolder should return error for non-existing folder`` () =
 
         match result with
         | Ok _ -> failwith "Expected error, but got success"
-        | Error ex -> raise ex)
+        | Error _ -> raise (Exception()))
     |> shouldFail<Exception>
 
 [<Test>]
@@ -167,7 +168,7 @@ let ``getChildFolders should return child folders for existing folder`` () =
         folders
         |> Seq.map (fun (FolderPath path) -> path)
         |> shouldEqual (seq [ "/fake/projects/Project1"; "/fake/projects/Project2" ])
-    | Error e -> Assert.Fail($"Expected Ok, but got Error: {e.Message}")
+    | Error e -> Assert.Fail($"Expected Ok, but got Error: {e}")
 
 [<Test>]
 let ``getFileName should return file name from file path`` () =

@@ -71,15 +71,15 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
         from project in ParseProjectName(projectName)
         from fullPath in ParseDirectory(project)
         let fileInfoResults = from path in fullPath
-            select from file in ProjectFiles
-                select GetFile(project, file)
+                              select from file in ProjectFiles
+                                     select GetFile(project, file)
         let items = from item in filter(
                 from result in fileInfoResults
                 select from info in result
-                    from content in fileSystem.ReadAllText(info.FullName)
-                    select (info.Name, Content: content)
+                       from content in fileSystem.ReadAllText(info.FullName)
+                       select (info.Name, Content: content)
             )
-            select new KeyValuePair<string, string>(item.Name, item.Content)
+                    select new KeyValuePair<string, string>(item.Name, item.Content)
         select items.ToFrozenDictionary();
 
     /// <summary>
@@ -134,7 +134,7 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
     public Result<string> ReplaceSection(string projectName, string filePath, SectionIdentifiers sectionIdentifiers, string replacementContent) =>
         from project in ParseProjectName(projectName)
         from file in ParseFilePath(project, filePath)
-        //
+            //
         from content in fileSystem.ReadAllText(file.FullName)
         let startIndex = content.IndexOf(sectionIdentifiers.Start, StringComparison.Ordinal)
         let endIndex = content.IndexOf(sectionIdentifiers.End, StringComparison.Ordinal)
@@ -142,7 +142,7 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
         from foundSection in startIndex >= 0 && endIndex >= 0
             ? ok(unit)
             : error("Section identifiers not found in file.")
-        //
+            //
         let newContent = content[..startIndex]
                          + replacementContent
                          + content[(endIndex + sectionIdentifiers.End.Length)..]
@@ -161,14 +161,14 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
     public Result<string> Replace(string projectName, string filePath, string search, string replacement) =>
         from project in ParseProjectName(projectName)
         from file in ParseFilePath(project, filePath)
-        //
+            //
         from content in fileSystem.ReadAllText(file.FullName)
         let index = content.IndexOf(search, StringComparison.Ordinal)
         //
         from found in index >= 0
             ? ok(unit)
             : error("Search string not found in file.")
-        //
+            //
         let newContent = content[..index] + replacement + content[(index + search.Length)..]
         let write = fileSystem.WriteAllText(file.FullName, newContent)
         select ok(newContent);
@@ -176,14 +176,14 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
     public Result<string> InsertBefore(string projectName, string filePath, string search, string content) =>
         from project in ParseProjectName(projectName)
         from file in ParseFilePath(project, filePath)
-        //
+            //
         from existing in fileSystem.ReadAllText(file.FullName)
         let index = existing.IndexOf(search, StringComparison.Ordinal)
         //
         from found in index >= 0
             ? ok(unit)
             : error("Search string not found in file.")
-        //
+            //
         let newContent = existing[..index] + content + existing[index..]
         let write = fileSystem.WriteAllText(file.FullName, newContent)
         select ok(newContent);
@@ -191,7 +191,7 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
     public Result<string> InsertAfter(string projectName, string filePath, string search, string content) =>
         from project in ParseProjectName(projectName)
         from file in ParseFilePath(project, filePath)
-        //
+            //
         from existing in fileSystem.ReadAllText(file.FullName)
         let index = existing.IndexOf(search, StringComparison.Ordinal)
         //
@@ -249,13 +249,13 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
         let folderItems = folderNames.Select(NewProjectFolder)
         from fileNames in GetFileNames(projectName, path)
         let fileItems = from fileName in fileNames
-            let fileInfo = GetFile(projectName, path, fileName)
-            select union(fileInfo) switch
-            {
-                Ok(var info) => NewProjectFile(info),
-                Error(var error) => NewProjectFileError(fileName, error.Message)
-            }
-        select ImmutableArray.Create<ProjectItemKind>([..folderItems, ..fileItems]);
+                        let fileInfo = GetFile(projectName, path, fileName)
+                        select union(fileInfo) switch
+                        {
+                            Ok(var info) => NewProjectFile(info),
+                            Error(var error) => NewProjectFileError(fileName, error.Message)
+                        }
+        select ImmutableArray.Create<ProjectItemKind>([.. folderItems, .. fileItems]);
 
     /// <summary>
     ///     Retrieves the names of directories from a specified path within a project.
@@ -266,10 +266,10 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
     private Result<ImmutableArray<string>> GetDirectoryNames(ProjectName projectName, string directoryPath = "") =>
         from fullPath in ParseDirectory(projectName, directoryPath)
         let folders = from path in fullPath
-            select from folder in fileSystem.GetDirectories(path)
-                let folderName = Path.GetFileName(folder)
-                where FolderFilters.All(predicate => predicate(folderName))
-                select folderName
+                      select from folder in fileSystem.GetDirectories(path)
+                             let folderName = Path.GetFileName(folder)
+                             where FolderFilters.All(predicate => predicate(folderName))
+                             select folderName
         select ImmutableArray.Create(folders.ToArray());
 
     /// <summary>
@@ -281,8 +281,8 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
     private Result<ImmutableArray<string>> GetFileNames(ProjectName projectName, string directoryPath) =>
         from fullPath in ParseDirectory(projectName, directoryPath)
         let files = from path in fullPath
-            select from file in fileSystem.GetFiles(path)
-                select Path.GetFileName(file)
+                    select from file in fileSystem.GetFiles(path)
+                           select Path.GetFileName(file)
         select ImmutableArray.Create(files.ToArray());
 
     /// <summary>
@@ -295,7 +295,7 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
     ///     exist.
     /// </returns>
     private Result<HiddenString> ParseDirectory(ProjectName projectName, params string[] directoryPath) =>
-        from fullPath in projectDirectory.Join([projectName.Name, ..directoryPath])
+        from fullPath in projectDirectory.Join([projectName.Name, .. directoryPath])
         let exists = fileSystem.DirectoryExists(fullPath)
         select exists
             ? ok(new HiddenString(fullPath))
@@ -308,7 +308,7 @@ public class ProjectBrowser(IFileSystem fileSystem, string projectDirectory)
     /// <param name="path">The file path(s) for which information is to be retrieved.</param>
     /// <returns>A Result containing FileInfo or an error message if the file does not exist.</returns>
     private Result<FileInfo> GetFile(ProjectName projectName, params string[] path) =>
-        from fullPath in projectDirectory.Join([projectName.Name, ..path])
+        from fullPath in projectDirectory.Join([projectName.Name, .. path])
         let exists = fileSystem.FileExists(fullPath)
         select exists
             ? ok(new FileInfo(fullPath))

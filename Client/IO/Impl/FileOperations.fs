@@ -2,19 +2,24 @@
 
 open System.IO
 open Client
-open Client.Effect
+
+let getFullPath path =
+    try
+        Path.GetFullPath path |> Ok
+    with e ->
+        e |> ExceptionError |> Error
 
 let readAllText (FilePath filePath) =
     try
         File.ReadAllText(filePath) |> Content |> Ok
     with e ->
-        e |> GenericError |> Error
+        e |> ExceptionError |> Error
 
 let writeAllText (FilePath filePath) (Content content) =
     try
         File.WriteAllText(filePath, content) |> Ok
     with e ->
-        e |> GenericError |> Error
+        e |> ExceptionError |> Error
 
 let parseFile path =
     match File.Exists path with
@@ -25,13 +30,13 @@ let copyFile (FilePath source) (FilePath destination) overwrite =
     try
         File.Copy(source, destination, overwrite) |> Ok
     with e ->
-        e |> GenericError |> Error
+        e |> ExceptionError |> Error
 
 let appendAllText (FilePath filePath) (Content content) =
     try
         File.AppendAllText(filePath, content) |> Ok
     with e ->
-        e |> GenericError |> Error
+        e |> ExceptionError |> Error
 
 let parseFolder path =
     match Directory.Exists path with
@@ -42,13 +47,13 @@ let getFiles (FolderPath path) =
     try
         Directory.EnumerateFiles path |> Seq.map FilePath |> Ok
     with e ->
-        e |> GenericError |> Error
+        e |> ExceptionError |> Error
 
 let getChildFolders (FolderPath path) =
     try
         Directory.EnumerateDirectories path |> Seq.map FolderPath |> Ok
     with e ->
-        e |> GenericError |> Error
+        e |> ExceptionError |> Error
 
 let getFileInfo (FilePath filePath) =
     try
@@ -59,8 +64,22 @@ let getFileInfo (FilePath filePath) =
         else
             "File does not exist" |> NotFoundError |> Error
     with e ->
-        e |> GenericError |> Error
+        e |> ExceptionError |> Error
 
 let getFolderName (FolderPath folderPath) = Path.GetFileName folderPath
 
 let getFileName (FilePath filePath) = Path.GetFileName filePath
+
+let impl =
+    { getFullPath = getFullPath
+      ReadAllText = readAllText
+      WriteAllText = writeAllText
+      parseFile = parseFile
+      CopyFile = copyFile
+      AppendAllText = appendAllText
+      parseFolder = parseFolder
+      GetFiles = getFiles
+      getChildFolders = getChildFolders
+      GetFileInfo = getFileInfo
+      GetFolderName = getFolderName
+      getFileName = getFileName }

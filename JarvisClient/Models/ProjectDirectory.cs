@@ -18,11 +18,11 @@ public class ProjectDirectory(string value)
     /// <returns>A Result containing the combined full path or an error message if the path is invalid.</returns>
     public Result<string> Join(params string[] paths)
     {
-        return from path in @try(() => string.Join(Path.DirectorySeparatorChar, (string[]) [value, ..CleanPaths(paths)]))
-            from fullPath in @try(() => Path.GetFullPath(path))
-            select Contains(fullPath)
-                ? ok(fullPath)
-                : error("Invalid path");
+        return from path in @try(() => string.Join(Path.DirectorySeparatorChar, (string[])[value, .. CleanPaths(paths)]))
+               from fullPath in @try(() => Path.GetFullPath(path))
+               select Contains(fullPath)
+                   ? ok(fullPath)
+                   : error("Invalid path");
     }
 
     public IEnumerable<string> GetDirectories(IFileSystem fileSystem)

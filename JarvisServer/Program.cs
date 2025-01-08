@@ -36,7 +36,7 @@ builder.Services.AddRateLimiter(options =>
         if (context.Lease.TryGetMetadata(MetadataName.RetryAfter, out var retryAfter))
         {
             context.HttpContext.Response.Headers.RetryAfter =
-                ((int) retryAfter.TotalSeconds).ToString(NumberFormatInfo.InvariantInfo);
+                ((int)retryAfter.TotalSeconds).ToString(NumberFormatInfo.InvariantInfo);
         }
 
         context.HttpContext.Response.StatusCode = StatusCodes.Status429TooManyRequests;

@@ -27,7 +27,7 @@ public class FileSystem : IFileSystem
         {
             return error(e);
         }
-        
+
     }
 
     public bool FileExists(string path) => File.Exists(path);
@@ -43,7 +43,7 @@ public class FileSystem : IFileSystem
         {
             return error(e);
         }
-        
+
     }
 
     public Result<Unit> AppendAllText(string path, string contents)

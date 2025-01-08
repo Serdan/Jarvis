@@ -1,19 +1,13 @@
 ﻿namespace Client.Effect
 
+open Client
 open Microsoft.FSharp.Core
-
-type EffectError =
-    | GenericError of exn
-    | ValidationError of string
-    | ContextError of string
-    | NotFoundError of string
-    | PermissionDenied of string
-    | AggregatedErrors of EffectError list
 
 module EffectError =
     let rec toString error =
         match error with
-        | GenericError exn -> $"GenericError: {exn.Message}"
+        | ExceptionError exn -> $"ExceptionError: {exn.Message}"
+        | GenericError message -> $"GenericError: {message}"
         | ValidationError message -> $"ValidationError: {message}"
         | ContextError message -> $"ContextError: {message}"
         | NotFoundError resource -> $"NotFoundError: {resource} not found"
@@ -31,6 +25,8 @@ module Effect =
 
     let inline lift' (f: 'a -> Result<'b, EffectError>) (a: 'a) : IO<_, _> = fun _ -> f a
 
+    let inline ofError (err) : IO<_, _> = fun _ -> Error err
+
     let inline bind f io : IO<'rt, 'a> =
         fun rt ->
             match io rt with
@@ -38,6 +34,18 @@ module Effect =
             | Error err -> Error err
 
     let inline map f io : IO<'rt, 'a> = bind (fun x -> ``return`` (f x)) io
+
+    let inline defaultValue (value: 'a) (io: IO<'rt, 'a>) : IO<'rt, 'a> =
+        fun rt ->
+            match io rt with
+            | Ok result -> Ok result
+            | Error _ -> Ok value
+
+    let inline defaultWith (f: EffectError -> 'a) (io: IO<'rt, 'a>) : 'rt -> 'a =
+        fun rt ->
+            match io rt with
+            | Ok result -> result
+            | Error err -> f err
 
     let inline ofOption err (option: 'a option) =
         fun _ ->

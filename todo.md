@@ -9,6 +9,7 @@
 - Add todo: Add todo bullet point.
 - Remove todo: Remove todo bullet point. Match everything on line before semicolon.
 - dotnet test: Run all tests and return the result to the agent.
+- Implement user-controlled permissions for keys, allowing scope-specific and role-specific access controls.- Add AgentCommand.InstallTool for handling missing tools, allowing the agent to install tools based on client responses.- Implement client-side permission handling to restrict operations based on user-defined rules.
 - Git: Consider exposing a limited set of git commands.
 - dotnet new: Allow the agent to create new projects in a solution. 
 - MoveFile: Could be useful.

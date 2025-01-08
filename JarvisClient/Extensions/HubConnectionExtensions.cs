@@ -80,7 +80,8 @@ public static class HubConnectionExtensions
 
             return parameterCount == delType.GenericTypeArguments.Length;
         }
-        else if (returnType == typeof(Task))
+
+        if (returnType == typeof(Task))
         {
             if (delType.Name.StartsWith("Func") is false)
             {

@@ -9,7 +9,7 @@
 
     <ItemGroup>
         <PackageReference Include="ExhaustiveMatching.Analyzer" Version="0.5.0"/>
-        <PackageReference Include="Kehlet.Functional" Version="1.0.19"/>
+        <PackageReference Include="Kehlet.Functional" Version="1.0.25" />
         <PackageReference Include="Kehlet.Functional.Generators.UnionGenerator" Version="1.0.1"/>
         <PackageReference Include="Kehlet.Generators.AutoInterface" Version="1.0.9"/>
     </ItemGroup>

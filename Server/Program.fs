@@ -43,16 +43,13 @@ let bind<'a> = routeBind<AgentMessage<'a>>
 let agentEndpoints =
     let endpoints =
         [ bind<OpenProjectCommand> "/openProject" Endpoints.openProject
-          bind<ListProjectDirectoryCommand> "/listProjectDirectory" Endpoints.listProjectDirectory
+          bind<ListDirectoryCommand> "/listProjectDirectory" Endpoints.listProjectDirectory
           bind<ReadFileCommand> "/readFile" Endpoints.readFile
           bind<WriteFileCommand> "/writeFile" Endpoints.writeFile
           bind<TextReplaceSectionCommand> "/textReplaceSection" Endpoints.textReplaceSection
           bind<TextReplaceCommand> "/textReplace" Endpoints.textReplace ]
 
-    subRoute "/agent" <| requiresApiKey
-    >=> noResponseCaching
-    >=> POST
-    >=> choose endpoints
+    subRoute "/agent" (requiresApiKey >=> noResponseCaching >=> POST >=> choose endpoints)
 
 let endpoints =
     choose [ route "/" >=> text "the future is tomorrow"; agentEndpoints; notFoundHandler ]

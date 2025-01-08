@@ -3,28 +3,31 @@
 open System
 open System.IO
 open System.Security.Cryptography
+open System.Threading.Tasks
 open Client
-open Client.Lib.Misc
 open Client.SignalR
-open Common
 open Common.SignalR
 open Microsoft.AspNetCore.SignalR.Client
 open Microsoft.Extensions.DependencyInjection
+open Microsoft.FSharp.Core
 
+[<TailCall>]
 let rec getDir path =
     if Directory.Exists path then
         path
     else
         Console.Write "Workspace directory: "
-        let path = Console.ReadLine()
-        getDir path
+        getDir (Console.ReadLine())
 
 // Connect to Jarvis Server
 let connect (connection: HubConnection) key =
     task {
+        do! connection.StartAsync()
         let! result = connection.invokeAsync<IHubService> _.Connect(key)
 
-        Result.printError result
+        match result with
+        | Ok _ -> printfn "Connected."
+        | Error err -> printfn $"Connection failed.\n{err.Message}\nRetrying..."
     }
 
 [<EntryPoint>]
@@ -34,7 +37,7 @@ let main args =
         | [| "--path"; path |] -> path
         | _ -> ""
 
-    let rt = ProjectBrowser.Runtime(dir |> getDir)
+    let rt = Runtime(getDir dir)
 
     let connection =
         HubConnectionBuilder()
@@ -43,33 +46,28 @@ let main args =
             .Build()
 
     ignoreAll {
-        connection.On<string>("ReceiveMessage", UserClient.receiveMessage)
-        connection.On<string, AgentCommand>("ReceiveCommand", UserClient.receiveCommand connection rt)
+        connection.On<_>("ReceiveMessage", Client.receiveMessage)
+        connection.On<_, Result<_, _>>("ReceiveCommand", Client.receiveCommand rt)
     }
 
     task {
-        do! connection.StartAsync()
-
         let key = RandomNumberGenerator.GetBytes 18 |> Convert.ToBase64String
 
         printfn "Provide this key to the agent:"
         printfn $"{key}"
         printfn ""
 
-        do! connect connection key
-
         let mutable loop = true
 
-        Console.CancelKeyPress.AddHandler(fun _ _ -> loop <- false)
+        Console.CancelKeyPress.AddHandler(fun _ _ ->
+            printfn "Closing..."
+            loop <- false)
 
         while loop do
-            Console.ReadLine() |> ignore
-            printfn $"{connection.State}"
-
             if connection.State = HubConnectionState.Disconnected then
                 do! connect connection key
 
-        let! _ = connection.invokeAsync<IHubService> _.Disconnect()
+            do! Task.Delay 1000
 
         do! connection.DisposeAsync()
 

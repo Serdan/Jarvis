@@ -4,11 +4,12 @@ open System
 open System.Linq.Expressions
 open System.Runtime.CompilerServices
 open System.Threading.Tasks
+open Microsoft.AspNetCore.SignalR.Client
 open Kehlet.SignalR
 
-type HubConnection =
+type HubConnectionE =
     [<Extension>]
-    static member invokeAsync(connection, f: Expression<Func<'hub, Task>>) =
+    static member invokeAsync(connection: HubConnection, f: Expression<Func<'hub, Task>>) =
         task {
             try
                 do! HubConnectionExtensions.InvokeAsync(connection, f)
@@ -16,19 +17,3 @@ type HubConnection =
             with ex ->
                 return Error ex
         }
-
-    [<Extension>]
-    static member on(connection, client, handler: Expression<Func<'client, Func<'a, 'b>>>) =
-        HubConnectionExtensions.On(connection, client, handler)
-
-    [<Extension>]
-    static member on(connection, client, handler: Expression<Func<'client, Func<'a, 'b, 'c>>>) =
-        HubConnectionExtensions.On(connection, client, handler)
-
-    [<Extension>]
-    static member on(connection, client, handler: Expression<Func<'client, Delegate>>) =
-        try
-            HubConnectionExtensions.On(connection, client, handler) |> ignore
-            Ok()
-        with ex ->
-            Error ex

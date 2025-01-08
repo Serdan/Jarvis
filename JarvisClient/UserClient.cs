@@ -26,73 +26,7 @@ public class UserClient(HubConnection hub, ProjectBrowser browser) : IUserClient
         Console.WriteLine(message);
         return Task.CompletedTask;
     }
-
-    public static AsyncEffect<TRuntime, Unit> Receive<TRuntime>(string correlationId, AgentCommand command)
-        where TRuntime : struct, IHasContext, IHasFileSystem<TRuntime>, IHasProcessIO<TRuntime>, IHasConsole<TRuntime>, IHasHub<TRuntime>
-    {
-        static AsyncEffect<TRuntime, string> RunCommand(AgentCommand command)
-        {
-            return asAsyncEffect<TRuntime, string>() <<
-            (
-                runtime =>
-                    from console in runtime.Console.ToAsync()
-                    let result = command switch
-                    {
-                        ListProjectsCommand =>
-                            ProjBrowser.ListProjects<TRuntime>()
-                                       .ToAsync()
-                                       .Select(Serialize2),
-                        GetProjectDetailsCommand(var projectName) =>
-                            ProjBrowser.GetProjectDetails<TRuntime>(projectName)
-                                       .Select(Serialize2),
-                        ListProjectDirectoryCommand(var projectName, var path) =>
-                            ProjBrowser.ListProjectDirectory<TRuntime>(projectName, path)
-                                       .Select(Serialize2),
-                        OpenFileCommand(var projectName, var path) =>
-                            ProjBrowser.OpenFile<TRuntime>(projectName, path)
-                                       .Select(Serialize2),
-                        WriteFileCommand(var projectName, var filePath, var content, var mode) =>
-                            ProjBrowser.WriteFile<TRuntime>(projectName, filePath, content, mode)
-                                       .Select(Serialize2),
-                        TextReplaceSectionCommand(var projectName, var filePath, var sectionIdentifiers, var replacementContent) =>
-                            ProjBrowser.ReplaceSection<TRuntime>(projectName, filePath, sectionIdentifiers, replacementContent)
-                                       .Select(Serialize2),
-                        TextReplaceCommand(var projectName, var filePath, var search, var content) =>
-                            ProjBrowser.Replace<TRuntime>(projectName, filePath, search, content)
-                                       .Select(Serialize2),
-                        TextInsertBeforeCommand(var projectName, var filePath, var search, var content) =>
-                            ProjBrowser.InsertBefore<TRuntime>(projectName, filePath, search, content)
-                                       .Select(Serialize2),
-                        TextInsertAfterCommand(var projectName, var filePath, var search, var content) =>
-                            ProjBrowser.InsertAfter<TRuntime>(projectName, filePath, search, content)
-                                       .Select(Serialize2),
-                        RunUnitTestsCommand(var projectName, var filePath) =>
-                            ProjBrowser.RunUnitTests<TRuntime>(projectName, filePath)
-                                       .Select(Serialize2),
-                        _ => errorAsyncEffect<string>("Unknown command.")
-                    }
-                    select result.Match(
-                        okCase: result => result,
-                        errorCase: exception =>
-                        {
-                            console.WriteLine(exception.Message);
-                            return exception.Message;
-                        })
-            );
-        }
-
-        return asAsyncEffect<TRuntime, Unit>() <<
-        (
-            runtime =>
-                from response in RunCommand(command)
-                from connection in runtime.Connect().ToAsync()
-                select connection.InvokeAsync<IJarvisHub>(x => x.SendClientResponse(correlationId, response))
-                                 .ToUnit()
-                                 .ToAsyncEffect()
-                                 .WithRuntime<TRuntime>()
-        );
-    }
-
+    
     /// <summary>
     /// Receives and processes a command from the server, executing appropriate actions in the ProjectBrowser.
     /// </summary>

@@ -19,7 +19,7 @@ public class ClientResponseTracker
                 source.TrySetCanceled();
             }
         });
-        
+
         messages.TryAdd(correlationId, tcs);
         return (correlationId, tcs.Task);
     }

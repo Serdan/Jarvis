@@ -14,13 +14,17 @@ type ListProjectsCommand = struct end
 
 type OpenProjectCommand = { ProjectName: string }
 
-type ListProjectDirectoryCommand =
+type ListDirectoryCommand =
     { ProjectName: string
       FolderPath: string }
 
 type ReadFileCommand =
     { ProjectName: string
       FilePath: string }
+
+type ReadFilesCommand =
+    { ProjectName: string
+      FilePaths: string list }
 
 type WriteFileCommand =
     { ProjectName: string
@@ -46,13 +50,14 @@ type LoadPageCommand = { Url: string }
 type AgentCommand =
     | ListProjectsCommand
     | OpenProjectCommand of OpenProjectCommand
-    | ListProjectDirectoryCommand of ListProjectDirectoryCommand
+    | ListDirectoryCommand of ListDirectoryCommand
     | ReadFileCommand of ReadFileCommand
+    | ReadFilesCommand of ReadFilesCommand
     | WriteFileCommand of WriteFileCommand
-    | TextReplaceSectionCommand of TextReplaceSectionCommand
-    | TextReplaceCommand of TextReplaceCommand
-    | TextInsertBeforeCommand of TextReplaceCommand
-    | TextInsertAfterCommand of TextReplaceCommand
+    | ReplaceSectionCommand of TextReplaceSectionCommand
+    | ReplaceCommand of TextReplaceCommand
+    | InsertBeforeCommand of TextReplaceCommand
+    | InsertAfterCommand of TextReplaceCommand
     | LoadPageCommand of LoadPageCommand
 
 type AgentMessage<'a> = { Key: string; Command: 'a }

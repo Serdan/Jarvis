@@ -72,7 +72,7 @@ public class SectionReplaceTests
         // Arrange
         var browser = new ProjectBrowser(fileSystem, @"C:\repos");
         var sectionIdentifiers = new SectionIdentifiers(identifier, identifier);
-        
+
 
         // Act
         var result = browser.ReplaceSection(projectName, fileName, sectionIdentifiers, replacementContent);

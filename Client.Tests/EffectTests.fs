@@ -1,5 +1,6 @@
 module EffectTests
 
+open Client
 open Client.Effect
 open NUnit.Framework
 open FsUnitTyped

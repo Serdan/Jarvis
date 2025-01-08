@@ -26,26 +26,29 @@ let listProjects (message: AgentMessage<ListProjectsCommand>) : HttpHandler =
 let openProject (message: AgentMessage<OpenProjectCommand>) : HttpHandler =
     fun (next: HttpFunc) (ctx: HttpContext) -> task { return! message |> handler OpenProjectCommand next ctx }
 
-let listProjectDirectory (message: AgentMessage<ListProjectDirectoryCommand>) : HttpHandler =
-    fun (next: HttpFunc) (ctx: HttpContext) -> task { return! message |> handler ListProjectDirectoryCommand next ctx }
+let listProjectDirectory (message: AgentMessage<ListDirectoryCommand>) : HttpHandler =
+    fun (next: HttpFunc) (ctx: HttpContext) -> task { return! message |> handler ListDirectoryCommand next ctx }
 
 let readFile (message: AgentMessage<ReadFileCommand>) : HttpHandler =
     fun (next: HttpFunc) (ctx: HttpContext) -> task { return! message |> handler ReadFileCommand next ctx }
+
+let readFiles (message: AgentMessage<ReadFilesCommand>) : HttpHandler =
+    fun (next: HttpFunc) (ctx: HttpContext) -> task { return! message |> handler ReadFilesCommand next ctx }
 
 let writeFile (message: AgentMessage<WriteFileCommand>) : HttpHandler =
     fun (next: HttpFunc) (ctx: HttpContext) -> task { return! message |> handler WriteFileCommand next ctx }
 
 let textReplaceSection (message: AgentMessage<TextReplaceSectionCommand>) : HttpHandler =
-    fun (next: HttpFunc) (ctx: HttpContext) -> task { return! message |> handler TextReplaceSectionCommand next ctx }
+    fun (next: HttpFunc) (ctx: HttpContext) -> task { return! message |> handler ReplaceSectionCommand next ctx }
 
 let textReplace (message: AgentMessage<TextReplaceCommand>) : HttpHandler =
-    fun (next: HttpFunc) (ctx: HttpContext) -> task { return! message |> handler TextReplaceCommand next ctx }
+    fun (next: HttpFunc) (ctx: HttpContext) -> task { return! message |> handler ReplaceCommand next ctx }
 
 let textInsertBefore (message: AgentMessage<TextReplaceCommand>) : HttpHandler =
-    fun (next: HttpFunc) (ctx: HttpContext) -> task { return! message |> handler TextInsertBeforeCommand next ctx }
+    fun (next: HttpFunc) (ctx: HttpContext) -> task { return! message |> handler InsertBeforeCommand next ctx }
 
 let textInsertAfter (message: AgentMessage<TextReplaceCommand>) : HttpHandler =
-    fun (next: HttpFunc) (ctx: HttpContext) -> task { return! message |> handler TextInsertAfterCommand next ctx }
+    fun (next: HttpFunc) (ctx: HttpContext) -> task { return! message |> handler InsertAfterCommand next ctx }
 
 let runUnitTests: HttpHandler = fun (f: HttpFunc) (ctx: HttpContext) -> f ctx
 

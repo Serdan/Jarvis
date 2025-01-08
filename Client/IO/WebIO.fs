@@ -1,4 +1,4 @@
-﻿module Client.IO.Web
+﻿module Client.IO.WebIO
 
 open Client
 

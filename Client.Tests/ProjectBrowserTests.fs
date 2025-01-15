@@ -1,95 +1,25 @@
 module ProjectBrowserTests
 
-open System
 open System.IO
 open Client
 open Client.Effect
 open Client.ProjectBrowser
+open Client.Tests.Fake
 open Common
 open NUnit.Framework
 open FsUnitTyped
 
-type Directory =
-    | File of name: string * content: string
-    | Directory of name: string * children: Directory list
-
-module Directory =
-    module private Utility =
-        [<TailCall>]
-        let rec updateItemCore (items: Directory list) item result =
-            let (|Name|) =
-                function
-                | File(name, _)
-                | Directory(name, _) -> name
-
-            let (|HasName|_|) (Name search) (Name item) = search = item
-
-            match items with
-            | [] -> item :: result |> List.rev
-            | HasName item :: rest -> (item :: result |> List.rev) @ rest
-            | head :: rest -> updateItemCore rest item (head :: result)
-
-    let updateItem item items = Utility.updateItemCore items item []
-
-    let splitPath (path: string) =
-        path.Split([| '/'; '\\' |], StringSplitOptions.RemoveEmptyEntries)
-        |> List.ofArray
-
-    let parseDirectory (path: string) =
-        let rec core paths =
-            match paths with
-            | [] -> Directory("root", [])
-            | [ path ] -> Directory(path, [])
-            | path :: rest -> Directory(path, [ core rest ])
-
-        path |> splitPath |> core
-
-    let rec addFile (pathParts: string list) (content: string) (directory: Directory) : Directory =
-        let isFolder folderName =
-            function
-            | Directory(name, _) when name = folderName -> true
-            | _ -> false
-
-        match pathParts, directory with
-        | [], _ -> directory
-        | [ fileName ], Directory(name, children) ->
-            let updatedChildren = children |> updateItem (File(fileName, content))
-
-            Directory(name, updatedChildren)
-        | folderName :: remainingPath, Directory(name, children) ->
-            let child = children |> List.tryFind (isFolder folderName)
-
-            let updatedChild =
-                match child with
-                | Some(Directory(folderName, subChildren)) ->
-                    // Recurse into the existing folder
-                    addFile remainingPath content (Directory(folderName, subChildren))
-                | _ ->
-                    // Create a new folder and recurse into it
-                    addFile remainingPath content (Directory(folderName, []))
-
-            let updatedChildren = children |> updateItem updatedChild
-
-            Directory(name, updatedChildren)
-        | _, _ -> failwith "Invalid path or directory structure"
-
-    let addFile' (path: string) content directory =
-        let pathParts = splitPath path
-        addFile pathParts content directory
-
-
-[<Test>]
-let ``Test dir`` () =
-    let folder = Directory.parseDirectory "/root/"
-    printfn $"{folder}"
-
-    let folder = Directory.addFile' "/Project1/file.md" "content" folder
-    let folder = Directory.addFile' "Project1/file2.md" "content2" folder
-    printfn $"{folder}"
-
-    ()
-
-let files = Directory("root", [])
+let createFakeDirectory () =
+    // Add files and directories
+    FileSystem.addFile "Project1/file1.md" "File 1 content"
+    FileSystem.addFile "Project1/file2.md" "File 2 content"
+    FileSystem.addFile "Project1/src/main.fs" "Main module"
+    FileSystem.addFile "Project1/src/helper.fs" "Helper module"
+    FileSystem.addFile "Project2/readme.md" "Readme for Project 2"
+    FileSystem.addFile "Project2/build/build.log" "Build log for Project 2"
+    FileSystem.addFile "docs/guide.md" "Documentation guide"
+    FileSystem.addFile "docs/images/logo.png" "Fake image content"
+    FileSystem.addFile "config.json" "{ \"setting\": \"value\" }"
 
 // Fake file operations with test data
 let fakeFileOperations =

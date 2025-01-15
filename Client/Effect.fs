@@ -19,7 +19,7 @@ module EffectError =
 type IO<'rt, 'r> = 'rt -> Result<'r, EffectError>
 
 module Effect =
-    let inline ``return`` x : IO<_, _> = fun _ -> Ok x
+    let inline liftValue x : IO<_, _> = fun _ -> Ok x
 
     let inline lift (f: 'a -> 'b) (x: 'a) : IO<_, _> = fun _ -> f x |> Ok
 
@@ -33,7 +33,7 @@ module Effect =
             | Ok result -> f result rt
             | Error err -> Error err
 
-    let inline map f io : IO<'rt, 'a> = bind (fun x -> ``return`` (f x)) io
+    let inline map f io : IO<'rt, 'a> = bind (fun x -> liftValue (f x)) io
 
     let inline defaultValue (value: 'a) (io: IO<'rt, 'a>) : IO<'rt, 'a> =
         fun rt ->
@@ -67,7 +67,7 @@ module Effect =
 [<AutoOpen>]
 module Operators =
     let inline (>>=) io f : IO<'rt, 'a> = Effect.bind f io
-    let inline (|>>) io f : IO<'rt, 'a> = io >>= fun x -> Effect.``return`` (f x)
+    let inline (|>>) io f : IO<'rt, 'a> = io >>= fun x -> Effect.liftValue (f x)
 
     let inline (>=>) f g : 'a -> IO<'rt, _> =
         fun x rt ->

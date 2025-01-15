@@ -29,7 +29,6 @@ connection.On(client, x => x.ReceiveMessage);
 connection.On(client, x => x.ReceiveCommand);
 connection.On("ReceiveCommand", (string id, AgentCommand cmd) => client.ReceiveCommand(id, cmd));
 
-
 var loop = true;
 
 Console.CancelKeyPress += (_, _) => loop = false;

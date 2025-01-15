@@ -3,7 +3,7 @@
     <PropertyGroup>
         <Nullable>enable</Nullable>
         <ImplicitUsings>enable</ImplicitUsings>
-        <LangVersion>latest</LangVersion>
+        <LangVersion>preview</LangVersion>
         <TargetFramework>net9.0</TargetFramework>
     </PropertyGroup>
 
@@ -14,7 +14,7 @@
 
     <ItemGroup>
         <PackageReference Include="ExhaustiveMatching.Analyzer" Version="0.5.0"/>
-        <PackageReference Include="Microsoft.AspNetCore.SignalR.Common" Version="9.0.0" />
+        <PackageReference Include="Microsoft.AspNetCore.SignalR.Common" Version="9.0.0"/>
     </ItemGroup>
 
     <ItemGroup>

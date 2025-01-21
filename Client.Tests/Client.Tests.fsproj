@@ -10,7 +10,6 @@
     <ItemGroup>
         <Compile Include="Fake\FileSystem.fs"/>
         <Compile Include="ProjectBrowserTests.fs"/>
-        <Compile Include="EffectTests.fs"/>
         <Compile Include="Program.fs"/>
     </ItemGroup>
 

@@ -6,6 +6,8 @@ open Microsoft.FSharp.Core
 open Client.IO
 open FsToolkit.ErrorHandling
 open Client.Effect
+open Kehlet.FSharp.IO
+open Kehlet.FSharp.IO.Effect.Operators
 
 module private Core =
     let private getFullPath (paths: string seq) : IO<'a, string> =
@@ -122,7 +124,7 @@ module private Core =
                 return Content content
             }
 
-        readFile projectName filePath >>= (Effect.lift' update) >>= save
+        readFile projectName filePath >>= (fun x _ -> update x) >>= save
 
     let replaceSection projectName filePath sectionIdentifiers replacementContent =
         let update (Content content) =

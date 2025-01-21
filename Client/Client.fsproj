@@ -30,12 +30,12 @@
 
     <ItemGroup>
         <PackageReference Update="FSharp.Core" Version="9.0.100"/>
+        <PackageReference Include="Kehlet.FSharp.IO" Version="1.1.0" />
         <PackageReference Include="Microsoft.AspNetCore.SignalR.Client" Version="9.0.0"/>
     </ItemGroup>
 
     <ItemGroup>
         <ProjectReference Include="..\Common\Common.fsproj"/>
-        <ProjectReference Include="..\Kehlet.SignalR\Kehlet.SignalR.csproj"/>
     </ItemGroup>
 
 </Project>

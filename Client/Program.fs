@@ -22,8 +22,10 @@ let rec getDir path =
 // Connect to Jarvis Server
 let connect (connection: HubConnection) key =
     task {
-        do! connection.StartAsync()
-        let! result = connection.invokeAsync<IHubService> _.Connect(key)
+        let! startResult = connection.startAsync()
+        
+        // let! result = connection.invokeAsync<IHubService> _.Connect(key)
+        let! result = connection.invokeAsync("Connect", key)
 
         match result with
         | Ok _ -> printfn "Connected."
@@ -42,7 +44,8 @@ let main args =
     let connection =
         HubConnectionBuilder()
             .AddJsonProtocol()
-            .WithUrl("https://jarvis.kehlet.dev/client")
+            // .WithUrl("https://jarvis.kehlet.dev/client")
+            .WithUrl("http://127.0.0.1:5095")
             .Build()
 
     ignoreAll {

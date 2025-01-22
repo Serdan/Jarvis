@@ -5,6 +5,7 @@
     </PropertyGroup>
 
     <ItemGroup>
+        <Content Include="Structure.md"/>
         <Compile Include="Services\ClientResponseTracker.fs"/>
         <Compile Include="Services\UserService.fs"/>
         <Compile Include="Services\HubService.fs"/>

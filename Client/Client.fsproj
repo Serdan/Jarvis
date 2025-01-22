@@ -11,26 +11,27 @@
     </PropertyGroup>
 
     <ItemGroup>
+        <Content Include="Structure.md"/>
         <Compile Include="Types.fs"/>
         <Compile Include="Misc.fs"/>
         <Compile Include="Effect.fs"/>
-        <Compile Include="IO\ProjectIO.fs" />
-        <Compile Include="IO\FileIO.fs" />
-        <Compile Include="IO\WebIO.fs" />
-        <Compile Include="IO\Impl\ProjectOperations.fs" />
-        <Compile Include="IO\Impl\FileOperations.fs" />
-        <Compile Include="IO\Impl\WebOperations.fs" />
+        <Compile Include="IO\ProjectIO.fs"/>
+        <Compile Include="IO\FileIO.fs"/>
+        <Compile Include="IO\WebIO.fs"/>
+        <Compile Include="IO\Impl\ProjectOperations.fs"/>
+        <Compile Include="IO\Impl\FileOperations.fs"/>
+        <Compile Include="IO\Impl\WebOperations.fs"/>
         <Compile Include="Modules\ProjectBrowser.fs"/>
         <Compile Include="Modules\ClientShell.fs"/>
         <Compile Include="SignalR\HubConnection.fs"/>
-        <Compile Include="SignalR\Client.fs" />
-        <Compile Include="Runtime.fs" />
+        <Compile Include="SignalR\Client.fs"/>
+        <Compile Include="Runtime.fs"/>
         <Compile Include="Program.fs"/>
     </ItemGroup>
 
     <ItemGroup>
         <PackageReference Update="FSharp.Core" Version="9.0.100"/>
-        <PackageReference Include="Kehlet.FSharp.IO" Version="1.1.0" />
+        <PackageReference Include="Kehlet.FSharp.IO" Version="1.1.0"/>
         <PackageReference Include="Microsoft.AspNetCore.SignalR.Client" Version="9.0.0"/>
     </ItemGroup>
 

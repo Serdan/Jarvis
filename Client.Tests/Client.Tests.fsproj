@@ -8,6 +8,7 @@
     </PropertyGroup>
 
     <ItemGroup>
+        <Content Include="Structure.md"/>
         <Compile Include="Fake\FileSystem.fs"/>
         <Compile Include="ProjectBrowserTests.fs"/>
         <Compile Include="Program.fs"/>

@@ -1,6 +1,7 @@
-﻿namespace Server.Services
+namespace Server.Services
 
 open System.Threading.Tasks
+open System.Text.Json
 open Common
 open Common.SignalR
 open Microsoft.AspNetCore.SignalR
@@ -20,7 +21,8 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                 let! id = getId message.Key
                 let correlationId, trackingTask = tracker.Register()
                 let client = ctx.Clients.Client(id)
-                do! client.ReceiveCommand(correlationId, message.Command)
+                let commandJson = JsonSerializer.Serialize<AgentCommand>(message.Command)
+                do! client.ReceiveCommand(correlationId, commandJson)
                 return! trackingTask
             }
 

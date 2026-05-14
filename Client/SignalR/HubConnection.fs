@@ -1,4 +1,4 @@
-﻿namespace Client.SignalR
+namespace Client.SignalR
 
 open System.Runtime.CompilerServices
 open System.Threading
@@ -20,6 +20,16 @@ type HubConnectionE =
         task {
             try
                 do! HubConnectionExtensions.InvokeAsync(connection, methodName, arg1, CancellationToken.None)
+                return Ok()
+            with ex ->
+                return Error ex
+        }
+
+    [<Extension>]
+    static member invokeAsync(connection: HubConnection, methodName: string, arg1, arg2) =
+        task {
+            try
+                do! HubConnectionExtensions.InvokeAsync(connection, methodName, arg1, arg2, CancellationToken.None)
                 return Ok()
             with ex ->
                 return Error ex

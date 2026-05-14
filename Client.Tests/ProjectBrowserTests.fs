@@ -4,59 +4,43 @@ open System.IO
 open Client
 open Client.Effect
 open Client.ProjectBrowser
-open Client.Tests.Fake
 open Common
 open NUnit.Framework
 open FsUnitTyped
 
-let createFakeDirectory () =
-    // Add files and directories
-    FileSystem.addFile "Project1/file1.md" "File 1 content"
-    FileSystem.addFile "Project1/file2.md" "File 2 content"
-    FileSystem.addFile "Project1/src/main.fs" "Main module"
-    FileSystem.addFile "Project1/src/helper.fs" "Helper module"
-    FileSystem.addFile "Project2/readme.md" "Readme for Project 2"
-    FileSystem.addFile "Project2/build/build.log" "Build log for Project 2"
-    FileSystem.addFile "docs/guide.md" "Documentation guide"
-    FileSystem.addFile "docs/images/logo.png" "Fake image content"
-    FileSystem.addFile "config.json" "{ \"setting\": \"value\" }"
+let readmeContent =
+    "Project 1 Readme\n# Start Config\nOld Text\n# End Config\n# Section Header\nBody\n# Section Footer\n"
 
-// Fake file operations with test data
+let todoContent = "Project 1 Todo"
+
 let fakeFileOperations =
     { getFullPath = _.Replace('\\', '/') >> Ok
       ReadAllText =
         fun (FilePath filePath) ->
             match filePath with
-            | "/fake/projects/Project1/readme.md" -> Ok(Content "Project 1 Readme")
-            | "/fake/projects/Project1/todo.md" -> Ok(Content "Project 1 Todo")
+            | "/fake/projects/Project1/readme.md" -> Ok(Content readmeContent)
+            | "/fake/projects/Project1/todo.md" -> Ok(Content todoContent)
+            | "/fake/projects/Project1/src/deep.md" -> Ok(Content "Nested Old Text")
             | _ -> Error(NotFoundError "File not found")
 
-      WriteAllText =
-        fun (FilePath filePath) (Content content) ->
-            printfn $"Writing content to %s{filePath}: %s{content}"
-            Ok()
+      WriteAllText = fun _ _ -> Ok()
 
       parseFile =
         fun path ->
-            if path = "/fake/projects/Project1/readme.md" then
-                Ok(FilePath path)
-            else
-                Error(NotFoundError $"File does not exist: {path}")
+            match path with
+            | "/fake/projects/Project1/readme.md"
+            | "/fake/projects/Project1/todo.md"
+            | "/fake/projects/Project1/src/deep.md" -> Ok(FilePath path)
+            | _ -> Error(NotFoundError $"File does not exist: {path}")
 
-      CopyFile =
-        fun (FilePath source) (FilePath destination) (overwrite: bool) ->
-            printfn $"Copying file from %s{source} to %s{destination} (overwrite: %b{overwrite})"
-            Ok()
-
-      AppendAllText =
-        fun (FilePath filePath) (Content content) ->
-            printfn $"Appending content to %s{filePath}: %s{content}"
-            Ok()
+      CopyFile = fun _ _ _ -> Ok()
+      AppendAllText = fun _ _ -> Ok()
 
       parseFolder =
         fun path ->
             match path with
             | "/fake/projects/Project1" -> Ok(FolderPath path)
+            | "/fake/projects/Project1/src" -> Ok(FolderPath path)
             | "/fake/projects" -> Ok(FolderPath path)
             | _ -> Error(NotFoundError path)
 
@@ -69,6 +53,7 @@ let fakeFileOperations =
                         [ FilePath "/fake/projects/Project1/readme.md"
                           FilePath "/fake/projects/Project1/todo.md" ]
                 )
+            | "/fake/projects/Project1/src" -> Ok(Seq.ofList [ FilePath "/fake/projects/Project1/src/deep.md" ])
             | _ -> Error(NotFoundError folderPath)
 
       getChildFolders =
@@ -76,18 +61,20 @@ let fakeFileOperations =
             match folderPath with
             | "/fake/projects" ->
                 Ok(Seq.ofList [ FolderPath "/fake/projects/Project1"; FolderPath "/fake/projects/Project2" ])
+            | "/fake/projects/Project1" -> Ok(Seq.ofList [ FolderPath "/fake/projects/Project1/src" ])
+            | "/fake/projects/Project1/src" -> Ok Seq.empty
             | _ -> Error(NotFoundError "Folder not found")
 
       GetFileInfo =
         fun (FilePath filePath) ->
             match filePath with
             | "/fake/projects/Project1/readme.md" -> Ok(FileInfo filePath)
+            | "/fake/projects/Project1/todo.md" -> Ok(FileInfo filePath)
             | _ -> Error(NotFoundError "File not found")
 
       GetFolderName = fun (FolderPath folderPath) -> Path.GetFileName folderPath
       getFileName = fun (FilePath filePath) -> Path.GetFileName filePath }
 
-// Fake project data
 let fakeProjectData =
     { Root = ProjectDirectory("/fake/projects")
       SpecialFiles = [ "readme.md"; "todo.md" ]
@@ -103,6 +90,16 @@ type FakeContext() =
 let fakeContext = FakeContext()
 
 [<Test>]
+let ``listCommands returns protocol 2 capabilities`` () =
+    let result = listCommands fakeContext
+
+    match result with
+    | Ok commands ->
+        commands.ProtocolVersion |> shouldEqual "2.0"
+        commands.Commands |> List.exists (fun c -> c.Name = "PatchFile") |> shouldEqual true
+    | Error e -> Assert.Fail($"Expected Ok, but got Error: {EffectError.toString e}")
+
+[<Test>]
 let ``listProjects returns existing projects`` () =
     let result = listProjects fakeContext
     let expected = seq [ ProjectName "Project1"; ProjectName "Project2" ] |> Ok
@@ -110,78 +107,90 @@ let ``listProjects returns existing projects`` () =
 
 [<Test>]
 let ``getProjectDetails retrieves special files`` () =
-    let result = openProject { ProjectName = "Project1" } fakeContext
-
-    let ct = Content ""
+    let result = getProjectDetails { ProjectName = "Project1" } fakeContext
 
     match result with
     | Ok details ->
-        details |> shouldContain ("readme.md", ct)
-        details |> shouldContain ("todo.md", ct)
+        details |> shouldContain ("readme.md", Content readmeContent)
+        details |> shouldContain ("todo.md", Content todoContent)
     | Error e -> Assert.Fail($"Expected Ok, but got Error: {EffectError.toString e}")
 
 [<Test>]
-let ``replaceSection updates section in file`` () =
-    let sectionIdentifiers =
-        { SectionIdentifiers.Start = "# Start Config"
-          End = "# End Config" }
-
+let ``writeFile should write new content to file`` () =
     let cmd =
         { ProjectName = "Project1"
-          FilePath = "/fake/projects/Project1/readme.md"
-          SectionIdentifiers = sectionIdentifiers
-          Content = "Updated section content" }
+          FilePath = "newfile.md"
+          Content = "New content written"
+          FileWriteMode = FileWriteMode.Write
+          ExpectedHash = None }
 
-    let result = replaceSection cmd fakeContext
-
-    result |> shouldEqual (Ok(Content ""))
-
-[<Test>]
-let ``writeFile should write new content to file`` () =
-    let filePath = FilePath "/fake/projects/Project1/newfile.md"
-    let content = Content "New content written"
-
-    let result = fakeFileOperations.WriteAllText filePath content
+    let result = writeFile cmd fakeContext
     result |> shouldEqual (Ok())
 
 [<Test>]
 let ``appendToFile should add content to existing file`` () =
-    let filePath = FilePath "/fake/projects/Project1/todo.md"
-    let content = Content "Appended content"
+    let cmd =
+        { ProjectName = "Project1"
+          FilePath = "todo.md"
+          Content = "Appended content"
+          FileWriteMode = FileWriteMode.Append
+          ExpectedHash = None }
 
-    let result = fakeFileOperations.AppendAllText filePath content
+    let result = writeFile cmd fakeContext
     result |> shouldEqual (Ok())
 
 [<Test>]
-let ``insertBefore should add content before search text`` () =
+let ``patchFile should modify specific text`` () =
+    let patch =
+        "--- a/readme.md\n+++ b/readme.md\n@@ -1,7 +1,7 @@\n Project 1 Readme\n # Start Config\n-Old Text\n+New Text\n # End Config\n # Section Header\n Body\n # Section Footer\n"
+
     let cmd =
         { ProjectName = "Project1"
-          FilePath = "/fake/projects/Project1/readme.md"
-          Search = "# Section Header"
-          Content = "Inserted content before header" }
+          FilePath = "readme.md"
+          ExpectedHash = None
+          Format = PatchFormat.UnifiedDiff
+          Patch = patch }
 
-    let result = insertBefore cmd fakeContext
+    let result = patchFile cmd fakeContext
 
-    result |> shouldEqual (Ok(Content ""))
+    result
+    |> shouldEqual (Ok(Content "Project 1 Readme\n# Start Config\nNew Text\n# End Config\n# Section Header\nBody\n# Section Footer\n"))
 
 [<Test>]
-let ``insertAfter should add content after search text`` () =
+let ``searchFiles returns matching project items`` () =
     let cmd =
         { ProjectName = "Project1"
-          FilePath = "/fake/projects/Project1/readme.md"
-          Search = "# Section Footer"
-          Content = "Inserted content after footer" }
+          Query = "readme"
+          FolderPath = None
+          MaxResults = Some 10 }
 
-    let result = insertAfter cmd fakeContext
-    result |> shouldEqual (Ok(Content ""))
+    let result = searchFiles cmd fakeContext
+
+    match result with
+    | Ok items -> items.Length |> shouldEqual 1
+    | Error e -> Assert.Fail($"Expected Ok, but got Error: {EffectError.toString e}")
 
 [<Test>]
-let ``replaceText should modify specific text in file`` () =
+let ``searchText returns matching files`` () =
     let cmd =
         { ProjectName = "Project1"
-          FilePath = "/fake/projects/Project1/readme.md"
-          Search = "Old Text"
-          Content = "New Text" }
+          Query = "Old Text"
+          FolderPath = None
+          IncludeGlobs = []
+          ExcludeGlobs = []
+          MaxResults = Some 10 }
 
-    let result = replaceText cmd fakeContext
-    result |> shouldEqual (Ok(Content ""))
+    let result = searchText cmd fakeContext
+    result |> shouldEqual (Ok [ "readme.md"; Path.Combine("src", "deep.md") ])
+
+[<Test>]
+let ``searchFiles recursively returns nested project items`` () =
+    let cmd =
+        { ProjectName = "Project1"
+          Query = "deep"
+          FolderPath = None
+          MaxResults = Some 10 }
+
+    match searchFiles cmd fakeContext with
+    | Ok items -> items |> shouldContain (ProjectFile(Path.Combine("src", "deep.md"), 0L, System.DateTimeOffset.MinValue, System.DateTimeOffset.MinValue))
+    | Error e -> Assert.Fail($"Expected Ok, but got Error: {EffectError.toString e}")

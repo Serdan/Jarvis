@@ -6,6 +6,7 @@
 **/[Bb]uild/
 **/[Ll]ogs/
 **/[Tt]est[Rr]esult*/
+artifacts/
 
 # Visual Studio files
 *.user
@@ -47,3 +48,6 @@ ipch/
 # Misc
 .DS_Store
 Thumbs.db
+
+.fake
+Client/BuildInfo.fs

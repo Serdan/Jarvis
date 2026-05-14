@@ -1,16 +1,25 @@
-﻿namespace Client
+namespace Client
 
 open System.Net.Http
+open System.Threading.Tasks
 open Client.IO
+open Client.ConsoleTui
+open Common
 
-type Runtime(root: string) =
+type Runtime(root: string, tui: ConsoleTui) =
     member _.httpClient = new HttpClient()
+    member _.Tui = tui
+
+    new(root: string) = Runtime(root, ConsoleTui())
 
     interface ProjectIO with
-        member this.Project = ProjectOperations.impl (ProjectDirectory root)
+        member _.Project = ProjectOperations.impl (ProjectDirectory root)
 
     interface FileIO with
-        member this.File = FileOperations.impl
+        member _.File = FileOperations.impl
 
     interface WebIO with
-        member this.Browser = WebOperations.impl
+        member _.Browser = WebOperations.impl
+
+    interface PermissionIO with
+        member _.PromptPermission command request = tui.PromptPermission command request

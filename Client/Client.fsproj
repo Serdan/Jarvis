@@ -1,38 +1,55 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
     <PropertyGroup>
         <OutputType>Exe</OutputType>
-        <TargetFramework>net9.0</TargetFramework>
-        <PublishReadyToRun>true</PublishReadyToRun>
-        <PublishSingleFile>true</PublishSingleFile>
+        <TargetFramework>net10.0</TargetFramework>
+        <AssemblyName>JarvisClient</AssemblyName>
+        <LangVersion>10.0</LangVersion>
+        <JarvisServerUrl Condition="'$(JarvisServerUrl)' == ''">http://127.0.0.1:5095/client</JarvisServerUrl>
+    </PropertyGroup>
+
+    <PropertyGroup Condition="'$(PublishSingleFile)' == 'true'">
         <SelfContained>true</SelfContained>
-        <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+        <PublishReadyToRun>true</PublishReadyToRun>
         <!--        <PublishTrimmed>true</PublishTrimmed>-->
     </PropertyGroup>
+
+    <Target Name="GenerateBuildInfo" BeforeTargets="CoreCompile">
+        <WriteLinesToFile
+            File="BuildInfo.fs"
+            Overwrite="true"
+            Lines="namespace Client&#x0A;&#x0A;module BuildInfo =&#x0A;    [&lt;Literal&gt;]&#x0A;    let ServerUrl = &quot;$(JarvisServerUrl)&quot;"/>
+    </Target>
 
     <ItemGroup>
         <Content Include="Structure.md"/>
         <Compile Include="Types.fs"/>
         <Compile Include="Misc.fs"/>
         <Compile Include="Effect.fs"/>
+        <Compile Include="BuildInfo.fs"/>
         <Compile Include="IO\ProjectIO.fs"/>
         <Compile Include="IO\FileIO.fs"/>
         <Compile Include="IO\WebIO.fs"/>
         <Compile Include="IO\Impl\ProjectOperations.fs"/>
         <Compile Include="IO\Impl\FileOperations.fs"/>
         <Compile Include="IO\Impl\WebOperations.fs"/>
+        <Compile Include="Modules\ProjectPaths.fs"/>
+        <Compile Include="Modules\AuditLog.fs"/>
+        <Compile Include="Modules\PermissionPolicy.fs"/>
+        <Compile Include="Modules\ConsoleTui.fs"/>
         <Compile Include="Modules\ProjectBrowser.fs"/>
         <Compile Include="Modules\ClientShell.fs"/>
+        <Compile Include="Modules\JobManager.fs"/>
+        <Compile Include="Runtime.fs"/>
         <Compile Include="SignalR\HubConnection.fs"/>
         <Compile Include="SignalR\Client.fs"/>
-        <Compile Include="Runtime.fs"/>
         <Compile Include="Program.fs"/>
     </ItemGroup>
 
     <ItemGroup>
-        <PackageReference Update="FSharp.Core" Version="9.0.100"/>
+        <PackageReference Update="FSharp.Core" Version="10.1.203"/>
         <PackageReference Include="Kehlet.FSharp.IO" Version="1.1.0"/>
-        <PackageReference Include="Microsoft.AspNetCore.SignalR.Client" Version="9.0.0"/>
+        <PackageReference Include="Microsoft.AspNetCore.SignalR.Client" Version="10.0.0"/>
     </ItemGroup>
 
     <ItemGroup>

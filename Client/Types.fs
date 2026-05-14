@@ -1,10 +1,12 @@
-﻿namespace Client
+namespace Client
 
 open System
 open System.IO
+open System.Threading.Tasks
 open System.Text.Json.Serialization
 open FsCodec.SystemTextJson
 open FsToolkit.ErrorHandling
+open Common
 
 type EffectError =
     | ExceptionError of exn
@@ -13,6 +15,7 @@ type EffectError =
     | ContextError of string
     | NotFoundError of string
     | PermissionDenied of string
+    | ConfirmationRequired of ConfirmationRequest
     | AggregatedErrors of EffectError list
 
 type ProjectName = ProjectName of string
@@ -63,6 +66,14 @@ type ProjectIO =
 type WebIO =
     abstract Browser: WebBrowser
 
+type PermissionApproval =
+    | AllowOnce
+    | AllowExactForSession
+    | Deny
+
+type PermissionIO =
+    abstract PromptPermission: AgentCommand -> ConfirmationRequest -> Task<PermissionApproval>
+
 type RuntimeConstraint<'a when 'a :> ProjectIO and 'a :> FileIO and 'a :> WebIO> = 'a
 
 type ClientOptions = { Path: string }
@@ -75,7 +86,10 @@ type ProjectItemKind =
 
 module ProjectItemKind =
     let ofFileInfo (info: FileInfo) =
-        ProjectFile(info.Name, info.Length, DateTimeOffset info.CreationTime, DateTimeOffset info.LastWriteTime)
+        try
+            ProjectFile(info.Name, info.Length, DateTimeOffset info.CreationTime, DateTimeOffset info.LastWriteTime)
+        with ex ->
+            ProjectFileError(info.Name, ex.Message)
 
 type IgnoreBuilder() =
     member inline _.Delay([<InlineIfLambda>] f) = f ()

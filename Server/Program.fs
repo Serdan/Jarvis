@@ -3,6 +3,7 @@
 open System
 open System.Globalization
 open System.Threading.RateLimiting
+open System.Text.Json
 open System.Threading.Tasks
 open Common
 open Giraffe
@@ -21,7 +22,7 @@ open Server.Services
 
 let rateLimiterPolicy = "Fixed"
 
-let notFoundHandler = RequestErrors.notFound (text "Not Found")
+let notFoundHandler: HttpHandler = RequestErrors.notFound (text "Not Found")
 
 let errorHandler (ex: Exception) (logger: ILogger) =
     logger.LogError(EventId(), ex, "An unhandled exception has occurred while executing the request.")
@@ -38,29 +39,63 @@ let validateApiKey (ctx: HttpContext) =
 
 let requiresApiKey: HttpHandler = authorizeRequest validateApiKey accessDenied
 
-let bind<'a> = routeBind<AgentMessage<'a>>
+let private jsonOptions =
+    JsonSerializerOptions(JsonSerializerDefaults.Web)
+
+let bind<'a> path (handler: AgentMessage<'a> -> HttpHandler) : HttpHandler =
+    route path
+    >=> fun next ctx ->
+        task {
+            let! message = JsonSerializer.DeserializeAsync<AgentMessage<'a>>(ctx.Request.Body, jsonOptions)
+            return! handler message next ctx
+        }
 
 let agentEndpoints =
     let endpoints =
-        [ bind<OpenProjectCommand> "/openProject" Endpoints.openProject
-          bind<ListDirectoryCommand> "/listProjectDirectory" Endpoints.listProjectDirectory
+        [ bind<ListCommandsCommand> "/listCommands" Endpoints.listCommands
+          bind<ListProjectsCommand> "/listProjects" Endpoints.listProjects
+          bind<GetProjectDetailsCommand> "/getProjectDetails" Endpoints.getProjectDetails
+          bind<ListDirectoryCommand> "/listDirectory" Endpoints.listProjectDirectory
+          bind<SearchFilesCommand> "/searchFiles" Endpoints.searchFiles
+          bind<SearchTextCommand> "/searchText" Endpoints.searchText
           bind<ReadFileCommand> "/readFile" Endpoints.readFile
+          bind<ReadFilesCommand> "/readFiles" Endpoints.readFiles
+          // Compatibility aliases for older deployed action schemas.
+          bind<GetProjectDetailsCommand> "/openProject" Endpoints.getProjectDetails
+          bind<ListDirectoryCommand> "/listProjectDirectory" Endpoints.listProjectDirectory
+          bind<ReadFileCommand> "/openfile" Endpoints.readFile
+          bind<ReadFileCommand> "/readfile" Endpoints.readFile
           bind<WriteFileCommand> "/writeFile" Endpoints.writeFile
-          bind<TextReplaceSectionCommand> "/textReplaceSection" Endpoints.textReplaceSection
-          bind<TextReplaceCommand> "/textReplace" Endpoints.textReplace ]
+          bind<PatchFileCommand> "/patchFile" Endpoints.patchFile
+          bind<RunCommandCommand> "/runCommand" Endpoints.runCommand
+          bind<GitStatusCommand> "/getGitStatus" Endpoints.getGitStatus
+          bind<GitDiffCommand> "/getGitDiff" Endpoints.getGitDiff
+          bind<GitCommitCommand> "/gitCommit" Endpoints.gitCommit
+          bind<StartJobCommand> "/startJob" Endpoints.startJob
+          bind<ListJobsCommand> "/listJobs" Endpoints.listJobs
+          bind<GetJobResultCommand> "/getJobResult" Endpoints.getJobResult
+          bind<CancelJobCommand> "/cancelJob" Endpoints.cancelJob ]
 
-    subRoute "/agent" (requiresApiKey >=> noResponseCaching >=> POST >=> choose endpoints)
-
-let endpoints =
-    choose [ route "/" >=> text "the future is tomorrow"; agentEndpoints; notFoundHandler ]
+    requiresApiKey >=> noResponseCaching >=> POST >=> choose endpoints
 
 let configureApp (appBuilder: WebApplication) =
-    appBuilder.MapHub<HubService>("/client").RequireRateLimiting(rateLimiterPolicy)
+    appBuilder.UseGiraffeErrorHandler(errorHandler) |> ignore
+    appBuilder.UseRouting() |> ignore
 
     appBuilder
-        .UseGiraffeErrorHandler(errorHandler)
-        .UseRouting()
-        .UseGiraffe(endpoints)
+        .MapHub<HubService>("/client")
+        .RequireRateLimiting(rateLimiterPolicy)
+    |> ignore
+
+    appBuilder.MapGet("/", Func<string>(fun () -> "the future is tomorrow")) |> ignore
+
+    appBuilder.Map(
+        "/agent",
+        Action<IApplicationBuilder>(fun (branch) ->
+            branch.UseGiraffe(agentEndpoints))
+    ) |> ignore
+
+    appBuilder
 
 let configureServices (services: IServiceCollection) =
     services.AddRouting().AddGiraffe()

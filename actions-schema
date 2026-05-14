@@ -1,0 +1,859 @@
+openapi: 3.1.0
+info:
+  title: Jarvis 2 Actions
+  version: 2.0.0
+  description: Project-local command surface for Jarvis 2.
+
+servers:
+  - url: https://jarvis2.kehlet.dev
+
+security:
+  - ApiKeyAuth: []
+
+paths:
+  /agent/listCommands:
+    post:
+      operationId: listCommands
+      summary: List supported Jarvis commands.
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ListCommandsMessage"
+      responses:
+        "200":
+          description: Command result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AnyResult"
+
+  /agent/listProjects:
+    post:
+      operationId: listProjects
+      summary: List available projects.
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ListProjectsMessage"
+      responses:
+        "200":
+          description: Command result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AnyResult"
+
+  /agent/getProjectDetails:
+    post:
+      operationId: getProjectDetails
+      summary: Get project details, notes, README, TODO, and related special files.
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GetProjectDetailsMessage"
+      responses:
+        "200":
+          description: Command result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AnyResult"
+
+  /agent/listDirectory:
+    post:
+      operationId: listDirectory
+      summary: List files and folders in a project directory.
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ListDirectoryMessage"
+      responses:
+        "200":
+          description: Command result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AnyResult"
+
+  /agent/searchFiles:
+    post:
+      operationId: searchFiles
+      summary: Search project file and folder names.
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SearchFilesMessage"
+      responses:
+        "200":
+          description: Command result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AnyResult"
+
+  /agent/searchText:
+    post:
+      operationId: searchText
+      summary: Search text inside project files.
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SearchTextMessage"
+      responses:
+        "200":
+          description: Command result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AnyResult"
+
+  /agent/readFile:
+    post:
+      operationId: readFile
+      summary: Read one project file.
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ReadFileMessage"
+      responses:
+        "200":
+          description: Command result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AnyResult"
+
+  /agent/readFiles:
+    post:
+      operationId: readFiles
+      summary: Read multiple project files.
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ReadFilesMessage"
+      responses:
+        "200":
+          description: Command result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AnyResult"
+
+  /agent/writeFile:
+    post:
+      operationId: writeFile
+      summary: Write or append to a project file. Requires local client approval.
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WriteFileMessage"
+      responses:
+        "200":
+          description: Command result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AnyResult"
+
+  /agent/patchFile:
+    post:
+      operationId: patchFile
+      summary: Apply an atomic unified diff patch to one file. Requires local client approval.
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PatchFileMessage"
+      responses:
+        "200":
+          description: Command result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AnyResult"
+
+  /agent/runCommand:
+    post:
+      operationId: runCommand
+      summary: Run a bounded local command in a project. Requires local client approval.
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RunCommandMessage"
+      responses:
+        "200":
+          description: Command result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AnyResult"
+
+  /agent/getGitStatus:
+    post:
+      operationId: getGitStatus
+      summary: Get git status for a project.
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GitStatusMessage"
+      responses:
+        "200":
+          description: Command result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AnyResult"
+
+  /agent/getGitDiff:
+    post:
+      operationId: getGitDiff
+      summary: Get git diff for a project or project-relative path.
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GitDiffMessage"
+      responses:
+        "200":
+          description: Command result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AnyResult"
+
+  /agent/gitCommit:
+    post:
+      operationId: gitCommit
+      summary: Create a git commit from selected paths. Requires local client approval.
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GitCommitMessage"
+      responses:
+        "200":
+          description: Command result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AnyResult"
+
+  /agent/startJob:
+    post:
+      operationId: startJob
+      summary: Start a long-running local job. Requires local client approval.
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StartJobMessage"
+      responses:
+        "200":
+          description: Command result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AnyResult"
+
+  /agent/listJobs:
+    post:
+      operationId: listJobs
+      summary: List running or completed jobs.
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ListJobsMessage"
+      responses:
+        "200":
+          description: Command result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AnyResult"
+
+  /agent/getJobResult:
+    post:
+      operationId: getJobResult
+      summary: Get buffered output and status for a job.
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GetJobResultMessage"
+      responses:
+        "200":
+          description: Command result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AnyResult"
+
+  /agent/cancelJob:
+    post:
+      operationId: cancelJob
+      summary: Cancel a running job. Requires local client approval.
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CancelJobMessage"
+      responses:
+        "200":
+          description: Command result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AnyResult"
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-Api-Key
+
+  schemas:
+    AnyResult:
+      description: Jarvis returns the serialized client result or error.
+      oneOf:
+        - type: string
+        - type: object
+          properties:
+            result:
+              description: Command result payload.
+            error:
+              description: Command error payload.
+          additionalProperties: true
+        - type: array
+          items: {}
+
+    EmptyCommand:
+      type: object
+      additionalProperties: false
+      properties:
+        noop:
+          type:
+            - boolean
+            - "null"
+          description: Optional placeholder. Do not set.
+
+    FileWriteMode:
+      type: string
+      enum:
+        - Append
+        - Write
+
+    PatchFormat:
+      type: string
+      enum:
+        - UnifiedDiff
+
+    ListCommandsMessage:
+      type: object
+      required: [key, command]
+      additionalProperties: false
+      properties:
+        key:
+          type: string
+          description: Client session key.
+        command:
+          $ref: "#/components/schemas/EmptyCommand"
+
+    ListProjectsMessage:
+      type: object
+      required: [key, command]
+      additionalProperties: false
+      properties:
+        key:
+          type: string
+          description: Client session key.
+        command:
+          $ref: "#/components/schemas/EmptyCommand"
+
+    GetProjectDetailsMessage:
+      type: object
+      required: [key, command]
+      additionalProperties: false
+      properties:
+        key:
+          type: string
+        command:
+          $ref: "#/components/schemas/GetProjectDetailsCommand"
+
+    GetProjectDetailsCommand:
+      type: object
+      required: [projectName]
+      additionalProperties: false
+      properties:
+        projectName:
+          type: string
+
+    ListDirectoryMessage:
+      type: object
+      required: [key, command]
+      additionalProperties: false
+      properties:
+        key:
+          type: string
+        command:
+          $ref: "#/components/schemas/ListDirectoryCommand"
+
+    ListDirectoryCommand:
+      type: object
+      required: [projectName, folderPath]
+      additionalProperties: false
+      properties:
+        projectName:
+          type: string
+        folderPath:
+          type: string
+          description: Project-relative folder path. Use empty string for project root.
+
+    SearchFilesMessage:
+      type: object
+      required: [key, command]
+      additionalProperties: false
+      properties:
+        key:
+          type: string
+        command:
+          $ref: "#/components/schemas/SearchFilesCommand"
+
+    SearchFilesCommand:
+      type: object
+      required: [projectName, query]
+      additionalProperties: false
+      properties:
+        projectName:
+          type: string
+        query:
+          type: string
+        folderPath:
+          type:
+            - string
+            - "null"
+          description: Optional project-relative folder path.
+        maxResults:
+          type:
+            - integer
+            - "null"
+          minimum: 1
+
+    SearchTextMessage:
+      type: object
+      required: [key, command]
+      additionalProperties: false
+      properties:
+        key:
+          type: string
+        command:
+          $ref: "#/components/schemas/SearchTextCommand"
+
+    SearchTextCommand:
+      type: object
+      required: [projectName, query, includeGlobs, excludeGlobs]
+      additionalProperties: false
+      properties:
+        projectName:
+          type: string
+        query:
+          type: string
+        folderPath:
+          type:
+            - string
+            - "null"
+        includeGlobs:
+          type: array
+          items:
+            type: string
+          default: []
+        excludeGlobs:
+          type: array
+          items:
+            type: string
+          default: []
+        maxResults:
+          type:
+            - integer
+            - "null"
+          minimum: 1
+
+    ReadFileMessage:
+      type: object
+      required: [key, command]
+      additionalProperties: false
+      properties:
+        key:
+          type: string
+        command:
+          $ref: "#/components/schemas/ReadFileCommand"
+
+    ReadFileCommand:
+      type: object
+      required: [projectName, filePath]
+      additionalProperties: false
+      properties:
+        projectName:
+          type: string
+        filePath:
+          type: string
+          description: Project-relative file path.
+
+    ReadFilesMessage:
+      type: object
+      required: [key, command]
+      additionalProperties: false
+      properties:
+        key:
+          type: string
+        command:
+          $ref: "#/components/schemas/ReadFilesCommand"
+
+    ReadFilesCommand:
+      type: object
+      required: [projectName, filePaths]
+      additionalProperties: false
+      properties:
+        projectName:
+          type: string
+        filePaths:
+          type: array
+          items:
+            type: string
+
+    WriteFileMessage:
+      type: object
+      required: [key, command]
+      additionalProperties: false
+      properties:
+        key:
+          type: string
+        command:
+          $ref: "#/components/schemas/WriteFileCommand"
+
+    WriteFileCommand:
+      type: object
+      required: [projectName, filePath, content, fileWriteMode]
+      additionalProperties: false
+      properties:
+        projectName:
+          type: string
+        filePath:
+          type: string
+        content:
+          type: string
+        fileWriteMode:
+          $ref: "#/components/schemas/FileWriteMode"
+        expectedHash:
+          type:
+            - string
+            - "null"
+          description: Optional sha256:<lowercase-hex> optimistic concurrency hash.
+
+    PatchFileMessage:
+      type: object
+      required: [key, command]
+      additionalProperties: false
+      properties:
+        key:
+          type: string
+        command:
+          $ref: "#/components/schemas/PatchFileCommand"
+
+    PatchFileCommand:
+      type: object
+      required: [projectName, filePath, format, patch]
+      additionalProperties: false
+      properties:
+        projectName:
+          type: string
+        filePath:
+          type: string
+        expectedHash:
+          type:
+            - string
+            - "null"
+        format:
+          $ref: "#/components/schemas/PatchFormat"
+        patch:
+          type: string
+          description: Unified diff applying to exactly filePath.
+
+    RunCommandMessage:
+      type: object
+      required: [key, command]
+      additionalProperties: false
+      properties:
+        key:
+          type: string
+        command:
+          $ref: "#/components/schemas/RunCommandCommand"
+
+    RunCommandCommand:
+      type: object
+      required: [projectName, executable, args]
+      additionalProperties: false
+      properties:
+        projectName:
+          type: string
+        executable:
+          type: string
+          description: Executable name, not a shell command string.
+        args:
+          type: array
+          items:
+            type: string
+        workingDirectory:
+          type:
+            - string
+            - "null"
+          description: Optional project-relative working directory.
+        timeoutSeconds:
+          type:
+            - integer
+            - "null"
+          minimum: 1
+        maxOutputBytes:
+          type:
+            - integer
+            - "null"
+          minimum: 1
+
+    GitStatusMessage:
+      type: object
+      required: [key, command]
+      additionalProperties: false
+      properties:
+        key:
+          type: string
+        command:
+          $ref: "#/components/schemas/GitStatusCommand"
+
+    GitStatusCommand:
+      type: object
+      required: [projectName]
+      additionalProperties: false
+      properties:
+        projectName:
+          type: string
+
+    GitDiffMessage:
+      type: object
+      required: [key, command]
+      additionalProperties: false
+      properties:
+        key:
+          type: string
+        command:
+          $ref: "#/components/schemas/GitDiffCommand"
+
+    GitDiffCommand:
+      type: object
+      required: [projectName]
+      additionalProperties: false
+      properties:
+        projectName:
+          type: string
+        path:
+          type:
+            - string
+            - "null"
+          description: Optional project-relative path.
+        maxOutputBytes:
+          type:
+            - integer
+            - "null"
+          minimum: 1
+
+    GitCommitMessage:
+      type: object
+      required: [key, command]
+      additionalProperties: false
+      properties:
+        key:
+          type: string
+        command:
+          $ref: "#/components/schemas/GitCommitCommand"
+
+    GitCommitCommand:
+      type: object
+      required: [projectName, message, paths, allowEmpty]
+      additionalProperties: false
+      properties:
+        projectName:
+          type: string
+        message:
+          type: string
+        body:
+          type:
+            - string
+            - "null"
+        paths:
+          type: array
+          items:
+            type: string
+          description: Project-relative paths to stage.
+        allowEmpty:
+          type: boolean
+
+    StartJobMessage:
+      type: object
+      required: [key, command]
+      additionalProperties: false
+      properties:
+        key:
+          type: string
+        command:
+          $ref: "#/components/schemas/StartJobCommand"
+
+    StartJobCommand:
+      type: object
+      required: [projectName, executable, args]
+      additionalProperties: false
+      properties:
+        projectName:
+          type: string
+        executable:
+          type: string
+        args:
+          type: array
+          items:
+            type: string
+        workingDirectory:
+          type:
+            - string
+            - "null"
+        maxOutputBytes:
+          type:
+            - integer
+            - "null"
+          minimum: 1
+
+    ListJobsMessage:
+      type: object
+      required: [key, command]
+      additionalProperties: false
+      properties:
+        key:
+          type: string
+        command:
+          $ref: "#/components/schemas/ListJobsCommand"
+
+    ListJobsCommand:
+      type: object
+      required: [includeCompleted]
+      additionalProperties: false
+      properties:
+        projectName:
+          type:
+            - string
+            - "null"
+        includeCompleted:
+          type: boolean
+
+    GetJobResultMessage:
+      type: object
+      required: [key, command]
+      additionalProperties: false
+      properties:
+        key:
+          type: string
+        command:
+          $ref: "#/components/schemas/GetJobResultCommand"
+
+    GetJobResultCommand:
+      type: object
+      required: [jobId]
+      additionalProperties: false
+      properties:
+        jobId:
+          type: string
+        fromOffset:
+          type:
+            - integer
+            - "null"
+          minimum: 0
+
+    CancelJobMessage:
+      type: object
+      required: [key, command]
+      additionalProperties: false
+      properties:
+        key:
+          type: string
+        command:
+          $ref: "#/components/schemas/CancelJobCommand"
+
+    CancelJobCommand:
+      type: object
+      required: [jobId]
+      additionalProperties: false
+      properties:
+        jobId:
+          type: string

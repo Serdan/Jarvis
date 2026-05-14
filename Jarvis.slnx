@@ -1,0 +1,6 @@
+<Solution>
+  <Project Path="Client.Tests/Client.Tests.fsproj" />
+  <Project Path="Client/Client.fsproj" />
+  <Project Path="Common/Common.fsproj" />
+  <Project Path="Server/Server.fsproj" />
+</Solution>

@@ -1,4 +1,4 @@
-﻿namespace Client.Effect
+namespace Client.Effect
 
 open Client
 open Microsoft.FSharp.Core
@@ -13,6 +13,7 @@ module EffectError =
         | ContextError message -> $"ContextError: {message}"
         | NotFoundError resource -> $"NotFoundError: {resource} not found"
         | PermissionDenied resource -> $"PermissionDenied: Access denied to {resource}"
+        | ConfirmationRequired request -> $"ConfirmationRequired: {request.Summary}"
         | AggregatedErrors errors ->
             let errorList = errors |> List.map toString |> String.concat "\n"
             $"AggregatedErrors:\n{errorList}"

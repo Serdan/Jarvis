@@ -50,3 +50,4 @@ ipch/
 Thumbs.db
 
 .fake
+Client/BuildInfo.fs

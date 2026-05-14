@@ -24,12 +24,18 @@ let rec getDir path =
 
 let connect (tui: ConsoleTui) (connection: HubConnection) key =
     task {
+        tui.Log $"Connecting to {BuildInfo.ServerUrl}..."
         let! startResult = connection.startAsync()
-        let! result = connection.invokeAsync("Connect", key)
 
-        match result with
-        | Ok _ -> tui.Log "Connected."
-        | Error err -> tui.Log $"Connection failed: {err.Message}. Retrying..."
+        match startResult with
+        | Error err ->
+            tui.Log $"Connection start failed: {err.Message}. Retrying..."
+        | Ok _ ->
+            let! result = connection.invokeAsync("Connect", key)
+
+            match result with
+            | Ok _ -> tui.Log "Connected."
+            | Error err -> tui.Log $"Connection registration failed: {err.Message}. Retrying..."
     }
 
 [<EntryPoint>]

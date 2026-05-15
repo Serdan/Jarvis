@@ -201,3 +201,107 @@ let ``searchFiles recursively returns nested project items`` () =
     match searchFiles cmd fakeContext with
     | Ok items -> items |> shouldContain (ProjectFile(Path.Combine("src", "deep.md"), 0L, System.DateTimeOffset.MinValue, System.DateTimeOffset.MinValue))
     | Error e -> Assert.Fail($"Expected Ok, but got Error: {EffectError.toString e}")
+
+
+[<Test>]
+let ``unknown project returns not found`` () =
+    let cmd = { ProjectName = "Missing"; FolderPath = "" }
+
+    match listDirectory cmd fakeContext with
+    | Error(NotFoundError message) -> message.Contains("Unknown project name") |> shouldEqual true
+    | other -> Assert.Fail($"Expected NotFoundError, got {other}")
+
+[<Test>]
+let ``listDirectory returns files and folders`` () =
+    let cmd = { ProjectName = "Project1"; FolderPath = "" }
+
+    match listDirectory cmd fakeContext with
+    | Ok items ->
+        items |> shouldContain (ProjectFolder "src")
+        items |> shouldContain (ProjectFile("readme.md", 0L, System.DateTimeOffset.MinValue, System.DateTimeOffset.MinValue))
+        items |> shouldContain (ProjectFile("todo.md", 0L, System.DateTimeOffset.MinValue, System.DateTimeOffset.MinValue))
+    | Error e -> Assert.Fail($"Expected Ok, got Error: {EffectError.toString e}")
+
+[<Test>]
+let ``listDirectory aggregates missing folder errors`` () =
+    let cmd = { ProjectName = "Project1"; FolderPath = "missing" }
+
+    match listDirectory cmd fakeContext with
+    | Error(AggregatedErrors errors) -> errors.Length |> shouldEqual 2
+    | other -> Assert.Fail($"Expected AggregatedErrors, got {other}")
+
+[<Test>]
+let ``readFile returns content`` () =
+    let cmd = { ProjectName = "Project1"; FilePath = "readme.md" }
+    readFile cmd fakeContext |> shouldEqual (Ok(Content readmeContent))
+
+[<Test>]
+let ``readFile returns file error`` () =
+    let cmd = { ProjectName = "Project1"; FilePath = "missing.md" }
+
+    match readFile cmd fakeContext with
+    | Error(NotFoundError _) -> ()
+    | other -> Assert.Fail($"Expected NotFoundError, got {other}")
+
+[<Test>]
+let ``readFiles preserves per-file errors`` () =
+    let cmd = { ProjectName = "Project1"; FilePaths = [ "readme.md"; "missing.md"; "todo.md" ] }
+
+    match readFiles cmd fakeContext with
+    | Ok results ->
+        let values = results |> Seq.toList
+        values.Length |> shouldEqual 3
+        values[0] |> shouldEqual (Content'.Text readmeContent)
+        match values[1] with
+        | Content'.Error(NotFoundError _) -> ()
+        | other -> Assert.Fail($"Expected per-file NotFoundError, got {other}")
+        values[2] |> shouldEqual (Content'.Text todoContent)
+    | Error e -> Assert.Fail($"Expected Ok, got Error: {EffectError.toString e}")
+
+[<Test>]
+let ``searchFiles respects max results`` () =
+    let cmd =
+        { ProjectName = "Project1"
+          Query = ".md"
+          FolderPath = None
+          MaxResults = Some 1 }
+
+    match searchFiles cmd fakeContext with
+    | Ok items -> items.Length |> shouldEqual 1
+    | Error e -> Assert.Fail($"Expected Ok, got Error: {EffectError.toString e}")
+
+[<Test>]
+let ``searchFiles can scope to folder`` () =
+    let cmd =
+        { ProjectName = "Project1"
+          Query = "deep"
+          FolderPath = Some "src"
+          MaxResults = None }
+
+    match searchFiles cmd fakeContext with
+    | Ok items -> items |> shouldEqual [ ProjectFile(Path.Combine("src", "deep.md"), 0L, System.DateTimeOffset.MinValue, System.DateTimeOffset.MinValue) ]
+    | Error e -> Assert.Fail($"Expected Ok, got Error: {EffectError.toString e}")
+
+[<Test>]
+let ``searchText respects max results`` () =
+    let cmd =
+        { ProjectName = "Project1"
+          Query = "Old Text"
+          FolderPath = None
+          IncludeGlobs = []
+          ExcludeGlobs = []
+          MaxResults = Some 1 }
+
+    searchText cmd fakeContext |> shouldEqual (Ok [ "readme.md" ])
+
+[<Test>]
+let ``searchText returns empty when no matches`` () =
+    let cmd =
+        { ProjectName = "Project1"
+          Query = "does-not-exist"
+          FolderPath = None
+          IncludeGlobs = []
+          ExcludeGlobs = []
+          MaxResults = None }
+
+    searchText cmd fakeContext |> shouldEqual (Ok [])

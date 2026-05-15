@@ -22,6 +22,16 @@ let rec getDir path =
         Console.Write "Workspace directory: "
         getDir (Console.ReadLine())
 
+let private parseArgs args =
+    let rec loop path permissionMode remaining =
+        match remaining with
+        | [] -> Ok(path, permissionMode)
+        | "--path" :: value :: tail -> loop value permissionMode tail
+        | "--permission-mode" :: value :: tail -> loop path value tail
+        | unknown :: _ -> Error $"Unknown or incomplete argument: {unknown}"
+
+    loop "" (Environment.GetEnvironmentVariable "JARVIS_PERMISSION_MODE") (args |> Array.toList)
+
 let connect (tui: ConsoleTui) (connection: HubConnection) key =
     task {
         tui.Log $"Connecting to {BuildInfo.ServerUrl}..."
@@ -40,13 +50,23 @@ let connect (tui: ConsoleTui) (connection: HubConnection) key =
 
 [<EntryPoint>]
 let main args =
-    let dir =
-        match args with
-        | [| "--path"; path |] -> path
-        | _ -> ""
-
     let tui = ConsoleTui()
-    let rt = Runtime(getDir dir, tui)
+
+    let dir, permissionMode =
+        match parseArgs args with
+        | Ok(path, modeValue) ->
+            match PermissionMode.parse modeValue with
+            | Ok mode -> path, mode
+            | Error message ->
+                eprintfn $"%s{message}"
+                exit 2
+        | Error message ->
+            eprintfn $"%s{message}"
+            eprintfn "Usage: JarvisClient [--path <workspace>] [--permission-mode confirm|workspace-write|trust-session]"
+            exit 2
+
+    let rt = Runtime(getDir dir, tui, permissionMode)
+    tui.Log $"Permission mode: {PermissionMode.toDisplayName permissionMode}"
 
     let connection =
         HubConnectionBuilder()

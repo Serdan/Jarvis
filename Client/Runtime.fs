@@ -6,11 +6,11 @@ open Client.IO
 open Client.ConsoleTui
 open Common
 
-type Runtime(root: string, tui: ConsoleTui) =
+type Runtime(root: string, tui: ConsoleTui, permissionMode: PermissionMode) =
     member _.httpClient = new HttpClient()
     member _.Tui = tui
 
-    new(root: string) = Runtime(root, ConsoleTui())
+    new(root: string) = Runtime(root, ConsoleTui(), Confirm)
 
     interface ProjectIO with
         member _.Project = ProjectOperations.impl (ProjectDirectory root)
@@ -22,4 +22,5 @@ type Runtime(root: string, tui: ConsoleTui) =
         member _.Browser = WebOperations.impl
 
     interface PermissionIO with
+        member _.PermissionMode = permissionMode
         member _.PromptPermission command request = tui.PromptPermission command request

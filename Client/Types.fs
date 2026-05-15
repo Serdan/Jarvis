@@ -71,7 +71,34 @@ type PermissionApproval =
     | AllowExactForSession
     | Deny
 
+type PermissionMode =
+    | Confirm
+    | AllowWorkspaceWrite
+    | TrustSession
+
+module PermissionMode =
+    let parse (value: string) =
+        match value |> Option.ofObj |> Option.map (fun x -> x.Trim().ToLowerInvariant()) with
+        | Some "confirm"
+        | Some "default"
+        | Some "" -> Ok Confirm
+        | Some "workspace-write"
+        | Some "workspacewrite"
+        | Some "write" -> Ok AllowWorkspaceWrite
+        | Some "trust-session"
+        | Some "trustsession"
+        | Some "trusted" -> Ok TrustSession
+        | Some value -> Error $"Unknown permission mode: {value}. Use confirm, workspace-write, or trust-session."
+        | None -> Ok Confirm
+
+    let toDisplayName =
+        function
+        | Confirm -> "confirm"
+        | AllowWorkspaceWrite -> "workspace-write"
+        | TrustSession -> "trust-session"
+
 type PermissionIO =
+    abstract PermissionMode: PermissionMode
     abstract PromptPermission: AgentCommand -> ConfirmationRequest -> Task<PermissionApproval>
 
 type RuntimeConstraint<'a when 'a :> ProjectIO and 'a :> FileIO and 'a :> WebIO> = 'a

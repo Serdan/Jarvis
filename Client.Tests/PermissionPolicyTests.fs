@@ -80,3 +80,54 @@ let ``grant does not allow changed command payload`` () =
     match evaluate changed with
     | Error(Client.ConfirmationRequired request) -> request.Args |> shouldEqual [ "build" ]
     | other -> Assert.Fail($"Expected ConfirmationRequired, got {other}")
+
+
+[<Test>]
+let ``workspace-write mode allows write and patch commands`` () =
+    let writeCommand =
+        WriteFileCommand
+            { ProjectName = "Project1"
+              FilePath = "readme.md"
+              Content = "updated"
+              FileWriteMode = FileWriteMode.Write
+              ExpectedHash = None }
+
+    let patchCommand =
+        PatchFileCommand
+            { ProjectName = "Project1"
+              FilePath = "readme.md"
+              ExpectedHash = None
+              Format = PatchFormat.UnifiedDiff
+              Patch = "patch" }
+
+    evaluateWithMode AllowWorkspaceWrite writeCommand |> shouldEqual (Ok())
+    evaluateWithMode AllowWorkspaceWrite patchCommand |> shouldEqual (Ok())
+
+[<Test>]
+let ``workspace-write mode still confirms process execution`` () =
+    let command =
+        RunCommandCommand
+            { ProjectName = "Project1"
+              Executable = "dotnet"
+              Args = [ "test" ]
+              WorkingDirectory = None
+              TimeoutSeconds = Some 60
+              MaxOutputBytes = Some 4096 }
+
+    match evaluateWithMode AllowWorkspaceWrite command with
+    | Error(Client.ConfirmationRequired request) ->
+        request.CommandName |> shouldEqual "RunCommand"
+        request.Permissions |> shouldEqual [ ProcessExecution ]
+    | other -> Assert.Fail($"Expected ConfirmationRequired, got {other}")
+
+[<Test>]
+let ``trust-session mode allows confirmable commands`` () =
+    let command =
+        GitCommitCommand
+            { ProjectName = "Project1"
+              Message = "Test commit"
+              Body = None
+              Paths = [ "readme.md" ]
+              AllowEmpty = false }
+
+    evaluateWithMode TrustSession command |> shouldEqual (Ok())

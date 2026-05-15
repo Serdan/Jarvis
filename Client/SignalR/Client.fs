@@ -101,7 +101,8 @@ let receiveCommand (rt: Runtime) (command: AgentCommand) =
     task {
         rt.Tui.Log $"Incoming command: {command.GetType().Name}"
 
-        let! authorization = PermissionPolicy.authorize ((rt :> PermissionIO).PromptPermission) command
+        let permission = rt :> PermissionIO
+        let! authorization = PermissionPolicy.authorizeWithMode permission.PermissionMode permission.PromptPermission command
 
         let! response =
             match authorization with

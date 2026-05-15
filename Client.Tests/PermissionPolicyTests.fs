@@ -137,3 +137,66 @@ let ``trust-session mode allows confirmable commands`` () =
               AllowEmpty = false }
 
     evaluateWithMode TrustSession command |> shouldEqual (Ok())
+
+
+[<Test>]
+let ``trust-except-run-command mode confirms run command`` () =
+    let command =
+        RunCommandCommand
+            { ProjectName = "Project1"
+              Executable = "dotnet"
+              Args = [ "test" ]
+              WorkingDirectory = None
+              TimeoutSeconds = Some 60
+              MaxOutputBytes = Some 4096 }
+
+    match evaluateWithMode TrustExceptRunCommand command with
+    | Error(Client.ConfirmationRequired request) ->
+        request.CommandName |> shouldEqual "RunCommand"
+        request.Permissions |> shouldEqual [ ProcessExecution ]
+    | other -> Assert.Fail($"Expected ConfirmationRequired, got {other}")
+
+[<Test>]
+let ``trust-except-run-command mode allows other mutating commands`` () =
+    let writeCommand =
+        WriteFileCommand
+            { ProjectName = "Project1"
+              FilePath = "readme.md"
+              Content = "updated"
+              FileWriteMode = FileWriteMode.Write
+              ExpectedHash = None }
+
+    let patchCommand =
+        PatchFileCommand
+            { ProjectName = "Project1"
+              FilePath = "readme.md"
+              ExpectedHash = None
+              Format = PatchFormat.UnifiedDiff
+              Patch = "patch"
+              DryRun = None
+              FuzzyContextLines = None
+              ReturnContent = None }
+
+    let commitCommand =
+        GitCommitCommand
+            { ProjectName = "Project1"
+              Message = "Test commit"
+              Body = None
+              Paths = [ "readme.md" ]
+              AllowEmpty = false }
+
+    let startJobCommand =
+        StartJobCommand
+            { ProjectName = "Project1"
+              Executable = "dotnet"
+              Args = [ "watch" ]
+              WorkingDirectory = None
+              MaxOutputBytes = Some 4096 }
+
+    let cancelJobCommand = CancelJobCommand { JobId = "job-1" }
+
+    evaluateWithMode TrustExceptRunCommand writeCommand |> shouldEqual (Ok())
+    evaluateWithMode TrustExceptRunCommand patchCommand |> shouldEqual (Ok())
+    evaluateWithMode TrustExceptRunCommand commitCommand |> shouldEqual (Ok())
+    evaluateWithMode TrustExceptRunCommand startJobCommand |> shouldEqual (Ok())
+    evaluateWithMode TrustExceptRunCommand cancelJobCommand |> shouldEqual (Ok())

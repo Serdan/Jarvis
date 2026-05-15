@@ -74,6 +74,7 @@ type PermissionApproval =
 type PermissionMode =
     | Confirm
     | AllowWorkspaceWrite
+    | TrustExceptRunCommand
     | TrustSession
 
 module PermissionMode =
@@ -85,16 +86,24 @@ module PermissionMode =
         | Some "workspace-write"
         | Some "workspacewrite"
         | Some "write" -> Ok AllowWorkspaceWrite
+        | Some "trust-except-run-command"
+        | Some "trust-except-runcommand"
+        | Some "trustexcept-runcommand"
+        | Some "trustexceptruncommand"
+        | Some "trust-no-run"
+        | Some "no-run-command"
+        | Some "noruncommand" -> Ok TrustExceptRunCommand
         | Some "trust-session"
         | Some "trustsession"
         | Some "trusted" -> Ok TrustSession
-        | Some value -> Error $"Unknown permission mode: {value}. Use confirm, workspace-write, or trust-session."
+        | Some value -> Error $"Unknown permission mode: {value}. Use confirm, workspace-write, trust-except-run-command, or trust-session."
         | None -> Ok Confirm
 
     let toDisplayName =
         function
         | Confirm -> "confirm"
         | AllowWorkspaceWrite -> "workspace-write"
+        | TrustExceptRunCommand -> "trust-except-run-command"
         | TrustSession -> "trust-session"
 
 type PermissionIO =

@@ -62,7 +62,7 @@ let main args =
                 exit 2
         | Error message ->
             eprintfn $"%s{message}"
-            eprintfn "Usage: JarvisClient [--path <workspace>] [--permission-mode confirm|workspace-write|trust-session]"
+            eprintfn "Usage: JarvisClient [--path <workspace>] [--permission-mode confirm|workspace-write|trust-except-run-command|trust-session]"
             exit 2
 
     let rt = Runtime(getDir dir, tui, permissionMode)

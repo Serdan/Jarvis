@@ -45,7 +45,8 @@ module private Patch =
             | _ -> None
 
     let private nearbyContext lineIndex (lines: string list) =
-        let start = max 0 (lineIndex - 3)
+        let index = lineIndex |> max 0 |> min lines.Length
+        let start = max 0 (index - 3)
         lines |> List.skip start |> List.truncate 7
 
     let private expectedContext (hunkLines: string list) =
@@ -85,7 +86,60 @@ module private Patch =
             || (line.StartsWith("-", StringComparison.Ordinal) && not (line.StartsWith("---", StringComparison.Ordinal))))
         |> List.length
 
-    let applyUnifiedDiff (patch: string) (content: string) : Client.Result<ApplyResult> =
+    let private collectHunk (lines: string list) =
+        let rec loop acc remaining =
+            match remaining with
+            | [] -> List.rev acc, []
+            | [ "" ] -> List.rev acc, []
+            | next :: _ when next.StartsWith("@@", StringComparison.Ordinal) -> List.rev acc, remaining
+            | next :: tailLines -> loop (next :: acc) tailLines
+
+        loop [] lines
+
+    let private canMatchAt (original: string list) startIndex (hunkLines: string list) =
+        let rec loop currentIndex hasEvidence (remaining: string list) =
+            match remaining with
+            | [] -> Ok hasEvidence
+            | next :: tailLines when next.StartsWith("\\", StringComparison.Ordinal) -> loop currentIndex hasEvidence tailLines
+            | next :: tailLines when next.StartsWith("+", StringComparison.Ordinal) -> loop currentIndex hasEvidence tailLines
+            | next :: tailLines when next.StartsWith("-", StringComparison.Ordinal) ->
+                if currentIndex >= original.Length then Error "Patch removal extends beyond the end of the file."
+                elif original[currentIndex] <> tail next then Error $"Patch removal mismatch at line {currentIndex + 1}."
+                else loop (currentIndex + 1) true tailLines
+            | next :: tailLines when next.StartsWith(" ", StringComparison.Ordinal) ->
+                if currentIndex >= original.Length then Error "Patch context extends beyond the end of the file."
+                elif original[currentIndex] <> tail next then Error $"Patch context mismatch at line {currentIndex + 1}."
+                else loop (currentIndex + 1) true tailLines
+            | next :: _ -> Error $"Invalid patch line: {next}"
+
+        if startIndex < 0 || startIndex > original.Length then
+            Error $"Patch target index {startIndex + 1} is outside the file."
+        else
+            loop startIndex false hunkLines
+
+    let private applyHunkAt (hunkLines: string list) startIndex =
+        let rec loop currentIndex acc (remaining: string list) =
+            match remaining with
+            | [] -> Ok(currentIndex, acc)
+            | next :: tailLines when next.StartsWith("\\", StringComparison.Ordinal) -> loop currentIndex acc tailLines
+            | next :: tailLines when next.StartsWith("+", StringComparison.Ordinal) -> loop currentIndex (tail next :: acc) tailLines
+            | next :: tailLines when next.StartsWith("-", StringComparison.Ordinal) -> loop (currentIndex + 1) acc tailLines
+            | next :: tailLines when next.StartsWith(" ", StringComparison.Ordinal) -> loop (currentIndex + 1) (tail next :: acc) tailLines
+            | next :: _ -> Error(Client.ValidationError $"Invalid patch line: {next}")
+
+        loop startIndex [] hunkLines
+
+    let private findFuzzyCandidates oldIndex targetIndex fuzzyContextLines (original: string list) (hunkLines: string list) =
+        let searchStart = max oldIndex (targetIndex - fuzzyContextLines)
+        let searchEnd = min original.Length (targetIndex + fuzzyContextLines)
+
+        [ searchStart .. searchEnd ]
+        |> List.choose (fun candidate ->
+            match canMatchAt original candidate hunkLines with
+            | Ok true -> Some candidate
+            | _ -> None)
+
+    let applyUnifiedDiff fuzzyContextLines (patch: string) (content: string) : Client.Result<ApplyResult> =
         let ending = detectLineEnding content
         let original = splitLines content
         let patchLines = splitLines patch
@@ -114,50 +168,43 @@ module private Patch =
                 | Some oldStart ->
                     let currentHunkIndex = hunkIndex + 1
                     let targetIndex = max 0 (oldStart - 1)
+                    let hunkLines, remaining = collectHunk rest
+                    let expected = expectedContext hunkLines
 
                     if targetIndex < oldIndex || targetIndex > original.Length then
-                        diagnostic currentHunkIndex Failed (Some oldStart) None $"Patch hunk targets invalid line {oldStart}." [] (nearbyContext targetIndex original) |> failWith
+                        diagnostic currentHunkIndex Failed (Some oldStart) None $"Patch hunk targets invalid line {oldStart}." expected (nearbyContext targetIndex original) |> failWith
                     else
-                        let unchanged = original |> List.skip oldIndex |> List.take (targetIndex - oldIndex)
+                        let strictMatch = canMatchAt original targetIndex hunkLines
 
-                        let rec collectHunk acc remaining =
-                            match remaining with
-                            | [] -> List.rev acc, []
-                            | [ "" ] -> List.rev acc, []
-                            | next :: _ when next.StartsWith("@@", StringComparison.Ordinal) -> List.rev acc, remaining
-                            | next :: tailLines -> collectHunk (next :: acc) tailLines
+                        let placement =
+                            match strictMatch with
+                            | Ok true -> Ok(targetIndex, AppliedStrict, "Applied strictly.")
+                            | Ok false ->
+                                diagnostic currentHunkIndex Failed (Some oldStart) (Some oldStart) "Patch hunk has no context or removal lines; fuzzy matching requires evidence." expected (nearbyContext targetIndex original) |> failWith
+                            | Error strictError when fuzzyContextLines <= 0 ->
+                                diagnostic currentHunkIndex Failed (Some oldStart) (Some oldStart) strictError expected (nearbyContext targetIndex original) |> failWith
+                            | Error strictError ->
+                                match findFuzzyCandidates oldIndex targetIndex fuzzyContextLines original hunkLines with
+                                | [ candidate ] ->
+                                    let offset = candidate - targetIndex
+                                    Ok(candidate, AppliedWithOffset offset, $"Applied with offset {offset}.")
+                                | [] ->
+                                    diagnostic currentHunkIndex Failed (Some oldStart) (Some oldStart) $"{strictError} No valid fuzzy match found within {fuzzyContextLines} lines." expected (nearbyContext targetIndex original) |> failWith
+                                | candidates ->
+                                    let candidateLines = candidates |> List.map (fun x -> string (x + 1)) |> String.concat ", "
+                                    diagnostic currentHunkIndex Failed (Some oldStart) None $"Ambiguous fuzzy match. Candidate lines: {candidateLines}." expected (nearbyContext targetIndex original) |> failWith
 
-                        let hunkLines, remaining = collectHunk [] rest
-                        let expected = expectedContext hunkLines
-
-                        let rec applyHunk currentIndex acc (remainingHunk: string list) =
-                            match remainingHunk with
-                            | [] -> Ok(currentIndex, acc)
-                            | next :: tailLines when next.StartsWith("\\", StringComparison.Ordinal) -> applyHunk currentIndex acc tailLines
-                            | next :: tailLines when next.StartsWith("+", StringComparison.Ordinal) ->
-                                applyHunk currentIndex (tail next :: acc) tailLines
-                            | next :: tailLines when next.StartsWith("-", StringComparison.Ordinal) ->
-                                if currentIndex >= original.Length then
-                                    diagnostic currentHunkIndex Failed (Some oldStart) (Some(currentIndex + 1)) "Patch removal extends beyond the end of the file." expected (nearbyContext currentIndex original) |> failWith
-                                elif original[currentIndex] <> tail next then
-                                    diagnostic currentHunkIndex Failed (Some oldStart) (Some(currentIndex + 1)) $"Patch removal mismatch at line {currentIndex + 1}." expected (nearbyContext currentIndex original) |> failWith
-                                else
-                                    applyHunk (currentIndex + 1) acc tailLines
-                            | next :: tailLines when next.StartsWith(" ", StringComparison.Ordinal) ->
-                                if currentIndex >= original.Length then
-                                    diagnostic currentHunkIndex Failed (Some oldStart) (Some(currentIndex + 1)) "Patch context extends beyond the end of the file." expected (nearbyContext currentIndex original) |> failWith
-                                elif original[currentIndex] <> tail next then
-                                    diagnostic currentHunkIndex Failed (Some oldStart) (Some(currentIndex + 1)) $"Patch context mismatch at line {currentIndex + 1}." expected (nearbyContext currentIndex original) |> failWith
-                                else
-                                    applyHunk (currentIndex + 1) (tail next :: acc) tailLines
-                            | next :: _ ->
-                                diagnostic currentHunkIndex Failed (Some oldStart) (Some(currentIndex + 1)) $"Invalid patch line: {next}" expected (nearbyContext currentIndex original) |> failWith
-
-                        match applyHunk targetIndex [] hunkLines with
+                        match placement with
                         | Error error -> Error error
-                        | Ok(nextOldIndex, hunkOutput) ->
-                            let diag = diagnostic currentHunkIndex AppliedStrict (Some oldStart) (Some oldStart) "Applied strictly." expected []
-                            applyHunks currentHunkIndex nextOldIndex (output @ unchanged @ List.rev hunkOutput) (diag :: diagnostics) (changedLines + changedLineCount hunkLines) remaining
+                        | Ok(appliedIndex, status, message) ->
+                            let unchanged = original |> List.skip oldIndex |> List.take (appliedIndex - oldIndex)
+
+                            match applyHunkAt hunkLines appliedIndex with
+                            | Error error -> Error error
+                            | Ok(nextOldIndex, hunkOutput) ->
+                                let appliedLine = appliedIndex + 1
+                                let diag = diagnostic currentHunkIndex status (Some oldStart) (Some appliedLine) message expected []
+                                applyHunks currentHunkIndex nextOldIndex (output @ unchanged @ List.rev hunkOutput) (diag :: diagnostics) (changedLines + changedLineCount hunkLines) remaining
             | line :: _ ->
                 diagnostic (hunkIndex + 1) Failed None None $"Unexpected patch content outside hunk: {line}" [] [] |> failWith
 
@@ -381,6 +428,12 @@ module private Core =
         | Some expected when expected = actual -> Ok actual
         | Some expected -> Error(Client.ValidationError $"Expected hash {expected}, actual hash {actual}.")
 
+    let private rejectBinaryContent (content: string) =
+        if content.Contains('\u0000') then
+            Error(Client.ValidationError "PatchFile does not support binary files.")
+        else
+            Ok()
+
     let writeFile projectName filePath content mode expectedHash =
         let write =
             match mode with
@@ -410,14 +463,13 @@ module private Core =
 
                 if fuzzyContextLines < 0 || fuzzyContextLines > 50 then
                     return! Client.ValidationError "FuzzyContextLines must be between 0 and 50." |> Effect.ofError
-                elif fuzzyContextLines > 0 then
-                    return! Client.ValidationError "FuzzyContextLines is reserved for a future fuzzy patching implementation." |> Effect.ofError
                 else
                     let! path = parseProjectName projectName >>= parseFilePath filePath
                     let! current = FileIO.readAllText path
                     let (Content content) = current
                     let! beforeHash = fun _ -> verifyExpectedHash expectedHash content
-                    let! applied = fun _ -> Patch.applyUnifiedDiff patch content
+                    do! fun _ -> rejectBinaryContent content
+                    let! applied = fun _ -> Patch.applyUnifiedDiff fuzzyContextLines patch content
                     let afterHash = Hash.sha256 applied.Content
 
                     do!

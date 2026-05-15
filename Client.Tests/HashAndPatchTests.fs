@@ -40,15 +40,18 @@ type TestContext(?initialContent: string) =
               GetFolderName = fun (FolderPath path) -> Path.GetFileName path
               getFileName = fun (FilePath path) -> Path.GetFileName path }
 
-let patchCommand patch expectedHash dryRun returnContent =
+let patchCommandWithFuzzy patch expectedHash dryRun returnContent fuzzyContextLines =
     { ProjectName = "Project1"
       FilePath = "test.txt"
       ExpectedHash = expectedHash
       Format = PatchFormat.UnifiedDiff
       Patch = patch
       DryRun = dryRun
-      FuzzyContextLines = None
+      FuzzyContextLines = fuzzyContextLines
       ReturnContent = returnContent }
+
+let patchCommand patch expectedHash dryRun returnContent =
+    patchCommandWithFuzzy patch expectedHash dryRun returnContent None
 
 [<Test>]
 let ``writeFile rejects mismatched expected hash`` () =
@@ -123,5 +126,120 @@ let ``patchFile context mismatch includes diagnostic context`` () =
         message.Contains("Patch hunk 1 failed") |> shouldEqual true
         message.Contains("Expected context") |> shouldEqual true
         message.Contains("Actual context") |> shouldEqual true
+        context.WriteCount |> shouldEqual 0
+    | other -> Assert.Fail($"Expected ValidationError, got {other}")
+
+
+[<Test>]
+let ``patchFile fuzzy mode applies hunk shifted down within window`` () =
+    let context = TestContext("intro\nhello\nworld\n")
+    let patch = "--- a/test.txt\n+++ b/test.txt\n@@ -1,2 +1,2 @@\n hello\n-world\n+there\n"
+    let cmd = patchCommandWithFuzzy patch None None (Some true) (Some 2)
+
+    match patchFile cmd context with
+    | Ok result ->
+        result.Content |> shouldEqual (Some "intro\nhello\nthere\n")
+        result.Diagnostics.Length |> shouldEqual 1
+        match result.Diagnostics.Head.Status with
+        | AppliedWithOffset offset -> offset |> shouldEqual 1
+        | other -> Assert.Fail($"Expected AppliedWithOffset, got {other}")
+    | Error error -> Assert.Fail($"Expected successful fuzzy patch, got {error}")
+
+[<Test>]
+let ``patchFile fuzzy mode applies hunk shifted up within window`` () =
+    let context = TestContext("hello\nworld\noutro\n")
+    let patch = "--- a/test.txt\n+++ b/test.txt\n@@ -2,2 +2,2 @@\n hello\n-world\n+there\n"
+    let cmd = patchCommandWithFuzzy patch None None (Some true) (Some 2)
+
+    match patchFile cmd context with
+    | Ok result ->
+        result.Content |> shouldEqual (Some "hello\nthere\noutro\n")
+        match result.Diagnostics.Head.Status with
+        | AppliedWithOffset offset -> offset |> shouldEqual -1
+        | other -> Assert.Fail($"Expected AppliedWithOffset, got {other}")
+    | Error error -> Assert.Fail($"Expected successful fuzzy patch, got {error}")
+
+[<Test>]
+let ``patchFile fuzzy mode fails when match is outside window`` () =
+    let context = TestContext("a\nb\nc\nhello\nworld\n")
+    let patch = "--- a/test.txt\n+++ b/test.txt\n@@ -1,2 +1,2 @@\n hello\n-world\n+there\n"
+    let cmd = patchCommandWithFuzzy patch None None None (Some 2)
+
+    match patchFile cmd context with
+    | Error(ValidationError message) ->
+        message.Contains("No valid fuzzy match") |> shouldEqual true
+        context.WriteCount |> shouldEqual 0
+    | other -> Assert.Fail($"Expected ValidationError, got {other}")
+
+[<Test>]
+let ``patchFile fuzzy mode fails on ambiguous matches`` () =
+    let context = TestContext("hello\nworld\nspacer\nhello\nworld\n")
+    let patch = "--- a/test.txt\n+++ b/test.txt\n@@ -2,2 +2,2 @@\n hello\n-world\n+there\n"
+    let cmd = patchCommandWithFuzzy patch None None None (Some 4)
+
+    match patchFile cmd context with
+    | Error(ValidationError message) ->
+        message.Contains("Ambiguous fuzzy match") |> shouldEqual true
+        context.WriteCount |> shouldEqual 0
+    | other -> Assert.Fail($"Expected ValidationError, got {other}")
+
+[<Test>]
+let ``patchFile fuzzy mode rejects addition only hunks`` () =
+    let context = TestContext("hello\nworld\n")
+    let patch = "--- a/test.txt\n+++ b/test.txt\n@@ -1,0 +1,1 @@\n+inserted\n"
+    let cmd = patchCommandWithFuzzy patch None None None (Some 2)
+
+    match patchFile cmd context with
+    | Error(ValidationError message) ->
+        message.Contains("requires evidence") |> shouldEqual true
+        context.WriteCount |> shouldEqual 0
+    | other -> Assert.Fail($"Expected ValidationError, got {other}")
+
+
+[<Test>]
+let ``patchFile preserves CRLF line endings`` () =
+    let context = TestContext("hello\r\nworld\r\n")
+    let patch = "--- a/test.txt\n+++ b/test.txt\n@@ -1,2 +1,2 @@\n hello\n-world\n+there\n"
+    let cmd = patchCommand patch None None (Some true)
+
+    match patchFile cmd context with
+    | Ok result ->
+        result.Content |> shouldEqual (Some "hello\r\nthere\r\n")
+        context.Content |> shouldEqual "hello\r\nthere\r\n"
+    | Error error -> Assert.Fail($"Expected successful CRLF patch, got {error}")
+
+[<Test>]
+let ``patchFile ambiguous fuzzy diagnostic lists candidate lines`` () =
+    let context = TestContext("hello\nworld\nspacer\nhello\nworld\n")
+    let patch = "--- a/test.txt\n+++ b/test.txt\n@@ -2,2 +2,2 @@\n hello\n-world\n+there\n"
+    let cmd = patchCommandWithFuzzy patch None None None (Some 4)
+
+    match patchFile cmd context with
+    | Error(ValidationError message) ->
+        message.Contains("Ambiguous fuzzy match") |> shouldEqual true
+        message.Contains("Candidate lines: 1, 4") |> shouldEqual true
+        context.WriteCount |> shouldEqual 0
+    | other -> Assert.Fail($"Expected ValidationError, got {other}")
+
+[<Test>]
+let ``patchFile fuzzy result records applied line`` () =
+    let context = TestContext("intro\nhello\nworld\n")
+    let patch = "--- a/test.txt\n+++ b/test.txt\n@@ -1,2 +1,2 @@\n hello\n-world\n+there\n"
+    let cmd = patchCommandWithFuzzy patch None None (Some true) (Some 2)
+
+    match patchFile cmd context with
+    | Ok result -> result.Diagnostics.Head.AppliedStartLine |> shouldEqual (Some 2)
+    | Error error -> Assert.Fail($"Expected successful fuzzy patch, got {error}")
+
+
+[<Test>]
+let ``patchFile rejects binary-looking content`` () =
+    let context = TestContext("hello\u0000world\n")
+    let patch = "--- a/test.txt\n+++ b/test.txt\n@@ -1,1 +1,1 @@\n-hello\u0000world\n+hello there\n"
+    let cmd = patchCommand patch None None None
+
+    match patchFile cmd context with
+    | Error(ValidationError message) ->
+        message.Contains("binary files") |> shouldEqual true
         context.WriteCount |> shouldEqual 0
     | other -> Assert.Fail($"Expected ValidationError, got {other}")

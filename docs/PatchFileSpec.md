@@ -1,5 +1,17 @@
 # PatchFile Improvement Spec
 
+## Implementation Status
+
+- Protocol fields and structured `PatchFileResult`: implemented.
+- Dry-run validation: implemented.
+- Strict-mode diagnostics: implemented.
+- Optional fuzzy hunk matching: implemented.
+- CRLF line-ending preservation: covered by tests.
+- Binary-looking files containing NUL bytes are rejected before patch parsing.
+- Structured diagnostics for failed patches remain limited by the current error channel; failures are returned as validation messages.
+
+---
+
 ## Purpose
 
 Improve `PatchFile` so agents can make focused, reviewable edits without falling back to ad-hoc text replacement scripts.
@@ -355,7 +367,7 @@ Recommended agent flow:
 2. Should failed patch diagnostics be represented as an `AgentError` case instead of a validation string?
 3. Should fuzzy matching be enabled by default with a tiny window, or always require opt-in?
 4. Should patch parsing support file creation and deletion?
-5. Should binary files be explicitly rejected before patch parsing?
+5. Should binary files be explicitly rejected before patch parsing? Current first pass rejects NUL-containing content.
 
 ---
 

@@ -95,7 +95,7 @@ let ``listCommands returns protocol 2 capabilities`` () =
 
     match result with
     | Ok commands ->
-        commands.ProtocolVersion |> shouldEqual "2.0"
+        commands.ProtocolVersion |> shouldEqual "2.1"
         commands.Commands |> List.exists (fun c -> c.Name = "PatchFile") |> shouldEqual true
     | Error e -> Assert.Fail($"Expected Ok, but got Error: {EffectError.toString e}")
 
@@ -149,12 +149,19 @@ let ``patchFile should modify specific text`` () =
           FilePath = "readme.md"
           ExpectedHash = None
           Format = PatchFormat.UnifiedDiff
-          Patch = patch }
+          Patch = patch
+          DryRun = None
+          FuzzyContextLines = None
+          ReturnContent = None }
 
     let result = patchFile cmd fakeContext
 
-    result
-    |> shouldEqual (Ok(Content "Project 1 Readme\n# Start Config\nNew Text\n# End Config\n# Section Header\nBody\n# Section Footer\n"))
+    match result with
+    | Ok patchResult ->
+        patchResult.Applied |> shouldEqual true
+        patchResult.HunksApplied |> shouldEqual 1
+        patchResult.ChangedLines |> shouldEqual 2
+    | Error e -> Assert.Fail($"Expected Ok, but got Error: {EffectError.toString e}")
 
 [<Test>]
 let ``searchFiles returns matching project items`` () =

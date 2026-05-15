@@ -39,7 +39,10 @@ let ``grant allows exact command payload`` () =
               FilePath = "readme.md"
               ExpectedHash = None
               Format = PatchFormat.UnifiedDiff
-              Patch = "patch" }
+              Patch = "patch"
+              DryRun = None
+              FuzzyContextLines = None
+              ReturnContent = None }
 
     let request =
         match evaluate command with
@@ -98,7 +101,10 @@ let ``workspace-write mode allows write and patch commands`` () =
               FilePath = "readme.md"
               ExpectedHash = None
               Format = PatchFormat.UnifiedDiff
-              Patch = "patch" }
+              Patch = "patch"
+              DryRun = None
+              FuzzyContextLines = None
+              ReturnContent = None }
 
     evaluateWithMode AllowWorkspaceWrite writeCommand |> shouldEqual (Ok())
     evaluateWithMode AllowWorkspaceWrite patchCommand |> shouldEqual (Ok())

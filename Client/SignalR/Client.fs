@@ -86,7 +86,6 @@ let private dispatch rt command =
     | PatchFileCommand cmd ->
         rt
         |> ProjectBrowser.patchFile cmd
-        |> Result.map unwrapContent
         |> serialize'
     | RunCommandCommand cmd -> rt |> ClientShell.runCommand cmd |> serialize'
     | GetGitStatusCommand cmd -> rt |> ClientShell.getGitStatus cmd |> serialize'

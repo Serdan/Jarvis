@@ -90,12 +90,41 @@ type WriteFileCommand =
       FileWriteMode: FileWriteMode
       ExpectedHash: string option }
 
+[<JsonConverter(typeof<UnionConverter<PatchHunkStatus>>)>]
+type PatchHunkStatus =
+    | AppliedStrict
+    | AppliedWithOffset of offset: int
+    | Failed
+
+type PatchHunkDiagnostic =
+    { HunkIndex: int
+      Status: PatchHunkStatus
+      OriginalStartLine: int option
+      AppliedStartLine: int option
+      Message: string
+      ExpectedContext: string list
+      ActualContext: string list }
+
+type PatchFileResult =
+    { Applied: bool
+      DryRun: bool
+      FilePath: string
+      HunksApplied: int
+      ChangedLines: int
+      BeforeHash: string
+      AfterHash: string option
+      Content: string option
+      Diagnostics: PatchHunkDiagnostic list }
+
 type PatchFileCommand =
     { ProjectName: string
       FilePath: string
       ExpectedHash: string option
       Format: PatchFormat
-      Patch: string }
+      Patch: string
+      DryRun: bool option
+      FuzzyContextLines: int option
+      ReturnContent: bool option }
 
 type RunCommandCommand =
     { ProjectName: string
@@ -219,7 +248,7 @@ type AgentMessage<'a> = { Key: string; Command: 'a }
 type AgentMessage = { Key: string; Command: AgentCommand }
 
 module AgentProtocol =
-    let version = "2.0"
+    let version = "2.1"
 
     let private capability name description permissions mutates requiresConfirmation supportsDryRun =
         { Name = name

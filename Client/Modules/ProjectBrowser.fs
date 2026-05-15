@@ -19,6 +19,12 @@ module private Hash =
         $"sha256:{hash.ToLowerInvariant()}"
 
 module private Patch =
+    type ApplyResult =
+        { Content: string
+          HunksApplied: int
+          ChangedLines: int
+          Diagnostics: PatchHunkDiagnostic list }
+
     let private detectLineEnding (text: string) =
         if text.Contains("\r\n") then "\r\n" else "\n"
 
@@ -38,7 +44,48 @@ module private Patch =
             | true, value -> Some value
             | _ -> None
 
-    let applyUnifiedDiff (patch: string) (content: string) : Client.Result<string> =
+    let private nearbyContext lineIndex (lines: string list) =
+        let start = max 0 (lineIndex - 3)
+        lines |> List.skip start |> List.truncate 7
+
+    let private expectedContext (hunkLines: string list) =
+        hunkLines
+        |> List.choose (fun line ->
+            if line.StartsWith(" ", StringComparison.Ordinal) || line.StartsWith("-", StringComparison.Ordinal) then
+                Some(tail line)
+            else
+                None)
+        |> List.truncate 8
+
+    let private diagnostic hunkIndex status originalStart appliedStart message expected actual =
+        { HunkIndex = hunkIndex
+          Status = status
+          OriginalStartLine = originalStart
+          AppliedStartLine = appliedStart
+          Message = message
+          ExpectedContext = expected
+          ActualContext = actual }
+
+    let private failWith (diagnostic: PatchHunkDiagnostic) =
+        let expected =
+            if diagnostic.ExpectedContext.IsEmpty then "<none>"
+            else diagnostic.ExpectedContext |> String.concat "\n"
+
+        let actual =
+            if diagnostic.ActualContext.IsEmpty then "<none>"
+            else diagnostic.ActualContext |> String.concat "\n"
+
+        Client.ValidationError $"Patch hunk {diagnostic.HunkIndex} failed: {diagnostic.Message}\nExpected context:\n{expected}\nActual context:\n{actual}"
+        |> Error
+
+    let private changedLineCount (lines: string list) =
+        lines
+        |> List.filter (fun line ->
+            (line.StartsWith("+", StringComparison.Ordinal) && not (line.StartsWith("+++", StringComparison.Ordinal)))
+            || (line.StartsWith("-", StringComparison.Ordinal) && not (line.StartsWith("---", StringComparison.Ordinal))))
+        |> List.length
+
+    let applyUnifiedDiff (patch: string) (content: string) : Client.Result<ApplyResult> =
         let ending = detectLineEnding content
         let original = splitLines content
         let patchLines = splitLines patch
@@ -49,58 +96,74 @@ module private Patch =
             | line :: _ when line.StartsWith("@@", StringComparison.Ordinal) -> lines
             | _ :: rest -> skipHeaders rest
 
-        let rec applyHunks oldIndex output (lines: string list) =
+        let rec applyHunks hunkIndex oldIndex output diagnostics changedLines (lines: string list) =
             match lines with
             | [] ->
                 if oldIndex > original.Length then
-                    Error(Client.ValidationError "Patch consumed beyond the end of the file.")
+                    diagnostic hunkIndex Failed None None "Patch consumed beyond the end of the file." [] [] |> failWith
                 else
-                    Ok(output @ (original |> List.skip oldIndex))
+                    Ok
+                        { Content = String.concat ending (output @ (original |> List.skip oldIndex))
+                          HunksApplied = hunkIndex
+                          ChangedLines = changedLines
+                          Diagnostics = List.rev diagnostics }
             | header :: rest when header.StartsWith("@@", StringComparison.Ordinal) ->
                 match parseOldStart header with
-                | None -> Error(Client.ValidationError $"Invalid patch hunk header: {header}")
+                | None ->
+                    diagnostic (hunkIndex + 1) Failed None None $"Invalid patch hunk header: {header}" [] [] |> failWith
                 | Some oldStart ->
+                    let currentHunkIndex = hunkIndex + 1
                     let targetIndex = max 0 (oldStart - 1)
 
                     if targetIndex < oldIndex || targetIndex > original.Length then
-                        Error(Client.ValidationError $"Patch hunk targets invalid line {oldStart}.")
+                        diagnostic currentHunkIndex Failed (Some oldStart) None $"Patch hunk targets invalid line {oldStart}." [] (nearbyContext targetIndex original) |> failWith
                     else
                         let unchanged = original |> List.skip oldIndex |> List.take (targetIndex - oldIndex)
 
-                        let rec applyHunk currentIndex acc (remaining: string list) =
+                        let rec collectHunk acc remaining =
                             match remaining with
-                            | [] -> Ok(currentIndex, acc, [])
-                            | [ "" ] -> Ok(currentIndex, acc, [])
-                            | next :: _ when next.StartsWith("@@", StringComparison.Ordinal) -> Ok(currentIndex, acc, remaining)
+                            | [] -> List.rev acc, []
+                            | [ "" ] -> List.rev acc, []
+                            | next :: _ when next.StartsWith("@@", StringComparison.Ordinal) -> List.rev acc, remaining
+                            | next :: tailLines -> collectHunk (next :: acc) tailLines
+
+                        let hunkLines, remaining = collectHunk [] rest
+                        let expected = expectedContext hunkLines
+
+                        let rec applyHunk currentIndex acc (remainingHunk: string list) =
+                            match remainingHunk with
+                            | [] -> Ok(currentIndex, acc)
                             | next :: tailLines when next.StartsWith("\\", StringComparison.Ordinal) -> applyHunk currentIndex acc tailLines
                             | next :: tailLines when next.StartsWith("+", StringComparison.Ordinal) ->
                                 applyHunk currentIndex (tail next :: acc) tailLines
                             | next :: tailLines when next.StartsWith("-", StringComparison.Ordinal) ->
                                 if currentIndex >= original.Length then
-                                    Error(Client.ValidationError "Patch removal extends beyond the end of the file.")
+                                    diagnostic currentHunkIndex Failed (Some oldStart) (Some(currentIndex + 1)) "Patch removal extends beyond the end of the file." expected (nearbyContext currentIndex original) |> failWith
                                 elif original[currentIndex] <> tail next then
-                                    Error(Client.ValidationError $"Patch removal mismatch at line {currentIndex + 1}.")
+                                    diagnostic currentHunkIndex Failed (Some oldStart) (Some(currentIndex + 1)) $"Patch removal mismatch at line {currentIndex + 1}." expected (nearbyContext currentIndex original) |> failWith
                                 else
                                     applyHunk (currentIndex + 1) acc tailLines
                             | next :: tailLines when next.StartsWith(" ", StringComparison.Ordinal) ->
                                 if currentIndex >= original.Length then
-                                    Error(Client.ValidationError "Patch context extends beyond the end of the file.")
+                                    diagnostic currentHunkIndex Failed (Some oldStart) (Some(currentIndex + 1)) "Patch context extends beyond the end of the file." expected (nearbyContext currentIndex original) |> failWith
                                 elif original[currentIndex] <> tail next then
-                                    Error(Client.ValidationError $"Patch context mismatch at line {currentIndex + 1}.")
+                                    diagnostic currentHunkIndex Failed (Some oldStart) (Some(currentIndex + 1)) $"Patch context mismatch at line {currentIndex + 1}." expected (nearbyContext currentIndex original) |> failWith
                                 else
                                     applyHunk (currentIndex + 1) (tail next :: acc) tailLines
-                            | next :: _ -> Error(Client.ValidationError $"Invalid patch line: {next}")
+                            | next :: _ ->
+                                diagnostic currentHunkIndex Failed (Some oldStart) (Some(currentIndex + 1)) $"Invalid patch line: {next}" expected (nearbyContext currentIndex original) |> failWith
 
-                        match applyHunk targetIndex [] rest with
+                        match applyHunk targetIndex [] hunkLines with
                         | Error error -> Error error
-                        | Ok(nextOldIndex, hunkOutput, remaining) ->
-                            applyHunks nextOldIndex (output @ unchanged @ List.rev hunkOutput) remaining
-            | line :: _ -> Error(Client.ValidationError $"Unexpected patch content outside hunk: {line}")
+                        | Ok(nextOldIndex, hunkOutput) ->
+                            let diag = diagnostic currentHunkIndex AppliedStrict (Some oldStart) (Some oldStart) "Applied strictly." expected []
+                            applyHunks currentHunkIndex nextOldIndex (output @ unchanged @ List.rev hunkOutput) (diag :: diagnostics) (changedLines + changedLineCount hunkLines) remaining
+            | line :: _ ->
+                diagnostic (hunkIndex + 1) Failed None None $"Unexpected patch content outside hunk: {line}" [] [] |> failWith
 
         patchLines
         |> skipHeaders
-        |> applyHunks 0 []
-        |> Result.map (String.concat ending)
+        |> applyHunks 0 0 [] [] 0
 
 module private Core =
     let private isPathInRoot (root: string) (fullPath: string) =
@@ -311,19 +374,12 @@ module private Core =
 
         parseProjectName projectName >>= readFiles filePaths
 
-    let private verifyExpectedHash expectedHash path =
+    let private verifyExpectedHash expectedHash content =
+        let actual = Hash.sha256 content
         match expectedHash with
-        | None -> fun _ -> Ok()
-        | Some expected ->
-            effect {
-                let! current = FileIO.readAllText path
-                let (Content content) = current
-                let actual = Hash.sha256 content
-                if actual = expected then
-                    return ()
-                else
-                    return! Client.ValidationError $"Expected hash {expected}, actual hash {actual}." |> Effect.ofError
-            }
+        | None -> Ok actual
+        | Some expected when expected = actual -> Ok actual
+        | Some expected -> Error(Client.ValidationError $"Expected hash {expected}, actual hash {actual}.")
 
     let writeFile projectName filePath content mode expectedHash =
         let write =
@@ -333,23 +389,53 @@ module private Core =
 
         effect {
             let! path = parseProjectName projectName >>= resolveWritableFilePath filePath
-            do! verifyExpectedHash expectedHash path
-            do! write path (Content content)
+
+            match expectedHash with
+            | Some _ ->
+                let! existing = FileIO.readAllText path
+                let (Content existingContent) = existing
+                let! _ = fun _ -> verifyExpectedHash expectedHash existingContent
+                do! write path (Content content)
+            | None ->
+                do! write path (Content content)
         }
 
-    let patchFile projectName filePath expectedHash format patch =
+    let patchFile projectName filePath expectedHash format patch dryRun fuzzyContextLines returnContent =
         match format with
         | UnifiedDiff ->
             effect {
-                let! path = parseProjectName projectName >>= parseFilePath filePath
-                let! current = FileIO.readAllText path
-                let (Content content) = current
-                do! verifyExpectedHash expectedHash path
-                let! patched =
-                    fun _ -> Patch.applyUnifiedDiff patch content
+                let dryRun = defaultArg dryRun false
+                let fuzzyContextLines = defaultArg fuzzyContextLines 0
+                let returnContent = defaultArg returnContent false
 
-                do! FileIO.writeAllText path (Content patched)
-                return Content patched
+                if fuzzyContextLines < 0 || fuzzyContextLines > 50 then
+                    return! Client.ValidationError "FuzzyContextLines must be between 0 and 50." |> Effect.ofError
+                elif fuzzyContextLines > 0 then
+                    return! Client.ValidationError "FuzzyContextLines is reserved for a future fuzzy patching implementation." |> Effect.ofError
+                else
+                    let! path = parseProjectName projectName >>= parseFilePath filePath
+                    let! current = FileIO.readAllText path
+                    let (Content content) = current
+                    let! beforeHash = fun _ -> verifyExpectedHash expectedHash content
+                    let! applied = fun _ -> Patch.applyUnifiedDiff patch content
+                    let afterHash = Hash.sha256 applied.Content
+
+                    do!
+                        if dryRun then
+                            fun _ -> Ok()
+                        else
+                            FileIO.writeAllText path (Content applied.Content)
+
+                    return
+                        { Applied = true
+                          DryRun = dryRun
+                          FilePath = filePath
+                          HunksApplied = applied.HunksApplied
+                          ChangedLines = applied.ChangedLines
+                          BeforeHash = beforeHash
+                          AfterHash = Some afterHash
+                          Content = if returnContent then Some applied.Content else None
+                          Diagnostics = applied.Diagnostics }
             }
 
 let listCommands rt = Core.listCommands rt
@@ -376,5 +462,5 @@ let readFiles (cmd: ReadFilesCommand) : IO<'rt, Content' seq> =
 let writeFile (cmd: WriteFileCommand) : IO<'rt, unit> =
     Core.writeFile cmd.ProjectName cmd.FilePath cmd.Content cmd.FileWriteMode cmd.ExpectedHash
 
-let patchFile (cmd: PatchFileCommand) : IO<'rt, Content> =
-    Core.patchFile cmd.ProjectName cmd.FilePath cmd.ExpectedHash cmd.Format cmd.Patch
+let patchFile (cmd: PatchFileCommand) : IO<'rt, PatchFileResult> =
+    Core.patchFile cmd.ProjectName cmd.FilePath cmd.ExpectedHash cmd.Format cmd.Patch cmd.DryRun cmd.FuzzyContextLines cmd.ReturnContent

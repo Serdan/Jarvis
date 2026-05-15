@@ -103,7 +103,9 @@ let configureServices (services: IServiceCollection) =
     services
         .AddSignalR()
         .AddJsonProtocol()
-        .AddHubOptions<HubService>(fun x -> x.EnableDetailedErrors <- true)
+        .AddHubOptions<HubService>(fun x ->
+            x.EnableDetailedErrors <- true
+            x.MaximumReceiveMessageSize <- Nullable<int64>(1024L * 1024L))
 
     services
         .AddSingleton<UserService>()

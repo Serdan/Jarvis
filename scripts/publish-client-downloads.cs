@@ -1,6 +1,7 @@
 #!/usr/bin/env dotnet
 
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 
 const string ServerUrl = "https://jarvis2.kehlet.dev/client";
@@ -14,6 +15,7 @@ Directory.CreateDirectory(downloads);
 
 foreach (var rid in rids)
 {
+    var isWin = rid.StartsWith("win", StringComparison.OrdinalIgnoreCase);
     var code = DotNet(
         "scripts/build.cs",
         "publish-client",
@@ -23,10 +25,8 @@ foreach (var rid in rids)
     if (code != 0)
         return code;
 
-    var sourceName = rid.StartsWith("win", StringComparison.OrdinalIgnoreCase) ? "JarvisClient.exe" : "JarvisClient";
-    var targetName = rid.StartsWith("win", StringComparison.OrdinalIgnoreCase)
-        ? $"JarvisClient-{rid}.exe"
-        : $"JarvisClient-{rid}";
+    var sourceName = isWin ? "JarvisClient.exe" : "JarvisClient";
+    var targetName = isWin ? $"JarvisClient-{rid}.exe" : $"JarvisClient-{rid}";
 
     var source = Path.Combine(root, "artifacts", "client", rid, sourceName);
     var target = Path.Combine(downloads, targetName);
@@ -39,8 +39,10 @@ foreach (var rid in rids)
 
     File.Copy(source, target, overwrite: true);
 
-    if (!rid.StartsWith("win", StringComparison.OrdinalIgnoreCase))
+    if (!isWin && !RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+    {
         File.SetUnixFileMode(target, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute | UnixFileMode.GroupRead | UnixFileMode.GroupExecute | UnixFileMode.OtherRead | UnixFileMode.OtherExecute);
+    }
 }
 
 WriteChecksums(downloads);

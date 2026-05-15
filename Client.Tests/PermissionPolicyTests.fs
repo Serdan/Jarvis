@@ -200,3 +200,108 @@ let ``trust-except-run-command mode allows other mutating commands`` () =
     evaluateWithMode TrustExceptRunCommand commitCommand |> shouldEqual (Ok())
     evaluateWithMode TrustExceptRunCommand startJobCommand |> shouldEqual (Ok())
     evaluateWithMode TrustExceptRunCommand cancelJobCommand |> shouldEqual (Ok())
+
+
+[<Test>]
+let ``permission mode parse accepts aliases`` () =
+    PermissionMode.parse null |> shouldEqual (Ok Confirm)
+    PermissionMode.parse "" |> shouldEqual (Ok Confirm)
+    PermissionMode.parse "default" |> shouldEqual (Ok Confirm)
+    PermissionMode.parse "workspace-write" |> shouldEqual (Ok AllowWorkspaceWrite)
+    PermissionMode.parse "write" |> shouldEqual (Ok AllowWorkspaceWrite)
+    PermissionMode.parse "trust-except-run-command" |> shouldEqual (Ok TrustExceptRunCommand)
+    PermissionMode.parse "trust-no-run" |> shouldEqual (Ok TrustExceptRunCommand)
+    PermissionMode.parse "trust-session" |> shouldEqual (Ok TrustSession)
+    PermissionMode.parse "trusted" |> shouldEqual (Ok TrustSession)
+
+[<Test>]
+let ``permission mode parse rejects unknown values`` () =
+    match PermissionMode.parse "YOLO" with
+    | Error message -> message.Contains("Unknown permission mode") |> shouldEqual true
+    | other -> Assert.Fail($"Expected Error, got {other}")
+
+[<Test>]
+let ``authorizeWithMode allow once does not create grant`` () =
+    task {
+        let command =
+            RunCommandCommand
+                { ProjectName = "Project1"
+                  Executable = "dotnet"
+                  Args = [ "test" ]
+                  WorkingDirectory = None
+                  TimeoutSeconds = Some 60
+                  MaxOutputBytes = Some 4096 }
+
+        let mutable prompts = 0
+        let prompt _ _ =
+            task {
+                prompts <- prompts + 1
+                return AllowOnce
+            }
+
+        let! first = authorizeWithMode Confirm prompt command
+        let! second = authorizeWithMode Confirm prompt command
+
+        first |> shouldEqual (Ok())
+        second |> shouldEqual (Ok())
+        prompts |> shouldEqual 2
+    }
+
+[<Test>]
+let ``authorizeWithMode allow exact for session creates grant`` () =
+    task {
+        let command =
+            RunCommandCommand
+                { ProjectName = "Project1"
+                  Executable = "dotnet"
+                  Args = [ "test" ]
+                  WorkingDirectory = None
+                  TimeoutSeconds = Some 60
+                  MaxOutputBytes = Some 4096 }
+
+        let mutable prompts = 0
+        let prompt _ _ =
+            task {
+                prompts <- prompts + 1
+                return AllowExactForSession
+            }
+
+        let! first = authorizeWithMode Confirm prompt command
+        let! second = authorizeWithMode Confirm prompt command
+
+        first |> shouldEqual (Ok())
+        second |> shouldEqual (Ok())
+        prompts |> shouldEqual 1
+    }
+
+[<Test>]
+let ``authorizeWithMode deny returns permission denied`` () =
+    task {
+        let command =
+            GitCommitCommand
+                { ProjectName = "Project1"
+                  Message = "Test commit"
+                  Body = None
+                  Paths = [ "readme.md" ]
+                  AllowEmpty = false }
+
+        let prompt _ _ = task { return (Client.PermissionApproval.Deny) }
+        let! result = authorizeWithMode Confirm prompt command
+
+        match result with
+        | Error(Client.PermissionDenied message) -> message.Contains("Commit") |> shouldEqual true
+        | other -> Assert.Fail($"Expected PermissionDenied, got {other}")
+    }
+
+[<Test>]
+let ``trust-session mode allows run command`` () =
+    let command =
+        RunCommandCommand
+            { ProjectName = "Project1"
+              Executable = "dotnet"
+              Args = [ "test" ]
+              WorkingDirectory = None
+              TimeoutSeconds = Some 60
+              MaxOutputBytes = Some 4096 }
+
+    evaluateWithMode TrustSession command |> shouldEqual (Ok())

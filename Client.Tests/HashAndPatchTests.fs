@@ -243,3 +243,105 @@ let ``patchFile rejects binary-looking content`` () =
         message.Contains("binary files") |> shouldEqual true
         context.WriteCount |> shouldEqual 0
     | other -> Assert.Fail($"Expected ValidationError, got {other}")
+
+
+[<Test>]
+let ``patchFile multiple hunks are atomic when later hunk fails`` () =
+    let initial = "alpha\none\nbeta\ntwo\n"
+    let context = TestContext(initial)
+    let patch = "--- a/test.txt\n+++ b/test.txt\n@@ -1,2 +1,2 @@\n alpha\n-one\n+ONE\n@@ -3,2 +3,2 @@\n beta\n-missing\n+TWO\n"
+    let cmd = patchCommand patch None None None
+
+    match patchFile cmd context with
+    | Error(ValidationError message) ->
+        message.Contains("Patch hunk 2 failed") |> shouldEqual true
+        context.Content |> shouldEqual initial
+        context.WriteCount |> shouldEqual 0
+    | other -> Assert.Fail($"Expected ValidationError, got {other}")
+
+[<Test>]
+let ``patchFile applies multiple hunks`` () =
+    let context = TestContext("alpha\none\nbeta\ntwo\n")
+    let patch = "--- a/test.txt\n+++ b/test.txt\n@@ -1,2 +1,2 @@\n alpha\n-one\n+ONE\n@@ -3,2 +3,2 @@\n beta\n-two\n+TWO\n"
+    let cmd = patchCommand patch None None (Some true)
+
+    match patchFile cmd context with
+    | Ok result ->
+        result.Content |> shouldEqual (Some "alpha\nONE\nbeta\nTWO\n")
+        result.HunksApplied |> shouldEqual 2
+        result.ChangedLines |> shouldEqual 4
+        context.WriteCount |> shouldEqual 1
+    | Error error -> Assert.Fail($"Expected successful multi-hunk patch, got {error}")
+
+[<Test>]
+let ``patchFile rejects negative fuzzy context lines`` () =
+    let context = TestContext()
+    let patch = "--- a/test.txt\n+++ b/test.txt\n@@ -1,2 +1,2 @@\n hello\n-world\n+there\n"
+    let cmd = patchCommandWithFuzzy patch None None None (Some -1)
+
+    match patchFile cmd context with
+    | Error(ValidationError message) ->
+        message.Contains("FuzzyContextLines") |> shouldEqual true
+        context.WriteCount |> shouldEqual 0
+    | other -> Assert.Fail($"Expected ValidationError, got {other}")
+
+[<Test>]
+let ``patchFile rejects excessive fuzzy context lines`` () =
+    let context = TestContext()
+    let patch = "--- a/test.txt\n+++ b/test.txt\n@@ -1,2 +1,2 @@\n hello\n-world\n+there\n"
+    let cmd = patchCommandWithFuzzy patch None None None (Some 51)
+
+    match patchFile cmd context with
+    | Error(ValidationError message) ->
+        message.Contains("FuzzyContextLines") |> shouldEqual true
+        context.WriteCount |> shouldEqual 0
+    | other -> Assert.Fail($"Expected ValidationError, got {other}")
+
+[<Test>]
+let ``patchFile rejects malformed hunk header`` () =
+    let context = TestContext()
+    let patch = "--- a/test.txt\n+++ b/test.txt\n@@ nope @@\n hello\n-world\n+there\n"
+    let cmd = patchCommand patch None None None
+
+    match patchFile cmd context with
+    | Error(ValidationError message) ->
+        message.Contains("Invalid patch hunk header") |> shouldEqual true
+        context.WriteCount |> shouldEqual 0
+    | other -> Assert.Fail($"Expected ValidationError, got {other}")
+
+[<Test>]
+let ``patchFile rejects invalid patch line`` () =
+    let context = TestContext()
+    let patch = "--- a/test.txt\n+++ b/test.txt\n@@ -1,2 +1,2 @@\n hello\n?bad\n"
+    let cmd = patchCommand patch None None None
+
+    match patchFile cmd context with
+    | Error(ValidationError message) ->
+        message.Contains("Invalid patch line") |> shouldEqual true
+        context.WriteCount |> shouldEqual 0
+    | other -> Assert.Fail($"Expected ValidationError, got {other}")
+
+[<Test>]
+let ``patchFile return content false omits content on write`` () =
+    let context = TestContext()
+    let patch = "--- a/test.txt\n+++ b/test.txt\n@@ -1,2 +1,2 @@\n hello\n-world\n+there\n"
+    let cmd = patchCommand patch None None (Some false)
+
+    match patchFile cmd context with
+    | Ok result ->
+        result.Content |> shouldEqual None
+        context.Content |> shouldEqual "hello\nthere\n"
+    | Error error -> Assert.Fail($"Expected successful patch, got {error}")
+
+[<Test>]
+let ``patchFile accepts matching expected hash`` () =
+    let context = TestContext()
+    let expectedHash = Some "sha256:4a1e67f2fe1d1cc7b31d0ca2ec441da4778203a036a77da10344c85e24ff0f92"
+    let patch = "--- a/test.txt\n+++ b/test.txt\n@@ -1,2 +1,2 @@\n hello\n-world\n+there\n"
+    let cmd = patchCommand patch expectedHash None (Some true)
+
+    match patchFile cmd context with
+    | Ok result ->
+        result.BeforeHash |> shouldEqual expectedHash.Value
+        result.Content |> shouldEqual (Some "hello\nthere\n")
+    | Error error -> Assert.Fail($"Expected successful patch, got {error}")

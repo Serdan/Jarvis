@@ -99,6 +99,19 @@ dotnet scripts/build.cs publish-server \
 
 Server outputs are written to `artifacts/server/<rid>/` by default. The server executable is named `JarvisServer` (`JarvisServer.exe` on Windows).
 
+### Server authentication
+
+The server reads settings from environment variables prefixed with `Jarvis`.
+
+- `JarvisApiKey` authenticates the legacy `/agent` API through `X-Api-Key`.
+- `JarvisMcpApiKey` authenticates `/mcp` through `Authorization: Bearer <token>`.
+
+Generate a dedicated MCP token with:
+
+```bash
+openssl rand -base64 48
+```
+
 Publish the Jarvis 2 linux server and client:
 
 ```bash

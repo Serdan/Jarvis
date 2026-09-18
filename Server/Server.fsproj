@@ -13,6 +13,7 @@
         <Compile Include="Services\HubService.fs"/>
         <Compile Include="Services\ClientService.fs"/>
         <Compile Include="JarvisOptions.fs"/>
+        <Compile Include="McpTools.fs"/>
         <Compile Include="Endpoints.fs"/>
         <Compile Include="Program.fs"/>
     </ItemGroup>
@@ -20,6 +21,7 @@
     <ItemGroup>
         <PackageReference Update="FSharp.Core" Version="10.1.203"/>
         <PackageReference Include="Giraffe" Version="7.0.2"/>
+        <PackageReference Include="ModelContextProtocol.AspNetCore" Version="1.4.1"/>
     </ItemGroup>
 
     <ItemGroup>

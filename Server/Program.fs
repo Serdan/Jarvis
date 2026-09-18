@@ -2,7 +2,9 @@
 
 open System
 open System.Globalization
+open System.Security.Cryptography
 open System.Threading.RateLimiting
+open System.Text
 open System.Text.Json
 open System.Threading.Tasks
 open Common
@@ -17,6 +19,7 @@ open Microsoft.Extensions.Hosting
 open Microsoft.Extensions.Logging
 open Microsoft.Extensions.Options
 open Microsoft.Extensions.Primitives
+open ModelContextProtocol.Server
 open Server
 open Server.Services
 
@@ -38,6 +41,25 @@ let validateApiKey (ctx: HttpContext) =
     | None -> false
 
 let requiresApiKey: HttpHandler = authorizeRequest validateApiKey accessDenied
+
+let private fixedTimeEquals (expected: string) (provided: string) =
+    if String.IsNullOrEmpty(expected) || String.IsNullOrEmpty(provided) then
+        false
+    else
+        let expectedBytes = Encoding.UTF8.GetBytes(expected)
+        let providedBytes = Encoding.UTF8.GetBytes(provided)
+        CryptographicOperations.FixedTimeEquals(expectedBytes, providedBytes)
+
+let validateMcpApiKey (ctx: HttpContext) =
+    let authorization = ctx.Request.Headers.Authorization.ToString()
+    let bearerPrefix = "Bearer "
+
+    if authorization.StartsWith(bearerPrefix, StringComparison.OrdinalIgnoreCase) then
+        let provided = authorization.Substring(bearerPrefix.Length).Trim()
+        let options = ctx.RequestServices.GetRequiredService<IOptionsSnapshot<JarvisOptions>>()
+        fixedTimeEquals options.Value.McpApiKey provided
+    else
+        false
 
 let private jsonOptions =
     JsonSerializerOptions(JsonSerializerDefaults.Web)
@@ -82,12 +104,31 @@ let configureApp (appBuilder: WebApplication) =
     appBuilder.UseGiraffeErrorHandler(errorHandler) |> ignore
     appBuilder.UseRouting() |> ignore
 
+    appBuilder.UseWhen(
+        (fun ctx -> ctx.Request.Path.StartsWithSegments(PathString("/mcp"))),
+        (fun branch ->
+            branch.Use(
+                Func<HttpContext, RequestDelegate, Task>(fun ctx next ->
+                    task {
+                        if validateMcpApiKey ctx then
+                            do! next.Invoke(ctx)
+                        else
+                            ctx.Response.StatusCode <- StatusCodes.Status401Unauthorized
+                            ctx.Response.Headers.WWWAuthenticate <- StringValues("Bearer")
+                            do! ctx.Response.WriteAsync("Unauthorized")
+                    }))
+            |> ignore)
+    )
+    |> ignore
+
     appBuilder
         .MapHub<HubService>("/client")
         .RequireRateLimiting(rateLimiterPolicy)
     |> ignore
 
     appBuilder.MapGet("/", Func<string>(fun () -> "the future is tomorrow")) |> ignore
+
+    appBuilder.MapMcp("/mcp") |> ignore
 
     appBuilder.Map(
         "/agent",
@@ -99,6 +140,12 @@ let configureApp (appBuilder: WebApplication) =
 
 let configureServices (services: IServiceCollection) =
     services.AddRouting().AddGiraffe()
+
+    services
+        .AddMcpServer()
+        .WithHttpTransport(fun options -> options.Stateless <- true)
+        .WithTools<JarvisMcpTools>()
+    |> ignore
 
     services
         .AddSignalR()

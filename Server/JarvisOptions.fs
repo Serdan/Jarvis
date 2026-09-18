@@ -1,4 +1,6 @@
-﻿namespace Server
+namespace Server
 
 [<CLIMutable>]
-type JarvisOptions = { ApiKey: string }
+type JarvisOptions =
+    { ApiKey: string
+      McpApiKey: string }

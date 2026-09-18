@@ -32,20 +32,29 @@ let private parseArgs args =
 
     loop "" (Environment.GetEnvironmentVariable "JARVIS_PERMISSION_MODE") (args |> Array.toList)
 
-let connect (tui: ConsoleTui) (connection: HubConnection) key =
+let register (tui: ConsoleTui) (connection: HubConnection) key =
+    task {
+        let! result = connection.invokeAsync("Connect", key)
+
+        match result with
+        | Ok _ ->
+            tui.Log "Connected and registered."
+            return true
+        | Error err ->
+            tui.Log $"Connection registration failed: {err.Message}. Retrying..."
+            return false
+    }
+
+let connect (tui: ConsoleTui) (connection: HubConnection) =
     task {
         tui.Log $"Connecting to {BuildInfo.ServerUrl}..."
         let! startResult = connection.startAsync()
 
         match startResult with
+        | Ok _ -> return true
         | Error err ->
             tui.Log $"Connection start failed: {err.Message}. Retrying..."
-        | Ok _ ->
-            let! result = connection.invokeAsync("Connect", key)
-
-            match result with
-            | Ok _ -> tui.Log "Connected."
-            | Error err -> tui.Log $"Connection registration failed: {err.Message}. Retrying..."
+            return false
     }
 
 [<EntryPoint>]
@@ -83,9 +92,8 @@ let main args =
         use cts = new CancellationTokenSource()
         let inputLoop = tui.RunInputLoop(cts.Token)
         let key = RandomNumberGenerator.GetBytes 18 |> Convert.ToBase64String
-
-        tui.SetKey key
-        tui.Log "Provide this key to the agent."
+        let mutable registered = false
+        let mutable announced = false
 
         Console.CancelKeyPress.AddHandler(ConsoleCancelEventHandler(fun _ args ->
             args.Cancel <- true
@@ -95,7 +103,21 @@ let main args =
 
         while not tui.ShouldQuit do
             if connection.State = HubConnectionState.Disconnected then
-                do! connect tui connection key
+                registered <- false
+                let! connected = connect tui connection
+
+                if connected then
+                    let! isRegistered = register tui connection key
+                    registered <- isRegistered
+
+            elif connection.State = HubConnectionState.Connected && not registered then
+                let! isRegistered = register tui connection key
+                registered <- isRegistered
+
+            if registered && not announced then
+                tui.SetKey key
+                tui.Log "Provide this key to the agent."
+                announced <- true
 
             do! Task.Delay 1000
 

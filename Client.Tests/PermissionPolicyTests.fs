@@ -1,6 +1,7 @@
 module PermissionPolicyTests
 
 open Client
+open Client.Effect
 open Client.PermissionPolicy
 open Common
 open NUnit.Framework
@@ -13,6 +14,11 @@ let setup () = clearGrants ()
 let ``read only commands are allowed`` () =
     let command = ReadFileCommand { ProjectName = "Project1"; FilePath = "readme.md" }
     evaluate command |> shouldEqual (Ok())
+
+[<Test>]
+let ``effect errors map to protocol errors`` () =
+    EffectError.toAgentError (Client.ValidationError "bad input")
+    |> shouldEqual (AgentError.ValidationFailed "bad input")
 
 [<Test>]
 let ``mutating commands require confirmation`` () =
@@ -157,7 +163,7 @@ let ``trust-except-run-command mode confirms run command`` () =
     | other -> Assert.Fail($"Expected ConfirmationRequired, got {other}")
 
 [<Test>]
-let ``trust-except-run-command mode allows other mutating commands`` () =
+let ``trust-except-run-command mode allows non-process mutating commands`` () =
     let writeCommand =
         WriteFileCommand
             { ProjectName = "Project1"
@@ -185,6 +191,15 @@ let ``trust-except-run-command mode allows other mutating commands`` () =
               Paths = [ "readme.md" ]
               AllowEmpty = false }
 
+    let cancelJobCommand = CancelJobCommand { JobId = "job-1" }
+
+    evaluateWithMode TrustExceptRunCommand writeCommand |> shouldEqual (Ok())
+    evaluateWithMode TrustExceptRunCommand patchCommand |> shouldEqual (Ok())
+    evaluateWithMode TrustExceptRunCommand commitCommand |> shouldEqual (Ok())
+    evaluateWithMode TrustExceptRunCommand cancelJobCommand |> shouldEqual (Ok())
+
+[<Test>]
+let ``trust-except-run-command mode confirms start job`` () =
     let startJobCommand =
         StartJobCommand
             { ProjectName = "Project1"
@@ -193,13 +208,11 @@ let ``trust-except-run-command mode allows other mutating commands`` () =
               WorkingDirectory = None
               MaxOutputBytes = Some 4096 }
 
-    let cancelJobCommand = CancelJobCommand { JobId = "job-1" }
-
-    evaluateWithMode TrustExceptRunCommand writeCommand |> shouldEqual (Ok())
-    evaluateWithMode TrustExceptRunCommand patchCommand |> shouldEqual (Ok())
-    evaluateWithMode TrustExceptRunCommand commitCommand |> shouldEqual (Ok())
-    evaluateWithMode TrustExceptRunCommand startJobCommand |> shouldEqual (Ok())
-    evaluateWithMode TrustExceptRunCommand cancelJobCommand |> shouldEqual (Ok())
+    match evaluateWithMode TrustExceptRunCommand startJobCommand with
+    | Error(Client.ConfirmationRequired request) ->
+        request.CommandName |> shouldEqual "StartJob"
+        request.Permissions |> shouldEqual [ ProcessExecution ]
+    | other -> Assert.Fail($"Expected ConfirmationRequired, got {other}")
 
 
 [<Test>]

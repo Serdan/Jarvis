@@ -223,6 +223,10 @@ type AgentError =
     | ExecutionFailed of string
     | OutputTruncated of string
 
+type AgentCommandResponse =
+    { Result: string option
+      Error: AgentError option }
+
 [<JsonConverter(typeof<UnionConverter<AgentCommand>>)>]
 type AgentCommand =
     | ListCommandsCommand
@@ -271,13 +275,13 @@ module AgentProtocol =
           capability "SearchText" "Searches project file contents." [ ReadOnly ] false false false
           capability "ReadFile" "Reads one file." [ ReadOnly ] false false false
           capability "ReadFiles" "Reads multiple files." [ ReadOnly ] false false false
-          capability "WriteFile" "Writes or appends one file." [ WorkspaceWrite ] true true true
+          capability "WriteFile" "Writes or appends one file." [ WorkspaceWrite ] true true false
           capability "PatchFile" "Applies an atomic unified diff to one file." [ WorkspaceWrite ] true true true
-          capability "RunCommand" "Runs a bounded local process." [ ProcessExecution ] true true true
+          capability "RunCommand" "Runs a bounded local process." [ ProcessExecution ] true true false
           capability "GetGitStatus" "Reads git status." [ ReadOnly ] false false false
           capability "GetGitDiff" "Reads git diff." [ ReadOnly ] false false false
-          capability "GitCommit" "Creates a local git commit." [ VersionControlWrite ] true true true
-          capability "StartJob" "Starts a long-running process." [ ProcessExecution ] true true true
+          capability "GitCommit" "Creates a local git commit." [ VersionControlWrite ] true true false
+          capability "StartJob" "Starts a long-running process." [ ProcessExecution ] true true false
           capability "ListJobs" "Lists known jobs." [ ReadOnly ] false false false
           capability "GetJobResult" "Reads buffered job output." [ ReadOnly ] false false false
           capability "CancelJob" "Cancels a running job." [ ProcessExecution ] true true false ]

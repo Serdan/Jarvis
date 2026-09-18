@@ -100,6 +100,7 @@ let private modeAllows mode command =
     match mode, command with
     | TrustSession, _ -> true
     | TrustExceptRunCommand, RunCommandCommand _ -> false
+    | TrustExceptRunCommand, StartJobCommand _ -> false
     | TrustExceptRunCommand, _ -> true
     | AllowWorkspaceWrite, WriteFileCommand _
     | AllowWorkspaceWrite, PatchFileCommand _ -> true

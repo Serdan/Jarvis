@@ -1,6 +1,7 @@
 namespace Server.Services
 
 open System.Threading.Tasks
+open Common
 open Common.SignalR
 open Microsoft.AspNetCore.SignalR
 
@@ -15,8 +16,8 @@ type HubService(users: UserService, tracker: ClientResponseTracker) =
         users.Add(userId, this.Context.ConnectionId)
         Task.CompletedTask
 
-    member this.SendClientResponse(correlationId: string, result: string) =
-        tracker.Complete(correlationId, result)
+    member this.SendClientResponse(correlationId: string, response: AgentCommandResponse) =
+        tracker.Complete(correlationId, response)
         Task.CompletedTask
 
     interface IHubService with

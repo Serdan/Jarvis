@@ -32,6 +32,23 @@ module private Core =
         else
             Ok executable
 
+    let private takeUtf8Prefix maxBytes (value: string) =
+        let output = Text.StringBuilder()
+        let mutable bytes = 0
+        let mutable accepting = true
+
+        for rune in value.EnumerateRunes() do
+            if accepting then
+                let runeBytes = rune.Utf8SequenceLength
+
+                if bytes + runeBytes <= maxBytes then
+                    output.Append(rune.ToString()) |> ignore
+                    bytes <- bytes + runeBytes
+                else
+                    accepting <- false
+
+        output.ToString()
+
     let private truncate maxBytes (value: string) =
         if String.IsNullOrEmpty value then
             value, false
@@ -41,8 +58,7 @@ module private Core =
             if bytes <= maxBytes then
                 value, false
             else
-                let maxChars = min value.Length maxBytes
-                value.Substring(0, maxChars), true
+                takeUtf8Prefix maxBytes value, true
 
     let private runProcess workingDirectory executable args timeoutSeconds maxOutputBytes : Client.Result<RunCommandResult> =
         try
@@ -150,6 +166,20 @@ module private Core =
                     else
                         git cmd.ProjectName ([ "add"; "--" ] @ safePaths) None |>> Some
 
+                let! stagedResult =
+                    if safePaths.IsEmpty then
+                        git cmd.ProjectName [ "diff"; "--cached"; "--quiet"; "--" ] None |>> Some
+                    else
+                        fun _ -> Ok None
+
+                do!
+                    match stagedResult with
+                    | Some result when result.ExitCode = 1 ->
+                        Client.ValidationError "Cannot create an empty commit while staged changes already exist." |> Effect.ofError
+                    | Some result when result.ExitCode <> 0 ->
+                        Client.GenericError result.StdErr |> Effect.ofError
+                    | _ -> fun _ -> Ok()
+
                 match addResult with
                 | Some result when result.ExitCode <> 0 ->
                     return! Client.GenericError result.StdErr |> Effect.ofError
@@ -163,7 +193,11 @@ module private Core =
                           | Some body when not (String.IsNullOrWhiteSpace body) ->
                               yield "-m"
                               yield body
-                          | _ -> () ]
+                          | _ -> ()
+                          if not safePaths.IsEmpty then
+                              yield "--only"
+                              yield "--"
+                              yield! safePaths ]
 
                     let! commitResult = git cmd.ProjectName commitArgs None
 

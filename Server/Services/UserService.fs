@@ -1,6 +1,7 @@
-﻿namespace Server.Services
+namespace Server.Services
 
 open System.Collections.Concurrent
+open System.Collections.Generic
 
 module ConcurrentDictionary =
     let inline tryRemove (key: 'a) (dictionary: ConcurrentDictionary<'a, _>) =
@@ -11,7 +12,9 @@ module ConcurrentDictionary =
     let removeValues (value: 'b) (dictionary: ConcurrentDictionary<'a, 'b>) =
         dictionary
         |> Seq.filter (fun kvp -> value = kvp.Value)
-        |> Seq.iter (fun kvp -> tryRemove kvp.Key dictionary |> ignore)
+        |> Seq.iter (fun kvp ->
+            (dictionary :> ICollection<KeyValuePair<'a, 'b>>).Remove(KeyValuePair(kvp.Key, kvp.Value))
+            |> ignore)
 
     let inline tryGetValue key (dictionary: ConcurrentDictionary<_, _>) =
         match dictionary.TryGetValue(key) with

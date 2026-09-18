@@ -25,7 +25,6 @@
 - **Client/Modules/JobManager.fs** - Long-running local job management.
 - **Client/Modules/ClientShell.fs** - Bounded process execution and git command support.
 - **Server/Services/ClientService.fs** - Server-side command forwarding and client response tracking.
+- **Server/McpTools.fs** - MCP tool surface backed by the shared Jarvis command protocol.
 - **readme.md** - Project overview and build/publish usage.
-- **todo.md** - Pending tasks and development roadmap.
-- **ProcessTracker.md** - Tracks current refactor goals, subtasks, and verification steps.
-- **actions-schema** / **openai_tools.json** - Tool/action schema artifacts for external integration.
+- **actions-schema** - Legacy HTTP Actions schema for external integrations.

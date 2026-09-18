@@ -96,7 +96,15 @@ let ``listCommands returns protocol 2 capabilities`` () =
     match result with
     | Ok commands ->
         commands.ProtocolVersion |> shouldEqual "2.1"
-        commands.Commands |> List.exists (fun c -> c.Name = "PatchFile") |> shouldEqual true
+        let capability name =
+            commands.Commands
+            |> List.find (fun command -> command.Name = name)
+
+        capability "PatchFile" |> _.SupportsDryRun |> shouldEqual true
+        capability "WriteFile" |> _.SupportsDryRun |> shouldEqual false
+        capability "RunCommand" |> _.SupportsDryRun |> shouldEqual false
+        capability "GitCommit" |> _.SupportsDryRun |> shouldEqual false
+        capability "StartJob" |> _.SupportsDryRun |> shouldEqual false
     | Error e -> Assert.Fail($"Expected Ok, but got Error: {EffectError.toString e}")
 
 [<Test>]
@@ -189,6 +197,32 @@ let ``searchText returns matching files`` () =
 
     let result = searchText cmd fakeContext
     result |> shouldEqual (Ok [ "readme.md"; Path.Combine("src", "deep.md") ])
+
+[<Test>]
+let ``searchText respects include globs`` () =
+    let cmd =
+        { ProjectName = "Project1"
+          Query = "Old Text"
+          FolderPath = None
+          IncludeGlobs = [ "src/**" ]
+          ExcludeGlobs = []
+          MaxResults = Some 10 }
+
+    searchText cmd fakeContext
+    |> shouldEqual (Ok [ Path.Combine("src", "deep.md") ])
+
+[<Test>]
+let ``searchText respects exclude globs`` () =
+    let cmd =
+        { ProjectName = "Project1"
+          Query = "Old Text"
+          FolderPath = None
+          IncludeGlobs = []
+          ExcludeGlobs = [ "src/**" ]
+          MaxResults = Some 10 }
+
+    searchText cmd fakeContext
+    |> shouldEqual (Ok [ "readme.md" ])
 
 [<Test>]
 let ``searchFiles recursively returns nested project items`` () =

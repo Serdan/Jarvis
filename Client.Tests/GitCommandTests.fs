@@ -34,6 +34,11 @@ let expectGitSuccess context args =
     | Ok result when result.ExitCode = 0 -> ()
     | other -> Assert.Fail($"Expected git success for {args}, got {other}")
 
+let gitOutput context args =
+    match runCommand (git "Project1" args) context with
+    | Ok result when result.ExitCode = 0 -> result.StdOut.Trim()
+    | other -> failwith $"Expected git success for {args}, got {other}"
+
 let initRepo context =
     expectGitSuccess context [ "init" ]
     expectGitSuccess context [ "config"; "user.name"; "Jarvis Test" ]
@@ -99,5 +104,80 @@ let ``gitCommit stages selected path and returns hash`` () =
         | Ok result ->
             result.CommitHash.Length |> shouldEqual 40
         | Error error -> Assert.Fail($"Expected GitCommit Ok, got {error}")
+    finally
+        Directory.Delete(root, true)
+
+[<Test>]
+let ``gitCommit leaves unrelated staged changes out of commit`` () =
+    let root, project = createTempProject ()
+    try
+        let context = TestContext root
+        initRepo context
+
+        let selected = Path.Combine(project, "selected.txt")
+        let unrelated = Path.Combine(project, "unrelated.txt")
+        File.WriteAllText(selected, "initial selected\n")
+        File.WriteAllText(unrelated, "initial unrelated\n")
+        expectGitSuccess context [ "add"; "--"; "selected.txt"; "unrelated.txt" ]
+        expectGitSuccess context [ "commit"; "-m"; "Initial" ]
+
+        File.WriteAllText(selected, "changed selected\n")
+        File.WriteAllText(unrelated, "changed unrelated\n")
+        expectGitSuccess context [ "add"; "--"; "unrelated.txt" ]
+
+        let cmd =
+            { ProjectName = "Project1"
+              Message = "Commit selected"
+              Body = None
+              Paths = [ "selected.txt" ]
+              AllowEmpty = false }
+
+        match gitCommit cmd context with
+        | Ok _ -> ()
+        | Error error -> Assert.Fail($"Expected GitCommit Ok, got {error}")
+
+        let committedPaths =
+            gitOutput context [ "show"; "--format="; "--name-only"; "HEAD" ]
+            |> _.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+            |> Array.toList
+
+        committedPaths |> shouldContain "selected.txt"
+        committedPaths |> shouldNotContain "unrelated.txt"
+
+        let stagedPaths =
+            gitOutput context [ "diff"; "--cached"; "--name-only" ]
+            |> _.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+            |> Array.toList
+
+        stagedPaths |> shouldContain "unrelated.txt"
+    finally
+        Directory.Delete(root, true)
+
+[<Test>]
+let ``empty gitCommit refuses unrelated staged changes`` () =
+    let root, project = createTempProject ()
+    try
+        let context = TestContext root
+        initRepo context
+
+        let file = Path.Combine(project, "staged.txt")
+        File.WriteAllText(file, "initial\n")
+        expectGitSuccess context [ "add"; "--"; "staged.txt" ]
+        expectGitSuccess context [ "commit"; "-m"; "Initial" ]
+
+        File.WriteAllText(file, "changed\n")
+        expectGitSuccess context [ "add"; "--"; "staged.txt" ]
+
+        let cmd =
+            { ProjectName = "Project1"
+              Message = "Empty"
+              Body = None
+              Paths = []
+              AllowEmpty = true }
+
+        match gitCommit cmd context with
+        | Error(Client.ValidationError message) ->
+            message.Contains("staged changes") |> shouldEqual true
+        | other -> Assert.Fail($"Expected ValidationError, got {other}")
     finally
         Directory.Delete(root, true)

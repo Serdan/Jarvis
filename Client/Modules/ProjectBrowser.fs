@@ -4,6 +4,7 @@ open System
 open System.IO
 open System.Security.Cryptography
 open System.Text
+open System.Text.RegularExpressions
 open Common
 open Microsoft.FSharp.Core
 open Client.IO
@@ -385,10 +386,57 @@ module private Core =
     let readFile projectName filePath =
         parseProjectName projectName >>= parseFilePath filePath >>= FileIO.readAllText
 
-    let searchText projectName folderPath (query: string) maxResults =
+    let private compileGlob (glob: string) =
+        let normalized = glob.Replace('\\', '/')
+        let matchFileNameOnly = not (normalized.Contains('/'))
+        let pattern = StringBuilder("^")
+        let mutable index = 0
+
+        while index < normalized.Length do
+            match normalized[index] with
+            | '*' when index + 1 < normalized.Length && normalized[index + 1] = '*' ->
+                if index + 2 < normalized.Length && normalized[index + 2] = '/' then
+                    pattern.Append("(?:.*/)?") |> ignore
+                    index <- index + 3
+                else
+                    pattern.Append(".*") |> ignore
+                    index <- index + 2
+            | '*' ->
+                pattern.Append("[^/]*") |> ignore
+                index <- index + 1
+            | '?' ->
+                pattern.Append("[^/]") |> ignore
+                index <- index + 1
+            | character ->
+                pattern.Append(Regex.Escape(string character)) |> ignore
+                index <- index + 1
+
+        pattern.Append("$") |> ignore
+
+        let options =
+            if OperatingSystem.IsWindows() then RegexOptions.IgnoreCase
+            else RegexOptions.None
+
+        let regex = Regex(pattern.ToString(), options)
+
+        fun (path: string) ->
+            let normalizedPath = path.Replace('\\', '/')
+            let candidate =
+                if matchFileNameOnly then Path.GetFileName normalizedPath
+                else normalizedPath
+            regex.IsMatch candidate
+
+    let searchText projectName folderPath (query: string) includeGlobs excludeGlobs maxResults =
+        let includeMatchers = includeGlobs |> List.map compileGlob
+        let excludeMatchers = excludeGlobs |> List.map compileGlob
+
+        let shouldSearch path =
+            (includeMatchers.IsEmpty || includeMatchers |> List.exists (fun matches -> matches path))
+            && not (excludeMatchers |> List.exists (fun matches -> matches path))
+
         let searchFile projectName item =
             match item with
-            | ProjectFile(path, _, _, _) ->
+            | ProjectFile(path, _, _, _) when shouldSearch path ->
                 fun rt ->
                     match readFile projectName path rt with
                     | Ok(Content content) when content.Contains(query, StringComparison.OrdinalIgnoreCase) -> Ok(Some path)
@@ -503,7 +551,7 @@ let searchFiles (cmd: SearchFilesCommand) : IO<'rt, ProjectItemKind list> =
     Core.searchFiles cmd.ProjectName cmd.FolderPath cmd.Query cmd.MaxResults
 
 let searchText (cmd: SearchTextCommand) : IO<'rt, string list> =
-    Core.searchText cmd.ProjectName cmd.FolderPath cmd.Query cmd.MaxResults
+    Core.searchText cmd.ProjectName cmd.FolderPath cmd.Query cmd.IncludeGlobs cmd.ExcludeGlobs cmd.MaxResults
 
 let readFile (cmd: ReadFileCommand) : IO<'rt, Content> =
     Core.readFile cmd.ProjectName cmd.FilePath

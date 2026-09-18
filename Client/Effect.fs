@@ -18,6 +18,18 @@ module EffectError =
             let errorList = errors |> List.map toString |> String.concat "\n"
             $"AggregatedErrors:\n{errorList}"
 
+    let toAgentError error =
+        match error with
+        | ExceptionError exn -> Common.AgentError.ExecutionFailed exn.Message
+        | GenericError message -> Common.AgentError.ExecutionFailed message
+        | ValidationError message -> Common.AgentError.ValidationFailed message
+        | ContextError message -> Common.AgentError.ExecutionFailed message
+        | NotFoundError resource -> Common.AgentError.NotFound resource
+        | PermissionDenied resource -> Common.AgentError.PermissionDenied resource
+        | ConfirmationRequired request -> Common.AgentError.ConfirmationRequired request
+        | AggregatedErrors errors ->
+            errors |> List.map toString |> String.concat "\n" |> Common.AgentError.ExecutionFailed
+
 type IO<'runtime, 'a> = IO<'runtime, 'a, EffectError>
 
 module Effect =

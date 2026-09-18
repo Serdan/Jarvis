@@ -173,14 +173,27 @@ let configureServices (services: IServiceCollection) =
 
                 ValueTask.CompletedTask)
 
-        options.AddFixedWindowLimiter(
+        options.AddPolicy(
             rateLimiterPolicy,
-            fun opt ->
-                opt.PermitLimit <- 3
-                opt.Window <- TimeSpan.FromSeconds(10L)
-                opt.QueueProcessingOrder <- QueueProcessingOrder.OldestFirst
-                opt.QueueLimit <- 1
+            fun context ->
+                let partitionKey =
+                    match context.Connection.RemoteIpAddress with
+                    | null -> "unknown"
+                    | address -> address.ToString()
+
+                RateLimitPartition.GetFixedWindowLimiter(
+                    partitionKey,
+                    fun _ ->
+                        let opt = FixedWindowRateLimiterOptions()
+                        opt.PermitLimit <- 30
+                        opt.Window <- TimeSpan.FromSeconds(10L)
+                        opt.QueueProcessingOrder <- QueueProcessingOrder.OldestFirst
+                        opt.QueueLimit <- 5
+                        opt.AutoReplenishment <- true
+                        opt
+                )
         )
+        |> ignore
 
         ())
 
@@ -192,8 +205,6 @@ builder.Services.Configure<JarvisOptions>(builder.Configuration)
 configureServices builder.Services
 
 let app = builder.Build()
-
-app.UseRateLimiter()
 
 if app.Environment.IsDevelopment() then
     app.UseDeveloperExceptionPage()
@@ -210,6 +221,7 @@ else
 
     ()
 
+app.UseRateLimiter()
 
 configureApp app
 app.Run()

@@ -5,6 +5,7 @@ open System.IO
 open Client
 open Client.ClientShell
 open Client.IO
+open Client.ProjectPaths
 open Client.JobManager
 open Common
 open NUnit.Framework
@@ -68,3 +69,30 @@ let ``gitCommit rejects option-like path`` () =
         | other -> Assert.Fail($"Expected ValidationError, got {other}")
     finally
         Directory.Delete(root, true)
+
+[<Test>]
+let ``project paths reject symbolic link escapes`` () =
+    let root = createTempProject ()
+    let outside = Path.Combine(Path.GetTempPath(), "jarvis-outside-" + Guid.NewGuid().ToString("N"))
+    Directory.CreateDirectory(outside) |> ignore
+    File.WriteAllText(Path.Combine(outside, "secret.txt"), "outside")
+
+    try
+        let link = Path.Combine(root, "Project1", "outside-link")
+
+        try
+            Directory.CreateSymbolicLink(link, outside) |> ignore
+        with
+        | :? UnauthorizedAccessException ->
+            Assert.Ignore("Symbolic links are not available in this test environment.")
+        | :? PlatformNotSupportedException ->
+            Assert.Ignore("Symbolic links are not supported on this platform.")
+
+        let context = TestContext root
+
+        match resolveProjectFile "Project1" (Path.Combine("outside-link", "secret.txt")) context with
+        | Error(Client.PermissionDenied _) -> ()
+        | other -> Assert.Fail($"Expected PermissionDenied, got {other}")
+    finally
+        if Directory.Exists root then Directory.Delete(root, true)
+        if Directory.Exists outside then Directory.Delete(outside, true)

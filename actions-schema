@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Jarvis 2 Actions
-  version: 2.0.0
+  version: 2.1.0
   description: Project-local command surface for Jarvis 2.
 
 servers:
@@ -380,18 +380,22 @@ components:
 
   schemas:
     AnyResult:
-      description: Jarvis returns the serialized client result or error.
-      oneOf:
-        - type: string
-        - type: object
-          properties:
-            result:
-              description: Command result payload.
-            error:
-              description: Command error payload.
+      description: Structured Jarvis command response. Exactly one of result or error is normally non-null.
+      type: object
+      required: [result, error]
+      additionalProperties: false
+      properties:
+        result:
+          type:
+            - string
+            - "null"
+          description: Serialized command result payload.
+        error:
+          type:
+            - object
+            - "null"
+          description: Structured AgentError payload.
           additionalProperties: true
-        - type: array
-          items: {}
 
     EmptyCommand:
       type: object
@@ -644,6 +648,23 @@ components:
         patch:
           type: string
           description: Unified diff applying to exactly filePath.
+        dryRun:
+          type:
+            - boolean
+            - "null"
+          description: Validate and calculate the patch without writing.
+        fuzzyContextLines:
+          type:
+            - integer
+            - "null"
+          minimum: 0
+          maximum: 50
+          description: Nearby lines to search when strict hunk placement fails.
+        returnContent:
+          type:
+            - boolean
+            - "null"
+          description: Include the patched content in the result.
 
     RunCommandMessage:
       type: object

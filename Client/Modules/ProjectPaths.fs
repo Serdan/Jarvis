@@ -22,13 +22,45 @@ let isPathInRoot (root: string) (fullPath: string) =
     normalizedPath.Equals(normalizedRoot, comparison)
     || normalizedPath.StartsWith(normalizedRoot + "/", comparison)
 
+let private ensureNoLinksInPath (root: string) (fullPath: string) =
+    let relative = Path.GetRelativePath(root, fullPath)
+    let parts =
+        relative.Split(
+            [| Path.DirectorySeparatorChar; Path.AltDirectorySeparatorChar |],
+            StringSplitOptions.RemoveEmptyEntries
+        )
+
+    let rec loop current index =
+        if index >= parts.Length then
+            Ok()
+        else
+            let candidate = Path.Combine(current, parts[index])
+
+            let linkCheck =
+                try
+                    let attributes = File.GetAttributes candidate
+                    Ok(attributes.HasFlag FileAttributes.ReparsePoint)
+                with
+                | :? FileNotFoundException
+                | :? DirectoryNotFoundException -> Ok false
+                | ex -> Error(ExceptionError ex)
+
+            match linkCheck with
+            | Error error -> Error error
+            | Ok true -> Error(PermissionDenied $"Symbolic links are not allowed in project paths: {candidate}")
+            | Ok false -> loop candidate (index + 1)
+
+    loop root 0
+
 let resolveWorkspacePath (parts: string seq) : IO<'rt, string> =
     effect {
         let! (ProjectDirectory workspaceRoot) = ProjectIO.root
         let! fullPath = parts |> Path.combineAll |> Path.combine workspaceRoot |> FileIO.getFullPath
 
         match fullPath |> isPathInRoot workspaceRoot with
-        | true -> return fullPath
+        | true ->
+            do! fun _ -> ensureNoLinksInPath workspaceRoot fullPath
+            return fullPath
         | false -> return! Client.PermissionDenied "Path is outside workspace root." |> Effect.ofError
     }
 
@@ -41,7 +73,9 @@ let resolveProjectPath projectName relativePath : IO<'rt, string> =
         let! fullPath = [ relativePath ] |> Path.combineAll |> Path.combine projectRoot |> FileIO.getFullPath
 
         match fullPath |> isPathInRoot projectRoot with
-        | true -> return fullPath
+        | true ->
+            do! fun _ -> ensureNoLinksInPath projectRoot fullPath
+            return fullPath
         | false -> return! Client.PermissionDenied "Path is outside project root." |> Effect.ofError
     }
 

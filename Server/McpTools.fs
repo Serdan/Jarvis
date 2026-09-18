@@ -17,6 +17,14 @@ module private McpToolHelpers =
     let optionOfNullable (value: Nullable<int>) =
         if value.HasValue then Some value.Value else None
 
+    let optionOfNullableBool (value: Nullable<bool>) =
+        if value.HasValue then Some value.Value else None
+
+    let parseFileWriteMode (value: string) =
+        if String.Equals(value, "Append", StringComparison.OrdinalIgnoreCase) then Append
+        elif String.Equals(value, "Write", StringComparison.OrdinalIgnoreCase) then Write
+        else invalidArg "fileWriteMode" $"Unknown file write mode: {value}"
+
 [<McpServerToolType>]
 type JarvisMcpTools =
     [<McpServerTool; Description("List the commands supported by the connected Jarvis client.")>]
@@ -63,7 +71,7 @@ type JarvisMcpTools =
 
     [<McpServerTool; Description("Write or append to a project file. Requires approval in the local Jarvis client.")>]
     static member WriteFile(key: string, projectName: string, filePath: string, content: string, fileWriteMode: string, expectedHash: string, client: ClientService) =
-        let mode = if String.Equals(fileWriteMode, "Append", StringComparison.OrdinalIgnoreCase) then Append else Write
+        let mode = McpToolHelpers.parseFileWriteMode fileWriteMode
         McpToolHelpers.send client key (WriteFileCommand {
             ProjectName = projectName
             FilePath = filePath
@@ -72,16 +80,16 @@ type JarvisMcpTools =
             ExpectedHash = McpToolHelpers.optionOfString expectedHash })
 
     [<McpServerTool; Description("Apply an atomic unified diff patch to one project file. Requires approval in the local Jarvis client.")>]
-    static member PatchFile(key: string, projectName: string, filePath: string, patch: string, expectedHash: string, dryRun: Nullable<bool>, client: ClientService) =
+    static member PatchFile(key: string, projectName: string, filePath: string, patch: string, expectedHash: string, dryRun: Nullable<bool>, fuzzyContextLines: Nullable<int>, returnContent: Nullable<bool>, client: ClientService) =
         McpToolHelpers.send client key (PatchFileCommand {
             ProjectName = projectName
             FilePath = filePath
             ExpectedHash = McpToolHelpers.optionOfString expectedHash
             Format = UnifiedDiff
             Patch = patch
-            DryRun = if dryRun.HasValue then Some dryRun.Value else None
-            FuzzyContextLines = None
-            ReturnContent = None })
+            DryRun = McpToolHelpers.optionOfNullableBool dryRun
+            FuzzyContextLines = McpToolHelpers.optionOfNullable fuzzyContextLines
+            ReturnContent = McpToolHelpers.optionOfNullableBool returnContent })
 
     [<McpServerTool; Description("Run a bounded local command in a project. Requires approval in the local Jarvis client.")>]
     static member RunCommand(key: string, projectName: string, executable: string, args: string array, workingDirectory: string, timeoutSeconds: Nullable<int>, maxOutputBytes: Nullable<int>, client: ClientService) =

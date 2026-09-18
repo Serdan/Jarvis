@@ -23,12 +23,32 @@ type private JobRecord =
       StdOut: StringBuilder
       StdErr: StringBuilder
       MaxOutputBytes: int
+      mutable StdOutBytes: int
+      mutable StdErrBytes: int
+      mutable StdOutTruncated: bool
+      mutable StdErrTruncated: bool
+      mutable CancellationRequested: bool
       mutable Status: JobStatus
       mutable CompletedAt: DateTimeOffset option }
 
 module private Core =
     let private defaultMaxOutputBytes = 64 * 1024
+    let private maxCompletedJobs = 100
     let private jobs = ConcurrentDictionary<string, JobRecord>()
+
+    let private pruneCompletedJobs () =
+        jobs.Values
+        |> Seq.filter (fun job -> job.Status <> Running)
+        |> Seq.sortByDescending (fun job -> job.StartedAt)
+        |> Seq.indexed
+        |> Seq.choose (fun (index, job) ->
+            if index >= maxCompletedJobs then Some job else None)
+        |> Seq.iter (fun job ->
+            match jobs.TryRemove job.JobId with
+            | true, removed ->
+                try removed.Process.Dispose()
+                with _ -> ()
+            | false, _ -> ())
 
     let private deniedExecutables =
         set [ "bash"; "sh"; "zsh"; "fish"; "cmd"; "cmd.exe"; "powershell"; "powershell.exe"; "pwsh"; "pwsh.exe" ]
@@ -46,13 +66,33 @@ module private Core =
         | None -> ProjectPaths.resolveProjectRoot projectName
         | Some relativePath -> ProjectPaths.resolveProjectFolder projectName relativePath
 
+    let private takeUtf8Prefix maxBytes (value: string) =
+        let output = StringBuilder()
+        let mutable bytes = 0
+        let mutable accepting = true
+
+        for rune in value.EnumerateRunes() do
+            if accepting then
+                let runeBytes = rune.Utf8SequenceLength
+
+                if bytes + runeBytes <= maxBytes then
+                    output.Append(rune.ToString()) |> ignore
+                    bytes <- bytes + runeBytes
+                else
+                    accepting <- false
+
+        output.ToString(), bytes
+
     let private truncate maxBytes (value: string) =
         if String.IsNullOrEmpty value then
             value, false
         else
             let bytes = Encoding.UTF8.GetByteCount value
-            if bytes <= maxBytes then value, false
-            else value.Substring(0, min value.Length maxBytes), true
+            if bytes <= maxBytes then
+                value, false
+            else
+                let prefix, _ = takeUtf8Prefix maxBytes value
+                prefix, true
 
     let private sliceFrom offset maxBytes (builder: StringBuilder) =
         let text = lock builder (fun () -> builder.ToString())
@@ -61,9 +101,16 @@ module private Core =
         let value, truncated = truncate maxBytes value
         value, offset + value.Length, truncated
 
-    let private appendLine (builder: StringBuilder) (data: string) =
-        if not (isNull data) then
-            lock builder (fun () -> builder.AppendLine data |> ignore)
+    let private appendLine maxBytes currentBytes (builder: StringBuilder) (data: string) =
+        if isNull data then
+            currentBytes, false
+        else
+            lock builder (fun () ->
+                let value = data + Environment.NewLine
+                let remaining = max 0 (maxBytes - currentBytes)
+                let fragment, addedBytes = takeUtf8Prefix remaining value
+                builder.Append(fragment) |> ignore
+                currentBytes + addedBytes, addedBytes < Encoding.UTF8.GetByteCount value)
 
     let private startProcess projectName workingDirectory executable args maxOutputBytes : Client.Result<StartJobResult> =
         try
@@ -93,29 +140,52 @@ module private Core =
                       StdOut = StringBuilder()
                       StdErr = StringBuilder()
                       MaxOutputBytes = maxOutputBytes
+                      StdOutBytes = 0
+                      StdErrBytes = 0
+                      StdOutTruncated = false
+                      StdErrTruncated = false
+                      CancellationRequested = false
                       Status = Running
                       CompletedAt = None }
 
-                proc.OutputDataReceived.Add(fun event -> appendLine job.StdOut event.Data)
-                proc.ErrorDataReceived.Add(fun event -> appendLine job.StdErr event.Data)
+                proc.OutputDataReceived.Add(fun event ->
+                    let bytes, truncated = appendLine job.MaxOutputBytes job.StdOutBytes job.StdOut event.Data
+                    job.StdOutBytes <- bytes
+                    job.StdOutTruncated <- job.StdOutTruncated || truncated)
+
+                proc.ErrorDataReceived.Add(fun event ->
+                    let bytes, truncated = appendLine job.MaxOutputBytes job.StdErrBytes job.StdErr event.Data
+                    job.StdErrBytes <- bytes
+                    job.StdErrTruncated <- job.StdErrTruncated || truncated)
+
                 proc.Exited.Add(fun _ ->
-                    if job.Status <> Canceled then
+                    if job.CancellationRequested then
+                        job.Status <- Canceled
+                    else
                         try job.Status <- Completed proc.ExitCode
                         with _ -> job.Status <- FailedToStart "Process exited before an exit code was available."
-                    job.CompletedAt <- Some DateTimeOffset.UtcNow)
+                    job.CompletedAt <- Some DateTimeOffset.UtcNow
+                    pruneCompletedJobs())
 
                 if not (jobs.TryAdd(jobId, job)) then
                     proc.Dispose()
                     Error(Client.ContextError "Failed to register job.")
-                elif not (proc.Start()) then
-                    let mutable removed = Unchecked.defaultof<JobRecord>
-                    jobs.TryRemove(jobId, &removed) |> ignore
-                    proc.Dispose()
-                    Error(Client.ContextError "Failed to start job.")
                 else
-                    proc.BeginOutputReadLine()
-                    proc.BeginErrorReadLine()
-                    Ok { JobId = jobId; StartedAt = job.StartedAt }
+                    try
+                        if not (proc.Start()) then
+                            let mutable removed = Unchecked.defaultof<JobRecord>
+                            jobs.TryRemove(jobId, &removed) |> ignore
+                            proc.Dispose()
+                            Error(Client.ContextError "Failed to start job.")
+                        else
+                            proc.BeginOutputReadLine()
+                            proc.BeginErrorReadLine()
+                            Ok { JobId = jobId; StartedAt = job.StartedAt }
+                    with ex ->
+                        let mutable removed = Unchecked.defaultof<JobRecord>
+                        jobs.TryRemove(jobId, &removed) |> ignore
+                        proc.Dispose()
+                        Error(ExceptionError ex)
         with ex ->
             Error(ExceptionError ex)
 
@@ -166,7 +236,7 @@ module private Core =
                       StdOut = stdout
                       StdErr = stderr
                       OutputOffset = outputOffset
-                      Truncated = stdoutTruncated || stderrTruncated }
+                      Truncated = job.StdOutTruncated || job.StdErrTruncated || stdoutTruncated || stderrTruncated }
 
     let cancelJob (cmd: CancelJobCommand) =
         fun _ ->
@@ -174,12 +244,15 @@ module private Core =
             | false, _ -> Error(NotFoundError $"Unknown job id: {cmd.JobId}")
             | true, job ->
                 if job.Status = Running then
-                    job.Status <- Canceled
-                    job.CompletedAt <- Some DateTimeOffset.UtcNow
+                    job.CancellationRequested <- true
                     try
                         if not job.Process.HasExited then job.Process.Kill(entireProcessTree = true)
+                        job.Status <- Canceled
+                        job.CompletedAt <- Some DateTimeOffset.UtcNow
                         Ok()
-                    with ex -> Error(ExceptionError ex)
+                    with ex ->
+                        job.CancellationRequested <- false
+                        Error(ExceptionError ex)
                 else
                     Ok()
 

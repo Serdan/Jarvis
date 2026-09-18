@@ -8,8 +8,29 @@ open ModelContextProtocol.Server
 open Server.Services
 
 module private McpToolHelpers =
+    let private formatError error =
+        match error with
+        | NotFound message -> $"NotFound: {message}"
+        | PermissionDenied message -> $"PermissionDenied: {message}"
+        | ConfirmationRequired request -> $"ConfirmationRequired: {request.Summary}"
+        | ValidationFailed message -> $"ValidationFailed: {message}"
+        | Conflict message -> $"Conflict: {message}"
+        | ExecutionFailed message -> $"ExecutionFailed: {message}"
+        | OutputTruncated message -> $"OutputTruncated: {message}"
+
     let send (client: ClientService) key command =
-        client.SendCommandToUser({ Key = key; Command = command })
+        task {
+            let! response = client.SendCommandToUser({ Key = key; Command = command })
+
+            match response.Result, response.Error with
+            | Some result, None -> return result
+            | None, Some error ->
+                return raise (InvalidOperationException(formatError error))
+            | Some _, Some error ->
+                return raise (InvalidOperationException($"Invalid Jarvis response: both result and error were set. {formatError error}"))
+            | None, None ->
+                return raise (InvalidOperationException("Invalid Jarvis response: neither result nor error was set."))
+        }
 
     let optionOfString (value: string) =
         if String.IsNullOrWhiteSpace(value) then None else Some value

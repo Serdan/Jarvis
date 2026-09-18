@@ -105,6 +105,8 @@ let ``listCommands returns protocol 2 capabilities`` () =
         capability "RunCommand" |> _.SupportsDryRun |> shouldEqual false
         capability "GitCommit" |> _.SupportsDryRun |> shouldEqual false
         capability "StartJob" |> _.SupportsDryRun |> shouldEqual false
+        capability "ReadFile" |> _.MaxOutputBytes |> shouldEqual (Some AgentProtocol.maxResponseBytes)
+        capability "ReadFiles" |> _.MaxOutputBytes |> shouldEqual (Some AgentProtocol.maxResponseBytes)
     | Error e -> Assert.Fail($"Expected Ok, but got Error: {EffectError.toString e}")
 
 [<Test>]

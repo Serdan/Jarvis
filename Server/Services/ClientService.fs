@@ -41,6 +41,7 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                             { Result = None
                               Error = Some(ExecutionFailed "Timeout. Client didn't respond.") }
                 with ex ->
+                    tracker.Cancel(correlationId)
                     return
                         { Result = None
                           Error = Some(ExecutionFailed ex.Message) }

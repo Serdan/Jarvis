@@ -40,3 +40,10 @@ type ClientResponseTracker() =
             source.Timeout.Dispose()
             source.Completion.TrySetResult result |> ignore
         | _ -> ()
+
+    member this.Cancel(correlationId: string) =
+        match messages.TryRemove(correlationId) with
+        | true, source ->
+            source.Timeout.Dispose()
+            source.Completion.TrySetCanceled() |> ignore
+        | _ -> ()

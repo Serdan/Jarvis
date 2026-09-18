@@ -22,8 +22,6 @@ let private serialize<'a> (value: 'a) =
 
 let private serialize'<'a> = Result.bind serialize<'a> >> ValueTask<_>
 
-let private maxSignalRResponseBytes = 900 * 1024
-
 let private toAgentResponse response =
     match response with
     | Error error ->
@@ -32,12 +30,12 @@ let private toAgentResponse response =
     | Ok (payload: string) ->
         let bytes = Encoding.UTF8.GetByteCount payload
 
-        if bytes <= maxSignalRResponseBytes then
+        if bytes <= AgentProtocol.maxResponseBytes then
             { Result = Some payload
               Error = None }
         else
             { Result = None
-              Error = Some(OutputTruncated $"Command response was {bytes} bytes and exceeds the safe SignalR response size of {maxSignalRResponseBytes} bytes. Narrow the request or read fewer files.") }
+              Error = Some(OutputTruncated $"Command response was {bytes} bytes and exceeds the safe SignalR response size of {AgentProtocol.maxResponseBytes} bytes. Narrow the request or read fewer files.") }
 
 let private unwrapProjectName (ProjectName name) = name
 let private unwrapContent (Content content) = content

@@ -49,16 +49,35 @@ module private Core =
 
         output.ToString()
 
-    let private truncate maxBytes (value: string) =
-        if String.IsNullOrEmpty value then
-            value, false
-        else
-            let bytes = Text.Encoding.UTF8.GetByteCount value
+    let private readBounded maxBytes (reader: StreamReader) =
+        task {
+            let buffer = Array.zeroCreate<char> 4096
+            let output = Text.StringBuilder()
+            let mutable bytes = 0
+            let mutable truncated = false
+            let mutable reading = true
 
-            if bytes <= maxBytes then
-                value, false
-            else
-                takeUtf8Prefix maxBytes value, true
+            while reading do
+                let! count = reader.ReadAsync(buffer, 0, buffer.Length)
+
+                if count = 0 then
+                    reading <- false
+                else
+                    let chunk = String(buffer, 0, count)
+                    let chunkBytes = Text.Encoding.UTF8.GetByteCount chunk
+                    let remaining = max 0 (maxBytes - bytes)
+
+                    if remaining > 0 then
+                        let fragment = takeUtf8Prefix remaining chunk
+                        let addedBytes = Text.Encoding.UTF8.GetByteCount fragment
+                        output.Append(fragment) |> ignore
+                        bytes <- bytes + addedBytes
+                        truncated <- truncated || addedBytes < chunkBytes
+                    else
+                        truncated <- true
+
+            return output.ToString(), truncated
+        }
 
     let private runProcess workingDirectory executable args timeoutSeconds maxOutputBytes : Client.Result<RunCommandResult> =
         try
@@ -79,18 +98,19 @@ module private Core =
                 if not (proc.Start()) then
                     Error(Client.ContextError "Failed to start process.")
                 else
-                    let stdoutTask = proc.StandardOutput.ReadToEndAsync()
-                    let stderrTask = proc.StandardError.ReadToEndAsync()
+                    let stdoutTask = readBounded maxOutputBytes proc.StandardOutput
+                    let stderrTask = readBounded maxOutputBytes proc.StandardError
                     let timeoutMs = timeoutSeconds * 1000
                     let exited = proc.WaitForExit timeoutMs
 
                     if not exited then
-                        try proc.Kill(entireProcessTree = true) with _ -> ()
+                        try
+                            proc.Kill(entireProcessTree = true)
+                            proc.WaitForExit()
+                        with _ -> ()
 
-                    let stdout = stdoutTask.Result
-                    let stderr = stderrTask.Result
-                    let stdout, stdoutTruncated = truncate maxOutputBytes stdout
-                    let stderr, stderrTruncated = truncate maxOutputBytes stderr
+                    let stdout, stdoutTruncated = stdoutTask.Result
+                    let stderr, stderrTruncated = stderrTask.Result
 
                     Ok
                         { ExitCode = if exited then proc.ExitCode else -1

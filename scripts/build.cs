@@ -44,7 +44,7 @@ var outputOption = new Option<string?>("--output")
 
 var rootCommand = new RootCommand("Jarvis build script");
 
-var testCommand = new Command("test", "Run the client test suite.");
+var testCommand = new Command("test", "Run the test suites.");
 testCommand.Options.Add(configurationOption);
 testCommand.SetAction(parseResult =>
 {
@@ -125,7 +125,11 @@ return rootCommand.Parse(args).Invoke();
 
 int Test(string configuration)
 {
-    return DotNet("test", "Client.Tests/Client.Tests.fsproj", "-c", configuration);
+    var clientCode = DotNet("test", "Client.Tests/Client.Tests.fsproj", "-c", configuration);
+    if (clientCode != 0)
+        return clientCode;
+
+    return DotNet("test", "Server.Tests/Server.Tests.fsproj", "-c", configuration);
 }
 
 int Build(string configuration)

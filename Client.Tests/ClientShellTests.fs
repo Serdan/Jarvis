@@ -42,6 +42,31 @@ let ``runCommand executes structured command`` () =
         Directory.Delete(root, true)
 
 [<Test>]
+let ``runCommand bounds retained UTF8 output`` () =
+    let root = createTempProject ()
+    try
+        let project = Path.Combine(root, "Project1")
+        File.WriteAllText(Path.Combine(project, "output.fsx"), "for _ in 1 .. 200 do printf \"æ\"")
+        let context = TestContext root
+        let cmd =
+            { ProjectName = "Project1"
+              Executable = "dotnet"
+              Args = [ "fsi"; "--exec"; "output.fsx" ]
+              WorkingDirectory = None
+              TimeoutSeconds = Some 20
+              MaxOutputBytes = Some 63 }
+
+        match runCommand cmd context with
+        | Ok output ->
+            output.ExitCode |> shouldEqual 0
+            Text.Encoding.UTF8.GetByteCount(output.StdOut) <= 63 |> shouldEqual true
+            Text.Encoding.UTF8.GetByteCount(output.StdErr) <= 63 |> shouldEqual true
+            output.Truncated |> shouldEqual true
+        | Error error -> Assert.Fail($"Expected Ok, got {error}")
+    finally
+        Directory.Delete(root, true)
+
+[<Test>]
 let ``runCommand rejects shell executable`` () =
     let root = createTempProject ()
     try

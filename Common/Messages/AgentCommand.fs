@@ -253,6 +253,7 @@ type AgentMessage = { Key: string; Command: AgentCommand }
 
 module AgentProtocol =
     let version = "2.1"
+    let maxResponseBytes = 900 * 1024
 
     let private capability name description permissions mutates requiresConfirmation supportsDryRun =
         { Name = name
@@ -262,7 +263,7 @@ module AgentProtocol =
           RequiresConfirmation = requiresConfirmation
           SupportsDryRun = supportsDryRun
           MaxInputBytes = None
-          MaxOutputBytes = None
+          MaxOutputBytes = Some maxResponseBytes
           InputSchemaJson = None
           OutputSchemaJson = None }
 

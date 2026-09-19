@@ -41,6 +41,7 @@ type FileOperations =
       ReadLines: FilePath -> int -> int option -> Result<(int * string) list>
       SearchText: FilePath -> string -> int -> Result<(int * int * string) list>
       WriteAllText: FilePath -> Content -> Result<unit>
+      CreateDirectory: FolderPath -> Result<unit>
       parseFile: string -> Result<FilePath>
       CopyFile: FilePath -> FilePath -> bool -> Result<unit>
       AppendAllText: FilePath -> Content -> Result<unit>

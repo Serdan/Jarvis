@@ -75,6 +75,7 @@ let fakeFileOperations =
                 |> Ok
 
       WriteAllText = fun _ _ -> Ok()
+      CreateDirectory = fun _ -> Ok()
 
       parseFile =
         fun path ->
@@ -146,7 +147,7 @@ let ``listCommands returns protocol 2 capabilities`` () =
 
     match result with
     | Ok commands ->
-        commands.ProtocolVersion |> shouldEqual "2.4"
+        commands.ProtocolVersion |> shouldEqual "2.5"
         let capability name =
             commands.Commands
             |> List.find (fun command -> command.Name = name)
@@ -183,7 +184,8 @@ let ``writeFile should write new content to file`` () =
           FilePath = "newfile.md"
           Content = "New content written"
           FileWriteMode = FileWriteMode.Write
-          ExpectedHash = None }
+          ExpectedHash = None
+          CreateParents = None }
 
     let result = writeFile cmd fakeContext
     result |> shouldEqual (Ok())
@@ -195,7 +197,8 @@ let ``appendToFile should add content to existing file`` () =
           FilePath = "todo.md"
           Content = "Appended content"
           FileWriteMode = FileWriteMode.Append
-          ExpectedHash = None }
+          ExpectedHash = None
+          CreateParents = None }
 
     let result = writeFile cmd fakeContext
     result |> shouldEqual (Ok())

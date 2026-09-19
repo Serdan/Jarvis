@@ -569,11 +569,18 @@ module private Core =
         else
             Ok()
 
-    let writeFile projectName filePath content mode expectedHash =
+    let writeFile projectName filePath content mode expectedHash createParents =
         let write =
             match mode with
             | Append -> FileIO.appendAllText
             | Write -> FileIO.writeAllText
+
+        let ensureParent (FilePath fullPath) =
+            effect {
+                if defaultArg createParents false then
+                    let parent = Path.GetDirectoryName(fullPath)
+                    do! FileIO.createDirectory (FolderPath parent)
+            }
 
         effect {
             let! path = parseProjectName projectName >>= resolveWritableFilePath filePath
@@ -583,8 +590,10 @@ module private Core =
                 let! existing = FileIO.readAllText path
                 let (Content existingContent) = existing
                 let! _ = fun _ -> verifyExpectedHash expectedHash existingContent
+                do! ensureParent path
                 do! write path (Content content)
             | None ->
+                do! ensureParent path
                 do! write path (Content content)
         }
 
@@ -647,7 +656,7 @@ let readFiles (cmd: ReadFilesCommand) : IO<'rt, Content' seq> =
     Core.readFiles cmd.ProjectName cmd.FilePaths
 
 let writeFile (cmd: WriteFileCommand) : IO<'rt, unit> =
-    Core.writeFile cmd.ProjectName cmd.FilePath cmd.Content cmd.FileWriteMode cmd.ExpectedHash
+    Core.writeFile cmd.ProjectName cmd.FilePath cmd.Content cmd.FileWriteMode cmd.ExpectedHash cmd.CreateParents
 
 let patchFile (cmd: PatchFileCommand) : IO<'rt, PatchFileResult> =
     Core.patchFile cmd.ProjectName cmd.FilePath cmd.ExpectedHash cmd.Format cmd.Patch cmd.DryRun cmd.FuzzyContextLines cmd.ReturnContent

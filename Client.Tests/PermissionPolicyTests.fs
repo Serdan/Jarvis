@@ -28,7 +28,8 @@ let ``mutating commands require confirmation`` () =
               FilePath = "readme.md"
               Content = "updated"
               FileWriteMode = FileWriteMode.Write
-              ExpectedHash = None }
+              ExpectedHash = None
+              CreateParents = None }
 
     match evaluate command with
     | Error(Client.ConfirmationRequired request) ->
@@ -99,7 +100,8 @@ let ``workspace-write mode allows write and patch commands`` () =
               FilePath = "readme.md"
               Content = "updated"
               FileWriteMode = FileWriteMode.Write
-              ExpectedHash = None }
+              ExpectedHash = None
+              CreateParents = None }
 
     let patchCommand =
         PatchFileCommand
@@ -170,7 +172,8 @@ let ``trust-except-run-command mode allows non-process mutating commands`` () =
               FilePath = "readme.md"
               Content = "updated"
               FileWriteMode = FileWriteMode.Write
-              ExpectedHash = None }
+              ExpectedHash = None
+              CreateParents = None }
 
     let patchCommand =
         PatchFileCommand

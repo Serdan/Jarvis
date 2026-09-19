@@ -189,10 +189,13 @@ type WriteFileCommand =
       FilePath: string
       Content: string
       FileWriteMode: FileWriteMode
-      ExpectedHash: string option }
+      ExpectedHash: string option
+      CreateParents: bool option }
 ```
 
 `WriteFile` may create a new file when `FileWriteMode = Write`. It must still reject paths outside the resolved project root.
+
+`CreateParents` defaults to false. When true, Jarvis creates missing parent directories only after the destination has passed project-root and symlink-safety validation.
 
 `ExpectedHash` provides optimistic concurrency for overwrites and appends. If supplied, the implementation must reject the write when the current file hash does not match. For new files, `ExpectedHash = None` means the file is expected not to exist.
 
@@ -726,7 +729,7 @@ Search commands should support enough include/exclude input to let clients expre
 
 ### Protocol Version
 
-The initial version of this command surface was `2.0`. The current version is `2.4`.
+The initial version of this command surface was `2.0`. The current version is `2.5`.
 
 This is a breaking redesign of the original Jarvis command set. Implementations should not preserve old command names solely for backwards compatibility.
 

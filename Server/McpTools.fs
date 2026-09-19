@@ -99,14 +99,15 @@ type JarvisMcpTools =
         McpToolHelpers.send client key (ReadFilesCommand { ProjectName = projectName; FilePaths = filePaths |> Array.toList })
 
     [<McpServerTool(UseStructuredContent = true); Description("Write or append to a project file. Requires approval in the local Jarvis client.")>]
-    static member WriteFile(key: string, projectName: string, filePath: string, content: string, fileWriteMode: string, expectedHash: string, client: ClientService) =
+    static member WriteFile(key: string, projectName: string, filePath: string, content: string, fileWriteMode: string, expectedHash: string, createParents: Nullable<bool>, client: ClientService) =
         let mode = McpToolHelpers.parseFileWriteMode fileWriteMode
         McpToolHelpers.send client key (WriteFileCommand {
             ProjectName = projectName
             FilePath = filePath
             Content = content
             FileWriteMode = mode
-            ExpectedHash = McpToolHelpers.optionOfString expectedHash })
+            ExpectedHash = McpToolHelpers.optionOfString expectedHash
+            CreateParents = McpToolHelpers.optionOfNullableBool createParents })
 
     [<McpServerTool(UseStructuredContent = true); Description("Apply an atomic unified diff patch to one project file. Requires approval in the local Jarvis client.")>]
     static member PatchFile(key: string, projectName: string, filePath: string, patch: string, expectedHash: string, dryRun: Nullable<bool>, fuzzyContextLines: Nullable<int>, returnContent: Nullable<bool>, client: ClientService) =

@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Jarvis 2 Actions
-  version: 2.4.0
+  version: 2.5.0
   description: Project-local command surface for Jarvis 2.
 
 servers:
@@ -636,6 +636,12 @@ components:
             - string
             - "null"
           description: Optional sha256:<lowercase-hex> optimistic concurrency hash.
+        createParents:
+          type:
+            - boolean
+            - "null"
+          default: false
+          description: Create missing parent directories inside the resolved project root before writing.
 
     PatchFileMessage:
       type: object

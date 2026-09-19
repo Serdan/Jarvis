@@ -14,4 +14,5 @@ let readAllText file (rt: #FileIO) = rt.File.ReadAllText file
 let readLines file startLine endLine (rt: #FileIO) = rt.File.ReadLines file startLine endLine
 let searchText file query maxResults (rt: #FileIO) = rt.File.SearchText file query maxResults
 let writeAllText filePath content (rt: #FileIO) = rt.File.WriteAllText filePath content
+let createDirectory folderPath (rt: #FileIO) = rt.File.CreateDirectory folderPath
 let appendAllText file content (rt: #FileIO) = rt.File.AppendAllText file content

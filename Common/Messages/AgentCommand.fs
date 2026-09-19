@@ -97,7 +97,8 @@ type WriteFileCommand =
       FilePath: string
       Content: string
       FileWriteMode: FileWriteMode
-      ExpectedHash: string option }
+      ExpectedHash: string option
+      CreateParents: bool option }
 
 [<JsonConverter(typeof<UnionConverter<PatchHunkStatus>>)>]
 type PatchHunkStatus =
@@ -261,7 +262,7 @@ type AgentMessage<'a> = { Key: string; Command: 'a }
 type AgentMessage = { Key: string; Command: AgentCommand }
 
 module AgentProtocol =
-    let version = "2.4"
+    let version = "2.5"
     let defaultPatchFuzzyContextLines = 3
     let maxResponseBytes = 900 * 1024
 

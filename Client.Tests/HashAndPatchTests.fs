@@ -29,6 +29,7 @@ type TestContext(?initialContent: string) =
                   currentContent <- text
                   writeCount <- writeCount + 1
                   Ok()
+              CreateDirectory = fun _ -> Ok()
               parseFile = fun path -> Ok(FilePath path)
               CopyFile = fun _ _ _ -> Ok()
               AppendAllText = fun _ (Content text) ->
@@ -64,7 +65,8 @@ let ``writeFile rejects mismatched expected hash`` () =
           FilePath = "test.txt"
           Content = "new"
           FileWriteMode = FileWriteMode.Write
-          ExpectedHash = Some "sha256:not-the-right-hash" }
+          ExpectedHash = Some "sha256:not-the-right-hash"
+          CreateParents = None }
 
     match writeFile cmd context with
     | Error(ValidationError message) -> message.Contains("Expected hash") |> shouldEqual true

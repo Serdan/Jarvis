@@ -72,6 +72,13 @@ let searchText (FilePath filePath) (query: string) maxResults =
     with e ->
         e |> ExceptionError |> Error
 
+let createDirectory (FolderPath folderPath) =
+    try
+        Directory.CreateDirectory(folderPath) |> ignore
+        Ok()
+    with e ->
+        e |> ExceptionError |> Error
+
 let writeAllText (FilePath filePath) (Content content) =
     try
         File.WriteAllText(filePath, content) |> Ok
@@ -133,6 +140,7 @@ let impl =
       ReadLines = readLines
       SearchText = searchText
       WriteAllText = writeAllText
+      CreateDirectory = createDirectory
       parseFile = parseFile
       CopyFile = copyFile
       AppendAllText = appendAllText

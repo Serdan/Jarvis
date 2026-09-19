@@ -291,6 +291,74 @@ let ``authorizeWithMode allow exact for session creates grant`` () =
     }
 
 [<Test>]
+let ``authorize executable for session allows changed args in same project`` () =
+    task {
+        clearGrants()
+        let first =
+            RunCommandCommand
+                { ProjectName = "Project1"
+                  Executable = "dotnet"
+                  Args = [ "test" ]
+                  WorkingDirectory = None
+                  TimeoutSeconds = Some 60
+                  MaxOutputBytes = Some 4096 }
+
+        let second =
+            RunCommandCommand
+                { ProjectName = "Project1"
+                  Executable = "dotnet"
+                  Args = [ "build" ]
+                  WorkingDirectory = None
+                  TimeoutSeconds = Some 60
+                  MaxOutputBytes = Some 4096 }
+
+        let prompt _ _ = task { return AllowExecutableForSession }
+        let! approved = authorizeWithMode Confirm prompt first
+
+        approved |> shouldEqual (Ok())
+        evaluate second |> shouldEqual (Ok())
+    }
+
+[<Test>]
+let ``executable session grant is scoped by project and command kind`` () =
+    clearGrants()
+    let run =
+        RunCommandCommand
+            { ProjectName = "Project1"
+              Executable = "dotnet"
+              Args = [ "test" ]
+              WorkingDirectory = None
+              TimeoutSeconds = Some 60
+              MaxOutputBytes = Some 4096 }
+
+    grantExecutable run |> shouldEqual true
+
+    let otherProject =
+        RunCommandCommand
+            { ProjectName = "Project2"
+              Executable = "dotnet"
+              Args = [ "test" ]
+              WorkingDirectory = None
+              TimeoutSeconds = Some 60
+              MaxOutputBytes = Some 4096 }
+
+    let startJob =
+        StartJobCommand
+            { ProjectName = "Project1"
+              Executable = "dotnet"
+              Args = [ "watch" ]
+              WorkingDirectory = None
+              MaxOutputBytes = Some 4096 }
+
+    match evaluate otherProject with
+    | Error(Client.ConfirmationRequired _) -> ()
+    | other -> Assert.Fail($"Expected project-scoped confirmation, got {other}")
+
+    match evaluate startJob with
+    | Error(Client.ConfirmationRequired _) -> ()
+    | other -> Assert.Fail($"Expected command-kind-scoped confirmation, got {other}")
+
+[<Test>]
 let ``authorizeWithMode deny returns permission denied`` () =
     task {
         let command =

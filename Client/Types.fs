@@ -72,6 +72,7 @@ type WebIO =
 type PermissionApproval =
     | AllowOnce
     | AllowExactForSession
+    | AllowExecutableForSession
     | Deny
 
 type PermissionMode =

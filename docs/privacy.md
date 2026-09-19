@@ -49,7 +49,9 @@ The audit log is held in client memory and is not intended to contain full proje
 
 ## User Control and Permissions
 
-Read-only commands can inspect project structure and contents exposed by the selected workspace. Mutating, process-execution, and version-control-write commands require local approval from the user before they run.
+Read-only commands can inspect project structure and contents exposed by the selected workspace. Mutating, process-execution, and version-control-write commands are controlled by the client's local permission policy.
+
+In confirmation mode, users may approve a command once, approve the exact command for the current client session, or approve a specific process executable for the current project and command kind. Executable-scoped grants are explicit user choices; Jarvis does not infer process safety from command arguments.
 
 Users can stop access by closing the local client, quitting the session, or refusing permission prompts.
 

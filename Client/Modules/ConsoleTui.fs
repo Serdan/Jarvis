@@ -40,7 +40,7 @@ type ConsoleTui() =
             Console.WriteLine "Jarvis Client"
             Console.WriteLine "============="
             Console.WriteLine $"Key: {key}"
-            Console.WriteLine "Keys: ↑/↓ select permission, A allow once, S allow exact for session, D deny, Q quit"
+            Console.WriteLine "Keys: ↑/↓ select, A allow once, S allow exact, E allow executable, D deny, Q quit"
             Console.WriteLine ""
             Console.WriteLine "Activity"
             Console.WriteLine "--------"
@@ -141,6 +141,7 @@ type ConsoleTui() =
                                 renderUnsafe())
                         | ConsoleKey.A -> completeSelected AllowOnce
                         | ConsoleKey.S -> completeSelected AllowExactForSession
+                        | ConsoleKey.E -> completeSelected AllowExecutableForSession
                         | ConsoleKey.D -> completeSelected Deny
                         | ConsoleKey.Q -> shouldQuit <- true
                         | _ -> ()

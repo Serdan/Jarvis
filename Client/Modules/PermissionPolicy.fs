@@ -18,6 +18,7 @@ type Grant =
 
 module private Store =
     let grants = ConcurrentDictionary<string, Grant>()
+    let executableGrants = ConcurrentDictionary<string, byte>()
 
 let private hashCommand command =
     let json = JsonSerializer.Serialize command
@@ -26,6 +27,18 @@ let private hashCommand command =
     hash.ToLowerInvariant()
 
 let private readOnly = Ok()
+
+let private executableGrantKey command =
+    let normalizeExecutable (executable: string) =
+        if OperatingSystem.IsWindows() then executable.Trim().ToUpperInvariant()
+        else executable.Trim()
+
+    match command with
+    | RunCommandCommand cmd ->
+        Some $"RunCommand\u0000{cmd.ProjectName}\u0000{normalizeExecutable cmd.Executable}"
+    | StartJobCommand cmd ->
+        Some $"StartJob\u0000{cmd.ProjectName}\u0000{normalizeExecutable cmd.Executable}"
+    | _ -> None
 
 let private request commandName projectName permissions paths executable args impact supportsDryRun =
     { CommandName = commandName
@@ -54,6 +67,18 @@ let grant command request expiresAt =
     Store.grants[grant.CommandHash] <- grant
     grant
 
+let grantExecutable command =
+    match executableGrantKey command with
+    | Some key ->
+        Store.executableGrants[key] <- 0uy
+        true
+    | None -> false
+
+let private hasExecutableGrant command =
+    match executableGrantKey command with
+    | Some key -> Store.executableGrants.ContainsKey key
+    | None -> false
+
 let private hasGrant command =
     let hash = hashCommand command
 
@@ -67,7 +92,9 @@ let private hasGrant command =
             false
         | _ -> true
 
-let clearGrants () = Store.grants.Clear()
+let clearGrants () =
+    Store.grants.Clear()
+    Store.executableGrants.Clear()
 
 let private requiresConfirmation command =
     match command with
@@ -107,7 +134,7 @@ let private modeAllows mode command =
     | _ -> false
 
 let evaluateWithMode mode command =
-    if hasGrant command || modeAllows mode command then
+    if hasGrant command || hasExecutableGrant command || modeAllows mode command then
         Ok()
     else
         requiresConfirmation command
@@ -126,6 +153,11 @@ let authorizeWithMode mode (prompt: AgentCommand -> ConfirmationRequest -> Task<
             | AllowExactForSession ->
                 grant command request None |> ignore
                 return Ok()
+            | AllowExecutableForSession ->
+                if grantExecutable command then
+                    return Ok()
+                else
+                    return Error(PermissionDenied "Executable-scoped approval only applies to RunCommand and StartJob.")
             | Deny -> return Error(PermissionDenied request.Summary)
         | Error error -> return Error error
     }

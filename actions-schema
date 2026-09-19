@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Jarvis 2 Actions
-  version: 2.1.0
+  version: 2.2.0
   description: Project-local command surface for Jarvis 2.
 
 servers:
@@ -568,6 +568,23 @@ components:
         filePath:
           type: string
           description: Project-relative file path.
+        startLine:
+          type:
+            - integer
+            - "null"
+          minimum: 1
+          description: Optional one-based first line to return.
+        endLine:
+          type:
+            - integer
+            - "null"
+          minimum: 1
+          description: Optional one-based inclusive final line to return.
+        includeLineNumbers:
+          type:
+            - boolean
+            - "null"
+          description: Prefix returned lines with their one-based line number and a tab.
 
     ReadFilesMessage:
       type: object

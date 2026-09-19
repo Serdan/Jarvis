@@ -77,7 +77,10 @@ type SearchTextCommand =
 
 type ReadFileCommand =
     { ProjectName: string
-      FilePath: string }
+      FilePath: string
+      StartLine: int option
+      EndLine: int option
+      IncludeLineNumbers: bool option }
 
 type ReadFilesCommand =
     { ProjectName: string
@@ -252,7 +255,7 @@ type AgentMessage<'a> = { Key: string; Command: 'a }
 type AgentMessage = { Key: string; Command: AgentCommand }
 
 module AgentProtocol =
-    let version = "2.1"
+    let version = "2.2"
     let maxResponseBytes = 900 * 1024
 
     let private capability name description permissions mutates requiresConfirmation supportsDryRun =

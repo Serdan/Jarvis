@@ -23,6 +23,25 @@ let fakeFileOperations =
             | "/fake/projects/Project1/src/deep.md" -> Ok(Content "Nested Old Text")
             | _ -> Error(NotFoundError "File not found")
 
+      ReadLines =
+        fun (FilePath filePath) startLine endLine ->
+            let content =
+                match filePath with
+                | "/fake/projects/Project1/readme.md" -> Some readmeContent
+                | "/fake/projects/Project1/todo.md" -> Some todoContent
+                | "/fake/projects/Project1/src/deep.md" -> Some "Nested Old Text"
+                | _ -> None
+
+            match content with
+            | None -> Error(NotFoundError "File not found")
+            | Some content ->
+                content.Replace("\r\n", "\n").Split('\n')
+                |> Seq.mapi (fun index line -> index + 1, line)
+                |> Seq.filter (fun (lineNumber, _) -> lineNumber >= startLine)
+                |> Seq.filter (fun (lineNumber, _) -> endLine |> Option.forall (fun lastLine -> lineNumber <= lastLine))
+                |> Seq.toList
+                |> Ok
+
       WriteAllText = fun _ _ -> Ok()
 
       parseFile =
@@ -95,7 +114,7 @@ let ``listCommands returns protocol 2 capabilities`` () =
 
     match result with
     | Ok commands ->
-        commands.ProtocolVersion |> shouldEqual "2.1"
+        commands.ProtocolVersion |> shouldEqual "2.2"
         let capability name =
             commands.Commands
             |> List.find (fun command -> command.Name = name)
@@ -268,12 +287,59 @@ let ``listDirectory aggregates missing folder errors`` () =
 
 [<Test>]
 let ``readFile returns content`` () =
-    let cmd = { ProjectName = "Project1"; FilePath = "readme.md" }
+    let cmd = { ProjectName = "Project1"; FilePath = "readme.md"; StartLine = None; EndLine = None; IncludeLineNumbers = None }
     readFile cmd fakeContext |> shouldEqual (Ok(Content readmeContent))
 
 [<Test>]
+let ``readFile returns requested line range`` () =
+    let cmd =
+        { ProjectName = "Project1"
+          FilePath = "readme.md"
+          StartLine = Some 2
+          EndLine = Some 4
+          IncludeLineNumbers = None }
+
+    let expected =
+        [ "# Start Config"; "Old Text"; "# End Config" ]
+        |> String.concat System.Environment.NewLine
+        |> Content
+        |> Ok
+
+    readFile cmd fakeContext |> shouldEqual expected
+
+[<Test>]
+let ``readFile can include line numbers`` () =
+    let cmd =
+        { ProjectName = "Project1"
+          FilePath = "readme.md"
+          StartLine = Some 2
+          EndLine = Some 3
+          IncludeLineNumbers = Some true }
+
+    let expected =
+        [ "2\t# Start Config"; "3\tOld Text" ]
+        |> String.concat System.Environment.NewLine
+        |> Content
+        |> Ok
+
+    readFile cmd fakeContext |> shouldEqual expected
+
+[<Test>]
+let ``readFile rejects invalid line range`` () =
+    let cmd =
+        { ProjectName = "Project1"
+          FilePath = "readme.md"
+          StartLine = Some 4
+          EndLine = Some 2
+          IncludeLineNumbers = None }
+
+    match readFile cmd fakeContext with
+    | Error(ValidationError _) -> ()
+    | other -> Assert.Fail($"Expected ValidationError, got {other}")
+
+[<Test>]
 let ``readFile returns file error`` () =
-    let cmd = { ProjectName = "Project1"; FilePath = "missing.md" }
+    let cmd = { ProjectName = "Project1"; FilePath = "missing.md"; StartLine = None; EndLine = None; IncludeLineNumbers = None }
 
     match readFile cmd fakeContext with
     | Error(NotFoundError _) -> ()

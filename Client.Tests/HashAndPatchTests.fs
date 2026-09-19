@@ -23,6 +23,7 @@ type TestContext(?initialContent: string) =
         member _.File =
             { getFullPath = _.Replace('\\', '/') >> Ok
               ReadAllText = fun _ -> Ok(Content currentContent)
+              ReadLines = fun _ _ _ -> Ok []
               WriteAllText = fun _ (Content text) ->
                   currentContent <- text
                   writeCount <- writeCount + 1

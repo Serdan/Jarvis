@@ -1,10 +1,13 @@
 module ServerServiceTests
 
 open System
+open System.Text.Json
 open System.Threading.Tasks
 open Common
+open ModelContextProtocol.Server
 open NUnit.Framework
 open FsUnitTyped
+open Server
 open Server.Services
 
 [<Test>]
@@ -60,3 +63,20 @@ let ``response tracker honors configured timeout`` () =
         with :? TaskCanceledException ->
             ()
     }
+
+[<Test>]
+let ``all Jarvis MCP tools return structured JSON content`` () =
+    let methods =
+        typeof<JarvisMcpTools>.GetMethods()
+        |> Array.choose (fun methodInfo ->
+            match methodInfo.GetCustomAttributes(typeof<McpServerToolAttribute>, false) with
+            | [| :? McpServerToolAttribute as attribute |] -> Some(methodInfo, attribute)
+            | _ -> None)
+
+    methods.Length > 0 |> shouldEqual true
+
+    for methodInfo, attribute in methods do
+        attribute.UseStructuredContent |> shouldEqual true
+        methodInfo.ReturnType.IsGenericType |> shouldEqual true
+        methodInfo.ReturnType.GetGenericTypeDefinition() |> shouldEqual typedefof<Task<_>>
+        methodInfo.ReturnType.GetGenericArguments()[0] |> shouldEqual typeof<JsonElement>

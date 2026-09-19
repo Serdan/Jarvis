@@ -1,4 +1,4 @@
-﻿module Client.IO.FileOperations
+module Client.IO.FileOperations
 
 open System.IO
 open Client
@@ -12,6 +12,21 @@ let getFullPath path =
 let readAllText (FilePath filePath) =
     try
         File.ReadAllText(filePath) |> Content |> Ok
+    with e ->
+        e |> ExceptionError |> Error
+
+let readLines (FilePath filePath) startLine endLine =
+    try
+        File.ReadLines(filePath)
+        |> Seq.indexed
+        |> Seq.skipWhile (fun (index, _) -> index < startLine - 1)
+        |> fun lines ->
+            match endLine with
+            | Some endLine -> lines |> Seq.takeWhile (fun (index, _) -> index < endLine)
+            | None -> lines
+        |> Seq.map (fun (index, line) -> index + 1, line)
+        |> Seq.toList
+        |> Ok
     with e ->
         e |> ExceptionError |> Error
 
@@ -73,6 +88,7 @@ let getFileName (FilePath filePath) = Path.GetFileName filePath
 let impl =
     { getFullPath = getFullPath
       ReadAllText = readAllText
+      ReadLines = readLines
       WriteAllText = writeAllText
       parseFile = parseFile
       CopyFile = copyFile

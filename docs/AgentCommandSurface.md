@@ -145,8 +145,13 @@ Read-only.
 ```fsharp
 type ReadFileCommand =
     { ProjectName: string
-      FilePath: string }
+      FilePath: string
+      StartLine: int option
+      EndLine: int option
+      IncludeLineNumbers: bool option }
 ```
+
+Line ranges are one-based and inclusive. A request without range or numbering options preserves the normal full-file read behavior. When a range or line numbering is requested, the client streams lines and stops after `EndLine` when one is supplied.
 
 ### `ReadFiles`
 
@@ -708,7 +713,7 @@ Search commands should support enough include/exclude input to let clients expre
 
 ### Protocol Version
 
-The initial version of this command surface is `2.0`.
+The initial version of this command surface was `2.0`. The current version is `2.2`.
 
 This is a breaking redesign of the original Jarvis command set. Implementations should not preserve old command names solely for backwards compatibility.
 

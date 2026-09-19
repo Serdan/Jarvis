@@ -12,7 +12,7 @@ let setup () = clearGrants ()
 
 [<Test>]
 let ``read only commands are allowed`` () =
-    let command = ReadFileCommand { ProjectName = "Project1"; FilePath = "readme.md" }
+    let command = ReadFileCommand { ProjectName = "Project1"; FilePath = "readme.md"; StartLine = None; EndLine = None; IncludeLineNumbers = None }
     evaluate command |> shouldEqual (Ok())
 
 [<Test>]

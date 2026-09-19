@@ -386,6 +386,33 @@ module private Core =
     let readFile projectName filePath =
         parseProjectName projectName >>= parseFilePath filePath >>= FileIO.readAllText
 
+    let readFileWithOptions projectName filePath startLine endLine includeLineNumbers =
+        let includeLineNumbers = defaultArg includeLineNumbers false
+
+        match startLine, endLine, includeLineNumbers with
+        | None, None, false -> readFile projectName filePath
+        | _ ->
+            effect {
+                let startLine = defaultArg startLine 1
+
+                if startLine < 1 then
+                    return! Client.ValidationError "StartLine must be greater than zero." |> Effect.ofError
+                elif endLine |> Option.exists (fun value -> value < startLine) then
+                    return! Client.ValidationError "EndLine must be greater than or equal to StartLine." |> Effect.ofError
+                else
+                    let! parsedProject = parseProjectName projectName
+                    let! path = parseFilePath filePath parsedProject
+                    let! lines = FileIO.readLines path startLine endLine
+
+                    let content =
+                        lines
+                        |> List.map (fun (lineNumber, line) ->
+                            if includeLineNumbers then $"{lineNumber}\t{line}" else line)
+                        |> String.concat Environment.NewLine
+
+                    return Content content
+            }
+
     let private compileGlob (glob: string) =
         let normalized = glob.Replace('\\', '/')
         let matchFileNameOnly = not (normalized.Contains('/'))
@@ -591,7 +618,7 @@ let searchText (cmd: SearchTextCommand) : IO<'rt, string list> =
     Core.searchText cmd.ProjectName cmd.FolderPath cmd.Query cmd.IncludeGlobs cmd.ExcludeGlobs cmd.MaxResults
 
 let readFile (cmd: ReadFileCommand) : IO<'rt, Content> =
-    Core.readFile cmd.ProjectName cmd.FilePath
+    Core.readFileWithOptions cmd.ProjectName cmd.FilePath cmd.StartLine cmd.EndLine cmd.IncludeLineNumbers
 
 let readFiles (cmd: ReadFilesCommand) : IO<'rt, Content' seq> =
     Core.readFiles cmd.ProjectName cmd.FilePaths

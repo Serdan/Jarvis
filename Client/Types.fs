@@ -38,6 +38,7 @@ type Result<'a> = Result<'a, EffectError>
 type FileOperations =
     { getFullPath: string -> Result<string>
       ReadAllText: FilePath -> Result<Content>
+      ReadLines: FilePath -> int -> int option -> Result<(int * string) list>
       WriteAllText: FilePath -> Content -> Result<unit>
       parseFile: string -> Result<FilePath>
       CopyFile: FilePath -> FilePath -> bool -> Result<unit>

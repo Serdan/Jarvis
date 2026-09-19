@@ -593,7 +593,7 @@ module private Core =
         | UnifiedDiff ->
             effect {
                 let dryRun = defaultArg dryRun false
-                let fuzzyContextLines = defaultArg fuzzyContextLines 0
+                let fuzzyContextLines = defaultArg fuzzyContextLines AgentProtocol.defaultPatchFuzzyContextLines
                 let returnContent = defaultArg returnContent false
 
                 if fuzzyContextLines < 0 || fuzzyContextLines > 50 then

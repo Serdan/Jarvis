@@ -133,6 +133,32 @@ let ``patchFile context mismatch includes diagnostic context`` () =
 
 
 [<Test>]
+let ``patchFile defaults to a small fuzzy context window`` () =
+    let context = TestContext("intro\nhello\nworld\n")
+    let patch = "--- a/test.txt\n+++ b/test.txt\n@@ -1,2 +1,2 @@\n hello\n-world\n+there\n"
+    let cmd = patchCommand patch None None (Some true)
+
+    match patchFile cmd context with
+    | Ok result ->
+        result.Content |> shouldEqual (Some "intro\nhello\nthere\n")
+        match result.Diagnostics.Head.Status with
+        | AppliedWithOffset offset -> offset |> shouldEqual 1
+        | other -> Assert.Fail($"Expected AppliedWithOffset, got {other}")
+    | Error error -> Assert.Fail($"Expected default fuzzy patch to succeed, got {error}")
+
+[<Test>]
+let ``patchFile fuzzy context zero remains strict only`` () =
+    let context = TestContext("intro\nhello\nworld\n")
+    let patch = "--- a/test.txt\n+++ b/test.txt\n@@ -1,2 +1,2 @@\n hello\n-world\n+there\n"
+    let cmd = patchCommandWithFuzzy patch None None None (Some 0)
+
+    match patchFile cmd context with
+    | Error(ValidationError message) ->
+        message.Contains("mismatch") |> shouldEqual true
+        context.WriteCount |> shouldEqual 0
+    | other -> Assert.Fail($"Expected strict-only ValidationError, got {other}")
+
+[<Test>]
 let ``patchFile fuzzy mode applies hunk shifted down within window`` () =
     let context = TestContext("intro\nhello\nworld\n")
     let patch = "--- a/test.txt\n+++ b/test.txt\n@@ -1,2 +1,2 @@\n hello\n-world\n+there\n"

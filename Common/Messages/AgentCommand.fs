@@ -261,7 +261,8 @@ type AgentMessage<'a> = { Key: string; Command: 'a }
 type AgentMessage = { Key: string; Command: AgentCommand }
 
 module AgentProtocol =
-    let version = "2.3"
+    let version = "2.4"
+    let defaultPatchFuzzyContextLines = 3
     let maxResponseBytes = 900 * 1024
 
     let private capability name description permissions mutates requiresConfirmation supportsDryRun =

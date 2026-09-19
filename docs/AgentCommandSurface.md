@@ -211,8 +211,13 @@ type PatchFileCommand =
       FilePath: string
       ExpectedHash: string option
       Format: PatchFormat
-      Patch: string }
+      Patch: string
+      DryRun: bool option
+      FuzzyContextLines: int option
+      ReturnContent: bool option }
 ```
+
+`FuzzyContextLines` defaults to 3. Strict placement is attempted first; on failure Jarvis searches nearby and applies only a unique context/removal match. Ambiguous matches are rejected. Set it to `Some 0` for strict-only placement.
 
 `PatchFile` should become the preferred edit command. It replaces these older commands:
 
@@ -721,7 +726,7 @@ Search commands should support enough include/exclude input to let clients expre
 
 ### Protocol Version
 
-The initial version of this command surface was `2.0`. The current version is `2.3`.
+The initial version of this command surface was `2.0`. The current version is `2.4`.
 
 This is a breaking redesign of the original Jarvis command set. Implementations should not preserve old command names solely for backwards compatibility.
 

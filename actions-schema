@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Jarvis 2 Actions
-  version: 2.3.0
+  version: 2.4.0
   description: Project-local command surface for Jarvis 2.
 
 servers:
@@ -676,7 +676,8 @@ components:
             - "null"
           minimum: 0
           maximum: 50
-          description: Nearby lines to search when strict hunk placement fails.
+          default: 3
+          description: Nearby lines to search when strict hunk placement fails. Set to 0 for strict-only placement.
         returnContent:
           type:
             - boolean

@@ -41,6 +41,9 @@ module private McpToolHelpers =
     let optionOfNullable (value: Nullable<int>) =
         if value.HasValue then Some value.Value else None
 
+    let optionOfNullableInt64 (value: Nullable<int64>) =
+        if value.HasValue then Some value.Value else None
+
     let optionOfNullableBool (value: Nullable<bool>) =
         if value.HasValue then Some value.Value else None
 
@@ -175,10 +178,10 @@ type JarvisMcpTools =
             IncludeCompleted = includeCompleted })
 
     [<McpServerTool(UseStructuredContent = true); Description("Get buffered output and status for a Jarvis job.")>]
-    static member GetJobResult(key: string, jobId: string, fromOffset: Nullable<int>, client: ClientService) =
+    static member GetJobResult(key: string, jobId: string, afterSequence: Nullable<int64>, client: ClientService) =
         McpToolHelpers.send client key (GetJobResultCommand {
             JobId = jobId
-            FromOffset = McpToolHelpers.optionOfNullable fromOffset })
+            AfterSequence = McpToolHelpers.optionOfNullableInt64 afterSequence })
 
     [<McpServerTool(UseStructuredContent = true); Description("Cancel a running Jarvis job. Requires approval in the local Jarvis client.")>]
     static member CancelJob(key: string, jobId: string, client: ClientService) =

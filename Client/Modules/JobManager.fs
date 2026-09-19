@@ -20,13 +20,12 @@ type private JobRecord =
       WorkingDirectory: string option
       StartedAt: DateTimeOffset
       Process: Process
-      StdOut: StringBuilder
-      StdErr: StringBuilder
+      SyncRoot: obj
+      Events: ResizeArray<JobOutputEvent>
       MaxOutputBytes: int
-      mutable StdOutBytes: int
-      mutable StdErrBytes: int
-      mutable StdOutTruncated: bool
-      mutable StdErrTruncated: bool
+      mutable OutputBytes: int
+      mutable OutputTruncated: bool
+      mutable NextSequence: int64
       mutable CancellationRequested: bool
       mutable Status: JobStatus
       mutable CompletedAt: DateTimeOffset option }
@@ -83,34 +82,23 @@ module private Core =
 
         output.ToString(), bytes
 
-    let private truncate maxBytes (value: string) =
-        if String.IsNullOrEmpty value then
-            value, false
-        else
-            let bytes = Encoding.UTF8.GetByteCount value
-            if bytes <= maxBytes then
-                value, false
-            else
-                let prefix, _ = takeUtf8Prefix maxBytes value
-                prefix, true
-
-    let private sliceFrom offset maxBytes (builder: StringBuilder) =
-        let text = lock builder (fun () -> builder.ToString())
-        let offset = defaultArg offset 0 |> max 0 |> min text.Length
-        let value = text.Substring offset
-        let value, truncated = truncate maxBytes value
-        value, offset + value.Length, truncated
-
-    let private appendLine maxBytes currentBytes (builder: StringBuilder) (data: string) =
-        if isNull data then
-            currentBytes, false
-        else
-            lock builder (fun () ->
+    let private appendEvent (job: JobRecord) stream (data: string) =
+        if not (isNull data) then
+            lock job.SyncRoot (fun () ->
+                job.NextSequence <- job.NextSequence + 1L
                 let value = data + Environment.NewLine
-                let remaining = max 0 (maxBytes - currentBytes)
+                let remaining = max 0 (job.MaxOutputBytes - job.OutputBytes)
                 let fragment, addedBytes = takeUtf8Prefix remaining value
-                builder.Append(fragment) |> ignore
-                currentBytes + addedBytes, addedBytes < Encoding.UTF8.GetByteCount value)
+                let valueBytes = Encoding.UTF8.GetByteCount value
+
+                if addedBytes > 0 then
+                    job.Events.Add
+                        { Sequence = job.NextSequence
+                          Stream = stream
+                          Text = fragment }
+
+                job.OutputBytes <- job.OutputBytes + addedBytes
+                job.OutputTruncated <- job.OutputTruncated || addedBytes < valueBytes)
 
     let private startProcess projectName workingDirectory executable args maxOutputBytes : Client.Result<StartJobResult> =
         try
@@ -137,34 +125,33 @@ module private Core =
                       WorkingDirectory = Some workingDirectory
                       StartedAt = DateTimeOffset.UtcNow
                       Process = proc
-                      StdOut = StringBuilder()
-                      StdErr = StringBuilder()
+                      SyncRoot = obj()
+                      Events = ResizeArray()
                       MaxOutputBytes = maxOutputBytes
-                      StdOutBytes = 0
-                      StdErrBytes = 0
-                      StdOutTruncated = false
-                      StdErrTruncated = false
+                      OutputBytes = 0
+                      OutputTruncated = false
+                      NextSequence = 0L
                       CancellationRequested = false
                       Status = Running
                       CompletedAt = None }
 
                 proc.OutputDataReceived.Add(fun event ->
-                    let bytes, truncated = appendLine job.MaxOutputBytes job.StdOutBytes job.StdOut event.Data
-                    job.StdOutBytes <- bytes
-                    job.StdOutTruncated <- job.StdOutTruncated || truncated)
+                    appendEvent job JobOutputStream.StdOut event.Data)
 
                 proc.ErrorDataReceived.Add(fun event ->
-                    let bytes, truncated = appendLine job.MaxOutputBytes job.StdErrBytes job.StdErr event.Data
-                    job.StdErrBytes <- bytes
-                    job.StdErrTruncated <- job.StdErrTruncated || truncated)
+                    appendEvent job JobOutputStream.StdErr event.Data)
 
                 proc.Exited.Add(fun _ ->
-                    if job.CancellationRequested then
-                        job.Status <- Canceled
-                    else
-                        try job.Status <- Completed proc.ExitCode
-                        with _ -> job.Status <- FailedToStart "Process exited before an exit code was available."
-                    job.CompletedAt <- Some DateTimeOffset.UtcNow
+                    try proc.WaitForExit()
+                    with _ -> ()
+
+                    lock job.SyncRoot (fun () ->
+                        if job.CancellationRequested then
+                            job.Status <- Canceled
+                        else
+                            try job.Status <- Completed proc.ExitCode
+                            with _ -> job.Status <- FailedToStart "Process exited before an exit code was available."
+                        job.CompletedAt <- Some DateTimeOffset.UtcNow)
                     pruneCompletedJobs())
 
                 if not (jobs.TryAdd(jobId, job)) then
@@ -201,14 +188,15 @@ module private Core =
         }
 
     let private toSummary (job: JobRecord) =
-        { JobId = job.JobId
-          ProjectName = job.ProjectName
-          Executable = job.Executable
-          Args = job.Args
-          WorkingDirectory = job.WorkingDirectory
-          Status = job.Status
-          StartedAt = job.StartedAt
-          CompletedAt = job.CompletedAt }
+        lock job.SyncRoot (fun () ->
+            { JobId = job.JobId
+              ProjectName = job.ProjectName
+              Executable = job.Executable
+              Args = job.Args
+              WorkingDirectory = job.WorkingDirectory
+              Status = job.Status
+              StartedAt = job.StartedAt
+              CompletedAt = job.CompletedAt })
 
     let listJobs (cmd: ListJobsCommand) =
         fun _ ->
@@ -228,15 +216,19 @@ module private Core =
             match jobs.TryGetValue cmd.JobId with
             | false, _ -> Error(NotFoundError $"Unknown job id: {cmd.JobId}")
             | true, job ->
-                let stdout, outputOffset, stdoutTruncated = sliceFrom cmd.FromOffset job.MaxOutputBytes job.StdOut
-                let stderr, _, stderrTruncated = sliceFrom None job.MaxOutputBytes job.StdErr
-                Ok
-                    { JobId = job.JobId
-                      Status = job.Status
-                      StdOut = stdout
-                      StdErr = stderr
-                      OutputOffset = outputOffset
-                      Truncated = job.StdOutTruncated || job.StdErrTruncated || stdoutTruncated || stderrTruncated }
+                lock job.SyncRoot (fun () ->
+                    let afterSequence = defaultArg cmd.AfterSequence 0L |> max 0L
+                    let events =
+                        job.Events
+                        |> Seq.filter (fun event -> event.Sequence > afterSequence)
+                        |> Seq.toList
+
+                    Ok
+                        { JobId = job.JobId
+                          Status = job.Status
+                          Events = events
+                          NextSequence = job.NextSequence
+                          Truncated = job.OutputTruncated })
 
     let cancelJob (cmd: CancelJobCommand) =
         fun _ ->

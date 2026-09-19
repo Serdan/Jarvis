@@ -479,18 +479,30 @@ Retrieves output and status for a previously started job.
 ```fsharp
 type GetJobResultCommand =
     { JobId: string
-      FromOffset: int option }
+      AfterSequence: int64 option }
+
+type JobOutputStream =
+    | StdOut
+    | StdErr
+
+type JobOutputEvent =
+    { Sequence: int64
+      Stream: JobOutputStream
+      Text: string }
 
 type JobResult =
     { JobId: string
       Status: JobStatus
-      StdOut: string
-      StdErr: string
-      OutputOffset: int
+      Events: JobOutputEvent list
+      NextSequence: int64
       Truncated: bool }
 ```
 
-`FromOffset` avoids resending the same output repeatedly.
+`Sequence` is one-based and shared by stdout and stderr. `AfterSequence = None` is equivalent to zero; responses contain retained events with `Sequence > AfterSequence`. Pass `NextSequence` back as the next cursor to avoid replaying either stream.
+
+The event order is the order in which Jarvis observes the asynchronous stdout/stderr callbacks. It preserves a stable client-visible interleaving, but does not claim a stronger operating-system-level ordering between the two independent redirected pipes.
+
+`MaxOutputBytes` limits the retained combined event text across both streams. If later output cannot be retained, `Truncated` is true and sequence numbers may contain gaps.
 
 ### `CancelJob`
 
@@ -775,7 +787,7 @@ Search commands should support enough include/exclude input to let clients expre
 
 ### Protocol Version
 
-The initial version of this command surface was `2.0`. The current version is `2.6`.
+The initial version of this command surface was `2.0`. The current version is `2.7`.
 
 This is a breaking redesign of the original Jarvis command set. Implementations should not preserve old command names solely for backwards compatibility.
 

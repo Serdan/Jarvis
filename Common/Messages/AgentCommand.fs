@@ -217,16 +217,25 @@ type JobSummary =
 
 type ListJobsResult = { Jobs: JobSummary list }
 
+[<JsonConverter(typeof<TypeSafeEnumConverter<JobOutputStream>>)>]
+type JobOutputStream =
+    | StdOut
+    | StdErr
+
+type JobOutputEvent =
+    { Sequence: int64
+      Stream: JobOutputStream
+      Text: string }
+
 type GetJobResultCommand =
     { JobId: string
-      FromOffset: int option }
+      AfterSequence: int64 option }
 
 type JobResult =
     { JobId: string
       Status: JobStatus
-      StdOut: string
-      StdErr: string
-      OutputOffset: int
+      Events: JobOutputEvent list
+      NextSequence: int64
       Truncated: bool }
 
 type CancelJobCommand = { JobId: string }
@@ -283,7 +292,7 @@ type AgentMessage<'a> = { Key: string; Command: 'a }
 type AgentMessage = { Key: string; Command: AgentCommand }
 
 module AgentProtocol =
-    let version = "2.6"
+    let version = "2.7"
     let defaultPatchFuzzyContextLines = 3
     let maxResponseBytes = 900 * 1024
 

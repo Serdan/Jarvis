@@ -147,7 +147,7 @@ let ``listCommands returns protocol 2 capabilities`` () =
 
     match result with
     | Ok commands ->
-        commands.ProtocolVersion |> shouldEqual "2.6"
+        commands.ProtocolVersion |> shouldEqual "2.7"
         let capability name =
             commands.Commands
             |> List.find (fun command -> command.Name = name)

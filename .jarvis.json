@@ -1,0 +1,18 @@
+{
+  "tasks": {
+    "build": {
+      "description": "Build the full Jarvis solution without restoring",
+      "executable": "dotnet",
+      "args": ["build", "Jarvis.slnx", "--no-restore"],
+      "timeoutSeconds": 120,
+      "maxOutputBytes": 40000
+    },
+    "test": {
+      "description": "Run the canonical Jarvis test workflow",
+      "executable": "dotnet",
+      "args": ["scripts/build.cs", "test"],
+      "timeoutSeconds": 120,
+      "maxOutputBytes": 50000
+    }
+  }
+}

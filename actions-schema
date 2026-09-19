@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Jarvis 2 Actions
-  version: 2.5.0
+  version: 2.6.0
   description: Project-local command surface for Jarvis 2.
 
 servers:
@@ -223,6 +223,46 @@ paths:
           application/json:
             schema:
               $ref: "#/components/schemas/RunCommandMessage"
+      responses:
+        "200":
+          description: Command result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AnyResult"
+
+  /agent/listProjectTasks:
+    post:
+      operationId: listProjectTasks
+      summary: List locally configured tasks for a project.
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ListProjectTasksMessage"
+      responses:
+        "200":
+          description: Command result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AnyResult"
+
+  /agent/runProjectTask:
+    post:
+      operationId: runProjectTask
+      summary: Run a named task configured in the project's .jarvis.json. Requires local process approval.
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RunProjectTaskMessage"
       responses:
         "200":
           description: Command result.
@@ -729,6 +769,45 @@ components:
             - integer
             - "null"
           minimum: 1
+
+    ListProjectTasksMessage:
+      type: object
+      required: [key, command]
+      additionalProperties: false
+      properties:
+        key:
+          type: string
+        command:
+          $ref: "#/components/schemas/ListProjectTasksCommand"
+
+    ListProjectTasksCommand:
+      type: object
+      required: [projectName]
+      additionalProperties: false
+      properties:
+        projectName:
+          type: string
+
+    RunProjectTaskMessage:
+      type: object
+      required: [key, command]
+      additionalProperties: false
+      properties:
+        key:
+          type: string
+        command:
+          $ref: "#/components/schemas/RunProjectTaskCommand"
+
+    RunProjectTaskCommand:
+      type: object
+      required: [projectName, taskName]
+      additionalProperties: false
+      properties:
+        projectName:
+          type: string
+        taskName:
+          type: string
+          minLength: 1
 
     GitStatusMessage:
       type: object

@@ -54,6 +54,12 @@ let patchFile (message: AgentMessage<PatchFileCommand>) : HttpHandler =
 let runCommand (message: AgentMessage<RunCommandCommand>) : HttpHandler =
     fun (next: HttpFunc) (ctx: HttpContext) -> task { return! message |> handler RunCommandCommand next ctx }
 
+let listProjectTasks (message: AgentMessage<ListProjectTasksCommand>) : HttpHandler =
+    fun (next: HttpFunc) (ctx: HttpContext) -> task { return! message |> handler ListProjectTasksCommand next ctx }
+
+let runProjectTask (message: AgentMessage<RunProjectTaskCommand>) : HttpHandler =
+    fun (next: HttpFunc) (ctx: HttpContext) -> task { return! message |> handler RunProjectTaskCommand next ctx }
+
 let getGitStatus (message: AgentMessage<GitStatusCommand>) : HttpHandler =
     fun (next: HttpFunc) (ctx: HttpContext) -> task { return! message |> handler GetGitStatusCommand next ctx }
 

@@ -3,6 +3,7 @@ module Client.ClientShell
 open System
 open System.Diagnostics
 open System.IO
+open System.Text.Json
 open Common
 open Client.Effect
 open Client.IO
@@ -145,6 +146,124 @@ module private Core =
     let runCommand (cmd: RunCommandCommand) =
         run cmd.ProjectName cmd.WorkingDirectory cmd.Executable cmd.Args cmd.TimeoutSeconds cmd.MaxOutputBytes
 
+    let private tryProperty (name: string) (element: JsonElement) =
+        let mutable value = Unchecked.defaultof<JsonElement>
+        if element.TryGetProperty(name, &value) then Some value else None
+
+    let private optionalString name (element: JsonElement) =
+        match tryProperty name element with
+        | None -> Ok None
+        | Some value when value.ValueKind = JsonValueKind.Null -> Ok None
+        | Some value when value.ValueKind = JsonValueKind.String ->
+            match value.GetString() with
+            | null -> Ok None
+            | text when String.IsNullOrWhiteSpace text -> Ok None
+            | text -> Ok(Some text)
+        | _ -> Error(Client.ValidationError $".jarvis.json task property '{name}' must be a string or null.")
+
+    let private optionalInt name (element: JsonElement) =
+        match tryProperty name element with
+        | None -> Ok None
+        | Some value when value.ValueKind = JsonValueKind.Null -> Ok None
+        | Some value when value.ValueKind = JsonValueKind.Number ->
+            let mutable parsed = 0
+            if value.TryGetInt32(&parsed) then Ok(Some parsed)
+            else Error(Client.ValidationError $".jarvis.json task property '{name}' must be a 32-bit integer.")
+        | _ -> Error(Client.ValidationError $".jarvis.json task property '{name}' must be an integer or null.")
+
+    let private args (element: JsonElement) =
+        match tryProperty "args" element with
+        | None -> Ok []
+        | Some value when value.ValueKind = JsonValueKind.Array ->
+            value.EnumerateArray()
+            |> Seq.fold
+                (fun state item ->
+                    match state with
+                    | Error error -> Error error
+                    | Ok values when item.ValueKind = JsonValueKind.String ->
+                        Ok(item.GetString() :: values)
+                    | Ok _ ->
+                        Error(Client.ValidationError ".jarvis.json task args must contain only strings."))
+                (Ok [])
+            |> Result.map (List.rev >> List.map (Option.ofObj >> Option.defaultValue ""))
+        | _ -> Error(Client.ValidationError ".jarvis.json task property 'args' must be an array of strings.")
+
+    let private parseTask (property: JsonProperty) =
+        let name = property.Name
+        let element = property.Value
+
+        if String.IsNullOrWhiteSpace name then
+            Error(Client.ValidationError ".jarvis.json task names cannot be empty.")
+        elif element.ValueKind <> JsonValueKind.Object then
+            Error(Client.ValidationError $".jarvis.json task '{name}' must be an object.")
+        else
+            match tryProperty "executable" element with
+            | Some executable when executable.ValueKind = JsonValueKind.String && not (String.IsNullOrWhiteSpace(executable.GetString())) ->
+                match optionalString "description" element, args element, optionalString "workingDirectory" element, optionalInt "timeoutSeconds" element, optionalInt "maxOutputBytes" element with
+                | Ok description, Ok args, Ok workingDirectory, Ok timeoutSeconds, Ok maxOutputBytes ->
+                    Ok
+                        { Name = name
+                          Description = description
+                          Executable = executable.GetString()
+                          Args = args
+                          WorkingDirectory = workingDirectory
+                          TimeoutSeconds = timeoutSeconds
+                          MaxOutputBytes = maxOutputBytes }
+                | Error error, _, _, _, _
+                | _, Error error, _, _, _
+                | _, _, Error error, _, _
+                | _, _, _, Error error, _
+                | _, _, _, _, Error error -> Error error
+            | _ ->
+                Error(Client.ValidationError $".jarvis.json task '{name}' requires a non-empty string 'executable'.")
+
+    let private parseProjectTasks (json: string) =
+        try
+            use document = JsonDocument.Parse(json)
+
+            match tryProperty "tasks" document.RootElement with
+            | None -> Ok { Tasks = [] }
+            | Some tasks when tasks.ValueKind = JsonValueKind.Object ->
+                tasks.EnumerateObject()
+                |> Seq.fold
+                    (fun state property ->
+                        match state, parseTask property with
+                        | Ok values, Ok value -> Ok(value :: values)
+                        | Error error, _ -> Error error
+                        | _, Error error -> Error error)
+                    (Ok [])
+                |> Result.map (List.rev >> fun tasks -> { Tasks = tasks })
+            | _ ->
+                Error(Client.ValidationError ".jarvis.json property 'tasks' must be an object.")
+        with
+        | :? JsonException as ex ->
+            Error(Client.ValidationError $"Invalid .jarvis.json: {ex.Message}")
+        | ex ->
+            Error(ExceptionError ex)
+
+    let listProjectTasks (cmd: ListProjectTasksCommand) =
+        fun rt ->
+            match ProjectPaths.resolveProjectFile cmd.ProjectName ".jarvis.json" rt with
+            | Error(NotFoundError _) -> Ok { Tasks = [] }
+            | Error error -> Error error
+            | Ok configPath ->
+                match FileIO.readAllText configPath rt with
+                | Error(ExceptionError (:? FileNotFoundException)) -> Ok { Tasks = [] }
+                | Error error -> Error error
+                | Ok(Content json) -> parseProjectTasks json
+
+    let resolveProjectTask (cmd: RunProjectTaskCommand) =
+        fun rt ->
+            match listProjectTasks { ProjectName = cmd.ProjectName } rt with
+            | Error error -> Error error
+            | Ok result ->
+                result.Tasks
+                |> List.tryFind (fun task -> String.Equals(task.Name, cmd.TaskName, StringComparison.Ordinal))
+                |> Result.requireSome (NotFoundError $"Unknown project task: {cmd.TaskName}")
+
+    let runProjectTask projectName (task: ProjectTaskDefinition) =
+        run projectName task.WorkingDirectory task.Executable task.Args task.TimeoutSeconds task.MaxOutputBytes
+
     let private git projectName args maxOutputBytes =
         run projectName None "git" args (Some defaultTimeoutSeconds) maxOutputBytes
 
@@ -235,6 +354,20 @@ module private Core =
         }
 
 let runCommand cmd = Core.runCommand cmd
+let listProjectTasks cmd = Core.listProjectTasks cmd
+let resolveProjectTask cmd = Core.resolveProjectTask cmd
+
+let runProjectTask projectName (task: ProjectTaskDefinition) =
+    Core.runProjectTask projectName task
+
+let projectTaskAsRunCommand projectName (task: ProjectTaskDefinition) =
+    { ProjectName = projectName
+      Executable = task.Executable
+      Args = task.Args
+      WorkingDirectory = task.WorkingDirectory
+      TimeoutSeconds = task.TimeoutSeconds
+      MaxOutputBytes = task.MaxOutputBytes }
+
 let getGitStatus cmd = Core.getGitStatus cmd
 let getGitDiff cmd = Core.getGitDiff cmd
 let gitCommit cmd = Core.gitCommit cmd

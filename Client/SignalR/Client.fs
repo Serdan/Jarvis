@@ -56,6 +56,7 @@ let private auditDetails command =
     | WriteFileCommand cmd -> Some("WriteFile", Some cmd.ProjectName, [ WorkspaceWrite ], [ cmd.FilePath ], None, [])
     | PatchFileCommand cmd -> Some("PatchFile", Some cmd.ProjectName, [ WorkspaceWrite ], [ cmd.FilePath ], None, [])
     | RunCommandCommand cmd -> Some("RunCommand", Some cmd.ProjectName, [ ProcessExecution ], [], Some cmd.Executable, cmd.Args)
+    | RunProjectTaskCommand cmd -> Some("RunProjectTask", Some cmd.ProjectName, [ ProcessExecution ], [], None, [ cmd.TaskName ])
     | GitCommitCommand cmd -> Some("GitCommit", Some cmd.ProjectName, [ VersionControlWrite ], cmd.Paths, Some "git", [ cmd.Message ])
     | StartJobCommand cmd -> Some("StartJob", Some cmd.ProjectName, [ ProcessExecution ], [], Some cmd.Executable, cmd.Args)
     | CancelJobCommand cmd -> Some("CancelJob", None, [ ProcessExecution ], [], None, [ cmd.JobId ])
@@ -104,6 +105,12 @@ let private dispatch rt command =
         |> ProjectBrowser.patchFile cmd
         |> serialize'
     | RunCommandCommand cmd -> rt |> ClientShell.runCommand cmd |> serialize'
+    | ListProjectTasksCommand cmd -> rt |> ClientShell.listProjectTasks cmd |> serialize'
+    | RunProjectTaskCommand cmd ->
+        rt
+        |> ClientShell.resolveProjectTask cmd
+        |> Result.bind (fun task -> ClientShell.runProjectTask cmd.ProjectName task rt)
+        |> serialize'
     | GetGitStatusCommand cmd -> rt |> ClientShell.getGitStatus cmd |> serialize'
     | GetGitDiffCommand cmd -> rt |> ClientShell.getGitDiff cmd |> serialize'
     | GitCommitCommand cmd -> rt |> ClientShell.gitCommit cmd |> serialize'
@@ -117,12 +124,38 @@ let receiveCommand (rt: Runtime) (command: AgentCommand) =
         rt.Tui.Log $"Incoming command: {command.GetType().Name}"
 
         let permission = rt :> PermissionIO
-        let! authorization = PermissionPolicy.authorizeWithMode permission.PermissionMode permission.PromptPermission command
+        let resolution =
+            match command with
+            | RunProjectTaskCommand cmd ->
+                ClientShell.resolveProjectTask cmd rt
+                |> Result.map (fun task ->
+                    let authorizationCommand =
+                        ClientShell.projectTaskAsRunCommand cmd.ProjectName task
+                        |> RunCommandCommand
+
+                    authorizationCommand, Some(cmd, task))
+            | _ ->
+                Ok(command, None)
 
         let! response =
-            match authorization with
-            | Error error -> Error error |> ValueTask<_>
-            | Ok() -> dispatch rt command
+            task {
+                match resolution with
+                | Error error ->
+                    return Error error
+                | Ok(authorizationCommand, resolvedTask) ->
+                    let! authorization =
+                        PermissionPolicy.authorizeWithMode permission.PermissionMode permission.PromptPermission authorizationCommand
+
+                    match authorization, resolvedTask with
+                    | Error error, _ ->
+                        return Error error
+                    | Ok(), Some(cmd, task) ->
+                        let! result = ClientShell.runProjectTask cmd.ProjectName task rt |> serialize'
+                        return result
+                    | Ok(), None ->
+                        let! result = dispatch rt command
+                        return result
+            }
 
         match response with
         | Ok _ -> rt.Tui.Log "Command executed. Sending response."

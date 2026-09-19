@@ -389,3 +389,21 @@ let ``trust-session mode allows run command`` () =
               MaxOutputBytes = Some 4096 }
 
     evaluateWithMode TrustSession command |> shouldEqual (Ok())
+
+[<Test>]
+let ``project task listing is read only`` () =
+    let command = ListProjectTasksCommand { ProjectName = "Project1" }
+    evaluate command |> shouldEqual (Ok())
+
+[<Test>]
+let ``trust-except-run-command mode confirms project task execution`` () =
+    let command =
+        RunProjectTaskCommand
+            { ProjectName = "Project1"
+              TaskName = "build" }
+
+    match evaluateWithMode TrustExceptRunCommand command with
+    | Error(Client.ConfirmationRequired request) ->
+        request.CommandName |> shouldEqual "RunProjectTask"
+        request.Permissions |> shouldEqual [ ProcessExecution ]
+    | other -> Assert.Fail($"Expected ConfirmationRequired, got {other}")

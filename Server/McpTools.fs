@@ -131,6 +131,14 @@ type JarvisMcpTools =
             TimeoutSeconds = McpToolHelpers.optionOfNullable timeoutSeconds
             MaxOutputBytes = McpToolHelpers.optionOfNullable maxOutputBytes })
 
+    [<McpServerTool(UseStructuredContent = true); Description("List locally configured project tasks from .jarvis.json.")>]
+    static member ListProjectTasks(key: string, projectName: string, client: ClientService) =
+        McpToolHelpers.send client key (ListProjectTasksCommand { ProjectName = projectName })
+
+    [<McpServerTool(UseStructuredContent = true); Description("Run a named task configured in the project's .jarvis.json. Requires local process approval.")>]
+    static member RunProjectTask(key: string, projectName: string, taskName: string, client: ClientService) =
+        McpToolHelpers.send client key (RunProjectTaskCommand { ProjectName = projectName; TaskName = taskName })
+
     [<McpServerTool(UseStructuredContent = true); Description("Get git status for a project.")>]
     static member GetGitStatus(key: string, projectName: string, client: ClientService) =
         McpToolHelpers.send client key (GetGitStatusCommand { ProjectName = projectName })

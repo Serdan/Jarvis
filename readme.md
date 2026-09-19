@@ -22,6 +22,30 @@ Jarvis is a collaborative agent for working with project files that live outside
 - **Bounded Local Commands**: Jarvis can run approved commands such as tests and builds.
 - **Git Operations**: Jarvis can read status/diffs and create approved local commits.
 
+### Project Tasks
+
+Projects can expose named build/test/format/lint tasks through a project-root `.jarvis.json`:
+
+```json
+{
+  "tasks": {
+    "build": {
+      "description": "Build the solution",
+      "executable": "dotnet",
+      "args": ["build", "Jarvis.slnx", "--no-restore"],
+      "timeoutSeconds": 120,
+      "maxOutputBytes": 40000
+    },
+    "test": {
+      "executable": "dotnet",
+      "args": ["test", "Client.Tests/Client.Tests.fsproj", "--no-restore"]
+    }
+  }
+}
+```
+
+`ListProjectTasks` exposes the configured names and definitions. `RunProjectTask` accepts only a project and task name; executable, arguments, working directory, timeout, and output limits come from the local config. Jarvis resolves the task before permission approval and executes that same resolved definition after approval.
+
 ### Real-Time Collaboration
 - **SignalR Client Connection**: The local client connects to the server and receives commands in real time.
 - **Permission Prompting**: Mutating, process, and version-control commands require local approval.

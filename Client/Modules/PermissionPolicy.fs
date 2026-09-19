@@ -106,6 +106,7 @@ let private requiresConfirmation command =
     | SearchTextCommand _
     | ReadFileCommand _
     | ReadFilesCommand _
+    | ListProjectTasksCommand _
     | GetGitStatusCommand _
     | GetGitDiffCommand _
     | ListJobsCommand _
@@ -116,6 +117,8 @@ let private requiresConfirmation command =
         confirmation "PatchFile" (Some cmd.ProjectName) [ WorkspaceWrite ] [ cmd.FilePath ] None [] $"Patch file {cmd.FilePath}" true
     | RunCommandCommand cmd ->
         confirmation "RunCommand" (Some cmd.ProjectName) [ ProcessExecution ] [] (Some cmd.Executable) cmd.Args $"Run {cmd.Executable}" true
+    | RunProjectTaskCommand cmd ->
+        confirmation "RunProjectTask" (Some cmd.ProjectName) [ ProcessExecution ] [] None [ cmd.TaskName ] $"Run project task {cmd.TaskName}" false
     | GitCommitCommand cmd ->
         confirmation "GitCommit" (Some cmd.ProjectName) [ VersionControlWrite ] cmd.Paths (Some "git") [ cmd.Message ] $"Commit {cmd.Paths.Length} path(s)" true
     | StartJobCommand cmd ->
@@ -127,6 +130,7 @@ let private modeAllows mode command =
     match mode, command with
     | TrustSession, _ -> true
     | TrustExceptRunCommand, RunCommandCommand _ -> false
+    | TrustExceptRunCommand, RunProjectTaskCommand _ -> false
     | TrustExceptRunCommand, StartJobCommand _ -> false
     | TrustExceptRunCommand, _ -> true
     | AllowWorkspaceWrite, WriteFileCommand _

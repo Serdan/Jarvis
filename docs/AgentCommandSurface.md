@@ -62,6 +62,8 @@ type AgentCommand =
     | WriteFileCommand of WriteFileCommand
     | PatchFileCommand of PatchFileCommand
     | RunCommandCommand of RunCommandCommand
+    | ListProjectTasksCommand of ListProjectTasksCommand
+    | RunProjectTaskCommand of RunProjectTaskCommand
     | GetGitStatusCommand of GitStatusCommand
     | GetGitDiffCommand of GitDiffCommand
     | GitCommitCommand of GitCommitCommand
@@ -271,7 +273,49 @@ type RunCommandResult =
       Truncated: bool }
 ```
 
-Specialized helpers such as `RunTests`, `BuildProject`, and `FormatProject` can be implemented either as separate commands or as validated `RunCommand` presets.
+### Project Tasks
+
+Projects can define named execution presets in a project-root `.jarvis.json`. This gives agents a narrower interface for routine build, test, format, and lint operations without allowing the invocation to substitute an executable or argument list.
+
+```json
+{
+  "tasks": {
+    "build": {
+      "description": "Build the solution",
+      "executable": "dotnet",
+      "args": ["build", "Jarvis.slnx", "--no-restore"],
+      "timeoutSeconds": 120,
+      "maxOutputBytes": 40000
+    },
+    "test": {
+      "executable": "dotnet",
+      "args": ["test", "Client.Tests/Client.Tests.fsproj", "--no-restore"]
+    }
+  }
+}
+```
+
+```fsharp
+type ProjectTaskDefinition =
+    { Name: string
+      Description: string option
+      Executable: string
+      Args: string list
+      WorkingDirectory: string option
+      TimeoutSeconds: int option
+      MaxOutputBytes: int option }
+
+type ListProjectTasksCommand =
+    { ProjectName: string }
+
+type RunProjectTaskCommand =
+    { ProjectName: string
+      TaskName: string }
+```
+
+`ListProjectTasks` is read-only. `RunProjectTask` resolves the named definition locally, then applies the same executable, working-directory, timeout, shell-deny, output, and process-permission checks as `RunCommand`.
+
+For authorization, Jarvis resolves the task before prompting and authorizes the resolved executable and arguments. The same resolved definition is then executed, so editing `.jarvis.json` after a session grant was created cannot silently change what an already-approved exact command means.
 
 ## Git Commands
 
@@ -483,7 +527,7 @@ Meaning:
 |---|---|---|
 | `ReadOnly` | Reads local metadata or content without modifying state. | `ListProjects`, `ReadFile`, `GetGitDiff` |
 | `WorkspaceWrite` | Modifies files inside an allowed project root. | `WriteFile`, `PatchFile` |
-| `ProcessExecution` | Starts local processes. May mutate state indirectly. | `RunCommand`, `StartJob` |
+| `ProcessExecution` | Starts local processes. May mutate state indirectly. | `RunCommand`, `RunProjectTask`, `StartJob` |
 | `VersionControlWrite` | Mutates git state without changing working tree files directly. | `GitCommit` |
 | `NetworkAccess` | Performs outbound network IO. | `LoadPage`, future package/security tools |
 | `Destructive` | Deletes data, discards work, rewrites history, or performs broad irreversible operations. | future `DeleteFile`, `GitReset`, `GitClean` |
@@ -551,6 +595,8 @@ If `InputSchemaJson` and `OutputSchemaJson` are added later, they should be incl
 | `WriteFile` | `WorkspaceWrite` | `RequireConfirmation` | Creates or overwrites project files. |
 | `PatchFile` | `WorkspaceWrite` | `RequireConfirmation` | Preferred edit path. |
 | `RunCommand` | `ProcessExecution` | `RequireConfirmation` | Use allowlists/presets where possible. |
+| `ListProjectTasks` | `ReadOnly` | `Allow` | Reads project-local task definitions. |
+| `RunProjectTask` | `ProcessExecution` | `RequireConfirmation` | Authorize the resolved task definition, not only its name. |
 | `GetGitStatus` | `ReadOnly` | `Allow` | Does not change git state. |
 | `GetGitDiff` | `ReadOnly` | `Allow` | Output may be truncated. |
 | `GitCommit` | `VersionControlWrite` | `RequireConfirmation` | Must stage only requested paths. |
@@ -729,7 +775,7 @@ Search commands should support enough include/exclude input to let clients expre
 
 ### Protocol Version
 
-The initial version of this command surface was `2.0`. The current version is `2.5`.
+The initial version of this command surface was `2.0`. The current version is `2.6`.
 
 This is a breaking redesign of the original Jarvis command set. Implementations should not preserve old command names solely for backwards compatibility.
 

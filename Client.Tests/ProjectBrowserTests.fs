@@ -147,7 +147,7 @@ let ``listCommands returns protocol 2 capabilities`` () =
 
     match result with
     | Ok commands ->
-        commands.ProtocolVersion |> shouldEqual "2.5"
+        commands.ProtocolVersion |> shouldEqual "2.6"
         let capability name =
             commands.Commands
             |> List.find (fun command -> command.Name = name)
@@ -155,6 +155,8 @@ let ``listCommands returns protocol 2 capabilities`` () =
         capability "PatchFile" |> _.SupportsDryRun |> shouldEqual true
         capability "WriteFile" |> _.SupportsDryRun |> shouldEqual false
         capability "RunCommand" |> _.SupportsDryRun |> shouldEqual false
+        capability "ListProjectTasks" |> _.Permissions |> shouldEqual [ ReadOnly ]
+        capability "RunProjectTask" |> _.Permissions |> shouldEqual [ ProcessExecution ]
         capability "GitCommit" |> _.SupportsDryRun |> shouldEqual false
         capability "StartJob" |> _.SupportsDryRun |> shouldEqual false
         capability "ReadFile" |> _.MaxOutputBytes |> shouldEqual (Some AgentProtocol.maxResponseBytes)

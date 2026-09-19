@@ -90,6 +90,8 @@ let agentEndpoints =
           bind<WriteFileCommand> "/writeFile" Endpoints.writeFile
           bind<PatchFileCommand> "/patchFile" Endpoints.patchFile
           bind<RunCommandCommand> "/runCommand" Endpoints.runCommand
+          bind<ListProjectTasksCommand> "/listProjectTasks" Endpoints.listProjectTasks
+          bind<RunProjectTaskCommand> "/runProjectTask" Endpoints.runProjectTask
           bind<GitStatusCommand> "/getGitStatus" Endpoints.getGitStatus
           bind<GitDiffCommand> "/getGitDiff" Endpoints.getGitDiff
           bind<GitCommitCommand> "/gitCommit" Endpoints.gitCommit

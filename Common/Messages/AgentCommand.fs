@@ -144,6 +144,25 @@ type RunCommandCommand =
       TimeoutSeconds: int option
       MaxOutputBytes: int option }
 
+type ProjectTaskDefinition =
+    { Name: string
+      Description: string option
+      Executable: string
+      Args: string list
+      WorkingDirectory: string option
+      TimeoutSeconds: int option
+      MaxOutputBytes: int option }
+
+type ListProjectTasksCommand =
+    { ProjectName: string }
+
+type ListProjectTasksResult =
+    { Tasks: ProjectTaskDefinition list }
+
+type RunProjectTaskCommand =
+    { ProjectName: string
+      TaskName: string }
+
 type RunCommandResult =
     { ExitCode: int
       TimedOut: bool
@@ -250,6 +269,8 @@ type AgentCommand =
     | WriteFileCommand of WriteFileCommand
     | PatchFileCommand of PatchFileCommand
     | RunCommandCommand of RunCommandCommand
+    | ListProjectTasksCommand of ListProjectTasksCommand
+    | RunProjectTaskCommand of RunProjectTaskCommand
     | GetGitStatusCommand of GitStatusCommand
     | GetGitDiffCommand of GitDiffCommand
     | GitCommitCommand of GitCommitCommand
@@ -262,7 +283,7 @@ type AgentMessage<'a> = { Key: string; Command: 'a }
 type AgentMessage = { Key: string; Command: AgentCommand }
 
 module AgentProtocol =
-    let version = "2.5"
+    let version = "2.6"
     let defaultPatchFuzzyContextLines = 3
     let maxResponseBytes = 900 * 1024
 
@@ -290,6 +311,8 @@ module AgentProtocol =
           capability "WriteFile" "Writes or appends one file." [ WorkspaceWrite ] true true false
           capability "PatchFile" "Applies an atomic unified diff to one file." [ WorkspaceWrite ] true true true
           capability "RunCommand" "Runs a bounded local process." [ ProcessExecution ] true true false
+          capability "ListProjectTasks" "Lists locally configured project tasks." [ ReadOnly ] false false false
+          capability "RunProjectTask" "Runs a locally configured project task." [ ProcessExecution ] true true false
           capability "GetGitStatus" "Reads git status." [ ReadOnly ] false false false
           capability "GetGitDiff" "Reads git diff." [ ReadOnly ] false false false
           capability "GitCommit" "Creates a local git commit." [ VersionControlWrite ] true true false

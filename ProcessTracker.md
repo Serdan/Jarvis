@@ -6,7 +6,7 @@ Improve Jarvis based on direct agent use during a substantial review/edit/test s
 
 ## Status
 
-Items 1-6 complete. Starting item 7: first-class project tasks.
+Items 1-7 complete. Starting item 8: ordered incremental job output.
 
 ## Notes
 
@@ -23,7 +23,7 @@ Items 1-6 complete. Starting item 7: first-class project tasks.
 - [x] 4. Improve PatchFile ergonomics while preserving safety.
 - [x] 5. Add first-class directory creation / create-parent support.
 - [x] 6. Make process permissions more granular.
-- [ ] 7. Add project-configured first-class tasks.
+- [x] 7. Add project-configured first-class tasks.
 - [ ] 8. Model incremental job output with proper stdout/stderr offsets or ordered events.
 - [ ] 9. Control inherited environment variables for spawned processes.
 - [ ] 10. Generate external command surfaces from one command specification.

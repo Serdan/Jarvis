@@ -6,7 +6,7 @@ Improve Jarvis based on direct agent use during a substantial review/edit/test s
 
 ## Status
 
-Items 1-2 complete. Starting item 3: rich text-search matches with line, column, and preview.
+Items 1-3 complete. Starting item 4: safer default patch fuzziness for routine sequential edits.
 
 ## Notes
 
@@ -19,7 +19,7 @@ Items 1-2 complete. Starting item 3: rich text-search matches with line, column,
 
 - [x] 1. Return structured MCP results instead of JSON strings.
 - [x] 2. Add ranged file reads with optional line numbers.
-- [ ] 3. Return line/column/snippet matches from text search.
+- [x] 3. Return line/column/snippet matches from text search.
 - [ ] 4. Improve PatchFile ergonomics while preserving safety.
 - [ ] 5. Add first-class directory creation / create-parent support.
 - [ ] 6. Make process permissions more granular.

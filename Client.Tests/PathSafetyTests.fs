@@ -5,6 +5,7 @@ open System.IO
 open Client
 open Client.ClientShell
 open Client.IO
+open Client.ProjectBrowser
 open Client.ProjectPaths
 open Client.JobManager
 open Common
@@ -96,3 +97,37 @@ let ``project paths reject symbolic link escapes`` () =
     finally
         if Directory.Exists root then Directory.Delete(root, true)
         if Directory.Exists outside then Directory.Delete(outside, true)
+
+[<Test>]
+let ``searchText reports multiple matches with line and column from real files`` () =
+    let root = createTempProject ()
+
+    try
+        let project = Path.Combine(root, "Project1")
+        File.WriteAllText(Path.Combine(project, "sample.txt"), "prefix needle and NEEDLE\nnext needle")
+        let context = TestContext root
+        let cmd =
+            { ProjectName = "Project1"
+              Query = "needle"
+              FolderPath = None
+              IncludeGlobs = []
+              ExcludeGlobs = []
+              MaxResults = Some 2 }
+
+        match searchText cmd context with
+        | Error error -> Assert.Fail($"Expected SearchText Ok, got {error}")
+        | Ok matches ->
+            let expected =
+                [ { FilePath = "sample.txt"
+                    Line = 1
+                    Column = 8
+                    Preview = "prefix needle and NEEDLE" }
+                  { FilePath = "sample.txt"
+                    Line = 1
+                    Column = 19
+                    Preview = "prefix needle and NEEDLE" } ]
+
+            if matches <> expected then
+                Assert.Fail($"Expected {expected}, got {matches}")
+    finally
+        Directory.Delete(root, true)

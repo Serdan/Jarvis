@@ -42,6 +42,38 @@ let fakeFileOperations =
                 |> Seq.toList
                 |> Ok
 
+      SearchText =
+        fun (FilePath filePath) query maxResults ->
+            let content =
+                match filePath with
+                | "/fake/projects/Project1/readme.md" -> Some readmeContent
+                | "/fake/projects/Project1/todo.md" -> Some todoContent
+                | "/fake/projects/Project1/src/deep.md" -> Some "Nested Old Text"
+                | _ -> None
+
+            match content with
+            | None -> Error(NotFoundError "File not found")
+            | Some content ->
+                content.Replace("\r\n", "\n").Split('\n')
+                |> Seq.mapi (fun lineIndex line -> lineIndex + 1, line)
+                |> Seq.collect (fun (lineNumber, line) ->
+                    seq {
+                        let mutable searchIndex = 0
+                        let mutable searching = true
+
+                        while searching do
+                            let index = line.IndexOf(query, searchIndex, System.StringComparison.OrdinalIgnoreCase)
+
+                            if index < 0 then
+                                searching <- false
+                            else
+                                yield lineNumber, index + 1, line
+                                searchIndex <- index + max 1 query.Length
+                    })
+                |> Seq.truncate maxResults
+                |> Seq.toList
+                |> Ok
+
       WriteAllText = fun _ _ -> Ok()
 
       parseFile =
@@ -114,7 +146,7 @@ let ``listCommands returns protocol 2 capabilities`` () =
 
     match result with
     | Ok commands ->
-        commands.ProtocolVersion |> shouldEqual "2.2"
+        commands.ProtocolVersion |> shouldEqual "2.3"
         let capability name =
             commands.Commands
             |> List.find (fun command -> command.Name = name)
@@ -207,7 +239,7 @@ let ``searchFiles returns matching project items`` () =
     | Error e -> Assert.Fail($"Expected Ok, but got Error: {EffectError.toString e}")
 
 [<Test>]
-let ``searchText returns matching files`` () =
+let ``searchText returns structured matches`` () =
     let cmd =
         { ProjectName = "Project1"
           Query = "Old Text"
@@ -217,7 +249,17 @@ let ``searchText returns matching files`` () =
           MaxResults = Some 10 }
 
     let result = searchText cmd fakeContext
-    result |> shouldEqual (Ok [ "readme.md"; Path.Combine("src", "deep.md") ])
+    result
+    |> shouldEqual
+        (Ok
+            [ { FilePath = "readme.md"
+                Line = 3
+                Column = 1
+                Preview = "Old Text" }
+              { FilePath = Path.Combine("src", "deep.md")
+                Line = 1
+                Column = 8
+                Preview = "Nested Old Text" } ])
 
 [<Test>]
 let ``searchText respects include globs`` () =
@@ -230,7 +272,12 @@ let ``searchText respects include globs`` () =
           MaxResults = Some 10 }
 
     searchText cmd fakeContext
-    |> shouldEqual (Ok [ Path.Combine("src", "deep.md") ])
+    |> shouldEqual
+        (Ok
+            [ { FilePath = Path.Combine("src", "deep.md")
+                Line = 1
+                Column = 8
+                Preview = "Nested Old Text" } ])
 
 [<Test>]
 let ``searchText respects exclude globs`` () =
@@ -243,7 +290,12 @@ let ``searchText respects exclude globs`` () =
           MaxResults = Some 10 }
 
     searchText cmd fakeContext
-    |> shouldEqual (Ok [ "readme.md" ])
+    |> shouldEqual
+        (Ok
+            [ { FilePath = "readme.md"
+                Line = 3
+                Column = 1
+                Preview = "Old Text" } ])
 
 [<Test>]
 let ``searchFiles recursively returns nested project items`` () =
@@ -394,7 +446,13 @@ let ``searchText respects max results`` () =
           ExcludeGlobs = []
           MaxResults = Some 1 }
 
-    searchText cmd fakeContext |> shouldEqual (Ok [ "readme.md" ])
+    searchText cmd fakeContext
+    |> shouldEqual
+        (Ok
+            [ { FilePath = "readme.md"
+                Line = 3
+                Column = 1
+                Preview = "Old Text" } ])
 
 [<Test>]
 let ``searchText returns empty when no matches`` () =

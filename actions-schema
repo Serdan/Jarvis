@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Jarvis 2 Actions
-  version: 2.2.0
+  version: 2.3.0
   description: Project-local command surface for Jarvis 2.
 
 servers:

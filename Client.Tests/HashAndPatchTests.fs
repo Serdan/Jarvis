@@ -24,6 +24,7 @@ type TestContext(?initialContent: string) =
             { getFullPath = _.Replace('\\', '/') >> Ok
               ReadAllText = fun _ -> Ok(Content currentContent)
               ReadLines = fun _ _ _ -> Ok []
+              SearchText = fun _ _ _ -> Ok []
               WriteAllText = fun _ (Content text) ->
                   currentContent <- text
                   writeCount <- writeCount + 1

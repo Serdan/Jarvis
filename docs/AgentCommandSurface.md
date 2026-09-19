@@ -132,7 +132,15 @@ type SearchTextCommand =
       IncludeGlobs: string list
       ExcludeGlobs: string list
       MaxResults: int option }
+
+type SearchTextMatch =
+    { FilePath: string
+      Line: int
+      Column: int
+      Preview: string }
 ```
+
+Results are individual matches rather than filenames. `Line` and `Column` are one-based. Multiple matches in the same file or line are returned independently. `Preview` is a bounded excerpt of the matching line. `MaxResults` is a global match budget and stops further file traversal once satisfied.
 
 ## File Access Commands
 
@@ -713,7 +721,7 @@ Search commands should support enough include/exclude input to let clients expre
 
 ### Protocol Version
 
-The initial version of this command surface was `2.0`. The current version is `2.2`.
+The initial version of this command surface was `2.0`. The current version is `2.3`.
 
 This is a breaking redesign of the original Jarvis command set. Implementations should not preserve old command names solely for backwards compatibility.
 

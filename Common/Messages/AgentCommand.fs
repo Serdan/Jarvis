@@ -75,6 +75,12 @@ type SearchTextCommand =
       ExcludeGlobs: string list
       MaxResults: int option }
 
+type SearchTextMatch =
+    { FilePath: string
+      Line: int
+      Column: int
+      Preview: string }
+
 type ReadFileCommand =
     { ProjectName: string
       FilePath: string
@@ -255,7 +261,7 @@ type AgentMessage<'a> = { Key: string; Command: 'a }
 type AgentMessage = { Key: string; Command: AgentCommand }
 
 module AgentProtocol =
-    let version = "2.2"
+    let version = "2.3"
     let maxResponseBytes = 900 * 1024
 
     let private capability name description permissions mutates requiresConfirmation supportsDryRun =

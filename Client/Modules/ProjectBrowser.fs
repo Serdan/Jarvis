@@ -463,63 +463,86 @@ module private Core =
             && not (excludeMatchers |> List.exists (fun matches -> matches path))
 
         effect {
-            let! parsedProject = parseProjectName projectName
-            let (ProjectName rawProjectName) = parsedProject
+            if String.IsNullOrEmpty query then
+                return! Client.ValidationError "Search query cannot be empty." |> Effect.ofError
+            elif take <= 0 then
+                return! Client.ValidationError "MaxResults must be greater than zero." |> Effect.ofError
+            else
+                let! parsedProject = parseProjectName projectName
 
-            let rec searchFolder currentPath remaining rt =
-                if remaining <= 0 then
-                    Ok []
-                else
-                    match getItems currentPath parsedProject rt with
-                    | Error error -> Error error
-                    | Ok items ->
-                        let qualify name =
-                            if String.IsNullOrWhiteSpace currentPath then name
-                            else Path.Combine(currentPath, name)
+                let searchFile relativePath remaining rt =
+                    match parseFilePath relativePath parsedProject rt with
+                    | Error _ -> Ok []
+                    | Ok filePath ->
+                        match FileIO.searchText filePath query remaining rt with
+                        | Error _ -> Ok []
+                        | Ok matches ->
+                            matches
+                            |> List.map (fun (line, column, preview) ->
+                                { FilePath = relativePath
+                                  Line = line
+                                  Column = column
+                                  Preview = preview })
+                            |> Ok
 
-                        let localMatches =
-                            items
-                            |> Seq.choose (function
-                                | ProjectFile(name, _, _, _) ->
-                                    let path = qualify name
+                let rec searchFolder currentPath remaining rt =
+                    if remaining <= 0 then
+                        Ok []
+                    else
+                        match getItems currentPath parsedProject rt with
+                        | Error error -> Error error
+                        | Ok items ->
+                            let qualify name =
+                                if String.IsNullOrWhiteSpace currentPath then name
+                                else Path.Combine(currentPath, name)
 
-                                    if shouldSearch path then
-                                        match readFile rawProjectName path rt with
-                                        | Ok(Content content) when content.Contains(query, StringComparison.OrdinalIgnoreCase) ->
-                                            Some path
-                                        | _ -> None
-                                    else
-                                        None
-                                | _ -> None)
-                            |> Seq.truncate remaining
-                            |> Seq.toList
-
-                        let remainingAfterLocal = remaining - localMatches.Length
-
-                        if remainingAfterLocal <= 0 then
-                            Ok localMatches
-                        else
-                            let folders =
+                            let files =
                                 items
                                 |> List.choose (function
-                                    | ProjectFolder name -> Some(qualify name)
+                                    | ProjectFile(name, _, _, _) -> Some(qualify name)
                                     | _ -> None)
 
-                            let rec searchFolders remaining acc pending =
+                            let rec searchFiles remaining acc pending =
                                 match pending with
                                 | [] -> Ok acc
                                 | _ when remaining <= 0 -> Ok acc
-                                | folder :: rest ->
-                                    match searchFolder folder remaining rt with
-                                    | Error error -> Error error
+                                | path :: rest when not (shouldSearch path) ->
+                                    searchFiles remaining acc rest
+                                | path :: rest ->
+                                    match searchFile path remaining rt with
+                                    | Error _ -> searchFiles remaining acc rest
                                     | Ok matches ->
-                                        searchFolders (remaining - matches.Length) (acc @ matches) rest
+                                        searchFiles (remaining - matches.Length) (acc @ matches) rest
 
-                            match searchFolders remainingAfterLocal [] folders with
+                            match searchFiles remaining [] files with
                             | Error error -> Error error
-                            | Ok nested -> Ok(localMatches @ nested)
+                            | Ok localMatches ->
+                                let remainingAfterLocal = remaining - localMatches.Length
 
-            return! fun rt -> searchFolder (defaultArg folderPath "") take rt
+                                if remainingAfterLocal <= 0 then
+                                    Ok localMatches
+                                else
+                                    let folders =
+                                        items
+                                        |> List.choose (function
+                                            | ProjectFolder name -> Some(qualify name)
+                                            | _ -> None)
+
+                                    let rec searchFolders remaining acc pending =
+                                        match pending with
+                                        | [] -> Ok acc
+                                        | _ when remaining <= 0 -> Ok acc
+                                        | folder :: rest ->
+                                            match searchFolder folder remaining rt with
+                                            | Error error -> Error error
+                                            | Ok matches ->
+                                                searchFolders (remaining - matches.Length) (acc @ matches) rest
+
+                                    match searchFolders remainingAfterLocal [] folders with
+                                    | Error error -> Error error
+                                    | Ok nested -> Ok(localMatches @ nested)
+
+                return! fun rt -> searchFolder (defaultArg folderPath "") take rt
         }
 
     let readFiles projectName filePaths =
@@ -614,7 +637,7 @@ let listDirectory (cmd: ListDirectoryCommand) : IO<'rt, ProjectItemKind list> =
 let searchFiles (cmd: SearchFilesCommand) : IO<'rt, ProjectItemKind list> =
     Core.searchFiles cmd.ProjectName cmd.FolderPath cmd.Query cmd.MaxResults
 
-let searchText (cmd: SearchTextCommand) : IO<'rt, string list> =
+let searchText (cmd: SearchTextCommand) : IO<'rt, SearchTextMatch list> =
     Core.searchText cmd.ProjectName cmd.FolderPath cmd.Query cmd.IncludeGlobs cmd.ExcludeGlobs cmd.MaxResults
 
 let readFile (cmd: ReadFileCommand) : IO<'rt, Content> =

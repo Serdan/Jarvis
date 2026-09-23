@@ -21,7 +21,7 @@
     <ItemGroup>
         <PackageReference Update="FSharp.Core" Version="10.1.203"/>
         <PackageReference Include="Giraffe" Version="7.0.2"/>
-        <PackageReference Include="ModelContextProtocol.AspNetCore" Version="1.4.1"/>
+        <PackageReference Include="ModelContextProtocol.AspNetCore" Version="2.2.0"/>
     </ItemGroup>
 
     <ItemGroup>

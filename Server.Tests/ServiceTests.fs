@@ -4,6 +4,7 @@ open System
 open System.Text.Json
 open System.Threading.Tasks
 open Common
+open Common.SignalR
 open ModelContextProtocol.Protocol
 open ModelContextProtocol.Server
 open NUnit.Framework
@@ -12,15 +13,87 @@ open Server
 open Server.Services
 
 [<Test>]
-let ``user service preserves a replacement connection when the old connection is removed`` () =
+let ``user service exposes transport connection before registration`` () =
     let users = UserService()
-    users.Add("session", "old-connection")
-    users.Add("session", "new-connection")
+    users.TransportConnected("connection")
 
-    users.Remove("old-connection")
+    match users.GetTransportConnection("connection") with
+    | ValueNone -> Assert.Fail("Expected transport connection.")
+    | ValueSome connection ->
+        connection.ConnectionId |> shouldEqual "connection"
+        connection.RegisteredKey |> shouldEqual None
 
-    users.GetConnectionId("session")
-    |> shouldEqual (ValueSome "new-connection")
+[<Test>]
+let ``user service increments generation and preserves replacement on stale disconnect`` () =
+    let users = UserService()
+    let registration =
+        { Key = "session"
+          ProtocolVersion = AgentProtocol.version
+          ClientVersion = "1.2.3" }
+
+    users.TransportConnected("old-connection")
+    let first = users.Register(registration, "old-connection")
+    users.TransportConnected("new-connection")
+    let second = users.Register(registration, "new-connection")
+
+    first.Generation |> shouldEqual 1L
+    second.Generation |> shouldEqual 2L
+    second.RegistrationReason.Contains("Reconnect", StringComparison.Ordinal) |> shouldEqual true
+
+    users.Disconnect("old-connection", Some "stale disconnect")
+
+    match users.GetSession("session") with
+    | ValueNone -> Assert.Fail("Expected retained session.")
+    | ValueSome session ->
+        session.State |> shouldEqual Registered
+        session.ConnectionId |> shouldEqual (Some "new-connection")
+        session.Generation |> shouldEqual 2L
+        session.ProtocolVersion |> shouldEqual AgentProtocol.version
+        session.ClientVersion |> shouldEqual "1.2.3"
+        users.GetConnectionId("session") |> shouldEqual (ValueSome "new-connection")
+
+[<Test>]
+let ``user service retains disconnected session and failure reason`` () =
+    let users = UserService()
+    let registration =
+        { Key = "session"
+          ProtocolVersion = AgentProtocol.version
+          ClientVersion = "1.0.0" }
+
+    users.TransportConnected("connection")
+    users.Register(registration, "connection") |> ignore
+    users.RecordDispatchFailure("session", "connection", "dispatch failed")
+
+    match users.GetSession("session") with
+    | ValueNone -> Assert.Fail("Expected session.")
+    | ValueSome session ->
+        session.LastFailure |> shouldEqual (Some "dispatch failed")
+
+    users.Disconnect("connection", Some "network lost")
+
+    match users.GetSession("session") with
+    | ValueNone -> Assert.Fail("Expected retained disconnected session.")
+    | ValueSome session ->
+        session.State |> shouldEqual Disconnected
+        session.ConnectionId |> shouldEqual None
+        session.DisconnectedAt.IsSome |> shouldEqual true
+        session.LastFailure |> shouldEqual (Some "network lost")
+        users.GetConnectionId("session") |> shouldEqual ValueNone
+
+[<Test>]
+let ``user service records protocol mismatch in registration reason`` () =
+    let users = UserService()
+    users.TransportConnected("connection")
+
+    let result =
+        users.Register(
+            { Key = "session"
+              ProtocolVersion = "older"
+              ClientVersion = "1.0.0" },
+            "connection"
+        )
+
+    result.RegistrationReason.Contains("protocol mismatch", StringComparison.Ordinal) |> shouldEqual true
 
 [<Test>]
 let ``response tracker completes registered response`` () =

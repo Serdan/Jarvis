@@ -61,6 +61,8 @@ Users can stop access by closing the local client, quitting the session, or refu
 
 Jarvis is primarily a routing service between the agent and the local client. The project does not intentionally store project file contents on the server.
 
+The server retains session lifecycle metadata in memory so reconnects and failures can be distinguished. This includes the session key, current connection state, connection generation, client/protocol versions, registration and last-seen timestamps, and recent disconnect/dispatch failure information. This state is process-local and is not project file content.
+
 Operational logs, hosting logs, reverse-proxy logs, crash reports, or diagnostics may be retained according to the configuration of the environment where the server is deployed.
 
 ## Data Sharing
@@ -79,4 +81,4 @@ This document may be updated as Jarvis changes. Material changes should be refle
 
 For questions about privacy or data handling, contact admin@kehlet.dev.
 
-_Last Updated: 2026-05-15_
+_Last Updated: 2026-09-23_

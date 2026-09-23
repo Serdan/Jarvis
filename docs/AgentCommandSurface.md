@@ -792,9 +792,26 @@ Search commands should support enough include/exclude input to let clients expre
 
 The MCP tool surface and `actions-schema` remain adapter-specific code, but tests require their command/tool names, operation IDs, and primary routes to match the catalog exactly. Adding or renaming a command therefore fails tests until all external surfaces are synchronized.
 
+### Session Registration
+
+Protocol 2.8 makes the SignalR registration lifecycle explicit. A client registers with its session key, command protocol version, and client version. The server returns the assigned connection generation, registration timestamp, and registration reason.
+
+The first registration of a key uses generation 1; each later registration increments the generation. Disconnect handling is conditional on the current connection ID, so an old connection cannot mark a newer generation disconnected.
+
+The server retains in-memory session state after transport disconnect, including:
+
+- registered/disconnected state and the active connection ID when present;
+- connection generation and client/protocol versions;
+- registration, last-seen, and disconnect timestamps;
+- registration reason and the latest dispatch/disconnect failure.
+
+SignalR transport connections are tracked before they register a key, making the transport-connected-but-unregistered state observable as well.
+
+This state lets dispatch distinguish a key that has never been registered from a known but disconnected session. Successful dispatch/response activity updates last-seen state, while dispatch failures are recorded only when the failing connection still owns the current generation. Protocol-version mismatches are recorded in the registration reason.
+
 ### Protocol Version
 
-The initial version of this command surface was `2.0`. The current version is `2.7`.
+The initial version of this command surface was `2.0`. The current version is `2.8`.
 
 This is a breaking redesign of the original Jarvis command set. Implementations should not preserve old command names solely for backwards compatibility.
 

@@ -25,6 +25,8 @@
 - **Client/Modules/ProcessEnvironment.fs** - Sensitive environment filtering and explicit user allowlists for spawned processes.
 - **Client/Modules/JobManager.fs** - Long-running local job management.
 - **Client/Modules/ClientShell.fs** - Bounded process execution and git command support.
+- **Server/Services/UserService.fs** - Retained client-session lifecycle state, reconnect generations, transport registration, and failure metadata.
+- **Server/Services/HubService.fs** - SignalR transport lifecycle and client registration handshake.
 - **Server/Services/ClientService.fs** - Server-side command forwarding and client response tracking.
 - **Server/McpTools.fs** - MCP tool surface backed by the shared Jarvis command protocol.
 - **readme.md** - Project overview and build/publish usage.

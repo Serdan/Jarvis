@@ -21,28 +21,63 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
 
     member this.SendCommandToUser(message: AgentMessage) =
         task {
-            match users.GetConnectionId(message.Key) with
+            match users.GetSession(message.Key) with
             | ValueNone ->
                 return
                     { Result = None
-                      Error = Some(NotFound $"User not found with key: {message.Key}") }
-            | ValueSome id ->
-                let correlationId, trackingTask = tracker.Register(this.ResponseTimeout message.Command)
-                let client = ctx.Clients.Client(id)
-                let commandJson = JsonSerializer.Serialize<AgentCommand>(message.Command)
+                      Error = Some(NotFound $"Session key has never been registered: {message.Key}") }
+            | ValueSome session ->
+                match session.State, session.ConnectionId with
+                | Disconnected, _ ->
+                    let reason = session.LastFailure |> Option.defaultValue "Transport disconnected"
 
-                try
-                    do! client.ReceiveCommand(correlationId, commandJson)
-
-                    try
-                        return! trackingTask
-                    with :? TaskCanceledException ->
-                        return
-                            { Result = None
-                              Error = Some(ExecutionFailed "Timeout. Client didn't respond.") }
-                with ex ->
-                    tracker.Cancel(correlationId)
                     return
                         { Result = None
-                          Error = Some(ExecutionFailed ex.Message) }
+                          Error =
+                            Some(
+                                ExecutionFailed
+                                    $"Client session is disconnected (generation {session.Generation}, protocol {session.ProtocolVersion}, last seen {session.LastSeenAt:O}). Reason: {reason}"
+                            ) }
+                | Registered, None ->
+                    return
+                        { Result = None
+                          Error =
+                            Some(
+                                ExecutionFailed
+                                    $"Client session generation {session.Generation} is registered without an active connection."
+                            ) }
+                | Registered, Some connectionId ->
+                    let correlationId, trackingTask = tracker.Register(this.ResponseTimeout message.Command)
+                    let client = ctx.Clients.Client(connectionId)
+                    let commandJson = JsonSerializer.Serialize<AgentCommand>(message.Command)
+
+                    try
+                        do! client.ReceiveCommand(correlationId, commandJson)
+                        users.RecordDispatchSuccess(message.Key, connectionId)
+
+                        try
+                            return! trackingTask
+                        with :? TaskCanceledException ->
+                            let reason =
+                                $"Client response timeout for session generation {session.Generation}."
+
+                            users.RecordDispatchFailure(message.Key, connectionId, reason)
+
+                            return
+                                { Result = None
+                                  Error =
+                                    Some(
+                                        ExecutionFailed
+                                            $"{reason} Protocol {session.ProtocolVersion}, client {session.ClientVersion}, last seen {session.LastSeenAt:O}."
+                                    ) }
+                    with ex ->
+                        tracker.Cancel(correlationId)
+                        let reason =
+                            $"Dispatch failed for session generation {session.Generation}: {ex.Message}"
+
+                        users.RecordDispatchFailure(message.Key, connectionId, reason)
+
+                        return
+                            { Result = None
+                              Error = Some(ExecutionFailed reason) }
         }

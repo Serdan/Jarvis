@@ -6,7 +6,7 @@ Improve Jarvis based on direct agent use during a substantial review/edit/test s
 
 ## Status
 
-Items 1-11 complete. Starting item 12: explicit session/registration state.
+All 12 approved agent-ergonomics items are complete.
 
 ## Notes
 
@@ -28,7 +28,7 @@ Items 1-11 complete. Starting item 12: explicit session/registration state.
 - [x] 9. Control inherited environment variables for spawned processes.
 - [x] 10. Generate external command surfaces from one command specification.
 - [x] 11. Preserve typed errors through MCP.
-- [ ] 12. Expose explicit session/registration state.
+- [x] 12. Expose explicit session/registration state.
 
 ## Verification
 

@@ -2,6 +2,7 @@ module Program
 
 open System
 open System.IO
+open System.Reflection
 open System.Security.Cryptography
 open System.Threading
 open System.Threading.Tasks
@@ -44,11 +45,21 @@ let private parseArgs args =
 
 let register (tui: ConsoleTui) (connection: HubConnection) key =
     task {
-        let! result = connection.invokeAsync("Connect", key)
+        let clientVersion =
+            match Assembly.GetExecutingAssembly().GetName().Version with
+            | null -> "unknown"
+            | version -> version.ToString()
+
+        let registration =
+            { Key = key
+              ProtocolVersion = AgentProtocol.version
+              ClientVersion = clientVersion }
+
+        let! result = connection.invokeResultAsync<ClientRegistrationResult>("Connect", registration)
 
         match result with
-        | Ok _ ->
-            tui.Log "Connected and registered."
+        | Ok registered ->
+            tui.Log $"Connected and registered as generation {registered.Generation}. {registered.RegistrationReason}."
             return true
         | Error err ->
             tui.Log $"Connection registration failed: {err.Message}. Retrying..."

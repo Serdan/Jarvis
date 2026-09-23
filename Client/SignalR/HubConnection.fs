@@ -34,3 +34,20 @@ type HubConnectionE =
             with ex ->
                 return Error ex
         }
+
+    [<Extension>]
+    static member invokeResultAsync<'result>(connection: HubConnection, methodName: string, arg1) =
+        task {
+            try
+                let! result =
+                    HubConnectionExtensions.InvokeCoreAsync<'result>(
+                        connection,
+                        methodName,
+                        [| box arg1 |],
+                        CancellationToken.None
+                    )
+
+                return Ok result
+            with ex ->
+                return Error ex
+        }

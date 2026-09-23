@@ -369,3 +369,45 @@ let mcp_tools_never_expose_session_key_parameters () =
         methodInfo.GetParameters()
         |> Array.exists (fun parameter -> String.Equals(parameter.Name, "key", StringComparison.OrdinalIgnoreCase))
         |> shouldEqual false
+
+
+[<Test>]
+let mcp_tool_oauth_metadata_matches_command_permissions () =
+    let expectedScope (definition: CommandDefinition) =
+        if definition.Permissions |> List.contains WorkspaceWrite then Auth.WorkspaceWrite
+        elif definition.Permissions |> List.contains ProcessExecution then Auth.ProcessExecute
+        elif definition.Permissions |> List.contains VersionControlWrite then Auth.GitWrite
+        else Auth.WorkspaceRead
+
+    let definitions =
+        AgentProtocol.commandDefinitions
+        |> List.map (fun definition -> definition.Name, definition)
+        |> Map.ofList
+
+    let methods =
+        typeof<JarvisMcpTools>.GetMethods()
+        |> Array.choose (fun methodInfo ->
+            match methodInfo.GetCustomAttributes(typeof<McpServerToolAttribute>, false) with
+            | [| :? McpServerToolAttribute as attribute |] -> Some(methodInfo, attribute)
+            | _ -> None)
+
+    for methodInfo, attribute in methods do
+        let definition = definitions[methodInfo.Name]
+        let scope = expectedScope definition
+        let readOnly = definition.Permissions = [ ReadOnly ]
+
+        attribute.ReadOnly |> shouldEqual readOnly
+        attribute.Destructive |> shouldEqual (not readOnly)
+
+        let securityMeta =
+            methodInfo.GetCustomAttributes(typeof<McpMetaAttribute>, false)
+            |> Array.choose (function
+                | :? McpMetaAttribute as metadata -> Some metadata
+                | _ -> None)
+            |> Array.find (fun metadata -> metadata.Name = "securitySchemes")
+
+        use document = JsonDocument.Parse(securityMeta.JsonValue)
+        let scheme = document.RootElement[0]
+        scheme.GetProperty("type").GetString() |> shouldEqual "oauth2"
+        let scopes = scheme.GetProperty("scopes")
+        scopes[0].GetString() |> shouldEqual scope

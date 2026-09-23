@@ -100,10 +100,20 @@ let main args =
     tui.Log $"Permission mode: {PermissionMode.toDisplayName permissionMode}"
     tui.Log $"Allowed sensitive environment variables: {allowedEnvironmentVariables.Length}"
 
+    let oauth =
+        OAuth.login tui.Log
+        |> Async.AwaitTask
+        |> Async.RunSynchronously
+
     let connection =
         HubConnectionBuilder()
             .AddJsonProtocol()
-            .WithUrl(BuildInfo.ServerUrl)
+            .WithUrl(
+                BuildInfo.ServerUrl,
+                Action<Microsoft.AspNetCore.Http.Connections.Client.HttpConnectionOptions>(fun options ->
+                    options.AccessTokenProvider <-
+                        Func<Task<string>>(fun () -> oauth.GetAccessTokenAsync()))
+            )
             .Build()
 
     ignoreAll {

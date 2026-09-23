@@ -22,6 +22,7 @@
 - **Client/Modules/ProjectBrowser.fs** - Project/file browsing, search, reads, writes, and unified-diff patch support.
 - **Client/Modules/ProjectPaths.fs** - Workspace/project path resolution and containment safety checks.
 - **Client/Modules/PermissionPolicy.fs** - Client-side confirmation policy and session grants.
+- **Client/Modules/ProcessEnvironment.fs** - Sensitive environment filtering and explicit user allowlists for spawned processes.
 - **Client/Modules/JobManager.fs** - Long-running local job management.
 - **Client/Modules/ClientShell.fs** - Bounded process execution and git command support.
 - **Server/Services/ClientService.fs** - Server-side command forwarding and client response tracking.

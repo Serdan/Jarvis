@@ -165,3 +165,65 @@ let ``project task names are case sensitive`` () =
         | other -> Assert.Fail($"Expected NotFoundError, got {other}")
     finally
         Directory.Delete(root, true)
+
+[<Test>]
+let ``process environment strips sensitive names but keeps ordinary variables`` () =
+    let startInfo = Diagnostics.ProcessStartInfo()
+    startInfo.UseShellExecute <- false
+    startInfo.Environment["JARVIS_TEST_SECRET_TOKEN"] <- "secret"
+    startInfo.Environment["JARVIS_TEST_SAFE_VALUE"] <- "safe"
+
+    ProcessEnvironment.applyWithAllowed [] startInfo
+
+    startInfo.Environment.ContainsKey("JARVIS_TEST_SECRET_TOKEN") |> shouldEqual false
+    startInfo.Environment["JARVIS_TEST_SAFE_VALUE"] |> shouldEqual "safe"
+
+[<Test>]
+let ``process environment allowlist preserves explicitly allowed sensitive variable`` () =
+    let startInfo = Diagnostics.ProcessStartInfo()
+    startInfo.UseShellExecute <- false
+    startInfo.Environment["JARVIS_TEST_SECRET_TOKEN"] <- "secret"
+
+    ProcessEnvironment.applyWithAllowed [ "jarvis_test_secret_token" ] startInfo
+
+    startInfo.Environment["JARVIS_TEST_SECRET_TOKEN"] |> shouldEqual "secret"
+
+[<Test; NonParallelizable>]
+let ``runCommand strips sensitive inherited environment unless explicitly allowed`` () =
+    let root = createTempProject ()
+    let variable = "JARVIS_TEST_SECRET_TOKEN"
+    let original = Environment.GetEnvironmentVariable variable
+
+    try
+        Environment.SetEnvironmentVariable(variable, "hidden-value")
+        let project = Path.Combine(root, "Project1")
+        File.WriteAllText(
+            Path.Combine(project, "environment.fsx"),
+            """open System
+printf "%s" (Environment.GetEnvironmentVariable("JARVIS_TEST_SECRET_TOKEN") |> Option.ofObj |> Option.defaultValue "missing")"""
+        )
+
+        let context = TestContext root
+        let cmd =
+            { ProjectName = "Project1"
+              Executable = "dotnet"
+              Args = [ "fsi"; "--exec"; "environment.fsx" ]
+              WorkingDirectory = None
+              TimeoutSeconds = Some 20
+              MaxOutputBytes = Some 4096 }
+
+        ProcessEnvironment.configureAllowedEnvironmentVariables []
+
+        match runCommand cmd context with
+        | Ok output -> output.StdOut.Trim() |> shouldEqual "missing"
+        | Error error -> Assert.Fail($"Expected sanitized RunCommand Ok, got {error}")
+
+        ProcessEnvironment.configureAllowedEnvironmentVariables [ variable ]
+
+        match runCommand cmd context with
+        | Ok output -> output.StdOut.Trim() |> shouldEqual "hidden-value"
+        | Error error -> Assert.Fail($"Expected allowlisted RunCommand Ok, got {error}")
+    finally
+        ProcessEnvironment.configureAllowedEnvironmentVariables []
+        Environment.SetEnvironmentVariable(variable, original)
+        Directory.Delete(root, true)

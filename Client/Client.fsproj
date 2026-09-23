@@ -38,6 +38,7 @@
         <Compile Include="Modules\PermissionPolicy.fs"/>
         <Compile Include="Modules\ConsoleTui.fs"/>
         <Compile Include="Modules\ProjectBrowser.fs"/>
+        <Compile Include="Modules\ProcessEnvironment.fs"/>
         <Compile Include="Modules\ClientShell.fs"/>
         <Compile Include="Modules\JobManager.fs"/>
         <Compile Include="Runtime.fs"/>

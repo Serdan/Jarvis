@@ -53,6 +53,8 @@ Read-only commands can inspect project structure and contents exposed by the sel
 
 In confirmation mode, users may approve a command once, approve the exact command for the current client session, or approve a specific process executable for the current project and command kind. Executable-scoped grants are explicit user choices; Jarvis does not infer process safety from command arguments.
 
+Spawned processes do not receive environment variables whose names look credential-bearing (for example tokens, secrets, passwords, API keys, connection strings, or agent credential paths) unless the user explicitly allowlists the variable at client startup. Allowlist exceptions can be supplied with repeated `--allow-env NAME` arguments or `JARVIS_ALLOWED_ENVIRONMENT_VARIABLES`. Project-owned `.jarvis.json` files cannot change this allowlist.
+
 Users can stop access by closing the local client, quitting the session, or refusing permission prompts.
 
 ## Data Retention

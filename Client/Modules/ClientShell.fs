@@ -94,6 +94,7 @@ module private Core =
                 proc.StartInfo.UseShellExecute <- false
                 proc.StartInfo.CreateNoWindow <- true
 
+                ProcessEnvironment.apply proc.StartInfo
                 args |> List.iter proc.StartInfo.ArgumentList.Add
 
                 if not (proc.Start()) then

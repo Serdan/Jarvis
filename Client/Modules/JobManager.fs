@@ -114,6 +114,7 @@ module private Core =
                 proc.StartInfo.RedirectStandardError <- true
                 proc.StartInfo.UseShellExecute <- false
                 proc.StartInfo.CreateNoWindow <- true
+                ProcessEnvironment.apply proc.StartInfo
                 proc.EnableRaisingEvents <- true
                 args |> List.iter proc.StartInfo.ArgumentList.Add
 

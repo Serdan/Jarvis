@@ -23,14 +23,24 @@ let rec getDir path =
         getDir (Console.ReadLine())
 
 let private parseArgs args =
-    let rec loop path permissionMode remaining =
+    let configuredEnvironmentVariables =
+        match Environment.GetEnvironmentVariable "JARVIS_ALLOWED_ENVIRONMENT_VARIABLES" with
+        | null
+        | "" -> []
+        | value ->
+            value.Split([| ','; ';' |], StringSplitOptions.RemoveEmptyEntries ||| StringSplitOptions.TrimEntries)
+            |> Array.toList
+
+    let rec loop path permissionMode allowedEnvironmentVariables remaining =
         match remaining with
-        | [] -> Ok(path, permissionMode)
-        | "--path" :: value :: tail -> loop value permissionMode tail
-        | "--permission-mode" :: value :: tail -> loop path value tail
+        | [] -> Ok(path, permissionMode, List.rev allowedEnvironmentVariables)
+        | "--path" :: value :: tail -> loop value permissionMode allowedEnvironmentVariables tail
+        | "--permission-mode" :: value :: tail -> loop path value allowedEnvironmentVariables tail
+        | "--allow-env" :: value :: tail ->
+            loop path permissionMode (value :: allowedEnvironmentVariables) tail
         | unknown :: _ -> Error $"Unknown or incomplete argument: {unknown}"
 
-    loop "" (Environment.GetEnvironmentVariable "JARVIS_PERMISSION_MODE") (args |> Array.toList)
+    loop "" (Environment.GetEnvironmentVariable "JARVIS_PERMISSION_MODE") (List.rev configuredEnvironmentVariables) (args |> Array.toList)
 
 let register (tui: ConsoleTui) (connection: HubConnection) key =
     task {
@@ -61,21 +71,23 @@ let connect (tui: ConsoleTui) (connection: HubConnection) =
 let main args =
     let tui = ConsoleTui()
 
-    let dir, permissionMode =
+    let dir, permissionMode, allowedEnvironmentVariables =
         match parseArgs args with
-        | Ok(path, modeValue) ->
+        | Ok(path, modeValue, allowedEnvironmentVariables) ->
             match PermissionMode.parse modeValue with
-            | Ok mode -> path, mode
+            | Ok mode -> path, mode, allowedEnvironmentVariables
             | Error message ->
                 eprintfn $"%s{message}"
                 exit 2
         | Error message ->
             eprintfn $"%s{message}"
-            eprintfn "Usage: JarvisClient [--path <workspace>] [--permission-mode confirm|workspace-write|trust-except-run-command|trust-session]"
+            eprintfn "Usage: JarvisClient [--path <workspace>] [--permission-mode confirm|workspace-write|trust-except-run-command|trust-session] [--allow-env NAME]..."
             exit 2
 
+    ProcessEnvironment.configureAllowedEnvironmentVariables allowedEnvironmentVariables
     let rt = Runtime(getDir dir, tui, permissionMode)
     tui.Log $"Permission mode: {PermissionMode.toDisplayName permissionMode}"
+    tui.Log $"Allowed sensitive environment variables: {allowedEnvironmentVariables.Length}"
 
     let connection =
         HubConnectionBuilder()

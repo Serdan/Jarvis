@@ -260,7 +260,8 @@ Execution policy:
 - Prefer an allowlist for commands.
 - Capture stdout, stderr, exit code, and timeout state.
 - Truncate output according to `MaxOutputBytes` or implementation defaults.
-- Do not inherit sensitive environment variables unless explicitly allowed.
+- Strip environment variables whose names match the client sensitive-environment policy before starting the process.
+- Permit exceptions only through user-controlled client startup configuration (`--allow-env NAME` or `JARVIS_ALLOWED_ENVIRONMENT_VARIABLES`), not project-owned configuration.
 
 Suggested result shape:
 

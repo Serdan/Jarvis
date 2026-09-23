@@ -163,3 +163,52 @@ let ``job output polling is ordered and incremental across streams`` () =
             second.NextSequence |> shouldEqual first.NextSequence
     finally
         Directory.Delete(root, true)
+
+[<Test; NonParallelizable>]
+let ``startJob strips sensitive inherited environment`` () =
+    let root = createTempProject ()
+    let variable = "JARVIS_TEST_JOB_SECRET_TOKEN"
+    let original = Environment.GetEnvironmentVariable variable
+
+    try
+        Environment.SetEnvironmentVariable(variable, "hidden-job-value")
+        ProcessEnvironment.configureAllowedEnvironmentVariables []
+
+        let project = Path.Combine(root, "Project1")
+        File.WriteAllText(
+            Path.Combine(project, "environment.fsx"),
+            """open System
+printfn "%s" (Environment.GetEnvironmentVariable("JARVIS_TEST_JOB_SECRET_TOKEN") |> Option.ofObj |> Option.defaultValue "missing")"""
+        )
+
+        let context = TestContext root
+        let start =
+            { ProjectName = "Project1"
+              Executable = "dotnet"
+              Args = [ "fsi"; "--exec"; "environment.fsx" ]
+              WorkingDirectory = None
+              MaxOutputBytes = Some 4096 }
+
+        let jobId =
+            match startJob start context with
+            | Ok result -> result.JobId
+            | Error error -> failwith $"Expected StartJob Ok, got {error}"
+
+        let rec waitForCompletion remaining =
+            match getJobResult { JobId = jobId; AfterSequence = Some 0L } context with
+            | Error error -> failwith $"Expected GetJobResult Ok, got {error}"
+            | Ok result when result.Status <> Running -> result
+            | Ok _ when remaining <= 0 -> failwith "Job did not complete in time."
+            | Ok _ ->
+                Thread.Sleep 50
+                waitForCompletion (remaining - 1)
+
+        let result = waitForCompletion 100
+        let output = result.Events |> List.map (fun event -> event.Text) |> String.concat ""
+
+        output.Contains("missing") |> shouldEqual true
+        output.Contains("hidden-job-value") |> shouldEqual false
+    finally
+        ProcessEnvironment.configureAllowedEnvironmentVariables []
+        Environment.SetEnvironmentVariable(variable, original)
+        Directory.Delete(root, true)

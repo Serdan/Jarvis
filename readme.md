@@ -71,6 +71,15 @@ chmod +x JarvisClient-linux-x64
 ./JarvisClient-linux-x64 --path ~/Projects
 ```
 
+Spawned commands and jobs strip likely credential-bearing environment variables by default. Explicit exceptions are user-controlled:
+
+```bash
+./JarvisClient-linux-x64 --path ~/Projects --allow-env NUGET_AUTH_TOKEN
+JARVIS_ALLOWED_ENVIRONMENT_VARIABLES=NUGET_AUTH_TOKEN,GITHUB_TOKEN ./JarvisClient-linux-x64 --path ~/Projects
+```
+
+Project `.jarvis.json` files cannot grant themselves access to filtered environment variables.
+
 ## Build Scripts
 
 Jarvis uses a .NET 10 file-based C# build app with `System.CommandLine`:

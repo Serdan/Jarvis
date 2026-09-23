@@ -16,7 +16,7 @@
 
 - **Jarvis.slnx** - Solution file managing all project components.
 - **scripts/build.cs** - Build, test, clean, and publish entry point.
-- **Common/Messages/AgentCommand.fs** - Protocol v2 command definitions, command capabilities, permission levels, errors, jobs, and git command types.
+- **Common/Messages/AgentCommand.fs** - Protocol v2 command types plus the authoritative command catalog used to derive capabilities and primary legacy routes.
 - **Common/SignalR/IClientService.fs** - Shared SignalR client contract.
 - **Client/SignalR/Client.fs** - Client command receiver/dispatcher and response serialization.
 - **Client/Modules/ProjectBrowser.fs** - Project/file browsing, search, reads, writes, and unified-diff patch support.

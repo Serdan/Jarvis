@@ -74,31 +74,31 @@ let bind<'a> path (handler: AgentMessage<'a> -> HttpHandler) : HttpHandler =
 
 let agentEndpoints =
     let endpoints =
-        [ bind<ListCommandsCommand> "/listCommands" Endpoints.listCommands
-          bind<ListProjectsCommand> "/listProjects" Endpoints.listProjects
-          bind<GetProjectDetailsCommand> "/getProjectDetails" Endpoints.getProjectDetails
-          bind<ListDirectoryCommand> "/listDirectory" Endpoints.listProjectDirectory
-          bind<SearchFilesCommand> "/searchFiles" Endpoints.searchFiles
-          bind<SearchTextCommand> "/searchText" Endpoints.searchText
-          bind<ReadFileCommand> "/readFile" Endpoints.readFile
-          bind<ReadFilesCommand> "/readFiles" Endpoints.readFiles
+        [ bind<ListCommandsCommand> (AgentProtocol.legacyRoute "ListCommands") Endpoints.listCommands
+          bind<ListProjectsCommand> (AgentProtocol.legacyRoute "ListProjects") Endpoints.listProjects
+          bind<GetProjectDetailsCommand> (AgentProtocol.legacyRoute "GetProjectDetails") Endpoints.getProjectDetails
+          bind<ListDirectoryCommand> (AgentProtocol.legacyRoute "ListDirectory") Endpoints.listProjectDirectory
+          bind<SearchFilesCommand> (AgentProtocol.legacyRoute "SearchFiles") Endpoints.searchFiles
+          bind<SearchTextCommand> (AgentProtocol.legacyRoute "SearchText") Endpoints.searchText
+          bind<ReadFileCommand> (AgentProtocol.legacyRoute "ReadFile") Endpoints.readFile
+          bind<ReadFilesCommand> (AgentProtocol.legacyRoute "ReadFiles") Endpoints.readFiles
           // Compatibility aliases for older deployed action schemas.
           bind<GetProjectDetailsCommand> "/openProject" Endpoints.getProjectDetails
           bind<ListDirectoryCommand> "/listProjectDirectory" Endpoints.listProjectDirectory
           bind<ReadFileCommand> "/openfile" Endpoints.readFile
           bind<ReadFileCommand> "/readfile" Endpoints.readFile
-          bind<WriteFileCommand> "/writeFile" Endpoints.writeFile
-          bind<PatchFileCommand> "/patchFile" Endpoints.patchFile
-          bind<RunCommandCommand> "/runCommand" Endpoints.runCommand
-          bind<ListProjectTasksCommand> "/listProjectTasks" Endpoints.listProjectTasks
-          bind<RunProjectTaskCommand> "/runProjectTask" Endpoints.runProjectTask
-          bind<GitStatusCommand> "/getGitStatus" Endpoints.getGitStatus
-          bind<GitDiffCommand> "/getGitDiff" Endpoints.getGitDiff
-          bind<GitCommitCommand> "/gitCommit" Endpoints.gitCommit
-          bind<StartJobCommand> "/startJob" Endpoints.startJob
-          bind<ListJobsCommand> "/listJobs" Endpoints.listJobs
-          bind<GetJobResultCommand> "/getJobResult" Endpoints.getJobResult
-          bind<CancelJobCommand> "/cancelJob" Endpoints.cancelJob ]
+          bind<WriteFileCommand> (AgentProtocol.legacyRoute "WriteFile") Endpoints.writeFile
+          bind<PatchFileCommand> (AgentProtocol.legacyRoute "PatchFile") Endpoints.patchFile
+          bind<RunCommandCommand> (AgentProtocol.legacyRoute "RunCommand") Endpoints.runCommand
+          bind<ListProjectTasksCommand> (AgentProtocol.legacyRoute "ListProjectTasks") Endpoints.listProjectTasks
+          bind<RunProjectTaskCommand> (AgentProtocol.legacyRoute "RunProjectTask") Endpoints.runProjectTask
+          bind<GitStatusCommand> (AgentProtocol.legacyRoute "GetGitStatus") Endpoints.getGitStatus
+          bind<GitDiffCommand> (AgentProtocol.legacyRoute "GetGitDiff") Endpoints.getGitDiff
+          bind<GitCommitCommand> (AgentProtocol.legacyRoute "GitCommit") Endpoints.gitCommit
+          bind<StartJobCommand> (AgentProtocol.legacyRoute "StartJob") Endpoints.startJob
+          bind<ListJobsCommand> (AgentProtocol.legacyRoute "ListJobs") Endpoints.listJobs
+          bind<GetJobResultCommand> (AgentProtocol.legacyRoute "GetJobResult") Endpoints.getJobResult
+          bind<CancelJobCommand> (AgentProtocol.legacyRoute "CancelJob") Endpoints.cancelJob ]
 
     requiresApiKey >=> noResponseCaching >=> POST >=> choose endpoints
 

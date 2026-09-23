@@ -80,3 +80,70 @@ let ``all Jarvis MCP tools return structured JSON content`` () =
         methodInfo.ReturnType.IsGenericType |> shouldEqual true
         methodInfo.ReturnType.GetGenericTypeDefinition() |> shouldEqual typedefof<Task<_>>
         methodInfo.ReturnType.GetGenericArguments()[0] |> shouldEqual typeof<JsonElement>
+
+[<Test>]
+let ``command catalog matches AgentCommand union and MCP tools`` () =
+    let catalogNames =
+        AgentProtocol.commandDefinitions
+        |> List.map (fun definition -> definition.Name)
+        |> Set.ofList
+
+    let unionNames =
+        Microsoft.FSharp.Reflection.FSharpType.GetUnionCases(typeof<AgentCommand>)
+        |> Array.map (fun unionCase ->
+            if unionCase.Name.EndsWith("Command", StringComparison.Ordinal) then
+                unionCase.Name.Substring(0, unionCase.Name.Length - "Command".Length)
+            else
+                unionCase.Name)
+        |> Set.ofArray
+
+    let mcpNames =
+        typeof<JarvisMcpTools>.GetMethods()
+        |> Array.choose (fun methodInfo ->
+            match methodInfo.GetCustomAttributes(typeof<McpServerToolAttribute>, false) with
+            | [| :? McpServerToolAttribute |] -> Some methodInfo.Name
+            | _ -> None)
+        |> Set.ofArray
+
+    unionNames |> shouldEqual catalogNames
+    mcpNames |> shouldEqual catalogNames
+
+[<Test>]
+let ``actions schema matches command catalog operations and routes`` () =
+    let schemaPath =
+        IO.Path.GetFullPath(IO.Path.Combine(__SOURCE_DIRECTORY__, "..", "actions-schema"))
+
+    let lines = IO.File.ReadAllLines schemaPath
+
+    let operationIds =
+        lines
+        |> Array.choose (fun line ->
+            let trimmed = line.Trim()
+            let prefix = "operationId: "
+            if trimmed.StartsWith(prefix, StringComparison.Ordinal) then
+                Some(trimmed.Substring(prefix.Length))
+            else
+                None)
+        |> Set.ofArray
+
+    let routes =
+        lines
+        |> Array.choose (fun line ->
+            if line.StartsWith("  /agent/", StringComparison.Ordinal) && line.EndsWith(":", StringComparison.Ordinal) then
+                Some(line.Trim().TrimEnd(':'))
+            else
+                None)
+        |> Set.ofArray
+
+    let expectedOperationIds =
+        AgentProtocol.commandDefinitions
+        |> List.map (fun definition -> definition.OperationId)
+        |> Set.ofList
+
+    let expectedRoutes =
+        AgentProtocol.commandDefinitions
+        |> List.map (fun definition -> "/agent" + AgentProtocol.legacyRoute definition.Name)
+        |> Set.ofList
+
+    operationIds |> shouldEqual expectedOperationIds
+    routes |> shouldEqual expectedRoutes

@@ -6,7 +6,7 @@ Improve Jarvis based on direct agent use during a substantial review/edit/test s
 
 ## Status
 
-Items 1-9 complete. Starting item 10: single authoritative command specification.
+Items 1-10 complete. Starting item 11: typed MCP errors.
 
 ## Notes
 
@@ -26,7 +26,7 @@ Items 1-9 complete. Starting item 10: single authoritative command specification
 - [x] 7. Add project-configured first-class tasks.
 - [x] 8. Model incremental job output with proper stdout/stderr offsets or ordered events.
 - [x] 9. Control inherited environment variables for spawned processes.
-- [ ] 10. Generate external command surfaces from one command specification.
+- [x] 10. Generate external command surfaces from one command specification.
 - [ ] 11. Preserve typed errors through MCP.
 - [ ] 12. Expose explicit session/registration state.
 

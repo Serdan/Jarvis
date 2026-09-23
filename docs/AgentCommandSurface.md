@@ -786,6 +786,12 @@ Search commands should support enough include/exclude input to let clients expre
 
 ## Additional Protocol Rules
 
+### Command Catalog
+
+`AgentProtocol.commandDefinitions` is the authoritative command catalog for command name, operation ID, description, permissions, mutation/confirmation behavior, and dry-run support. `ListCommands` capabilities and primary legacy HTTP route paths are derived from this catalog.
+
+The MCP tool surface and `actions-schema` remain adapter-specific code, but tests require their command/tool names, operation IDs, and primary routes to match the catalog exactly. Adding or renaming a command therefore fails tests until all external surfaces are synchronized.
+
 ### Protocol Version
 
 The initial version of this command surface was `2.0`. The current version is `2.7`.

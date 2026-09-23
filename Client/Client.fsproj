@@ -33,6 +33,7 @@
         <Compile Include="IO\Impl\ProjectOperations.fs"/>
         <Compile Include="IO\Impl\FileOperations.fs"/>
         <Compile Include="IO\Impl\WebOperations.fs"/>
+        <Compile Include="Modules\DeviceIdentity.fs"/>
         <Compile Include="Modules\ProjectPaths.fs"/>
         <Compile Include="Modules\AuditLog.fs"/>
         <Compile Include="Modules\PermissionPolicy.fs"/>

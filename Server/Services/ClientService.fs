@@ -19,24 +19,23 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
             TimeSpan.FromSeconds(float executionSeconds) + permissionMargin
         | _ -> TimeSpan.FromMinutes(10L)
 
-    member this.SendCommandToUser(message: AgentMessage) =
+    member this.SendCommandToUser(userId: string, command: AgentCommand) =
         task {
-            match users.GetSession(message.Key) with
+            match users.GetSession(userId) with
             | ValueNone ->
                 return
                     { Result = None
-                      Error = Some(NotFound $"Session key has never been registered: {message.Key}") }
+                      Error = Some(NotFound "No Jarvis client has registered for the authenticated user.") }
             | ValueSome session ->
                 match session.State, session.ConnectionId with
                 | Disconnected, _ ->
                     let reason = session.LastFailure |> Option.defaultValue "Transport disconnected"
-
                     return
                         { Result = None
                           Error =
                             Some(
                                 ExecutionFailed
-                                    $"Client session is disconnected (generation {session.Generation}, protocol {session.ProtocolVersion}, last seen {session.LastSeenAt:O}). Reason: {reason}"
+                                    $"Jarvis device {session.DeviceName} is disconnected (generation {session.Generation}, protocol {session.ProtocolVersion}, last seen {session.LastSeenAt:O}). Reason: {reason}"
                             ) }
                 | Registered, None ->
                     return
@@ -44,25 +43,23 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                           Error =
                             Some(
                                 ExecutionFailed
-                                    $"Client session generation {session.Generation} is registered without an active connection."
+                                    $"Jarvis device {session.DeviceName} generation {session.Generation} is registered without an active connection."
                             ) }
                 | Registered, Some connectionId ->
-                    let correlationId, trackingTask = tracker.Register(this.ResponseTimeout message.Command)
+                    let correlationId, trackingTask = tracker.Register(this.ResponseTimeout command)
                     let client = ctx.Clients.Client(connectionId)
-                    let commandJson = JsonSerializer.Serialize<AgentCommand>(message.Command)
+                    let commandJson = JsonSerializer.Serialize<AgentCommand>(command)
 
                     try
                         do! client.ReceiveCommand(correlationId, commandJson)
-                        users.RecordDispatchSuccess(message.Key, connectionId)
+                        users.RecordDispatchSuccess(userId, connectionId)
 
                         try
                             return! trackingTask
                         with :? TaskCanceledException ->
                             let reason =
-                                $"Client response timeout for session generation {session.Generation}."
-
-                            users.RecordDispatchFailure(message.Key, connectionId, reason)
-
+                                $"Client response timeout for {session.DeviceName} generation {session.Generation}."
+                            users.RecordDispatchFailure(userId, connectionId, reason)
                             return
                                 { Result = None
                                   Error =
@@ -73,10 +70,8 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                     with ex ->
                         tracker.Cancel(correlationId)
                         let reason =
-                            $"Dispatch failed for session generation {session.Generation}: {ex.Message}"
-
-                        users.RecordDispatchFailure(message.Key, connectionId, reason)
-
+                            $"Dispatch failed for {session.DeviceName} generation {session.Generation}: {ex.Message}"
+                        users.RecordDispatchFailure(userId, connectionId, reason)
                         return
                             { Result = None
                               Error = Some(ExecutionFailed reason) }

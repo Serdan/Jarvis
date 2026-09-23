@@ -5,25 +5,31 @@ open System.Threading.Tasks
 open Common
 open Common.SignalR
 open Microsoft.AspNetCore.SignalR
+open Server
 
 type HubService(users: UserService, tracker: ClientResponseTracker) =
     inherit Hub<IClientService>()
 
+    member private this.UserId =
+        match Auth.tryUserId this.Context.User with
+        | Some userId -> userId
+        | None -> raise (InvalidOperationException("Authenticated SignalR connection is missing a subject claim."))
+
     override this.OnConnectedAsync() =
-        users.TransportConnected(this.Context.ConnectionId)
+        users.TransportConnected(this.UserId, this.Context.ConnectionId)
         base.OnConnectedAsync()
 
-    override this.OnDisconnectedAsync(``exception``) =
+    override this.OnDisconnectedAsync(error) =
         let reason =
-            match ``exception`` with
+            match error with
             | null -> None
             | ex -> Some ex.Message
 
         users.Disconnect(this.Context.ConnectionId, reason)
-        base.OnDisconnectedAsync(``exception``)
+        base.OnDisconnectedAsync(error)
 
     member this.Connect(registration: ClientRegistration) =
-        users.Register(registration, this.Context.ConnectionId)
+        users.Register(this.UserId, registration, this.Context.ConnectionId)
         |> Task.FromResult
 
     member this.SendClientResponse(correlationId: string, response: AgentCommandResponse) =

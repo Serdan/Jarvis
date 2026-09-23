@@ -5,6 +5,7 @@ open System.ComponentModel
 open System.Text.Json
 open System.Threading.Tasks
 open Common
+open Microsoft.AspNetCore.Http
 open ModelContextProtocol.Protocol
 open ModelContextProtocol.Server
 open Server.Services
@@ -62,10 +63,14 @@ module McpToolHelpers =
         | None, None ->
             errorResult (ExecutionFailed "Invalid Jarvis response: neither result nor error was set.")
 
-    let send (client: ClientService) key command =
+    let send (client: ClientService) (http: IHttpContextAccessor) command =
         task {
-            let! response = client.SendCommandToUser({ Key = key; Command = command })
-            return toCallToolResult response
+            match Option.ofObj http.HttpContext |> Option.bind (fun context -> Auth.tryUserId context.User) with
+            | Some userId ->
+                let! response = client.SendCommandToUser(userId, command)
+                return toCallToolResult response
+            | None ->
+                return errorResult (PermissionDenied "The MCP request is missing an authenticated user identity.")
         }
 
     let optionOfString (value: string) =
@@ -88,32 +93,32 @@ module McpToolHelpers =
 [<McpServerToolType>]
 type JarvisMcpTools =
     [<McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof<JsonElement>); Description("List the commands supported by the connected Jarvis client.")>]
-    static member ListCommands([<Description("Jarvis client session key shown by the local client.")>] key: string, client: ClientService) =
-        McpToolHelpers.send client key ListCommandsCommand
+    static member ListCommands(client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http ListCommandsCommand
 
     [<McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof<JsonElement>); Description("List projects exposed by the connected Jarvis client.")>]
-    static member ListProjects([<Description("Jarvis client session key shown by the local client.")>] key: string, client: ClientService) =
-        McpToolHelpers.send client key ListProjectsCommand
+    static member ListProjects(client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http ListProjectsCommand
 
     [<McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof<JsonElement>); Description("Get project details, README, notes, TODO, and related special files.")>]
-    static member GetProjectDetails(key: string, projectName: string, client: ClientService) =
-        McpToolHelpers.send client key (GetProjectDetailsCommand { ProjectName = projectName })
+    static member GetProjectDetails(projectName: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http (GetProjectDetailsCommand { ProjectName = projectName })
 
     [<McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof<JsonElement>); Description("List files and folders in a project directory.")>]
-    static member ListDirectory(key: string, projectName: string, folderPath: string, client: ClientService) =
-        McpToolHelpers.send client key (ListDirectoryCommand { ProjectName = projectName; FolderPath = folderPath })
+    static member ListDirectory(projectName: string, folderPath: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http (ListDirectoryCommand { ProjectName = projectName; FolderPath = folderPath })
 
     [<McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof<JsonElement>); Description("Search project file and folder names.")>]
-    static member SearchFiles(key: string, projectName: string, query: string, folderPath: string, maxResults: Nullable<int>, client: ClientService) =
-        McpToolHelpers.send client key (SearchFilesCommand {
+    static member SearchFiles(projectName: string, query: string, folderPath: string, maxResults: Nullable<int>, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http (SearchFilesCommand {
             ProjectName = projectName
             Query = query
             FolderPath = McpToolHelpers.optionOfString folderPath
             MaxResults = McpToolHelpers.optionOfNullable maxResults })
 
     [<McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof<JsonElement>); Description("Search text inside project files.")>]
-    static member SearchText(key: string, projectName: string, query: string, folderPath: string, includeGlobs: string array, excludeGlobs: string array, maxResults: Nullable<int>, client: ClientService) =
-        McpToolHelpers.send client key (SearchTextCommand {
+    static member SearchText(projectName: string, query: string, folderPath: string, includeGlobs: string array, excludeGlobs: string array, maxResults: Nullable<int>, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http (SearchTextCommand {
             ProjectName = projectName
             Query = query
             FolderPath = McpToolHelpers.optionOfString folderPath
@@ -122,8 +127,8 @@ type JarvisMcpTools =
             MaxResults = McpToolHelpers.optionOfNullable maxResults })
 
     [<McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof<JsonElement>); Description("Read one project file.")>]
-    static member ReadFile(key: string, projectName: string, filePath: string, startLine: Nullable<int>, endLine: Nullable<int>, includeLineNumbers: Nullable<bool>, client: ClientService) =
-        McpToolHelpers.send client key (ReadFileCommand {
+    static member ReadFile(projectName: string, filePath: string, startLine: Nullable<int>, endLine: Nullable<int>, includeLineNumbers: Nullable<bool>, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http (ReadFileCommand {
             ProjectName = projectName
             FilePath = filePath
             StartLine = McpToolHelpers.optionOfNullable startLine
@@ -131,13 +136,13 @@ type JarvisMcpTools =
             IncludeLineNumbers = McpToolHelpers.optionOfNullableBool includeLineNumbers })
 
     [<McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof<JsonElement>); Description("Read multiple project files.")>]
-    static member ReadFiles(key: string, projectName: string, filePaths: string array, client: ClientService) =
-        McpToolHelpers.send client key (ReadFilesCommand { ProjectName = projectName; FilePaths = filePaths |> Array.toList })
+    static member ReadFiles(projectName: string, filePaths: string array, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http (ReadFilesCommand { ProjectName = projectName; FilePaths = filePaths |> Array.toList })
 
     [<McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof<JsonElement>); Description("Write or append to a project file. Requires approval in the local Jarvis client.")>]
-    static member WriteFile(key: string, projectName: string, filePath: string, content: string, fileWriteMode: string, expectedHash: string, createParents: Nullable<bool>, client: ClientService) =
+    static member WriteFile(projectName: string, filePath: string, content: string, fileWriteMode: string, expectedHash: string, createParents: Nullable<bool>, client: ClientService, http: IHttpContextAccessor) =
         let mode = McpToolHelpers.parseFileWriteMode fileWriteMode
-        McpToolHelpers.send client key (WriteFileCommand {
+        McpToolHelpers.send client http (WriteFileCommand {
             ProjectName = projectName
             FilePath = filePath
             Content = content
@@ -146,8 +151,8 @@ type JarvisMcpTools =
             CreateParents = McpToolHelpers.optionOfNullableBool createParents })
 
     [<McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof<JsonElement>); Description("Apply an atomic unified diff patch to one project file. Requires approval in the local Jarvis client.")>]
-    static member PatchFile(key: string, projectName: string, filePath: string, patch: string, expectedHash: string, dryRun: Nullable<bool>, fuzzyContextLines: Nullable<int>, returnContent: Nullable<bool>, client: ClientService) =
-        McpToolHelpers.send client key (PatchFileCommand {
+    static member PatchFile(projectName: string, filePath: string, patch: string, expectedHash: string, dryRun: Nullable<bool>, fuzzyContextLines: Nullable<int>, returnContent: Nullable<bool>, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http (PatchFileCommand {
             ProjectName = projectName
             FilePath = filePath
             ExpectedHash = McpToolHelpers.optionOfString expectedHash
@@ -158,8 +163,8 @@ type JarvisMcpTools =
             ReturnContent = McpToolHelpers.optionOfNullableBool returnContent })
 
     [<McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof<JsonElement>); Description("Run a bounded local command in a project. Requires approval in the local Jarvis client.")>]
-    static member RunCommand(key: string, projectName: string, executable: string, args: string array, workingDirectory: string, timeoutSeconds: Nullable<int>, maxOutputBytes: Nullable<int>, client: ClientService) =
-        McpToolHelpers.send client key (RunCommandCommand {
+    static member RunCommand(projectName: string, executable: string, args: string array, workingDirectory: string, timeoutSeconds: Nullable<int>, maxOutputBytes: Nullable<int>, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http (RunCommandCommand {
             ProjectName = projectName
             Executable = executable
             Args = args |> Array.toList
@@ -168,27 +173,27 @@ type JarvisMcpTools =
             MaxOutputBytes = McpToolHelpers.optionOfNullable maxOutputBytes })
 
     [<McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof<JsonElement>); Description("List locally configured project tasks from .jarvis.json.")>]
-    static member ListProjectTasks(key: string, projectName: string, client: ClientService) =
-        McpToolHelpers.send client key (ListProjectTasksCommand { ProjectName = projectName })
+    static member ListProjectTasks(projectName: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http (ListProjectTasksCommand { ProjectName = projectName })
 
     [<McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof<JsonElement>); Description("Run a named task configured in the project's .jarvis.json. Requires local process approval.")>]
-    static member RunProjectTask(key: string, projectName: string, taskName: string, client: ClientService) =
-        McpToolHelpers.send client key (RunProjectTaskCommand { ProjectName = projectName; TaskName = taskName })
+    static member RunProjectTask(projectName: string, taskName: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http (RunProjectTaskCommand { ProjectName = projectName; TaskName = taskName })
 
     [<McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof<JsonElement>); Description("Get git status for a project.")>]
-    static member GetGitStatus(key: string, projectName: string, client: ClientService) =
-        McpToolHelpers.send client key (GetGitStatusCommand { ProjectName = projectName })
+    static member GetGitStatus(projectName: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http (GetGitStatusCommand { ProjectName = projectName })
 
     [<McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof<JsonElement>); Description("Get git diff for a project or project-relative path.")>]
-    static member GetGitDiff(key: string, projectName: string, path: string, maxOutputBytes: Nullable<int>, client: ClientService) =
-        McpToolHelpers.send client key (GetGitDiffCommand {
+    static member GetGitDiff(projectName: string, path: string, maxOutputBytes: Nullable<int>, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http (GetGitDiffCommand {
             ProjectName = projectName
             Path = McpToolHelpers.optionOfString path
             MaxOutputBytes = McpToolHelpers.optionOfNullable maxOutputBytes })
 
     [<McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof<JsonElement>); Description("Create a local git commit from selected paths. Requires approval in the local Jarvis client.")>]
-    static member GitCommit(key: string, projectName: string, message: string, body: string, paths: string array, allowEmpty: bool, client: ClientService) =
-        McpToolHelpers.send client key (GitCommitCommand {
+    static member GitCommit(projectName: string, message: string, body: string, paths: string array, allowEmpty: bool, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http (GitCommitCommand {
             ProjectName = projectName
             Message = message
             Body = McpToolHelpers.optionOfString body
@@ -196,8 +201,8 @@ type JarvisMcpTools =
             AllowEmpty = allowEmpty })
 
     [<McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof<JsonElement>); Description("Start a long-running local job. Requires approval in the local Jarvis client.")>]
-    static member StartJob(key: string, projectName: string, executable: string, args: string array, workingDirectory: string, maxOutputBytes: Nullable<int>, client: ClientService) =
-        McpToolHelpers.send client key (StartJobCommand {
+    static member StartJob(projectName: string, executable: string, args: string array, workingDirectory: string, maxOutputBytes: Nullable<int>, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http (StartJobCommand {
             ProjectName = projectName
             Executable = executable
             Args = args |> Array.toList
@@ -205,17 +210,17 @@ type JarvisMcpTools =
             MaxOutputBytes = McpToolHelpers.optionOfNullable maxOutputBytes })
 
     [<McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof<JsonElement>); Description("List running or completed Jarvis jobs.")>]
-    static member ListJobs(key: string, projectName: string, includeCompleted: bool, client: ClientService) =
-        McpToolHelpers.send client key (ListJobsCommand {
+    static member ListJobs(projectName: string, includeCompleted: bool, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http (ListJobsCommand {
             ProjectName = McpToolHelpers.optionOfString projectName
             IncludeCompleted = includeCompleted })
 
     [<McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof<JsonElement>); Description("Get buffered output and status for a Jarvis job.")>]
-    static member GetJobResult(key: string, jobId: string, afterSequence: Nullable<int64>, client: ClientService) =
-        McpToolHelpers.send client key (GetJobResultCommand {
+    static member GetJobResult(jobId: string, afterSequence: Nullable<int64>, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http (GetJobResultCommand {
             JobId = jobId
             AfterSequence = McpToolHelpers.optionOfNullableInt64 afterSequence })
 
     [<McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof<JsonElement>); Description("Cancel a running Jarvis job. Requires approval in the local Jarvis client.")>]
-    static member CancelJob(key: string, jobId: string, client: ClientService) =
-        McpToolHelpers.send client key (CancelJobCommand { JobId = jobId })
+    static member CancelJob(jobId: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http (CancelJobCommand { JobId = jobId })

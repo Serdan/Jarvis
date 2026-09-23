@@ -297,11 +297,8 @@ type AgentCommand =
     | GetJobResultCommand of GetJobResultCommand
     | CancelJobCommand of CancelJobCommand
 
-type AgentMessage<'a> = { Key: string; Command: 'a }
-type AgentMessage = { Key: string; Command: AgentCommand }
-
 module AgentProtocol =
-    let version = "2.8"
+    let version = "3.0"
     let defaultPatchFuzzyContextLines = 3
     let maxResponseBytes = 900 * 1024
 
@@ -362,7 +359,3 @@ module AgentProtocol =
         { ProtocolVersion = version
           Commands = capabilities }
 
-module AgentMessage =
-    let create f (message: AgentMessage<'a>) =
-        { Key = message.Key
-          Command = f message.Command }

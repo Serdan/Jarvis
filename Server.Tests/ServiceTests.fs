@@ -13,28 +13,31 @@ open Server
 open Server.Services
 
 [<Test>]
-let ``user service exposes transport connection before registration`` () =
+let user_service_exposes_authenticated_transport_before_registration () =
     let users = UserService()
-    users.TransportConnected("connection")
+    users.TransportConnected("auth0|user", "connection")
 
     match users.GetTransportConnection("connection") with
     | ValueNone -> Assert.Fail("Expected transport connection.")
     | ValueSome connection ->
         connection.ConnectionId |> shouldEqual "connection"
-        connection.RegisteredKey |> shouldEqual None
+        connection.UserId |> shouldEqual "auth0|user"
+        connection.RegisteredDeviceId |> shouldEqual None
 
 [<Test>]
-let ``user service increments generation and preserves replacement on stale disconnect`` () =
+let user_service_increments_generation_and_preserves_replacement_on_stale_disconnect () =
     let users = UserService()
+    let userId = "auth0|user"
     let registration =
-        { Key = "session"
+        { DeviceId = "device-1"
+          DeviceName = "Workstation"
           ProtocolVersion = AgentProtocol.version
           ClientVersion = "1.2.3" }
 
-    users.TransportConnected("old-connection")
-    let first = users.Register(registration, "old-connection")
-    users.TransportConnected("new-connection")
-    let second = users.Register(registration, "new-connection")
+    users.TransportConnected(userId, "old-connection")
+    let first = users.Register(userId, registration, "old-connection")
+    users.TransportConnected(userId, "new-connection")
+    let second = users.Register(userId, registration, "new-connection")
 
     first.Generation |> shouldEqual 1L
     second.Generation |> shouldEqual 2L
@@ -42,52 +45,85 @@ let ``user service increments generation and preserves replacement on stale disc
 
     users.Disconnect("old-connection", Some "stale disconnect")
 
-    match users.GetSession("session") with
+    match users.GetSession(userId) with
     | ValueNone -> Assert.Fail("Expected retained session.")
     | ValueSome session ->
         session.State |> shouldEqual Registered
         session.ConnectionId |> shouldEqual (Some "new-connection")
         session.Generation |> shouldEqual 2L
+        session.UserId |> shouldEqual userId
+        session.DeviceId |> shouldEqual registration.DeviceId
+        session.DeviceName |> shouldEqual registration.DeviceName
         session.ProtocolVersion |> shouldEqual AgentProtocol.version
         session.ClientVersion |> shouldEqual "1.2.3"
-        users.GetConnectionId("session") |> shouldEqual (ValueSome "new-connection")
+        users.GetConnectionId(userId) |> shouldEqual (ValueSome "new-connection")
 
 [<Test>]
-let ``user service retains disconnected session and failure reason`` () =
+let user_service_switches_active_device_for_same_user () =
     let users = UserService()
+    let userId = "auth0|user"
+    let firstRegistration =
+        { DeviceId = "device-1"
+          DeviceName = "Desktop"
+          ProtocolVersion = AgentProtocol.version
+          ClientVersion = "1.0.0" }
+    let secondRegistration = { firstRegistration with DeviceId = "device-2"; DeviceName = "Laptop" }
+
+    users.TransportConnected(userId, "desktop-connection")
+    users.Register(userId, firstRegistration, "desktop-connection") |> ignore
+    users.TransportConnected(userId, "laptop-connection")
+    let switched = users.Register(userId, secondRegistration, "laptop-connection")
+
+    switched.Generation |> shouldEqual 2L
+    switched.RegistrationReason.Contains("Device switch", StringComparison.Ordinal) |> shouldEqual true
+
+    match users.GetSession(userId) with
+    | ValueNone -> Assert.Fail("Expected active device.")
+    | ValueSome session ->
+        session.DeviceId |> shouldEqual "device-2"
+        session.DeviceName |> shouldEqual "Laptop"
+        session.ConnectionId |> shouldEqual (Some "laptop-connection")
+
+[<Test>]
+let user_service_retains_disconnected_session_and_failure_reason () =
+    let users = UserService()
+    let userId = "auth0|user"
     let registration =
-        { Key = "session"
+        { DeviceId = "device-1"
+          DeviceName = "Workstation"
           ProtocolVersion = AgentProtocol.version
           ClientVersion = "1.0.0" }
 
-    users.TransportConnected("connection")
-    users.Register(registration, "connection") |> ignore
-    users.RecordDispatchFailure("session", "connection", "dispatch failed")
+    users.TransportConnected(userId, "connection")
+    users.Register(userId, registration, "connection") |> ignore
+    users.RecordDispatchFailure(userId, "connection", "dispatch failed")
 
-    match users.GetSession("session") with
+    match users.GetSession(userId) with
     | ValueNone -> Assert.Fail("Expected session.")
-    | ValueSome session ->
-        session.LastFailure |> shouldEqual (Some "dispatch failed")
+    | ValueSome session -> session.LastFailure |> shouldEqual (Some "dispatch failed")
 
     users.Disconnect("connection", Some "network lost")
 
-    match users.GetSession("session") with
+    match users.GetSession(userId) with
     | ValueNone -> Assert.Fail("Expected retained disconnected session.")
     | ValueSome session ->
         session.State |> shouldEqual Disconnected
         session.ConnectionId |> shouldEqual None
         session.DisconnectedAt.IsSome |> shouldEqual true
         session.LastFailure |> shouldEqual (Some "network lost")
-        users.GetConnectionId("session") |> shouldEqual ValueNone
+        users.GetConnectionId(userId) |> shouldEqual ValueNone
 
 [<Test>]
-let ``user service records protocol mismatch in registration reason`` () =
+let user_service_records_protocol_mismatch_in_registration_reason () =
     let users = UserService()
-    users.TransportConnected("connection")
+    let userId = "auth0|user"
+    users.TransportConnected(userId, "connection")
 
     let result =
         users.Register(
-            { Key = "session"
+            userId,
+            { DeviceId = "device-1"
+              DeviceName = "Workstation"
               ProtocolVersion = "older"
               ClientVersion = "1.0.0" },
             "connection"
@@ -318,3 +354,18 @@ let auth_scope_lookup_handles_space_separated_scope_claim () =
     Auth.hasScope Auth.WorkspaceRead principal |> shouldEqual true
     Auth.hasScope Auth.ProcessExecute principal |> shouldEqual true
     Auth.hasScope Auth.GitWrite principal |> shouldEqual false
+
+
+[<Test>]
+let mcp_tools_never_expose_session_key_parameters () =
+    let methods =
+        typeof<JarvisMcpTools>.GetMethods()
+        |> Array.choose (fun methodInfo ->
+            match methodInfo.GetCustomAttributes(typeof<McpServerToolAttribute>, false) with
+            | [| :? McpServerToolAttribute |] -> Some methodInfo
+            | _ -> None)
+
+    for methodInfo in methods do
+        methodInfo.GetParameters()
+        |> Array.exists (fun parameter -> String.Equals(parameter.Name, "key", StringComparison.OrdinalIgnoreCase))
+        |> shouldEqual false

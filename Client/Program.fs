@@ -3,7 +3,6 @@ module Program
 open System
 open System.IO
 open System.Reflection
-open System.Security.Cryptography
 open System.Threading
 open System.Threading.Tasks
 open Client
@@ -43,7 +42,7 @@ let private parseArgs args =
 
     loop "" (Environment.GetEnvironmentVariable "JARVIS_PERMISSION_MODE") (List.rev configuredEnvironmentVariables) (args |> Array.toList)
 
-let register (tui: ConsoleTui) (connection: HubConnection) key =
+let register (tui: ConsoleTui) (connection: HubConnection) deviceId =
     task {
         let clientVersion =
             match Assembly.GetExecutingAssembly().GetName().Version with
@@ -51,7 +50,8 @@ let register (tui: ConsoleTui) (connection: HubConnection) key =
             | version -> version.ToString()
 
         let registration =
-            { Key = key
+            { DeviceId = deviceId
+              DeviceName = Environment.MachineName
               ProtocolVersion = AgentProtocol.version
               ClientVersion = clientVersion }
 
@@ -114,9 +114,8 @@ let main args =
     task {
         use cts = new CancellationTokenSource()
         let inputLoop = tui.RunInputLoop(cts.Token)
-        let key = RandomNumberGenerator.GetBytes 18 |> Convert.ToBase64String
+        let deviceId = DeviceIdentity.getOrCreate ()
         let mutable registered = false
-        let mutable announced = false
 
         Console.CancelKeyPress.AddHandler(ConsoleCancelEventHandler(fun _ args ->
             args.Cancel <- true
@@ -130,17 +129,12 @@ let main args =
                 let! connected = connect tui connection
 
                 if connected then
-                    let! isRegistered = register tui connection key
+                    let! isRegistered = register tui connection deviceId
                     registered <- isRegistered
 
             elif connection.State = HubConnectionState.Connected && not registered then
-                let! isRegistered = register tui connection key
+                let! isRegistered = register tui connection deviceId
                 registered <- isRegistered
-
-            if registered && not announced then
-                tui.SetKey key
-                tui.Log "Provide this key to the agent."
-                announced <- true
 
             do! Task.Delay 1000
 

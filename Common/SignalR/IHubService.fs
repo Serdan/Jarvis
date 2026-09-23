@@ -5,7 +5,8 @@ open System.Threading.Tasks
 open Common
 
 type ClientRegistration =
-    { Key: string
+    { DeviceId: string
+      DeviceName: string
       ProtocolVersion: string
       ClientVersion: string }
 

@@ -93,6 +93,8 @@ let configureServices (services: IServiceCollection) (configuration: IConfigurat
         ))
     |> ignore
 
+    services.AddHttpContextAccessor() |> ignore
+
     services
         .AddMcpServer()
         .WithHttpTransport(fun options -> options.Stateless <- true)

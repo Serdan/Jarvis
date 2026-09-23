@@ -813,6 +813,14 @@ type AgentError =
     | OutputTruncated of string
 ```
 
+MCP tools return command/business failures as normal `CallToolResult` values with `IsError = true`, rather than flattening them into thrown exception text. The human-readable `Content` still contains the error kind and message, while `StructuredContent` contains a stable object:
+
+```json
+{ "kind": "NotFound", "message": "..." }
+```
+
+`ConfirmationRequired` additionally includes `confirmationRequest` with the complete `ConfirmationRequest` record. Successful MCP calls keep the original command result in `StructuredContent` and set `IsError = false`.
+
 `ConfirmationRequired` is the preferred confirmation transport. When a command requires confirmation, return this error with the exact `ConfirmationRequest`. The caller may resubmit the same payload after the user grants permission. If the payload changes, the old confirmation is invalid.
 
 ### Hash Format

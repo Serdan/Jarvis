@@ -4,6 +4,7 @@ open System
 open System.Text.Json
 open System.Threading.Tasks
 open Common
+open ModelContextProtocol.Protocol
 open ModelContextProtocol.Server
 open NUnit.Framework
 open FsUnitTyped
@@ -79,7 +80,8 @@ let ``all Jarvis MCP tools return structured JSON content`` () =
         attribute.UseStructuredContent |> shouldEqual true
         methodInfo.ReturnType.IsGenericType |> shouldEqual true
         methodInfo.ReturnType.GetGenericTypeDefinition() |> shouldEqual typedefof<Task<_>>
-        methodInfo.ReturnType.GetGenericArguments()[0] |> shouldEqual typeof<JsonElement>
+        methodInfo.ReturnType.GetGenericArguments()[0] |> shouldEqual typeof<CallToolResult>
+        attribute.OutputSchemaType |> shouldEqual typeof<JsonElement>
 
 [<Test>]
 let ``command catalog matches AgentCommand union and MCP tools`` () =
@@ -147,3 +149,74 @@ let ``actions schema matches command catalog operations and routes`` () =
 
     operationIds |> shouldEqual expectedOperationIds
     routes |> shouldEqual expectedRoutes
+
+[<Test>]
+let ``MCP bridge preserves successful structured content`` () =
+    let response =
+        { Result = Some """{"value":42,"items":[1,2]}"""
+          Error = None }
+
+    let result = McpToolHelpers.toCallToolResult response
+
+    result.IsError |> shouldEqual (Nullable false)
+    result.StructuredContent.HasValue |> shouldEqual true
+    let structured = result.StructuredContent.Value
+    structured.GetProperty("value").GetInt32() |> shouldEqual 42
+    structured.GetProperty("items").GetArrayLength() |> shouldEqual 2
+
+    let text = result.Content[0] :?> TextContentBlock
+    text.Text |> shouldEqual """{"value":42,"items":[1,2]}"""
+
+[<Test>]
+let ``MCP bridge preserves typed confirmation error details`` () =
+    let confirmation =
+        { CommandName = "RunCommand"
+          ProjectName = Some "Project1"
+          Permissions = [ ProcessExecution ]
+          Summary = "Run dotnet"
+          Paths = []
+          Executable = Some "dotnet"
+          Args = [ "test" ]
+          EstimatedImpact = "Run dotnet"
+          SupportsDryRun = false }
+
+    let response =
+        { Result = None
+          Error = Some(ConfirmationRequired confirmation) }
+
+    let result = McpToolHelpers.toCallToolResult response
+
+    result.IsError |> shouldEqual (Nullable true)
+    result.StructuredContent.HasValue |> shouldEqual true
+    let structured = result.StructuredContent.Value
+    structured.GetProperty("kind").GetString() |> shouldEqual "ConfirmationRequired"
+    structured.GetProperty("message").GetString() |> shouldEqual confirmation.Summary
+
+    let request = structured.GetProperty("confirmationRequest")
+    request.GetProperty("CommandName").GetString() |> shouldEqual confirmation.CommandName
+    request.GetProperty("Summary").GetString() |> shouldEqual confirmation.Summary
+
+    let text = result.Content[0] :?> TextContentBlock
+    text.Text.Contains("ConfirmationRequired", StringComparison.Ordinal) |> shouldEqual true
+
+[<Test>]
+let ``MCP bridge preserves stable AgentError kinds`` () =
+    let cases =
+        [ NotFound "missing", "NotFound", "missing"
+          PermissionDenied "denied", "PermissionDenied", "denied"
+          ValidationFailed "invalid", "ValidationFailed", "invalid"
+          Conflict "conflict", "Conflict", "conflict"
+          ExecutionFailed "failed", "ExecutionFailed", "failed"
+          OutputTruncated "truncated", "OutputTruncated", "truncated" ]
+
+    for error, expectedKind, expectedMessage in cases do
+        let result =
+            { Result = None
+              Error = Some error }
+            |> McpToolHelpers.toCallToolResult
+
+        result.IsError |> shouldEqual (Nullable true)
+        result.StructuredContent.HasValue |> shouldEqual true
+        let structured = result.StructuredContent.Value
+        structured.GetProperty("kind").GetString() |> shouldEqual expectedKind
+        structured.GetProperty("message").GetString() |> shouldEqual expectedMessage

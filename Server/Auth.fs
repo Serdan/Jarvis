@@ -2,6 +2,8 @@ namespace Server
 
 open System
 open System.Security.Claims
+open System.Security.Cryptography
+open System.Text
 
 module Auth =
     [<Literal>]
@@ -54,3 +56,9 @@ module Auth =
         | null -> None
         | claim when String.IsNullOrWhiteSpace(claim.Value) -> None
         | claim -> Some claim.Value
+
+
+    let profileId (userId: string) =
+        let bytes: byte array = Encoding.UTF8.GetBytes(userId)
+        let hash: byte array = SHA256.HashData(bytes)
+        Convert.ToHexString(hash).ToLowerInvariant()

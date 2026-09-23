@@ -49,7 +49,6 @@ type CommandCapability =
 
 type CommandDefinition =
     { Name: string
-      OperationId: string
       Description: string
       Permissions: PermissionLevel list
       MutatesState: bool
@@ -302,9 +301,8 @@ module AgentProtocol =
     let defaultPatchFuzzyContextLines = 3
     let maxResponseBytes = 900 * 1024
 
-    let private definition name operationId description permissions mutates requiresConfirmation supportsDryRun : CommandDefinition =
+    let private definition name description permissions mutates requiresConfirmation supportsDryRun : CommandDefinition =
         { Name = name
-          OperationId = operationId
           Description = description
           Permissions = permissions
           MutatesState = mutates
@@ -312,26 +310,26 @@ module AgentProtocol =
           SupportsDryRun = supportsDryRun }
 
     let commandDefinitions =
-        [ definition "ListCommands" "listCommands" "Lists supported Jarvis commands." [ ReadOnly ] false false false
-          definition "ListProjects" "listProjects" "Lists configured projects." [ ReadOnly ] false false false
-          definition "GetProjectDetails" "getProjectDetails" "Reads project summary details and special files." [ ReadOnly ] false false false
-          definition "ListDirectory" "listDirectory" "Lists files and folders in a project directory." [ ReadOnly ] false false false
-          definition "SearchFiles" "searchFiles" "Searches project file names." [ ReadOnly ] false false false
-          definition "SearchText" "searchText" "Searches project file contents." [ ReadOnly ] false false false
-          definition "ReadFile" "readFile" "Reads one file." [ ReadOnly ] false false false
-          definition "ReadFiles" "readFiles" "Reads multiple files." [ ReadOnly ] false false false
-          definition "WriteFile" "writeFile" "Writes or appends one file." [ WorkspaceWrite ] true true false
-          definition "PatchFile" "patchFile" "Applies an atomic unified diff to one file." [ WorkspaceWrite ] true true true
-          definition "RunCommand" "runCommand" "Runs a bounded local process." [ ProcessExecution ] true true false
-          definition "ListProjectTasks" "listProjectTasks" "Lists locally configured project tasks." [ ReadOnly ] false false false
-          definition "RunProjectTask" "runProjectTask" "Runs a locally configured project task." [ ProcessExecution ] true true false
-          definition "GetGitStatus" "getGitStatus" "Reads git status." [ ReadOnly ] false false false
-          definition "GetGitDiff" "getGitDiff" "Reads git diff." [ ReadOnly ] false false false
-          definition "GitCommit" "gitCommit" "Creates a local git commit." [ VersionControlWrite ] true true false
-          definition "StartJob" "startJob" "Starts a long-running process." [ ProcessExecution ] true true false
-          definition "ListJobs" "listJobs" "Lists known jobs." [ ReadOnly ] false false false
-          definition "GetJobResult" "getJobResult" "Reads buffered job output." [ ReadOnly ] false false false
-          definition "CancelJob" "cancelJob" "Cancels a running job." [ ProcessExecution ] true true false ]
+        [ definition "ListCommands" "Lists supported Jarvis commands." [ ReadOnly ] false false false
+          definition "ListProjects" "Lists configured projects." [ ReadOnly ] false false false
+          definition "GetProjectDetails" "Reads project summary details and special files." [ ReadOnly ] false false false
+          definition "ListDirectory" "Lists files and folders in a project directory." [ ReadOnly ] false false false
+          definition "SearchFiles" "Searches project file names." [ ReadOnly ] false false false
+          definition "SearchText" "Searches project file contents." [ ReadOnly ] false false false
+          definition "ReadFile" "Reads one file." [ ReadOnly ] false false false
+          definition "ReadFiles" "Reads multiple files." [ ReadOnly ] false false false
+          definition "WriteFile" "Writes or appends one file." [ WorkspaceWrite ] true true false
+          definition "PatchFile" "Applies an atomic unified diff to one file." [ WorkspaceWrite ] true true true
+          definition "RunCommand" "Runs a bounded local process." [ ProcessExecution ] true true false
+          definition "ListProjectTasks" "Lists locally configured project tasks." [ ReadOnly ] false false false
+          definition "RunProjectTask" "Runs a locally configured project task." [ ProcessExecution ] true true false
+          definition "GetGitStatus" "Reads git status." [ ReadOnly ] false false false
+          definition "GetGitDiff" "Reads git diff." [ ReadOnly ] false false false
+          definition "GitCommit" "Creates a local git commit." [ VersionControlWrite ] true true false
+          definition "StartJob" "Starts a long-running process." [ ProcessExecution ] true true false
+          definition "ListJobs" "Lists known jobs." [ ReadOnly ] false false false
+          definition "GetJobResult" "Reads buffered job output." [ ReadOnly ] false false false
+          definition "CancelJob" "Cancels a running job." [ ProcessExecution ] true true false ]
 
     let private toCapability (definition: CommandDefinition) : CommandCapability =
         { Name = definition.Name
@@ -350,10 +348,6 @@ module AgentProtocol =
     let tryFindDefinition name =
         commandDefinitions |> List.tryFind (fun definition -> definition.Name = name)
 
-    let legacyRoute name =
-        match tryFindDefinition name with
-        | Some definition -> "/" + definition.OperationId
-        | None -> invalidArg "name" $"Unknown Jarvis command: {name}"
 
     let listCommandsResult =
         { ProtocolVersion = version

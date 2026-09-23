@@ -110,7 +110,7 @@ module OAuth =
             let! body = response.Content.ReadAsStringAsync()
 
             if not response.IsSuccessStatusCode then
-                invalidOp $"OAuth token request failed ({int response.StatusCode}): {body}"
+                invalidOp $"OAuth token request failed with HTTP {int response.StatusCode}."
 
             use document = JsonDocument.Parse(body)
             let root = document.RootElement

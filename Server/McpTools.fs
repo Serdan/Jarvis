@@ -1,5 +1,8 @@
 namespace Server
 
+[<CLIMutable>]
+type ProfileResult = { id: string }
+
 open System
 open System.ComponentModel
 open System.Text.Json
@@ -89,20 +92,35 @@ module McpToolHelpers =
         | CancelJobCommand _ -> Auth.ProcessExecute
         | GitCommitCommand _ -> Auth.GitWrite
 
-    let private authorizationErrorResult (context: HttpContext) scope =
-        let response = errorResult (PermissionDenied $"Missing required OAuth scope: {scope}")
+    let private oauthErrorResult (context: HttpContext) errorCode description scope =
+        let response = errorResult (PermissionDenied description)
         let options = context.RequestServices.GetRequiredService<IOptions<JarvisOptions>>().Value
         let quote = Char.ToString(char 34)
+        let scopePart =
+            match scope with
+            | Some value -> ", scope=" + quote + value + quote
+            | None -> ""
+
         let challenge =
             "Bearer resource_metadata=" + quote + Auth.resourceMetadataUri options + quote
-            + ", error=" + quote + "insufficient_scope" + quote
-            + ", error_description=" + quote + "Missing required scope: " + scope + quote
-            + ", scope=" + quote + scope + quote
+            + ", error=" + quote + errorCode + quote
+            + ", error_description=" + quote + description + quote
+            + scopePart
 
         let meta = JsonObject()
         meta["mcp/www_authenticate"] <- JsonValue.Create(challenge)
         response.Meta <- meta
         response
+
+    let private authorizationErrorResult (context: HttpContext) scope =
+        oauthErrorResult
+            context
+            "insufficient_scope"
+            $"Missing required OAuth scope: {scope}"
+            (Some scope)
+
+    let private authenticationErrorResult (context: HttpContext) scope =
+        oauthErrorResult context "invalid_token" "Authentication required." scope
 
     let send (client: ClientService) (http: IHttpContextAccessor) command =
         task {
@@ -119,7 +137,23 @@ module McpToolHelpers =
                 | Some _ ->
                     return authorizationErrorResult context scope
                 | None ->
-                    return errorResult (PermissionDenied "The MCP request is missing an authenticated user identity.")
+                    return authenticationErrorResult context (Some scope)
+        }
+
+    let getProfile (http: IHttpContextAccessor) =
+        task {
+            match Option.ofObj http.HttpContext with
+            | None ->
+                return errorResult (PermissionDenied "The MCP request is missing its HTTP context.")
+            | Some context ->
+                match Auth.tryUserId context.User with
+                | Some userId ->
+                    let profile = { id = Auth.profileId userId }
+                    let structured = JsonSerializer.SerializeToElement(profile)
+                    let serialized = JsonSerializer.Serialize(profile)
+                    return result structured serialized false
+                | None ->
+                    return authenticationErrorResult context None
         }
 
     let optionOfString (value: string) =
@@ -141,6 +175,10 @@ module McpToolHelpers =
 
 [<McpServerToolType>]
 type JarvisMcpTools =
+    [<McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof<ProfileResult>, ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":[]}]"""); McpMeta("openai/profile", true); Description("Return the profile represented by the authenticated OAuth credentials.")>]
+    static member GetProfile(http: IHttpContextAccessor) =
+        McpToolHelpers.getProfile http
+
     [<McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof<JsonElement>, ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("List the commands supported by the connected Jarvis client.")>]
     static member ListCommands(client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http ListCommandsCommand
@@ -240,7 +278,7 @@ type JarvisMcpTools =
             Path = McpToolHelpers.optionOfString path
             MaxOutputBytes = McpToolHelpers.optionOfNullable maxOutputBytes })
 
-    [<McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof<JsonElement>, ReadOnly = false, Destructive = true, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Create a local git commit from selected paths. Requires approval in the local Jarvis client.")>]
+    [<McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof<JsonElement>, ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Create a reversible local git commit from selected paths. Requires approval in the local Jarvis client and does not push to a remote.")>]
     static member GitCommit(projectName: string, message: string, body: string, paths: string array, allowEmpty: bool, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (GitCommitCommand {
             ProjectName = projectName

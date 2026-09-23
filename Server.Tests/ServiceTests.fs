@@ -190,7 +190,10 @@ let ``all Jarvis MCP tools return structured JSON content`` () =
         methodInfo.ReturnType.IsGenericType |> shouldEqual true
         methodInfo.ReturnType.GetGenericTypeDefinition() |> shouldEqual typedefof<Task<_>>
         methodInfo.ReturnType.GetGenericArguments()[0] |> shouldEqual typeof<CallToolResult>
-        attribute.OutputSchemaType |> shouldEqual typeof<JsonElement>
+        if methodInfo.Name = "GetProfile" then
+            attribute.OutputSchemaType |> shouldEqual typeof<ProfileResult>
+        else
+            attribute.OutputSchemaType |> shouldEqual typeof<JsonElement>
 
 [<Test>]
 let ``command catalog matches AgentCommand union and MCP tools`` () =
@@ -217,47 +220,8 @@ let ``command catalog matches AgentCommand union and MCP tools`` () =
         |> Set.ofArray
 
     unionNames |> shouldEqual catalogNames
-    mcpNames |> shouldEqual catalogNames
-
-[<Test>]
-let ``actions schema matches command catalog operations and routes`` () =
-    let schemaPath =
-        IO.Path.GetFullPath(IO.Path.Combine(__SOURCE_DIRECTORY__, "..", "actions-schema"))
-
-    let lines = IO.File.ReadAllLines schemaPath
-
-    let operationIds =
-        lines
-        |> Array.choose (fun line ->
-            let trimmed = line.Trim()
-            let prefix = "operationId: "
-            if trimmed.StartsWith(prefix, StringComparison.Ordinal) then
-                Some(trimmed.Substring(prefix.Length))
-            else
-                None)
-        |> Set.ofArray
-
-    let routes =
-        lines
-        |> Array.choose (fun line ->
-            if line.StartsWith("  /agent/", StringComparison.Ordinal) && line.EndsWith(":", StringComparison.Ordinal) then
-                Some(line.Trim().TrimEnd(':'))
-            else
-                None)
-        |> Set.ofArray
-
-    let expectedOperationIds =
-        AgentProtocol.commandDefinitions
-        |> List.map (fun definition -> definition.OperationId)
-        |> Set.ofList
-
-    let expectedRoutes =
-        AgentProtocol.commandDefinitions
-        |> List.map (fun definition -> "/agent" + AgentProtocol.legacyRoute definition.Name)
-        |> Set.ofList
-
-    operationIds |> shouldEqual expectedOperationIds
-    routes |> shouldEqual expectedRoutes
+    (mcpNames |> Set.remove "GetProfile") |> shouldEqual catalogNames
+    (Set.difference mcpNames catalogNames) |> shouldEqual (Set.singleton "GetProfile")
 
 [<Test>]
 let ``MCP bridge preserves successful structured content`` () =
@@ -335,7 +299,8 @@ let ``MCP bridge preserves stable AgentError kinds`` () =
 let auth_issuer_normalizes_auth0_domain () =
     let options =
         { Auth0Domain = "dev-kn4j3jz3qv2cvw05.eu.auth0.com"
-          Audience = "https://jarvis2.kehlet.dev" }
+          Audience = "https://jarvis2.kehlet.dev"
+          OpenAIAppsChallenge = "" }
 
     Auth.issuer options |> shouldEqual "https://dev-kn4j3jz3qv2cvw05.eu.auth0.com/"
 
@@ -391,13 +356,24 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
             | [| :? McpServerToolAttribute as attribute |] -> Some(methodInfo, attribute)
             | _ -> None)
 
-    for methodInfo, attribute in methods do
+    for methodInfo, attribute in methods |> Array.filter (fun (methodInfo, _) -> methodInfo.Name <> "GetProfile") do
         let definition = definitions[methodInfo.Name]
         let scope = expectedScope definition
         let readOnly = definition.Permissions = [ ReadOnly ]
 
+        let destructive =
+            match methodInfo.Name with
+            | "WriteFile" | "PatchFile" | "RunCommand" | "RunProjectTask" | "StartJob" | "CancelJob" -> true
+            | _ -> false
+
+        let openWorld =
+            match methodInfo.Name with
+            | "RunCommand" | "RunProjectTask" | "StartJob" -> true
+            | _ -> false
+
         attribute.ReadOnly |> shouldEqual readOnly
-        attribute.Destructive |> shouldEqual (not readOnly)
+        attribute.Destructive |> shouldEqual destructive
+        attribute.OpenWorld |> shouldEqual openWorld
 
         let securityMeta =
             methodInfo.GetCustomAttributes(typeof<McpMetaAttribute>, false)
@@ -411,3 +387,54 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
         scheme.GetProperty("type").GetString() |> shouldEqual "oauth2"
         let scopes = scheme.GetProperty("scopes")
         scopes[0].GetString() |> shouldEqual scope
+
+
+[<Test>]
+let mcp_profile_tool_uses_authenticated_subject () =
+    let context = Microsoft.AspNetCore.Http.DefaultHttpContext()
+    let identity =
+        System.Security.Claims.ClaimsIdentity(
+            [ System.Security.Claims.Claim("sub", "auth0|profile-user") ],
+            "test"
+        )
+    context.User <- System.Security.Claims.ClaimsPrincipal(identity)
+
+    let accessor = Microsoft.AspNetCore.Http.HttpContextAccessor()
+    accessor.HttpContext <- context
+
+    let result =
+        McpToolHelpers.getProfile accessor
+        |> Async.AwaitTask
+        |> Async.RunSynchronously
+
+    result.IsError |> shouldEqual (Nullable false)
+    result.StructuredContent.HasValue |> shouldEqual true
+    result.StructuredContent.Value.GetProperty("id").GetString()
+    |> shouldEqual (Auth.profileId "auth0|profile-user")
+
+    let methodInfo = typeof<JarvisMcpTools>.GetMethod("GetProfile")
+    let attribute =
+        methodInfo.GetCustomAttributes(typeof<McpServerToolAttribute>, false)
+        |> Array.choose (function
+            | :? McpServerToolAttribute as item -> Some item
+            | _ -> None)
+        |> Array.exactlyOne
+
+    attribute.ReadOnly |> shouldEqual true
+    attribute.Destructive |> shouldEqual false
+    attribute.OpenWorld |> shouldEqual false
+    attribute.OutputSchemaType |> shouldEqual typeof<ProfileResult>
+
+    let metadata =
+        methodInfo.GetCustomAttributes(typeof<McpMetaAttribute>, false)
+        |> Array.choose (function
+            | :? McpMetaAttribute as item -> Some(item.Name, item.JsonValue)
+            | _ -> None)
+        |> Map.ofArray
+
+    use profileMarker = JsonDocument.Parse(metadata["openai/profile"])
+    profileMarker.RootElement.GetBoolean() |> shouldEqual true
+
+    use security = JsonDocument.Parse(metadata["securitySchemes"])
+    security.RootElement[0].GetProperty("type").GetString() |> shouldEqual "oauth2"
+    security.RootElement[0].GetProperty("scopes").GetArrayLength() |> shouldEqual 0

@@ -23,7 +23,8 @@ let rateLimiterPolicy = "Fixed"
 let private getConfiguredOptions (configuration: IConfiguration) =
     let options =
         { Auth0Domain = configuration["Auth0Domain"]
-          Audience = configuration["Audience"] }
+          Audience = configuration["Audience"]
+          OpenAIAppsChallenge = configuration["OpenAIAppsChallenge"] }
 
     if String.IsNullOrWhiteSpace(options.Auth0Domain) then
         invalidOp "Auth0Domain is required."
@@ -63,16 +64,12 @@ let configureServices (services: IServiceCollection) (configuration: IConfigurat
                     context.HandleResponse()
                     context.Response.StatusCode <- StatusCodes.Status401Unauthorized
 
-                    let scope =
+                    let resourceMetadata = Auth.resourceMetadataUri configured
+                    let challenge =
                         if context.Request.Path.StartsWithSegments(PathString("/client")) then
-                            Auth.ClientConnect
+                            sprintf "Bearer resource_metadata=\"%s\", scope=\"%s\"" resourceMetadata Auth.ClientConnect
                         else
-                            String.Join(" ", Auth.mcpScopes)
-
-                    let challenge: string =
-                        sprintf "Bearer resource_metadata=\"%s\", scope=\"%s\""
-                            (Auth.resourceMetadataUri configured)
-                            scope
+                            sprintf "Bearer resource_metadata=\"%s\"" resourceMetadata
 
                     context.Response.Headers.WWWAuthenticate <- StringValues(challenge)
                     Task.CompletedTask)
@@ -168,6 +165,16 @@ let configureApp (app: WebApplication) =
     app.MapGet("/", Func<string>(fun () -> "the future is tomorrow")) |> ignore
 
     app.MapGet(
+        "/.well-known/openai-apps-challenge",
+        Func<IResult>(fun () ->
+            if String.IsNullOrWhiteSpace(configured.OpenAIAppsChallenge) then
+                Results.NotFound()
+            else
+                Results.Text(configured.OpenAIAppsChallenge.Trim(), "text/plain"))
+    )
+    |> ignore
+
+    app.MapGet(
         "/.well-known/oauth-protected-resource",
         Func<IResult>(fun () ->
             Results.Json(
@@ -178,7 +185,7 @@ let configureApp (app: WebApplication) =
     )
     |> ignore
 
-    app.MapMcp("/mcp").RequireAuthorization() |> ignore
+    app.MapMcp("/mcp") |> ignore
 
     app
 

@@ -293,3 +293,28 @@ let ``MCP bridge preserves stable AgentError kinds`` () =
         let structured = result.StructuredContent.Value
         structured.GetProperty("kind").GetString() |> shouldEqual expectedKind
         structured.GetProperty("message").GetString() |> shouldEqual expectedMessage
+
+
+[<Test>]
+let auth_issuer_normalizes_auth0_domain () =
+    let options =
+        { Auth0Domain = "dev-kn4j3jz3qv2cvw05.eu.auth0.com"
+          Audience = "https://jarvis2.kehlet.dev" }
+
+    Auth.issuer options |> shouldEqual "https://dev-kn4j3jz3qv2cvw05.eu.auth0.com/"
+
+[<Test>]
+let auth_scope_lookup_handles_space_separated_scope_claim () =
+    let identity =
+        System.Security.Claims.ClaimsIdentity(
+            [ System.Security.Claims.Claim("sub", "auth0|user")
+              System.Security.Claims.Claim("scope", "workspace:read process:execute") ],
+            "test"
+        )
+
+    let principal = System.Security.Claims.ClaimsPrincipal(identity)
+
+    Auth.tryUserId principal |> shouldEqual (Some "auth0|user")
+    Auth.hasScope Auth.WorkspaceRead principal |> shouldEqual true
+    Auth.hasScope Auth.ProcessExecute principal |> shouldEqual true
+    Auth.hasScope Auth.GitWrite principal |> shouldEqual false

@@ -2,13 +2,10 @@
 
 open System
 open System.Globalization
-open System.Security.Cryptography
 open System.Threading.RateLimiting
-open System.Text
-open System.Text.Json
 open System.Threading.Tasks
-open Common
-open Giraffe
+open Microsoft.AspNetCore.Authentication.JwtBearer
+open Microsoft.AspNetCore.Authorization
 open Microsoft.AspNetCore.Builder
 open Microsoft.AspNetCore.Http
 open Microsoft.AspNetCore.HttpOverrides
@@ -16,8 +13,6 @@ open Microsoft.AspNetCore.RateLimiting
 open Microsoft.Extensions.Configuration
 open Microsoft.Extensions.DependencyInjection
 open Microsoft.Extensions.Hosting
-open Microsoft.Extensions.Logging
-open Microsoft.Extensions.Options
 open Microsoft.Extensions.Primitives
 open ModelContextProtocol.Server
 open Server
@@ -25,123 +20,78 @@ open Server.Services
 
 let rateLimiterPolicy = "Fixed"
 
-let notFoundHandler: HttpHandler = RequestErrors.notFound (text "Not Found")
+let private getConfiguredOptions (configuration: IConfiguration) =
+    let options =
+        { Auth0Domain = configuration["Auth0Domain"]
+          Audience = configuration["Audience"] }
 
-let errorHandler (ex: Exception) (logger: ILogger) =
-    logger.LogError(EventId(), ex, "An unhandled exception has occurred while executing the request.")
-    clearResponse >=> ServerErrors.INTERNAL_ERROR ex.Message
+    if String.IsNullOrWhiteSpace(options.Auth0Domain) then
+        invalidOp "Auth0Domain is required."
 
-let accessDenied = setStatusCode 401 >=> text "Access Denied"
+    if String.IsNullOrWhiteSpace(options.Audience) then
+        invalidOp "Audience is required."
 
-let validateApiKey (ctx: HttpContext) =
-    match ctx.TryGetRequestHeader "X-Api-Key" with
-    | Some key ->
-        let opt = ctx.GetService<IOptionsSnapshot<JarvisOptions>>()
-        opt.Value.ApiKey = key
-    | None -> false
+    options
 
-let requiresApiKey: HttpHandler = authorizeRequest validateApiKey accessDenied
+let configureServices (services: IServiceCollection) (configuration: IConfiguration) =
+    let configured = getConfiguredOptions configuration
 
-let private fixedTimeEquals (expected: string) (provided: string) =
-    if String.IsNullOrEmpty(expected) || String.IsNullOrEmpty(provided) then
-        false
-    else
-        let expectedBytes = Encoding.UTF8.GetBytes(expected)
-        let providedBytes = Encoding.UTF8.GetBytes(provided)
-        CryptographicOperations.FixedTimeEquals(expectedBytes, providedBytes)
+    services.Configure<JarvisOptions>(configuration) |> ignore
 
-let validateMcpApiKey (ctx: HttpContext) =
-    let authorization = ctx.Request.Headers.Authorization.ToString()
-    let bearerPrefix = "Bearer "
+    services
+        .AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+        .AddJwtBearer(fun options ->
+            options.Authority <- Auth.issuer configured
+            options.Audience <- configured.Audience
+            options.MapInboundClaims <- false
+            options.RequireHttpsMetadata <- true
 
-    if authorization.StartsWith(bearerPrefix, StringComparison.OrdinalIgnoreCase) then
-        let provided = authorization.Substring(bearerPrefix.Length).Trim()
-        let options = ctx.RequestServices.GetRequiredService<IOptionsSnapshot<JarvisOptions>>()
-        fixedTimeEquals options.Value.McpApiKey provided
-    else
-        false
+            let events = JwtBearerEvents()
 
-let private jsonOptions =
-    JsonSerializerOptions(JsonSerializerDefaults.Web)
+            events.OnMessageReceived <-
+                Func<MessageReceivedContext, Task>(fun context ->
+                    let accessToken = context.Request.Query["access_token"].ToString()
 
-let bind<'a> path (handler: AgentMessage<'a> -> HttpHandler) : HttpHandler =
-    route path
-    >=> fun next ctx ->
-        task {
-            let! message = JsonSerializer.DeserializeAsync<AgentMessage<'a>>(ctx.Request.Body, jsonOptions)
-            return! handler message next ctx
-        }
+                    if not (String.IsNullOrWhiteSpace(accessToken))
+                       && context.HttpContext.Request.Path.StartsWithSegments(PathString("/client")) then
+                        context.Token <- accessToken
 
-let agentEndpoints =
-    let endpoints =
-        [ bind<ListCommandsCommand> (AgentProtocol.legacyRoute "ListCommands") Endpoints.listCommands
-          bind<ListProjectsCommand> (AgentProtocol.legacyRoute "ListProjects") Endpoints.listProjects
-          bind<GetProjectDetailsCommand> (AgentProtocol.legacyRoute "GetProjectDetails") Endpoints.getProjectDetails
-          bind<ListDirectoryCommand> (AgentProtocol.legacyRoute "ListDirectory") Endpoints.listProjectDirectory
-          bind<SearchFilesCommand> (AgentProtocol.legacyRoute "SearchFiles") Endpoints.searchFiles
-          bind<SearchTextCommand> (AgentProtocol.legacyRoute "SearchText") Endpoints.searchText
-          bind<ReadFileCommand> (AgentProtocol.legacyRoute "ReadFile") Endpoints.readFile
-          bind<ReadFilesCommand> (AgentProtocol.legacyRoute "ReadFiles") Endpoints.readFiles
-          // Compatibility aliases for older deployed action schemas.
-          bind<GetProjectDetailsCommand> "/openProject" Endpoints.getProjectDetails
-          bind<ListDirectoryCommand> "/listProjectDirectory" Endpoints.listProjectDirectory
-          bind<ReadFileCommand> "/openfile" Endpoints.readFile
-          bind<ReadFileCommand> "/readfile" Endpoints.readFile
-          bind<WriteFileCommand> (AgentProtocol.legacyRoute "WriteFile") Endpoints.writeFile
-          bind<PatchFileCommand> (AgentProtocol.legacyRoute "PatchFile") Endpoints.patchFile
-          bind<RunCommandCommand> (AgentProtocol.legacyRoute "RunCommand") Endpoints.runCommand
-          bind<ListProjectTasksCommand> (AgentProtocol.legacyRoute "ListProjectTasks") Endpoints.listProjectTasks
-          bind<RunProjectTaskCommand> (AgentProtocol.legacyRoute "RunProjectTask") Endpoints.runProjectTask
-          bind<GitStatusCommand> (AgentProtocol.legacyRoute "GetGitStatus") Endpoints.getGitStatus
-          bind<GitDiffCommand> (AgentProtocol.legacyRoute "GetGitDiff") Endpoints.getGitDiff
-          bind<GitCommitCommand> (AgentProtocol.legacyRoute "GitCommit") Endpoints.gitCommit
-          bind<StartJobCommand> (AgentProtocol.legacyRoute "StartJob") Endpoints.startJob
-          bind<ListJobsCommand> (AgentProtocol.legacyRoute "ListJobs") Endpoints.listJobs
-          bind<GetJobResultCommand> (AgentProtocol.legacyRoute "GetJobResult") Endpoints.getJobResult
-          bind<CancelJobCommand> (AgentProtocol.legacyRoute "CancelJob") Endpoints.cancelJob ]
+                    Task.CompletedTask)
 
-    requiresApiKey >=> noResponseCaching >=> POST >=> choose endpoints
+            events.OnChallenge <-
+                Func<JwtBearerChallengeContext, Task>(fun context ->
+                    context.HandleResponse()
+                    context.Response.StatusCode <- StatusCodes.Status401Unauthorized
 
-let configureApp (appBuilder: WebApplication) =
-    appBuilder.UseGiraffeErrorHandler(errorHandler) |> ignore
-    appBuilder.UseRouting() |> ignore
-
-    appBuilder.UseWhen(
-        (fun ctx -> ctx.Request.Path.StartsWithSegments(PathString("/mcp"))),
-        (fun branch ->
-            branch.Use(
-                Func<HttpContext, RequestDelegate, Task>(fun ctx next ->
-                    task {
-                        if validateMcpApiKey ctx then
-                            do! next.Invoke(ctx)
+                    let scope =
+                        if context.Request.Path.StartsWithSegments(PathString("/client")) then
+                            Auth.ClientConnect
                         else
-                            ctx.Response.StatusCode <- StatusCodes.Status401Unauthorized
-                            ctx.Response.Headers.WWWAuthenticate <- StringValues("Bearer")
-                            do! ctx.Response.WriteAsync("Unauthorized")
-                    }))
-            |> ignore)
-    )
+                            String.Join(" ", Auth.mcpScopes)
+
+                    let challenge: string =
+                        sprintf "Bearer resource_metadata=\"%s\", scope=\"%s\""
+                            (Auth.resourceMetadataUri configured)
+                            scope
+
+                    context.Response.Headers.WWWAuthenticate <- StringValues(challenge)
+                    Task.CompletedTask)
+
+            options.Events <- events)
     |> ignore
 
-    appBuilder
-        .MapHub<HubService>("/client")
-        .RequireRateLimiting(rateLimiterPolicy)
+    services.AddAuthorization(fun options ->
+        options.AddPolicy(
+            Auth.ClientConnectPolicy,
+            fun policy ->
+                policy.RequireAuthenticatedUser() |> ignore
+                policy.RequireAssertion(
+                    Func<AuthorizationHandlerContext, bool>(fun context ->
+                        Auth.hasScope Auth.ClientConnect context.User)
+                )
+                |> ignore
+        ))
     |> ignore
-
-    appBuilder.MapGet("/", Func<string>(fun () -> "the future is tomorrow")) |> ignore
-
-    appBuilder.MapMcp("/mcp") |> ignore
-
-    appBuilder.Map(
-        "/agent",
-        Action<IApplicationBuilder>(fun (branch) ->
-            branch.UseGiraffe(agentEndpoints))
-    ) |> ignore
-
-    appBuilder
-
-let configureServices (services: IServiceCollection) =
-    services.AddRouting().AddGiraffe()
 
     services
         .AddMcpServer()
@@ -152,14 +102,16 @@ let configureServices (services: IServiceCollection) =
     services
         .AddSignalR()
         .AddJsonProtocol()
-        .AddHubOptions<HubService>(fun x ->
-            x.EnableDetailedErrors <- true
-            x.MaximumReceiveMessageSize <- Nullable<int64>(1024L * 1024L))
+        .AddHubOptions<HubService>(fun options ->
+            options.EnableDetailedErrors <- true
+            options.MaximumReceiveMessageSize <- Nullable<int64>(1024L * 1024L))
+    |> ignore
 
     services
         .AddSingleton<UserService>()
         .AddSingleton<ClientResponseTracker>()
         .AddScoped<ClientService>()
+    |> ignore
 
     services.AddRateLimiter(fun options ->
         options.OnRejected <-
@@ -172,7 +124,6 @@ let configureServices (services: IServiceCollection) =
                 | _ -> ()
 
                 context.HttpContext.Response.StatusCode <- StatusCodes.Status429TooManyRequests
-
                 ValueTask.CompletedTask)
 
         options.AddPolicy(
@@ -186,44 +137,69 @@ let configureServices (services: IServiceCollection) =
                 RateLimitPartition.GetFixedWindowLimiter(
                     partitionKey,
                     fun _ ->
-                        let opt = FixedWindowRateLimiterOptions()
-                        opt.PermitLimit <- 30
-                        opt.Window <- TimeSpan.FromSeconds(10L)
-                        opt.QueueProcessingOrder <- QueueProcessingOrder.OldestFirst
-                        opt.QueueLimit <- 5
-                        opt.AutoReplenishment <- true
-                        opt
+                        let limiter = FixedWindowRateLimiterOptions()
+                        limiter.PermitLimit <- 30
+                        limiter.Window <- TimeSpan.FromSeconds(10L)
+                        limiter.QueueProcessingOrder <- QueueProcessingOrder.OldestFirst
+                        limiter.QueueLimit <- 5
+                        limiter.AutoReplenishment <- true
+                        limiter
                 )
         )
-        |> ignore
+        |> ignore)
+    |> ignore
 
-        ())
+let configureApp (app: WebApplication) =
+    let configured = app.Services.GetRequiredService<Microsoft.Extensions.Options.IOptions<JarvisOptions>>().Value
+
+    app.UseRouting() |> ignore
+    app.UseAuthentication() |> ignore
+    app.UseAuthorization() |> ignore
+    app.UseRateLimiter() |> ignore
+
+    app
+        .MapHub<HubService>("/client")
+        .RequireAuthorization(Auth.ClientConnectPolicy)
+        .RequireRateLimiting(rateLimiterPolicy)
+    |> ignore
+
+    app.MapGet("/", Func<string>(fun () -> "the future is tomorrow")) |> ignore
+
+    app.MapGet(
+        "/.well-known/oauth-protected-resource",
+        Func<IResult>(fun () ->
+            Results.Json(
+                {| resource = configured.Audience
+                   authorization_servers = [| Auth.issuer configured |]
+                   scopes_supported = Auth.mcpScopes |> List.toArray |}
+            ))
+    )
+    |> ignore
+
+    app.MapMcp("/mcp").RequireAuthorization() |> ignore
+
+    app
 
 let builder = WebApplication.CreateBuilder()
 
-builder.Configuration.AddEnvironmentVariables("Jarvis")
-builder.Services.Configure<JarvisOptions>(builder.Configuration)
+builder.Configuration.AddEnvironmentVariables("Jarvis") |> ignore
+builder.Services.Configure<JarvisOptions>(builder.Configuration) |> ignore
 
-configureServices builder.Services
+configureServices builder.Services builder.Configuration
 
 let app = builder.Build()
 
 if app.Environment.IsDevelopment() then
-    app.UseDeveloperExceptionPage()
-
-    ()
+    app.UseDeveloperExceptionPage() |> ignore
 else
     app.UseForwardedHeaders(
         ForwardedHeadersOptions(
             ForwardedHeaders = (ForwardedHeaders.XForwardedFor ||| ForwardedHeaders.XForwardedProto)
         )
     )
+    |> ignore
 
-    app.UseHttpsRedirection()
+    app.UseHttpsRedirection() |> ignore
 
-    ()
-
-app.UseRateLimiter()
-
-configureApp app
+configureApp app |> ignore
 app.Run()

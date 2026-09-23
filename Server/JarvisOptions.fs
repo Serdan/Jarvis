@@ -2,5 +2,5 @@ namespace Server
 
 [<CLIMutable>]
 type JarvisOptions =
-    { ApiKey: string
-      McpApiKey: string }
+    { Auth0Domain: string
+      Audience: string }

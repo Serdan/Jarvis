@@ -1,60 +1,83 @@
 # JARVIS
 
-## Overview
+Jarvis connects ChatGPT and other MCP clients to projects on a user's own computer without uploading the workspace to a hosted development environment.
 
-Jarvis is a collaborative agent for working with project files that live outside the agent runtime. A local Jarvis client connects to the Jarvis server, exposes selected project directories, and lets an agent list, search, read, edit, test, and commit project changes with user-controlled permissions.
+A local Jarvis client exposes a user-selected workspace. The public Jarvis server authenticates both the MCP caller and the local client with OAuth, matches them by authenticated user identity, and forwards structured project commands over SignalR. Mutating and process-execution operations remain subject to the local client's permission policy.
+
+## Architecture
+
+```text
+ChatGPT / MCP client
+        |
+        | OAuth bearer token
+        v
+https://jarvis2.kehlet.dev/mcp
+        |
+        | authenticated user identity
+        v
+Jarvis server
+        |
+        | authenticated SignalR connection
+        v
+JarvisClient on the user's machine
+        |
+        v
+User-selected workspace
+```
+
+There is no copied session key. ChatGPT never receives a Jarvis routing secret.
 
 ## Features
 
-### Project Directory Listing
-- **List Project Directories**: Jarvis can list directories within a configured project and show a clear view of the project structure.
+- Project discovery and metadata.
+- Directory listing and bounded file-name/content search.
+- Single and batch file reads, including ranged reads.
+- Optimistic-concurrency writes and atomic unified-diff patches.
+- Named project tasks from `.jarvis.json`.
+- Bounded process execution and asynchronous jobs.
+- Git status/diff and local commits.
+- Project-root and symlink confinement.
+- Local confirmation and session-grant policy for state-changing operations.
+- Sensitive environment-variable filtering for child processes.
+- Structured MCP results and typed errors.
 
-### Enhanced File Metadata
-- **File Metadata Retrieval**: Directory listings include file size, creation date, and modification date.
+## Authentication
 
-### Secure File Handling
-- **Secure Path Management**: Jarvis resolves project-relative paths and prevents access outside the selected workspace/project root.
+Jarvis uses Auth0 as its OAuth authorization server.
 
-### Project File Management
-- **Open and Edit Files**: Users can let an agent read, write, patch, and inspect project files through the local client.
+Production resource:
 
-### Command Execution and Git
-- **Bounded Local Commands**: Jarvis can run approved commands such as tests and builds.
-- **Git Operations**: Jarvis can read status/diffs and create approved local commits.
-
-### Project Tasks
-
-Projects can expose named build/test/format/lint tasks through a project-root `.jarvis.json`:
-
-```json
-{
-  "tasks": {
-    "build": {
-      "description": "Build the solution",
-      "executable": "dotnet",
-      "args": ["build", "Jarvis.slnx", "--no-restore"],
-      "timeoutSeconds": 120,
-      "maxOutputBytes": 40000
-    },
-    "test": {
-      "executable": "dotnet",
-      "args": ["test", "Client.Tests/Client.Tests.fsproj", "--no-restore"]
-    }
-  }
-}
+```text
+https://jarvis2.kehlet.dev
 ```
 
-`ListProjectTasks` exposes the configured names and definitions. `RunProjectTask` accepts only a project and task name; executable, arguments, working directory, timeout, and output limits come from the local config. Jarvis resolves the task before permission approval and executes that same resolved definition after approval.
+MCP endpoint:
 
-### Real-Time Collaboration
-- **SignalR Client Connection**: The local client connects to the server and receives commands in real time.
-- **Permission Prompting**: Mutating, process, and version-control commands require local approval.
+```text
+https://jarvis2.kehlet.dev/mcp
+```
 
-## Usage
+Protected-resource metadata:
 
-Download the client for your operating system, run it, choose the workspace directory that contains your projects, then provide the displayed key to the agent.
+```text
+https://jarvis2.kehlet.dev/.well-known/oauth-protected-resource
+```
 
-Production client downloads:
+OAuth scopes:
+
+| Scope | Purpose |
+|---|---|
+| `workspace:read` | Project discovery, search, file reads, git/job status |
+| `workspace:write` | File writes and patches |
+| `process:execute` | Commands, project tasks, jobs, cancellation |
+| `git:write` | Local git commits |
+| `client:connect` | Authenticate JarvisClient's SignalR connection |
+
+The MCP server verifies token issuer, audience, expiry, and required scope. The native client uses Authorization Code + PKCE and never uses a client secret.
+
+## Run JarvisClient
+
+Production downloads:
 
 ```text
 https://jarvis2.kehlet.dev/downloads/JarvisClient-linux-x64
@@ -71,6 +94,29 @@ chmod +x JarvisClient-linux-x64
 ./JarvisClient-linux-x64 --path ~/Projects
 ```
 
+JarvisClient opens the browser for Auth0 sign-in, receives an authorization code on the loopback callback, exchanges it with PKCE, and authenticates the SignalR connection. The MCP connection and JarvisClient must be signed into the same Jarvis/Auth0 account.
+
+Default native OAuth configuration:
+
+```text
+Auth0 domain: dev-kn4j3jz3qv2cvw05.eu.auth0.com
+Audience: https://jarvis2.kehlet.dev
+Callback: http://127.0.0.1:43821/callback
+```
+
+Non-secret OAuth metadata can be overridden with:
+
+```text
+JARVIS_AUTH0_DOMAIN
+JARVIS_OAUTH_AUDIENCE
+JARVIS_OAUTH_CLIENT_ID
+JARVIS_OAUTH_REDIRECT_URI
+```
+
+### Local permissions
+
+Jarvis distinguishes read-only, workspace-write, process-execution, and version-control-write operations. State-changing operations can require local approval according to the selected permission mode.
+
 Spawned commands and jobs strip likely credential-bearing environment variables by default. Explicit exceptions are user-controlled:
 
 ```bash
@@ -78,32 +124,52 @@ Spawned commands and jobs strip likely credential-bearing environment variables 
 JARVIS_ALLOWED_ENVIRONMENT_VARIABLES=NUGET_AUTH_TOKEN,GITHUB_TOKEN ./JarvisClient-linux-x64 --path ~/Projects
 ```
 
-Project `.jarvis.json` files cannot grant themselves access to filtered environment variables.
+Project-owned `.jarvis.json` files cannot grant themselves access to filtered environment variables.
 
-## Build Scripts
+## Project tasks
 
-Jarvis uses a .NET 10 file-based C# build app with `System.CommandLine`:
+Projects can expose named build/test/format/lint tasks in a project-root `.jarvis.json`:
 
-```bash
-dotnet scripts/build.cs --help
+```json
+{
+  "tasks": {
+    "build": {
+      "description": "Build the solution",
+      "executable": "dotnet",
+      "args": ["build", "Jarvis.slnx", "--no-restore"],
+      "timeoutSeconds": 120,
+      "maxOutputBytes": 40000
+    }
+  }
+}
 ```
 
-Common commands:
+The executable and arguments come from local project configuration rather than model-supplied task arguments. Jarvis resolves the task before permission approval and executes that same definition afterward.
+
+## Server configuration
+
+Server settings are read from environment variables with the `Jarvis` prefix:
+
+```text
+JarvisAuth0Domain=dev-kn4j3jz3qv2cvw05.eu.auth0.com
+JarvisAudience=https://jarvis2.kehlet.dev
+JarvisOpenAIAppsChallenge=<set only while verifying the plugin domain>
+```
+
+`JarvisOpenAIAppsChallenge`, when present, is returned verbatim from:
+
+```text
+/.well-known/openai-apps-challenge
+```
+
+## Build
 
 ```bash
 dotnet scripts/build.cs test
 dotnet scripts/build.cs compile
 ```
 
-Publish one self-contained single-file client with a server URL embedded at build time:
-
-```bash
-dotnet scripts/build.cs publish-client \
-  --rid linux-x64 \
-  --server https://jarvis2.kehlet.dev/client
-```
-
-Publish multiple stamped clients:
+Publish clients:
 
 ```bash
 dotnet scripts/build.cs publish-clients \
@@ -113,44 +179,37 @@ dotnet scripts/build.cs publish-clients \
   --rid osx-arm64
 ```
 
-Build outputs are written to `artifacts/client/<rid>/` by default. The client executable is named `JarvisClient` (`JarvisClient.exe` on Windows).
+Publish the server:
 
-Publish nginx-ready client downloads:
+```bash
+dotnet scripts/build.cs publish-server --rid linux-x64
+```
+
+Publish production client downloads:
 
 ```bash
 dotnet scripts/publish-client-downloads.cs
 ```
 
-This writes stable download names and `SHA256SUMS` to `artifacts/downloads/`. See `docs/ClientDownloads.md` for the Ubuntu/nginx deployment steps.
+## Plugin package
 
-Publish a self-contained single-file server:
+The source-controlled portable plugin package is under `plugin/`:
 
-```bash
-dotnet scripts/build.cs publish-server \
-  --rid linux-x64
+```text
+plugin/
+├── plugin.json
+├── mcp.json
+└── skills/
+    └── project-work/
+        └── SKILL.md
 ```
 
-Server outputs are written to `artifacts/server/<rid>/` by default. The server executable is named `JarvisServer` (`JarvisServer.exe` on Windows).
+The public plugin itself is submitted against the production HTTPS MCP endpoint.
 
-### Server authentication
+## Privacy
 
-The server reads settings from environment variables prefixed with `Jarvis`.
-
-- `JarvisApiKey` authenticates the legacy `/agent` API through `X-Api-Key`.
-- `JarvisMcpApiKey` authenticates `/mcp` through `Authorization: Bearer <token>`.
-
-Generate a dedicated MCP token with:
-
-```bash
-openssl rand -base64 48
-```
-
-Publish the Jarvis 2 linux server and client:
-
-```bash
-dotnet scripts/build.cs publish-jarvis2-linux
-```
+See `docs/privacy.md`.
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+MIT. See `LICENSE`.

@@ -1,0 +1,10 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "jarvis",
+  "version": "0.1.0",
+  "description": "Work with projects on an authenticated local machine through Jarvis.",
+  "homepage": "https://jarvis2.kehlet.dev",
+  "repository": "https://github.com/Serdan/Jarvis",
+  "license": "MIT",
+  "keywords": ["development", "coding", "projects", "git"]
+}

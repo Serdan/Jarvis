@@ -1,17 +1,10 @@
 # Server Module Structure
 
-## Main Directories
-
-- **Properties/** - Configuration and metadata for the server.
-- **Services/** - Contains core services and business logic implementations.
-
----
-
-## Key Files
-
-- **appsettings.Development.json** - Development-specific configuration settings.
-- **appsettings.json** - General configuration settings for the server.
-- **Endpoints.fs** - Defines server API endpoints.
-- **JarvisOptions.fs** - Configuration options for the server.
-- **Program.fs** - Entry point of the server application.
-- **Server.fsproj** - Project file managing server dependencies and build process.
+- **Auth.fs** — OAuth scope constants, issuer/resource helpers, subject extraction, and scope checks.
+- **JarvisOptions.fs** — Auth0 resource-server and OpenAI domain-verification configuration.
+- **McpTools.fs** — Public MCP tools, OAuth scope enforcement, tool annotations, profile tool, and typed MCP errors.
+- **Program.fs** — ASP.NET host, JWT bearer authentication, protected-resource metadata, MCP endpoint, SignalR endpoint, rate limiting, and OpenAI domain-verification challenge.
+- **Services/UserService.fs** — In-memory authenticated user/device connection state.
+- **Services/HubService.fs** — Authenticated SignalR hub and device registration.
+- **Services/ClientService.fs** — Routes MCP commands to the active local device and tracks responses.
+- **Services/ClientResponseTracker.fs** — Correlates server requests with local client responses.

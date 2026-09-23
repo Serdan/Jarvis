@@ -788,32 +788,27 @@ Search commands should support enough include/exclude input to let clients expre
 
 ### Command Catalog
 
-`AgentProtocol.commandDefinitions` is the authoritative command catalog for command name, operation ID, description, permissions, mutation/confirmation behavior, and dry-run support. `ListCommands` capabilities and primary legacy HTTP route paths are derived from this catalog.
+`AgentProtocol.commandDefinitions` is the authoritative catalog for local command names, descriptions, permission categories, mutation/confirmation behavior, and dry-run support. `ListCommands` capabilities are derived from it.
 
-The MCP tool surface and `actions-schema` remain adapter-specific code, but tests require their command/tool names, operation IDs, and primary routes to match the catalog exactly. Adding or renaming a command therefore fails tests until all external surfaces are synchronized.
+The MCP surface contains the command-backed tools plus server-local tools such as `GetProfile`. Tests require every local `AgentCommand` union case to have a matching command definition and matching MCP tool.
 
-### Session Registration
+### Authenticated Device Registration
 
-Protocol 2.8 makes the SignalR registration lifecycle explicit. A client registers with its session key, command protocol version, and client version. The server returns the assigned connection generation, registration timestamp, and registration reason.
+Protocol 3.0 removes copied session keys. JarvisClient authenticates its SignalR connection with an OAuth access token carrying `client:connect`. The server derives the user identity from the validated `sub` claim.
 
-The first registration of a key uses generation 1; each later registration increments the generation. Disconnect handling is conditional on the current connection ID, so an old connection cannot mark a newer generation disconnected.
+After the transport is authenticated, the client registers only non-secret device metadata: device ID, device name, command protocol version, and client version. The server tracks one active device per authenticated user and retains process-local lifecycle state so reconnects, device switches, stale disconnects, and dispatch failures can be distinguished.
 
-The server retains in-memory session state after transport disconnect, including:
+The first registration for a user uses generation 1; later registrations increment the generation. Disconnect handling is conditional on the current connection ID, so a stale connection cannot mark a newer generation disconnected. Protocol-version mismatches are recorded diagnostically.
 
-- registered/disconnected state and the active connection ID when present;
-- connection generation and client/protocol versions;
-- registration, last-seen, and disconnect timestamps;
-- registration reason and the latest dispatch/disconnect failure.
+### OAuth Authorization
 
-SignalR transport connections are tracked before they register a key, making the transport-connected-but-unregistered state observable as well.
+The public MCP endpoint is an OAuth resource server. It validates token issuer, audience/resource, expiry, and the scope required by each tool. MCP requests are routed to the local device associated with the authenticated subject rather than any identifier supplied by the model.
 
-This state lets dispatch distinguish a key that has never been registered from a known but disconnected session. Successful dispatch/response activity updates last-seen state, while dispatch failures are recorded only when the failing connection still owns the current generation. Protocol-version mismatches are recorded in the registration reason.
+The OAuth scopes are `workspace:read`, `workspace:write`, `process:execute`, and `git:write`. The native client uses the separate `client:connect` scope. Local permission prompts remain an independent authorization boundary after OAuth.
 
 ### Protocol Version
 
-The initial version of this command surface was `2.0`. The current version is `2.8`.
-
-This is a breaking redesign of the original Jarvis command set. Implementations should not preserve old command names solely for backwards compatibility.
+The current command protocol version is `3.0`. Version 3 removes copied session keys and changes registration/routing to authenticated user and device identity. Backward compatibility with the old Actions/API-key surface is intentionally not maintained.
 
 ### Error Model
 

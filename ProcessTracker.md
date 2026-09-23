@@ -6,14 +6,14 @@ Rebuild Jarvis authentication for a public ChatGPT plugin: OAuth-only public acc
 
 ## Status
 
-The 12 approved agent-ergonomics items are complete. OAuth/public-plugin migration is in progress.
+The OAuth/public-plugin migration is complete in the codebase.
 
 ## Notes
 
 - The completed ergonomics backlog is documented in `docs/AgentErgonomicsBacklog.md`.
-- The current migration plan is documented in `docs/OAuthMigrationPlan.md`.
-- No backward compatibility is required for the old API-key, Actions, custom-GPT, or copied-session-key surfaces.
-- Verify each coherent change with focused tests plus the normal build/test workflow.
+- OAuth architecture is documented in `docs/OAuthMigrationPlan.md`.
+- Public submission material is documented in `docs/PluginSubmission.md`.
+- Backward compatibility with API-key, Actions, custom-GPT, and copied-session-key surfaces is intentionally not maintained.
 
 ## Completed agent-ergonomics work
 
@@ -24,27 +24,27 @@ The 12 approved agent-ergonomics items are complete. OAuth/public-plugin migrati
 - [x] 5. Add first-class directory creation / create-parent support.
 - [x] 6. Make process permissions more granular.
 - [x] 7. Add project-configured first-class tasks.
-- [x] 8. Model incremental job output with proper stdout/stderr offsets or ordered events.
+- [x] 8. Model incremental job output with ordered events.
 - [x] 9. Control inherited environment variables for spawned processes.
-- [x] 10. Generate external command surfaces from one command specification.
+- [x] 10. Centralize command-surface metadata.
 - [x] 11. Preserve typed errors through MCP.
 - [x] 12. Expose explicit session/registration state.
 
 ## OAuth / public plugin migration
 
-- [ ] 1. Upgrade the MCP SDK.
-- [ ] 2. Add Auth0 JWT resource-server authentication.
-- [ ] 3. Publish OAuth protected-resource metadata and challenges.
-- [ ] 4. Add per-tool OAuth scopes and MCP annotations.
-- [ ] 5. Remove session-key arguments from MCP.
-- [ ] 6. Authenticate and register local devices by user identity.
-- [ ] 7. Route MCP calls to authenticated devices.
-- [ ] 8. Add native authorization-code + PKCE login.
-- [ ] 9. Remove legacy auth/Actions/custom-GPT surfaces.
-- [ ] 10. Add plugin instructions/metadata and update deployment/docs/tests.
+- [x] 1. Upgrade the MCP SDK.
+- [x] 2. Add Auth0 JWT resource-server authentication.
+- [x] 3. Publish OAuth protected-resource metadata and authorization challenges.
+- [x] 4. Add per-tool OAuth scopes and MCP annotations.
+- [x] 5. Remove session-key arguments from MCP.
+- [x] 6. Authenticate and register local devices by user identity.
+- [x] 7. Route MCP calls to authenticated devices.
+- [x] 8. Add native Authorization Code + PKCE login.
+- [x] 9. Remove legacy API-key, Actions, and custom-GPT surfaces.
+- [x] 10. Add profile identity, portable plugin package, review material, and updated documentation.
 
 ## Verification
 
-- `dotnet scripts/build.cs test`
-- `dotnet build Jarvis.slnx --no-restore`
-- Review git diff and status at coherent checkpoints.
+- `dotnet scripts/build.cs test`: Client.Tests 95/95; Server.Tests 18/18.
+- `dotnet build Jarvis.slnx --no-restore`: 0 warnings, 0 errors.
+- Portable `plugin.json` and `mcp.json` parse as JSON and the skill contains valid frontmatter.

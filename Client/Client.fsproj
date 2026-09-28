@@ -38,6 +38,7 @@
         <Compile Include="Modules\ProjectPaths.fs"/>
         <Compile Include="Modules\AuditLog.fs"/>
         <Compile Include="Modules\PermissionPolicy.fs"/>
+        <Compile Include="Modules\ActivityPresentation.fs"/>
         <Compile Include="Modules\ConsoleTui.fs"/>
         <Compile Include="Modules\ProjectBrowser.fs"/>
         <Compile Include="Modules\ProcessEnvironment.fs"/>

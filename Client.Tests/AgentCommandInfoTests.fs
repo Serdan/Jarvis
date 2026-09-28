@@ -17,8 +17,8 @@ let ``project-scoped commands render compact activity labels`` () =
 
     AgentCommandInfo.name command |> shouldEqual "RunCommandCommand"
     AgentCommandInfo.projectName command |> shouldEqual (Some "Wayfold")
-    AgentCommandInfo.detail command |> shouldEqual (Some "dotnet")
-    AgentCommandInfo.activityLabel command |> shouldEqual "@Wayfold RunCommandCommand(dotnet)"
+    AgentCommandInfo.detail command |> shouldEqual (Some "dotnet test")
+    AgentCommandInfo.activityLabel command |> shouldEqual "@Wayfold RunCommandCommand(dotnet test)"
 
 [<Test>]
 let ``file commands show the target path`` () =

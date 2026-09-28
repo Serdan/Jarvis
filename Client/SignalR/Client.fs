@@ -122,8 +122,9 @@ let private dispatch rt command =
 
 let receiveCommand (rt: Runtime) (command: AgentCommand) =
     task {
-        let commandDescription = AgentCommandInfo.activityLabel command
-        let activityId = rt.Tui.StartActivity commandDescription
+        let projectName = AgentCommandInfo.projectName command
+        let commandDescription = AgentCommandInfo.invocation command
+        let activityId = rt.Tui.StartActivity(projectName, commandDescription)
         let stopwatch = Stopwatch.StartNew()
 
         let permission = rt :> PermissionIO
@@ -146,8 +147,16 @@ let receiveCommand (rt: Runtime) (command: AgentCommand) =
                 | Error error ->
                     return Error error
                 | Ok(authorizationCommand, resolvedTask) ->
+                    let promptWithActivityState promptCommand request =
+                        task {
+                            rt.Tui.MarkActivityAwaitingPermission activityId
+                            let! approval = permission.PromptPermission promptCommand request
+                            rt.Tui.MarkActivityRunning activityId
+                            return approval
+                        }
+
                     let! authorization =
-                        PermissionPolicy.authorizeWithMode permission.PermissionMode permission.PromptPermission authorizationCommand
+                        PermissionPolicy.authorizeWithMode permission.PermissionMode promptWithActivityState authorizationCommand
 
                     match authorization, resolvedTask with
                     | Error error, _ ->
@@ -161,11 +170,13 @@ let receiveCommand (rt: Runtime) (command: AgentCommand) =
             }
 
         stopwatch.Stop()
-        let completedDescription = $"{commandDescription} ({stopwatch.ElapsedMilliseconds} ms)"
 
         match response with
-        | Ok _ -> rt.Tui.UpdateActivity(activityId, completedDescription)
-        | Error err -> rt.Tui.UpdateActivity(activityId, $"{completedDescription} FAILED: {EffectError.toString err}")
+        | Ok payload ->
+            let outcome = ActivityPresentation.tryResultSummary command payload
+            rt.Tui.CompleteActivity(activityId, stopwatch.ElapsedMilliseconds, outcome)
+        | Error err ->
+            rt.Tui.FailActivity(activityId, stopwatch.ElapsedMilliseconds, ActivityPresentation.shortError err, ActivityPresentation.fullError err)
 
         audit command response
 

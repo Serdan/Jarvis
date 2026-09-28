@@ -344,21 +344,47 @@ module AgentCommandInfo =
     let private compact (value: string) =
         value.Replace("\r", " ").Replace("\n", " ").Trim()
 
+    let private truncate maxLength value =
+        let value = compact value
+        if value.Length <= maxLength then value
+        else value.Substring(0, maxLength - 1) + "…"
+
+    let private quoted value =
+        "\"" + truncate 48 value + "\""
+
+    let private commandPreview executable args =
+        let argsPreview =
+            args
+            |> List.truncate 2
+            |> List.map (truncate 28)
+
+        let suffix =
+            match args, argsPreview with
+            | [], _ -> ""
+            | original, preview when original.Length > preview.Length -> " " + String.concat " " preview + " …"
+            | _, preview -> " " + String.concat " " preview
+
+        truncate 72 (compact executable + suffix)
+
+    let private shortId value =
+        let value = compact value
+        if value.Length <= 8 then value else value.Substring(0, 8)
+
     let detail = function
-        | ListDirectoryCommand cmd -> Some(compact cmd.FolderPath)
-        | SearchFilesCommand cmd -> Some(compact cmd.Query)
-        | SearchTextCommand cmd -> Some(compact cmd.Query)
-        | ReadFileCommand cmd -> Some(compact cmd.FilePath)
+        | ListDirectoryCommand cmd -> Some(truncate 64 cmd.FolderPath)
+        | SearchFilesCommand cmd -> Some(quoted cmd.Query)
+        | SearchTextCommand cmd -> Some(quoted cmd.Query)
+        | ReadFileCommand cmd -> Some(truncate 64 cmd.FilePath)
         | ReadFilesCommand cmd -> Some $"{cmd.FilePaths.Length} files"
-        | WriteFileCommand cmd -> Some(compact cmd.FilePath)
-        | PatchFileCommand cmd -> Some(compact cmd.FilePath)
-        | RunCommandCommand cmd -> Some(compact cmd.Executable)
-        | RunProjectTaskCommand cmd -> Some(compact cmd.TaskName)
-        | GetGitDiffCommand cmd -> cmd.Path |> Option.map compact
-        | GitCommitCommand cmd -> Some(compact cmd.Message)
-        | StartJobCommand cmd -> Some(compact cmd.Executable)
-        | GetJobResultCommand cmd -> Some(compact cmd.JobId)
-        | CancelJobCommand cmd -> Some(compact cmd.JobId)
+        | WriteFileCommand cmd -> Some(truncate 64 cmd.FilePath)
+        | PatchFileCommand cmd -> Some(truncate 64 cmd.FilePath)
+        | RunCommandCommand cmd -> Some(commandPreview cmd.Executable cmd.Args)
+        | RunProjectTaskCommand cmd -> Some(truncate 48 cmd.TaskName)
+        | GetGitDiffCommand cmd -> cmd.Path |> Option.map (truncate 64)
+        | GitCommitCommand cmd -> Some(quoted cmd.Message)
+        | StartJobCommand cmd -> Some(commandPreview cmd.Executable cmd.Args)
+        | GetJobResultCommand cmd -> Some(shortId cmd.JobId)
+        | CancelJobCommand cmd -> Some(shortId cmd.JobId)
         | ListCommandsCommand
         | ListProjectsCommand
         | GetProjectDetailsCommand _
@@ -366,15 +392,15 @@ module AgentCommandInfo =
         | GetGitStatusCommand _
         | ListJobsCommand _ -> None
 
-    let activityLabel command =
-        let invocation =
-            match detail command with
-            | Some detail when not (String.IsNullOrWhiteSpace detail) -> $"{name command}({detail})"
-            | _ -> name command
+    let invocation command =
+        match detail command with
+        | Some detail when not (String.IsNullOrWhiteSpace detail) -> $"{name command}({detail})"
+        | _ -> name command
 
+    let activityLabel command =
         match projectName command with
-        | Some projectName -> $"@{projectName} {invocation}"
-        | None -> invocation
+        | Some projectName -> $"@{projectName} {invocation command}"
+        | None -> invocation command
 
 module AgentProtocol =
     let version = "3.0"

@@ -11,6 +11,7 @@ The OAuth/public-plugin migration is complete in the codebase.
 ## Notes
 
 - The completed ergonomics backlog is documented in `docs/AgentErgonomicsBacklog.md`.
+- The completed client activity feedback work is documented in `docs/ClientActivityTasks.md`.
 - OAuth architecture is documented in `docs/OAuthMigrationPlan.md`.
 - Public submission material is documented in `docs/PluginSubmission.md`.
 - Backward compatibility with API-key, Actions, custom-GPT, and copied-session-key surfaces is intentionally not maintained.
@@ -45,6 +46,6 @@ The OAuth/public-plugin migration is complete in the codebase.
 
 ## Verification
 
-- `dotnet scripts/build.cs test`: Client.Tests 95/95; Server.Tests 18/18.
+- Current activity-feedback verification: Client.Tests 106/106; Server.Tests 19/19.
 - `dotnet build Jarvis.slnx --no-restore`: 0 warnings, 0 errors.
 - Portable `plugin.json` and `mcp.json` parse as JSON and the skill contains valid frontmatter.

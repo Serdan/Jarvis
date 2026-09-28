@@ -59,28 +59,29 @@ let register (tui: ConsoleTui) (connection: HubConnection) deviceId =
 
         match result with
         | Ok registered ->
-            tui.Log $"Connected and registered as generation {registered.Generation}. {registered.RegistrationReason}."
+            tui.SetConnectionState(Connected, BuildInfo.ServerUrl)
             return true
         | Error err ->
-            tui.Log $"Connection registration failed: {err.Message}. Retrying..."
+            tui.SetConnectionState(Connecting, BuildInfo.ServerUrl)
             return false
     }
 
 let connect (tui: ConsoleTui) (connection: HubConnection) =
     task {
-        tui.Log $"Connecting to {BuildInfo.ServerUrl}..."
+        tui.SetConnectionState(Connecting, BuildInfo.ServerUrl)
         let! startResult = connection.startAsync()
 
         match startResult with
         | Ok _ -> return true
         | Error err ->
-            tui.Log $"Connection start failed: {err.Message}. Retrying..."
+            tui.SetConnectionState(Disconnected, BuildInfo.ServerUrl)
             return false
     }
 
 [<EntryPoint>]
 let main args =
     let tui = ConsoleTui()
+    tui.SetConnectionState(Disconnected, BuildInfo.ServerUrl)
 
     let dir, permissionMode, allowedEnvironmentVariables =
         match parseArgs args with
@@ -130,26 +131,19 @@ let main args =
     connection.add_Reconnecting(
         Func<Exception, Task>(fun error ->
             registered <- false
-            let reason =
-                if isNull error then "transport interrupted"
-                else error.Message
-            tui.Log $"Connection interrupted: {reason}. Reconnecting..."
+            tui.SetConnectionState(Reconnecting, BuildInfo.ServerUrl)
             Task.CompletedTask))
 
     connection.add_Reconnected(
         Func<string, Task>(fun connectionId ->
             registered <- false
-            let id = if String.IsNullOrWhiteSpace connectionId then "unknown" else connectionId
-            tui.Log $"SignalR transport reconnected as {id}. Re-registering..."
+            tui.SetConnectionState(Connecting, BuildInfo.ServerUrl)
             Task.CompletedTask))
 
     connection.add_Closed(
         Func<Exception, Task>(fun error ->
             registered <- false
-            let reason =
-                if isNull error then "transport closed"
-                else error.Message
-            tui.Log $"Connection closed: {reason}. Retrying..."
+            tui.SetConnectionState(Disconnected, BuildInfo.ServerUrl)
             Task.CompletedTask))
 
     task {
@@ -159,7 +153,7 @@ let main args =
 
         Console.CancelKeyPress.AddHandler(ConsoleCancelEventHandler(fun _ args ->
             args.Cancel <- true
-            tui.Log "Closing..."
+            tui.SetConnectionState(Closing, BuildInfo.ServerUrl)
             tui.RequestQuit()
             cts.Cancel()))
 

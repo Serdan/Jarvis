@@ -25,6 +25,7 @@ let git projectName args =
     { ProjectName = projectName
       Executable = "git"
       Args = args
+      Reason = None
       WorkingDirectory = None
       TimeoutSeconds = Some 10
       MaxOutputBytes = Some 4096 }

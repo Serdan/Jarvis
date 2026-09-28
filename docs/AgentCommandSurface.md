@@ -248,6 +248,7 @@ type RunCommandCommand =
     { ProjectName: string
       Executable: string
       Args: string list
+      Reason: string option
       WorkingDirectory: string option
       TimeoutSeconds: int option
       MaxOutputBytes: int option }
@@ -255,6 +256,7 @@ type RunCommandCommand =
 
 Execution policy:
 
+- `Reason` is presentation-only context for the local client and does not affect command authorization identity.
 - Resolve `WorkingDirectory` under the project root.
 - Reject working directories outside the project root.
 - Prefer an allowlist for commands.

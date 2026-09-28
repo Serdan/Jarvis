@@ -21,7 +21,13 @@ module private Store =
     let executableGrants = ConcurrentDictionary<string, byte>()
 
 let private hashCommand command =
-    let json = JsonSerializer.Serialize command
+    let authorizationIdentity =
+        match command with
+        | RunCommandCommand cmd ->
+            RunCommandCommand { cmd with Reason = None }
+        | _ -> command
+
+    let json = JsonSerializer.Serialize authorizationIdentity
     let bytes = Encoding.UTF8.GetBytes json
     let hash = SHA256.HashData bytes |> Convert.ToHexString
     hash.ToLowerInvariant()

@@ -237,6 +237,9 @@ type ConsoleTui() =
 
                     Console.WriteLine ""
                     Console.WriteLine $"    {trim prompt.Request.Summary (Math.Max(20, width - 4))}"
+                    AgentCommandInfo.reason prompt.Command
+                    |> Option.iter (fun reason ->
+                        Console.WriteLine $"    Reason: {trim reason (Math.Max(20, width - 12))}")
 
             if showLastError then
                 match latestFailureUnsafe() with

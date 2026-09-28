@@ -66,6 +66,7 @@ let ``grant does not allow changed command payload`` () =
             { ProjectName = "Project1"
               Executable = "dotnet"
               Args = [ "test" ]
+              Reason = None
               WorkingDirectory = None
               TimeoutSeconds = Some 60
               MaxOutputBytes = Some 4096 }
@@ -75,6 +76,7 @@ let ``grant does not allow changed command payload`` () =
             { ProjectName = "Project1"
               Executable = "dotnet"
               Args = [ "build" ]
+              Reason = None
               WorkingDirectory = None
               TimeoutSeconds = Some 60
               MaxOutputBytes = Some 4096 }
@@ -90,6 +92,36 @@ let ``grant does not allow changed command payload`` () =
     match evaluate changed with
     | Error(Client.ConfirmationRequired request) -> request.Args |> shouldEqual [ "build" ]
     | other -> Assert.Fail($"Expected ConfirmationRequired, got {other}")
+
+[<Test>]
+let ``exact run command grant ignores presentation reason`` () =
+    let original =
+        RunCommandCommand
+            { ProjectName = "Project1"
+              Executable = "dotnet"
+              Args = [ "test" ]
+              Reason = Some "verify the feature"
+              WorkingDirectory = None
+              TimeoutSeconds = Some 60
+              MaxOutputBytes = Some 4096 }
+
+    let sameCommandDifferentReason =
+        RunCommandCommand
+            { ProjectName = "Project1"
+              Executable = "dotnet"
+              Args = [ "test" ]
+              Reason = Some "run the tests"
+              WorkingDirectory = None
+              TimeoutSeconds = Some 60
+              MaxOutputBytes = Some 4096 }
+
+    let request =
+        match evaluate original with
+        | Error(Client.ConfirmationRequired request) -> request
+        | other -> failwith $"Expected ConfirmationRequired, got {other}"
+
+    grant original request None |> ignore
+    evaluate sameCommandDifferentReason |> shouldEqual (Ok())
 
 
 [<Test>]
@@ -124,6 +156,7 @@ let ``workspace-write mode still confirms process execution`` () =
             { ProjectName = "Project1"
               Executable = "dotnet"
               Args = [ "test" ]
+              Reason = None
               WorkingDirectory = None
               TimeoutSeconds = Some 60
               MaxOutputBytes = Some 4096 }
@@ -154,6 +187,7 @@ let ``trust-except-run-command mode confirms run command`` () =
             { ProjectName = "Project1"
               Executable = "dotnet"
               Args = [ "test" ]
+              Reason = None
               WorkingDirectory = None
               TimeoutSeconds = Some 60
               MaxOutputBytes = Some 4096 }
@@ -244,6 +278,7 @@ let ``authorizeWithMode allow once does not create grant`` () =
                 { ProjectName = "Project1"
                   Executable = "dotnet"
                   Args = [ "test" ]
+                  Reason = None
                   WorkingDirectory = None
                   TimeoutSeconds = Some 60
                   MaxOutputBytes = Some 4096 }
@@ -271,6 +306,7 @@ let ``authorizeWithMode allow exact for session creates grant`` () =
                 { ProjectName = "Project1"
                   Executable = "dotnet"
                   Args = [ "test" ]
+                  Reason = None
                   WorkingDirectory = None
                   TimeoutSeconds = Some 60
                   MaxOutputBytes = Some 4096 }
@@ -299,6 +335,7 @@ let ``authorize executable for session allows changed args in same project`` () 
                 { ProjectName = "Project1"
                   Executable = "dotnet"
                   Args = [ "test" ]
+                  Reason = None
                   WorkingDirectory = None
                   TimeoutSeconds = Some 60
                   MaxOutputBytes = Some 4096 }
@@ -308,6 +345,7 @@ let ``authorize executable for session allows changed args in same project`` () 
                 { ProjectName = "Project1"
                   Executable = "dotnet"
                   Args = [ "build" ]
+                  Reason = None
                   WorkingDirectory = None
                   TimeoutSeconds = Some 60
                   MaxOutputBytes = Some 4096 }
@@ -327,6 +365,7 @@ let ``executable session grant is scoped by project and command kind`` () =
             { ProjectName = "Project1"
               Executable = "dotnet"
               Args = [ "test" ]
+              Reason = None
               WorkingDirectory = None
               TimeoutSeconds = Some 60
               MaxOutputBytes = Some 4096 }
@@ -338,6 +377,7 @@ let ``executable session grant is scoped by project and command kind`` () =
             { ProjectName = "Project2"
               Executable = "dotnet"
               Args = [ "test" ]
+              Reason = None
               WorkingDirectory = None
               TimeoutSeconds = Some 60
               MaxOutputBytes = Some 4096 }
@@ -384,6 +424,7 @@ let ``trust-session mode allows run command`` () =
             { ProjectName = "Project1"
               Executable = "dotnet"
               Args = [ "test" ]
+              Reason = None
               WorkingDirectory = None
               TimeoutSeconds = Some 60
               MaxOutputBytes = Some 4096 }

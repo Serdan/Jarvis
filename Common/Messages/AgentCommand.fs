@@ -148,6 +148,7 @@ type RunCommandCommand =
     { ProjectName: string
       Executable: string
       Args: string list
+      Reason: string option
       WorkingDirectory: string option
       TimeoutSeconds: int option
       MaxOutputBytes: int option }
@@ -319,6 +320,28 @@ module AgentCommandInfo =
         | GetJobResultCommand _ -> "GetJobResultCommand"
         | CancelJobCommand _ -> "CancelJobCommand"
 
+    let displayName = function
+        | ListCommandsCommand -> "ListCommands"
+        | ListProjectsCommand -> "ListProjects"
+        | GetProjectDetailsCommand _ -> "GetProjectDetails"
+        | ListDirectoryCommand _ -> "ListDirectory"
+        | SearchFilesCommand _ -> "SearchFiles"
+        | SearchTextCommand _ -> "SearchText"
+        | ReadFileCommand _ -> "ReadFile"
+        | ReadFilesCommand _ -> "ReadFiles"
+        | WriteFileCommand _ -> "WriteFile"
+        | PatchFileCommand _ -> "PatchFile"
+        | RunCommandCommand _ -> "RunCommand"
+        | ListProjectTasksCommand _ -> "ListProjectTasks"
+        | RunProjectTaskCommand _ -> "RunTask"
+        | GetGitStatusCommand _ -> "GitStatus"
+        | GetGitDiffCommand _ -> "GitDiff"
+        | GitCommitCommand _ -> "GitCommit"
+        | StartJobCommand _ -> "StartJob"
+        | ListJobsCommand _ -> "ListJobs"
+        | GetJobResultCommand _ -> "GetJobResult"
+        | CancelJobCommand _ -> "CancelJob"
+
     let projectName = function
         | ListCommandsCommand
         | ListProjectsCommand
@@ -392,10 +415,22 @@ module AgentCommandInfo =
         | GetGitStatusCommand _
         | ListJobsCommand _ -> None
 
+    let reason = function
+        | RunCommandCommand cmd ->
+            cmd.Reason
+            |> Option.map (truncate 64)
+            |> Option.filter (String.IsNullOrWhiteSpace >> not)
+        | _ -> None
+
     let invocation command =
-        match detail command with
-        | Some detail when not (String.IsNullOrWhiteSpace detail) -> $"{name command}({detail})"
-        | _ -> name command
+        let call =
+            match detail command with
+            | Some detail when not (String.IsNullOrWhiteSpace detail) -> $"{displayName command}({detail})"
+            | _ -> displayName command
+
+        match reason command with
+        | Some reason -> $"{call} — {reason}"
+        | None -> call
 
     let activityLabel command =
         match projectName command with

@@ -242,12 +242,13 @@ type JarvisMcpTools =
             FuzzyContextLines = McpToolHelpers.optionOfNullable fuzzyContextLines
             ReturnContent = McpToolHelpers.optionOfNullableBool returnContent })
 
-    [<McpServerTool(Title = "Run command", ReadOnly = false, Destructive = true, Idempotent = false, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["process:execute"]}]"""); Description("Run a bounded local command in a project. Requires approval in the local Jarvis client.")>]
-    static member RunCommand(projectName: string, executable: string, args: string array, workingDirectory: string, timeoutSeconds: Nullable<int>, maxOutputBytes: Nullable<int>, client: ClientService, http: IHttpContextAccessor) =
+    [<McpServerTool(Title = "Run command", ReadOnly = false, Destructive = true, Idempotent = false, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["process:execute"]}]"""); Description("Run a bounded local command in a project. Supply a short human-readable reason for why the command is needed. Requires approval in the local Jarvis client.")>]
+    static member RunCommand(projectName: string, executable: string, args: string array, reason: string, workingDirectory: string, timeoutSeconds: Nullable<int>, maxOutputBytes: Nullable<int>, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (RunCommandCommand {
             ProjectName = projectName
             Executable = executable
             Args = args |> Array.toList
+            Reason = McpToolHelpers.optionOfString reason
             WorkingDirectory = McpToolHelpers.optionOfString workingDirectory
             TimeoutSeconds = McpToolHelpers.optionOfNullable timeoutSeconds
             MaxOutputBytes = McpToolHelpers.optionOfNullable maxOutputBytes })

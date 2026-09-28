@@ -365,6 +365,7 @@ let projectTaskAsRunCommand projectName (task: ProjectTaskDefinition) =
     { ProjectName = projectName
       Executable = task.Executable
       Args = task.Args
+      Reason = None
       WorkingDirectory = task.WorkingDirectory
       TimeoutSeconds = task.TimeoutSeconds
       MaxOutputBytes = task.MaxOutputBytes }

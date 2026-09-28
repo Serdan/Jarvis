@@ -11,6 +11,7 @@ let private runCommand =
         { ProjectName = "Jarvis"
           Executable = "dotnet"
           Args = [ "test" ]
+          Reason = None
           WorkingDirectory = None
           TimeoutSeconds = None
           MaxOutputBytes = None }

@@ -11,14 +11,32 @@ let ``project-scoped commands render compact activity labels`` () =
             { ProjectName = "Wayfold"
               Executable = "dotnet"
               Args = [ "test" ]
+              Reason = None
               WorkingDirectory = None
               TimeoutSeconds = None
               MaxOutputBytes = None }
 
     AgentCommandInfo.name command |> shouldEqual "RunCommandCommand"
+    AgentCommandInfo.displayName command |> shouldEqual "RunCommand"
     AgentCommandInfo.projectName command |> shouldEqual (Some "Wayfold")
     AgentCommandInfo.detail command |> shouldEqual (Some "dotnet test")
-    AgentCommandInfo.activityLabel command |> shouldEqual "@Wayfold RunCommandCommand(dotnet test)"
+    AgentCommandInfo.activityLabel command |> shouldEqual "@Wayfold RunCommand(dotnet test)"
+
+[<Test>]
+let ``run command reason is shown after invocation`` () =
+    let command =
+        RunCommandCommand
+            { ProjectName = "Jarvis"
+              Executable = "dotnet"
+              Args = [ "test" ]
+              Reason = Some "verify client activity changes"
+              WorkingDirectory = None
+              TimeoutSeconds = None
+              MaxOutputBytes = None }
+
+    AgentCommandInfo.reason command |> shouldEqual (Some "verify client activity changes")
+    AgentCommandInfo.activityLabel command
+    |> shouldEqual "@Jarvis RunCommand(dotnet test) — verify client activity changes"
 
 [<Test>]
 let ``file commands show the target path`` () =
@@ -30,14 +48,14 @@ let ``file commands show the target path`` () =
               EndLine = None
               IncludeLineNumbers = None }
 
-    AgentCommandInfo.activityLabel command |> shouldEqual "@Jarvis ReadFileCommand(docs/AI.md)"
+    AgentCommandInfo.activityLabel command |> shouldEqual "@Jarvis ReadFile(docs/AI.md)"
 
 [<Test>]
 let ``global commands omit project from activity description`` () =
     let command = ListProjectsCommand
 
     AgentCommandInfo.projectName command |> shouldEqual None
-    AgentCommandInfo.activityLabel command |> shouldEqual "ListProjectsCommand"
+    AgentCommandInfo.activityLabel command |> shouldEqual "ListProjects"
 
 [<Test>]
 let ``list jobs includes optional project when supplied`` () =
@@ -51,5 +69,5 @@ let ``list jobs includes optional project when supplied`` () =
             { ProjectName = None
               IncludeCompleted = true }
 
-    AgentCommandInfo.activityLabel scoped |> shouldEqual "@Jarvis ListJobsCommand"
-    AgentCommandInfo.activityLabel globalCommand |> shouldEqual "ListJobsCommand"
+    AgentCommandInfo.activityLabel scoped |> shouldEqual "@Jarvis ListJobs"
+    AgentCommandInfo.activityLabel globalCommand |> shouldEqual "ListJobs"

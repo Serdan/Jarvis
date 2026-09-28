@@ -27,39 +27,29 @@ module McpToolHelpers =
         | ExecutionFailed message -> $"ExecutionFailed: {message}"
         | OutputTruncated message -> $"OutputTruncated: {message}"
 
-    let private errorPayload error =
-        match error with
-        | NotFound message -> JsonSerializer.SerializeToElement({| kind = "NotFound"; message = message |})
-        | PermissionDenied message -> JsonSerializer.SerializeToElement({| kind = "PermissionDenied"; message = message |})
-        | ConfirmationRequired request ->
-            JsonSerializer.SerializeToElement(
-                {| kind = "ConfirmationRequired"
-                   message = request.Summary
-                   confirmationRequest = request |})
-        | ValidationFailed message -> JsonSerializer.SerializeToElement({| kind = "ValidationFailed"; message = message |})
-        | Conflict message -> JsonSerializer.SerializeToElement({| kind = "Conflict"; message = message |})
-        | ExecutionFailed message -> JsonSerializer.SerializeToElement({| kind = "ExecutionFailed"; message = message |})
-        | OutputTruncated message -> JsonSerializer.SerializeToElement({| kind = "OutputTruncated"; message = message |})
-
     let private textContent text =
         TextContentBlock(Text = text) :> ContentBlock
 
-    let private result structuredContent text isError =
+    let private textResult text isError =
         let result = CallToolResult()
         result.Content <- ResizeArray<ContentBlock>([ textContent text ])
-        result.StructuredContent <- Nullable structuredContent
         result.IsError <- Nullable isError
         result
 
+    let private structuredResult structuredContent text isError =
+        let result = textResult text isError
+        result.StructuredContent <- Nullable structuredContent
+        result
+
     let private errorResult error =
-        result (errorPayload error) (formatError error) true
+        textResult (formatError error) true
 
     let toCallToolResult (response: AgentCommandResponse) =
         match response.Result, response.Error with
         | Some serialized, None ->
             try
-                use document = JsonDocument.Parse(serialized)
-                result (document.RootElement.Clone()) serialized false
+                use _ = JsonDocument.Parse(serialized)
+                textResult serialized false
             with ex ->
                 errorResult (ExecutionFailed $"Invalid serialized Jarvis result: {ex.Message}")
         | None, Some error ->
@@ -107,8 +97,11 @@ module McpToolHelpers =
             + ", error_description=" + quote + description + quote
             + scopePart
 
+        let challenges = JsonArray()
+        challenges.Add(JsonValue.Create(challenge))
+
         let meta = JsonObject()
-        meta["mcp/www_authenticate"] <- JsonValue.Create(challenge)
+        meta["mcp/www_authenticate"] <- challenges
         response.Meta <- meta
         response
 
@@ -151,7 +144,7 @@ module McpToolHelpers =
                     let profile = { id = Auth.profileId userId }
                     let structured = JsonSerializer.SerializeToElement(profile)
                     let serialized = JsonSerializer.Serialize(profile)
-                    return result structured serialized false
+                    return structuredResult structured serialized false
                 | None ->
                     return authenticationErrorResult context None
         }
@@ -175,27 +168,27 @@ module McpToolHelpers =
 
 [<McpServerToolType>]
 type JarvisMcpTools =
-    [<McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof<ProfileResult>, ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":[]}]"""); McpMeta("openai/profile", true); Description("Return the profile represented by the authenticated OAuth credentials.")>]
+    [<McpServerTool(Title = "Get profile", UseStructuredContent = true, OutputSchemaType = typeof<ProfileResult>, ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":[]}]"""); McpMeta("openai/profile", true); Description("Return the profile represented by the authenticated OAuth credentials.")>]
     static member GetProfile(http: IHttpContextAccessor) =
         McpToolHelpers.getProfile http
 
-    [<McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof<JsonElement>, ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("List the commands supported by the connected Jarvis client.")>]
+    [<McpServerTool(Title = "List commands", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("List the commands supported by the connected Jarvis client.")>]
     static member ListCommands(client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http ListCommandsCommand
 
-    [<McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof<JsonElement>, ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("List projects exposed by the connected Jarvis client.")>]
+    [<McpServerTool(Title = "List projects", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("List projects exposed by the connected Jarvis client.")>]
     static member ListProjects(client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http ListProjectsCommand
 
-    [<McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof<JsonElement>, ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Get project details, README, notes, TODO, and related special files.")>]
+    [<McpServerTool(Title = "Get project details", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Get project details, README, notes, TODO, and related special files.")>]
     static member GetProjectDetails(projectName: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (GetProjectDetailsCommand { ProjectName = projectName })
 
-    [<McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof<JsonElement>, ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("List files and folders in a project directory.")>]
+    [<McpServerTool(Title = "List directory", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("List files and folders in a project directory.")>]
     static member ListDirectory(projectName: string, folderPath: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (ListDirectoryCommand { ProjectName = projectName; FolderPath = folderPath })
 
-    [<McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof<JsonElement>, ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Search project file and folder names.")>]
+    [<McpServerTool(Title = "Search files", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Search project file and folder names.")>]
     static member SearchFiles(projectName: string, query: string, folderPath: string, maxResults: Nullable<int>, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (SearchFilesCommand {
             ProjectName = projectName
@@ -203,7 +196,7 @@ type JarvisMcpTools =
             FolderPath = McpToolHelpers.optionOfString folderPath
             MaxResults = McpToolHelpers.optionOfNullable maxResults })
 
-    [<McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof<JsonElement>, ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Search text inside project files.")>]
+    [<McpServerTool(Title = "Search text", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Search text inside project files.")>]
     static member SearchText(projectName: string, query: string, folderPath: string, includeGlobs: string array, excludeGlobs: string array, maxResults: Nullable<int>, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (SearchTextCommand {
             ProjectName = projectName
@@ -213,7 +206,7 @@ type JarvisMcpTools =
             ExcludeGlobs = excludeGlobs |> Array.toList
             MaxResults = McpToolHelpers.optionOfNullable maxResults })
 
-    [<McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof<JsonElement>, ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read one project file.")>]
+    [<McpServerTool(Title = "Read file", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read one project file.")>]
     static member ReadFile(projectName: string, filePath: string, startLine: Nullable<int>, endLine: Nullable<int>, includeLineNumbers: Nullable<bool>, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (ReadFileCommand {
             ProjectName = projectName
@@ -222,11 +215,11 @@ type JarvisMcpTools =
             EndLine = McpToolHelpers.optionOfNullable endLine
             IncludeLineNumbers = McpToolHelpers.optionOfNullableBool includeLineNumbers })
 
-    [<McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof<JsonElement>, ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read multiple project files.")>]
+    [<McpServerTool(Title = "Read files", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read multiple project files.")>]
     static member ReadFiles(projectName: string, filePaths: string array, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (ReadFilesCommand { ProjectName = projectName; FilePaths = filePaths |> Array.toList })
 
-    [<McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof<JsonElement>, ReadOnly = false, Destructive = true, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:write"]}]"""); Description("Write or append to a project file. Requires approval in the local Jarvis client.")>]
+    [<McpServerTool(Title = "Write file", ReadOnly = false, Destructive = true, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:write"]}]"""); Description("Write or append to a project file. Requires approval in the local Jarvis client.")>]
     static member WriteFile(projectName: string, filePath: string, content: string, fileWriteMode: string, expectedHash: string, createParents: Nullable<bool>, client: ClientService, http: IHttpContextAccessor) =
         let mode = McpToolHelpers.parseFileWriteMode fileWriteMode
         McpToolHelpers.send client http (WriteFileCommand {
@@ -237,7 +230,7 @@ type JarvisMcpTools =
             ExpectedHash = McpToolHelpers.optionOfString expectedHash
             CreateParents = McpToolHelpers.optionOfNullableBool createParents })
 
-    [<McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof<JsonElement>, ReadOnly = false, Destructive = true, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:write"]}]"""); Description("Apply an atomic unified diff patch to one project file. Requires approval in the local Jarvis client.")>]
+    [<McpServerTool(Title = "Patch file", ReadOnly = false, Destructive = true, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:write"]}]"""); Description("Apply an atomic unified diff patch to one project file. Requires approval in the local Jarvis client.")>]
     static member PatchFile(projectName: string, filePath: string, patch: string, expectedHash: string, dryRun: Nullable<bool>, fuzzyContextLines: Nullable<int>, returnContent: Nullable<bool>, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (PatchFileCommand {
             ProjectName = projectName
@@ -249,7 +242,7 @@ type JarvisMcpTools =
             FuzzyContextLines = McpToolHelpers.optionOfNullable fuzzyContextLines
             ReturnContent = McpToolHelpers.optionOfNullableBool returnContent })
 
-    [<McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof<JsonElement>, ReadOnly = false, Destructive = true, Idempotent = false, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["process:execute"]}]"""); Description("Run a bounded local command in a project. Requires approval in the local Jarvis client.")>]
+    [<McpServerTool(Title = "Run command", ReadOnly = false, Destructive = true, Idempotent = false, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["process:execute"]}]"""); Description("Run a bounded local command in a project. Requires approval in the local Jarvis client.")>]
     static member RunCommand(projectName: string, executable: string, args: string array, workingDirectory: string, timeoutSeconds: Nullable<int>, maxOutputBytes: Nullable<int>, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (RunCommandCommand {
             ProjectName = projectName
@@ -259,26 +252,26 @@ type JarvisMcpTools =
             TimeoutSeconds = McpToolHelpers.optionOfNullable timeoutSeconds
             MaxOutputBytes = McpToolHelpers.optionOfNullable maxOutputBytes })
 
-    [<McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof<JsonElement>, ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("List locally configured project tasks from .jarvis.json.")>]
+    [<McpServerTool(Title = "List project tasks", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("List locally configured project tasks from .jarvis.json.")>]
     static member ListProjectTasks(projectName: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (ListProjectTasksCommand { ProjectName = projectName })
 
-    [<McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof<JsonElement>, ReadOnly = false, Destructive = true, Idempotent = false, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["process:execute"]}]"""); Description("Run a named task configured in the project's .jarvis.json. Requires local process approval.")>]
+    [<McpServerTool(Title = "Run project task", ReadOnly = false, Destructive = true, Idempotent = false, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["process:execute"]}]"""); Description("Run a named task configured in the project's .jarvis.json. Requires local process approval.")>]
     static member RunProjectTask(projectName: string, taskName: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (RunProjectTaskCommand { ProjectName = projectName; TaskName = taskName })
 
-    [<McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof<JsonElement>, ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Get git status for a project.")>]
+    [<McpServerTool(Title = "Get git status", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Get git status for a project.")>]
     static member GetGitStatus(projectName: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (GetGitStatusCommand { ProjectName = projectName })
 
-    [<McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof<JsonElement>, ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Get git diff for a project or project-relative path.")>]
+    [<McpServerTool(Title = "Get git diff", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Get git diff for a project or project-relative path.")>]
     static member GetGitDiff(projectName: string, path: string, maxOutputBytes: Nullable<int>, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (GetGitDiffCommand {
             ProjectName = projectName
             Path = McpToolHelpers.optionOfString path
             MaxOutputBytes = McpToolHelpers.optionOfNullable maxOutputBytes })
 
-    [<McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof<JsonElement>, ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Create a reversible local git commit from selected paths. Requires approval in the local Jarvis client and does not push to a remote.")>]
+    [<McpServerTool(Title = "Create git commit", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Create a reversible local git commit from selected paths. Requires approval in the local Jarvis client and does not push to a remote.")>]
     static member GitCommit(projectName: string, message: string, body: string, paths: string array, allowEmpty: bool, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (GitCommitCommand {
             ProjectName = projectName
@@ -287,7 +280,7 @@ type JarvisMcpTools =
             Paths = paths |> Array.toList
             AllowEmpty = allowEmpty })
 
-    [<McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof<JsonElement>, ReadOnly = false, Destructive = true, Idempotent = false, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["process:execute"]}]"""); Description("Start a long-running local job. Requires approval in the local Jarvis client.")>]
+    [<McpServerTool(Title = "Start job", ReadOnly = false, Destructive = true, Idempotent = false, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["process:execute"]}]"""); Description("Start a long-running local job. Requires approval in the local Jarvis client.")>]
     static member StartJob(projectName: string, executable: string, args: string array, workingDirectory: string, maxOutputBytes: Nullable<int>, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (StartJobCommand {
             ProjectName = projectName
@@ -296,18 +289,18 @@ type JarvisMcpTools =
             WorkingDirectory = McpToolHelpers.optionOfString workingDirectory
             MaxOutputBytes = McpToolHelpers.optionOfNullable maxOutputBytes })
 
-    [<McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof<JsonElement>, ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("List running or completed Jarvis jobs.")>]
+    [<McpServerTool(Title = "List jobs", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("List running or completed Jarvis jobs.")>]
     static member ListJobs(projectName: string, includeCompleted: bool, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (ListJobsCommand {
             ProjectName = McpToolHelpers.optionOfString projectName
             IncludeCompleted = includeCompleted })
 
-    [<McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof<JsonElement>, ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Get buffered output and status for a Jarvis job.")>]
+    [<McpServerTool(Title = "Get job result", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Get buffered output and status for a Jarvis job.")>]
     static member GetJobResult(jobId: string, afterSequence: Nullable<int64>, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (GetJobResultCommand {
             JobId = jobId
             AfterSequence = McpToolHelpers.optionOfNullableInt64 afterSequence })
 
-    [<McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof<JsonElement>, ReadOnly = false, Destructive = true, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["process:execute"]}]"""); Description("Cancel a running Jarvis job. Requires approval in the local Jarvis client.")>]
+    [<McpServerTool(Title = "Cancel job", ReadOnly = false, Destructive = true, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["process:execute"]}]"""); Description("Cancel a running Jarvis job. Requires approval in the local Jarvis client.")>]
     static member CancelJob(jobId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (CancelJobCommand { JobId = jobId })

@@ -2,6 +2,7 @@ module ServerServiceTests
 
 open System
 open System.Text.Json
+open System.Text.Json.Nodes
 open System.Threading.Tasks
 open Common
 open Common.SignalR
@@ -175,7 +176,7 @@ let ``response tracker honors configured timeout`` () =
     }
 
 [<Test>]
-let ``all Jarvis MCP tools return structured JSON content`` () =
+let ``all Jarvis MCP tools expose ChatGPT-compatible discovery metadata`` () =
     let methods =
         typeof<JarvisMcpTools>.GetMethods()
         |> Array.choose (fun methodInfo ->
@@ -186,14 +187,16 @@ let ``all Jarvis MCP tools return structured JSON content`` () =
     methods.Length > 0 |> shouldEqual true
 
     for methodInfo, attribute in methods do
-        attribute.UseStructuredContent |> shouldEqual true
+        String.IsNullOrWhiteSpace(attribute.Title) |> shouldEqual false
         methodInfo.ReturnType.IsGenericType |> shouldEqual true
         methodInfo.ReturnType.GetGenericTypeDefinition() |> shouldEqual typedefof<Task<_>>
         methodInfo.ReturnType.GetGenericArguments()[0] |> shouldEqual typeof<CallToolResult>
         if methodInfo.Name = "GetProfile" then
+            attribute.UseStructuredContent |> shouldEqual true
             attribute.OutputSchemaType |> shouldEqual typeof<ProfileResult>
         else
-            attribute.OutputSchemaType |> shouldEqual typeof<JsonElement>
+            attribute.UseStructuredContent |> shouldEqual false
+            isNull attribute.OutputSchemaType |> shouldEqual true
 
 [<Test>]
 let ``command catalog matches AgentCommand union and MCP tools`` () =
@@ -224,7 +227,7 @@ let ``command catalog matches AgentCommand union and MCP tools`` () =
     (Set.difference mcpNames catalogNames) |> shouldEqual (Set.singleton "GetProfile")
 
 [<Test>]
-let ``MCP bridge preserves successful structured content`` () =
+let ``MCP bridge returns successful JSON as text without a mismatched output schema`` () =
     let response =
         { Result = Some """{"value":42,"items":[1,2]}"""
           Error = None }
@@ -232,10 +235,7 @@ let ``MCP bridge preserves successful structured content`` () =
     let result = McpToolHelpers.toCallToolResult response
 
     result.IsError |> shouldEqual (Nullable false)
-    result.StructuredContent.HasValue |> shouldEqual true
-    let structured = result.StructuredContent.Value
-    structured.GetProperty("value").GetInt32() |> shouldEqual 42
-    structured.GetProperty("items").GetArrayLength() |> shouldEqual 2
+    result.StructuredContent.HasValue |> shouldEqual false
 
     let text = result.Content[0] :?> TextContentBlock
     text.Text |> shouldEqual """{"value":42,"items":[1,2]}"""
@@ -260,14 +260,7 @@ let ``MCP bridge preserves typed confirmation error details`` () =
     let result = McpToolHelpers.toCallToolResult response
 
     result.IsError |> shouldEqual (Nullable true)
-    result.StructuredContent.HasValue |> shouldEqual true
-    let structured = result.StructuredContent.Value
-    structured.GetProperty("kind").GetString() |> shouldEqual "ConfirmationRequired"
-    structured.GetProperty("message").GetString() |> shouldEqual confirmation.Summary
-
-    let request = structured.GetProperty("confirmationRequest")
-    request.GetProperty("CommandName").GetString() |> shouldEqual confirmation.CommandName
-    request.GetProperty("Summary").GetString() |> shouldEqual confirmation.Summary
+    result.StructuredContent.HasValue |> shouldEqual false
 
     let text = result.Content[0] :?> TextContentBlock
     text.Text.Contains("ConfirmationRequired", StringComparison.Ordinal) |> shouldEqual true
@@ -289,10 +282,9 @@ let ``MCP bridge preserves stable AgentError kinds`` () =
             |> McpToolHelpers.toCallToolResult
 
         result.IsError |> shouldEqual (Nullable true)
-        result.StructuredContent.HasValue |> shouldEqual true
-        let structured = result.StructuredContent.Value
-        structured.GetProperty("kind").GetString() |> shouldEqual expectedKind
-        structured.GetProperty("message").GetString() |> shouldEqual expectedMessage
+        result.StructuredContent.HasValue |> shouldEqual false
+        let text = result.Content[0] :?> TextContentBlock
+        text.Text |> shouldEqual $"{expectedKind}: {expectedMessage}"
 
 
 [<Test>]
@@ -438,3 +430,44 @@ let mcp_profile_tool_uses_authenticated_subject () =
     use security = JsonDocument.Parse(metadata["securitySchemes"])
     security.RootElement[0].GetProperty("type").GetString() |> shouldEqual "oauth2"
     security.RootElement[0].GetProperty("scopes").GetArrayLength() |> shouldEqual 0
+
+
+[<Test>]
+let mcp_profile_tool_returns_chatgpt_compatible_authentication_challenge () =
+    let services =
+        Microsoft.Extensions.DependencyInjection.ServiceCollection()
+        :> Microsoft.Extensions.DependencyInjection.IServiceCollection
+
+    Microsoft.Extensions.DependencyInjection.ServiceCollectionServiceExtensions.AddSingleton<Microsoft.Extensions.Options.IOptions<JarvisOptions>>(
+        services,
+        Microsoft.Extensions.Options.Options.Create(
+            { Auth0Domain = "dev-kn4j3jz3qv2cvw05.eu.auth0.com"
+              Audience = "https://jarvis2.kehlet.dev"
+              OpenAIAppsChallenge = "" }
+        )
+    )
+    |> ignore
+
+    use provider =
+        Microsoft.Extensions.DependencyInjection.ServiceCollectionContainerBuilderExtensions.BuildServiceProvider(services)
+    let context = Microsoft.AspNetCore.Http.DefaultHttpContext()
+    context.RequestServices <- provider
+
+    let accessor = Microsoft.AspNetCore.Http.HttpContextAccessor()
+    accessor.HttpContext <- context
+
+    let result =
+        McpToolHelpers.getProfile accessor
+        |> Async.AwaitTask
+        |> Async.RunSynchronously
+
+    result.IsError |> shouldEqual (Nullable true)
+
+    let challenges = result.Meta["mcp/www_authenticate"] :?> JsonArray
+    challenges.Count |> shouldEqual 1
+
+    let challenge = challenges[0].GetValue<string>()
+    challenge.Contains("resource_metadata=\"https://jarvis2.kehlet.dev/.well-known/oauth-protected-resource\"")
+    |> shouldEqual true
+    challenge.Contains("error=\"invalid_token\"") |> shouldEqual true
+    challenge.Contains("error_description=\"Authentication required.\"") |> shouldEqual true

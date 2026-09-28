@@ -103,6 +103,8 @@ let configureServices (services: IServiceCollection) (configuration: IConfigurat
         .AddJsonProtocol()
         .AddHubOptions<HubService>(fun options ->
             options.EnableDetailedErrors <- true
+            options.ClientTimeoutInterval <- TimeSpan.FromSeconds 60.0
+            options.KeepAliveInterval <- TimeSpan.FromSeconds 10.0
             options.MaximumReceiveMessageSize <- Nullable<int64>(1024L * 1024L))
     |> ignore
 

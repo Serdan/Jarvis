@@ -1,15 +1,29 @@
 namespace Client.SignalR
 
+open System
 open System.Runtime.CompilerServices
 open System.Threading
 open Microsoft.AspNetCore.SignalR.Client
+
+type PersistentRetryPolicy() =
+    interface IRetryPolicy with
+        member _.NextRetryDelay(context: RetryContext) =
+            let delay =
+                match context.PreviousRetryCount with
+                | 0L -> TimeSpan.Zero
+                | 1L -> TimeSpan.FromSeconds 2.0
+                | 2L -> TimeSpan.FromSeconds 10.0
+                | _ -> TimeSpan.FromSeconds 30.0
+
+            Nullable delay
 
 type HubConnectionE =
     [<Extension>]
     static member startAsync(connection: HubConnection) =
         task {
             try
-                do! connection.StartAsync()
+                use timeout = new CancellationTokenSource(TimeSpan.FromSeconds 15.0)
+                do! connection.StartAsync(timeout.Token)
                 return Ok()
             with ex ->
                 return Error ex

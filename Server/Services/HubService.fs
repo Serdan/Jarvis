@@ -5,9 +5,10 @@ open System.Threading.Tasks
 open Common
 open Common.SignalR
 open Microsoft.AspNetCore.SignalR
+open Microsoft.Extensions.Logging
 open Server
 
-type HubService(users: UserService, tracker: ClientResponseTracker) =
+type HubService(users: UserService, tracker: ClientResponseTracker, logger: ILogger<HubService>) =
     inherit Hub<IClientService>()
 
     member private this.UserId =
@@ -24,6 +25,19 @@ type HubService(users: UserService, tracker: ClientResponseTracker) =
             match error with
             | null -> None
             | ex -> Some ex.Message
+
+        match error with
+        | null ->
+            logger.LogInformation(
+                "Jarvis client connection {ConnectionId} disconnected.",
+                this.Context.ConnectionId
+            )
+        | ex ->
+            logger.LogWarning(
+                ex,
+                "Jarvis client connection {ConnectionId} disconnected with an error.",
+                this.Context.ConnectionId
+            )
 
         users.Disconnect(this.Context.ConnectionId, reason)
         base.OnDisconnectedAsync(error)

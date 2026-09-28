@@ -100,6 +100,8 @@ let main args =
     tui.Log $"Permission mode: {PermissionMode.toDisplayName permissionMode}"
     tui.Log $"Allowed sensitive environment variables: {allowedEnvironmentVariables.Length}"
 
+    let mutable registered = false
+
     let oauth =
         OAuth.login tui.Log
         |> Async.AwaitTask
@@ -114,18 +116,46 @@ let main args =
                     options.AccessTokenProvider <-
                         Func<Task<string>>(fun () -> oauth.GetAccessTokenAsync()))
             )
+            .WithAutomaticReconnect(PersistentRetryPolicy())
             .Build()
+
+    connection.KeepAliveInterval <- TimeSpan.FromSeconds 10.0
+    connection.ServerTimeout <- TimeSpan.FromSeconds 60.0
 
     ignoreAll {
         connection.On<string>("ReceiveMessage", Func<string, Task>(Client.receiveMessage rt))
         connection.On<string, string>("ReceiveCommand", Func<string, string, Task>(Client.receiveCommandAndReply connection rt))
     }
 
+    connection.add_Reconnecting(
+        Func<Exception, Task>(fun error ->
+            registered <- false
+            let reason =
+                if isNull error then "transport interrupted"
+                else error.Message
+            tui.Log $"Connection interrupted: {reason}. Reconnecting..."
+            Task.CompletedTask))
+
+    connection.add_Reconnected(
+        Func<string, Task>(fun connectionId ->
+            registered <- false
+            let id = if String.IsNullOrWhiteSpace connectionId then "unknown" else connectionId
+            tui.Log $"SignalR transport reconnected as {id}. Re-registering..."
+            Task.CompletedTask))
+
+    connection.add_Closed(
+        Func<Exception, Task>(fun error ->
+            registered <- false
+            let reason =
+                if isNull error then "transport closed"
+                else error.Message
+            tui.Log $"Connection closed: {reason}. Retrying..."
+            Task.CompletedTask))
+
     task {
         use cts = new CancellationTokenSource()
         let inputLoop = tui.RunInputLoop(cts.Token)
         let deviceId = DeviceIdentity.getOrCreate ()
-        let mutable registered = false
 
         Console.CancelKeyPress.AddHandler(ConsoleCancelEventHandler(fun _ args ->
             args.Cancel <- true

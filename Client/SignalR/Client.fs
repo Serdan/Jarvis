@@ -1,5 +1,6 @@
 module Client.SignalR.Client
 
+open System.Diagnostics
 open System.Text
 open System.Text.Json
 open System.Threading.Tasks
@@ -121,8 +122,9 @@ let private dispatch rt command =
 
 let receiveCommand (rt: Runtime) (command: AgentCommand) =
     task {
-        let commandDescription = AgentCommandInfo.describe command
-        rt.Tui.Log $"Incoming command: {commandDescription}"
+        let commandDescription = AgentCommandInfo.activityLabel command
+        let activityId = rt.Tui.StartActivity commandDescription
+        let stopwatch = Stopwatch.StartNew()
 
         let permission = rt :> PermissionIO
         let resolution =
@@ -158,9 +160,12 @@ let receiveCommand (rt: Runtime) (command: AgentCommand) =
                         return result
             }
 
+        stopwatch.Stop()
+        let completedDescription = $"{commandDescription} ({stopwatch.ElapsedMilliseconds} ms)"
+
         match response with
-        | Ok _ -> rt.Tui.Log $"Command executed: {commandDescription}. Sending response."
-        | Error err -> rt.Tui.Log $"Command failed: {commandDescription}. {EffectError.toString err}"
+        | Ok _ -> rt.Tui.UpdateActivity(activityId, completedDescription)
+        | Error err -> rt.Tui.UpdateActivity(activityId, $"{completedDescription} FAILED: {EffectError.toString err}")
 
         audit command response
 

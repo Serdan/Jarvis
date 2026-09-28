@@ -5,7 +5,7 @@ open FsUnitTyped
 open NUnit.Framework
 
 [<Test>]
-let ``project-scoped commands include project in activity description`` () =
+let ``project-scoped commands render compact activity labels`` () =
     let command =
         RunCommandCommand
             { ProjectName = "Wayfold"
@@ -17,14 +17,27 @@ let ``project-scoped commands include project in activity description`` () =
 
     AgentCommandInfo.name command |> shouldEqual "RunCommandCommand"
     AgentCommandInfo.projectName command |> shouldEqual (Some "Wayfold")
-    AgentCommandInfo.describe command |> shouldEqual "RunCommandCommand project=Wayfold"
+    AgentCommandInfo.detail command |> shouldEqual (Some "dotnet")
+    AgentCommandInfo.activityLabel command |> shouldEqual "@Wayfold RunCommandCommand(dotnet)"
+
+[<Test>]
+let ``file commands show the target path`` () =
+    let command =
+        ReadFileCommand
+            { ProjectName = "Jarvis"
+              FilePath = "docs/AI.md"
+              StartLine = None
+              EndLine = None
+              IncludeLineNumbers = None }
+
+    AgentCommandInfo.activityLabel command |> shouldEqual "@Jarvis ReadFileCommand(docs/AI.md)"
 
 [<Test>]
 let ``global commands omit project from activity description`` () =
     let command = ListProjectsCommand
 
     AgentCommandInfo.projectName command |> shouldEqual None
-    AgentCommandInfo.describe command |> shouldEqual "ListProjectsCommand"
+    AgentCommandInfo.activityLabel command |> shouldEqual "ListProjectsCommand"
 
 [<Test>]
 let ``list jobs includes optional project when supplied`` () =
@@ -38,5 +51,5 @@ let ``list jobs includes optional project when supplied`` () =
             { ProjectName = None
               IncludeCompleted = true }
 
-    AgentCommandInfo.describe scoped |> shouldEqual "ListJobsCommand project=Jarvis"
-    AgentCommandInfo.describe globalCommand |> shouldEqual "ListJobsCommand"
+    AgentCommandInfo.activityLabel scoped |> shouldEqual "@Jarvis ListJobsCommand"
+    AgentCommandInfo.activityLabel globalCommand |> shouldEqual "ListJobsCommand"

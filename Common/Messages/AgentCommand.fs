@@ -341,10 +341,40 @@ module AgentCommandInfo =
         | StartJobCommand cmd -> Some cmd.ProjectName
         | ListJobsCommand cmd -> cmd.ProjectName
 
-    let describe command =
+    let private compact (value: string) =
+        value.Replace("\r", " ").Replace("\n", " ").Trim()
+
+    let detail = function
+        | ListDirectoryCommand cmd -> Some(compact cmd.FolderPath)
+        | SearchFilesCommand cmd -> Some(compact cmd.Query)
+        | SearchTextCommand cmd -> Some(compact cmd.Query)
+        | ReadFileCommand cmd -> Some(compact cmd.FilePath)
+        | ReadFilesCommand cmd -> Some $"{cmd.FilePaths.Length} files"
+        | WriteFileCommand cmd -> Some(compact cmd.FilePath)
+        | PatchFileCommand cmd -> Some(compact cmd.FilePath)
+        | RunCommandCommand cmd -> Some(compact cmd.Executable)
+        | RunProjectTaskCommand cmd -> Some(compact cmd.TaskName)
+        | GetGitDiffCommand cmd -> cmd.Path |> Option.map compact
+        | GitCommitCommand cmd -> Some(compact cmd.Message)
+        | StartJobCommand cmd -> Some(compact cmd.Executable)
+        | GetJobResultCommand cmd -> Some(compact cmd.JobId)
+        | CancelJobCommand cmd -> Some(compact cmd.JobId)
+        | ListCommandsCommand
+        | ListProjectsCommand
+        | GetProjectDetailsCommand _
+        | ListProjectTasksCommand _
+        | GetGitStatusCommand _
+        | ListJobsCommand _ -> None
+
+    let activityLabel command =
+        let invocation =
+            match detail command with
+            | Some detail when not (String.IsNullOrWhiteSpace detail) -> $"{name command}({detail})"
+            | _ -> name command
+
         match projectName command with
-        | Some projectName -> $"{name command} project={projectName}"
-        | None -> name command
+        | Some projectName -> $"@{projectName} {invocation}"
+        | None -> invocation
 
 module AgentProtocol =
     let version = "3.0"

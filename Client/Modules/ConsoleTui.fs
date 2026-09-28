@@ -13,22 +13,35 @@ type private PendingPrompt =
       Request: ConfirmationRequest
       Completion: TaskCompletionSource<PermissionApproval> }
 
+type private ActivityEntry =
+    { Id: int
+      Timestamp: string
+      mutable Message: string }
+
 type ConsoleTui() =
     let syncRoot = obj()
-    let logs = Queue<string>()
+    let logs = ResizeArray<ActivityEntry>()
     let prompts = ResizeArray<PendingPrompt>()
     let mutable selectedPrompt = 0
+    let mutable nextActivityId = 1
     let mutable nextPromptId = 1
     let mutable shouldQuit = false
     let mutable key = ""
     let maxLogs = 12
 
     let addLogUnsafe message =
-        let timestamp = DateTimeOffset.Now.ToString("HH:mm:ss")
-        logs.Enqueue $"{timestamp}  {message}"
+        let entry =
+            { Id = nextActivityId
+              Timestamp = DateTimeOffset.Now.ToString("HH.mm.ss")
+              Message = message }
+
+        nextActivityId <- nextActivityId + 1
+        logs.Add entry
 
         while logs.Count > maxLogs do
-            logs.Dequeue() |> ignore
+            logs.RemoveAt 0
+
+        entry.Id
 
     let trim value maxLength =
         if String.IsNullOrEmpty value || value.Length <= maxLength then value
@@ -48,8 +61,8 @@ type ConsoleTui() =
             if logs.Count = 0 then
                 Console.WriteLine "No activity yet."
             else
-                for log in logs do
-                    Console.WriteLine(trim log (Math.Max(20, Console.WindowWidth - 1)))
+                for entry in logs do
+                    Console.WriteLine(trim $"{entry.Timestamp} {entry.Message}" (Math.Max(20, Console.WindowWidth - 1)))
 
             Console.WriteLine ""
             Console.WriteLine "Permission requests"
@@ -81,7 +94,7 @@ type ConsoleTui() =
                     let prompt = prompts[index]
                     prompts.RemoveAt index
                     selectedPrompt <- selectedPrompt |> min (prompts.Count - 1) |> max 0
-                    addLogUnsafe $"Permission {approval} for #{prompt.Id} {prompt.Request.CommandName}"
+                    addLogUnsafe $"Permission {approval} for #{prompt.Id} {prompt.Request.CommandName}" |> ignore
                     renderUnsafe()
                     Some prompt.Completion)
 
@@ -94,7 +107,21 @@ type ConsoleTui() =
 
     member _.Log message =
         lock syncRoot (fun () ->
-            addLogUnsafe message
+            addLogUnsafe message |> ignore
+            renderUnsafe())
+
+    member _.StartActivity message =
+        lock syncRoot (fun () ->
+            let id = addLogUnsafe message
+            renderUnsafe()
+            id)
+
+    member _.UpdateActivity(id, message) =
+        lock syncRoot (fun () ->
+            logs
+            |> Seq.tryFind (fun entry -> entry.Id = id)
+            |> Option.iter (fun entry -> entry.Message <- message)
+
             renderUnsafe())
 
     member _.PromptPermission command request =
@@ -110,7 +137,7 @@ type ConsoleTui() =
             nextPromptId <- nextPromptId + 1
             prompts.Add prompt
             selectedPrompt <- prompts.Count - 1
-            addLogUnsafe $"Permission requested: #{prompt.Id} {request.CommandName}"
+            addLogUnsafe $"Permission requested: #{prompt.Id} {request.CommandName}" |> ignore
             renderUnsafe())
 
         tcs.Task
@@ -151,7 +178,7 @@ type ConsoleTui() =
                 | :? OperationCanceledException -> ()
                 | ex ->
                     lock syncRoot (fun () ->
-                        addLogUnsafe $"TUI error: {ex.Message}"
+                        addLogUnsafe $"TUI error: {ex.Message}" |> ignore
                         renderUnsafe())
                     do! Task.Delay(250, cancellationToken)
         }

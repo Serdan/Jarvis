@@ -471,3 +471,14 @@ let mcp_profile_tool_returns_chatgpt_compatible_authentication_challenge () =
     |> shouldEqual true
     challenge.Contains("error=\"invalid_token\"") |> shouldEqual true
     challenge.Contains("error_description=\"Authentication required.\"") |> shouldEqual true
+
+[<Test>]
+let run_command_reason_parameter_is_optional_for_mcp_compatibility () =
+    let methodInfo = typeof<JarvisMcpTools>.GetMethod("RunCommand")
+    let reason =
+        methodInfo.GetParameters()
+        |> Array.find (fun parameter -> parameter.Name = "reason")
+
+    reason.IsOptional |> shouldEqual true
+    reason.HasDefaultValue |> shouldEqual true
+    reason.DefaultValue |> shouldEqual ""

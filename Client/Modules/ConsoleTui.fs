@@ -32,7 +32,7 @@ type ConsoleTui() =
     let addLogUnsafe message =
         let entry =
             { Id = nextActivityId
-              Timestamp = DateTimeOffset.Now.ToString("HH.mm.ss")
+              Timestamp = DateTimeOffset.Now.ToString("HH:mm:ss")
               Message = message }
 
         nextActivityId <- nextActivityId + 1

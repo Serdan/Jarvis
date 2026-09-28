@@ -296,6 +296,56 @@ type AgentCommand =
     | GetJobResultCommand of GetJobResultCommand
     | CancelJobCommand of CancelJobCommand
 
+module AgentCommandInfo =
+    let name = function
+        | ListCommandsCommand -> "ListCommandsCommand"
+        | ListProjectsCommand -> "ListProjectsCommand"
+        | GetProjectDetailsCommand _ -> "GetProjectDetailsCommand"
+        | ListDirectoryCommand _ -> "ListDirectoryCommand"
+        | SearchFilesCommand _ -> "SearchFilesCommand"
+        | SearchTextCommand _ -> "SearchTextCommand"
+        | ReadFileCommand _ -> "ReadFileCommand"
+        | ReadFilesCommand _ -> "ReadFilesCommand"
+        | WriteFileCommand _ -> "WriteFileCommand"
+        | PatchFileCommand _ -> "PatchFileCommand"
+        | RunCommandCommand _ -> "RunCommandCommand"
+        | ListProjectTasksCommand _ -> "ListProjectTasksCommand"
+        | RunProjectTaskCommand _ -> "RunProjectTaskCommand"
+        | GetGitStatusCommand _ -> "GetGitStatusCommand"
+        | GetGitDiffCommand _ -> "GetGitDiffCommand"
+        | GitCommitCommand _ -> "GitCommitCommand"
+        | StartJobCommand _ -> "StartJobCommand"
+        | ListJobsCommand _ -> "ListJobsCommand"
+        | GetJobResultCommand _ -> "GetJobResultCommand"
+        | CancelJobCommand _ -> "CancelJobCommand"
+
+    let projectName = function
+        | ListCommandsCommand
+        | ListProjectsCommand
+        | GetJobResultCommand _
+        | CancelJobCommand _ -> None
+        | GetProjectDetailsCommand cmd -> Some cmd.ProjectName
+        | ListDirectoryCommand cmd -> Some cmd.ProjectName
+        | SearchFilesCommand cmd -> Some cmd.ProjectName
+        | SearchTextCommand cmd -> Some cmd.ProjectName
+        | ReadFileCommand cmd -> Some cmd.ProjectName
+        | ReadFilesCommand cmd -> Some cmd.ProjectName
+        | WriteFileCommand cmd -> Some cmd.ProjectName
+        | PatchFileCommand cmd -> Some cmd.ProjectName
+        | RunCommandCommand cmd -> Some cmd.ProjectName
+        | ListProjectTasksCommand cmd -> Some cmd.ProjectName
+        | RunProjectTaskCommand cmd -> Some cmd.ProjectName
+        | GetGitStatusCommand cmd -> Some cmd.ProjectName
+        | GetGitDiffCommand cmd -> Some cmd.ProjectName
+        | GitCommitCommand cmd -> Some cmd.ProjectName
+        | StartJobCommand cmd -> Some cmd.ProjectName
+        | ListJobsCommand cmd -> cmd.ProjectName
+
+    let describe command =
+        match projectName command with
+        | Some projectName -> $"{name command} project={projectName}"
+        | None -> name command
+
 module AgentProtocol =
     let version = "3.0"
     let defaultPatchFuzzyContextLines = 3

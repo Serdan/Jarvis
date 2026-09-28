@@ -121,7 +121,8 @@ let private dispatch rt command =
 
 let receiveCommand (rt: Runtime) (command: AgentCommand) =
     task {
-        rt.Tui.Log $"Incoming command: {command.GetType().Name}"
+        let commandDescription = AgentCommandInfo.describe command
+        rt.Tui.Log $"Incoming command: {commandDescription}"
 
         let permission = rt :> PermissionIO
         let resolution =
@@ -158,8 +159,8 @@ let receiveCommand (rt: Runtime) (command: AgentCommand) =
             }
 
         match response with
-        | Ok _ -> rt.Tui.Log "Command executed. Sending response."
-        | Error err -> rt.Tui.Log $"Command failed: {EffectError.toString err}"
+        | Ok _ -> rt.Tui.Log $"Command executed: {commandDescription}. Sending response."
+        | Error err -> rt.Tui.Log $"Command failed: {commandDescription}. {EffectError.toString err}"
 
         audit command response
 

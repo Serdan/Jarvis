@@ -17,6 +17,7 @@
         <Compile Include="HashAndPatchTests.fs"/>
         <Compile Include="PathSafetyTests.fs"/>
         <Compile Include="PermissionPolicyTests.fs"/>
+        <Compile Include="AgentCommandInfoTests.fs"/>
         <Compile Include="Program.fs"/>
     </ItemGroup>
 

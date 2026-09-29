@@ -12,6 +12,7 @@
         <Compile Include="Auth.fs"/>
         <Compile Include="Services\ClientResponseTracker.fs"/>
         <Compile Include="Services\UserService.fs"/>
+        <Compile Include="Services\FeedbackStore.fs"/>
         <Compile Include="Services\HubService.fs"/>
         <Compile Include="Services\ClientService.fs"/>
         <Compile Include="McpTools.fs"/>
@@ -21,6 +22,7 @@
     <ItemGroup>
         <PackageReference Update="FSharp.Core" Version="10.1.203"/>
         <PackageReference Include="Microsoft.AspNetCore.Authentication.JwtBearer" Version="10.0.12"/>
+        <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.12"/>
         <PackageReference Include="ModelContextProtocol.AspNetCore" Version="2.2.0"/>
     </ItemGroup>
 

@@ -34,8 +34,17 @@ let private getConfiguredOptions (configuration: IConfiguration) =
 
     options
 
+let private getDatabasePath (configuration: IConfiguration) =
+    let path = configuration["DatabasePath"]
+
+    if String.IsNullOrWhiteSpace(path) then
+        invalidOp "DatabasePath is required."
+
+    path
+
 let configureServices (services: IServiceCollection) (configuration: IConfiguration) =
     let configured = getConfiguredOptions configuration
+    let databasePath = getDatabasePath configuration
 
     services.Configure<JarvisOptions>(configuration) |> ignore
 
@@ -111,6 +120,7 @@ let configureServices (services: IServiceCollection) (configuration: IConfigurat
     services
         .AddSingleton<UserService>()
         .AddSingleton<ClientResponseTracker>()
+        .AddSingleton<FeedbackStore>(fun _ -> FeedbackStore(databasePath))
         .AddScoped<ClientService>()
     |> ignore
 

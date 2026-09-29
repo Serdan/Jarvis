@@ -5,6 +5,7 @@ type ProfileResult = { id: string }
 
 open System
 open System.ComponentModel
+open System.Diagnostics
 open System.Runtime.InteropServices
 open System.Text.Json
 open System.Text.Json.Nodes
@@ -44,6 +45,19 @@ module McpToolHelpers =
 
     let private errorResult error =
         textResult (formatError error) true
+
+    let private jsonResult value =
+        JsonSerializer.Serialize(value)
+        |> fun serialized -> textResult serialized false
+
+    let private errorCategory = function
+        | NotFound _ -> "NotFound"
+        | PermissionDenied _ -> "PermissionDenied"
+        | ConfirmationRequired _ -> "ConfirmationRequired"
+        | ValidationFailed _ -> "ValidationFailed"
+        | Conflict _ -> "Conflict"
+        | ExecutionFailed _ -> "ExecutionFailed"
+        | OutputTruncated _ -> "OutputTruncated"
 
     let toCallToolResult (response: AgentCommandResponse) =
         match response.Result, response.Error with
@@ -116,6 +130,64 @@ module McpToolHelpers =
     let private authenticationErrorResult (context: HttpContext) scope =
         oauthErrorResult context "invalid_token" "Authentication required." scope
 
+    let private toolName command =
+        let name = AgentCommandInfo.name command
+        if name.EndsWith("Command", StringComparison.Ordinal) then
+            name.Substring(0, name.Length - "Command".Length)
+        else
+            name
+
+    let private serverVersion =
+        match typeof<JarvisOptions>.Assembly.GetName().Version with
+        | null -> "unknown"
+        | version -> version.ToString()
+
+    let private beginOperation (context: HttpContext) userId command =
+        try
+            let store = context.RequestServices.GetRequiredService<FeedbackStore>()
+            let users = context.RequestServices.GetRequiredService<UserService>()
+            let clientVersion, protocolVersion =
+                match users.GetSession userId with
+                | ValueSome session -> Some session.ClientVersion, Some session.ProtocolVersion
+                | ValueNone -> None, None
+
+            let operation =
+                store.BeginOperation(
+                    userId,
+                    toolName command,
+                    AgentCommandInfo.projectName command,
+                    serverVersion,
+                    clientVersion,
+                    protocolVersion
+                )
+
+            Some(store, operation)
+        with _ ->
+            None
+
+    let private finishOperation tracking response elapsedMs =
+        match tracking with
+        | None -> ()
+        | Some(store: FeedbackStore, operation: OperationStart) ->
+            try
+                let success = response.Error.IsNone && response.Result.IsSome
+                let category = response.Error |> Option.map errorCategory
+                store.CompleteOperation(operation.Id, success, category, elapsedMs)
+            with _ ->
+                ()
+
+    let private attachOperationId tracking (result: CallToolResult) =
+        match tracking with
+        | None -> result
+        | Some(_, operation: OperationStart) ->
+            let meta =
+                if isNull result.Meta then JsonObject()
+                else result.Meta
+
+            meta["jarvis/operation_id"] <- JsonValue.Create(operation.Id)
+            result.Meta <- meta
+            result
+
     let send (client: ClientService) (http: IHttpContextAccessor) command =
         task {
             match Option.ofObj http.HttpContext with
@@ -126,8 +198,15 @@ module McpToolHelpers =
 
                 match Auth.tryUserId context.User with
                 | Some userId when Auth.hasScope scope context.User ->
+                    let tracking = beginOperation context userId command
+                    let stopwatch = Stopwatch.StartNew()
                     let! response = client.SendCommandToUser(userId, command)
-                    return toCallToolResult response
+                    stopwatch.Stop()
+                    finishOperation tracking response stopwatch.ElapsedMilliseconds
+
+                    return
+                        toCallToolResult response
+                        |> attachOperationId tracking
                 | Some _ ->
                     return authorizationErrorResult context scope
                 | None ->
@@ -148,6 +227,149 @@ module McpToolHelpers =
                     return structuredResult structured serialized false
                 | None ->
                     return authenticationErrorResult context None
+        }
+
+    let private optionalString (value: string) =
+        if String.IsNullOrWhiteSpace value then None else Some value
+
+    let private validateText fieldName maxLength value =
+        if String.IsNullOrWhiteSpace value then
+            Error $"{fieldName} is required."
+        elif value.Length > maxLength then
+            Error $"{fieldName} must be at most {maxLength} characters."
+        else
+            Ok(value.Trim())
+
+    let private optionalBoundedText fieldName maxLength value =
+        match optionalString value with
+        | None -> Ok None
+        | Some text when text.Length > maxLength ->
+            Error $"{fieldName} must be at most {maxLength} characters."
+        | Some text ->
+            Ok(Some(text.Trim()))
+
+    let private authenticatedFeedbackContext (http: IHttpContextAccessor) =
+        match Option.ofObj http.HttpContext with
+        | None ->
+            Error(errorResult (PermissionDenied "The MCP request is missing its HTTP context."))
+        | Some context ->
+            match Auth.tryUserId context.User with
+            | Some userId when Auth.hasScope Auth.WorkspaceRead context.User ->
+                Ok(context, userId)
+            | Some _ ->
+                Error(authorizationErrorResult context Auth.WorkspaceRead)
+            | None ->
+                Error(authenticationErrorResult context (Some Auth.WorkspaceRead))
+
+    let submitFeedback
+        (store: FeedbackStore)
+        (http: IHttpContextAccessor)
+        (projectName: string)
+        (toolName: string)
+        (category: string)
+        (severity: string)
+        (summary: string)
+        (details: string)
+        (workaround: string)
+        (operationId: string)
+        =
+        task {
+            match authenticatedFeedbackContext http with
+            | Error result ->
+                return result
+            | Ok(_, userId) ->
+                let projectResult = optionalBoundedText "projectName" 128 projectName
+                let toolResult = optionalBoundedText "toolName" 128 toolName
+                let categoryResult = FeedbackValidation.category category
+                let severityResult = FeedbackValidation.severity severity
+                let summaryResult = validateText "summary" 240 summary
+                let detailsResult = optionalBoundedText "details" 4000 details
+                let workaroundResult = optionalBoundedText "workaround" 2000 workaround
+                let operationResult = optionalBoundedText "operationId" 64 operationId
+
+                match
+                    projectResult,
+                    toolResult,
+                    categoryResult,
+                    severityResult,
+                    summaryResult,
+                    detailsResult,
+                    workaroundResult,
+                    operationResult
+                with
+                | Ok project, Ok tool, Ok category, Ok severity, Ok summary, Ok details, Ok workaround, Ok explicitOperation ->
+                    match store.ResolveOperation(userId, explicitOperation, tool, project) with
+                    | Error message ->
+                        return errorResult (ValidationFailed message)
+                    | Ok linkedOperation ->
+                        let input =
+                            { ProjectName = project
+                              ToolName = tool
+                              Category = category
+                              Severity = severity
+                              Summary = summary
+                              Details = details
+                              Workaround = workaround
+                              OperationId = explicitOperation }
+
+                        return
+                            store.AddFeedback(userId, input, linkedOperation)
+                            |> jsonResult
+                | Error message, _, _, _, _, _, _, _
+                | _, Error message, _, _, _, _, _, _
+                | _, _, Error message, _, _, _, _, _
+                | _, _, _, Error message, _, _, _, _
+                | _, _, _, _, Error message, _, _, _
+                | _, _, _, _, _, Error message, _, _
+                | _, _, _, _, _, _, Error message, _
+                | _, _, _, _, _, _, _, Error message ->
+                    return errorResult (ValidationFailed message)
+        }
+
+    let listFeedback
+        (store: FeedbackStore)
+        (http: IHttpContextAccessor)
+        (projectName: string)
+        (toolName: string)
+        (category: string)
+        (severity: string)
+        (limit: Nullable<int>)
+        =
+        task {
+            match authenticatedFeedbackContext http with
+            | Error result -> return result
+            | Ok(_, userId) ->
+                let requestedLimit = if limit.HasValue then limit.Value else 50
+                if requestedLimit < 1 || requestedLimit > 100 then
+                    return errorResult (ValidationFailed "limit must be between 1 and 100.")
+                else
+                    let project = optionalString projectName
+                    let tool = optionalString toolName
+                    let categoryResult =
+                        match optionalString category with
+                        | None -> Ok None
+                        | Some value -> FeedbackValidation.category value |> Result.map Some
+                    let severityResult =
+                        match optionalString severity with
+                        | None -> Ok None
+                        | Some value -> FeedbackValidation.severity value |> Result.map Some
+
+                    match categoryResult, severityResult with
+                    | Ok category, Ok severity ->
+                        return store.ListFeedback(userId, project, tool, category, severity, requestedLimit) |> jsonResult
+                    | Error message, _
+                    | _, Error message ->
+                        return errorResult (ValidationFailed message)
+        }
+
+    let feedbackSummary (store: FeedbackStore) (http: IHttpContextAccessor) (projectName: string) (toolName: string) =
+        task {
+            match authenticatedFeedbackContext http with
+            | Error result -> return result
+            | Ok(_, userId) ->
+                return
+                    store.GetSummary(userId, optionalString projectName, optionalString toolName)
+                    |> jsonResult
         }
 
     let optionOfString (value: string) =
@@ -172,6 +394,42 @@ type JarvisMcpTools =
     [<McpServerTool(Title = "Get profile", UseStructuredContent = true, OutputSchemaType = typeof<ProfileResult>, ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":[]}]"""); McpMeta("openai/profile", true); Description("Return the profile represented by the authenticated OAuth credentials.")>]
     static member GetProfile(http: IHttpContextAccessor) =
         McpToolHelpers.getProfile http
+
+    [<McpServerTool(Title = "Submit feedback", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Submit structured feedback about Jarvis tool failures, limitations, ergonomics, missing capabilities, documentation, or positive behavior. Does not require local client approval.")>]
+    static member Feedback(
+        [<Optional; DefaultParameterValue("")>] projectName: string,
+        [<Optional; DefaultParameterValue("")>] toolName: string,
+        category: string,
+        severity: string,
+        summary: string,
+        [<Optional; DefaultParameterValue("")>] details: string,
+        [<Optional; DefaultParameterValue("")>] workaround: string,
+        [<Optional; DefaultParameterValue("")>] operationId: string,
+        store: FeedbackStore,
+        http: IHttpContextAccessor
+    ) =
+        McpToolHelpers.submitFeedback store http projectName toolName category severity summary details workaround operationId
+
+    [<McpServerTool(Title = "List feedback", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("List recent feedback submitted by the authenticated user. Filters are optional and limit defaults to 50.")>]
+    static member ListFeedback(
+        [<Optional; DefaultParameterValue("")>] projectName: string,
+        [<Optional; DefaultParameterValue("")>] toolName: string,
+        [<Optional; DefaultParameterValue("")>] category: string,
+        [<Optional; DefaultParameterValue("")>] severity: string,
+        [<Optional; DefaultParameterValue(50)>] limit: int,
+        store: FeedbackStore,
+        http: IHttpContextAccessor
+    ) =
+        McpToolHelpers.listFeedback store http projectName toolName category severity (Nullable limit)
+
+    [<McpServerTool(Title = "Get feedback summary", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Summarize feedback counts by tool, category, and severity for the authenticated user.")>]
+    static member GetFeedbackSummary(
+        [<Optional; DefaultParameterValue("")>] projectName: string,
+        [<Optional; DefaultParameterValue("")>] toolName: string,
+        store: FeedbackStore,
+        http: IHttpContextAccessor
+    ) =
+        McpToolHelpers.feedbackSummary store http projectName toolName
 
     [<McpServerTool(Title = "List commands", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("List the commands supported by the connected Jarvis client.")>]
     static member ListCommands(client: ClientService, http: IHttpContextAccessor) =

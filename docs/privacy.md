@@ -33,7 +33,20 @@ The hosted server forwards MCP commands to the authenticated user's connected Ja
 
 Results can contain project file contents, search matches, file paths, command output, git output, and error information required to complete the user's request.
 
-Jarvis does not intentionally persist project file contents or command results in a server-side database. Data necessarily exists in server memory while requests are being routed. Hosting, reverse-proxy, operating-system, or diagnostic infrastructure may retain normal operational metadata according to deployment configuration.
+Jarvis does not intentionally persist project file contents, command arguments, command results, file paths, stdout/stderr, or commit messages in its server-side database. Data necessarily exists in server memory while requests are being routed. Hosting, reverse-proxy, operating-system, or diagnostic infrastructure may retain normal operational metadata according to deployment configuration.
+
+Jarvis persists coarse operation telemetry for authenticated MCP tool calls. Operation records can include:
+
+- a generated operation identifier;
+- the authenticated Auth0 subject;
+- tool and optional project names;
+- start/completion timestamps and duration;
+- success/failure and a coarse error category;
+- server, client, and protocol versions.
+
+Jarvis also provides an explicit agent-feedback tool. Feedback text is persisted only when an agent deliberately submits it and can include a summary, optional details, and an optional workaround. Feedback may be linked to a recent operation belonging to the same authenticated user.
+
+This persisted state is stored in the Jarvis server's SQLite database. It is not intended for advertising or behavioral profiling.
 
 ## Server-side state
 
@@ -48,6 +61,14 @@ The server keeps process-local, in-memory state required to route commands and d
 - pending command-response correlation state.
 
 The state is discarded when the server process is restarted unless hosting infrastructure independently records related operational logs.
+
+In addition, the server persistently stores:
+
+- the coarse operation telemetry described above;
+- explicitly submitted agent feedback;
+- links between feedback and operations where applicable.
+
+The server does not automatically persist raw command payloads or project contents as part of this telemetry.
 
 ## Client-side state
 
@@ -84,4 +105,4 @@ Users should expose only workspaces they are comfortable making available to the
 
 Privacy questions can be sent to admin@kehlet.dev.
 
-_Last updated: 2026-09-24_
+_Last updated: 2026-09-29_

@@ -222,9 +222,12 @@ let ``command catalog matches AgentCommand union and MCP tools`` () =
             | _ -> None)
         |> Set.ofArray
 
+    let serverLocalNames =
+        set [ "GetProfile"; "Feedback"; "ListFeedback"; "GetFeedbackSummary" ]
+
     unionNames |> shouldEqual catalogNames
-    (mcpNames |> Set.remove "GetProfile") |> shouldEqual catalogNames
-    (Set.difference mcpNames catalogNames) |> shouldEqual (Set.singleton "GetProfile")
+    Set.difference mcpNames serverLocalNames |> shouldEqual catalogNames
+    Set.difference mcpNames catalogNames |> shouldEqual serverLocalNames
 
 [<Test>]
 let ``MCP bridge returns successful JSON as text without a mismatched output schema`` () =
@@ -349,9 +352,20 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
             | _ -> None)
 
     for methodInfo, attribute in methods |> Array.filter (fun (methodInfo, _) -> methodInfo.Name <> "GetProfile") do
-        let definition = definitions[methodInfo.Name]
-        let scope = expectedScope definition
-        let readOnly = definition.Permissions = [ ReadOnly ]
+        let definition = definitions |> Map.tryFind methodInfo.Name
+        let scope =
+            match definition with
+            | Some definition -> expectedScope definition
+            | None -> Auth.WorkspaceRead
+
+        let readOnly =
+            match definition with
+            | Some definition -> definition.Permissions = [ ReadOnly ]
+            | None ->
+                match methodInfo.Name with
+                | "Feedback" -> false
+                | "ListFeedback" | "GetFeedbackSummary" -> true
+                | name -> failwith $"Unexpected server-local MCP tool: {name}"
 
         let destructive =
             match methodInfo.Name with

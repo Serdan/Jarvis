@@ -150,5 +150,14 @@ The schema includes timestamps so retention can be added later without migration
 - [x] Add `ListFeedback` and `GetFeedbackSummary`.
 - [x] Add validation and bounded query limits.
 - [x] Add storage and MCP tests.
-- [ ] Deploy database directory, server update, and verify persistence.
-- [ ] Commit and leave the repository clean.
+- [x] Deploy database directory, server update, and verify persistence.
+- [x] Commit and leave the repository clean.
+
+## Verification
+
+- Full solution build: 0 warnings, 0 errors.
+- Client tests: 108/108 passed.
+- Server tests: 25/25 passed.
+- Production service uses `StateDirectory=jarvis`, `JarvisDatabasePath=/var/lib/jarvis/jarvis.db`, and a state-directory bundle extraction path.
+- Production SQLite database is owned by the `jarvis` service account.
+- Live MCP calls create operation rows and finalize them with success/failure and duration.

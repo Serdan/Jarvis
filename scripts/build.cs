@@ -173,7 +173,8 @@ int PublishServer(string rid, string configuration, string output)
         "-r", rid,
         "-o", output,
         "-p:PublishSingleFile=true",
-        "-p:SelfContained=true"
+        "-p:SelfContained=true",
+        "-p:IncludeNativeLibrariesForSelfExtract=true"
     );
 }
 

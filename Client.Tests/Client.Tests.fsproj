@@ -10,6 +10,7 @@
     <ItemGroup>
         <Content Include="Structure.md"/>
         <Compile Include="Fake\FileSystem.fs"/>
+        <Compile Include="WorkspaceDefaultsTests.fs"/>
         <Compile Include="ProjectBrowserTests.fs"/>
         <Compile Include="ClientShellTests.fs"/>
         <Compile Include="JobManagerTests.fs"/>

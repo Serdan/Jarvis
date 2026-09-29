@@ -40,7 +40,7 @@ let private parseArgs args =
             loop path permissionMode (value :: allowedEnvironmentVariables) tail
         | unknown :: _ -> Error $"Unknown or incomplete argument: {unknown}"
 
-    loop "" (Environment.GetEnvironmentVariable "JARVIS_PERMISSION_MODE") (List.rev configuredEnvironmentVariables) (args |> Array.toList)
+    loop (WorkspaceDefaults.current()) (Environment.GetEnvironmentVariable "JARVIS_PERMISSION_MODE") (List.rev configuredEnvironmentVariables) (args |> Array.toList)
 
 let register (tui: ConsoleTui) (connection: HubConnection) deviceId =
     task {

@@ -73,6 +73,17 @@ The receive timestamp remains fixed when the row is updated.
   - Permission requests remain visible from the activity view so waiting commands are discoverable without taking over navigation.
   - New activity follows the latest row only while the user is already at the latest activity; browsing older history remains stable.
 
+- [x] **10. Add activity filtering.**
+  - `/` edits a free-text activity filter and applies it live while typing.
+  - Pressing `@` from the activity view enters filter editing with an `@` project term ready to type.
+  - Terms prefixed with `@` match project names case-insensitively by substring; e.g. `@Loke` matches `Projekt Loke`.
+  - Other terms match command name, activity text, full reason/detail, and retained failure text case-insensitively.
+  - Multiple text/project terms are combined with AND semantics.
+  - `S` cycles the predefined status filter: All, Running, Awaiting, Completed, Failed, Info.
+  - `C` clears text/project and status filters.
+  - Navigation, details, paging, and `End` operate on the filtered result set while preserving the underlying history.
+  - Incoming non-matching activity does not disturb the filtered viewport.
+
 ## Design constraints
 
 - Keep one command per activity row.
@@ -84,6 +95,6 @@ The receive timestamp remains fixed when the row is updated.
 ## Verification
 
 - `dotnet build Jarvis.slnx --no-restore`: 0 warnings, 0 errors.
-- Client tests: 125/125 passed.
+- Client tests: 134/134 passed.
 - Server tests: 26/26 passed.
 - Linux x64 client published with the production server URL and installed into the ignored `artifacts/client/linux-x64` launch location.

@@ -32,6 +32,7 @@ type private ActivityEntry =
 type private TuiMode =
     | ActivityMode
     | PermissionMode
+    | FilterMode
 
 type private PendingPrompt =
     { Id: int
@@ -50,6 +51,9 @@ type ConsoleTui() =
     let mutable key = ""
     let mutable mode = ActivityMode
     let mutable selectedActivityId: int option = None
+    let mutable activityFilterText = ""
+    let mutable filterOriginalText = ""
+    let mutable statusFilter = ActivityFilter.All
     let mutable activityScrollOffset = 0
     let mutable showActivityDetails = false
     let mutable connectionState = Disconnected
@@ -93,54 +97,90 @@ type ConsoleTui() =
     let projectColor projectName =
         projectColorAssignments.Get projectName
 
+    let activityStatusMatches (filter: ActivityFilter.Status) (status: ActivityStatus) =
+        match status with
+        | _ when filter = ActivityFilter.All -> true
+        | Running -> filter = ActivityFilter.Running
+        | AwaitingPermission -> filter = ActivityFilter.AwaitingPermission
+        | Completed _ -> filter = ActivityFilter.Completed
+        | Failed _ -> filter = ActivityFilter.Failed
+        | Informational -> filter = ActivityFilter.Informational
+
+    let searchableActivityText (entry: ActivityEntry) =
+        let commandParts =
+            match entry.Command with
+            | None -> []
+            | Some command ->
+                [ AgentCommandInfo.displayName command
+                  AgentCommandInfo.fullReason command |> Option.defaultValue ""
+                  AgentCommandInfo.fullDetail command |> Option.defaultValue "" ]
+
+        [ yield entry.Message
+          yield! commandParts
+          yield entry.FailureDetail |> Option.defaultValue "" ]
+        |> String.concat " "
+
+    let filteredActivityUnsafe () =
+        let terms = ActivityFilter.parseTerms activityFilterText
+        activity
+        |> Seq.filter (fun entry ->
+            activityStatusMatches statusFilter entry.Status
+            && ActivityFilter.matchesTerms terms entry.ProjectName (searchableActivityText entry))
+        |> Seq.toArray
+
     let maxScrollOffsetUnsafe () =
-        max 0 (activity.Count - visibleActivityRows)
+        max 0 ((filteredActivityUnsafe()).Length - visibleActivityRows)
 
     let clampScrollOffsetUnsafe () =
         activityScrollOffset <- activityScrollOffset |> max 0 |> min (maxScrollOffsetUnsafe())
 
     let selectedActivityIndexUnsafe () =
+        let filtered = filteredActivityUnsafe()
         match selectedActivityId with
         | None -> None
         | Some id ->
-            activity
-            |> Seq.tryFindIndex (fun entry -> entry.Id = id)
+            filtered
+            |> Array.tryFindIndex (fun entry -> entry.Id = id)
 
     let selectActivityIndexUnsafe index =
-        match ActivityNavigation.normalizeSelection activity.Count (Some index) with
+        let filtered = filteredActivityUnsafe()
+        match ActivityNavigation.normalizeSelection filtered.Length (Some index) with
         | None ->
             selectedActivityId <- None
             activityScrollOffset <- 0
         | Some selectedIndex ->
-            selectedActivityId <- Some activity[selectedIndex].Id
+            selectedActivityId <- Some filtered[selectedIndex].Id
             activityScrollOffset <-
                 ActivityNavigation.scrollOffsetForSelection
-                    activity.Count
+                    filtered.Length
                     visibleActivityRows
                     activityScrollOffset
                     selectedIndex
 
     let ensureActivitySelectionUnsafe () =
+        let filtered = filteredActivityUnsafe()
         match selectedActivityIndexUnsafe() with
         | Some index -> Some index
         | None ->
-            match ActivityNavigation.normalizeSelection activity.Count None with
+            match ActivityNavigation.normalizeSelection filtered.Length None with
             | None -> None
             | Some index ->
-                selectedActivityId <- Some activity[index].Id
+                selectedActivityId <- Some filtered[index].Id
                 Some index
 
     let moveActivitySelectionUnsafe delta =
+        let filtered = filteredActivityUnsafe()
         let current = ensureActivitySelectionUnsafe()
-        match ActivityNavigation.move activity.Count delta current with
+        match ActivityNavigation.move filtered.Length delta current with
         | Some index -> selectActivityIndexUnsafe index
         | None -> ()
 
     let addActivityUnsafe projectName message command status =
         let wasScrolled = activityScrollOffset > 0
+        let previousFiltered = filteredActivityUnsafe()
         let previousLastId =
-            if activity.Count = 0 then None
-            else Some activity[activity.Count - 1].Id
+            if previousFiltered.Length = 0 then None
+            else Some previousFiltered[previousFiltered.Length - 1].Id
         let followLatest =
             not showActivityDetails
             && activityScrollOffset = 0
@@ -157,10 +197,14 @@ type ConsoleTui() =
         nextActivityId <- nextActivityId + 1
         activity.Add entry
 
-        if followLatest then
+        let entryMatchesFilter =
+            filteredActivityUnsafe()
+            |> Array.exists (fun item -> item.Id = entry.Id)
+
+        if followLatest && entryMatchesFilter then
             selectedActivityId <- Some entry.Id
 
-        if wasScrolled then
+        if wasScrolled && entryMatchesFilter then
             activityScrollOffset <- activityScrollOffset + 1
 
         while activity.Count > maxHistory do
@@ -217,10 +261,11 @@ type ConsoleTui() =
         Console.ForegroundColor <- previous
 
     let activityRangeUnsafe () =
+        let filtered = filteredActivityUnsafe()
         clampScrollOffsetUnsafe()
-        let endExclusive = activity.Count - activityScrollOffset
+        let endExclusive = filtered.Length - activityScrollOffset
         let start = max 0 (endExclusive - visibleActivityRows)
-        start, endExclusive
+        filtered, start, endExclusive
 
     let wrappedLines width (detail: string) =
         let maxWidth = max 20 width
@@ -237,8 +282,9 @@ type ConsoleTui() =
         |> Seq.toList
 
     let selectedActivityUnsafe () =
+        let filtered = filteredActivityUnsafe()
         ensureActivitySelectionUnsafe()
-        |> Option.map (fun index -> activity[index])
+        |> Option.map (fun index -> filtered[index])
 
     let statusName = function
         | Informational -> "Info"
@@ -318,29 +364,41 @@ type ConsoleTui() =
             Console.WriteLine $"Key: {key}"
             match mode with
             | ActivityMode ->
-                Console.WriteLine "Keys: ↑/↓ activity, PgUp/PgDn page, End latest, Enter details, P permissions, Q quit"
+                Console.WriteLine "Keys: ↑/↓ activity, PgUp/PgDn page, End latest, Enter details, / filter, @ project, S status, C clear, P permissions, Q quit"
             | PermissionMode ->
                 Console.WriteLine "Keys: ↑/↓ permission, A allow once, S allow exact, E allow executable, D deny, Esc activity, Q quit"
+            | FilterMode ->
+                Console.WriteLine "Filter: type text; @term filters project, Backspace edits, Enter applies, Esc cancels"
             Console.WriteLine ""
 
             ensureActivitySelectionUnsafe() |> ignore
-            let startIndex, endExclusive = activityRangeUnsafe()
+            let filtered, startIndex, endExclusive = activityRangeUnsafe()
             let historySuffix =
-                if activity.Count > visibleActivityRows then
-                    $" [{startIndex + 1}-{endExclusive} of {activity.Count}]"
-                else ""
+                if filtered.Length = 0 then
+                    $" [0 of {activity.Count}]"
+                elif filtered.Length > visibleActivityRows || filtered.Length <> activity.Count then
+                    $" [{startIndex + 1}-{endExclusive} of {filtered.Length} / {activity.Count} total]"
+                else
+                    ""
 
-            Console.WriteLine $"Activity{historySuffix}"
+            let filterSuffix =
+                let text = if String.IsNullOrWhiteSpace activityFilterText then "" else sprintf " text=\"%s\"" activityFilterText
+                let status = if statusFilter = ActivityFilter.All then "" else $" status={ActivityFilter.statusLabel statusFilter}"
+                if text = "" && status = "" then "" else $" [{text.Trim()}{status}]"
+
+            Console.WriteLine $"Activity{filterSuffix}{historySuffix}"
             Console.WriteLine "--------"
 
             if activity.Count = 0 then
                 Console.WriteLine "No activity yet."
+            elif filtered.Length = 0 then
+                Console.WriteLine "No matching activity."
             else
                 for index = startIndex to endExclusive - 1 do
                     let marker =
-                        if mode = ActivityMode && selectedActivityId = Some activity[index].Id then ">"
+                        if mode = ActivityMode && selectedActivityId = Some filtered[index].Id then ">"
                         else " "
-                    writeColoredProjectLine width marker activity[index]
+                    writeColoredProjectLine width marker filtered[index]
 
             renderActivityDetailsUnsafe width
 
@@ -395,6 +453,39 @@ type ConsoleTui() =
                     Some prompt.Completion)
 
         completion |> Option.iter (fun tcs -> tcs.TrySetResult approval |> ignore)
+
+    let resetFilteredViewUnsafe () =
+        selectedActivityId <- None
+        activityScrollOffset <- 0
+        showActivityDetails <- false
+
+    let beginFilterUnsafe prefix =
+        filterOriginalText <- activityFilterText
+
+        if not (String.IsNullOrEmpty prefix) then
+            let separator =
+                if String.IsNullOrWhiteSpace activityFilterText || Char.IsWhiteSpace(activityFilterText[activityFilterText.Length - 1]) then
+                    ""
+                else
+                    " "
+
+            activityFilterText <- activityFilterText + separator + prefix
+
+        mode <- FilterMode
+        resetFilteredViewUnsafe()
+
+    let updateFilterTextUnsafe value =
+        activityFilterText <- value
+        resetFilteredViewUnsafe()
+
+    let cycleStatusFilterUnsafe () =
+        statusFilter <- ActivityFilter.nextStatus statusFilter
+        resetFilteredViewUnsafe()
+
+    let clearFiltersUnsafe () =
+        activityFilterText <- ""
+        statusFilter <- ActivityFilter.All
+        resetFilteredViewUnsafe()
 
     member _.SetKey value =
         lock syncRoot (fun () ->
@@ -486,65 +577,103 @@ type ConsoleTui() =
                     if Console.KeyAvailable then
                         let keyInfo = Console.ReadKey(intercept = true)
 
-                        match keyInfo.Key with
-                        | ConsoleKey.UpArrow ->
-                            lock syncRoot (fun () ->
-                                match mode with
-                                | ActivityMode -> moveActivitySelectionUnsafe -1
-                                | PermissionMode ->
-                                    selectedPrompt <- max 0 (selectedPrompt - 1)
-                                renderUnsafe())
-                        | ConsoleKey.DownArrow ->
-                            lock syncRoot (fun () ->
-                                match mode with
-                                | ActivityMode -> moveActivitySelectionUnsafe 1
-                                | PermissionMode ->
-                                    selectedPrompt <- min (prompts.Count - 1) (selectedPrompt + 1)
-                                    selectedPrompt <- max 0 selectedPrompt
-                                renderUnsafe())
-                        | ConsoleKey.PageUp ->
-                            lock syncRoot (fun () ->
-                                if mode = ActivityMode then
-                                    moveActivitySelectionUnsafe -visibleActivityRows
-                                renderUnsafe())
-                        | ConsoleKey.PageDown ->
-                            lock syncRoot (fun () ->
-                                if mode = ActivityMode then
-                                    moveActivitySelectionUnsafe visibleActivityRows
-                                renderUnsafe())
-                        | ConsoleKey.End ->
-                            lock syncRoot (fun () ->
-                                if mode = ActivityMode && activity.Count > 0 then
-                                    selectActivityIndexUnsafe (activity.Count - 1)
-                                renderUnsafe())
-                        | ConsoleKey.Enter ->
-                            lock syncRoot (fun () ->
-                                if mode = ActivityMode && activity.Count > 0 then
-                                    showActivityDetails <- not showActivityDetails
-                                renderUnsafe())
-                        | ConsoleKey.P ->
-                            lock syncRoot (fun () ->
-                                mode <- PermissionMode
-                                showActivityDetails <- false
-                                renderUnsafe())
-                        | ConsoleKey.Escape ->
-                            lock syncRoot (fun () ->
-                                mode <- ActivityMode
-                                renderUnsafe())
-                        | ConsoleKey.A ->
-                            if mode = PermissionMode then
+                        if mode = FilterMode then
+                            match keyInfo.Key with
+                            | ConsoleKey.Backspace ->
+                                lock syncRoot (fun () ->
+                                    if activityFilterText.Length > 0 then
+                                        updateFilterTextUnsafe (activityFilterText.Substring(0, activityFilterText.Length - 1))
+                                    renderUnsafe())
+                            | ConsoleKey.Enter ->
+                                lock syncRoot (fun () ->
+                                    mode <- ActivityMode
+                                    renderUnsafe())
+                            | ConsoleKey.Escape ->
+                                lock syncRoot (fun () ->
+                                    activityFilterText <- filterOriginalText
+                                    mode <- ActivityMode
+                                    resetFilteredViewUnsafe()
+                                    renderUnsafe())
+                            | _ when not (Char.IsControl keyInfo.KeyChar) ->
+                                lock syncRoot (fun () ->
+                                    updateFilterTextUnsafe (activityFilterText + string keyInfo.KeyChar)
+                                    renderUnsafe())
+                            | _ -> ()
+                        else
+                            match keyInfo.KeyChar, keyInfo.Key with
+                            | '/', _ when mode = ActivityMode ->
+                                lock syncRoot (fun () ->
+                                    beginFilterUnsafe ""
+                                    renderUnsafe())
+                            | '@', _ when mode = ActivityMode ->
+                                lock syncRoot (fun () ->
+                                    beginFilterUnsafe "@"
+                                    renderUnsafe())
+                            | _, ConsoleKey.UpArrow ->
+                                lock syncRoot (fun () ->
+                                    match mode with
+                                    | ActivityMode -> moveActivitySelectionUnsafe -1
+                                    | PermissionMode ->
+                                        selectedPrompt <- max 0 (selectedPrompt - 1)
+                                    | FilterMode -> ()
+                                    renderUnsafe())
+                            | _, ConsoleKey.DownArrow ->
+                                lock syncRoot (fun () ->
+                                    match mode with
+                                    | ActivityMode -> moveActivitySelectionUnsafe 1
+                                    | PermissionMode ->
+                                        selectedPrompt <- min (prompts.Count - 1) (selectedPrompt + 1)
+                                        selectedPrompt <- max 0 selectedPrompt
+                                    | FilterMode -> ()
+                                    renderUnsafe())
+                            | _, ConsoleKey.PageUp ->
+                                lock syncRoot (fun () ->
+                                    if mode = ActivityMode then
+                                        moveActivitySelectionUnsafe -visibleActivityRows
+                                    renderUnsafe())
+                            | _, ConsoleKey.PageDown ->
+                                lock syncRoot (fun () ->
+                                    if mode = ActivityMode then
+                                        moveActivitySelectionUnsafe visibleActivityRows
+                                    renderUnsafe())
+                            | _, ConsoleKey.End ->
+                                lock syncRoot (fun () ->
+                                    let filtered = filteredActivityUnsafe()
+                                    if mode = ActivityMode && filtered.Length > 0 then
+                                        selectActivityIndexUnsafe (filtered.Length - 1)
+                                    renderUnsafe())
+                            | _, ConsoleKey.Enter ->
+                                lock syncRoot (fun () ->
+                                    if mode = ActivityMode && (filteredActivityUnsafe()).Length > 0 then
+                                        showActivityDetails <- not showActivityDetails
+                                    renderUnsafe())
+                            | _, ConsoleKey.P when mode = ActivityMode ->
+                                lock syncRoot (fun () ->
+                                    mode <- PermissionMode
+                                    showActivityDetails <- false
+                                    renderUnsafe())
+                            | _, ConsoleKey.Escape when mode = PermissionMode ->
+                                lock syncRoot (fun () ->
+                                    mode <- ActivityMode
+                                    renderUnsafe())
+                            | _, ConsoleKey.A when mode = PermissionMode ->
                                 completeSelected AllowOnce
-                        | ConsoleKey.S ->
-                            if mode = PermissionMode then
+                            | _, ConsoleKey.S when mode = PermissionMode ->
                                 completeSelected AllowExactForSession
-                        | ConsoleKey.E ->
-                            if mode = PermissionMode then
+                            | _, ConsoleKey.S when mode = ActivityMode ->
+                                lock syncRoot (fun () ->
+                                    cycleStatusFilterUnsafe()
+                                    renderUnsafe())
+                            | _, ConsoleKey.C when mode = ActivityMode ->
+                                lock syncRoot (fun () ->
+                                    clearFiltersUnsafe()
+                                    renderUnsafe())
+                            | _, ConsoleKey.E when mode = PermissionMode ->
                                 completeSelected AllowExecutableForSession
-                        | ConsoleKey.D ->
-                            if mode = PermissionMode then
+                            | _, ConsoleKey.D when mode = PermissionMode ->
                                 completeSelected Deny
-                        | ConsoleKey.Q -> shouldQuit <- true
-                        | _ -> ()
+                            | _, ConsoleKey.Q -> shouldQuit <- true
+                            | _ -> ()
                     else
                         do! Task.Delay(50, cancellationToken)
                 with

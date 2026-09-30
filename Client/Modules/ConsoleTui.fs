@@ -442,7 +442,6 @@ type ConsoleTui() =
 
             Console.WriteLine "Jarvis Client"
             Console.WriteLine "============="
-            Console.Write "Connection: "
             let previous = Console.ForegroundColor
             Console.ForegroundColor <- connectionColor connectionState
             Console.Write(connectionLabel connectionState)

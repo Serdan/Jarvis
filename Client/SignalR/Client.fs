@@ -157,7 +157,7 @@ let receiveCommand (rt: Runtime) (command: AgentCommand) =
                         }
 
                     let! authorization =
-                        PermissionPolicy.authorizeWithMode permission.PermissionMode promptWithActivityState authorizationCommand
+                        PermissionPolicy.authorizeWithTrust permission.TrustLevel promptWithActivityState authorizationCommand
 
                     match authorization, resolvedTask with
                     | Error error, _ ->

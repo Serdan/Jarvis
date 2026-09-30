@@ -560,7 +560,29 @@ type PermissionDecision =
 
 Implementations should resolve a command to one of these decisions before execution.
 
-Default policy:
+### Trust Levels
+
+The Jarvis client exposes a single user-facing trust option:
+
+```text
+--trust none
+--trust partial
+--trust full
+```
+
+`partial` is the default.
+
+| Trust | Structured operations | Process execution |
+|---|---|---|
+| `none` | Confirm state-changing commands | Confirm |
+| `partial` | Allow | Confirm |
+| `full` | Allow | Allow |
+
+`ProcessExecution` includes `RunCommand`, `RunProjectTask`, `StartJob`, and `CancelJob`.
+
+`full` disables the local interactive confirmation layer. It does not disable project-root confinement, canonical path checks, OAuth scopes, output limits, sensitive-environment filtering, command validation, or operating-system permissions.
+
+The no-trust policy is:
 
 | Permission level | Default decision |
 |---|---|
@@ -571,7 +593,7 @@ Default policy:
 | `NetworkAccess` | `RequireConfirmation` |
 | `Destructive` | `Deny` |
 
-A user or host application may override these defaults, but `Destructive` operations should remain denied until a dedicated permission UX exists.
+Trust levels may bypass confirmation decisions, but they do not bypass structural safety checks.
 
 ### Capability Metadata
 
@@ -618,7 +640,7 @@ If `InputSchemaJson` and `OutputSchemaJson` are added later, they should be incl
 | `StartJob` | `ProcessExecution` | `RequireConfirmation` | Long-running process. |
 | `ListJobs` | `ReadOnly` | `Allow` | Lists job metadata for visible projects/session. |
 | `GetJobResult` | `ReadOnly` | `Allow` | Reads buffered process output. |
-| `CancelJob` | `ProcessExecution` | `Allow` for same-session jobs, otherwise `RequireConfirmation` | Stops a process. |
+| `CancelJob` | `ProcessExecution` | `RequireConfirmation` | Stops a process; `partial` treats it consistently with other process-execution commands. |
 
 ### Confirmation Requests
 

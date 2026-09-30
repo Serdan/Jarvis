@@ -115,13 +115,27 @@ JARVIS_OAUTH_REDIRECT_URI
 
 ### Local permissions
 
-Jarvis distinguishes read-only, workspace-write, process-execution, and version-control-write operations. State-changing operations can require local approval according to the selected permission mode.
+Jarvis exposes one user-facing trust setting:
+
+```bash
+./JarvisClient-linux-x64 --trust none
+./JarvisClient-linux-x64 --trust partial
+./JarvisClient-linux-x64 --trust full
+```
+
+`partial` is the default.
+
+- `none` prompts for state-changing and process-execution commands.
+- `partial` allows structured Jarvis operations such as file edits and git commits, but prompts before process execution.
+- `full` disables interactive Jarvis permission prompts.
+
+Trust affects the local confirmation layer only. Project-root confinement, path validation, OAuth scopes, output limits, command validation, and operating-system permissions still apply.
 
 Spawned commands and jobs strip likely credential-bearing environment variables by default. Explicit exceptions are user-controlled:
 
 ```bash
-./JarvisClient-linux-x64 --path ~/Projects --allow-env NUGET_AUTH_TOKEN
-JARVIS_ALLOWED_ENVIRONMENT_VARIABLES=NUGET_AUTH_TOKEN,GITHUB_TOKEN ./JarvisClient-linux-x64 --path ~/Projects
+./JarvisClient-linux-x64 --trust full --allow-env NUGET_AUTH_TOKEN
+JARVIS_ALLOWED_ENVIRONMENT_VARIABLES=NUGET_AUTH_TOKEN,GITHUB_TOKEN ./JarvisClient-linux-x64 --trust full
 ```
 
 Project-owned `.jarvis.json` files cannot grant themselves access to filtered environment variables.

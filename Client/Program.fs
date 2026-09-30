@@ -31,16 +31,16 @@ let private parseArgs args =
             value.Split([| ','; ';' |], StringSplitOptions.RemoveEmptyEntries ||| StringSplitOptions.TrimEntries)
             |> Array.toList
 
-    let rec loop path permissionMode allowedEnvironmentVariables remaining =
+    let rec loop path trustLevel allowedEnvironmentVariables remaining =
         match remaining with
-        | [] -> Ok(path, permissionMode, List.rev allowedEnvironmentVariables)
-        | "--path" :: value :: tail -> loop value permissionMode allowedEnvironmentVariables tail
-        | "--permission-mode" :: value :: tail -> loop path value allowedEnvironmentVariables tail
+        | [] -> Ok(path, trustLevel, List.rev allowedEnvironmentVariables)
+        | "--path" :: value :: tail -> loop value trustLevel allowedEnvironmentVariables tail
+        | "--trust" :: value :: tail -> loop path value allowedEnvironmentVariables tail
         | "--allow-env" :: value :: tail ->
-            loop path permissionMode (value :: allowedEnvironmentVariables) tail
+            loop path trustLevel (value :: allowedEnvironmentVariables) tail
         | unknown :: _ -> Error $"Unknown or incomplete argument: {unknown}"
 
-    loop (WorkspaceDefaults.current()) (Environment.GetEnvironmentVariable "JARVIS_PERMISSION_MODE") (List.rev configuredEnvironmentVariables) (args |> Array.toList)
+    loop (WorkspaceDefaults.current()) "partial" (List.rev configuredEnvironmentVariables) (args |> Array.toList)
 
 let register (tui: ConsoleTui) (connection: HubConnection) deviceId =
     task {
@@ -83,22 +83,22 @@ let main args =
     let tui = ConsoleTui()
     tui.SetConnectionState(Disconnected, BuildInfo.ServerUrl)
 
-    let dir, permissionMode, allowedEnvironmentVariables =
+    let dir, trustLevel, allowedEnvironmentVariables =
         match parseArgs args with
-        | Ok(path, modeValue, allowedEnvironmentVariables) ->
-            match PermissionMode.parse modeValue with
-            | Ok mode -> path, mode, allowedEnvironmentVariables
+        | Ok(path, trustValue, allowedEnvironmentVariables) ->
+            match TrustLevel.parse trustValue with
+            | Ok level -> path, level, allowedEnvironmentVariables
             | Error message ->
                 eprintfn $"%s{message}"
                 exit 2
         | Error message ->
             eprintfn $"%s{message}"
-            eprintfn "Usage: JarvisClient [--path <workspace>] [--permission-mode confirm|workspace-write|trust-except-run-command|trust-session] [--allow-env NAME]..."
+            eprintfn "Usage: JarvisClient [--path <workspace>] [--trust none|partial|full] [--allow-env NAME]..."
             exit 2
 
     ProcessEnvironment.configureAllowedEnvironmentVariables allowedEnvironmentVariables
-    let rt = Runtime(getDir dir, tui, permissionMode)
-    tui.Log $"Permission mode: {PermissionMode.toDisplayName permissionMode}"
+    let rt = Runtime(getDir dir, tui, trustLevel)
+    tui.Log $"Trust: {TrustLevel.toDisplayName trustLevel}"
     tui.Log $"Allowed sensitive environment variables: {allowedEnvironmentVariables.Length}"
 
     let mutable registered = false

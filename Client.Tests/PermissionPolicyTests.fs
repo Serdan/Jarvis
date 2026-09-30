@@ -125,7 +125,7 @@ let ``exact run command grant ignores presentation reason`` () =
 
 
 [<Test>]
-let ``workspace-write mode allows write and patch commands`` () =
+let ``partial trust allows workspace mutations`` () =
     let writeCommand =
         WriteFileCommand
             { ProjectName = "Project1"
@@ -146,11 +146,11 @@ let ``workspace-write mode allows write and patch commands`` () =
               FuzzyContextLines = None
               ReturnContent = None }
 
-    evaluateWithMode AllowWorkspaceWrite writeCommand |> shouldEqual (Ok())
-    evaluateWithMode AllowWorkspaceWrite patchCommand |> shouldEqual (Ok())
+    evaluateWithTrust PartialTrust writeCommand |> shouldEqual (Ok())
+    evaluateWithTrust PartialTrust patchCommand |> shouldEqual (Ok())
 
 [<Test>]
-let ``workspace-write mode still confirms process execution`` () =
+let ``partial trust confirms run command`` () =
     let command =
         RunCommandCommand
             { ProjectName = "Project1"
@@ -161,14 +161,14 @@ let ``workspace-write mode still confirms process execution`` () =
               TimeoutSeconds = Some 60
               MaxOutputBytes = Some 4096 }
 
-    match evaluateWithMode AllowWorkspaceWrite command with
+    match evaluateWithTrust PartialTrust command with
     | Error(Client.ConfirmationRequired request) ->
         request.CommandName |> shouldEqual "RunCommand"
         request.Permissions |> shouldEqual [ ProcessExecution ]
     | other -> Assert.Fail($"Expected ConfirmationRequired, got {other}")
 
 [<Test>]
-let ``trust-session mode allows confirmable commands`` () =
+let ``full trust allows structured mutation`` () =
     let command =
         GitCommitCommand
             { ProjectName = "Project1"
@@ -177,11 +177,11 @@ let ``trust-session mode allows confirmable commands`` () =
               Paths = [ "readme.md" ]
               AllowEmpty = false }
 
-    evaluateWithMode TrustSession command |> shouldEqual (Ok())
+    evaluateWithTrust FullTrust command |> shouldEqual (Ok())
 
 
 [<Test>]
-let ``trust-except-run-command mode confirms run command`` () =
+let ``partial trust confirms run command consistently`` () =
     let command =
         RunCommandCommand
             { ProjectName = "Project1"
@@ -192,14 +192,14 @@ let ``trust-except-run-command mode confirms run command`` () =
               TimeoutSeconds = Some 60
               MaxOutputBytes = Some 4096 }
 
-    match evaluateWithMode TrustExceptRunCommand command with
+    match evaluateWithTrust PartialTrust command with
     | Error(Client.ConfirmationRequired request) ->
         request.CommandName |> shouldEqual "RunCommand"
         request.Permissions |> shouldEqual [ ProcessExecution ]
     | other -> Assert.Fail($"Expected ConfirmationRequired, got {other}")
 
 [<Test>]
-let ``trust-except-run-command mode allows non-process mutating commands`` () =
+let ``partial trust allows non-process mutating commands`` () =
     let writeCommand =
         WriteFileCommand
             { ProjectName = "Project1"
@@ -228,15 +228,12 @@ let ``trust-except-run-command mode allows non-process mutating commands`` () =
               Paths = [ "readme.md" ]
               AllowEmpty = false }
 
-    let cancelJobCommand = CancelJobCommand { JobId = "job-1" }
-
-    evaluateWithMode TrustExceptRunCommand writeCommand |> shouldEqual (Ok())
-    evaluateWithMode TrustExceptRunCommand patchCommand |> shouldEqual (Ok())
-    evaluateWithMode TrustExceptRunCommand commitCommand |> shouldEqual (Ok())
-    evaluateWithMode TrustExceptRunCommand cancelJobCommand |> shouldEqual (Ok())
+    evaluateWithTrust PartialTrust writeCommand |> shouldEqual (Ok())
+    evaluateWithTrust PartialTrust patchCommand |> shouldEqual (Ok())
+    evaluateWithTrust PartialTrust commitCommand |> shouldEqual (Ok())
 
 [<Test>]
-let ``trust-except-run-command mode confirms start job`` () =
+let ``partial trust confirms start job`` () =
     let startJobCommand =
         StartJobCommand
             { ProjectName = "Project1"
@@ -245,7 +242,7 @@ let ``trust-except-run-command mode confirms start job`` () =
               WorkingDirectory = None
               MaxOutputBytes = Some 4096 }
 
-    match evaluateWithMode TrustExceptRunCommand startJobCommand with
+    match evaluateWithTrust PartialTrust startJobCommand with
     | Error(Client.ConfirmationRequired request) ->
         request.CommandName |> shouldEqual "StartJob"
         request.Permissions |> shouldEqual [ ProcessExecution ]
@@ -253,25 +250,37 @@ let ``trust-except-run-command mode confirms start job`` () =
 
 
 [<Test>]
-let ``permission mode parse accepts aliases`` () =
-    PermissionMode.parse null |> shouldEqual (Ok Confirm)
-    PermissionMode.parse "" |> shouldEqual (Ok Confirm)
-    PermissionMode.parse "default" |> shouldEqual (Ok Confirm)
-    PermissionMode.parse "workspace-write" |> shouldEqual (Ok AllowWorkspaceWrite)
-    PermissionMode.parse "write" |> shouldEqual (Ok AllowWorkspaceWrite)
-    PermissionMode.parse "trust-except-run-command" |> shouldEqual (Ok TrustExceptRunCommand)
-    PermissionMode.parse "trust-no-run" |> shouldEqual (Ok TrustExceptRunCommand)
-    PermissionMode.parse "trust-session" |> shouldEqual (Ok TrustSession)
-    PermissionMode.parse "trusted" |> shouldEqual (Ok TrustSession)
+let ``partial trust confirms cancel job`` () =
+    let command = CancelJobCommand { JobId = "job-1" }
+
+    match evaluateWithTrust PartialTrust command with
+    | Error(Client.ConfirmationRequired request) ->
+        request.CommandName |> shouldEqual "CancelJob"
+        request.Permissions |> shouldEqual [ ProcessExecution ]
+    | other -> Assert.Fail($"Expected ConfirmationRequired, got {other}")
 
 [<Test>]
-let ``permission mode parse rejects unknown values`` () =
-    match PermissionMode.parse "YOLO" with
-    | Error message -> message.Contains("Unknown permission mode") |> shouldEqual true
-    | other -> Assert.Fail($"Expected Error, got {other}")
+let ``trust level parse accepts public values and defaults to partial`` () =
+    TrustLevel.parse null |> shouldEqual (Ok PartialTrust)
+    TrustLevel.parse "none" |> shouldEqual (Ok NoTrust)
+    TrustLevel.parse "partial" |> shouldEqual (Ok PartialTrust)
+    TrustLevel.parse "full" |> shouldEqual (Ok FullTrust)
 
 [<Test>]
-let ``authorizeWithMode allow once does not create grant`` () =
+let ``trust level parse rejects legacy and unknown values`` () =
+    for value in [ ""; "confirm"; "workspace-write"; "trust-except-run-command"; "trust-session"; "YOLO" ] do
+        match TrustLevel.parse value with
+        | Error message -> message.Contains("Unknown trust level") |> shouldEqual true
+        | other -> Assert.Fail($"Expected Error for {value}, got {other}")
+
+[<Test>]
+let ``trust display names match CLI values`` () =
+    TrustLevel.toDisplayName NoTrust |> shouldEqual "none"
+    TrustLevel.toDisplayName PartialTrust |> shouldEqual "partial"
+    TrustLevel.toDisplayName FullTrust |> shouldEqual "full"
+
+[<Test>]
+let ``authorizeWithTrust allow once does not create grant`` () =
     task {
         let command =
             RunCommandCommand
@@ -290,8 +299,8 @@ let ``authorizeWithMode allow once does not create grant`` () =
                 return AllowOnce
             }
 
-        let! first = authorizeWithMode Confirm prompt command
-        let! second = authorizeWithMode Confirm prompt command
+        let! first = authorizeWithTrust NoTrust prompt command
+        let! second = authorizeWithTrust NoTrust prompt command
 
         first |> shouldEqual (Ok())
         second |> shouldEqual (Ok())
@@ -299,7 +308,7 @@ let ``authorizeWithMode allow once does not create grant`` () =
     }
 
 [<Test>]
-let ``authorizeWithMode allow exact for session creates grant`` () =
+let ``authorizeWithTrust allow exact for session creates grant`` () =
     task {
         let command =
             RunCommandCommand
@@ -318,8 +327,8 @@ let ``authorizeWithMode allow exact for session creates grant`` () =
                 return AllowExactForSession
             }
 
-        let! first = authorizeWithMode Confirm prompt command
-        let! second = authorizeWithMode Confirm prompt command
+        let! first = authorizeWithTrust NoTrust prompt command
+        let! second = authorizeWithTrust NoTrust prompt command
 
         first |> shouldEqual (Ok())
         second |> shouldEqual (Ok())
@@ -351,7 +360,7 @@ let ``authorize executable for session allows changed args in same project`` () 
                   MaxOutputBytes = Some 4096 }
 
         let prompt _ _ = task { return AllowExecutableForSession }
-        let! approved = authorizeWithMode Confirm prompt first
+        let! approved = authorizeWithTrust NoTrust prompt first
 
         approved |> shouldEqual (Ok())
         evaluate second |> shouldEqual (Ok())
@@ -399,7 +408,7 @@ let ``executable session grant is scoped by project and command kind`` () =
     | other -> Assert.Fail($"Expected command-kind-scoped confirmation, got {other}")
 
 [<Test>]
-let ``authorizeWithMode deny returns permission denied`` () =
+let ``authorizeWithTrust deny returns permission denied`` () =
     task {
         let command =
             GitCommitCommand
@@ -410,7 +419,7 @@ let ``authorizeWithMode deny returns permission denied`` () =
                   AllowEmpty = false }
 
         let prompt _ _ = task { return (Client.PermissionApproval.Deny) }
-        let! result = authorizeWithMode Confirm prompt command
+        let! result = authorizeWithTrust NoTrust prompt command
 
         match result with
         | Error(Client.PermissionDenied message) -> message.Contains("Commit") |> shouldEqual true
@@ -418,7 +427,7 @@ let ``authorizeWithMode deny returns permission denied`` () =
     }
 
 [<Test>]
-let ``trust-session mode allows run command`` () =
+let ``full trust allows run command`` () =
     let command =
         RunCommandCommand
             { ProjectName = "Project1"
@@ -429,7 +438,7 @@ let ``trust-session mode allows run command`` () =
               TimeoutSeconds = Some 60
               MaxOutputBytes = Some 4096 }
 
-    evaluateWithMode TrustSession command |> shouldEqual (Ok())
+    evaluateWithTrust FullTrust command |> shouldEqual (Ok())
 
 [<Test>]
 let ``project task listing is read only`` () =
@@ -437,13 +446,13 @@ let ``project task listing is read only`` () =
     evaluate command |> shouldEqual (Ok())
 
 [<Test>]
-let ``trust-except-run-command mode confirms project task execution`` () =
+let ``partial trust confirms project task execution`` () =
     let command =
         RunProjectTaskCommand
             { ProjectName = "Project1"
               TaskName = "build" }
 
-    match evaluateWithMode TrustExceptRunCommand command with
+    match evaluateWithTrust PartialTrust command with
     | Error(Client.ConfirmationRequired request) ->
         request.CommandName |> shouldEqual "RunProjectTask"
         request.Permissions |> shouldEqual [ ProcessExecution ]

@@ -75,43 +75,28 @@ type PermissionApproval =
     | AllowExecutableForSession
     | Deny
 
-type PermissionMode =
-    | Confirm
-    | AllowWorkspaceWrite
-    | TrustExceptRunCommand
-    | TrustSession
+type TrustLevel =
+    | NoTrust
+    | PartialTrust
+    | FullTrust
 
-module PermissionMode =
+module TrustLevel =
     let parse (value: string) =
         match value |> Option.ofObj |> Option.map (fun x -> x.Trim().ToLowerInvariant()) with
-        | Some "confirm"
-        | Some "default"
-        | Some "" -> Ok Confirm
-        | Some "workspace-write"
-        | Some "workspacewrite"
-        | Some "write" -> Ok AllowWorkspaceWrite
-        | Some "trust-except-run-command"
-        | Some "trust-except-runcommand"
-        | Some "trustexcept-runcommand"
-        | Some "trustexceptruncommand"
-        | Some "trust-no-run"
-        | Some "no-run-command"
-        | Some "noruncommand" -> Ok TrustExceptRunCommand
-        | Some "trust-session"
-        | Some "trustsession"
-        | Some "trusted" -> Ok TrustSession
-        | Some value -> Error $"Unknown permission mode: {value}. Use confirm, workspace-write, trust-except-run-command, or trust-session."
-        | None -> Ok Confirm
+        | Some "none" -> Ok NoTrust
+        | Some "partial" -> Ok PartialTrust
+        | Some "full" -> Ok FullTrust
+        | Some value -> Error $"Unknown trust level: {value}. Use none, partial, or full."
+        | None -> Ok PartialTrust
 
     let toDisplayName =
         function
-        | Confirm -> "confirm"
-        | AllowWorkspaceWrite -> "workspace-write"
-        | TrustExceptRunCommand -> "trust-except-run-command"
-        | TrustSession -> "trust-session"
+        | NoTrust -> "none"
+        | PartialTrust -> "partial"
+        | FullTrust -> "full"
 
 type PermissionIO =
-    abstract PermissionMode: PermissionMode
+    abstract TrustLevel: TrustLevel
     abstract PromptPermission: AgentCommand -> ConfirmationRequest -> Task<PermissionApproval>
 
 type RuntimeConstraint<'a when 'a :> ProjectIO and 'a :> FileIO and 'a :> WebIO> = 'a

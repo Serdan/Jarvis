@@ -132,28 +132,27 @@ let private requiresConfirmation command =
     | CancelJobCommand cmd ->
         confirmation "CancelJob" None [ ProcessExecution ] [] None [ cmd.JobId ] $"Cancel job {cmd.JobId}" false
 
-let private modeAllows mode command =
-    match mode, command with
-    | TrustSession, _ -> true
-    | TrustExceptRunCommand, RunCommandCommand _ -> false
-    | TrustExceptRunCommand, RunProjectTaskCommand _ -> false
-    | TrustExceptRunCommand, StartJobCommand _ -> false
-    | TrustExceptRunCommand, _ -> true
-    | AllowWorkspaceWrite, WriteFileCommand _
-    | AllowWorkspaceWrite, PatchFileCommand _ -> true
-    | _ -> false
+let private trustAllows trustLevel command =
+    match trustLevel, command with
+    | FullTrust, _ -> true
+    | PartialTrust, RunCommandCommand _
+    | PartialTrust, RunProjectTaskCommand _
+    | PartialTrust, StartJobCommand _
+    | PartialTrust, CancelJobCommand _ -> false
+    | PartialTrust, _ -> true
+    | NoTrust, _ -> false
 
-let evaluateWithMode mode command =
-    if hasGrant command || hasExecutableGrant command || modeAllows mode command then
+let evaluateWithTrust trustLevel command =
+    if hasGrant command || hasExecutableGrant command || trustAllows trustLevel command then
         Ok()
     else
         requiresConfirmation command
 
-let evaluate command = evaluateWithMode Confirm command
+let evaluate command = evaluateWithTrust NoTrust command
 
-let authorizeWithMode mode (prompt: AgentCommand -> ConfirmationRequest -> Task<PermissionApproval>) command =
+let authorizeWithTrust trustLevel (prompt: AgentCommand -> ConfirmationRequest -> Task<PermissionApproval>) command =
     task {
-        match evaluateWithMode mode command with
+        match evaluateWithTrust trustLevel command with
         | Ok() -> return Ok()
         | Error(ConfirmationRequired request) ->
             let! approval = prompt command request
@@ -172,4 +171,4 @@ let authorizeWithMode mode (prompt: AgentCommand -> ConfirmationRequest -> Task<
         | Error error -> return Error error
     }
 
-let authorize prompt command = authorizeWithMode Confirm prompt command
+let authorize prompt command = authorizeWithTrust NoTrust prompt command

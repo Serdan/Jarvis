@@ -423,14 +423,15 @@ module AgentCommandInfo =
         | _ -> None
 
     let invocation command =
-        let call =
-            match detail command with
-            | Some detail when not (String.IsNullOrWhiteSpace detail) -> $"{displayName command}({detail})"
-            | _ -> displayName command
-
-        match reason command with
-        | Some reason -> $"{call} — {reason}"
-        | None -> call
+        match reason command, detail command with
+        | Some reason, Some detail when not (String.IsNullOrWhiteSpace detail) ->
+            $"{reason} · {detail}"
+        | Some reason, _ ->
+            reason
+        | None, Some detail when not (String.IsNullOrWhiteSpace detail) ->
+            $"{displayName command}({detail})"
+        | None, _ ->
+            displayName command
 
     let activityLabel command =
         match projectName command with

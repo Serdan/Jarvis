@@ -23,7 +23,7 @@ let ``project-scoped commands render compact activity labels`` () =
     AgentCommandInfo.activityLabel command |> shouldEqual "@Wayfold RunCommand(dotnet test)"
 
 [<Test>]
-let ``run command reason is shown after invocation`` () =
+let ``run command reason is the primary activity label`` () =
     let command =
         RunCommandCommand
             { ProjectName = "Jarvis"
@@ -36,7 +36,7 @@ let ``run command reason is shown after invocation`` () =
 
     AgentCommandInfo.reason command |> shouldEqual (Some "verify client activity changes")
     AgentCommandInfo.activityLabel command
-    |> shouldEqual "@Jarvis RunCommand(dotnet test) — verify client activity changes"
+    |> shouldEqual "@Jarvis verify client activity changes · dotnet test"
 
 [<Test>]
 let ``file commands show the target path`` () =

@@ -1,5 +1,6 @@
 module Client.SignalR.Client
 
+open System
 open System.Diagnostics
 open System.Text
 open System.Text.Json
@@ -195,9 +196,15 @@ let receiveCommandAndReply (connection: HubConnection) (rt: Runtime) (correlatio
             }
 
         let agentResponse = toAgentResponse response
-        let! sendResult = connection.invokeAsync("SendClientResponse", correlationId, agentResponse)
+        let! sendResult =
+            ResponseDelivery.sendWithReconnectRetry
+                (TimeSpan.FromMinutes 2.0)
+                (TimeSpan.FromMilliseconds 250.0)
+                (fun () -> connection.State)
+                (fun () -> connection.invokeAsync("SendClientResponse", correlationId, agentResponse))
 
         match sendResult with
         | Ok() -> ()
-        | Error ex -> rt.Tui.Log $"Failed to send command response: {ex.Message}"
+        | Error ex ->
+            rt.Tui.Log $"Failed to deliver command response after reconnect retries: {ex.Message}"
     }

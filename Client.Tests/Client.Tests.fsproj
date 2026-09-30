@@ -13,6 +13,7 @@
         <Compile Include="WorkspaceDefaultsTests.fs"/>
         <Compile Include="ResponseDeliveryTests.fs"/>
         <Compile Include="ActivityFilterTests.fs"/>
+        <Compile Include="ActivityExportTests.fs"/>
         <Compile Include="ProjectColorAssignmentsTests.fs"/>
         <Compile Include="ActivityNavigationTests.fs"/>
         <Compile Include="ProjectBrowserTests.fs"/>

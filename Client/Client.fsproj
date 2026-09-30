@@ -41,6 +41,8 @@
         <Compile Include="Modules\PermissionPolicy.fs"/>
         <Compile Include="Modules\ActivityPresentation.fs"/>
         <Compile Include="Modules\ActivityFilter.fs"/>
+        <Compile Include="Modules\ActivityExport.fs"/>
+        <Compile Include="Modules\Clipboard.fs"/>
         <Compile Include="Modules\ProjectColorAssignments.fs"/>
         <Compile Include="Modules\ActivityNavigation.fs"/>
         <Compile Include="Modules\ConsoleTui.fs"/>

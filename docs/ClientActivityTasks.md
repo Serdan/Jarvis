@@ -84,6 +84,15 @@ The receive timestamp remains fixed when the row is updated.
   - Navigation, details, paging, and `End` operate on the filtered result set while preserving the underlying history.
   - Incoming non-matching activity does not disturb the filtered viewport.
 
+- [x] **11. Copy recent command activity for chat recovery.**
+  - `R` opens a compact numeric prompt for copying recent command activity.
+  - Default to 20 commands; typing a digit replaces the default and additional digits extend it.
+  - Ignore informational client log rows when counting commands.
+  - Export oldest-to-newest with timestamp, project, command, full reason/detail, status, duration, and compact result/failure summary.
+  - Do not include raw command stdout/stderr in the recovery transcript.
+  - Use platform clipboard helpers: `clip.exe` on Windows, `pbcopy` on macOS, and `wl-copy`/X11 fallbacks on Linux.
+  - Report clipboard success or failure as client activity without counting that report as a command.
+
 ## Design constraints
 
 - Keep one command per activity row.
@@ -95,6 +104,6 @@ The receive timestamp remains fixed when the row is updated.
 ## Verification
 
 - `dotnet build Jarvis.slnx --no-restore`: 0 warnings, 0 errors.
-- Client tests: 134/134 passed.
+- Client tests: 135/135 passed.
 - Server tests: 26/26 passed.
 - Linux x64 client published with the production server URL and installed into the ignored `artifacts/client/linux-x64` launch location.

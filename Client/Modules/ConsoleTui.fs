@@ -33,6 +33,7 @@ type private TuiMode =
     | ActivityMode
     | PermissionMode
     | FilterMode
+    | CopyRecentMode
 
 type private PendingPrompt =
     { Id: int
@@ -53,6 +54,8 @@ type ConsoleTui() =
     let mutable selectedActivityId: int option = None
     let mutable activityFilterText = ""
     let mutable filterOriginalText = ""
+    let mutable copyRecentCountText = "20"
+    let mutable copyRecentCountEdited = false
     let mutable statusFilter = ActivityFilter.All
     let mutable activityScrollOffset = 0
     let mutable showActivityDetails = false
@@ -290,6 +293,7 @@ type ConsoleTui() =
         writeMnemonic 's' "status"; Console.Write ", "
         writeMnemonic 'c' "clear"; Console.Write ", "
         writeMnemonic 'p' "permissions"; Console.Write ", "
+        writeMnemonic 'r' "copy recent"; Console.Write ", "
         writeMnemonic 'q' "quit"; Console.WriteLine ""
 
     let writePermissionHotkeys () =
@@ -307,6 +311,12 @@ type ConsoleTui() =
         writeHotkeyToken "@"; Console.Write "term filters project, "
         writeHotkeyToken "Backspace"; Console.Write " edits, "
         writeHotkeyToken "Enter"; Console.Write " applies, "
+        writeHotkeyToken "Esc"; Console.WriteLine " cancels"
+
+    let writeCopyRecentHotkeys () =
+        Console.Write $"Copy recent commands: {copyRecentCountText}"
+        Console.Write "  "
+        writeHotkeyToken "Enter"; Console.Write " copies, "
         writeHotkeyToken "Esc"; Console.WriteLine " cancels"
 
     let activityRangeUnsafe () =
@@ -351,6 +361,34 @@ type ConsoleTui() =
         | Completed(_, outcome) -> outcome
         | Failed(_, shortError) -> Some shortError
         | _ -> None
+
+    let recentCommandExportUnsafe count =
+        activity
+        |> Seq.choose (fun entry ->
+            entry.Command
+            |> Option.map (fun command ->
+                let exported: ActivityExport.Entry =
+                    { Timestamp = entry.Timestamp
+                      ProjectName = entry.ProjectName
+                      CommandName = AgentCommandInfo.displayName command
+                      Reason = AgentCommandInfo.fullReason command
+                      Detail = AgentCommandInfo.fullDetail command
+                      Status = statusName entry.Status
+                      DurationMs = statusDuration entry.Status
+                      Result = statusOutcome entry.Status }
+                exported))
+        |> Seq.rev
+        |> Seq.truncate count
+        |> Seq.rev
+        |> Seq.toList
+        |> ActivityExport.formatRecent
+
+    let recentCommandCountUnsafe count =
+        activity
+        |> Seq.filter (fun entry -> entry.Command.IsSome)
+        |> Seq.rev
+        |> Seq.truncate count
+        |> Seq.length
 
     let writeDetailField width label value =
         let labelWidth = 11
@@ -418,6 +456,8 @@ type ConsoleTui() =
                 writePermissionHotkeys()
             | FilterMode ->
                 writeFilterHotkeys()
+            | CopyRecentMode ->
+                writeCopyRecentHotkeys()
             Console.WriteLine ""
 
             ensureActivitySelectionUnsafe() |> ignore
@@ -626,7 +666,59 @@ type ConsoleTui() =
                     if Console.KeyAvailable then
                         let keyInfo = Console.ReadKey(intercept = true)
 
-                        if mode = FilterMode then
+                        if mode = CopyRecentMode then
+                            match keyInfo.Key with
+                            | ConsoleKey.Backspace ->
+                                lock syncRoot (fun () ->
+                                    copyRecentCountEdited <- true
+                                    if copyRecentCountText.Length > 0 then
+                                        copyRecentCountText <- copyRecentCountText.Substring(0, copyRecentCountText.Length - 1)
+                                    renderUnsafe())
+                            | ConsoleKey.Enter ->
+                                let request =
+                                    lock syncRoot (fun () ->
+                                        match Int32.TryParse copyRecentCountText with
+                                        | true, requested when requested > 0 ->
+                                            let count = min maxHistory requested
+                                            let actual = recentCommandCountUnsafe count
+                                            let text =
+                                                if actual = 0 then None
+                                                else Some(recentCommandExportUnsafe count)
+                                            mode <- ActivityMode
+                                            renderUnsafe()
+                                            Some(actual, text)
+                                        | _ -> None)
+
+                                match request with
+                                | Some(0, _) ->
+                                    lock syncRoot (fun () ->
+                                        addActivityUnsafe None "No command activity to copy." None Informational |> ignore
+                                        renderUnsafe())
+                                | Some(actual, Some text) ->
+                                    let result = Clipboard.copyText text
+                                    lock syncRoot (fun () ->
+                                        let message =
+                                            match result with
+                                            | Ok provider -> $"Copied {actual} recent commands to clipboard via {provider}."
+                                            | Error error -> $"Clipboard copy failed: {error}"
+                                        addActivityUnsafe None message None Informational |> ignore
+                                        renderUnsafe())
+                                | _ -> ()
+                            | ConsoleKey.Escape ->
+                                lock syncRoot (fun () ->
+                                    mode <- ActivityMode
+                                    renderUnsafe())
+                            | _ when Char.IsDigit keyInfo.KeyChar ->
+                                lock syncRoot (fun () ->
+                                    let digit = string keyInfo.KeyChar
+                                    if not copyRecentCountEdited then
+                                        copyRecentCountText <- digit
+                                        copyRecentCountEdited <- true
+                                    elif copyRecentCountText.Length < 3 then
+                                        copyRecentCountText <- copyRecentCountText + digit
+                                    renderUnsafe())
+                            | _ -> ()
+                        elif mode = FilterMode then
                             match keyInfo.Key with
                             | ConsoleKey.Backspace ->
                                 lock syncRoot (fun () ->
@@ -665,6 +757,7 @@ type ConsoleTui() =
                                     | PermissionMode ->
                                         selectedPrompt <- max 0 (selectedPrompt - 1)
                                     | FilterMode -> ()
+                                    | CopyRecentMode -> ()
                                     renderUnsafe())
                             | _, ConsoleKey.DownArrow ->
                                 lock syncRoot (fun () ->
@@ -674,6 +767,7 @@ type ConsoleTui() =
                                         selectedPrompt <- min (prompts.Count - 1) (selectedPrompt + 1)
                                         selectedPrompt <- max 0 selectedPrompt
                                     | FilterMode -> ()
+                                    | CopyRecentMode -> ()
                                     renderUnsafe())
                             | _, ConsoleKey.PageUp ->
                                 lock syncRoot (fun () ->
@@ -716,6 +810,13 @@ type ConsoleTui() =
                             | _, ConsoleKey.C when mode = ActivityMode ->
                                 lock syncRoot (fun () ->
                                     clearFiltersUnsafe()
+                                    renderUnsafe())
+                            | _, ConsoleKey.R when mode = ActivityMode ->
+                                lock syncRoot (fun () ->
+                                    copyRecentCountText <- "20"
+                                    copyRecentCountEdited <- false
+                                    mode <- CopyRecentMode
+                                    showActivityDetails <- false
                                     renderUnsafe())
                             | _, ConsoleKey.E when mode = PermissionMode ->
                                 completeSelected AllowExecutableForSession

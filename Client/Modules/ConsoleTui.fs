@@ -79,7 +79,8 @@ type ConsoleTui() =
         | Disconnected -> ConsoleColor.Red
         | Closing -> ConsoleColor.DarkYellow
 
-    let projectColors =
+    let projectColorAssignments =
+        ProjectColorAssignments.ProjectColorAssignments(
         [| ConsoleColor.Cyan
            ConsoleColor.Green
            ConsoleColor.Magenta
@@ -87,13 +88,10 @@ type ConsoleTui() =
            ConsoleColor.Blue
            ConsoleColor.DarkCyan
            ConsoleColor.DarkGreen
-           ConsoleColor.DarkMagenta |]
+           ConsoleColor.DarkMagenta |])
 
-    let projectColor (projectName: string) =
-        let mutable hash = 2166136261u
-        for ch in projectName do
-            hash <- (hash ^^^ uint32 (int ch)) * 16777619u
-        projectColors[int (hash % uint32 projectColors.Length)]
+    let projectColor projectName =
+        projectColorAssignments.Get projectName
 
     let maxScrollOffsetUnsafe () =
         max 0 (activity.Count - visibleActivityRows)

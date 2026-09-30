@@ -230,6 +230,23 @@ let ``command catalog matches AgentCommand union and MCP tools`` () =
     Set.difference mcpNames catalogNames |> shouldEqual serverLocalNames
 
 [<Test>]
+let ``server ListCommands catalog matches public MCP tools`` () =
+    let mcpNames =
+        typeof<JarvisMcpTools>.GetMethods()
+        |> Array.choose (fun methodInfo ->
+            match methodInfo.GetCustomAttributes(typeof<McpServerToolAttribute>, false) with
+            | [| :? McpServerToolAttribute |] -> Some methodInfo.Name
+            | _ -> None)
+        |> Set.ofArray
+
+    let listedNames =
+        McpToolHelpers.mcpListCommandsResult.Commands
+        |> List.map (fun capability -> capability.Name)
+        |> Set.ofList
+
+    listedNames |> shouldEqual mcpNames
+
+[<Test>]
 let ``MCP bridge returns successful JSON as text without a mismatched output schema`` () =
     let response =
         { Result = Some """{"value":42,"items":[1,2]}"""

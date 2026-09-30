@@ -792,7 +792,14 @@ Search commands should support enough include/exclude input to let clients expre
 
 `AgentProtocol.commandDefinitions` is the authoritative catalog for local command names, descriptions, permission categories, mutation/confirmation behavior, and dry-run support. `ListCommands` capabilities are derived from it.
 
-The MCP surface contains the command-backed tools plus server-local tools such as `GetProfile`. Tests require every local `AgentCommand` union case to have a matching command definition and matching MCP tool.
+The public MCP surface contains the command-backed tools plus server-local tools such as `GetProfile` and the feedback tools. The MCP `ListCommands` tool is server-owned and returns the complete public MCP catalog:
+
+- all local command capabilities from `AgentProtocol.commandDefinitions`;
+- server-local capabilities declared by the server.
+
+It must not require a connected local client merely to enumerate the public MCP surface. The client-side `ListCommandsCommand` remains a local protocol capability and returns only the local command catalog when invoked directly.
+
+Tests require every local `AgentCommand` union case to have a matching command definition and matching MCP tool, and require the server-side `ListCommands` catalog names to exactly match the public MCP tool methods.
 
 ### Authenticated Device Registration
 

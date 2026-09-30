@@ -50,6 +50,39 @@ module McpToolHelpers =
         JsonSerializer.Serialize(value)
         |> fun serialized -> textResult serialized false
 
+    let private serverLocalCapability name description permissions mutatesState : CommandCapability =
+        { Name = name
+          Description = description
+          Permissions = permissions
+          MutatesState = mutatesState
+          RequiresConfirmation = false
+          SupportsDryRun = false
+          MaxInputBytes = None
+          MaxOutputBytes = Some AgentProtocol.maxResponseBytes
+          InputSchemaJson = None
+          OutputSchemaJson = None }
+
+    let mcpListCommandsResult : ListCommandsResult =
+        { ProtocolVersion = AgentProtocol.version
+          Commands =
+            AgentProtocol.capabilities
+            @ [ serverLocalCapability
+                    "GetProfile"
+                    "Returns the profile represented by the authenticated OAuth credentials."
+                    [ ReadOnly ]
+                    false
+                serverLocalCapability
+                    "Feedback"
+                    "Persists explicit structured agent feedback on the Jarvis server."
+                    []
+                    true
+                serverLocalCapability "ListFeedback" "Lists persisted agent feedback." [ ReadOnly ] false
+                serverLocalCapability
+                    "GetFeedbackSummary"
+                    "Summarizes persisted agent feedback."
+                    [ ReadOnly ]
+                    false ] }
+
     let private errorCategory = function
         | NotFound _ -> "NotFound"
         | PermissionDenied _ -> "PermissionDenied"
@@ -372,6 +405,14 @@ module McpToolHelpers =
                     |> jsonResult
         }
 
+    let listMcpCommands (http: IHttpContextAccessor) =
+        task {
+            match authenticatedFeedbackContext http with
+            | Error result -> return result
+            | Ok _ ->
+                return mcpListCommandsResult |> jsonResult
+        }
+
     let optionOfString (value: string) =
         if String.IsNullOrWhiteSpace(value) then None else Some value
 
@@ -431,9 +472,9 @@ type JarvisMcpTools =
     ) =
         McpToolHelpers.feedbackSummary store http projectName toolName
 
-    [<McpServerTool(Title = "List commands", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("List the commands supported by the connected Jarvis client.")>]
-    static member ListCommands(client: ClientService, http: IHttpContextAccessor) =
-        McpToolHelpers.send client http ListCommandsCommand
+    [<McpServerTool(Title = "List commands", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("List the complete public Jarvis MCP command catalog, including server-local tools.")>]
+    static member ListCommands(http: IHttpContextAccessor) =
+        McpToolHelpers.listMcpCommands http
 
     [<McpServerTool(Title = "List projects", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("List projects exposed by the connected Jarvis client.")>]
     static member ListProjects(client: ClientService, http: IHttpContextAccessor) =

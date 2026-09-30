@@ -260,6 +260,55 @@ type ConsoleTui() =
         Console.Write($"@{projectName}")
         Console.ForegroundColor <- previous
 
+    let hotkeyColor = ConsoleColor.Cyan
+
+    let writeHotkeyToken (token: string) =
+        let previous = Console.ForegroundColor
+        Console.ForegroundColor <- hotkeyColor
+        Console.Write token
+        Console.ForegroundColor <- previous
+
+    let writeMnemonic hotkey (label: string) =
+        let hotkeyText = string hotkey
+        let index = label.IndexOf(hotkeyText, StringComparison.OrdinalIgnoreCase)
+
+        if index < 0 then
+            Console.Write label
+        else
+            Console.Write(label.Substring(0, index))
+            writeHotkeyToken (label.Substring(index, 1))
+            Console.Write(label.Substring(index + 1))
+
+    let writeActivityHotkeys () =
+        Console.Write "Keys: "
+        writeHotkeyToken "↑/↓"; Console.Write " activity, "
+        writeHotkeyToken "PgUp/PgDn"; Console.Write " page, "
+        writeHotkeyToken "End"; Console.Write " latest, "
+        writeHotkeyToken "Enter"; Console.Write " details, "
+        writeHotkeyToken "/"; Console.Write " filter, "
+        writeHotkeyToken "@"; Console.Write " project, "
+        writeMnemonic 's' "status"; Console.Write ", "
+        writeMnemonic 'c' "clear"; Console.Write ", "
+        writeMnemonic 'p' "permissions"; Console.Write ", "
+        writeMnemonic 'q' "quit"; Console.WriteLine ""
+
+    let writePermissionHotkeys () =
+        Console.Write "Keys: "
+        writeHotkeyToken "↑/↓"; Console.Write " permission, "
+        writeMnemonic 'a' "allow once"; Console.Write ", "
+        writeMnemonic 's' "allow exact for session"; Console.Write ", "
+        writeMnemonic 'e' "executable"; Console.Write ", "
+        writeMnemonic 'd' "deny"; Console.Write ", "
+        writeHotkeyToken "Esc"; Console.Write " activity, "
+        writeMnemonic 'q' "quit"; Console.WriteLine ""
+
+    let writeFilterHotkeys () =
+        Console.Write "Filter: type text; "
+        writeHotkeyToken "@"; Console.Write "term filters project, "
+        writeHotkeyToken "Backspace"; Console.Write " edits, "
+        writeHotkeyToken "Enter"; Console.Write " applies, "
+        writeHotkeyToken "Esc"; Console.WriteLine " cancels"
+
     let activityRangeUnsafe () =
         let filtered = filteredActivityUnsafe()
         clampScrollOffsetUnsafe()
@@ -364,11 +413,11 @@ type ConsoleTui() =
             Console.WriteLine $"Key: {key}"
             match mode with
             | ActivityMode ->
-                Console.WriteLine "Keys: ↑/↓ activity, PgUp/PgDn page, End latest, Enter details, / filter, @ project, S status, C clear, P permissions, Q quit"
+                writeActivityHotkeys()
             | PermissionMode ->
-                Console.WriteLine "Keys: ↑/↓ permission, A allow once, S allow exact, E allow executable, D deny, Esc activity, Q quit"
+                writePermissionHotkeys()
             | FilterMode ->
-                Console.WriteLine "Filter: type text; @term filters project, Backspace edits, Enter applies, Esc cancels"
+                writeFilterHotkeys()
             Console.WriteLine ""
 
             ensureActivitySelectionUnsafe() |> ignore

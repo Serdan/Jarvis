@@ -123,9 +123,7 @@ let private dispatch rt command =
 
 let receiveCommand (rt: Runtime) (command: AgentCommand) =
     task {
-        let projectName = AgentCommandInfo.projectName command
-        let commandDescription = AgentCommandInfo.invocation command
-        let activityId = rt.Tui.StartActivity(projectName, commandDescription)
+        let activityId = rt.Tui.StartActivity(command)
         let stopwatch = Stopwatch.StartNew()
 
         let permission = rt :> PermissionIO

@@ -39,6 +39,23 @@ let ``run command reason is the primary activity label`` () =
     |> shouldEqual "@Jarvis verify client activity changes · dotnet test"
 
 [<Test>]
+let ``full activity details preserve untruncated command and reason`` () =
+    let reason = String.replicate 80 "r"
+    let longArg = String.replicate 90 "x"
+    let command =
+        RunCommandCommand
+            { ProjectName = "Jarvis"
+              Executable = "dotnet"
+              Args = [ "test"; longArg ]
+              Reason = Some reason
+              WorkingDirectory = None
+              TimeoutSeconds = None
+              MaxOutputBytes = None }
+
+    AgentCommandInfo.fullReason command |> shouldEqual (Some reason)
+    AgentCommandInfo.fullDetail command |> shouldEqual (Some $"dotnet test {longArg}")
+
+[<Test>]
 let ``file commands show the target path`` () =
     let command =
         ReadFileCommand

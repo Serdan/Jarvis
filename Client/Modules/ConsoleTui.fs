@@ -25,8 +25,13 @@ type private ActivityEntry =
       Timestamp: string
       ProjectName: string option
       Message: string
+      Command: AgentCommand option
       mutable Status: ActivityStatus
       mutable FailureDetail: string option }
+
+type private TuiMode =
+    | ActivityMode
+    | PermissionMode
 
 type private PendingPrompt =
     { Id: int
@@ -43,8 +48,10 @@ type ConsoleTui() =
     let mutable nextPromptId = 1
     let mutable shouldQuit = false
     let mutable key = ""
+    let mutable mode = ActivityMode
+    let mutable selectedActivityId: int option = None
     let mutable activityScrollOffset = 0
-    let mutable showLastError = false
+    let mutable showActivityDetails = false
     let mutable connectionState = Disconnected
     let mutable serverHost = "-"
     let maxHistory = 500
@@ -94,24 +101,75 @@ type ConsoleTui() =
     let clampScrollOffsetUnsafe () =
         activityScrollOffset <- activityScrollOffset |> max 0 |> min (maxScrollOffsetUnsafe())
 
-    let addActivityUnsafe projectName message status =
+    let selectedActivityIndexUnsafe () =
+        match selectedActivityId with
+        | None -> None
+        | Some id ->
+            activity
+            |> Seq.tryFindIndex (fun entry -> entry.Id = id)
+
+    let selectActivityIndexUnsafe index =
+        match ActivityNavigation.normalizeSelection activity.Count (Some index) with
+        | None ->
+            selectedActivityId <- None
+            activityScrollOffset <- 0
+        | Some selectedIndex ->
+            selectedActivityId <- Some activity[selectedIndex].Id
+            activityScrollOffset <-
+                ActivityNavigation.scrollOffsetForSelection
+                    activity.Count
+                    visibleActivityRows
+                    activityScrollOffset
+                    selectedIndex
+
+    let ensureActivitySelectionUnsafe () =
+        match selectedActivityIndexUnsafe() with
+        | Some index -> Some index
+        | None ->
+            match ActivityNavigation.normalizeSelection activity.Count None with
+            | None -> None
+            | Some index ->
+                selectedActivityId <- Some activity[index].Id
+                Some index
+
+    let moveActivitySelectionUnsafe delta =
+        let current = ensureActivitySelectionUnsafe()
+        match ActivityNavigation.move activity.Count delta current with
+        | Some index -> selectActivityIndexUnsafe index
+        | None -> ()
+
+    let addActivityUnsafe projectName message command status =
         let wasScrolled = activityScrollOffset > 0
+        let previousLastId =
+            if activity.Count = 0 then None
+            else Some activity[activity.Count - 1].Id
+        let followLatest =
+            not showActivityDetails
+            && activityScrollOffset = 0
+            && (selectedActivityId.IsNone || selectedActivityId = previousLastId)
         let entry =
             { Id = nextActivityId
               Timestamp = DateTimeOffset.Now.ToString("HH:mm:ss")
               ProjectName = projectName
               Message = message
+              Command = command
               Status = status
               FailureDetail = None }
 
         nextActivityId <- nextActivityId + 1
         activity.Add entry
 
+        if followLatest then
+            selectedActivityId <- Some entry.Id
+
         if wasScrolled then
             activityScrollOffset <- activityScrollOffset + 1
 
         while activity.Count > maxHistory do
+            let removed = activity[0]
             activity.RemoveAt 0
+            if selectedActivityId = Some removed.Id && activity.Count > 0 then
+                selectedActivityId <- Some activity[0].Id
 
         clampScrollOffsetUnsafe()
         entry.Id
@@ -135,8 +193,8 @@ type ConsoleTui() =
 
         $"{entry.Timestamp} {project}{entry.Message}{statusSuffix entry.Status}"
 
-    let writeColoredProjectLine width entry =
-        let rendered = activityText entry |> fun value -> trim value width
+    let writeColoredProjectLine width marker entry =
+        let rendered = $"{marker} {activityText entry}" |> fun value -> trim value width
 
         match entry.ProjectName with
         | None -> Console.WriteLine rendered
@@ -166,12 +224,7 @@ type ConsoleTui() =
         let start = max 0 (endExclusive - visibleActivityRows)
         start, endExclusive
 
-    let latestFailureUnsafe () =
-        activity
-        |> Seq.rev
-        |> Seq.tryFind (fun entry -> entry.FailureDetail.IsSome)
-
-    let errorDetailLines width (detail: string) =
+    let wrappedLines width (detail: string) =
         let maxWidth = max 20 width
         detail.Replace("\r", "").Split('\n')
         |> Seq.collect (fun line ->
@@ -184,6 +237,72 @@ type ConsoleTui() =
                     offset <- offset + length
             })
         |> Seq.toList
+
+    let selectedActivityUnsafe () =
+        ensureActivitySelectionUnsafe()
+        |> Option.map (fun index -> activity[index])
+
+    let statusName = function
+        | Informational -> "Info"
+        | Running -> "Running"
+        | AwaitingPermission -> "Awaiting permission"
+        | Completed _ -> "Completed"
+        | Failed _ -> "Failed"
+
+    let statusDuration = function
+        | Completed(durationMs, _)
+        | Failed(durationMs, _) -> Some durationMs
+        | _ -> None
+
+    let statusOutcome = function
+        | Completed(_, outcome) -> outcome
+        | Failed(_, shortError) -> Some shortError
+        | _ -> None
+
+    let writeDetailField width label value =
+        let labelWidth = 11
+        let available = max 20 (width - labelWidth)
+        let lines = wrappedLines available value
+
+        match lines with
+        | [] -> Console.WriteLine($"{label,-11}")
+        | first :: rest ->
+            Console.WriteLine($"{label,-11}{first}")
+            let indent = String.replicate labelWidth " "
+            for line in rest do
+                Console.WriteLine($"{indent}{line}")
+
+    let renderActivityDetailsUnsafe width =
+        if showActivityDetails then
+            match selectedActivityUnsafe() with
+            | None -> ()
+            | Some entry ->
+                Console.WriteLine ""
+                Console.WriteLine "Activity details"
+                Console.WriteLine "----------------"
+                writeDetailField width "Time" entry.Timestamp
+                entry.ProjectName
+                |> Option.iter (writeDetailField width "Project")
+
+                match entry.Command with
+                | Some command ->
+                    writeDetailField width "Command" (AgentCommandInfo.displayName command)
+                    AgentCommandInfo.fullReason command
+                    |> Option.iter (writeDetailField width "Reason")
+                    AgentCommandInfo.fullDetail command
+                    |> Option.iter (writeDetailField width "Detail")
+                | None ->
+                    writeDetailField width "Command" "Log"
+                    writeDetailField width "Detail" entry.Message
+
+                writeDetailField width "Status" (statusName entry.Status)
+                statusDuration entry.Status
+                |> Option.iter (fun durationMs -> writeDetailField width "Duration" $"{durationMs} ms")
+                statusOutcome entry.Status
+                |> Option.iter (writeDetailField width "Result")
+
+                entry.FailureDetail
+                |> Option.iter (writeDetailField width "Error")
 
     let renderUnsafe () =
         try
@@ -199,9 +318,14 @@ type ConsoleTui() =
             Console.ForegroundColor <- previous
             Console.WriteLine $" • {serverHost}"
             Console.WriteLine $"Key: {key}"
-            Console.WriteLine "Keys: ↑/↓ permission, A allow once, S allow exact, E allow executable, D deny, PgUp/PgDn activity, End latest, V error, Q quit"
+            match mode with
+            | ActivityMode ->
+                Console.WriteLine "Keys: ↑/↓ activity, PgUp/PgDn page, End latest, Enter details, P permissions, Q quit"
+            | PermissionMode ->
+                Console.WriteLine "Keys: ↑/↓ permission, A allow once, S allow exact, E allow executable, D deny, Esc activity, Q quit"
             Console.WriteLine ""
 
+            ensureActivitySelectionUnsafe() |> ignore
             let startIndex, endExclusive = activityRangeUnsafe()
             let historySuffix =
                 if activity.Count > visibleActivityRows then
@@ -215,10 +339,18 @@ type ConsoleTui() =
                 Console.WriteLine "No activity yet."
             else
                 for index = startIndex to endExclusive - 1 do
-                    writeColoredProjectLine width activity[index]
+                    let marker =
+                        if mode = ActivityMode && selectedActivityId = Some activity[index].Id then ">"
+                        else " "
+                    writeColoredProjectLine width marker activity[index]
+
+            renderActivityDetailsUnsafe width
 
             Console.WriteLine ""
-            Console.WriteLine "Permission requests"
+            let permissionSuffix =
+                if prompts.Count = 0 then ""
+                else $" ({prompts.Count})"
+            Console.WriteLine $"Permission requests{permissionSuffix}"
             Console.WriteLine "-------------------"
 
             if prompts.Count = 0 then
@@ -226,7 +358,9 @@ type ConsoleTui() =
             else
                 for index = 0 to prompts.Count - 1 do
                     let prompt = prompts[index]
-                    let marker = if index = selectedPrompt then ">" else " "
+                    let marker =
+                        if mode = PermissionMode && index = selectedPrompt then ">"
+                        else " "
                     Console.Write $"{marker} #{prompt.Id} {prompt.Request.CommandName}"
 
                     match prompt.Request.ProjectName with
@@ -240,19 +374,6 @@ type ConsoleTui() =
                     AgentCommandInfo.reason prompt.Command
                     |> Option.iter (fun reason ->
                         Console.WriteLine $"    Reason: {trim reason (Math.Max(20, width - 12))}")
-
-            if showLastError then
-                match latestFailureUnsafe() with
-                | Some entry ->
-                    Console.WriteLine ""
-                    Console.WriteLine "Latest error"
-                    Console.WriteLine "------------"
-                    Console.WriteLine(trim (activityText entry) width)
-                    entry.FailureDetail
-                    |> Option.iter (fun detail ->
-                        for line in errorDetailLines width detail do
-                            Console.WriteLine line)
-                | None -> ()
 
             Console.WriteLine ""
         with _ ->
@@ -270,6 +391,8 @@ type ConsoleTui() =
                     let prompt = prompts[index]
                     prompts.RemoveAt index
                     selectedPrompt <- selectedPrompt |> min (prompts.Count - 1) |> max 0
+                    if prompts.Count = 0 then
+                        mode <- ActivityMode
                     renderUnsafe()
                     Some prompt.Completion)
 
@@ -294,12 +417,17 @@ type ConsoleTui() =
 
     member _.Log message =
         lock syncRoot (fun () ->
-            addActivityUnsafe None (compact message) Informational |> ignore
+            addActivityUnsafe None (compact message) None Informational |> ignore
             renderUnsafe())
 
-    member _.StartActivity(projectName, message) =
+    member _.StartActivity(command: AgentCommand) =
         lock syncRoot (fun () ->
-            let id = addActivityUnsafe projectName message Running
+            let id =
+                addActivityUnsafe
+                    (AgentCommandInfo.projectName command)
+                    (AgentCommandInfo.invocation command)
+                    (Some command)
+                    Running
             renderUnsafe()
             id)
 
@@ -363,33 +491,60 @@ type ConsoleTui() =
                         match keyInfo.Key with
                         | ConsoleKey.UpArrow ->
                             lock syncRoot (fun () ->
-                                selectedPrompt <- max 0 (selectedPrompt - 1)
+                                match mode with
+                                | ActivityMode -> moveActivitySelectionUnsafe -1
+                                | PermissionMode ->
+                                    selectedPrompt <- max 0 (selectedPrompt - 1)
                                 renderUnsafe())
                         | ConsoleKey.DownArrow ->
                             lock syncRoot (fun () ->
-                                selectedPrompt <- min (prompts.Count - 1) (selectedPrompt + 1)
-                                selectedPrompt <- max 0 selectedPrompt
+                                match mode with
+                                | ActivityMode -> moveActivitySelectionUnsafe 1
+                                | PermissionMode ->
+                                    selectedPrompt <- min (prompts.Count - 1) (selectedPrompt + 1)
+                                    selectedPrompt <- max 0 selectedPrompt
                                 renderUnsafe())
                         | ConsoleKey.PageUp ->
                             lock syncRoot (fun () ->
-                                activityScrollOffset <- min (maxScrollOffsetUnsafe()) (activityScrollOffset + visibleActivityRows)
+                                if mode = ActivityMode then
+                                    moveActivitySelectionUnsafe -visibleActivityRows
                                 renderUnsafe())
                         | ConsoleKey.PageDown ->
                             lock syncRoot (fun () ->
-                                activityScrollOffset <- max 0 (activityScrollOffset - visibleActivityRows)
+                                if mode = ActivityMode then
+                                    moveActivitySelectionUnsafe visibleActivityRows
                                 renderUnsafe())
                         | ConsoleKey.End ->
                             lock syncRoot (fun () ->
-                                activityScrollOffset <- 0
+                                if mode = ActivityMode && activity.Count > 0 then
+                                    selectActivityIndexUnsafe (activity.Count - 1)
                                 renderUnsafe())
-                        | ConsoleKey.V ->
+                        | ConsoleKey.Enter ->
                             lock syncRoot (fun () ->
-                                showLastError <- not showLastError
+                                if mode = ActivityMode && activity.Count > 0 then
+                                    showActivityDetails <- not showActivityDetails
                                 renderUnsafe())
-                        | ConsoleKey.A -> completeSelected AllowOnce
-                        | ConsoleKey.S -> completeSelected AllowExactForSession
-                        | ConsoleKey.E -> completeSelected AllowExecutableForSession
-                        | ConsoleKey.D -> completeSelected Deny
+                        | ConsoleKey.P ->
+                            lock syncRoot (fun () ->
+                                mode <- PermissionMode
+                                showActivityDetails <- false
+                                renderUnsafe())
+                        | ConsoleKey.Escape ->
+                            lock syncRoot (fun () ->
+                                mode <- ActivityMode
+                                renderUnsafe())
+                        | ConsoleKey.A ->
+                            if mode = PermissionMode then
+                                completeSelected AllowOnce
+                        | ConsoleKey.S ->
+                            if mode = PermissionMode then
+                                completeSelected AllowExactForSession
+                        | ConsoleKey.E ->
+                            if mode = PermissionMode then
+                                completeSelected AllowExecutableForSession
+                        | ConsoleKey.D ->
+                            if mode = PermissionMode then
+                                completeSelected Deny
                         | ConsoleKey.Q -> shouldQuit <- true
                         | _ -> ()
                     else
@@ -398,7 +553,7 @@ type ConsoleTui() =
                 | :? OperationCanceledException -> ()
                 | ex ->
                     lock syncRoot (fun () ->
-                        addActivityUnsafe None $"TUI error: {compact ex.Message}" Informational |> ignore
+                        addActivityUnsafe None $"TUI error: {compact ex.Message}" None Informational |> ignore
                         renderUnsafe())
                     do! Task.Delay(250, cancellationToken)
         }

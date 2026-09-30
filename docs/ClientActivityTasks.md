@@ -63,6 +63,16 @@ The receive timestamp remains fixed when the row is updated.
   - Publish the Linux client artifact.
   - Commit coherent source changes and confirm a clean working tree.
 
+- [x] **9. Add selectable activity details.**
+  - Arrow keys select activity rows in the normal view.
+  - Page Up / Page Down move the activity selection by one viewport and `End` returns to the latest activity.
+  - `Enter` toggles an expanded detail pane for the selected activity.
+  - Expanded details preserve full command-specific detail and the full RunCommand reason rather than reusing truncated row text.
+  - Failures expose their retained full error in the selected activity pane.
+  - `P` enters the permission view; permission arrows and A/S/E/D apply only there, and `Esc` returns to activity.
+  - Permission requests remain visible from the activity view so waiting commands are discoverable without taking over navigation.
+  - New activity follows the latest row only while the user is already at the latest activity; browsing older history remains stable.
+
 ## Design constraints
 
 - Keep one command per activity row.
@@ -74,6 +84,6 @@ The receive timestamp remains fixed when the row is updated.
 ## Verification
 
 - `dotnet build Jarvis.slnx --no-restore`: 0 warnings, 0 errors.
-- Client tests: 106/106 passed.
-- Server tests: 19/19 passed.
+- Client tests: 125/125 passed.
+- Server tests: 26/26 passed.
 - Linux x64 client published with the production server URL and installed into the ignored `artifacts/client/linux-x64` launch location.

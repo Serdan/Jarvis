@@ -393,6 +393,34 @@ module AgentCommandInfo =
         let value = compact value
         if value.Length <= 8 then value else value.Substring(0, 8)
 
+    let private fullCommand executable args =
+        executable :: args
+        |> List.map compact
+        |> List.filter (String.IsNullOrWhiteSpace >> not)
+        |> String.concat " "
+
+    let fullDetail = function
+        | ListDirectoryCommand cmd -> Some(compact cmd.FolderPath)
+        | SearchFilesCommand cmd -> Some(""" + compact cmd.Query + """)
+        | SearchTextCommand cmd -> Some(""" + compact cmd.Query + """)
+        | ReadFileCommand cmd -> Some(compact cmd.FilePath)
+        | ReadFilesCommand cmd -> Some(String.concat ", " (cmd.FilePaths |> List.map compact))
+        | WriteFileCommand cmd -> Some(compact cmd.FilePath)
+        | PatchFileCommand cmd -> Some(compact cmd.FilePath)
+        | RunCommandCommand cmd -> Some(fullCommand cmd.Executable cmd.Args)
+        | RunProjectTaskCommand cmd -> Some(compact cmd.TaskName)
+        | GetGitDiffCommand cmd -> cmd.Path |> Option.map compact
+        | GitCommitCommand cmd -> Some(compact cmd.Message)
+        | StartJobCommand cmd -> Some(fullCommand cmd.Executable cmd.Args)
+        | GetJobResultCommand cmd -> Some(compact cmd.JobId)
+        | CancelJobCommand cmd -> Some(compact cmd.JobId)
+        | ListCommandsCommand
+        | ListProjectsCommand
+        | GetProjectDetailsCommand _
+        | ListProjectTasksCommand _
+        | GetGitStatusCommand _
+        | ListJobsCommand _ -> None
+
     let detail = function
         | ListDirectoryCommand cmd -> Some(truncate 64 cmd.FolderPath)
         | SearchFilesCommand cmd -> Some(quoted cmd.Query)
@@ -414,6 +442,13 @@ module AgentCommandInfo =
         | ListProjectTasksCommand _
         | GetGitStatusCommand _
         | ListJobsCommand _ -> None
+
+    let fullReason = function
+        | RunCommandCommand cmd ->
+            cmd.Reason
+            |> Option.map compact
+            |> Option.filter (String.IsNullOrWhiteSpace >> not)
+        | _ -> None
 
     let reason = function
         | RunCommandCommand cmd ->

@@ -56,6 +56,29 @@ let ``full activity details preserve untruncated command and reason`` () =
     AgentCommandInfo.fullDetail command |> shouldEqual (Some $"dotnet test {longArg}")
 
 [<Test>]
+let ``search full details contain the actual query`` () =
+    let searchText =
+        SearchTextCommand
+            { ProjectName = "Wayfold"
+              Query = "CreatureRenderer"
+              FolderPath = None
+              IncludeGlobs = []
+              ExcludeGlobs = []
+              MaxResults = None }
+
+    let searchFiles =
+        SearchFilesCommand
+            { ProjectName = "Wayfold"
+              Query = "*.bam"
+              FolderPath = None
+              MaxResults = None }
+
+    AgentCommandInfo.fullDetail searchText
+    |> shouldEqual (Some "\"CreatureRenderer\"")
+    AgentCommandInfo.fullDetail searchFiles
+    |> shouldEqual (Some "\"*.bam\"")
+
+[<Test>]
 let ``file commands show the target path`` () =
     let command =
         ReadFileCommand

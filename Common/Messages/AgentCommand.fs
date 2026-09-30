@@ -401,8 +401,8 @@ module AgentCommandInfo =
 
     let fullDetail = function
         | ListDirectoryCommand cmd -> Some(compact cmd.FolderPath)
-        | SearchFilesCommand cmd -> Some(""" + compact cmd.Query + """)
-        | SearchTextCommand cmd -> Some(""" + compact cmd.Query + """)
+        | SearchFilesCommand cmd -> Some(sprintf "\"%s\"" (compact cmd.Query))
+        | SearchTextCommand cmd -> Some(sprintf "\"%s\"" (compact cmd.Query))
         | ReadFileCommand cmd -> Some(compact cmd.FilePath)
         | ReadFilesCommand cmd -> Some(String.concat ", " (cmd.FilePaths |> List.map compact))
         | WriteFileCommand cmd -> Some(compact cmd.FilePath)

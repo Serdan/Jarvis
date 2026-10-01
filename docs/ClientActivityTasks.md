@@ -90,7 +90,7 @@ The receive timestamp remains fixed when the row is updated.
   - Ignore informational client log rows when counting commands.
   - Export oldest-to-newest with timestamp, project, command, full reason/detail, status, duration, and compact result/failure summary.
   - Do not include raw command stdout/stderr in the recovery transcript.
-  - Use platform clipboard helpers: `clip.exe` on Windows, `pbcopy` on macOS, and `wl-copy`/X11 fallbacks on Linux.
+  - Use platform clipboard helpers: `clip.exe` on Windows, `pbcopy` on macOS, KDE Klipper over `qdbus6` first on Linux, then `wl-copy`/X11 fallbacks.
   - Report clipboard success or failure as client activity without counting that report as a command.
 
 ## Design constraints

@@ -223,7 +223,7 @@ let ``command catalog matches AgentCommand union and MCP tools`` () =
         |> Set.ofArray
 
     let serverLocalNames =
-        set [ "GetProfile"; "Feedback"; "ListFeedback"; "GetFeedbackSummary" ]
+        set [ "GetProfile"; "Feedback"; "ListFeedback"; "GetFeedbackSummary"; "GetConnectionDiagnostics" ]
 
     unionNames |> shouldEqual catalogNames
     Set.difference mcpNames serverLocalNames |> shouldEqual catalogNames
@@ -381,7 +381,7 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
             | None ->
                 match methodInfo.Name with
                 | "Feedback" -> false
-                | "ListFeedback" | "GetFeedbackSummary" -> true
+                | "ListFeedback" | "GetFeedbackSummary" | "GetConnectionDiagnostics" -> true
                 | name -> failwith $"Unexpected server-local MCP tool: {name}"
 
         let destructive =

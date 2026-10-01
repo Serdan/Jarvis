@@ -132,18 +132,30 @@ let main args =
         Func<Exception, Task>(fun error ->
             registered <- false
             tui.SetConnectionState(Reconnecting, BuildInfo.ServerUrl)
+            let detail =
+                if isNull error then "no exception"
+                else $"{error.GetType().FullName}: {error.Message}"
+            tui.Log $"SignalR reconnecting: {detail}"
             Task.CompletedTask))
 
     connection.add_Reconnected(
         Func<string, Task>(fun connectionId ->
             registered <- false
             tui.SetConnectionState(Connecting, BuildInfo.ServerUrl)
+            let id =
+                if String.IsNullOrWhiteSpace connectionId then "(no connection id)"
+                else connectionId
+            tui.Log $"SignalR transport reconnected: {id}; re-registering client."
             Task.CompletedTask))
 
     connection.add_Closed(
         Func<Exception, Task>(fun error ->
             registered <- false
             tui.SetConnectionState(Disconnected, BuildInfo.ServerUrl)
+            let detail =
+                if isNull error then "no exception"
+                else $"{error.GetType().FullName}: {error.Message}"
+            tui.Log $"SignalR connection closed: {detail}"
             Task.CompletedTask))
 
     task {

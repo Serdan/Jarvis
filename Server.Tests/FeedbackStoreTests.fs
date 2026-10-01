@@ -165,3 +165,42 @@ let ``feedback list enforces user isolation`` () =
         |> Array.length
         |> shouldEqual 0
     )
+
+[<Test>]
+let ``connection diagnostics persist disconnect metadata and isolate users`` () =
+    withStore (fun store ->
+        store.AddConnectionEvent(
+            "user-1",
+            "TransportConnected",
+            "connection-1",
+            None, None, None, None, None, None, None, None
+        )
+
+        store.AddConnectionEvent(
+            "user-1",
+            "TransportDisconnected",
+            "connection-1",
+            Some "device-1",
+            Some "Serdan-Home",
+            Some 9L,
+            Some "1.2.3",
+            Some "3.0",
+            Some 60000L,
+            Some "System.TimeoutException",
+            Some "Client hasn't sent a message/ping within the configured ClientTimeoutInterval."
+        )
+
+        let events = store.ListConnectionEvents("user-1", 10)
+        events.Length |> shouldEqual 2
+        events[0].EventType |> shouldEqual "TransportDisconnected"
+        events[0].DeviceName |> shouldEqual "Serdan-Home"
+        events[0].Generation.Value |> shouldEqual 9L
+        events[0].DurationMs.Value |> shouldEqual 60000L
+        events[0].ErrorType |> shouldEqual "System.TimeoutException"
+        events[0].ErrorMessage.Contains("ClientTimeoutInterval", StringComparison.Ordinal)
+        |> shouldEqual true
+
+        store.ListConnectionEvents("user-2", 10)
+        |> Array.length
+        |> shouldEqual 0
+    )

@@ -52,6 +52,20 @@ type OperationStart =
     { Id: string
       StartedAt: DateTimeOffset }
 
+[<CLIMutable>]
+type ConnectionEventEntry =
+    { CreatedAt: DateTimeOffset
+      EventType: string
+      ConnectionId: string
+      DeviceId: string
+      DeviceName: string
+      Generation: Nullable<int64>
+      ClientVersion: string
+      ProtocolVersion: string
+      DurationMs: Nullable<int64>
+      ErrorType: string
+      ErrorMessage: string }
+
 module FeedbackValidation =
     let categories =
         set
@@ -165,12 +179,116 @@ CREATE INDEX IF NOT EXISTS ix_feedback_user_created
 
 CREATE INDEX IF NOT EXISTS ix_feedback_operation
     ON feedback(operation_id);
+
+CREATE TABLE IF NOT EXISTS connection_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    connection_id TEXT NOT NULL,
+    device_id TEXT NULL,
+    device_name TEXT NULL,
+    generation INTEGER NULL,
+    client_version TEXT NULL,
+    protocol_version TEXT NULL,
+    duration_ms INTEGER NULL,
+    error_type TEXT NULL,
+    error_message TEXT NULL
+);
+
+CREATE INDEX IF NOT EXISTS ix_connection_events_user_created
+    ON connection_events(user_id, created_at DESC);
 """
         schema.ExecuteNonQuery() |> ignore
 
     do initialize()
 
     member _.DatabasePath = databasePath
+
+    member _.AddConnectionEvent(
+        userId: string,
+        eventType: string,
+        connectionId: string,
+        deviceId: string option,
+        deviceName: string option,
+        generation: int64 option,
+        clientVersion: string option,
+        protocolVersion: string option,
+        durationMs: int64 option,
+        errorType: string option,
+        errorMessage: string option
+    ) =
+        let createdAt = DateTimeOffset.UtcNow
+        let bounded maxLength (value: string option) =
+            value
+            |> Option.map (fun text ->
+                if text.Length <= maxLength then text
+                else text.Substring(0, maxLength))
+
+        use connection = openConnection()
+        use command = connection.CreateCommand()
+        command.CommandText <-
+            """
+INSERT INTO connection_events (
+    created_at, user_id, event_type, connection_id,
+    device_id, device_name, generation, client_version, protocol_version,
+    duration_ms, error_type, error_message
+) VALUES (
+    $createdAt, $userId, $eventType, $connectionId,
+    $deviceId, $deviceName, $generation, $clientVersion, $protocolVersion,
+    $durationMs, $errorType, $errorMessage
+);
+"""
+
+        addParameter command "$createdAt" (createdAt.ToString("O"))
+        addParameter command "$userId" userId
+        addParameter command "$eventType" eventType
+        addParameter command "$connectionId" connectionId
+        addParameter command "$deviceId" (dbValue (bounded 256 deviceId))
+        addParameter command "$deviceName" (dbValue (bounded 256 deviceName))
+        addParameter command "$generation" (dbValue generation)
+        addParameter command "$clientVersion" (dbValue (bounded 128 clientVersion))
+        addParameter command "$protocolVersion" (dbValue (bounded 128 protocolVersion))
+        addParameter command "$durationMs" (dbValue durationMs)
+        addParameter command "$errorType" (dbValue (bounded 512 errorType))
+        addParameter command "$errorMessage" (dbValue (bounded 4000 errorMessage))
+        command.ExecuteNonQuery() |> ignore
+
+    member _.ListConnectionEvents(userId: string, limit: int) =
+        use connection = openConnection()
+        use command = connection.CreateCommand()
+        command.CommandText <-
+            """
+SELECT created_at, event_type, connection_id, device_id, device_name,
+       generation, client_version, protocol_version, duration_ms,
+       error_type, error_message
+FROM connection_events
+WHERE user_id = $userId
+ORDER BY created_at DESC
+LIMIT $limit;
+"""
+        addParameter command "$userId" userId
+        addParameter command "$limit" limit
+
+        use reader = command.ExecuteReader()
+        let results = ResizeArray<ConnectionEventEntry>()
+
+        while reader.Read() do
+            results.Add(
+                { CreatedAt = DateTimeOffset.Parse(reader.GetString 0)
+                  EventType = reader.GetString 1
+                  ConnectionId = reader.GetString 2
+                  DeviceId = optionText reader 3 |> textOrEmpty
+                  DeviceName = optionText reader 4 |> textOrEmpty
+                  Generation = if reader.IsDBNull 5 then Nullable() else Nullable(reader.GetInt64 5)
+                  ClientVersion = optionText reader 6 |> textOrEmpty
+                  ProtocolVersion = optionText reader 7 |> textOrEmpty
+                  DurationMs = if reader.IsDBNull 8 then Nullable() else Nullable(reader.GetInt64 8)
+                  ErrorType = optionText reader 9 |> textOrEmpty
+                  ErrorMessage = optionText reader 10 |> textOrEmpty }
+            )
+
+        results.ToArray()
 
     member _.BeginOperation(
         userId: string,

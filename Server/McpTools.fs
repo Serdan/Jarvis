@@ -81,6 +81,11 @@ module McpToolHelpers =
                     "GetFeedbackSummary"
                     "Summarizes persisted agent feedback."
                     [ ReadOnly ]
+                    false
+                serverLocalCapability
+                    "GetConnectionDiagnostics"
+                    "Returns the current Jarvis client session and recent persisted connection lifecycle events."
+                    [ ReadOnly ]
                     false ] }
 
     let private errorCategory = function
@@ -405,6 +410,47 @@ module McpToolHelpers =
                     |> jsonResult
         }
 
+    let getConnectionDiagnostics
+        (store: FeedbackStore)
+        (users: UserService)
+        (http: IHttpContextAccessor)
+        (limit: Nullable<int>)
+        =
+        task {
+            match authenticatedFeedbackContext http with
+            | Error result -> return result
+            | Ok(_, userId) ->
+                let requestedLimit = if limit.HasValue then limit.Value else 50
+                if requestedLimit < 1 || requestedLimit > 100 then
+                    return errorResult (ValidationFailed "limit must be between 1 and 100.")
+                else
+                    let currentSession =
+                        match users.GetSession userId with
+                        | ValueNone -> null
+                        | ValueSome session ->
+                            box
+                                {| state =
+                                    match session.State with
+                                    | Registered -> "Registered"
+                                    | Disconnected -> "Disconnected"
+                                   deviceId = session.DeviceId
+                                   deviceName = session.DeviceName
+                                   connectionId = session.ConnectionId |> Option.defaultValue ""
+                                   generation = session.Generation
+                                   protocolVersion = session.ProtocolVersion
+                                   clientVersion = session.ClientVersion
+                                   registeredAt = session.RegisteredAt
+                                   lastSeenAt = session.LastSeenAt
+                                   disconnectedAt = session.DisconnectedAt |> Option.map _.ToString("O") |> Option.defaultValue ""
+                                   lastFailure = session.LastFailure |> Option.defaultValue ""
+                                   registrationReason = session.RegistrationReason |}
+
+                    return
+                        {| currentSession = currentSession
+                           events = store.ListConnectionEvents(userId, requestedLimit) |}
+                        |> jsonResult
+        }
+
     let listMcpCommands (http: IHttpContextAccessor) =
         task {
             match authenticatedFeedbackContext http with
@@ -471,6 +517,15 @@ type JarvisMcpTools =
         http: IHttpContextAccessor
     ) =
         McpToolHelpers.feedbackSummary store http projectName toolName
+
+    [<McpServerTool(Title = "Get connection diagnostics", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Return the current Jarvis client session and recent persisted SignalR connection lifecycle events. Does not require the local client to be connected.")>]
+    static member GetConnectionDiagnostics(
+        [<Optional; DefaultParameterValue(50)>] limit: int,
+        store: FeedbackStore,
+        users: UserService,
+        http: IHttpContextAccessor
+    ) =
+        McpToolHelpers.getConnectionDiagnostics store users http (Nullable limit)
 
     [<McpServerTool(Title = "List commands", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("List the complete public Jarvis MCP command catalog, including server-local tools.")>]
     static member ListCommands(http: IHttpContextAccessor) =

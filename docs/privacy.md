@@ -60,15 +60,18 @@ The server keeps process-local, in-memory state required to route commands and d
 - the latest transport or dispatch failure;
 - pending command-response correlation state.
 
-The state is discarded when the server process is restarted unless hosting infrastructure independently records related operational logs.
+Most live routing state is discarded when the server process is restarted.
 
 In addition, the server persistently stores:
 
 - the coarse operation telemetry described above;
 - explicitly submitted agent feedback;
-- links between feedback and operations where applicable.
+- links between feedback and operations where applicable;
+- bounded SignalR connection lifecycle metadata for diagnostics, including connect/register/disconnect timestamps, connection/device identifiers, generation, client/protocol versions, connection duration, and disconnect exception type/message.
 
-The server does not automatically persist raw command payloads or project contents as part of this telemetry.
+Connection diagnostics are scoped to the authenticated user and are exposed through the read-only `GetConnectionDiagnostics` MCP tool so connection failures can be investigated after the local client reconnects.
+
+The server does not automatically persist raw command payloads, project contents, file paths, command arguments, stdout/stderr, or command results as part of this telemetry.
 
 ## Client-side state
 

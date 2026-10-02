@@ -24,20 +24,24 @@ let private serialize<'a> (value: 'a) =
 
 let private serialize'<'a> = Result.bind serialize<'a> >> ValueTask<_>
 
-let private toAgentResponse response =
+let private toAgentResponse command response =
     match response with
     | Error error ->
         { Result = None
           Error = Some(EffectError.toAgentError error) }
     | Ok (payload: string) ->
         let bytes = Encoding.UTF8.GetByteCount payload
+        let maxBytes =
+            match command with
+            | ReadImageCommand _ -> (AgentProtocol.maxImageBytes * 4 / 3) + (64 * 1024)
+            | _ -> AgentProtocol.maxResponseBytes
 
-        if bytes <= AgentProtocol.maxResponseBytes then
+        if bytes <= maxBytes then
             { Result = Some payload
               Error = None }
         else
             { Result = None
-              Error = Some(OutputTruncated $"Command response was {bytes} bytes and exceeds the safe SignalR response size of {AgentProtocol.maxResponseBytes} bytes. Narrow the request or read fewer files.") }
+              Error = Some(OutputTruncated $"Command response was {bytes} bytes and exceeds the safe response size of {maxBytes} bytes.") }
 
 let private unwrapProjectName (ProjectName name) = name
 let private unwrapContent (Content content) = content
@@ -100,6 +104,10 @@ let private dispatch rt command =
         rt
         |> ProjectBrowser.readFiles cmd
         |> Result.map (Seq.zip cmd.FilePaths >> Seq.map (fun (path, result) -> readFileResultToDto path result) >> Seq.toList)
+        |> serialize'
+    | ReadImageCommand cmd ->
+        rt
+        |> ProjectBrowser.readImage cmd
         |> serialize'
     | WriteFileCommand cmd -> rt |> ProjectBrowser.writeFile cmd |> serialize'
     | PatchFileCommand cmd ->
@@ -184,16 +192,21 @@ let receiveCommand (rt: Runtime) (command: AgentCommand) =
 
 let receiveCommandAndReply (connection: HubConnection) (rt: Runtime) (correlationId: string) (commandJson: string) : Task =
     task {
+        let mutable parsedCommand = None
         let! response =
             task {
                 try
                     let command = JsonSerializer.Deserialize<AgentCommand>(commandJson)
+                    parsedCommand <- Some command
                     return! receiveCommand rt command
                 with ex ->
                     return Error(ExceptionError ex)
             }
 
-        let agentResponse = toAgentResponse response
+        let agentResponse =
+            match parsedCommand with
+            | Some command -> toAgentResponse command response
+            | None -> toAgentResponse ListCommandsCommand response
         let! sendResult =
             ResponseDelivery.sendWithReconnectRetry
                 (TimeSpan.FromMinutes 2.0)

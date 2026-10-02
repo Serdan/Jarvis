@@ -11,6 +11,7 @@ let getFileName file (rt: #FileIO) = rt.File.getFileName file
 let getFiles path (rt: #FileIO) = rt.File.GetFiles path
 let getFileInfo file (rt: #FileIO) = rt.File.GetFileInfo file
 let readAllText file (rt: #FileIO) = rt.File.ReadAllText file
+let readAllBytes file (rt: #FileIO) = rt.File.ReadAllBytes file
 let readLines file startLine endLine (rt: #FileIO) = rt.File.ReadLines file startLine endLine
 let searchText file query maxResults (rt: #FileIO) = rt.File.SearchText file query maxResults
 let writeAllText filePath content (rt: #FileIO) = rt.File.WriteAllText filePath content

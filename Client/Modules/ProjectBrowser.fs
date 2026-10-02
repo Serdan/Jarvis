@@ -556,6 +556,35 @@ module private Core =
 
         parseProjectName projectName >>= readFiles filePaths
 
+    let readImage projectName filePath =
+        let detectMimeType (path: string) =
+            match Path.GetExtension(path).ToLowerInvariant() with
+            | ".png" -> Ok "image/png"
+            | ".jpg"
+            | ".jpeg" -> Ok "image/jpeg"
+            | ".webp" -> Ok "image/webp"
+            | extension ->
+                Error(Client.ValidationError $"Unsupported image type '{extension}'. Supported types are PNG, JPEG, and WebP.")
+
+        effect {
+            let! parsedProject = parseProjectName projectName
+            let! path = parseFilePath filePath parsedProject
+            let! info = FileIO.getFileInfo path
+
+            if info.Length > int64 AgentProtocol.maxImageBytes then
+                return!
+                    Client.ValidationError
+                        $"Image is {info.Length} bytes and exceeds the {AgentProtocol.maxImageBytes} byte limit."
+                    |> Effect.ofError
+            else
+                let! mimeType = fun _ -> detectMimeType filePath
+                let! data = FileIO.readAllBytes path
+                return
+                    { FilePath = filePath
+                      MimeType = mimeType
+                      Data = data }
+        }
+
     let private verifyExpectedHash expectedHash content =
         let actual = Hash.sha256 content
         match expectedHash with
@@ -654,6 +683,9 @@ let readFile (cmd: ReadFileCommand) : IO<'rt, Content> =
 
 let readFiles (cmd: ReadFilesCommand) : IO<'rt, Content' seq> =
     Core.readFiles cmd.ProjectName cmd.FilePaths
+
+let readImage (cmd: ReadImageCommand) : IO<'rt, ReadImageResult> =
+    Core.readImage cmd.ProjectName cmd.FilePath
 
 let writeFile (cmd: WriteFileCommand) : IO<'rt, unit> =
     Core.writeFile cmd.ProjectName cmd.FilePath cmd.Content cmd.FileWriteMode cmd.ExpectedHash cmd.CreateParents

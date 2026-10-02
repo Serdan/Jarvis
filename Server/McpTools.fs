@@ -112,6 +112,27 @@ module McpToolHelpers =
         | None, None ->
             errorResult (ExecutionFailed "Invalid Jarvis response: neither result nor error was set.")
 
+    let private imageResult (response: AgentCommandResponse) =
+        match response.Result, response.Error with
+        | Some serialized, None ->
+            try
+                let image = JsonSerializer.Deserialize<ReadImageResult>(serialized)
+                let result = CallToolResult()
+                result.Content <-
+                    ResizeArray<ContentBlock>(
+                        [ TextContentBlock(Text = image.FilePath) :> ContentBlock
+                          ImageContentBlock.FromBytes(image.Data, image.MimeType) :> ContentBlock ]
+                    )
+                result.IsError <- Nullable false
+                result
+            with ex ->
+                errorResult (ExecutionFailed $"Invalid serialized Jarvis image result: {ex.Message}")
+        | None, Some error -> errorResult error
+        | Some _, Some error ->
+            errorResult (ExecutionFailed $"Invalid Jarvis response: both result and error were set. {formatError error}")
+        | None, None ->
+            errorResult (ExecutionFailed "Invalid Jarvis response: neither result nor error was set.")
+
     let private requiredScope command =
         match command with
         | ListCommandsCommand
@@ -122,6 +143,7 @@ module McpToolHelpers =
         | SearchTextCommand _
         | ReadFileCommand _
         | ReadFilesCommand _
+        | ReadImageCommand _
         | ListProjectTasksCommand _
         | GetGitStatusCommand _
         | GetGitDiffCommand _
@@ -243,7 +265,9 @@ module McpToolHelpers =
                     finishOperation tracking response stopwatch.ElapsedMilliseconds
 
                     return
-                        toCallToolResult response
+                        (match command with
+                         | ReadImageCommand _ -> imageResult response
+                         | _ -> toCallToolResult response)
                         |> attachOperationId tracking
                 | Some _ ->
                     return authorizationErrorResult context scope
@@ -573,6 +597,10 @@ type JarvisMcpTools =
     [<McpServerTool(Title = "Read files", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read multiple project files.")>]
     static member ReadFiles(projectName: string, filePaths: string array, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (ReadFilesCommand { ProjectName = projectName; FilePaths = filePaths |> Array.toList })
+
+    [<McpServerTool(Title = "Read image", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read a PNG, JPEG, or WebP image from a project and return it as native MCP image content for model vision.")>]
+    static member ReadImage(projectName: string, filePath: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http (ReadImageCommand { ProjectName = projectName; FilePath = filePath })
 
     [<McpServerTool(Title = "Write file", ReadOnly = false, Destructive = true, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:write"]}]"""); Description("Write or append to a project file. Requires approval in the local Jarvis client.")>]
     static member WriteFile(projectName: string, filePath: string, content: string, fileWriteMode: string, expectedHash: string, createParents: Nullable<bool>, client: ClientService, http: IHttpContextAccessor) =

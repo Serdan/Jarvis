@@ -22,6 +22,7 @@ let fakeFileOperations =
             | "/fake/projects/Project1/todo.md" -> Ok(Content todoContent)
             | "/fake/projects/Project1/src/deep.md" -> Ok(Content "Nested Old Text")
             | _ -> Error(NotFoundError "File not found")
+      ReadAllBytes = fun _ -> Ok [||]
 
       ReadLines =
         fun (FilePath filePath) startLine endLine ->
@@ -147,7 +148,7 @@ let ``listCommands returns protocol 2 capabilities`` () =
 
     match result with
     | Ok commands ->
-        commands.ProtocolVersion |> shouldEqual "3.0"
+        commands.ProtocolVersion |> shouldEqual "3.1"
         let capability name =
             commands.Commands
             |> List.find (fun command -> command.Name = name)
@@ -161,6 +162,8 @@ let ``listCommands returns protocol 2 capabilities`` () =
         capability "StartJob" |> _.SupportsDryRun |> shouldEqual false
         capability "ReadFile" |> _.MaxOutputBytes |> shouldEqual (Some AgentProtocol.maxResponseBytes)
         capability "ReadFiles" |> _.MaxOutputBytes |> shouldEqual (Some AgentProtocol.maxResponseBytes)
+        capability "ReadImage" |> _.Permissions |> shouldEqual [ ReadOnly ]
+        capability "ReadImage" |> _.MaxOutputBytes |> shouldEqual (Some AgentProtocol.maxImageBytes)
     | Error e -> Assert.Fail($"Expected Ok, but got Error: {EffectError.toString e}")
 
 [<Test>]

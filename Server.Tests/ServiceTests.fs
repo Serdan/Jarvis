@@ -306,6 +306,23 @@ let ``MCP bridge preserves stable AgentError kinds`` () =
         let text = result.Content[0] :?> TextContentBlock
         text.Text |> shouldEqual $"{expectedKind}: {expectedMessage}"
 
+[<Test>]
+let mcp_image_content_serializes_data_as_base64 () =
+    let bytes = [| 0uy; 1uy; 2uy; 127uy; 128uy; 255uy |]
+    let result = CallToolResult()
+    result.Content <-
+        ResizeArray<ContentBlock>(
+            [ ImageContentBlock.FromBytes(bytes, "image/png") :> ContentBlock ]
+        )
+
+    let json = JsonSerializer.Serialize(result, global.ModelContextProtocol.McpJsonUtilities.DefaultOptions)
+    use document = JsonDocument.Parse(json)
+    let image = document.RootElement.GetProperty("content")[0]
+
+    image.GetProperty("type").GetString() |> shouldEqual "image"
+    image.GetProperty("mimeType").GetString() |> shouldEqual "image/png"
+    image.GetProperty("data").GetString() |> shouldEqual (Convert.ToBase64String bytes)
+
 
 [<Test>]
 let auth_issuer_normalizes_auth0_domain () =

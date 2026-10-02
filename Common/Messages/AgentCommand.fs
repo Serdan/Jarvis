@@ -100,6 +100,15 @@ type ReadFilesCommand =
     { ProjectName: string
       FilePaths: string list }
 
+type ReadImageCommand =
+    { ProjectName: string
+      FilePath: string }
+
+type ReadImageResult =
+    { FilePath: string
+      MimeType: string
+      Data: byte[] }
+
 type WriteFileCommand =
     { ProjectName: string
       FilePath: string
@@ -284,6 +293,7 @@ type AgentCommand =
     | SearchTextCommand of SearchTextCommand
     | ReadFileCommand of ReadFileCommand
     | ReadFilesCommand of ReadFilesCommand
+    | ReadImageCommand of ReadImageCommand
     | WriteFileCommand of WriteFileCommand
     | PatchFileCommand of PatchFileCommand
     | RunCommandCommand of RunCommandCommand
@@ -307,6 +317,7 @@ module AgentCommandInfo =
         | SearchTextCommand _ -> "SearchTextCommand"
         | ReadFileCommand _ -> "ReadFileCommand"
         | ReadFilesCommand _ -> "ReadFilesCommand"
+        | ReadImageCommand _ -> "ReadImageCommand"
         | WriteFileCommand _ -> "WriteFileCommand"
         | PatchFileCommand _ -> "PatchFileCommand"
         | RunCommandCommand _ -> "RunCommandCommand"
@@ -329,6 +340,7 @@ module AgentCommandInfo =
         | SearchTextCommand _ -> "SearchText"
         | ReadFileCommand _ -> "ReadFile"
         | ReadFilesCommand _ -> "ReadFiles"
+        | ReadImageCommand _ -> "ReadImage"
         | WriteFileCommand _ -> "WriteFile"
         | PatchFileCommand _ -> "PatchFile"
         | RunCommandCommand _ -> "RunCommand"
@@ -353,6 +365,7 @@ module AgentCommandInfo =
         | SearchTextCommand cmd -> Some cmd.ProjectName
         | ReadFileCommand cmd -> Some cmd.ProjectName
         | ReadFilesCommand cmd -> Some cmd.ProjectName
+        | ReadImageCommand cmd -> Some cmd.ProjectName
         | WriteFileCommand cmd -> Some cmd.ProjectName
         | PatchFileCommand cmd -> Some cmd.ProjectName
         | RunCommandCommand cmd -> Some cmd.ProjectName
@@ -405,6 +418,7 @@ module AgentCommandInfo =
         | SearchTextCommand cmd -> Some(sprintf "\"%s\"" (compact cmd.Query))
         | ReadFileCommand cmd -> Some(compact cmd.FilePath)
         | ReadFilesCommand cmd -> Some(String.concat ", " (cmd.FilePaths |> List.map compact))
+        | ReadImageCommand cmd -> Some(compact cmd.FilePath)
         | WriteFileCommand cmd -> Some(compact cmd.FilePath)
         | PatchFileCommand cmd -> Some(compact cmd.FilePath)
         | RunCommandCommand cmd -> Some(fullCommand cmd.Executable cmd.Args)
@@ -427,6 +441,7 @@ module AgentCommandInfo =
         | SearchTextCommand cmd -> Some(quoted cmd.Query)
         | ReadFileCommand cmd -> Some(truncate 64 cmd.FilePath)
         | ReadFilesCommand cmd -> Some $"{cmd.FilePaths.Length} files"
+        | ReadImageCommand cmd -> Some(truncate 64 cmd.FilePath)
         | WriteFileCommand cmd -> Some(truncate 64 cmd.FilePath)
         | PatchFileCommand cmd -> Some(truncate 64 cmd.FilePath)
         | RunCommandCommand cmd -> Some(commandPreview cmd.Executable cmd.Args)
@@ -474,9 +489,10 @@ module AgentCommandInfo =
         | None -> invocation command
 
 module AgentProtocol =
-    let version = "3.0"
+    let version = "3.1"
     let defaultPatchFuzzyContextLines = 3
     let maxResponseBytes = 900 * 1024
+    let maxImageBytes = 8 * 1024 * 1024
 
     let private definition name description permissions mutates requiresConfirmation supportsDryRun : CommandDefinition =
         { Name = name
@@ -495,6 +511,7 @@ module AgentProtocol =
           definition "SearchText" "Searches project file contents." [ ReadOnly ] false false false
           definition "ReadFile" "Reads one file." [ ReadOnly ] false false false
           definition "ReadFiles" "Reads multiple files." [ ReadOnly ] false false false
+          definition "ReadImage" "Reads one PNG, JPEG, or WebP image for model vision." [ ReadOnly ] false false false
           definition "WriteFile" "Writes or appends one file." [ WorkspaceWrite ] true true false
           definition "PatchFile" "Applies an atomic unified diff to one file." [ WorkspaceWrite ] true true true
           definition "RunCommand" "Runs a bounded local process." [ ProcessExecution ] true true false
@@ -516,7 +533,9 @@ module AgentProtocol =
           RequiresConfirmation = definition.RequiresConfirmation
           SupportsDryRun = definition.SupportsDryRun
           MaxInputBytes = None
-          MaxOutputBytes = Some maxResponseBytes
+          MaxOutputBytes =
+              if definition.Name = "ReadImage" then Some maxImageBytes
+              else Some maxResponseBytes
           InputSchemaJson = None
           OutputSchemaJson = None }
 

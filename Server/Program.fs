@@ -114,7 +114,7 @@ let configureServices (services: IServiceCollection) (configuration: IConfigurat
             options.EnableDetailedErrors <- true
             options.ClientTimeoutInterval <- TimeSpan.FromSeconds 60.0
             options.KeepAliveInterval <- TimeSpan.FromSeconds 10.0
-            options.MaximumReceiveMessageSize <- Nullable<int64>(1024L * 1024L))
+            options.MaximumReceiveMessageSize <- Nullable<int64>(12L * 1024L * 1024L))
     |> ignore
 
     services

@@ -16,6 +16,12 @@ let readAllText (FilePath filePath) =
     with e ->
         e |> ExceptionError |> Error
 
+let readAllBytes (FilePath filePath) =
+    try
+        File.ReadAllBytes(filePath) |> Ok
+    with e ->
+        e |> ExceptionError |> Error
+
 let readLines (FilePath filePath) startLine endLine =
     try
         File.ReadLines(filePath)
@@ -137,6 +143,7 @@ let getFileName (FilePath filePath) = Path.GetFileName filePath
 let impl =
     { getFullPath = getFullPath
       ReadAllText = readAllText
+      ReadAllBytes = readAllBytes
       ReadLines = readLines
       SearchText = searchText
       WriteAllText = writeAllText

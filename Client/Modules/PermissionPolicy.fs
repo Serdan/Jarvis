@@ -112,6 +112,7 @@ let private requiresConfirmation command =
     | SearchTextCommand _
     | ReadFileCommand _
     | ReadFilesCommand _
+    | ReadImageCommand _
     | ListProjectTasksCommand _
     | GetGitStatusCommand _
     | GetGitDiffCommand _

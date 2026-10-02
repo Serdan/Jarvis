@@ -457,3 +457,29 @@ let ``partial trust confirms project task execution`` () =
         request.CommandName |> shouldEqual "RunProjectTask"
         request.Permissions |> shouldEqual [ ProcessExecution ]
     | other -> Assert.Fail($"Expected ConfirmationRequired, got {other}")
+
+[<Test>]
+let create_skill_requires_workspace_write_confirmation () =
+    let command =
+        CreateSkillCommand
+            { ProjectName = "Project1"
+              SkillName = "release"
+              Content = "# Release"
+              Overwrite = false }
+
+    match evaluate command with
+    | Error(Client.ConfirmationRequired request) ->
+        request.CommandName |> shouldEqual "CreateSkill"
+        request.Permissions |> shouldEqual [ WorkspaceWrite ]
+        request.Paths |> shouldEqual [ ".jarvis/skills/release/SKILL.md" ]
+    | other -> Assert.Fail($"Expected ConfirmationRequired, got {other}")
+
+[<Test>]
+let partial_trust_allows_create_skill () =
+    CreateSkillCommand
+        { ProjectName = "Project1"
+          SkillName = "release"
+          Content = "# Release"
+          Overwrite = false }
+    |> evaluateWithTrust PartialTrust
+    |> shouldEqual (Ok())

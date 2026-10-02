@@ -199,6 +199,18 @@ type GetSkillResult =
     { Name: string
       Content: string }
 
+type CreateSkillCommand =
+    { ProjectName: string
+      SkillName: string
+      Content: string
+      Overwrite: bool }
+
+type CreateSkillResult =
+    { Name: string
+      Path: string
+      Hash: string
+      Overwritten: bool }
+
 type RunCommandResult =
     { ExitCode: int
       TimedOut: bool
@@ -339,6 +351,7 @@ type AgentCommand =
     | RunProjectTaskCommand of RunProjectTaskCommand
     | ListSkillsCommand of ListSkillsCommand
     | GetSkillCommand of GetSkillCommand
+    | CreateSkillCommand of CreateSkillCommand
     | GetGitStatusCommand of GitStatusCommand
     | GetGitDiffCommand of GitDiffCommand
     | GitCommitCommand of GitCommitCommand
@@ -366,6 +379,7 @@ module AgentCommandInfo =
         | RunProjectTaskCommand _ -> "RunProjectTaskCommand"
         | ListSkillsCommand _ -> "ListSkillsCommand"
         | GetSkillCommand _ -> "GetSkillCommand"
+        | CreateSkillCommand _ -> "CreateSkillCommand"
         | GetGitStatusCommand _ -> "GetGitStatusCommand"
         | GetGitDiffCommand _ -> "GetGitDiffCommand"
         | GitCommitCommand _ -> "GitCommitCommand"
@@ -392,6 +406,7 @@ module AgentCommandInfo =
         | RunProjectTaskCommand _ -> "RunTask"
         | ListSkillsCommand _ -> "ListSkills"
         | GetSkillCommand _ -> "GetSkill"
+        | CreateSkillCommand _ -> "CreateSkill"
         | GetGitStatusCommand _ -> "GitStatus"
         | GetGitDiffCommand _ -> "GitDiff"
         | GitCommitCommand _ -> "GitCommit"
@@ -421,6 +436,7 @@ module AgentCommandInfo =
         | RunProjectTaskCommand cmd -> Some cmd.ProjectName
         | ListSkillsCommand cmd -> Some cmd.ProjectName
         | GetSkillCommand cmd -> Some cmd.ProjectName
+        | CreateSkillCommand cmd -> Some cmd.ProjectName
         | GetGitStatusCommand cmd -> Some cmd.ProjectName
         | GetGitDiffCommand cmd -> Some cmd.ProjectName
         | GitCommitCommand cmd -> Some cmd.ProjectName
@@ -474,6 +490,7 @@ module AgentCommandInfo =
         | RunCommandCommand cmd -> Some(fullCommand cmd.Executable cmd.Args)
         | RunProjectTaskCommand cmd -> Some(compact cmd.TaskName)
         | GetSkillCommand cmd -> Some(compact cmd.SkillName)
+        | CreateSkillCommand cmd -> Some(compact cmd.SkillName)
         | ListSkillsCommand _ -> None
         | GetGitDiffCommand cmd -> cmd.Path |> Option.map compact
         | GitCommitCommand cmd -> Some(compact cmd.Message)
@@ -500,6 +517,7 @@ module AgentCommandInfo =
         | RunCommandCommand cmd -> Some(commandPreview cmd.Executable cmd.Args)
         | RunProjectTaskCommand cmd -> Some(truncate 48 cmd.TaskName)
         | GetSkillCommand cmd -> Some(truncate 48 cmd.SkillName)
+        | CreateSkillCommand cmd -> Some(truncate 48 cmd.SkillName)
         | ListSkillsCommand _ -> None
         | GetGitDiffCommand cmd -> cmd.Path |> Option.map (truncate 64)
         | GitCommitCommand cmd -> Some(quoted cmd.Message)
@@ -545,7 +563,7 @@ module AgentCommandInfo =
         | None -> invocation command
 
 module AgentProtocol =
-    let version = "3.3"
+    let version = "3.4"
     let defaultPatchFuzzyContextLines = 3
     let maxResponseBytes = 900 * 1024
     let maxImageBytes = 8 * 1024 * 1024
@@ -575,6 +593,7 @@ module AgentProtocol =
           definition "RunProjectTask" "Runs a locally configured project task." [ ProcessExecution ] true true false
           definition "ListSkills" "Lists project-local Jarvis skills." [ ReadOnly ] false false false
           definition "GetSkill" "Reads a project-local Jarvis skill." [ ReadOnly ] false false false
+          definition "CreateSkill" "Creates a project-local Jarvis skill." [ WorkspaceWrite ] true true false
           definition "GetGitStatus" "Reads git status." [ ReadOnly ] false false false
           definition "GetGitDiff" "Reads git diff." [ ReadOnly ] false false false
           definition "GitCommit" "Creates a local git commit." [ VersionControlWrite ] true true false

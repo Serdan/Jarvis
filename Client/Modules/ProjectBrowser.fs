@@ -423,6 +423,38 @@ module private Core =
                             { Name = validated
                               Content = content }
 
+    let createSkill projectName skillName content overwrite =
+        effect {
+            let! validated = fun _ -> validateSkillName skillName
+
+            if String.IsNullOrWhiteSpace content then
+                return! Client.ValidationError "Skill content cannot be empty." |> Effect.ofError
+            else
+                let! parsedProject = parseProjectName projectName
+
+                let! overwritten =
+                    fun rt ->
+                        match readSkillContent parsedProject validated rt with
+                        | Ok _ when not overwrite ->
+                            Error(Client.ValidationError $"Skill '{validated}' already exists. Set overwrite=true to replace it.")
+                        | Ok _ -> Ok true
+                        | Error(NotFoundError _) -> Ok false
+                        | Error error -> Error error
+
+                let relativePath = skillPath validated "SKILL.md"
+                let! path = resolveWritableFilePath relativePath parsedProject
+                let (FilePath fullPath) = path
+                let parent = Path.GetDirectoryName(fullPath)
+                do! FileIO.createDirectory (FolderPath parent)
+                do! FileIO.writeAllText path (Content content)
+
+                return
+                    { Name = validated
+                      Path = relativePath.Replace('\\', '/')
+                      Hash = Hash.sha256 content
+                      Overwritten = overwritten }
+        }
+
     let listProjectDirectory projectName folderPath =
         projectName |> parseProjectName >>= getItems folderPath
 
@@ -769,6 +801,9 @@ let listSkills (cmd: ListSkillsCommand) : IO<'rt, ListSkillsResult> =
 
 let getSkill (cmd: GetSkillCommand) : IO<'rt, GetSkillResult> =
     Core.getSkill cmd.ProjectName cmd.SkillName
+
+let createSkill (cmd: CreateSkillCommand) : IO<'rt, CreateSkillResult> =
+    Core.createSkill cmd.ProjectName cmd.SkillName cmd.Content cmd.Overwrite
 
 let listDirectory (cmd: ListDirectoryCommand) : IO<'rt, ProjectItemKind list> =
     Core.listProjectDirectory cmd.ProjectName cmd.FolderPath

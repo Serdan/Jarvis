@@ -63,6 +63,7 @@ let private auditDetails command =
     | PatchFileCommand cmd -> Some("PatchFile", Some cmd.ProjectName, [ WorkspaceWrite ], [ cmd.FilePath ], None, [])
     | RunCommandCommand cmd -> Some("RunCommand", Some cmd.ProjectName, [ ProcessExecution ], [], Some cmd.Executable, cmd.Args)
     | RunProjectTaskCommand cmd -> Some("RunProjectTask", Some cmd.ProjectName, [ ProcessExecution ], [], None, [ cmd.TaskName ])
+    | CreateSkillCommand cmd -> Some("CreateSkill", Some cmd.ProjectName, [ WorkspaceWrite ], [ $".jarvis/skills/{cmd.SkillName}/SKILL.md" ], None, [])
     | GitCommitCommand cmd -> Some("GitCommit", Some cmd.ProjectName, [ VersionControlWrite ], cmd.Paths, Some "git", [ cmd.Message ])
     | StartJobCommand cmd -> Some("StartJob", Some cmd.ProjectName, [ ProcessExecution ], [], Some cmd.Executable, cmd.Args)
     | CancelJobCommand cmd -> Some("CancelJob", None, [ ProcessExecution ], [], None, [ cmd.JobId ])
@@ -123,6 +124,7 @@ let private dispatch (rt: Runtime) (command: AgentCommand) =
         |> serialize'
     | ListSkillsCommand cmd -> rt |> ProjectBrowser.listSkills cmd |> serialize'
     | GetSkillCommand cmd -> rt |> ProjectBrowser.getSkill cmd |> serialize'
+    | CreateSkillCommand cmd -> rt |> ProjectBrowser.createSkill cmd |> serialize'
     | GetGitStatusCommand cmd -> rt |> ClientShell.getGitStatus cmd |> serialize'
     | GetGitDiffCommand cmd -> rt |> ClientShell.getGitDiff cmd |> serialize'
     | GitCommitCommand cmd -> rt |> ClientShell.gitCommit cmd |> serialize'

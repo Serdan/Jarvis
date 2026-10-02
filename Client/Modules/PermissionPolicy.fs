@@ -125,6 +125,8 @@ let private requiresConfirmation command =
         confirmation "WriteFile" (Some cmd.ProjectName) [ WorkspaceWrite ] [ cmd.FilePath ] None [] $"Write file {cmd.FilePath}" true
     | PatchFileCommand cmd ->
         confirmation "PatchFile" (Some cmd.ProjectName) [ WorkspaceWrite ] [ cmd.FilePath ] None [] $"Patch file {cmd.FilePath}" true
+    | CreateSkillCommand cmd ->
+        confirmation "CreateSkill" (Some cmd.ProjectName) [ WorkspaceWrite ] [ $".jarvis/skills/{cmd.SkillName}/SKILL.md" ] None [] $"Create skill {cmd.SkillName}" false
     | RunCommandCommand cmd ->
         confirmation "RunCommand" (Some cmd.ProjectName) [ ProcessExecution ] [] (Some cmd.Executable) cmd.Args $"Run {cmd.Executable}" true
     | RunProjectTaskCommand cmd ->

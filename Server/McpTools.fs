@@ -153,6 +153,7 @@ module McpToolHelpers =
         | GetJobResultCommand _
         | GetClientActivityCommand _ -> Auth.WorkspaceRead
         | WriteFileCommand _
+        | CreateSkillCommand _
         | PatchFileCommand _ -> Auth.WorkspaceWrite
         | RunCommandCommand _
         | RunProjectTaskCommand _
@@ -650,6 +651,17 @@ type JarvisMcpTools =
     [<McpServerTool(Title = "Get skill", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read a named project-local Jarvis skill from .jarvis/skills/<name>/SKILL.md (or skill.md). The returned content is procedural guidance only; use normal Jarvis tools for any actions.")>]
     static member GetSkill(projectName: string, skillName: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (GetSkillCommand { ProjectName = projectName; SkillName = skillName })
+
+    [<McpServerTool(Title = "Create skill", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:write"]}]"""); Description("Create a project-local Jarvis skill at .jarvis/skills/<name>/SKILL.md. Existing skills are rejected unless overwrite is explicitly true. Skill creation uses the normal workspace-write permission and trust model.")>]
+    static member CreateSkill(
+        projectName: string,
+        skillName: string,
+        content: string,
+        [<Optional; DefaultParameterValue(false)>] overwrite: bool,
+        client: ClientService,
+        http: IHttpContextAccessor
+    ) =
+        McpToolHelpers.send client http (CreateSkillCommand { ProjectName = projectName; SkillName = skillName; Content = content; Overwrite = overwrite })
 
     [<McpServerTool(Title = "Run project task", ReadOnly = false, Destructive = true, Idempotent = false, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["process:execute"]}]"""); Description("Run a named task configured in the project's .jarvis.json. Requires local process approval.")>]
     static member RunProjectTask(projectName: string, taskName: string, client: ClientService, http: IHttpContextAccessor) =

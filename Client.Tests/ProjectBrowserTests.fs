@@ -160,6 +160,7 @@ let ``listCommands returns current protocol capabilities`` () =
         capability "RunProjectTask" |> _.Permissions |> shouldEqual [ ProcessExecution ]
         capability "ListSkills" |> _.Permissions |> shouldEqual [ ReadOnly ]
         capability "GetSkill" |> _.Permissions |> shouldEqual [ ReadOnly ]
+        capability "CreateSkill" |> _.Permissions |> shouldEqual [ WorkspaceWrite ]
         capability "GetClientActivity" |> _.Permissions |> shouldEqual [ ReadOnly ]
         capability "GitCommit" |> _.SupportsDryRun |> shouldEqual false
         capability "StartJob" |> _.SupportsDryRun |> shouldEqual false

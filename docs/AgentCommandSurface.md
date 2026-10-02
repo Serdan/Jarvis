@@ -518,6 +518,37 @@ type CancelJobCommand =
 
 Cancellation should first attempt graceful termination and then force-kill after an implementation-defined timeout.
 
+### `GetClientActivity`
+
+Reads the connected client's recent in-memory activity history so a new agent session can reconstruct what the local client was doing before a previous ChatGPT session stalled.
+
+```fsharp
+type GetClientActivityCommand =
+    { ProjectName: string option
+      Limit: int option }
+```
+
+The MCP tool exposes `projectName` as an optional filter and defaults `limit` to 20, bounded to 1–100 entries. Project matching is case-insensitive and exact.
+
+Each returned activity entry includes:
+
+- absolute start time and current age;
+- optional project and command name;
+- the compact activity message;
+- full command reason/detail when available;
+- current status;
+- completed duration and result summary when available;
+- retained full failure detail when available.
+
+The activity snapshot is intentionally ephemeral:
+
+- it is read directly from the connected client's existing in-memory history;
+- it is not persisted in server telemetry;
+- requesting `GetClientActivity` does not add another activity row to the client history;
+- it does not add raw stdout/stderr to the activity history.
+
+This complements `GetConnectionDiagnostics`: diagnostics answer whether the client transport is connected or reconnecting, while `GetClientActivity` shows whether the last local operation was running, awaiting permission, completed, or failed.
+
 ## Permission Model
 
 Jarvis permissions should be explicit, inspectable through `ListCommands`, and enforced by both the server and the local client. The model should describe what a command is allowed to do before the command is executed.
@@ -839,7 +870,7 @@ The OAuth scopes are `workspace:read`, `workspace:write`, `process:execute`, and
 
 ### Protocol Version
 
-The current command protocol version is `3.0`. Version 3 removes copied session keys and changes registration/routing to authenticated user and device identity. Backward compatibility with the old Actions/API-key surface is intentionally not maintained.
+The current command protocol version is `3.2`. Version 3 removes copied session keys and changes registration/routing to authenticated user and device identity. Backward compatibility with the old Actions/API-key surface is intentionally not maintained.
 
 ### Error Model
 

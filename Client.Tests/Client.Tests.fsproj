@@ -15,6 +15,7 @@
         <Compile Include="ActivityFilterTests.fs"/>
         <Compile Include="ActivityExportTests.fs"/>
         <Compile Include="ClipboardTests.fs"/>
+        <Compile Include="ClientActivityTests.fs"/>
         <Compile Include="ProjectColorAssignmentsTests.fs"/>
         <Compile Include="ActivityNavigationTests.fs"/>
         <Compile Include="ProjectBrowserTests.fs"/>

@@ -93,6 +93,15 @@ The receive timestamp remains fixed when the row is updated.
   - Use platform clipboard helpers: `clip.exe` on Windows, `pbcopy` on macOS, KDE Klipper over `qdbus6` first on Linux, then `wl-copy`/X11 fallbacks.
   - Report clipboard success or failure as client activity without counting that report as a command.
 
+- [x] **12. Expose recent activity to fresh agent sessions.**
+  - Add read-only `GetClientActivity` to the local protocol and public MCP surface.
+  - Read directly from the connected client's in-memory 500-entry activity history; do not persist detailed activity on the server.
+  - Default to 20 entries and bound requests to 1–100.
+  - Support optional case-insensitive exact project filtering.
+  - Return absolute start time, age, command/reason/detail, status, duration/result, and retained failure detail.
+  - Do not log the inspection command itself as client activity.
+  - Use `GetConnectionDiagnostics` separately when the client is disconnected or reconnecting.
+
 ## Design constraints
 
 - Keep one command per activity row.
@@ -104,6 +113,6 @@ The receive timestamp remains fixed when the row is updated.
 ## Verification
 
 - `dotnet build Jarvis.slnx --no-restore`: 0 warnings, 0 errors.
-- Client tests: 135/135 passed.
-- Server tests: 26/26 passed.
+- Client tests: 138/138 passed.
+- Server tests: 28/28 passed.
 - Linux x64 client published with the production server URL and installed into the ignored `artifacts/client/linux-x64` launch location.

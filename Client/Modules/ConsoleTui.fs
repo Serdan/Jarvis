@@ -22,6 +22,7 @@ type private ActivityStatus =
 
 type private ActivityEntry =
     { Id: int
+      StartedAt: DateTimeOffset
       Timestamp: string
       ProjectName: string option
       Message: string
@@ -188,9 +189,11 @@ type ConsoleTui() =
             not showActivityDetails
             && activityScrollOffset = 0
             && (selectedActivityId.IsNone || selectedActivityId = previousLastId)
+        let startedAt = DateTimeOffset.Now
         let entry =
             { Id = nextActivityId
-              Timestamp = DateTimeOffset.Now.ToString("HH:mm:ss")
+              StartedAt = startedAt
+              Timestamp = startedAt.ToString("HH:mm:ss")
               ProjectName = projectName
               Message = message
               Command = command
@@ -633,6 +636,47 @@ type ConsoleTui() =
                 entry.Status <- Failed(durationMs, shortError)
                 entry.FailureDetail <- Some fullError)
             renderUnsafe())
+
+    member _.GetActivitySnapshot(projectName: string option, limit: int option) =
+        lock syncRoot (fun () ->
+            let now = DateTimeOffset.Now
+            let count = limit |> Option.defaultValue 20 |> max 1 |> min 100
+            let projectMatches (entry: ActivityEntry) =
+                match projectName with
+                | None -> true
+                | Some expected ->
+                    entry.ProjectName
+                    |> Option.exists (fun actual -> String.Equals(actual, expected, StringComparison.OrdinalIgnoreCase))
+
+            let entries =
+                activity
+                |> Seq.filter projectMatches
+                |> Seq.rev
+                |> Seq.truncate count
+                |> Seq.rev
+                |> Seq.map (fun entry ->
+                    let commandName, reason, detail =
+                        match entry.Command with
+                        | None -> None, None, None
+                        | Some command ->
+                            Some(AgentCommandInfo.displayName command),
+                            AgentCommandInfo.fullReason command,
+                            AgentCommandInfo.fullDetail command
+
+                    { StartedAt = entry.StartedAt
+                      AgeMs = max 0L (int64 (now - entry.StartedAt).TotalMilliseconds)
+                      ProjectName = entry.ProjectName
+                      CommandName = commandName
+                      Message = entry.Message
+                      Reason = reason
+                      Detail = detail
+                      Status = statusName entry.Status
+                      DurationMs = statusDuration entry.Status
+                      Result = statusOutcome entry.Status
+                      Error = entry.FailureDetail })
+                |> Seq.toList
+
+            { Entries = entries })
 
     member _.PromptPermission command request =
         let tcs = TaskCompletionSource<PermissionApproval>(TaskCreationOptions.RunContinuationsAsynchronously)

@@ -117,7 +117,8 @@ let private requiresConfirmation command =
     | GetGitStatusCommand _
     | GetGitDiffCommand _
     | ListJobsCommand _
-    | GetJobResultCommand _ -> readOnly
+    | GetJobResultCommand _
+    | GetClientActivityCommand _ -> readOnly
     | WriteFileCommand cmd ->
         confirmation "WriteFile" (Some cmd.ProjectName) [ WorkspaceWrite ] [ cmd.FilePath ] None [] $"Write file {cmd.FilePath}" true
     | PatchFileCommand cmd ->

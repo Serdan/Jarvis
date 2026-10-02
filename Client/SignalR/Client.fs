@@ -79,7 +79,7 @@ let private audit command response =
 
         AuditLog.recordCommand commandName projectName permissions paths executable args summary
 
-let private dispatch rt command =
+let private dispatch (rt: Runtime) (command: AgentCommand) =
     match command with
     | ListCommandsCommand -> rt |> ProjectBrowser.listCommands |> serialize'
     | ListProjectsCommand ->
@@ -128,10 +128,17 @@ let private dispatch rt command =
     | ListJobsCommand cmd -> rt |> JobManager.listJobs cmd |> serialize'
     | GetJobResultCommand cmd -> rt |> JobManager.getJobResult cmd |> serialize'
     | CancelJobCommand cmd -> rt |> JobManager.cancelJob cmd |> serialize'
+    | GetClientActivityCommand cmd ->
+        rt.Tui.GetActivitySnapshot(cmd.ProjectName, cmd.Limit)
+        |> Ok
+        |> serialize'
 
 let receiveCommand (rt: Runtime) (command: AgentCommand) =
     task {
-        let activityId = rt.Tui.StartActivity(command)
+        let activityId =
+            match command with
+            | GetClientActivityCommand _ -> None
+            | _ -> Some(rt.Tui.StartActivity(command))
         let stopwatch = Stopwatch.StartNew()
 
         let permission = rt :> PermissionIO
@@ -156,9 +163,11 @@ let receiveCommand (rt: Runtime) (command: AgentCommand) =
                 | Ok(authorizationCommand, resolvedTask) ->
                     let promptWithActivityState promptCommand request =
                         task {
-                            rt.Tui.MarkActivityAwaitingPermission activityId
+                            activityId
+                            |> Option.iter rt.Tui.MarkActivityAwaitingPermission
                             let! approval = permission.PromptPermission promptCommand request
-                            rt.Tui.MarkActivityRunning activityId
+                            activityId
+                            |> Option.iter rt.Tui.MarkActivityRunning
                             return approval
                         }
 
@@ -181,9 +190,13 @@ let receiveCommand (rt: Runtime) (command: AgentCommand) =
         match response with
         | Ok payload ->
             let outcome = ActivityPresentation.tryResultSummary command payload
-            rt.Tui.CompleteActivity(activityId, stopwatch.ElapsedMilliseconds, outcome)
+            activityId
+            |> Option.iter (fun id ->
+                rt.Tui.CompleteActivity(id, stopwatch.ElapsedMilliseconds, outcome))
         | Error err ->
-            rt.Tui.FailActivity(activityId, stopwatch.ElapsedMilliseconds, ActivityPresentation.shortError err, ActivityPresentation.fullError err)
+            activityId
+            |> Option.iter (fun id ->
+                rt.Tui.FailActivity(id, stopwatch.ElapsedMilliseconds, ActivityPresentation.shortError err, ActivityPresentation.fullError err))
 
         audit command response
 

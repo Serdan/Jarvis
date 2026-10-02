@@ -148,7 +148,8 @@ module McpToolHelpers =
         | GetGitStatusCommand _
         | GetGitDiffCommand _
         | ListJobsCommand _
-        | GetJobResultCommand _ -> Auth.WorkspaceRead
+        | GetJobResultCommand _
+        | GetClientActivityCommand _ -> Auth.WorkspaceRead
         | WriteFileCommand _
         | PatchFileCommand _ -> Auth.WorkspaceWrite
         | RunCommandCommand _
@@ -688,3 +689,19 @@ type JarvisMcpTools =
     [<McpServerTool(Title = "Cancel job", ReadOnly = false, Destructive = true, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["process:execute"]}]"""); Description("Cancel a running Jarvis job. Requires approval in the local Jarvis client.")>]
     static member CancelJob(jobId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (CancelJobCommand { JobId = jobId })
+
+    [<McpServerTool(Title = "Get client activity", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read recent in-memory activity from the connected Jarvis client. Use this to reconstruct what the client was doing when a previous ChatGPT session stalled. Optionally filter by project.")>]
+    static member GetClientActivity(
+        [<Optional; DefaultParameterValue("")>] projectName: string,
+        [<Optional; DefaultParameterValue(20)>] limit: int,
+        client: ClientService,
+        http: IHttpContextAccessor
+    ) =
+        let boundedLimit =
+            limit
+            |> max 1
+            |> min 100
+
+        McpToolHelpers.send client http (GetClientActivityCommand {
+            ProjectName = McpToolHelpers.optionOfString projectName
+            Limit = Some boundedLimit })

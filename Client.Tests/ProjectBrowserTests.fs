@@ -143,12 +143,12 @@ type FakeContext() =
 let fakeContext = FakeContext()
 
 [<Test>]
-let ``listCommands returns protocol 2 capabilities`` () =
+let ``listCommands returns current protocol capabilities`` () =
     let result = listCommands fakeContext
 
     match result with
     | Ok commands ->
-        commands.ProtocolVersion |> shouldEqual "3.1"
+        commands.ProtocolVersion |> shouldEqual AgentProtocol.version
         let capability name =
             commands.Commands
             |> List.find (fun command -> command.Name = name)
@@ -158,6 +158,7 @@ let ``listCommands returns protocol 2 capabilities`` () =
         capability "RunCommand" |> _.SupportsDryRun |> shouldEqual false
         capability "ListProjectTasks" |> _.Permissions |> shouldEqual [ ReadOnly ]
         capability "RunProjectTask" |> _.Permissions |> shouldEqual [ ProcessExecution ]
+        capability "GetClientActivity" |> _.Permissions |> shouldEqual [ ReadOnly ]
         capability "GitCommit" |> _.SupportsDryRun |> shouldEqual false
         capability "StartJob" |> _.SupportsDryRun |> shouldEqual false
         capability "ReadFile" |> _.MaxOutputBytes |> shouldEqual (Some AgentProtocol.maxResponseBytes)

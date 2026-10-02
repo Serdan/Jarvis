@@ -145,6 +145,8 @@ module McpToolHelpers =
         | ReadFilesCommand _
         | ReadImageCommand _
         | ListProjectTasksCommand _
+        | ListSkillsCommand _
+        | GetSkillCommand _
         | GetGitStatusCommand _
         | GetGitDiffCommand _
         | ListJobsCommand _
@@ -640,6 +642,14 @@ type JarvisMcpTools =
     [<McpServerTool(Title = "List project tasks", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("List locally configured project tasks from .jarvis.json.")>]
     static member ListProjectTasks(projectName: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (ListProjectTasksCommand { ProjectName = projectName })
+
+    [<McpServerTool(Title = "List skills", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("List project-local Jarvis skills from .jarvis/skills. Skills provide procedural instructions and do not grant execution privileges.")>]
+    static member ListSkills(projectName: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http (ListSkillsCommand { ProjectName = projectName })
+
+    [<McpServerTool(Title = "Get skill", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read a named project-local Jarvis skill from .jarvis/skills/<name>/SKILL.md (or skill.md). The returned content is procedural guidance only; use normal Jarvis tools for any actions.")>]
+    static member GetSkill(projectName: string, skillName: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http (GetSkillCommand { ProjectName = projectName; SkillName = skillName })
 
     [<McpServerTool(Title = "Run project task", ReadOnly = false, Destructive = true, Idempotent = false, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["process:execute"]}]"""); Description("Run a named task configured in the project's .jarvis.json. Requires local process approval.")>]
     static member RunProjectTask(projectName: string, taskName: string, client: ClientService, http: IHttpContextAccessor) =

@@ -328,6 +328,101 @@ module private Core =
 
         projectName |> parseProjectName >>= parseFolderPath "" >>= projectFilesInfo
 
+    let private validateSkillName (skillName: string) =
+        if String.IsNullOrWhiteSpace skillName then
+            Error(Client.ValidationError "Skill name cannot be empty.")
+        elif skillName = "." || skillName = ".." then
+            Error(Client.ValidationError "Skill name is invalid.")
+        elif skillName.Contains('/') || skillName.Contains('\\') then
+            Error(Client.ValidationError "Skill name must be a single directory name.")
+        else
+            Ok(skillName.Trim())
+
+    let private skillPath skillName fileName =
+        Path.Combine(".jarvis", "skills", skillName, fileName)
+
+    let private readSkillContent parsedProject skillName =
+        fun rt ->
+            let rec tryCandidates candidates =
+                match candidates with
+                | [] ->
+                    Error(NotFoundError $"Skill '{skillName}' does not contain SKILL.md or skill.md.")
+                | relativePath :: rest ->
+                    match parseFilePath relativePath parsedProject rt with
+                    | Error(NotFoundError _) -> tryCandidates rest
+                    | Error error -> Error error
+                    | Ok filePath ->
+                        match FileIO.readAllText filePath rt with
+                        | Ok content -> Ok content
+                        | Error(NotFoundError _) -> tryCandidates rest
+                        | Error error -> Error error
+
+            tryCandidates
+                [ skillPath skillName "SKILL.md"
+                  skillPath skillName "skill.md" ]
+
+    let private skillDescription (Content content) =
+        content.Replace("\r\n", "\n").Split('\n')
+        |> Seq.map (fun line -> line.Trim())
+        |> Seq.filter (String.IsNullOrWhiteSpace >> not)
+        |> Seq.tryFind (fun line ->
+            not (line.StartsWith("#", StringComparison.Ordinal))
+            && line <> "---")
+        |> Option.map (fun line ->
+            if line.Length <= 240 then line
+            else line.Substring(0, 239) + "…")
+
+    let listSkills projectName =
+        fun rt ->
+            match parseProjectName projectName rt with
+            | Error error -> Error error
+            | Ok parsedProject ->
+                let skillsPath = Path.Combine(".jarvis", "skills")
+
+                match parseFolderPath skillsPath parsedProject rt with
+                | Error(NotFoundError _) -> Ok { Skills = [] }
+                | Error error -> Error error
+                | Ok skillsFolder ->
+                    match FileIO.getChildFolders skillsFolder rt with
+                    | Error(NotFoundError _) -> Ok { Skills = [] }
+                    | Error error -> Error error
+                    | Ok folders ->
+                        let skills =
+                            folders
+                            |> Seq.choose (fun folder ->
+                                let name = FileIO.getFolderName folder rt
+
+                                match validateSkillName name with
+                                | Error _ -> None
+                                | Ok validated ->
+                                    match readSkillContent parsedProject validated rt with
+                                    | Ok content ->
+                                        Some
+                                            { Name = validated
+                                              Description = skillDescription content }
+                                    | Error(NotFoundError _) -> None
+                                    | Error _ -> None)
+                            |> Seq.sortWith (fun left right ->
+                                StringComparer.OrdinalIgnoreCase.Compare(left.Name, right.Name))
+                            |> Seq.toList
+
+                        Ok { Skills = skills }
+
+    let getSkill projectName skillName =
+        fun rt ->
+            match validateSkillName skillName with
+            | Error error -> Error error
+            | Ok validated ->
+                match parseProjectName projectName rt with
+                | Error error -> Error error
+                | Ok parsedProject ->
+                    match readSkillContent parsedProject validated rt with
+                    | Error error -> Error error
+                    | Ok(Content content) ->
+                        Ok
+                            { Name = validated
+                              Content = content }
+
     let listProjectDirectory projectName folderPath =
         projectName |> parseProjectName >>= getItems folderPath
 
@@ -668,6 +763,12 @@ let listProjects rt = Core.listProjects rt
 
 let getProjectDetails (cmd: GetProjectDetailsCommand) : IO<'rt, (string * Content) list> =
     Core.getProjectDetails cmd.ProjectName
+
+let listSkills (cmd: ListSkillsCommand) : IO<'rt, ListSkillsResult> =
+    Core.listSkills cmd.ProjectName
+
+let getSkill (cmd: GetSkillCommand) : IO<'rt, GetSkillResult> =
+    Core.getSkill cmd.ProjectName cmd.SkillName
 
 let listDirectory (cmd: ListDirectoryCommand) : IO<'rt, ProjectItemKind list> =
     Core.listProjectDirectory cmd.ProjectName cmd.FolderPath

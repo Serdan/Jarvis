@@ -121,6 +121,8 @@ let private dispatch (rt: Runtime) (command: AgentCommand) =
         |> ClientShell.resolveProjectTask cmd
         |> Result.bind (fun task -> ClientShell.runProjectTask cmd.ProjectName task rt)
         |> serialize'
+    | ListSkillsCommand cmd -> rt |> ProjectBrowser.listSkills cmd |> serialize'
+    | GetSkillCommand cmd -> rt |> ProjectBrowser.getSkill cmd |> serialize'
     | GetGitStatusCommand cmd -> rt |> ClientShell.getGitStatus cmd |> serialize'
     | GetGitDiffCommand cmd -> rt |> ClientShell.getGitDiff cmd |> serialize'
     | GitCommitCommand cmd -> rt |> ClientShell.gitCommit cmd |> serialize'

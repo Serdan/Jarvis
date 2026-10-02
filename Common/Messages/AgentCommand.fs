@@ -181,6 +181,24 @@ type RunProjectTaskCommand =
     { ProjectName: string
       TaskName: string }
 
+type ListSkillsCommand =
+    { ProjectName: string }
+
+type SkillSummary =
+    { Name: string
+      Description: string option }
+
+type ListSkillsResult =
+    { Skills: SkillSummary list }
+
+type GetSkillCommand =
+    { ProjectName: string
+      SkillName: string }
+
+type GetSkillResult =
+    { Name: string
+      Content: string }
+
 type RunCommandResult =
     { ExitCode: int
       TimedOut: bool
@@ -319,6 +337,8 @@ type AgentCommand =
     | RunCommandCommand of RunCommandCommand
     | ListProjectTasksCommand of ListProjectTasksCommand
     | RunProjectTaskCommand of RunProjectTaskCommand
+    | ListSkillsCommand of ListSkillsCommand
+    | GetSkillCommand of GetSkillCommand
     | GetGitStatusCommand of GitStatusCommand
     | GetGitDiffCommand of GitDiffCommand
     | GitCommitCommand of GitCommitCommand
@@ -344,6 +364,8 @@ module AgentCommandInfo =
         | RunCommandCommand _ -> "RunCommandCommand"
         | ListProjectTasksCommand _ -> "ListProjectTasksCommand"
         | RunProjectTaskCommand _ -> "RunProjectTaskCommand"
+        | ListSkillsCommand _ -> "ListSkillsCommand"
+        | GetSkillCommand _ -> "GetSkillCommand"
         | GetGitStatusCommand _ -> "GetGitStatusCommand"
         | GetGitDiffCommand _ -> "GetGitDiffCommand"
         | GitCommitCommand _ -> "GitCommitCommand"
@@ -368,6 +390,8 @@ module AgentCommandInfo =
         | RunCommandCommand _ -> "RunCommand"
         | ListProjectTasksCommand _ -> "ListProjectTasks"
         | RunProjectTaskCommand _ -> "RunTask"
+        | ListSkillsCommand _ -> "ListSkills"
+        | GetSkillCommand _ -> "GetSkill"
         | GetGitStatusCommand _ -> "GitStatus"
         | GetGitDiffCommand _ -> "GitDiff"
         | GitCommitCommand _ -> "GitCommit"
@@ -395,6 +419,8 @@ module AgentCommandInfo =
         | RunCommandCommand cmd -> Some cmd.ProjectName
         | ListProjectTasksCommand cmd -> Some cmd.ProjectName
         | RunProjectTaskCommand cmd -> Some cmd.ProjectName
+        | ListSkillsCommand cmd -> Some cmd.ProjectName
+        | GetSkillCommand cmd -> Some cmd.ProjectName
         | GetGitStatusCommand cmd -> Some cmd.ProjectName
         | GetGitDiffCommand cmd -> Some cmd.ProjectName
         | GitCommitCommand cmd -> Some cmd.ProjectName
@@ -447,6 +473,8 @@ module AgentCommandInfo =
         | PatchFileCommand cmd -> Some(compact cmd.FilePath)
         | RunCommandCommand cmd -> Some(fullCommand cmd.Executable cmd.Args)
         | RunProjectTaskCommand cmd -> Some(compact cmd.TaskName)
+        | GetSkillCommand cmd -> Some(compact cmd.SkillName)
+        | ListSkillsCommand _ -> None
         | GetGitDiffCommand cmd -> cmd.Path |> Option.map compact
         | GitCommitCommand cmd -> Some(compact cmd.Message)
         | StartJobCommand cmd -> Some(fullCommand cmd.Executable cmd.Args)
@@ -471,6 +499,8 @@ module AgentCommandInfo =
         | PatchFileCommand cmd -> Some(truncate 64 cmd.FilePath)
         | RunCommandCommand cmd -> Some(commandPreview cmd.Executable cmd.Args)
         | RunProjectTaskCommand cmd -> Some(truncate 48 cmd.TaskName)
+        | GetSkillCommand cmd -> Some(truncate 48 cmd.SkillName)
+        | ListSkillsCommand _ -> None
         | GetGitDiffCommand cmd -> cmd.Path |> Option.map (truncate 64)
         | GitCommitCommand cmd -> Some(quoted cmd.Message)
         | StartJobCommand cmd -> Some(commandPreview cmd.Executable cmd.Args)
@@ -515,7 +545,7 @@ module AgentCommandInfo =
         | None -> invocation command
 
 module AgentProtocol =
-    let version = "3.2"
+    let version = "3.3"
     let defaultPatchFuzzyContextLines = 3
     let maxResponseBytes = 900 * 1024
     let maxImageBytes = 8 * 1024 * 1024
@@ -543,6 +573,8 @@ module AgentProtocol =
           definition "RunCommand" "Runs a bounded local process." [ ProcessExecution ] true true false
           definition "ListProjectTasks" "Lists locally configured project tasks." [ ReadOnly ] false false false
           definition "RunProjectTask" "Runs a locally configured project task." [ ProcessExecution ] true true false
+          definition "ListSkills" "Lists project-local Jarvis skills." [ ReadOnly ] false false false
+          definition "GetSkill" "Reads a project-local Jarvis skill." [ ReadOnly ] false false false
           definition "GetGitStatus" "Reads git status." [ ReadOnly ] false false false
           definition "GetGitDiff" "Reads git diff." [ ReadOnly ] false false false
           definition "GitCommit" "Creates a local git commit." [ VersionControlWrite ] true true false

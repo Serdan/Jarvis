@@ -67,17 +67,14 @@ module ResponseDelivery =
                     )
         }
 
-type PersistentRetryPolicy() =
-    interface IRetryPolicy with
-        member _.NextRetryDelay(context: RetryContext) =
-            let delay =
-                match context.PreviousRetryCount with
-                | 0L -> TimeSpan.Zero
-                | 1L -> TimeSpan.FromSeconds 2.0
-                | 2L -> TimeSpan.FromSeconds 10.0
-                | _ -> TimeSpan.FromSeconds 30.0
-
-            Nullable delay
+module ReconnectSchedule =
+    let delayForFailureCount failureCount =
+        match max 0 failureCount with
+        | 0 -> TimeSpan.Zero
+        | 1 -> TimeSpan.FromSeconds 2.0
+        | 2 -> TimeSpan.FromSeconds 5.0
+        | 3 -> TimeSpan.FromSeconds 10.0
+        | _ -> TimeSpan.FromSeconds 30.0
 
 type HubConnectionE =
     [<Extension>]

@@ -117,7 +117,6 @@ let main args =
                     options.AccessTokenProvider <-
                         Func<Task<string>>(fun () -> oauth.GetAccessTokenAsync()))
             )
-            .WithAutomaticReconnect(PersistentRetryPolicy())
             .Build()
 
     connection.KeepAliveInterval <- TimeSpan.FromSeconds 10.0
@@ -127,26 +126,6 @@ let main args =
         connection.On<string>("ReceiveMessage", Func<string, Task>(Client.receiveMessage rt))
         connection.On<string, string>("ReceiveCommand", Func<string, string, Task>(Client.receiveCommandAndReply connection rt))
     }
-
-    connection.add_Reconnecting(
-        Func<Exception, Task>(fun error ->
-            registered <- false
-            tui.SetConnectionState(Reconnecting, BuildInfo.ServerUrl)
-            let detail =
-                if isNull error then "no exception"
-                else $"{error.GetType().FullName}: {error.Message}"
-            tui.Log $"SignalR reconnecting: {detail}"
-            Task.CompletedTask))
-
-    connection.add_Reconnected(
-        Func<string, Task>(fun connectionId ->
-            registered <- false
-            tui.SetConnectionState(Connecting, BuildInfo.ServerUrl)
-            let id =
-                if String.IsNullOrWhiteSpace connectionId then "(no connection id)"
-                else connectionId
-            tui.Log $"SignalR transport reconnected: {id}; re-registering client."
-            Task.CompletedTask))
 
     connection.add_Closed(
         Func<Exception, Task>(fun error ->
@@ -162,6 +141,7 @@ let main args =
         use cts = new CancellationTokenSource()
         let inputLoop = tui.RunInputLoop(cts.Token)
         let deviceId = DeviceIdentity.getOrCreate ()
+        let mutable connectionFailureCount = 0
 
         Console.CancelKeyPress.AddHandler(ConsoleCancelEventHandler(fun _ args ->
             args.Cancel <- true
@@ -172,17 +152,37 @@ let main args =
         while not tui.ShouldQuit do
             if connection.State = HubConnectionState.Disconnected then
                 registered <- false
-                let! connected = connect tui connection
+                let retryDelay = ReconnectSchedule.delayForFailureCount connectionFailureCount
 
-                if connected then
-                    let! isRegistered = register tui connection deviceId
-                    registered <- isRegistered
+                if retryDelay > TimeSpan.Zero then
+                    tui.SetConnectionState(Reconnecting, BuildInfo.ServerUrl)
+                    let retrySeconds = int retryDelay.TotalSeconds
+                    tui.Log $"Jarvis server unavailable; retrying in {retrySeconds} seconds."
+
+                    try
+                        do! Task.Delay(retryDelay, cts.Token)
+                    with :? OperationCanceledException ->
+                        ()
+
+                if not tui.ShouldQuit && connection.State = HubConnectionState.Disconnected then
+                    let! connected = connect tui connection
+
+                    if connected then
+                        connectionFailureCount <- 0
+                        let! isRegistered = register tui connection deviceId
+                        registered <- isRegistered
+                    else
+                        connectionFailureCount <- connectionFailureCount + 1
 
             elif connection.State = HubConnectionState.Connected && not registered then
                 let! isRegistered = register tui connection deviceId
                 registered <- isRegistered
 
-            do! Task.Delay 1000
+            if not tui.ShouldQuit then
+                try
+                    do! Task.Delay(1000, cts.Token)
+                with :? OperationCanceledException ->
+                    ()
 
         cts.Cancel()
         do! connection.DisposeAsync()

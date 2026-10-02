@@ -80,8 +80,20 @@ let connect (tui: ConsoleTui) (connection: HubConnection) =
 
 [<EntryPoint>]
 let main args =
-    let tui = ConsoleTui()
+    let activityStore, activityStoreError =
+        try
+            Some(Client.ActivityLog.Store.CreateDefault()), None
+        with ex ->
+            None, Some ex.Message
+
+    let tui =
+        match activityStore with
+        | Some store -> ConsoleTui(activityLog = store)
+        | None -> ConsoleTui()
+
     tui.SetConnectionState(Disconnected, BuildInfo.ServerUrl)
+    activityStoreError
+    |> Option.iter (fun error -> tui.Log $"Activity persistence unavailable: {error}")
 
     let dir, trustLevel, allowedEnvironmentVariables =
         match parseArgs args with
@@ -186,6 +198,9 @@ let main args =
 
         cts.Cancel()
         do! connection.DisposeAsync()
+
+        activityStore
+        |> Option.iter (fun store -> (store :> IDisposable).Dispose())
 
         try
             do! inputLoop

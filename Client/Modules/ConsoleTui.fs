@@ -19,14 +19,18 @@ type private ActivityStatus =
     | AwaitingPermission
     | Completed of durationMs: int64 * outcome: string option
     | Failed of durationMs: int64 * shortError: string
+    | Interrupted
 
 type private ActivityEntry =
     { Id: int
+      PersistenceId: string
       StartedAt: DateTimeOffset
       Timestamp: string
       ProjectName: string option
       Message: string
-      Command: AgentCommand option
+      CommandName: string option
+      Reason: string option
+      Detail: string option
       mutable Status: ActivityStatus
       mutable FailureDetail: string option }
 
@@ -42,7 +46,7 @@ type private PendingPrompt =
       Request: ConfirmationRequest
       Completion: TaskCompletionSource<PermissionApproval> }
 
-type ConsoleTui() =
+type ConsoleTui(?activityLog: ActivityLog.Store) =
     let syncRoot = obj()
     let activity = ResizeArray<ActivityEntry>()
     let prompts = ResizeArray<PendingPrompt>()
@@ -107,17 +111,15 @@ type ConsoleTui() =
         | Running -> filter = ActivityFilter.Running
         | AwaitingPermission -> filter = ActivityFilter.AwaitingPermission
         | Completed _ -> filter = ActivityFilter.Completed
-        | Failed _ -> filter = ActivityFilter.Failed
+        | Failed _
+        | Interrupted -> filter = ActivityFilter.Failed
         | Informational -> filter = ActivityFilter.Informational
 
     let searchableActivityText (entry: ActivityEntry) =
         let commandParts =
-            match entry.Command with
-            | None -> []
-            | Some command ->
-                [ AgentCommandInfo.displayName command
-                  AgentCommandInfo.fullReason command |> Option.defaultValue ""
-                  AgentCommandInfo.fullDetail command |> Option.defaultValue "" ]
+            [ entry.CommandName |> Option.defaultValue ""
+              entry.Reason |> Option.defaultValue ""
+              entry.Detail |> Option.defaultValue "" ]
 
         [ yield entry.Message
           yield! commandParts
@@ -179,6 +181,56 @@ type ConsoleTui() =
         | Some index -> selectActivityIndexUnsafe index
         | None -> ()
 
+    let statusName = function
+        | Informational -> "Info"
+        | Running -> "Running"
+        | AwaitingPermission -> "Awaiting permission"
+        | Completed _ -> "Completed"
+        | Failed _ -> "Failed"
+        | Interrupted -> "Interrupted"
+
+    let statusDuration = function
+        | Completed(durationMs, _)
+        | Failed(durationMs, _) -> Some durationMs
+        | _ -> None
+
+    let statusOutcome = function
+        | Completed(_, outcome) -> outcome
+        | Failed(_, shortError) -> Some shortError
+        | _ -> None
+
+    let commandMetadata command =
+        match command with
+        | None -> None, None, None
+        | Some value ->
+            Some(AgentCommandInfo.displayName value),
+            AgentCommandInfo.fullReason value,
+            AgentCommandInfo.fullDetail value
+
+    let persistEntryUnsafe (entry: ActivityEntry) =
+        activityLog
+        |> Option.iter (fun store ->
+            let duration =
+                match statusDuration entry.Status with
+                | Some value -> Nullable value
+                | None -> Nullable()
+
+            let snapshot: ActivityLog.Snapshot =
+                { Version = 1
+                  ActivityId = entry.PersistenceId
+                  StartedAt = entry.StartedAt
+                  ProjectName = entry.ProjectName |> Option.toObj
+                  CommandName = entry.CommandName |> Option.toObj
+                  Message = entry.Message
+                  Reason = entry.Reason |> Option.toObj
+                  Detail = entry.Detail |> Option.toObj
+                  Status = statusName entry.Status
+                  DurationMs = duration
+                  Result = statusOutcome entry.Status |> Option.toObj
+                  Error = entry.FailureDetail |> Option.toObj }
+
+            store.Append snapshot)
+
     let addActivityUnsafe projectName message command status =
         let wasScrolled = activityScrollOffset > 0
         let previousFiltered = filteredActivityUnsafe()
@@ -190,18 +242,23 @@ type ConsoleTui() =
             && activityScrollOffset = 0
             && (selectedActivityId.IsNone || selectedActivityId = previousLastId)
         let startedAt = DateTimeOffset.Now
+        let commandName, reason, detail = commandMetadata command
         let entry =
             { Id = nextActivityId
+              PersistenceId = Guid.NewGuid().ToString("N")
               StartedAt = startedAt
               Timestamp = startedAt.ToString("HH:mm:ss")
               ProjectName = projectName
               Message = message
-              Command = command
+              CommandName = commandName
+              Reason = reason
+              Detail = detail
               Status = status
               FailureDetail = None }
 
         nextActivityId <- nextActivityId + 1
         activity.Add entry
+        persistEntryUnsafe entry
 
         let entryMatchesFilter =
             filteredActivityUnsafe()
@@ -232,6 +289,7 @@ type ConsoleTui() =
         | Completed(durationMs, None) -> $" ({durationMs} ms)"
         | Completed(durationMs, Some outcome) -> $" ({durationMs} ms, {outcome})"
         | Failed(durationMs, shortError) -> $" ({durationMs} ms) FAILED: {shortError}"
+        | Interrupted -> " [interrupted]"
 
     let activityText entry =
         let project =
@@ -348,34 +406,17 @@ type ConsoleTui() =
         ensureActivitySelectionUnsafe()
         |> Option.map (fun index -> filtered[index])
 
-    let statusName = function
-        | Informational -> "Info"
-        | Running -> "Running"
-        | AwaitingPermission -> "Awaiting permission"
-        | Completed _ -> "Completed"
-        | Failed _ -> "Failed"
-
-    let statusDuration = function
-        | Completed(durationMs, _)
-        | Failed(durationMs, _) -> Some durationMs
-        | _ -> None
-
-    let statusOutcome = function
-        | Completed(_, outcome) -> outcome
-        | Failed(_, shortError) -> Some shortError
-        | _ -> None
-
     let recentCommandExportUnsafe count =
         activity
         |> Seq.choose (fun entry ->
-            entry.Command
-            |> Option.map (fun command ->
+            entry.CommandName
+            |> Option.map (fun commandName ->
                 let exported: ActivityExport.Entry =
                     { Timestamp = entry.Timestamp
                       ProjectName = entry.ProjectName
-                      CommandName = AgentCommandInfo.displayName command
-                      Reason = AgentCommandInfo.fullReason command
-                      Detail = AgentCommandInfo.fullDetail command
+                      CommandName = commandName
+                      Reason = entry.Reason
+                      Detail = entry.Detail
                       Status = statusName entry.Status
                       DurationMs = statusDuration entry.Status
                       Result = statusOutcome entry.Status }
@@ -388,7 +429,7 @@ type ConsoleTui() =
 
     let recentCommandCountUnsafe count =
         activity
-        |> Seq.filter (fun entry -> entry.Command.IsSome)
+        |> Seq.filter (fun entry -> entry.CommandName.IsSome)
         |> Seq.rev
         |> Seq.truncate count
         |> Seq.length
@@ -418,12 +459,12 @@ type ConsoleTui() =
                 entry.ProjectName
                 |> Option.iter (writeDetailField width "Project")
 
-                match entry.Command with
-                | Some command ->
-                    writeDetailField width "Command" (AgentCommandInfo.displayName command)
-                    AgentCommandInfo.fullReason command
+                match entry.CommandName with
+                | Some commandName ->
+                    writeDetailField width "Command" commandName
+                    entry.Reason
                     |> Option.iter (writeDetailField width "Reason")
-                    AgentCommandInfo.fullDetail command
+                    entry.Detail
                     |> Option.iter (writeDetailField width "Detail")
                 | None ->
                     writeDetailField width "Command" "Log"
@@ -578,6 +619,42 @@ type ConsoleTui() =
         statusFilter <- ActivityFilter.All
         resetFilteredViewUnsafe()
 
+    let restoredStatus (snapshot: ActivityLog.Snapshot) =
+        match snapshot.Status with
+        | "Info" -> Informational
+        | "Completed" ->
+            let duration = if snapshot.DurationMs.HasValue then snapshot.DurationMs.Value else 0L
+            Completed(duration, Option.ofObj snapshot.Result)
+        | "Failed" ->
+            let duration = if snapshot.DurationMs.HasValue then snapshot.DurationMs.Value else 0L
+            let shortError = Option.ofObj snapshot.Result |> Option.defaultValue "Failed"
+            Failed(duration, shortError)
+        | "Interrupted" -> Interrupted
+        | _ -> Interrupted
+
+    do
+        activityLog
+        |> Option.iter (fun store ->
+            for snapshot in store.LoadRecent(maxHistory) do
+                let entry =
+                    { Id = nextActivityId
+                      PersistenceId = snapshot.ActivityId
+                      StartedAt = snapshot.StartedAt
+                      Timestamp = snapshot.StartedAt.ToString("HH:mm:ss")
+                      ProjectName = Option.ofObj snapshot.ProjectName
+                      Message = snapshot.Message
+                      CommandName = Option.ofObj snapshot.CommandName
+                      Reason = Option.ofObj snapshot.Reason
+                      Detail = Option.ofObj snapshot.Detail
+                      Status = restoredStatus snapshot
+                      FailureDetail = Option.ofObj snapshot.Error }
+
+                nextActivityId <- nextActivityId + 1
+                activity.Add entry
+
+            if activity.Count > 0 then
+                selectedActivityId <- Some activity[activity.Count - 1].Id)
+
     member _.SetKey value =
         lock syncRoot (fun () ->
             key <- value
@@ -614,19 +691,25 @@ type ConsoleTui() =
     member _.MarkActivityAwaitingPermission id =
         lock syncRoot (fun () ->
             tryFindActivityUnsafe id
-            |> Option.iter (fun entry -> entry.Status <- AwaitingPermission)
+            |> Option.iter (fun entry ->
+                entry.Status <- AwaitingPermission
+                persistEntryUnsafe entry)
             renderUnsafe())
 
     member _.MarkActivityRunning id =
         lock syncRoot (fun () ->
             tryFindActivityUnsafe id
-            |> Option.iter (fun entry -> entry.Status <- Running)
+            |> Option.iter (fun entry ->
+                entry.Status <- Running
+                persistEntryUnsafe entry)
             renderUnsafe())
 
     member _.CompleteActivity(id, durationMs, outcome) =
         lock syncRoot (fun () ->
             tryFindActivityUnsafe id
-            |> Option.iter (fun entry -> entry.Status <- Completed(durationMs, outcome))
+            |> Option.iter (fun entry ->
+                entry.Status <- Completed(durationMs, outcome)
+                persistEntryUnsafe entry)
             renderUnsafe())
 
     member _.FailActivity(id, durationMs, shortError, fullError) =
@@ -634,7 +717,8 @@ type ConsoleTui() =
             tryFindActivityUnsafe id
             |> Option.iter (fun entry ->
                 entry.Status <- Failed(durationMs, shortError)
-                entry.FailureDetail <- Some fullError)
+                entry.FailureDetail <- Some fullError
+                persistEntryUnsafe entry)
             renderUnsafe())
 
     member _.GetActivitySnapshot(projectName: string option, limit: int option) =
@@ -655,21 +739,13 @@ type ConsoleTui() =
                 |> Seq.truncate count
                 |> Seq.rev
                 |> Seq.map (fun entry ->
-                    let commandName, reason, detail =
-                        match entry.Command with
-                        | None -> None, None, None
-                        | Some command ->
-                            Some(AgentCommandInfo.displayName command),
-                            AgentCommandInfo.fullReason command,
-                            AgentCommandInfo.fullDetail command
-
                     { StartedAt = entry.StartedAt
                       AgeMs = max 0L (int64 (now - entry.StartedAt).TotalMilliseconds)
                       ProjectName = entry.ProjectName
-                      CommandName = commandName
+                      CommandName = entry.CommandName
                       Message = entry.Message
-                      Reason = reason
-                      Detail = detail
+                      Reason = entry.Reason
+                      Detail = entry.Detail
                       Status = statusName entry.Status
                       DurationMs = statusDuration entry.Status
                       Result = statusOutcome entry.Status

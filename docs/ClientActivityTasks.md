@@ -102,6 +102,17 @@ The receive timestamp remains fixed when the row is updated.
   - Do not log the inspection command itself as client activity.
   - Use `GetConnectionDiagnostics` separately when the client is disconnected or reconnecting.
 
+- [x] **13. Persist client activity across launches.**
+  - Stream activity snapshots to append-only JSONL files in the client's local application-data directory.
+  - Persist the visible activity metadata only: project, command name, reason/detail, lifecycle status, result, and retained failure detail; do not serialize full command payloads.
+  - Flush each lifecycle transition so completed/failed state is available to a later client session without rewriting the history file.
+  - Replay the latest 500 activities when the client starts so `GetClientActivity`, filtering, details, and copy-recent work after a restart.
+  - Restore commands left in running or awaiting-permission state as `Interrupted`.
+  - Rotate activity files at 10 MiB and by local calendar day.
+  - Keep 14 days of activity logs and prune older files.
+  - Ignore malformed/truncated JSONL records during replay so a damaged tail does not prevent client startup.
+  - Treat persistence as best-effort; filesystem failures must not stop Jarvis command execution.
+
 ## Design constraints
 
 - Keep one command per activity row.
@@ -113,6 +124,6 @@ The receive timestamp remains fixed when the row is updated.
 ## Verification
 
 - `dotnet build Jarvis.slnx --no-restore`: 0 warnings, 0 errors.
-- Client tests: 138/138 passed.
+- Client tests: 145/145 passed.
 - Server tests: 28/28 passed.
 - Linux x64 client published with the production server URL and installed into the ignored `artifacts/client/linux-x64` launch location.

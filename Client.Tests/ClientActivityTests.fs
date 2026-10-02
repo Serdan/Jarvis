@@ -1,5 +1,7 @@
 module ClientActivityTests
 
+open System
+open System.IO
 open System.Text.Json
 open Client
 open Common
@@ -60,3 +62,40 @@ let ``GetClientActivity does not add itself to client activity`` () =
             result.Entries.Length |> shouldEqual 1
             result.Entries.Head.Reason |> shouldEqual (Some "Existing activity")
     }
+
+[<Test>]
+let ``persisted activity is restored into client snapshots`` () =
+    let path =
+        Path.Combine(Path.GetTempPath(), "jarvis-client-activity-tests", Guid.NewGuid().ToString("N"))
+
+    Directory.CreateDirectory(path) |> ignore
+
+    let settings: ActivityLog.Settings =
+        { DirectoryPath = path
+          RetentionDays = 14
+          MaxFileBytes = 1024L * 1024L }
+
+    try
+        let writeActivity () =
+            use store = new ActivityLog.Store(settings)
+            let tui = ConsoleTui.ConsoleTui(activityLog = store)
+            let activityId = tui.StartActivity(sampleRunCommand "Wayfold" "Persisted activity")
+            tui.CompleteActivity(activityId, 23L, Some "exit 0")
+
+        writeActivity ()
+
+        use replayStore = new ActivityLog.Store(settings)
+        let replayTui = ConsoleTui.ConsoleTui(activityLog = replayStore)
+        let snapshot = replayTui.GetActivitySnapshot(Some "wayfold", Some 20)
+
+        snapshot.Entries.Length |> shouldEqual 1
+        let entry = snapshot.Entries.Head
+        entry.ProjectName |> shouldEqual (Some "Wayfold")
+        entry.CommandName |> shouldEqual (Some "RunCommand")
+        entry.Reason |> shouldEqual (Some "Persisted activity")
+        entry.Detail |> shouldEqual (Some "dotnet test")
+        entry.Status |> shouldEqual "Completed"
+        entry.DurationMs |> shouldEqual (Some 23L)
+        entry.Result |> shouldEqual (Some "exit 0")
+    finally
+        Directory.Delete(path, true)

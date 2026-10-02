@@ -14,6 +14,7 @@
         <Compile Include="ReconnectScheduleTests.fs"/>
         <Compile Include="ResponseDeliveryTests.fs"/>
         <Compile Include="ActivityFilterTests.fs"/>
+        <Compile Include="ActivityLogTests.fs"/>
         <Compile Include="ActivityExportTests.fs"/>
         <Compile Include="ClipboardTests.fs"/>
         <Compile Include="ClientActivityTests.fs"/>

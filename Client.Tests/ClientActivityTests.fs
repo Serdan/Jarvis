@@ -99,3 +99,48 @@ let ``persisted activity is restored into client snapshots`` () =
         entry.Result |> shouldEqual (Some "exit 0")
     finally
         Directory.Delete(path, true)
+
+[<Test>]
+let ``Message records one informational project activity without a command wrapper`` () =
+    task {
+        let tui = ConsoleTui.ConsoleTui()
+        let runtime = Runtime(".", tui, NoTrust)
+        let command =
+            MessageCommand
+                { ProjectName = Some "Wayfold"
+                  Message = "Done with this turn" }
+
+        let! response = Client.SignalR.Client.receiveCommand runtime command
+
+        match response with
+        | Error error -> failwith $"Message failed: {error}"
+        | Ok _ -> ()
+
+        let snapshot = tui.GetActivitySnapshot(Some "wayfold", Some 20)
+        snapshot.Entries.Length |> shouldEqual 1
+        let entry = snapshot.Entries.Head
+        entry.ProjectName |> shouldEqual (Some "Wayfold")
+        entry.CommandName |> shouldEqual None
+        entry.Message |> shouldEqual "Done with this turn"
+        entry.Status |> shouldEqual "Info"
+    }
+
+[<Test>]
+let ``Message rejects blank content without adding activity`` () =
+    task {
+        let tui = ConsoleTui.ConsoleTui()
+        let runtime = Runtime(".", tui, NoTrust)
+        let command =
+            MessageCommand
+                { ProjectName = Some "Jarvis"
+                  Message = "   " }
+
+        let! response = Client.SignalR.Client.receiveCommand runtime command
+
+        match response with
+        | Error(ValidationError _) -> ()
+        | Error error -> Assert.Fail($"Expected validation error, got {error}")
+        | Ok _ -> Assert.Fail("Expected blank Message to fail.")
+
+        tui.GetActivitySnapshot(None, Some 20).Entries |> shouldEqual []
+    }

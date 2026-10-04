@@ -677,6 +677,11 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
             addActivityUnsafe None (compact message) None Informational |> ignore
             renderUnsafe())
 
+    member _.Message(projectName: string option, message: string) =
+        lock syncRoot (fun () ->
+            addActivityUnsafe projectName (compact message) None Informational |> ignore
+            renderUnsafe())
+
     member _.StartActivity(command: AgentCommand) =
         lock syncRoot (fun () ->
             let id =

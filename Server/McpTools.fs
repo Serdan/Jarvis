@@ -151,6 +151,7 @@ module McpToolHelpers =
         | GetGitDiffCommand _
         | ListJobsCommand _
         | GetJobResultCommand _
+        | MessageCommand _
         | GetClientActivityCommand _ -> Auth.WorkspaceRead
         | WriteFileCommand _
         | CreateSkillCommand _
@@ -712,6 +713,17 @@ type JarvisMcpTools =
     [<McpServerTool(Title = "Cancel job", ReadOnly = false, Destructive = true, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["process:execute"]}]"""); Description("Cancel a running Jarvis job. Requires approval in the local Jarvis client.")>]
     static member CancelJob(jobId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (CancelJobCommand { JobId = jobId })
+
+    [<McpServerTool(Title = "Message", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Send a short informational message to the connected Jarvis client activity log, for example progress or turn-completion messages such as 'Done with this turn'. This does not require local approval.")>]
+    static member Message(
+        message: string,
+        [<Optional; DefaultParameterValue("")>] projectName: string,
+        client: ClientService,
+        http: IHttpContextAccessor
+    ) =
+        McpToolHelpers.send client http (MessageCommand {
+            ProjectName = McpToolHelpers.optionOfString projectName
+            Message = message })
 
     [<McpServerTool(Title = "Get client activity", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read recent in-memory activity from the connected Jarvis client. Use this to reconstruct what the client was doing when a previous ChatGPT session stalled. Optionally filter by project.")>]
     static member GetClientActivity(

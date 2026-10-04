@@ -132,6 +132,14 @@ let private dispatch (rt: Runtime) (command: AgentCommand) =
     | ListJobsCommand cmd -> rt |> JobManager.listJobs cmd |> serialize'
     | GetJobResultCommand cmd -> rt |> JobManager.getJobResult cmd |> serialize'
     | CancelJobCommand cmd -> rt |> JobManager.cancelJob cmd |> serialize'
+    | MessageCommand cmd ->
+        if String.IsNullOrWhiteSpace cmd.Message then
+            Error(Client.ValidationError "Message cannot be empty.") |> serialize'
+        elif cmd.Message.Length > 1000 then
+            Error(Client.ValidationError "Message cannot exceed 1000 characters.") |> serialize'
+        else
+            rt.Tui.Message(cmd.ProjectName, cmd.Message)
+            Ok() |> serialize'
     | GetClientActivityCommand cmd ->
         rt.Tui.GetActivitySnapshot(cmd.ProjectName, cmd.Limit)
         |> Ok
@@ -141,7 +149,8 @@ let receiveCommand (rt: Runtime) (command: AgentCommand) =
     task {
         let activityId =
             match command with
-            | GetClientActivityCommand _ -> None
+            | GetClientActivityCommand _
+            | MessageCommand _ -> None
             | _ -> Some(rt.Tui.StartActivity(command))
         let stopwatch = Stopwatch.StartNew()
 

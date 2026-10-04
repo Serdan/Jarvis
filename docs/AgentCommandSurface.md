@@ -522,6 +522,24 @@ type CancelJobCommand =
 
 Cancellation should first attempt graceful termination and then force-kill after an implementation-defined timeout.
 
+### `Message`
+
+Adds a short informational entry to the connected client's activity history.
+
+```fsharp
+type MessageCommand =
+    { ProjectName: string option
+      Message: string }
+```
+
+Use this for lightweight agent-to-client status messages such as `Done with this turn`, handoff notes, or other progress markers that do not represent an executable operation.
+
+- `ProjectName` is optional. When present, the message participates in normal project filtering and project coloring.
+- `Message` must be non-empty and is limited to 1000 characters.
+- The command does not require a local permission prompt and does not modify the workspace.
+- It creates exactly one `Info` activity entry rather than a normal running/completed command activity pair.
+- The informational entry is persisted by the client activity log and is visible through `GetClientActivity`.
+
 ### `GetClientActivity`
 
 Reads the connected client's recent in-memory activity history so a new agent session can reconstruct what the local client was doing before a previous ChatGPT session stalled.

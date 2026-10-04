@@ -161,6 +161,9 @@ let ``listCommands returns current protocol capabilities`` () =
         capability "ListSkills" |> _.Permissions |> shouldEqual [ ReadOnly ]
         capability "GetSkill" |> _.Permissions |> shouldEqual [ ReadOnly ]
         capability "CreateSkill" |> _.Permissions |> shouldEqual [ WorkspaceWrite ]
+        capability "Message" |> _.Permissions |> shouldEqual []
+        capability "Message" |> _.MutatesState |> shouldEqual true
+        capability "Message" |> _.RequiresConfirmation |> shouldEqual false
         capability "GetClientActivity" |> _.Permissions |> shouldEqual [ ReadOnly ]
         capability "GitCommit" |> _.SupportsDryRun |> shouldEqual false
         capability "StartJob" |> _.SupportsDryRun |> shouldEqual false

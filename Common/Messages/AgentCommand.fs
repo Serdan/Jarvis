@@ -290,6 +290,10 @@ type JobResult =
 
 type CancelJobCommand = { JobId: string }
 
+type MessageCommand =
+    { ProjectName: string option
+      Message: string }
+
 type GetClientActivityCommand =
     { ProjectName: string option
       Limit: int option }
@@ -361,6 +365,7 @@ type AgentCommand =
     | ListJobsCommand of ListJobsCommand
     | GetJobResultCommand of GetJobResultCommand
     | CancelJobCommand of CancelJobCommand
+    | MessageCommand of MessageCommand
     | GetClientActivityCommand of GetClientActivityCommand
 
 module AgentCommandInfo =
@@ -389,6 +394,7 @@ module AgentCommandInfo =
         | ListJobsCommand _ -> "ListJobsCommand"
         | GetJobResultCommand _ -> "GetJobResultCommand"
         | CancelJobCommand _ -> "CancelJobCommand"
+        | MessageCommand _ -> "MessageCommand"
         | GetClientActivityCommand _ -> "GetClientActivityCommand"
 
     let displayName = function
@@ -416,6 +422,7 @@ module AgentCommandInfo =
         | ListJobsCommand _ -> "ListJobs"
         | GetJobResultCommand _ -> "GetJobResult"
         | CancelJobCommand _ -> "CancelJob"
+        | MessageCommand _ -> "Message"
         | GetClientActivityCommand _ -> "GetClientActivity"
 
     let projectName = function
@@ -423,6 +430,7 @@ module AgentCommandInfo =
         | ListProjectsCommand
         | GetJobResultCommand _
         | CancelJobCommand _ -> None
+        | MessageCommand cmd -> cmd.ProjectName
         | GetClientActivityCommand cmd -> cmd.ProjectName
         | GetProjectDetailsCommand cmd -> Some cmd.ProjectName
         | ListDirectoryCommand cmd -> Some cmd.ProjectName
@@ -499,6 +507,7 @@ module AgentCommandInfo =
         | StartJobCommand cmd -> Some(fullCommand cmd.Executable cmd.Args)
         | GetJobResultCommand cmd -> Some(compact cmd.JobId)
         | CancelJobCommand cmd -> Some(compact cmd.JobId)
+        | MessageCommand cmd -> Some(compact cmd.Message)
         | GetClientActivityCommand _ -> None
         | ListCommandsCommand
         | ListProjectsCommand
@@ -526,6 +535,7 @@ module AgentCommandInfo =
         | StartJobCommand cmd -> Some(commandPreview cmd.Executable cmd.Args)
         | GetJobResultCommand cmd -> Some(shortId cmd.JobId)
         | CancelJobCommand cmd -> Some(shortId cmd.JobId)
+        | MessageCommand cmd -> Some(truncate 64 cmd.Message)
         | GetClientActivityCommand _ -> None
         | ListCommandsCommand
         | ListProjectsCommand
@@ -573,7 +583,7 @@ module AgentCommandInfo =
         | None -> invocation command
 
 module AgentProtocol =
-    let version = "3.5"
+    let version = "3.6"
     let defaultPatchFuzzyContextLines = 3
     let maxResponseBytes = 900 * 1024
     let maxImageBytes = 8 * 1024 * 1024
@@ -611,6 +621,7 @@ module AgentProtocol =
           definition "ListJobs" "Lists known jobs." [ ReadOnly ] false false false
           definition "GetJobResult" "Reads buffered job output." [ ReadOnly ] false false false
           definition "CancelJob" "Cancels a running job." [ ProcessExecution ] true true false
+          definition "Message" "Adds an informational message to client activity." [] true false false
           definition "GetClientActivity" "Reads recent in-memory Jarvis client activity, optionally filtered by project." [ ReadOnly ] false false false ]
 
     let private toCapability (definition: CommandDefinition) : CommandCapability =

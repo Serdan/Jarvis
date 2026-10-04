@@ -31,6 +31,7 @@ let ``job lifecycle starts lists reads and cancels`` () =
             { ProjectName = "Project1"
               Executable = "dotnet"
               Args = [ "--info" ]
+              Reason = Some "Inspect dotnet runtime"
               WorkingDirectory = None
               MaxOutputBytes = Some 8192 }
 
@@ -40,7 +41,9 @@ let ``job lifecycle starts lists reads and cancels`` () =
             | Error error -> failwith $"Expected StartJob Ok, got {error}"
 
         match listJobs { ProjectName = Some "Project1"; IncludeCompleted = true } context with
-        | Ok result -> result.Jobs |> List.exists (fun job -> job.JobId = jobId) |> shouldEqual true
+        | Ok result ->
+            let job = result.Jobs |> List.find (fun job -> job.JobId = jobId)
+            job.Reason |> shouldEqual (Some "Inspect dotnet runtime")
         | Error error -> Assert.Fail($"Expected ListJobs Ok, got {error}")
 
         Thread.Sleep 500
@@ -64,6 +67,7 @@ let ``job output is bounded by max output bytes`` () =
             { ProjectName = "Project1"
               Executable = "dotnet"
               Args = [ "--info" ]
+              Reason = None
               WorkingDirectory = None
               MaxOutputBytes = Some 64 }
 
@@ -96,6 +100,7 @@ let ``failed job start does not leave a ghost job`` () =
             { ProjectName = "Project1"
               Executable = executable
               Args = []
+              Reason = None
               WorkingDirectory = None
               MaxOutputBytes = Some 4096 }
 
@@ -128,6 +133,7 @@ let ``job output polling is ordered and incremental across streams`` () =
             { ProjectName = "Project1"
               Executable = "dotnet"
               Args = [ "fsi"; "--exec"; "events.fsx" ]
+              Reason = None
               WorkingDirectory = None
               MaxOutputBytes = Some 4096 }
 
@@ -186,6 +192,7 @@ printfn "%s" (Environment.GetEnvironmentVariable("JARVIS_TEST_JOB_SECRET_TOKEN")
             { ProjectName = "Project1"
               Executable = "dotnet"
               Args = [ "fsi"; "--exec"; "environment.fsx" ]
+              Reason = None
               WorkingDirectory = None
               MaxOutputBytes = Some 4096 }
 

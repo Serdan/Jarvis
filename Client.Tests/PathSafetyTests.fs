@@ -31,6 +31,7 @@ let ``startJob rejects working directory outside project root`` () =
             { ProjectName = "Project1"
               Executable = "dotnet"
               Args = [ "--version" ]
+              Reason = None
               WorkingDirectory = Some ".."
               MaxOutputBytes = Some 4096 }
 

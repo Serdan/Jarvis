@@ -17,6 +17,7 @@ type private JobRecord =
       ProjectName: string
       Executable: string
       Args: string list
+      Reason: string option
       WorkingDirectory: string option
       StartedAt: DateTimeOffset
       Process: Process
@@ -100,7 +101,7 @@ module private Core =
                 job.OutputBytes <- job.OutputBytes + addedBytes
                 job.OutputTruncated <- job.OutputTruncated || addedBytes < valueBytes)
 
-    let private startProcess projectName workingDirectory executable args maxOutputBytes : Client.Result<StartJobResult> =
+    let private startProcess projectName workingDirectory executable args reason maxOutputBytes : Client.Result<StartJobResult> =
         try
             match validateExecutable executable with
             | Error error -> Error error
@@ -123,6 +124,7 @@ module private Core =
                       ProjectName = projectName
                       Executable = executable
                       Args = args
+                      Reason = reason
                       WorkingDirectory = Some workingDirectory
                       StartedAt = DateTimeOffset.UtcNow
                       Process = proc
@@ -184,7 +186,7 @@ module private Core =
                 return! Client.ValidationError "MaxOutputBytes must be greater than zero." |> Effect.ofError
             else
                 let! (FolderPath workingDirectory) = resolveWorkingDirectory cmd.ProjectName cmd.WorkingDirectory
-                let! result = fun _ -> startProcess cmd.ProjectName workingDirectory cmd.Executable cmd.Args maxOutputBytes
+                let! result = fun _ -> startProcess cmd.ProjectName workingDirectory cmd.Executable cmd.Args cmd.Reason maxOutputBytes
                 return result
         }
 
@@ -194,6 +196,7 @@ module private Core =
               ProjectName = job.ProjectName
               Executable = job.Executable
               Args = job.Args
+              Reason = job.Reason
               WorkingDirectory = job.WorkingDirectory
               Status = job.Status
               StartedAt = job.StartedAt

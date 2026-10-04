@@ -25,6 +25,8 @@ let private hashCommand command =
         match command with
         | RunCommandCommand cmd ->
             RunCommandCommand { cmd with Reason = None }
+        | StartJobCommand cmd ->
+            StartJobCommand { cmd with Reason = None }
         | _ -> command
 
     let json = JsonSerializer.Serialize authorizationIdentity

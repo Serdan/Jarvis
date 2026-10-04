@@ -111,3 +111,19 @@ let ``list jobs includes optional project when supplied`` () =
 
     AgentCommandInfo.activityLabel scoped |> shouldEqual "@Jarvis ListJobs"
     AgentCommandInfo.activityLabel globalCommand |> shouldEqual "ListJobs"
+
+[<Test>]
+let ``start job reason is the primary activity label`` () =
+    let command =
+        StartJobCommand
+            { ProjectName = "Jarvis"
+              Executable = "dotnet"
+              Args = [ "watch" ]
+              Reason = Some "Watch the development server"
+              WorkingDirectory = None
+              MaxOutputBytes = None }
+
+    AgentCommandInfo.reason command |> shouldEqual (Some "Watch the development server")
+    AgentCommandInfo.fullReason command |> shouldEqual (Some "Watch the development server")
+    AgentCommandInfo.activityLabel command
+    |> shouldEqual "@Jarvis Watch the development server · dotnet watch"

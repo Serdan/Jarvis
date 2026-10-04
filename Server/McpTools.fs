@@ -688,11 +688,12 @@ type JarvisMcpTools =
             AllowEmpty = allowEmpty })
 
     [<McpServerTool(Title = "Start job", ReadOnly = false, Destructive = true, Idempotent = false, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["process:execute"]}]"""); Description("Start a long-running local job. Requires approval in the local Jarvis client.")>]
-    static member StartJob(projectName: string, executable: string, args: string array, workingDirectory: string, maxOutputBytes: Nullable<int>, client: ClientService, http: IHttpContextAccessor) =
+    static member StartJob(projectName: string, executable: string, args: string array, workingDirectory: string, maxOutputBytes: Nullable<int>, [<Optional; DefaultParameterValue("")>] reason: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (StartJobCommand {
             ProjectName = projectName
             Executable = executable
             Args = args |> Array.toList
+            Reason = McpToolHelpers.optionOfString reason
             WorkingDirectory = McpToolHelpers.optionOfString workingDirectory
             MaxOutputBytes = McpToolHelpers.optionOfNullable maxOutputBytes })
 

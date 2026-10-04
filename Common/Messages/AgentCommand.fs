@@ -242,6 +242,7 @@ type StartJobCommand =
     { ProjectName: string
       Executable: string
       Args: string list
+      Reason: string option
       WorkingDirectory: string option
       MaxOutputBytes: int option }
 
@@ -258,6 +259,7 @@ type JobSummary =
       ProjectName: string
       Executable: string
       Args: string list
+      Reason: string option
       WorkingDirectory: string option
       Status: JobStatus
       StartedAt: DateTimeOffset
@@ -537,10 +539,18 @@ module AgentCommandInfo =
             cmd.Reason
             |> Option.map compact
             |> Option.filter (String.IsNullOrWhiteSpace >> not)
+        | StartJobCommand cmd ->
+            cmd.Reason
+            |> Option.map compact
+            |> Option.filter (String.IsNullOrWhiteSpace >> not)
         | _ -> None
 
     let reason = function
         | RunCommandCommand cmd ->
+            cmd.Reason
+            |> Option.map (truncate 64)
+            |> Option.filter (String.IsNullOrWhiteSpace >> not)
+        | StartJobCommand cmd ->
             cmd.Reason
             |> Option.map (truncate 64)
             |> Option.filter (String.IsNullOrWhiteSpace >> not)
@@ -563,7 +573,7 @@ module AgentCommandInfo =
         | None -> invocation command
 
 module AgentProtocol =
-    let version = "3.4"
+    let version = "3.5"
     let defaultPatchFuzzyContextLines = 3
     let maxResponseBytes = 900 * 1024
     let maxImageBytes = 8 * 1024 * 1024

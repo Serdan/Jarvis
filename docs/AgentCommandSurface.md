@@ -432,6 +432,7 @@ type StartJobCommand =
     { ProjectName: string
       Executable: string
       Args: string list
+      Reason: string option
       WorkingDirectory: string option
       MaxOutputBytes: int option }
 
@@ -442,6 +443,8 @@ type StartJobResult =
 
 Example use cases:
 
+- `Reason` is optional presentation metadata, like `RunCommand.Reason`; it appears in activity/history and does not change authorization identity.
+- `ListJobs` preserves the reason with the job summary.
 - `dotnet test --watch`
 - `dotnet run`
 - `npm run dev`
@@ -464,6 +467,7 @@ type JobSummary =
       ProjectName: string
       Executable: string
       Args: string list
+      Reason: string option
       WorkingDirectory: string option
       Status: JobStatus
       StartedAt: System.DateTimeOffset

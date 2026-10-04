@@ -239,6 +239,7 @@ let ``partial trust confirms start job`` () =
             { ProjectName = "Project1"
               Executable = "dotnet"
               Args = [ "watch" ]
+              Reason = None
               WorkingDirectory = None
               MaxOutputBytes = Some 4096 }
 
@@ -396,6 +397,7 @@ let ``executable session grant is scoped by project and command kind`` () =
             { ProjectName = "Project1"
               Executable = "dotnet"
               Args = [ "watch" ]
+              Reason = None
               WorkingDirectory = None
               MaxOutputBytes = Some 4096 }
 
@@ -483,3 +485,31 @@ let partial_trust_allows_create_skill () =
           Overwrite = false }
     |> evaluateWithTrust PartialTrust
     |> shouldEqual (Ok())
+
+[<Test>]
+let ``start job exact grant ignores presentation reason`` () =
+    let original =
+        StartJobCommand
+            { ProjectName = "Project1"
+              Executable = "dotnet"
+              Args = [ "watch" ]
+              Reason = Some "Watch tests"
+              WorkingDirectory = None
+              MaxOutputBytes = Some 4096 }
+
+    let sameJobDifferentReason =
+        StartJobCommand
+            { ProjectName = "Project1"
+              Executable = "dotnet"
+              Args = [ "watch" ]
+              Reason = Some "Keep the test watcher running"
+              WorkingDirectory = None
+              MaxOutputBytes = Some 4096 }
+
+    let request =
+        match evaluate original with
+        | Error(Client.ConfirmationRequired request) -> request
+        | other -> failwith $"Expected ConfirmationRequired, got {other}"
+
+    grant original request None |> ignore
+    evaluate sameJobDifferentReason |> shouldEqual (Ok())

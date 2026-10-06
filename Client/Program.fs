@@ -31,16 +31,21 @@ let private parseArgs args =
             value.Split([| ','; ';' |], StringSplitOptions.RemoveEmptyEntries ||| StringSplitOptions.TrimEntries)
             |> Array.toList
 
-    let rec loop path trustLevel allowedEnvironmentVariables remaining =
+    let rec loop path trustLevel allowedEnvironmentVariables maxImportBytes remaining =
         match remaining with
-        | [] -> Ok(path, trustLevel, List.rev allowedEnvironmentVariables)
-        | "--path" :: value :: tail -> loop value trustLevel allowedEnvironmentVariables tail
-        | "--trust" :: value :: tail -> loop path value allowedEnvironmentVariables tail
+        | [] -> Ok(path, trustLevel, List.rev allowedEnvironmentVariables, maxImportBytes)
+        | "--path" :: value :: tail -> loop value trustLevel allowedEnvironmentVariables maxImportBytes tail
+        | "--trust" :: value :: tail -> loop path value allowedEnvironmentVariables maxImportBytes tail
         | "--allow-env" :: value :: tail ->
-            loop path trustLevel (value :: allowedEnvironmentVariables) tail
+            loop path trustLevel (value :: allowedEnvironmentVariables) maxImportBytes tail
+        | "--max-import-bytes" :: value :: tail ->
+            match Int64.TryParse value with
+            | true, parsed when parsed >= 0L ->
+                loop path trustLevel allowedEnvironmentVariables parsed tail
+            | _ -> Error "--max-import-bytes must be a non-negative integer. Use 0 for unlimited."
         | unknown :: _ -> Error $"Unknown or incomplete argument: {unknown}"
 
-    loop (WorkspaceDefaults.current()) "partial" (List.rev configuredEnvironmentVariables) (args |> Array.toList)
+    loop (WorkspaceDefaults.current()) "partial" (List.rev configuredEnvironmentVariables) AgentProtocol.defaultMaxImportBytes (args |> Array.toList)
 
 let register (tui: ConsoleTui) (connection: HubConnection) deviceId =
     task {
@@ -95,23 +100,26 @@ let main args =
     activityStoreError
     |> Option.iter (fun error -> tui.Log $"Activity persistence unavailable: {error}")
 
-    let dir, trustLevel, allowedEnvironmentVariables =
+    let dir, trustLevel, allowedEnvironmentVariables, maxImportBytes =
         match parseArgs args with
-        | Ok(path, trustValue, allowedEnvironmentVariables) ->
+        | Ok(path, trustValue, allowedEnvironmentVariables, maxImportBytes) ->
             match TrustLevel.parse trustValue with
-            | Ok level -> path, level, allowedEnvironmentVariables
+            | Ok level -> path, level, allowedEnvironmentVariables, maxImportBytes
             | Error message ->
                 eprintfn $"%s{message}"
                 exit 2
         | Error message ->
             eprintfn $"%s{message}"
-            eprintfn "Usage: JarvisClient [--path <workspace>] [--trust none|partial|full] [--allow-env NAME]..."
+            eprintfn "Usage: JarvisClient [--path <workspace>] [--trust none|partial|full] [--allow-env NAME]... [--max-import-bytes BYTES]"
             exit 2
 
     ProcessEnvironment.configureAllowedEnvironmentVariables allowedEnvironmentVariables
-    let rt = Runtime(getDir dir, tui, trustLevel)
+    let rt = Runtime(getDir dir, tui, trustLevel, maxImportBytes)
     tui.Log $"Trust: {TrustLevel.toDisplayName trustLevel}"
     tui.Log $"Allowed sensitive environment variables: {allowedEnvironmentVariables.Length}"
+    let importSizeDescription =
+        if maxImportBytes = 0L then "unlimited" else $"{maxImportBytes} bytes"
+    tui.Log $"Maximum import size: {importSizeDescription}"
 
     let mutable registered = false
 

@@ -230,6 +230,30 @@ let ``command catalog matches AgentCommand union and MCP tools`` () =
     Set.difference mcpNames catalogNames |> shouldEqual serverLocalNames
 
 [<Test>]
+let ``ImportFile advertises the ChatGPT file parameter`` () =
+    let methodInfo =
+        typeof<JarvisMcpTools>.GetMethod("ImportFile")
+
+    isNull methodInfo |> shouldEqual false
+
+    let metadata =
+        methodInfo.GetCustomAttributes(typeof<McpMetaAttribute>, false)
+        |> Array.choose (function
+            | :? McpMetaAttribute as value -> Some value
+            | _ -> None)
+        |> Array.find (fun value -> value.Name = "openai/fileParams")
+
+    use document = JsonDocument.Parse(metadata.JsonValue)
+    document.RootElement.GetArrayLength() |> shouldEqual 1
+    document.RootElement[0].GetString() |> shouldEqual "file"
+
+    let fileParameter =
+        methodInfo.GetParameters()
+        |> Array.find (fun parameter -> parameter.Name = "file")
+
+    fileParameter.ParameterType |> shouldEqual typeof<OpenAIFileParam>
+
+[<Test>]
 let ``server ListCommands catalog matches public MCP tools`` () =
     let mcpNames =
         typeof<JarvisMcpTools>.GetMethods()
@@ -403,12 +427,12 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
 
         let destructive =
             match methodInfo.Name with
-            | "WriteFile" | "PatchFile" | "RunCommand" | "RunProjectTask" | "StartJob" | "CancelJob" -> true
+            | "ImportFile" | "WriteFile" | "PatchFile" | "RunCommand" | "RunProjectTask" | "StartJob" | "CancelJob" -> true
             | _ -> false
 
         let openWorld =
             match methodInfo.Name with
-            | "RunCommand" | "RunProjectTask" | "StartJob" -> true
+            | "ImportFile" | "RunCommand" | "RunProjectTask" | "StartJob" -> true
             | _ -> false
 
         attribute.ReadOnly |> shouldEqual readOnly

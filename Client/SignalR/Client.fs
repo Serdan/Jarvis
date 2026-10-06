@@ -2,6 +2,10 @@ module Client.SignalR.Client
 
 open System
 open System.Diagnostics
+open System.IO
+open System.Net
+open System.Net.Http
+open System.Security.Cryptography
 open System.Text
 open System.Text.Json
 open System.Threading.Tasks
@@ -59,6 +63,7 @@ let private readFileResultToDto path value =
 
 let private auditDetails command =
     match command with
+    | ImportFileCommand cmd -> Some("ImportFile", Some cmd.ProjectName, [ WorkspaceWrite; NetworkAccess ], [ cmd.FilePath ], None, [])
     | WriteFileCommand cmd -> Some("WriteFile", Some cmd.ProjectName, [ WorkspaceWrite ], [ cmd.FilePath ], None, [])
     | PatchFileCommand cmd -> Some("PatchFile", Some cmd.ProjectName, [ WorkspaceWrite ], [ cmd.FilePath ], None, [])
     | RunCommandCommand cmd -> Some("RunCommand", Some cmd.ProjectName, [ ProcessExecution ], [], Some cmd.Executable, cmd.Args)
@@ -79,6 +84,93 @@ let private audit command response =
             | Error error -> EffectError.toString error
 
         AuditLog.recordCommand commandName projectName permissions paths executable args summary
+
+let private importFile (cmd: ImportFileCommand) (rt: Runtime) =
+    match cmd.MaxBytes with
+    | Some value when value <= 0L ->
+        Error(Client.ValidationError "MaxBytes must be greater than zero when supplied.")
+    | requestedLimit ->
+        match Uri.TryCreate(cmd.DownloadUrl, UriKind.Absolute) with
+        | false, _ ->
+            Error(Client.ValidationError "DownloadUrl must be an absolute URL.")
+        | true, uri when uri.Scheme <> Uri.UriSchemeHttps ->
+            Error(Client.ValidationError "DownloadUrl must use HTTPS.")
+        | true, uri ->
+            match ProjectPaths.resolveWritableProjectFile cmd.ProjectName cmd.FilePath rt with
+            | Error error -> Error error
+            | Ok(FilePath destinationPath) ->
+                let localLimit =
+                    if rt.MaxImportBytes = 0L then Int64.MaxValue
+                    else rt.MaxImportBytes
+
+                let effectiveLimit =
+                    requestedLimit
+                    |> Option.map (fun requested -> min requested localLimit)
+                    |> Option.defaultValue localLimit
+
+                let parentPath = Path.GetDirectoryName destinationPath
+                let tempPath =
+                    Path.Combine(parentPath, $".{Path.GetFileName(destinationPath)}.{Guid.NewGuid():N}.jarvis-import")
+
+                try
+                    if File.Exists destinationPath && not cmd.Overwrite then
+                        Error(Client.ValidationError $"Destination file already exists: {cmd.FilePath}")
+                    else
+                        if cmd.CreateParents then
+                            Directory.CreateDirectory(parentPath) |> ignore
+                        elif not (Directory.Exists parentPath) then
+                            raise (DirectoryNotFoundException $"Parent directory does not exist: {Path.GetDirectoryName(cmd.FilePath)}")
+
+                        use request = new HttpRequestMessage(HttpMethod.Get, uri)
+                        use response = rt.httpClient.Send(request, HttpCompletionOption.ResponseHeadersRead)
+
+                        if response.StatusCode < HttpStatusCode.OK || response.StatusCode >= HttpStatusCode.MultipleChoices then
+                            Error(Client.ValidationError $"Download failed with HTTP status {int response.StatusCode}.")
+                        else
+                            let contentLength = response.Content.Headers.ContentLength
+
+                            if contentLength.HasValue && contentLength.Value > effectiveLimit then
+                                Error(Client.ValidationError $"File is {contentLength.Value} bytes and exceeds the {effectiveLimit} byte import limit.")
+                            else
+                                use source = response.Content.ReadAsStream()
+                                use destination =
+                                    new FileStream(tempPath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 81920, FileOptions.SequentialScan)
+                                use hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256)
+                                let buffer = Array.zeroCreate<byte> 81920
+                                let mutable total = 0L
+                                let mutable finished = false
+
+                                while not finished do
+                                    let read = source.Read(buffer, 0, buffer.Length)
+                                    if read = 0 then
+                                        finished <- true
+                                    else
+                                        total <- total + int64 read
+                                        if total > effectiveLimit then
+                                            raise (InvalidDataException $"Downloaded file exceeds the {effectiveLimit} byte import limit.")
+
+                                        destination.Write(buffer, 0, read)
+                                        hash.AppendData(buffer, 0, read)
+
+                                destination.Flush(true)
+                                let digest =
+                                    hash.GetHashAndReset()
+                                    |> Convert.ToHexString
+                                    |> fun value -> $"sha256:{value.ToLowerInvariant()}"
+
+                                File.Move(tempPath, destinationPath, cmd.Overwrite)
+
+                                Ok
+                                    { FilePath = cmd.FilePath
+                                      FileId = cmd.FileId
+                                      BytesWritten = total
+                                      MimeType = cmd.MimeType
+                                      Sha256 = digest }
+                with ex ->
+                    if File.Exists tempPath then
+                        try File.Delete tempPath with _ -> ()
+
+                    Error(Client.ExceptionError ex)
 
 let private dispatch (rt: Runtime) (command: AgentCommand) =
     match command with
@@ -110,6 +202,7 @@ let private dispatch (rt: Runtime) (command: AgentCommand) =
         rt
         |> ProjectBrowser.readImage cmd
         |> serialize'
+    | ImportFileCommand cmd -> rt |> importFile cmd |> serialize'
     | WriteFileCommand cmd -> rt |> ProjectBrowser.writeFile cmd |> serialize'
     | PatchFileCommand cmd ->
         rt

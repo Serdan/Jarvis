@@ -1,6 +1,13 @@
 namespace Server
 
 [<CLIMutable>]
+type OpenAIFileParam =
+    { download_url: string
+      file_id: string
+      mime_type: string
+      file_name: string }
+
+[<CLIMutable>]
 type ProfileResult = { id: string }
 
 open System
@@ -153,6 +160,7 @@ module McpToolHelpers =
         | GetJobResultCommand _
         | MessageCommand _
         | GetClientActivityCommand _ -> Auth.WorkspaceRead
+        | ImportFileCommand _
         | WriteFileCommand _
         | CreateSkillCommand _
         | PatchFileCommand _ -> Auth.WorkspaceWrite
@@ -606,6 +614,31 @@ type JarvisMcpTools =
     [<McpServerTool(Title = "Read image", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read a PNG, JPEG, or WebP image from a project and return it as native MCP image content for model vision.")>]
     static member ReadImage(projectName: string, filePath: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (ReadImageCommand { ProjectName = projectName; FilePath = filePath })
+
+    [<McpServerTool(Title = "Import file", ReadOnly = false, Destructive = true, Idempotent = false, OpenWorld = true);
+      McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:write"]}]""");
+      McpMeta("openai/fileParams", JsonValue = """["file"]""");
+      Description("Import a ChatGPT-provided file into a project path. The Jarvis client downloads the temporary file URL directly and enforces its local import-size limit.")>]
+    static member ImportFile(
+        projectName: string,
+        filePath: string,
+        file: OpenAIFileParam,
+        overwrite: bool,
+        createParents: bool,
+        maxBytes: Nullable<int64>,
+        client: ClientService,
+        http: IHttpContextAccessor
+    ) =
+        McpToolHelpers.send client http (ImportFileCommand {
+            ProjectName = projectName
+            FilePath = filePath
+            DownloadUrl = file.download_url
+            FileId = file.file_id
+            MimeType = McpToolHelpers.optionOfString file.mime_type
+            FileName = McpToolHelpers.optionOfString file.file_name
+            Overwrite = overwrite
+            CreateParents = createParents
+            MaxBytes = McpToolHelpers.optionOfNullableInt64 maxBytes })
 
     [<McpServerTool(Title = "Write file", ReadOnly = false, Destructive = true, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:write"]}]"""); Description("Write or append to a project file. Requires approval in the local Jarvis client.")>]
     static member WriteFile(projectName: string, filePath: string, content: string, fileWriteMode: string, expectedHash: string, createParents: Nullable<bool>, client: ClientService, http: IHttpContextAccessor) =

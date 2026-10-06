@@ -185,6 +185,38 @@ type ReadFilesCommand =
       FilePaths: string list }
 ```
 
+### `ImportFile`
+
+Downloads a ChatGPT-provided file directly from its temporary HTTPS URL into a project-relative destination.
+
+Mutates state and performs network access.
+
+```fsharp
+type ImportFileCommand =
+    { ProjectName: string
+      FilePath: string
+      DownloadUrl: string
+      FileId: string
+      MimeType: string option
+      FileName: string option
+      Overwrite: bool
+      CreateParents: bool
+      MaxBytes: int64 option }
+```
+
+The public MCP tool accepts the ChatGPT file object as a top-level `file` parameter and advertises it through `_meta["openai/fileParams"] = ["file"]`. The server forwards the temporary download URL and metadata to the local client; file bytes do not transit the Jarvis server or SignalR.
+
+The client:
+
+- accepts HTTPS download URLs only;
+- streams to a temporary file in the destination directory;
+- enforces `Content-Length` when present and independently enforces the limit while streaming;
+- calculates SHA-256 during the transfer;
+- atomically moves the completed temporary file into place;
+- removes the temporary file if the import fails.
+
+The local default maximum is 32 MiB. `--max-import-bytes BYTES` changes the local maximum and `0` means unlimited. `MaxBytes` on an individual command may lower the effective limit but cannot raise the locally configured maximum.
+
 ### `WriteFile`
 
 Writes or appends full content to a project-relative file.

@@ -109,6 +109,24 @@ type ReadImageResult =
       MimeType: string
       Data: byte[] }
 
+type ImportFileCommand =
+    { ProjectName: string
+      FilePath: string
+      DownloadUrl: string
+      FileId: string
+      MimeType: string option
+      FileName: string option
+      Overwrite: bool
+      CreateParents: bool
+      MaxBytes: int64 option }
+
+type ImportFileResult =
+    { FilePath: string
+      FileId: string
+      BytesWritten: int64
+      MimeType: string option
+      Sha256: string }
+
 type WriteFileCommand =
     { ProjectName: string
       FilePath: string
@@ -350,6 +368,7 @@ type AgentCommand =
     | ReadFileCommand of ReadFileCommand
     | ReadFilesCommand of ReadFilesCommand
     | ReadImageCommand of ReadImageCommand
+    | ImportFileCommand of ImportFileCommand
     | WriteFileCommand of WriteFileCommand
     | PatchFileCommand of PatchFileCommand
     | RunCommandCommand of RunCommandCommand
@@ -379,6 +398,7 @@ module AgentCommandInfo =
         | ReadFileCommand _ -> "ReadFileCommand"
         | ReadFilesCommand _ -> "ReadFilesCommand"
         | ReadImageCommand _ -> "ReadImageCommand"
+        | ImportFileCommand _ -> "ImportFileCommand"
         | WriteFileCommand _ -> "WriteFileCommand"
         | PatchFileCommand _ -> "PatchFileCommand"
         | RunCommandCommand _ -> "RunCommandCommand"
@@ -407,6 +427,7 @@ module AgentCommandInfo =
         | ReadFileCommand _ -> "ReadFile"
         | ReadFilesCommand _ -> "ReadFiles"
         | ReadImageCommand _ -> "ReadImage"
+        | ImportFileCommand _ -> "ImportFile"
         | WriteFileCommand _ -> "WriteFile"
         | PatchFileCommand _ -> "PatchFile"
         | RunCommandCommand _ -> "RunCommand"
@@ -439,6 +460,7 @@ module AgentCommandInfo =
         | ReadFileCommand cmd -> Some cmd.ProjectName
         | ReadFilesCommand cmd -> Some cmd.ProjectName
         | ReadImageCommand cmd -> Some cmd.ProjectName
+        | ImportFileCommand cmd -> Some cmd.ProjectName
         | WriteFileCommand cmd -> Some cmd.ProjectName
         | PatchFileCommand cmd -> Some cmd.ProjectName
         | RunCommandCommand cmd -> Some cmd.ProjectName
@@ -495,6 +517,7 @@ module AgentCommandInfo =
         | ReadFileCommand cmd -> Some(compact cmd.FilePath)
         | ReadFilesCommand cmd -> Some(String.concat ", " (cmd.FilePaths |> List.map compact))
         | ReadImageCommand cmd -> Some(compact cmd.FilePath)
+        | ImportFileCommand cmd -> Some(compact cmd.FilePath)
         | WriteFileCommand cmd -> Some(compact cmd.FilePath)
         | PatchFileCommand cmd -> Some(compact cmd.FilePath)
         | RunCommandCommand cmd -> Some(fullCommand cmd.Executable cmd.Args)
@@ -523,6 +546,7 @@ module AgentCommandInfo =
         | ReadFileCommand cmd -> Some(truncate 64 cmd.FilePath)
         | ReadFilesCommand cmd -> Some $"{cmd.FilePaths.Length} files"
         | ReadImageCommand cmd -> Some(truncate 64 cmd.FilePath)
+        | ImportFileCommand cmd -> Some(truncate 64 cmd.FilePath)
         | WriteFileCommand cmd -> Some(truncate 64 cmd.FilePath)
         | PatchFileCommand cmd -> Some(truncate 64 cmd.FilePath)
         | RunCommandCommand cmd -> Some(commandPreview cmd.Executable cmd.Args)
@@ -583,10 +607,11 @@ module AgentCommandInfo =
         | None -> invocation command
 
 module AgentProtocol =
-    let version = "3.6"
+    let version = "3.7"
     let defaultPatchFuzzyContextLines = 3
     let maxResponseBytes = 900 * 1024
     let maxImageBytes = 8 * 1024 * 1024
+    let defaultMaxImportBytes = 32L * 1024L * 1024L
 
     let private definition name description permissions mutates requiresConfirmation supportsDryRun : CommandDefinition =
         { Name = name
@@ -606,6 +631,7 @@ module AgentProtocol =
           definition "ReadFile" "Reads one file." [ ReadOnly ] false false false
           definition "ReadFiles" "Reads multiple files." [ ReadOnly ] false false false
           definition "ReadImage" "Reads one PNG, JPEG, or WebP image for model vision." [ ReadOnly ] false false false
+          definition "ImportFile" "Downloads a ChatGPT-provided file into a project path." [ WorkspaceWrite; NetworkAccess ] true true false
           definition "WriteFile" "Writes or appends one file." [ WorkspaceWrite ] true true false
           definition "PatchFile" "Applies an atomic unified diff to one file." [ WorkspaceWrite ] true true true
           definition "RunCommand" "Runs a bounded local process." [ ProcessExecution ] true true false

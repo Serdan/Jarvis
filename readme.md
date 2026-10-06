@@ -32,6 +32,7 @@ There is no copied session key. ChatGPT never receives a Jarvis routing secret.
 - Project discovery and metadata.
 - Directory listing and bounded file-name/content search.
 - Single and batch file reads, including ranged reads.
+- Binary file import from ChatGPT file parameters with streamed local download, hashing, and atomic placement.
 - Optimistic-concurrency writes and atomic unified-diff patches.
 - Named project tasks from `.jarvis.json`.
 - Project-local skill discovery, reading, and creation with `ListSkills`, `GetSkill`, and `CreateSkill`.
@@ -142,6 +143,15 @@ JARVIS_ALLOWED_ENVIRONMENT_VARIABLES=NUGET_AUTH_TOKEN,GITHUB_TOKEN ./JarvisClien
 ```
 
 Project-owned `.jarvis.json` files cannot grant themselves access to filtered environment variables.
+
+Imported files default to a 32 MiB local maximum. Override it when launching the client:
+
+```bash
+./JarvisClient-linux-x64 --max-import-bytes 134217728
+./JarvisClient-linux-x64 --max-import-bytes 0
+```
+
+`0` means unlimited. A tool call may request a lower per-import limit, but cannot raise the client-configured maximum.
 
 ## Project tasks
 

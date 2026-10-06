@@ -34,7 +34,10 @@ There is no copied session key. ChatGPT never receives a Jarvis routing secret.
 - Single and batch file reads, including ranged reads.
 - Optimistic-concurrency writes and atomic unified-diff patches.
 - Named project tasks from `.jarvis.json`.
-- Bounded process execution and asynchronous jobs.
+- Project-local skill discovery, reading, and creation with `ListSkills`, `GetSkill`, and `CreateSkill`.
+- Bounded process execution and asynchronous jobs, with optional human-readable `reason` metadata on `RunCommand` and `StartJob`.
+- Persisted client activity and fresh-session recovery through `GetClientActivity`.
+- Lightweight progress and turn-completion notes in client activity through `Message`.
 - Git status/diff and local commits.
 - Project-root and symlink confinement.
 - Local confirmation and session-grant policy for state-changing operations.
@@ -67,8 +70,8 @@ OAuth scopes:
 
 | Scope | Purpose |
 |---|---|
-| `workspace:read` | Project discovery, search, file reads, git/job status |
-| `workspace:write` | File writes and patches |
+| `workspace:read` | Project discovery, search, file/skill reads, git/job status, client activity, messages |
+| `workspace:write` | File writes, patches, skill creation |
 | `process:execute` | Commands, project tasks, jobs, cancellation |
 | `git:write` | Local git commits |
 | `client:connect` | Authenticate JarvisClient's SignalR connection |
@@ -159,6 +162,24 @@ Projects can expose named build/test/format/lint tasks in a project-root `.jarvi
 ```
 
 The executable and arguments come from local project configuration rather than model-supplied task arguments. Jarvis resolves the task before permission approval and executes that same definition afterward.
+
+## Project skills
+
+Projects can store reusable procedural instructions at `.jarvis/skills/<skill-name>/SKILL.md`. `ListSkills(projectName)` discovers names and short descriptions; `GetSkill(projectName, skillName)` reads the full Markdown. `CreateSkill(projectName, skillName, content, overwrite=false)` writes the canonical path and rejects existing skills unless overwrite is explicit.
+
+Skill reads require `workspace:read`; creation requires `workspace:write` and follows the local trust policy. Skills provide guidance and do not execute code or grant permissions. See [Jarvis Skills](docs/Skills.md) for the format and validation rules.
+
+## Client activity and recovery
+
+JarvisClient retains the latest 500 activities and restores them from local JSONL logs after a restart. Logs rotate daily and at 10 MiB, with 14 days of retention. Commands left running or awaiting permission are restored as `Interrupted`; activity recovery does not resume processes or restore job handles.
+
+A fresh agent session can call `GetClientActivity(projectName?, limit=20)` to inspect recent activity, including timestamps, reasons/details, status, duration, and result or failure summaries. Requests are bounded to 1–100 entries, with optional case-insensitive exact project filtering. The client must be connected; use `GetConnectionDiagnostics` separately to inspect connection state. Activity inspection does not add an activity row, and detailed history is not persisted on the server. The client also supports `R` to copy recent commands for chat recovery.
+
+Supply a short `reason` when using `RunCommand` or `StartJob` to explain the operation in activity/history. `ListJobs` also retains `StartJob` reasons. Reasons are presentation metadata and do not change authorization identity or grant permissions.
+
+Use `Message(message, projectName?)` for short progress or turn-completion notes. It accepts non-empty text up to 1000 characters and creates one persisted `Info` entry visible through `GetClientActivity`, optionally associated with a project. It requires `workspace:read`, needs no local approval, and does not modify the workspace.
+
+See [Client Activity Feedback Tasks](docs/ClientActivityTasks.md) for recovery and log behavior, [Agent Command Surface](docs/AgentCommandSurface.md) for command details, and [Privacy and Data Handling](docs/privacy.md) for stored metadata.
 
 ## Server configuration
 

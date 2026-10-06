@@ -80,9 +80,14 @@ JarvisClient stores:
 - the chosen workspace for the running process;
 - a non-secret device identifier in the user's application-data directory;
 - OAuth tokens in process memory;
-- an in-memory audit log for sensitive command categories.
+- an in-memory audit log for sensitive command categories;
+- local activity history in append-only JSONL files under `Jarvis/activity` in the user's local application-data directory.
 
 Audit entries can contain timestamps, command names, project names, affected paths, executable names/arguments, permission categories, and result summaries. The audit log is not intended to contain full project file contents or OAuth credentials.
+
+Activity logs persist visible metadata: timestamps, project and command names, compact activity messages, full reasons/details, lifecycle status, duration, result summaries, and retained failure detail. These fields can include paths, executable arguments, or informational `Message` text; activity logs do not serialize full command payloads or raw stdout/stderr. Logs rotate by local calendar day and at 10 MiB, and files older than 14 days are pruned. The latest 500 activities are restored on launch, with unfinished commands marked `Interrupted`. Persistence is best-effort.
+
+The authenticated MCP caller can read this history through `GetClientActivity` while the client is connected. Detailed activity remains stored on the client rather than in the server's telemetry database. `Message` adds a persisted local informational entry without a permission prompt; it does not modify project files.
 
 ## Local permissions
 
@@ -108,4 +113,4 @@ Users should expose only workspaces they are comfortable making available to the
 
 Privacy questions can be sent to admin@kehlet.dev.
 
-_Last updated: 2026-09-29_
+_Last updated: 2026-10-06_

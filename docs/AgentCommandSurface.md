@@ -11,7 +11,7 @@ Jarvis should not try to be a complete coding-agent runtime. Its purpose is to e
 - Prefer auditable patch-based edits over brittle text replacement commands.
 - Keep all path resolution confined to the selected project root.
 - Let clients and servers negotiate available capabilities at runtime.
-- Avoid long-running HTTP requests by supporting asynchronous job handles later.
+- Avoid long-running HTTP requests by supporting asynchronous job handles.
 
 ## Protocol Metadata
 
@@ -59,14 +59,24 @@ type AgentCommand =
     | SearchTextCommand of SearchTextCommand
     | ReadFileCommand of ReadFileCommand
     | ReadFilesCommand of ReadFilesCommand
+    | ReadImageCommand of ReadImageCommand
     | WriteFileCommand of WriteFileCommand
     | PatchFileCommand of PatchFileCommand
     | RunCommandCommand of RunCommandCommand
     | ListProjectTasksCommand of ListProjectTasksCommand
     | RunProjectTaskCommand of RunProjectTaskCommand
+    | ListSkillsCommand of ListSkillsCommand
+    | GetSkillCommand of GetSkillCommand
+    | CreateSkillCommand of CreateSkillCommand
     | GetGitStatusCommand of GitStatusCommand
     | GetGitDiffCommand of GitDiffCommand
     | GitCommitCommand of GitCommitCommand
+    | StartJobCommand of StartJobCommand
+    | ListJobsCommand of ListJobsCommand
+    | GetJobResultCommand of GetJobResultCommand
+    | CancelJobCommand of CancelJobCommand
+    | MessageCommand of MessageCommand
+    | GetClientActivityCommand of GetClientActivityCommand
 ```
 
 ## Project Discovery Commands
@@ -320,6 +330,12 @@ type RunProjectTaskCommand =
 
 For authorization, Jarvis resolves the task before prompting and authorizes the resolved executable and arguments. The same resolved definition is then executed, so editing `.jarvis.json` after a session grant was created cannot silently change what an already-approved exact command means.
 
+## Project Skills
+
+`ListSkills(projectName)` discovers project-local skill names and descriptions. `GetSkill(projectName, skillName)` returns the full Markdown. Both are read-only and require `workspace:read`.
+
+`CreateSkill(projectName, skillName, content, overwrite=false)` writes `.jarvis/skills/<skill-name>/SKILL.md`. It requires `workspace:write` and follows the local trust policy; existing skills require explicit overwrite. Skills are procedural guidance, not executable operations or permission grants. See [Jarvis Skills](Skills.md) for the authoritative layout, validation, and result details.
+
 ## Git Commands
 
 Git commands provide an audit boundary for agent changes.
@@ -397,9 +413,9 @@ Policy:
 
 Avoid exposing arbitrary git subcommands at first. `push`, `pull`, `rebase`, `reset`, and `checkout` need a stronger permission model.
 
-## Later: Asynchronous Jobs
+## Asynchronous Jobs
 
-Long-running processes should not be tied to a single HTTP request. Add asynchronous job handles after the synchronous execution model is stable.
+Long-running processes use asynchronous job handles rather than remaining tied to a single HTTP request.
 
 Use `Job` terminology here because `Command` already means a protocol message in Jarvis.
 
@@ -441,10 +457,10 @@ type StartJobResult =
       StartedAt: System.DateTimeOffset }
 ```
 
+`Reason` is optional presentation metadata, like `RunCommand.Reason`; it appears in activity/history and does not change authorization identity. `ListJobs` preserves the reason with the job summary. Supply a short explanation of why the job is needed.
+
 Example use cases:
 
-- `Reason` is optional presentation metadata, like `RunCommand.Reason`; it appears in activity/history and does not change authorization identity.
-- `ListJobs` preserves the reason with the job summary.
 - `dotnet test --watch`
 - `dotnet run`
 - `npm run dev`
@@ -522,6 +538,8 @@ type CancelJobCommand =
 
 Cancellation should first attempt graceful termination and then force-kill after an implementation-defined timeout.
 
+## Client Activity and Messages
+
 ### `Message`
 
 Adds a short informational entry to the connected client's activity history.
@@ -537,12 +555,13 @@ Use this for lightweight agent-to-client status messages such as `Done with this
 - `ProjectName` is optional. When present, the message participates in normal project filtering and project coloring.
 - `Message` must be non-empty and is limited to 1000 characters.
 - The command does not require a local permission prompt and does not modify the workspace.
+- The MCP tool requires `workspace:read`.
 - It creates exactly one `Info` activity entry rather than a normal running/completed command activity pair.
 - The informational entry is persisted by the client activity log and is visible through `GetClientActivity`.
 
 ### `GetClientActivity`
 
-Reads the connected client's recent in-memory activity history so a new agent session can reconstruct what the local client was doing before a previous ChatGPT session stalled.
+Reads the connected client's recent activity history so a new agent session can reconstruct what the local client was doing before a previous ChatGPT session stalled or the client restarted. The MCP tool requires `workspace:read`.
 
 ```fsharp
 type GetClientActivityCommand =
@@ -562,14 +581,16 @@ Each returned activity entry includes:
 - completed duration and result summary when available;
 - retained full failure detail when available.
 
-The activity snapshot is intentionally ephemeral:
+The activity snapshot is client-owned:
 
-- it is read directly from the connected client's existing in-memory history;
+- it is read directly from the connected client's latest 500 in-memory activities, restored from local logs at startup;
 - it is not persisted in server telemetry;
 - requesting `GetClientActivity` does not add another activity row to the client history;
 - it does not add raw stdout/stderr to the activity history.
 
-This complements `GetConnectionDiagnostics`: diagnostics answer whether the client transport is connected or reconnecting, while `GetClientActivity` shows whether the last local operation was running, awaiting permission, completed, or failed.
+The client streams activity metadata to local append-only JSONL logs, rotates them daily and at 10 MiB, and retains 14 days. Replay restores unfinished running or awaiting-permission entries as `Interrupted`. Persistence is best-effort; malformed records are ignored and log failures do not stop command execution. Recovery restores activity history, not processes or job handles. See [Client Activity Feedback Tasks](ClientActivityTasks.md) for the detailed behavior.
+
+This complements `GetConnectionDiagnostics`: diagnostics can inspect connection state without a connected client, while `GetClientActivity` requires a connected client and shows operation progress and outcomes, including restored `Interrupted` entries and informational messages.
 
 ## Permission Model
 
@@ -682,11 +703,15 @@ If `InputSchemaJson` and `OutputSchemaJson` are added later, they should be incl
 | `SearchText` | `ReadOnly` | `Allow` | Should respect ignored directories and max output limits. |
 | `ReadFile` | `ReadOnly` | `Allow` | May still be blocked by sensitive-file filters. |
 | `ReadFiles` | `ReadOnly` | `Allow` | May still be blocked by sensitive-file filters. |
+| `ReadImage` | `ReadOnly` | `Allow` | Reads a PNG, JPEG, or WebP image for model vision. |
 | `WriteFile` | `WorkspaceWrite` | `RequireConfirmation` | Creates or overwrites project files. |
 | `PatchFile` | `WorkspaceWrite` | `RequireConfirmation` | Preferred edit path. |
 | `RunCommand` | `ProcessExecution` | `RequireConfirmation` | Use allowlists/presets where possible. |
 | `ListProjectTasks` | `ReadOnly` | `Allow` | Reads project-local task definitions. |
 | `RunProjectTask` | `ProcessExecution` | `RequireConfirmation` | Authorize the resolved task definition, not only its name. |
+| `ListSkills` | `ReadOnly` | `Allow` | Discovers project-local skills. |
+| `GetSkill` | `ReadOnly` | `Allow` | Reads skill guidance. |
+| `CreateSkill` | `WorkspaceWrite` | `RequireConfirmation` | Creates a skill; overwrite must be explicit. |
 | `GetGitStatus` | `ReadOnly` | `Allow` | Does not change git state. |
 | `GetGitDiff` | `ReadOnly` | `Allow` | Output may be truncated. |
 | `GitCommit` | `VersionControlWrite` | `RequireConfirmation` | Must stage only requested paths. |
@@ -694,6 +719,8 @@ If `InputSchemaJson` and `OutputSchemaJson` are added later, they should be incl
 | `ListJobs` | `ReadOnly` | `Allow` | Lists job metadata for visible projects/session. |
 | `GetJobResult` | `ReadOnly` | `Allow` | Reads buffered process output. |
 | `CancelJob` | `ProcessExecution` | `RequireConfirmation` | Stops a process; `partial` treats it consistently with other process-execution commands. |
+| `Message` | None | `Allow` | Adds client activity only; MCP requires `workspace:read`. |
+| `GetClientActivity` | `ReadOnly` | `Allow` | Reads connected-client history without adding an activity row. |
 
 ### Confirmation Requests
 
@@ -718,7 +745,7 @@ Examples of good summaries:
 - `Run dotnet test Client.Tests/Client.Tests.fsproj`
 - `Commit 9 files with message "Update Jarvis F# rewrite to .NET 10"`
 
-Confirmation should be specific to the exact command payload. If the payload changes, the previous confirmation is invalid.
+Confirmation should be specific to the command's authorization identity. For `RunCommand` and `StartJob`, presentation-only `Reason` is excluded from that identity; changing only the reason does not invalidate an existing grant. Changes to authorization-relevant fields still require approval.
 
 ### Scopes
 
@@ -892,7 +919,7 @@ The OAuth scopes are `workspace:read`, `workspace:write`, `process:execute`, and
 
 ### Protocol Version
 
-The current command protocol version is `3.2`. Version 3 removes copied session keys and changes registration/routing to authenticated user and device identity. Backward compatibility with the old Actions/API-key surface is intentionally not maintained.
+The current command protocol version is `3.6`. Version 3 removes copied session keys and changes registration/routing to authenticated user and device identity. Backward compatibility with the old Actions/API-key surface is intentionally not maintained.
 
 ### Error Model
 
@@ -917,7 +944,7 @@ MCP tools return command/business failures as normal `CallToolResult` values wit
 
 `ConfirmationRequired` additionally includes `confirmationRequest` with the complete `ConfirmationRequest` record. Successful MCP calls keep the original command result in `StructuredContent` and set `IsError = false`.
 
-`ConfirmationRequired` is the preferred confirmation transport. When a command requires confirmation, return this error with the exact `ConfirmationRequest`. The caller may resubmit the same payload after the user grants permission. If the payload changes, the old confirmation is invalid.
+`ConfirmationRequired` is the preferred confirmation transport. When a command requires confirmation, return this error with the exact `ConfirmationRequest`. The caller may resubmit the same payload after the user grants permission. If authorization-relevant fields change, the old confirmation is invalid; presentation-only `RunCommand.Reason` and `StartJob.Reason` are excluded.
 
 ### Hash Format
 
@@ -969,4 +996,4 @@ All command implementations must follow these rules:
 9. Add read-only git commands: `GetGitStatus`, `GetGitDiff`.
 10. Add controlled `GitCommit`.
 11. Add bounded `RunCommand`.
-12. Add asynchronous `StartJob`, `ListJobs`, `GetJobResult`, and `CancelJob` later.
+12. Add asynchronous `StartJob`, `ListJobs`, `GetJobResult`, and `CancelJob` (implemented).

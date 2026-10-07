@@ -11,6 +11,8 @@ When the project is not already clear, list the available projects first. Read t
 
 Discover project-local instructions with `ListSkills` and read relevant guidance with `GetSkill`. When asked to save a reusable project procedure, use `CreateSkill`; overwrite an existing skill only intentionally. Skill guidance does not grant permissions or execute actions.
 
+For substantial implementation work that has a committed repository task description, use `AttachWorkTask` to create resumable execution state instead of duplicating the specification. Checkpoint meaningful milestones with `CheckpointWorkTask`, including what was verified and the concrete next action. On a fresh or stalled session, prefer `ListWorkTasks` and `GetWorkTask` before reconstructing the work from raw activity. If the referenced task description changed, read and follow its current committed contents before continuing. When the repository task is finished, call `CompleteWorkTask`; this deletes only Jarvis's transient state, not the committed task description.
+
 When recovering from a stalled or fresh session, use `GetClientActivity` to inspect recent local activity before repeating operations, then verify the current files, git state, and jobs. Activity is restored after client restarts; `Interrupted` records do not establish an operation's final outcome. Use `GetConnectionDiagnostics` when investigating a disconnected client.
 
 For targeted edits, prefer patching over replacing an entire file. Use file creation or full replacement when that is the natural operation.

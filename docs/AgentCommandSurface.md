@@ -65,6 +65,11 @@ type AgentCommand =
     | RunCommandCommand of RunCommandCommand
     | ListProjectTasksCommand of ListProjectTasksCommand
     | RunProjectTaskCommand of RunProjectTaskCommand
+    | AttachWorkTaskCommand of AttachWorkTaskCommand
+    | GetWorkTaskCommand of GetWorkTaskCommand
+    | ListWorkTasksCommand of ListWorkTasksCommand
+    | CheckpointWorkTaskCommand of CheckpointWorkTaskCommand
+    | CompleteWorkTaskCommand of CompleteWorkTaskCommand
     | ListSkillsCommand of ListSkillsCommand
     | GetSkillCommand of GetSkillCommand
     | CreateSkillCommand of CreateSkillCommand
@@ -361,6 +366,14 @@ type RunProjectTaskCommand =
 `ListProjectTasks` is read-only. `RunProjectTask` resolves the named definition locally, then applies the same executable, working-directory, timeout, shell-deny, output, and process-permission checks as `RunCommand`.
 
 For authorization, Jarvis resolves the task before prompting and authorizes the resolved executable and arguments. The same resolved definition is then executed, so editing `.jarvis.json` after a session grant was created cannot silently change what an already-approved exact command means.
+
+## Persisted Work Tasks
+
+`AttachWorkTask(projectName, taskId, taskPath)` attaches transient execution state to a task description that is already tracked, committed, and clean in git. State lives in `.jarvis/tasks/<taskId>.json`, while the referenced repository file remains authoritative. The task's commit is captured when attached.
+
+`GetWorkTask` returns the checkpoint plus the current committed task content, current task commit, dirty state, and whether the committed description changed since attachment. `ListWorkTasks` lists all unfinished states without embedding every task body. `CheckpointWorkTask` updates the `active` or `blocked` checkpoint, summary, next action, verification notes, blocker, and optional last implementation commit.
+
+`CompleteWorkTask` returns the final repository HEAD and removes the local state file. Jarvis locally excludes `/.jarvis/tasks/` through `.git/info/exclude`; completion does not delete or modify the committed task description.
 
 ## Project Skills
 

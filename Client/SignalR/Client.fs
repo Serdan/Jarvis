@@ -210,6 +210,11 @@ let private dispatch (rt: Runtime) (command: AgentCommand) =
         |> serialize'
     | RunCommandCommand cmd -> rt |> ClientShell.runCommand cmd |> serialize'
     | ListProjectTasksCommand cmd -> rt |> ClientShell.listProjectTasks cmd |> serialize'
+    | AttachWorkTaskCommand cmd -> rt |> ClientShell.attachWorkTask cmd |> serialize'
+    | GetWorkTaskCommand cmd -> rt |> ClientShell.getWorkTask cmd |> serialize'
+    | ListWorkTasksCommand cmd -> rt |> ClientShell.listWorkTasks cmd |> serialize'
+    | CheckpointWorkTaskCommand cmd -> rt |> ClientShell.checkpointWorkTask cmd |> serialize'
+    | CompleteWorkTaskCommand cmd -> rt |> ClientShell.completeWorkTask cmd |> serialize'
     | RunProjectTaskCommand cmd ->
         rt
         |> ClientShell.resolveProjectTask cmd

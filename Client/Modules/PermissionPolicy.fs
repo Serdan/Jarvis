@@ -116,6 +116,11 @@ let private requiresConfirmation command =
     | ReadFilesCommand _
     | ReadImageCommand _
     | ListProjectTasksCommand _
+    | AttachWorkTaskCommand _
+    | GetWorkTaskCommand _
+    | ListWorkTasksCommand _
+    | CheckpointWorkTaskCommand _
+    | CompleteWorkTaskCommand _
     | ListSkillsCommand _
     | GetSkillCommand _
     | GetGitStatusCommand _

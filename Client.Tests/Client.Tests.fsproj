@@ -25,6 +25,7 @@
         <Compile Include="ClientShellTests.fs"/>
         <Compile Include="JobManagerTests.fs"/>
         <Compile Include="GitCommandTests.fs"/>
+        <Compile Include="WorkTaskTests.fs"/>
         <Compile Include="HashAndPatchTests.fs"/>
         <Compile Include="PathSafetyTests.fs"/>
         <Compile Include="PermissionPolicyTests.fs"/>

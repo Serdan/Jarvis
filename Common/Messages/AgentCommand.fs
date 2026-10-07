@@ -199,6 +199,58 @@ type RunProjectTaskCommand =
     { ProjectName: string
       TaskName: string }
 
+type AttachWorkTaskCommand =
+    { ProjectName: string
+      TaskId: string
+      TaskPath: string }
+
+type GetWorkTaskCommand =
+    { ProjectName: string
+      TaskId: string }
+
+type ListWorkTasksCommand =
+    { ProjectName: string }
+
+type CheckpointWorkTaskCommand =
+    { ProjectName: string
+      TaskId: string
+      Status: string
+      Summary: string
+      NextAction: string
+      Verified: string list
+      Blocker: string option
+      LastCommit: string option }
+
+type CompleteWorkTaskCommand =
+    { ProjectName: string
+      TaskId: string }
+
+type WorkTask =
+    { TaskId: string
+      TaskPath: string
+      TaskCommit: string
+      CurrentTaskCommit: string option
+      TaskChanged: bool
+      TaskDirty: bool
+      Status: string
+      Summary: string option
+      NextAction: string option
+      Verified: string list
+      Blocker: string option
+      CreatedAt: DateTimeOffset
+      UpdatedAt: DateTimeOffset
+      LastCommit: string option
+      TaskContent: string option }
+
+type ListWorkTasksResult = { Tasks: WorkTask list }
+
+type CompleteWorkTaskResult =
+    { TaskId: string
+      TaskPath: string
+      TaskCommit: string
+      FinalCommit: string
+      CompletedAt: DateTimeOffset }
+
 type ListSkillsCommand =
     { ProjectName: string }
 
@@ -374,6 +426,11 @@ type AgentCommand =
     | RunCommandCommand of RunCommandCommand
     | ListProjectTasksCommand of ListProjectTasksCommand
     | RunProjectTaskCommand of RunProjectTaskCommand
+    | AttachWorkTaskCommand of AttachWorkTaskCommand
+    | GetWorkTaskCommand of GetWorkTaskCommand
+    | ListWorkTasksCommand of ListWorkTasksCommand
+    | CheckpointWorkTaskCommand of CheckpointWorkTaskCommand
+    | CompleteWorkTaskCommand of CompleteWorkTaskCommand
     | ListSkillsCommand of ListSkillsCommand
     | GetSkillCommand of GetSkillCommand
     | CreateSkillCommand of CreateSkillCommand
@@ -404,6 +461,11 @@ module AgentCommandInfo =
         | RunCommandCommand _ -> "RunCommandCommand"
         | ListProjectTasksCommand _ -> "ListProjectTasksCommand"
         | RunProjectTaskCommand _ -> "RunProjectTaskCommand"
+        | AttachWorkTaskCommand _ -> "AttachWorkTaskCommand"
+        | GetWorkTaskCommand _ -> "GetWorkTaskCommand"
+        | ListWorkTasksCommand _ -> "ListWorkTasksCommand"
+        | CheckpointWorkTaskCommand _ -> "CheckpointWorkTaskCommand"
+        | CompleteWorkTaskCommand _ -> "CompleteWorkTaskCommand"
         | ListSkillsCommand _ -> "ListSkillsCommand"
         | GetSkillCommand _ -> "GetSkillCommand"
         | CreateSkillCommand _ -> "CreateSkillCommand"
@@ -433,6 +495,11 @@ module AgentCommandInfo =
         | RunCommandCommand _ -> "RunCommand"
         | ListProjectTasksCommand _ -> "ListProjectTasks"
         | RunProjectTaskCommand _ -> "RunTask"
+        | AttachWorkTaskCommand _ -> "AttachWorkTask"
+        | GetWorkTaskCommand _ -> "GetWorkTask"
+        | ListWorkTasksCommand _ -> "ListWorkTasks"
+        | CheckpointWorkTaskCommand _ -> "CheckpointWorkTask"
+        | CompleteWorkTaskCommand _ -> "CompleteWorkTask"
         | ListSkillsCommand _ -> "ListSkills"
         | GetSkillCommand _ -> "GetSkill"
         | CreateSkillCommand _ -> "CreateSkill"
@@ -466,6 +533,11 @@ module AgentCommandInfo =
         | RunCommandCommand cmd -> Some cmd.ProjectName
         | ListProjectTasksCommand cmd -> Some cmd.ProjectName
         | RunProjectTaskCommand cmd -> Some cmd.ProjectName
+        | AttachWorkTaskCommand cmd -> Some cmd.ProjectName
+        | GetWorkTaskCommand cmd -> Some cmd.ProjectName
+        | ListWorkTasksCommand cmd -> Some cmd.ProjectName
+        | CheckpointWorkTaskCommand cmd -> Some cmd.ProjectName
+        | CompleteWorkTaskCommand cmd -> Some cmd.ProjectName
         | ListSkillsCommand cmd -> Some cmd.ProjectName
         | GetSkillCommand cmd -> Some cmd.ProjectName
         | CreateSkillCommand cmd -> Some cmd.ProjectName
@@ -522,6 +594,11 @@ module AgentCommandInfo =
         | PatchFileCommand cmd -> Some(compact cmd.FilePath)
         | RunCommandCommand cmd -> Some(fullCommand cmd.Executable cmd.Args)
         | RunProjectTaskCommand cmd -> Some(compact cmd.TaskName)
+        | AttachWorkTaskCommand cmd -> Some(compact cmd.TaskId)
+        | GetWorkTaskCommand cmd -> Some(compact cmd.TaskId)
+        | ListWorkTasksCommand _ -> None
+        | CheckpointWorkTaskCommand cmd -> Some(compact cmd.TaskId)
+        | CompleteWorkTaskCommand cmd -> Some(compact cmd.TaskId)
         | GetSkillCommand cmd -> Some(compact cmd.SkillName)
         | CreateSkillCommand cmd -> Some(compact cmd.SkillName)
         | ListSkillsCommand _ -> None
@@ -551,6 +628,11 @@ module AgentCommandInfo =
         | PatchFileCommand cmd -> Some(truncate 64 cmd.FilePath)
         | RunCommandCommand cmd -> Some(commandPreview cmd.Executable cmd.Args)
         | RunProjectTaskCommand cmd -> Some(truncate 48 cmd.TaskName)
+        | AttachWorkTaskCommand cmd -> Some(truncate 48 cmd.TaskId)
+        | GetWorkTaskCommand cmd -> Some(truncate 48 cmd.TaskId)
+        | ListWorkTasksCommand _ -> None
+        | CheckpointWorkTaskCommand cmd -> Some(truncate 48 cmd.TaskId)
+        | CompleteWorkTaskCommand cmd -> Some(truncate 48 cmd.TaskId)
         | GetSkillCommand cmd -> Some(truncate 48 cmd.SkillName)
         | CreateSkillCommand cmd -> Some(truncate 48 cmd.SkillName)
         | ListSkillsCommand _ -> None
@@ -607,7 +689,7 @@ module AgentCommandInfo =
         | None -> invocation command
 
 module AgentProtocol =
-    let version = "3.7"
+    let version = "3.8"
     let defaultPatchFuzzyContextLines = 3
     let maxResponseBytes = 900 * 1024
     let maxImageBytes = 8 * 1024 * 1024
@@ -637,6 +719,11 @@ module AgentProtocol =
           definition "RunCommand" "Runs a bounded local process." [ ProcessExecution ] true true false
           definition "ListProjectTasks" "Lists locally configured project tasks." [ ReadOnly ] false false false
           definition "RunProjectTask" "Runs a locally configured project task." [ ProcessExecution ] true true false
+          definition "AttachWorkTask" "Attaches local execution state to a committed task description in the project repository." [] true false false
+          definition "GetWorkTask" "Reads one persisted project work task and its current committed task description." [ ReadOnly ] false false false
+          definition "ListWorkTasks" "Lists unfinished persisted project work tasks." [ ReadOnly ] false false false
+          definition "CheckpointWorkTask" "Updates the execution checkpoint for a persisted project work task." [] true false false
+          definition "CompleteWorkTask" "Completes a persisted project work task and deletes its local execution-state file." [] true false false
           definition "ListSkills" "Lists project-local Jarvis skills." [ ReadOnly ] false false false
           definition "GetSkill" "Reads a project-local Jarvis skill." [ ReadOnly ] false false false
           definition "CreateSkill" "Creates a project-local Jarvis skill." [ WorkspaceWrite ] true true false

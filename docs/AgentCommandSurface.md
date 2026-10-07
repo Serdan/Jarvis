@@ -373,6 +373,8 @@ For authorization, Jarvis resolves the task before prompting and authorizes the 
 
 `GetWorkTask` returns the checkpoint plus the current committed task content, current task commit, dirty state, and whether the committed description changed since attachment. `ListWorkTasks` lists all unfinished states without embedding every task body. `CheckpointWorkTask` updates the `active` or `blocked` checkpoint, summary, next action, verification notes, blocker, and optional last implementation commit.
 
+Recovery should combine persisted work-task state with `GetClientActivity`, not choose between them. Work-task state provides durable intent and the explicit handoff point; activity provides the recent execution trail and can reveal attempts or interruptions that have not yet been checkpointed. Agents should reconcile both, then verify current files, git state, and jobs before resuming.
+
 `CompleteWorkTask` returns the final repository HEAD and removes the local state file. Jarvis locally excludes `/.jarvis/tasks/` through `.git/info/exclude`; completion does not delete or modify the committed task description.
 
 ## Project Skills

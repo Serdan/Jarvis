@@ -180,6 +180,8 @@ Long-running agent work can be attached to an existing task description committe
 
 `GetWorkTask` returns the current checkpoint together with the current committed task text and reports whether that task description has changed since attachment. `ListWorkTasks` lists unfinished work, and `CheckpointWorkTask` records an `active` or `blocked` checkpoint with a summary, next action, verification notes, blocker, and optional last commit.
 
+On recovery, agents should inspect both work-task state and `GetClientActivity`. The task state supplies the durable handoff and current intent; the activity log supplies the recent execution trail. Agents reconcile both before checking current files, git state, and jobs and continuing.
+
 Task descriptions must already be tracked, committed, and clean when attached. Jarvis adds `/.jarvis/tasks/` to the repository's local `.git/info/exclude` so execution state does not dirty or enter the repository.
 
 `CompleteWorkTask` records the final repository HEAD in its result and deletes the local execution-state file. The committed task description and git history remain as the durable record.

@@ -61,6 +61,7 @@ type AgentCommand =
     | ReadFilesCommand of ReadFilesCommand
     | ReadImageCommand of ReadImageCommand
     | ExportFileCommand of ExportFileCommand
+    | UpdateClientCommand
     | WriteFileCommand of WriteFileCommand
     | PatchFileCommand of PatchFileCommand
     | RunCommandCommand of RunCommandCommand
@@ -753,6 +754,7 @@ If `InputSchemaJson` and `OutputSchemaJson` are added later, they should be incl
 | `ReadFiles` | `ReadOnly` | `Allow` | May still be blocked by sensitive-file filters. |
 | `ReadImage` | `ReadOnly` | `Allow` | Reads a PNG, JPEG, or WebP image for model vision. |
 | `ExportFile` | `ReadOnly` | `Allow` | Copies one bounded project file to server memory and returns a 10-minute unguessable HTTPS bearer link for the user. |
+| `UpdateClient` | `ProcessExecution`, `NetworkAccess`, `Destructive` | `Allow` at partial/full trust; confirm at no trust | Downloads only from the configured Jarvis server, verifies `SHA256SUMS`, keeps `.prev`, replaces the standalone client, then restarts in the same terminal. |
 | `WriteFile` | `WorkspaceWrite` | `RequireConfirmation` | Creates or overwrites project files. |
 | `PatchFile` | `WorkspaceWrite` | `RequireConfirmation` | Preferred edit path. |
 | `RunCommand` | `ProcessExecution` | `RequireConfirmation` | Use allowlists/presets where possible. |

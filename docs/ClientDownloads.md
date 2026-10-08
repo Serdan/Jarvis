@@ -2,6 +2,8 @@
 
 Jarvis clients are distributed as self-contained single-file executables. The client has the SignalR server URL embedded at publish time, so each public build must be stamped with the production hub URL.
 
+The self-update facility treats these files and `SHA256SUMS` as the authoritative update channel. Whenever a deployment changes the client/shared protocol, publish and upload the matching download artifacts before relying on `UpdateClient`.
+
 For the current production host, clients should connect to:
 
 ```text

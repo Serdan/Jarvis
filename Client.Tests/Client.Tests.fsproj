@@ -28,6 +28,7 @@
         <Compile Include="WorkTaskTests.fs"/>
         <Compile Include="HashAndPatchTests.fs"/>
         <Compile Include="PathSafetyTests.fs"/>
+        <Compile Include="SelfUpdateTests.fs"/>
         <Compile Include="PermissionPolicyTests.fs"/>
         <Compile Include="AgentCommandInfoTests.fs"/>
         <Compile Include="ActivityPresentationTests.fs"/>

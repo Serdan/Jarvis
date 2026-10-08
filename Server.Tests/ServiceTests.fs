@@ -447,12 +447,12 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
 
         let destructive =
             match methodInfo.Name with
-            | "ImportFile" | "WriteFile" | "PatchFile" | "RunCommand" | "RunProjectTask" | "StartJob" | "CancelJob" -> true
+            | "ImportFile" | "UpdateClient" | "WriteFile" | "PatchFile" | "RunCommand" | "RunProjectTask" | "StartJob" | "CancelJob" -> true
             | _ -> false
 
         let openWorld =
             match methodInfo.Name with
-            | "ImportFile" | "RunCommand" | "RunProjectTask" | "StartJob" -> true
+            | "ImportFile" | "UpdateClient" | "RunCommand" | "RunProjectTask" | "StartJob" -> true
             | _ -> false
 
         attribute.ReadOnly |> shouldEqual readOnly

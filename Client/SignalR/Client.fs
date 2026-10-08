@@ -65,6 +65,7 @@ let private readFileResultToDto path value =
 let private auditDetails command =
     match command with
     | ImportFileCommand cmd -> Some("ImportFile", Some cmd.ProjectName, [ WorkspaceWrite; NetworkAccess ], [ cmd.FilePath ], None, [])
+    | UpdateClientCommand -> Some("UpdateClient", None, [ ProcessExecution; NetworkAccess; Destructive ], [], None, [])
     | WriteFileCommand cmd -> Some("WriteFile", Some cmd.ProjectName, [ WorkspaceWrite ], [ cmd.FilePath ], None, [])
     | PatchFileCommand cmd -> Some("PatchFile", Some cmd.ProjectName, [ WorkspaceWrite ], [ cmd.FilePath ], None, [])
     | RunCommandCommand cmd -> Some("RunCommand", Some cmd.ProjectName, [ ProcessExecution ], [], Some cmd.Executable, cmd.Args)
@@ -208,6 +209,7 @@ let private dispatch (rt: Runtime) (command: AgentCommand) =
         |> ProjectBrowser.exportFile cmd
         |> serialize'
     | ImportFileCommand cmd -> rt |> importFile cmd |> serialize'
+    | UpdateClientCommand -> SelfUpdate.prepare () |> Async.AwaitTask |> Async.RunSynchronously |> serialize'
     | WriteFileCommand cmd -> rt |> ProjectBrowser.writeFile cmd |> serialize'
     | PatchFileCommand cmd ->
         rt
@@ -347,4 +349,12 @@ let receiveCommandAndReply (connection: HubConnection) (rt: Runtime) (correlatio
         | Ok() -> ()
         | Error ex ->
             rt.Tui.Log $"Failed to deliver command response after reconnect retries: {ex.Message}"
+
+        match sendResult, parsedCommand, response with
+        | Ok(), Some UpdateClientCommand, Ok _ ->
+            rt.Tui.Log "Update verified and installed; restarting Jarvis in this terminal."
+            match SelfUpdate.activatePending () with
+            | Ok _ -> ()
+            | Error error -> rt.Tui.Log $"Self-update activation failed: {EffectError.toString error}"
+        | _ -> ()
     }

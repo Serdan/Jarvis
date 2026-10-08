@@ -132,6 +132,8 @@ let private requiresConfirmation command =
     | GetClientActivityCommand _ -> readOnly
     | ImportFileCommand cmd ->
         confirmation "ImportFile" (Some cmd.ProjectName) [ WorkspaceWrite; NetworkAccess ] [ cmd.FilePath ] None [] $"Import file {cmd.FilePath}" false
+    | UpdateClientCommand ->
+        confirmation "UpdateClient" None [ ProcessExecution; NetworkAccess; Destructive ] [] None [] "Update and restart Jarvis client" false
     | WriteFileCommand cmd ->
         confirmation "WriteFile" (Some cmd.ProjectName) [ WorkspaceWrite ] [ cmd.FilePath ] None [] $"Write file {cmd.FilePath}" true
     | PatchFileCommand cmd ->

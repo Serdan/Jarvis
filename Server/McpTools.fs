@@ -199,6 +199,7 @@ module McpToolHelpers =
         | WriteFileCommand _
         | CreateSkillCommand _
         | PatchFileCommand _ -> Auth.WorkspaceWrite
+        | UpdateClientCommand -> Auth.ProcessExecute
         | RunCommandCommand _
         | RunProjectTaskCommand _
         | StartJobCommand _
@@ -710,6 +711,10 @@ type JarvisMcpTools =
             Overwrite = overwrite
             CreateParents = createParents
             MaxBytes = McpToolHelpers.optionOfNullableInt64 maxBytes })
+
+    [<McpServerTool(Title = "Update client", ReadOnly = false, Destructive = true, Idempotent = false, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["process:execute"]}]"""); Description("Download the latest published Jarvis client from this Jarvis server, verify its SHA-256 manifest entry, atomically replace the running client binary, and restart it in the same terminal.")>]
+    static member UpdateClient(client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http UpdateClientCommand
 
     [<McpServerTool(Title = "Write file", ReadOnly = false, Destructive = true, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:write"]}]"""); Description("Write or append to a project file. Requires approval in the local Jarvis client.")>]
     static member WriteFile(projectName: string, filePath: string, content: string, [<Description("File write mode. Allowed values: Write, Append.")>] fileWriteMode: string, expectedHash: string, createParents: Nullable<bool>, client: ClientService, http: IHttpContextAccessor) =

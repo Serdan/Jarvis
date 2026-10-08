@@ -21,6 +21,18 @@ let ``export file is read only`` () =
     evaluate command |> shouldEqual (Ok())
 
 [<Test>]
+let ``partial trust allows structured client self update`` () =
+    evaluateWithTrust PartialTrust UpdateClientCommand |> shouldEqual (Ok())
+
+[<Test>]
+let ``no trust requires confirmation for client self update`` () =
+    match evaluateWithTrust NoTrust UpdateClientCommand with
+    | Error(Client.ConfirmationRequired request) ->
+        request.CommandName |> shouldEqual "UpdateClient"
+        request.Permissions |> shouldEqual [ ProcessExecution; NetworkAccess; Destructive ]
+    | other -> Assert.Fail($"Expected ConfirmationRequired, got {other}")
+
+[<Test>]
 let ``effect errors map to protocol errors`` () =
     EffectError.toAgentError (Client.ValidationError "bad input")
     |> shouldEqual (AgentError.ValidationFailed "bad input")

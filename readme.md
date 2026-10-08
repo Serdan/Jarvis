@@ -34,6 +34,7 @@ There is no copied session key. ChatGPT never receives a Jarvis routing secret.
 - Single and batch file reads, including ranged reads.
 - Short-lived HTTPS export links for bounded project files, so generated images and other files can be opened by the remote user without exposing the workspace filesystem.
 - Binary file import from ChatGPT file parameters with streamed local download, hashing, and atomic placement.
+- Verified self-update for published Linux/macOS clients: the client reads `SHA256SUMS` from its configured Jarvis server, atomically swaps the standalone executable with a `.prev` rollback copy, and restarts attached to the same terminal.
 - Optimistic-concurrency writes and atomic unified-diff patches.
 - Named project tasks from `.jarvis.json`.
 - Persisted unfinished work tasks in `.jarvis/tasks` that reference committed task descriptions and carry resumable execution checkpoints.

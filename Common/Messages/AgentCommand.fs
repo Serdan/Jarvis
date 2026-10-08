@@ -144,6 +144,14 @@ type ImportFileResult =
       MimeType: string option
       Sha256: string }
 
+type UpdateClientCommand = struct end
+
+type UpdateClientResult =
+    { RuntimeIdentifier: string
+      Sha256: string
+      DownloadUrl: string
+      RestartScheduled: bool }
+
 type WriteFileCommand =
     { ProjectName: string
       FilePath: string
@@ -439,6 +447,7 @@ type AgentCommand =
     | ReadImageCommand of ReadImageCommand
     | ExportFileCommand of ExportFileCommand
     | ImportFileCommand of ImportFileCommand
+    | UpdateClientCommand
     | WriteFileCommand of WriteFileCommand
     | PatchFileCommand of PatchFileCommand
     | RunCommandCommand of RunCommandCommand
@@ -475,6 +484,7 @@ module AgentCommandInfo =
         | ReadImageCommand _ -> "ReadImageCommand"
         | ExportFileCommand _ -> "ExportFileCommand"
         | ImportFileCommand _ -> "ImportFileCommand"
+        | UpdateClientCommand -> "UpdateClientCommand"
         | WriteFileCommand _ -> "WriteFileCommand"
         | PatchFileCommand _ -> "PatchFileCommand"
         | RunCommandCommand _ -> "RunCommandCommand"
@@ -510,6 +520,7 @@ module AgentCommandInfo =
         | ReadImageCommand _ -> "ReadImage"
         | ExportFileCommand _ -> "ExportFile"
         | ImportFileCommand _ -> "ImportFile"
+        | UpdateClientCommand -> "UpdateClient"
         | WriteFileCommand _ -> "WriteFile"
         | PatchFileCommand _ -> "PatchFile"
         | RunCommandCommand _ -> "RunCommand"
@@ -537,7 +548,8 @@ module AgentCommandInfo =
         | ListCommandsCommand
         | ListProjectsCommand
         | GetJobResultCommand _
-        | CancelJobCommand _ -> None
+        | CancelJobCommand _
+        | UpdateClientCommand -> None
         | MessageCommand cmd -> cmd.ProjectName
         | GetClientActivityCommand cmd -> cmd.ProjectName
         | GetProjectDetailsCommand cmd -> Some cmd.ProjectName
@@ -612,6 +624,7 @@ module AgentCommandInfo =
         | ReadImageCommand cmd -> Some(compact cmd.FilePath)
         | ExportFileCommand cmd -> Some(compact cmd.FilePath)
         | ImportFileCommand cmd -> Some(compact cmd.FilePath)
+        | UpdateClientCommand -> Some "latest published client"
         | WriteFileCommand cmd -> Some(compact cmd.FilePath)
         | PatchFileCommand cmd -> Some(compact cmd.FilePath)
         | RunCommandCommand cmd -> Some(fullCommand cmd.Executable cmd.Args)
@@ -647,6 +660,7 @@ module AgentCommandInfo =
         | ReadImageCommand cmd -> Some(truncate 64 cmd.FilePath)
         | ExportFileCommand cmd -> Some(truncate 64 cmd.FilePath)
         | ImportFileCommand cmd -> Some(truncate 64 cmd.FilePath)
+        | UpdateClientCommand -> Some "self-update"
         | WriteFileCommand cmd -> Some(truncate 64 cmd.FilePath)
         | PatchFileCommand cmd -> Some(truncate 64 cmd.FilePath)
         | RunCommandCommand cmd -> Some(commandPreview cmd.Executable cmd.Args)
@@ -712,7 +726,7 @@ module AgentCommandInfo =
         | None -> invocation command
 
 module AgentProtocol =
-    let version = "3.9"
+    let version = "3.10"
     let defaultPatchFuzzyContextLines = 3
     let maxResponseBytes = 900 * 1024
     let maxImageBytes = 8 * 1024 * 1024
@@ -739,6 +753,7 @@ module AgentProtocol =
           definition "ReadImage" "Reads one PNG, JPEG, or WebP image for model vision." [ ReadOnly ] false false false
           definition "ExportFile" "Copies one bounded project file to a short-lived user download URL." [ ReadOnly ] false false false
           definition "ImportFile" "Downloads a ChatGPT-provided file into a project path." [ WorkspaceWrite; NetworkAccess ] true true false
+          definition "UpdateClient" "Downloads, verifies, installs, and restarts into the latest published Jarvis client." [ ProcessExecution; NetworkAccess; Destructive ] true false false
           definition "WriteFile" "Writes or appends one file." [ WorkspaceWrite ] true true false
           definition "PatchFile" "Applies an atomic unified diff to one file." [ WorkspaceWrite ] true true true
           definition "RunCommand" "Runs a bounded local process." [ ProcessExecution ] true true false

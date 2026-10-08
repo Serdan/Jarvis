@@ -173,6 +173,9 @@ let ``listCommands returns current protocol capabilities`` () =
         capability "ReadImage" |> _.MaxOutputBytes |> shouldEqual (Some AgentProtocol.maxImageBytes)
         capability "ExportFile" |> _.Permissions |> shouldEqual [ ReadOnly ]
         capability "ExportFile" |> _.MaxOutputBytes |> shouldEqual (Some AgentProtocol.maxExportBytes)
+        capability "UpdateClient" |> _.Permissions |> shouldEqual [ ProcessExecution; NetworkAccess; Destructive ]
+        capability "UpdateClient" |> _.RequiresConfirmation |> shouldEqual false
+        capability "UpdateClient" |> _.MutatesState |> shouldEqual true
     | Error e -> Assert.Fail($"Expected Ok, but got Error: {EffectError.toString e}")
 
 [<Test>]

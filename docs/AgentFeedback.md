@@ -1,5 +1,12 @@
 # Agent Feedback and Operation Telemetry
 
+## Resolution workflow
+
+Feedback records default to `Open` and expose `Status`, `ResolvedAt`, `ResolutionCommit`, and `ResolutionNotes` in `ListFeedback` and the new `GetFeedback(feedbackId)` MCP tool. Use `UpdateFeedback(feedbackId, status, resolutionCommit, resolutionNotes)` to set `Open`, `InProgress`, `Resolved`, or `WontFix` (case-insensitive). Closing records sets a resolution timestamp and stores optional commit and notes. Reopening clears the resolution details. Every lookup and update is scoped to the authenticated user, without requiring a connected client.
+
+The SQLite migration is additive and preserves existing feedback with the default `Open` state. Updating feedback requires the `workspace:read` OAuth scope and no local client approval. Resolution metadata follows the feedback retention policy independently of expiring operation telemetry.
+
+
 ## Goal
 
 Give agents a first-class, low-friction way to report problems, limitations, useful workarounds, and positive ergonomics while they are using Jarvis.

@@ -84,6 +84,8 @@ module McpToolHelpers =
                     []
                     true
                 serverLocalCapability "ListFeedback" "Lists persisted agent feedback." [ ReadOnly ] false
+                serverLocalCapability "GetFeedback" "Reads one feedback item." [ ReadOnly ] false
+                serverLocalCapability "UpdateFeedback" "Updates feedback resolution state." [] true
                 serverLocalCapability
                     "GetFeedbackSummary"
                     "Summarizes persisted agent feedback."
@@ -502,6 +504,45 @@ module McpToolHelpers =
                             return errorResult (ExecutionFailed "Feedback filter validation aggregation invariant failed.")
         }
 
+    let getFeedback (store: FeedbackStore) (http: IHttpContextAccessor) (feedbackId: string) =
+        task {
+            match authenticatedFeedbackContext http with
+            | Error result -> return result
+            | Ok(_, userId) ->
+                match validateText "feedbackId" 64 feedbackId with
+                | Error message -> return errorResult (ValidationFailed message)
+                | Ok id ->
+                    match store.GetFeedback(userId, id) with
+                    | Some entry -> return jsonResult entry
+                    | None -> return errorResult (NotFound "Feedback was not found for the authenticated user.")
+        }
+
+    let updateFeedback
+        (store: FeedbackStore) (http: IHttpContextAccessor)
+        (feedbackId: string) (status: string) (resolutionCommit: string) (resolutionNotes: string) =
+        task {
+            match authenticatedFeedbackContext http with
+            | Error result -> return result
+            | Ok(_, userId) ->
+                let idResult = validateText "feedbackId" 64 feedbackId
+                let statusResult = FeedbackValidation.status status
+                let commitResult = optionalBoundedText "resolutionCommit" 128 resolutionCommit
+                let notesResult = optionalBoundedText "resolutionNotes" 4000 resolutionNotes
+                let errors =
+                    [ idResult |> Result.map ignore
+                      statusResult |> Result.map ignore
+                      commitResult |> Result.map ignore
+                      notesResult |> Result.map ignore ] |> validationMessages
+                if not errors.IsEmpty then return errorResult (aggregateValidationError errors)
+                else
+                    match idResult, statusResult, commitResult, notesResult with
+                    | Ok id, Ok state, Ok commit, Ok notes ->
+                        match store.UpdateFeedback(userId, id, state, commit, notes) with
+                        | Some updated -> return jsonResult updated
+                        | None -> return errorResult (NotFound "Feedback was not found for the authenticated user.")
+                    | _ -> return errorResult (ExecutionFailed "Feedback validation aggregation invariant failed.")
+        }
+
     let feedbackSummary (store: FeedbackStore) (http: IHttpContextAccessor) (projectName: string) (toolName: string) =
         task {
             match authenticatedFeedbackContext http with
@@ -611,6 +652,14 @@ type JarvisMcpTools =
         http: IHttpContextAccessor
     ) =
         McpToolHelpers.listFeedback store http projectName toolName category severity (Nullable limit)
+
+    [<McpServerTool(Title = "Get feedback", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Get a feedback record by ID for the authenticated user.")>]
+    static member GetFeedback(feedbackId: string, store: FeedbackStore, http: IHttpContextAccessor) =
+        McpToolHelpers.getFeedback store http feedbackId
+
+    [<McpServerTool(Title = "Update feedback", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Update feedback status: Open, InProgress, Resolved, WontFix. Closing stores resolution commit and notes; reopening clears resolution details.")>]
+    static member UpdateFeedback(feedbackId: string, status: string, resolutionCommit: string, resolutionNotes: string, store: FeedbackStore, http: IHttpContextAccessor) =
+        McpToolHelpers.updateFeedback store http feedbackId status resolutionCommit resolutionNotes
 
     [<McpServerTool(Title = "Get feedback summary", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Summarize feedback counts by tool, category, and severity for the authenticated user.")>]
     static member GetFeedbackSummary(

@@ -17,7 +17,11 @@ type FeedbackEntry =
       Summary: string
       Details: string
       Workaround: string
-      OperationId: string }
+      OperationId: string
+      Status: string
+      ResolvedAt: Nullable<DateTimeOffset>
+      ResolutionCommit: string
+      ResolutionNotes: string }
 
 [<CLIMutable>]
 type FeedbackCreated =
@@ -93,6 +97,9 @@ module FeedbackValidation =
 
     let category value = canonical categories "category" value
     let severity value = canonical severities "severity" value
+    let statuses = set [ "Open"; "InProgress"; "Resolved"; "WontFix" ]
+    let status value = canonical statuses "status" value
+    let isClosed value = value = "Resolved" || value = "WontFix"
 
 type FeedbackStore(databasePath: string, ?telemetryRetention: TimeSpan) =
     let telemetryRetention = defaultArg telemetryRetention (TimeSpan.FromDays 30.0)
@@ -203,6 +210,22 @@ CREATE INDEX IF NOT EXISTS ix_connection_events_user_created
     ON connection_events(user_id, created_at DESC);
 """
         schema.ExecuteNonQuery() |> ignore
+
+        use inspect = connection.CreateCommand()
+        inspect.CommandText <- "PRAGMA table_info(feedback);"
+        use reader = inspect.ExecuteReader()
+        let columns = ResizeArray<string>()
+        while reader.Read() do columns.Add(reader.GetString(1))
+        reader.Close()
+        for column, definition in
+            [ "status", "TEXT NOT NULL DEFAULT 'Open'"
+              "resolved_at", "TEXT NULL"
+              "resolution_commit", "TEXT NULL"
+              "resolution_notes", "TEXT NULL" ] do
+            if not (columns.Contains(column)) then
+                use migration = connection.CreateCommand()
+                migration.CommandText <- $"ALTER TABLE feedback ADD COLUMN {column} {definition};"
+                migration.ExecuteNonQuery() |> ignore
 
     let pruneTelemetry (now: DateTimeOffset) =
         use connection = openConnection()
@@ -494,7 +517,8 @@ INSERT INTO feedback (
         command.CommandText <-
             $"""
 SELECT id, created_at, project_name, tool_name, category, severity,
-       summary, details, workaround, operation_id
+       summary, details, workaround, operation_id,
+       status, resolved_at, resolution_commit, resolution_notes
 FROM feedback
 WHERE {where}
 ORDER BY created_at DESC
@@ -515,10 +539,59 @@ LIMIT $limit;
                   Summary = reader.GetString 6
                   Details = optionText reader 7 |> textOrEmpty
                   Workaround = optionText reader 8 |> textOrEmpty
-                  OperationId = optionText reader 9 |> textOrEmpty }
+                  OperationId = optionText reader 9 |> textOrEmpty
+                  Status = reader.GetString 10
+                  ResolvedAt = if reader.IsDBNull 11 then Nullable() else Nullable(DateTimeOffset.Parse(reader.GetString 11))
+                  ResolutionCommit = optionText reader 12 |> textOrEmpty
+                  ResolutionNotes = optionText reader 13 |> textOrEmpty }
             )
 
         results.ToArray()
+
+    member _.GetFeedback(userId: string, feedbackId: string) =
+        use connection = openConnection()
+        use command = connection.CreateCommand()
+        command.CommandText <-
+            """SELECT id, created_at, project_name, tool_name, category, severity,
+                      summary, details, workaround, operation_id, status,
+                      resolved_at, resolution_commit, resolution_notes
+               FROM feedback WHERE user_id = $userId AND id = $id LIMIT 1;"""
+        addParameter command "$userId" userId
+        addParameter command "$id" feedbackId
+        use reader = command.ExecuteReader()
+        if reader.Read() then
+            Some
+                { Id = reader.GetString 0
+                  CreatedAt = DateTimeOffset.Parse(reader.GetString 1)
+                  ProjectName = optionText reader 2 |> textOrEmpty
+                  ToolName = optionText reader 3 |> textOrEmpty
+                  Category = reader.GetString 4
+                  Severity = reader.GetString 5
+                  Summary = reader.GetString 6
+                  Details = optionText reader 7 |> textOrEmpty
+                  Workaround = optionText reader 8 |> textOrEmpty
+                  OperationId = optionText reader 9 |> textOrEmpty
+                  Status = reader.GetString 10
+                  ResolvedAt = if reader.IsDBNull 11 then Nullable() else Nullable(DateTimeOffset.Parse(reader.GetString 11))
+                  ResolutionCommit = optionText reader 12 |> textOrEmpty
+                  ResolutionNotes = optionText reader 13 |> textOrEmpty }
+        else None
+
+    member this.UpdateFeedback(userId: string, feedbackId: string, status: string, commit: string option, notes: string option) =
+        use connection = openConnection()
+        use command = connection.CreateCommand()
+        command.CommandText <-
+            """UPDATE feedback SET status = $status,
+                   resolved_at = $resolvedAt, resolution_commit = $commit, resolution_notes = $notes
+               WHERE id = $id AND user_id = $userId;"""
+        addParameter command "$status" status
+        addParameter command "$resolvedAt" (if FeedbackValidation.isClosed status then box (DateTimeOffset.UtcNow.ToString("O")) else box DBNull.Value)
+        addParameter command "$commit" (if FeedbackValidation.isClosed status then dbValue commit else box DBNull.Value)
+        addParameter command "$notes" (if FeedbackValidation.isClosed status then dbValue notes else box DBNull.Value)
+        addParameter command "$id" feedbackId
+        addParameter command "$userId" userId
+        if command.ExecuteNonQuery() = 0 then None
+        else this.GetFeedback(userId, feedbackId)
 
     member _.GetSummary(userId: string, projectName: string option, toolName: string option) =
         use connection = openConnection()

@@ -3,6 +3,7 @@ module FeedbackStoreTests
 open System
 open System.IO
 open System.Security.Claims
+open Microsoft.Data.Sqlite
 open Microsoft.AspNetCore.Http
 open NUnit.Framework
 open FsUnitTyped
@@ -44,6 +45,78 @@ let private authenticatedAccessor userId =
     let accessor = HttpContextAccessor()
     accessor.HttpContext <- context
     accessor
+
+[<Test>]
+let ``existing feedback database migrates without losing records`` () =
+    let directory = Path.Combine(Path.GetTempPath(), "jarvis-feedback-legacy-" + Guid.NewGuid().ToString("N"))
+    Directory.CreateDirectory(directory) |> ignore
+    let databasePath = Path.Combine(directory, "legacy.db")
+    try
+        use connection = new SqliteConnection($"Data Source={databasePath}")
+        connection.Open()
+        use setup = connection.CreateCommand()
+        setup.CommandText <-
+            """CREATE TABLE feedback (
+                 id TEXT PRIMARY KEY, created_at TEXT NOT NULL, user_id TEXT NOT NULL,
+                 project_name TEXT NULL, tool_name TEXT NULL, category TEXT NOT NULL,
+                 severity TEXT NOT NULL, summary TEXT NOT NULL, details TEXT NULL,
+                 workaround TEXT NULL, operation_id TEXT NULL);
+               INSERT INTO feedback (id, created_at, user_id, category, severity, summary)
+               VALUES ('old-1', '2026-01-01T00:00:00.0000000+00:00', 'alice', 'Other', 'Info', 'Legacy');"""
+        setup.ExecuteNonQuery() |> ignore
+        connection.Close()
+        use store = new FeedbackStore(databasePath)
+        let migrated = store.GetFeedback("alice", "old-1").Value
+        migrated.Summary |> shouldEqual "Legacy"
+        migrated.Status |> shouldEqual "Open"
+        migrated.ResolvedAt.HasValue |> shouldEqual false
+        store.UpdateFeedback("alice", "old-1", "WontFix", None, Some "Not planned").Value.Status
+        |> shouldEqual "WontFix"
+    finally
+        Directory.Delete(directory, true)
+
+[<Test>]
+let ``feedback resolution updates persist and remain user scoped`` () =
+    withStore (fun store ->
+        let created =
+            store.AddFeedback("alice", feedbackInput None None "ToolFailure" "Friction" "Problem" None None, None)
+        let original = store.GetFeedback("alice", created.Id).Value
+        original.Status |> shouldEqual "Open"
+        original.ResolvedAt.HasValue |> shouldEqual false
+        store.GetFeedback("bob", created.Id) |> shouldEqual None
+        store.UpdateFeedback("bob", created.Id, "Resolved", Some "abc123", Some "fixed") |> shouldEqual None
+
+        let resolved = store.UpdateFeedback("alice", created.Id, "Resolved", Some "abc123", Some "fixed").Value
+        resolved.Status |> shouldEqual "Resolved"
+        resolved.ResolvedAt.HasValue |> shouldEqual true
+        resolved.ResolutionCommit |> shouldEqual "abc123"
+        resolved.ResolutionNotes |> shouldEqual "fixed"
+        let persisted = store.GetFeedback("alice", created.Id).Value
+        persisted.ResolutionCommit |> shouldEqual "abc123"
+        let listed = store.ListFeedback("alice", None, None, None, None, 10)
+        listed[0].Status |> shouldEqual "Resolved"
+
+        let reopened = store.UpdateFeedback("alice", created.Id, "Open", None, None).Value
+        reopened.ResolvedAt.HasValue |> shouldEqual false
+        reopened.ResolutionCommit |> shouldEqual ""
+        reopened.ResolutionNotes |> shouldEqual ""
+    )
+
+[<Test>]
+let ``feedback update helper validates state and enforces user identity`` () =
+    withStore (fun store ->
+        let created = store.AddFeedback("alice", feedbackInput None None "Other" "Info" "Issue" None None, None)
+        let alice = authenticatedAccessor "alice"
+        let invalid = McpToolHelpers.updateFeedback store alice created.Id "Invalid" "" "" |> Async.AwaitTask |> Async.RunSynchronously
+        invalid.IsError |> shouldEqual (Nullable true)
+        let bob = authenticatedAccessor "bob"
+        let denied = McpToolHelpers.updateFeedback store bob created.Id "Resolved" "abc" "" |> Async.AwaitTask |> Async.RunSynchronously
+        denied.IsError |> shouldEqual (Nullable true)
+        let alice = authenticatedAccessor "alice"
+        let updated = McpToolHelpers.updateFeedback store alice created.Id "resolved" "abc" "fixed" |> Async.AwaitTask |> Async.RunSynchronously
+        updated.IsError |> shouldEqual (Nullable false)
+        store.GetFeedback("alice", created.Id).Value.Status |> shouldEqual "Resolved"
+    )
 
 [<Test>]
 let ``telemetry expires while feedback survives and loses pruned operation link`` () =

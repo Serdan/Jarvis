@@ -77,15 +77,102 @@ let user_service_switches_active_device_for_same_user () =
     users.TransportConnected(userId, "laptop-connection")
     let switched = users.Register(userId, secondRegistration, "laptop-connection")
 
-    switched.Generation |> shouldEqual 2L
-    switched.RegistrationReason.Contains("Device switch", StringComparison.Ordinal) |> shouldEqual true
+    switched.Generation |> shouldEqual 1L
+    switched.RegistrationReason.Contains("Initial registration", StringComparison.Ordinal) |> shouldEqual true
 
     match users.GetSession(userId) with
     | ValueNone -> Assert.Fail("Expected active device.")
     | ValueSome session ->
-        session.DeviceId |> shouldEqual "device-2"
-        session.DeviceName |> shouldEqual "Laptop"
-        session.ConnectionId |> shouldEqual (Some "laptop-connection")
+        session.DeviceId |> shouldEqual "device-1"
+        session.DeviceName |> shouldEqual "Desktop"
+        session.ConnectionId |> shouldEqual (Some "desktop-connection")
+
+    users.ListDevices(userId).Length |> shouldEqual 2
+    users.SetDefaultDevice(userId, "device-2") |> shouldEqual true
+    match users.GetSession(userId) with
+    | ValueSome session -> session.DeviceId |> shouldEqual "device-2"
+    | ValueNone -> Assert.Fail("Selected default device was not retained.")
+
+[<Test>]
+let ``multiple device sessions remain independent across reconnect and disconnect`` () =
+    let users = UserService()
+    let userId = "alice"
+    let makeRegistration id name =
+        { DeviceId = id
+          DeviceName = name
+          ProtocolVersion = AgentProtocol.version
+          ClientVersion = "1.0.0"
+          SupportedCommands = AgentProtocol.commandDefinitions |> List.map _.Name }
+
+    users.TransportConnected(userId, "home-1")
+    users.Register(userId, makeRegistration "home" "Home", "home-1") |> ignore
+    users.TransportConnected(userId, "work-1")
+    users.Register(userId, makeRegistration "work" "Work", "work-1") |> ignore
+
+    users.GetDefaultDeviceId(userId) |> shouldEqual (Some "home")
+    users.GetSessionByConnection("home-1") |> function
+        | ValueSome session -> session.DeviceId |> shouldEqual "home"
+        | _ -> Assert.Fail("Home connection not registered")
+    users.GetSessionByConnection("work-1") |> function
+        | ValueSome session -> session.DeviceId |> shouldEqual "work"
+        | _ -> Assert.Fail("Work connection not registered")
+
+    users.SetDefaultDevice(userId, "work") |> shouldEqual true
+    users.TransportConnected(userId, "home-2")
+    let reconnected = users.Register(userId, makeRegistration "home" "Home", "home-2")
+    reconnected.Generation |> shouldEqual 2L
+    users.GetDefaultDeviceId(userId) |> shouldEqual (Some "work")
+    users.GetSessionByConnection("home-1") |> shouldEqual ValueNone
+    users.Disconnect("home-1", None)
+    users.GetSessionByConnection("home-2") |> function
+        | ValueSome session -> session.State |> shouldEqual Registered
+        | _ -> Assert.Fail("New home connection was lost after stale disconnect")
+
+    users.Disconnect("work-1", Some "network lost")
+    match users.GetSession(userId) with
+    | ValueSome session ->
+        session.DeviceId |> shouldEqual "work"
+        session.State |> shouldEqual Disconnected
+    | ValueNone -> Assert.Fail("Default device disappeared")
+    users.GetConnectionId(userId) |> shouldEqual ValueNone
+    users.SetDefaultDevice(userId, "home") |> shouldEqual true
+    users.GetConnectionId(userId) |> shouldEqual (ValueSome "home-2")
+
+[<Test>]
+let ``re-registering a different device on one transport disconnects previous device`` () =
+    let users = UserService()
+    let registration device =
+        { DeviceId = device
+          DeviceName = device
+          ProtocolVersion = AgentProtocol.version
+          ClientVersion = "1.0"
+          SupportedCommands = [ "ListProjects" ] }
+    users.TransportConnected("alice", "connection")
+    users.Register("alice", registration "old", "connection") |> ignore
+    users.Register("alice", registration "new", "connection") |> ignore
+    match users.GetSessionByDevice("alice", "old") with
+    | ValueSome session ->
+        session.State |> shouldEqual Disconnected
+        session.ConnectionId |> shouldEqual None
+    | ValueNone -> Assert.Fail("Previous registration missing")
+    match users.GetSessionByConnection("connection") with
+    | ValueSome session -> session.DeviceId |> shouldEqual "new"
+    | ValueNone -> Assert.Fail("New device not registered")
+
+[<Test>]
+let ``device selection is scoped to owning user`` () =
+    let users = UserService()
+    let registration =
+        { DeviceId = "shared-device-id"
+          DeviceName = "Desktop"
+          ProtocolVersion = AgentProtocol.version
+          ClientVersion = "1.0.0"
+          SupportedCommands = [ "ListProjects" ] }
+    users.TransportConnected("alice", "alice-connection")
+    users.Register("alice", registration, "alice-connection") |> ignore
+    users.ListDevices("bob").Length |> shouldEqual 0
+    users.SetDefaultDevice("bob", "shared-device-id") |> shouldEqual false
+    users.GetSessionByDevice("bob", "shared-device-id") |> shouldEqual ValueNone
 
 [<Test>]
 let user_service_retains_disconnected_session_and_failure_reason () =
@@ -328,7 +415,7 @@ let ``command catalog matches AgentCommand union and MCP tools`` () =
         |> Set.ofArray
 
     let serverLocalNames =
-        set [ "GetProfile"; "Feedback"; "ListFeedback"; "GetFeedback"; "UpdateFeedback"; "GetFeedbackSummary"; "GetConnectionDiagnostics" ]
+        set [ "GetProfile"; "Feedback"; "ListFeedback"; "GetFeedback"; "UpdateFeedback"; "GetFeedbackSummary"; "GetConnectionDiagnostics"; "ListDevices"; "SelectDevice" ]
 
     unionNames |> shouldEqual catalogNames
     Set.difference mcpNames serverLocalNames |> shouldEqual catalogNames
@@ -546,8 +633,8 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
             | Some definition -> definition.Permissions = [ ReadOnly ]
             | None ->
                 match methodInfo.Name with
-                | "Feedback" | "UpdateFeedback" -> false
-                | "ListFeedback" | "GetFeedback" | "GetFeedbackSummary" | "GetConnectionDiagnostics" -> true
+                | "Feedback" | "UpdateFeedback" | "SelectDevice" -> false
+                | "ListFeedback" | "GetFeedback" | "GetFeedbackSummary" | "GetConnectionDiagnostics" | "ListDevices" -> true
                 | name -> failwith $"Unexpected server-local MCP tool: {name}"
 
         let destructive =

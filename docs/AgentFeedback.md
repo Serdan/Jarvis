@@ -1,5 +1,12 @@
 # Agent Feedback and Operation Telemetry
 
+## Multiple Jarvis clients (implementation in progress)
+
+Jarvis now retains independent server-side sessions for each authenticated user and persistent device ID. The first registered device becomes the default destination until explicitly changed using the new `SelectDevice(deviceId)` MCP tool. `ListDevices` shows known connected/disconnected devices, their capabilities and session generations. `GetConnectionDiagnostics` now also includes this device list and the selected default. Both MCP tools operate against the authenticated user's devices only.
+
+Registrations on a second computer do not replace or silently redirect the first computer; each device reconnects independently. If the selected default disconnects, existing MCP tools return a disconnected-device error rather than silently executing against another computer. Select another known device to change routing. Default selection is currently process-local, so a persistent cross-restart preference and per-command device targeting remain future work. Do not mark the multiclient feedback resolved until both are implemented and covered by tests.
+
+
 ## Resolution workflow
 
 Feedback records default to `Open` and expose `Status`, `ResolvedAt`, `ResolutionCommit`, and `ResolutionNotes` in `ListFeedback` and the new `GetFeedback(feedbackId)` MCP tool. Use `UpdateFeedback(feedbackId, status, resolutionCommit, resolutionNotes)` to set `Open`, `InProgress`, `Resolved`, or `WontFix` (case-insensitive). Closing records sets a resolution timestamp and stores optional commit and notes. Reopening clears the resolution details. Every lookup and update is scoped to the authenticated user, without requiring a connected client.

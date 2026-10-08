@@ -55,7 +55,7 @@ type HubService(users: UserService, tracker: ClientResponseTracker, store: Feedb
 
     override this.OnDisconnectedAsync(error) =
         let transport = users.GetTransportConnection(this.Context.ConnectionId)
-        let session = users.GetSession(this.UserId)
+        let session = users.GetSessionByConnection(this.Context.ConnectionId)
         let deviceId, deviceName, generation, clientVersion, protocolVersion =
             match session with
             | ValueSome current when current.ConnectionId = Some this.Context.ConnectionId ->
@@ -123,7 +123,7 @@ type HubService(users: UserService, tracker: ClientResponseTracker, store: Feedb
 
     member this.SendClientResponse(correlationId: string, response: AgentCommandResponse) =
         users.TouchConnection(this.Context.ConnectionId)
-        match users.GetSession(this.UserId) with
+        match users.GetSessionByConnection(this.Context.ConnectionId) with
         | ValueSome session when session.State = Registered && session.ConnectionId = Some this.Context.ConnectionId ->
             if not (tracker.Complete(correlationId, this.UserId, this.Context.ConnectionId, session.Generation, response)) then
                 logger.LogWarning("Rejected unexpected or stale Jarvis response {CorrelationId} from {ConnectionId}.", correlationId, this.Context.ConnectionId)

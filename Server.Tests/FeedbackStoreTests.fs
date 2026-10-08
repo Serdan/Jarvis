@@ -47,6 +47,34 @@ let private authenticatedAccessor userId =
     accessor
 
 [<Test>]
+let ``device MCP tools preserve user isolation and explicit selection`` () =
+    let users = UserService()
+    let registration id : Common.SignalR.ClientRegistration =
+        { DeviceId = id
+          DeviceName = id
+          ProtocolVersion = Common.AgentProtocol.version
+          ClientVersion = "1.0.0"
+          SupportedCommands = [ "ListProjects" ] }
+    users.TransportConnected("alice", "home-connection")
+    users.Register("alice", registration "home", "home-connection") |> ignore
+    users.TransportConnected("alice", "work-connection")
+    users.Register("alice", registration "work", "work-connection") |> ignore
+
+    let bobResult = McpToolHelpers.selectDevice users (authenticatedAccessor "bob") "home"
+                    |> Async.AwaitTask |> Async.RunSynchronously
+    bobResult.IsError |> shouldEqual (Nullable true)
+    let invalid = McpToolHelpers.selectDevice users (authenticatedAccessor "alice") "unknown"
+                  |> Async.AwaitTask |> Async.RunSynchronously
+    invalid.IsError |> shouldEqual (Nullable true)
+    let selected = McpToolHelpers.selectDevice users (authenticatedAccessor "alice") "work"
+                   |> Async.AwaitTask |> Async.RunSynchronously
+    selected.IsError |> shouldEqual (Nullable false)
+    users.GetDefaultDeviceId("alice") |> shouldEqual (Some "work")
+    let listed = McpToolHelpers.listDevices users (authenticatedAccessor "alice")
+                 |> Async.AwaitTask |> Async.RunSynchronously
+    listed.IsError |> shouldEqual (Nullable false)
+
+[<Test>]
 let ``existing feedback database migrates without losing records`` () =
     let directory = Path.Combine(Path.GetTempPath(), "jarvis-feedback-legacy-" + Guid.NewGuid().ToString("N"))
     Directory.CreateDirectory(directory) |> ignore

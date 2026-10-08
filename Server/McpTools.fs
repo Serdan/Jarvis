@@ -91,6 +91,8 @@ module McpToolHelpers =
                     "Summarizes persisted agent feedback."
                     [ ReadOnly ]
                     false
+                serverLocalCapability "ListDevices" "Lists registered Jarvis devices and the selected default." [ ReadOnly ] false
+                serverLocalCapability "SelectDevice" "Selects the default Jarvis command destination." [] true
                 serverLocalCapability
                     "GetConnectionDiagnostics"
                     "Returns the current Jarvis client session and recent persisted connection lifecycle events."
@@ -553,6 +555,50 @@ module McpToolHelpers =
                     |> jsonResult
         }
 
+    let private deviceStatuses (users: UserService) userId =
+        users.ListDevices(userId)
+        |> Array.map (fun session ->
+            {| deviceId = session.DeviceId
+               deviceName = session.DeviceName
+               state = match session.State with | Registered -> "Registered" | Disconnected -> "Disconnected"
+               connectionId = session.ConnectionId |> Option.defaultValue ""
+               generation = session.Generation
+               protocolVersion = session.ProtocolVersion
+               clientVersion = session.ClientVersion
+               supportedCommands = session.SupportedCommands
+               registeredAt = session.RegisteredAt
+               lastSeenAt = session.LastSeenAt
+               disconnectedAt = session.DisconnectedAt |> Option.map _.ToString("O") |> Option.defaultValue ""
+               lastFailure = session.LastFailure |> Option.defaultValue "" |})
+
+    let listDevices (users: UserService) (http: IHttpContextAccessor) =
+        task {
+            match authenticatedFeedbackContext http with
+            | Error result -> return result
+            | Ok(_, userId) ->
+                return
+                    {| defaultDeviceId = users.GetDefaultDeviceId(userId) |> Option.defaultValue ""
+                       devices = deviceStatuses users userId |}
+                    |> jsonResult
+        }
+
+    let selectDevice (users: UserService) (http: IHttpContextAccessor) (deviceId: string) =
+        task {
+            match authenticatedFeedbackContext http with
+            | Error result -> return result
+            | Ok(_, userId) ->
+                match validateText "deviceId" 256 deviceId with
+                | Error message -> return errorResult (ValidationFailed message)
+                | Ok id ->
+                    if users.SetDefaultDevice(userId, id) then
+                        return
+                            {| defaultDeviceId = id
+                               devices = deviceStatuses users userId |}
+                            |> jsonResult
+                    else
+                        return errorResult (NotFound "Device not registered for the authenticated user.")
+        }
+
     let getConnectionDiagnostics
         (store: FeedbackStore)
         (users: UserService)
@@ -591,6 +637,8 @@ module McpToolHelpers =
 
                     return
                         {| currentSession = currentSession
+                           defaultDeviceId = users.GetDefaultDeviceId(userId) |> Option.defaultValue ""
+                           devices = deviceStatuses users userId
                            events = store.ListConnectionEvents(userId, requestedLimit) |}
                         |> jsonResult
         }
@@ -669,6 +717,14 @@ type JarvisMcpTools =
         http: IHttpContextAccessor
     ) =
         McpToolHelpers.feedbackSummary store http projectName toolName
+
+    [<McpServerTool(Title = "List devices", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("List authenticated user's Jarvis devices, connection states, and selected default target.")>]
+    static member ListDevices(users: UserService, http: IHttpContextAccessor) =
+        McpToolHelpers.listDevices users http
+
+    [<McpServerTool(Title = "Select device", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Select the Jarvis device for subsequent MCP commands; no silent fallback.")>]
+    static member SelectDevice(deviceId: string, users: UserService, http: IHttpContextAccessor) =
+        McpToolHelpers.selectDevice users http deviceId
 
     [<McpServerTool(Title = "Get connection diagnostics", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Return the current Jarvis client session and recent persisted SignalR connection lifecycle events. Does not require the local client to be connected.")>]
     static member GetConnectionDiagnostics(

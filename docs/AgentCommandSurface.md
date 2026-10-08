@@ -60,6 +60,7 @@ type AgentCommand =
     | ReadFileCommand of ReadFileCommand
     | ReadFilesCommand of ReadFilesCommand
     | ReadImageCommand of ReadImageCommand
+    | ExportFileCommand of ExportFileCommand
     | WriteFileCommand of WriteFileCommand
     | PatchFileCommand of PatchFileCommand
     | RunCommandCommand of RunCommandCommand
@@ -751,6 +752,7 @@ If `InputSchemaJson` and `OutputSchemaJson` are added later, they should be incl
 | `ReadFile` | `ReadOnly` | `Allow` | May still be blocked by sensitive-file filters. |
 | `ReadFiles` | `ReadOnly` | `Allow` | May still be blocked by sensitive-file filters. |
 | `ReadImage` | `ReadOnly` | `Allow` | Reads a PNG, JPEG, or WebP image for model vision. |
+| `ExportFile` | `ReadOnly` | `Allow` | Copies one bounded project file to server memory and returns a 10-minute unguessable HTTPS bearer link for the user. |
 | `WriteFile` | `WorkspaceWrite` | `RequireConfirmation` | Creates or overwrites project files. |
 | `PatchFile` | `WorkspaceWrite` | `RequireConfirmation` | Preferred edit path. |
 | `RunCommand` | `ProcessExecution` | `RequireConfirmation` | Use allowlists/presets where possible. |

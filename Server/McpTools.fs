@@ -140,6 +140,35 @@ module McpToolHelpers =
         | None, None ->
             errorResult (ExecutionFailed "Invalid Jarvis response: neither result nor error was set.")
 
+    let private exportResult (context: HttpContext) (response: AgentCommandResponse) =
+        match response.Result, response.Error with
+        | Some serialized, None ->
+            try
+                let payload = JsonSerializer.Deserialize<ExportFilePayload>(serialized)
+                if isNull payload.Data then
+                    errorResult (ExecutionFailed "Invalid serialized Jarvis export result: data was null.")
+                elif payload.Data.LongLength > int64 AgentProtocol.maxExportBytes then
+                    errorResult (OutputTruncated $"Export payload exceeded the {AgentProtocol.maxExportBytes} byte limit.")
+                else
+                    let store = context.RequestServices.GetRequiredService<ExportStore>()
+                    let created = store.Add(payload.FilePath, payload.Data)
+                    let downloadUrl =
+                        $"{context.Request.Scheme}://{context.Request.Host}/exports/{created.Token}"
+                    { FilePath = payload.FilePath
+                      FileName = created.FileName
+                      MimeType = created.MimeType
+                      Bytes = created.Bytes
+                      DownloadUrl = downloadUrl
+                      ExpiresAt = created.ExpiresAt }
+                    |> jsonResult
+            with ex ->
+                errorResult (ExecutionFailed $"Invalid serialized Jarvis export result: {ex.Message}")
+        | None, Some error -> errorResult error
+        | Some _, Some error ->
+            errorResult (ExecutionFailed $"Invalid Jarvis response: both result and error were set. {formatError error}")
+        | None, None ->
+            errorResult (ExecutionFailed "Invalid Jarvis response: neither result nor error was set.")
+
     let private requiredScope command =
         match command with
         | ListCommandsCommand
@@ -151,6 +180,7 @@ module McpToolHelpers =
         | ReadFileCommand _
         | ReadFilesCommand _
         | ReadImageCommand _
+        | ExportFileCommand _
         | ListProjectTasksCommand _
         | AttachWorkTaskCommand _
         | GetWorkTaskCommand _
@@ -285,6 +315,7 @@ module McpToolHelpers =
                     return
                         (match command with
                          | ReadImageCommand _ -> imageResult response
+                         | ExportFileCommand _ -> exportResult context response
                          | _ -> toCallToolResult response)
                         |> attachOperationId tracking
                 | Some _ ->
@@ -650,6 +681,10 @@ type JarvisMcpTools =
     [<McpServerTool(Title = "Read image", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read a PNG, JPEG, or WebP image from a project and return it as native MCP image content for model vision.")>]
     static member ReadImage(projectName: string, filePath: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (ReadImageCommand { ProjectName = projectName; FilePath = filePath })
+
+    [<McpServerTool(Title = "Export file", ReadOnly = true, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Export one bounded project file to a short-lived HTTPS URL that can be opened by the user. The URL is an unguessable bearer capability and expires automatically.")>]
+    static member ExportFile(projectName: string, filePath: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http (ExportFileCommand { ProjectName = projectName; FilePath = filePath })
 
     [<McpServerTool(Title = "Import file", ReadOnly = false, Destructive = true, Idempotent = false, OpenWorld = true);
       McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:write"]}]""");

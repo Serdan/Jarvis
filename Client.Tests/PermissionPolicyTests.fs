@@ -16,6 +16,11 @@ let ``read only commands are allowed`` () =
     evaluate command |> shouldEqual (Ok())
 
 [<Test>]
+let ``export file is read only`` () =
+    let command = ExportFileCommand { ProjectName = "Project1"; FilePath = "render.png" }
+    evaluate command |> shouldEqual (Ok())
+
+[<Test>]
 let ``effect errors map to protocol errors`` () =
     EffectError.toAgentError (Client.ValidationError "bad input")
     |> shouldEqual (AgentError.ValidationFailed "bad input")

@@ -683,6 +683,24 @@ module private Core =
 
         parseProjectName projectName >>= readFiles filePaths
 
+    let exportFile projectName filePath =
+        effect {
+            let! parsedProject = parseProjectName projectName
+            let! path = parseFilePath filePath parsedProject
+            let! info = FileIO.getFileInfo path
+
+            if info.Length > int64 AgentProtocol.maxExportBytes then
+                return!
+                    Client.ValidationError
+                        $"File is {info.Length} bytes and exceeds the {AgentProtocol.maxExportBytes} byte export limit."
+                    |> Effect.ofError
+            else
+                let! data = FileIO.readAllBytes path
+                return
+                    { FilePath = filePath
+                      Data = data }
+        }
+
     let readImage projectName filePath =
         let detectMimeType (path: string) =
             match Path.GetExtension(path).ToLowerInvariant() with
@@ -819,6 +837,9 @@ let readFile (cmd: ReadFileCommand) : IO<'rt, Content> =
 
 let readFiles (cmd: ReadFilesCommand) : IO<'rt, Content' seq> =
     Core.readFiles cmd.ProjectName cmd.FilePaths
+
+let exportFile (cmd: ExportFileCommand) : IO<'rt, ExportFilePayload> =
+    Core.exportFile cmd.ProjectName cmd.FilePath
 
 let readImage (cmd: ReadImageCommand) : IO<'rt, ReadImageResult> =
     Core.readImage cmd.ProjectName cmd.FilePath

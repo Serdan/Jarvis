@@ -120,6 +120,7 @@ let configureServices (services: IServiceCollection) (configuration: IConfigurat
     services
         .AddSingleton<UserService>()
         .AddSingleton<ClientResponseTracker>()
+        .AddSingleton<ExportStore>()
         .AddSingleton<FeedbackStore>(fun _ -> FeedbackStore(databasePath))
         .AddScoped<ClientService>()
     |> ignore
@@ -195,6 +196,28 @@ let configureApp (app: WebApplication) =
                    scopes_supported = Auth.mcpScopes |> List.toArray |}
             ))
     )
+    |> ignore
+
+    app.MapGet(
+        "/exports/{token}",
+        Func<HttpContext, string, ExportStore, IResult>(fun context token store ->
+            match store.TryGet token with
+            | ValueNone -> Results.NotFound()
+            | ValueSome exported ->
+                context.Response.Headers.CacheControl <- StringValues("no-store")
+                context.Response.Headers["X-Content-Type-Options"] <- StringValues("nosniff")
+                context.Response.Headers["Referrer-Policy"] <- StringValues("no-referrer")
+
+                let disposition =
+                    System.Net.Http.Headers.ContentDispositionHeaderValue(
+                        if ExportMimeType.isInlineSafe exported.MimeType then "inline" else "attachment"
+                    )
+                disposition.FileNameStar <- exported.FileName
+                context.Response.Headers.ContentDisposition <- StringValues(disposition.ToString())
+
+                Results.Bytes(exported.Data, exported.MimeType) :> IResult)
+    )
+    |> fun endpoint -> endpoint.RequireRateLimiting(rateLimiterPolicy)
     |> ignore
 
     app.MapMcp("/mcp") |> ignore

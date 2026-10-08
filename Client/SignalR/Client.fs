@@ -38,6 +38,7 @@ let private toAgentResponse command response =
         let maxBytes =
             match command with
             | ReadImageCommand _ -> (AgentProtocol.maxImageBytes * 4 / 3) + (64 * 1024)
+            | ExportFileCommand _ -> (AgentProtocol.maxExportBytes * 4 / 3) + (64 * 1024)
             | _ -> AgentProtocol.maxResponseBytes
 
         if bytes <= maxBytes then
@@ -201,6 +202,10 @@ let private dispatch (rt: Runtime) (command: AgentCommand) =
     | ReadImageCommand cmd ->
         rt
         |> ProjectBrowser.readImage cmd
+        |> serialize'
+    | ExportFileCommand cmd ->
+        rt
+        |> ProjectBrowser.exportFile cmd
         |> serialize'
     | ImportFileCommand cmd -> rt |> importFile cmd |> serialize'
     | WriteFileCommand cmd -> rt |> ProjectBrowser.writeFile cmd |> serialize'

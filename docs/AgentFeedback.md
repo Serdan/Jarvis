@@ -1,10 +1,14 @@
 # Agent Feedback and Operation Telemetry
 
-## Multiple Jarvis clients (implementation in progress)
+## Multiple Jarvis clients and conversation routing
 
-Jarvis now retains independent server-side sessions for each authenticated user and persistent device ID. The first registered device becomes the default destination until explicitly changed using the new `SelectDevice(deviceId)` MCP tool. `ListDevices` shows known connected/disconnected devices, their capabilities and session generations. `GetConnectionDiagnostics` now also includes this device list and the selected default. Both MCP tools operate against the authenticated user's devices only.
+Jarvis retains independent server-side sessions for each authenticated user and persistent device ID. The first registered device is the process-local fallback default. `ListDevices` exposes registered devices, connections, capabilities, and this conversation's selected device. `GetConnectionDiagnostics` includes the global fallback and conversation selection. Device discovery and selection are always scoped to the OAuth user.
 
-Registrations on a second computer do not replace or silently redirect the first computer; each device reconnects independently. If the selected default disconnects, existing MCP tools return a disconnected-device error rather than silently executing against another computer. Select another known device to change routing. Default selection is currently process-local, so a persistent cross-restart preference and per-command device targeting remain future work. Do not mark the multiclient feedback resolved until both are implemented and covered by tests.
+The MCP SDK call-tool filter reads the documented `_meta["openai/session"]` string for each `tools/call` request. `SelectDevice(deviceId)` associates that conversation with a device using the `(authenticated user, openai/session)` key. Other conversations under the same OAuth account retain their selections. If `openai/session` is absent, `SelectDevice` fails instead of mutating another agent's routing. Commands without session metadata and without an explicit override use the process-local fallback device.
+
+All 33 client-backed MCP tools also expose an optional `deviceId` argument that overrides conversation selection **for that call only**. Requests can alternatively carry `_meta["jarvis/deviceId"]` for explicit routing; the tool argument takes precedence. Invalid or unknown device targets must never silently redirect to another device. Commands aimed at a disconnected device fail rather than falling back to another connected computer.
+
+The conversation mapping and global fallback are currently server-memory state: they reset on server restart. A persistent user-preferred fallback may be implemented separately, but must not introduce cross-conversation mutable routing. Client software does not need new device-selection logic; the change is on the server and the MCP tool schemas.
 
 
 ## Resolution workflow

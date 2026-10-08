@@ -4,6 +4,9 @@ open System
 open System.IO
 open System.Security.Claims
 open Microsoft.Data.Sqlite
+open System.Text.Json.Nodes
+open System.Text.Json
+open System.Threading.Tasks
 open Microsoft.AspNetCore.Http
 open NUnit.Framework
 open FsUnitTyped
@@ -47,6 +50,90 @@ let private authenticatedAccessor userId =
     accessor
 
 [<Test>]
+let ``per-call device argument overrides conversation selection without changing it`` () =
+    let users = UserService()
+    let registration id : Common.SignalR.ClientRegistration =
+        { DeviceId = id
+          DeviceName = id
+          ProtocolVersion = Common.AgentProtocol.version
+          ClientVersion = "1.0"
+          SupportedCommands = [ "ListProjects" ] }
+    users.TransportConnected("alice", "home-connection")
+    users.Register("alice", registration "home", "home-connection") |> ignore
+    users.TransportConnected("alice", "work-connection")
+    users.Register("alice", registration "work", "work-connection") |> ignore
+    users.SelectConversationDevice("alice", "conversation-a", "home") |> shouldEqual true
+    users.SelectConversationDevice("alice", "conversation-b", "work") |> shouldEqual true
+
+    let request (sessionId: string) (overrideId: string option) =
+        let meta = JsonObject()
+        meta["openai/session"] <- JsonValue.Create(sessionId)
+        let arguments = System.Collections.Generic.Dictionary<string, JsonElement>()
+        match overrideId with
+        | Some id -> arguments["deviceId"] <- JsonSerializer.SerializeToElement(id)
+        | None -> ()
+        ModelContextProtocol.Protocol.CallToolRequestParams(Name = "ListProjects", Meta = meta, Arguments = arguments)
+
+    let effective request =
+        RequestDeviceRouting.withMetadata request (fun () ->
+            task {
+                let selected = users.GetSelectedSession("alice", RequestDeviceRouting.session(), RequestDeviceRouting.deviceOverride())
+                return
+                    match selected with
+                    | ValueSome session -> session.DeviceId
+                    | ValueNone -> "missing"
+            })
+        |> Async.AwaitTask |> Async.RunSynchronously
+
+    effective (request "conversation-a" None) |> shouldEqual "home"
+    effective (request "conversation-b" None) |> shouldEqual "work"
+    effective (request "conversation-a" (Some "work")) |> shouldEqual "work"
+    effective (request "conversation-a" None) |> shouldEqual "home"
+    users.GetSelectedDeviceId("alice", Some "conversation-a") |> shouldEqual (Some "home")
+    users.GetSelectedDeviceId("alice", Some "conversation-b") |> shouldEqual (Some "work")
+    users.GetSelectedDeviceId("bob", Some "conversation-a") |> shouldEqual None
+
+[<Test>]
+let ``request metadata does not leak between concurrent MCP calls`` () =
+    task {
+        let request (id: string) =
+            let meta = JsonObject()
+            meta["openai/session"] <- JsonValue.Create(id)
+            ModelContextProtocol.Protocol.CallToolRequestParams(Name = "ListProjects", Meta = meta)
+        let run (id: string) (delay: int) =
+            RequestDeviceRouting.withMetadata (request id) (fun () ->
+                task {
+                    do! Task.Delay delay
+                    return RequestDeviceRouting.session()
+                })
+        let a = run "conversation-a" 20
+        let b = run "conversation-b" 5
+        let! results = Task.WhenAll([| a; b |])
+        results[0] |> shouldEqual (Some "conversation-a")
+        results[1] |> shouldEqual (Some "conversation-b")
+        RequestDeviceRouting.session() |> shouldEqual None
+    }
+
+[<Test>]
+let ``missing conversation metadata never mutates global device selection`` () =
+    let users = UserService()
+    let registration : Common.SignalR.ClientRegistration =
+        { DeviceId = "home"
+          DeviceName = "Home"
+          ProtocolVersion = Common.AgentProtocol.version
+          ClientVersion = "1.0"
+          SupportedCommands = [ "ListProjects" ] }
+    users.TransportConnected("alice", "home-connection")
+    users.Register("alice", registration, "home-connection") |> ignore
+    let request = ModelContextProtocol.Protocol.CallToolRequestParams(Name = "SelectDevice")
+    let attempted =
+        RequestDeviceRouting.withMetadata request (fun () ->
+            McpToolHelpers.selectDevice users (authenticatedAccessor "alice") "home")
+        |> Async.AwaitTask |> Async.RunSynchronously
+    attempted.IsError |> shouldEqual (Nullable true)
+    users.GetDefaultDeviceId("alice") |> shouldEqual (Some "home")
+
+[<Test>]
 let ``device MCP tools preserve user isolation and explicit selection`` () =
     let users = UserService()
     let registration id : Common.SignalR.ClientRegistration =
@@ -68,8 +155,18 @@ let ``device MCP tools preserve user isolation and explicit selection`` () =
     invalid.IsError |> shouldEqual (Nullable true)
     let selected = McpToolHelpers.selectDevice users (authenticatedAccessor "alice") "work"
                    |> Async.AwaitTask |> Async.RunSynchronously
+    selected.IsError |> shouldEqual (Nullable true)
+    let meta = JsonObject()
+    meta["openai/session"] <- JsonValue.Create("conversation-1")
+    let request = ModelContextProtocol.Protocol.CallToolRequestParams(Name = "SelectDevice", Meta = meta)
+    let selected =
+        RequestDeviceRouting.withMetadata request (fun () ->
+            McpToolHelpers.selectDevice users (authenticatedAccessor "alice") "work")
+        |> Async.AwaitTask |> Async.RunSynchronously
     selected.IsError |> shouldEqual (Nullable false)
-    users.GetDefaultDeviceId("alice") |> shouldEqual (Some "work")
+    users.GetDefaultDeviceId("alice") |> shouldEqual (Some "home")
+    users.GetSelectedDeviceId("alice", Some "conversation-1") |> shouldEqual (Some "work")
+    users.GetSelectedDeviceId("alice", Some "conversation-2") |> shouldEqual (Some "home")
     let listed = McpToolHelpers.listDevices users (authenticatedAccessor "alice")
                  |> Async.AwaitTask |> Async.RunSynchronously
     listed.IsError |> shouldEqual (Nullable false)

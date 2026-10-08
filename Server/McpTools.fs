@@ -17,6 +17,7 @@ open System.Runtime.InteropServices
 open System.Text.Json
 open System.Text.Json.Nodes
 open System.Threading.Tasks
+open System.Threading
 open Common
 open Microsoft.AspNetCore.Http
 open Microsoft.Extensions.DependencyInjection
@@ -24,6 +25,55 @@ open Microsoft.Extensions.Options
 open ModelContextProtocol.Protocol
 open ModelContextProtocol.Server
 open Server.Services
+
+module RequestDeviceRouting =
+    // Per-invocation context: never use shared defaults to represent a ChatGPT conversation.
+    let private currentSession = AsyncLocal<string option>()
+    let private currentDeviceOverride = AsyncLocal<string option>()
+
+    let private valueFrom (meta: JsonObject) (name: string) =
+        if isNull meta then None
+        else
+            match meta[name] with
+            | value when not (isNull value) ->
+                try
+                    let text = value.GetValue<string>()
+                    if String.IsNullOrWhiteSpace(text) || text.Length > 256 then None else Some text
+                with _ -> None
+            | _ -> None
+
+    let session () = currentSession.Value
+    let deviceOverride () = currentDeviceOverride.Value
+    let private invalidDeviceId = String.replicate 257 "x"
+
+
+    let private deviceArgument (request: CallToolRequestParams) =
+        match request.Arguments with
+        | null -> None
+        | arguments ->
+            match arguments.TryGetValue("deviceId") with
+            | true, value when value.ValueKind = JsonValueKind.String ->
+                let text = value.GetString()
+                if String.IsNullOrWhiteSpace(text) then None
+                elif text.Length > 256 then Some invalidDeviceId
+                else Some text
+            | true, _ -> Some invalidDeviceId
+            | false, _ -> None
+
+    let private metadataDevice (meta: JsonObject) =
+        if isNull meta || not (meta.ContainsKey "jarvis/deviceId") then None
+        else valueFrom meta "jarvis/deviceId" |> Option.orElse (Some invalidDeviceId)
+
+    let withMetadata (request: CallToolRequestParams) (operation: unit -> Task<'a>) =
+        task {
+            let oldSession, oldDevice = currentSession.Value, currentDeviceOverride.Value
+            currentSession.Value <- valueFrom request.Meta "openai/session"
+            currentDeviceOverride.Value <- deviceArgument request |> Option.orElseWith (fun () -> metadataDevice request.Meta)
+            try return! operation()
+            finally
+                currentSession.Value <- oldSession
+                currentDeviceOverride.Value <- oldDevice
+        }
 
 module McpToolHelpers =
     let private formatError error =
@@ -257,7 +307,7 @@ module McpToolHelpers =
             let store = context.RequestServices.GetRequiredService<FeedbackStore>()
             let users = context.RequestServices.GetRequiredService<UserService>()
             let clientVersion, protocolVersion =
-                match users.GetSession userId with
+                match users.GetSelectedSession(userId, RequestDeviceRouting.session(), RequestDeviceRouting.deviceOverride()) with
                 | ValueSome session -> Some session.ClientVersion, Some session.ProtocolVersion
                 | ValueNone -> None, None
 
@@ -310,7 +360,7 @@ module McpToolHelpers =
                 | Some userId when Auth.hasScope scope context.User ->
                     let tracking = beginOperation context userId command
                     let stopwatch = Stopwatch.StartNew()
-                    let! response = client.SendCommandToUser(userId, command)
+                    let! response = client.SendCommandToUser(userId, command, ?conversationId = RequestDeviceRouting.session(), ?deviceId = RequestDeviceRouting.deviceOverride())
                     stopwatch.Stop()
                     finishOperation tracking response stopwatch.ElapsedMilliseconds
 
@@ -578,6 +628,8 @@ module McpToolHelpers =
             | Ok(_, userId) ->
                 return
                     {| defaultDeviceId = users.GetDefaultDeviceId(userId) |> Option.defaultValue ""
+                       conversationSelection = users.GetSelectedDeviceId(userId, RequestDeviceRouting.session()) |> Option.defaultValue ""
+                       conversationIdAvailable = RequestDeviceRouting.session().IsSome
                        devices = deviceStatuses users userId |}
                     |> jsonResult
         }
@@ -590,12 +642,14 @@ module McpToolHelpers =
                 match validateText "deviceId" 256 deviceId with
                 | Error message -> return errorResult (ValidationFailed message)
                 | Ok id ->
-                    if users.SetDefaultDevice(userId, id) then
+                    match RequestDeviceRouting.session() with
+                    | None -> return errorResult (ValidationFailed "openai/session metadata is required for conversation-scoped device selection. Use a per-command deviceId override when session metadata is unavailable.")
+                    | Some conversationId when users.SelectConversationDevice(userId, conversationId, id) ->
                         return
-                            {| defaultDeviceId = id
+                            {| selectedDeviceId = id
                                devices = deviceStatuses users userId |}
                             |> jsonResult
-                    else
+                    | Some _ ->
                         return errorResult (NotFound "Device not registered for the authenticated user.")
         }
 
@@ -614,7 +668,7 @@ module McpToolHelpers =
                     return errorResult (ValidationFailed "limit must be between 1 and 100.")
                 else
                     let currentSession =
-                        match users.GetSession userId with
+                        match users.GetSelectedSession(userId, RequestDeviceRouting.session(), RequestDeviceRouting.deviceOverride()) with
                         | ValueNone -> null
                         | ValueSome session ->
                             box
@@ -638,6 +692,8 @@ module McpToolHelpers =
                     return
                         {| currentSession = currentSession
                            defaultDeviceId = users.GetDefaultDeviceId(userId) |> Option.defaultValue ""
+                           selectedDeviceId = users.GetSelectedDeviceId(userId, RequestDeviceRouting.session()) |> Option.defaultValue ""
+                           conversationIdAvailable = RequestDeviceRouting.session() |> Option.isSome
                            devices = deviceStatuses users userId
                            events = store.ListConnectionEvents(userId, requestedLimit) |}
                         |> jsonResult
@@ -718,11 +774,11 @@ type JarvisMcpTools =
     ) =
         McpToolHelpers.feedbackSummary store http projectName toolName
 
-    [<McpServerTool(Title = "List devices", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("List authenticated user's Jarvis devices, connection states, and selected default target.")>]
+    [<McpServerTool(Title = "List devices", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("List the authenticated user's Jarvis devices, global fallback default, and this ChatGPT conversation's selected device.")>]
     static member ListDevices(users: UserService, http: IHttpContextAccessor) =
         McpToolHelpers.listDevices users http
 
-    [<McpServerTool(Title = "Select device", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Select the Jarvis device for subsequent MCP commands; no silent fallback.")>]
+    [<McpServerTool(Title = "Select device", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Select a Jarvis device for this ChatGPT conversation using openai/session metadata, without changing other agents' selections. Requires session metadata; alternatively pass deviceId to individual command tools.")>]
     static member SelectDevice(deviceId: string, users: UserService, http: IHttpContextAccessor) =
         McpToolHelpers.selectDevice users http deviceId
 
@@ -740,19 +796,19 @@ type JarvisMcpTools =
         McpToolHelpers.listMcpCommands http
 
     [<McpServerTool(Title = "List projects", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("List projects exposed by the connected Jarvis client.")>]
-    static member ListProjects(client: ClientService, http: IHttpContextAccessor) =
+    static member ListProjects([<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http ListProjectsCommand
 
     [<McpServerTool(Title = "Get project details", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Get project details, README, notes, TODO, and related special files.")>]
-    static member GetProjectDetails(projectName: string, client: ClientService, http: IHttpContextAccessor) =
+    static member GetProjectDetails(projectName: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (GetProjectDetailsCommand { ProjectName = projectName })
 
     [<McpServerTool(Title = "List directory", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("List files and folders in a project directory.")>]
-    static member ListDirectory(projectName: string, folderPath: string, client: ClientService, http: IHttpContextAccessor) =
+    static member ListDirectory(projectName: string, folderPath: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (ListDirectoryCommand { ProjectName = projectName; FolderPath = folderPath })
 
     [<McpServerTool(Title = "Search files", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Search project file and folder names.")>]
-    static member SearchFiles(projectName: string, query: string, folderPath: string, maxResults: Nullable<int>, client: ClientService, http: IHttpContextAccessor) =
+    static member SearchFiles(projectName: string, query: string, folderPath: string, maxResults: Nullable<int>, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (SearchFilesCommand {
             ProjectName = projectName
             Query = query
@@ -760,7 +816,7 @@ type JarvisMcpTools =
             MaxResults = McpToolHelpers.optionOfNullable maxResults })
 
     [<McpServerTool(Title = "Search text", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Search text inside project files.")>]
-    static member SearchText(projectName: string, query: string, folderPath: string, includeGlobs: string array, excludeGlobs: string array, maxResults: Nullable<int>, client: ClientService, http: IHttpContextAccessor) =
+    static member SearchText(projectName: string, query: string, folderPath: string, includeGlobs: string array, excludeGlobs: string array, maxResults: Nullable<int>, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (SearchTextCommand {
             ProjectName = projectName
             Query = query
@@ -770,7 +826,7 @@ type JarvisMcpTools =
             MaxResults = McpToolHelpers.optionOfNullable maxResults })
 
     [<McpServerTool(Title = "Read file", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read one project file.")>]
-    static member ReadFile(projectName: string, filePath: string, startLine: Nullable<int>, endLine: Nullable<int>, includeLineNumbers: Nullable<bool>, client: ClientService, http: IHttpContextAccessor) =
+    static member ReadFile(projectName: string, filePath: string, startLine: Nullable<int>, endLine: Nullable<int>, includeLineNumbers: Nullable<bool>, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (ReadFileCommand {
             ProjectName = projectName
             FilePath = filePath
@@ -779,15 +835,15 @@ type JarvisMcpTools =
             IncludeLineNumbers = McpToolHelpers.optionOfNullableBool includeLineNumbers })
 
     [<McpServerTool(Title = "Read files", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read multiple project files.")>]
-    static member ReadFiles(projectName: string, filePaths: string array, client: ClientService, http: IHttpContextAccessor) =
+    static member ReadFiles(projectName: string, filePaths: string array, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (ReadFilesCommand { ProjectName = projectName; FilePaths = filePaths |> Array.toList })
 
     [<McpServerTool(Title = "Read image", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read a PNG, JPEG, or WebP image from a project and return it as native MCP image content for model vision.")>]
-    static member ReadImage(projectName: string, filePath: string, client: ClientService, http: IHttpContextAccessor) =
+    static member ReadImage(projectName: string, filePath: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (ReadImageCommand { ProjectName = projectName; FilePath = filePath })
 
     [<McpServerTool(Title = "Export file", ReadOnly = true, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Export one bounded project file to a short-lived HTTPS URL that can be opened by the user. The URL is an unguessable bearer capability and expires automatically.")>]
-    static member ExportFile(projectName: string, filePath: string, client: ClientService, http: IHttpContextAccessor) =
+    static member ExportFile(projectName: string, filePath: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (ExportFileCommand { ProjectName = projectName; FilePath = filePath })
 
     [<McpServerTool(Title = "Import file", ReadOnly = false, Destructive = true, Idempotent = false, OpenWorld = true);
@@ -801,7 +857,7 @@ type JarvisMcpTools =
         overwrite: bool,
         createParents: bool,
         maxBytes: Nullable<int64>,
-        client: ClientService,
+        [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService,
         http: IHttpContextAccessor
     ) =
         McpToolHelpers.send client http (ImportFileCommand {
@@ -816,11 +872,11 @@ type JarvisMcpTools =
             MaxBytes = McpToolHelpers.optionOfNullableInt64 maxBytes })
 
     [<McpServerTool(Title = "Update client", ReadOnly = false, Destructive = true, Idempotent = false, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["process:execute"]}]"""); Description("Download the latest published Jarvis client from this Jarvis server, verify its SHA-256 manifest entry, atomically replace the running client binary, and restart it in the same terminal.")>]
-    static member UpdateClient(client: ClientService, http: IHttpContextAccessor) =
+    static member UpdateClient([<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http UpdateClientCommand
 
     [<McpServerTool(Title = "Write file", ReadOnly = false, Destructive = true, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:write"]}]"""); Description("Write or append to a project file. Requires approval in the local Jarvis client.")>]
-    static member WriteFile(projectName: string, filePath: string, content: string, [<Description("File write mode. Allowed values: Write, Append.")>] fileWriteMode: string, expectedHash: string, createParents: Nullable<bool>, client: ClientService, http: IHttpContextAccessor) =
+    static member WriteFile(projectName: string, filePath: string, content: string, [<Description("File write mode. Allowed values: Write, Append.")>] fileWriteMode: string, expectedHash: string, createParents: Nullable<bool>, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         match McpToolHelpers.parseFileWriteMode fileWriteMode with
         | Error message ->
             Task.FromResult(McpToolHelpers.validationErrorResult message)
@@ -834,7 +890,7 @@ type JarvisMcpTools =
                 CreateParents = McpToolHelpers.optionOfNullableBool createParents })
 
     [<McpServerTool(Title = "Patch file", ReadOnly = false, Destructive = true, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:write"]}]"""); Description("Apply an atomic unified diff patch to one project file. Requires approval in the local Jarvis client.")>]
-    static member PatchFile(projectName: string, filePath: string, patch: string, expectedHash: string, dryRun: Nullable<bool>, fuzzyContextLines: Nullable<int>, returnContent: Nullable<bool>, client: ClientService, http: IHttpContextAccessor) =
+    static member PatchFile(projectName: string, filePath: string, patch: string, expectedHash: string, dryRun: Nullable<bool>, fuzzyContextLines: Nullable<int>, returnContent: Nullable<bool>, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (PatchFileCommand {
             ProjectName = projectName
             FilePath = filePath
@@ -846,7 +902,7 @@ type JarvisMcpTools =
             ReturnContent = McpToolHelpers.optionOfNullableBool returnContent })
 
     [<McpServerTool(Title = "Run command", ReadOnly = false, Destructive = true, Idempotent = false, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["process:execute"]}]"""); Description("Run a bounded local command in a project. Supply a short human-readable reason for why the command is needed. Requires approval in the local Jarvis client.")>]
-    static member RunCommand(projectName: string, executable: string, args: string array, [<Optional; DefaultParameterValue("")>] reason: string, workingDirectory: string, timeoutSeconds: Nullable<int>, maxOutputBytes: Nullable<int>, client: ClientService, http: IHttpContextAccessor) =
+    static member RunCommand(projectName: string, executable: string, args: string array, [<Optional; DefaultParameterValue("")>] reason: string, workingDirectory: string, timeoutSeconds: Nullable<int>, maxOutputBytes: Nullable<int>, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (RunCommandCommand {
             ProjectName = projectName
             Executable = executable
@@ -857,22 +913,22 @@ type JarvisMcpTools =
             MaxOutputBytes = McpToolHelpers.optionOfNullable maxOutputBytes })
 
     [<McpServerTool(Title = "List project tasks", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("List locally configured project tasks from .jarvis.json.")>]
-    static member ListProjectTasks(projectName: string, client: ClientService, http: IHttpContextAccessor) =
+    static member ListProjectTasks(projectName: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (ListProjectTasksCommand { ProjectName = projectName })
 
     [<McpServerTool(Title = "Attach work task", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Attach persisted Jarvis execution state to a committed task description in a project repository. The task description must be tracked, committed, and clean.")>]
-    static member AttachWorkTask(projectName: string, taskId: string, taskPath: string, client: ClientService, http: IHttpContextAccessor) =
+    static member AttachWorkTask(projectName: string, taskId: string, taskPath: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (AttachWorkTaskCommand {
             ProjectName = projectName
             TaskId = taskId
             TaskPath = taskPath })
 
     [<McpServerTool(Title = "Get work task", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read a persisted Jarvis work-task checkpoint together with the current committed task description and change indicators.")>]
-    static member GetWorkTask(projectName: string, taskId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member GetWorkTask(projectName: string, taskId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (GetWorkTaskCommand { ProjectName = projectName; TaskId = taskId })
 
     [<McpServerTool(Title = "List work tasks", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("List unfinished Jarvis work tasks persisted for a project.")>]
-    static member ListWorkTasks(projectName: string, client: ClientService, http: IHttpContextAccessor) =
+    static member ListWorkTasks(projectName: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (ListWorkTasksCommand { ProjectName = projectName })
 
     [<McpServerTool(Title = "Checkpoint work task", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Update the execution checkpoint for an attached Jarvis work task. Status must be active or blocked.")>]
@@ -885,7 +941,7 @@ type JarvisMcpTools =
         verified: string array,
         [<Optional; DefaultParameterValue("")>] blocker: string,
         [<Optional; DefaultParameterValue("")>] lastCommit: string,
-        client: ClientService,
+        [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService,
         http: IHttpContextAccessor
     ) =
         McpToolHelpers.send client http (CheckpointWorkTaskCommand {
@@ -899,15 +955,15 @@ type JarvisMcpTools =
             LastCommit = McpToolHelpers.optionOfString lastCommit })
 
     [<McpServerTool(Title = "Complete work task", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Complete an attached Jarvis work task and delete its local persisted execution-state file. The committed task description remains in the repository.")>]
-    static member CompleteWorkTask(projectName: string, taskId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member CompleteWorkTask(projectName: string, taskId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (CompleteWorkTaskCommand { ProjectName = projectName; TaskId = taskId })
 
     [<McpServerTool(Title = "List skills", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("List project-local Jarvis skills from .jarvis/skills. Skills provide procedural instructions and do not grant execution privileges.")>]
-    static member ListSkills(projectName: string, client: ClientService, http: IHttpContextAccessor) =
+    static member ListSkills(projectName: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (ListSkillsCommand { ProjectName = projectName })
 
     [<McpServerTool(Title = "Get skill", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read a named project-local Jarvis skill from .jarvis/skills/<name>/SKILL.md (or skill.md). The returned content is procedural guidance only; use normal Jarvis tools for any actions.")>]
-    static member GetSkill(projectName: string, skillName: string, client: ClientService, http: IHttpContextAccessor) =
+    static member GetSkill(projectName: string, skillName: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (GetSkillCommand { ProjectName = projectName; SkillName = skillName })
 
     [<McpServerTool(Title = "Create skill", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:write"]}]"""); Description("Create a project-local Jarvis skill at .jarvis/skills/<name>/SKILL.md. Existing skills are rejected unless overwrite is explicitly true. Skill creation uses the normal workspace-write permission and trust model.")>]
@@ -916,28 +972,28 @@ type JarvisMcpTools =
         skillName: string,
         content: string,
         [<Optional; DefaultParameterValue(false)>] overwrite: bool,
-        client: ClientService,
+        [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService,
         http: IHttpContextAccessor
     ) =
         McpToolHelpers.send client http (CreateSkillCommand { ProjectName = projectName; SkillName = skillName; Content = content; Overwrite = overwrite })
 
     [<McpServerTool(Title = "Run project task", ReadOnly = false, Destructive = true, Idempotent = false, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["process:execute"]}]"""); Description("Run a named task configured in the project's .jarvis.json. Requires local process approval.")>]
-    static member RunProjectTask(projectName: string, taskName: string, client: ClientService, http: IHttpContextAccessor) =
+    static member RunProjectTask(projectName: string, taskName: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (RunProjectTaskCommand { ProjectName = projectName; TaskName = taskName })
 
     [<McpServerTool(Title = "Get git status", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Get git status for a project.")>]
-    static member GetGitStatus(projectName: string, client: ClientService, http: IHttpContextAccessor) =
+    static member GetGitStatus(projectName: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (GetGitStatusCommand { ProjectName = projectName })
 
     [<McpServerTool(Title = "Get git diff", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Get git diff for a project or project-relative path.")>]
-    static member GetGitDiff(projectName: string, path: string, maxOutputBytes: Nullable<int>, client: ClientService, http: IHttpContextAccessor) =
+    static member GetGitDiff(projectName: string, path: string, maxOutputBytes: Nullable<int>, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (GetGitDiffCommand {
             ProjectName = projectName
             Path = McpToolHelpers.optionOfString path
             MaxOutputBytes = McpToolHelpers.optionOfNullable maxOutputBytes })
 
     [<McpServerTool(Title = "Create git commit", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Create a reversible local git commit from selected paths. Requires approval in the local Jarvis client and does not push to a remote.")>]
-    static member GitCommit(projectName: string, message: string, body: string, paths: string array, allowEmpty: bool, client: ClientService, http: IHttpContextAccessor) =
+    static member GitCommit(projectName: string, message: string, body: string, paths: string array, allowEmpty: bool, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (GitCommitCommand {
             ProjectName = projectName
             Message = message
@@ -946,7 +1002,7 @@ type JarvisMcpTools =
             AllowEmpty = allowEmpty })
 
     [<McpServerTool(Title = "Start job", ReadOnly = false, Destructive = true, Idempotent = false, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["process:execute"]}]"""); Description("Start a long-running local job. Requires approval in the local Jarvis client.")>]
-    static member StartJob(projectName: string, executable: string, args: string array, workingDirectory: string, maxOutputBytes: Nullable<int>, [<Optional; DefaultParameterValue("")>] reason: string, client: ClientService, http: IHttpContextAccessor) =
+    static member StartJob(projectName: string, executable: string, args: string array, workingDirectory: string, maxOutputBytes: Nullable<int>, [<Optional; DefaultParameterValue("")>] reason: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (StartJobCommand {
             ProjectName = projectName
             Executable = executable
@@ -956,26 +1012,26 @@ type JarvisMcpTools =
             MaxOutputBytes = McpToolHelpers.optionOfNullable maxOutputBytes })
 
     [<McpServerTool(Title = "List jobs", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("List running or completed Jarvis jobs.")>]
-    static member ListJobs(projectName: string, includeCompleted: bool, client: ClientService, http: IHttpContextAccessor) =
+    static member ListJobs(projectName: string, includeCompleted: bool, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (ListJobsCommand {
             ProjectName = McpToolHelpers.optionOfString projectName
             IncludeCompleted = includeCompleted })
 
     [<McpServerTool(Title = "Get job result", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Get buffered output and status for a Jarvis job.")>]
-    static member GetJobResult(jobId: string, afterSequence: Nullable<int64>, client: ClientService, http: IHttpContextAccessor) =
+    static member GetJobResult(jobId: string, afterSequence: Nullable<int64>, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (GetJobResultCommand {
             JobId = jobId
             AfterSequence = McpToolHelpers.optionOfNullableInt64 afterSequence })
 
     [<McpServerTool(Title = "Cancel job", ReadOnly = false, Destructive = true, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["process:execute"]}]"""); Description("Cancel a running Jarvis job. Requires approval in the local Jarvis client.")>]
-    static member CancelJob(jobId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member CancelJob(jobId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (CancelJobCommand { JobId = jobId })
 
     [<McpServerTool(Title = "Message", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Send a short informational message to the connected Jarvis client activity log, for example progress or turn-completion messages such as 'Done with this turn'. This does not require local approval.")>]
     static member Message(
         message: string,
         [<Optional; DefaultParameterValue("")>] projectName: string,
-        client: ClientService,
+        [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService,
         http: IHttpContextAccessor
     ) =
         McpToolHelpers.send client http (MessageCommand {
@@ -986,7 +1042,7 @@ type JarvisMcpTools =
     static member GetClientActivity(
         [<Optional; DefaultParameterValue("")>] projectName: string,
         [<Optional; DefaultParameterValue(20)>] limit: int,
-        client: ClientService,
+        [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService,
         http: IHttpContextAccessor
     ) =
         let boundedLimit =

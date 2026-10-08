@@ -104,6 +104,16 @@ let configureServices (services: IServiceCollection) (configuration: IConfigurat
     services
         .AddMcpServer()
         .WithHttpTransport(fun options -> options.Stateless <- true)
+        .WithRequestFilters(fun filters ->
+            filters.AddCallToolFilter(
+                McpRequestFilter<_, _>(fun next ->
+                    McpRequestHandler<_, _>(fun context cancellation ->
+                    ValueTask<ModelContextProtocol.Protocol.CallToolResult>(
+                        RequestDeviceRouting.withMetadata context.Params (fun () ->
+                            next.Invoke(context, cancellation).AsTask())
+                    )))
+            )
+            |> ignore)
         .WithTools<JarvisMcpTools>()
     |> ignore
 

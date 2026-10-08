@@ -19,9 +19,17 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
             TimeSpan.FromSeconds(float executionSeconds) + permissionMargin
         | _ -> TimeSpan.FromMinutes(10L)
 
-    member this.SendCommandToUser(userId: string, command: AgentCommand) =
+    member this.SendCommandToUser(userId: string, command: AgentCommand, ?conversationId: string, ?deviceId: string) =
         task {
-            match users.GetSession(userId) with
+            match users.GetSelectedSession(userId, conversationId, deviceId) with
+            | ValueNone when deviceId.IsSome ->
+                let requested = deviceId.Value
+                let error =
+                    if String.IsNullOrWhiteSpace requested || requested.Length > 256 then
+                        ValidationFailed "deviceId must be a nonempty device ID of at most 256 characters."
+                    else
+                        NotFound $"Jarvis device '{requested}' is not registered for the authenticated user. Use ListDevices to find available devices."
+                return { Result = None; Error = Some error }
             | ValueNone ->
                 return
                     { Result = None

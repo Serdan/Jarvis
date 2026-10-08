@@ -423,6 +423,23 @@ let ``command catalog matches AgentCommand union and MCP tools`` () =
 
 
 [<Test>]
+let ``client-backed MCP tools expose an optional per-command deviceId`` () =
+    let methods = typeof<JarvisMcpTools>.GetMethods()
+    let clientMethods =
+        methods
+        |> Array.filter (fun methodInfo ->
+            methodInfo.GetParameters()
+            |> Array.exists (fun parameter -> parameter.ParameterType = typeof<ClientService>))
+    clientMethods.Length |> shouldEqual 33
+    for methodInfo in clientMethods do
+        let deviceParam = methodInfo.GetParameters() |> Array.tryFind (fun parameter -> parameter.Name = "deviceId")
+        match deviceParam with
+        | None -> Assert.Fail($"{methodInfo.Name} is missing the deviceId override.")
+        | Some parameter ->
+            parameter.ParameterType |> shouldEqual typeof<string>
+            parameter.IsOptional |> shouldEqual true
+
+[<Test>]
 let ``WriteFile rejects invalid file write mode with actionable validation error`` () =
     let result =
         JarvisMcpTools.WriteFile(
@@ -432,6 +449,7 @@ let ``WriteFile rejects invalid file write mode with actionable validation error
             "Create",
             "",
             Nullable(),
+            "",
             Unchecked.defaultof<ClientService>,
             Unchecked.defaultof<Microsoft.AspNetCore.Http.IHttpContextAccessor>)
         |> Async.AwaitTask

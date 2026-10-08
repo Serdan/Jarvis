@@ -35,6 +35,7 @@ type UserService() =
     let gate = obj()
     let sessions = Dictionary<struct (string * string), ClientSessionStatus>()
     let defaults = Dictionary<string, string>(StringComparer.Ordinal)
+    let conversationSelections = Dictionary<struct (string * string), string>()
     let connections = Dictionary<string, TransportConnectionStatus>(StringComparer.Ordinal)
 
     let tryGet key (dictionary: Dictionary<'key, 'a>) =
@@ -217,6 +218,40 @@ type UserService() =
                 if session.UserId = userId then
                     { session with LastSeenAt = now; LastFailure = Some reason }
                 else session))
+
+    member _.GetSelectedDeviceId(userId: string, conversationId: string option) =
+        lock gate (fun () ->
+            match conversationId with
+            | Some id when not (String.IsNullOrWhiteSpace id) ->
+                match tryGet (struct (userId, id)) conversationSelections with
+                | ValueSome selected -> Some selected
+                | ValueNone ->
+                    match tryGet userId defaults with
+                    | ValueSome selected -> Some selected
+                    | ValueNone -> None
+            | _ ->
+                match tryGet userId defaults with
+                | ValueSome selected -> Some selected
+                | ValueNone -> None)
+
+    member this.GetSelectedSession(userId: string, conversationId: string option, deviceOverride: string option) =
+        let selected =
+            match deviceOverride with
+            | Some deviceId -> Some deviceId
+            | None -> this.GetSelectedDeviceId(userId, conversationId)
+        match selected with
+        | Some deviceId -> this.GetSessionByDevice(userId, deviceId)
+        | None -> ValueNone
+
+    member _.SelectConversationDevice(userId: string, conversationId: string, deviceId: string) =
+        lock gate (fun () ->
+            if String.IsNullOrWhiteSpace conversationId || conversationId.Length > 256 then false
+            else
+                match tryGet (struct (userId, deviceId)) sessions with
+                | ValueSome _ ->
+                    conversationSelections[struct (userId, conversationId)] <- deviceId
+                    true
+                | ValueNone -> false)
 
     member _.GetSession(userId: string) =
         lock gate (fun () -> getDefault userId)

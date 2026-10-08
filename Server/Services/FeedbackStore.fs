@@ -3,6 +3,7 @@ namespace Server.Services
 open System
 open System.Collections.Generic
 open System.IO
+open System.Threading
 open Microsoft.Data.Sqlite
 
 [<CLIMutable>]
@@ -93,7 +94,9 @@ module FeedbackValidation =
     let category value = canonical categories "category" value
     let severity value = canonical severities "severity" value
 
-type FeedbackStore(databasePath: string) =
+type FeedbackStore(databasePath: string, ?telemetryRetention: TimeSpan) =
+    let telemetryRetention = defaultArg telemetryRetention (TimeSpan.FromDays 30.0)
+    do if telemetryRetention <= TimeSpan.Zero then invalidArg "telemetryRetention" "Must be positive"
     let connectionString =
         let builder = SqliteConnectionStringBuilder()
         builder.DataSource <- databasePath
@@ -201,7 +204,29 @@ CREATE INDEX IF NOT EXISTS ix_connection_events_user_created
 """
         schema.ExecuteNonQuery() |> ignore
 
+    let pruneTelemetry (now: DateTimeOffset) =
+        use connection = openConnection()
+        use transaction = connection.BeginTransaction()
+        let cutoff = now - telemetryRetention
+        for table in [ "connection_events"; "operations" ] do
+            use command = connection.CreateCommand()
+            command.Transaction <- transaction
+            command.CommandText <- $"DELETE FROM {table} WHERE created_at < $cutoff;"
+            addParameter command "$cutoff" (cutoff.ToString("O"))
+            command.ExecuteNonQuery() |> ignore
+        transaction.Commit()
+
     do initialize()
+    do pruneTelemetry DateTimeOffset.UtcNow
+    let pruneTimer =
+        new Timer(TimerCallback(fun _ ->
+            try pruneTelemetry DateTimeOffset.UtcNow
+            with _ -> ()), null, TimeSpan.FromHours 1.0, TimeSpan.FromHours 1.0)
+
+    member _.PruneTelemetry(now: DateTimeOffset) = pruneTelemetry now
+
+    interface IDisposable with
+        member _.Dispose() = pruneTimer.Dispose()
 
     member _.DatabasePath = databasePath
 

@@ -46,6 +46,31 @@ let private authenticatedAccessor userId =
     accessor
 
 [<Test>]
+let ``telemetry expires while feedback survives and loses pruned operation link`` () =
+    withStore (fun store ->
+        let operation = store.BeginOperation("user-1", "RunCommand", None, "server", None, None)
+        store.CompleteOperation(operation.Id, false, Some "Failure", 1L)
+        store.AddFeedback(
+            "user-1",
+            feedbackInput None None "ToolFailure" "Info" "Keep this report" None None,
+            Some operation.Id
+        ) |> ignore
+        store.AddConnectionEvent(
+            "user-1", "TransportConnected", "connection-1",
+            None, None, None, None, None, None, None, None
+        )
+
+        store.PruneTelemetry(DateTimeOffset.UtcNow.AddDays(31.0))
+        store.ListConnectionEvents("user-1", 10).Length |> shouldEqual 0
+        store.ResolveOperation("user-1", Some operation.Id, None, None)
+        |> Result.isError |> shouldEqual true
+        let feedback = store.ListFeedback("user-1", None, None, None, None, 10)
+        feedback.Length |> shouldEqual 1
+        feedback[0].Summary |> shouldEqual "Keep this report"
+        feedback[0].OperationId |> shouldEqual ""
+    )
+
+[<Test>]
 let ``feedback store links recent operation and aggregates it`` () =
     withStore (fun store ->
         let operation =

@@ -48,6 +48,9 @@ Jarvis also provides an explicit agent-feedback tool. Feedback text is persisted
 
 This persisted state is stored in the Jarvis server's SQLite database. It is not intended for advertising or behavioral profiling.
 
+Server-side operation telemetry and connection diagnostics are kept for 30 days by default. Cleanup runs at startup and hourly. Old operation records are deleted without deleting linked feedback (the link is cleared). Explicitly submitted feedback has no automatic expiry; backup retention is separate.
+
+
 ## Server-side state
 
 The server keeps process-local, in-memory state required to route commands and diagnose connection state. This can include:

@@ -151,7 +151,8 @@ module McpToolHelpers =
                     errorResult (OutputTruncated $"Export payload exceeded the {AgentProtocol.maxExportBytes} byte limit.")
                 else
                     let store = context.RequestServices.GetRequiredService<ExportStore>()
-                    let created = store.Add(payload.FilePath, payload.Data)
+                    let ownerId = Auth.tryUserId context.User |> Option.defaultValue ""
+                    let created = store.Add(payload.FilePath, payload.Data, ownerId = ownerId)
                     let downloadUrl =
                         $"{context.Request.Scheme}://{context.Request.Host}/exports/{created.Token}"
                     { FilePath = payload.FilePath

@@ -328,6 +328,23 @@ module McpToolHelpers =
         | Some text ->
             Ok(Some(text.Trim()))
 
+    let private validationMessages results =
+        results
+        |> List.choose (function
+            | Ok () -> None
+            | Error message -> Some message)
+
+    let private aggregateValidationError messages =
+        let formatted =
+            messages
+            |> List.map (fun message -> $"- {message}")
+            |> String.concat Environment.NewLine
+
+        ValidationFailed $"Invalid arguments:{Environment.NewLine}{formatted}"
+
+    let validationErrorResult message =
+        errorResult (ValidationFailed message)
+
     let private authenticatedFeedbackContext (http: IHttpContextAccessor) =
         match Option.ofObj http.HttpContext with
         | None ->
@@ -367,43 +384,50 @@ module McpToolHelpers =
                 let workaroundResult = optionalBoundedText "workaround" 2000 workaround
                 let operationResult = optionalBoundedText "operationId" 64 operationId
 
-                match
-                    projectResult,
-                    toolResult,
-                    categoryResult,
-                    severityResult,
-                    summaryResult,
-                    detailsResult,
-                    workaroundResult,
-                    operationResult
-                with
-                | Ok project, Ok tool, Ok category, Ok severity, Ok summary, Ok details, Ok workaround, Ok explicitOperation ->
-                    match store.ResolveOperation(userId, explicitOperation, tool, project) with
-                    | Error message ->
-                        return errorResult (ValidationFailed message)
-                    | Ok linkedOperation ->
-                        let input =
-                            { ProjectName = project
-                              ToolName = tool
-                              Category = category
-                              Severity = severity
-                              Summary = summary
-                              Details = details
-                              Workaround = workaround
-                              OperationId = explicitOperation }
+                let validationErrors =
+                    [ projectResult |> Result.map ignore
+                      toolResult |> Result.map ignore
+                      categoryResult |> Result.map ignore
+                      severityResult |> Result.map ignore
+                      summaryResult |> Result.map ignore
+                      detailsResult |> Result.map ignore
+                      workaroundResult |> Result.map ignore
+                      operationResult |> Result.map ignore ]
+                    |> validationMessages
 
-                        return
-                            store.AddFeedback(userId, input, linkedOperation)
-                            |> jsonResult
-                | Error message, _, _, _, _, _, _, _
-                | _, Error message, _, _, _, _, _, _
-                | _, _, Error message, _, _, _, _, _
-                | _, _, _, Error message, _, _, _, _
-                | _, _, _, _, Error message, _, _, _
-                | _, _, _, _, _, Error message, _, _
-                | _, _, _, _, _, _, Error message, _
-                | _, _, _, _, _, _, _, Error message ->
-                    return errorResult (ValidationFailed message)
+                if not validationErrors.IsEmpty then
+                    return errorResult (aggregateValidationError validationErrors)
+                else
+                    match
+                        projectResult,
+                        toolResult,
+                        categoryResult,
+                        severityResult,
+                        summaryResult,
+                        detailsResult,
+                        workaroundResult,
+                        operationResult
+                    with
+                    | Ok project, Ok tool, Ok category, Ok severity, Ok summary, Ok details, Ok workaround, Ok explicitOperation ->
+                        match store.ResolveOperation(userId, explicitOperation, tool, project) with
+                        | Error message ->
+                            return errorResult (ValidationFailed message)
+                        | Ok linkedOperation ->
+                            let input =
+                                { ProjectName = project
+                                  ToolName = tool
+                                  Category = category
+                                  Severity = severity
+                                  Summary = summary
+                                  Details = details
+                                  Workaround = workaround
+                                  OperationId = explicitOperation }
+
+                            return
+                                store.AddFeedback(userId, input, linkedOperation)
+                                |> jsonResult
+                    | _ ->
+                        return errorResult (ExecutionFailed "Feedback validation aggregation invariant failed.")
         }
 
     let listFeedback
@@ -434,12 +458,19 @@ module McpToolHelpers =
                         | None -> Ok None
                         | Some value -> FeedbackValidation.severity value |> Result.map Some
 
-                    match categoryResult, severityResult with
-                    | Ok category, Ok severity ->
-                        return store.ListFeedback(userId, project, tool, category, severity, requestedLimit) |> jsonResult
-                    | Error message, _
-                    | _, Error message ->
-                        return errorResult (ValidationFailed message)
+                    let validationErrors =
+                        [ categoryResult |> Result.map ignore
+                          severityResult |> Result.map ignore ]
+                        |> validationMessages
+
+                    if not validationErrors.IsEmpty then
+                        return errorResult (aggregateValidationError validationErrors)
+                    else
+                        match categoryResult, severityResult with
+                        | Ok category, Ok severity ->
+                            return store.ListFeedback(userId, project, tool, category, severity, requestedLimit) |> jsonResult
+                        | _ ->
+                            return errorResult (ExecutionFailed "Feedback filter validation aggregation invariant failed.")
         }
 
     let feedbackSummary (store: FeedbackStore) (http: IHttpContextAccessor) (projectName: string) (toolName: string) =
@@ -514,9 +545,9 @@ module McpToolHelpers =
         if value.HasValue then Some value.Value else None
 
     let parseFileWriteMode (value: string) =
-        if String.Equals(value, "Append", StringComparison.OrdinalIgnoreCase) then Append
-        elif String.Equals(value, "Write", StringComparison.OrdinalIgnoreCase) then Write
-        else invalidArg "fileWriteMode" $"Unknown file write mode: {value}"
+        if String.Equals(value, "Append", StringComparison.OrdinalIgnoreCase) then Ok Append
+        elif String.Equals(value, "Write", StringComparison.OrdinalIgnoreCase) then Ok Write
+        else Error $"fileWriteMode must be one of: Append, Write. Received: '{value}'."
 
 [<McpServerToolType>]
 type JarvisMcpTools =
@@ -528,8 +559,8 @@ type JarvisMcpTools =
     static member Feedback(
         [<Optional; DefaultParameterValue("")>] projectName: string,
         [<Optional; DefaultParameterValue("")>] toolName: string,
-        category: string,
-        severity: string,
+        [<Description("Feedback category. Allowed values: ToolFailure, ToolLimitation, Ergonomics, MissingCapability, Documentation, Positive, Other.")>] category: string,
+        [<Description("Feedback severity. Allowed values: Info, Friction, Blocking.")>] severity: string,
         summary: string,
         [<Optional; DefaultParameterValue("")>] details: string,
         [<Optional; DefaultParameterValue("")>] workaround: string,
@@ -646,15 +677,18 @@ type JarvisMcpTools =
             MaxBytes = McpToolHelpers.optionOfNullableInt64 maxBytes })
 
     [<McpServerTool(Title = "Write file", ReadOnly = false, Destructive = true, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:write"]}]"""); Description("Write or append to a project file. Requires approval in the local Jarvis client.")>]
-    static member WriteFile(projectName: string, filePath: string, content: string, fileWriteMode: string, expectedHash: string, createParents: Nullable<bool>, client: ClientService, http: IHttpContextAccessor) =
-        let mode = McpToolHelpers.parseFileWriteMode fileWriteMode
-        McpToolHelpers.send client http (WriteFileCommand {
-            ProjectName = projectName
-            FilePath = filePath
-            Content = content
-            FileWriteMode = mode
-            ExpectedHash = McpToolHelpers.optionOfString expectedHash
-            CreateParents = McpToolHelpers.optionOfNullableBool createParents })
+    static member WriteFile(projectName: string, filePath: string, content: string, [<Description("File write mode. Allowed values: Write, Append.")>] fileWriteMode: string, expectedHash: string, createParents: Nullable<bool>, client: ClientService, http: IHttpContextAccessor) =
+        match McpToolHelpers.parseFileWriteMode fileWriteMode with
+        | Error message ->
+            Task.FromResult(McpToolHelpers.validationErrorResult message)
+        | Ok mode ->
+            McpToolHelpers.send client http (WriteFileCommand {
+                ProjectName = projectName
+                FilePath = filePath
+                Content = content
+                FileWriteMode = mode
+                ExpectedHash = McpToolHelpers.optionOfString expectedHash
+                CreateParents = McpToolHelpers.optionOfNullableBool createParents })
 
     [<McpServerTool(Title = "Patch file", ReadOnly = false, Destructive = true, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:write"]}]"""); Description("Apply an atomic unified diff patch to one project file. Requires approval in the local Jarvis client.")>]
     static member PatchFile(projectName: string, filePath: string, patch: string, expectedHash: string, dryRun: Nullable<bool>, fuzzyContextLines: Nullable<int>, returnContent: Nullable<bool>, client: ClientService, http: IHttpContextAccessor) =

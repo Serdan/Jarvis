@@ -229,6 +229,26 @@ let ``command catalog matches AgentCommand union and MCP tools`` () =
     Set.difference mcpNames serverLocalNames |> shouldEqual catalogNames
     Set.difference mcpNames catalogNames |> shouldEqual serverLocalNames
 
+
+[<Test>]
+let ``WriteFile rejects invalid file write mode with actionable validation error`` () =
+    let result =
+        JarvisMcpTools.WriteFile(
+            "Project1",
+            "test.txt",
+            "content",
+            "Create",
+            "",
+            Nullable(),
+            Unchecked.defaultof<ClientService>,
+            Unchecked.defaultof<Microsoft.AspNetCore.Http.IHttpContextAccessor>)
+        |> Async.AwaitTask
+        |> Async.RunSynchronously
+
+    result.IsError |> shouldEqual (Nullable true)
+    let text = result.Content[0] :?> TextContentBlock
+    text.Text |> shouldEqual "ValidationFailed: fileWriteMode must be one of: Append, Write. Received: 'Create'."
+
 [<Test>]
 let ``ImportFile advertises the ChatGPT file parameter`` () =
     let methodInfo =

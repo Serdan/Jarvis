@@ -151,6 +151,32 @@ let ``feedback MCP helper stores without a registered local client`` () =
         entries[0].Workaround |> shouldEqual "Used a Python script"
     )
 
+
+[<Test>]
+let ``feedback MCP helper aggregates independent validation errors`` () =
+    withStore (fun store ->
+        let accessor = authenticatedAccessor "user-validation"
+
+        let result =
+            McpToolHelpers.submitFeedback
+                store
+                accessor
+                ""
+                "Feedback"
+                "ErrorHandling"
+                "Medium"
+                "Test"
+                ""
+                ""
+                ""
+            |> Async.AwaitTask
+            |> Async.RunSynchronously
+
+        result.IsError |> shouldEqual (Nullable true)
+        let text = result.Content[0] :?> ModelContextProtocol.Protocol.TextContentBlock
+        text.Text.Contains("category must be one of", StringComparison.Ordinal) |> shouldEqual true
+        text.Text.Contains("severity must be one of", StringComparison.Ordinal) |> shouldEqual true)
+
 [<Test>]
 let ``feedback list enforces user isolation`` () =
     withStore (fun store ->

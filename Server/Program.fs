@@ -120,7 +120,7 @@ let configureServices (services: IServiceCollection) (configuration: IConfigurat
     services
         .AddSingleton<UserService>()
         .AddSingleton<ClientResponseTracker>()
-        .AddSingleton<ExportStore>()
+        .AddSingleton<ExportStore>(fun _ -> new ExportStore())
         .AddSingleton<FeedbackStore>(fun _ -> FeedbackStore(databasePath))
         .AddScoped<ClientService>()
     |> ignore

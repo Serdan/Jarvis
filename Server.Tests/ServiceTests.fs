@@ -223,22 +223,40 @@ let ``registration without capability metadata negotiates no commands`` () =
 let ``response tracker completes registered response`` () =
     task {
         let tracker = ClientResponseTracker()
-        let correlationId, pending = tracker.Register(TimeSpan.FromSeconds 5L)
+        let correlationId, pending = tracker.Register("alice", "conn-1", 1L, TimeSpan.FromSeconds 5L)
         let expected =
             { Result = Some "ok"
               Error = None }
 
-        tracker.Complete(correlationId, expected)
+        tracker.Complete(correlationId, "alice", "conn-1", 1L, expected) |> shouldEqual true
         let! actual = pending
 
         actual |> shouldEqual expected
     }
 
 [<Test>]
+let ``response tracker rejects other users connections and generations`` () =
+    task {
+        let tracker = ClientResponseTracker()
+        let correlationId, pending = tracker.Register("alice", "connection-a", 3L, TimeSpan.FromSeconds 5L)
+        let response = { Result = Some "accepted"; Error = None }
+
+        tracker.Complete(correlationId, "bob", "connection-a", 3L, response) |> shouldEqual false
+        tracker.Complete(correlationId, "alice", "connection-b", 3L, response) |> shouldEqual false
+        tracker.Complete(correlationId, "alice", "connection-a", 2L, response) |> shouldEqual false
+        pending.IsCompleted |> shouldEqual false
+
+        tracker.Complete(correlationId, "alice", "connection-a", 3L, response) |> shouldEqual true
+        let! actual = pending
+        actual |> shouldEqual response
+        tracker.Complete(correlationId, "alice", "connection-a", 3L, response) |> shouldEqual false
+    }
+
+[<Test>]
 let ``response tracker cancellation removes pending response`` () =
     task {
         let tracker = ClientResponseTracker()
-        let correlationId, pending = tracker.Register(TimeSpan.FromSeconds 5L)
+        let correlationId, pending = tracker.Register("alice", "conn-1", 1L, TimeSpan.FromSeconds 5L)
 
         tracker.Cancel(correlationId)
 
@@ -253,7 +271,7 @@ let ``response tracker cancellation removes pending response`` () =
 let ``response tracker honors configured timeout`` () =
     task {
         let tracker = ClientResponseTracker()
-        let _, pending = tracker.Register(TimeSpan.FromMilliseconds 25L)
+        let _, pending = tracker.Register("alice", "conn-1", 1L, TimeSpan.FromMilliseconds 25L)
 
         try
             let! _ = pending

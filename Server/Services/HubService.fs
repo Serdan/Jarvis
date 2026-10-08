@@ -123,7 +123,12 @@ type HubService(users: UserService, tracker: ClientResponseTracker, store: Feedb
 
     member this.SendClientResponse(correlationId: string, response: AgentCommandResponse) =
         users.TouchConnection(this.Context.ConnectionId)
-        tracker.Complete(correlationId, response)
+        match users.GetSession(this.UserId) with
+        | ValueSome session when session.State = Registered && session.ConnectionId = Some this.Context.ConnectionId ->
+            if not (tracker.Complete(correlationId, this.UserId, this.Context.ConnectionId, session.Generation, response)) then
+                logger.LogWarning("Rejected unexpected or stale Jarvis response {CorrelationId} from {ConnectionId}.", correlationId, this.Context.ConnectionId)
+        | _ ->
+            logger.LogWarning("Rejected Jarvis response {CorrelationId} from inactive connection {ConnectionId}.", correlationId, this.Context.ConnectionId)
         Task.CompletedTask
 
     interface IHubService with

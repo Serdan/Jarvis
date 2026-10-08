@@ -57,7 +57,7 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                                         $"Jarvis device {session.DeviceName} does not advertise support for {commandName}. Client {session.ClientVersion} uses protocol {session.ProtocolVersion}; the server uses protocol {AgentProtocol.version}. Update Jarvis to a compatible version and reconnect."
                                 ) }
                     else
-                        let correlationId, trackingTask = tracker.Register(this.ResponseTimeout command)
+                        let correlationId, trackingTask = tracker.Register(userId, connectionId, session.Generation, this.ResponseTimeout command)
                         let client = ctx.Clients.Client(connectionId)
                         let commandJson = JsonSerializer.Serialize<AgentCommand>(command)
 

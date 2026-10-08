@@ -33,7 +33,8 @@ let user_service_increments_generation_and_preserves_replacement_on_stale_discon
         { DeviceId = "device-1"
           DeviceName = "Workstation"
           ProtocolVersion = AgentProtocol.version
-          ClientVersion = "1.2.3" }
+          ClientVersion = "1.2.3"
+          SupportedCommands = AgentProtocol.commandDefinitions |> List.map _.Name }
 
     users.TransportConnected(userId, "old-connection")
     let first = users.Register(userId, registration, "old-connection")
@@ -67,7 +68,8 @@ let user_service_switches_active_device_for_same_user () =
         { DeviceId = "device-1"
           DeviceName = "Desktop"
           ProtocolVersion = AgentProtocol.version
-          ClientVersion = "1.0.0" }
+          ClientVersion = "1.0.0"
+          SupportedCommands = AgentProtocol.commandDefinitions |> List.map _.Name }
     let secondRegistration = { firstRegistration with DeviceId = "device-2"; DeviceName = "Laptop" }
 
     users.TransportConnected(userId, "desktop-connection")
@@ -93,7 +95,8 @@ let user_service_retains_disconnected_session_and_failure_reason () =
         { DeviceId = "device-1"
           DeviceName = "Workstation"
           ProtocolVersion = AgentProtocol.version
-          ClientVersion = "1.0.0" }
+          ClientVersion = "1.0.0"
+          SupportedCommands = AgentProtocol.commandDefinitions |> List.map _.Name }
 
     users.TransportConnected(userId, "connection")
     users.Register(userId, registration, "connection") |> ignore
@@ -126,11 +129,95 @@ let user_service_records_protocol_mismatch_in_registration_reason () =
             { DeviceId = "device-1"
               DeviceName = "Workstation"
               ProtocolVersion = "older"
-              ClientVersion = "1.0.0" },
+              ClientVersion = "1.0.0"
+              SupportedCommands = [ "ListProjects" ] },
             "connection"
         )
 
     result.RegistrationReason.Contains("protocol mismatch", StringComparison.Ordinal) |> shouldEqual true
+
+[<Test>]
+let ``registration negotiates only commands known to both client and server`` () =
+    let users = UserService()
+    let userId = "auth0|user"
+    users.TransportConnected(userId, "connection")
+
+    let result =
+        users.Register(
+            userId,
+            { DeviceId = "device-1"
+              DeviceName = "Workstation"
+              ProtocolVersion = AgentProtocol.version
+              ClientVersion = "1.0.0"
+              SupportedCommands = [ "WriteFile"; "FutureCommand"; "ListProjects" ] },
+            "connection"
+        )
+
+    result.ServerProtocolVersion |> shouldEqual AgentProtocol.version
+    result.EnabledCommands |> shouldEqual [ "ListProjects"; "WriteFile" ]
+
+    match users.GetSession(userId) with
+    | ValueNone -> Assert.Fail("Expected registered session.")
+    | ValueSome session ->
+        session.SupportedCommands |> shouldEqual result.EnabledCommands
+        session.RegistrationReason.Contains("negotiated 2/", StringComparison.Ordinal) |> shouldEqual true
+
+[<Test>]
+let ``client service rejects commands not negotiated by the registered client`` () =
+    task {
+        let users = UserService()
+        let userId = "auth0|user"
+        users.TransportConnected(userId, "connection")
+        users.Register(
+            userId,
+            { DeviceId = "device-1"
+              DeviceName = "Workstation"
+              ProtocolVersion = "3.9"
+              ClientVersion = "1.0.0"
+              SupportedCommands = [ "ListProjects" ] },
+            "connection"
+        )
+        |> ignore
+
+        let client = ClientService(Unchecked.defaultof<_>, users, ClientResponseTracker())
+        let command =
+            WriteFileCommand
+                { ProjectName = "Jarvis"
+                  FilePath = "notes.txt"
+                  Content = "content"
+                  FileWriteMode = Write
+                  ExpectedHash = None
+                  CreateParents = None }
+
+        let! response = client.SendCommandToUser(userId, command)
+
+        match response.Error with
+        | Some(ExecutionFailed message) ->
+            message.Contains("WriteFile", StringComparison.Ordinal) |> shouldEqual true
+            message.Contains("client 1.0.0", StringComparison.OrdinalIgnoreCase) |> shouldEqual true
+            message.Contains("protocol 3.9", StringComparison.Ordinal) |> shouldEqual true
+            message.Contains($"server uses protocol {AgentProtocol.version}", StringComparison.Ordinal) |> shouldEqual true
+            message.Contains("reconnect", StringComparison.OrdinalIgnoreCase) |> shouldEqual true
+        | other -> Assert.Fail($"Expected unsupported-command diagnostic, got {other}")
+    }
+
+[<Test>]
+let ``registration without capability metadata negotiates no commands`` () =
+    let users = UserService()
+    users.TransportConnected("auth0|user", "connection")
+
+    let result =
+        users.Register(
+            "auth0|user",
+            { DeviceId = "legacy-device"
+              DeviceName = "Legacy"
+              ProtocolVersion = "3.10"
+              ClientVersion = "0.9.0"
+              SupportedCommands = Unchecked.defaultof<string list> },
+            "connection"
+        )
+
+    result.EnabledCommands |> shouldEqual []
 
 [<Test>]
 let ``response tracker completes registered response`` () =

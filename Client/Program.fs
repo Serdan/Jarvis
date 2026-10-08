@@ -58,13 +58,17 @@ let register (tui: ConsoleTui) (connection: HubConnection) deviceId =
             { DeviceId = deviceId
               DeviceName = Environment.MachineName
               ProtocolVersion = AgentProtocol.version
-              ClientVersion = clientVersion }
+              ClientVersion = clientVersion
+              SupportedCommands =
+                AgentProtocol.commandDefinitions
+                |> List.map (fun definition -> definition.Name) }
 
         let! result = connection.invokeResultAsync<ClientRegistrationResult>("Connect", registration)
 
         match result with
         | Ok registered ->
             tui.SetConnectionState(Connected, BuildInfo.ServerUrl)
+            tui.Log $"Negotiated {registered.EnabledCommands.Length} commands with server protocol {registered.ServerProtocolVersion}."
             return true
         | Error err ->
             tui.SetConnectionState(Connecting, BuildInfo.ServerUrl)

@@ -8,12 +8,15 @@ type ClientRegistration =
     { DeviceId: string
       DeviceName: string
       ProtocolVersion: string
-      ClientVersion: string }
+      ClientVersion: string
+      SupportedCommands: string list }
 
 type ClientRegistrationResult =
     { Generation: int64
       RegisteredAt: DateTimeOffset
-      RegistrationReason: string }
+      RegistrationReason: string
+      ServerProtocolVersion: string
+      EnabledCommands: string list }
 
 type IHubService =
     abstract Connect: registration: ClientRegistration -> Task<ClientRegistrationResult>

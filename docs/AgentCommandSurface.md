@@ -47,6 +47,14 @@ type ListCommandsResult =
 
 `ListCommands` should be available before project selection. It describes the bridge itself, not a particular project.
 
+## Registration Capability Negotiation
+
+Each client advertises the command names it implements when it registers with the SignalR hub. The server intersects that list with its own command catalog and returns the enabled command names together with its protocol version. The negotiated list is stored with the active client generation.
+
+The server checks the negotiated list before dispatching every command. If a command was not negotiated, it is rejected without sending anything to the client; the error identifies the unsupported command, client version, client protocol, and server protocol, and asks the user to update and reconnect. A legacy registration with no capability metadata negotiates no commands rather than receiving commands it may not understand.
+
+Protocol versions remain useful diagnostics, but a version mismatch alone does not disable commands present in both catalogs.
+
 ## Core Command Set
 
 ```fsharp

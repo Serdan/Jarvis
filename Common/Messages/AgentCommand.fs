@@ -508,6 +508,13 @@ module AgentCommandInfo =
         | MessageCommand _ -> "MessageCommand"
         | GetClientActivityCommand _ -> "GetClientActivityCommand"
 
+    let protocolName command =
+        let commandName = name command
+        if commandName.EndsWith("Command", StringComparison.Ordinal) then
+            commandName.Substring(0, commandName.Length - "Command".Length)
+        else
+            commandName
+
     let displayName = function
         | ListCommandsCommand -> "ListCommands"
         | ListProjectsCommand -> "ListProjects"
@@ -726,7 +733,7 @@ module AgentCommandInfo =
         | None -> invocation command
 
 module AgentProtocol =
-    let version = "3.10"
+    let version = "3.11"
     let defaultPatchFuzzyContextLines = 3
     let maxResponseBytes = 900 * 1024
     let maxImageBytes = 8 * 1024 * 1024

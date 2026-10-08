@@ -240,11 +240,7 @@ module McpToolHelpers =
         oauthErrorResult context "invalid_token" "Authentication required." scope
 
     let private toolName command =
-        let name = AgentCommandInfo.name command
-        if name.EndsWith("Command", StringComparison.Ordinal) then
-            name.Substring(0, name.Length - "Command".Length)
-        else
-            name
+        AgentCommandInfo.protocolName command
 
     let private serverVersion =
         match typeof<JarvisOptions>.Assembly.GetName().Version with
@@ -544,6 +540,7 @@ module McpToolHelpers =
                                    generation = session.Generation
                                    protocolVersion = session.ProtocolVersion
                                    clientVersion = session.ClientVersion
+                                   supportedCommands = session.SupportedCommands
                                    registeredAt = session.RegisteredAt
                                    lastSeenAt = session.LastSeenAt
                                    disconnectedAt = session.DisconnectedAt |> Option.map _.ToString("O") |> Option.defaultValue ""

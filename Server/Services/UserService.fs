@@ -24,6 +24,7 @@ type ClientSessionStatus =
       Generation: int64
       ProtocolVersion: string
       ClientVersion: string
+      SupportedCommands: string list
       RegisteredAt: DateTimeOffset
       LastSeenAt: DateTimeOffset
       DisconnectedAt: DateTimeOffset option
@@ -67,6 +68,18 @@ type UserService() =
         if String.IsNullOrWhiteSpace(registration.DeviceName) then
             invalidArg "registration" "DeviceName is required."
 
+        let advertisedCommands =
+            registration.SupportedCommands
+            |> Option.ofObj
+            |> Option.defaultValue []
+            |> List.filter (String.IsNullOrWhiteSpace >> not)
+            |> Set.ofList
+
+        let enabledCommands =
+            AgentProtocol.commandDefinitions
+            |> List.map (fun definition -> definition.Name)
+            |> List.filter advertisedCommands.Contains
+
         lock gate (fun () ->
             let now = DateTimeOffset.UtcNow
             let previous = tryGet userId sessions
@@ -86,10 +99,13 @@ type UserService() =
                     $"Device switch from {session.DeviceName} generation {session.Generation} to {registration.DeviceName}"
 
             let registrationReason =
+                let negotiation =
+                    $"negotiated {enabledCommands.Length}/{AgentProtocol.commandDefinitions.Length} server commands"
+
                 if String.Equals(registration.ProtocolVersion, AgentProtocol.version, StringComparison.Ordinal) then
-                    connectionReason
+                    $"{connectionReason}; {negotiation}"
                 else
-                    $"{connectionReason}; protocol mismatch: client {registration.ProtocolVersion}, server {AgentProtocol.version}"
+                    $"{connectionReason}; protocol mismatch: client {registration.ProtocolVersion}, server {AgentProtocol.version}; {negotiation}"
 
             let session =
                 { UserId = userId
@@ -100,6 +116,7 @@ type UserService() =
                   Generation = generation
                   ProtocolVersion = registration.ProtocolVersion
                   ClientVersion = registration.ClientVersion
+                  SupportedCommands = enabledCommands
                   RegisteredAt = now
                   LastSeenAt = now
                   DisconnectedAt = None
@@ -121,7 +138,9 @@ type UserService() =
 
             { Generation = generation
               RegisteredAt = now
-              RegistrationReason = registrationReason })
+              RegistrationReason = registrationReason
+              ServerProtocolVersion = AgentProtocol.version
+              EnabledCommands = enabledCommands })
 
     member _.Disconnect(connectionId: string, reason: string option) =
         lock gate (fun () ->

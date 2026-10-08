@@ -4,6 +4,8 @@ Jarvis clients are distributed as self-contained single-file executables. The cl
 
 The self-update facility treats these files and `SHA256SUMS` as the authoritative update channel. Whenever a deployment changes the client/shared protocol, publish and upload the matching download artifacts before relying on `UpdateClient`.
 
+On Linux and macOS, activation replaces the running process with the verified executable using `exec`, preserving the client PID and terminal session. If process replacement fails, Jarvis restores the previous executable from the `.prev` backup and reports the activation failure without exiting the current client.
+
 For the current production host, clients should connect to:
 
 ```text

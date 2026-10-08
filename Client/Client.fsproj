@@ -23,6 +23,7 @@
 
     <ItemGroup>
         <Content Include="Structure.md"/>
+        <Compile Include="AssemblyInfo.fs"/>
         <Compile Include="Types.fs"/>
         <Compile Include="Misc.fs"/>
         <Compile Include="Effect.fs"/>

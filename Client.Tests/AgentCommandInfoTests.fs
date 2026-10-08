@@ -5,6 +5,18 @@ open FsUnitTyped
 open NUnit.Framework
 
 [<Test>]
+let ``protocol names remain canonical when display names are shortened`` () =
+    RunProjectTaskCommand
+        { ProjectName = "Wayfold"
+          TaskName = "test" }
+    |> AgentCommandInfo.protocolName
+    |> shouldEqual "RunProjectTask"
+
+    GetGitStatusCommand { ProjectName = "Wayfold" }
+    |> AgentCommandInfo.protocolName
+    |> shouldEqual "GetGitStatus"
+
+[<Test>]
 let ``project-scoped commands render compact activity labels`` () =
     let command =
         RunCommandCommand

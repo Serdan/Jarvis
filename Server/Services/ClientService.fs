@@ -46,33 +46,44 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                                     $"Jarvis device {session.DeviceName} generation {session.Generation} is registered without an active connection."
                             ) }
                 | Registered, Some connectionId ->
-                    let correlationId, trackingTask = tracker.Register(this.ResponseTimeout command)
-                    let client = ctx.Clients.Client(connectionId)
-                    let commandJson = JsonSerializer.Serialize<AgentCommand>(command)
+                    let commandName = AgentCommandInfo.protocolName command
 
-                    try
-                        do! client.ReceiveCommand(correlationId, commandJson)
-                        users.RecordDispatchSuccess(userId, connectionId)
+                    if not (session.SupportedCommands |> List.contains commandName) then
+                        return
+                            { Result = None
+                              Error =
+                                Some(
+                                    ExecutionFailed
+                                        $"Jarvis device {session.DeviceName} does not advertise support for {commandName}. Client {session.ClientVersion} uses protocol {session.ProtocolVersion}; the server uses protocol {AgentProtocol.version}. Update Jarvis to a compatible version and reconnect."
+                                ) }
+                    else
+                        let correlationId, trackingTask = tracker.Register(this.ResponseTimeout command)
+                        let client = ctx.Clients.Client(connectionId)
+                        let commandJson = JsonSerializer.Serialize<AgentCommand>(command)
 
                         try
-                            return! trackingTask
-                        with :? TaskCanceledException ->
+                            do! client.ReceiveCommand(correlationId, commandJson)
+                            users.RecordDispatchSuccess(userId, connectionId)
+
+                            try
+                                return! trackingTask
+                            with :? TaskCanceledException ->
+                                let reason =
+                                    $"Client response timeout for {session.DeviceName} generation {session.Generation}."
+                                users.RecordDispatchFailure(userId, connectionId, reason)
+                                return
+                                    { Result = None
+                                      Error =
+                                        Some(
+                                            ExecutionFailed
+                                                $"{reason} Protocol {session.ProtocolVersion}, client {session.ClientVersion}, last seen {session.LastSeenAt:O}."
+                                        ) }
+                        with ex ->
+                            tracker.Cancel(correlationId)
                             let reason =
-                                $"Client response timeout for {session.DeviceName} generation {session.Generation}."
+                                $"Dispatch failed for {session.DeviceName} generation {session.Generation}: {ex.Message}"
                             users.RecordDispatchFailure(userId, connectionId, reason)
                             return
                                 { Result = None
-                                  Error =
-                                    Some(
-                                        ExecutionFailed
-                                            $"{reason} Protocol {session.ProtocolVersion}, client {session.ClientVersion}, last seen {session.LastSeenAt:O}."
-                                    ) }
-                    with ex ->
-                        tracker.Cancel(correlationId)
-                        let reason =
-                            $"Dispatch failed for {session.DeviceName} generation {session.Generation}: {ex.Message}"
-                        users.RecordDispatchFailure(userId, connectionId, reason)
-                        return
-                            { Result = None
-                              Error = Some(ExecutionFailed reason) }
+                                  Error = Some(ExecutionFailed reason) }
         }

@@ -8,11 +8,14 @@ open System.Runtime.InteropServices
 open System.Security.Cryptography
 open Common
 
-type private PreparedUpdate =
+type internal PreparedUpdate =
     { LivePath: string
       StagedPath: string
       BackupPath: string
       Arguments: string array }
+
+[<DllImport("libc", SetLastError = true)>]
+extern int private execv(string path, nativeint arguments)
 
 let private gate = obj()
 let mutable private pending: PreparedUpdate option = None
@@ -142,16 +145,41 @@ let prepare () =
                 return Error(Client.ExceptionError ex)
     }
 
-let activatePending () =
-    let prepared = lock gate (fun () -> let value = pending in pending <- None; value)
-    match prepared with
-    | None -> Ok false
-    | Some update ->
+let private execUnix path (arguments: string array) =
+    let argumentPointers =
+        Array.append [| path |] arguments
+        |> Array.map Marshal.StringToCoTaskMemUTF8
+
+    let argv = Marshal.AllocCoTaskMem((argumentPointers.Length + 1) * IntPtr.Size)
+
+    try
+        argumentPointers
+        |> Array.iteri (fun index pointer -> Marshal.WriteIntPtr(argv, index * IntPtr.Size, pointer))
+        Marshal.WriteIntPtr(argv, argumentPointers.Length * IntPtr.Size, IntPtr.Zero)
+
+        let result = execv(path, argv)
+        let error = Marshal.GetLastPInvokeError()
+        raise (InvalidOperationException($"Failed to replace the Jarvis process with {path}; execv returned {result} (errno {error})."))
+    finally
+        Marshal.FreeCoTaskMem argv
+        argumentPointers |> Array.iter Marshal.FreeCoTaskMem
+
+let private restoreBackup (update: PreparedUpdate) activationError =
+    try
+        if File.Exists update.LivePath then File.Delete update.LivePath
+        if File.Exists update.BackupPath then File.Move(update.BackupPath, update.LivePath)
+        activationError
+    with rollbackError ->
+        AggregateException("Self-update activation and rollback both failed.", activationError, rollbackError) :> exn
+
+let internal activate (update: PreparedUpdate) =
+    try
+        if File.Exists update.BackupPath then File.Delete update.BackupPath
+        File.Move(update.LivePath, update.BackupPath)
         try
-            if File.Exists update.BackupPath then File.Delete update.BackupPath
-            File.Move(update.LivePath, update.BackupPath)
-            try
-                File.Move(update.StagedPath, update.LivePath)
+            File.Move(update.StagedPath, update.LivePath)
+
+            if OperatingSystem.IsWindows() then
                 let startInfo = ProcessStartInfo(update.LivePath)
                 startInfo.UseShellExecute <- false
                 startInfo.WorkingDirectory <- Environment.CurrentDirectory
@@ -161,8 +189,15 @@ let activatePending () =
                 | _ ->
                     Environment.Exit 0
                     Ok true
-            with ex ->
-                if File.Exists update.LivePath then File.Delete update.LivePath
-                if File.Exists update.BackupPath then File.Move(update.BackupPath, update.LivePath)
-                raise ex
-        with ex -> Error(Client.ExceptionError ex)
+            else
+                execUnix update.LivePath update.Arguments
+                Ok true
+        with ex ->
+            raise (restoreBackup update ex)
+    with ex -> Error(Client.ExceptionError ex)
+
+let activatePending () =
+    let prepared = lock gate (fun () -> let value = pending in pending <- None; value)
+    match prepared with
+    | None -> Ok false
+    | Some update -> activate update

@@ -141,6 +141,8 @@ module McpToolHelpers =
                     "Summarizes persisted agent feedback."
                     [ ReadOnly ]
                     false
+                serverLocalCapability "UpdateServer" "Schedules a verified systemd-managed server update with rollback." [ ProcessExecution; NetworkAccess; Destructive ] true
+                serverLocalCapability "GetServerUpdateStatus" "Reads the server update status file." [ ReadOnly ] false
                 serverLocalCapability "ListDevices" "Lists registered Jarvis devices and the selected default." [ ReadOnly ] false
                 serverLocalCapability "SelectDevice" "Selects the default Jarvis command destination." [] true
                 serverLocalCapability
@@ -605,6 +607,62 @@ module McpToolHelpers =
                     |> jsonResult
         }
 
+    let private serverUpdateGate = obj()
+    let mutable private serverUpdatePending = false
+
+    let updateServer (http: IHttpContextAccessor) =
+        task {
+            match authenticatedFeedbackContext http with
+            | Error result -> return result
+            | Ok(context, _) when not (Auth.hasScope Auth.ProcessExecute context.User) ->
+                return authorizationErrorResult context Auth.ProcessExecute
+            | Ok _ ->
+                let acquired = lock serverUpdateGate (fun () ->
+                    if serverUpdatePending then false
+                    else serverUpdatePending <- true; true)
+                if not acquired then
+                    return errorResult (Conflict "A server update request is already being scheduled.")
+                else
+                    use _releaseGate = { new IDisposable with member _.Dispose() = lock serverUpdateGate (fun () -> serverUpdatePending <- false) }
+                    try
+                        let info = ProcessStartInfo("/usr/bin/sudo")
+                        info.ArgumentList.Add("-n")
+                        info.ArgumentList.Add("/usr/bin/systemd-run")
+                        info.ArgumentList.Add("--unit=jarvis-server-update")
+                        info.ArgumentList.Add("--collect")
+                        info.ArgumentList.Add("/usr/local/sbin/jarvis-update-server")
+                        info.UseShellExecute <- false
+                        info.RedirectStandardOutput <- true
+                        info.RedirectStandardError <- true
+                        use updaterProcess = new Process()
+                        updaterProcess.StartInfo <- info
+                        if not (updaterProcess.Start()) then
+                            return errorResult (ExecutionFailed "Unable to launch server updater.")
+                        else
+                            let! stdout = updaterProcess.StandardOutput.ReadToEndAsync()
+                            let! stderr = updaterProcess.StandardError.ReadToEndAsync()
+                            do! updaterProcess.WaitForExitAsync()
+                            if updaterProcess.ExitCode <> 0 then
+                                return errorResult (ExecutionFailed $"Server update scheduling failed: {stderr.Trim()}")
+                            else
+                                return jsonResult {| scheduled = true; message = stdout.Trim(); statusTool = "GetServerUpdateStatus" |}
+                    with ex ->
+                        return errorResult (ExecutionFailed $"Server update scheduling failed: {ex.Message}")
+        }
+
+    let getServerUpdateStatus (http: IHttpContextAccessor) =
+        task {
+            match authenticatedFeedbackContext http with
+            | Error result -> return result
+            | Ok _ ->
+                try
+                    let path = "/var/lib/jarvis/server-update-status"
+                    let status = if System.IO.File.Exists(path) then System.IO.File.ReadAllText(path).Trim() else "not-configured"
+                    return jsonResult {| status = status |}
+                with ex ->
+                    return errorResult (ExecutionFailed ex.Message)
+        }
+
     let private deviceStatuses (users: UserService) userId =
         users.ListDevices(userId)
         |> Array.map (fun session ->
@@ -773,6 +831,14 @@ type JarvisMcpTools =
         http: IHttpContextAccessor
     ) =
         McpToolHelpers.feedbackSummary store http projectName toolName
+
+    [<McpServerTool(Title = "Update server", ReadOnly = false, Destructive = true, Idempotent = false, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["process:execute"]}]"""); Description("Schedule a verified update of the production server from published downloads. Uses systemd with automatic rollback and interrupts the current MCP connection during restart.")>]
+    static member UpdateServer(http: IHttpContextAccessor) =
+        McpToolHelpers.updateServer http
+
+    [<McpServerTool(Title = "Get server update status", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read the latest server update result after reconnecting.")>]
+    static member GetServerUpdateStatus(http: IHttpContextAccessor) =
+        McpToolHelpers.getServerUpdateStatus http
 
     [<McpServerTool(Title = "List devices", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("List the authenticated user's Jarvis devices, global fallback default, and this ChatGPT conversation's selected device.")>]
     static member ListDevices(users: UserService, http: IHttpContextAccessor) =

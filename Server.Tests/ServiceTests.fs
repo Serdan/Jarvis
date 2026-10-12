@@ -415,7 +415,7 @@ let ``command catalog matches AgentCommand union and MCP tools`` () =
         |> Set.ofArray
 
     let serverLocalNames =
-        set [ "GetProfile"; "Feedback"; "ListFeedback"; "GetFeedback"; "UpdateFeedback"; "GetFeedbackSummary"; "GetConnectionDiagnostics"; "ListDevices"; "SelectDevice" ]
+        set [ "GetProfile"; "Feedback"; "ListFeedback"; "GetFeedback"; "UpdateFeedback"; "GetFeedbackSummary"; "GetConnectionDiagnostics"; "ListDevices"; "SelectDevice"; "UpdateServer"; "GetServerUpdateStatus" ]
 
     unionNames |> shouldEqual catalogNames
     Set.difference mcpNames serverLocalNames |> shouldEqual catalogNames
@@ -644,6 +644,7 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
         let scope =
             match definition with
             | Some definition -> expectedScope definition
+            | None when methodInfo.Name = "UpdateServer" -> Auth.ProcessExecute
             | None -> Auth.WorkspaceRead
 
         let readOnly =
@@ -651,18 +652,18 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
             | Some definition -> definition.Permissions = [ ReadOnly ]
             | None ->
                 match methodInfo.Name with
-                | "Feedback" | "UpdateFeedback" | "SelectDevice" -> false
-                | "ListFeedback" | "GetFeedback" | "GetFeedbackSummary" | "GetConnectionDiagnostics" | "ListDevices" -> true
+                | "Feedback" | "UpdateFeedback" | "SelectDevice" | "UpdateServer" -> false
+                | "ListFeedback" | "GetFeedback" | "GetFeedbackSummary" | "GetConnectionDiagnostics" | "ListDevices" | "GetServerUpdateStatus" -> true
                 | name -> failwith $"Unexpected server-local MCP tool: {name}"
 
         let destructive =
             match methodInfo.Name with
-            | "ImportFile" | "UpdateClient" | "WriteFile" | "PatchFile" | "RunCommand" | "RunProjectTask" | "StartJob" | "CancelJob" -> true
+            | "ImportFile" | "UpdateClient" | "UpdateServer" | "WriteFile" | "PatchFile" | "RunCommand" | "RunProjectTask" | "StartJob" | "CancelJob" -> true
             | _ -> false
 
         let openWorld =
             match methodInfo.Name with
-            | "ImportFile" | "UpdateClient" | "RunCommand" | "RunProjectTask" | "StartJob" -> true
+            | "ImportFile" | "UpdateClient" | "UpdateServer" | "RunCommand" | "RunProjectTask" | "StartJob" -> true
             | _ -> false
 
         attribute.ReadOnly |> shouldEqual readOnly

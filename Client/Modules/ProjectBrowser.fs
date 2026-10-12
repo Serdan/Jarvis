@@ -242,7 +242,7 @@ module private Core =
 
     let listCommands _ = Ok AgentProtocol.listCommandsResult
 
-    let listProjects rt =
+    let private enumerateProjects rt =
         effect {
             let! root = ProjectIO.root |>> ProjectDirectory.toFolderPath
             let! children = FileIO.getChildFolders root
@@ -251,9 +251,13 @@ module private Core =
         }
         <| rt
 
+    let listProjects rt =
+        enumerateProjects rt
+        |> Result.map (Seq.filter (fun (ProjectName name) -> not (name.StartsWith(".", StringComparison.Ordinal))))
+
     let private parseProjectName (projectName: string) =
         effect {
-            let! projects = listProjects
+            let! projects = enumerateProjects
 
             return!
                 projects

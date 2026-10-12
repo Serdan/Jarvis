@@ -98,7 +98,7 @@ type AgentCommand =
 
 ### `ListProjects`
 
-Lists available projects under the configured workspace root.
+Lists available projects under the configured workspace root, excluding dot-prefixed directories by default. Dot-prefixed projects remain accessible through other commands when named explicitly.
 
 Read-only.
 

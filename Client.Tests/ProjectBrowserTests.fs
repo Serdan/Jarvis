@@ -94,6 +94,7 @@ let fakeFileOperations =
             match path with
             | "/fake/projects/Project1" -> Ok(FolderPath path)
             | "/fake/projects/Project1/src" -> Ok(FolderPath path)
+            | "/fake/projects/.Hidden" -> Ok(FolderPath path)
             | "/fake/projects" -> Ok(FolderPath path)
             | _ -> Error(NotFoundError path)
 
@@ -113,7 +114,8 @@ let fakeFileOperations =
         fun (FolderPath folderPath) ->
             match folderPath with
             | "/fake/projects" ->
-                Ok(Seq.ofList [ FolderPath "/fake/projects/Project1"; FolderPath "/fake/projects/Project2" ])
+                Ok(Seq.ofList [ FolderPath "/fake/projects/Project1"; FolderPath "/fake/projects/.Hidden"; FolderPath "/fake/projects/Project2" ])
+            | "/fake/projects/.Hidden" -> Ok Seq.empty
             | "/fake/projects/Project1" -> Ok(Seq.ofList [ FolderPath "/fake/projects/Project1/src" ])
             | "/fake/projects/Project1/src" -> Ok Seq.empty
             | _ -> Error(NotFoundError "Folder not found")
@@ -183,6 +185,11 @@ let ``listProjects returns existing projects`` () =
     let result = listProjects fakeContext
     let expected = seq [ ProjectName "Project1"; ProjectName "Project2" ] |> Ok
     expected |> shouldEqual result
+
+[<Test>]
+let ``dot-prefixed projects remain accessible by explicit name`` () =
+    getProjectDetails { ProjectName = ".Hidden" } fakeContext
+    |> shouldEqual (Ok [])
 
 [<Test>]
 let ``getProjectDetails retrieves special files`` () =

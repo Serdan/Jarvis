@@ -10,6 +10,7 @@ open System.Text.Json
 type Snapshot =
     { Version: int
       ActivityId: string
+      Origin: string
       StartedAt: DateTimeOffset
       ProjectName: string
       CommandName: string

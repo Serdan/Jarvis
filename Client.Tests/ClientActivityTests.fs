@@ -51,7 +51,8 @@ let ``GetClientActivity does not add itself to client activity`` () =
         let command =
             GetClientActivityCommand
                 { ProjectName = None
-                  Limit = Some 20 }
+                  Limit = Some 20
+                  IncludeObservers = None }
 
         let! response = Client.SignalR.Client.receiveCommand runtime command
 
@@ -143,4 +144,42 @@ let ``Message rejects blank content without adding activity`` () =
         | Ok _ -> Assert.Fail("Expected blank Message to fail.")
 
         tui.GetActivitySnapshot(None, Some 20).Entries |> shouldEqual []
+    }
+
+[<Test>]
+let ``observer diagnostics stay available but are excluded by default`` () =
+    let tui = ConsoleTui.ConsoleTui()
+    let observerId = tui.StartActivity(GetGitStatusCommand { ProjectName = "Wayfold" })
+    tui.CompleteActivity(observerId, 2L, None)
+    let workerId = tui.StartActivity(sampleRunCommand "Wayfold" "Build")
+    tui.CompleteActivity(workerId, 18L, None)
+    let work = tui.GetActivitySnapshot(Some "Wayfold", Some 20)
+    work.Entries.Length |> shouldEqual 1
+    work.Entries.Head.Origin |> shouldEqual "Worker"
+    let all = tui.GetActivitySnapshot(Some "Wayfold", Some 20, includeObservers = true)
+    all.Entries.Length |> shouldEqual 2
+    all.Entries.Head.Origin |> shouldEqual "Observer"
+    all.Entries.Tail.Head.Origin |> shouldEqual "Worker"
+
+[<Test>]
+let ``GetClientActivity respects explicit observer inclusion`` () =
+    task {
+        let tui = ConsoleTui.ConsoleTui()
+        let id = tui.StartActivity(GetGitStatusCommand { ProjectName = "Wayfold" })
+        tui.CompleteActivity(id, 3L, None)
+        let rt = Runtime(".", tui, PartialTrust)
+
+        for includeObservers, expectedCount in [ false, 0; true, 1 ] do
+            let command =
+                GetClientActivityCommand {
+                    ProjectName = Some "Wayfold"
+                    Limit = Some 10
+                    IncludeObservers = Some includeObservers }
+            let! response = Client.SignalR.Client.receiveCommand rt command
+            match response with
+            | Error error -> Assert.Fail($"Activity query failed: {error}")
+            | Ok serialized ->
+                let result = JsonSerializer.Deserialize<GetClientActivityResult>(serialized)
+                result.Entries.Length |> shouldEqual expectedCount
+                if includeObservers then result.Entries.Head.Origin |> shouldEqual "Observer"
     }

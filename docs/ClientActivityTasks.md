@@ -113,6 +113,12 @@ The receive timestamp remains fixed when the row is updated.
   - Ignore malformed/truncated JSONL records during replay so a damaged tail does not prevent client startup.
   - Treat persistence as best-effort; filesystem failures must not stop Jarvis command execution.
 
+## Observer diagnostics
+
+`GitStatus`, `ListJobs` and `ListWorkTasks` are recorded with `Origin = "Observer"` because they are status checks, not project mutations. The ordinary TUI view and `GetClientActivity` response hide these entries to avoid presenting another session's monitoring as new worker activity. This is a command-kind classification, **not** proof of which agent invoked the call.
+
+`GetClientActivity(includeObservers=true)` returns both work and observer entries, including their origin. The client TUI's `O` key toggles their visibility; entries remain in the persisted JSONL log. Existing logs without an origin field are interpreted as work. `GetClientActivity` itself is never recorded.
+
 ## Design constraints
 
 - Keep one command per activity row.

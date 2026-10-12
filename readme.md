@@ -38,9 +38,9 @@ There is no copied session key. ChatGPT never receives a Jarvis routing secret.
 - Optimistic-concurrency writes and atomic unified-diff patches.
 - Named project tasks from `.jarvis.json`.
 - Persisted unfinished work tasks in `.jarvis/tasks` that reference committed task descriptions and carry resumable execution checkpoints.
-- Project-local skill discovery, reading, and creation with `ListSkills`, `GetSkill`, and `CreateSkill`.
+- Project-local and workspace-global skill discovery, reading, and creation with `ListSkills`, `GetSkill`, and `CreateSkill`.
 - Bounded process execution and asynchronous jobs, with optional human-readable `reason` metadata on `RunCommand` and `StartJob`.
-- Persisted client activity and fresh-session recovery through `GetClientActivity`.
+- Persisted client activity and fresh-session recovery through `GetClientActivity`, with observer diagnostics excluded by default and retrievable explicitly.
 - Lightweight progress and turn-completion notes in client activity through `Message`.
 - Git status/diff and local commits.
 - Project-root and symlink confinement.
@@ -188,9 +188,11 @@ Task descriptions must already be tracked, committed, and clean when attached. J
 
 `CompleteWorkTask` records the final repository HEAD in its result and deletes the local execution-state file. The committed task description and git history remain as the durable record.
 
-## Project skills
+## Project and global skills
 
-Projects can store reusable procedural instructions at `.jarvis/skills/<skill-name>/SKILL.md`. `ListSkills(projectName)` discovers names and short descriptions; `GetSkill(projectName, skillName)` reads the full Markdown. `CreateSkill(projectName, skillName, content, overwrite=false)` writes the canonical path and rejects existing skills unless overwrite is explicit.
+Projects store instructions at `<project>/.jarvis/skills/<skill-name>/SKILL.md`. The shared workspace skill scope uses `<workspace>/.jarvis/skills/<skill-name>/SKILL.md`.
+
+`ListSkills(projectName)` returns local and global skills with an explicit scope. Use `projectName="@global"` for `GetSkill` or `CreateSkill` when targeting the global scope. Existing skills require `overwrite=true`.
 
 Skill reads require `workspace:read`; creation requires `workspace:write` and follows the local trust policy. Skills provide guidance and do not execute code or grant permissions. See [Jarvis Skills](docs/Skills.md) for the format and validation rules.
 
@@ -198,7 +200,7 @@ Skill reads require `workspace:read`; creation requires `workspace:write` and fo
 
 JarvisClient retains the latest 500 activities and restores them from local JSONL logs after a restart. Logs rotate daily and at 10 MiB, with 14 days of retention. Commands left running or awaiting permission are restored as `Interrupted`; activity recovery does not resume processes or restore job handles.
 
-A fresh agent session can call `GetClientActivity(projectName?, limit=20)` to inspect recent activity, including timestamps, reasons/details, status, duration, and result or failure summaries. Requests are bounded to 1–100 entries, with optional case-insensitive exact project filtering. The client must be connected; use `GetConnectionDiagnostics` separately to inspect connection state. Activity inspection does not add an activity row, and detailed history is not persisted on the server. The client also supports `R` to copy recent commands for chat recovery.
+A fresh agent session can call `GetClientActivity(projectName?, limit=20, includeObservers=false)` to inspect recent activity, including timestamps, reasons/details, status, duration, and result or failure summaries. Requests are bounded to 1–100 entries, with optional case-insensitive exact project filtering. The client must be connected; use `GetConnectionDiagnostics` separately to inspect connection state. Activity inspection does not add an activity row, and detailed history is not persisted on the server. The client also supports `R` to copy recent commands for chat recovery.
 
 Supply a short `reason` when using `RunCommand` or `StartJob` to explain the operation in activity/history. `ListJobs` also retains `StartJob` reasons. Reasons are presentation metadata and do not change authorization identity or grant permissions.
 

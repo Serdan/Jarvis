@@ -1024,15 +1024,15 @@ type JarvisMcpTools =
     static member CompleteWorkTask(projectName: string, taskId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (CompleteWorkTaskCommand { ProjectName = projectName; TaskId = taskId })
 
-    [<McpServerTool(Title = "List skills", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("List project-local Jarvis skills from .jarvis/skills. Skills provide procedural instructions and do not grant execution privileges.")>]
+    [<McpServerTool(Title = "List skills", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("List project skills and shared workspace-global skills (scope identified on each result). Use projectName=@global to list global skills only. Skills do not grant execution privileges.")>]
     static member ListSkills(projectName: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (ListSkillsCommand { ProjectName = projectName })
 
-    [<McpServerTool(Title = "Get skill", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read a named project-local Jarvis skill from .jarvis/skills/<name>/SKILL.md (or skill.md). The returned content is procedural guidance only; use normal Jarvis tools for any actions.")>]
+    [<McpServerTool(Title = "Get skill", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read a project skill; use projectName=@global for a shared workspace-global skill. Skills contain procedural guidance only.")>]
     static member GetSkill(projectName: string, skillName: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (GetSkillCommand { ProjectName = projectName; SkillName = skillName })
 
-    [<McpServerTool(Title = "Create skill", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:write"]}]"""); Description("Create a project-local Jarvis skill at .jarvis/skills/<name>/SKILL.md. Existing skills are rejected unless overwrite is explicitly true. Skill creation uses the normal workspace-write permission and trust model.")>]
+    [<McpServerTool(Title = "Create skill", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:write"]}]"""); Description("Create or update a project-local skill, or use projectName=@global for a workspace-global skill. Existing skills require overwrite=true. Uses normal workspace-write permissions.")>]
     static member CreateSkill(
         projectName: string,
         skillName: string,
@@ -1104,10 +1104,11 @@ type JarvisMcpTools =
             ProjectName = McpToolHelpers.optionOfString projectName
             Message = message })
 
-    [<McpServerTool(Title = "Get client activity", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read recent in-memory activity from the connected Jarvis client. Use this to reconstruct what the client was doing when a previous ChatGPT session stalled. Optionally filter by project.")>]
+    [<McpServerTool(Title = "Get client activity", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read connected client activity. Observer diagnostics (GitStatus/ListJobs/ListWorkTasks) are omitted by default; set includeObservers=true to include them. Optionally filter by project.")>]
     static member GetClientActivity(
         [<Optional; DefaultParameterValue("")>] projectName: string,
         [<Optional; DefaultParameterValue(20)>] limit: int,
+        [<Optional; DefaultParameterValue(false)>] includeObservers: bool,
         [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService,
         http: IHttpContextAccessor
     ) =
@@ -1118,4 +1119,5 @@ type JarvisMcpTools =
 
         McpToolHelpers.send client http (GetClientActivityCommand {
             ProjectName = McpToolHelpers.optionOfString projectName
-            Limit = Some boundedLimit })
+            Limit = Some boundedLimit
+            IncludeObservers = Some includeObservers })

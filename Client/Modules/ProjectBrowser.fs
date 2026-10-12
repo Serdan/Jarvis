@@ -376,7 +376,7 @@ module private Core =
             if line.Length <= 240 then line
             else line.Substring(0, 239) + "…")
 
-    let listSkills projectName =
+    let private listProjectSkills projectName =
         fun rt ->
             match parseProjectName projectName rt with
             | Error error -> Error error
@@ -403,6 +403,7 @@ module private Core =
                                     | Ok content ->
                                         Some
                                             { Name = validated
+                                              Scope = "project"
                                               Description = skillDescription content }
                                     | Error(NotFoundError _) -> None
                                     | Error _ -> None)
@@ -412,7 +413,7 @@ module private Core =
 
                         Ok { Skills = skills }
 
-    let getSkill projectName skillName =
+    let private getProjectSkill projectName skillName =
         fun rt ->
             match validateSkillName skillName with
             | Error error -> Error error
@@ -425,9 +426,10 @@ module private Core =
                     | Ok(Content content) ->
                         Ok
                             { Name = validated
+                              Scope = "project"
                               Content = content }
 
-    let createSkill projectName skillName content overwrite =
+    let private createProjectSkill projectName skillName content overwrite =
         effect {
             let! validated = fun _ -> validateSkillName skillName
 
@@ -454,10 +456,107 @@ module private Core =
 
                 return
                     { Name = validated
+                      Scope = "project"
                       Path = relativePath.Replace('\\', '/')
                       Hash = Hash.sha256 content
                       Overwritten = overwritten }
         }
+
+    // Workspace-wide skills are kept outside individual projects but inside the
+    // selected workspace, and use the same symlink-safe path resolution.
+    let private globalScope = "@global"
+
+    let private globalSkillPath skillName fileName =
+        ProjectPaths.resolveWorkspacePath [ ".jarvis"; "skills"; skillName; fileName ]
+
+    let private readGlobalSkill skillName =
+        fun rt ->
+            let rec find = function
+                | [] -> Error(NotFoundError $"Global skill '{skillName}' was not found.")
+                | fileName :: rest ->
+                    match globalSkillPath skillName fileName rt with
+                    | Error error -> Error error
+                    | Ok path when not (File.Exists path) -> find rest
+                    | Ok path -> FileIO.readAllText (FilePath path) rt
+            find [ "SKILL.md"; "skill.md" ]
+
+    let private listGlobalSkills rt =
+        match ProjectPaths.resolveWorkspacePath [ ".jarvis"; "skills" ] rt with
+        | Error error -> Error error
+        | Ok directory when not (Directory.Exists directory) -> Ok []
+        | Ok directory ->
+            try
+                Directory.EnumerateDirectories(directory)
+                |> Seq.choose (fun directory ->
+                    let name = Path.GetFileName directory
+                    match validateSkillName name with
+                    | Error _ -> None
+                    | Ok valid ->
+                        match readGlobalSkill valid rt with
+                        | Ok content ->
+                            Some { Name = valid; Scope = "global"; Description = skillDescription content }
+                        | _ -> None)
+                |> Seq.toList
+                |> Ok
+            with ex -> Error(ExceptionError ex)
+
+    let listSkills projectName =
+        fun rt ->
+            match listGlobalSkills rt with
+            | Error error -> Error error
+            | Ok globals ->
+                let local =
+                    if projectName = globalScope then Ok { Skills = [] }
+                    else listProjectSkills projectName rt
+                match local with
+                | Error error -> Error error
+                | Ok result ->
+                    Ok { Skills =
+                        result.Skills @ globals
+                        |> List.sortWith (fun a b ->
+                            let nameOrder = StringComparer.OrdinalIgnoreCase.Compare(a.Name, b.Name)
+                            if nameOrder <> 0 then nameOrder
+                            else StringComparer.Ordinal.Compare(a.Scope, b.Scope)) }
+
+    let getSkill projectName skillName =
+        fun rt ->
+            if projectName <> globalScope then getProjectSkill projectName skillName rt
+            else
+                match validateSkillName skillName with
+                | Error error -> Error error
+                | Ok valid ->
+                    match readGlobalSkill valid rt with
+                    | Error error -> Error error
+                    | Ok(Content content) ->
+                        Ok { Name = valid; Scope = "global"; Content = content }
+
+    let createSkill projectName skillName content overwrite =
+        if projectName <> globalScope then createProjectSkill projectName skillName content overwrite
+        else
+            effect {
+                let! valid = fun _ -> validateSkillName skillName
+                if String.IsNullOrWhiteSpace content then
+                    return! Client.ValidationError "Skill content cannot be empty." |> Effect.ofError
+                else
+                    let! overwritten =
+                        fun rt ->
+                            match readGlobalSkill valid rt with
+                            | Ok _ when not overwrite ->
+                                Error(Client.ValidationError $"Global skill '{valid}' already exists. Set overwrite=true to replace it.")
+                            | Ok _ -> Ok true
+                            | Error(NotFoundError _) -> Ok false
+                            | Error error -> Error error
+                    let! path = globalSkillPath valid "SKILL.md"
+                    let parent = Path.GetDirectoryName path
+                    do! FileIO.createDirectory (FolderPath parent)
+                    do! FileIO.writeAllText (FilePath path) (Content content)
+                    return
+                        { Name = valid
+                          Scope = "global"
+                          Path = $".jarvis/skills/{valid}/SKILL.md"
+                          Hash = Hash.sha256 content
+                          Overwritten = overwritten }
+            }
 
     let listProjectDirectory projectName folderPath =
         projectName |> parseProjectName >>= getItems folderPath

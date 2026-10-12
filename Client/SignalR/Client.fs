@@ -246,7 +246,7 @@ let private dispatch (rt: Runtime) (command: AgentCommand) =
             rt.Tui.Message(cmd.ProjectName, cmd.Message)
             Ok() |> serialize'
     | GetClientActivityCommand cmd ->
-        rt.Tui.GetActivitySnapshot(cmd.ProjectName, cmd.Limit)
+        rt.Tui.GetActivitySnapshot(cmd.ProjectName, cmd.Limit, includeObservers = defaultArg cmd.IncludeObservers false)
         |> Ok
         |> serialize'
 

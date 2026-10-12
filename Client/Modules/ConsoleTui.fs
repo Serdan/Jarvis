@@ -24,6 +24,7 @@ type private ActivityStatus =
 type private ActivityEntry =
     { Id: int
       PersistenceId: string
+      Origin: string
       StartedAt: DateTimeOffset
       Timestamp: string
       ProjectName: string option
@@ -62,6 +63,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
     let mutable copyRecentCountText = "20"
     let mutable copyRecentCountEdited = false
     let mutable statusFilter = ActivityFilter.All
+    let mutable showObservers = false
     let mutable activityScrollOffset = 0
     let mutable showActivityDetails = false
     let mutable connectionState = Disconnected
@@ -130,7 +132,8 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         let terms = ActivityFilter.parseTerms activityFilterText
         activity
         |> Seq.filter (fun entry ->
-            activityStatusMatches statusFilter entry.Status
+            (showObservers || entry.Origin <> "Observer")
+            && activityStatusMatches statusFilter entry.Status
             && ActivityFilter.matchesTerms terms entry.ProjectName (searchableActivityText entry))
         |> Seq.toArray
 
@@ -218,6 +221,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
             let snapshot: ActivityLog.Snapshot =
                 { Version = 1
                   ActivityId = entry.PersistenceId
+                  Origin = entry.Origin
                   StartedAt = entry.StartedAt
                   ProjectName = entry.ProjectName |> Option.toObj
                   CommandName = entry.CommandName |> Option.toObj
@@ -243,9 +247,16 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
             && (selectedActivityId.IsNone || selectedActivityId = previousLastId)
         let startedAt = DateTimeOffset.Now
         let commandName, reason, detail = commandMetadata command
+        let origin =
+            match command with
+            | Some(GetGitStatusCommand _)
+            | Some(ListJobsCommand _)
+            | Some(ListWorkTasksCommand _) -> "Observer"
+            | _ -> "Worker"
         let entry =
             { Id = nextActivityId
               PersistenceId = Guid.NewGuid().ToString("N")
+              Origin = origin
               StartedAt = startedAt
               Timestamp = startedAt.ToString("HH:mm:ss")
               ProjectName = projectName
@@ -355,6 +366,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         writeMnemonic 'c' "clear"; Console.Write ", "
         writeMnemonic 'p' "permissions"; Console.Write ", "
         writeMnemonic 'r' "copy recent"; Console.Write ", "
+        writeMnemonic 'o' (if showObservers then "hide observers" else "show observers"); Console.Write ", "
         writeMnemonic 'q' "quit"; Console.WriteLine ""
 
     let writePermissionHotkeys () =
@@ -408,6 +420,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
 
     let recentCommandExportUnsafe count =
         activity
+        |> Seq.filter (fun entry -> showObservers || entry.Origin <> "Observer")
         |> Seq.choose (fun entry ->
             entry.CommandName
             |> Option.map (fun commandName ->
@@ -429,7 +442,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
 
     let recentCommandCountUnsafe count =
         activity
-        |> Seq.filter (fun entry -> entry.CommandName.IsSome)
+        |> Seq.filter (fun entry -> (showObservers || entry.Origin <> "Observer") && entry.CommandName.IsSome)
         |> Seq.rev
         |> Seq.truncate count
         |> Seq.length
@@ -470,6 +483,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                     writeDetailField width "Command" "Log"
                     writeDetailField width "Detail" entry.Message
 
+                writeDetailField width "Origin" entry.Origin
                 writeDetailField width "Status" (statusName entry.Status)
                 statusDuration entry.Status
                 |> Option.iter (fun durationMs -> writeDetailField width "Duration" $"{durationMs} ms")
@@ -639,6 +653,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                 let entry =
                     { Id = nextActivityId
                       PersistenceId = snapshot.ActivityId
+                      Origin = if snapshot.Origin = "Observer" then "Observer" else "Worker"
                       StartedAt = snapshot.StartedAt
                       Timestamp = snapshot.StartedAt.ToString("HH:mm:ss")
                       ProjectName = Option.ofObj snapshot.ProjectName
@@ -726,7 +741,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                 persistEntryUnsafe entry)
             renderUnsafe())
 
-    member _.GetActivitySnapshot(projectName: string option, limit: int option) =
+    member _.GetActivitySnapshot(projectName: string option, limit: int option, ?includeObservers: bool) =
         lock syncRoot (fun () ->
             let now = DateTimeOffset.Now
             let count = limit |> Option.defaultValue 20 |> max 1 |> min 100
@@ -740,11 +755,13 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
             let entries =
                 activity
                 |> Seq.filter projectMatches
+                |> Seq.filter (fun entry -> defaultArg includeObservers false || entry.Origin <> "Observer")
                 |> Seq.rev
                 |> Seq.truncate count
                 |> Seq.rev
                 |> Seq.map (fun entry ->
-                    { StartedAt = entry.StartedAt
+                    { Origin = entry.Origin
+                      StartedAt = entry.StartedAt
                       AgeMs = max 0L (int64 (now - entry.StartedAt).TotalMilliseconds)
                       ProjectName = entry.ProjectName
                       CommandName = entry.CommandName

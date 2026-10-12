@@ -42,8 +42,10 @@ let listSkills_discovers_skill_files_and_descriptions () =
             result.Skills
             |> shouldEqual
                 [ { Name = "build"
+                    Scope = "project"
                     Description = Some "Run the canonical build workflow." }
                   { Name = "deploy"
+                    Scope = "project"
                     Description = Some "Deploy production safely." } ]
     finally
         Directory.Delete(workspace, true)
@@ -66,6 +68,7 @@ let getSkill_reads_skill_content_and_accepts_lowercase_file_name () =
         |> shouldEqual
             (Ok
                 { Name = "diagnose"
+                  Scope = "project"
                   Content = content })
     finally
         Directory.Delete(workspace, true)
@@ -157,6 +160,7 @@ let createSkill_writes_canonical_file_and_returns_metadata () =
             |> shouldEqual
                 (Ok
                     { Name = "release"
+                      Scope = "project"
                       Content = content })
     finally
         Directory.Delete(workspace, true)
@@ -232,3 +236,44 @@ let createSkill_rejects_empty_content () =
         | Ok _ -> Assert.Fail("Expected empty skill content to be rejected.")
     finally
         Directory.Delete(workspace, true)
+
+[<Test>]
+let globalSkills_are_visible_from_multiple_projects_and_can_be_updated () =
+    let workspace = tempWorkspace ()
+    try
+        createProject workspace "One"
+        createProject workspace "Two"
+        let runtime = Runtime(workspace)
+        let command content overwrite = {
+            ProjectName = "@global"
+            SkillName = "engineering-judgment"
+            Content = content
+            Overwrite = overwrite }
+        let original = "# Engineering judgment\n\nAvoid unnecessary complexity."
+        match createSkill (command original false) runtime with
+        | Error error -> Assert.Fail($"Global skill creation failed: {EffectError.toString error}")
+        | Ok created ->
+            created.Scope |> shouldEqual "global"
+            created.Overwritten |> shouldEqual false
+
+        for projectName in [ "One"; "Two" ] do
+            match listSkills { ProjectName = projectName } runtime with
+            | Error error -> Assert.Fail($"ListSkills failed: {EffectError.toString error}")
+            | Ok result ->
+                result.Skills |> List.exists (fun item -> item.Name = "engineering-judgment" && item.Scope = "global")
+                |> shouldEqual true
+
+        getSkill { ProjectName = "@global"; SkillName = "engineering-judgment" } runtime
+        |> shouldEqual (Ok { Name = "engineering-judgment"; Scope = "global"; Content = original })
+
+        match createSkill (command "# Changed" false) runtime with
+        | Error(ValidationError _) -> ()
+        | _ -> Assert.Fail("Overwrite must be explicit.")
+
+        match createSkill (command "# Changed" true) runtime with
+        | Error error -> Assert.Fail($"Global skill overwrite failed: {EffectError.toString error}")
+        | Ok result -> result.Overwritten |> shouldEqual true
+
+        getSkill { ProjectName = "@global"; SkillName = "engineering-judgment" } runtime
+        |> shouldEqual (Ok { Name = "engineering-judgment"; Scope = "global"; Content = "# Changed" })
+    finally Directory.Delete(workspace, true)

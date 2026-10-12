@@ -1,6 +1,6 @@
 # Jarvis Skills
 
-Jarvis skills are project-owned procedural instructions that an agent can discover, read, and create through the MCP surface. Skills do not execute code, grant permissions, or bypass the normal Jarvis trust model.
+Jarvis skills are project-local or workspace-global procedural instructions that an agent can discover, read, and create through the MCP surface. Skills do not execute code, grant permissions, or bypass the normal Jarvis trust model.
 
 ## Layout
 
@@ -9,6 +9,14 @@ Store project-local skills under:
 ```text
 <project>/.jarvis/skills/<skill-name>/SKILL.md
 ```
+
+Global skills shared by every project under a client's selected workspace live at:
+
+```text
+<workspace>/.jarvis/skills/<skill-name>/SKILL.md
+```
+
+Global skills belong to the current local workspace, not to every device or unrelated workspace.
 
 For compatibility, `skill.md` is also accepted when `SKILL.md` is absent. `CreateSkill` always writes the canonical uppercase `SKILL.md` path.
 
@@ -40,11 +48,11 @@ Implement an Infinity Engine opcode using the existing typed decoding and runtim
 
 ## MCP tools
 
-`ListSkills(projectName)` returns the available project-local skill names and short descriptions.
+`ListSkills(projectName)` returns project-local skills **and** global skills visible from that project, with `scope: "project"` or `scope: "global"` on each item. Skills with the same name in the two scopes are listed separately. `ListSkills("@global")` lists only global skills.
 
-`GetSkill(projectName, skillName)` returns the full Markdown content for one skill.
+`GetSkill(projectName, skillName)` returns project-local content. To read a global skill, use `GetSkill("@global", skillName)`.
 
-`CreateSkill(projectName, skillName, content, overwrite=false)` creates the canonical `.jarvis/skills/<name>/SKILL.md` file. Existing skills are rejected unless `overwrite=true` is explicitly supplied. The result includes the canonical name, project-relative path, SHA-256 hash, and whether an existing skill was overwritten.
+`CreateSkill(projectName, skillName, content, overwrite=false)` creates the canonical project-local file. Use `CreateSkill("@global", skillName, content, overwrite=false)` to create or update the workspace-global file. Existing skills are rejected unless `overwrite=true` is supplied. Files are confined to the local workspace; symlink traversal is rejected. The result includes the skill scope, canonical name, workspace-relative or project-relative path, SHA-256 hash, and whether an existing skill was overwritten.
 
 `ListSkills` and `GetSkill` are read-only and require `workspace:read`. `CreateSkill` requires `workspace:write` and follows the same local trust and confirmation model as other structured workspace mutations. Skill names must be a single directory name; rooted and traversal-style paths are rejected. Empty skill content is rejected.
 
@@ -54,4 +62,4 @@ Skills are guidance, not capabilities. Instructions inside a skill that require 
 
 `CreateSkill` persists only the skill content supplied by the caller. It does not execute the skill, grant the skill additional authority, or alter the permissions of later commands.
 
-The initial implementation is deliberately project-local. Global or workspace-level skill scopes can be added later without changing the basic skill format.
+The `@global` name is a reserved project selector for the shared workspace skill scope. The global scope grants no additional execution authority.

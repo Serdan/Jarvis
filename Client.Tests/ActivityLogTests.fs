@@ -19,6 +19,7 @@ let private settings path maxFileBytes =
 let private snapshot id status =
     { Version = 1
       ActivityId = id
+      Origin = "Worker"
       StartedAt = DateTimeOffset.Parse("2026-10-02T15:00:00+02:00")
       ProjectName = "Wayfold"
       CommandName = "RunCommand"

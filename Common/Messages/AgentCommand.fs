@@ -281,6 +281,7 @@ type ListSkillsCommand =
 
 type SkillSummary =
     { Name: string
+      Scope: string
       Description: string option }
 
 type ListSkillsResult =
@@ -292,6 +293,7 @@ type GetSkillCommand =
 
 type GetSkillResult =
     { Name: string
+      Scope: string
       Content: string }
 
 type CreateSkillCommand =
@@ -302,6 +304,7 @@ type CreateSkillCommand =
 
 type CreateSkillResult =
     { Name: string
+      Scope: string
       Path: string
       Hash: string
       Overwritten: bool }
@@ -391,10 +394,12 @@ type MessageCommand =
 
 type GetClientActivityCommand =
     { ProjectName: string option
-      Limit: int option }
+      Limit: int option
+      IncludeObservers: bool option }
 
 type ClientActivityEntry =
-    { StartedAt: DateTimeOffset
+    { Origin: string
+      StartedAt: DateTimeOffset
       AgeMs: int64
       ProjectName: string option
       CommandName: string option
@@ -733,7 +738,7 @@ module AgentCommandInfo =
         | None -> invocation command
 
 module AgentProtocol =
-    let version = "3.11"
+    let version = "3.12"
     let defaultPatchFuzzyContextLines = 3
     let maxResponseBytes = 900 * 1024
     let maxImageBytes = 8 * 1024 * 1024

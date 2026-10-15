@@ -56,7 +56,7 @@ Project identity and target paths come from the *actual validated command*, not 
 
 The local client resolves instructions **as part of the same command dispatch**, before a project mutation or process execution can occur. This avoids two independent requests selecting different devices or client generations.
 
-Extend the existing command response envelope with optional, typed instruction context without changing tool input signatures or replacing the command's normal result. Include each document's:
+Extend the existing command response envelope with an ordered, typed Instructions array without changing tool input signatures or replacing the command's normal result. The array is empty when no instructions apply. Its [JSON Schema](AgentCommandResponse.schema.json) is authoritative for the envelope shape. Include each document's:
 
 - Scope (`workspace` or `project`).
 - Workspace-relative source path (no absolute local filesystem path).

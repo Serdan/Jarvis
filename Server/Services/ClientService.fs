@@ -29,11 +29,12 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                         ValidationFailed "deviceId must be a nonempty device ID of at most 256 characters."
                     else
                         NotFound $"Jarvis device '{requested}' is not registered for the authenticated user. Use ListDevices to find available devices."
-                return { Result = None; Error = Some error }
+                return { Result = None; Error = Some error; Instructions = [] }
             | ValueNone ->
                 return
                     { Result = None
-                      Error = Some(NotFound "No Jarvis client has registered for the authenticated user.") }
+                      Error = Some(NotFound "No Jarvis client has registered for the authenticated user.")
+                      Instructions = [] }
             | ValueSome session ->
                 match session.State, session.ConnectionId with
                 | Disconnected, _ ->
@@ -44,7 +45,8 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                             Some(
                                 ExecutionFailed
                                     $"Jarvis device {session.DeviceName} is disconnected (generation {session.Generation}, protocol {session.ProtocolVersion}, last seen {session.LastSeenAt:O}). Reason: {reason}"
-                            ) }
+                            )
+                          Instructions = [] }
                 | Registered, None ->
                     return
                         { Result = None
@@ -52,7 +54,8 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                             Some(
                                 ExecutionFailed
                                     $"Jarvis device {session.DeviceName} generation {session.Generation} is registered without an active connection."
-                            ) }
+                            )
+                          Instructions = [] }
                 | Registered, Some connectionId ->
                     let commandName = AgentCommandInfo.protocolName command
 
@@ -63,7 +66,8 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                                 Some(
                                     ExecutionFailed
                                         $"Jarvis device {session.DeviceName} does not advertise support for {commandName}. Client {session.ClientVersion} uses protocol {session.ProtocolVersion}; the server uses protocol {AgentProtocol.version}. Update Jarvis to a compatible version and reconnect."
-                                ) }
+                                )
+                              Instructions = [] }
                     else
                         let correlationId, trackingTask = tracker.Register(userId, connectionId, session.Generation, this.ResponseTimeout command)
                         let client = ctx.Clients.Client(connectionId)
@@ -85,7 +89,8 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                                         Some(
                                             ExecutionFailed
                                                 $"{reason} Protocol {session.ProtocolVersion}, client {session.ClientVersion}, last seen {session.LastSeenAt:O}."
-                                        ) }
+                                        )
+                                      Instructions = [] }
                         with ex ->
                             tracker.Cancel(correlationId)
                             let reason =
@@ -93,5 +98,6 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                             users.RecordDispatchFailure(userId, connectionId, reason)
                             return
                                 { Result = None
-                                  Error = Some(ExecutionFailed reason) }
+                                  Error = Some(ExecutionFailed reason)
+                                  Instructions = [] }
         }

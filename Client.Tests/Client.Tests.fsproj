@@ -17,6 +17,7 @@
         <Compile Include="ActivityLogTests.fs"/>
         <Compile Include="ActivityExportTests.fs"/>
         <Compile Include="SkillTests.fs"/>
+        <Compile Include="AgentInstructionsTests.fs"/>
         <Compile Include="ClipboardTests.fs"/>
         <Compile Include="ClientActivityTests.fs"/>
         <Compile Include="ProjectColorAssignmentsTests.fs"/>

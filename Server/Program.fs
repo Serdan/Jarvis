@@ -102,7 +102,7 @@ let configureServices (services: IServiceCollection) (configuration: IConfigurat
     services.AddHttpContextAccessor() |> ignore
 
     services
-        .AddMcpServer()
+        .AddMcpServer(fun options -> options.ServerInstructions <- InstructionGuidance.Text)
         .WithHttpTransport(fun options -> options.Stateless <- true)
         .WithRequestFilters(fun filters ->
             filters.AddCallToolFilter(

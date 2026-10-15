@@ -313,7 +313,8 @@ let ``response tracker completes registered response`` () =
         let correlationId, pending = tracker.Register("alice", "conn-1", 1L, TimeSpan.FromSeconds 5L)
         let expected =
             { Result = Some "ok"
-              Error = None }
+              Error = None
+              Instructions = [] }
 
         tracker.Complete(correlationId, "alice", "conn-1", 1L, expected) |> shouldEqual true
         let! actual = pending
@@ -326,7 +327,7 @@ let ``response tracker rejects other users connections and generations`` () =
     task {
         let tracker = ClientResponseTracker()
         let correlationId, pending = tracker.Register("alice", "connection-a", 3L, TimeSpan.FromSeconds 5L)
-        let response = { Result = Some "accepted"; Error = None }
+        let response = { Result = Some "accepted"; Error = None; Instructions = [] }
 
         tracker.Complete(correlationId, "bob", "connection-a", 3L, response) |> shouldEqual false
         tracker.Complete(correlationId, "alice", "connection-b", 3L, response) |> shouldEqual false
@@ -504,7 +505,8 @@ let ``server ListCommands catalog matches public MCP tools`` () =
 let ``MCP bridge returns successful JSON as text without a mismatched output schema`` () =
     let response =
         { Result = Some """{"value":42,"items":[1,2]}"""
-          Error = None }
+          Error = None
+          Instructions = [] }
 
     let result = McpToolHelpers.toCallToolResult response
 
@@ -529,7 +531,8 @@ let ``MCP bridge preserves typed confirmation error details`` () =
 
     let response =
         { Result = None
-          Error = Some(ConfirmationRequired confirmation) }
+          Error = Some(ConfirmationRequired confirmation)
+          Instructions = [] }
 
     let result = McpToolHelpers.toCallToolResult response
 
@@ -552,7 +555,8 @@ let ``MCP bridge preserves stable AgentError kinds`` () =
     for error, expectedKind, expectedMessage in cases do
         let result =
             { Result = None
-              Error = Some error }
+              Error = Some error
+              Instructions = [] }
             |> McpToolHelpers.toCallToolResult
 
         result.IsError |> shouldEqual (Nullable true)
@@ -785,3 +789,64 @@ let run_command_reason_parameter_is_optional_for_mcp_compatibility () =
     reason.IsOptional |> shouldEqual true
     reason.HasDefaultValue |> shouldEqual true
     reason.DefaultValue |> shouldEqual ""
+
+[<Test>]
+let mcp_guidance_blocks_precede_result_without_changing_success () =
+    let instructions =
+        [ { Scope = "project"
+            Path = "Demo/src/AGENTS.md"
+            Sha256 = "sha256:" + String('a', 64)
+            Content = "Source guidance" } ]
+    let response =
+        { Result = Some """{"result":"ok"}"""
+          Error = None
+          Instructions = instructions }
+    let result = response |> McpToolHelpers.toCallToolResult |> McpToolHelpers.attachInstructions instructions
+    Assert.That(result.IsError, Is.EqualTo(Nullable false))
+    Assert.That(result.Content.Count, Is.EqualTo(2))
+    let guidance = result.Content[0] :?> TextContentBlock
+    Assert.That(guidance.Text, Does.Contain("Demo/src/AGENTS.md"))
+    Assert.That(guidance.Text, Does.Contain("Source guidance"))
+    let operation = result.Content[1] :?> TextContentBlock
+    Assert.That(operation.Text, Is.EqualTo("""{"result":"ok"}"""))
+
+[<Test>]
+let mcp_guidance_preserves_errors_and_non_text_blocks () =
+    let instructions =
+        [ { Scope = "workspace"
+            Path = "AGENTS.md"
+            Sha256 = "sha256:" + String('b', 64)
+            Content = "Workspace guidance" } ]
+    let failure =
+        { Result = None
+          Error = Some(ValidationFailed "Unrelated error")
+          Instructions = instructions }
+    let error = failure |> McpToolHelpers.toCallToolResult |> McpToolHelpers.attachInstructions instructions
+    Assert.That(error.IsError, Is.EqualTo(Nullable true))
+    Assert.That((error.Content[1] :?> TextContentBlock).Text, Is.EqualTo("ValidationFailed: Unrelated error"))
+    let image = CallToolResult()
+    image.Content <- ResizeArray<ContentBlock>([ ImageContentBlock.FromBytes([| 137uy; 80uy; 78uy; 71uy |], "image/png") :> ContentBlock ])
+    let augmented = McpToolHelpers.attachInstructions instructions image
+    Assert.That(augmented.Content.Count, Is.EqualTo(2))
+    Assert.That(augmented.Content[1], Is.InstanceOf<ImageContentBlock>())
+    Assert.That(augmented.Content[0], Is.InstanceOf<TextContentBlock>())
+
+[<Test>]
+let mcp_server_instructions_are_static_and_concise () =
+    Assert.That(InstructionGuidance.Text, Does.Contain("AGENTS.md"))
+    Assert.That(InstructionGuidance.Text.Length, Is.LessThan(512))
+
+[<Test>]
+let response_json_carries_typed_hierarchical_instructions () =
+    let response =
+        { Result = Some """{"ok":true}"""
+          Error = None
+          Instructions = [ { Scope = "project"; Path = "Demo/AGENTS.md"; Sha256 = "sha256:" + String('f', 64); Content = "# Guidance" } ] }
+    let json = JsonSerializer.Serialize(response)
+    use document = JsonDocument.Parse(json)
+    let root = document.RootElement
+    Assert.That(root.GetProperty("Result").GetString(), Is.EqualTo("""{"ok":true}"""))
+    let instruction = root.GetProperty("Instructions").EnumerateArray() |> Seq.head
+    Assert.That(instruction.GetProperty("Path").GetString(), Is.EqualTo("Demo/AGENTS.md"))
+    Assert.That(instruction.GetProperty("Scope").GetString(), Is.EqualTo("project"))
+    Assert.That(instruction.GetProperty("Content").GetString(), Is.EqualTo("# Guidance"))

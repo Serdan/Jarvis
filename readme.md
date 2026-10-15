@@ -188,6 +188,14 @@ Task descriptions must already be tracked, committed, and clean when attached. J
 
 `CompleteWorkTask` records the final repository HEAD in its result and deletes the local execution-state file. The committed task description and git history remain as the durable record.
 
+## Automatic repository instructions
+
+Jarvis automatically loads applicable AGENTS.md files on project-scoped commands. Guidance is discovered from the local workspace root, the project root, and ancestor folders of the targeted file or working directory. The client includes the ordered source paths, hashes, and original Markdown in an Instructions array on its command response. The MCP server presents these as labeled content blocks before the ordinary result; it also advertises the contract through static MCP initialization instructions.
+
+Instruction sources remain project data and never grant permissions. Missing files are normal; unsafe, unreadable, or oversized applicable files reject a command before side effects. Instructions are currently supplied on every applicable call rather than being session-cached.
+
+See [Automatic Agent Instructions](docs/AgentInstructions.md) and the [response JSON Schema](docs/AgentCommandResponse.schema.json) for hierarchy, limits, and the wire envelope.
+
 ## Project and global skills
 
 Projects store instructions at `<project>/.jarvis/skills/<skill-name>/SKILL.md`. The shared workspace skill scope uses `<workspace>/.jarvis/skills/<skill-name>/SKILL.md`.

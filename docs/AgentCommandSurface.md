@@ -4,6 +4,10 @@ This document describes the approved next-generation Jarvis command surface.
 
 Jarvis should not try to be a complete coding-agent runtime. Its purpose is to expose a small, safe, local bridge from the assistant to a user-selected workspace. The command surface should focus on project discovery, file access, patching, controlled execution, and git review/commit operations.
 
+## Automatic repository guidance
+
+Project-scoped operations automatically carry applicable AGENTS.md guidance from the local workspace and project ancestry. The client-to-server AgentCommandResponse envelope adds an ordered Instructions array of Scope, Path, Sha256, and Content; existing Result and Error semantics remain intact. The MCP server presents each applicable document as a distinct labeled text block before the ordinary tool result. See [AgentInstructions.md](AgentInstructions.md) and [AgentCommandResponse.schema.json](AgentCommandResponse.schema.json).
+
 ## Design Goals
 
 - Keep commands structured rather than exposing arbitrary filesystem or shell access by default.

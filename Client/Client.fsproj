@@ -53,6 +53,7 @@
         <Compile Include="Modules\ClientShell.fs"/>
         <Compile Include="Modules\JobManager.fs"/>
         <Compile Include="Runtime.fs"/>
+        <Compile Include="Modules\AgentInstructions.fs"/>
         <Compile Include="Modules\SelfUpdate.fs"/>
         <Compile Include="SignalR\HubConnection.fs"/>
         <Compile Include="SignalR\Client.fs"/>

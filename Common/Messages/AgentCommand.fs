@@ -435,9 +435,16 @@ type AgentError =
     | ExecutionFailed of string
     | OutputTruncated of string
 
+type InstructionDocument =
+    { Scope: string
+      Path: string
+      Sha256: string
+      Content: string }
+
 type AgentCommandResponse =
     { Result: string option
-      Error: AgentError option }
+      Error: AgentError option
+      Instructions: InstructionDocument list }
 
 [<JsonConverter(typeof<UnionConverter<AgentCommand>>)>]
 type AgentCommand =
@@ -738,7 +745,7 @@ module AgentCommandInfo =
         | None -> invocation command
 
 module AgentProtocol =
-    let version = "3.12"
+    let version = "3.13"
     let defaultPatchFuzzyContextLines = 3
     let maxResponseBytes = 900 * 1024
     let maxImageBytes = 8 * 1024 * 1024

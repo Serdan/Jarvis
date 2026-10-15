@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:jarvis:agent-command-response",
+  "title": "AgentCommandResponse",
+  "description": "Client-to-server Jarvis command response. The MCP server renders Instructions as ordered labeled content blocks before ordinary tool content.",
+  "type": "object",
+  "required": [
+    "Result",
+    "Error",
+    "Instructions"
+  ],
+  "properties": {
+    "Result": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Existing serialized command result, unchanged."
+    },
+    "Error": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "description": "Existing AgentError discriminated union representation, unchanged."
+    },
+    "Instructions": {
+      "type": "array",
+      "maxItems": 16,
+      "description": "Applicable instructions ordered from workspace to project root to deeper directories; empty for no applicable guidance.",
+      "items": {
+        "$ref": "#/$defs/InstructionDocument"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "InstructionDocument": {
+      "type": "object",
+      "required": [
+        "Scope",
+        "Path",
+        "Sha256",
+        "Content"
+      ],
+      "properties": {
+        "Scope": {
+          "type": "string",
+          "enum": [
+            "workspace",
+            "project"
+          ]
+        },
+        "Path": {
+          "type": "string",
+          "minLength": 9,
+          "description": "Workspace-relative source path using '/' separators. No absolute paths."
+        },
+        "Sha256": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "Content": {
+          "type": "string",
+          "description": "Original UTF-8 Markdown. The 16 KiB/file and 32 KiB combined UTF-8 byte limits are enforced by the client, not by JSON Schema."
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

@@ -53,3 +53,18 @@ Only pursue if repeated documents prove materially expensive.
 - [ ] If justified, key tracking by authenticated user, stable conversation/session, selected device, project, and source digests, with safe invalidation and eviction.
 - [ ] Preserve full injection for sessions without stable identity; never suppress instructions solely because a server process remembers a previous call.
 - **Accept:** Any optimization retains the initial implementation's correctness and multi-client isolation.
+
+## Implementation checkpoint — 2026-10-15
+
+Implemented locally, without deployment:
+
+- MCP static server initialization guidance via `ServerInstructions`.
+- Client-side workspace/project/nested resolver, byte and document limits, UTF-8 and symlink checks, SHA-256, exact-case filenames, and multiple-target deduplication.
+- Typed `AgentCommandResponse.Instructions` array, command pre-execution resolution, content-aware result size accounting, and per-call delivery without session state.
+- MCP labeled content blocks before ordinary success/error/image/export content; workspace-read scope enforcement.
+- JSON Schema at `docs/AgentCommandResponse.schema.json` and user/plugin/command surface documentation.
+- Response protocol version advanced from 3.12 to 3.13.
+
+Automated verification: 182 client tests, 60 server tests passed; `git diff --check` passed. New tests cover hierarchy ordering, sibling exclusion, missing and edited sources, malformed UTF-8, size limits, symlinks, pre-execution write prevention, first-call delivery, response JSON, and MCP content/error preservation.
+
+Remaining release acceptance: directly inspect an MCP handshake against the installed server and smoke-test an actual Wayfold command after updating/deploying both components. Test the two-device live routing isolation after deployment. Avoid claiming live host behavior until these checks have been performed. Do not deploy or restart the interactive client without explicit approval.

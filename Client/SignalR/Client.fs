@@ -28,13 +28,15 @@ let private serialize<'a> (value: 'a) =
 
 let private serialize'<'a> = Result.bind serialize<'a> >> ValueTask<_>
 
-let private toAgentResponse command response =
+let private toAgentResponse command instructions response =
     match response with
     | Error error ->
         { Result = None
-          Error = Some(EffectError.toAgentError error) }
+          Error = Some(EffectError.toAgentError error)
+          Instructions = instructions }
     | Ok (payload: string) ->
-        let bytes = Encoding.UTF8.GetByteCount payload
+        let bytes = Encoding.UTF8.GetByteCount payload +
+                    Encoding.UTF8.GetByteCount(JsonSerializer.Serialize instructions)
         let maxBytes =
             match command with
             | ReadImageCommand _ -> (AgentProtocol.maxImageBytes * 4 / 3) + (64 * 1024)
@@ -43,10 +45,12 @@ let private toAgentResponse command response =
 
         if bytes <= maxBytes then
             { Result = Some payload
-              Error = None }
+              Error = None
+              Instructions = instructions }
         else
             { Result = None
-              Error = Some(OutputTruncated $"Command response was {bytes} bytes and exceeds the safe response size of {maxBytes} bytes.") }
+              Error = Some(OutputTruncated $"Command response was {bytes} bytes and exceeds the safe response size of {maxBytes} bytes.")
+              Instructions = instructions }
 
 let private unwrapProjectName (ProjectName name) = name
 let private unwrapContent (Content content) = content
@@ -321,23 +325,35 @@ let receiveCommand (rt: Runtime) (command: AgentCommand) =
         return response
     }
 
+let receiveCommandWithInstructions (rt: Runtime) command =
+    task {
+        match AgentInstructions.resolve rt command with
+        | Error error -> return Error error, []
+        | Ok instructions ->
+            let! response = receiveCommand rt command
+            return response, instructions
+    }
+
 let receiveCommandAndReply (connection: HubConnection) (rt: Runtime) (correlationId: string) (commandJson: string) : Task =
     task {
         let mutable parsedCommand = None
+        let mutable instructions: InstructionDocument list = []
         let! response =
             task {
                 try
                     let command = JsonSerializer.Deserialize<AgentCommand>(commandJson)
                     parsedCommand <- Some command
-                    return! receiveCommand rt command
+                    let! response, applicable = receiveCommandWithInstructions rt command
+                    instructions <- applicable
+                    return response
                 with ex ->
                     return Error(ExceptionError ex)
             }
 
         let agentResponse =
             match parsedCommand with
-            | Some command -> toAgentResponse command response
-            | None -> toAgentResponse ListCommandsCommand response
+            | Some command -> toAgentResponse command instructions response
+            | None -> toAgentResponse ListCommandsCommand [] response
         let! sendResult =
             ResponseDelivery.sendWithReconnectRetry
                 (TimeSpan.FromMinutes 2.0)

@@ -111,6 +111,7 @@ let prepare () =
                                 do! destination.WriteAsync(buffer.AsMemory(0, count))
                         do! destination.FlushAsync()
                         destination.Flush(true)
+                        destination.Dispose()
 
                         let actualHash = sha256File stagedPath
                         if not (String.Equals(actualHash, expectedHash, StringComparison.OrdinalIgnoreCase)) then

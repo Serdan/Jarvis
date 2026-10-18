@@ -63,7 +63,7 @@
     <ItemGroup>
         <PackageReference Update="FSharp.Core" Version="10.1.203"/>
         <PackageReference Include="Kehlet.FSharp.IO" Version="1.1.0"/>
-        <PackageReference Include="Microsoft.AspNetCore.SignalR.Client" Version="10.0.0"/>
+        <PackageReference Include="Microsoft.AspNetCore.SignalR.Client" Version="10.0.13"/>
     </ItemGroup>
 
     <ItemGroup>

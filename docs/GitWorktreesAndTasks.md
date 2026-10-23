@@ -3,13 +3,11 @@
 Status: proposed specification
 Date: 2026-10-23
 
-## Goals and boundaries
+## Purpose
 
-Jarvis shall expose Git worktrees and repository-backed tasks as native client operations. Git and the checked-out files are authoritative; no task database, task registry or write coordinator is added to the server. The server authenticates and forwards commands. Agents should not need to hand-edit task-state JSON or manually stage/commit routine task changes.
+Jarvis shall expose Git worktrees and repository-backed tasks as native client operations. Git and the checked-out files are authoritative. The client manages task files and Git operations, while the server authenticates and forwards commands. Agents use native task commands for state changes and routine commits.
 
-The main repository remains a normal top-level project. Existing worktrees are discovered from Git metadata irrespective of their location. A hidden worktree container is a *creation convention*, not a discovery or compatibility constraint.
-
-Non-goals: remote issue tracker, distributed locks or lease service, agent scheduler, automatic push, automatic merge of feature branches, automatic migration of existing worktrees, and a separate server task store.
+The main repository remains a normal top-level project. Existing worktrees are discovered from Git metadata irrespective of their location. New worktrees use hidden project-specific containers; discovery uses Git metadata for all registered worktrees.
 
 ## Repository and worktree model
 
@@ -33,18 +31,18 @@ Example:
 - Existing worktree access remains supported. Commands accept a stable *worktree selector* (canonical absolute path or an opaque ID returned by discovery) in addition to the project; the selector is resolved and verified by the client against Git's registered worktree list, not trusted as an arbitrary filesystem path. Omitted selector means the main project as before.
 - For new worktrees use `<projectsRoot>/.<mainProjectName>-worktrees/<safeName>`. Keep directory names flat and independent of branch names. Branch names may contain slashes. Fail if the target exists or is registered elsewhere; do not silently reuse.
 - Validate project/worktree identity, path containment for newly created directories, path normalization, symlinks/reparse points, and Git arguments. Use argument arrays, never shell interpolation. Existing worktrees outside the project root may be accessed only through registered, explicitly selected worktree identifiers and with the same permission enforcement as normal projects.
-- `CreateWorktree`: specify base ref and requested branch; report actual path and branch. No implicit checkout, push, force replacement, or branch reuse. `GetWorktree` / `ListWorktrees`: read-only. `RemoveWorktree`: refuse if dirty, locked, unmerged, or running work is associated; never force or delete a branch by default. Report why cleanup is refused. Remove the empty hidden parent directory after a successful removal, if safe. Determine integration against an explicit target branch (default project's configured main branch, not hard-coded `main`), and distinguish merge from squashed/rebased integration; don't claim integrated on branch-name heuristics.
+- `CreateWorktree`: specify base ref and requested branch; report actual path and branch. Creation explicitly selects a base ref and new branch, with collisions reported as errors. `GetWorktree` / `ListWorktrees`: read-only. `RemoveWorktree`: refuse if dirty, locked, unmerged, or running work is associated; never force or delete a branch by default. Report why cleanup is refused. Remove the empty hidden parent directory after a successful removal, if safe. Determine integration against an explicit target branch (default project's configured main branch, not hard-coded `main`), and distinguish merge from squashed/rebased integration; don't claim integrated on branch-name heuristics.
 - Worktree selection is scoped to each command invocation (or explicit session selector, if implemented separately); never silently change another agent's selected worktree. Worktree identity should appear in client activity.
 - Local jobs and file operations in a selected worktree must use that worktree's root and established path/permission protections. No path traversal via task or worktree identifiers.
 
 ## Canonical task files
 
-The repository defines one canonical task folder, configurable per project (for example `docs/tasks` for existing projects). Do not require moving established Wayfold HTML files. Configuration is version-controlled and belongs to the repository, with a documented default when absent.
+The repository defines one canonical task folder, configurable per project (for example `docs/tasks` for existing projects). Existing Wayfold HTML files remain in place. Configuration is version-controlled and belongs to the repository, with a documented default when absent.
 
 - Preserve human-readable HTML for the substantive description, rationale, requirements, and acceptance criteria.
-- Store machine-managed task metadata and state as JSON, in the same canonical task directory, one JSON per task. Default convention: `<id>.html` and `<id>.json`; projects may configure naming patterns only where necessary to accommodate existing tasks. No combined registry/state.json.
-- HTML and JSON are both versioned and branch-local. Jarvis reads and writes the selected worktree's checkout; no global synchronization across feature branches is simulated.
-- Existing HTML-only tasks remain readable and may receive a JSON companion lazily. Do not modify existing HTML just to introduce a JSON state file. Existing task IDs must remain valid. New IDs should be collision-resistant across independent branches (e.g. ULID); do not require centralized numeric allocation. Display legacy numeric IDs unchanged.
+- Store machine-managed task metadata and state as JSON, in the same canonical task directory, one JSON per task. Default convention: `<id>.html` and `<id>.json`; projects may configure naming patterns only where necessary to accommodate existing tasks. Each task has an independent JSON state file.
+- HTML and JSON are both versioned and branch-local. Jarvis reads and writes the selected worktree's checkout; each branch retains its own version until Git integration.
+- Existing HTML-only tasks remain readable and may receive a JSON companion lazily. Adding JSON state preserves the existing HTML content. Existing task IDs must remain valid. New IDs should be collision-resistant across independent branches (e.g. ULID); do not require centralized numeric allocation. Display legacy numeric IDs unchanged.
 - Task JSON is deliberately small and extensible, for example:
 
 ```json
@@ -94,7 +92,7 @@ Retain unrelated `RunProjectTask` commands from `.jarvis.json` as build/run auto
 - Stage only the exact task file paths changed by the command, never `git add -A` or other dirty working-tree files. Refuse/diagnose preexisting staged changes to those paths instead of committing someone else's edits.
 - Mutations are atomic at the file-system level where practicable: write temporary files in the same directory, validate, then rename; keep HTML/JSON pair creation recoverable if interrupted. A successful mutation response identifies the resulting commit hash and changed paths.
 - If Git commit fails, return a typed failure with on-disk and index state and recovery guidance. Do not report a successful completed task operation merely because the JSON write succeeded. Don't quietly amend arbitrary existing commits.
-- Task-only auto-commits still obey normal Jarvis workspace-write permissions/trust settings. Never automatically push, merge, cherry-pick, or rewrite remote history.
+- Task-only auto-commits still obey normal Jarvis workspace-write permissions/trust settings. Automatic commits are local to the selected branch; branch integration follows the existing Git workflow.
 - A local command-level mutex may serialize operations within one client/worktree to avoid races; use optimistic expected revision checks to prevent stale overwrites. This cannot guarantee cross-device claiming of the same branch; document this limitation.
 - Multiple branches editing the same existing task may conflict when merged. Preserve normal Git conflict behavior and surface explicit resolution instructions; no implicit last-writer-wins merge of status or checkpoint fields.
 
@@ -136,4 +134,4 @@ The current local modules `ProjectBrowser`, `ProjectPaths`, and `ClientShell` pr
 3. Transactional task mutation, task-scoped Git auto-commit, state/history commands.
 4. Integrate old work-task commands, update agent instructions and documentation, end-to-end multi-worktree tests.
 
-No existing worktrees should be moved as part of these changes.
+Existing worktrees remain at their current paths and are discovered through Git.

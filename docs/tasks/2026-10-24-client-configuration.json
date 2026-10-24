@@ -2,17 +2,22 @@
   "schemaVersion": 1,
   "id": "2026-10-24-client-configuration",
   "title": "Persistent user-level client configuration",
-  "status": "open",
+  "status": "active",
   "dependencies": [],
   "owner": {
     "agent": null,
     "worktree": null
   },
   "checkpoint": {
-    "summary": "",
-    "nextAction": "Implement platform config resolver and validated JSON persistence.",
-    "verified": [],
-    "lastCommit": null
+    "summary": "Persistent per-user configuration, CLI overrides/config commands, machine display-name registration, and Settings TUI implemented locally on main; canonical client and server test workflow passed.",
+    "nextAction": "Perform an interactive local terminal Settings screen smoke test and native Windows/macOS validation before release; do not deploy or restart running clients without authorization.",
+    "verified": [
+      "Client test suite: 191 passed, 0 failed.",
+      "Canonical dotnet scripts/build.cs test passed (client and server).",
+      "CLI config show/path succeeded without OAuth login.",
+      "git diff --check passed."
+    ],
+    "lastCommit": "5b66d769fc1c4867e6d76346df32e891cbd4e76c"
   },
-  "updatedAt": "2026-10-24T15:40:00Z"
+  "updatedAt": "2026-10-24T20:27:00Z"
 }

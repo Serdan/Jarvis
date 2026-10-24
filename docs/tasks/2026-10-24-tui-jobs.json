@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "id": "2026-10-24-tui-jobs",
+  "title": "Jobs screen in Jarvis Client TUI",
+  "status": "open",
+  "dependencies": [],
+  "owner": {
+    "agent": null,
+    "worktree": null
+  },
+  "checkpoint": {
+    "summary": "",
+    "nextAction": "Implement read-only Jobs TUI list and navigation with focused tests.",
+    "verified": [],
+    "lastCommit": null
+  },
+  "updatedAt": "2026-10-24T16:45:00Z"
+}

@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Jarvis Client TUI: Jobs screen</title>
+</head>
+<body>
+  <main>
+    <h1>Jobs screen in Jarvis Client TUI</h1>
+    <p><strong>Status:</strong> Open. <strong>Date:</strong> 2026-10-24.</p>
+    <h2>Purpose</h2>
+    <p>Provide a dedicated local Jobs screen in the existing terminal UI so the user can inspect processes launched by Jarvis agents, follow their output, identify failures and cancel running jobs. This view reports the existing client-side JobManager state; it does not construct an independent process registry. Jobs are associated with the client on which they were started, not aggregated from other registered machines.</p>
+    <h2>Interaction and presentation</h2>
+    <ul>
+      <li>Open Jobs with <code>j</code> from the Activity screen. Show <strong>Activity</strong>, <strong>Jobs</strong>, <strong>Permissions</strong>, and <strong>Settings</strong> as discoverable destinations in the TUI navigation/help; preserve the current meaning of <code>s</code> for Activity status filtering and the settings shortcut <code>g</code>. Escape returns to the previous screen.</li>
+      <li>The Jobs list defaults to running jobs, with a visible toggle to include recently completed, failed or canceled jobs. Show each job's project (using the current project-color convention), reason where present, executable/command summary, status, start time, elapsed time, and exit code when available. Display running and retained-completed counts. Include project filtering and sensible ordering (running first; most recent first within each status grouping).</li>
+      <li>Use Up/Down and PageUp/PageDown for selection/navigation. Enter opens a details/output view for the selected job. Preserve selection by stable JobId through refreshes and state transitions. Support empty lists and a recently finished job transitioning from Running to Completed without disrupting selection.</li>
+      <li>Job details show JobId, project, reason, executable and arguments, working directory, start/completion times, elapsed time, status and exit code. Display the captured stdout/stderr events in their original sequence order with clear stream distinctions, a bounded scrollback, and a visible output-truncated indicator when the existing buffer limit was reached.</li>
+      <li>Follow mode tracks new output while at the bottom; manually scrolling up pauses auto-follow. Add an explicit jump-to-bottom/follow action. Refresh job status/output while Jobs is visible without freezing keyboard interaction or spinning a high-frequency render loop. Refresh only changed views and avoid unbounded memory growth or repeated full-buffer copies where possible.</li>
+      <li><code>c</code> on a running job initiates cancellation with a confirmation that identifies the job/project/command. Cancel through the existing local JobManager cancellation semantics and display actual outcome, including exit/cancel races, permission or process errors. Completed jobs cannot be canceled. Record local user cancellations in client activity.</li>
+      <li>Keep pending permission requests visible and reachable while Jobs is active so agents are not left waiting. Navigation back to other screens preserves job selection, filter and output scroll position where reasonable; reconnects must not reset the view unnecessarily.</li>
+      <li>Safely render ANSI/terminal-control characters and hostile output strings so child process output cannot inject terminal commands. Handle long paths, Unicode, small/resized terminals, rapid output, concurrent completion/cancellation, and jobs removed by retention pruning.</li>
+    </ul>
+    <h2>Existing model and integration</h2>
+    <p><code>Client/Modules/JobManager.fs</code> already implements <code>startJob</code>, <code>listJobs</code>, <code>getJobResult</code> and <code>cancelJob</code>. Its job summaries include JobId, ProjectName, Executable, Args, Reason, WorkingDirectory, Status, StartedAt and CompletedAt. Output events include Sequence, Stream and Text; the result includes NextSequence and Truncated. Reuse these local interfaces (or introduce a thin read-only TUI adapter), rather than routing local UI operations through the Jarvis server or MCP. Existing output limits and the recent-completed retention behavior remain authoritative.</p>
+    <p>Jobs are currently stored in the client's process-local manager. The Jobs screen must accurately describe that lifecycle. In particular, activity logs recovered after restart are historical events, not evidence that a process still exists. Do not misrepresent historical job entries as running. Any later job-process recovery feature should explicitly establish liveness and ownership before showing it as active.</p>
+    <h2>Independently testable implementation slices</h2>
+    <h3>1. Job list view and navigation</h3>
+    <p>Add a Jobs TUI mode and read-only snapshot integration. Implement sorted status summaries, running/recent toggle, project filter, stable selection, counters and navigation. Reuse existing colors and hotkey rendering.</p>
+    <p><strong>Tests:</strong> empty state, one/multiple jobs, project filtering, status grouping, scrolling, stable selection after completion/pruning, narrow terminal rendering, and no regression in Activity/Permissions/Settings navigation.</p>
+    <p><strong>Accept:</strong> A user can open Jobs and identify all active local jobs and their projects, statuses, commands and reasons, even while disconnected from the Jarvis server.</p>
+    <h3>2. Job details and live output</h3>
+    <p>Implement job details and buffered stdout/stderr output. Incrementally consume output using <code>AfterSequence</code> and <code>NextSequence</code> while maintaining ordered streams, truncated indicators and follow/scroll behavior. Avoid blocking the TUI input path on output refresh.</p>
+    <p><strong>Tests:</strong> mixed stdout/stderr ordering, successive incremental reads with no duplicates, multi-line/Unicode output, truncation, finish while viewed, auto-follow versus manual scroll, redraw/resize, and console control-character sanitization.</p>
+    <p><strong>Accept:</strong> Running output appears and completed output remains inspectable within existing capture limits, without hanging the TUI or corrupting the terminal.</p>
+    <h3>3. User-initiated cancellation and activity</h3>
+    <p>Add explicit selected-job cancellation and a confirmation view. Delegate to JobManager and record the action in local activity. Keep permission prompts usable and handle races safely.</p>
+    <p><strong>Tests:</strong> confirmation accepts/declines, selected-job identity verification, successful cancellation, already-exited job, process-kill failure, concurrent finish, and permissions pending during cancellation.</p>
+    <p><strong>Accept:</strong> A user can stop a specific running job from the TUI, see the verified result, and never inadvertently cancel a different job after list reordering.</p>
+    <h3>4. Integration and documentation</h3>
+    <p>Update TUI help, README, TUI tests and any client module documentation. Exercise jobs started by MCP agents while the local user is viewing Jobs, with multiple simultaneous jobs and output. Run focused tests and Jarvis client test suite, committing each verified slice separately.</p>
+    <p><strong>Tests:</strong> agent-created job appears in local view; concurrent work continues while viewed; completion, failure and cancellation statuses agree with MCP ListJobs/GetJobResult; client restart does not invent live jobs from historical activity.</p>
+    <p><strong>Accept:</strong> The Jobs screen is a reliable local control panel for Jarvis jobs without altering their existing API or execution rules.</p>
+  </main>
+</body>
+</html>

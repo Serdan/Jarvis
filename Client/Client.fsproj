@@ -47,6 +47,7 @@
         <Compile Include="Modules\Clipboard.fs"/>
         <Compile Include="Modules\ProjectColorAssignments.fs"/>
         <Compile Include="Modules\ActivityNavigation.fs"/>
+        <Compile Include="Modules\JobView.fs"/>
         <Compile Include="Modules\ConsoleTui.fs"/>
         <Compile Include="Modules\ProjectBrowser.fs"/>
         <Compile Include="Modules\ProcessEnvironment.fs"/>

@@ -40,12 +40,21 @@ type private TuiMode =
     | PermissionMode
     | FilterMode
     | CopyRecentMode
+    | JobsMode
+    | JobDetailsMode
+    | JobCancelMode
+    | JobFilterMode
 
 type private PendingPrompt =
     { Id: int
       Command: AgentCommand
       Request: ConfirmationRequest
       Completion: TaskCompletionSource<PermissionApproval> }
+
+type JobUiAccess =
+    { List: unit -> Result<JobSummary list, string>
+      Read: string -> int64 -> Result<JobResult, string>
+      Cancel: string -> Result<unit, string> }
 
 type ConsoleTui(?activityLog: ActivityLog.Store) =
     let syncRoot = obj()
@@ -66,6 +75,23 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
     let mutable showObservers = false
     let mutable activityScrollOffset = 0
     let mutable showActivityDetails = false
+    let mutable jobsAccess: JobUiAccess option = None
+    let mutable jobSummaries: JobSummary list = []
+    let mutable jobSelectedId: string option = None
+    let mutable jobDetailId: string option = None
+    let mutable jobIncludeCompleted = false
+    let mutable jobProjectFilter = ""
+    let mutable jobOriginalFilter = ""
+    let mutable jobListScroll = 0
+    let mutable jobOutputLines: JobView.OutputLine list = []
+    let mutable jobNextSequence = 0L
+    let mutable jobOutputTruncated = false
+    let mutable jobFollow = true
+    let mutable jobOutputScroll = 0
+    let mutable jobError: string option = None
+    let mutable jobLastPoll = DateTimeOffset.MinValue
+    let mutable permissionReturnMode = ActivityMode
+    let mutable jobCancelReturnMode = JobsMode
     let mutable connectionState = Disconnected
     let mutable serverHost = "-"
     let maxHistory = 500
@@ -365,6 +391,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         writeMnemonic 's' "status"; Console.Write ", "
         writeMnemonic 'c' "clear"; Console.Write ", "
         writeMnemonic 'p' "permissions"; Console.Write ", "
+        writeMnemonic 'j' "jobs"; Console.Write ", "
         writeMnemonic 'r' "copy recent"; Console.Write ", "
         writeMnemonic 'o' (if showObservers then "hide observers" else "show observers"); Console.Write ", "
         writeMnemonic 'q' "quit"; Console.WriteLine ""
@@ -493,6 +520,192 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                 entry.FailureDetail
                 |> Option.iter (writeDetailField width "Error")
 
+    let jobListUnsafe () =
+        JobView.visibleJobs jobIncludeCompleted jobProjectFilter jobSummaries
+
+    let currentJobUnsafe () =
+        jobSummaries
+        |> List.tryFind (fun job -> Some job.JobId = jobSelectedId)
+
+    let selectJobIndexUnsafe index =
+        let items = jobListUnsafe() |> List.toArray
+        if items.Length = 0 then
+            jobSelectedId <- None
+            jobListScroll <- 0
+        else
+            let bounded = max 0 (min (items.Length - 1) index)
+            jobSelectedId <- Some items[bounded].JobId
+            let maxRows = 12
+            if bounded < jobListScroll then jobListScroll <- bounded
+            elif bounded >= jobListScroll + maxRows then jobListScroll <- bounded - maxRows + 1
+
+    let moveJobSelectionUnsafe delta =
+        let items = jobListUnsafe() |> List.toArray
+        let current =
+            items |> Array.tryFindIndex (fun job -> Some job.JobId = jobSelectedId)
+            |> Option.defaultValue 0
+        selectJobIndexUnsafe (current + delta)
+
+    let resetJobDetailsUnsafe jobId =
+        jobDetailId <- Some jobId
+        jobSelectedId <- Some jobId
+        jobOutputLines <- []
+        jobNextSequence <- 0L
+        jobOutputTruncated <- false
+        jobFollow <- true
+        jobOutputScroll <- 0
+        jobError <- None
+
+    let pollJobsUnsafe () =
+        jobLastPoll <- DateTimeOffset.UtcNow
+        match jobsAccess with
+        | None -> jobError <- Some "Job manager unavailable."
+        | Some access ->
+            match access.List() with
+            | Error error -> jobError <- Some error
+            | Ok summaries ->
+                jobError <- None
+                let oldSelection = currentJobUnsafe()
+                jobSummaries <- summaries
+                match oldSelection with
+                | Some before when JobView.isRunning before
+                                   && (jobSummaries |> List.exists (fun after ->
+                                       after.JobId = before.JobId && not (JobView.isRunning after))) ->
+                    jobIncludeCompleted <- true
+                | _ -> ()
+                let items = jobListUnsafe()
+                if not (items |> List.exists (fun job -> Some job.JobId = jobSelectedId)) then
+                    jobSelectedId <- items |> List.tryHead |> Option.map _.JobId
+                    jobListScroll <- 0
+                match jobDetailId with
+                | Some jobId when mode = JobDetailsMode || mode = JobCancelMode ->
+                    match access.Read jobId jobNextSequence with
+                    | Ok result ->
+                        if not result.Events.IsEmpty then
+                            jobOutputLines <- JobView.appendOutput 1500 jobOutputLines result.Events
+                            if jobFollow then jobOutputScroll <- 0
+                        jobNextSequence <- result.NextSequence
+                        jobOutputTruncated <- result.Truncated
+                    | Error error -> jobError <- Some error
+                | _ -> ()
+
+    let openJobDetailsUnsafe () =
+        match currentJobUnsafe() with
+        | None -> ()
+        | Some job ->
+            resetJobDetailsUnsafe job.JobId
+            mode <- JobDetailsMode
+            pollJobsUnsafe()
+
+    let beginJobCancellationUnsafe () =
+        let selected =
+            match jobDetailId, mode with
+            | Some id, JobDetailsMode -> jobSummaries |> List.tryFind (fun job -> job.JobId = id)
+            | _ -> currentJobUnsafe()
+        match selected with
+        | Some job when JobView.isRunning job ->
+            jobSelectedId <- Some job.JobId
+            jobCancelReturnMode <- mode
+            mode <- JobCancelMode
+        | _ -> jobError <- Some "Selected job is no longer running."
+
+    let confirmJobCancellationUnsafe () =
+        let id = jobSelectedId
+        mode <- jobCancelReturnMode
+        match id, jobsAccess with
+        | Some jobId, Some access ->
+            // Recheck the exact ID and current status: list selection may have changed.
+            match access.List() with
+            | Ok jobs when jobs |> List.exists (fun job -> job.JobId = jobId && JobView.isRunning job) ->
+                match access.Cancel jobId with
+                | Ok () ->
+                    addActivityUnsafe None $"Local cancellation requested for job {jobId}." None Informational |> ignore
+                    jobError <- None
+                | Error error ->
+                    jobError <- Some error
+                    addActivityUnsafe None $"Job cancellation failed: {error}" None Informational |> ignore
+            | Ok _ -> jobError <- Some "Job has already finished or been removed."
+            | Error error -> jobError <- Some error
+        | _ -> ()
+        pollJobsUnsafe()
+
+    let writeJobsHotkeys () =
+        Console.WriteLine "Keys: Up/Down select, PgUp/PgDn page, Enter output, t toggle completed,"
+        Console.WriteLine "      f filter project, c cancel, p permissions, Esc activity, q quit"
+
+    let writeJobDetailsHotkeys () =
+        Console.WriteLine "Keys: Up/Down/PgUp/PgDn scroll output, b follow/bottom, c cancel,"
+        Console.WriteLine "      p permissions, Esc jobs, q quit"
+
+    let renderJobsUnsafe width =
+        let items = jobListUnsafe() |> List.toArray
+        let running = jobSummaries |> List.filter JobView.isRunning |> List.length
+        let finished = jobSummaries.Length - running
+        let safe value = JobView.safeLine value
+        Console.WriteLine $"Jobs: {running} running, {finished} recent completed"
+        let filterLabel = if jobProjectFilter = "" then "(all)" else safe jobProjectFilter
+        let completedLabel = if jobIncludeCompleted then "shown" else "hidden"
+        Console.WriteLine $"Project filter: {filterLabel} | Finished: {completedLabel}"
+        jobError |> Option.iter (fun error -> Console.WriteLine($"Error: {trim (safe error) (width - 7)}"))
+        match mode with
+        | JobsMode | JobFilterMode ->
+            if mode = JobFilterMode then Console.WriteLine $"Filter project: {safe jobProjectFilter} (Enter apply, Esc revert)"
+            if items.Length = 0 then Console.WriteLine "No matching jobs."
+            else
+                let selected = items |> Array.tryFindIndex (fun job -> Some job.JobId = jobSelectedId) |> Option.defaultValue 0
+                let maxRows = 12
+                jobListScroll <- max 0 (min jobListScroll (max 0 (items.Length - maxRows)))
+                if selected < jobListScroll then jobListScroll <- selected
+                if selected >= jobListScroll + maxRows then jobListScroll <- selected - maxRows + 1
+                let last = min items.Length (jobListScroll + maxRows)
+                for index = jobListScroll to last - 1 do
+                    let job: JobSummary = items[index]
+                    let marker = if selected = index then ">" else " "
+                    let elapsed = JobView.duration DateTimeOffset.UtcNow job
+                    let status = JobView.statusText job.Status
+                    let reason = job.Reason |> Option.defaultValue (String.concat " " (job.Executable :: job.Args))
+                    Console.Write(marker + " ")
+                    let previous = Console.ForegroundColor
+                    Console.ForegroundColor <- projectColor job.ProjectName
+                    Console.Write("@" + safe job.ProjectName)
+                    Console.ForegroundColor <- previous
+                    Console.WriteLine (" " + trim (safe ($"{status} | {elapsed} | {reason}")) (max 15 (width - job.ProjectName.Length - 4)))
+        | JobDetailsMode | JobCancelMode ->
+            match jobDetailId |> Option.bind (fun id -> jobSummaries |> List.tryFind (fun job -> job.JobId = id)) with
+            | None -> Console.WriteLine "Job no longer retained by the client."
+            | Some job ->
+                let field name value = Console.WriteLine(trim (safe ($"{name}: {value}")) width)
+                field "Id" job.JobId
+                field "Project" job.ProjectName
+                field "Reason" (job.Reason |> Option.defaultValue "(none)")
+                field "Command" (String.concat " " (job.Executable :: job.Args))
+                field "Directory" (job.WorkingDirectory |> Option.defaultValue "(project root)")
+                field "Started" (job.StartedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss"))
+                field "Finished" (job.CompletedAt |> Option.map (fun value -> value.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss")) |> Option.defaultValue "-")
+                field "Duration" (JobView.duration DateTimeOffset.UtcNow job)
+                field "Status" (JobView.statusText job.Status)
+                if jobOutputTruncated then Console.WriteLine "Output capture truncated at the job's byte limit."
+                Console.WriteLine (if jobFollow then "Output (following)" else "Output (scroll paused; b to follow)")
+                Console.WriteLine "---------------------"
+                let lines = jobOutputLines |> List.toArray
+                let rows = max 3 (min 15 (Console.WindowHeight - 19))
+                jobOutputScroll <- max 0 (min jobOutputScroll (max 0 (lines.Length - rows)))
+                let finish = max 0 (lines.Length - jobOutputScroll)
+                let start = max 0 (finish - rows)
+                for i = start to finish - 1 do
+                    let line = lines[i]
+                    let prefix = if line.Stream = JobOutputStream.StdErr then "ERR " else "OUT "
+                    Console.WriteLine(trim (prefix + line.Text) width)
+                if lines.Length = 0 then Console.WriteLine "(no output captured)"
+                if jobOutputScroll > 0 then Console.WriteLine $"({jobOutputScroll} lines below)"
+                if mode = JobCancelMode then
+                    Console.WriteLine ""
+                    Console.WriteLine $"Cancel running job {job.JobId} for {safe job.ProjectName}?"
+                    Console.WriteLine "y confirms; n/Esc returns."
+        | _ -> ()
+        Console.WriteLine ""
+        if prompts.Count > 0 then Console.WriteLine $"{prompts.Count} pending permission request(s): press p to review."
+
     let renderUnsafe () =
         try
             Console.Clear()
@@ -515,69 +728,77 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                 writeFilterHotkeys()
             | CopyRecentMode ->
                 writeCopyRecentHotkeys()
+            | JobsMode | JobFilterMode ->
+                writeJobsHotkeys()
+            | JobDetailsMode | JobCancelMode ->
+                writeJobDetailsHotkeys()
             Console.WriteLine ""
 
-            ensureActivitySelectionUnsafe() |> ignore
-            let filtered, startIndex, endExclusive = activityRangeUnsafe()
-            let historySuffix =
-                if filtered.Length = 0 then
-                    $" [0 of {activity.Count}]"
-                elif filtered.Length > visibleActivityRows || filtered.Length <> activity.Count then
-                    $" [{startIndex + 1}-{endExclusive} of {filtered.Length} / {activity.Count} total]"
+            match mode with
+            | JobsMode | JobDetailsMode | JobCancelMode | JobFilterMode ->
+                renderJobsUnsafe width
+            | _ ->
+                ensureActivitySelectionUnsafe() |> ignore
+                let filtered, startIndex, endExclusive = activityRangeUnsafe()
+                let historySuffix =
+                    if filtered.Length = 0 then
+                        $" [0 of {activity.Count}]"
+                    elif filtered.Length > visibleActivityRows || filtered.Length <> activity.Count then
+                        $" [{startIndex + 1}-{endExclusive} of {filtered.Length} / {activity.Count} total]"
+                    else
+                        ""
+
+                let filterSuffix =
+                    let text = if String.IsNullOrWhiteSpace activityFilterText then "" else sprintf " text=\"%s\"" activityFilterText
+                    let status = if statusFilter = ActivityFilter.All then "" else $" status={ActivityFilter.statusLabel statusFilter}"
+                    if text = "" && status = "" then "" else $" [{text.Trim()}{status}]"
+
+                Console.WriteLine $"Activity{filterSuffix}{historySuffix}"
+                Console.WriteLine "--------"
+
+                if activity.Count = 0 then
+                    Console.WriteLine "No activity yet."
+                elif filtered.Length = 0 then
+                    Console.WriteLine "No matching activity."
                 else
-                    ""
+                    for index = startIndex to endExclusive - 1 do
+                        let marker =
+                            if mode = ActivityMode && selectedActivityId = Some filtered[index].Id then ">"
+                            else " "
+                        writeColoredProjectLine width marker filtered[index]
 
-            let filterSuffix =
-                let text = if String.IsNullOrWhiteSpace activityFilterText then "" else sprintf " text=\"%s\"" activityFilterText
-                let status = if statusFilter = ActivityFilter.All then "" else $" status={ActivityFilter.statusLabel statusFilter}"
-                if text = "" && status = "" then "" else $" [{text.Trim()}{status}]"
+                renderActivityDetailsUnsafe width
 
-            Console.WriteLine $"Activity{filterSuffix}{historySuffix}"
-            Console.WriteLine "--------"
+                Console.WriteLine ""
+                let permissionSuffix =
+                    if prompts.Count = 0 then ""
+                    else $" ({prompts.Count})"
+                Console.WriteLine $"Permission requests{permissionSuffix}"
+                Console.WriteLine "-------------------"
 
-            if activity.Count = 0 then
-                Console.WriteLine "No activity yet."
-            elif filtered.Length = 0 then
-                Console.WriteLine "No matching activity."
-            else
-                for index = startIndex to endExclusive - 1 do
-                    let marker =
-                        if mode = ActivityMode && selectedActivityId = Some filtered[index].Id then ">"
-                        else " "
-                    writeColoredProjectLine width marker filtered[index]
+                if prompts.Count = 0 then
+                    Console.WriteLine "No pending permission requests."
+                else
+                    for index = 0 to prompts.Count - 1 do
+                        let prompt = prompts[index]
+                        let marker =
+                            if mode = PermissionMode && index = selectedPrompt then ">"
+                            else " "
+                        Console.Write $"{marker} #{prompt.Id} {prompt.Request.CommandName}"
 
-            renderActivityDetailsUnsafe width
+                        match prompt.Request.ProjectName with
+                        | Some projectName ->
+                            Console.Write " "
+                            writeColoredProject projectName
+                        | None -> ()
 
-            Console.WriteLine ""
-            let permissionSuffix =
-                if prompts.Count = 0 then ""
-                else $" ({prompts.Count})"
-            Console.WriteLine $"Permission requests{permissionSuffix}"
-            Console.WriteLine "-------------------"
+                        Console.WriteLine ""
+                        Console.WriteLine $"    {trim prompt.Request.Summary (Math.Max(20, width - 4))}"
+                        AgentCommandInfo.reason prompt.Command
+                        |> Option.iter (fun reason ->
+                            Console.WriteLine $"    Reason: {trim reason (Math.Max(20, width - 12))}")
 
-            if prompts.Count = 0 then
-                Console.WriteLine "No pending permission requests."
-            else
-                for index = 0 to prompts.Count - 1 do
-                    let prompt = prompts[index]
-                    let marker =
-                        if mode = PermissionMode && index = selectedPrompt then ">"
-                        else " "
-                    Console.Write $"{marker} #{prompt.Id} {prompt.Request.CommandName}"
-
-                    match prompt.Request.ProjectName with
-                    | Some projectName ->
-                        Console.Write " "
-                        writeColoredProject projectName
-                    | None -> ()
-
-                    Console.WriteLine ""
-                    Console.WriteLine $"    {trim prompt.Request.Summary (Math.Max(20, width - 4))}"
-                    AgentCommandInfo.reason prompt.Command
-                    |> Option.iter (fun reason ->
-                        Console.WriteLine $"    Reason: {trim reason (Math.Max(20, width - 12))}")
-
-            Console.WriteLine ""
+                Console.WriteLine ""
         with _ ->
             ()
 
@@ -594,7 +815,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                     prompts.RemoveAt index
                     selectedPrompt <- selectedPrompt |> min (prompts.Count - 1) |> max 0
                     if prompts.Count = 0 then
-                        mode <- ActivityMode
+                        mode <- permissionReturnMode
                     renderUnsafe()
                     Some prompt.Completion)
 
@@ -669,6 +890,9 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
 
             if activity.Count > 0 then
                 selectedActivityId <- Some activity[activity.Count - 1].Id)
+
+    member _.SetJobAccess(access: JobUiAccess) =
+        lock syncRoot (fun () -> jobsAccess <- Some access)
 
     member _.SetKey value =
         lock syncRoot (fun () ->
@@ -804,10 +1028,38 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
 
             while not shouldQuit && not cancellationToken.IsCancellationRequested do
                 try
+                    if (mode = JobsMode || mode = JobDetailsMode || mode = JobCancelMode || mode = JobFilterMode)
+                       && DateTimeOffset.UtcNow - jobLastPoll > TimeSpan.FromMilliseconds(750.) then
+                        lock syncRoot (fun () ->
+                            pollJobsUnsafe()
+                            renderUnsafe())
                     if Console.KeyAvailable then
                         let keyInfo = Console.ReadKey(intercept = true)
 
-                        if mode = CopyRecentMode then
+                        if mode = JobFilterMode then
+                            lock syncRoot (fun () ->
+                                match keyInfo.Key with
+                                | ConsoleKey.Enter -> mode <- JobsMode
+                                | ConsoleKey.Escape ->
+                                    jobProjectFilter <- jobOriginalFilter
+                                    mode <- JobsMode
+                                | ConsoleKey.Backspace when jobProjectFilter.Length > 0 ->
+                                    jobProjectFilter <- jobProjectFilter.Substring(0, jobProjectFilter.Length - 1)
+                                | _ when not (Char.IsControl keyInfo.KeyChar) ->
+                                    jobProjectFilter <- jobProjectFilter + string keyInfo.KeyChar
+                                | _ -> ()
+                                let items = jobListUnsafe()
+                                jobSelectedId <- items |> List.tryHead |> Option.map _.JobId
+                                jobListScroll <- 0
+                                renderUnsafe())
+                        elif mode = JobCancelMode then
+                            lock syncRoot (fun () ->
+                                match keyInfo.Key with
+                                | ConsoleKey.Y -> confirmJobCancellationUnsafe()
+                                | ConsoleKey.N | ConsoleKey.Escape -> mode <- jobCancelReturnMode
+                                | _ -> ()
+                                renderUnsafe())
+                        elif mode = CopyRecentMode then
                             match keyInfo.Key with
                             | ConsoleKey.Backspace ->
                                 lock syncRoot (fun () ->
@@ -897,8 +1149,11 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                                     | ActivityMode -> moveActivitySelectionUnsafe -1
                                     | PermissionMode ->
                                         selectedPrompt <- max 0 (selectedPrompt - 1)
-                                    | FilterMode -> ()
-                                    | CopyRecentMode -> ()
+                                    | JobsMode -> moveJobSelectionUnsafe -1
+                                    | JobDetailsMode ->
+                                        jobFollow <- false
+                                        jobOutputScroll <- min (jobOutputLines.Length - 1 |> max 0) (jobOutputScroll + 1)
+                                    | _ -> ()
                                     renderUnsafe())
                             | _, ConsoleKey.DownArrow ->
                                 lock syncRoot (fun () ->
@@ -907,18 +1162,31 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                                     | PermissionMode ->
                                         selectedPrompt <- min (prompts.Count - 1) (selectedPrompt + 1)
                                         selectedPrompt <- max 0 selectedPrompt
-                                    | FilterMode -> ()
-                                    | CopyRecentMode -> ()
+                                    | JobsMode -> moveJobSelectionUnsafe 1
+                                    | JobDetailsMode ->
+                                        jobOutputScroll <- max 0 (jobOutputScroll - 1)
+                                        if jobOutputScroll = 0 then jobFollow <- true
+                                    | _ -> ()
                                     renderUnsafe())
                             | _, ConsoleKey.PageUp ->
                                 lock syncRoot (fun () ->
-                                    if mode = ActivityMode then
-                                        moveActivitySelectionUnsafe -visibleActivityRows
+                                    match mode with
+                                    | ActivityMode -> moveActivitySelectionUnsafe -visibleActivityRows
+                                    | JobsMode -> moveJobSelectionUnsafe -12
+                                    | JobDetailsMode ->
+                                        jobFollow <- false
+                                        jobOutputScroll <- min (jobOutputLines.Length - 1 |> max 0) (jobOutputScroll + 10)
+                                    | _ -> ()
                                     renderUnsafe())
                             | _, ConsoleKey.PageDown ->
                                 lock syncRoot (fun () ->
-                                    if mode = ActivityMode then
-                                        moveActivitySelectionUnsafe visibleActivityRows
+                                    match mode with
+                                    | ActivityMode -> moveActivitySelectionUnsafe visibleActivityRows
+                                    | JobsMode -> moveJobSelectionUnsafe 12
+                                    | JobDetailsMode ->
+                                        jobOutputScroll <- max 0 (jobOutputScroll - 10)
+                                        if jobOutputScroll = 0 then jobFollow <- true
+                                    | _ -> ()
                                     renderUnsafe())
                             | _, ConsoleKey.End ->
                                 lock syncRoot (fun () ->
@@ -930,15 +1198,52 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                                 lock syncRoot (fun () ->
                                     if mode = ActivityMode && (filteredActivityUnsafe()).Length > 0 then
                                         showActivityDetails <- not showActivityDetails
+                                    elif mode = JobsMode then openJobDetailsUnsafe()
                                     renderUnsafe())
-                            | _, ConsoleKey.P when mode = ActivityMode ->
+                            | _, ConsoleKey.J when mode = ActivityMode ->
                                 lock syncRoot (fun () ->
+                                    mode <- JobsMode
+                                    pollJobsUnsafe()
+                                    renderUnsafe())
+                            | _, ConsoleKey.F when mode = JobsMode ->
+                                lock syncRoot (fun () ->
+                                    jobOriginalFilter <- jobProjectFilter
+                                    mode <- JobFilterMode
+                                    renderUnsafe())
+                            | _, ConsoleKey.T when mode = JobsMode ->
+                                lock syncRoot (fun () ->
+                                    jobIncludeCompleted <- not jobIncludeCompleted
+                                    let items = jobListUnsafe()
+                                    if not (items |> List.exists (fun job -> Some job.JobId = jobSelectedId)) then
+                                        jobSelectedId <- items |> List.tryHead |> Option.map _.JobId
+                                    renderUnsafe())
+                            | _, ConsoleKey.B when mode = JobDetailsMode ->
+                                lock syncRoot (fun () ->
+                                    jobFollow <- true
+                                    jobOutputScroll <- 0
+                                    renderUnsafe())
+                            | _, ConsoleKey.C when mode = JobsMode || mode = JobDetailsMode ->
+                                lock syncRoot (fun () ->
+                                    beginJobCancellationUnsafe()
+                                    renderUnsafe())
+                            | _, ConsoleKey.Escape when mode = JobDetailsMode ->
+                                lock syncRoot (fun () ->
+                                    mode <- JobsMode
+                                    jobDetailId <- None
+                                    renderUnsafe())
+                            | _, ConsoleKey.Escape when mode = JobsMode ->
+                                lock syncRoot (fun () ->
+                                    mode <- ActivityMode
+                                    renderUnsafe())
+                            | _, ConsoleKey.P when mode = ActivityMode || mode = JobsMode || mode = JobDetailsMode ->
+                                lock syncRoot (fun () ->
+                                    permissionReturnMode <- mode
                                     mode <- PermissionMode
                                     showActivityDetails <- false
                                     renderUnsafe())
                             | _, ConsoleKey.Escape when mode = PermissionMode ->
                                 lock syncRoot (fun () ->
-                                    mode <- ActivityMode
+                                    mode <- permissionReturnMode
                                     renderUnsafe())
                             | _, ConsoleKey.A when mode = PermissionMode ->
                                 completeSelected AllowOnce

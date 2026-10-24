@@ -119,6 +119,18 @@ let main args =
 
     ProcessEnvironment.configureAllowedEnvironmentVariables allowedEnvironmentVariables
     let rt = Runtime(getDir dir, tui, trustLevel, maxImportBytes)
+    let formatJobResult value = value |> Result.mapError (fun error -> sprintf "%A" error)
+    tui.SetJobAccess
+        { List = (fun () ->
+            JobManager.listJobs { ProjectName = None; IncludeCompleted = true } rt
+            |> Result.map (fun result -> result.Jobs)
+            |> formatJobResult)
+          Read = (fun jobId afterSequence ->
+            JobManager.getJobResult { JobId = jobId; AfterSequence = Some afterSequence } rt
+            |> formatJobResult)
+          Cancel = (fun jobId ->
+            JobManager.cancelJob { JobId = jobId } rt
+            |> formatJobResult) }
     tui.Log $"Trust: {TrustLevel.toDisplayName trustLevel}"
     tui.Log $"Allowed sensitive environment variables: {allowedEnvironmentVariables.Length}"
     let importSizeDescription =

@@ -24,6 +24,7 @@
         <Compile Include="ActivityNavigationTests.fs"/>
         <Compile Include="ProjectBrowserTests.fs"/>
         <Compile Include="ClientShellTests.fs"/>
+        <Compile Include="JobViewTests.fs"/>
         <Compile Include="JobManagerTests.fs"/>
         <Compile Include="GitCommandTests.fs"/>
         <Compile Include="WorkTaskTests.fs"/>

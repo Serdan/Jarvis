@@ -204,6 +204,10 @@ Projects store instructions at `<project>/.jarvis/skills/<skill-name>/SKILL.md`.
 
 Skill reads require `workspace:read`; creation requires `workspace:write` and follows the local trust policy. Skills provide guidance and do not execute code or grant permissions. See [Jarvis Skills](docs/Skills.md) for the format and validation rules.
 
+## Local Jobs screen
+
+Press `j` on the Jarvis client Activity screen to open the local Jobs list. Running jobs appear by default; `t` toggles recently completed jobs, `f` filters by project name, and `Enter` opens job details with bounded stdout/stderr output. Output follows new events until you scroll; `b` resumes following. Press `c` to request cancellation of the selected running job and confirm with `y`; `p` opens pending permissions and `Esc` returns. This view uses the local client JobManager, so it remains available while disconnected from the server. Jobs from other machines are not listed, and persisted activity does not imply a job survives a client restart.
+
 ## Client activity and recovery
 
 JarvisClient retains the latest 500 activities and restores them from local JSONL logs after a restart. Logs rotate daily and at 10 MiB, with 14 days of retention. Commands left running or awaiting permission are restored as `Interrupted`; activity recovery does not resume processes or restore job handles.

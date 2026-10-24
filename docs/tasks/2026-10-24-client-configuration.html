@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Jarvis Client: persistent user-level configuration</title>
+</head>
+<body>
+  <main>
+    <h1>Persistent user-level client configuration</h1>
+    <p><strong>Status:</strong> Open. <strong>Date:</strong> 2026-10-24.</p>
+    <h2>Goal</h2>
+    <p>JarvisClient loads and manages persistent, machine-local settings from the current OS user's standard configuration directory. Every copy of the executable launched by that user shares the same configuration, regardless of executable location, working directory, downloaded version, or self-update. A friendly machine name becomes configurable without changing the stable device identity used for multiclient routing.</p>
+    <h2>Location and file format</h2>
+    <p>Use a human-editable, versioned <code>config.json</code> in the per-user OS configuration location. Resolve Linux via <code>$XDG_CONFIG_HOME/Jarvis/config.json</code>, defaulting to <code>~/.config/Jarvis/config.json</code>; Windows via <code>%APPDATA%\Jarvis\config.json</code>; macOS via <code>~/Library/Application Support/Jarvis/config.json</code>. Use platform APIs where appropriate and test the exact path resolution. The location is shared by installations for one OS account, not a server-hosted or repository-scoped store.</p>
+    <p>Continue using the existing persistent device ID; preserve its value and established location across client upgrades. Reuse a common platform-directory resolver where it helps, without regenerating identities on migration. Store configuration outside the binary installation, project directories, Git repositories, and updater replacement paths.</p>
+    <h2>Initial settings</h2>
+    <pre>{
+  "schemaVersion": 1,
+  "machineName": "Home Desktop",
+  "workspacePath": "/home/user/Projects",
+  "trustLevel": "partial",
+  "allowedEnvironmentVariables": [],
+  "maxImportBytes": 33554432
+}</pre>
+    <p>The example is illustrative; missing keys use existing defaults. <code>machineName</code> defaults to the OS hostname and is only a display label; the UUID in <code>device-id</code> remains the routing identity. The remaining fields correspond to existing startup options (<code>--path</code>, <code>--trust</code>, <code>--allow-env</code>, and <code>--max-import-bytes</code>). Preserve existing environment-variable overrides for OAuth and permitted environment names, and define and document their effective resolution.</p>
+    <h2>Behavior</h2>
+    <ul>
+      <li>Startup resolves defaults, persisted configuration, environment variables, and CLI overrides deterministically. Explicit CLI values override stored scalar settings. Keep the existing additive semantics for allowed sensitive environment variables, with duplicate removal; document how a stored allowlist, environment list, and repeated <code>--allow-env</code> flags combine.</li>
+      <li>Provide a local CLI interface for inspecting the effective configuration and source file, setting a key, and removing an override, e.g. <code>JarvisClient config show</code>, <code>JarvisClient config path</code>, <code>JarvisClient config set machine-name "Home Desktop"</code>, and <code>JarvisClient config unset machine-name</code>. These commands operate without OAuth login or a connected server. Also support a temporary <code>--machine-name</code> startup override.</li>
+      <li>Register the resolved machine name at every client connection or reconnection. Changes to its persisted value appear on the next registration; they must not create a second device or alter conversation device selections. Preserve multiclient routing by UUID even when names are duplicated.</li>
+      <li>Handle absent config by using current defaults. Reject invalid JSON, unsupported schema versions, invalid values, and unsafe or unreadable configuration with an actionable local error. Never silently switch from a requested restrictive trust configuration to a more permissive one. Permit manual JSON editing.</li>
+      <li>Write configuration atomically using a same-directory temporary file and replacement; preserve unrelated well-formed fields when changing one key. Protect user configuration with appropriate OS file permissions and keep secrets and OAuth refresh tokens out of plain configuration. Do not provide an agent-accessible remote MCP settings mutation command.</li>
+    </ul>
+    <h2>Implementation slices</h2>
+    <h3>1. Location, schema, and persistence</h3>
+    <p>Implement the platform directory resolver and typed, validated, versioned JSON loader/writer. Add tests for Linux XDG overrides/defaults, Windows and macOS directories, absent/malformed/unsupported files, value validation, atomic replacement, and preservation of existing device identity.</p>
+    <p><strong>Accept:</strong> Two client executables launched under the same OS user resolve the same config file independently of their binary paths; corrupt configuration never silently changes security posture.</p>
+    <h3>2. Startup resolution and registration</h3>
+    <p>Integrate stored values with existing startup defaults, CLI arguments, and environment settings. Add <code>--machine-name</code>. Register the resolved name while retaining the same UUID. Test precedence, allowlist combination, reconnects, renamed devices, duplicate labels, and launch from different directories.</p>
+    <p><strong>Accept:</strong> A saved machine name and workspace are applied at startup, CLI values can temporarily override them, and device routing remains stable.</p>
+    <h3>3. Local config commands and safe edits</h3>
+    <p>Implement <code>config path/show/set/unset</code> with documented key names and noninteractive operation, including updates to numeric, list, and enum settings. Test round trips, atomicity, unknown/invalid keys, restricted file access, and read-only inspection without authentication.</p>
+    <p><strong>Accept:</strong> A user can rename the registered machine persistently without editing files manually, and a later client restart uses that choice.</p>
+    <h3>4. Documentation and end-to-end verification</h3>
+    <p>Document paths, schema, examples, precedence, security-sensitive settings, and migration from startup flags in README/client help. Cover existing client update/restart behavior and verify that replacing or moving the binary does not change configuration or identity. Run focused client tests and the full Jarvis test suite; commit each verified slice independently.</p>
+    <p><strong>Accept:</strong> Linux, Windows, and macOS path/serialization tests pass; manual multiclient registration and self-update checks preserve existing identity and selection.</p>
+  </main>
+</body>
+</html>

@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "id": "2026-10-24-client-configuration",
+  "title": "Persistent user-level client configuration",
+  "status": "open",
+  "dependencies": [],
+  "owner": {
+    "agent": null,
+    "worktree": null
+  },
+  "checkpoint": {
+    "summary": "",
+    "nextAction": "Implement platform config resolver and validated JSON persistence.",
+    "verified": [],
+    "lastCommit": null
+  },
+  "updatedAt": "2026-10-24T15:40:00Z"
+}

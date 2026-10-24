@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "2026-10-24-runpod-benchmark-lifecycle",
+  "title": "Automatic Runpod benchmark pod shutdown and wake-on-acquire",
+  "status": "open",
+  "dependencies": [],
+  "owner": {
+    "agent": null,
+    "worktree": null
+  },
+  "checkpoint": {
+    "summary": "2026-10-24: Identified Runpod pod scr17d7ppy6z9k, verified no active cloud jobs, persisted .NET 11 SDK/BGEE/city/Jarvis assets and restore.sh on /workspace, stopped pod via REST v2, HTTP 200 status EXITED. No automatic external watchdog or account-level key configured yet.",
+    "nextAction": "Implement testable provider REST-v2 adapter and durable server-side lease/watchdog slices in an exclusive Jarvis worktree. Deploy only after account-scoped key is provisioned out-of-band; real stopped->running->restored->stopped acceptance required. Never restart A40 merely for development.",
+    "verified": [
+      "Runpod REST v2 GET live pod succeeded with pod-scoped injected key; stop POST returned HTTP200 status EXITED for exact pod ID scr17d7ppy6z9k.",
+      "No active cloud Jarvis jobs on Wayfold and Wayfold-benchmark-277 before stop.",
+      "Verified dotnet 11.0.100-rc.2.26504.105 executes from /workspace/Wayfold-toolchain/dotnet; BGEE and frozen evidence retained; restore.sh and README saved on persistent volume."
+    ],
+    "lastCommit": null
+  },
+  "updatedAt": "2026-10-24T20:15:00Z"
+}

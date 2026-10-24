@@ -1,6 +1,7 @@
 module JobManagerTests
 
 open System
+open System.Diagnostics
 open System.IO
 open System.Text
 open System.Threading
@@ -142,16 +143,19 @@ let ``job output polling is ordered and incremental across streams`` () =
             | Ok result -> result.JobId
             | Error error -> failwith $"Expected StartJob Ok, got {error}"
 
-        let rec waitForCompletion remaining =
+        // dotnet fsi startup can exceed five seconds on heavily loaded dev hosts.
+        // Keep polling incrementally but use a measured deadline, not a fixed 100 iterations.
+        let deadline = Stopwatch.StartNew()
+        let rec waitForCompletion () =
             match getJobResult { JobId = jobId; AfterSequence = Some 0L } context with
             | Error error -> failwith $"Expected GetJobResult Ok, got {error}"
             | Ok result when result.Status <> Running -> result
-            | Ok _ when remaining <= 0 -> failwith "Job did not complete in time."
+            | Ok _ when deadline.Elapsed >= TimeSpan.FromSeconds 20.0 -> failwith "Job did not complete in 20 seconds."
             | Ok _ ->
                 Thread.Sleep 50
-                waitForCompletion (remaining - 1)
+                waitForCompletion ()
 
-        let first = waitForCompletion 100
+        let first = waitForCompletion ()
         first.Events.IsEmpty |> shouldEqual false
         first.Events |> List.exists (fun event -> event.Stream = JobOutputStream.StdOut) |> shouldEqual true
         first.Events |> List.exists (fun event -> event.Stream = JobOutputStream.StdErr) |> shouldEqual true

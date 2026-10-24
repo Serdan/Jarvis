@@ -23,31 +23,52 @@ let rec getDir path =
         getDir (Console.ReadLine())
 
 let private parseArgs args =
-    let configuredEnvironmentVariables =
-        match Environment.GetEnvironmentVariable "JARVIS_ALLOWED_ENVIRONMENT_VARIABLES" with
-        | null
-        | "" -> []
-        | value ->
-            value.Split([| ','; ';' |], StringSplitOptions.RemoveEmptyEntries ||| StringSplitOptions.TrimEntries)
-            |> Array.toList
+    ClientConfig.load()
+    |> Result.bind (fun snapshot ->
+        ClientConfig.resolve snapshot.Stored (args |> Array.toList)
+        |> Result.map (fun effective -> snapshot, effective))
 
-    let rec loop path trustLevel allowedEnvironmentVariables maxImportBytes remaining =
-        match remaining with
-        | [] -> Ok(path, trustLevel, List.rev allowedEnvironmentVariables, maxImportBytes)
-        | "--path" :: value :: tail -> loop value trustLevel allowedEnvironmentVariables maxImportBytes tail
-        | "--trust" :: value :: tail -> loop path value allowedEnvironmentVariables maxImportBytes tail
-        | "--allow-env" :: value :: tail ->
-            loop path trustLevel (value :: allowedEnvironmentVariables) maxImportBytes tail
-        | "--max-import-bytes" :: value :: tail ->
-            match Int64.TryParse value with
-            | true, parsed when parsed >= 0L ->
-                loop path trustLevel allowedEnvironmentVariables parsed tail
-            | _ -> Error "--max-import-bytes must be a non-negative integer. Use 0 for unlimited."
-        | unknown :: _ -> Error $"Unknown or incomplete argument: {unknown}"
+let private runConfigCommand (args: string array) =
+    match ClientConfig.load() with
+    | Error error ->
+        eprintfn "%s" error
+        2
+    | Ok snapshot ->
+        let show () =
+            let stored = snapshot.Stored
+            let resolved = ClientConfig.resolve stored []
+            match resolved with
+            | Error error -> eprintfn "%s" error; 2
+            | Ok config ->
+                printfn "File: %s" snapshot.Path
+                printfn "Machine name: %s" config.MachineName
+                printfn "Workspace: %s" config.WorkspacePath
+                printfn "Trust: %s" config.TrustLevel
+                printfn "Allowed environment variables: %s" (String.concat ", " config.AllowedEnvironmentVariables)
+                printfn "Maximum import bytes: %d" config.MaxImportBytes
+                0
+        match args |> Array.toList with
+        | [ "config"; "path" ] -> printfn "%s" snapshot.Path; 0
+        | [ "config"; "show" ] -> show ()
+        | [ "config"; "set"; key; value ] ->
+            match ClientConfig.updateKey key value snapshot.Stored with
+            | Error error -> eprintfn "%s" error; 2
+            | Ok stored ->
+                match ClientConfig.save snapshot stored with
+                | Ok _ -> printfn "Saved %s" key; 0
+                | Error error -> eprintfn "%s" error; 2
+        | [ "config"; "unset"; key ] ->
+            match ClientConfig.unsetKey key snapshot.Stored with
+            | Error error -> eprintfn "%s" error; 2
+            | Ok stored ->
+                match ClientConfig.save snapshot stored with
+                | Ok _ -> printfn "Unset %s" key; 0
+                | Error error -> eprintfn "%s" error; 2
+        | _ ->
+            eprintfn "Usage: JarvisClient config path|show|set <key> <value>|unset <key>"
+            2
 
-    loop (WorkspaceDefaults.current()) "partial" (List.rev configuredEnvironmentVariables) AgentProtocol.defaultMaxImportBytes (args |> Array.toList)
-
-let register (tui: ConsoleTui) (connection: HubConnection) deviceId =
+let register (tui: ConsoleTui) (connection: HubConnection) deviceId (machineName: unit -> string) =
     task {
         let clientVersion =
             match Assembly.GetExecutingAssembly().GetName().Version with
@@ -56,7 +77,7 @@ let register (tui: ConsoleTui) (connection: HubConnection) deviceId =
 
         let registration =
             { DeviceId = deviceId
-              DeviceName = Environment.MachineName
+              DeviceName = machineName()
               ProtocolVersion = AgentProtocol.version
               ClientVersion = clientVersion
               SupportedCommands =
@@ -87,8 +108,7 @@ let connect (tui: ConsoleTui) (connection: HubConnection) =
             return false
     }
 
-[<EntryPoint>]
-let main args =
+let private runClient args =
     let activityStore, activityStoreError =
         try
             Some(Client.ActivityLog.Store.CreateDefault()), None
@@ -104,19 +124,38 @@ let main args =
     activityStoreError
     |> Option.iter (fun error -> tui.Log $"Activity persistence unavailable: {error}")
 
-    let dir, trustLevel, allowedEnvironmentVariables, maxImportBytes =
+    let _, effective =
         match parseArgs args with
-        | Ok(path, trustValue, allowedEnvironmentVariables, maxImportBytes) ->
-            match TrustLevel.parse trustValue with
-            | Ok level -> path, level, allowedEnvironmentVariables, maxImportBytes
-            | Error message ->
-                eprintfn $"%s{message}"
-                exit 2
+        | Ok result -> result
         | Error message ->
-            eprintfn $"%s{message}"
-            eprintfn "Usage: JarvisClient [--path <workspace>] [--trust none|partial|full] [--allow-env NAME]... [--max-import-bytes BYTES]"
+            eprintfn "%s" message
+            eprintfn "Usage: JarvisClient [--path <workspace>] [--machine-name <name>] [--trust none|partial|full] [--allow-env NAME]... [--max-import-bytes BYTES]"
             exit 2
 
+    let dir = effective.WorkspacePath
+    let allowedEnvironmentVariables = effective.AllowedEnvironmentVariables
+    let maxImportBytes = effective.MaxImportBytes
+    let resolveMachineName () =
+        // Re-read only the display name on registration, leaving runtime settings unchanged.
+        match ClientConfig.load() with
+        | Error error ->
+            tui.Log $"Unable to reload configured machine name: {error}"
+            effective.MachineName
+        | Ok latest ->
+            match ClientConfig.resolve latest.Stored (args |> Array.toList) with
+            | Ok current -> current.MachineName
+            | Error error ->
+                tui.Log $"Unable to reload configured machine name: {error}"
+                effective.MachineName
+    let trustLevel =
+        match TrustLevel.parse effective.TrustLevel with
+        | Ok level -> level
+        | Error error -> eprintfn "%s" error; exit 2
+
+    tui.SetSettingsAccess
+        { Load = ClientConfig.load
+          Save = ClientConfig.save
+          Effective = effective }
     ProcessEnvironment.configureAllowedEnvironmentVariables allowedEnvironmentVariables
     let rt = Runtime(getDir dir, tui, trustLevel, maxImportBytes)
     let formatJobResult value = value |> Result.mapError (fun error -> sprintf "%A" error)
@@ -205,13 +244,13 @@ let main args =
 
                     if connected then
                         connectionFailureCount <- 0
-                        let! isRegistered = register tui connection deviceId
+                        let! isRegistered = register tui connection deviceId resolveMachineName
                         registered <- isRegistered
                     else
                         connectionFailureCount <- connectionFailureCount + 1
 
             elif connection.State = HubConnectionState.Connected && not registered then
-                let! isRegistered = register tui connection deviceId
+                let! isRegistered = register tui connection deviceId resolveMachineName
                 registered <- isRegistered
 
             if not tui.ShouldQuit then
@@ -235,3 +274,11 @@ let main args =
     }
     |> Async.AwaitTask
     |> Async.RunSynchronously
+
+[<EntryPoint>]
+let main args =
+    if args.Length = 2 && args[0] = "config" && args[1] = "path" then
+        printfn "%s" (ClientConfig.configPath())
+        0
+    elif args.Length > 0 && args[0] = "config" then runConfigCommand args
+    else runClient args

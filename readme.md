@@ -120,6 +120,27 @@ JARVIS_OAUTH_CLIENT_ID
 JARVIS_OAUTH_REDIRECT_URI
 ```
 
+### User-level client configuration
+
+JarvisClient stores its editable configuration in the current OS user's configuration directory, **not next to the executable**: `$XDG_CONFIG_HOME/Jarvis/config.json` on Linux (default `~/.config/Jarvis/config.json`), `%APPDATA%\\Jarvis\\config.json` on Windows, and `~/Library/Application Support/Jarvis/config.json` on macOS. The existing stable device ID remains separate and is not changed by renaming a client.
+
+Configuration is a versioned JSON object with optional `machineName`, `workspacePath`, `trustLevel`, `allowedEnvironmentVariables` and `maxImportBytes` fields. Missing fields retain previous defaults. To inspect or edit configuration locally without authenticating:
+
+```sh
+JarvisClient config path
+JarvisClient config show
+JarvisClient config set machine-name "Home Desktop"
+JarvisClient config set workspace-path "/home/user/Projects"
+JarvisClient config set trust-level partial
+JarvisClient config set max-import-bytes 33554432
+JarvisClient config set allowed-environment-variables "NUGET_AUTH_TOKEN,GITHUB_TOKEN"
+JarvisClient config unset machine-name
+```
+
+Startup flags (`--machine-name`, `--path`, `--trust`, `--max-import-bytes`) override persisted scalar settings for that run. The sensitive-environment-variable allowlist combines saved names, `JARVIS_ALLOWED_ENVIRONMENT_VARIABLES`, and `--allow-env` flags. Invalid config is reported instead of silently ignoring it; settings are saved through atomic replacement with a revision check. OAuth tokens are not stored in this file.
+
+Press **g** on the client's Activity or Jobs screen to open **Settings**. Select with arrow keys, edit with Enter, unset with **u**, save with **s**, and return without saving with Escape. Turning on full trust requires an explicit confirmation. The screen shows active runtime values and flags startup overrides. Workspace, trust and import-limit changes take effect after restarting the client; a changed display name is picked up when the client next registers/reconnects. The device UUID is stable.
+
 ### Local permissions
 
 Jarvis exposes one user-facing trust setting:

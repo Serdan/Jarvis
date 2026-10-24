@@ -3,6 +3,7 @@
 - **IO/** — Filesystem, project, and web IO abstractions.
 - **Modules/OAuth.fs** — Auth0 native Authorization Code + PKCE login and token refresh.
 - **Modules/DeviceIdentity.fs** — Stable non-secret installation identifier.
+- **Modules/ClientConfig.fs** — OS user-level versioned JSON client configuration, CLI resolution, atomic writes.
 - **Modules/ProjectPaths.fs** — Workspace/project containment and path safety.
 - **Modules/ProjectBrowser.fs** — Structured project/file operations.
 - **Modules/PermissionPolicy.fs** — Local authorization and confirmation policy.

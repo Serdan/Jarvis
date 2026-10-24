@@ -44,6 +44,9 @@ type private TuiMode =
     | JobDetailsMode
     | JobCancelMode
     | JobFilterMode
+    | SettingsMode
+    | SettingsEditMode
+    | SettingsConfirmMode
 
 type private PendingPrompt =
     { Id: int
@@ -55,6 +58,11 @@ type JobUiAccess =
     { List: unit -> Result<JobSummary list, string>
       Read: string -> int64 -> Result<JobResult, string>
       Cancel: string -> Result<unit, string> }
+
+type SettingsUiAccess =
+    { Load: unit -> Result<ClientConfigSnapshot, string>
+      Save: ClientConfigSnapshot -> ClientStoredConfig -> Result<ClientConfigSnapshot, string>
+      Effective: ClientEffectiveConfig }
 
 type ConsoleTui(?activityLog: ActivityLog.Store) =
     let syncRoot = obj()
@@ -92,6 +100,13 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
     let mutable jobLastPoll = DateTimeOffset.MinValue
     let mutable permissionReturnMode = ActivityMode
     let mutable jobCancelReturnMode = JobsMode
+    let mutable settingsAccess: SettingsUiAccess option = None
+    let mutable settingsSnapshot: ClientConfigSnapshot option = None
+    let mutable settingsStaged = ClientConfig.empty
+    let mutable settingsSelected = 0
+    let mutable settingsEditing = ""
+    let mutable settingsError: string option = None
+    let mutable settingsReturnMode = ActivityMode
     let mutable connectionState = Disconnected
     let mutable serverHost = "-"
     let maxHistory = 500
@@ -392,6 +407,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         writeMnemonic 'c' "clear"; Console.Write ", "
         writeMnemonic 'p' "permissions"; Console.Write ", "
         writeMnemonic 'j' "jobs"; Console.Write ", "
+        writeMnemonic 'g' "settings"; Console.Write ", "
         writeMnemonic 'r' "copy recent"; Console.Write ", "
         writeMnemonic 'o' (if showObservers then "hide observers" else "show observers"); Console.Write ", "
         writeMnemonic 'q' "quit"; Console.WriteLine ""
@@ -706,6 +722,110 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         Console.WriteLine ""
         if prompts.Count > 0 then Console.WriteLine $"{prompts.Count} pending permission request(s): press p to review."
 
+    let settingKeys = [| "machine-name"; "workspace-path"; "trust-level"; "allowed-environment-variables"; "max-import-bytes" |]
+    let settingLabels = [| "Machine name"; "Workspace directory"; "Trust level"; "Allowed environment variables"; "Maximum import bytes" |]
+
+    let settingsValue key (stored: ClientStoredConfig) =
+        match key with
+        | "machine-name" -> stored.MachineName
+        | "workspace-path" -> stored.WorkspacePath
+        | "trust-level" -> stored.TrustLevel
+        | "allowed-environment-variables" -> stored.AllowedEnvironmentVariables |> Option.map (String.concat ",")
+        | "max-import-bytes" -> stored.MaxImportBytes |> Option.map string
+        | _ -> None
+
+    let settingsEffective key (config: ClientEffectiveConfig) =
+        match key with
+        | "machine-name" -> config.MachineName
+        | "workspace-path" -> config.WorkspacePath
+        | "trust-level" -> config.TrustLevel
+        | "allowed-environment-variables" -> String.concat "," config.AllowedEnvironmentVariables
+        | "max-import-bytes" -> string config.MaxImportBytes
+        | _ -> ""
+
+    let openSettingsUnsafe () =
+        settingsReturnMode <- mode
+        settingsSnapshot <- None
+        settingsStaged <- ClientConfig.empty
+        settingsError <- None
+        match settingsAccess with
+        | None -> settingsError <- Some "Configuration service unavailable."
+        | Some access ->
+            match access.Load() with
+            | Error error -> settingsError <- Some error
+            | Ok snapshot ->
+                settingsSnapshot <- Some snapshot
+                settingsStaged <- snapshot.Stored
+        mode <- SettingsMode
+
+    let saveSettingsUnsafe () =
+        match settingsAccess, settingsSnapshot with
+        | Some access, Some snapshot ->
+            match access.Save snapshot settingsStaged with
+            | Error error -> settingsError <- Some error
+            | Ok saved ->
+                settingsSnapshot <- Some saved
+                settingsError <- Some "Saved. Restart client for changed runtime settings; machine name updates at next registration."
+        | _ -> settingsError <- Some "Configuration unavailable."
+
+    let applySettingsEditUnsafe () =
+        let key = settingKeys[settingsSelected]
+        match ClientConfig.updateKey key settingsEditing settingsStaged with
+        | Error error -> settingsError <- Some error
+        | Ok stored ->
+            settingsStaged <- stored
+            settingsError <- None
+            mode <- SettingsMode
+
+    let renderSettingsUnsafe width =
+        let safe = JobView.safeLine
+        Console.WriteLine "Settings (user-level configuration)"
+        Console.WriteLine "-----------------------------------"
+        match settingsSnapshot with
+        | None -> Console.WriteLine "Config unavailable."
+        | Some snapshot ->
+            Console.WriteLine(trim (safe snapshot.Path) width)
+            let effective = settingsAccess |> Option.map _.Effective
+            for index = 0 to settingKeys.Length - 1 do
+                let key = settingKeys[index]
+                let value = settingsValue key settingsStaged |> Option.defaultValue "(default)"
+                let source =
+                    match effective with
+                    | Some e when e.Overrides.Contains(
+                        match key with
+                        | "machine-name" -> "machineName"
+                        | "workspace-path" -> "workspacePath"
+                        | "trust-level" -> "trustLevel"
+                        | "allowed-environment-variables" -> "allowedEnvironmentVariables"
+                        | _ -> "maxImportBytes") -> " [startup override]"
+                    | _ -> ""
+                let marker = if settingsSelected = index then ">" else " "
+                Console.WriteLine(trim (safe $"{marker} {settingLabels[index]}: {value}{source}") width)
+            match effective with
+            | Some e ->
+                Console.WriteLine ""
+                Console.WriteLine "Startup effective values (changes may require restart):"
+                for index = 0 to settingKeys.Length - 1 do
+                    Console.WriteLine(trim (safe $"{settingLabels[index]}: {settingsEffective settingKeys[index] e}") width)
+            | None -> ()
+        Console.WriteLine ""
+        if mode = SettingsEditMode then
+            Console.WriteLine(trim (safe $"Editing {settingLabels[settingsSelected]}: {settingsEditing}") width)
+            Console.WriteLine "Enter accepts field, Esc cancels edit."
+            if settingsSelected = 3 then
+                Console.WriteLine "Warning: allowlisted variables can expose credentials to processes started by agents."
+        elif mode = SettingsConfirmMode then
+            Console.WriteLine "WARNING: Full trust disables local confirmation for agent operations."
+            Console.WriteLine "Press y to save, n/Esc to cancel."
+        else
+            Console.WriteLine "Up/Down select, Enter edit, u restore default, s save, Esc back."
+            Console.WriteLine "Saved changes to workspace, trust and limits require restart."
+            let originalVariables = settingsSnapshot |> Option.bind (fun s -> s.Stored.AllowedEnvironmentVariables)
+            if originalVariables <> settingsStaged.AllowedEnvironmentVariables then
+                Console.WriteLine "Warning: environment allowlist changes can expose credential variables."
+        settingsError |> Option.iter (fun error -> Console.WriteLine(trim (safe error) width))
+        if prompts.Count > 0 then Console.WriteLine $"{prompts.Count} permission requests pending (p to review)."
+
     let renderUnsafe () =
         try
             Console.Clear()
@@ -732,11 +852,15 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                 writeJobsHotkeys()
             | JobDetailsMode | JobCancelMode ->
                 writeJobDetailsHotkeys()
+            | SettingsMode | SettingsEditMode | SettingsConfirmMode ->
+                Console.WriteLine "Settings: fields, save, defaults, permissions"
             Console.WriteLine ""
 
             match mode with
             | JobsMode | JobDetailsMode | JobCancelMode | JobFilterMode ->
                 renderJobsUnsafe width
+            | SettingsMode | SettingsEditMode | SettingsConfirmMode ->
+                renderSettingsUnsafe width
             | _ ->
                 ensureActivitySelectionUnsafe() |> ignore
                 let filtered, startIndex, endExclusive = activityRangeUnsafe()
@@ -891,6 +1015,9 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
             if activity.Count > 0 then
                 selectedActivityId <- Some activity[activity.Count - 1].Id)
 
+    member _.SetSettingsAccess(access: SettingsUiAccess) =
+        lock syncRoot (fun () -> settingsAccess <- Some access)
+
     member _.SetJobAccess(access: JobUiAccess) =
         lock syncRoot (fun () -> jobsAccess <- Some access)
 
@@ -1036,7 +1163,25 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                     if Console.KeyAvailable then
                         let keyInfo = Console.ReadKey(intercept = true)
 
-                        if mode = JobFilterMode then
+                        if mode = SettingsEditMode then
+                            lock syncRoot (fun () ->
+                                match keyInfo.Key with
+                                | ConsoleKey.Enter -> applySettingsEditUnsafe()
+                                | ConsoleKey.Escape -> mode <- SettingsMode
+                                | ConsoleKey.Backspace when settingsEditing.Length > 0 ->
+                                    settingsEditing <- settingsEditing.Substring(0, settingsEditing.Length - 1)
+                                | _ when not (Char.IsControl keyInfo.KeyChar) ->
+                                    settingsEditing <- settingsEditing + string keyInfo.KeyChar
+                                | _ -> ()
+                                renderUnsafe())
+                        elif mode = SettingsConfirmMode then
+                            lock syncRoot (fun () ->
+                                match keyInfo.Key with
+                                | ConsoleKey.Y -> saveSettingsUnsafe(); mode <- SettingsMode
+                                | ConsoleKey.N | ConsoleKey.Escape -> mode <- SettingsMode
+                                | _ -> ()
+                                renderUnsafe())
+                        elif mode = JobFilterMode then
                             lock syncRoot (fun () ->
                                 match keyInfo.Key with
                                 | ConsoleKey.Enter -> mode <- JobsMode
@@ -1149,6 +1294,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                                     | ActivityMode -> moveActivitySelectionUnsafe -1
                                     | PermissionMode ->
                                         selectedPrompt <- max 0 (selectedPrompt - 1)
+                                    | SettingsMode -> settingsSelected <- max 0 (settingsSelected - 1)
                                     | JobsMode -> moveJobSelectionUnsafe -1
                                     | JobDetailsMode ->
                                         jobFollow <- false
@@ -1162,6 +1308,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                                     | PermissionMode ->
                                         selectedPrompt <- min (prompts.Count - 1) (selectedPrompt + 1)
                                         selectedPrompt <- max 0 selectedPrompt
+                                    | SettingsMode -> settingsSelected <- min (settingKeys.Length - 1) (settingsSelected + 1)
                                     | JobsMode -> moveJobSelectionUnsafe 1
                                     | JobDetailsMode ->
                                         jobOutputScroll <- max 0 (jobOutputScroll - 1)
@@ -1199,6 +1346,32 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                                     if mode = ActivityMode && (filteredActivityUnsafe()).Length > 0 then
                                         showActivityDetails <- not showActivityDetails
                                     elif mode = JobsMode then openJobDetailsUnsafe()
+                                    elif mode = SettingsMode then
+                                        settingsEditing <- settingsValue settingKeys[settingsSelected] settingsStaged
+                                                           |> Option.defaultValue ""
+                                        settingsError <- None
+                                        mode <- SettingsEditMode
+                                    renderUnsafe())
+                            | _, ConsoleKey.G when mode = ActivityMode || mode = JobsMode ->
+                                lock syncRoot (fun () ->
+                                    openSettingsUnsafe()
+                                    renderUnsafe())
+                            | _, ConsoleKey.U when mode = SettingsMode ->
+                                lock syncRoot (fun () ->
+                                    match ClientConfig.unsetKey settingKeys[settingsSelected] settingsStaged with
+                                    | Ok stored -> settingsStaged <- stored; settingsError <- None
+                                    | Error error -> settingsError <- Some error
+                                    renderUnsafe())
+                            | _, ConsoleKey.S when mode = SettingsMode ->
+                                lock syncRoot (fun () ->
+                                    let original = settingsSnapshot |> Option.map (fun snap -> snap.Stored.TrustLevel)
+                                    if settingsStaged.TrustLevel = Some "full" && original <> Some (Some "full") then
+                                        mode <- SettingsConfirmMode
+                                    else saveSettingsUnsafe()
+                                    renderUnsafe())
+                            | _, ConsoleKey.Escape when mode = SettingsMode ->
+                                lock syncRoot (fun () ->
+                                    mode <- settingsReturnMode
                                     renderUnsafe())
                             | _, ConsoleKey.J when mode = ActivityMode ->
                                 lock syncRoot (fun () ->
@@ -1235,7 +1408,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                                 lock syncRoot (fun () ->
                                     mode <- ActivityMode
                                     renderUnsafe())
-                            | _, ConsoleKey.P when mode = ActivityMode || mode = JobsMode || mode = JobDetailsMode ->
+                            | _, ConsoleKey.P when mode = ActivityMode || mode = JobsMode || mode = JobDetailsMode || mode = SettingsMode ->
                                 lock syncRoot (fun () ->
                                     permissionReturnMode <- mode
                                     mode <- PermissionMode

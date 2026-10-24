@@ -36,6 +36,7 @@
         <Compile Include="IO\Impl\WebOperations.fs"/>
         <Compile Include="Modules\WorkspaceDefaults.fs"/>
         <Compile Include="Modules\DeviceIdentity.fs"/>
+        <Compile Include="Modules\ClientConfig.fs"/>
         <Compile Include="Modules\OAuth.fs"/>
         <Compile Include="Modules\ProjectPaths.fs"/>
         <Compile Include="Modules\AuditLog.fs"/>

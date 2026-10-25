@@ -21,6 +21,8 @@ type TaskSummary =
       DescriptionPath: string
       StatePath: string
       HasState: bool
+      Owner: string option
+      Dependencies: string list
       Revision: string option
       Diagnostics: string list }
 
@@ -84,18 +86,48 @@ let private directory (root: string) =
             else Ok(configured.Replace('\\', '/'), path)
     with ex -> Error(Client.ValidationError($"Task directory configuration: {ex.Message}"))
 
+let private canonicalTaskId (stem: string) =
+    let matchResult = Regex.Match(stem, "^([0-9]+)-")
+    if matchResult.Success then matchResult.Groups[1].Value else stem
+
+let private descriptionCandidates (folder: string) (id: string) =
+    let exact = Path.Combine(folder, id + ".html")
+    if File.Exists exact then [ exact ]
+    elif id |> Seq.forall Char.IsDigit then
+        if Directory.Exists folder then
+            Directory.GetFiles(folder, id + "-*.html")
+            |> Array.filter (fun path -> canonicalTaskId(Path.GetFileNameWithoutExtension path) = id)
+            |> Array.toList
+        else []
+    else []
+
+let private descriptionPath (folder: string) (id: string) =
+    match descriptionCandidates folder id with
+    | [ path ] -> Ok path
+    | [] -> Error "Missing HTML task description."
+    | _ -> Error "Multiple HTML task descriptions share this task ID."
+
 let private summary (relativeDir: string) (folder: string) (id: string) =
-    let html = Path.Combine(folder, id + ".html")
+    let resolvedHtml = descriptionPath folder id
     let json = Path.Combine(folder, id + ".json")
     let stateExists = File.Exists json
-    let docExists = File.Exists html
-    let descriptionPath = relativeDir + "/" + id + ".html"
+    let docExists = resolvedHtml.IsOk
+    let descriptionPath =
+        match resolvedHtml with
+        | Ok path -> relativeDir + "/" + Path.GetFileName(path)
+        | Error _ -> relativeDir + "/" + id + ".html"
     let statePath = relativeDir + "/" + id + ".json"
     let mutable diagnostics = []
     let mutable title = id
     let mutable status = "open"
+    let mutable owner = None
+    let mutable dependencies = []
     let mutable hash = None
-    if not docExists then diagnostics <- "Missing HTML task description." :: diagnostics
+    match resolvedHtml with
+    | Error message -> diagnostics <- message :: diagnostics
+    | Ok path when (File.GetAttributes path).HasFlag(FileAttributes.ReparsePoint) ->
+        diagnostics <- "Task HTML is a symbolic link." :: diagnostics
+    | Ok _ -> ()
     if stateExists then
         if (File.GetAttributes json).HasFlag(FileAttributes.ReparsePoint) then
             diagnostics <- "Task JSON is a symbolic link." :: diagnostics
@@ -106,6 +138,17 @@ let private summary (relativeDir: string) (folder: string) (id: string) =
                 | Ok obj ->
                     title <- getString obj "title" |> Option.defaultValue id
                     status <- getString obj "status" |> Option.defaultValue "open"
+                    owner <-
+                        match obj["owner"] with
+                        | :? JsonObject as ownerObj -> getString ownerObj "agent"
+                        | _ -> None
+                    dependencies <-
+                        match obj["dependencies"] with
+                        | :? JsonArray as values ->
+                            values |> Seq.choose (fun value ->
+                                if isNull value then None
+                                else try Some(value.GetValue<string>()) with _ -> None) |> Seq.toList
+                        | _ -> []
                 | Error err -> diagnostics <- err :: diagnostics
             with ex -> diagnostics <- ex.Message :: diagnostics
     { Id = id
@@ -114,6 +157,8 @@ let private summary (relativeDir: string) (folder: string) (id: string) =
       DescriptionPath = descriptionPath
       StatePath = statePath
       HasState = stateExists
+      Owner = owner
+      Dependencies = dependencies
       Revision = hash
       Diagnostics = List.rev diagnostics }
 
@@ -126,7 +171,9 @@ let listTasks (cmd: ListTasksCommand) =
             let names =
                 [ "*.html"; "*.json" ]
                 |> List.collect (fun pattern -> Directory.GetFiles(folder, pattern) |> Array.toList)
-                |> List.map (Path.GetFileNameWithoutExtension)
+                |> List.map (fun path ->
+                    let stem = Path.GetFileNameWithoutExtension path
+                    if Path.GetExtension path = ".html" then canonicalTaskId stem else stem)
                 |> List.distinct
                 |> List.sort
             return
@@ -135,8 +182,11 @@ let listTasks (cmd: ListTasksCommand) =
                     if validId id then summary relative folder id
                     else
                         { Id = id; Title = id; Status = "invalid"; DescriptionPath = ""; StatePath = ""
-                          HasState = false; Revision = None; Diagnostics = [ "Invalid task identifier." ] })
-                |> List.filter (fun item -> cmd.Status.IsNone || Some item.Status = cmd.Status)
+                          HasState = false; Owner = None; Dependencies = []; Revision = None; Diagnostics = [ "Invalid task identifier." ] })
+                |> List.filter (fun item ->
+                    (cmd.Status.IsNone || Some item.Status = cmd.Status)
+                    && (cmd.Owner.IsNone || item.Owner = cmd.Owner)
+                    && (cmd.DependsOn.IsNone || item.Dependencies |> List.contains cmd.DependsOn.Value))
     }
 
 let getTask (cmd: GetTaskCommand) =
@@ -146,16 +196,21 @@ let getTask (cmd: GetTaskCommand) =
         else
             let! (FolderPath root) = ProjectPaths.resolveProjectRoot cmd.ProjectName
             let! (relative, folder) = fun _ -> directory root
-            let html = Path.Combine(folder, cmd.TaskId + ".html")
-            let json = Path.Combine(folder, cmd.TaskId + ".json")
-            if not (File.Exists html || File.Exists json) then
+            let id = canonicalTaskId cmd.TaskId
+            let html = descriptionPath folder id
+            let json = Path.Combine(folder, id + ".json")
+            if html.IsError && not (File.Exists json) then
                 return! Client.NotFoundError "Task does not exist." |> Effect.ofError
-            elif (File.Exists html && (File.GetAttributes html).HasFlag(FileAttributes.ReparsePoint)) then
+            elif (match html with
+                  | Ok path -> (File.GetAttributes path).HasFlag(FileAttributes.ReparsePoint)
+                  | Error _ -> false) then
                 return! Client.PermissionDenied "Task description is a symbolic link." |> Effect.ofError
+            elif html.IsError && (descriptionCandidates folder id).Length > 1 then
+                return! Client.ValidationError "Multiple HTML descriptions share this task ID." |> Effect.ofError
             else
                 return
-                    { Task = summary relative folder cmd.TaskId
-                      Html = if File.Exists html then File.ReadAllText html else ""
+                    { Task = summary relative folder id
+                      Html = match html with Ok path -> File.ReadAllText path | Error _ -> ""
                       StateJson = if File.Exists json && not ((File.GetAttributes json).HasFlag(FileAttributes.ReparsePoint)) then Some(File.ReadAllText json) else None }
     }
 
@@ -231,10 +286,10 @@ let private readMutableState root taskId expectedRevision =
     | Ok(relative, folder) ->
         if not (validId taskId) then Error(Client.ValidationError "Invalid task identifier.")
         else
-            let html = Path.Combine(folder, taskId + ".html")
+            let htmlResult = descriptionPath folder taskId
             let path = Path.Combine(folder, taskId + ".json")
-            if not (File.Exists html) then Error(Client.NotFoundError "Task HTML description does not exist.")
-            elif hasLink folder || (File.GetAttributes html).HasFlag(FileAttributes.ReparsePoint) then
+            if htmlResult.IsError then Error(Client.NotFoundError "Task HTML description does not exist or is ambiguous.")
+            elif hasLink folder || (match htmlResult with Ok path -> (File.GetAttributes path).HasFlag(FileAttributes.ReparsePoint) | Error _ -> false) then
                 Error(Client.PermissionDenied "Task description path is unsafe.")
             elif File.Exists path && (File.GetAttributes path).HasFlag(FileAttributes.ReparsePoint) then
                 Error(Client.PermissionDenied "Task state path is unsafe.")
@@ -283,7 +338,18 @@ let createTask (cmd: CreateTaskCommand) =
             let! (relative, folder) = fun _ -> directory root
             let html = Path.Combine(folder, id + ".html")
             let json = Path.Combine(folder, id + ".json")
-            if File.Exists html || File.Exists json || hasLink folder then
+            let hasExistingHtml = File.Exists html
+            let canRecover =
+                hasExistingHtml
+                && not (File.Exists json)
+                && not ((File.GetAttributes html).HasFlag(FileAttributes.ReparsePoint))
+                && File.ReadAllText(html) = cmd.Html
+            let collision =
+                (descriptionCandidates folder id).Length > (if canRecover then 1 else 0)
+                || (hasExistingHtml && not canRecover)
+                || File.Exists json
+                || hasLink folder
+            if collision then
                 return! Client.ValidationError "Task already exists or its directory is unsafe." |> Effect.ofError
             else
                 let state = initialState id cmd.Title cmd.Dependencies
@@ -293,12 +359,12 @@ let createTask (cmd: CreateTaskCommand) =
                     fun _ ->
                         try
                             Directory.CreateDirectory folder |> ignore
-                            atomicWrite html cmd.Html
+                            if not canRecover then atomicWrite html cmd.Html
                             atomicWrite json (serialize state)
                             Ok()
                         with ex ->
                             if File.Exists json then File.Delete json
-                            if File.Exists html then File.Delete html
+                            if not canRecover && File.Exists html then File.Delete html
                             Error(Client.ExceptionError ex)
                 let! commit = commitScope cmd.ProjectName paths $"Create task {id}: {cmd.Title}"
                 let! details = getTask { ProjectName = cmd.ProjectName; TaskId = id }
@@ -319,6 +385,7 @@ let updateTask (cmd: UpdateTaskCommand) =
                 cmd.Status |> Option.iter (fun status -> obj["status"] <- JsonValue.Create(status))
                 cmd.Title |> Option.iter (fun title -> obj["title"] <- JsonValue.Create(title))
                 cmd.Dependencies |> Option.iter (fun deps -> obj["dependencies"] <- System.Text.Json.JsonSerializer.SerializeToNode(deps))
+                cmd.DescriptionCommit |> Option.iter (fun commit -> obj["descriptionCommit"] <- JsonValue.Create(commit))
                 Ok())
 
 let claimTask (cmd: ClaimTaskCommand) =
@@ -352,8 +419,10 @@ let checkpointTask (cmd: CheckpointTaskCommand) =
                 checkpoint["summary"] <- JsonValue.Create(cmd.Summary)
                 checkpoint["nextAction"] <- JsonValue.Create(cmd.NextAction)
                 checkpoint["verified"] <- System.Text.Json.JsonSerializer.SerializeToNode(cmd.Verified)
+                checkpoint["blocker"] <- cmd.Blocker |> Option.map JsonValue.Create |> Option.defaultValue null
                 checkpoint["lastCommit"] <- cmd.LastCommit |> Option.map JsonValue.Create |> Option.defaultValue null
                 obj["checkpoint"] <- checkpoint
+                cmd.DescriptionCommit |> Option.iter (fun commit -> obj["descriptionCommit"] <- JsonValue.Create(commit))
                 obj["status"] <- JsonValue.Create(cmd.Status)
                 Ok())
 
@@ -376,13 +445,46 @@ let getTaskHistory (cmd: GetTaskHistoryCommand) =
             let! (FolderPath root) = ProjectPaths.resolveProjectRoot cmd.ProjectName
             let! (relative, _) = fun _ -> directory root
             let limit = cmd.Limit |> Option.defaultValue 20 |> max 1 |> min 100
+            let! task = getTask { ProjectName = cmd.ProjectName; TaskId = cmd.TaskId }
             let! result =
                 git cmd.ProjectName
-                    [ "log"; $"-n{limit}"; "--format=%H%x09%s"; "--"
-                      relative + "/" + cmd.TaskId + ".html"
-                      relative + "/" + cmd.TaskId + ".json" ]
+                    [ "log"; $"-n{limit}"; "--format=%H%x09%s"; "--patch"; "--"
+                      task.Task.DescriptionPath
+                      task.Task.StatePath ]
             if result.ExitCode <> 0 || result.TimedOut then
                 return! Client.ValidationError "Cannot read task Git history." |> Effect.ofError
+            elif result.Truncated then
+                return result.StdOut + "
+[Git history output truncated]
+"
             else
                 return result.StdOut
     }
+
+type WorktreeTaskGroup =
+    { Worktree: Worktrees.WorktreeInfo
+      Tasks: TaskSummary list
+      Error: string option }
+
+let compareWorktreeTasks (cmd: CompareWorktreeTasksCommand) =
+    fun rt ->
+        let projectName =
+            let separator = cmd.ProjectName.IndexOf("::", StringComparison.Ordinal)
+            if separator >= 0 then cmd.ProjectName.Substring(0, separator)
+            else cmd.ProjectName
+        match Worktrees.listWorktrees { ProjectName = projectName } rt with
+        | Error error -> Error error
+        | Ok worktrees ->
+            worktrees
+            |> List.map (fun worktree ->
+                let selector =
+                    if worktree.IsMain then projectName
+                    else projectName + "::" + Path.GetFileName(worktree.Path)
+                match listTasks
+                    { ProjectName = selector
+                      Status = None
+                      Owner = None
+                      DependsOn = None } rt with
+                | Ok tasks -> { Worktree = worktree; Tasks = tasks; Error = None }
+                | Error error -> { Worktree = worktree; Tasks = []; Error = Some(string error) })
+            |> Ok

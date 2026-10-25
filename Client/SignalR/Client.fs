@@ -195,6 +195,7 @@ let private dispatch (rt: Runtime) (command: AgentCommand) =
     | RemoveWorktreeCommand cmd -> rt |> Worktrees.removeWorktree cmd |> serialize'
     | ListTasksCommand cmd -> rt |> TaskStore.listTasks cmd |> serialize'
     | GetTaskCommand cmd -> rt |> TaskStore.getTask cmd |> serialize'
+    | CompareWorktreeTasksCommand cmd -> rt |> TaskStore.compareWorktreeTasks cmd |> serialize'
     | CreateTaskCommand cmd -> rt |> TaskStore.createTask cmd |> serialize'
     | UpdateTaskCommand cmd -> rt |> TaskStore.updateTask cmd |> serialize'
     | ClaimTaskCommand cmd -> rt |> TaskStore.claimTask cmd |> serialize'
@@ -241,11 +242,11 @@ let private dispatch (rt: Runtime) (command: AgentCommand) =
         |> serialize'
     | RunCommandCommand cmd -> rt |> ClientShell.runCommand cmd |> serialize'
     | ListProjectTasksCommand cmd -> rt |> ClientShell.listProjectTasks cmd |> serialize'
-    | AttachWorkTaskCommand cmd -> rt |> ClientShell.attachWorkTask cmd |> serialize'
-    | GetWorkTaskCommand cmd -> rt |> ClientShell.getWorkTask cmd |> serialize'
-    | ListWorkTasksCommand cmd -> rt |> ClientShell.listWorkTasks cmd |> serialize'
-    | CheckpointWorkTaskCommand cmd -> rt |> ClientShell.checkpointWorkTask cmd |> serialize'
-    | CompleteWorkTaskCommand cmd -> rt |> ClientShell.completeWorkTask cmd |> serialize'
+    | AttachWorkTaskCommand cmd -> rt |> WorkTaskCompat.attachWorkTask cmd |> serialize'
+    | GetWorkTaskCommand cmd -> rt |> WorkTaskCompat.getWorkTask cmd |> serialize'
+    | ListWorkTasksCommand cmd -> rt |> WorkTaskCompat.listWorkTasks cmd |> serialize'
+    | CheckpointWorkTaskCommand cmd -> rt |> WorkTaskCompat.checkpointWorkTask cmd |> serialize'
+    | CompleteWorkTaskCommand cmd -> rt |> WorkTaskCompat.completeWorkTask cmd |> serialize'
     | RunProjectTaskCommand cmd ->
         rt
         |> ClientShell.resolveProjectTask cmd

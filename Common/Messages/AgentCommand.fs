@@ -80,8 +80,9 @@ type RemoveWorktreeCommand =
       TargetRef: string option }
 
 
-type ListTasksCommand = { ProjectName: string; Status: string option }
+type ListTasksCommand = { ProjectName: string; Status: string option; Owner: string option; DependsOn: string option }
 type GetTaskCommand = { ProjectName: string; TaskId: string }
+type CompareWorktreeTasksCommand = { ProjectName: string }
 type CreateTaskCommand =
     { ProjectName: string
       TaskId: string option
@@ -94,7 +95,8 @@ type UpdateTaskCommand =
       ExpectedRevision: string option
       Title: string option
       Status: string option
-      Dependencies: string list option }
+      Dependencies: string list option
+      DescriptionCommit: string option }
 type ClaimTaskCommand =
     { ProjectName: string
       TaskId: string
@@ -109,7 +111,9 @@ type CheckpointTaskCommand =
       Summary: string
       NextAction: string
       Verified: string list
-      LastCommit: string option }
+      Blocker: string option
+      LastCommit: string option
+      DescriptionCommit: string option }
 type CompleteTaskCommand =
     { ProjectName: string
       TaskId: string
@@ -517,6 +521,7 @@ type AgentCommand =
     | RemoveWorktreeCommand of RemoveWorktreeCommand
     | ListTasksCommand of ListTasksCommand
     | GetTaskCommand of GetTaskCommand
+    | CompareWorktreeTasksCommand of CompareWorktreeTasksCommand
     | CreateTaskCommand of CreateTaskCommand
     | UpdateTaskCommand of UpdateTaskCommand
     | ClaimTaskCommand of ClaimTaskCommand
@@ -567,6 +572,7 @@ module AgentCommandInfo =
         | RemoveWorktreeCommand _ -> "RemoveWorktreeCommand"
         | ListTasksCommand _ -> "ListTasksCommand"
         | GetTaskCommand _ -> "GetTaskCommand"
+        | CompareWorktreeTasksCommand _ -> "CompareWorktreeTasksCommand"
         | CreateTaskCommand _ -> "CreateTaskCommand"
         | UpdateTaskCommand _ -> "UpdateTaskCommand"
         | ClaimTaskCommand _ -> "ClaimTaskCommand"
@@ -623,6 +629,7 @@ module AgentCommandInfo =
         | RemoveWorktreeCommand _ -> "RemoveWorktree"
         | ListTasksCommand _ -> "ListTasks"
         | GetTaskCommand _ -> "GetTask"
+        | CompareWorktreeTasksCommand _ -> "CompareWorktreeTasks"
         | CreateTaskCommand _ -> "CreateTask"
         | UpdateTaskCommand _ -> "UpdateTask"
         | ClaimTaskCommand _ -> "ClaimTask"
@@ -677,6 +684,7 @@ module AgentCommandInfo =
         | RemoveWorktreeCommand cmd -> Some cmd.ProjectName
         | ListTasksCommand cmd -> Some cmd.ProjectName
         | GetTaskCommand cmd -> Some cmd.ProjectName
+        | CompareWorktreeTasksCommand cmd -> Some cmd.ProjectName
         | CreateTaskCommand cmd -> Some cmd.ProjectName
         | UpdateTaskCommand cmd -> Some cmd.ProjectName
         | ClaimTaskCommand cmd -> Some cmd.ProjectName
@@ -790,7 +798,7 @@ module AgentCommandInfo =
         | ListCommandsCommand
         | ListProjectsCommand
         | ListWorktreesCommand _
-        | InspectWorktreeRemovalCommand _
+        | CompareWorktreeTasksCommand _
         | GetProjectDetailsCommand _
         | ListProjectTasksCommand _
         | GetGitStatusCommand _
@@ -840,7 +848,7 @@ module AgentCommandInfo =
         | ListCommandsCommand
         | ListProjectsCommand
         | ListWorktreesCommand _
-        | InspectWorktreeRemovalCommand _
+        | CompareWorktreeTasksCommand _
         | GetProjectDetailsCommand _
         | ListProjectTasksCommand _
         | GetGitStatusCommand _
@@ -908,6 +916,7 @@ module AgentProtocol =
           definition "CreateWorktree" "Creates an isolated Git worktree and branch." [ VersionControlWrite ] true true false
           definition "InspectWorktreeRemoval" "Checks registered worktree removal safety." [ ReadOnly ] false false false
           definition "ListTasks" "Lists repository-backed HTML and JSON task files." [ ReadOnly ] false false false
+          definition "CompareWorktreeTasks" "Summarizes task files across every registered worktree." [ ReadOnly ] false false false
           definition "GetTask" "Reads HTML task definition and adjacent JSON state." [ ReadOnly ] false false false
           definition "CreateTask" "Creates and commits HTML and JSON task files." [ WorkspaceWrite; VersionControlWrite ] true true false
           definition "UpdateTask" "Updates structured task metadata with a task-only commit." [ WorkspaceWrite; VersionControlWrite ] true true false

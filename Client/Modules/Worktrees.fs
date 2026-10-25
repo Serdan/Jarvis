@@ -12,12 +12,14 @@ open Kehlet.FSharp.IO.Effect.Operators
 
 type WorktreeInfo =
     { Path: string
+      MainPath: string
       Head: string
       Branch: string option
       IsMain: bool
       IsDetached: bool
       IsLocked: bool
-      IsPrunable: bool }
+      IsPrunable: bool
+      IsClean: bool option }
 
 let private git projectName args =
     ClientShell.runCommand
@@ -48,12 +50,14 @@ let parsePorcelain (mainPath: string) (output: string) : Result<WorktreeInfo lis
                 let path = Path.GetFullPath(path).TrimEnd(Path.DirectorySeparatorChar)
                 Ok
                     { Path = path
+                      MainPath = mainPath
                       Head = head
                       Branch = value "branch " |> Option.map (fun s -> s.Replace("refs/heads/", ""))
                       IsMain = String.Equals(path, mainPath, (if OperatingSystem.IsWindows() then StringComparison.OrdinalIgnoreCase else StringComparison.Ordinal))
                       IsDetached = Array.contains "detached" lines
                       IsLocked = lines |> Array.exists (fun line -> line = "locked" || line.StartsWith("locked ", StringComparison.Ordinal))
-                      IsPrunable = lines |> Array.exists (fun line -> line = "prunable" || line.StartsWith("prunable ", StringComparison.Ordinal)) }
+                      IsPrunable = lines |> Array.exists (fun line -> line = "prunable" || line.StartsWith("prunable ", StringComparison.Ordinal))
+                      IsClean = None }
             with ex -> Error($"Invalid Git worktree path: {ex.Message}")
         | _ -> Error "Malformed git worktree --porcelain record."
     entries
@@ -80,7 +84,17 @@ let listWorktrees (cmd: ListWorktreesCommand) =
                 | None -> Client.ValidationError "Git did not return a main worktree." |> Effect.ofError
                 | Some mainPath ->
                     match parsePorcelain mainPath result.StdOut with
-                    | Ok items -> fun _ -> Ok items
+                    | Ok items ->
+                        fun rt ->
+                            items
+                            |> List.map (fun item ->
+                                if not (Directory.Exists item.Path) then item
+                                else
+                                    match git cmd.ProjectName [ "-C"; item.Path; "status"; "--porcelain" ] rt with
+                                    | Ok status when status.ExitCode = 0 && not status.TimedOut && not status.Truncated ->
+                                        { item with IsClean = Some(String.IsNullOrWhiteSpace status.StdOut) }
+                                    | _ -> item)
+                            |> Ok
                     | Error message -> Client.ValidationError message |> Effect.ofError
     }
 
@@ -156,7 +170,11 @@ let inspectRemoval (cmd: InspectWorktreeRemovalCommand) =
                 }
         let! status = git cmd.ProjectName [ "-C"; entry.Path; "status"; "--porcelain" ]
         let! integrated = git cmd.ProjectName [ "merge-base"; "--is-ancestor"; entry.Head; target ]
-        let! jobs = JobManager.listJobs { ProjectName = Some cmd.ProjectName; IncludeCompleted = false }
+        let! allJobs = JobManager.listJobs { ProjectName = None; IncludeCompleted = false }
+        let jobs =
+            allJobs.Jobs |> List.filter (fun job ->
+                job.ProjectName = cmd.ProjectName
+                || job.ProjectName.StartsWith(cmd.ProjectName + "::", StringComparison.Ordinal))
         let isClean = status.ExitCode = 0 && not status.TimedOut && not status.Truncated && String.IsNullOrWhiteSpace status.StdOut
         let isIntegrated = not (String.IsNullOrWhiteSpace target) && integrated.ExitCode = 0 && not integrated.TimedOut
         let reasons =
@@ -165,13 +183,13 @@ let inspectRemoval (cmd: InspectWorktreeRemovalCommand) =
               if entry.IsPrunable then "Worktree registration is prunable"
               if not isClean then "Worktree has changes or cannot be inspected"
               if not isIntegrated then "HEAD is not verified integrated into target"
-              if not jobs.Jobs.IsEmpty then "Jarvis project has active jobs" ]
+              if not jobs.IsEmpty then "Jarvis project has active jobs" ]
         return
             { Worktree = entry
               TargetRef = target
               IsClean = isClean
               IsIntegrated = isIntegrated
-              RunningJobCount = jobs.Jobs.Length
+              RunningJobCount = jobs.Length
               CanRemove = reasons.IsEmpty
               Reasons = reasons }
     }

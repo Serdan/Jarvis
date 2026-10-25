@@ -113,6 +113,7 @@ let private requiresConfirmation command =
     | InspectWorktreeRemovalCommand _
     | ListTasksCommand _
     | GetTaskCommand _
+    | CompareWorktreeTasksCommand _
     | GetTaskHistoryCommand _
     | GetProjectDetailsCommand _
     | ListDirectoryCommand _

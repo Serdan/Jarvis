@@ -185,3 +185,31 @@ let ``unmerged unique worktree commit prevents safe removal`` () =
         match removeWorktree { ProjectName = "Project1"; WorktreePath = created.Path; TargetRef = None } context with
         | Error _ -> Directory.Exists created.Path |> shouldEqual true
         | Ok _ -> Assert.Fail("Unmerged branch was removed."))
+
+[<Test>]
+let ``active job in a selected worktree blocks safe removal`` () =
+    if OperatingSystem.IsWindows() then
+        Assert.Ignore("Uses the POSIX sleep executable.")
+    else
+        withRepo (fun _ _ context ->
+            let created =
+                match createWorktree
+                    { ProjectName = "Project1"; Name = "running-job"
+                      Branch = "feature/running-job"; BaseRef = "HEAD" } context with
+                | Ok item -> item
+                | Error e -> failwith $"Create failed: {e}"
+            let id =
+                match Client.JobManager.startJob
+                    { ProjectName = "Project1::running-job"
+                      Executable = "sleep"; Args = [ "30" ]; Reason = Some "Test active worktree job"
+                      WorkingDirectory = None; MaxOutputBytes = Some 1024 } context with
+                | Ok started -> started.JobId
+                | Error e -> failwith $"StartJob failed: {e}"
+            try
+                match inspectRemoval { ProjectName = "Project1"; WorktreePath = created.Path; TargetRef = None } context with
+                | Ok inspection ->
+                    inspection.CanRemove |> shouldEqual false
+                    inspection.RunningJobCount |> shouldEqual 1
+                | Error e -> Assert.Fail($"Inspection failed: {e}")
+            finally
+                Client.JobManager.cancelJob { JobId = id } context |> ignore)

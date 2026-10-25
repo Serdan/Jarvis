@@ -268,6 +268,16 @@ let private ensureUnstaged projectName (paths: string list) =
         else return ()
     }
 
+let private ensureUnmodifiedTaskPath projectName path =
+    effect {
+        let! result = git projectName [ "status"; "--porcelain"; "--"; path ]
+        if result.ExitCode <> 0 || result.TimedOut || result.Truncated then
+            return! Client.ValidationError "Cannot verify task file cleanliness." |> Effect.ofError
+        elif not (String.IsNullOrWhiteSpace result.StdOut) then
+            return! Client.ValidationError "Task JSON has existing uncommitted changes; commit or reconcile them before updating." |> Effect.ofError
+        else return ()
+    }
+
 let private commitScope projectName (paths: string list) message =
     effect {
         do! ensureUnstaged projectName paths
@@ -312,7 +322,7 @@ let private updateState projectName taskId expectedRevision message mutate =
         let! (FolderPath root) = ProjectPaths.resolveProjectRoot projectName
         let! (relative, folder, statePath, obj) = fun _ -> readMutableState root taskId expectedRevision
         let path = relative + "/" + taskId + ".json"
-        do! ensureUnstaged projectName [ path ]
+        do! ensureUnmodifiedTaskPath projectName path
         let! () = fun _ -> mutate obj
         obj["updatedAt"] <- JsonValue.Create(DateTimeOffset.UtcNow.ToString("O"))
         let! () =

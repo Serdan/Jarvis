@@ -1,6 +1,6 @@
 # Git worktrees and repository task files
 
-Jarvis uses the local Git repository to manage worktrees and task state. All operations run on the authenticated client and use the normal local permission policy. The server routes native MCP commands.
+Jarvis uses the local Git repository to manage worktrees and task state. These commands are introduced with agent protocol 3.14. All operations run on the authenticated client and use the normal local permission policy. The server routes native MCP commands.
 
 ## Worktrees
 
@@ -61,7 +61,7 @@ A typical JSON state:
 
 Use `ListTasks` and `GetTask` to inspect HTML and JSON, including revision hashes and diagnostics. `ListTasks` filters by status, owner and dependency. `CompareWorktreeTasks` summarizes the task records in all Git-registered worktrees, preserving branch-local statuses and returning per-worktree diagnostics when a checkout cannot be read. `CreateTask` creates and commits the HTML+JSON pair, and can resume an interrupted write when only an identical HTML description was saved. `UpdateTask` (including optional JSON-encoded dependency changes), `ClaimTask`, `CheckpointTask` and `CompleteTask` validate, write and commit JSON state. The status vocabulary is `open`, `active`, `blocked`, `completed`. Completion preserves task state and its Git history; `GetTaskHistory` returns bounded relevant commits and patches for both the original HTML description and JSON state.
 
-Mutations preserve unknown JSON fields and use optimistic `expectedRevision` checking where provided. Claims reject another owner until explicitly reassigned. Jarvis serializes task mutations for a selected worktree within one local client, stages only the task's paths, and rejects preexisting staged edits to those paths. Each successful mutation returns the Git commit hash. The commit is local to the selected branch and subject to the client's version-control permissions; task changes become visible on main when integrated through Git.
+Mutations reject pre-existing staged or unstaged task JSON edits, preserve unknown JSON fields and use optimistic `expectedRevision` checking where provided. Claims reject another owner until explicitly reassigned. Jarvis serializes task mutations for a selected worktree within one local client, stages only the task's paths, and rejects preexisting staged edits to those paths. Each successful mutation returns the Git commit hash. The commit is local to the selected branch and subject to the client's version-control permissions; task changes become visible on main when integrated through Git.
 
 ## Existing checkpoint API
 

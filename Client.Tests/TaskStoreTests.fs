@@ -314,3 +314,23 @@ let ``cross-worktree task view includes branch-local tasks absent from main`` ()
                 |> List.collect (fun group -> group.Tasks |> List.map (fun task -> task.Id))
                 |> Set.ofList
             ids |> shouldEqual (set [ "agent-a"; "agent-b" ]))
+
+[<Test>]
+let ``task update refuses and preserves unstaged JSON edits`` () =
+    withProject (fun _ project context ->
+        match createTask
+            { ProjectName = "Project1"; TaskId = Some "unstaged"; Title = "Original"
+              Html = "<h1>Unstaged</h1>"; Dependencies = [] } context with
+        | Error e -> Assert.Fail($"Create failed: {e}")
+        | Ok created ->
+            let json = Path.Combine(project, "docs", "tasks", "unstaged.json")
+            let original = File.ReadAllText(json)
+            let manual = original.Replace("open", "blocked")
+            File.WriteAllText(json, manual)
+            let command =
+                { ProjectName = "Project1"; TaskId = "unstaged"
+                  ExpectedRevision = None; Title = Some "Agent update"
+                  Status = Some "active"; Dependencies = None; DescriptionCommit = None }
+            match updateTask command context with
+            | Error _ -> File.ReadAllText(json) |> shouldEqual manual
+            | Ok _ -> Assert.Fail("Task update overwrote unstaged JSON."))

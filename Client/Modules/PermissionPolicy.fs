@@ -108,6 +108,8 @@ let private requiresConfirmation command =
     match command with
     | ListCommandsCommand
     | ListProjectsCommand
+    | ListWorktreesCommand _
+    | GetWorktreeCommand _
     | GetProjectDetailsCommand _
     | ListDirectoryCommand _
     | SearchFilesCommand _
@@ -144,6 +146,8 @@ let private requiresConfirmation command =
         confirmation "RunCommand" (Some cmd.ProjectName) [ ProcessExecution ] [] (Some cmd.Executable) cmd.Args $"Run {cmd.Executable}" true
     | RunProjectTaskCommand cmd ->
         confirmation "RunProjectTask" (Some cmd.ProjectName) [ ProcessExecution ] [] None [ cmd.TaskName ] $"Run project task {cmd.TaskName}" false
+    | CreateWorktreeCommand cmd ->
+        confirmation "CreateWorktree" (Some cmd.ProjectName) [ VersionControlWrite ] [] (Some "git") [ cmd.Branch; cmd.Name ] $"Create worktree {cmd.Name}" true
     | GitCommitCommand cmd ->
         confirmation "GitCommit" (Some cmd.ProjectName) [ VersionControlWrite ] cmd.Paths (Some "git") [ cmd.Message ] $"Commit {cmd.Paths.Length} path(s)" true
     | StartJobCommand cmd ->

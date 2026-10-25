@@ -63,6 +63,14 @@ type ListCommandsResult =
 
 type ListProjectsCommand = struct end
 
+type ListWorktreesCommand = { ProjectName: string }
+type GetWorktreeCommand = { ProjectName: string; WorktreePath: string }
+type CreateWorktreeCommand =
+    { ProjectName: string
+      Name: string
+      Branch: string
+      BaseRef: string }
+
 type GetProjectDetailsCommand = { ProjectName: string }
 
 type ListDirectoryCommand =
@@ -450,6 +458,9 @@ type AgentCommandResponse =
 type AgentCommand =
     | ListCommandsCommand
     | ListProjectsCommand
+    | ListWorktreesCommand of ListWorktreesCommand
+    | GetWorktreeCommand of GetWorktreeCommand
+    | CreateWorktreeCommand of CreateWorktreeCommand
     | GetProjectDetailsCommand of GetProjectDetailsCommand
     | ListDirectoryCommand of ListDirectoryCommand
     | SearchFilesCommand of SearchFilesCommand
@@ -487,6 +498,9 @@ module AgentCommandInfo =
     let name = function
         | ListCommandsCommand -> "ListCommandsCommand"
         | ListProjectsCommand -> "ListProjectsCommand"
+        | ListWorktreesCommand _ -> "ListWorktreesCommand"
+        | GetWorktreeCommand _ -> "GetWorktreeCommand"
+        | CreateWorktreeCommand _ -> "CreateWorktreeCommand"
         | GetProjectDetailsCommand _ -> "GetProjectDetailsCommand"
         | ListDirectoryCommand _ -> "ListDirectoryCommand"
         | SearchFilesCommand _ -> "SearchFilesCommand"
@@ -530,6 +544,9 @@ module AgentCommandInfo =
     let displayName = function
         | ListCommandsCommand -> "ListCommands"
         | ListProjectsCommand -> "ListProjects"
+        | ListWorktreesCommand _ -> "ListWorktrees"
+        | GetWorktreeCommand _ -> "GetWorktree"
+        | CreateWorktreeCommand _ -> "CreateWorktree"
         | GetProjectDetailsCommand _ -> "GetProjectDetails"
         | ListDirectoryCommand _ -> "ListDirectory"
         | SearchFilesCommand _ -> "SearchFiles"
@@ -571,6 +588,9 @@ module AgentCommandInfo =
         | UpdateClientCommand -> None
         | MessageCommand cmd -> cmd.ProjectName
         | GetClientActivityCommand cmd -> cmd.ProjectName
+        | ListWorktreesCommand cmd -> Some cmd.ProjectName
+        | GetWorktreeCommand cmd -> Some cmd.ProjectName
+        | CreateWorktreeCommand cmd -> Some cmd.ProjectName
         | GetProjectDetailsCommand cmd -> Some cmd.ProjectName
         | ListDirectoryCommand cmd -> Some cmd.ProjectName
         | SearchFilesCommand cmd -> Some cmd.ProjectName
@@ -656,6 +676,8 @@ module AgentCommandInfo =
         | GetSkillCommand cmd -> Some(compact cmd.SkillName)
         | CreateSkillCommand cmd -> Some(compact cmd.SkillName)
         | ListSkillsCommand _ -> None
+        | GetWorktreeCommand cmd -> Some(compact cmd.WorktreePath)
+        | CreateWorktreeCommand cmd -> Some(compact cmd.Name)
         | GetGitDiffCommand cmd -> cmd.Path |> Option.map compact
         | GitCommitCommand cmd -> Some(compact cmd.Message)
         | StartJobCommand cmd -> Some(fullCommand cmd.Executable cmd.Args)
@@ -665,6 +687,7 @@ module AgentCommandInfo =
         | GetClientActivityCommand _ -> None
         | ListCommandsCommand
         | ListProjectsCommand
+        | ListWorktreesCommand _
         | GetProjectDetailsCommand _
         | ListProjectTasksCommand _
         | GetGitStatusCommand _
@@ -692,6 +715,8 @@ module AgentCommandInfo =
         | GetSkillCommand cmd -> Some(truncate 48 cmd.SkillName)
         | CreateSkillCommand cmd -> Some(truncate 48 cmd.SkillName)
         | ListSkillsCommand _ -> None
+        | GetWorktreeCommand cmd -> Some(truncate 64 cmd.WorktreePath)
+        | CreateWorktreeCommand cmd -> Some(truncate 64 cmd.Name)
         | GetGitDiffCommand cmd -> cmd.Path |> Option.map (truncate 64)
         | GitCommitCommand cmd -> Some(quoted cmd.Message)
         | StartJobCommand cmd -> Some(commandPreview cmd.Executable cmd.Args)
@@ -701,6 +726,7 @@ module AgentCommandInfo =
         | GetClientActivityCommand _ -> None
         | ListCommandsCommand
         | ListProjectsCommand
+        | ListWorktreesCommand _
         | GetProjectDetailsCommand _
         | ListProjectTasksCommand _
         | GetGitStatusCommand _
@@ -763,6 +789,9 @@ module AgentProtocol =
     let commandDefinitions =
         [ definition "ListCommands" "Lists supported Jarvis commands." [ ReadOnly ] false false false
           definition "ListProjects" "Lists configured projects." [ ReadOnly ] false false false
+          definition "ListWorktrees" "Lists Git worktrees registered for a project." [ ReadOnly ] false false false
+          definition "GetWorktree" "Inspects a registered Git worktree." [ ReadOnly ] false false false
+          definition "CreateWorktree" "Creates an isolated Git worktree and branch." [ VersionControlWrite ] true true false
           definition "GetProjectDetails" "Reads project summary details and special files." [ ReadOnly ] false false false
           definition "ListDirectory" "Lists files and folders in a project directory." [ ReadOnly ] false false false
           definition "SearchFiles" "Searches project file names." [ ReadOnly ] false false false

@@ -75,6 +75,7 @@ let private auditDetails command =
     | RunCommandCommand cmd -> Some("RunCommand", Some cmd.ProjectName, [ ProcessExecution ], [], Some cmd.Executable, cmd.Args)
     | RunProjectTaskCommand cmd -> Some("RunProjectTask", Some cmd.ProjectName, [ ProcessExecution ], [], None, [ cmd.TaskName ])
     | CreateSkillCommand cmd -> Some("CreateSkill", Some cmd.ProjectName, [ WorkspaceWrite ], [ $".jarvis/skills/{cmd.SkillName}/SKILL.md" ], None, [])
+    | CreateWorktreeCommand cmd -> Some("CreateWorktree", Some cmd.ProjectName, [ VersionControlWrite ], [], Some "git", [ cmd.Branch; cmd.Name ])
     | GitCommitCommand cmd -> Some("GitCommit", Some cmd.ProjectName, [ VersionControlWrite ], cmd.Paths, Some "git", [ cmd.Message ])
     | StartJobCommand cmd -> Some("StartJob", Some cmd.ProjectName, [ ProcessExecution ], [], Some cmd.Executable, cmd.Args)
     | CancelJobCommand cmd -> Some("CancelJob", None, [ ProcessExecution ], [], None, [ cmd.JobId ])
@@ -181,6 +182,9 @@ let private importFile (cmd: ImportFileCommand) (rt: Runtime) =
 let private dispatch (rt: Runtime) (command: AgentCommand) =
     match command with
     | ListCommandsCommand -> rt |> ProjectBrowser.listCommands |> serialize'
+    | ListWorktreesCommand cmd -> rt |> Worktrees.listWorktrees cmd |> serialize'
+    | GetWorktreeCommand cmd -> rt |> Worktrees.getWorktree cmd |> serialize'
+    | CreateWorktreeCommand cmd -> rt |> Worktrees.createWorktree cmd |> serialize'
     | ListProjectsCommand ->
         rt
         |> ProjectBrowser.listProjects

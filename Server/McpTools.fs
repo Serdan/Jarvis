@@ -248,6 +248,8 @@ module McpToolHelpers =
         match command with
         | ListCommandsCommand
         | ListProjectsCommand
+        | ListWorktreesCommand _
+        | GetWorktreeCommand _
         | GetProjectDetailsCommand _
         | ListDirectoryCommand _
         | SearchFilesCommand _
@@ -279,7 +281,8 @@ module McpToolHelpers =
         | RunProjectTaskCommand _
         | StartJobCommand _
         | CancelJobCommand _ -> Auth.ProcessExecute
-        | GitCommitCommand _ -> Auth.GitWrite
+        | GitCommitCommand _
+        | CreateWorktreeCommand _ -> Auth.GitWrite
 
     let private oauthErrorResult (context: HttpContext) errorCode description scope =
         let response = errorResult (PermissionDenied description)
@@ -889,6 +892,18 @@ type JarvisMcpTools =
     [<McpServerTool(Title = "List projects", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("List projects exposed by the connected Jarvis client.")>]
     static member ListProjects([<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http ListProjectsCommand
+
+    [<McpServerTool(Title = "List worktrees", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Discover all registered Git worktrees for a project, regardless of directory layout.")>]
+    static member ListWorktrees(projectName: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http (ListWorktreesCommand { ProjectName = projectName })
+
+    [<McpServerTool(Title = "Get worktree", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Inspect an existing Git-registered project worktree.")>]
+    static member GetWorktree(projectName: string, worktreePath: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http (GetWorktreeCommand { ProjectName = projectName; WorktreePath = worktreePath })
+
+    [<McpServerTool(Title = "Create worktree", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Create a new branch and a Git worktree in a hidden sibling project container. Requires local version-control approval.")>]
+    static member CreateWorktree(projectName: string, name: string, branch: string, baseRef: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http (CreateWorktreeCommand { ProjectName = projectName; Name = name; Branch = branch; BaseRef = baseRef })
 
     [<McpServerTool(Title = "Get project details", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Get project details, README, notes, TODO, and related special files.")>]
     static member GetProjectDetails(projectName: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =

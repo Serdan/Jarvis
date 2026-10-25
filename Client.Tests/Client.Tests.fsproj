@@ -28,6 +28,7 @@
         <Compile Include="JobViewTests.fs"/>
         <Compile Include="JobManagerTests.fs"/>
         <Compile Include="GitCommandTests.fs"/>
+        <Compile Include="WorktreeTests.fs"/>
         <Compile Include="WorkTaskTests.fs"/>
         <Compile Include="HashAndPatchTests.fs"/>
         <Compile Include="PathSafetyTests.fs"/>

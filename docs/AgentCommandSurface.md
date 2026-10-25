@@ -381,15 +381,13 @@ type RunProjectTaskCommand =
 
 For authorization, Jarvis resolves the task before prompting and authorizes the resolved executable and arguments. The same resolved definition is then executed, so editing `.jarvis.json` after a session grant was created cannot silently change what an already-approved exact command means.
 
-## Persisted Work Tasks
+## Git Worktrees and Repository Task State
 
-`AttachWorkTask(projectName, taskId, taskPath)` attaches transient execution state to a task description that is already tracked, committed, and clean in git. State lives in `.jarvis/tasks/<taskId>.json`, while the referenced repository file remains authoritative. The task's commit is captured when attached.
+`ListWorktrees`, `GetWorktree`, `CreateWorktree`, `InspectWorktreeRemoval` and `RemoveWorktree` operate on Git-registered checkouts. Worktree selection for existing project-scoped commands uses `projectName="<MainProject>::<worktree-directory-name>"`. `ListProjects` shows top-level main projects; sibling linked checkouts are discovered through Git.
 
-`GetWorkTask` returns the checkpoint plus the current committed task content, current task commit, dirty state, and whether the committed description changed since attachment. `ListWorkTasks` lists all unfinished states without embedding every task body. `CheckpointWorkTask` updates the `active` or `blocked` checkpoint, summary, next action, verification notes, blocker, and optional last implementation commit.
+`ListTasks` and `GetTask` expose HTML task descriptions and adjacent structured JSON state in the selected worktree. `CompareWorktreeTasks` gives a read-only view across registered worktrees. `CreateTask`, `UpdateTask`, `ClaimTask`, `CheckpointTask` and `CompleteTask` manage state and create scoped commits; `GetTaskHistory` reads bounded Git history and patches. Workspace reads require `workspace:read`, while task and worktree Git mutations require `git:write` plus local permission/trust approval.
 
-Recovery should combine persisted work-task state with `GetClientActivity`, not choose between them. Work-task state provides durable intent and the explicit handoff point; activity provides the recent execution trail and can reveal attempts or interruptions that have not yet been checkpointed. Agents should reconcile both, then verify current files, git state, and jobs before resuming.
-
-`CompleteWorkTask` returns the final repository HEAD and removes the local state file. Jarvis locally excludes `/.jarvis/tasks/` through `.git/info/exclude`; completion does not delete or modify the committed task description.
+Existing `AttachWorkTask`, `GetWorkTask`, `ListWorkTasks`, `CheckpointWorkTask` and `CompleteWorkTask` commands operate on canonical HTML tasks through Git-backed JSON. Earlier local checkpoint records migrate on the next update; non-HTML task checkpoints retain their original local persistence until converted. See [Git-backed task operations](GitBackedTasks.md).
 
 ## Project Skills
 

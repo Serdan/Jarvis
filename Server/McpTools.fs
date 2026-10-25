@@ -248,6 +248,13 @@ module McpToolHelpers =
         match command with
         | ListCommandsCommand
         | ListProjectsCommand
+        | ListWorktreesCommand _
+        | GetWorktreeCommand _
+        | InspectWorktreeRemovalCommand _
+        | ListTasksCommand _
+        | GetTaskCommand _
+        | CompareWorktreeTasksCommand _
+        | GetTaskHistoryCommand _
         | GetProjectDetailsCommand _
         | ListDirectoryCommand _
         | SearchFilesCommand _
@@ -279,7 +286,14 @@ module McpToolHelpers =
         | RunProjectTaskCommand _
         | StartJobCommand _
         | CancelJobCommand _ -> Auth.ProcessExecute
-        | GitCommitCommand _ -> Auth.GitWrite
+        | GitCommitCommand _
+        | CreateWorktreeCommand _
+        | RemoveWorktreeCommand _
+        | CreateTaskCommand _
+        | UpdateTaskCommand _
+        | ClaimTaskCommand _
+        | CheckpointTaskCommand _
+        | CompleteTaskCommand _ -> Auth.GitWrite
 
     let private oauthErrorResult (context: HttpContext) errorCode description scope =
         let response = errorResult (PermissionDenied description)
@@ -889,6 +903,65 @@ type JarvisMcpTools =
     [<McpServerTool(Title = "List projects", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("List projects exposed by the connected Jarvis client.")>]
     static member ListProjects([<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http ListProjectsCommand
+
+    [<McpServerTool(Title = "List worktrees", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Discover all registered Git worktrees for a project, regardless of directory layout.")>]
+    static member ListWorktrees(projectName: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http (ListWorktreesCommand { ProjectName = projectName })
+
+    [<McpServerTool(Title = "Get worktree", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Inspect an existing Git-registered project worktree.")>]
+    static member GetWorktree(projectName: string, worktreePath: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http (GetWorktreeCommand { ProjectName = projectName; WorktreePath = worktreePath })
+
+    [<McpServerTool(Title = "Create worktree", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Create a new branch and a Git worktree in a hidden sibling project container. Requires local version-control approval.")>]
+    static member CreateWorktree(projectName: string, name: string, branch: string, baseRef: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http (CreateWorktreeCommand { ProjectName = projectName; Name = name; Branch = branch; BaseRef = baseRef })
+
+    [<McpServerTool(Title = "Inspect worktree removal", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Inspect cleanliness, lock state and integration before removing a worktree.")>]
+    static member InspectWorktreeRemoval(projectName: string, worktreePath: string, [<Optional; DefaultParameterValue("")>] targetRef: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http (InspectWorktreeRemovalCommand { ProjectName = projectName; WorktreePath = worktreePath; TargetRef = McpToolHelpers.optionOfString targetRef })
+
+    [<McpServerTool(Title = "Remove worktree", ReadOnly = false, Destructive = true, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Safely remove a clean, integrated and unlocked linked worktree. Requires local approval.")>]
+    static member RemoveWorktree(projectName: string, worktreePath: string, [<Optional; DefaultParameterValue("")>] targetRef: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http (RemoveWorktreeCommand { ProjectName = projectName; WorktreePath = worktreePath; TargetRef = McpToolHelpers.optionOfString targetRef })
+
+    [<McpServerTool(Title = "List task files", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("List repository-local HTML tasks and their JSON state, optionally filtered by status.")>]
+    static member ListTasks(projectName: string, [<Optional; DefaultParameterValue("")>] status: string, [<Optional; DefaultParameterValue("")>] owner: string, [<Optional; DefaultParameterValue("")>] dependsOn: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http (ListTasksCommand { ProjectName = projectName; Status = McpToolHelpers.optionOfString status; Owner = McpToolHelpers.optionOfString owner; DependsOn = McpToolHelpers.optionOfString dependsOn })
+
+    [<McpServerTool(Title = "Get task file", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read the HTML description, JSON state and revision of a project task.")>]
+    static member GetTask(projectName: string, taskId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http (GetTaskCommand { ProjectName = projectName; TaskId = taskId })
+
+    [<McpServerTool(Title = "Create task", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Create and commit a human-readable HTML task with adjacent JSON state. Task ID may be empty for automatic generation.")>]
+    static member CreateTask(projectName: string, taskId: string, title: string, html: string, dependencies: string array, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http (CreateTaskCommand { ProjectName = projectName; TaskId = McpToolHelpers.optionOfString taskId; Title = title; Html = html; Dependencies = dependencies |> Array.toList })
+
+    [<McpServerTool(Title = "Update task", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Update task title or status with a revision check and Git commit.")>]
+    static member UpdateTask(projectName: string, taskId: string, expectedRevision: string, title: string, status: string, [<Optional; DefaultParameterValue("")>] dependenciesJson: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        let deps =
+            if String.IsNullOrWhiteSpace dependenciesJson then None
+            else Some(System.Text.Json.JsonSerializer.Deserialize<string array>(dependenciesJson) |> Array.toList)
+        McpToolHelpers.send client http (UpdateTaskCommand { ProjectName = projectName; TaskId = taskId; ExpectedRevision = McpToolHelpers.optionOfString expectedRevision; Title = McpToolHelpers.optionOfString title; Status = McpToolHelpers.optionOfString status; Dependencies = deps; DescriptionCommit = None })
+
+    [<McpServerTool(Title = "Claim task", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Assign a task to one agent, with explicit reassignment and optimistic revision checking.")>]
+    static member ClaimTask(projectName: string, taskId: string, owner: string, allowReassign: bool, [<Optional; DefaultParameterValue("")>] expectedRevision: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http (ClaimTaskCommand { ProjectName = projectName; TaskId = taskId; Owner = owner; AllowReassign = allowReassign; ExpectedRevision = McpToolHelpers.optionOfString expectedRevision })
+
+    [<McpServerTool(Title = "Checkpoint task", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Persist and commit task progress, next action and verification evidence.")>]
+    static member CheckpointTask(projectName: string, taskId: string, status: string, summary: string, nextAction: string, verified: string array, [<Optional; DefaultParameterValue("")>] lastCommit: string, [<Optional; DefaultParameterValue("")>] expectedRevision: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http (CheckpointTaskCommand { ProjectName = projectName; TaskId = taskId; Status = status; Summary = summary; NextAction = nextAction; Verified = verified |> Array.toList; Blocker = None; LastCommit = McpToolHelpers.optionOfString lastCommit; DescriptionCommit = None; ExpectedRevision = McpToolHelpers.optionOfString expectedRevision })
+
+    [<McpServerTool(Title = "Complete task", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Mark task completed, retain its state and commit verification details.")>]
+    static member CompleteTask(projectName: string, taskId: string, verified: string array, [<Optional; DefaultParameterValue("")>] finalCommit: string, [<Optional; DefaultParameterValue("")>] expectedRevision: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http (CompleteTaskCommand { ProjectName = projectName; TaskId = taskId; Verified = verified |> Array.toList; FinalCommit = McpToolHelpers.optionOfString finalCommit; ExpectedRevision = McpToolHelpers.optionOfString expectedRevision })
+
+    [<McpServerTool(Title = "Get task history", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read Git commit history for one repository-backed task.")>]
+    static member GetTaskHistory(projectName: string, taskId: string, [<Optional; DefaultParameterValue(20)>] limit: int, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http (GetTaskHistoryCommand { ProjectName = projectName; TaskId = taskId; Limit = Some limit })
+
+    [<McpServerTool(Title = "Compare worktree tasks", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read task statuses across all Git-registered worktrees of a project, including branch-local tasks.")>]
+    static member CompareWorktreeTasks(projectName: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http (CompareWorktreeTasksCommand { ProjectName = projectName })
 
     [<McpServerTool(Title = "Get project details", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Get project details, README, notes, TODO, and related special files.")>]
     static member GetProjectDetails(projectName: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =

@@ -2,6 +2,7 @@ module Client.ProjectPaths
 
 open System
 open System.IO
+open System.Diagnostics
 open Client
 open Client.Effect
 open Client.IO
@@ -64,8 +65,70 @@ let resolveWorkspacePath (parts: string seq) : IO<'rt, string> =
         | false -> return! Client.PermissionDenied "Path is outside workspace root." |> Effect.ofError
     }
 
-let resolveProjectRoot projectName : IO<'rt, FolderPath> =
-    resolveWorkspacePath [ projectName ] >>= FileIO.parseFolder
+let private resolveRegisteredWorktree (mainRoot: string) (selector: string) : Client.Result<string> =
+    if String.IsNullOrWhiteSpace selector
+       || selector = "." || selector = ".."
+       || selector.Contains('/') || selector.Contains('\\')
+       || selector.Contains("..", StringComparison.Ordinal) then
+        Error(Client.ValidationError "Invalid worktree selector.")
+    else
+        try
+            use proc = new Process()
+            proc.StartInfo.FileName <- "git"
+            proc.StartInfo.WorkingDirectory <- mainRoot
+            proc.StartInfo.UseShellExecute <- false
+            proc.StartInfo.RedirectStandardOutput <- true
+            proc.StartInfo.RedirectStandardError <- true
+            proc.StartInfo.ArgumentList.Add("worktree")
+            proc.StartInfo.ArgumentList.Add("list")
+            proc.StartInfo.ArgumentList.Add("--porcelain")
+            if not (proc.Start()) then
+                Error(Client.ValidationError "Cannot inspect worktree registration.")
+            else
+                let output = proc.StandardOutput.ReadToEnd()
+                if not (proc.WaitForExit(10000)) then
+                    proc.Kill(true)
+                    Error(Client.ValidationError "Git worktree discovery timed out.")
+                elif proc.ExitCode <> 0 then
+                    Error(Client.ValidationError "Cannot inspect worktree registration.")
+                else
+                    let comparison = if OperatingSystem.IsWindows() then StringComparison.OrdinalIgnoreCase else StringComparison.Ordinal
+                    let matches =
+                        output.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                        |> Array.choose (fun line ->
+                            if line.StartsWith("worktree ", StringComparison.Ordinal) then
+                                let path = Path.GetFullPath(line.Substring("worktree ".Length).TrimEnd('\r'))
+                                if String.Equals(Path.GetFileName(Path.TrimEndingDirectorySeparator(path)), selector, comparison) then Some path else None
+                            else None)
+                    match matches with
+                    | [| path |] when Directory.Exists(path) ->
+                        let rec containsLink (dir: DirectoryInfo) =
+                            if dir = null then false
+                            elif dir.Attributes.HasFlag(FileAttributes.ReparsePoint) then true
+                            else containsLink dir.Parent
+                        if containsLink (DirectoryInfo(path)) then
+                            Error(Client.PermissionDenied "Worktree path contains a symbolic link.")
+                        else Ok path
+                    | [||] -> Error(Client.NotFoundError "Unknown Git-registered worktree selector.")
+                    | _ -> Error(Client.ValidationError "Ambiguous worktree selector.")
+        with ex -> Error(Client.ExceptionError ex)
+
+let resolveProjectRoot (projectName: string) : IO<'rt, FolderPath> =
+    let separator = projectName.IndexOf("::", StringComparison.Ordinal)
+    if separator < 0 then
+        resolveWorkspacePath [ projectName ] >>= FileIO.parseFolder
+    else
+        effect {
+            let mainName = projectName.Substring(0, separator)
+            let selector = projectName.Substring(separator + 2)
+            if String.IsNullOrWhiteSpace mainName || mainName = "." || mainName = ".."
+               || mainName.Contains('/') || mainName.Contains('\\') then
+                return! Client.ValidationError "Invalid project identifier." |> Effect.ofError
+            else
+                let! (FolderPath mainRoot) = resolveWorkspacePath [ mainName ] >>= FileIO.parseFolder
+                let! path = fun _ -> resolveRegisteredWorktree mainRoot selector
+                return FolderPath path
+        }
 
 let resolveProjectPath projectName relativePath : IO<'rt, string> =
     effect {

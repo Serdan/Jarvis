@@ -63,6 +63,70 @@ type ListCommandsResult =
 
 type ListProjectsCommand = struct end
 
+type ListWorktreesCommand = { ProjectName: string }
+type GetWorktreeCommand = { ProjectName: string; WorktreePath: string }
+type CreateWorktreeCommand =
+    { ProjectName: string
+      Name: string
+      Branch: string
+      BaseRef: string }
+type InspectWorktreeRemovalCommand =
+    { ProjectName: string
+      WorktreePath: string
+      TargetRef: string option }
+type RemoveWorktreeCommand =
+    { ProjectName: string
+      WorktreePath: string
+      TargetRef: string option }
+
+
+type ListTasksCommand = { ProjectName: string; Status: string option; Owner: string option; DependsOn: string option }
+type GetTaskCommand = { ProjectName: string; TaskId: string }
+type CompareWorktreeTasksCommand = { ProjectName: string }
+type CreateTaskCommand =
+    { ProjectName: string
+      TaskId: string option
+      Title: string
+      Html: string
+      Dependencies: string list }
+type UpdateTaskCommand =
+    { ProjectName: string
+      TaskId: string
+      ExpectedRevision: string option
+      Title: string option
+      Status: string option
+      Dependencies: string list option
+      DescriptionCommit: string option }
+type ClaimTaskCommand =
+    { ProjectName: string
+      TaskId: string
+      ExpectedRevision: string option
+      Owner: string
+      AllowReassign: bool }
+type CheckpointTaskCommand =
+    { ProjectName: string
+      TaskId: string
+      ExpectedRevision: string option
+      Status: string
+      Summary: string
+      NextAction: string
+      Verified: string list
+      Blocker: string option
+      LastCommit: string option
+      DescriptionCommit: string option }
+type CompleteTaskCommand =
+    { ProjectName: string
+      TaskId: string
+      ExpectedRevision: string option
+      Verified: string list
+      FinalCommit: string option }
+type GetTaskHistoryCommand =
+    { ProjectName: string
+      TaskId: string
+      Limit: int option }
+
+
+
 type GetProjectDetailsCommand = { ProjectName: string }
 
 type ListDirectoryCommand =
@@ -450,6 +514,20 @@ type AgentCommandResponse =
 type AgentCommand =
     | ListCommandsCommand
     | ListProjectsCommand
+    | ListWorktreesCommand of ListWorktreesCommand
+    | GetWorktreeCommand of GetWorktreeCommand
+    | CreateWorktreeCommand of CreateWorktreeCommand
+    | InspectWorktreeRemovalCommand of InspectWorktreeRemovalCommand
+    | RemoveWorktreeCommand of RemoveWorktreeCommand
+    | ListTasksCommand of ListTasksCommand
+    | GetTaskCommand of GetTaskCommand
+    | CompareWorktreeTasksCommand of CompareWorktreeTasksCommand
+    | CreateTaskCommand of CreateTaskCommand
+    | UpdateTaskCommand of UpdateTaskCommand
+    | ClaimTaskCommand of ClaimTaskCommand
+    | CheckpointTaskCommand of CheckpointTaskCommand
+    | CompleteTaskCommand of CompleteTaskCommand
+    | GetTaskHistoryCommand of GetTaskHistoryCommand
     | GetProjectDetailsCommand of GetProjectDetailsCommand
     | ListDirectoryCommand of ListDirectoryCommand
     | SearchFilesCommand of SearchFilesCommand
@@ -487,6 +565,20 @@ module AgentCommandInfo =
     let name = function
         | ListCommandsCommand -> "ListCommandsCommand"
         | ListProjectsCommand -> "ListProjectsCommand"
+        | ListWorktreesCommand _ -> "ListWorktreesCommand"
+        | GetWorktreeCommand _ -> "GetWorktreeCommand"
+        | CreateWorktreeCommand _ -> "CreateWorktreeCommand"
+        | InspectWorktreeRemovalCommand _ -> "InspectWorktreeRemovalCommand"
+        | RemoveWorktreeCommand _ -> "RemoveWorktreeCommand"
+        | ListTasksCommand _ -> "ListTasksCommand"
+        | GetTaskCommand _ -> "GetTaskCommand"
+        | CompareWorktreeTasksCommand _ -> "CompareWorktreeTasksCommand"
+        | CreateTaskCommand _ -> "CreateTaskCommand"
+        | UpdateTaskCommand _ -> "UpdateTaskCommand"
+        | ClaimTaskCommand _ -> "ClaimTaskCommand"
+        | CheckpointTaskCommand _ -> "CheckpointTaskCommand"
+        | CompleteTaskCommand _ -> "CompleteTaskCommand"
+        | GetTaskHistoryCommand _ -> "GetTaskHistoryCommand"
         | GetProjectDetailsCommand _ -> "GetProjectDetailsCommand"
         | ListDirectoryCommand _ -> "ListDirectoryCommand"
         | SearchFilesCommand _ -> "SearchFilesCommand"
@@ -530,6 +622,20 @@ module AgentCommandInfo =
     let displayName = function
         | ListCommandsCommand -> "ListCommands"
         | ListProjectsCommand -> "ListProjects"
+        | ListWorktreesCommand _ -> "ListWorktrees"
+        | GetWorktreeCommand _ -> "GetWorktree"
+        | CreateWorktreeCommand _ -> "CreateWorktree"
+        | InspectWorktreeRemovalCommand _ -> "InspectWorktreeRemoval"
+        | RemoveWorktreeCommand _ -> "RemoveWorktree"
+        | ListTasksCommand _ -> "ListTasks"
+        | GetTaskCommand _ -> "GetTask"
+        | CompareWorktreeTasksCommand _ -> "CompareWorktreeTasks"
+        | CreateTaskCommand _ -> "CreateTask"
+        | UpdateTaskCommand _ -> "UpdateTask"
+        | ClaimTaskCommand _ -> "ClaimTask"
+        | CheckpointTaskCommand _ -> "CheckpointTask"
+        | CompleteTaskCommand _ -> "CompleteTask"
+        | GetTaskHistoryCommand _ -> "GetTaskHistory"
         | GetProjectDetailsCommand _ -> "GetProjectDetails"
         | ListDirectoryCommand _ -> "ListDirectory"
         | SearchFilesCommand _ -> "SearchFiles"
@@ -571,6 +677,20 @@ module AgentCommandInfo =
         | UpdateClientCommand -> None
         | MessageCommand cmd -> cmd.ProjectName
         | GetClientActivityCommand cmd -> cmd.ProjectName
+        | ListWorktreesCommand cmd -> Some cmd.ProjectName
+        | GetWorktreeCommand cmd -> Some cmd.ProjectName
+        | CreateWorktreeCommand cmd -> Some cmd.ProjectName
+        | InspectWorktreeRemovalCommand cmd -> Some cmd.ProjectName
+        | RemoveWorktreeCommand cmd -> Some cmd.ProjectName
+        | ListTasksCommand cmd -> Some cmd.ProjectName
+        | GetTaskCommand cmd -> Some cmd.ProjectName
+        | CompareWorktreeTasksCommand cmd -> Some cmd.ProjectName
+        | CreateTaskCommand cmd -> Some cmd.ProjectName
+        | UpdateTaskCommand cmd -> Some cmd.ProjectName
+        | ClaimTaskCommand cmd -> Some cmd.ProjectName
+        | CheckpointTaskCommand cmd -> Some cmd.ProjectName
+        | CompleteTaskCommand cmd -> Some cmd.ProjectName
+        | GetTaskHistoryCommand cmd -> Some cmd.ProjectName
         | GetProjectDetailsCommand cmd -> Some cmd.ProjectName
         | ListDirectoryCommand cmd -> Some cmd.ProjectName
         | SearchFilesCommand cmd -> Some cmd.ProjectName
@@ -656,6 +776,18 @@ module AgentCommandInfo =
         | GetSkillCommand cmd -> Some(compact cmd.SkillName)
         | CreateSkillCommand cmd -> Some(compact cmd.SkillName)
         | ListSkillsCommand _ -> None
+        | GetWorktreeCommand cmd -> Some(compact cmd.WorktreePath)
+        | CreateWorktreeCommand cmd -> Some(compact cmd.Name)
+        | InspectWorktreeRemovalCommand cmd -> Some(compact cmd.WorktreePath)
+        | RemoveWorktreeCommand cmd -> Some(compact cmd.WorktreePath)
+        | ListTasksCommand _ -> None
+        | GetTaskCommand cmd -> Some(compact cmd.TaskId)
+        | CreateTaskCommand cmd -> Some(compact (cmd.TaskId |> Option.defaultValue "new"))
+        | UpdateTaskCommand cmd -> Some(compact cmd.TaskId)
+        | ClaimTaskCommand cmd -> Some(compact cmd.TaskId)
+        | CheckpointTaskCommand cmd -> Some(compact cmd.TaskId)
+        | CompleteTaskCommand cmd -> Some(compact cmd.TaskId)
+        | GetTaskHistoryCommand cmd -> Some(compact cmd.TaskId)
         | GetGitDiffCommand cmd -> cmd.Path |> Option.map compact
         | GitCommitCommand cmd -> Some(compact cmd.Message)
         | StartJobCommand cmd -> Some(fullCommand cmd.Executable cmd.Args)
@@ -665,6 +797,8 @@ module AgentCommandInfo =
         | GetClientActivityCommand _ -> None
         | ListCommandsCommand
         | ListProjectsCommand
+        | ListWorktreesCommand _
+        | CompareWorktreeTasksCommand _
         | GetProjectDetailsCommand _
         | ListProjectTasksCommand _
         | GetGitStatusCommand _
@@ -692,6 +826,18 @@ module AgentCommandInfo =
         | GetSkillCommand cmd -> Some(truncate 48 cmd.SkillName)
         | CreateSkillCommand cmd -> Some(truncate 48 cmd.SkillName)
         | ListSkillsCommand _ -> None
+        | GetWorktreeCommand cmd -> Some(truncate 64 cmd.WorktreePath)
+        | CreateWorktreeCommand cmd -> Some(truncate 64 cmd.Name)
+        | InspectWorktreeRemovalCommand cmd -> Some(truncate 64 cmd.WorktreePath)
+        | RemoveWorktreeCommand cmd -> Some(truncate 64 cmd.WorktreePath)
+        | ListTasksCommand _ -> None
+        | GetTaskCommand cmd -> Some(truncate 64 cmd.TaskId)
+        | CreateTaskCommand cmd -> Some(truncate 64 (cmd.TaskId |> Option.defaultValue "new"))
+        | UpdateTaskCommand cmd -> Some(truncate 64 cmd.TaskId)
+        | ClaimTaskCommand cmd -> Some(truncate 64 cmd.TaskId)
+        | CheckpointTaskCommand cmd -> Some(truncate 64 cmd.TaskId)
+        | CompleteTaskCommand cmd -> Some(truncate 64 cmd.TaskId)
+        | GetTaskHistoryCommand cmd -> Some(truncate 64 cmd.TaskId)
         | GetGitDiffCommand cmd -> cmd.Path |> Option.map (truncate 64)
         | GitCommitCommand cmd -> Some(quoted cmd.Message)
         | StartJobCommand cmd -> Some(commandPreview cmd.Executable cmd.Args)
@@ -701,6 +847,8 @@ module AgentCommandInfo =
         | GetClientActivityCommand _ -> None
         | ListCommandsCommand
         | ListProjectsCommand
+        | ListWorktreesCommand _
+        | CompareWorktreeTasksCommand _
         | GetProjectDetailsCommand _
         | ListProjectTasksCommand _
         | GetGitStatusCommand _
@@ -745,7 +893,7 @@ module AgentCommandInfo =
         | None -> invocation command
 
 module AgentProtocol =
-    let version = "3.13"
+    let version = "3.14"
     let defaultPatchFuzzyContextLines = 3
     let maxResponseBytes = 900 * 1024
     let maxImageBytes = 8 * 1024 * 1024
@@ -763,6 +911,20 @@ module AgentProtocol =
     let commandDefinitions =
         [ definition "ListCommands" "Lists supported Jarvis commands." [ ReadOnly ] false false false
           definition "ListProjects" "Lists configured projects." [ ReadOnly ] false false false
+          definition "ListWorktrees" "Lists Git worktrees registered for a project." [ ReadOnly ] false false false
+          definition "GetWorktree" "Inspects a registered Git worktree." [ ReadOnly ] false false false
+          definition "CreateWorktree" "Creates an isolated Git worktree and branch." [ VersionControlWrite ] true true false
+          definition "InspectWorktreeRemoval" "Checks registered worktree removal safety." [ ReadOnly ] false false false
+          definition "ListTasks" "Lists repository-backed HTML and JSON task files." [ ReadOnly ] false false false
+          definition "CompareWorktreeTasks" "Summarizes task files across every registered worktree." [ ReadOnly ] false false false
+          definition "GetTask" "Reads HTML task definition and adjacent JSON state." [ ReadOnly ] false false false
+          definition "CreateTask" "Creates and commits HTML and JSON task files." [ WorkspaceWrite; VersionControlWrite ] true true false
+          definition "UpdateTask" "Updates structured task metadata with a task-only commit." [ WorkspaceWrite; VersionControlWrite ] true true false
+          definition "ClaimTask" "Claims or reassigns repository-backed task ownership." [ WorkspaceWrite; VersionControlWrite ] true true false
+          definition "CheckpointTask" "Commits task progress and next action." [ WorkspaceWrite; VersionControlWrite ] true true false
+          definition "CompleteTask" "Marks a task complete and commits verification." [ WorkspaceWrite; VersionControlWrite ] true true false
+          definition "GetTaskHistory" "Reads Git change history for one task." [ ReadOnly ] false false false
+          definition "RemoveWorktree" "Removes a clean integrated Git worktree." [ VersionControlWrite; Destructive ] true true false
           definition "GetProjectDetails" "Reads project summary details and special files." [ ReadOnly ] false false false
           definition "ListDirectory" "Lists files and folders in a project directory." [ ReadOnly ] false false false
           definition "SearchFiles" "Searches project file names." [ ReadOnly ] false false false

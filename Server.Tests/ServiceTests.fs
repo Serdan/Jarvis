@@ -431,7 +431,7 @@ let ``client-backed MCP tools expose an optional per-command deviceId`` () =
         |> Array.filter (fun methodInfo ->
             methodInfo.GetParameters()
             |> Array.exists (fun parameter -> parameter.ParameterType = typeof<ClientService>))
-    clientMethods.Length |> shouldEqual 33
+    clientMethods.Length |> shouldEqual (AgentProtocol.commandDefinitions.Length - 1)
     for methodInfo in clientMethods do
         let deviceParam = methodInfo.GetParameters() |> Array.tryFind (fun parameter -> parameter.Name = "deviceId")
         match deviceParam with
@@ -626,9 +626,9 @@ let mcp_tools_never_expose_session_key_parameters () =
 [<Test>]
 let mcp_tool_oauth_metadata_matches_command_permissions () =
     let expectedScope (definition: CommandDefinition) =
-        if definition.Permissions |> List.contains WorkspaceWrite then Auth.WorkspaceWrite
+        if definition.Permissions |> List.contains VersionControlWrite then Auth.GitWrite
+        elif definition.Permissions |> List.contains WorkspaceWrite then Auth.WorkspaceWrite
         elif definition.Permissions |> List.contains ProcessExecution then Auth.ProcessExecute
-        elif definition.Permissions |> List.contains VersionControlWrite then Auth.GitWrite
         else Auth.WorkspaceRead
 
     let definitions =
@@ -662,7 +662,7 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
 
         let destructive =
             match methodInfo.Name with
-            | "ImportFile" | "UpdateClient" | "UpdateServer" | "WriteFile" | "PatchFile" | "RunCommand" | "RunProjectTask" | "StartJob" | "CancelJob" -> true
+            | "ImportFile" | "UpdateClient" | "UpdateServer" | "WriteFile" | "PatchFile" | "RunCommand" | "RunProjectTask" | "StartJob" | "CancelJob" | "RemoveWorktree" -> true
             | _ -> false
 
         let openWorld =

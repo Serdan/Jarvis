@@ -66,15 +66,22 @@ let parsePorcelain (mainPath: string) (output: string) : Result<WorktreeInfo lis
 
 let listWorktrees (cmd: ListWorktreesCommand) =
     effect {
-        let! (FolderPath root) = ProjectPaths.resolveProjectRoot cmd.ProjectName
         let! result = git cmd.ProjectName [ "worktree"; "list"; "--porcelain" ]
         if result.ExitCode <> 0 || result.TimedOut || result.Truncated then
             return! Client.ValidationError($"Cannot inspect Git worktrees: {result.StdErr}") |> Effect.ofError
         else
+            let firstPath =
+                result.StdOut.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                |> Array.tryPick (fun line ->
+                    if line.StartsWith("worktree ", StringComparison.Ordinal) then Some(line.Substring(9))
+                    else None)
             return!
-                match parsePorcelain root result.StdOut with
-                | Ok items -> fun _ -> Ok items
-                | Error message -> Client.ValidationError message |> Effect.ofError
+                match firstPath with
+                | None -> Client.ValidationError "Git did not return a main worktree." |> Effect.ofError
+                | Some mainPath ->
+                    match parsePorcelain mainPath result.StdOut with
+                    | Ok items -> fun _ -> Ok items
+                    | Error message -> Client.ValidationError message |> Effect.ofError
     }
 
 let getWorktree (cmd: GetWorktreeCommand) =
@@ -110,8 +117,8 @@ let createWorktree (cmd: CreateWorktreeCommand) =
         elif not (safeRef cmd.Branch && safeRef cmd.BaseRef) then
             return! Client.ValidationError "Invalid branch or base ref." |> Effect.ofError
         else
-            let! (FolderPath root) = ProjectPaths.resolveProjectRoot cmd.ProjectName
-            let main = DirectoryInfo(root)
+            let! entries = listWorktrees { ProjectName = cmd.ProjectName }
+            let main = entries |> List.find (fun item -> item.IsMain) |> fun item -> DirectoryInfo(item.Path)
             let parent = Path.Combine(main.Parent.FullName, "." + main.Name + "-worktrees")
             let path = Path.Combine(parent, cmd.Name)
             if Directory.Exists(path) || File.Exists(path) || (Directory.Exists(parent) && (File.GetAttributes(parent).HasFlag(FileAttributes.ReparsePoint))) then
@@ -142,7 +149,9 @@ let inspectRemoval (cmd: InspectWorktreeRemovalCommand) =
             | Some _ -> Client.ValidationError "Invalid integration target ref." |> Effect.ofError
             | None ->
                 effect {
-                    let! branch = git cmd.ProjectName [ "branch"; "--show-current" ]
+                    let! entries = listWorktrees { ProjectName = cmd.ProjectName }
+                    let main = entries |> List.find (fun item -> item.IsMain)
+                    let! branch = git cmd.ProjectName [ "-C"; main.Path; "branch"; "--show-current" ]
                     return branch.StdOut.Trim()
                 }
         let! status = git cmd.ProjectName [ "-C"; entry.Path; "status"; "--porcelain" ]
@@ -182,8 +191,9 @@ let removeWorktree (cmd: RemoveWorktreeCommand) =
                 return! Client.ValidationError($"Worktree removal failed: {removal.StdErr}") |> Effect.ofError
             else
                 let parent = Directory.GetParent(inspection.Worktree.Path)
-                let! (FolderPath root) = ProjectPaths.resolveProjectRoot cmd.ProjectName
-                let expected = Path.Combine(Directory.GetParent(root).FullName, "." + DirectoryInfo(root).Name + "-worktrees")
+                let! entries = listWorktrees { ProjectName = cmd.ProjectName }
+                let main = entries |> List.find (fun item -> item.IsMain) |> fun item -> DirectoryInfo(item.Path)
+                let expected = Path.Combine(main.Parent.FullName, "." + main.Name + "-worktrees")
                 if parent <> null && parent.FullName = expected && Directory.Exists(expected) && Array.isEmpty (Directory.GetFileSystemEntries(expected)) then
                     Directory.Delete(expected)
                 return inspection.Worktree

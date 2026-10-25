@@ -165,3 +165,23 @@ let ``list projects hides linked sibling worktrees discovered through Git`` () =
             names |> shouldContain "Project1"
             names |> shouldNotContain "linked-sibling"
         | Error e -> Assert.Fail($"ListProjects failed: {e}"))
+
+[<Test>]
+let ``unmerged unique worktree commit prevents safe removal`` () =
+    withRepo (fun _ _ context ->
+        let created =
+            match createWorktree { ProjectName = "Project1"; Name = "pending"; Branch = "feature/pending"; BaseRef = "HEAD" } context with
+            | Ok item -> item
+            | Error e -> failwith $"Create failed: {e}"
+        let feature = "Project1::pending"
+        match Client.ClientShell.runCommand
+            { ProjectName = feature; Executable = "git"; Args = [ "commit"; "--allow-empty"; "-m"; "Unique" ]
+              Reason = None; WorkingDirectory = None; TimeoutSeconds = Some 10; MaxOutputBytes = Some 4000 } context with
+        | Ok result when result.ExitCode = 0 -> ()
+        | other -> Assert.Fail($"Unique commit failed: {other}")
+        match inspectRemoval { ProjectName = "Project1"; WorktreePath = created.Path; TargetRef = None } context with
+        | Ok inspect -> inspect.IsIntegrated |> shouldEqual false
+        | Error e -> Assert.Fail($"Unmerged inspection failed: {e}")
+        match removeWorktree { ProjectName = "Project1"; WorktreePath = created.Path; TargetRef = None } context with
+        | Error _ -> Directory.Exists created.Path |> shouldEqual true
+        | Ok _ -> Assert.Fail("Unmerged branch was removed."))

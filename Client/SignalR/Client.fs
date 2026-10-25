@@ -76,6 +76,11 @@ let private auditDetails command =
     | RunProjectTaskCommand cmd -> Some("RunProjectTask", Some cmd.ProjectName, [ ProcessExecution ], [], None, [ cmd.TaskName ])
     | CreateSkillCommand cmd -> Some("CreateSkill", Some cmd.ProjectName, [ WorkspaceWrite ], [ $".jarvis/skills/{cmd.SkillName}/SKILL.md" ], None, [])
     | RemoveWorktreeCommand cmd -> Some("RemoveWorktree", Some cmd.ProjectName, [ VersionControlWrite; Destructive ], [], Some "git", [ cmd.WorktreePath ])
+    | CreateTaskCommand cmd -> Some("CreateTask", Some cmd.ProjectName, [ WorkspaceWrite; VersionControlWrite ], [], Some "git", [ cmd.TaskId |> Option.defaultValue "new" ])
+    | UpdateTaskCommand cmd -> Some("UpdateTask", Some cmd.ProjectName, [ WorkspaceWrite; VersionControlWrite ], [], Some "git", [ cmd.TaskId ])
+    | ClaimTaskCommand cmd -> Some("ClaimTask", Some cmd.ProjectName, [ WorkspaceWrite; VersionControlWrite ], [], Some "git", [ cmd.TaskId ])
+    | CheckpointTaskCommand cmd -> Some("CheckpointTask", Some cmd.ProjectName, [ WorkspaceWrite; VersionControlWrite ], [], Some "git", [ cmd.TaskId ])
+    | CompleteTaskCommand cmd -> Some("CompleteTask", Some cmd.ProjectName, [ WorkspaceWrite; VersionControlWrite ], [], Some "git", [ cmd.TaskId ])
     | CreateWorktreeCommand cmd -> Some("CreateWorktree", Some cmd.ProjectName, [ VersionControlWrite ], [], Some "git", [ cmd.Branch; cmd.Name ])
     | GitCommitCommand cmd -> Some("GitCommit", Some cmd.ProjectName, [ VersionControlWrite ], cmd.Paths, Some "git", [ cmd.Message ])
     | StartJobCommand cmd -> Some("StartJob", Some cmd.ProjectName, [ ProcessExecution ], [], Some cmd.Executable, cmd.Args)
@@ -190,6 +195,12 @@ let private dispatch (rt: Runtime) (command: AgentCommand) =
     | RemoveWorktreeCommand cmd -> rt |> Worktrees.removeWorktree cmd |> serialize'
     | ListTasksCommand cmd -> rt |> TaskStore.listTasks cmd |> serialize'
     | GetTaskCommand cmd -> rt |> TaskStore.getTask cmd |> serialize'
+    | CreateTaskCommand cmd -> rt |> TaskStore.createTask cmd |> serialize'
+    | UpdateTaskCommand cmd -> rt |> TaskStore.updateTask cmd |> serialize'
+    | ClaimTaskCommand cmd -> rt |> TaskStore.claimTask cmd |> serialize'
+    | CheckpointTaskCommand cmd -> rt |> TaskStore.checkpointTask cmd |> serialize'
+    | CompleteTaskCommand cmd -> rt |> TaskStore.completeTask cmd |> serialize'
+    | GetTaskHistoryCommand cmd -> rt |> TaskStore.getTaskHistory cmd |> serialize'
     | ListProjectsCommand ->
         rt
         |> ProjectBrowser.listProjects

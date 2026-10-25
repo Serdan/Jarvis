@@ -82,6 +82,46 @@ type RemoveWorktreeCommand =
 
 type ListTasksCommand = { ProjectName: string; Status: string option }
 type GetTaskCommand = { ProjectName: string; TaskId: string }
+type CreateTaskCommand =
+    { ProjectName: string
+      TaskId: string option
+      Title: string
+      Html: string
+      Dependencies: string list }
+type UpdateTaskCommand =
+    { ProjectName: string
+      TaskId: string
+      ExpectedRevision: string option
+      Title: string option
+      Status: string option
+      Dependencies: string list option }
+type ClaimTaskCommand =
+    { ProjectName: string
+      TaskId: string
+      ExpectedRevision: string option
+      Owner: string
+      AllowReassign: bool }
+type CheckpointTaskCommand =
+    { ProjectName: string
+      TaskId: string
+      ExpectedRevision: string option
+      Status: string
+      Summary: string
+      NextAction: string
+      Verified: string list
+      LastCommit: string option }
+type CompleteTaskCommand =
+    { ProjectName: string
+      TaskId: string
+      ExpectedRevision: string option
+      Verified: string list
+      FinalCommit: string option }
+type GetTaskHistoryCommand =
+    { ProjectName: string
+      TaskId: string
+      Limit: int option }
+
+
 
 type GetProjectDetailsCommand = { ProjectName: string }
 
@@ -477,6 +517,12 @@ type AgentCommand =
     | RemoveWorktreeCommand of RemoveWorktreeCommand
     | ListTasksCommand of ListTasksCommand
     | GetTaskCommand of GetTaskCommand
+    | CreateTaskCommand of CreateTaskCommand
+    | UpdateTaskCommand of UpdateTaskCommand
+    | ClaimTaskCommand of ClaimTaskCommand
+    | CheckpointTaskCommand of CheckpointTaskCommand
+    | CompleteTaskCommand of CompleteTaskCommand
+    | GetTaskHistoryCommand of GetTaskHistoryCommand
     | GetProjectDetailsCommand of GetProjectDetailsCommand
     | ListDirectoryCommand of ListDirectoryCommand
     | SearchFilesCommand of SearchFilesCommand
@@ -521,6 +567,12 @@ module AgentCommandInfo =
         | RemoveWorktreeCommand _ -> "RemoveWorktreeCommand"
         | ListTasksCommand _ -> "ListTasksCommand"
         | GetTaskCommand _ -> "GetTaskCommand"
+        | CreateTaskCommand _ -> "CreateTaskCommand"
+        | UpdateTaskCommand _ -> "UpdateTaskCommand"
+        | ClaimTaskCommand _ -> "ClaimTaskCommand"
+        | CheckpointTaskCommand _ -> "CheckpointTaskCommand"
+        | CompleteTaskCommand _ -> "CompleteTaskCommand"
+        | GetTaskHistoryCommand _ -> "GetTaskHistoryCommand"
         | GetProjectDetailsCommand _ -> "GetProjectDetailsCommand"
         | ListDirectoryCommand _ -> "ListDirectoryCommand"
         | SearchFilesCommand _ -> "SearchFilesCommand"
@@ -571,6 +623,12 @@ module AgentCommandInfo =
         | RemoveWorktreeCommand _ -> "RemoveWorktree"
         | ListTasksCommand _ -> "ListTasks"
         | GetTaskCommand _ -> "GetTask"
+        | CreateTaskCommand _ -> "CreateTask"
+        | UpdateTaskCommand _ -> "UpdateTask"
+        | ClaimTaskCommand _ -> "ClaimTask"
+        | CheckpointTaskCommand _ -> "CheckpointTask"
+        | CompleteTaskCommand _ -> "CompleteTask"
+        | GetTaskHistoryCommand _ -> "GetTaskHistory"
         | GetProjectDetailsCommand _ -> "GetProjectDetails"
         | ListDirectoryCommand _ -> "ListDirectory"
         | SearchFilesCommand _ -> "SearchFiles"
@@ -619,6 +677,12 @@ module AgentCommandInfo =
         | RemoveWorktreeCommand cmd -> Some cmd.ProjectName
         | ListTasksCommand cmd -> Some cmd.ProjectName
         | GetTaskCommand cmd -> Some cmd.ProjectName
+        | CreateTaskCommand cmd -> Some cmd.ProjectName
+        | UpdateTaskCommand cmd -> Some cmd.ProjectName
+        | ClaimTaskCommand cmd -> Some cmd.ProjectName
+        | CheckpointTaskCommand cmd -> Some cmd.ProjectName
+        | CompleteTaskCommand cmd -> Some cmd.ProjectName
+        | GetTaskHistoryCommand cmd -> Some cmd.ProjectName
         | GetProjectDetailsCommand cmd -> Some cmd.ProjectName
         | ListDirectoryCommand cmd -> Some cmd.ProjectName
         | SearchFilesCommand cmd -> Some cmd.ProjectName
@@ -710,6 +774,12 @@ module AgentCommandInfo =
         | RemoveWorktreeCommand cmd -> Some(compact cmd.WorktreePath)
         | ListTasksCommand _ -> None
         | GetTaskCommand cmd -> Some(compact cmd.TaskId)
+        | CreateTaskCommand cmd -> Some(compact (cmd.TaskId |> Option.defaultValue "new"))
+        | UpdateTaskCommand cmd -> Some(compact cmd.TaskId)
+        | ClaimTaskCommand cmd -> Some(compact cmd.TaskId)
+        | CheckpointTaskCommand cmd -> Some(compact cmd.TaskId)
+        | CompleteTaskCommand cmd -> Some(compact cmd.TaskId)
+        | GetTaskHistoryCommand cmd -> Some(compact cmd.TaskId)
         | GetGitDiffCommand cmd -> cmd.Path |> Option.map compact
         | GitCommitCommand cmd -> Some(compact cmd.Message)
         | StartJobCommand cmd -> Some(fullCommand cmd.Executable cmd.Args)
@@ -754,6 +824,12 @@ module AgentCommandInfo =
         | RemoveWorktreeCommand cmd -> Some(truncate 64 cmd.WorktreePath)
         | ListTasksCommand _ -> None
         | GetTaskCommand cmd -> Some(truncate 64 cmd.TaskId)
+        | CreateTaskCommand cmd -> Some(truncate 64 (cmd.TaskId |> Option.defaultValue "new"))
+        | UpdateTaskCommand cmd -> Some(truncate 64 cmd.TaskId)
+        | ClaimTaskCommand cmd -> Some(truncate 64 cmd.TaskId)
+        | CheckpointTaskCommand cmd -> Some(truncate 64 cmd.TaskId)
+        | CompleteTaskCommand cmd -> Some(truncate 64 cmd.TaskId)
+        | GetTaskHistoryCommand cmd -> Some(truncate 64 cmd.TaskId)
         | GetGitDiffCommand cmd -> cmd.Path |> Option.map (truncate 64)
         | GitCommitCommand cmd -> Some(quoted cmd.Message)
         | StartJobCommand cmd -> Some(commandPreview cmd.Executable cmd.Args)
@@ -833,6 +909,12 @@ module AgentProtocol =
           definition "InspectWorktreeRemoval" "Checks registered worktree removal safety." [ ReadOnly ] false false false
           definition "ListTasks" "Lists repository-backed HTML and JSON task files." [ ReadOnly ] false false false
           definition "GetTask" "Reads HTML task definition and adjacent JSON state." [ ReadOnly ] false false false
+          definition "CreateTask" "Creates and commits HTML and JSON task files." [ WorkspaceWrite; VersionControlWrite ] true true false
+          definition "UpdateTask" "Updates structured task metadata with a task-only commit." [ WorkspaceWrite; VersionControlWrite ] true true false
+          definition "ClaimTask" "Claims or reassigns repository-backed task ownership." [ WorkspaceWrite; VersionControlWrite ] true true false
+          definition "CheckpointTask" "Commits task progress and next action." [ WorkspaceWrite; VersionControlWrite ] true true false
+          definition "CompleteTask" "Marks a task complete and commits verification." [ WorkspaceWrite; VersionControlWrite ] true true false
+          definition "GetTaskHistory" "Reads Git change history for one task." [ ReadOnly ] false false false
           definition "RemoveWorktree" "Removes a clean integrated Git worktree." [ VersionControlWrite; Destructive ] true true false
           definition "GetProjectDetails" "Reads project summary details and special files." [ ReadOnly ] false false false
           definition "ListDirectory" "Lists files and folders in a project directory." [ ReadOnly ] false false false

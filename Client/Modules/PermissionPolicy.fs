@@ -113,6 +113,7 @@ let private requiresConfirmation command =
     | InspectWorktreeRemovalCommand _
     | ListTasksCommand _
     | GetTaskCommand _
+    | GetTaskHistoryCommand _
     | GetProjectDetailsCommand _
     | ListDirectoryCommand _
     | SearchFilesCommand _
@@ -151,6 +152,16 @@ let private requiresConfirmation command =
         confirmation "RunProjectTask" (Some cmd.ProjectName) [ ProcessExecution ] [] None [ cmd.TaskName ] $"Run project task {cmd.TaskName}" false
     | RemoveWorktreeCommand cmd ->
         confirmation "RemoveWorktree" (Some cmd.ProjectName) [ VersionControlWrite; Destructive ] [] (Some "git") [ cmd.WorktreePath ] $"Remove worktree {cmd.WorktreePath}" false
+    | CreateTaskCommand cmd ->
+        confirmation "CreateTask" (Some cmd.ProjectName) [ WorkspaceWrite; VersionControlWrite ] [] (Some "git") [ cmd.TaskId |> Option.defaultValue "new" ] "CreateTask task" false
+    | UpdateTaskCommand cmd ->
+        confirmation "UpdateTask" (Some cmd.ProjectName) [ WorkspaceWrite; VersionControlWrite ] [] (Some "git") [ cmd.TaskId ] "UpdateTask task" false
+    | ClaimTaskCommand cmd ->
+        confirmation "ClaimTask" (Some cmd.ProjectName) [ WorkspaceWrite; VersionControlWrite ] [] (Some "git") [ cmd.TaskId ] "ClaimTask task" false
+    | CheckpointTaskCommand cmd ->
+        confirmation "CheckpointTask" (Some cmd.ProjectName) [ WorkspaceWrite; VersionControlWrite ] [] (Some "git") [ cmd.TaskId ] "CheckpointTask task" false
+    | CompleteTaskCommand cmd ->
+        confirmation "CompleteTask" (Some cmd.ProjectName) [ WorkspaceWrite; VersionControlWrite ] [] (Some "git") [ cmd.TaskId ] "CompleteTask task" false
     | CreateWorktreeCommand cmd ->
         confirmation "CreateWorktree" (Some cmd.ProjectName) [ VersionControlWrite ] [] (Some "git") [ cmd.Branch; cmd.Name ] $"Create worktree {cmd.Name}" true
     | GitCommitCommand cmd ->

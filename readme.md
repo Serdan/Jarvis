@@ -197,17 +197,15 @@ Projects can expose named build/test/format/lint tasks in a project-root `.jarvi
 
 The executable and arguments come from local project configuration rather than model-supplied task arguments. Jarvis resolves the task before permission approval and executes that same definition afterward.
 
-## Persisted work tasks
+## Worktrees and repository-backed tasks
 
-Long-running agent work can be attached to an existing task description committed in the project repository. `AttachWorkTask` records only execution state under `.jarvis/tasks/<task-id>.json`; the committed task description remains the source of truth.
+Jarvis discovers existing worktrees using Git metadata. New worktrees use hidden sibling directories such as `~/Projects/.Wayfold-worktrees/input-config/`, and `ListProjects` groups Git worktrees under their main projects. A registered worktree can be selected for any project-scoped command using `projectName="Wayfold::input-config"`, without affecting other agents.
 
-`GetWorkTask` returns the current checkpoint together with the current committed task text and reports whether that task description has changed since attachment. `ListWorkTasks` lists unfinished work, and `CheckpointWorkTask` records an `active` or `blocked` checkpoint with a summary, next action, verification notes, blocker, and optional last commit.
+Jarvis manages human-readable HTML task descriptions and adjacent version-controlled JSON state. The default canonical folder is `docs/tasks`, configurable through `"taskDirectory"` in project-root `.jarvis.json`. Commands include `CreateTask`, `ListTasks`, `GetTask`, `CompareWorktreeTasks`, `UpdateTask`, `ClaimTask`, `CheckpointTask`, `CompleteTask` and `GetTaskHistory`. Mutations commit only the affected task files on the selected branch.
 
-On recovery, agents should inspect both work-task state and `GetClientActivity`. The task state supplies the durable handoff and current intent; the activity log supplies the recent execution trail. Agents reconcile both before checking current files, git state, and jobs and continuing.
+For HTML tasks, the older `AttachWorkTask` and checkpoint commands use Git-backed state; previously stored local checkpoints are migrated on their next update. Existing non-HTML checkpoints continue using the prior local format until explicitly converted.
 
-Task descriptions must already be tracked, committed, and clean when attached. Jarvis adds `/.jarvis/tasks/` to the repository's local `.git/info/exclude` so execution state does not dirty or enter the repository.
-
-`CompleteWorkTask` records the final repository HEAD in its result and deletes the local execution-state file. The committed task description and git history remain as the durable record.
+See [Git worktrees and task files](docs/GitBackedTasks.md) for API details, file conventions and tests.
 
 ## Automatic repository instructions
 

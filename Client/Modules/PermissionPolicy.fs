@@ -110,6 +110,9 @@ let private requiresConfirmation command =
     | ListProjectsCommand
     | ListWorktreesCommand _
     | GetWorktreeCommand _
+    | InspectWorktreeRemovalCommand _
+    | ListTasksCommand _
+    | GetTaskCommand _
     | GetProjectDetailsCommand _
     | ListDirectoryCommand _
     | SearchFilesCommand _
@@ -146,6 +149,8 @@ let private requiresConfirmation command =
         confirmation "RunCommand" (Some cmd.ProjectName) [ ProcessExecution ] [] (Some cmd.Executable) cmd.Args $"Run {cmd.Executable}" true
     | RunProjectTaskCommand cmd ->
         confirmation "RunProjectTask" (Some cmd.ProjectName) [ ProcessExecution ] [] None [ cmd.TaskName ] $"Run project task {cmd.TaskName}" false
+    | RemoveWorktreeCommand cmd ->
+        confirmation "RemoveWorktree" (Some cmd.ProjectName) [ VersionControlWrite; Destructive ] [] (Some "git") [ cmd.WorktreePath ] $"Remove worktree {cmd.WorktreePath}" false
     | CreateWorktreeCommand cmd ->
         confirmation "CreateWorktree" (Some cmd.ProjectName) [ VersionControlWrite ] [] (Some "git") [ cmd.Branch; cmd.Name ] $"Create worktree {cmd.Name}" true
     | GitCommitCommand cmd ->

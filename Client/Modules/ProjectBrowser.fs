@@ -251,9 +251,25 @@ module private Core =
         }
         <| rt
 
+    let private isLinkedWorktree (root: string) (name: string) =
+        let gitFile = Path.Combine(root, name, ".git")
+        try
+            if not (File.Exists gitFile) then false
+            else
+                let contents = File.ReadAllText(gitFile)
+                contents.StartsWith("gitdir:", StringComparison.OrdinalIgnoreCase)
+                && (contents.Contains("/worktrees/", StringComparison.Ordinal)
+                    || contents.Contains("\\worktrees\\", StringComparison.Ordinal))
+        with _ -> false
+
     let listProjects rt =
-        enumerateProjects rt
-        |> Result.map (Seq.filter (fun (ProjectName name) -> not (name.StartsWith(".", StringComparison.Ordinal))))
+        effect {
+            let! (ProjectDirectory root) = ProjectIO.root
+            let! projects = enumerateProjects
+            return projects |> Seq.filter (fun (ProjectName name) ->
+                not (name.StartsWith(".", StringComparison.Ordinal))
+                && not (isLinkedWorktree root name))
+        } <| rt
 
     let private parseProjectName (projectName: string) =
         effect {
@@ -261,7 +277,11 @@ module private Core =
 
             return!
                 projects
-                |> Seq.tryFind (fun (ProjectName name) -> name = projectName)
+                |> Seq.tryFind (fun (ProjectName name) ->
+                    let separator = projectName.IndexOf("::", StringComparison.Ordinal)
+                    if separator >= 0 then name = projectName.Substring(0, separator)
+                    else name = projectName)
+                |> Option.map (fun _ -> ProjectName projectName)
                 |> Effect.ofOption (fun () -> NotFoundError $"Unknown project name: {projectName}")
         }
 

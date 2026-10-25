@@ -75,6 +75,7 @@ let private auditDetails command =
     | RunCommandCommand cmd -> Some("RunCommand", Some cmd.ProjectName, [ ProcessExecution ], [], Some cmd.Executable, cmd.Args)
     | RunProjectTaskCommand cmd -> Some("RunProjectTask", Some cmd.ProjectName, [ ProcessExecution ], [], None, [ cmd.TaskName ])
     | CreateSkillCommand cmd -> Some("CreateSkill", Some cmd.ProjectName, [ WorkspaceWrite ], [ $".jarvis/skills/{cmd.SkillName}/SKILL.md" ], None, [])
+    | RemoveWorktreeCommand cmd -> Some("RemoveWorktree", Some cmd.ProjectName, [ VersionControlWrite; Destructive ], [], Some "git", [ cmd.WorktreePath ])
     | CreateWorktreeCommand cmd -> Some("CreateWorktree", Some cmd.ProjectName, [ VersionControlWrite ], [], Some "git", [ cmd.Branch; cmd.Name ])
     | GitCommitCommand cmd -> Some("GitCommit", Some cmd.ProjectName, [ VersionControlWrite ], cmd.Paths, Some "git", [ cmd.Message ])
     | StartJobCommand cmd -> Some("StartJob", Some cmd.ProjectName, [ ProcessExecution ], [], Some cmd.Executable, cmd.Args)
@@ -185,6 +186,10 @@ let private dispatch (rt: Runtime) (command: AgentCommand) =
     | ListWorktreesCommand cmd -> rt |> Worktrees.listWorktrees cmd |> serialize'
     | GetWorktreeCommand cmd -> rt |> Worktrees.getWorktree cmd |> serialize'
     | CreateWorktreeCommand cmd -> rt |> Worktrees.createWorktree cmd |> serialize'
+    | InspectWorktreeRemovalCommand cmd -> rt |> Worktrees.inspectRemoval cmd |> serialize'
+    | RemoveWorktreeCommand cmd -> rt |> Worktrees.removeWorktree cmd |> serialize'
+    | ListTasksCommand cmd -> rt |> TaskStore.listTasks cmd |> serialize'
+    | GetTaskCommand cmd -> rt |> TaskStore.getTask cmd |> serialize'
     | ListProjectsCommand ->
         rt
         |> ProjectBrowser.listProjects

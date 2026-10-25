@@ -53,8 +53,9 @@
         <Compile Include="Modules\ProjectBrowser.fs"/>
         <Compile Include="Modules\ProcessEnvironment.fs"/>
         <Compile Include="Modules\ClientShell.fs"/>
-        <Compile Include="Modules\\Worktrees.fs"/>
         <Compile Include="Modules\JobManager.fs"/>
+        <Compile Include="Modules\\Worktrees.fs"/>
+        <Compile Include="Modules\\TaskStore.fs"/>
         <Compile Include="Runtime.fs"/>
         <Compile Include="Modules\AgentInstructions.fs"/>
         <Compile Include="Modules\SelfUpdate.fs"/>

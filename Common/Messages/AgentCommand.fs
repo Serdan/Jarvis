@@ -70,6 +70,18 @@ type CreateWorktreeCommand =
       Name: string
       Branch: string
       BaseRef: string }
+type InspectWorktreeRemovalCommand =
+    { ProjectName: string
+      WorktreePath: string
+      TargetRef: string option }
+type RemoveWorktreeCommand =
+    { ProjectName: string
+      WorktreePath: string
+      TargetRef: string option }
+
+
+type ListTasksCommand = { ProjectName: string; Status: string option }
+type GetTaskCommand = { ProjectName: string; TaskId: string }
 
 type GetProjectDetailsCommand = { ProjectName: string }
 
@@ -461,6 +473,10 @@ type AgentCommand =
     | ListWorktreesCommand of ListWorktreesCommand
     | GetWorktreeCommand of GetWorktreeCommand
     | CreateWorktreeCommand of CreateWorktreeCommand
+    | InspectWorktreeRemovalCommand of InspectWorktreeRemovalCommand
+    | RemoveWorktreeCommand of RemoveWorktreeCommand
+    | ListTasksCommand of ListTasksCommand
+    | GetTaskCommand of GetTaskCommand
     | GetProjectDetailsCommand of GetProjectDetailsCommand
     | ListDirectoryCommand of ListDirectoryCommand
     | SearchFilesCommand of SearchFilesCommand
@@ -501,6 +517,10 @@ module AgentCommandInfo =
         | ListWorktreesCommand _ -> "ListWorktreesCommand"
         | GetWorktreeCommand _ -> "GetWorktreeCommand"
         | CreateWorktreeCommand _ -> "CreateWorktreeCommand"
+        | InspectWorktreeRemovalCommand _ -> "InspectWorktreeRemovalCommand"
+        | RemoveWorktreeCommand _ -> "RemoveWorktreeCommand"
+        | ListTasksCommand _ -> "ListTasksCommand"
+        | GetTaskCommand _ -> "GetTaskCommand"
         | GetProjectDetailsCommand _ -> "GetProjectDetailsCommand"
         | ListDirectoryCommand _ -> "ListDirectoryCommand"
         | SearchFilesCommand _ -> "SearchFilesCommand"
@@ -547,6 +567,10 @@ module AgentCommandInfo =
         | ListWorktreesCommand _ -> "ListWorktrees"
         | GetWorktreeCommand _ -> "GetWorktree"
         | CreateWorktreeCommand _ -> "CreateWorktree"
+        | InspectWorktreeRemovalCommand _ -> "InspectWorktreeRemoval"
+        | RemoveWorktreeCommand _ -> "RemoveWorktree"
+        | ListTasksCommand _ -> "ListTasks"
+        | GetTaskCommand _ -> "GetTask"
         | GetProjectDetailsCommand _ -> "GetProjectDetails"
         | ListDirectoryCommand _ -> "ListDirectory"
         | SearchFilesCommand _ -> "SearchFiles"
@@ -591,6 +615,10 @@ module AgentCommandInfo =
         | ListWorktreesCommand cmd -> Some cmd.ProjectName
         | GetWorktreeCommand cmd -> Some cmd.ProjectName
         | CreateWorktreeCommand cmd -> Some cmd.ProjectName
+        | InspectWorktreeRemovalCommand cmd -> Some cmd.ProjectName
+        | RemoveWorktreeCommand cmd -> Some cmd.ProjectName
+        | ListTasksCommand cmd -> Some cmd.ProjectName
+        | GetTaskCommand cmd -> Some cmd.ProjectName
         | GetProjectDetailsCommand cmd -> Some cmd.ProjectName
         | ListDirectoryCommand cmd -> Some cmd.ProjectName
         | SearchFilesCommand cmd -> Some cmd.ProjectName
@@ -678,6 +706,10 @@ module AgentCommandInfo =
         | ListSkillsCommand _ -> None
         | GetWorktreeCommand cmd -> Some(compact cmd.WorktreePath)
         | CreateWorktreeCommand cmd -> Some(compact cmd.Name)
+        | InspectWorktreeRemovalCommand cmd -> Some(compact cmd.WorktreePath)
+        | RemoveWorktreeCommand cmd -> Some(compact cmd.WorktreePath)
+        | ListTasksCommand _ -> None
+        | GetTaskCommand cmd -> Some(compact cmd.TaskId)
         | GetGitDiffCommand cmd -> cmd.Path |> Option.map compact
         | GitCommitCommand cmd -> Some(compact cmd.Message)
         | StartJobCommand cmd -> Some(fullCommand cmd.Executable cmd.Args)
@@ -688,6 +720,7 @@ module AgentCommandInfo =
         | ListCommandsCommand
         | ListProjectsCommand
         | ListWorktreesCommand _
+        | InspectWorktreeRemovalCommand _
         | GetProjectDetailsCommand _
         | ListProjectTasksCommand _
         | GetGitStatusCommand _
@@ -717,6 +750,10 @@ module AgentCommandInfo =
         | ListSkillsCommand _ -> None
         | GetWorktreeCommand cmd -> Some(truncate 64 cmd.WorktreePath)
         | CreateWorktreeCommand cmd -> Some(truncate 64 cmd.Name)
+        | InspectWorktreeRemovalCommand cmd -> Some(truncate 64 cmd.WorktreePath)
+        | RemoveWorktreeCommand cmd -> Some(truncate 64 cmd.WorktreePath)
+        | ListTasksCommand _ -> None
+        | GetTaskCommand cmd -> Some(truncate 64 cmd.TaskId)
         | GetGitDiffCommand cmd -> cmd.Path |> Option.map (truncate 64)
         | GitCommitCommand cmd -> Some(quoted cmd.Message)
         | StartJobCommand cmd -> Some(commandPreview cmd.Executable cmd.Args)
@@ -727,6 +764,7 @@ module AgentCommandInfo =
         | ListCommandsCommand
         | ListProjectsCommand
         | ListWorktreesCommand _
+        | InspectWorktreeRemovalCommand _
         | GetProjectDetailsCommand _
         | ListProjectTasksCommand _
         | GetGitStatusCommand _
@@ -792,6 +830,10 @@ module AgentProtocol =
           definition "ListWorktrees" "Lists Git worktrees registered for a project." [ ReadOnly ] false false false
           definition "GetWorktree" "Inspects a registered Git worktree." [ ReadOnly ] false false false
           definition "CreateWorktree" "Creates an isolated Git worktree and branch." [ VersionControlWrite ] true true false
+          definition "InspectWorktreeRemoval" "Checks registered worktree removal safety." [ ReadOnly ] false false false
+          definition "ListTasks" "Lists repository-backed HTML and JSON task files." [ ReadOnly ] false false false
+          definition "GetTask" "Reads HTML task definition and adjacent JSON state." [ ReadOnly ] false false false
+          definition "RemoveWorktree" "Removes a clean integrated Git worktree." [ VersionControlWrite; Destructive ] true true false
           definition "GetProjectDetails" "Reads project summary details and special files." [ ReadOnly ] false false false
           definition "ListDirectory" "Lists files and folders in a project directory." [ ReadOnly ] false false false
           definition "SearchFiles" "Searches project file names." [ ReadOnly ] false false false

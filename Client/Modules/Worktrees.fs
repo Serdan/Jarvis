@@ -123,3 +123,68 @@ let createWorktree (cmd: CreateWorktreeCommand) =
                 else
                     return! getWorktree { ProjectName = cmd.ProjectName; WorktreePath = path }
     }
+
+type WorktreeRemovalInspection =
+    { Worktree: WorktreeInfo
+      TargetRef: string
+      IsClean: bool
+      IsIntegrated: bool
+      RunningJobCount: int
+      CanRemove: bool
+      Reasons: string list }
+
+let inspectRemoval (cmd: InspectWorktreeRemovalCommand) =
+    effect {
+        let! entry = getWorktree { ProjectName = cmd.ProjectName; WorktreePath = cmd.WorktreePath }
+        let! target =
+            match cmd.TargetRef with
+            | Some r when safeRef r -> fun _ -> Ok r
+            | Some _ -> Client.ValidationError "Invalid integration target ref." |> Effect.ofError
+            | None ->
+                effect {
+                    let! branch = git cmd.ProjectName [ "branch"; "--show-current" ]
+                    return branch.StdOut.Trim()
+                }
+        let! status = git cmd.ProjectName [ "-C"; entry.Path; "status"; "--porcelain" ]
+        let! integrated = git cmd.ProjectName [ "merge-base"; "--is-ancestor"; entry.Head; target ]
+        let! jobs = JobManager.listJobs { ProjectName = Some cmd.ProjectName; IncludeCompleted = false }
+        let isClean = status.ExitCode = 0 && not status.TimedOut && not status.Truncated && String.IsNullOrWhiteSpace status.StdOut
+        let isIntegrated = not (String.IsNullOrWhiteSpace target) && integrated.ExitCode = 0 && not integrated.TimedOut
+        let reasons =
+            [ if entry.IsMain then "Main worktree"
+              if entry.IsLocked then "Worktree is locked"
+              if entry.IsPrunable then "Worktree registration is prunable"
+              if not isClean then "Worktree has changes or cannot be inspected"
+              if not isIntegrated then "HEAD is not verified integrated into target"
+              if not jobs.Jobs.IsEmpty then "Jarvis project has active jobs" ]
+        return
+            { Worktree = entry
+              TargetRef = target
+              IsClean = isClean
+              IsIntegrated = isIntegrated
+              RunningJobCount = jobs.Jobs.Length
+              CanRemove = reasons.IsEmpty
+              Reasons = reasons }
+    }
+
+let removeWorktree (cmd: RemoveWorktreeCommand) =
+    effect {
+        let! inspection =
+            inspectRemoval
+                { ProjectName = cmd.ProjectName
+                  WorktreePath = cmd.WorktreePath
+                  TargetRef = cmd.TargetRef }
+        if not inspection.CanRemove then
+            return! Client.ValidationError(String.concat "; " inspection.Reasons) |> Effect.ofError
+        else
+            let! removal = git cmd.ProjectName [ "worktree"; "remove"; inspection.Worktree.Path ]
+            if removal.ExitCode <> 0 || removal.TimedOut then
+                return! Client.ValidationError($"Worktree removal failed: {removal.StdErr}") |> Effect.ofError
+            else
+                let parent = Directory.GetParent(inspection.Worktree.Path)
+                let! (FolderPath root) = ProjectPaths.resolveProjectRoot cmd.ProjectName
+                let expected = Path.Combine(Directory.GetParent(root).FullName, "." + DirectoryInfo(root).Name + "-worktrees")
+                if parent <> null && parent.FullName = expected && Directory.Exists(expected) && Array.isEmpty (Directory.GetFileSystemEntries(expected)) then
+                    Directory.Delete(expected)
+                return inspection.Worktree
+    }

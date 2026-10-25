@@ -49,6 +49,11 @@ let private getString (json: JsonObject) (key: string) =
         try Some(value.GetValue<string>()) with _ -> None
     else None
 
+let private normalizeStatus value =
+    match value with
+    | "in_progress" -> "active"
+    | other -> other
+
 let private validateJson (id: string) (json: string) =
     match JsonNode.Parse(json) with
     | :? JsonObject as obj ->
@@ -58,7 +63,7 @@ let private validateJson (id: string) (json: string) =
             try obj["schemaVersion"].GetValue<int>() with _ -> -1
         if version <> 1 then Error "Unsupported task state schema version."
         elif stateId <> Some id then Error "Task state id does not match its filename."
-        elif not (List.contains (defaultArg status "") [ "open"; "active"; "blocked"; "completed" ]) then
+        elif not (List.contains (defaultArg status "" |> normalizeStatus) [ "open"; "active"; "blocked"; "completed" ]) then
             Error "Task state status is invalid."
         else Ok obj
     | _ -> Error "Task state must be a JSON object."
@@ -87,7 +92,9 @@ let private directory (root: string) =
     with ex -> Error(Client.ValidationError($"Task directory configuration: {ex.Message}"))
 
 let private canonicalTaskId (stem: string) =
-    let matchResult = Regex.Match(stem, "^([0-9]+)-")
+    // Legacy numeric task IDs use a numeric prefix followed by a word slug.
+    // Date-prefixed IDs such as 2026-10-24-task must retain their full name.
+    let matchResult = Regex.Match(stem, "^([0-9]+)-(?=[A-Za-z])")
     if matchResult.Success then matchResult.Groups[1].Value else stem
 
 let private descriptionCandidates (folder: string) (id: string) =
@@ -137,7 +144,10 @@ let private summary (relativeDir: string) (folder: string) (id: string) =
                 match validateJson id (File.ReadAllText json) with
                 | Ok obj ->
                     title <- getString obj "title" |> Option.defaultValue id
-                    status <- getString obj "status" |> Option.defaultValue "open"
+                    status <-
+                        getString obj "status"
+                        |> Option.defaultValue "open"
+                        |> normalizeStatus
                     owner <-
                         match obj["owner"] with
                         | :? JsonObject as ownerObj -> getString ownerObj "agent"
@@ -184,7 +194,7 @@ let listTasks (cmd: ListTasksCommand) =
                         { Id = id; Title = id; Status = "invalid"; DescriptionPath = ""; StatePath = ""
                           HasState = false; Owner = None; Dependencies = []; Revision = None; Diagnostics = [ "Invalid task identifier." ] })
                 |> List.filter (fun item ->
-                    (cmd.Status.IsNone || Some item.Status = cmd.Status)
+                    (cmd.Status.IsNone || (cmd.Status |> Option.map normalizeStatus) = Some item.Status)
                     && (cmd.Owner.IsNone || item.Owner = cmd.Owner)
                     && (cmd.DependsOn.IsNone || item.Dependencies |> List.contains cmd.DependsOn.Value))
     }

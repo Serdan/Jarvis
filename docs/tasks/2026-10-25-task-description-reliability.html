@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Jarvis: Reliable task-description size limits and retrieval</title>
+</head>
+<body>
+  <main>
+    <h1>Reliable task-description limits and retrieval</h1>
+    <p><strong>Status:</strong> Open. <strong>Date:</strong> 2026-10-25.</p>
+
+    <h2>Goal</h2>
+    <p>Allow human-readable, Git-tracked task descriptions up to <strong>1 MiB (1,048,576 UTF-8 bytes)</strong> to be created, attached, and read reliably. A response must never present truncated task content as though it were complete. Give agents a way to retrieve the entire supported description even when it cannot fit in one MCP response. Keep canonical task descriptions and task state in source control as defined by the Git-backed worktree/task specification.</p>
+
+    <h2>Current behavior and integration points</h2>
+    <p>Existing <code>AttachWorkTask</code> and <code>GetWorkTask</code> resolve the committed task description through <code>ClientShell.taskContentAt</code>, which invokes <code>git show &lt;commit&gt;:&lt;taskPath&gt;</code>. The common Git wrapper uses <code>runProcess</code>'s default 64 KiB maximum output. Although <code>RunCommandResult.Truncated</code> is available, <code>taskContentAt</code> currently accepts <code>StdOut</code> without checking it. Independently, <code>Client/SignalR/Client.fs</code> enforces <code>AgentProtocol.maxResponseBytes</code> of 900 KiB for ordinary command responses, including instruction documents. The planned Git-backed task APIs are specified in <code>docs/GitWorktreesAndTasks.md</code> and <code>docs/tasks/2026-10-23-worktrees-and-tasks.md</code>; apply the same content-size and completeness contract to their <code>GetTask</code>/<code>CreateTask</code>/<code>UpdateTask</code> operations as they are implemented.</p>
+
+    <h2>Content limits and response contract</h2>
+    <ul>
+      <li><strong>Accepted description:</strong> maximum 1,048,576 bytes for the complete committed task-description blob. Measure Git blob bytes, not .NET character count or encoded JSON response size. UTF-8 HTML/Markdown must decode fully; chunk boundaries must not split a Unicode scalar value.</li>
+      <li><strong>Oversized description:</strong> return a typed, actionable validation error with task ID/path, actual size, and allowed size. Detect size before attempting to materialize or return the full content. Attach/create/update paths must refuse the oversized content before mutating task state or committing task files.</li>
+      <li><strong>Complete vs. deferred content:</strong> a successful full-content response means the entire description was returned. If the content would exceed the safe response budget, return task metadata plus an explicit <em>content available separately</em> status and a stable content reference, never a partial string masquerading as the full task. Differentiate missing description, deferred content, invalid/oversized content, and actual read failure.</li>
+      <li><strong>Chunked content:</strong> expose an explicit bounded read operation for committed task text, using a stable source revision (commit and blob identity) and byte offset/cursor. Each response includes the source identity, requested/returned offset, UTF-8 byte count, total byte count, next offset or completion marker, and content. Reassembling all chunks must reproduce the exact decoded description. Reject invalid ranges and stale/mismatched source revisions explicitly.</li>
+      <li><strong>Response budget:</strong> choose a conservative fixed maximum chunk payload below the 900 KiB ordinary response ceiling, allowing for JSON escaping, metadata, instruction injection, and serialization overhead. Verify the fully serialized envelope, including instructions, respects the existing protocol response limit. Do not raise that global limit as the workaround.</li>
+      <li><strong>Small descriptions:</strong> preserve the current convenient single-call content path for descriptions that safely fit, and keep metadata/list/checkpoint operations compact. The client should not read or attach a 1 MiB blob merely to list task summaries.</li>
+      <li><strong>Correct authority:</strong> read immutable committed blob content, not uncommitted working-tree edits. Honor the selected, Git-verified project/worktree and repository path confinement. A task's commit/blob identity must remain stable throughout a paged read, even if another branch or worktree is updated.</li>
+      <li><strong>Diagnostics:</strong> never ignore process exit codes, Git output truncation flags, malformed UTF-8, a missing blob, or output size discrepancies. Surface a distinct error rather than returning partial task data or silently replacing it with empty content.</li>
+    </ul>
+
+    <h2>Implementation slices</h2>
+
+    <h3>1. Size-aware committed-description retrieval</h3>
+    <p>Introduce a dedicated Git blob-reading service for task descriptions. Determine committed blob size before retrieval (for example, by <code>git cat-file -s</code> on a verified commit/path), enforce the 1 MiB ceiling, read with an explicit sufficient output bound, check process exit/truncation, and validate complete UTF-8. Reuse it from existing <code>taskContentAt</code> and the future canonical task read path.</p>
+    <p><strong>Tests:</strong> small HTML; descriptions at 64 KiB−1, 64 KiB, and 64 KiB+1; exactly 1,048,576 bytes; 1,048,577 bytes; multibyte UTF-8; malformed blob; nonexistent commit/path; injected Git failure; truncation and byte-count mismatch. Use disposable Git repositories.</p>
+    <p><strong>Accept:</strong> committed descriptions above 64 KiB are read fully and byte-perfectly; descriptions above 1 MiB yield an explicit error; no successful read can contain silently truncated data.</p>
+
+    <h3>2. Stable, bounded content pagination</h3>
+    <p>Add a task-content read contract, reachable through client protocol and MCP, that pages content from a known committed task revision. A content-bearing <code>GetWorkTask</code>/<code>AttachWorkTask</code> result embeds content only when it fits the response allowance; otherwise it returns metadata plus the stable source locator and tells the caller how to fetch the remainder. Integrate equivalent behavior with the planned <code>GetTask</code> API. Keep existing callers of short descriptions working unchanged.</p>
+    <p><strong>Tests:</strong> one-chunk and multi-chunk reads; reconstruct a 1 MiB description exactly; UTF-8 character across a requested byte boundary; empty content and EOF; invalid cursor; repeated/overlapping pages; source revision changes between requests; large JSON-escaped text and instruction documents that approach the 900 KiB response budget.</p>
+    <p><strong>Accept:</strong> the complete supported description is always recoverable through finite, bounded requests without exceeding the MCP response limit.</p>
+
+    <h3>3. Validation across task lifecycle commands</h3>
+    <p>Apply the same limit and explicit completeness semantics to <code>AttachWorkTask</code>, <code>GetWorkTask</code>, and task creation/updates in the canonical Git-backed task workstream. Validate source size and expected revision before any task-state mutation or task-file commit. Include size/content availability in returned task metadata while leaving list/checkpoint results concise. Preserve existing task ID and path validation, Git-backed authority, and worktree isolation.</p>
+    <p><strong>Tests:</strong> attach an exact-limit task; reject an over-limit attach without a new local checkpoint; retrieve a short legacy task; update an existing task across the size boundary; two agents reading different revisions concurrently; ensure listing and checkpoint updates do not implicitly fetch large content.</p>
+    <p><strong>Accept:</strong> every task operation gives a consistent, testable answer about existence, revision, size, and content completeness, without partial state changes on rejection.</p>
+
+    <h3>4. End-to-end tests and documentation</h3>
+    <p>Document the 1 MiB description limit, the distinction from the 900 KiB response limit, content pagination, explicit errors, and behavior for existing tasks. Extend client, protocol/serialization, and MCP tests; run the full client and server suites with a real disposable Git repository. Add a regression fixture larger than 64 KiB that would previously have returned incomplete text.</p>
+    <p><strong>Tests:</strong> full agent-facing attach/read/reassemble flow; error formatting for oversized and corrupt descriptions; task worktree/revision stability; no new truncation in small-task responses; full suite and solution build.</p>
+    <p><strong>Accept:</strong> fresh agents can recover the entire description of any valid task up to 1 MiB with unambiguous completion semantics; no route can silently truncate it.</p>
+  </main>
+</body>
+</html>

@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "id": "2026-10-25-task-description-reliability",
+  "title": "Reliable task-description limits and retrieval",
+  "status": "open",
+  "dependencies": [],
+  "owner": {
+    "agent": null,
+    "worktree": null
+  },
+  "checkpoint": {
+    "summary": "Specification created; implementation not started.",
+    "nextAction": "Implement size-aware committed Git blob retrieval and regression tests for the current 64 KiB silent-truncation path.",
+    "verified": [],
+    "lastCommit": null
+  },
+  "updatedAt": "2026-10-25T19:42:00Z"
+}

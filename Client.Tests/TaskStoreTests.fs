@@ -334,3 +334,62 @@ let ``task update refuses and preserves unstaged JSON edits`` () =
             match updateTask command context with
             | Error _ -> File.ReadAllText(json) |> shouldEqual manual
             | Ok _ -> Assert.Fail("Task update overwrote unstaged JSON."))
+
+[<Test>]
+let ``date-prefixed task IDs retain year month day and do not collide`` () =
+    withProject (fun _ project context ->
+        let folder = Path.Combine(project, "docs", "tasks")
+        Directory.CreateDirectory folder |> ignore
+        let ids = [ "2026-10-24-client-configuration"; "2026-10-24-runpod-benchmark-lifecycle" ]
+        for id in ids do
+            File.WriteAllText(Path.Combine(folder, id + ".html"), "<h1>" + id + "</h1>")
+            let json = """{"schemaVersion":1,"id":"TASK_ID","title":"Fixture","status":"open"}""".Replace("TASK_ID", id)
+            File.WriteAllText(Path.Combine(folder, id + ".json"), json)
+        match listTasks { ProjectName = "Project1"; Status = None; Owner = None; DependsOn = None } context with
+        | Ok tasks ->
+            (tasks |> List.map (fun task -> task.Id)) |> shouldEqual ids
+            tasks |> List.forall (fun task -> task.Diagnostics.IsEmpty && task.HasState) |> shouldEqual true
+        | Error error -> Assert.Fail($"Date task discovery failed: {error}")
+        for id in ids do
+            match getTask { ProjectName = "Project1"; TaskId = id } context with
+            | Ok task ->
+                task.Task.Id |> shouldEqual id
+                task.Task.DescriptionPath |> shouldEqual ("docs/tasks/" + id + ".html")
+                task.Task.StatePath |> shouldEqual ("docs/tasks/" + id + ".json")
+            | Error error -> Assert.Fail($"Cannot get date task {id}: {error}")
+        match getTask { ProjectName = "Project1"; TaskId = "2026" } context with
+        | Error _ -> ()
+        | Ok _ -> Assert.Fail("Date tasks were incorrectly aliased to year 2026."))
+
+[<Test>]
+let ``legacy in_progress status reads as active without rewriting source JSON`` () =
+    withProject (fun _ project context ->
+        let folder = Path.Combine(project, "docs", "tasks")
+        Directory.CreateDirectory folder |> ignore
+        let id = "2026-10-24-runpod-benchmark-lifecycle"
+        File.WriteAllText(Path.Combine(folder, id + ".html"), "<h1>Runpod lifecycle</h1>")
+        let path = Path.Combine(folder, id + ".json")
+        let original = """{"schemaVersion":1,"id":"2026-10-24-runpod-benchmark-lifecycle","title":"Runpod lifecycle","status":"in_progress","customField":"preserve"}"""
+        File.WriteAllText(path, original)
+        for requestedStatus in [ "active"; "in_progress" ] do
+            match listTasks { ProjectName = "Project1"; Status = Some requestedStatus; Owner = None; DependsOn = None } context with
+            | Ok [task] ->
+                task.Id |> shouldEqual id
+                task.Status |> shouldEqual "active"
+                task.Diagnostics |> shouldEqual []
+            | other -> Assert.Fail($"Legacy status filter {requestedStatus} failed: {other}")
+        match getTask { ProjectName = "Project1"; TaskId = id } context with
+        | Ok task ->
+            task.Task.Status |> shouldEqual "active"
+            task.StateJson |> shouldEqual (Some original)
+        | Error error -> Assert.Fail($"Legacy status get failed: {error}")
+        File.ReadAllText(path) |> shouldEqual original
+        GitCommandTests.expectGitSuccess context [ "add"; "docs/tasks/" + id + ".html"; "docs/tasks/" + id + ".json" ]
+        GitCommandTests.expectGitSuccess context [ "commit"; "-m"; "Existing Runpod task checkpoint" ]
+        match updateTask
+            { ProjectName = "Project1"; TaskId = id; ExpectedRevision = None
+              Title = None; Status = Some "blocked"; Dependencies = None; DescriptionCommit = None } context with
+        | Ok updated ->
+            updated.Task.Task.Status |> shouldEqual "blocked"
+            updated.Task.StateJson.Value.Contains("preserve") |> shouldEqual true
+        | Error error -> Assert.Fail($"Cannot update legacy status task: {error}"))

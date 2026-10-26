@@ -959,9 +959,9 @@ type JarvisMcpTools =
     static member GetTaskHistory(projectName: string, taskId: string, [<Optional; DefaultParameterValue(20)>] limit: int, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (GetTaskHistoryCommand { ProjectName = projectName; TaskId = taskId; Limit = Some limit })
 
-    [<McpServerTool(Title = "Compare worktree tasks", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read task statuses across all Git-registered worktrees of a project, including branch-local tasks.")>]
-    static member CompareWorktreeTasks(projectName: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
-        McpToolHelpers.send client http (CompareWorktreeTasksCommand { ProjectName = projectName })
+    [<McpServerTool(Title = "Compare worktree tasks", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read task statuses across all Git-registered worktrees, optionally filtered by nextActor (agent or reviewer). Each group includes its branch and worktree; tasks include owner, revision, and handoff state.")>]
+    static member CompareWorktreeTasks(projectName: string, [<Optional; DefaultParameterValue("")>] nextActor: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http (CompareWorktreeTasksCommand { ProjectName = projectName; NextActor = McpToolHelpers.optionOfString nextActor })
 
     [<McpServerTool(Title = "Get project details", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Get project details, README, notes, TODO, and related special files.")>]
     static member GetProjectDetails(projectName: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =

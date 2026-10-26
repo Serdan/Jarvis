@@ -59,7 +59,7 @@ A typical JSON state:
 }
 ```
 
-Use `ListTasks` and `GetTask` to inspect HTML and JSON, including revision hashes and diagnostics. `ListTasks` filters by status, owner and dependency. `CompareWorktreeTasks` summarizes the task records in all Git-registered worktrees, preserving branch-local statuses and returning per-worktree diagnostics when a checkout cannot be read. `CreateTask` creates and commits the HTML+JSON pair, and can resume an interrupted write when only an identical HTML description was saved. `UpdateTask` (including optional JSON-encoded dependency changes), `ClaimTask`, `CheckpointTask` and `CompleteTask` validate, write and commit JSON state. The status vocabulary is `open`, `active`, `blocked`, `completed`. Existing JSON using `in_progress` is interpreted as `active` for reading and filtering; the original JSON bytes remain unchanged until an explicit task mutation. Completion preserves task state and its Git history; `GetTaskHistory` returns bounded relevant commits and patches for both the original HTML description and JSON state.
+Use `ListTasks` and `GetTask` to inspect HTML and JSON, including revision hashes and diagnostics. `ListTasks` filters by status, owner, dependency and next actor. `CompareWorktreeTasks` summarizes the task records in all Git-registered worktrees, optionally filtering by `nextActor` with the same semantics as `ListTasks`. It preserves branch-local statuses, includes worktree/branch identity alongside task ID, revision, owner and handoff fields, and returns per-worktree diagnostics when a checkout cannot be read. `CreateTask` creates and commits the HTML+JSON pair, and can resume an interrupted write when only an identical HTML description was saved. `UpdateTask` (including optional JSON-encoded dependency changes), `ClaimTask`, `CheckpointTask` and `CompleteTask` validate, write and commit JSON state. The status vocabulary is `open`, `active`, `blocked`, `completed`. Existing JSON using `in_progress` is interpreted as `active` for reading and filtering; the original JSON bytes remain unchanged until an explicit task mutation. Completion preserves task state and its Git history; `GetTaskHistory` returns bounded relevant commits and patches for both the original HTML description and JSON state.
 
 ### Missing task directories and Git recovery
 
@@ -151,9 +151,10 @@ actually executed, plus optional `actorId`. Jarvis rejects missing or
 stale acknowledgements once an assignment exists. The checkpoint preserves
 the assignment, records acknowledgement, and marks `nextActor=reviewer`,
 `lastUpdatedBy={role:agent,id:<actorId or claimed owner>}`.
-`CompleteTask` also requires acknowledgement of an existing assignment and
-requests reviewer attention; completion on a feature branch does not imply
-the implementation has been merged.
+`CompleteTask` also requires acknowledgement of an existing assignment. It
+marks the task `completed` and clears `nextActor`, without changing the owner,
+checkpoint or retained evidence. Completion on a feature branch does not
+imply the implementation has been merged.
 
 Existing tasks **without** an `assignment` remain readable and may use their
 legacy `checkpoint.nextAction` without an acknowledgement. Older checkpoints
@@ -161,6 +162,15 @@ are never rewritten just to introduce the new structure. When an assignment
 does exist, it supersedes the checkpoint's legacy `nextAction` as the next
 set of instructions for the agent. The JSON and Git commits retain the
 historical checkpoint.
+
+As of protocol 3.16, `CheckpointTask` and `UpdateTask` also clear `nextActor`
+when setting status to `completed`, so completed tasks have no pending turn.
+Both `ListTasks(nextActor=...)` and `CompareWorktreeTasks(nextActor=...)`
+exclude completed tasks, including older JSON records still storing
+`nextActor=reviewer`. Unfiltered reads preserve the historic JSON and full
+task list; no migration or rewriting of existing task files occurs. When a
+worktree contains no matching tasks it still appears as an empty group,
+retaining branch identity and any error diagnostics.
 
 This is a **branch-local handoff protocol**, not a distributed lease or proof
 that an agent's ChatGPT session is currently executing. Concurrent edits in

@@ -82,7 +82,7 @@ type RemoveWorktreeCommand =
 
 type ListTasksCommand = { ProjectName: string; Status: string option; Owner: string option; DependsOn: string option; NextActor: string option }
 type GetTaskCommand = { ProjectName: string; TaskId: string }
-type CompareWorktreeTasksCommand = { ProjectName: string }
+type CompareWorktreeTasksCommand = { ProjectName: string; NextActor: string option }
 type CreateTaskCommand =
     { ProjectName: string
       TaskId: string option
@@ -902,7 +902,7 @@ module AgentCommandInfo =
         | None -> invocation command
 
 module AgentProtocol =
-    let version = "3.15"
+    let version = "3.16"
     let defaultPatchFuzzyContextLines = 3
     let maxResponseBytes = 900 * 1024
     let maxImageBytes = 8 * 1024 * 1024
@@ -925,7 +925,7 @@ module AgentProtocol =
           definition "CreateWorktree" "Creates an isolated Git worktree and branch." [ VersionControlWrite ] true true false
           definition "InspectWorktreeRemoval" "Checks registered worktree removal safety." [ ReadOnly ] false false false
           definition "ListTasks" "Lists repository-backed HTML and JSON task files." [ ReadOnly ] false false false
-          definition "CompareWorktreeTasks" "Summarizes task files across every registered worktree." [ ReadOnly ] false false false
+          definition "CompareWorktreeTasks" "Summarizes tasks across registered worktrees with optional nextActor filtering." [ ReadOnly ] false false false
           definition "GetTask" "Reads HTML task definition and adjacent JSON state." [ ReadOnly ] false false false
           definition "CreateTask" "Creates and commits HTML and JSON task files." [ WorkspaceWrite; VersionControlWrite ] true true false
           definition "UpdateTask" "Updates task metadata or reviewer assignment without changing owner or progress." [ WorkspaceWrite; VersionControlWrite ] true true false

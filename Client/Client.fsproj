@@ -49,6 +49,7 @@
         <Compile Include="Modules\ProjectColorAssignments.fs"/>
         <Compile Include="Modules\ActivityNavigation.fs"/>
         <Compile Include="Modules\JobView.fs"/>
+        <Compile Include="Modules\AgentView.fs"/>
         <Compile Include="Modules\ConsoleTui.fs"/>
         <Compile Include="Modules\ProjectBrowser.fs"/>
         <Compile Include="Modules\ProcessEnvironment.fs"/>
@@ -56,6 +57,7 @@
         <Compile Include="Modules\JobManager.fs"/>
         <Compile Include="Modules\\Worktrees.fs"/>
         <Compile Include="Modules\\TaskStore.fs"/>
+        <Compile Include="Modules\AgentDashboard.fs"/>
         <Compile Include="Modules\\WorkTaskCompat.fs"/>
         <Compile Include="Runtime.fs"/>
         <Compile Include="Modules\AgentInstructions.fs"/>

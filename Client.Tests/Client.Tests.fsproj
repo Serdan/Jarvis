@@ -30,6 +30,7 @@
         <Compile Include="GitCommandTests.fs"/>
         <Compile Include="WorktreeTests.fs"/>
         <Compile Include="TaskStoreTests.fs"/>
+        <Compile Include="AgentViewTests.fs"/>
         <Compile Include="WorkTaskCompatTests.fs"/>
         <Compile Include="WorkTaskTests.fs"/>
         <Compile Include="HashAndPatchTests.fs"/>

@@ -84,7 +84,7 @@ Native commands, operating in the selected worktree:
 - `GetTaskHistory`: return relevant Git commits/diffs affecting the task files, bounded in size.
 - Optional repository-wide inspection may compare tasks across discovered worktrees and label branch-local/new/unmerged changes. This is an observational view, never a second authoritative state.
 
-Retain unrelated `RunProjectTask` commands from `.jarvis.json` as build/run automation; do not confuse them with issue/task records. Existing `AttachWorkTask`, `GetWorkTask`, `CheckpointWorkTask`, `CompleteWorkTask` behavior must be inventoried and either adapted to the new model or explicitly deprecated with a tested migration; do not leave two competing notions of task state.
+Retain unrelated `RunProjectTask` commands from `.jarvis.json` as build/run automation; do not confuse them with issue/task records. Legacy WorkTask API endpoints are retired. The authoritative state is the committed repository task JSON. Audit and archive older local `.jarvis/tasks/` records without overwriting the active assignment, checkpoint or ownership; do not retain two competing notions of task status.
 
 ## Automatic Git commits
 

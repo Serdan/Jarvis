@@ -203,7 +203,7 @@ Jarvis discovers existing worktrees using Git metadata. New worktrees use hidden
 
 Jarvis manages human-readable HTML task descriptions and adjacent version-controlled JSON state. The default canonical folder is `docs/tasks`, configurable through `"taskDirectory"` in project-root `.jarvis.json`. Commands include `CreateTask`, `ListTasks`, `GetTask`, `CompareWorktreeTasks`, `UpdateTask`, `ClaimTask`, `CheckpointTask`, `CompleteTask` and `GetTaskHistory`. Mutations commit only the affected task files on the selected branch.
 
-For HTML tasks, the older `AttachWorkTask` and checkpoint commands use Git-backed state; previously stored local checkpoints are migrated on their next update. Existing non-HTML checkpoints continue using the prior local format until explicitly converted.
+For task coordination, use repository-backed `ListTasks`, `GetTask`, `ClaimTask`, `UpdateTask`, `CheckpointTask`, and `CompleteTask`. The older WorkTask MCP endpoints have been retired. Historical `.jarvis/tasks/` checkpoint files are non-authoritative and must be reconciled with repository task JSON before archival or removal.
 
 See [Git worktrees and task files](docs/GitBackedTasks.md) for API details, file conventions and tests.
 

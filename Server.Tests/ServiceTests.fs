@@ -418,7 +418,12 @@ let ``command catalog matches AgentCommand union and MCP tools`` () =
     let serverLocalNames =
         set [ "GetProfile"; "Feedback"; "ListFeedback"; "GetFeedback"; "UpdateFeedback"; "GetFeedbackSummary"; "GetConnectionDiagnostics"; "ListDevices"; "SelectDevice"; "UpdateServer"; "GetServerUpdateStatus" ]
 
-    unionNames |> shouldEqual catalogNames
+    // Retired legacy wire cases remain internal for old-client compatibility,
+    // but must never be discoverable or callable as public MCP tools.
+    let retired = set [ "AttachWorkTask"; "GetWorkTask"; "ListWorkTasks"; "CheckpointWorkTask"; "CompleteWorkTask" ]
+    Set.difference unionNames retired |> shouldEqual catalogNames
+    Set.intersect mcpNames retired |> shouldEqual Set.empty
+    Set.intersect catalogNames retired |> shouldEqual Set.empty
     Set.difference mcpNames serverLocalNames |> shouldEqual catalogNames
     Set.difference mcpNames catalogNames |> shouldEqual serverLocalNames
 

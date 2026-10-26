@@ -1110,48 +1110,6 @@ type JarvisMcpTools =
     static member ListProjectTasks(projectName: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (ListProjectTasksCommand { ProjectName = projectName })
 
-    [<McpServerTool(Title = "Attach work task", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Attach persisted Jarvis execution state to a committed task description in a project repository. The task description must be tracked, committed, and clean.")>]
-    static member AttachWorkTask(projectName: string, taskId: string, taskPath: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
-        McpToolHelpers.send client http (AttachWorkTaskCommand {
-            ProjectName = projectName
-            TaskId = taskId
-            TaskPath = taskPath })
-
-    [<McpServerTool(Title = "Get work task", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read a persisted Jarvis work-task checkpoint together with the current committed task description and change indicators.")>]
-    static member GetWorkTask(projectName: string, taskId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
-        McpToolHelpers.send client http (GetWorkTaskCommand { ProjectName = projectName; TaskId = taskId })
-
-    [<McpServerTool(Title = "List work tasks", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("List unfinished Jarvis work tasks persisted for a project.")>]
-    static member ListWorkTasks(projectName: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
-        McpToolHelpers.send client http (ListWorkTasksCommand { ProjectName = projectName })
-
-    [<McpServerTool(Title = "Checkpoint work task", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Update the execution checkpoint for an attached Jarvis work task. Status must be active or blocked.")>]
-    static member CheckpointWorkTask(
-        projectName: string,
-        taskId: string,
-        status: string,
-        summary: string,
-        nextAction: string,
-        verified: string array,
-        [<Optional; DefaultParameterValue("")>] blocker: string,
-        [<Optional; DefaultParameterValue("")>] lastCommit: string,
-        [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService,
-        http: IHttpContextAccessor
-    ) =
-        McpToolHelpers.send client http (CheckpointWorkTaskCommand {
-            ProjectName = projectName
-            TaskId = taskId
-            Status = status
-            Summary = summary
-            NextAction = nextAction
-            Verified = verified |> Array.toList
-            Blocker = McpToolHelpers.optionOfString blocker
-            LastCommit = McpToolHelpers.optionOfString lastCommit })
-
-    [<McpServerTool(Title = "Complete work task", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Complete an attached Jarvis work task and delete its local persisted execution-state file. The committed task description remains in the repository.")>]
-    static member CompleteWorkTask(projectName: string, taskId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
-        McpToolHelpers.send client http (CompleteWorkTaskCommand { ProjectName = projectName; TaskId = taskId })
-
     [<McpServerTool(Title = "List skills", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("List project skills and shared workspace-global skills (scope identified on each result). Use projectName=@global to list global skills only. Skills do not grant execution privileges.")>]
     static member ListSkills(projectName: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (ListSkillsCommand { ProjectName = projectName })
@@ -1232,7 +1190,7 @@ type JarvisMcpTools =
             ProjectName = McpToolHelpers.optionOfString projectName
             Message = message })
 
-    [<McpServerTool(Title = "Get client activity", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read connected client activity. Observer diagnostics (GitStatus/ListJobs/ListWorkTasks) are omitted by default; set includeObservers=true to include them. Optionally filter by project.")>]
+    [<McpServerTool(Title = "Get client activity", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read connected client activity. Observer diagnostics (GitStatus/ListJobs) are omitted by default; set includeObservers=true to include them. Optionally filter by project.")>]
     static member GetClientActivity(
         [<Optional; DefaultParameterValue("")>] projectName: string,
         [<Optional; DefaultParameterValue(20)>] limit: int,

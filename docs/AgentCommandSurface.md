@@ -79,11 +79,7 @@ type AgentCommand =
     | RunCommandCommand of RunCommandCommand
     | ListProjectTasksCommand of ListProjectTasksCommand
     | RunProjectTaskCommand of RunProjectTaskCommand
-    | AttachWorkTaskCommand of AttachWorkTaskCommand
-    | GetWorkTaskCommand of GetWorkTaskCommand
-    | ListWorkTasksCommand of ListWorkTasksCommand
-    | CheckpointWorkTaskCommand of CheckpointWorkTaskCommand
-    | CompleteWorkTaskCommand of CompleteWorkTaskCommand
+    // Legacy WorkTask wire cases are internal compatibility only; no public MCP endpoints.
     | ListSkillsCommand of ListSkillsCommand
     | GetSkillCommand of GetSkillCommand
     | CreateSkillCommand of CreateSkillCommand
@@ -387,7 +383,7 @@ For authorization, Jarvis resolves the task before prompting and authorizes the 
 
 `ListTasks` and `GetTask` expose HTML task descriptions and adjacent structured JSON state in the selected worktree. `CompareWorktreeTasks` gives a read-only view across registered worktrees. `CreateTask`, `UpdateTask`, `ClaimTask`, `CheckpointTask` and `CompleteTask` manage state and create scoped commits; `GetTaskHistory` reads bounded Git history and patches. Workspace reads require `workspace:read`, while task and worktree Git mutations require `git:write` plus local permission/trust approval.
 
-Existing `AttachWorkTask`, `GetWorkTask`, `ListWorkTasks`, `CheckpointWorkTask` and `CompleteWorkTask` commands operate on canonical HTML tasks through Git-backed JSON. Earlier local checkpoint records migrate on the next update; non-HTML task checkpoints retain their original local persistence until converted. See [Git-backed task operations](GitBackedTasks.md).
+Public WorkTask MCP endpoints have been retired. Repository-backed tasks and their committed JSON, rather than old local checkpoint files, govern assignment and reviewer handoff. See [Git-backed task operations](GitBackedTasks.md).
 
 ## Project Skills
 

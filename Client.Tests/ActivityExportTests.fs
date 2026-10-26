@@ -48,3 +48,19 @@ let ``recent command export uses readable worktree labels`` () =
     exported.Contains("[02:30:00] @Wayfold/silver-ring-trade RunCommand")
     |> shouldEqual true
     exported.Contains("Wayfold::silver-ring-trade") |> shouldEqual false
+
+[<Test>]
+let ``recent command export translates hidden worktree path labels`` () =
+    let entry: ActivityExport.Entry =
+        { Timestamp = "02:30:00"
+          ProjectName = Some ".Wayfold-worktrees/silver-ring-trade"
+          CommandName = "RunCommand"
+          Reason = Some "Verify trade totals"
+          Detail = Some "dotnet test"
+          Status = "Completed"
+          DurationMs = Some 200L
+          Result = Some "exit 0" }
+    let exported = ActivityExport.formatRecent [ entry ]
+    exported.Contains("[02:30:00] @Wayfold/silver-ring-trade RunCommand")
+    |> shouldEqual true
+    exported.Contains(".Wayfold-worktrees/") |> shouldEqual false

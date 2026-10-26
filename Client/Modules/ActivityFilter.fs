@@ -34,21 +34,33 @@ let parseTerms (query: string) =
     { Text = List.rev text
       Projects = List.rev projects }
 
-// Worktree selectors stay in their command-routing form (Project::worktree).
-// Translate only at the presentation boundary so history and routing remain stable.
-let private separatorIndex (projectName: string) =
-    let index = projectName.IndexOf("::", StringComparison.Ordinal)
-    if index > 0 && index + 2 < projectName.Length then Some index else None
+// Preserve raw command project IDs; normalize only their presentation.
+// Worktrees are addressed as "Project::worktree" or ".Project-worktrees/worktree".
+let private worktreeParts (projectName: string) =
+    let separator = projectName.IndexOf("::", StringComparison.Ordinal)
+    if separator > 0 && separator + 2 < projectName.Length then
+        Some(projectName.Substring(0, separator), projectName.Substring(separator + 2))
+    else
+        let marker = "-worktrees/"
+        let index = projectName.IndexOf(marker, StringComparison.Ordinal)
+        if projectName.StartsWith(".", StringComparison.Ordinal)
+           && index > 1
+           && index + marker.Length < projectName.Length then
+            let project = projectName.Substring(1, index - 1)
+            let worktree = projectName.Substring(index + marker.Length)
+            if not (project.Contains('/')) && not (worktree.Contains('/')) then
+                Some(project, worktree)
+            else None
+        else None
 
 let projectRootName (projectName: string) =
-    match separatorIndex projectName with
-    | Some index -> projectName.Substring(0, index)
+    match worktreeParts projectName with
+    | Some(project, _) -> project
     | None -> projectName
 
 let projectLabel (projectName: string) =
-    match separatorIndex projectName with
-    | Some index ->
-        projectName.Substring(0, index) + "/" + projectName.Substring(index + 2)
+    match worktreeParts projectName with
+    | Some(project, worktree) -> project + "/" + worktree
     | None -> projectName
 
 let projectToken (projectName: string) =

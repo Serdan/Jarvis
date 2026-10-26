@@ -302,7 +302,7 @@ let ``cross-worktree task view includes branch-local tasks absent from main`` ()
                   Html = "<h1>" + name + "</h1>"; Dependencies = [] } context with
             | Error e -> Assert.Fail($"Could not create task in {name}: {e}")
             | Ok _ -> ()
-        match compareWorktreeTasks { ProjectName = "Project1" } context with
+        match compareWorktreeTasks { ProjectName = "Project1"; NextActor = None } context with
         | Error e -> Assert.Fail($"Compare failed: {e}")
         | Ok groups ->
             groups.Length |> shouldEqual 3
@@ -516,13 +516,21 @@ let ``reviewer assignment preserves agent claim and checkpoint and requires exac
         | Error e -> Assert.Fail($"Complete task failed: {e}")
         | Ok result ->
             result.Task.Task.Status |> shouldEqual "completed"
-            result.Task.Task.NextActor |> shouldEqual (Some "reviewer")
+            result.Task.Task.NextActor |> shouldEqual None
             result.Task.Task.Owner |> shouldEqual (Some "agent-6")
         match listTasks
             { ProjectName = projectName; Status = Some "completed"; Owner = None
               DependsOn = None; NextActor = Some "reviewer" } context with
-        | Ok [ item ] -> item.Id |> shouldEqual taskId
-        | other -> Assert.Fail($"Expected completed task pending review: {other}"))
+        | Ok [] -> ()
+        | other -> Assert.Fail($"Completed task must not remain pending review: {other}")
+        match listTasks
+            { ProjectName = projectName; Status = Some "completed"; Owner = None
+              DependsOn = None; NextActor = None } context with
+        | Ok [ item ] ->
+            item.Id |> shouldEqual taskId
+            item.Owner |> shouldEqual (Some "agent-6")
+            item.NextActor |> shouldEqual None
+        | other -> Assert.Fail($"Completed task missing from unfiltered historical list: {other}"))
 
 [<Test>]
 let ``invalid reviewer handoff fails without changing ownership or Git history`` () =
@@ -746,3 +754,160 @@ let failedHookThatChangesTaskFilePreservesUserChanges () =
         | other -> Assert.Fail($"External hook edits should be preserved: {other}")
         File.ReadAllText(json).Contains("manual-hook-change") |> shouldEqual true
         File.Delete hook)
+
+[<Test>]
+let compareWorktreeTasksFiltersReviewerAndAgentHandoffs () =
+    withProject (fun _ project context ->
+        File.WriteAllText(Path.Combine(project, "README.md"), "initial")
+        GitCommandTests.expectGitSuccess context [ "add"; "README.md" ]
+        GitCommandTests.expectGitSuccess context [ "commit"; "-m"; "Initial" ]
+        for name, turn in [ "ready-agent", "agent"; "ready-reviewer", "reviewer"; "done-branch", "completed" ] do
+            match Client.Worktrees.createWorktree
+                { ProjectName = "Project1"; Name = name; Branch = "feature/" + name; BaseRef = "HEAD" } context with
+            | Error error -> Assert.Fail($"Could not create {name}: {error}")
+            | Ok _ -> ()
+            let selector = "Project1::" + name
+            let created =
+                match createTask
+                    { ProjectName = selector; TaskId = Some name
+                      Title = name; Html = "<h1>" + name + "</h1>"; Dependencies = [] } context with
+                | Ok result -> result
+                | Error e -> failwith $"Create failed: {e}"
+            let claimed =
+                match claimTask
+                    { ProjectName = selector; TaskId = name
+                      ExpectedRevision = created.Task.Task.Revision
+                      Owner = "agent-7"; AllowReassign = false } context with
+                | Ok result -> result
+                | Error e -> failwith $"Claim failed: {e}"
+            if turn = "reviewer" then
+                match checkpointTask
+                    { ProjectName = selector; TaskId = name; ExpectedRevision = claimed.Task.Task.Revision
+                      Status = "active"; Summary = "Slice ready"; NextAction = "Review"
+                      Verified = [ "tests" ]; Blocker = None; LastCommit = Some "abc"
+                      DescriptionCommit = None; AcknowledgedAssignmentRevision = None
+                      ActorId = Some "agent-7" } context with
+                | Ok _ -> ()
+                | Error e -> Assert.Fail($"Checkpoint failed: {e}")
+            elif turn = "completed" then
+                match completeTask
+                    { ProjectName = selector; TaskId = name; ExpectedRevision = claimed.Task.Task.Revision
+                      Verified = [ "accepted" ]; FinalCommit = Some "def"
+                      AcknowledgedAssignmentRevision = None; ActorId = Some "agent-7" } context with
+                | Ok result -> result.Task.Task.NextActor |> shouldEqual None
+                | Error e -> Assert.Fail($"Complete failed: {e}")
+        let compare turn =
+            match compareWorktreeTasks { ProjectName = "Project1"; NextActor = turn } context with
+            | Ok groups ->
+                groups.Length |> shouldEqual 4
+                groups |> List.forall (fun group -> group.Error.IsNone) |> shouldEqual true
+                groups
+            | Error e -> failwith $"Compare failed: {e}"
+        let all =
+            compare None |> List.collect (fun group -> group.Tasks |> List.map (fun task -> task.Id))
+            |> Set.ofList
+        all |> shouldEqual (set [ "ready-agent"; "ready-reviewer"; "done-branch" ])
+        let review =
+            compare (Some "reviewer")
+            |> List.collect (fun group -> group.Tasks |> List.map (fun task -> group.Worktree, task))
+        match review with
+        | [ (worktree, task) ] ->
+            worktree.Branch |> shouldEqual (Some "feature/ready-reviewer")
+            worktree.Path.EndsWith("ready-reviewer") |> shouldEqual true
+            task.Id |> shouldEqual "ready-reviewer"
+            task.Owner |> shouldEqual (Some "agent-7")
+            task.Revision.IsSome |> shouldEqual true
+            task.NextActor |> shouldEqual (Some "reviewer")
+        | other -> Assert.Fail($"Expected one reviewer task, got: {other}")
+        let agent =
+            compare (Some "agent")
+            |> List.collect (fun group -> group.Tasks |> List.map (fun task -> group.Worktree.Branch, task.Id, task.NextActor))
+        agent |> shouldEqual [ Some "feature/ready-agent", "ready-agent", Some "agent" ])
+
+[<Test>]
+let completedHistoricalTaskNeverAppearsInHandoffFilters () =
+    withProject (fun _ project context ->
+        let created =
+            match createTask
+                { ProjectName = "Project1"; TaskId = Some "legacy-completed"
+                  Title = "Old complete"; Html = "<h1>Old</h1>"; Dependencies = [] } context with
+            | Ok result -> result
+            | Error error -> failwith $"Create failed: {error}"
+        let json = Path.Combine(project, "docs", "tasks", "legacy-completed.json")
+        let state = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(json))
+        state["status"] <- System.Text.Json.Nodes.JsonValue.Create("completed")
+        state["nextActor"] <- System.Text.Json.Nodes.JsonValue.Create("reviewer")
+        File.WriteAllText(json, state.ToJsonString())
+        match listTasks
+            { ProjectName = "Project1"; Status = None; Owner = None
+              DependsOn = None; NextActor = Some "reviewer" } context with
+        | Ok [] -> ()
+        | other -> Assert.Fail($"Completed task leaked into reviewer queue: {other}")
+        match compareWorktreeTasks { ProjectName = "Project1"; NextActor = Some "reviewer" } context with
+        | Ok groups when groups |> List.forall (fun group -> group.Tasks.IsEmpty) -> ()
+        | other -> Assert.Fail($"Cross-worktree reviewer queue contains completed task: {other}")
+        match listTasks
+            { ProjectName = "Project1"; Status = None; Owner = None
+              DependsOn = None; NextActor = None } context with
+        | Ok [ task ] ->
+            task.Id |> shouldEqual "legacy-completed"
+            task.Status |> shouldEqual "completed"
+            task.NextActor |> shouldEqual (Some "reviewer")
+            task.Revision.IsSome |> shouldEqual true
+        | other -> Assert.Fail($"Historical task was lost: {other}")
+        created.Task.Task.Id |> shouldEqual "legacy-completed")
+
+[<Test>]
+let completedTransitionsClearHandoffForEveryTaskMutation () =
+    withProject (fun _ _ context ->
+        for mode in [ "checkpoint"; "metadata"; "completion" ] do
+            let created =
+                match createTask
+                    { ProjectName = "Project1"; TaskId = Some mode
+                      Title = mode; Html = "<h1>" + mode + "</h1>"; Dependencies = [] } context with
+                | Ok result -> result
+                | Error e -> failwith $"Create failed: {e}"
+            let claimed =
+                match claimTask
+                    { ProjectName = "Project1"; TaskId = mode
+                      ExpectedRevision = created.Task.Task.Revision
+                      Owner = "agent-6"; AllowReassign = false } context with
+                | Ok result -> result
+                | Error e -> failwith $"Claim failed: {e}"
+            let updated =
+                if mode = "checkpoint" then
+                    checkpointTask
+                        { ProjectName = "Project1"; TaskId = mode
+                          ExpectedRevision = claimed.Task.Task.Revision
+                          Status = "completed"; Summary = "Accepted"; NextAction = ""
+                          Verified = [ "verified" ]; Blocker = None; LastCommit = Some "abc"
+                          DescriptionCommit = None; AcknowledgedAssignmentRevision = None
+                          ActorId = Some "agent-6" } context
+                    |> Result.map (fun value -> value.Task)
+                elif mode = "metadata" then
+                    updateTask
+                        { ProjectName = "Project1"; TaskId = mode
+                          ExpectedRevision = claimed.Task.Task.Revision
+                          Title = None; Status = Some "completed"; Dependencies = None
+                          DescriptionCommit = None; AssignmentInstructions = None
+                          AssignmentBaseCommit = None; ExpectedAssignmentRevision = None
+                          NextActor = Some "reviewer"; ActorId = Some "reviewer-1" } context
+                    |> Result.map (fun value -> value.Task)
+                else
+                    completeTask
+                        { ProjectName = "Project1"; TaskId = mode
+                          ExpectedRevision = claimed.Task.Task.Revision
+                          Verified = [ "accepted" ]; FinalCommit = Some "final"
+                          AcknowledgedAssignmentRevision = None; ActorId = Some "agent-6" } context
+                    |> Result.map (fun value -> value.Task)
+            match updated with
+            | Error error -> Assert.Fail($"Completion via {mode} failed: {error}")
+            | Ok details ->
+                details.Task.Status |> shouldEqual "completed"
+                details.Task.Owner |> shouldEqual (Some "agent-6")
+                details.Task.NextActor |> shouldEqual None
+        match listTasks
+            { ProjectName = "Project1"; Status = None; Owner = None
+              DependsOn = None; NextActor = Some "reviewer" } context with
+        | Ok [] -> ()
+        | other -> Assert.Fail($"Completed tasks in reviewer queue: {other}"))

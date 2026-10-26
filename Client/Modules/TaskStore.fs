@@ -219,7 +219,7 @@ let listTasks (cmd: ListTasksCommand) =
                     (cmd.Status.IsNone || (cmd.Status |> Option.map normalizeStatus) = Some item.Status)
                     && (cmd.Owner.IsNone || item.Owner = cmd.Owner)
                     && (cmd.DependsOn.IsNone || item.Dependencies |> List.contains cmd.DependsOn.Value)
-                    && (cmd.NextActor.IsNone || item.NextActor = cmd.NextActor))
+                    && (cmd.NextActor.IsNone || (item.Status <> "completed" && item.NextActor = cmd.NextActor)))
     }
 
 let getTask (cmd: GetTaskCommand) =
@@ -575,6 +575,7 @@ let updateTask (cmd: UpdateTaskCommand) =
                     else
                         cmd.NextActor |> Option.iter (fun actor -> obj["nextActor"] <- JsonValue.Create(actor))
                         cmd.ActorId |> Option.iter (fun id -> recordActor obj "reviewer" id)
+                    if getString obj "status" = Some "completed" then obj["nextActor"] <- null
                     Ok())
 
 let claimTask (cmd: ClaimTaskCommand) =
@@ -617,7 +618,7 @@ let checkpointTask (cmd: CheckpointTaskCommand) =
                     obj["checkpoint"] <- checkpoint
                     cmd.DescriptionCommit |> Option.iter (fun commit -> obj["descriptionCommit"] <- JsonValue.Create(commit))
                     obj["status"] <- JsonValue.Create(cmd.Status)
-                    obj["nextActor"] <- JsonValue.Create("reviewer")
+                    obj["nextActor"] <- (if cmd.Status = "completed" then null else JsonValue.Create("reviewer"))
                     recordActor obj "agent" (cmd.ActorId |> Option.orElseWith (fun () -> ownerId obj) |> Option.defaultValue "unspecified")
                     Ok())
 
@@ -635,7 +636,7 @@ let completeTask (cmd: CompleteTaskCommand) =
                 |> Option.iter (fun rev -> completion["acknowledgedAssignmentRevision"] <- JsonValue.Create(rev))
                 obj["completion"] <- completion
                 obj["status"] <- JsonValue.Create("completed")
-                obj["nextActor"] <- JsonValue.Create("reviewer")
+                obj["nextActor"] <- null
                 recordActor obj "agent" (cmd.ActorId |> Option.orElseWith (fun () -> ownerId obj) |> Option.defaultValue "unspecified")
                 Ok())
 
@@ -687,7 +688,7 @@ let compareWorktreeTasks (cmd: CompareWorktreeTasksCommand) =
                       Status = None
                       Owner = None
                       DependsOn = None
-                      NextActor = None } rt with
+                      NextActor = cmd.NextActor } rt with
                 | Ok tasks -> { Worktree = worktree; Tasks = tasks; Error = None }
                 | Error error -> { Worktree = worktree; Tasks = []; Error = Some(string error) })
             |> Ok

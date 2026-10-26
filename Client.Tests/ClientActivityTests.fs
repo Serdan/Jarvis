@@ -192,3 +192,12 @@ let ``client activity snapshots keep original worktree selector for API consumer
     let entries = tui.GetActivitySnapshot(Some "Wayfold::silver-ring-trade", Some 20).Entries
     entries.Length |> shouldEqual 1
     entries.Head.ProjectName |> shouldEqual (Some "Wayfold::silver-ring-trade")
+
+[<Test>]
+let ``live hidden worktree activity remains stored under its original selector`` () =
+    let tui = ConsoleTui.ConsoleTui()
+    let id = tui.StartActivity(sampleRunCommand ".Wayfold-worktrees/silver-ring-trade" "Verify trade totals")
+    tui.CompleteActivity(id, 9L, Some "exit 0")
+    let entries = tui.GetActivitySnapshot(Some ".Wayfold-worktrees/silver-ring-trade", Some 20).Entries
+    entries.Length |> shouldEqual 1
+    entries.Head.ProjectName |> shouldEqual (Some ".Wayfold-worktrees/silver-ring-trade")

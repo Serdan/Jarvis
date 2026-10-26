@@ -68,3 +68,33 @@ let ``non-worktree project labels remain unchanged`` () =
     ActivityFilter.projectToken "Jarvis" |> shouldEqual "@Jarvis"
     ActivityFilter.projectToken "Jarvis::" |> shouldEqual "@Jarvis::"
     ActivityFilter.projectToken "::invalid" |> shouldEqual "@::invalid"
+
+[<Test>]
+let ``hidden sibling worktree paths use readable project and worktree tokens`` () =
+    ActivityFilter.projectToken ".Wayfold-worktrees/silver-ring-trade"
+    |> shouldEqual "@Wayfold/silver-ring-trade"
+    ActivityFilter.projectToken ".Wayfold-worktrees/tooltip-fix"
+    |> shouldEqual "@Wayfold/tooltip-fix"
+    ActivityFilter.projectRootName ".Wayfold-worktrees/silver-ring-trade"
+    |> shouldEqual "Wayfold"
+    ActivityFilter.projectToken "Wayfold::silver-ring-trade"
+    |> shouldEqual "@Wayfold/silver-ring-trade"
+    ActivityFilter.projectToken "Wayfold"
+    |> shouldEqual "@Wayfold"
+
+[<Test>]
+let ``filters match hidden sibling worktrees using rendered tokens`` () =
+    let raw = Some ".Wayfold-worktrees/silver-ring-trade"
+    for query in [ "@Wayfold/silver-ring-trade"; "@wayfold/silver"; "@Wayfold"; "@.Wayfold-worktrees/silver-ring-trade" ] do
+        ActivityFilter.matchesTerms (ActivityFilter.parseTerms query) raw "Trade Silver Ring"
+        |> shouldEqual true
+    ActivityFilter.matchesTerms (ActivityFilter.parseTerms "@Wayfold/tooltip-fix") raw "Trade Silver Ring"
+    |> shouldEqual false
+
+[<Test>]
+let ``other path-like project names remain unchanged`` () =
+    ActivityFilter.projectToken "Wayfold-nav-alloc" |> shouldEqual "@Wayfold-nav-alloc"
+    ActivityFilter.projectToken ".Wayfold-worktrees" |> shouldEqual "@.Wayfold-worktrees"
+    ActivityFilter.projectToken ".Wayfold-worktrees/" |> shouldEqual "@.Wayfold-worktrees/"
+    ActivityFilter.projectToken ".Wayfold-worktrees/silver-ring-trade/nested"
+    |> shouldEqual "@.Wayfold-worktrees/silver-ring-trade/nested"

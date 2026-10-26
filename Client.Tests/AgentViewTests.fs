@@ -234,3 +234,27 @@ let agentsDashboardSkipsNonGitProjectsWithoutHidingGitFailures () =
                 issue.Contains("TEST") && issue.Contains("Git"))) |> shouldEqual true
     finally
         if Directory.Exists root then Directory.Delete(root, true)
+
+[<Test>]
+let agentFiltersShareActivityTextAndProjectTerms () =
+    let data = snapshot
+                   [ assignment "Agent 2" "Wayfold" "292" "Working"
+                     assignment "Agent 3" "Jarvis" "308" "Assigned" ] []
+    let names query = visibleRows query data |> List.map _.Agent
+    names "@Wayfold" |> shouldEqual [ "Agent 2" ]
+    names "@Jarvis" |> shouldEqual [ "Agent 3" ]
+    names "@Wayfold agent 2" |> shouldEqual [ "Agent 2" ]
+    names "working 292" |> shouldEqual [ "Agent 2" ]
+    names "agent 2 @Jarvis" |> shouldEqual []
+    names "@Wayfold::292" |> shouldEqual [ "Agent 2" ]
+    names "@" |> shouldEqual [ "Agent 3"; "Agent 2" ]
+    names "@missing" |> shouldEqual []
+
+[<Test>]
+let agentProjectAndTextFiltersMatchSameTask () =
+    let data = snapshot
+                   [ assignment "Agent 2" "Wayfold" "292" "Working"
+                     assignment "Agent 2" "Wayfold" "305" "Assigned" ] []
+    (visibleRows "@Wayfold::292 292" data).Length |> shouldEqual 1
+    (visibleRows "@Wayfold::292 305" data).Length |> shouldEqual 0
+    (visibleRows "@Wayfold::305 305" data).Length |> shouldEqual 1

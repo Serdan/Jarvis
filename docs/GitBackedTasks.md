@@ -287,9 +287,14 @@ task/agent ownership conflicts and shows handoff states:
 - Per-project pending reviews, unacknowledged assignments, inspection
   failures and conservative retirement-candidate counts
 
-Use Up/Down (or Page Up/Down) to select, Enter for details, `f` to filter
-by agent/project/task/worktree, `r` to refresh, and Escape to return.
-`p` opens pending permission requests without leaving the agent context.
+The Agents screen follows Activity: a 12-row selectable list with colored
+`@project` labels, timestamps and inline details toggled by Enter.
+Up/Down and Page Up/Down navigate; End selects the last row.
+Use `/` to filter by agent, task or worktree, or `@` to start a project
+filter; search terms can be combined just as in Activity. `f` remains an
+alias for text filtering. Press `r` to refresh and Escape to return.
+Permission requests appear below the details and open with `p`, using the
+same highlighting and controls as the Activity screen.
 
 The roster also retains the **three most recently updated completed tasks**
 for each project/agent, even after their active assignment leaves the handoff

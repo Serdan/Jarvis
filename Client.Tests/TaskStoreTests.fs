@@ -560,3 +560,189 @@ let ``invalid reviewer handoff fails without changing ownership or Git history``
             details.Task.Owner |> shouldEqual None
             details.Task.AssignmentRevision |> shouldEqual None
         | Error e -> Assert.Fail($"Cannot re-read task: {e}"))
+
+[<Test>]
+let missingTaskDirectoryIsEmptyUntilCreation () =
+    withProject (fun _ project context ->
+        let folder = Path.Combine(project, "docs", "tasks")
+        Directory.Exists folder |> shouldEqual false
+        match listTasks { ProjectName = "Project1"; Status = None; Owner = None; DependsOn = None; NextActor = None } context with
+        | Ok [] -> ()
+        | other -> Assert.Fail($"Missing task folder should list as empty: {other}")
+        Directory.Exists folder |> shouldEqual false
+        match createTask
+            { ProjectName = "Project1"; TaskId = Some "new-directory"
+              Title = "New"; Html = "<h1>New</h1>"; Dependencies = [] } context with
+        | Ok _ -> Directory.Exists folder |> shouldEqual true
+        | Error err -> Assert.Fail($"Create should initialize task folder: {err}"))
+
+[<Test>]
+let tasksWithoutGitRepositoryAllowReadsButNotWrites () =
+    let root, project = GitCommandTests.createTempProject ()
+    try
+        let context = GitCommandTests.TestContext root
+        let folder = Path.Combine(project, "docs", "tasks")
+        Directory.CreateDirectory folder |> ignore
+        File.WriteAllText(Path.Combine(folder, "legacy.html"), "<h1>Legacy</h1>")
+        match listTasks { ProjectName = "Project1"; Status = None; Owner = None; DependsOn = None; NextActor = None } context with
+        | Ok [item] -> item.Id |> shouldEqual "legacy"
+        | other -> Assert.Fail($"Read-only tasks should work without Git: {other}")
+        match createTask
+            { ProjectName = "Project1"; TaskId = Some "no-repo"
+              Title = "No repo"; Html = "<p>no repo</p>"; Dependencies = [] } context with
+        | Error(Client.ValidationError message) ->
+            message.Contains("not a Git working repository") |> shouldEqual true
+        | other -> Assert.Fail($"Expected explicit non-repository error: {other}")
+        File.Exists(Path.Combine(folder, "no-repo.html")) |> shouldEqual false
+        File.Exists(Path.Combine(folder, "no-repo.json")) |> shouldEqual false
+        match updateTask
+            { ProjectName = "Project1"; TaskId = "legacy"; ExpectedRevision = None
+              Title = None; Status = Some "active"; Dependencies = None
+              DescriptionCommit = None; AssignmentInstructions = None
+              AssignmentBaseCommit = None; ExpectedAssignmentRevision = None
+              NextActor = None; ActorId = None } context with
+        | Error(Client.ValidationError message) ->
+            message.Contains("not a Git working repository") |> shouldEqual true
+        | other -> Assert.Fail($"Existing task update should report non-repository: {other}")
+        File.Exists(Path.Combine(folder, "legacy.json")) |> shouldEqual false
+    finally
+        if Directory.Exists root then Directory.Delete(root, true)
+
+[<Test; NonParallelizable>]
+let missingGitExecutableFailsBeforeWritingFiles () =
+    withProject (fun _ project context ->
+        let previousPath = Environment.GetEnvironmentVariable("PATH")
+        let absentPath = Path.Combine(project, "no-git-executables")
+        Directory.CreateDirectory absentPath |> ignore
+        try
+            Environment.SetEnvironmentVariable("PATH", absentPath)
+            match createTask
+                { ProjectName = "Project1"; TaskId = Some "git-missing"
+                  Title = "No Git"; Html = "<h1>No Git</h1>"; Dependencies = [] } context with
+            | Error(Client.ValidationError message) ->
+                message.Contains("Git is not installed") |> shouldEqual true
+            | other -> Assert.Fail($"Expected executable-not-found error: {other}")
+        finally Environment.SetEnvironmentVariable("PATH", previousPath)
+        Directory.Exists(Path.Combine(project, "docs", "tasks")) |> shouldEqual false)
+
+let private rejectCommitHook project =
+    if OperatingSystem.IsWindows() then Assert.Ignore("Shell hook fixture runs on Unix")
+    let hooks = Path.Combine(project, ".git", "hooks")
+    Directory.CreateDirectory hooks |> ignore
+    let hook = Path.Combine(hooks, "pre-commit")
+    File.WriteAllText(hook, "#!/bin/sh\nprintf 'rejected by fixture hook\\n' >&2\nexit 1\n")
+    File.SetUnixFileMode(hook, UnixFileMode.UserRead ||| UnixFileMode.UserWrite ||| UnixFileMode.UserExecute)
+    hook
+
+[<Test>]
+let failedFirstTaskCommitRestoresFilesAndIndexAndCanRetry () =
+    withProject (fun _ project context ->
+        let unrelated = Path.Combine(project, "unrelated.txt")
+        File.WriteAllText(unrelated, "user staged file")
+        GitCommandTests.expectGitSuccess context [ "add"; "unrelated.txt" ]
+        let hook = rejectCommitHook project
+        let cmd =
+            { ProjectName = "Project1"; TaskId = Some "retry-first"
+              Title = "Retry first"; Html = "<h1>Retry</h1>"; Dependencies = [] }
+        match createTask cmd context with
+        | Error(Client.ValidationError message) ->
+            message.Contains("restored to their previous state") |> shouldEqual true
+        | other -> Assert.Fail($"Expected recoverable commit failure: {other}")
+        File.Exists(Path.Combine(project, "docs", "tasks", "retry-first.html")) |> shouldEqual false
+        File.Exists(Path.Combine(project, "docs", "tasks", "retry-first.json")) |> shouldEqual false
+        GitCommandTests.gitOutput context [ "diff"; "--cached"; "--name-only" ] |> shouldEqual "unrelated.txt"
+        File.Delete hook
+        match createTask cmd context with
+        | Error error -> Assert.Fail($"Retry failed after removing hook: {error}")
+        | Ok committed ->
+            committed.CommitHash.Length |> shouldEqual 40
+            committed.Task.Task.Id |> shouldEqual "retry-first"
+        GitCommandTests.gitOutput context [ "diff"; "--cached"; "--name-only" ] |> shouldEqual "unrelated.txt")
+
+[<Test>]
+let failedTaskUpdateRestoresOriginalBytesAndCanRetry () =
+    withProject (fun _ project context ->
+        let created =
+            match createTask
+                { ProjectName = "Project1"; TaskId = Some "retry-update"
+                  Title = "Original"; Html = "<h1>Original</h1>"; Dependencies = [] } context with
+            | Ok value -> value
+            | Error e -> failwith $"Setup failed: {e}"
+        let originalHead = GitCommandTests.gitOutput context [ "rev-parse"; "HEAD" ]
+        let json = Path.Combine(project, "docs", "tasks", "retry-update.json")
+        let originalBytes = File.ReadAllBytes json
+        File.WriteAllText(Path.Combine(project, "unrelated.txt"), "staged")
+        GitCommandTests.expectGitSuccess context [ "add"; "unrelated.txt" ]
+        let hook = rejectCommitHook project
+        let change =
+            { ProjectName = "Project1"; TaskId = "retry-update"; ExpectedRevision = created.Task.Task.Revision
+              Title = Some "Revised"; Status = Some "active"; Dependencies = None
+              DescriptionCommit = None; AssignmentInstructions = None
+              AssignmentBaseCommit = None; ExpectedAssignmentRevision = None
+              NextActor = None; ActorId = None }
+        match updateTask change context with
+        | Error(Client.ValidationError message) ->
+            message.Contains("restored to their previous state") |> shouldEqual true
+        | other -> Assert.Fail($"Expected rollback on update: {other}")
+        File.ReadAllBytes json |> shouldEqual originalBytes
+        GitCommandTests.gitOutput context [ "rev-parse"; "HEAD" ] |> shouldEqual originalHead
+        GitCommandTests.gitOutput context [ "diff"; "--cached"; "--name-only" ] |> shouldEqual "unrelated.txt"
+        File.Delete hook
+        match updateTask change context with
+        | Ok updated -> updated.Task.Task.Title |> shouldEqual "Revised"
+        | Error e -> Assert.Fail($"Retry failed after hook removal: {e}")
+        GitCommandTests.gitOutput context [ "diff"; "--cached"; "--name-only" ] |> shouldEqual "unrelated.txt")
+
+[<Test>]
+let failedLazyMetadataCommitPreservesExistingHTML () =
+    withProject (fun _ project context ->
+        let folder = Path.Combine(project, "docs", "tasks")
+        Directory.CreateDirectory folder |> ignore
+        let html = Path.Combine(folder, "lazy.html")
+        File.WriteAllText(html, "<h1>Existing description</h1>")
+        GitCommandTests.expectGitSuccess context [ "add"; "docs/tasks/lazy.html" ]
+        GitCommandTests.expectGitSuccess context [ "commit"; "-m"; "Original task HTML" ]
+        let hook = rejectCommitHook project
+        let cmd =
+            { ProjectName = "Project1"; TaskId = "lazy"; ExpectedRevision = None
+              Title = Some "Metadata"; Status = Some "active"; Dependencies = None
+              DescriptionCommit = None; AssignmentInstructions = None
+              AssignmentBaseCommit = None; ExpectedAssignmentRevision = None
+              NextActor = None; ActorId = None }
+        match updateTask cmd context with
+        | Error(Client.ValidationError message) ->
+            message.Contains("restored to their previous state") |> shouldEqual true
+        | other -> Assert.Fail($"Expected lazy state rollback: {other}")
+        File.ReadAllText html |> shouldEqual "<h1>Existing description</h1>"
+        File.Exists(Path.Combine(folder, "lazy.json")) |> shouldEqual false
+        GitCommandTests.gitOutput context [ "status"; "--porcelain"; "--"; "docs/tasks" ] |> shouldEqual ""
+        File.Delete hook
+        match updateTask cmd context with
+        | Ok result -> result.Task.Task.Status |> shouldEqual "active"
+        | Error e -> Assert.Fail($"Lazy task retry failed: {e}"))
+
+[<Test>]
+let failedHookThatChangesTaskFilePreservesUserChanges () =
+    withProject (fun _ project context ->
+        let created =
+            match createTask
+                { ProjectName = "Project1"; TaskId = Some "hook-change"
+                  Title = "Original"; Html = "<p>Original</p>"; Dependencies = [] } context with
+            | Ok item -> item
+            | Error e -> failwith $"Setup failed: {e}"
+        let hook = rejectCommitHook project
+        File.WriteAllText(hook, "#!/bin/sh\nprintf '\\nmanual-hook-change\\n' >> docs/tasks/hook-change.json\nexit 1\n")
+        let json = Path.Combine(project, "docs", "tasks", "hook-change.json")
+        let cmd =
+            { ProjectName = "Project1"; TaskId = "hook-change"
+              ExpectedRevision = created.Task.Task.Revision
+              Title = Some "Updated"; Status = None; Dependencies = None
+              DescriptionCommit = None; AssignmentInstructions = None
+              AssignmentBaseCommit = None; ExpectedAssignmentRevision = None
+              NextActor = None; ActorId = None }
+        match updateTask cmd context with
+        | Error(Client.ValidationError message) ->
+            message.Contains("no rollback was performed") |> shouldEqual true
+        | other -> Assert.Fail($"External hook edits should be preserved: {other}")
+        File.ReadAllText(json).Contains("manual-hook-change") |> shouldEqual true
+        File.Delete hook)

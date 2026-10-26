@@ -323,6 +323,87 @@ let private commitScope projectName (paths: string list) message =
                   AllowEmpty = false }
     }
 
+let private ensureGitReady projectName root =
+    effect {
+        let! result =
+            fun rt ->
+                match git projectName [ "rev-parse"; "--show-toplevel" ] rt with
+                | Error(Client.ExceptionError (:? System.ComponentModel.Win32Exception as ex)) when ex.NativeErrorCode = 2 ->
+                    Error(Client.ValidationError "Git is not installed or is not available in PATH. Install Git before modifying repository tasks.")
+                | Error(Client.ExceptionError (:? FileNotFoundException)) ->
+                    Error(Client.ValidationError "Git is not installed or is not available in PATH. Install Git before modifying repository tasks.")
+                | other -> other
+        if result.TimedOut || result.Truncated then
+            return! Client.ValidationError "Could not verify the Git repository (command timed out or output was truncated)." |> Effect.ofError
+        elif result.ExitCode <> 0 then
+            let error = result.StdErr.Trim()
+            if error.Contains("not a git repository", StringComparison.OrdinalIgnoreCase)
+               || error.Contains("must be run in a work tree", StringComparison.OrdinalIgnoreCase) then
+                return! Client.ValidationError "This project is not a Git working repository. Initialize it with git init before modifying tasks." |> Effect.ofError
+            else
+                return! Client.ValidationError($"Git cannot access this project's repository: {error}") |> Effect.ofError
+        elif not (String.Equals(Path.GetFullPath(result.StdOut.Trim()).TrimEnd(Path.DirectorySeparatorChar),
+                                 Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar),
+                                 (if OperatingSystem.IsWindows() then StringComparison.OrdinalIgnoreCase else StringComparison.Ordinal))) then
+            return! Client.ValidationError "The selected project is not the root of its Git working tree." |> Effect.ofError
+        else return ()
+    }
+
+let private restoreBytes path (original: byte[] option) =
+    match original with
+    | None -> if File.Exists path then File.Delete path
+    | Some bytes ->
+        let temp = path + "." + Guid.NewGuid().ToString("N") + ".rollback"
+        try
+            File.WriteAllBytes(temp, bytes)
+            File.Move(temp, path, true)
+        finally
+            if File.Exists temp then File.Delete temp
+
+// The saved bytes are captured before writing. On a failed commit, restore only if
+// the files still contain precisely our writes; never overwrite external edits.
+let private commitWithRollback projectName (paths: string list) message (snapshots: (string * byte[] option) list) =
+    fun rt ->
+        let head args =
+            match git projectName args rt with
+            | Ok result when result.ExitCode = 0 && not result.TimedOut && not result.Truncated ->
+                Some(result.StdOut.Trim())
+            | _ -> None
+        let originalHead = head [ "rev-parse"; "--verify"; "HEAD" ]
+        let expected =
+            snapshots
+            |> List.map (fun (path, original) -> path, original, File.ReadAllBytes(path))
+        match commitScope projectName paths message rt with
+        | Ok committed -> Ok committed
+        | Error commitError ->
+            let currentHead = head [ "rev-parse"; "--verify"; "HEAD" ]
+            let filesIntact =
+                expected
+                |> List.forall (fun (path, _, written) ->
+                    File.Exists path && File.ReadAllBytes(path) = written)
+            let failure = $"Git could not commit task changes: {commitError}."
+            if originalHead <> currentHead then
+                Error(Client.ValidationError($"{failure} Git HEAD changed; the task files were preserved. Inspect the commit before retrying."))
+            elif not filesIntact then
+                Error(Client.ValidationError($"{failure} Task files changed during the attempt; no rollback was performed. Reconcile the task files and Git index before retrying."))
+            else
+                let unstaged =
+                    let args =
+                        if originalHead.IsSome then [ "reset"; "-q"; "--" ] @ paths
+                        else [ "rm"; "--cached"; "-q"; "--ignore-unmatch"; "--" ] @ paths
+                    match git projectName args rt with
+                    | Ok result -> result.ExitCode = 0 && not result.TimedOut && not result.Truncated
+                    | Error _ -> false
+                if not unstaged then
+                    Error(Client.ValidationError($"{failure} Could not restore the task staging area; task files were preserved. Reconcile the Git index before retrying."))
+                else
+                    try
+                        for path, original, _ in expected do
+                            restoreBytes path original
+                        Error(Client.ValidationError($"{failure} Task files and staging were restored to their previous state. Fix Git and retry the operation."))
+                    with ex ->
+                        Error(Client.ValidationError($"{failure} Rollback failed: {ex.Message}. Inspect the task files and Git index before retrying."))
+
 let private readMutableState root taskId expectedRevision =
     match directory root with
     | Error err -> Error err
@@ -354,8 +435,10 @@ let private updateState projectName taskId expectedRevision message mutate =
     effect {
         let! (FolderPath root) = ProjectPaths.resolveProjectRoot projectName
         let! (relative, folder, statePath, obj) = fun _ -> readMutableState root taskId expectedRevision
+        do! ensureGitReady projectName root
         let path = relative + "/" + taskId + ".json"
         do! ensureUnmodifiedTaskPath projectName path
+        let previousState = if File.Exists statePath then Some(File.ReadAllBytes statePath) else None
         let! () = fun _ -> mutate obj
         obj["updatedAt"] <- JsonValue.Create(DateTimeOffset.UtcNow.ToString("O"))
         let! () =
@@ -364,7 +447,7 @@ let private updateState projectName taskId expectedRevision message mutate =
                     atomicWrite statePath (serialize obj)
                     Ok()
                 with ex -> Error(Client.ExceptionError ex)
-        let! commit = commitScope projectName [ path ] message
+        let! commit = commitWithRollback projectName [ path ] message [ statePath, previousState ]
         let! details = getTask { ProjectName = projectName; TaskId = taskId }
         return { Task = details; CommitHash = commit.CommitHash; ChangedPaths = [ path ] }
     } |> serializeMutations projectName
@@ -379,6 +462,7 @@ let createTask (cmd: CreateTaskCommand) =
         else
             let! (FolderPath root) = ProjectPaths.resolveProjectRoot cmd.ProjectName
             let! (relative, folder) = fun _ -> directory root
+            do! ensureGitReady cmd.ProjectName root
             let html = Path.Combine(folder, id + ".html")
             let json = Path.Combine(folder, id + ".json")
             let hasExistingHtml = File.Exists html
@@ -398,6 +482,9 @@ let createTask (cmd: CreateTaskCommand) =
                 let state = initialState id cmd.Title cmd.Dependencies
                 let paths = [ relative + "/" + id + ".html"; relative + "/" + id + ".json" ]
                 do! ensureUnstaged cmd.ProjectName paths
+                let snapshots =
+                    [ html, (if hasExistingHtml then Some(File.ReadAllBytes html) else None)
+                      json, None ]
                 let! () =
                     fun _ ->
                         try
@@ -409,7 +496,7 @@ let createTask (cmd: CreateTaskCommand) =
                             if File.Exists json then File.Delete json
                             if not canRecover && File.Exists html then File.Delete html
                             Error(Client.ExceptionError ex)
-                let! commit = commitScope cmd.ProjectName paths $"Create task {id}: {cmd.Title}"
+                let! commit = commitWithRollback cmd.ProjectName paths $"Create task {id}: {cmd.Title}" snapshots
                 let! details = getTask { ProjectName = cmd.ProjectName; TaskId = id }
                 return { Task = details; CommitHash = commit.CommitHash; ChangedPaths = paths }
     } |> serializeMutations cmd.ProjectName

@@ -146,7 +146,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
            ConsoleColor.DarkMagenta |])
 
     let projectColor projectName =
-        projectColorAssignments.Get projectName
+        projectColorAssignments.Get(ActivityFilter.projectRootName projectName)
 
     let activityStatusMatches (filter: ActivityFilter.Status) (status: ActivityStatus) =
         match status with
@@ -346,7 +346,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
     let activityText entry =
         let project =
             entry.ProjectName
-            |> Option.map (fun value -> $"@{value} ")
+            |> Option.map (fun value -> ActivityFilter.projectToken value + " ")
             |> Option.defaultValue ""
 
         $"{entry.Timestamp} {project}{entry.Message}{statusSuffix entry.Status}"
@@ -357,7 +357,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         match entry.ProjectName with
         | None -> Console.WriteLine rendered
         | Some projectName ->
-            let token = $"@{projectName}"
+            let token = ActivityFilter.projectToken projectName
             let index = rendered.IndexOf(token, StringComparison.Ordinal)
 
             if index < 0 then
@@ -373,7 +373,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
     let writeColoredProject projectName =
         let previous = Console.ForegroundColor
         Console.ForegroundColor <- projectColor projectName
-        Console.Write($"@{projectName}")
+        Console.Write(ActivityFilter.projectToken projectName)
         Console.ForegroundColor <- previous
 
     let hotkeyColor = ConsoleColor.Cyan
@@ -513,6 +513,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                 Console.WriteLine "----------------"
                 writeDetailField width "Time" entry.Timestamp
                 entry.ProjectName
+                |> Option.map ActivityFilter.projectToken
                 |> Option.iter (writeDetailField width "Project")
 
                 match entry.CommandName with
@@ -683,9 +684,9 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                     Console.Write(marker + " ")
                     let previous = Console.ForegroundColor
                     Console.ForegroundColor <- projectColor job.ProjectName
-                    Console.Write("@" + safe job.ProjectName)
+                    Console.Write(safe (ActivityFilter.projectToken job.ProjectName))
                     Console.ForegroundColor <- previous
-                    Console.WriteLine (" " + trim (safe ($"{status} | {elapsed} | {reason}")) (max 15 (width - job.ProjectName.Length - 4)))
+                    Console.WriteLine (" " + trim (safe ($"{status} | {elapsed} | {reason}")) (max 15 (width - (ActivityFilter.projectToken job.ProjectName).Length - 3)))
         | JobDetailsMode | JobCancelMode ->
             match jobDetailId |> Option.bind (fun id -> jobSummaries |> List.tryFind (fun job -> job.JobId = id)) with
             | None -> Console.WriteLine "Job no longer retained by the client."

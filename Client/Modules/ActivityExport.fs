@@ -37,7 +37,7 @@ let formatRecent (entries: Entry list) =
 
         entry.ProjectName
         |> Option.iter (fun projectName ->
-            builder.Append("@").Append(projectName).Append(" ") |> ignore)
+            builder.Append(ActivityFilter.projectToken projectName).Append(" ") |> ignore)
 
         builder.AppendLine(entry.CommandName) |> ignore
         appendOptional builder "Reason" entry.Reason

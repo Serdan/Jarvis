@@ -34,6 +34,26 @@ let parseTerms (query: string) =
     { Text = List.rev text
       Projects = List.rev projects }
 
+// Worktree selectors stay in their command-routing form (Project::worktree).
+// Translate only at the presentation boundary so history and routing remain stable.
+let private separatorIndex (projectName: string) =
+    let index = projectName.IndexOf("::", StringComparison.Ordinal)
+    if index > 0 && index + 2 < projectName.Length then Some index else None
+
+let projectRootName (projectName: string) =
+    match separatorIndex projectName with
+    | Some index -> projectName.Substring(0, index)
+    | None -> projectName
+
+let projectLabel (projectName: string) =
+    match separatorIndex projectName with
+    | Some index ->
+        projectName.Substring(0, index) + "/" + projectName.Substring(index + 2)
+    | None -> projectName
+
+let projectToken (projectName: string) =
+    "@" + projectLabel projectName
+
 let private containsIgnoreCase (needle: string) (haystack: string) =
     haystack.IndexOf(needle, StringComparison.OrdinalIgnoreCase) >= 0
 
@@ -42,7 +62,9 @@ let matchesTerms terms projectName searchableText =
         terms.Projects
         |> List.forall (fun term ->
             projectName
-            |> Option.exists (containsIgnoreCase term))
+            |> Option.exists (fun name ->
+                containsIgnoreCase term (projectLabel name)
+                || containsIgnoreCase term name))
 
     let textMatches =
         terms.Text

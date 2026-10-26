@@ -24,7 +24,7 @@ let ``legacy HTML task is listed without creating state`` () =
         let folder = Path.Combine(project, "docs", "tasks")
         Directory.CreateDirectory folder |> ignore
         File.WriteAllText(Path.Combine(folder, "311-responsive-loading.html"), "<h1>Loading</h1>")
-        match listTasks { ProjectName = "Project1"; Status = None; Owner = None; DependsOn = None } context with
+        match listTasks { ProjectName = "Project1"; Status = None; Owner = None; DependsOn = None; NextActor = None } context with
         | Ok [item] ->
             item.Id |> shouldEqual "311"
             item.HasState |> shouldEqual false
@@ -44,13 +44,13 @@ let ``JSON task state is parsed and can be filtered`` () =
         Directory.CreateDirectory folder |> ignore
         File.WriteAllText(Path.Combine(folder, "282.html"), "<h1>Input</h1>")
         File.WriteAllText(Path.Combine(folder, "282.json"), """{"schemaVersion":1,"id":"282","title":"Input","status":"active","dependencies":[]}""")
-        match listTasks { ProjectName = "Project1"; Status = Some "active"; Owner = None; DependsOn = None } context with
+        match listTasks { ProjectName = "Project1"; Status = Some "active"; Owner = None; DependsOn = None; NextActor = None } context with
         | Ok [item] ->
             item.Title |> shouldEqual "Input"
             item.Revision.IsSome |> shouldEqual true
             item.Diagnostics.IsEmpty |> shouldEqual true
         | other -> Assert.Fail($"Expected active task: {other}")
-        match listTasks { ProjectName = "Project1"; Status = Some "completed"; Owner = None; DependsOn = None } context with
+        match listTasks { ProjectName = "Project1"; Status = Some "completed"; Owner = None; DependsOn = None; NextActor = None } context with
         | Ok [] -> ()
         | other -> Assert.Fail($"Expected filtered empty list: {other}"))
 
@@ -72,7 +72,7 @@ let ``malformed state remains visible with diagnostics`` () =
         Directory.CreateDirectory folder |> ignore
         File.WriteAllText(Path.Combine(folder, "broken.html"), "<p>Broken</p>")
         File.WriteAllText(Path.Combine(folder, "broken.json"), """{"schemaVersion":1,"id":"wrong","status":"active"}""")
-        match listTasks { ProjectName = "Project1"; Status = None; Owner = None; DependsOn = None } context with
+        match listTasks { ProjectName = "Project1"; Status = None; Owner = None; DependsOn = None; NextActor = None } context with
         | Ok [item] -> item.Diagnostics.IsEmpty |> shouldEqual false
         | other -> Assert.Fail($"Malformed task omitted: {other}"))
 
@@ -80,7 +80,7 @@ let ``malformed state remains visible with diagnostics`` () =
 let ``task directory traversal is rejected`` () =
     withProject (fun _ project context ->
         File.WriteAllText(Path.Combine(project, ".jarvis.json"), """{"taskDirectory":"../outside"}""")
-        match listTasks { ProjectName = "Project1"; Status = None; Owner = None; DependsOn = None } context with
+        match listTasks { ProjectName = "Project1"; Status = None; Owner = None; DependsOn = None; NextActor = None } context with
         | Error _ -> ()
         | Ok _ -> Assert.Fail("Directory traversal must be rejected."))
 
@@ -111,7 +111,7 @@ let ``update uses optimistic revision and preserves HTML`` () =
             | Ok outcome -> outcome
             | Error e -> failwith $"Create failed: {e}"
         let oldRevision = made.Task.Task.Revision
-        let change = { ProjectName = "Project1"; TaskId = "update"; ExpectedRevision = oldRevision; Title = None; Status = Some "active"; Dependencies = None; DescriptionCommit = None }
+        let change = { ProjectName = "Project1"; TaskId = "update"; ExpectedRevision = oldRevision; Title = None; Status = Some "active"; Dependencies = None; DescriptionCommit = None; AssignmentInstructions = None; AssignmentBaseCommit = None; ExpectedAssignmentRevision = None; NextActor = None; ActorId = None }
         match updateTask change context with
         | Ok changed ->
             changed.Task.Task.Status |> shouldEqual "active"
@@ -139,7 +139,7 @@ let ``claim checkpoint and completion retain committed history`` () =
         | Ok _ -> Assert.Fail("Other agent stole task without reassignment.")
         let checkpoint =
             { ProjectName = "Project1"; TaskId = "chain"; ExpectedRevision = claimed.Task.Task.Revision
-              Status = "active"; Summary = "Implemented first slice"; NextAction = "Verify"; Verified = [ "unit tests" ]; Blocker = None; LastCommit = None; DescriptionCommit = None }
+              Status = "active"; Summary = "Implemented first slice"; NextAction = "Verify"; Verified = [ "unit tests" ]; Blocker = None; LastCommit = None; DescriptionCommit = None; AcknowledgedAssignmentRevision = None; ActorId = None }
         let progressed =
             match checkpointTask checkpoint context with
             | Ok outcome -> outcome
@@ -148,7 +148,7 @@ let ``claim checkpoint and completion retain committed history`` () =
         let completed =
             match completeTask
                 { ProjectName = "Project1"; TaskId = "chain"; ExpectedRevision = progressed.Task.Task.Revision
-                  Verified = [ "unit tests" ]; FinalCommit = Some "abc123" } context with
+                  Verified = [ "unit tests" ]; FinalCommit = Some "abc123"; AcknowledgedAssignmentRevision = None; ActorId = None } context with
             | Ok outcome -> outcome
             | Error e -> failwith $"Complete failed: {e}"
         completed.Task.Task.Status |> shouldEqual "completed"
@@ -168,7 +168,7 @@ let ``HTML-only legacy task materializes JSON on first update`` () =
         File.WriteAllText(html, "<h1>Legacy</h1>")
         GitCommandTests.expectGitSuccess context [ "add"; "docs/tasks/legacy.html" ]
         GitCommandTests.expectGitSuccess context [ "commit"; "-m"; "Legacy task" ]
-        match updateTask { ProjectName = "Project1"; TaskId = "legacy"; ExpectedRevision = None; Title = Some "Legacy task"; Status = Some "blocked"; Dependencies = None; DescriptionCommit = None } context with
+        match updateTask { ProjectName = "Project1"; TaskId = "legacy"; ExpectedRevision = None; Title = Some "Legacy task"; Status = Some "blocked"; Dependencies = None; DescriptionCommit = None; AssignmentInstructions = None; AssignmentBaseCommit = None; ExpectedAssignmentRevision = None; NextActor = None; ActorId = None } context with
         | Ok outcome ->
             outcome.Task.Task.Status |> shouldEqual "blocked"
             File.ReadAllText(html) |> shouldEqual "<h1>Legacy</h1>"
@@ -185,7 +185,7 @@ let ``pre-staged edits to task JSON are rejected`` () =
             let edited = File.ReadAllText(json).Replace("open", "blocked")
             File.WriteAllText(json, edited)
             GitCommandTests.expectGitSuccess context [ "add"; "docs/tasks/indexed.json" ]
-            match updateTask { ProjectName = "Project1"; TaskId = "indexed"; ExpectedRevision = None; Title = None; Status = Some "active"; Dependencies = None; DescriptionCommit = None } context with
+            match updateTask { ProjectName = "Project1"; TaskId = "indexed"; ExpectedRevision = None; Title = None; Status = Some "active"; Dependencies = None; DescriptionCommit = None; AssignmentInstructions = None; AssignmentBaseCommit = None; ExpectedAssignmentRevision = None; NextActor = None; ActorId = None } context with
             | Error _ -> File.ReadAllText(json) |> shouldEqual edited
             | Ok _ -> Assert.Fail("Should reject pre-staged task edits."))
 
@@ -207,12 +207,12 @@ let ``independent feature worktrees retain task changes until merged`` () =
                   Title = agent; Html = "<h1>" + agent + "</h1>"; Dependencies = [] } context with
             | Ok _ -> ()
             | Error e -> Assert.Fail($"Branch-local CreateTask failed: {e}")
-        match listTasks { ProjectName = "Project1"; Status = None; Owner = None; DependsOn = None } context with
+        match listTasks { ProjectName = "Project1"; Status = None; Owner = None; DependsOn = None; NextActor = None } context with
         | Ok [] -> ()
         | other -> Assert.Fail($"Feature tasks leaked into main: {other}")
         GitCommandTests.expectGitSuccess context [ "merge"; "--no-ff"; "feature/agent-a"; "-m"; "Merge agent-a" ]
         GitCommandTests.expectGitSuccess context [ "merge"; "--no-ff"; "feature/agent-b"; "-m"; "Merge agent-b" ]
-        match listTasks { ProjectName = "Project1"; Status = None; Owner = None; DependsOn = None } context with
+        match listTasks { ProjectName = "Project1"; Status = None; Owner = None; DependsOn = None; NextActor = None } context with
         | Ok tasks ->
             tasks |> List.map (fun item -> item.Id) |> Set.ofList
             |> shouldEqual (set [ "agent-a"; "agent-b" ])
@@ -229,7 +229,7 @@ let ``numeric task ID updates preserve existing slugged HTML`` () =
         GitCommandTests.expectGitSuccess context [ "commit"; "-m"; "Describe task 305" ]
         match updateTask
             { ProjectName = "Project1"; TaskId = "305"; ExpectedRevision = None
-              Title = Some "Component authority"; Status = Some "active"; Dependencies = None; DescriptionCommit = None } context with
+              Title = Some "Component authority"; Status = Some "active"; Dependencies = None; DescriptionCommit = None; AssignmentInstructions = None; AssignmentBaseCommit = None; ExpectedAssignmentRevision = None; NextActor = None; ActorId = None } context with
         | Ok outcome ->
             outcome.Task.Task.Id |> shouldEqual "305"
             outcome.Task.Task.DescriptionPath |> shouldEqual "docs/tasks/305-component-authority.html"
@@ -258,7 +258,7 @@ let ``task owner and dependency filters reflect committed metadata`` () =
         | Ok _ -> ()
         match listTasks
             { ProjectName = "Project1"; Status = Some "active"
-              Owner = Some "agent-a"; DependsOn = Some "parent" } context with
+              Owner = Some "agent-a"; DependsOn = Some "parent"; NextActor = None } context with
         | Ok [task] ->
             task.Id |> shouldEqual "filtered"
             task.Dependencies |> shouldEqual [ "parent" ]
@@ -266,7 +266,7 @@ let ``task owner and dependency filters reflect committed metadata`` () =
         | other -> Assert.Fail($"Expected filtered task: {other}")
         match listTasks
             { ProjectName = "Project1"; Status = None
-              Owner = Some "agent-b"; DependsOn = None } context with
+              Owner = Some "agent-b"; DependsOn = None; NextActor = None } context with
         | Ok [] -> ()
         | other -> Assert.Fail($"Unexpected task matched owner: {other}"))
 
@@ -330,7 +330,7 @@ let ``task update refuses and preserves unstaged JSON edits`` () =
             let command =
                 { ProjectName = "Project1"; TaskId = "unstaged"
                   ExpectedRevision = None; Title = Some "Agent update"
-                  Status = Some "active"; Dependencies = None; DescriptionCommit = None }
+                  Status = Some "active"; Dependencies = None; DescriptionCommit = None; AssignmentInstructions = None; AssignmentBaseCommit = None; ExpectedAssignmentRevision = None; NextActor = None; ActorId = None }
             match updateTask command context with
             | Error _ -> File.ReadAllText(json) |> shouldEqual manual
             | Ok _ -> Assert.Fail("Task update overwrote unstaged JSON."))
@@ -345,7 +345,7 @@ let ``date-prefixed task IDs retain year month day and do not collide`` () =
             File.WriteAllText(Path.Combine(folder, id + ".html"), "<h1>" + id + "</h1>")
             let json = """{"schemaVersion":1,"id":"TASK_ID","title":"Fixture","status":"open"}""".Replace("TASK_ID", id)
             File.WriteAllText(Path.Combine(folder, id + ".json"), json)
-        match listTasks { ProjectName = "Project1"; Status = None; Owner = None; DependsOn = None } context with
+        match listTasks { ProjectName = "Project1"; Status = None; Owner = None; DependsOn = None; NextActor = None } context with
         | Ok tasks ->
             (tasks |> List.map (fun task -> task.Id)) |> shouldEqual ids
             tasks |> List.forall (fun task -> task.Diagnostics.IsEmpty && task.HasState) |> shouldEqual true
@@ -372,7 +372,7 @@ let ``legacy in_progress status reads as active without rewriting source JSON`` 
         let original = """{"schemaVersion":1,"id":"2026-10-24-runpod-benchmark-lifecycle","title":"Runpod lifecycle","status":"in_progress","customField":"preserve"}"""
         File.WriteAllText(path, original)
         for requestedStatus in [ "active"; "in_progress" ] do
-            match listTasks { ProjectName = "Project1"; Status = Some requestedStatus; Owner = None; DependsOn = None } context with
+            match listTasks { ProjectName = "Project1"; Status = Some requestedStatus; Owner = None; DependsOn = None; NextActor = None } context with
             | Ok [task] ->
                 task.Id |> shouldEqual id
                 task.Status |> shouldEqual "active"
@@ -388,8 +388,175 @@ let ``legacy in_progress status reads as active without rewriting source JSON`` 
         GitCommandTests.expectGitSuccess context [ "commit"; "-m"; "Existing Runpod task checkpoint" ]
         match updateTask
             { ProjectName = "Project1"; TaskId = id; ExpectedRevision = None
-              Title = None; Status = Some "blocked"; Dependencies = None; DescriptionCommit = None } context with
+              Title = None; Status = Some "blocked"; Dependencies = None; DescriptionCommit = None; AssignmentInstructions = None; AssignmentBaseCommit = None; ExpectedAssignmentRevision = None; NextActor = None; ActorId = None } context with
         | Ok updated ->
             updated.Task.Task.Status |> shouldEqual "blocked"
             updated.Task.StateJson.Value.Contains("preserve") |> shouldEqual true
         | Error error -> Assert.Fail($"Cannot update legacy status task: {error}"))
+
+let private jsonString (node: System.Text.Json.Nodes.JsonNode) (path: string list) =
+    let result = path |> List.fold (fun (current: System.Text.Json.Nodes.JsonNode) segment -> current[segment]) node
+    result.GetValue<string>()
+
+[<Test>]
+let ``reviewer assignment preserves agent claim and checkpoint and requires exact acknowledgement`` () =
+    withProject (fun _ _ context ->
+        let projectName = "Project1"
+        let taskId = "review-handoff"
+        let created =
+            match createTask
+                { ProjectName = projectName; TaskId = Some taskId
+                  Title = "Reviewer handoff"; Html = "<h1>Reviewer handoff</h1>"; Dependencies = [] } context with
+            | Ok value -> value
+            | Error e -> failwith $"Create failed: {e}"
+        let claimed =
+            match claimTask
+                { ProjectName = projectName; TaskId = taskId
+                  ExpectedRevision = created.Task.Task.Revision
+                  Owner = "agent-6"; AllowReassign = false } context with
+            | Ok value -> value
+            | Error e -> failwith $"Claim failed: {e}"
+        let original =
+            match checkpointTask
+                { ProjectName = projectName; TaskId = taskId
+                  ExpectedRevision = claimed.Task.Task.Revision
+                  Status = "active"; Summary = "Storage passes tests"
+                  NextAction = "Review checkpoint"; Verified = [ "rollback tested" ]
+                  Blocker = None; LastCommit = Some "abc"; DescriptionCommit = None
+                  AcknowledgedAssignmentRevision = None; ActorId = Some "agent-6" } context with
+            | Ok value -> value
+            | Error e -> failwith $"Initial checkpoint failed: {e}"
+        original.Task.Task.NextActor |> shouldEqual (Some "reviewer")
+        let assigned =
+            match updateTask
+                { ProjectName = projectName; TaskId = taskId
+                  ExpectedRevision = original.Task.Task.Revision
+                  Title = None; Status = None; Dependencies = None; DescriptionCommit = None
+                  AssignmentInstructions = Some "Integrate the real position writer"
+                  AssignmentBaseCommit = Some "base123"
+                  ExpectedAssignmentRevision = None; NextActor = None; ActorId = Some "orchestrator" } context with
+            | Ok value -> value
+            | Error e -> failwith $"Assign failed: {e}"
+        assigned.Task.Task.Owner |> shouldEqual (Some "agent-6")
+        assigned.Task.Task.Status |> shouldEqual "active"
+        assigned.Task.Task.NextActor |> shouldEqual (Some "agent")
+        assigned.Task.Task.LastUpdatedBy |> shouldEqual (Some "reviewer:orchestrator")
+        let firstRevision = assigned.Task.Task.AssignmentRevision.Value
+        let assignedState = System.Text.Json.Nodes.JsonNode.Parse(assigned.Task.StateJson.Value)
+        jsonString assignedState [ "checkpoint"; "summary" ] |> shouldEqual "Storage passes tests"
+        assignedState.ToJsonString().Contains("rollback tested") |> shouldEqual true
+        jsonString assignedState [ "assignment"; "instructions" ] |> shouldEqual "Integrate the real position writer"
+        jsonString assignedState [ "assignment"; "baseCommit" ] |> shouldEqual "base123"
+        match listTasks
+            { ProjectName = projectName; Status = Some "active"; Owner = Some "agent-6"
+              DependsOn = None; NextActor = Some "agent" } context with
+        | Ok [ item ] -> item.Id |> shouldEqual taskId
+        | other -> Assert.Fail($"Expected agent handoff task: {other}")
+        let checkpoint ack revision =
+            checkpointTask
+                { ProjectName = projectName; TaskId = taskId
+                  ExpectedRevision = revision; Status = "active"
+                  Summary = "Writer integrated"; NextAction = "Review implementation"
+                  Verified = [ "movement tests pass" ]
+                  Blocker = None; LastCommit = Some "def"; DescriptionCommit = None
+                  AcknowledgedAssignmentRevision = ack; ActorId = Some "agent-6" } context
+        match checkpoint None assigned.Task.Task.Revision with
+        | Error _ -> ()
+        | Ok _ -> Assert.Fail("Missing assignment acknowledgement was accepted")
+        match checkpoint (Some "obsolete") assigned.Task.Task.Revision with
+        | Error _ -> ()
+        | Ok _ -> Assert.Fail("Stale assignment acknowledgement was accepted")
+        let acknowledged =
+            match checkpoint (Some firstRevision) assigned.Task.Task.Revision with
+            | Ok value -> value
+            | Error e -> failwith $"Ack failed: {e}"
+        acknowledged.Task.Task.NextActor |> shouldEqual (Some "reviewer")
+        acknowledged.Task.Task.LastUpdatedBy |> shouldEqual (Some "agent:agent-6")
+        let checkpointState = System.Text.Json.Nodes.JsonNode.Parse(acknowledged.Task.StateJson.Value)
+        jsonString checkpointState [ "assignment"; "revision" ] |> shouldEqual firstRevision
+        jsonString checkpointState [ "checkpoint"; "acknowledgedAssignmentRevision" ] |> shouldEqual firstRevision
+        let reassigned =
+            match updateTask
+                { ProjectName = projectName; TaskId = taskId
+                  ExpectedRevision = acknowledged.Task.Task.Revision
+                  Title = None; Status = None; Dependencies = None; DescriptionCommit = None
+                  AssignmentInstructions = Some "Verify actor ordering as well"
+                  AssignmentBaseCommit = None
+                  ExpectedAssignmentRevision = Some firstRevision
+                  NextActor = None; ActorId = Some "reviewer-1" } context with
+            | Ok value -> value
+            | Error e -> failwith $"Second assignment failed: {e}"
+        let secondRevision = reassigned.Task.Task.AssignmentRevision.Value
+        (secondRevision <> firstRevision) |> shouldEqual true
+        reassigned.Task.Task.NextActor |> shouldEqual (Some "agent")
+        reassigned.Task.Task.Owner |> shouldEqual (Some "agent-6")
+        let previousCheckpoint = System.Text.Json.Nodes.JsonNode.Parse(reassigned.Task.StateJson.Value)
+        jsonString previousCheckpoint [ "checkpoint"; "summary" ] |> shouldEqual "Writer integrated"
+        match checkpoint (Some firstRevision) reassigned.Task.Task.Revision with
+        | Error _ -> ()
+        | Ok _ -> Assert.Fail("Checkpoint for previous assignment was accepted")
+        match updateTask
+            { ProjectName = projectName; TaskId = taskId
+              ExpectedRevision = reassigned.Task.Task.Revision
+              Title = None; Status = None; Dependencies = None; DescriptionCommit = None
+              AssignmentInstructions = Some "Do not commit this"
+              AssignmentBaseCommit = None; ExpectedAssignmentRevision = Some firstRevision
+              NextActor = None; ActorId = Some "reviewer-1" } context with
+        | Error _ -> ()
+        | Ok _ -> Assert.Fail("Stale reviewer assignment revision was accepted")
+        let finalCheckpoint =
+            match checkpoint (Some secondRevision) reassigned.Task.Task.Revision with
+            | Ok value -> value
+            | Error e -> failwith $"Second acknowledgement failed: {e}"
+        match completeTask
+            { ProjectName = projectName; TaskId = taskId
+              ExpectedRevision = finalCheckpoint.Task.Task.Revision
+              Verified = [ "reviewed" ]; FinalCommit = Some "final123"
+              AcknowledgedAssignmentRevision = Some secondRevision; ActorId = Some "agent-6" } context with
+        | Error e -> Assert.Fail($"Complete task failed: {e}")
+        | Ok result ->
+            result.Task.Task.Status |> shouldEqual "completed"
+            result.Task.Task.NextActor |> shouldEqual (Some "reviewer")
+            result.Task.Task.Owner |> shouldEqual (Some "agent-6")
+        match listTasks
+            { ProjectName = projectName; Status = Some "completed"; Owner = None
+              DependsOn = None; NextActor = Some "reviewer" } context with
+        | Ok [ item ] -> item.Id |> shouldEqual taskId
+        | other -> Assert.Fail($"Expected completed task pending review: {other}"))
+
+[<Test>]
+let ``invalid reviewer handoff fails without changing ownership or Git history`` () =
+    withProject (fun _ _ context ->
+        let projectName = "Project1"
+        let taskId = "invalid-handoff"
+        let created =
+            match createTask
+                { ProjectName = projectName; TaskId = Some taskId
+                  Title = "Invalid assignment"; Html = "<h1>Invalid</h1>"; Dependencies = [] } context with
+            | Ok value -> value
+            | Error e -> failwith $"Create failed: {e}"
+        let revision = created.Task.Task.Revision
+        let head = GitCommandTests.gitOutput context [ "rev-parse"; "HEAD" ]
+        let command =
+            { ProjectName = projectName; TaskId = taskId; ExpectedRevision = revision
+              Title = None; Status = None; Dependencies = None; DescriptionCommit = None
+              AssignmentInstructions = Some "Implement this"; AssignmentBaseCommit = None
+              ExpectedAssignmentRevision = None; NextActor = None; ActorId = None }
+        match updateTask command context with
+        | Error _ -> ()
+        | Ok _ -> Assert.Fail("Assignment without reviewer ID was accepted")
+        match updateTask { command with ActorId = Some "orchestrator"; NextActor = Some "not-a-turn" } context with
+        | Error _ -> ()
+        | Ok _ -> Assert.Fail("Invalid next actor was accepted")
+        match updateTask
+            { command with AssignmentInstructions = None; NextActor = Some "reviewer" } context with
+        | Error _ -> ()
+        | Ok _ -> Assert.Fail("Turn update without reviewer ID was accepted")
+        let after = GitCommandTests.gitOutput context [ "rev-parse"; "HEAD" ]
+        head |> shouldEqual after
+        match getTask { ProjectName = projectName; TaskId = taskId } context with
+        | Ok details ->
+            details.Task.Revision |> shouldEqual revision
+            details.Task.Owner |> shouldEqual None
+            details.Task.AssignmentRevision |> shouldEqual None
+        | Error e -> Assert.Fail($"Cannot re-read task: {e}"))

@@ -106,7 +106,8 @@ let attachWorkTask (cmd: AttachWorkTaskCommand) rt =
                       Title = None
                       Status = Some "active"
                       Dependencies = None
-                      DescriptionCommit = Some(commit.StdOut.Trim()) } rt with
+                      DescriptionCommit = Some(commit.StdOut.Trim())
+                      AssignmentInstructions = None; AssignmentBaseCommit = None; ExpectedAssignmentRevision = None; NextActor = None; ActorId = None } rt with
                 | Ok result -> toWorkTask cmd.ProjectName result.Task rt
                 | Error error -> Error error
             | _ -> Error(Client.ValidationError "Commit a clean HTML description before attaching task state.")
@@ -118,7 +119,7 @@ let getWorkTask (cmd: GetWorkTaskCommand) rt =
     | None -> ClientShell.getWorkTask cmd rt
 
 let listWorkTasks (cmd: ListWorkTasksCommand) rt =
-    match TaskStore.listTasks { ProjectName = cmd.ProjectName; Status = None; Owner = None; DependsOn = None } rt,
+    match TaskStore.listTasks { ProjectName = cmd.ProjectName; Status = None; Owner = None; DependsOn = None; NextActor = None } rt,
           ClientShell.listWorkTasks cmd rt with
     | Ok tasks, Ok legacy ->
         let active = tasks |> List.filter (fun task ->
@@ -169,7 +170,8 @@ let checkpointWorkTask (cmd: CheckpointWorkTaskCommand) rt =
               Verified = cmd.Verified
               LastCommit = cmd.LastCommit
               Blocker = cmd.Blocker
-              DescriptionCommit = legacyState |> Option.map (fun saved -> saved.TaskCommit) } rt with
+              DescriptionCommit = legacyState |> Option.map (fun saved -> saved.TaskCommit)
+              AcknowledgedAssignmentRevision = None; ActorId = None } rt with
         | Ok result ->
             // Retire the old local checkpoint only after the Git-backed commit succeeds.
             match ClientShell.getWorkTask { ProjectName = cmd.ProjectName; TaskId = cmd.TaskId } rt with
@@ -214,7 +216,9 @@ let completeWorkTask (cmd: CompleteWorkTaskCommand) rt =
               TaskId = cmd.TaskId
               ExpectedRevision = None
               Verified = verified
-              FinalCommit = legacy |> Option.bind (fun task -> task.LastCommit) } rt with
+              FinalCommit = legacy |> Option.bind (fun task -> task.LastCommit)
+              AcknowledgedAssignmentRevision = None
+              ActorId = None } rt with
         | Error error -> Error error
         | Ok result ->
             match legacy with

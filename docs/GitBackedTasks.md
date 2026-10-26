@@ -76,3 +76,71 @@ On recovery, inspect task state, current repository status and client activity. 
 ## Verification
 
 Tests create disposable repositories and worktrees and exercise Git-backed task commits, branch isolation, legacy state migration, safe cleanup, rejection of staged task edits, conflicting owner claims and revision checks. Run `dotnet test Jarvis.slnx` for the full regression suite.
+
+
+## Reviewer/agent handoff (protocol 3.15)
+
+Task **status** (`open`, `active`, `blocked`, `completed`) is independent of
+**turn ownership** (`nextActor`: `agent`, `reviewer`, or absent).
+The `owner` records the implementing agent; a reviewer updating an assignment
+does **not** claim or reassign ownership.
+
+Reviewer instructions are stored in `assignment`, separate from the agent's
+execution evidence in `checkpoint`:
+
+```json
+{
+  "status": "active",
+  "owner": { "agent": "agent-6", "worktree": "Wayfold::world-store" },
+  "nextActor": "agent",
+  "lastUpdatedBy": { "role": "reviewer", "id": "orchestrator" },
+  "assignment": {
+    "instructions": "Integrate the next real movement writer.",
+    "baseCommit": "abc123",
+    "revision": "f6c8a1...",
+    "updatedAt": "2026-10-26T00:00:00Z"
+  },
+  "checkpoint": {
+    "summary": "Previous position-store implementation verified",
+    "verified": ["Rollback tests pass"],
+    "nextAction": "Previously proposed next action",
+    "lastCommit": "def456"
+  }
+}
+```
+
+An orchestrator calls `UpdateTask` with `assignmentInstructions`,
+optional `assignmentBaseCommit`, required `actorId`, and an optimistic
+`expectedRevision` and/or `expectedAssignmentRevision`. Jarvis updates
+the assignment and generates a **fresh opaque assignment revision** on each
+reissue, sets `nextActor=agent` by default, and records
+`lastUpdatedBy={role:reviewer,id:<actorId>}`. The current `owner`,
+`checkpoint`, and `status` remain unchanged unless explicit metadata
+fields request an update. `UpdateTask` can also update `nextActor`
+without changing instructions when a reviewer explicitly requests it with an `actorId`.
+`ListTasks` accepts a `nextActor` filter, and task summaries expose
+`nextActor`, `lastUpdatedBy`, and `assignmentRevision`.
+
+The implementing agent reads the current assignment and calls `CheckpointTask`
+with `acknowledgedAssignmentRevision` equal to the assignment revision it
+actually executed, plus optional `actorId`. Jarvis rejects missing or
+stale acknowledgements once an assignment exists. The checkpoint preserves
+the assignment, records acknowledgement, and marks `nextActor=reviewer`,
+`lastUpdatedBy={role:agent,id:<actorId or claimed owner>}`.
+`CompleteTask` also requires acknowledgement of an existing assignment and
+requests reviewer attention; completion on a feature branch does not imply
+the implementation has been merged.
+
+Existing tasks **without** an `assignment` remain readable and may use their
+legacy `checkpoint.nextAction` without an acknowledgement. Older checkpoints
+are never rewritten just to introduce the new structure. When an assignment
+does exist, it supersedes the checkpoint's legacy `nextAction` as the next
+set of instructions for the agent. The JSON and Git commits retain the
+historical checkpoint.
+
+This is a **branch-local handoff protocol**, not a distributed lease or proof
+that an agent's ChatGPT session is currently executing. Concurrent edits in
+different Git worktrees still require normal Git integration and conflict
+resolution. The new 3.15 command fields require a coordinated server/client
+rollout and refreshed MCP schema; updating the client can interrupt active
+agent sessions, so obtain explicit permission before invoking `UpdateClient`.

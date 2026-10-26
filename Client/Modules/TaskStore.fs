@@ -24,7 +24,10 @@ type TaskSummary =
       Owner: string option
       Dependencies: string list
       Revision: string option
-      Diagnostics: string list }
+      Diagnostics: string list
+      NextActor: string option
+      LastUpdatedBy: string option
+      AssignmentRevision: string option }
 
 type TaskDetails =
     { Task: TaskSummary
@@ -129,6 +132,9 @@ let private summary (relativeDir: string) (folder: string) (id: string) =
     let mutable status = "open"
     let mutable owner = None
     let mutable dependencies = []
+    let mutable nextActor = None
+    let mutable lastUpdatedBy = None
+    let mutable assignmentRevision = None
     let mutable hash = None
     match resolvedHtml with
     | Error message -> diagnostics <- message :: diagnostics
@@ -152,6 +158,18 @@ let private summary (relativeDir: string) (folder: string) (id: string) =
                         match obj["owner"] with
                         | :? JsonObject as ownerObj -> getString ownerObj "agent"
                         | _ -> None
+                    nextActor <- getString obj "nextActor"
+                    lastUpdatedBy <-
+                        match obj["lastUpdatedBy"] with
+                        | :? JsonObject as actor ->
+                            match getString actor "role", getString actor "id" with
+                            | Some role, Some id -> Some(role + ":" + id)
+                            | _ -> None
+                        | _ -> None
+                    assignmentRevision <-
+                        match obj["assignment"] with
+                        | :? JsonObject as assignment -> getString assignment "revision"
+                        | _ -> None
                     dependencies <-
                         match obj["dependencies"] with
                         | :? JsonArray as values ->
@@ -170,7 +188,10 @@ let private summary (relativeDir: string) (folder: string) (id: string) =
       Owner = owner
       Dependencies = dependencies
       Revision = hash
-      Diagnostics = List.rev diagnostics }
+      Diagnostics = List.rev diagnostics
+      NextActor = nextActor
+      LastUpdatedBy = lastUpdatedBy
+      AssignmentRevision = assignmentRevision }
 
 let listTasks (cmd: ListTasksCommand) =
     effect {
@@ -192,11 +213,13 @@ let listTasks (cmd: ListTasksCommand) =
                     if validId id then summary relative folder id
                     else
                         { Id = id; Title = id; Status = "invalid"; DescriptionPath = ""; StatePath = ""
-                          HasState = false; Owner = None; Dependencies = []; Revision = None; Diagnostics = [ "Invalid task identifier." ] })
+                          HasState = false; Owner = None; Dependencies = []; Revision = None; Diagnostics = [ "Invalid task identifier." ]
+                          NextActor = None; LastUpdatedBy = None; AssignmentRevision = None })
                 |> List.filter (fun item ->
                     (cmd.Status.IsNone || (cmd.Status |> Option.map normalizeStatus) = Some item.Status)
                     && (cmd.Owner.IsNone || item.Owner = cmd.Owner)
-                    && (cmd.DependsOn.IsNone || item.Dependencies |> List.contains cmd.DependsOn.Value))
+                    && (cmd.DependsOn.IsNone || item.Dependencies |> List.contains cmd.DependsOn.Value)
+                    && (cmd.NextActor.IsNone || item.NextActor = cmd.NextActor))
     }
 
 let getTask (cmd: GetTaskCommand) =
@@ -394,19 +417,78 @@ let createTask (cmd: CreateTaskCommand) =
 let private validStatus status =
     List.contains status [ "open"; "active"; "blocked"; "completed" ]
 
+let private validNextActor value =
+    List.contains value [ "agent"; "reviewer" ]
+
+let private assignmentRevision (obj: JsonObject) =
+    match obj["assignment"] with
+    | :? JsonObject as assignment -> getString assignment "revision"
+    | _ -> None
+
+let private ownerId (obj: JsonObject) =
+    match obj["owner"] with
+    | :? JsonObject as owner -> getString owner "agent"
+    | _ -> None
+
+let private recordActor (obj: JsonObject) (role: string) (id: string) =
+    let actor = JsonObject()
+    actor["role"] <- JsonValue.Create(role)
+    actor["id"] <- JsonValue.Create(id)
+    obj["lastUpdatedBy"] <- actor
+
+let private acknowledgeAssignment (obj: JsonObject) suppliedRevision =
+    match assignmentRevision obj, suppliedRevision with
+    | None, None -> Ok()
+    | Some current, Some acknowledged when current = acknowledged -> Ok()
+    | None, Some _ -> Error(Client.ValidationError "Task has no assignment to acknowledge.")
+    | Some _, _ -> Error(Client.ValidationError "Assignment revision is stale or missing; reload the current assignment before checkpointing.")
+
 let updateTask (cmd: UpdateTaskCommand) =
     updateState cmd.ProjectName cmd.TaskId cmd.ExpectedRevision $"Update task {cmd.TaskId}"
         (fun obj ->
+            let changesAssignment = cmd.AssignmentInstructions.IsSome || cmd.AssignmentBaseCommit.IsSome
             match cmd.Status with
             | Some status when not (validStatus status) -> Error(Client.ValidationError "Unknown task status.")
             | _ when cmd.Dependencies |> Option.exists (List.exists (validId >> not)) ->
                 Error(Client.ValidationError "Invalid dependency ID.")
+            | _ when cmd.NextActor |> Option.exists (validNextActor >> not) ->
+                Error(Client.ValidationError "Unknown next actor.")
+            | _ when (changesAssignment || cmd.NextActor.IsSome)
+                     && (cmd.ActorId |> Option.forall String.IsNullOrWhiteSpace) ->
+                Error(Client.ValidationError "Reviewer ID is required to update an assignment or handoff.")
+            | _ when changesAssignment && (cmd.AssignmentInstructions |> Option.exists String.IsNullOrWhiteSpace) ->
+                Error(Client.ValidationError "Assignment instructions cannot be blank.")
+            | _ when cmd.ExpectedAssignmentRevision.IsSome
+                     && cmd.ExpectedAssignmentRevision <> assignmentRevision obj ->
+                Error(Client.ValidationError "Assignment revision is stale.")
             | _ ->
-                cmd.Status |> Option.iter (fun status -> obj["status"] <- JsonValue.Create(status))
-                cmd.Title |> Option.iter (fun title -> obj["title"] <- JsonValue.Create(title))
-                cmd.Dependencies |> Option.iter (fun deps -> obj["dependencies"] <- System.Text.Json.JsonSerializer.SerializeToNode(deps))
-                cmd.DescriptionCommit |> Option.iter (fun commit -> obj["descriptionCommit"] <- JsonValue.Create(commit))
-                Ok())
+                let currentAssignment =
+                    match obj["assignment"] with
+                    | :? JsonObject as existing -> Some existing
+                    | _ -> None
+                if changesAssignment && currentAssignment.IsNone && cmd.AssignmentInstructions.IsNone then
+                    Error(Client.ValidationError "Instructions are required for the first assignment.")
+                else
+                    cmd.Status |> Option.iter (fun status -> obj["status"] <- JsonValue.Create(status))
+                    cmd.Title |> Option.iter (fun title -> obj["title"] <- JsonValue.Create(title))
+                    cmd.Dependencies |> Option.iter (fun deps -> obj["dependencies"] <- System.Text.Json.JsonSerializer.SerializeToNode(deps))
+                    cmd.DescriptionCommit |> Option.iter (fun commit -> obj["descriptionCommit"] <- JsonValue.Create(commit))
+                    if changesAssignment then
+                        let assignment =
+                            currentAssignment |> Option.defaultWith (fun () -> JsonObject())
+                        cmd.AssignmentInstructions
+                        |> Option.iter (fun instructions -> assignment["instructions"] <- JsonValue.Create(instructions))
+                        cmd.AssignmentBaseCommit
+                        |> Option.iter (fun commit -> assignment["baseCommit"] <- JsonValue.Create(commit))
+                        assignment["revision"] <- JsonValue.Create(Guid.NewGuid().ToString("N"))
+                        assignment["updatedAt"] <- JsonValue.Create(DateTimeOffset.UtcNow.ToString("O"))
+                        obj["assignment"] <- assignment
+                        obj["nextActor"] <- JsonValue.Create(cmd.NextActor |> Option.defaultValue "agent")
+                        recordActor obj "reviewer" cmd.ActorId.Value
+                    else
+                        cmd.NextActor |> Option.iter (fun actor -> obj["nextActor"] <- JsonValue.Create(actor))
+                        cmd.ActorId |> Option.iter (fun id -> recordActor obj "reviewer" id)
+                    Ok())
 
 let claimTask (cmd: ClaimTaskCommand) =
     updateState cmd.ProjectName cmd.TaskId cmd.ExpectedRevision $"Claim task {cmd.TaskId}"
@@ -414,10 +496,7 @@ let claimTask (cmd: ClaimTaskCommand) =
             if String.IsNullOrWhiteSpace cmd.Owner then
                 Error(Client.ValidationError "Owner is required.")
             else
-                let existing =
-                    match obj["owner"] with
-                    | :? JsonObject as owner -> getString owner "agent"
-                    | _ -> None
+                let existing = ownerId obj
                 match existing with
                 | Some other when other <> cmd.Owner && not cmd.AllowReassign ->
                     Error(Client.ValidationError "Task is claimed by another agent.")
@@ -427,6 +506,8 @@ let claimTask (cmd: ClaimTaskCommand) =
                     owner["worktree"] <- JsonValue.Create(cmd.ProjectName)
                     obj["owner"] <- owner
                     obj["status"] <- JsonValue.Create("active")
+                    obj["nextActor"] <- JsonValue.Create("agent")
+                    recordActor obj "agent" cmd.Owner
                     Ok())
 
 let checkpointTask (cmd: CheckpointTaskCommand) =
@@ -435,27 +516,41 @@ let checkpointTask (cmd: CheckpointTaskCommand) =
             if not (validStatus cmd.Status) then
                 Error(Client.ValidationError "Unknown task status.")
             else
-                let checkpoint = JsonObject()
-                checkpoint["summary"] <- JsonValue.Create(cmd.Summary)
-                checkpoint["nextAction"] <- JsonValue.Create(cmd.NextAction)
-                checkpoint["verified"] <- System.Text.Json.JsonSerializer.SerializeToNode(cmd.Verified)
-                checkpoint["blocker"] <- cmd.Blocker |> Option.map JsonValue.Create |> Option.defaultValue null
-                checkpoint["lastCommit"] <- cmd.LastCommit |> Option.map JsonValue.Create |> Option.defaultValue null
-                obj["checkpoint"] <- checkpoint
-                cmd.DescriptionCommit |> Option.iter (fun commit -> obj["descriptionCommit"] <- JsonValue.Create(commit))
-                obj["status"] <- JsonValue.Create(cmd.Status)
-                Ok())
+                match acknowledgeAssignment obj cmd.AcknowledgedAssignmentRevision with
+                | Error error -> Error error
+                | Ok () ->
+                    let checkpoint = JsonObject()
+                    checkpoint["summary"] <- JsonValue.Create(cmd.Summary)
+                    checkpoint["nextAction"] <- JsonValue.Create(cmd.NextAction)
+                    checkpoint["verified"] <- System.Text.Json.JsonSerializer.SerializeToNode(cmd.Verified)
+                    checkpoint["blocker"] <- cmd.Blocker |> Option.map JsonValue.Create |> Option.defaultValue null
+                    checkpoint["lastCommit"] <- cmd.LastCommit |> Option.map JsonValue.Create |> Option.defaultValue null
+                    cmd.AcknowledgedAssignmentRevision
+                    |> Option.iter (fun rev -> checkpoint["acknowledgedAssignmentRevision"] <- JsonValue.Create(rev))
+                    obj["checkpoint"] <- checkpoint
+                    cmd.DescriptionCommit |> Option.iter (fun commit -> obj["descriptionCommit"] <- JsonValue.Create(commit))
+                    obj["status"] <- JsonValue.Create(cmd.Status)
+                    obj["nextActor"] <- JsonValue.Create("reviewer")
+                    recordActor obj "agent" (cmd.ActorId |> Option.orElseWith (fun () -> ownerId obj) |> Option.defaultValue "unspecified")
+                    Ok())
 
 let completeTask (cmd: CompleteTaskCommand) =
     updateState cmd.ProjectName cmd.TaskId cmd.ExpectedRevision $"Complete task {cmd.TaskId}"
         (fun obj ->
-            let completion = JsonObject()
-            completion["verified"] <- System.Text.Json.JsonSerializer.SerializeToNode(cmd.Verified)
-            completion["finalCommit"] <- cmd.FinalCommit |> Option.map JsonValue.Create |> Option.defaultValue null
-            completion["completedAt"] <- JsonValue.Create(DateTimeOffset.UtcNow.ToString("O"))
-            obj["completion"] <- completion
-            obj["status"] <- JsonValue.Create("completed")
-            Ok())
+            match acknowledgeAssignment obj cmd.AcknowledgedAssignmentRevision with
+            | Error error -> Error error
+            | Ok () ->
+                let completion = JsonObject()
+                completion["verified"] <- System.Text.Json.JsonSerializer.SerializeToNode(cmd.Verified)
+                completion["finalCommit"] <- cmd.FinalCommit |> Option.map JsonValue.Create |> Option.defaultValue null
+                completion["completedAt"] <- JsonValue.Create(DateTimeOffset.UtcNow.ToString("O"))
+                cmd.AcknowledgedAssignmentRevision
+                |> Option.iter (fun rev -> completion["acknowledgedAssignmentRevision"] <- JsonValue.Create(rev))
+                obj["completion"] <- completion
+                obj["status"] <- JsonValue.Create("completed")
+                obj["nextActor"] <- JsonValue.Create("reviewer")
+                recordActor obj "agent" (cmd.ActorId |> Option.orElseWith (fun () -> ownerId obj) |> Option.defaultValue "unspecified")
+                Ok())
 
 let getTaskHistory (cmd: GetTaskHistoryCommand) =
     effect {
@@ -504,7 +599,8 @@ let compareWorktreeTasks (cmd: CompareWorktreeTasksCommand) =
                     { ProjectName = selector
                       Status = None
                       Owner = None
-                      DependsOn = None } rt with
+                      DependsOn = None
+                      NextActor = None } rt with
                 | Ok tasks -> { Worktree = worktree; Tasks = tasks; Error = None }
                 | Error error -> { Worktree = worktree; Tasks = []; Error = Some(string error) })
             |> Ok

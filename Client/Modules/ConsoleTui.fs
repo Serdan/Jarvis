@@ -36,6 +36,9 @@ type private ActivityEntry =
       mutable FailureDetail: string option }
 
 type private TuiMode =
+    | AgentsMode
+    | AgentDetailsMode
+    | AgentFilterMode
     | ActivityMode
     | PermissionMode
     | FilterMode
@@ -58,6 +61,9 @@ type JobUiAccess =
     { List: unit -> Result<JobSummary list, string>
       Read: string -> int64 -> Result<JobResult, string>
       Cancel: string -> Result<unit, string> }
+
+type AgentUiAccess =
+    { Load: unit -> Result<AgentView.Snapshot, string> }
 
 type SettingsUiAccess =
     { Load: unit -> Result<ClientConfigSnapshot, string>
@@ -83,6 +89,15 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
     let mutable showObservers = false
     let mutable activityScrollOffset = 0
     let mutable showActivityDetails = false
+    let mutable agentAccess: AgentUiAccess option = None
+    let mutable agentSnapshot: AgentView.Snapshot option = None
+    let mutable agentSelected: string option = None
+    let mutable agentFilter = ""
+    let mutable agentOriginalFilter = ""
+    let mutable agentScroll = 0
+    let mutable agentError: string option = None
+    let mutable agentRefreshing = false
+    let mutable agentLastPoll = DateTimeOffset.MinValue
     let mutable jobsAccess: JobUiAccess option = None
     let mutable jobSummaries: JobSummary list = []
     let mutable jobSelectedId: string option = None
@@ -407,6 +422,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         writeMnemonic 'c' "clear"; Console.Write ", "
         writeMnemonic 'p' "permissions"; Console.Write ", "
         writeMnemonic 'j' "jobs"; Console.Write ", "
+        writeMnemonic 'a' "agents"; Console.Write ", "
         writeMnemonic 'g' "settings"; Console.Write ", "
         writeMnemonic 'r' "copy recent"; Console.Write ", "
         writeMnemonic 'o' (if showObservers then "hide observers" else "show observers"); Console.Write ", "
@@ -723,6 +739,115 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         Console.WriteLine ""
         if prompts.Count > 0 then Console.WriteLine $"{prompts.Count} pending permission request(s): press p to review."
 
+    let agentListUnsafe () =
+        agentSnapshot
+        |> Option.map (AgentView.visibleRows agentFilter)
+        |> Option.defaultValue []
+        |> List.toArray
+
+    let selectedAgentUnsafe () =
+        agentListUnsafe() |> Array.tryFind (fun row -> Some row.Key = agentSelected)
+
+    let normalizeAgentSelectionUnsafe () =
+        let items = agentListUnsafe()
+        if not (items |> Array.exists (fun row -> Some row.Key = agentSelected)) then
+            agentSelected <- items |> Array.tryHead |> Option.map _.Key
+            agentScroll <- 0
+
+    let moveAgentSelectionUnsafe delta =
+        let items = agentListUnsafe()
+        if items.Length > 0 then
+            let index =
+                items |> Array.tryFindIndex (fun row -> Some row.Key = agentSelected)
+                |> Option.defaultValue 0
+            agentSelected <- Some items[max 0 (min (items.Length - 1) (index + delta))].Key
+
+    let writeAgentHotkeys () =
+        Console.WriteLine "Keys: Up/Down select, PgUp/PgDn page, Enter details, f filter, r refresh,"
+        Console.WriteLine "      p permissions, Esc activity, q quit"
+
+    let renderAgentsUnsafe width =
+        let safe (value: string) = compact value
+        let rows = agentListUnsafe()
+        let all = agentSnapshot |> Option.map (fun snapshot -> AgentView.rows snapshot) |> Option.defaultValue []
+        let conflicts =
+            let reported = agentSnapshot |> Option.map (fun value -> value.Conflicts.Length) |> Option.defaultValue 0
+            max reported (all |> List.filter _.Conflict |> List.length)
+        let reviewCount =
+            agentSnapshot
+            |> Option.map (fun snapshot -> snapshot.Projects |> List.sumBy _.PendingReviews)
+            |> Option.defaultValue 0
+        let unknown = agentSnapshot |> Option.map (fun snapshot -> snapshot.Issues.Length) |> Option.defaultValue 0
+        Console.WriteLine $"Agents: {all.Length} assigned | {reviewCount} awaiting review | {conflicts} conflicts | {unknown} inspection issues"
+        let updated =
+            agentSnapshot |> Option.map (fun snapshot -> snapshot.RefreshedAt.ToLocalTime().ToString("HH:mm:ss"))
+            |> Option.defaultValue "never"
+        let refresh = if agentRefreshing then " (refreshing...)" else ""
+        Console.WriteLine $"Snapshot: {updated}{refresh}; recorded assignment state, not live chat activity."
+        if agentFilter <> "" then Console.WriteLine(trim $"Filter: {safe agentFilter}" width)
+        agentError |> Option.iter (fun error -> Console.WriteLine(trim $"Error: {safe error}" width))
+        if mode = AgentFilterMode then Console.WriteLine "Type agent, project, task or worktree; Enter apply, Esc cancel."
+        if mode = AgentDetailsMode then
+            match selectedAgentUnsafe() with
+            | None -> Console.WriteLine "Agent no longer has a matching assignment. Esc returns to agents."
+            | Some row ->
+                Console.WriteLine ""
+                let heading = if row.Conflict then "OWNERSHIP CONFLICT" else "Assignment details"
+                Console.WriteLine(trim $"{row.Agent} - {heading}" width)
+                Console.WriteLine "--------------------------------------"
+                for item in row.Assignments do
+                    let field title value = Console.WriteLine(trim (safe $"{title}: {value}") width)
+                    field "Project" item.Project
+                    field "Task" (item.TaskId + " - " + item.Title)
+                    field "Status" item.Status
+                    field "Handoff" (AgentView.phaseLabel item.Phase)
+                    field "Next actor" (item.NextActor |> Option.defaultValue "(none)")
+                    field "Worktree" item.Worktree
+                    field "Branch" (item.Branch |> Option.defaultValue "(detached)")
+                    field "HEAD" item.Head
+                    field "Clean" (item.Clean |> Option.map string |> Option.defaultValue "unknown")
+                    field "Task revision" (item.AssignmentRevision |> Option.defaultValue "(none)")
+                    field "Acknowledged" (item.AcknowledgedRevision |> Option.defaultValue "(none)")
+                    field "Base commit" (item.BaseCommit |> Option.defaultValue "(none)")
+                    field "Instructions" (item.Instructions |> Option.defaultValue "(none)")
+                    Console.WriteLine ""
+                Console.WriteLine "These are persisted task records, not a runtime heartbeat."
+        else
+            if agentSnapshot.IsNone && not agentRefreshing then Console.WriteLine "No snapshot loaded. Press r to refresh."
+            elif rows.Length = 0 then Console.WriteLine "No assigned agents match the filter."
+            else
+                let selected =
+                    rows |> Array.tryFindIndex (fun row -> Some row.Key = agentSelected)
+                    |> Option.defaultValue 0
+                let rowCount = max 4 (min 14 (Console.WindowHeight - 16))
+                agentScroll <- max 0 (min agentScroll (max 0 (rows.Length - rowCount)))
+                if selected < agentScroll then agentScroll <- selected
+                if selected >= agentScroll + rowCount then agentScroll <- selected - rowCount + 1
+                let finish = min rows.Length (agentScroll + rowCount)
+                Console.WriteLine "Agent             Assignment / handoff"
+                Console.WriteLine "-----------------------------------------------"
+                for index = agentScroll to finish - 1 do
+                    let row = rows[index]
+                    let marker = if Some row.Key = agentSelected && mode = AgentsMode then ">" else " "
+                    let title = trim (safe row.Agent) 18
+                    let label = safe (AgentView.agentSummary row)
+                    let original = Console.ForegroundColor
+                    if row.Conflict then Console.ForegroundColor <- ConsoleColor.Red
+                    Console.Write(marker + " " + title.PadRight(19))
+                    Console.ForegroundColor <- original
+                    Console.WriteLine(trim label (max 15 (width - 23)))
+            agentSnapshot |> Option.iter (fun snapshot ->
+                Console.WriteLine ""
+                Console.WriteLine(trim $"Projects: {snapshot.Projects.Length}; retirement candidates: {snapshot.Projects |> List.sumBy _.RetirementCandidates}" width)
+                for project in snapshot.Projects |> List.filter (fun p -> p.Error.IsSome) |> List.truncate 3 do
+                    Console.WriteLine(trim $"{project.Project}: {project.Error.Value}" width)
+                for conflict in snapshot.Conflicts |> List.truncate 3 do
+                    Console.WriteLine(trim ("CONFLICT: " + safe conflict) width)
+                for issue in snapshot.Issues |> List.truncate 2 do
+                    Console.WriteLine(trim ("Issue: " + safe issue) width))
+        Console.WriteLine ""
+        if prompts.Count > 0 then Console.WriteLine $"{prompts.Count} permission requests pending (p to review)."
+
     let settingKeys = [| "machine-name"; "workspace-path"; "trust-level"; "allowed-environment-variables"; "max-import-bytes" |]
     let settingLabels = [| "Machine name"; "Workspace directory"; "Trust level"; "Allowed environment variables"; "Maximum import bytes" |]
 
@@ -849,6 +974,8 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                 writeFilterHotkeys()
             | CopyRecentMode ->
                 writeCopyRecentHotkeys()
+            | AgentsMode | AgentDetailsMode | AgentFilterMode ->
+                writeAgentHotkeys()
             | JobsMode | JobFilterMode ->
                 writeJobsHotkeys()
             | JobDetailsMode | JobCancelMode ->
@@ -858,6 +985,8 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
             Console.WriteLine ""
 
             match mode with
+            | AgentsMode | AgentDetailsMode | AgentFilterMode ->
+                renderAgentsUnsafe width
             | JobsMode | JobDetailsMode | JobCancelMode | JobFilterMode ->
                 renderJobsUnsafe width
             | SettingsMode | SettingsEditMode | SettingsConfirmMode ->
@@ -926,6 +1055,30 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                 Console.WriteLine ""
         with _ ->
             ()
+
+    // Git-backed inspection can take time. Do not block the terminal or UI lock.
+    let startAgentRefreshUnsafe () =
+        if not agentRefreshing then
+            agentRefreshing <- true
+            agentLastPoll <- DateTimeOffset.UtcNow
+            let provider = agentAccess
+            Task.Run(Action(fun () ->
+                let result =
+                    try
+                        match provider with
+                        | Some access -> access.Load()
+                        | None -> Error "Agent snapshot provider unavailable."
+                    with ex -> Error ex.Message
+                lock syncRoot (fun () ->
+                    agentRefreshing <- false
+                    match result with
+                    | Ok snapshot ->
+                        agentSnapshot <- Some snapshot
+                        agentError <- None
+                        normalizeAgentSelectionUnsafe()
+                    | Error error ->
+                        agentError <- Some error
+                    renderUnsafe()))) |> ignore
 
     let render () = lock syncRoot renderUnsafe
 
@@ -1021,6 +1174,9 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
 
     member _.SetJobAccess(access: JobUiAccess) =
         lock syncRoot (fun () -> jobsAccess <- Some access)
+
+    member _.SetAgentAccess(access: AgentUiAccess) =
+        lock syncRoot (fun () -> agentAccess <- Some access)
 
     member _.SetKey value =
         lock syncRoot (fun () ->
@@ -1161,6 +1317,9 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                         lock syncRoot (fun () ->
                             pollJobsUnsafe()
                             renderUnsafe())
+                    if (mode = AgentsMode || mode = AgentDetailsMode || mode = AgentFilterMode)
+                       && DateTimeOffset.UtcNow - agentLastPoll > TimeSpan.FromSeconds(45.) then
+                        lock syncRoot (fun () -> startAgentRefreshUnsafe())
                     if Console.KeyAvailable then
                         let keyInfo = Console.ReadKey(intercept = true)
 
@@ -1197,6 +1356,22 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                                 let items = jobListUnsafe()
                                 jobSelectedId <- items |> List.tryHead |> Option.map _.JobId
                                 jobListScroll <- 0
+                                renderUnsafe())
+                        elif mode = AgentFilterMode then
+                            lock syncRoot (fun () ->
+                                match keyInfo.Key with
+                                | ConsoleKey.Enter -> mode <- AgentsMode; normalizeAgentSelectionUnsafe()
+                                | ConsoleKey.Escape ->
+                                    agentFilter <- agentOriginalFilter
+                                    mode <- AgentsMode
+                                    normalizeAgentSelectionUnsafe()
+                                | ConsoleKey.Backspace when agentFilter.Length > 0 ->
+                                    agentFilter <- agentFilter.Substring(0, agentFilter.Length - 1)
+                                    normalizeAgentSelectionUnsafe()
+                                | _ when not (Char.IsControl keyInfo.KeyChar) ->
+                                    agentFilter <- agentFilter + string keyInfo.KeyChar
+                                    normalizeAgentSelectionUnsafe()
+                                | _ -> ()
                                 renderUnsafe())
                         elif mode = JobCancelMode then
                             lock syncRoot (fun () ->
@@ -1296,6 +1471,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                                     | PermissionMode ->
                                         selectedPrompt <- max 0 (selectedPrompt - 1)
                                     | SettingsMode -> settingsSelected <- max 0 (settingsSelected - 1)
+                                    | AgentsMode -> moveAgentSelectionUnsafe -1
                                     | JobsMode -> moveJobSelectionUnsafe -1
                                     | JobDetailsMode ->
                                         jobFollow <- false
@@ -1310,6 +1486,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                                         selectedPrompt <- min (prompts.Count - 1) (selectedPrompt + 1)
                                         selectedPrompt <- max 0 selectedPrompt
                                     | SettingsMode -> settingsSelected <- min (settingKeys.Length - 1) (settingsSelected + 1)
+                                    | AgentsMode -> moveAgentSelectionUnsafe 1
                                     | JobsMode -> moveJobSelectionUnsafe 1
                                     | JobDetailsMode ->
                                         jobOutputScroll <- max 0 (jobOutputScroll - 1)
@@ -1320,6 +1497,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                                 lock syncRoot (fun () ->
                                     match mode with
                                     | ActivityMode -> moveActivitySelectionUnsafe -visibleActivityRows
+                                    | AgentsMode -> moveAgentSelectionUnsafe -12
                                     | JobsMode -> moveJobSelectionUnsafe -12
                                     | JobDetailsMode ->
                                         jobFollow <- false
@@ -1330,6 +1508,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                                 lock syncRoot (fun () ->
                                     match mode with
                                     | ActivityMode -> moveActivitySelectionUnsafe visibleActivityRows
+                                    | AgentsMode -> moveAgentSelectionUnsafe 12
                                     | JobsMode -> moveJobSelectionUnsafe 12
                                     | JobDetailsMode ->
                                         jobOutputScroll <- max 0 (jobOutputScroll - 10)
@@ -1346,6 +1525,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                                 lock syncRoot (fun () ->
                                     if mode = ActivityMode && (filteredActivityUnsafe()).Length > 0 then
                                         showActivityDetails <- not showActivityDetails
+                                    elif mode = AgentsMode && agentSelected.IsSome then mode <- AgentDetailsMode
                                     elif mode = JobsMode then openJobDetailsUnsafe()
                                     elif mode = SettingsMode then
                                         settingsEditing <- settingsValue settingKeys[settingsSelected] settingsStaged
@@ -1353,7 +1533,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                                         settingsError <- None
                                         mode <- SettingsEditMode
                                     renderUnsafe())
-                            | _, ConsoleKey.G when mode = ActivityMode || mode = JobsMode ->
+                            | _, ConsoleKey.G when mode = ActivityMode || mode = JobsMode || mode = AgentsMode ->
                                 lock syncRoot (fun () ->
                                     openSettingsUnsafe()
                                     renderUnsafe())
@@ -1374,6 +1554,25 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                                 lock syncRoot (fun () ->
                                     mode <- settingsReturnMode
                                     renderUnsafe())
+                            | _, ConsoleKey.A when mode = ActivityMode || mode = JobsMode ->
+                                lock syncRoot (fun () ->
+                                    mode <- AgentsMode
+                                    normalizeAgentSelectionUnsafe()
+                                    startAgentRefreshUnsafe()
+                                    renderUnsafe())
+                            | _, ConsoleKey.F when mode = AgentsMode ->
+                                lock syncRoot (fun () ->
+                                    agentOriginalFilter <- agentFilter
+                                    mode <- AgentFilterMode
+                                    renderUnsafe())
+                            | _, ConsoleKey.R when mode = AgentsMode || mode = AgentDetailsMode ->
+                                lock syncRoot (fun () ->
+                                    startAgentRefreshUnsafe()
+                                    renderUnsafe())
+                            | _, ConsoleKey.Escape when mode = AgentDetailsMode ->
+                                lock syncRoot (fun () -> mode <- AgentsMode; renderUnsafe())
+                            | _, ConsoleKey.Escape when mode = AgentsMode ->
+                                lock syncRoot (fun () -> mode <- ActivityMode; renderUnsafe())
                             | _, ConsoleKey.J when mode = ActivityMode ->
                                 lock syncRoot (fun () ->
                                     mode <- JobsMode
@@ -1409,7 +1608,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                                 lock syncRoot (fun () ->
                                     mode <- ActivityMode
                                     renderUnsafe())
-                            | _, ConsoleKey.P when mode = ActivityMode || mode = JobsMode || mode = JobDetailsMode || mode = SettingsMode ->
+                            | _, ConsoleKey.P when mode = ActivityMode || mode = AgentsMode || mode = AgentDetailsMode || mode = JobsMode || mode = JobDetailsMode || mode = SettingsMode ->
                                 lock syncRoot (fun () ->
                                     permissionReturnMode <- mode
                                     mode <- PermissionMode

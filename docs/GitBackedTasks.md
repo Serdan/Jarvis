@@ -254,3 +254,35 @@ leftover checkout for manual inspection. No secondary authoritative task
 database is introduced. The new protocol requires a coordinated server/client
 deployment and refreshed MCP definitions; publishing these source changes
 alone does not update running clients.
+
+## Client Agents screen
+
+The client TUI now has an **Agents** screen (press `a` from Activity or
+Jobs). It reads the same Git-backed `GetOrchestrationSnapshot` model used by
+the server API; there is no second in-memory authority for assignment state.
+It discovers registered worktrees for each project in the configured
+workspace, groups agents by **project and agent ID**, highlights duplicate
+task/agent ownership conflicts and shows handoff states:
+
+- Assigned, Acknowledged, Working, Ready for review
+- Task ID/title, owning worktree/branch/HEAD, task revision, instructions,
+  base commit and acknowledged revision
+- Per-project pending reviews, unacknowledged assignments, inspection
+  failures and conservative retirement-candidate counts
+
+Use Up/Down (or Page Up/Down) to select, Enter for details, `f` to filter
+by agent/project/task/worktree, `r` to refresh, and Escape to return.
+`p` opens pending permission requests without leaving the agent context.
+
+The snapshot is fetched **asynchronously**, so Git inspection across many
+worktrees does not block terminal input or permission requests. While the
+Agents screen is open, the client refreshes at most once every 45 seconds;
+manual refresh is available. A failed refresh retains the previous snapshot
+with an explicit error. Projects without Git do not hide healthy projects:
+their inspection error is shown separately. This screen is read-only; use
+the permission-gated MCP tools to modify assignments or retire worktrees.
+
+The labels describe **persisted assignment lifecycle**, not live ChatGPT
+session liveness. A claimed/Working task does not prove that an agent is
+currently executing. The client has no reliable chat-session identity for
+arbitrary RunCommand calls and does not infer one from a project name.

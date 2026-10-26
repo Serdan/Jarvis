@@ -170,6 +170,7 @@ let private runClient args =
           Cancel = (fun jobId ->
             JobManager.cancelJob { JobId = jobId } rt
             |> formatJobResult) }
+    tui.SetAgentAccess { Load = (fun () -> AgentDashboard.load rt) }
     tui.Log $"Trust: {TrustLevel.toDisplayName trustLevel}"
     tui.Log $"Allowed sensitive environment variables: {allowedEnvironmentVariables.Length}"
     let importSizeDescription =

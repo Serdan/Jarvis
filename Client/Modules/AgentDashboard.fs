@@ -105,7 +105,7 @@ let fromSnapshots now (results: (string * Result<TaskStore.OrchestrationSnapshot
       RefreshedAt = now }
 
 let load rt =
-    match ProjectBrowser.listProjects rt with
+    match ProjectBrowser.listGitProjects rt with
     | Error error -> Error(string error)
     | Ok projects ->
         projects

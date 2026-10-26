@@ -271,6 +271,21 @@ module private Core =
                 && not (isLinkedWorktree root name))
         } <| rt
 
+    // The Agents dashboard is backed by Git worktrees. A configured project
+    // without its own .git marker is not an orchestration failure: it simply
+    // cannot contain Git-backed assignments. Keep ListProjects unrestricted.
+    let listGitProjects rt =
+        effect {
+            let! (ProjectDirectory root) = ProjectIO.root
+            let! projects = listProjects
+            return
+                projects
+                |> Seq.filter (fun (ProjectName name) ->
+                    let gitMarker = Path.Combine(root, name, ".git")
+                    Directory.Exists gitMarker || File.Exists gitMarker)
+                |> Seq.toList
+        } <| rt
+
     let private parseProjectName (projectName: string) =
         effect {
             let! projects = enumerateProjects
@@ -933,6 +948,7 @@ module private Core =
 
 let listCommands rt = Core.listCommands rt
 let listProjects rt = Core.listProjects rt
+let listGitProjects rt = Core.listGitProjects rt
 
 let getProjectDetails (cmd: GetProjectDetailsCommand) : IO<'rt, (string * Content) list> =
     Core.getProjectDetails cmd.ProjectName

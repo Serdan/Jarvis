@@ -307,9 +307,13 @@ The snapshot is fetched **asynchronously**, so Git inspection across many
 worktrees does not block terminal input or permission requests. While the
 Agents screen is open, the client refreshes at most once every 45 seconds;
 manual refresh is available. A failed refresh retains the previous snapshot
-with an explicit error. Projects without Git do not hide healthy projects:
-their inspection error is shown separately. This screen is read-only; use
-the permission-gated MCP tools to modify assignments or retire worktrees.
+with an explicit error. The Agents screen scans only projects with their
+own Git metadata (`.git` directory or file); ordinary non-Git folders are
+not orchestration errors and remain available through `ListProjects`.
+Projects that advertise Git metadata but fail actual repository inspection
+still report the error without hiding healthy repositories. This screen is
+read-only; use the permission-gated MCP tools to modify assignments or
+retire worktrees.
 
 The labels describe **persisted assignment lifecycle**, not live ChatGPT
 session liveness. A claimed/Working task does not prove that an agent is

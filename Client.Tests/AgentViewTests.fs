@@ -1,6 +1,7 @@
 module AgentViewTests
 
 open System
+open System.IO
 open Client
 open Client.AgentView
 open Client.AgentDashboard
@@ -194,3 +195,42 @@ let timestampOrCheckpointUpdatesMarkAgentAsChanged () =
     let after = snapshot [ updated ] []
     (changedAgents before after).Contains("Wayfold::Agent 1") |> shouldEqual true
     (changedAgents after after).IsEmpty |> shouldEqual true
+
+[<Test>]
+let agentsDashboardSkipsNonGitProjectsWithoutHidingGitFailures () =
+    let root, project = GitCommandTests.createTempProject()
+    try
+        let context = GitCommandTests.TestContext(root)
+        for name in [ "LexicalEffects"; "TEST"; "eyepuzzle" ] do
+            Directory.CreateDirectory(Path.Combine(root, name)) |> ignore
+        GitCommandTests.initRepo context
+        File.WriteAllText(Path.Combine(project, "README.md"), "initial")
+        GitCommandTests.expectGitSuccess context [ "add"; "README.md" ]
+        GitCommandTests.expectGitSuccess context [ "commit"; "-m"; "initial" ]
+        let all =
+            match Client.ProjectBrowser.listProjects context with
+            | Ok projects -> projects |> Seq.map (fun (Client.ProjectName value) -> value) |> Seq.toList
+            | Error error -> failwith $"Listing projects failed: {error}"
+        for name in [ "LexicalEffects"; "TEST"; "eyepuzzle"; "Project1" ] do
+            (List.contains name all) |> shouldEqual true
+        let gitOnly =
+            match Client.ProjectBrowser.listGitProjects context with
+            | Ok projects -> projects |> List.map (fun (Client.ProjectName value) -> value)
+            | Error error -> failwith $"Listing Git projects failed: {error}"
+        gitOnly |> shouldEqual [ "Project1" ]
+        match Client.AgentDashboard.load context with
+        | Ok snapshot ->
+            (snapshot.Projects |> List.map _.Project) |> shouldEqual [ "Project1" ]
+            snapshot.Issues |> shouldEqual []
+        | Error error -> Assert.Fail($"Agents dashboard failed: {error}")
+        // A directory advertising a Git root must still report real Git
+        // validation errors instead of being silently ignored.
+        Directory.CreateDirectory(Path.Combine(root, "TEST", ".git")) |> ignore
+        match Client.AgentDashboard.load context with
+        | Error error -> Assert.Fail($"Dashboard aborted instead of reporting Git failure: {error}")
+        | Ok snapshot ->
+            (snapshot.Projects |> List.map _.Project |> List.sort) |> shouldEqual [ "Project1"; "TEST" ]
+            (snapshot.Issues |> List.exists (fun issue ->
+                issue.Contains("TEST") && issue.Contains("Git"))) |> shouldEqual true
+    finally
+        if Directory.Exists root then Directory.Delete(root, true)

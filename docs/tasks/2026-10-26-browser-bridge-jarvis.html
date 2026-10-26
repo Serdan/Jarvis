@@ -5,6 +5,8 @@
 <h1>Local browser bridge and MCP command routing</h1>
 <p><strong>Scope:</strong> Jarvis-side foundation in <code>Jarvis::browser-bridge</code>, branch <code>feature/browser-bridge</code>. Implement the .NET client, shared protocol, MCP surface, policy, and test harness. Do <strong>not</strong> implement a browser extension in this task, merge to main, or deploy.</p>
 
+<p><strong>System-wide specification:</strong> <a href="../BrowserBridgeSystem.md">docs/BrowserBridgeSystem.md</a> defines the full architecture, browser extension, registration lifecycle, execution and WebSocket contracts, permission boundaries, tests and rollout phases. Implement this Jarvis-side task consistently with that spec; the separate extension remains out of scope here.</p>
+
 <h2>Goal</h2>
 <p>Let an authenticated ChatGPT/Jarvis session inspect tabs the user has manually registered in the browser extension and execute JavaScript from an ordinary Jarvis project file in one selected registered tab. An agent supplies a project identifier and project-relative script path; files are not registered with Jarvis and can be managed in Git normally. The path is MCP caller → existing authenticated Jarvis server/SignalR routing → selected JarvisClient → local loopback WebSocket → paired browser-extension client. The extension will be implemented separately; complete this task against a realistic simulated extension.</p>
 

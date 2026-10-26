@@ -61,6 +61,30 @@ A typical JSON state:
 
 Use `ListTasks` and `GetTask` to inspect HTML and JSON, including revision hashes and diagnostics. `ListTasks` filters by status, owner and dependency. `CompareWorktreeTasks` summarizes the task records in all Git-registered worktrees, preserving branch-local statuses and returning per-worktree diagnostics when a checkout cannot be read. `CreateTask` creates and commits the HTML+JSON pair, and can resume an interrupted write when only an identical HTML description was saved. `UpdateTask` (including optional JSON-encoded dependency changes), `ClaimTask`, `CheckpointTask` and `CompleteTask` validate, write and commit JSON state. The status vocabulary is `open`, `active`, `blocked`, `completed`. Existing JSON using `in_progress` is interpreted as `active` for reading and filtering; the original JSON bytes remain unchanged until an explicit task mutation. Completion preserves task state and its Git history; `GetTaskHistory` returns bounded relevant commits and patches for both the original HTML description and JSON state.
 
+### Missing task directories and Git recovery
+
+`ListTasks` returns an empty list when the configured task folder is absent;
+`GetTask` returns not found, and `CreateTask` creates the folder on demand.
+Task reads do not require Git, but mutations do. Before writing any task
+files Jarvis verifies that `git` is executable and that the selected project
+is the root of a Git working tree. Missing Git, non-repository projects and
+other Git-access failures produce distinct actionable errors. Jarvis never
+silently initializes a repository or falls back to unversioned task state.
+
+When a Git commit fails after files have been written (for example, a
+rejecting pre-commit hook or missing Git identity), Jarvis checks that Git HEAD
+and the task files have not changed unexpectedly, then restores the previous
+task bytes and unstages **only the task paths**. Existing unrelated staged
+changes remain in the index. The original command can be retried after fixing
+Git. New task files are deleted on rollback; a previous HTML-only task
+remains intact if its new JSON metadata commit fails.
+
+If the Git index cannot be safely restored, HEAD changed unexpectedly, or
+another process/hook edited the task files, Jarvis **preserves the current
+files** and returns an explicit reconciliation error rather than overwriting
+someone else's work. A newly created empty task directory may remain after a
+rolled-back commit; reads continue to report an empty task list.
+
 Mutations reject pre-existing staged or unstaged task JSON edits, preserve unknown JSON fields and use optimistic `expectedRevision` checking where provided. Claims reject another owner until explicitly reassigned. Jarvis serializes task mutations for a selected worktree within one local client, stages only the task's paths, and rejects preexisting staged edits to those paths. Each successful mutation returns the Git commit hash. The commit is local to the selected branch and subject to the client's version-control permissions; task changes become visible on main when integrated through Git.
 
 ## Existing checkpoint API

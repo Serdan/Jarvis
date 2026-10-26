@@ -114,6 +114,8 @@ let private requiresConfirmation command =
     | ListTasksCommand _
     | GetTaskCommand _
     | CompareWorktreeTasksCommand _
+    | GetAgentAssignmentCommand _
+    | GetOrchestrationSnapshotCommand _
     | GetTaskHistoryCommand _
     | GetProjectDetailsCommand _
     | ListDirectoryCommand _
@@ -157,6 +159,14 @@ let private requiresConfirmation command =
         confirmation "CreateTask" (Some cmd.ProjectName) [ WorkspaceWrite; VersionControlWrite ] [] (Some "git") [ cmd.TaskId |> Option.defaultValue "new" ] "CreateTask task" false
     | UpdateTaskCommand cmd ->
         confirmation "UpdateTask" (Some cmd.ProjectName) [ WorkspaceWrite; VersionControlWrite ] [] (Some "git") [ cmd.TaskId ] "UpdateTask task" false
+    | AssignTaskCommand cmd ->
+        confirmation "AssignTask" (Some cmd.ProjectName) [ WorkspaceWrite; VersionControlWrite ] [] (Some "git") [ cmd.Agent; cmd.TaskId ] "Assign task" false
+    | RetireWorktreeCommand cmd ->
+        confirmation "RetireWorktree" (Some cmd.ProjectName) [ VersionControlWrite; Destructive ] [] (Some "git") [ cmd.WorktreePath ] "Retire worktree" false
+    | BeginTaskCommand cmd ->
+        confirmation "BeginTask" (Some cmd.ProjectName) [ WorkspaceWrite; VersionControlWrite ] [] (Some "git") [ cmd.TaskId ] "Begin task" false
+    | AcknowledgeTaskCommand cmd ->
+        confirmation "AcknowledgeTask" (Some cmd.ProjectName) [ WorkspaceWrite; VersionControlWrite ] [] (Some "git") [ cmd.TaskId ] "Acknowledge assignment" false
     | ClaimTaskCommand cmd ->
         confirmation "ClaimTask" (Some cmd.ProjectName) [ WorkspaceWrite; VersionControlWrite ] [] (Some "git") [ cmd.TaskId ] "ClaimTask task" false
     | CheckpointTaskCommand cmd ->

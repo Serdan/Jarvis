@@ -83,6 +83,8 @@ type RemoveWorktreeCommand =
 type ListTasksCommand = { ProjectName: string; Status: string option; Owner: string option; DependsOn: string option; NextActor: string option }
 type GetTaskCommand = { ProjectName: string; TaskId: string }
 type CompareWorktreeTasksCommand = { ProjectName: string; NextActor: string option }
+type GetAgentAssignmentCommand = { ProjectName: string; Agent: string }
+type GetOrchestrationSnapshotCommand = { ProjectName: string }
 type CreateTaskCommand =
     { ProjectName: string
       TaskId: string option
@@ -102,6 +104,25 @@ type UpdateTaskCommand =
       ExpectedAssignmentRevision: string option
       NextActor: string option
       ActorId: string option }
+type AssignTaskCommand =
+    { ProjectName: string
+      Agent: string
+      TaskId: string
+      WorktreeName: string option
+      Branch: string option
+      Instructions: string
+      BaseCommit: string option
+      ExpectedRevision: string option
+      ExpectedAssignmentRevision: string option
+      ActorId: string }
+type RetireWorktreeCommand = { ProjectName: string; WorktreePath: string; TargetRef: string option; DeleteBranch: bool; DryRun: bool }
+type BeginTaskCommand = { ProjectName: string; TaskId: string; Agent: string; AssignmentRevision: string; ExpectedRevision: string option }
+type AcknowledgeTaskCommand =
+    { ProjectName: string
+      TaskId: string
+      Agent: string
+      AssignmentRevision: string
+      ExpectedRevision: string option }
 type ClaimTaskCommand =
     { ProjectName: string
       TaskId: string
@@ -531,6 +552,12 @@ type AgentCommand =
     | ListTasksCommand of ListTasksCommand
     | GetTaskCommand of GetTaskCommand
     | CompareWorktreeTasksCommand of CompareWorktreeTasksCommand
+    | GetAgentAssignmentCommand of GetAgentAssignmentCommand
+    | GetOrchestrationSnapshotCommand of GetOrchestrationSnapshotCommand
+    | AssignTaskCommand of AssignTaskCommand
+    | AcknowledgeTaskCommand of AcknowledgeTaskCommand
+    | BeginTaskCommand of BeginTaskCommand
+    | RetireWorktreeCommand of RetireWorktreeCommand
     | CreateTaskCommand of CreateTaskCommand
     | UpdateTaskCommand of UpdateTaskCommand
     | ClaimTaskCommand of ClaimTaskCommand
@@ -582,6 +609,12 @@ module AgentCommandInfo =
         | ListTasksCommand _ -> "ListTasksCommand"
         | GetTaskCommand _ -> "GetTaskCommand"
         | CompareWorktreeTasksCommand _ -> "CompareWorktreeTasksCommand"
+        | GetAgentAssignmentCommand _ -> "GetAgentAssignmentCommand"
+        | GetOrchestrationSnapshotCommand _ -> "GetOrchestrationSnapshotCommand"
+        | AssignTaskCommand _ -> "AssignTaskCommand"
+        | AcknowledgeTaskCommand _ -> "AcknowledgeTaskCommand"
+        | BeginTaskCommand _ -> "BeginTaskCommand"
+        | RetireWorktreeCommand _ -> "RetireWorktreeCommand"
         | CreateTaskCommand _ -> "CreateTaskCommand"
         | UpdateTaskCommand _ -> "UpdateTaskCommand"
         | ClaimTaskCommand _ -> "ClaimTaskCommand"
@@ -639,6 +672,12 @@ module AgentCommandInfo =
         | ListTasksCommand _ -> "ListTasks"
         | GetTaskCommand _ -> "GetTask"
         | CompareWorktreeTasksCommand _ -> "CompareWorktreeTasks"
+        | GetAgentAssignmentCommand _ -> "GetAgentAssignment"
+        | GetOrchestrationSnapshotCommand _ -> "GetOrchestrationSnapshot"
+        | AssignTaskCommand _ -> "AssignTask"
+        | AcknowledgeTaskCommand _ -> "AcknowledgeTask"
+        | BeginTaskCommand _ -> "BeginTask"
+        | RetireWorktreeCommand _ -> "RetireWorktree"
         | CreateTaskCommand _ -> "CreateTask"
         | UpdateTaskCommand _ -> "UpdateTask"
         | ClaimTaskCommand _ -> "ClaimTask"
@@ -694,6 +733,12 @@ module AgentCommandInfo =
         | ListTasksCommand cmd -> Some cmd.ProjectName
         | GetTaskCommand cmd -> Some cmd.ProjectName
         | CompareWorktreeTasksCommand cmd -> Some cmd.ProjectName
+        | GetAgentAssignmentCommand cmd -> Some cmd.ProjectName
+        | GetOrchestrationSnapshotCommand cmd -> Some cmd.ProjectName
+        | AssignTaskCommand cmd -> Some cmd.ProjectName
+        | AcknowledgeTaskCommand cmd -> Some cmd.ProjectName
+        | BeginTaskCommand cmd -> Some cmd.ProjectName
+        | RetireWorktreeCommand cmd -> Some cmd.ProjectName
         | CreateTaskCommand cmd -> Some cmd.ProjectName
         | UpdateTaskCommand cmd -> Some cmd.ProjectName
         | ClaimTaskCommand cmd -> Some cmd.ProjectName
@@ -808,6 +853,12 @@ module AgentCommandInfo =
         | ListProjectsCommand
         | ListWorktreesCommand _
         | CompareWorktreeTasksCommand _
+        | GetAgentAssignmentCommand _
+        | GetOrchestrationSnapshotCommand _
+        | AssignTaskCommand _
+        | AcknowledgeTaskCommand _
+        | BeginTaskCommand _
+        | RetireWorktreeCommand _
         | GetProjectDetailsCommand _
         | ListProjectTasksCommand _
         | GetGitStatusCommand _
@@ -858,6 +909,12 @@ module AgentCommandInfo =
         | ListProjectsCommand
         | ListWorktreesCommand _
         | CompareWorktreeTasksCommand _
+        | GetAgentAssignmentCommand _
+        | GetOrchestrationSnapshotCommand _
+        | AssignTaskCommand _
+        | AcknowledgeTaskCommand _
+        | BeginTaskCommand _
+        | RetireWorktreeCommand _
         | GetProjectDetailsCommand _
         | ListProjectTasksCommand _
         | GetGitStatusCommand _
@@ -902,7 +959,7 @@ module AgentCommandInfo =
         | None -> invocation command
 
 module AgentProtocol =
-    let version = "3.16"
+    let version = "3.17"
     let defaultPatchFuzzyContextLines = 3
     let maxResponseBytes = 900 * 1024
     let maxImageBytes = 8 * 1024 * 1024
@@ -926,6 +983,12 @@ module AgentProtocol =
           definition "InspectWorktreeRemoval" "Checks registered worktree removal safety." [ ReadOnly ] false false false
           definition "ListTasks" "Lists repository-backed HTML and JSON task files." [ ReadOnly ] false false false
           definition "CompareWorktreeTasks" "Summarizes tasks across registered worktrees with optional nextActor filtering." [ ReadOnly ] false false false
+          definition "GetAgentAssignment" "Finds an agent assignment across all registered worktrees; rejects ambiguous active ownership." [ ReadOnly ] false false false
+          definition "GetOrchestrationSnapshot" "Summarizes agent assignments, handoff phases, ownership conflicts, and worktree states." [ ReadOnly ] false false false
+          definition "AssignTask" "Atomically claims and assigns a task with global ownership checks." [ WorkspaceWrite; VersionControlWrite ] true true false
+          definition "AcknowledgeTask" "Records agent receipt of the current assignment without overwriting a checkpoint." [ WorkspaceWrite; VersionControlWrite ] true true false
+          definition "BeginTask" "Records work started for the exact acknowledged assignment revision." [ WorkspaceWrite; VersionControlWrite ] true true false
+          definition "RetireWorktree" "Dry-run or safely retire accepted worktree while preserving task commits and branch history." [ VersionControlWrite; Destructive ] true true false
           definition "GetTask" "Reads HTML task definition and adjacent JSON state." [ ReadOnly ] false false false
           definition "CreateTask" "Creates and commits HTML and JSON task files." [ WorkspaceWrite; VersionControlWrite ] true true false
           definition "UpdateTask" "Updates task metadata or reviewer assignment without changing owner or progress." [ WorkspaceWrite; VersionControlWrite ] true true false

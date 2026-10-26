@@ -91,6 +91,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
     let mutable showActivityDetails = false
     let mutable agentAccess: AgentUiAccess option = None
     let mutable agentSnapshot: AgentView.Snapshot option = None
+    let mutable agentChanged = Set.empty<string>
     let mutable agentSelected: string option = None
     let mutable agentFilter = ""
     let mutable agentOriginalFilter = ""
@@ -778,7 +779,12 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
             |> Option.map (fun snapshot -> snapshot.Projects |> List.sumBy _.PendingReviews)
             |> Option.defaultValue 0
         let unknown = agentSnapshot |> Option.map (fun snapshot -> snapshot.Issues.Length) |> Option.defaultValue 0
-        Console.WriteLine $"Agents: {all.Length} assigned | {reviewCount} awaiting review | {conflicts} conflicts | {unknown} inspection issues"
+        let completedCount =
+            agentSnapshot
+            |> Option.map (fun snap -> snap.Assignments |> List.filter (fun task -> task.Status = "completed") |> List.length)
+            |> Option.defaultValue 0
+        Console.WriteLine $"Agents: {all.Length} tracked | {reviewCount} awaiting review | {completedCount} completed | {conflicts} conflicts | {unknown} issues"
+        if not agentChanged.IsEmpty then Console.WriteLine $"{agentChanged.Count} agent(s) changed since previous refresh (*)."
         let updated =
             agentSnapshot |> Option.map (fun snapshot -> snapshot.RefreshedAt.ToLocalTime().ToString("HH:mm:ss"))
             |> Option.defaultValue "never"
@@ -794,6 +800,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                 Console.WriteLine ""
                 let heading = if row.Conflict then "OWNERSHIP CONFLICT" else "Assignment details"
                 Console.WriteLine(trim $"{row.Agent} - {heading}" width)
+                if Set.contains row.Key agentChanged then Console.WriteLine "Updated since previous snapshot."
                 Console.WriteLine "--------------------------------------"
                 for item in row.Assignments do
                     let field title value = Console.WriteLine(trim (safe $"{title}: {value}") width)
@@ -810,11 +817,20 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                     field "Acknowledged" (item.AcknowledgedRevision |> Option.defaultValue "(none)")
                     field "Base commit" (item.BaseCommit |> Option.defaultValue "(none)")
                     field "Instructions" (item.Instructions |> Option.defaultValue "(none)")
+                    field "Last updated" (item.UpdatedAt |> Option.map (fun timestamp ->
+                        timestamp.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss")) |> Option.defaultValue "(unknown)")
+                    field "Updated by" (item.LastUpdatedBy |> Option.defaultValue "(unknown)")
+                    field "Checkpoint" (item.CheckpointSummary |> Option.defaultValue "(none)")
+                    field "Next action" (item.CheckpointNextAction |> Option.defaultValue "(none)")
+                    field "Checkpoint commit" (item.CheckpointLastCommit |> Option.defaultValue "(none)")
+                    field "Blocker" (item.CheckpointBlocker |> Option.defaultValue "(none)")
+                    if item.Status = "completed" then
+                        field "Final commit" (item.CompletionFinalCommit |> Option.defaultValue "(not recorded)")
                     Console.WriteLine ""
                 Console.WriteLine "These are persisted task records, not a runtime heartbeat."
         else
             if agentSnapshot.IsNone && not agentRefreshing then Console.WriteLine "No snapshot loaded. Press r to refresh."
-            elif rows.Length = 0 then Console.WriteLine "No assigned agents match the filter."
+            elif rows.Length = 0 then Console.WriteLine "No agents or recent completions match the filter."
             else
                 let selected =
                     rows |> Array.tryFindIndex (fun row -> Some row.Key = agentSelected)
@@ -833,7 +849,8 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                     let label = safe (AgentView.agentSummary row)
                     let original = Console.ForegroundColor
                     if row.Conflict then Console.ForegroundColor <- ConsoleColor.Red
-                    Console.Write(marker + " " + title.PadRight(19))
+                    let changed = if Set.contains row.Key agentChanged then "*" else " "
+                    Console.Write(marker + changed + title.PadRight(19))
                     Console.ForegroundColor <- original
                     Console.WriteLine(trim label (max 15 (width - 23)))
             agentSnapshot |> Option.iter (fun snapshot ->
@@ -1073,6 +1090,10 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                     agentRefreshing <- false
                     match result with
                     | Ok snapshot ->
+                        agentChanged <-
+                            agentSnapshot
+                            |> Option.map (fun before -> AgentView.changedAgents before snapshot)
+                            |> Option.defaultValue Set.empty
                         agentSnapshot <- Some snapshot
                         agentError <- None
                         normalizeAgentSelectionUnsafe()

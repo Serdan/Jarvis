@@ -27,7 +27,13 @@ type TaskSummary =
       Diagnostics: string list
       NextActor: string option
       LastUpdatedBy: string option
-      AssignmentRevision: string option }
+      AssignmentRevision: string option
+      UpdatedAt: DateTimeOffset option
+      CheckpointSummary: string option
+      CheckpointNextAction: string option
+      CheckpointLastCommit: string option
+      CheckpointBlocker: string option
+      CompletionFinalCommit: string option }
 
 type TaskDetails =
     { Task: TaskSummary
@@ -135,6 +141,12 @@ let private summary (relativeDir: string) (folder: string) (id: string) =
     let mutable nextActor = None
     let mutable lastUpdatedBy = None
     let mutable assignmentRevision = None
+    let mutable updatedAt = None
+    let mutable checkpointSummary = None
+    let mutable checkpointNextAction = None
+    let mutable checkpointLastCommit = None
+    let mutable checkpointBlocker = None
+    let mutable completionFinalCommit = None
     let mutable hash = None
     match resolvedHtml with
     | Error message -> diagnostics <- message :: diagnostics
@@ -170,6 +182,23 @@ let private summary (relativeDir: string) (folder: string) (id: string) =
                         match obj["assignment"] with
                         | :? JsonObject as assignment -> getString assignment "revision"
                         | _ -> None
+                    updatedAt <-
+                        getString obj "updatedAt"
+                        |> Option.bind (fun value ->
+                            match DateTimeOffset.TryParse value with
+                            | true, parsed -> Some parsed
+                            | _ -> None)
+                    match obj["checkpoint"] with
+                    | :? JsonObject as checkpoint ->
+                        checkpointSummary <- getString checkpoint "summary"
+                        checkpointNextAction <- getString checkpoint "nextAction"
+                        checkpointLastCommit <- getString checkpoint "lastCommit"
+                        checkpointBlocker <- getString checkpoint "blocker"
+                    | _ -> ()
+                    match obj["completion"] with
+                    | :? JsonObject as completion ->
+                        completionFinalCommit <- getString completion "finalCommit"
+                    | _ -> ()
                     dependencies <-
                         match obj["dependencies"] with
                         | :? JsonArray as values ->
@@ -191,7 +220,13 @@ let private summary (relativeDir: string) (folder: string) (id: string) =
       Diagnostics = List.rev diagnostics
       NextActor = nextActor
       LastUpdatedBy = lastUpdatedBy
-      AssignmentRevision = assignmentRevision }
+      AssignmentRevision = assignmentRevision
+      UpdatedAt = updatedAt
+      CheckpointSummary = checkpointSummary
+      CheckpointNextAction = checkpointNextAction
+      CheckpointLastCommit = checkpointLastCommit
+      CheckpointBlocker = checkpointBlocker
+      CompletionFinalCommit = completionFinalCommit }
 
 let listTasks (cmd: ListTasksCommand) =
     effect {
@@ -214,7 +249,9 @@ let listTasks (cmd: ListTasksCommand) =
                     else
                         { Id = id; Title = id; Status = "invalid"; DescriptionPath = ""; StatePath = ""
                           HasState = false; Owner = None; Dependencies = []; Revision = None; Diagnostics = [ "Invalid task identifier." ]
-                          NextActor = None; LastUpdatedBy = None; AssignmentRevision = None })
+                          NextActor = None; LastUpdatedBy = None; AssignmentRevision = None
+                          UpdatedAt = None; CheckpointSummary = None; CheckpointNextAction = None
+                          CheckpointLastCommit = None; CheckpointBlocker = None; CompletionFinalCommit = None })
                 |> List.filter (fun item ->
                     (cmd.Status.IsNone || (cmd.Status |> Option.map normalizeStatus) = Some item.Status)
                     && (cmd.Owner.IsNone || item.Owner = cmd.Owner)

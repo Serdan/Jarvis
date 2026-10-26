@@ -13,7 +13,10 @@ let private assignment agent project task phase =
       Phase = phase; NextActor = Some "agent"; Worktree = "/tmp/" + task
       Branch = Some ("feature/" + task); Head = "abc"; Clean = Some true
       AssignmentRevision = Some "rev"; AcknowledgedRevision = None
-      Instructions = Some ("Implement " + task); BaseCommit = None }
+      Instructions = Some ("Implement " + task); BaseCommit = None
+      UpdatedAt = None; LastUpdatedBy = None; CheckpointSummary = None
+      CheckpointNextAction = None; CheckpointLastCommit = None
+      CheckpointBlocker = None; CompletionFinalCommit = None }
 
 let private snapshot entries conflicts =
     { Assignments = entries; Projects = []; Conflicts = conflicts; Issues = []
@@ -57,7 +60,10 @@ let snapshotAdapterPreservesAssignmentIdentityAndInspectionFailures () =
           DescriptionPath = "docs/tasks/292.html"; StatePath = "docs/tasks/292.json"
           HasState = true; Owner = Some "Agent 2"; Dependencies = []
           Revision = Some "taskrev"; Diagnostics = []; NextActor = Some "agent"
-          LastUpdatedBy = Some "orchestrator"; AssignmentRevision = Some "revision" }
+          LastUpdatedBy = Some "orchestrator"; AssignmentRevision = Some "revision"
+          UpdatedAt = None; CheckpointSummary = None
+          CheckpointNextAction = None; CheckpointLastCommit = None
+          CheckpointBlocker = None; CompletionFinalCommit = None }
     let assigned : Client.TaskStore.AgentAssignment =
         { Agent = "Agent 2"; ProjectName = "Wayfold::gold"; Worktree = tree
           Task = task; AssignmentInstructions = Some "Fix gold"
@@ -102,3 +108,85 @@ let duplicateTaskClaimFlagsBothAgentsWithinProject () =
     let result = rows data
     result |> List.forall _.Conflict |> shouldEqual true
     result.Length |> shouldEqual 2
+
+[<Test>]
+let completedWorkRemainsVisibleAfterActiveAssignmentDisappears () =
+    let tree : Client.Worktrees.WorktreeInfo =
+        { Path = "/tmp/Wayfold-finished"; MainPath = "/tmp/Wayfold"
+          Head = "abc"; Branch = Some "feature/292"
+          IsMain = false; IsDetached = false; IsLocked = false
+          IsPrunable = false; IsClean = Some true }
+    let completedTask : Client.TaskStore.TaskSummary =
+        { Id = "292"; Title = "Gold pickup"; Status = "completed"
+          DescriptionPath = "docs/tasks/292.html"; StatePath = "docs/tasks/292.json"
+          HasState = true; Owner = Some "Agent 2"; Dependencies = []
+          Revision = Some "final"; Diagnostics = []; NextActor = None
+          LastUpdatedBy = Some "agent:Agent 2"; AssignmentRevision = Some "rev"
+          UpdatedAt = Some(DateTimeOffset(2026, 10, 26, 16, 0, 0, TimeSpan.Zero))
+          CheckpointSummary = Some "Gold pickup implemented"
+          CheckpointNextAction = Some "Reviewer acceptance"
+          CheckpointLastCommit = Some "code-sha"
+          CheckpointBlocker = None; CompletionFinalCommit = Some "accepted-sha" }
+    let source : Client.TaskStore.OrchestrationSnapshot =
+        { ProjectName = "Wayfold"
+          Worktrees = [ { Worktree = tree; Tasks = [ completedTask ]; Error = None } ]
+          Assignments = []
+          Conflicts = []
+          ReviewerTaskCount = 0
+          UnacknowledgedTaskCount = 0
+          InspectionErrors = []
+          RetirementInspections = []
+          RetirementCandidates = []
+          IntegratedTasks = [] }
+    let inProgress = { completedTask with Status = "active"; Revision = Some "progress"; NextActor = Some "reviewer" }
+    let activeAssignment : Client.TaskStore.AgentAssignment =
+        { Agent = "Agent 2"; ProjectName = "Wayfold::Wayfold-finished"
+          Worktree = tree; Task = inProgress
+          AssignmentInstructions = Some "Implement"; AssignmentBaseCommit = None
+          AssignmentRevision = Some "rev"; AcknowledgedAssignmentRevision = Some "rev"
+          Phase = "ReadyForReview" }
+    let beforeSource = { source with
+                            Assignments = [ activeAssignment ]
+                            Worktrees = [ { Worktree = tree; Tasks = [ inProgress ]; Error = None } ] }
+    let before = fromSnapshots DateTimeOffset.UtcNow [ "Wayfold", Ok beforeSource ]
+    let finished = fromSnapshots DateTimeOffset.UtcNow [ "Wayfold", Ok source ]
+    let roster = rows finished
+    roster.Length |> shouldEqual 1
+    roster.Head.Agent |> shouldEqual "Agent 2"
+    roster.Head.Assignments.Length |> shouldEqual 1
+    roster.Head.Assignments.Head.Phase |> shouldEqual "Completed"
+    roster.Head.Assignments.Head.CheckpointSummary |> shouldEqual (Some "Gold pickup implemented")
+    roster.Head.Assignments.Head.CompletionFinalCommit |> shouldEqual (Some "accepted-sha")
+    (agentSummary roster.Head).Contains("Completed") |> shouldEqual true
+    (changedAgents before finished).Contains("Wayfold::Agent 2") |> shouldEqual true
+    let acceptedSource = { source with
+                               IntegratedTasks = [ { Worktree = tree; Task = completedTask; Phase = "Integrated" } ] }
+    let accepted = fromSnapshots DateTimeOffset.UtcNow [ "Wayfold", Ok acceptedSource ]
+    (rows accepted).Head.Assignments.Head.Phase |> shouldEqual "Integrated"
+    (changedAgents finished accepted).Contains("Wayfold::Agent 2") |> shouldEqual true
+    (changedAgents accepted accepted).IsEmpty |> shouldEqual true
+
+[<Test>]
+let recentCompletedTasksDoNotCreateFalseActiveConflicts () =
+    let today = DateTimeOffset.UtcNow
+    let completed =
+        { (assignment "Agent 2" "Wayfold" "old" "Completed") with
+            Status = "completed"; NextActor = None
+            UpdatedAt = Some(today.AddDays(-1.)) }
+    let current =
+        { (assignment "Agent 2" "Wayfold" "new" "Working") with UpdatedAt = Some today }
+    let roster = rows (snapshot [ completed; current ] [])
+    roster.Length |> shouldEqual 1
+    roster.Head.Conflict |> shouldEqual false
+    roster.Head.Assignments.Head.TaskId |> shouldEqual "new"
+    (agentSummary roster.Head).Contains("+1 completed") |> shouldEqual true
+
+[<Test>]
+let timestampOrCheckpointUpdatesMarkAgentAsChanged () =
+    let started = assignment "Agent 1" "Wayfold" "282" "Working"
+    let before = snapshot [started] []
+    let updated = { started with UpdatedAt = Some DateTimeOffset.UtcNow
+                                 CheckpointSummary = Some "New allocation evidence" }
+    let after = snapshot [ updated ] []
+    (changedAgents before after).Contains("Wayfold::Agent 1") |> shouldEqual true
+    (changedAgents after after).IsEmpty |> shouldEqual true

@@ -274,6 +274,18 @@ Use Up/Down (or Page Up/Down) to select, Enter for details, `f` to filter
 by agent/project/task/worktree, `r` to refresh, and Escape to return.
 `p` opens pending permission requests without leaving the agent context.
 
+The roster also retains the **three most recently updated completed tasks**
+for each project/agent, even after their active assignment leaves the handoff
+queue. The list shows **Completed** or **Integrated** using Git-verified
+source integration, rather than treating task completion as proof of merger.
+Agent details show the latest checkpoint summary, next action, blocker,
+checkpoint commit, final commit, last updater, and last persisted update time.
+A \`*\` beside an agent means its task status, checkpoint, or integration
+state changed since the previous successful snapshot. Historic completions
+do not count as simultaneous active assignments or ownership conflicts.
+These records are discoverable while the task's checkout remains registered
+(or the task state has been merged into a registered checkout).
+
 The snapshot is fetched **asynchronously**, so Git inspection across many
 worktrees does not block terminal input or permission requests. While the
 Agents screen is open, the client refreshes at most once every 45 seconds;

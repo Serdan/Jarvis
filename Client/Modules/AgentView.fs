@@ -33,6 +33,7 @@ type ProjectSummary =
       PendingReviews: int
       Unacknowledged: int
       RetirementCandidates: int
+      RetirementInspected: bool
       Error: string option }
 
 type Snapshot =

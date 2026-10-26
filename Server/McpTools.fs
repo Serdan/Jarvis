@@ -981,9 +981,25 @@ type JarvisMcpTools =
     static member AcknowledgeTask(projectName: string, taskId: string, agent: string, assignmentRevision: string, [<Optional; DefaultParameterValue("")>] expectedRevision: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (AcknowledgeTaskCommand { ProjectName = projectName; TaskId = taskId; Agent = agent; AssignmentRevision = assignmentRevision; ExpectedRevision = McpToolHelpers.optionOfString expectedRevision })
 
-    [<McpServerTool(Title = "Get orchestration snapshot", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("One cross-worktree view of agent task assignments, handoff phases and acknowledgement revisions, reviewer queue, ownership conflicts, and worktree Git state. Read-only; not proof of agent runtime activity.")>]
-    static member GetOrchestrationSnapshot(projectName: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
-        McpToolHelpers.send client http (GetOrchestrationSnapshotCommand { ProjectName = projectName })
+    [<McpServerTool(Title = "Get orchestration snapshot", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Bounded cross-worktree orchestration view. Default 60 task rows (maximum 100), sorted actionable first; use offset/limit pagination, optional owner/status/nextActor or reviewerOnly filters, includeRetirement=true for expensive worktree retirement inspections. Returns compact task groups, agent handoffs, global counts and separate bounded diagnostics; not proof of agent runtime activity.")>]
+    static member GetOrchestrationSnapshot(projectName: string,
+                                            [<Optional; DefaultParameterValue("")>] owner: string,
+                                            [<Optional; DefaultParameterValue("")>] status: string,
+                                            [<Optional; DefaultParameterValue("")>] nextActor: string,
+                                            [<Optional; DefaultParameterValue(false)>] reviewerOnly: bool,
+                                            [<Optional; DefaultParameterValue(0)>] offset: int,
+                                            [<Optional; DefaultParameterValue(60)>] limit: int,
+                                            [<Optional; DefaultParameterValue(false)>] includeRetirement: bool,
+                                            [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http (GetOrchestrationSnapshotCommand {
+            ProjectName = projectName
+            Owner = McpToolHelpers.optionOfString owner
+            Status = McpToolHelpers.optionOfString status
+            NextActor = McpToolHelpers.optionOfString nextActor
+            ReviewerOnly = reviewerOnly
+            Offset = offset
+            Limit = limit
+            IncludeRetirement = includeRetirement })
 
     [<McpServerTool(Title = "Retire worktree", ReadOnly = false, Destructive = true, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Inspect or retire a completed Git worktree after checking jobs, active task owners, ignored/untracked data, Git patch equivalence and task-only history. Dry-run by default; preserve historical branch unless explicitly deleting a fully merged branch.")>]
     static member RetireWorktree(projectName: string, worktreePath: string, [<Optional; DefaultParameterValue("")>] targetRef: string, [<Optional; DefaultParameterValue(false)>] deleteBranch: bool, [<Optional; DefaultParameterValue(true)>] dryRun: bool, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =

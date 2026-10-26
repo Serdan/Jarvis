@@ -179,7 +179,7 @@ resolution. The new 3.15 command fields require a coordinated server/client
 rollout and refreshed MCP schema; updating the client can interrupt active
 agent sessions, so obtain explicit permission before invoking `UpdateClient`.
 
-## Project-wide orchestration (protocol 3.17)
+## Project-wide orchestration (protocol 3.18)
 
 Agent identity **plus the base project name** is enough to recover an agent's
 current task, regardless of which completed worktree the agent last used.
@@ -226,13 +226,30 @@ Reissuing an assignment resets the current receipt but preserves the old
 checkpoint and its acknowledged revision. Stale acknowledgements or work-start
 requests fail. Completion clears `nextActor`.
 
-`GetOrchestrationSnapshot(projectName)` returns the worktree task groups,
-active agent assignments and phases, pending reviewer and unacknowledged
-counts, duplicate-agent/task conflicts, and each worktree's branch, HEAD,
-cleanliness and inspection errors. The snapshot also runs read-only retirement
-inspections to surface Git integration status and conservative retirement
-candidates. It does **not** infer whether an agent is active from a clean
-worktree, a missing Jarvis job, or a chat session.
+`GetOrchestrationSnapshot(projectName, owner?, status?, nextActor?,
+reviewerOnly?, offset=0, limit=60, includeRetirement=false)` returns a
+**bounded page** of task rows (1–100; default 60), sorted with actionable
+handoffs first and then most recently updated. All registered worktree identities
+remain visible, but their task lists contain only the selected page. Response
+fields include `TotalMatches`, `Offset`, `Limit`, and `NextOffset` for pagination,
+plus global `ReviewerTaskCount` and `UnacknowledgedTaskCount`. Filter by
+`owner`, `status`, `nextActor`, or `reviewerOnly=true`. Assignment rows omit
+full instructions to keep the payload bounded; use `GetAgentAssignment` to
+retrieve full instructions for a single agent.
+
+Historical parked tasks with `nextActor=null` retain their owner/checkpoint
+without counting as current assignments. Actionable tasks require an owner and
+`nextActor=agent` or `reviewer`. Duplicated or invalid unrelated historical task
+descriptions are returned through `TaskDiagnosticCount` and the bounded
+`TaskDiagnostics` sample, not treated as assignment blockers. A genuinely
+ambiguous target task or unreadable worktree still fails safely.
+
+The default snapshot skips expensive Git source-parity and retirement inspection;
+`RetirementInspected=false` means that empty `RetirementCandidates` are
+**uninspected**, not zero eligible checkouts. Opt into `includeRetirement=true`
+for verified source integration and retirement candidate details. Completed tasks
+on main may be marked integrated without a separate retirement scan. Statuses
+describe persisted Git-backed task handoffs, never current chat-session liveness.
 
 `RetireWorktree(projectName, worktreePath, dryRun=true)` checks real Git
 worktree ownership, active assignments, active Jarvis jobs, modified/staged,

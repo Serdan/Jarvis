@@ -83,20 +83,18 @@ let rows (snapshot: Snapshot) =
     |> List.sortBy (fun item ->
         (if item.Conflict then 0 else 1), item.Project.ToLowerInvariant(), item.Agent.ToLowerInvariant())
 
+// Use the same token parser as Activity: text terms are ANDed, and @terms
+// select a project (including a particular registered worktree).
 let matches (filter: string) (row: AgentRow) =
-    if String.IsNullOrWhiteSpace filter then true
-    else
-        let query = filter.Trim()
-        let fields =
-            row.Agent :: (row.Projects @
-                (row.Assignments |> List.collect (fun task ->
-                    [ task.TaskId
-                      task.Title
-                      task.Selector
-                      task.Worktree
-                      task.Branch |> Option.defaultValue ""
-                      task.Phase ])))
-        fields |> List.exists (fun value -> value.Contains(query, StringComparison.OrdinalIgnoreCase))
+    let terms = ActivityFilter.parseTerms filter
+    row.Assignments
+    |> List.exists (fun task ->
+        let searchable =
+            [ row.Agent; task.Project; task.TaskId; task.Title; task.Selector
+              task.Worktree; task.Branch |> Option.defaultValue ""; task.Phase
+              task.CheckpointSummary |> Option.defaultValue "" ]
+            |> String.concat " "
+        ActivityFilter.matchesTerms terms (Some task.Selector) searchable)
 
 let visibleRows filter snapshot =
     rows snapshot |> List.filter (matches filter)
@@ -118,7 +116,7 @@ let agentSummary (row: AgentRow) =
         |> Option.map (fun item ->
             let additional = row.Assignments |> List.filter (active >> not) |> List.length
             let suffix = if additional > 0 && active item then $" (+{additional} completed)" else ""
-            $"{item.Project}/{item.TaskId} - {phaseLabel item.Phase}{suffix}")
+            $"#{item.TaskId} - {phaseLabel item.Phase}{suffix}")
         |> Option.defaultValue "No recent tasks"
 
 let private identity (task: Assignment) =

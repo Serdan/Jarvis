@@ -37,7 +37,6 @@ type private ActivityEntry =
 
 type private TuiMode =
     | AgentsMode
-    | AgentDetailsMode
     | AgentFilterMode
     | ActivityMode
     | PermissionMode
@@ -96,6 +95,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
     let mutable agentFilter = ""
     let mutable agentOriginalFilter = ""
     let mutable agentScroll = 0
+    let mutable showAgentDetails = false
     let mutable agentError: string option = None
     let mutable agentRefreshing = false
     let mutable agentLastPoll = DateTimeOffset.MinValue
@@ -554,6 +554,34 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                 entry.FailureDetail
                 |> Option.iter (writeDetailField width "Error")
 
+    let renderPermissionRequestsUnsafe width =
+        Console.WriteLine ""
+        let permissionSuffix =
+            if prompts.Count = 0 then ""
+            else $" ({prompts.Count})"
+        Console.WriteLine $"Permission requests{permissionSuffix}"
+        Console.WriteLine "-------------------"
+        if prompts.Count = 0 then
+            Console.WriteLine "No pending permission requests."
+        else
+            for index = 0 to prompts.Count - 1 do
+                let prompt = prompts[index]
+                let marker =
+                    if mode = PermissionMode && index = selectedPrompt then ">"
+                    else " "
+                Console.Write $"{marker} #{prompt.Id} {prompt.Request.CommandName}"
+                match prompt.Request.ProjectName with
+                | Some projectName ->
+                    Console.Write " "
+                    writeColoredProject projectName
+                | None -> ()
+                Console.WriteLine ""
+                Console.WriteLine $"    {trim prompt.Request.Summary (Math.Max(20, width - 4))}"
+                AgentCommandInfo.reason prompt.Command
+                |> Option.iter (fun reason ->
+                    Console.WriteLine $"    Reason: {trim reason (Math.Max(20, width - 12))}")
+        Console.WriteLine ""
+
     let jobListUnsafe () =
         JobView.visibleJobs jobIncludeCompleted jobProjectFilter jobSummaries
 
@@ -755,119 +783,162 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
             agentSelected <- items |> Array.tryHead |> Option.map _.Key
             agentScroll <- 0
 
+    let selectAgentIndexUnsafe index =
+        let items = agentListUnsafe()
+        if items.Length > 0 then
+            let bounded = max 0 (min (items.Length - 1) index)
+            agentSelected <- Some items[bounded].Key
+            if bounded < agentScroll then agentScroll <- bounded
+            elif bounded >= agentScroll + visibleActivityRows then
+                agentScroll <- bounded - visibleActivityRows + 1
+
     let moveAgentSelectionUnsafe delta =
         let items = agentListUnsafe()
         if items.Length > 0 then
             let index =
                 items |> Array.tryFindIndex (fun row -> Some row.Key = agentSelected)
                 |> Option.defaultValue 0
-            agentSelected <- Some items[max 0 (min (items.Length - 1) (index + delta))].Key
+            selectAgentIndexUnsafe (index + delta)
 
     let writeAgentHotkeys () =
-        Console.WriteLine "Keys: Up/Down select, PgUp/PgDn page, Enter details, f filter, r refresh,"
-        Console.WriteLine "      p permissions, Esc activity, q quit"
+        Console.Write "Keys: "
+        writeHotkeyToken "↑/↓"; Console.Write " agent, "
+        writeHotkeyToken "PgUp/PgDn"; Console.Write " page, "
+        writeHotkeyToken "End"; Console.Write " last, "
+        writeHotkeyToken "Enter"; Console.Write " details, "
+        writeHotkeyToken "/"; Console.Write " filter, "
+        writeHotkeyToken "@"; Console.Write " project, "
+        writeMnemonic 'r' "refresh"; Console.Write ", "
+        writeMnemonic 'p' "permissions"; Console.Write ", "
+        writeHotkeyToken "Esc"; Console.Write " activity, "
+        writeMnemonic 'q' "quit"; Console.WriteLine ""
+
+    let writeColoredAgentLine width marker (row: AgentView.AgentRow) =
+        let item = row.Assignments |> List.tryHead
+        let timestamp =
+            item
+            |> Option.bind _.UpdatedAt
+            |> Option.map (fun updated -> updated.ToLocalTime().ToString("HH:mm:ss"))
+            |> Option.defaultValue "--:--:--"
+        let token = ActivityFilter.projectToken row.Project
+        let flag = if Set.contains row.Key agentChanged then "*" else " "
+        let status = AgentView.agentSummary row |> compact
+        let rendered = trim $"{marker}{flag} {timestamp} {token} {row.Agent}: {status}" width
+        let index = rendered.IndexOf(token, StringComparison.Ordinal)
+        if index < 0 then Console.WriteLine rendered
+        else
+            let original = Console.ForegroundColor
+            Console.Write(rendered.Substring(0, index))
+            Console.ForegroundColor <- projectColor row.Project
+            Console.Write(token)
+            Console.ForegroundColor <- original
+            let rest = rendered.Substring(index + token.Length)
+            if row.Conflict then Console.ForegroundColor <- ConsoleColor.Red
+            Console.WriteLine rest
+            Console.ForegroundColor <- original
+
+    let renderAgentDetailsUnsafe width =
+        if showAgentDetails then
+            match selectedAgentUnsafe () with
+            | None -> ()
+            | Some row ->
+                Console.WriteLine ""
+                Console.WriteLine "Agent details"
+                Console.WriteLine "-------------"
+                writeDetailField width "Agent" row.Agent
+                writeDetailField width "Project" (ActivityFilter.projectToken row.Project)
+                if row.Conflict then
+                    writeDetailField width "Conflict" "Multiple actionable assignments; review ownership."
+                if agentChanged.Contains row.Key then
+                    writeDetailField width "Updated" "Assignment state changed since previous refresh."
+                for item in row.Assignments do
+                    Console.WriteLine ""
+                    writeDetailField width "Task" (item.TaskId + " - " + item.Title)
+                    writeDetailField width "Status" (AgentView.phaseLabel item.Phase)
+                    writeDetailField width "Worktree" item.Worktree
+                    writeDetailField width "Branch" (item.Branch |> Option.defaultValue "(detached)")
+                    writeDetailField width "HEAD" item.Head
+                    item.Clean |> Option.iter (fun value -> writeDetailField width "Clean" (string value))
+                    item.NextActor |> Option.iter (writeDetailField width "Next actor")
+                    item.AssignmentRevision |> Option.iter (writeDetailField width "Revision")
+                    item.AcknowledgedRevision |> Option.iter (writeDetailField width "Ack revision")
+                    item.BaseCommit |> Option.iter (writeDetailField width "Base commit")
+                    item.Instructions |> Option.iter (writeDetailField width "Instructions")
+                    item.UpdatedAt
+                    |> Option.iter (fun value -> writeDetailField width "Updated" (value.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss")))
+                    item.LastUpdatedBy |> Option.iter (writeDetailField width "Updated by")
+                    item.CheckpointSummary |> Option.iter (writeDetailField width "Checkpoint")
+                    item.CheckpointNextAction |> Option.iter (writeDetailField width "Next action")
+                    item.CheckpointLastCommit |> Option.iter (writeDetailField width "Commit")
+                    item.CheckpointBlocker |> Option.iter (writeDetailField width "Blocker")
+                    item.CompletionFinalCommit |> Option.iter (writeDetailField width "Final commit")
+                Console.WriteLine ""
+                Console.WriteLine "Statuses reflect persisted task state, not live chat activity."
 
     let renderAgentsUnsafe width =
-        let safe (value: string) = compact value
-        let rows = agentListUnsafe()
-        let all = agentSnapshot |> Option.map (fun snapshot -> AgentView.rows snapshot) |> Option.defaultValue []
+        normalizeAgentSelectionUnsafe()
+        let filtered = agentListUnsafe()
+        let all = agentSnapshot |> Option.map AgentView.rows |> Option.defaultValue []
         let conflicts =
             let reported = agentSnapshot |> Option.map (fun value -> value.Conflicts.Length) |> Option.defaultValue 0
             max reported (all |> List.filter _.Conflict |> List.length)
-        let reviewCount =
-            agentSnapshot
-            |> Option.map (fun snapshot -> snapshot.Projects |> List.sumBy _.PendingReviews)
-            |> Option.defaultValue 0
-        let unknown = agentSnapshot |> Option.map (fun snapshot -> snapshot.Issues.Length) |> Option.defaultValue 0
+        let reviewCount = agentSnapshot |> Option.map (fun snap -> snap.Projects |> List.sumBy _.PendingReviews) |> Option.defaultValue 0
         let completedCount =
             agentSnapshot
             |> Option.map (fun snap -> snap.Assignments |> List.filter (fun task -> task.Status = "completed") |> List.length)
             |> Option.defaultValue 0
-        Console.WriteLine $"Agents: {all.Length} tracked | {reviewCount} awaiting review | {completedCount} completed | {conflicts} conflicts | {unknown} issues"
-        if not agentChanged.IsEmpty then Console.WriteLine $"{agentChanged.Count} agent(s) changed since previous refresh (*)."
-        let updated =
-            agentSnapshot |> Option.map (fun snapshot -> snapshot.RefreshedAt.ToLocalTime().ToString("HH:mm:ss"))
+        let filterSuffix =
+            if String.IsNullOrWhiteSpace agentFilter then ""
+            else $" [text=\"{trim (compact agentFilter) (max 20 (width - 22))}\"]"
+        let selected = filtered |> Array.tryFindIndex (fun row -> Some row.Key = agentSelected) |> Option.defaultValue 0
+        agentScroll <- max 0 (min agentScroll (max 0 (filtered.Length - visibleActivityRows)))
+        if filtered.Length > 0 && selected < agentScroll then agentScroll <- selected
+        if filtered.Length > 0 && selected >= agentScroll + visibleActivityRows then
+            agentScroll <- selected - visibleActivityRows + 1
+        let last = min filtered.Length (agentScroll + visibleActivityRows)
+        let historySuffix =
+            if filtered.Length = 0 then $" [0 of {all.Length}]"
+            elif filtered.Length > visibleActivityRows || filtered.Length <> all.Length then
+                $" [{agentScroll + 1}-{last} of {filtered.Length} / {all.Length} total]"
+            else ""
+        Console.WriteLine $"Agents{filterSuffix}{historySuffix}"
+        Console.WriteLine "------"
+        Console.WriteLine $"Tracked: {all.Length} | Review: {reviewCount} | Completed: {completedCount} | Conflicts: {conflicts}"
+        let refreshed =
+            agentSnapshot
+            |> Option.map (fun snap -> snap.RefreshedAt.ToLocalTime().ToString("HH:mm:ss"))
             |> Option.defaultValue "never"
-        let refresh = if agentRefreshing then " (refreshing...)" else ""
-        Console.WriteLine $"Snapshot: {updated}{refresh}; recorded assignment state, not live chat activity."
-        if agentFilter <> "" then Console.WriteLine(trim $"Filter: {safe agentFilter}" width)
-        agentError |> Option.iter (fun error -> Console.WriteLine(trim $"Error: {safe error}" width))
-        if mode = AgentFilterMode then Console.WriteLine "Type agent, project, task or worktree; Enter apply, Esc cancel."
-        if mode = AgentDetailsMode then
-            match selectedAgentUnsafe() with
-            | None -> Console.WriteLine "Agent no longer has a matching assignment. Esc returns to agents."
-            | Some row ->
-                Console.WriteLine ""
-                let heading = if row.Conflict then "OWNERSHIP CONFLICT" else "Assignment details"
-                Console.WriteLine(trim $"{row.Agent} - {heading}" width)
-                if Set.contains row.Key agentChanged then Console.WriteLine "Updated since previous snapshot."
-                Console.WriteLine "--------------------------------------"
-                for item in row.Assignments do
-                    let field title value = Console.WriteLine(trim (safe $"{title}: {value}") width)
-                    field "Project" item.Project
-                    field "Task" (item.TaskId + " - " + item.Title)
-                    field "Status" item.Status
-                    field "Handoff" (AgentView.phaseLabel item.Phase)
-                    field "Next actor" (item.NextActor |> Option.defaultValue "(none)")
-                    field "Worktree" item.Worktree
-                    field "Branch" (item.Branch |> Option.defaultValue "(detached)")
-                    field "HEAD" item.Head
-                    field "Clean" (item.Clean |> Option.map string |> Option.defaultValue "unknown")
-                    field "Task revision" (item.AssignmentRevision |> Option.defaultValue "(none)")
-                    field "Acknowledged" (item.AcknowledgedRevision |> Option.defaultValue "(none)")
-                    field "Base commit" (item.BaseCommit |> Option.defaultValue "(none)")
-                    field "Instructions" (item.Instructions |> Option.defaultValue "(none)")
-                    field "Last updated" (item.UpdatedAt |> Option.map (fun timestamp ->
-                        timestamp.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss")) |> Option.defaultValue "(unknown)")
-                    field "Updated by" (item.LastUpdatedBy |> Option.defaultValue "(unknown)")
-                    field "Checkpoint" (item.CheckpointSummary |> Option.defaultValue "(none)")
-                    field "Next action" (item.CheckpointNextAction |> Option.defaultValue "(none)")
-                    field "Checkpoint commit" (item.CheckpointLastCommit |> Option.defaultValue "(none)")
-                    field "Blocker" (item.CheckpointBlocker |> Option.defaultValue "(none)")
-                    if item.Status = "completed" then
-                        field "Final commit" (item.CompletionFinalCommit |> Option.defaultValue "(not recorded)")
-                    Console.WriteLine ""
-                Console.WriteLine "These are persisted task records, not a runtime heartbeat."
+        let refreshingSuffix = if agentRefreshing then " (refreshing...)" else ""
+        Console.WriteLine $"Snapshot: {refreshed}{refreshingSuffix}"
+        if not agentChanged.IsEmpty then
+            Console.WriteLine $"Updated agents: {agentChanged.Count} (*)"
+        agentError |> Option.iter (fun error -> Console.WriteLine(trim ("Error: " + compact error) width))
+        if mode = AgentFilterMode then Console.WriteLine $"Filter: {trim (compact agentFilter) (max 20 (width - 9))}"
+        if agentSnapshot.IsNone && not agentRefreshing then
+            Console.WriteLine "No snapshot loaded. Press r to refresh."
+        elif filtered.Length = 0 then
+            Console.WriteLine "No matching agents."
         else
-            if agentSnapshot.IsNone && not agentRefreshing then Console.WriteLine "No snapshot loaded. Press r to refresh."
-            elif rows.Length = 0 then Console.WriteLine "No agents or recent completions match the filter."
-            else
-                let selected =
-                    rows |> Array.tryFindIndex (fun row -> Some row.Key = agentSelected)
-                    |> Option.defaultValue 0
-                let rowCount = max 4 (min 14 (Console.WindowHeight - 16))
-                agentScroll <- max 0 (min agentScroll (max 0 (rows.Length - rowCount)))
-                if selected < agentScroll then agentScroll <- selected
-                if selected >= agentScroll + rowCount then agentScroll <- selected - rowCount + 1
-                let finish = min rows.Length (agentScroll + rowCount)
-                Console.WriteLine "Agent             Assignment / handoff"
-                Console.WriteLine "-----------------------------------------------"
-                for index = agentScroll to finish - 1 do
-                    let row = rows[index]
-                    let marker = if Some row.Key = agentSelected && mode = AgentsMode then ">" else " "
-                    let title = trim (safe row.Agent) 18
-                    let label = safe (AgentView.agentSummary row)
-                    let original = Console.ForegroundColor
-                    if row.Conflict then Console.ForegroundColor <- ConsoleColor.Red
-                    let changed = if Set.contains row.Key agentChanged then "*" else " "
-                    Console.Write(marker + changed + title.PadRight(19))
-                    Console.ForegroundColor <- original
-                    Console.WriteLine(trim label (max 15 (width - 23)))
-            agentSnapshot |> Option.iter (fun snapshot ->
+            for index = agentScroll to last - 1 do
+                let row = filtered[index]
+                let marker = if mode = AgentsMode && Some row.Key = agentSelected then ">" else " "
+                writeColoredAgentLine width marker row
+
+        renderAgentDetailsUnsafe width
+
+        agentSnapshot |> Option.iter (fun snap ->
+            let errors =
+                snap.Projects |> List.choose (fun project ->
+                    project.Error |> Option.map (fun error -> project.Project + ": " + error))
+            let issues = errors @ snap.Conflicts @ snap.Issues
+            if not issues.IsEmpty then
                 Console.WriteLine ""
-                let checkedProjects = snapshot.Projects |> List.filter _.RetirementInspected
-                let candidateStatus =
-                    if checkedProjects.IsEmpty then "not inspected"
-                    else string (checkedProjects |> List.sumBy _.RetirementCandidates)
-                Console.WriteLine(trim $"Projects: {snapshot.Projects.Length}; retirement candidates: {candidateStatus}" width)
-                for project in snapshot.Projects |> List.filter (fun p -> p.Error.IsSome) |> List.truncate 3 do
-                    Console.WriteLine(trim $"{project.Project}: {project.Error.Value}" width)
-                for conflict in snapshot.Conflicts |> List.truncate 3 do
-                    Console.WriteLine(trim ("CONFLICT: " + safe conflict) width)
-                for issue in snapshot.Issues |> List.truncate 2 do
-                    Console.WriteLine(trim ("Issue: " + safe issue) width))
-        Console.WriteLine ""
-        if prompts.Count > 0 then Console.WriteLine $"{prompts.Count} permission requests pending (p to review)."
+                Console.WriteLine $"Agent issues ({issues.Length})"
+                Console.WriteLine "------------"
+                for issue in issues |> List.truncate 5 do
+                    Console.WriteLine(trim (compact issue) width))
+
+        renderPermissionRequestsUnsafe width
 
     let settingKeys = [| "machine-name"; "workspace-path"; "trust-level"; "allowed-environment-variables"; "max-import-bytes" |]
     let settingLabels = [| "Machine name"; "Workspace directory"; "Trust level"; "Allowed environment variables"; "Maximum import bytes" |]
@@ -995,8 +1066,10 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                 writeFilterHotkeys()
             | CopyRecentMode ->
                 writeCopyRecentHotkeys()
-            | AgentsMode | AgentDetailsMode | AgentFilterMode ->
+            | AgentsMode ->
                 writeAgentHotkeys()
+            | AgentFilterMode ->
+                writeFilterHotkeys()
             | JobsMode | JobFilterMode ->
                 writeJobsHotkeys()
             | JobDetailsMode | JobCancelMode ->
@@ -1006,7 +1079,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
             Console.WriteLine ""
 
             match mode with
-            | AgentsMode | AgentDetailsMode | AgentFilterMode ->
+            | AgentsMode | AgentFilterMode ->
                 renderAgentsUnsafe width
             | JobsMode | JobDetailsMode | JobCancelMode | JobFilterMode ->
                 renderJobsUnsafe width
@@ -1044,36 +1117,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
 
                 renderActivityDetailsUnsafe width
 
-                Console.WriteLine ""
-                let permissionSuffix =
-                    if prompts.Count = 0 then ""
-                    else $" ({prompts.Count})"
-                Console.WriteLine $"Permission requests{permissionSuffix}"
-                Console.WriteLine "-------------------"
-
-                if prompts.Count = 0 then
-                    Console.WriteLine "No pending permission requests."
-                else
-                    for index = 0 to prompts.Count - 1 do
-                        let prompt = prompts[index]
-                        let marker =
-                            if mode = PermissionMode && index = selectedPrompt then ">"
-                            else " "
-                        Console.Write $"{marker} #{prompt.Id} {prompt.Request.CommandName}"
-
-                        match prompt.Request.ProjectName with
-                        | Some projectName ->
-                            Console.Write " "
-                            writeColoredProject projectName
-                        | None -> ()
-
-                        Console.WriteLine ""
-                        Console.WriteLine $"    {trim prompt.Request.Summary (Math.Max(20, width - 4))}"
-                        AgentCommandInfo.reason prompt.Command
-                        |> Option.iter (fun reason ->
-                            Console.WriteLine $"    Reason: {trim reason (Math.Max(20, width - 12))}")
-
-                Console.WriteLine ""
+                renderPermissionRequestsUnsafe width
         with _ ->
             ()
 
@@ -1342,7 +1386,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                         lock syncRoot (fun () ->
                             pollJobsUnsafe()
                             renderUnsafe())
-                    if (mode = AgentsMode || mode = AgentDetailsMode || mode = AgentFilterMode)
+                    if (mode = AgentsMode || mode = AgentFilterMode)
                        && DateTimeOffset.UtcNow - agentLastPoll > TimeSpan.FromSeconds(45.) then
                         lock syncRoot (fun () -> startAgentRefreshUnsafe())
                     if Console.KeyAvailable then
@@ -1522,7 +1566,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                                 lock syncRoot (fun () ->
                                     match mode with
                                     | ActivityMode -> moveActivitySelectionUnsafe -visibleActivityRows
-                                    | AgentsMode -> moveAgentSelectionUnsafe -12
+                                    | AgentsMode -> moveAgentSelectionUnsafe -visibleActivityRows
                                     | JobsMode -> moveJobSelectionUnsafe -12
                                     | JobDetailsMode ->
                                         jobFollow <- false
@@ -1533,7 +1577,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                                 lock syncRoot (fun () ->
                                     match mode with
                                     | ActivityMode -> moveActivitySelectionUnsafe visibleActivityRows
-                                    | AgentsMode -> moveAgentSelectionUnsafe 12
+                                    | AgentsMode -> moveAgentSelectionUnsafe visibleActivityRows
                                     | JobsMode -> moveJobSelectionUnsafe 12
                                     | JobDetailsMode ->
                                         jobOutputScroll <- max 0 (jobOutputScroll - 10)
@@ -1545,12 +1589,14 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                                     let filtered = filteredActivityUnsafe()
                                     if mode = ActivityMode && filtered.Length > 0 then
                                         selectActivityIndexUnsafe (filtered.Length - 1)
+                                    elif mode = AgentsMode then
+                                        selectAgentIndexUnsafe ((agentListUnsafe()).Length - 1)
                                     renderUnsafe())
                             | _, ConsoleKey.Enter ->
                                 lock syncRoot (fun () ->
                                     if mode = ActivityMode && (filteredActivityUnsafe()).Length > 0 then
                                         showActivityDetails <- not showActivityDetails
-                                    elif mode = AgentsMode && agentSelected.IsSome then mode <- AgentDetailsMode
+                                    elif mode = AgentsMode && agentSelected.IsSome then showAgentDetails <- not showAgentDetails
                                     elif mode = JobsMode then openJobDetailsUnsafe()
                                     elif mode = SettingsMode then
                                         settingsEditing <- settingsValue settingKeys[settingsSelected] settingsStaged
@@ -1585,17 +1631,22 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                                     normalizeAgentSelectionUnsafe()
                                     startAgentRefreshUnsafe()
                                     renderUnsafe())
-                            | _, ConsoleKey.F when mode = AgentsMode ->
+                            | ('/', _) | (_, ConsoleKey.F) when mode = AgentsMode ->
                                 lock syncRoot (fun () ->
                                     agentOriginalFilter <- agentFilter
                                     mode <- AgentFilterMode
                                     renderUnsafe())
-                            | _, ConsoleKey.R when mode = AgentsMode || mode = AgentDetailsMode ->
+                            | '@', _ when mode = AgentsMode ->
+                                lock syncRoot (fun () ->
+                                    agentOriginalFilter <- agentFilter
+                                    agentFilter <- "@"
+                                    normalizeAgentSelectionUnsafe()
+                                    mode <- AgentFilterMode
+                                    renderUnsafe())
+                            | _, ConsoleKey.R when mode = AgentsMode ->
                                 lock syncRoot (fun () ->
                                     startAgentRefreshUnsafe()
                                     renderUnsafe())
-                            | _, ConsoleKey.Escape when mode = AgentDetailsMode ->
-                                lock syncRoot (fun () -> mode <- AgentsMode; renderUnsafe())
                             | _, ConsoleKey.Escape when mode = AgentsMode ->
                                 lock syncRoot (fun () -> mode <- ActivityMode; renderUnsafe())
                             | _, ConsoleKey.J when mode = ActivityMode ->
@@ -1633,7 +1684,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                                 lock syncRoot (fun () ->
                                     mode <- ActivityMode
                                     renderUnsafe())
-                            | _, ConsoleKey.P when mode = ActivityMode || mode = AgentsMode || mode = AgentDetailsMode || mode = JobsMode || mode = JobDetailsMode || mode = SettingsMode ->
+                            | _, ConsoleKey.P when mode = ActivityMode || mode = AgentsMode || mode = JobsMode || mode = JobDetailsMode || mode = SettingsMode ->
                                 lock syncRoot (fun () ->
                                     permissionReturnMode <- mode
                                     mode <- PermissionMode

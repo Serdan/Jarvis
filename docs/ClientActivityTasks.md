@@ -11,6 +11,11 @@ The primary activity format is one mutable row per command:
 20.47.52 @Jarvis ReadFileCommand(docs/AI.md) (842 ms)
 ```
 
+Worktree activity uses `@Project/worktree`, for example `@Wayfold/silver-ring-trade`.
+Main checkout activity remains `@Project`. The underlying command and persisted activity
+identifier remains `Project::worktree`; filtering accepts both the readable slash form
+and the original selector syntax. Worktrees share their parent project's color.
+
 The receive timestamp remains fixed when the row is updated.
 
 ## Tasks

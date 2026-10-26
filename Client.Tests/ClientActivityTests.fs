@@ -183,3 +183,12 @@ let ``GetClientActivity respects explicit observer inclusion`` () =
                 result.Entries.Length |> shouldEqual expectedCount
                 if includeObservers then result.Entries.Head.Origin |> shouldEqual "Observer"
     }
+
+[<Test>]
+let ``client activity snapshots keep original worktree selector for API consumers`` () =
+    let tui = ConsoleTui.ConsoleTui()
+    let id = tui.StartActivity(sampleRunCommand "Wayfold::silver-ring-trade" "Verify trade totals")
+    tui.CompleteActivity(id, 42L, Some "exit 0")
+    let entries = tui.GetActivitySnapshot(Some "Wayfold::silver-ring-trade", Some 20).Entries
+    entries.Length |> shouldEqual 1
+    entries.Head.ProjectName |> shouldEqual (Some "Wayfold::silver-ring-trade")

@@ -38,3 +38,33 @@ let ``status cycle covers predefined list`` () =
     ActivityFilter.nextStatus ActivityFilter.Completed |> shouldEqual ActivityFilter.Failed
     ActivityFilter.nextStatus ActivityFilter.Failed |> shouldEqual ActivityFilter.Informational
     ActivityFilter.nextStatus ActivityFilter.Informational |> shouldEqual ActivityFilter.All
+
+[<Test>]
+let ``worktree activity labels use project slash worktree`` () =
+    ActivityFilter.projectToken "Wayfold::silver-ring-trade"
+    |> shouldEqual "@Wayfold/silver-ring-trade"
+    ActivityFilter.projectToken "Wayfold"
+    |> shouldEqual "@Wayfold"
+    ActivityFilter.projectRootName "Wayfold::silver-ring-trade"
+    |> shouldEqual "Wayfold"
+    ActivityFilter.projectLabel "Wayfold::silver-ring-trade"
+    |> shouldEqual "Wayfold/silver-ring-trade"
+
+[<Test>]
+let ``project filter accepts displayed worktree path and parent project`` () =
+    for query in [ "@Wayfold/silver-ring-trade"; "@wayfold/silver"; "@silver-ring-trade"; "@Wayfold"; "@Wayfold::silver-ring-trade" ] do
+        ActivityFilter.matchesTerms (ActivityFilter.parseTerms query)
+            (Some "Wayfold::silver-ring-trade") "RunCommand dotnet test"
+        |> shouldEqual true
+    ActivityFilter.matchesTerms (ActivityFilter.parseTerms "@Wayfold/other")
+        (Some "Wayfold::silver-ring-trade") "RunCommand dotnet test"
+    |> shouldEqual false
+    ActivityFilter.matchesTerms (ActivityFilter.parseTerms "@Wayfold/silver-ring-trade")
+        (Some "Wayfold") "RunCommand dotnet test"
+    |> shouldEqual false
+
+[<Test>]
+let ``non-worktree project labels remain unchanged`` () =
+    ActivityFilter.projectToken "Jarvis" |> shouldEqual "@Jarvis"
+    ActivityFilter.projectToken "Jarvis::" |> shouldEqual "@Jarvis::"
+    ActivityFilter.projectToken "::invalid" |> shouldEqual "@::invalid"

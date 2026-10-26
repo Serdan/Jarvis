@@ -178,3 +178,79 @@ different Git worktrees still require normal Git integration and conflict
 resolution. The new 3.15 command fields require a coordinated server/client
 rollout and refreshed MCP schema; updating the client can interrupt active
 agent sessions, so obtain explicit permission before invoking `UpdateClient`.
+
+## Project-wide orchestration (protocol 3.17)
+
+Agent identity **plus the base project name** is enough to recover an agent's
+current task, regardless of which completed worktree the agent last used.
+The canonical entrypoint is `GetAgentAssignment(projectName, agent)`.
+It inspects all Git-registered worktrees and returns the authoritative
+project selector (`Wayfold::gold-pickup`), path/branch/HEAD, task ID,
+status, owner, task revision, instructions, base commit, assignment revision,
+and current acknowledgement/phase. A missing assignment is explicitly
+reported; **two active task claims for the same agent are a conflict**, not
+an arbitrary selection. Read-only task discovery works without modifying Git.
+
+For orchestrators, `AssignTask(projectName, agent, taskId, instructions,
+actorId, ...)` chooses the task's unique existing checkout or the explicit
+`worktreeName`. When a new named checkout is required, also provide a
+`branch` and optionally a `baseCommit`; the task description must already
+exist in that base commit. One Git-backed task update **both claims the agent
+and issues the revisioned assignment**: the previous `checkpoint` is
+untouched, `owner` is verified, the new `assignment.revision` is recorded,
+and `nextActor=agent`. A conflicting active agent/task claim is rejected
+across all registered worktrees. `ClaimTask` now performs the same global
+conflict check. Within one client process these writes are serialized per
+base project, while the task file's Git revision provides optimistic
+concurrency. This is **not** a transaction spanning multiple independent
+devices or Git clones; operate on the common registered workspace and merge
+branch-local history normally.
+
+The lifecycle is recorded by explicit actions:
+
+- **Assigned:** `AssignTask` creates a fresh assignment revision.
+- **Acknowledged:** `AcknowledgeTask` records the owning agent's receipt
+  of the exact revision without replacing checkpoint evidence.
+- **Working:** `BeginTask` validates that the current revision was
+  acknowledged and records when execution began.
+- **Ready for review:** `CheckpointTask` records evidence and hands the
+  next turn to the reviewer.
+- **Integrated:** source acceptance remains the reviewer's decision.
+  `CompleteTask` marks task metadata completed, but does **not** by itself
+  prove the implementation reached main. The snapshot and retirement
+  inspection provide Git integration evidence separately. The snapshot reports
+  `IntegratedTasks` only where a completed task is on main or its checkout's
+  source commits are verified merged or patch-equivalent to the main target.
+
+Reissuing an assignment resets the current receipt but preserves the old
+checkpoint and its acknowledged revision. Stale acknowledgements or work-start
+requests fail. Completion clears `nextActor`.
+
+`GetOrchestrationSnapshot(projectName)` returns the worktree task groups,
+active agent assignments and phases, pending reviewer and unacknowledged
+counts, duplicate-agent/task conflicts, and each worktree's branch, HEAD,
+cleanliness and inspection errors. The snapshot also runs read-only retirement
+inspections to surface Git integration status and conservative retirement
+candidates. It does **not** infer whether an agent is active from a clean
+worktree, a missing Jarvis job, or a chat session.
+
+`RetireWorktree(projectName, worktreePath, dryRun=true)` checks real Git
+worktree ownership, active assignments, active Jarvis jobs, modified/staged,
+untracked **and ignored** artifacts, task metadata diagnostics, and source
+integration. The default is inspection-only. Source commits must be ancestors
+of the target or patch-equivalent through Git's cherry comparison. Non-
+equivalent commits affecting only the configured task directory may remain
+as historical task evidence on the preserved branch. Other unmatched source
+or merge commits block retirement. With `dryRun=false`, only a verified,
+clean non-main checkout is removed; **branches are preserved by default**,
+including task-only history. `deleteBranch=true` is restricted to histories
+fully merged into the target. Any failed check is reported as a blocker, never
+silently force-removed. If ignored files (including build output) are present,
+the caller must inspect and resolve them explicitly.
+
+If `AssignTask` creates a checkout but cannot finish, it attempts the same
+safe worktree removal. If cleanup is not verifiably safe it reports the
+leftover checkout for manual inspection. No secondary authoritative task
+database is introduced. The new protocol requires a coordinated server/client
+deployment and refreshed MCP definitions; publishing these source changes
+alone does not update running clients.

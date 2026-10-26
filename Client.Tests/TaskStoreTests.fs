@@ -777,7 +777,7 @@ let compareWorktreeTasksFiltersReviewerAndAgentHandoffs () =
                 match claimTask
                     { ProjectName = selector; TaskId = name
                       ExpectedRevision = created.Task.Task.Revision
-                      Owner = "agent-7"; AllowReassign = false } context with
+                      Owner = (if name = "ready-reviewer" then "agent-7" else "agent-" + name); AllowReassign = false } context with
                 | Ok result -> result
                 | Error e -> failwith $"Claim failed: {e}"
             if turn = "reviewer" then
@@ -911,3 +911,416 @@ let completedTransitionsClearHandoffForEveryTaskMutation () =
               DependsOn = None; NextActor = Some "reviewer" } context with
         | Ok [] -> ()
         | other -> Assert.Fail($"Completed tasks in reviewer queue: {other}"))
+
+[<Test>]
+let globalAgentAssignmentFindsCurrentWorktreeAfterOldTaskCompleted () =
+    withProject (fun _ project context ->
+        File.WriteAllText(Path.Combine(project, "README.md"), "initial")
+        GitCommandTests.expectGitSuccess context [ "add"; "README.md" ]
+        GitCommandTests.expectGitSuccess context [ "commit"; "-m"; "Initial" ]
+        for name in [ "old"; "next" ] do
+            match Client.Worktrees.createWorktree
+                { ProjectName = "Project1"; Name = name; Branch = "feature/" + name; BaseRef = "HEAD" } context with
+            | Ok _ -> ()
+            | Error e -> Assert.Fail($"Cannot create worktree: {e}")
+        let make name =
+            let selector = "Project1::" + name
+            let created =
+                match createTask
+                    { ProjectName = selector; TaskId = Some name
+                      Title = name; Html = "<h1>" + name + "</h1>"; Dependencies = [] } context with
+                | Ok task -> task
+                | Error e -> failwith $"Create failed: {e}"
+            let claimed =
+                match claimTask
+                    { ProjectName = selector; TaskId = name
+                      ExpectedRevision = created.Task.Task.Revision
+                      Owner = "Agent 2"; AllowReassign = false } context with
+                | Ok task -> task
+                | Error e -> failwith $"Claim failed: {e}"
+            selector, claimed
+        let oldSelector, oldTask = make "old"
+        match completeTask
+            { ProjectName = oldSelector; TaskId = "old"
+              ExpectedRevision = oldTask.Task.Task.Revision
+              Verified = [ "integrated" ]; FinalCommit = Some "abc"
+              AcknowledgedAssignmentRevision = None; ActorId = Some "Agent 2" } context with
+        | Error e -> Assert.Fail($"Complete failed: {e}")
+        | Ok _ -> ()
+        let nextSelector, nextTask = make "next"
+        let assigned =
+            match updateTask
+                { ProjectName = nextSelector; TaskId = "next"
+                  ExpectedRevision = nextTask.Task.Task.Revision
+                  Title = None; Status = None; Dependencies = None; DescriptionCommit = None
+                  AssignmentInstructions = Some "Implement Task 292"
+                  AssignmentBaseCommit = Some "abc123"
+                  ExpectedAssignmentRevision = None
+                  NextActor = None; ActorId = Some "orchestrator" } context with
+            | Ok result -> result
+            | Error e -> failwith $"Assign failed: {e}"
+        match getAgentAssignment { ProjectName = "Project1::old"; Agent = "Agent 2" } context with
+        | Ok inbox ->
+            inbox.Worktree.Branch |> shouldEqual (Some "feature/next")
+            inbox.Task.Id |> shouldEqual "next"
+            inbox.ProjectName |> shouldEqual "Project1::next"
+            inbox.Agent |> shouldEqual "Agent 2"
+            inbox.Task.Owner |> shouldEqual (Some "Agent 2")
+            inbox.Task.Revision |> shouldEqual assigned.Task.Task.Revision
+            inbox.AssignmentInstructions |> shouldEqual (Some "Implement Task 292")
+            inbox.AssignmentBaseCommit |> shouldEqual (Some "abc123")
+            inbox.AssignmentRevision.IsSome |> shouldEqual true
+            inbox.Phase |> shouldEqual "Assigned"
+        | Error e -> Assert.Fail($"Global assignment lookup failed: {e}"))
+
+[<Test>]
+let globalAgentAssignmentRejectsTwoActiveWorktreesAndMissingAgent () =
+    withProject (fun _ project context ->
+        File.WriteAllText(Path.Combine(project, "README.md"), "initial")
+        GitCommandTests.expectGitSuccess context [ "add"; "README.md" ]
+        GitCommandTests.expectGitSuccess context [ "commit"; "-m"; "Initial" ]
+        for name in [ "alpha"; "beta" ] do
+            match Client.Worktrees.createWorktree
+                { ProjectName = "Project1"; Name = name; Branch = "feature/" + name; BaseRef = "HEAD" } context with
+            | Ok _ -> ()
+            | Error e -> Assert.Fail($"Cannot create worktree: {e}")
+            let selector = "Project1::" + name
+            let task =
+                match createTask
+                    { ProjectName = selector; TaskId = Some name
+                      Title = name; Html = "<h1>" + name + "</h1>"; Dependencies = [] } context with
+                | Ok task -> task
+                | Error e -> failwith $"Create failed: {e}"
+            if name = "alpha" then
+                match claimTask
+                    { ProjectName = selector; TaskId = name
+                      ExpectedRevision = task.Task.Task.Revision
+                      Owner = "Agent 3"; AllowReassign = false } context with
+                | Ok _ -> ()
+                | Error e -> Assert.Fail($"Claim failed: {e}")
+            else
+                // Simulate a legacy conflicting record created before global claim protection.
+                let worktree =
+                    match Client.Worktrees.listWorktrees { ProjectName = "Project1" } context with
+                    | Ok entries -> entries |> List.find (fun entry -> entry.Path.EndsWith(name)) |> fun entry -> entry.Path
+                    | Error e -> failwith $"Cannot inspect worktree: {e}"
+                let statePath = Path.Combine(worktree, "docs", "tasks", name + ".json")
+                let state = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(statePath))
+                let owner = System.Text.Json.Nodes.JsonObject()
+                owner["agent"] <- System.Text.Json.Nodes.JsonValue.Create("Agent 3")
+                state["owner"] <- owner
+                state["status"] <- System.Text.Json.Nodes.JsonValue.Create("active")
+                state["nextActor"] <- System.Text.Json.Nodes.JsonValue.Create("agent")
+                File.WriteAllText(statePath, state.ToJsonString())
+        match getAgentAssignment { ProjectName = "Project1"; Agent = "Agent 3" } context with
+        | Error(Client.ValidationError message) ->
+            message.Contains("Conflicting active assignments") |> shouldEqual true
+            message.Contains("alpha") |> shouldEqual true
+            message.Contains("beta") |> shouldEqual true
+        | other -> Assert.Fail($"Expected explicit conflicting active assignment, got {other}")
+        match getAgentAssignment { ProjectName = "Project1"; Agent = "Agent 4" } context with
+        | Error(Client.NotFoundError _) -> ()
+        | other -> Assert.Fail($"Expected no assignment for Agent 4, got {other}"))
+
+[<Test>]
+let assignTaskCreatesWorktreeAndTracksAcknowledgementWithoutLosingCheckpoint () =
+    withProject (fun _ project context ->
+        let created =
+            match createTask
+                { ProjectName = "Project1"; TaskId = Some "292"
+                  Title = "Gold pickup"; Html = "<h1>Gold pickup</h1>"; Dependencies = [] } context with
+            | Ok value -> value
+            | Error e -> failwith $"Create failed: {e}"
+        let cmd =
+            { ProjectName = "Project1"; Agent = "Agent 2"; TaskId = "292"
+              WorktreeName = Some "gold-pickup"; Branch = Some "feature/gold-pickup"
+              Instructions = "Implement task 292"; BaseCommit = None
+              ExpectedRevision = None; ExpectedAssignmentRevision = None
+              ActorId = "orchestrator" }
+        let first =
+            match assignTask cmd context with
+            | Ok value -> value
+            | Error error -> failwith $"Assign failed: {error}"
+        first.Task.Task.Owner |> shouldEqual (Some "Agent 2")
+        first.Task.Task.NextActor |> shouldEqual (Some "agent")
+        let selector = "Project1::gold-pickup"
+        let firstRevision = first.Task.Task.AssignmentRevision.Value
+        match getAgentAssignment { ProjectName = "Project1"; Agent = "Agent 2" } context with
+        | Ok inbox ->
+            inbox.Task.Id |> shouldEqual "292"
+            inbox.ProjectName |> shouldEqual selector
+            inbox.Phase |> shouldEqual "Assigned"
+        | Error e -> Assert.Fail($"Inbox failed: {e}")
+        match acknowledgeTask
+            { ProjectName = selector; TaskId = "292"; Agent = "Agent 2"
+              AssignmentRevision = firstRevision; ExpectedRevision = first.Task.Task.Revision } context with
+        | Error e -> Assert.Fail($"Acknowledgement failed: {e}")
+        | Ok ack ->
+            let json = System.Text.Json.Nodes.JsonNode.Parse(ack.Task.StateJson.Value)
+            json["checkpoint"] = null |> shouldEqual true
+        match getAgentAssignment { ProjectName = "Project1"; Agent = "Agent 2" } context with
+        | Ok inbox ->
+            inbox.Phase |> shouldEqual "Acknowledged"
+            inbox.AcknowledgedAssignmentRevision |> shouldEqual (Some firstRevision)
+        | Error e -> Assert.Fail($"Acknowledged inbox failed: {e}")
+        let received =
+            match getTask { ProjectName = selector; TaskId = "292" } context with
+            | Ok value -> value
+            | Error e -> failwith $"Get acknowledged task failed: {e}"
+        match beginTask
+            { ProjectName = selector; TaskId = "292"; Agent = "Agent 2"
+              AssignmentRevision = firstRevision
+              ExpectedRevision = received.Task.Revision } context with
+        | Error e -> Assert.Fail($"Begin task failed: {e}")
+        | Ok _ -> ()
+        match getAgentAssignment { ProjectName = "Project1"; Agent = "Agent 2" } context with
+        | Ok inbox -> inbox.Phase |> shouldEqual "Working"
+        | Error e -> Assert.Fail($"Working inbox failed: {e}")
+        match acknowledgeTask
+            { ProjectName = selector; TaskId = "292"; Agent = "Agent 2"
+              AssignmentRevision = firstRevision; ExpectedRevision = None } context with
+        | Ok _ -> ()
+        | Error e -> Assert.Fail($"Repeated receipt failed: {e}")
+        match getAgentAssignment { ProjectName = "Project1"; Agent = "Agent 2" } context with
+        | Ok inbox -> inbox.Phase |> shouldEqual "Working"
+        | Error e -> Assert.Fail($"Repeated receipt regressed work phase: {e}")
+        let acknowledged =
+            match getTask { ProjectName = selector; TaskId = "292" } context with
+            | Ok value -> value
+            | Error e -> failwith $"GetTask failed: {e}"
+        match acknowledgeTask
+            { ProjectName = selector; TaskId = "292"; Agent = "Agent 2"
+              AssignmentRevision = "stale"; ExpectedRevision = acknowledged.Task.Revision } context with
+        | Error(Client.ValidationError error) ->
+            error.Contains("stale") |> shouldEqual true
+        | other -> Assert.Fail($"Stale acknowledgment accepted: {other}")
+        let checkpointed =
+            match checkpointTask
+                { ProjectName = selector; TaskId = "292"; ExpectedRevision = acknowledged.Task.Revision
+                  Status = "active"; Summary = "Work completed"; NextAction = "Review"
+                  Verified = [ "acceptance test" ]; Blocker = None
+                  LastCommit = Some "commit-one"; DescriptionCommit = None
+                  AcknowledgedAssignmentRevision = Some firstRevision; ActorId = Some "Agent 2" } context with
+            | Ok value -> value
+            | Error e -> failwith $"Checkpoint failed: {e}"
+        let reissued =
+            match assignTask
+                { cmd with WorktreeName = Some "gold-pickup"; Branch = None
+                           Instructions = "Fix remaining issue"
+                           ExpectedRevision = checkpointed.Task.Task.Revision
+                           ExpectedAssignmentRevision = Some firstRevision } context with
+            | Ok value -> value
+            | Error e -> failwith $"Reassignment failed: {e}"
+        let state = System.Text.Json.Nodes.JsonNode.Parse(reissued.Task.StateJson.Value)
+        (state.ToJsonString().Contains("Work completed")) |> shouldEqual true
+        reissued.Task.Task.Owner |> shouldEqual (Some "Agent 2")
+        (reissued.Task.Task.AssignmentRevision.Value <> firstRevision) |> shouldEqual true
+        match getAgentAssignment { ProjectName = "Project1::gold-pickup"; Agent = "Agent 2" } context with
+        | Ok inbox ->
+            inbox.Phase |> shouldEqual "Assigned"
+            inbox.AcknowledgedAssignmentRevision |> shouldEqual None
+        | Error e -> Assert.Fail($"Reassigned inbox failed: {e}")
+        match getOrchestrationSnapshot { ProjectName = "Project1" } context with
+        | Ok snapshot ->
+            snapshot.Assignments.Length |> shouldEqual 1
+            snapshot.UnacknowledgedTaskCount |> shouldEqual 1
+            snapshot.ReviewerTaskCount |> shouldEqual 0
+            snapshot.Conflicts.IsEmpty |> shouldEqual true
+            snapshot.Worktrees.Length |> shouldEqual 2
+        | Error e -> Assert.Fail($"Snapshot failed: {e}")
+        created.Task.Task.Id |> shouldEqual "292")
+
+[<Test>]
+let globalAssignAndClaimRejectSecondActiveAgentTask () =
+    withProject (fun _ _ context ->
+        let create id =
+            match createTask
+                { ProjectName = "Project1"; TaskId = Some id
+                  Title = id; Html = "<h1>" + id + "</h1>"; Dependencies = [] } context with
+            | Ok result -> result
+            | Error e -> failwith $"Create failed: {e}"
+        let old = create "301"
+        let pending = create "292"
+        match claimTask
+            { ProjectName = "Project1"; TaskId = "301"
+              ExpectedRevision = old.Task.Task.Revision; Owner = "Agent 2"; AllowReassign = false } context with
+        | Ok _ -> ()
+        | Error e -> Assert.Fail($"Old claim failed: {e}")
+        match claimTask
+            { ProjectName = "Project1"; TaskId = "292"
+              ExpectedRevision = pending.Task.Task.Revision; Owner = "Agent 2"; AllowReassign = false } context with
+        | Error(Client.ValidationError error) ->
+            error.Contains("Conflicting active global task ownership") |> shouldEqual true
+        | other -> Assert.Fail($"Duplicate claim accepted: {other}")
+        match assignTask
+            { ProjectName = "Project1"; Agent = "Agent 2"; TaskId = "292"
+              WorktreeName = None; Branch = None; Instructions = "New work"
+              BaseCommit = None; ExpectedRevision = pending.Task.Task.Revision
+              ExpectedAssignmentRevision = None; ActorId = "orchestrator" } context with
+        | Error(Client.ValidationError error) ->
+            error.Contains("Conflicting active global task ownership") |> shouldEqual true
+        | other -> Assert.Fail($"Duplicate assignment accepted: {other}")
+        match getTask { ProjectName = "Project1"; TaskId = "292" } context with
+        | Ok task ->
+            task.Task.Owner |> shouldEqual None
+            task.Task.Revision |> shouldEqual pending.Task.Task.Revision
+        | Error e -> Assert.Fail($"Conflicting claim modified task: {e}"))
+
+[<Test>]
+let retireWorktreePreservesTaskOnlyHistoryAndAcceptsPatchEquivalentSource () =
+    withProject (fun _ project context ->
+        File.WriteAllText(Path.Combine(project, ".gitignore"), "*.cache\n")
+        File.WriteAllText(Path.Combine(project, "README.md"), "Initial")
+        GitCommandTests.expectGitSuccess context [ "add"; ".gitignore"; "README.md" ]
+        GitCommandTests.expectGitSuccess context [ "commit"; "-m"; "Initial" ]
+        match Client.Worktrees.createWorktree
+            { ProjectName = "Project1"; Name = "retirement"
+              Branch = "feature/retirement"; BaseRef = "HEAD" } context with
+        | Error e -> Assert.Fail($"Could not create worktree: {e}")
+        | Ok _ -> ()
+        let worktree =
+            match Client.Worktrees.listWorktrees { ProjectName = "Project1" } context with
+            | Ok entries -> entries |> List.find (fun entry -> entry.Branch = Some "feature/retirement") |> fun entry -> entry.Path
+            | Error e -> failwith $"Could not inspect registered worktrees: {e}"
+        let task =
+            match createTask
+                { ProjectName = "Project1::retirement"; TaskId = Some "history"
+                  Title = "Task metadata"; Html = "<h1>History</h1>"; Dependencies = [] } context with
+            | Ok outcome -> outcome
+            | Error e -> failwith $"Create metadata failed: {e}"
+        File.WriteAllText(Path.Combine(worktree, "feature.cs"), "// accepted source")
+        GitCommandTests.expectGitSuccess context [ "-C"; worktree; "add"; "feature.cs" ]
+        GitCommandTests.expectGitSuccess context [ "-C"; worktree; "commit"; "-m"; "Feature source" ]
+        let source = GitCommandTests.gitOutput context [ "-C"; worktree; "rev-parse"; "HEAD" ]
+        GitCommandTests.expectGitSuccess context [ "cherry-pick"; source ]
+        match completeTask
+            { ProjectName = "Project1::retirement"; TaskId = "history"
+              ExpectedRevision = task.Task.Task.Revision
+              Verified = [ "source cherry-picked into main" ]
+              FinalCommit = Some source; AcknowledgedAssignmentRevision = None
+              ActorId = Some "Agent 1" } context with
+        | Ok _ -> ()
+        | Error e -> Assert.Fail($"Task completion failed: {e}")
+        match getOrchestrationSnapshot { ProjectName = "Project1" } context with
+        | Ok snapshot ->
+            (snapshot.IntegratedTasks |> List.exists (fun item ->
+                item.Task.Id = "history" && item.Phase = "Integrated")) |> shouldEqual true
+        | Error e -> Assert.Fail($"Integration snapshot failed: {e}")
+        let inspect () =
+            match retireWorktree
+                { ProjectName = "Project1"; WorktreePath = worktree
+                  TargetRef = Some "main"; DeleteBranch = false; DryRun = true } context with
+            | Ok value -> value
+            | Error e -> failwith $"Retirement inspect failed: {e}"
+        let first = inspect()
+        first.FullyMerged |> shouldEqual false
+        first.SourceEquivalent |> shouldEqual true
+        first.TaskOnlyCommitsPreservedOnBranch.IsEmpty |> shouldEqual false
+        first.CanRetire |> shouldEqual true
+        first.Retired |> shouldEqual false
+        File.WriteAllText(Path.Combine(worktree, "important.cache"), "preserve")
+        let blocked = inspect()
+        blocked.CanRetire |> shouldEqual false
+        blocked.HasIgnoredOrUntrackedArtifacts |> shouldEqual true
+        File.Delete(Path.Combine(worktree, "important.cache"))
+        match retireWorktree
+            { ProjectName = "Project1"; WorktreePath = worktree
+              TargetRef = Some "main"; DeleteBranch = false; DryRun = false } context with
+        | Error e -> Assert.Fail($"Retirement failed: {e}")
+        | Ok retired ->
+            retired.Retired |> shouldEqual true
+            retired.BranchDeleted |> shouldEqual false
+        Directory.Exists worktree |> shouldEqual false
+        let branchSha = GitCommandTests.gitOutput context [ "rev-parse"; "feature/retirement" ]
+        branchSha.Length |> shouldEqual 40
+        task.Task.Task.Id |> shouldEqual "history")
+
+[<Test>]
+let retireWorktreeBlocksUnintegratedSourceAndActiveTask () =
+    withProject (fun _ project context ->
+        File.WriteAllText(Path.Combine(project, "README.md"), "initial")
+        GitCommandTests.expectGitSuccess context [ "add"; "README.md" ]
+        GitCommandTests.expectGitSuccess context [ "commit"; "-m"; "Initial" ]
+        match Client.Worktrees.createWorktree
+            { ProjectName = "Project1"; Name = "unsafe"
+              Branch = "feature/unsafe"; BaseRef = "HEAD" } context with
+        | Ok _ -> ()
+        | Error e -> Assert.Fail($"Could not create worktree: {e}")
+        let worktree =
+            match Client.Worktrees.listWorktrees { ProjectName = "Project1" } context with
+            | Ok entries -> entries |> List.find (fun entry -> entry.Branch = Some "feature/unsafe") |> fun entry -> entry.Path
+            | Error e -> failwith $"List failed: {e}"
+        let created =
+            match createTask
+                { ProjectName = "Project1::unsafe"; TaskId = Some "active"
+                  Title = "Active"; Html = "<h1>Active</h1>"; Dependencies = [] } context with
+            | Ok task -> task
+            | Error e -> failwith $"Create failed: {e}"
+        match claimTask
+            { ProjectName = "Project1::unsafe"; TaskId = "active"
+              ExpectedRevision = created.Task.Task.Revision
+              Owner = "Agent 1"; AllowReassign = false } context with
+        | Ok _ -> ()
+        | Error e -> Assert.Fail($"Claim failed: {e}")
+        File.WriteAllText(Path.Combine(worktree, "source.cs"), "not integrated")
+        GitCommandTests.expectGitSuccess context [ "-C"; worktree; "add"; "source.cs" ]
+        GitCommandTests.expectGitSuccess context [ "-C"; worktree; "commit"; "-m"; "Unaccepted feature" ]
+        let requested =
+            { ProjectName = "Project1"; WorktreePath = worktree
+              TargetRef = Some "main"; DeleteBranch = false; DryRun = false }
+        match retireWorktree requested context with
+        | Error e -> Assert.Fail($"Retirement validation failed: {e}")
+        | Ok denied ->
+            denied.Retired |> shouldEqual false
+            denied.CanRetire |> shouldEqual false
+            denied.HasActiveWork |> shouldEqual true
+            denied.SourceEquivalent |> shouldEqual false
+            Directory.Exists worktree |> shouldEqual true)
+
+[<Test>]
+let failedNewWorktreeAssignmentCannotLeaveAnOrphanedCheckout () =
+    withProject (fun _ project context ->
+        File.WriteAllText(Path.Combine(project, "README.md"), "initial")
+        GitCommandTests.expectGitSuccess context [ "add"; "README.md" ]
+        GitCommandTests.expectGitSuccess context [ "commit"; "-m"; "Initial" ]
+        let oldBase = GitCommandTests.gitOutput context [ "rev-parse"; "HEAD" ]
+        let task =
+            match createTask
+                { ProjectName = "Project1"; TaskId = Some "next"
+                  Title = "Next task"; Html = "<h1>Next</h1>"; Dependencies = [] } context with
+            | Ok created -> created
+            | Error e -> failwith $"Create failed: {e}"
+        match assignTask
+            { ProjectName = "Project1"; Agent = "Agent 4"; TaskId = "next"
+              WorktreeName = Some "wrong-base"; Branch = Some "feature/wrong-base"
+              Instructions = "Implement"; BaseCommit = Some oldBase
+              ExpectedRevision = None; ExpectedAssignmentRevision = None
+              ActorId = "orchestrator" } context with
+        | Error(Client.ValidationError message) ->
+            message.Contains("absent from requested worktree base") |> shouldEqual true
+        | other -> Assert.Fail($"Expected old-base rejection: {other}")
+        let branches =
+            match Client.Worktrees.listWorktrees { ProjectName = "Project1" } context with
+            | Ok entries -> entries
+            | Error e -> failwith $"List failed: {e}"
+        branches.Length |> shouldEqual 1
+        let beforeClaim = task.Task.Task.Revision
+        match claimTask
+            { ProjectName = "Project1"; TaskId = "next"
+              ExpectedRevision = beforeClaim; Owner = "Agent 1"; AllowReassign = false } context with
+        | Ok _ -> ()
+        | Error e -> Assert.Fail($"Claim failed: {e}")
+        match assignTask
+            { ProjectName = "Project1"; Agent = "Agent 4"; TaskId = "next"
+              WorktreeName = Some "conflicting-base"; Branch = Some "feature/conflicting-base"
+              Instructions = "Implement"; BaseCommit = None
+              ExpectedRevision = None; ExpectedAssignmentRevision = None
+              ActorId = "orchestrator" } context with
+        | Error(Client.ValidationError message) ->
+            message.Contains("Conflicting active global task ownership") |> shouldEqual true
+        | other -> Assert.Fail($"Expected global ownership rejection: {other}")
+        let remaining =
+            match Client.Worktrees.listWorktrees { ProjectName = "Project1" } context with
+            | Ok entries -> entries
+            | Error e -> failwith $"List failed: {e}"
+        remaining.Length |> shouldEqual 1)

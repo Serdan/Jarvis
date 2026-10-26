@@ -78,6 +78,10 @@ let private auditDetails command =
     | RemoveWorktreeCommand cmd -> Some("RemoveWorktree", Some cmd.ProjectName, [ VersionControlWrite; Destructive ], [], Some "git", [ cmd.WorktreePath ])
     | CreateTaskCommand cmd -> Some("CreateTask", Some cmd.ProjectName, [ WorkspaceWrite; VersionControlWrite ], [], Some "git", [ cmd.TaskId |> Option.defaultValue "new" ])
     | UpdateTaskCommand cmd -> Some("UpdateTask", Some cmd.ProjectName, [ WorkspaceWrite; VersionControlWrite ], [], Some "git", [ cmd.TaskId ])
+    | AssignTaskCommand cmd -> Some("AssignTask", Some cmd.ProjectName, [ WorkspaceWrite; VersionControlWrite ], [], Some "git", [ cmd.TaskId ])
+    | RetireWorktreeCommand cmd -> Some("RetireWorktree", Some cmd.ProjectName, [ VersionControlWrite; Destructive ], [], Some "git", [ cmd.WorktreePath ])
+    | BeginTaskCommand cmd -> Some("BeginTask", Some cmd.ProjectName, [ WorkspaceWrite; VersionControlWrite ], [], Some "git", [ cmd.TaskId ])
+    | AcknowledgeTaskCommand cmd -> Some("AcknowledgeTask", Some cmd.ProjectName, [ WorkspaceWrite; VersionControlWrite ], [], Some "git", [ cmd.TaskId ])
     | ClaimTaskCommand cmd -> Some("ClaimTask", Some cmd.ProjectName, [ WorkspaceWrite; VersionControlWrite ], [], Some "git", [ cmd.TaskId ])
     | CheckpointTaskCommand cmd -> Some("CheckpointTask", Some cmd.ProjectName, [ WorkspaceWrite; VersionControlWrite ], [], Some "git", [ cmd.TaskId ])
     | CompleteTaskCommand cmd -> Some("CompleteTask", Some cmd.ProjectName, [ WorkspaceWrite; VersionControlWrite ], [], Some "git", [ cmd.TaskId ])
@@ -196,6 +200,12 @@ let private dispatch (rt: Runtime) (command: AgentCommand) =
     | ListTasksCommand cmd -> rt |> TaskStore.listTasks cmd |> serialize'
     | GetTaskCommand cmd -> rt |> TaskStore.getTask cmd |> serialize'
     | CompareWorktreeTasksCommand cmd -> rt |> TaskStore.compareWorktreeTasks cmd |> serialize'
+    | GetAgentAssignmentCommand cmd -> rt |> TaskStore.getAgentAssignment cmd |> serialize'
+    | GetOrchestrationSnapshotCommand cmd -> rt |> TaskStore.getOrchestrationSnapshot cmd |> serialize'
+    | AssignTaskCommand cmd -> rt |> TaskStore.assignTask cmd |> serialize'
+    | AcknowledgeTaskCommand cmd -> rt |> TaskStore.acknowledgeTask cmd |> serialize'
+    | BeginTaskCommand cmd -> rt |> TaskStore.beginTask cmd |> serialize'
+    | RetireWorktreeCommand cmd -> rt |> TaskStore.retireWorktree cmd |> serialize'
     | CreateTaskCommand cmd -> rt |> TaskStore.createTask cmd |> serialize'
     | UpdateTaskCommand cmd -> rt |> TaskStore.updateTask cmd |> serialize'
     | ClaimTaskCommand cmd -> rt |> TaskStore.claimTask cmd |> serialize'

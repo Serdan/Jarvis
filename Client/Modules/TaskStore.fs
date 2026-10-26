@@ -578,26 +578,96 @@ let updateTask (cmd: UpdateTaskCommand) =
                     if getString obj "status" = Some "completed" then obj["nextActor"] <- null
                     Ok())
 
-let claimTask (cmd: ClaimTaskCommand) =
-    updateState cmd.ProjectName cmd.TaskId cmd.ExpectedRevision $"Claim task {cmd.TaskId}"
-        (fun obj ->
-            if String.IsNullOrWhiteSpace cmd.Owner then
-                Error(Client.ValidationError "Owner is required.")
-            else
-                let existing = ownerId obj
-                match existing with
-                | Some other when other <> cmd.Owner && not cmd.AllowReassign ->
-                    Error(Client.ValidationError "Task is claimed by another agent.")
-                | _ ->
-                    let owner = JsonObject()
-                    owner["agent"] <- JsonValue.Create(cmd.Owner)
-                    owner["worktree"] <- JsonValue.Create(cmd.ProjectName)
-                    obj["owner"] <- owner
-                    obj["status"] <- JsonValue.Create("active")
-                    obj["nextActor"] <- JsonValue.Create("agent")
-                    recordActor obj "agent" cmd.Owner
-                    Ok())
 
+let private projectAssignmentLocks = ConcurrentDictionary<string, obj>(StringComparer.Ordinal)
+
+let private globalAssignmentMutation (projectName: string) (operation: IO<'rt, 'a>) : IO<'rt, 'a> =
+    fun rt ->
+        let root =
+            let separator = projectName.IndexOf("::", StringComparison.Ordinal)
+            if separator < 0 then projectName else projectName.Substring(0, separator)
+        let gate = projectAssignmentLocks.GetOrAdd(root, fun _ -> obj())
+        lock gate (fun () -> operation rt)
+
+let private ensureGlobalClaimAvailable (selector: string) (taskId: string) (agent: string) =
+    effect {
+        let rootName =
+            let separator = selector.IndexOf("::", StringComparison.Ordinal)
+            if separator < 0 then selector else selector.Substring(0, separator)
+        let! (FolderPath selectedRoot) = ProjectPaths.resolveProjectRoot selector
+        let! worktrees = Worktrees.listWorktrees { ProjectName = rootName }
+        let mutable conflicts = []
+        let mutable failures = []
+        let! listed =
+            fun rt ->
+                worktrees
+                |> List.map (fun worktree ->
+                    let worktreeSelector =
+                        if worktree.IsMain then rootName
+                        else rootName + "::" + Path.GetFileName(worktree.Path)
+                    worktree, listTasks
+                        { ProjectName = worktreeSelector
+                          Status = None; Owner = None; DependsOn = None; NextActor = None } rt)
+                |> Ok
+        let! () =
+            fun _ ->
+                for worktree, result in listed do
+                    let worktreeSelector =
+                        if worktree.IsMain then rootName
+                        else rootName + "::" + Path.GetFileName(worktree.Path)
+                    match result with
+                    | Error error -> failures <- (worktree.Path + ": " + string error) :: failures
+                    | Ok tasks ->
+                        for task in tasks do
+                            if task.Diagnostics.IsEmpty && task.Status <> "completed" then
+                                let sameTarget =
+                                    String.Equals(Path.GetFullPath selectedRoot, Path.GetFullPath worktree.Path,
+                                                  (if OperatingSystem.IsWindows() then StringComparison.OrdinalIgnoreCase else StringComparison.Ordinal))
+                                let sameTask = sameTarget && task.Id = taskId
+                                if not sameTask && (task.Owner = Some agent || (task.Id = taskId && task.Owner.IsSome)) then
+                                    conflicts <- (worktreeSelector, task) :: conflicts
+                            elif not task.Diagnostics.IsEmpty then
+                                failures <- (worktree.Path + "/" + task.Id + ": " + String.concat "; " task.Diagnostics) :: failures
+                Ok()
+        if not failures.IsEmpty then
+            let details = String.concat "; " failures
+            return! Client.ValidationError("Cannot assign task while global worktree ownership is unreadable: " + details)
+                    |> Effect.ofError
+        elif not conflicts.IsEmpty then
+            let details =
+                conflicts
+                |> List.map (fun (worktreeSelector, task) ->
+                    worktreeSelector + "/" + task.Id + " claimed by " + (task.Owner |> Option.defaultValue "(unknown)"))
+                |> String.concat "; "
+            return! Client.ValidationError("Conflicting active global task ownership: " + details)
+                    |> Effect.ofError
+        else return ()
+    }
+
+let claimTask (cmd: ClaimTaskCommand) =
+    effect {
+        do! ensureGlobalClaimAvailable cmd.ProjectName cmd.TaskId cmd.Owner
+        return!
+            updateState cmd.ProjectName cmd.TaskId cmd.ExpectedRevision $"Claim task {cmd.TaskId}"
+                (fun obj ->
+                    if String.IsNullOrWhiteSpace cmd.Owner then
+                        Error(Client.ValidationError "Owner is required.")
+                    else
+                        let existing = ownerId obj
+                        match existing with
+                        | Some other when other <> cmd.Owner && not cmd.AllowReassign ->
+                            Error(Client.ValidationError "Task is claimed by another agent.")
+                        | _ ->
+                            let owner = JsonObject()
+                            owner["agent"] <- JsonValue.Create(cmd.Owner)
+                            owner["worktree"] <- JsonValue.Create(cmd.ProjectName)
+                            obj["owner"] <- owner
+                            obj["status"] <- JsonValue.Create("active")
+                            obj["nextActor"] <- JsonValue.Create("agent")
+                            recordActor obj "agent" cmd.Owner
+                            Ok())
+
+    } |> globalAssignmentMutation cmd.ProjectName
 let checkpointTask (cmd: CheckpointTaskCommand) =
     updateState cmd.ProjectName cmd.TaskId cmd.ExpectedRevision $"Checkpoint task {cmd.TaskId}"
         (fun obj ->
@@ -692,3 +762,493 @@ let compareWorktreeTasks (cmd: CompareWorktreeTasksCommand) =
                 | Ok tasks -> { Worktree = worktree; Tasks = tasks; Error = None }
                 | Error error -> { Worktree = worktree; Tasks = []; Error = Some(string error) })
             |> Ok
+
+type AgentAssignment =
+    { Agent: string
+      ProjectName: string
+      Worktree: Worktrees.WorktreeInfo
+      Task: TaskSummary
+      AssignmentInstructions: string option
+      AssignmentBaseCommit: string option
+      AssignmentRevision: string option
+      AcknowledgedAssignmentRevision: string option
+      Phase: string }
+
+let private rootProjectName (projectName: string) =
+    let separator = projectName.IndexOf("::", StringComparison.Ordinal)
+    if separator < 0 then projectName else projectName.Substring(0, separator)
+
+let private projectSelector projectName (worktree: Worktrees.WorktreeInfo) =
+    if worktree.IsMain then projectName
+    else projectName + "::" + Path.GetFileName(worktree.Path)
+
+let private assignmentForTask agent projectName worktree (task: TaskSummary) =
+    let selector = projectSelector projectName worktree
+    effect {
+        let! details = getTask { ProjectName = selector; TaskId = task.Id }
+        let state =
+            details.StateJson
+            |> Option.map JsonNode.Parse
+        let nested (field: string) (key: string) =
+            match state with
+            | Some (:? JsonObject as obj) ->
+                match obj[field] with
+                | :? JsonObject as child -> getString child key
+                | _ -> None
+            | _ -> None
+        let revision = nested "assignment" "revision"
+        let acknowledged =
+            let receipt = nested "acknowledgement" "revision"
+            let checkpointReceipt = nested "checkpoint" "acknowledgedAssignmentRevision"
+            if revision.IsNone then None
+            elif receipt = revision then receipt
+            elif checkpointReceipt = revision then checkpointReceipt
+            else None
+        let phase =
+            if task.NextActor = Some "reviewer" then "ReadyForReview"
+            elif revision.IsSome && acknowledged = revision
+                 && (nested "acknowledgement" "startedAt").IsSome then "Working"
+            elif revision.IsSome && acknowledged = revision then "Acknowledged"
+            elif revision.IsSome then "Assigned"
+            else "Claimed"
+        return
+            { Agent = agent
+              ProjectName = selector
+              Worktree = worktree
+              Task = task
+              AssignmentInstructions = nested "assignment" "instructions"
+              AssignmentBaseCommit = nested "assignment" "baseCommit"
+              AssignmentRevision = revision
+              AcknowledgedAssignmentRevision = acknowledged
+              Phase = phase }
+    }
+
+let private activeAssignments projectName agent =
+    effect {
+        let! groups = compareWorktreeTasks { ProjectName = projectName; NextActor = None }
+        let failures = groups |> List.choose (fun group -> group.Error |> Option.map (fun error -> group.Worktree.Path + ": " + error))
+        if not failures.IsEmpty then
+            return! Client.ValidationError("Cannot trust global agent ownership while worktree inspection fails: " + String.concat "; " failures)
+                    |> Effect.ofError
+        else
+            return
+                groups
+                |> List.collect (fun group ->
+                    group.Tasks
+                    |> List.filter (fun task -> task.Owner = Some agent && task.Status <> "completed")
+                    |> List.map (fun task -> group.Worktree, task))
+    }
+
+let getAgentAssignment (cmd: GetAgentAssignmentCommand) =
+    effect {
+        if String.IsNullOrWhiteSpace cmd.Agent then
+            return! Client.ValidationError "Agent identity is required." |> Effect.ofError
+        else
+            let projectName = rootProjectName cmd.ProjectName
+            let! candidates = activeAssignments projectName cmd.Agent
+            match candidates with
+            | [] ->
+                return! Client.NotFoundError($"No active assignment found for agent '{cmd.Agent}' in project '{projectName}'.")
+                        |> Effect.ofError
+            | [ (worktree, task) ] ->
+                return! assignmentForTask cmd.Agent projectName worktree task
+            | many ->
+                let collisions =
+                    many
+                    |> List.map (fun (worktree, task) ->
+                        let branch = worktree.Branch |> Option.defaultValue "detached"
+                        $"{task.Id} [{branch}] {worktree.Path}")
+                let conflictDetails = String.concat "; " collisions
+                return! Client.ValidationError(
+                    $"Conflicting active assignments for agent '{cmd.Agent}': {conflictDetails}. Resolve duplicate ownership before continuing.")
+                    |> Effect.ofError
+    }
+
+let assignTask (cmd: AssignTaskCommand) =
+    let mutable createdWorktree = None
+    let operation = effect {
+        if String.IsNullOrWhiteSpace cmd.Agent
+           || String.IsNullOrWhiteSpace cmd.ActorId
+           || String.IsNullOrWhiteSpace cmd.Instructions
+           || String.IsNullOrWhiteSpace cmd.TaskId then
+            return! Client.ValidationError "Agent, reviewer ID, task ID and instructions are required." |> Effect.ofError
+        else
+            let projectName = rootProjectName cmd.ProjectName
+            let! groups = compareWorktreeTasks { ProjectName = projectName; NextActor = None }
+            let failures = groups |> List.choose (fun group -> group.Error |> Option.map (fun error -> group.Worktree.Path + ": " + error))
+            if not failures.IsEmpty then
+                let details = String.concat "; " failures
+                return! Client.ValidationError("Cannot assign while registered worktree inspection fails: " + details) |> Effect.ofError
+            else
+                let matches =
+                    groups
+                    |> List.filter (fun group -> group.Tasks |> List.exists (fun task -> task.Id = cmd.TaskId))
+                let existing =
+                    match cmd.WorktreeName with
+                    | Some name -> groups |> List.tryFind (fun group -> Path.GetFileName(group.Worktree.Path) = name)
+                    | None when matches.Length = 1 -> Some matches.Head
+                    | _ -> None
+                let! selector =
+                    match existing, cmd.WorktreeName, cmd.Branch with
+                    | Some group, _, _ ->
+                        fun _ -> Ok(projectSelector projectName group.Worktree)
+                    | None, Some name, Some branch ->
+                        effect {
+                            let! original = getTask { ProjectName = projectName; TaskId = cmd.TaskId }
+                            let baseRef = cmd.BaseCommit |> Option.defaultValue "HEAD"
+                            let! taskAtBase = git projectName [ "cat-file"; "-e"; baseRef + ":" + original.Task.DescriptionPath ]
+                            if taskAtBase.ExitCode <> 0 || taskAtBase.TimedOut then
+                                return! Client.ValidationError "Task HTML is absent from requested worktree base commit." |> Effect.ofError
+                            else
+                                let! created =
+                                    Worktrees.createWorktree
+                                        { ProjectName = projectName; Name = name; Branch = branch
+                                          BaseRef = baseRef }
+                                return (createdWorktree <- Some created.Path; projectSelector projectName created)
+                        }
+                    | None, Some _, None ->
+                        Client.ValidationError "Unknown worktree. Supply branch to create it, or use a registered worktree name." |> Effect.ofError
+                    | None, None, _ when matches.Length > 1 ->
+                        Client.ValidationError "Task exists in multiple worktrees. Supply worktreeName to select the intended checkout." |> Effect.ofError
+                    | _ ->
+                        Client.NotFoundError "No registered worktree contains this task. Create its HTML description before assigning." |> Effect.ofError
+                do! ensureGlobalClaimAvailable selector cmd.TaskId cmd.Agent
+                let! current = getTask { ProjectName = selector; TaskId = cmd.TaskId }
+                if current.Task.Status = "completed" then
+                    return! Client.ValidationError "Cannot assign a completed task; reopen it explicitly before assignment." |> Effect.ofError
+                elif current.Task.Owner.IsSome && current.Task.Owner <> Some cmd.Agent then
+                    return! Client.ValidationError "Task is claimed by another agent; explicit reassignment is required." |> Effect.ofError
+                else
+                    let expected =
+                        cmd.ExpectedRevision |> Option.orElse current.Task.Revision
+                    return!
+                        updateState selector cmd.TaskId expected $"Assign task {cmd.TaskId} to {cmd.Agent}"
+                            (fun obj ->
+                                if cmd.ExpectedAssignmentRevision.IsSome
+                                   && cmd.ExpectedAssignmentRevision <> assignmentRevision obj then
+                                    Error(Client.ValidationError "Assignment revision is stale.")
+                                else
+                                    let owner = JsonObject()
+                                    owner["agent"] <- JsonValue.Create(cmd.Agent)
+                                    owner["worktree"] <- JsonValue.Create(selector)
+                                    obj["owner"] <- owner
+                                    let assignment =
+                                        match obj["assignment"] with
+                                        | :? JsonObject as old -> old
+                                        | _ -> JsonObject()
+                                    assignment["instructions"] <- JsonValue.Create(cmd.Instructions)
+                                    cmd.BaseCommit
+                                    |> Option.iter (fun baseCommit -> assignment["baseCommit"] <- JsonValue.Create(baseCommit))
+                                    assignment["revision"] <- JsonValue.Create(Guid.NewGuid().ToString("N"))
+                                    assignment["updatedAt"] <- JsonValue.Create(DateTimeOffset.UtcNow.ToString("O"))
+                                    obj["assignment"] <- assignment
+                                    obj["acknowledgement"] <- null
+                                    obj["status"] <- JsonValue.Create("active")
+                                    obj["nextActor"] <- JsonValue.Create("agent")
+                                    recordActor obj "reviewer" cmd.ActorId
+                                    Ok())
+    }
+    (fun rt ->
+        match operation rt with
+        | Ok outcome -> Ok outcome
+        | Error original ->
+            match createdWorktree with
+            | None -> Error original
+            | Some path ->
+                let root = rootProjectName cmd.ProjectName
+                match Worktrees.removeWorktree
+                    { ProjectName = root; WorktreePath = path; TargetRef = None } rt with
+                | Ok _ -> Error original
+                | Error cleanup ->
+                    Error(Client.ValidationError(
+                        $"Assignment failed: {original}. The new worktree {path} could not be safely removed: {cleanup}. Inspect it before retrying.")))
+    |> globalAssignmentMutation cmd.ProjectName
+
+let acknowledgeTask (cmd: AcknowledgeTaskCommand) =
+    updateState cmd.ProjectName cmd.TaskId cmd.ExpectedRevision $"Acknowledge task {cmd.TaskId}"
+        (fun obj ->
+            if String.IsNullOrWhiteSpace cmd.Agent
+               || String.IsNullOrWhiteSpace cmd.AssignmentRevision then
+                Error(Client.ValidationError "Agent identity and assignment revision are required.")
+            elif ownerId obj <> Some cmd.Agent then
+                Error(Client.ValidationError "Only the claimed agent may acknowledge this task.")
+            elif assignmentRevision obj <> Some cmd.AssignmentRevision then
+                Error(Client.ValidationError "Assignment revision is stale or missing.")
+            elif getString obj "status" = Some "completed" then
+                Error(Client.ValidationError "Cannot acknowledge a completed task.")
+            else
+                let receipt =
+                    match obj["acknowledgement"] with
+                    | :? JsonObject as existing
+                        when getString existing "revision" = Some cmd.AssignmentRevision
+                             && getString existing "agent" = Some cmd.Agent -> existing
+                    | _ ->
+                        let created = JsonObject()
+                        created["revision"] <- JsonValue.Create(cmd.AssignmentRevision)
+                        created["agent"] <- JsonValue.Create(cmd.Agent)
+                        created["acknowledgedAt"] <- JsonValue.Create(DateTimeOffset.UtcNow.ToString("O"))
+                        created
+                obj["acknowledgement"] <- receipt
+                recordActor obj "agent" cmd.Agent
+                Ok())
+
+type WorktreeRetirement =
+    { Worktree: Worktrees.WorktreeInfo
+      TargetRef: string
+      FullyMerged: bool
+      SourceEquivalent: bool
+      TaskOnlyCommitsPreservedOnBranch: string list
+      HasActiveWork: bool
+      HasIgnoredOrUntrackedArtifacts: bool
+      Reasons: string list
+      CanRetire: bool
+      DryRun: bool
+      Retired: bool
+      BranchDeleted: bool }
+
+let retireWorktree (cmd: RetireWorktreeCommand) =
+    effect {
+        let rootName = rootProjectName cmd.ProjectName
+        let! worktree =
+            Worktrees.getWorktree
+                { ProjectName = rootName; WorktreePath = cmd.WorktreePath }
+        let! entries = Worktrees.listWorktrees { ProjectName = rootName }
+        let main = entries |> List.find (fun item -> item.IsMain)
+        let target = cmd.TargetRef |> Option.defaultValue (worktree.Branch |> Option.defaultValue "main")
+        let target =
+            if cmd.TargetRef.IsSome then target
+            else main.Branch |> Option.defaultValue "main"
+        let selector = projectSelector rootName worktree
+        let! taskList =
+            listTasks
+                { ProjectName = selector; Status = None; Owner = None
+                  DependsOn = None; NextActor = None }
+        let! workStatus =
+            git rootName [ "-C"; worktree.Path; "status"; "--porcelain"; "--untracked-files=all" ]
+        let! ignored =
+            git rootName [ "-C"; worktree.Path; "ls-files"; "--others"; "--ignored"; "--exclude-standard" ]
+        let! fullyMergedResult =
+            git rootName [ "merge-base"; "--is-ancestor"; worktree.Head; target ]
+        let fullyMerged = fullyMergedResult.ExitCode = 0 && not fullyMergedResult.TimedOut
+        let! cherry =
+            git rootName [ "-C"; worktree.Path; "cherry"; "-v"; target; "HEAD" ]
+        let! mergeCommits =
+            git rootName [ "-C"; worktree.Path; "rev-list"; "--merges"; target + "..HEAD" ]
+        let! (FolderPath selectedRoot) = ProjectPaths.resolveProjectRoot selector
+        let! (taskDir, _) = fun _ -> directory selectedRoot
+        let! (taskOnlyCommits, changedSource) =
+            fun rt ->
+                if cherry.ExitCode <> 0 || cherry.TimedOut || cherry.Truncated then
+                    Error(Client.ValidationError("Cannot establish patch equivalence: " + cherry.StdErr))
+                elif mergeCommits.ExitCode <> 0 || mergeCommits.TimedOut || mergeCommits.Truncated then
+                    Error(Client.ValidationError("Cannot inspect merge commits: " + mergeCommits.StdErr))
+                else
+                    let mutable metadata = []
+                    let mutable source = []
+                    for line in cherry.StdOut.Split('\n', StringSplitOptions.RemoveEmptyEntries) do
+                        if line.StartsWith("+ ", StringComparison.Ordinal) then
+                            let sha = line.Substring(2).Split(' ', StringSplitOptions.RemoveEmptyEntries)[0]
+                            match git rootName [ "-C"; worktree.Path; "show"; "--format="; "--name-only"; sha ] rt with
+                            | Ok details when details.ExitCode = 0 && not details.TimedOut && not details.Truncated ->
+                                let paths = details.StdOut.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                                if paths.Length > 0 && paths |> Array.forall (fun path ->
+                                    path.StartsWith(taskDir + "/", StringComparison.Ordinal)) then
+                                    metadata <- sha :: metadata
+                                else source <- sha :: source
+                            | _ -> source <- sha :: source
+                    Ok(List.rev metadata, List.rev source)
+        let! activeJobs = JobManager.listJobs { ProjectName = None; IncludeCompleted = false }
+        let jobs =
+            activeJobs.Jobs
+            |> List.filter (fun job -> job.ProjectName = selector || job.ProjectName = rootName)
+        let hasActiveWork =
+            taskList
+            |> List.exists (fun task -> task.Status <> "completed" &&
+                                          (task.Owner.IsSome || task.NextActor.IsSome))
+        let hasArtifacts =
+            workStatus.ExitCode <> 0 || ignored.ExitCode <> 0 ||
+            workStatus.TimedOut || ignored.TimedOut ||
+            workStatus.Truncated || ignored.Truncated ||
+            not (String.IsNullOrWhiteSpace workStatus.StdOut) ||
+            not (String.IsNullOrWhiteSpace ignored.StdOut)
+        let sourceEquivalent =
+            fullyMerged ||
+            (changedSource.IsEmpty &&
+             String.IsNullOrWhiteSpace mergeCommits.StdOut &&
+             not cherry.TimedOut && not cherry.Truncated)
+        let reasons =
+            [ if worktree.IsMain then "Cannot retire main worktree."
+              if worktree.IsLocked || worktree.IsPrunable then "Worktree is locked or prunable."
+              if hasArtifacts then "Worktree contains untracked, modified, staged or ignored files. Inspect and preserve them."
+              if hasActiveWork then "Worktree contains active task ownership or a pending handoff."
+              if not jobs.IsEmpty then "Jarvis still has running project jobs."
+              if taskList |> List.exists (fun task -> not task.Diagnostics.IsEmpty) then
+                  "Task records contain diagnostics and cannot be trusted for retirement."
+              if not sourceEquivalent then "Source commits are not verified as merged or patch-equivalent to target."
+              if cmd.DeleteBranch && not fullyMerged then
+                  "Cannot delete a branch with non-ancestor task history; retain the branch as evidence." ]
+        let canRetire = reasons.IsEmpty
+        if cmd.DryRun || not canRetire then
+            return
+                { Worktree = worktree; TargetRef = target; FullyMerged = fullyMerged
+                  SourceEquivalent = sourceEquivalent
+                  TaskOnlyCommitsPreservedOnBranch = taskOnlyCommits
+                  HasActiveWork = hasActiveWork
+                  HasIgnoredOrUntrackedArtifacts = hasArtifacts
+                  Reasons = reasons; CanRetire = canRetire; DryRun = cmd.DryRun
+                  Retired = false; BranchDeleted = false }
+        else
+            let! removal = git rootName [ "worktree"; "remove"; worktree.Path ]
+            if removal.ExitCode <> 0 || removal.TimedOut then
+                return! Client.ValidationError("Git refused worktree removal: " + removal.StdErr)
+                        |> Effect.ofError
+            else
+                let! deleted =
+                    if cmd.DeleteBranch then
+                        effect {
+                            match worktree.Branch with
+                            | None ->
+                                return! Client.ValidationError "Detached worktree has no branch to delete."
+                                        |> Effect.ofError
+                            | Some branch ->
+                                let! result = git rootName [ "branch"; "-d"; branch ]
+                                if result.ExitCode <> 0 then
+                                    return! Client.ValidationError("Checkout retired but branch deletion failed: " + result.StdErr)
+                                            |> Effect.ofError
+                                else return true
+                        }
+                    else fun _ -> Ok false
+                return
+                    { Worktree = worktree; TargetRef = target; FullyMerged = fullyMerged
+                      SourceEquivalent = sourceEquivalent
+                      TaskOnlyCommitsPreservedOnBranch = taskOnlyCommits
+                      HasActiveWork = false; HasIgnoredOrUntrackedArtifacts = false
+                      Reasons = []; CanRetire = true; DryRun = false
+                      Retired = true; BranchDeleted = deleted }
+    } |> globalAssignmentMutation cmd.ProjectName
+
+type IntegratedTask =
+    { Worktree: Worktrees.WorktreeInfo
+      Task: TaskSummary
+      Phase: string }
+
+type OrchestrationSnapshot =
+    { ProjectName: string
+      Worktrees: WorktreeTaskGroup list
+      Assignments: AgentAssignment list
+      Conflicts: string list
+      ReviewerTaskCount: int
+      UnacknowledgedTaskCount: int
+      InspectionErrors: string list
+      RetirementInspections: WorktreeRetirement list
+      RetirementCandidates: string list
+      IntegratedTasks: IntegratedTask list }
+
+let getOrchestrationSnapshot (cmd: GetOrchestrationSnapshotCommand) =
+    effect {
+        let projectName = rootProjectName cmd.ProjectName
+        let! groups = compareWorktreeTasks { ProjectName = projectName; NextActor = None }
+        let inspectionErrors =
+            groups |> List.choose (fun group ->
+                group.Error |> Option.map (fun error -> group.Worktree.Path + ": " + error))
+        let candidates =
+            groups
+            |> List.collect (fun group ->
+                group.Tasks
+                |> List.filter (fun task -> task.Status <> "completed" && task.Owner.IsSome)
+                |> List.map (fun task -> group.Worktree, task))
+        let! assignments, detailsErrors =
+            fun rt ->
+                let mutable found = []
+                let mutable errors = []
+                for worktree, task in candidates do
+                    match assignmentForTask task.Owner.Value projectName worktree task rt with
+                    | Ok assignment -> found <- assignment :: found
+                    | Error error ->
+                        errors <- (worktree.Path + "/" + task.Id + ": " + string error) :: errors
+                Ok(List.rev found, List.rev errors)
+        let! retirementInspections, retirementErrors =
+            fun rt ->
+                let mutable inspected = []
+                let mutable errors = []
+                for group in groups |> List.filter (fun group -> not group.Worktree.IsMain) do
+                    match retireWorktree
+                        { ProjectName = projectName; WorktreePath = group.Worktree.Path
+                          TargetRef = None; DeleteBranch = false; DryRun = true } rt with
+                    | Ok inspection -> inspected <- inspection :: inspected
+                    | Error error ->
+                        errors <- (group.Worktree.Path + ": " + string error) :: errors
+                Ok(List.rev inspected, List.rev errors)
+        let ownershipConflicts =
+            assignments
+            |> List.groupBy (fun assignment -> assignment.Agent)
+            |> List.choose (fun (agent, matches) ->
+                if matches.Length > 1 then
+                    Some("Agent " + agent + " has " + string matches.Length + " active assignments: " +
+                         (matches |> List.map (fun item -> item.ProjectName + "/" + item.Task.Id) |> String.concat ", "))
+                else None)
+        let duplicateTasks =
+            assignments
+            |> List.groupBy (fun assignment -> assignment.Task.Id)
+            |> List.choose (fun (taskId, matches) ->
+                if matches.Length > 1 then
+                    Some("Task " + taskId + " is actively claimed in " + string matches.Length + " worktrees: " +
+                         (matches |> List.map (fun item -> item.ProjectName) |> String.concat ", "))
+                else None)
+        return
+            { ProjectName = projectName
+              Worktrees = groups
+              Assignments = assignments
+              Conflicts = ownershipConflicts @ duplicateTasks
+              ReviewerTaskCount = assignments |> List.filter (fun item -> item.Task.NextActor = Some "reviewer") |> List.length
+              UnacknowledgedTaskCount =
+                  assignments
+                  |> List.filter (fun item ->
+                      item.AssignmentRevision.IsSome &&
+                      item.AssignmentRevision <> item.AcknowledgedAssignmentRevision &&
+                      item.Task.NextActor = Some "agent")
+                  |> List.length
+              InspectionErrors = inspectionErrors @ detailsErrors @ retirementErrors
+              RetirementInspections = retirementInspections
+              RetirementCandidates =
+                  retirementInspections
+                  |> List.filter (fun item -> item.CanRetire)
+                  |> List.map (fun item -> item.Worktree.Path)
+              IntegratedTasks =
+                  groups
+                  |> List.collect (fun group ->
+                      let integrated =
+                          group.Worktree.IsMain ||
+                          (retirementInspections
+                           |> List.exists (fun inspection ->
+                               inspection.Worktree.Path = group.Worktree.Path &&
+                               inspection.SourceEquivalent))
+                      if not integrated then []
+                      else
+                          group.Tasks
+                          |> List.filter (fun task -> task.Status = "completed")
+                          |> List.map (fun task ->
+                              { Worktree = group.Worktree
+                                Task = task; Phase = "Integrated" })) }
+    }
+
+
+let beginTask (cmd: BeginTaskCommand) =
+    updateState cmd.ProjectName cmd.TaskId cmd.ExpectedRevision $"Begin task {cmd.TaskId}"
+        (fun obj ->
+            if ownerId obj <> Some cmd.Agent then
+                Error(Client.ValidationError "Only the claimed agent may begin this task.")
+            elif assignmentRevision obj <> Some cmd.AssignmentRevision then
+                Error(Client.ValidationError "Assignment revision is stale or missing.")
+            elif getString obj "status" = Some "completed" then
+                Error(Client.ValidationError "Cannot begin a completed task.")
+            else
+                match obj["acknowledgement"] with
+                | :? JsonObject as receipt
+                    when getString receipt "revision" = Some cmd.AssignmentRevision
+                         && getString receipt "agent" = Some cmd.Agent ->
+                    receipt["startedAt"] <- JsonValue.Create(DateTimeOffset.UtcNow.ToString("O"))
+                    recordActor obj "agent" cmd.Agent
+                    Ok()
+                | _ ->
+                    Error(Client.ValidationError "Acknowledge the current assignment revision before beginning work."))

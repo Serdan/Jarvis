@@ -80,7 +80,7 @@ type RemoveWorktreeCommand =
       TargetRef: string option }
 
 
-type ListTasksCommand = { ProjectName: string; Status: string option; Owner: string option; DependsOn: string option }
+type ListTasksCommand = { ProjectName: string; Status: string option; Owner: string option; DependsOn: string option; NextActor: string option }
 type GetTaskCommand = { ProjectName: string; TaskId: string }
 type CompareWorktreeTasksCommand = { ProjectName: string }
 type CreateTaskCommand =
@@ -96,7 +96,12 @@ type UpdateTaskCommand =
       Title: string option
       Status: string option
       Dependencies: string list option
-      DescriptionCommit: string option }
+      DescriptionCommit: string option
+      AssignmentInstructions: string option
+      AssignmentBaseCommit: string option
+      ExpectedAssignmentRevision: string option
+      NextActor: string option
+      ActorId: string option }
 type ClaimTaskCommand =
     { ProjectName: string
       TaskId: string
@@ -113,13 +118,17 @@ type CheckpointTaskCommand =
       Verified: string list
       Blocker: string option
       LastCommit: string option
-      DescriptionCommit: string option }
+      DescriptionCommit: string option
+      AcknowledgedAssignmentRevision: string option
+      ActorId: string option }
 type CompleteTaskCommand =
     { ProjectName: string
       TaskId: string
       ExpectedRevision: string option
       Verified: string list
-      FinalCommit: string option }
+      FinalCommit: string option
+      AcknowledgedAssignmentRevision: string option
+      ActorId: string option }
 type GetTaskHistoryCommand =
     { ProjectName: string
       TaskId: string
@@ -893,7 +902,7 @@ module AgentCommandInfo =
         | None -> invocation command
 
 module AgentProtocol =
-    let version = "3.14"
+    let version = "3.15"
     let defaultPatchFuzzyContextLines = 3
     let maxResponseBytes = 900 * 1024
     let maxImageBytes = 8 * 1024 * 1024
@@ -919,9 +928,9 @@ module AgentProtocol =
           definition "CompareWorktreeTasks" "Summarizes task files across every registered worktree." [ ReadOnly ] false false false
           definition "GetTask" "Reads HTML task definition and adjacent JSON state." [ ReadOnly ] false false false
           definition "CreateTask" "Creates and commits HTML and JSON task files." [ WorkspaceWrite; VersionControlWrite ] true true false
-          definition "UpdateTask" "Updates structured task metadata with a task-only commit." [ WorkspaceWrite; VersionControlWrite ] true true false
+          definition "UpdateTask" "Updates task metadata or reviewer assignment without changing owner or progress." [ WorkspaceWrite; VersionControlWrite ] true true false
           definition "ClaimTask" "Claims or reassigns repository-backed task ownership." [ WorkspaceWrite; VersionControlWrite ] true true false
-          definition "CheckpointTask" "Commits task progress and next action." [ WorkspaceWrite; VersionControlWrite ] true true false
+          definition "CheckpointTask" "Commits agent progress and acknowledges the current assignment revision." [ WorkspaceWrite; VersionControlWrite ] true true false
           definition "CompleteTask" "Marks a task complete and commits verification." [ WorkspaceWrite; VersionControlWrite ] true true false
           definition "GetTaskHistory" "Reads Git change history for one task." [ ReadOnly ] false false false
           definition "RemoveWorktree" "Removes a clean integrated Git worktree." [ VersionControlWrite; Destructive ] true true false

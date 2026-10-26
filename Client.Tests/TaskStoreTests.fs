@@ -1137,7 +1137,9 @@ let assignTaskCreatesWorktreeAndTracksAcknowledgementWithoutLosingCheckpoint () 
             inbox.Phase |> shouldEqual "Assigned"
             inbox.AcknowledgedAssignmentRevision |> shouldEqual None
         | Error e -> Assert.Fail($"Reassigned inbox failed: {e}")
-        match getOrchestrationSnapshot { ProjectName = "Project1" } context with
+        match getOrchestrationSnapshot
+            { ProjectName = "Project1"; Status = None; Owner = None; NextActor = None
+              ReviewerOnly = false; Offset = 0; Limit = 60; IncludeRetirement = false } context with
         | Ok snapshot ->
             snapshot.Assignments.Length |> shouldEqual 1
             snapshot.UnacknowledgedTaskCount |> shouldEqual 1
@@ -1218,7 +1220,9 @@ let retireWorktreePreservesTaskOnlyHistoryAndAcceptsPatchEquivalentSource () =
               ActorId = Some "Agent 1" } context with
         | Ok _ -> ()
         | Error e -> Assert.Fail($"Task completion failed: {e}")
-        match getOrchestrationSnapshot { ProjectName = "Project1" } context with
+        match getOrchestrationSnapshot
+            { ProjectName = "Project1"; Status = None; Owner = None; NextActor = None
+              ReviewerOnly = false; Offset = 0; Limit = 60; IncludeRetirement = true } context with
         | Ok snapshot ->
             (snapshot.IntegratedTasks |> List.exists (fun item ->
                 item.Task.Id = "history" && item.Phase = "Integrated")) |> shouldEqual true
@@ -1341,3 +1345,178 @@ let failedNewWorktreeAssignmentCannotLeaveAnOrphanedCheckout () =
             | Ok entries -> entries
             | Error e -> failwith $"List failed: {e}"
         remaining.Length |> shouldEqual 1)
+
+[<Test>]
+let parkedHistoricalOwnerDoesNotBlockCurrentAgentAssignment () =
+    withProject (fun _ project context ->
+        File.WriteAllText(Path.Combine(project, "README.md"), "initial")
+        GitCommandTests.expectGitSuccess context ["add"; "README.md"]
+        GitCommandTests.expectGitSuccess context ["commit"; "-m"; "Initial"]
+        match Client.Worktrees.createWorktree
+            { ProjectName = "Project1"; Name = "controls-282"
+              Branch = "feature/controls-282"; BaseRef = "HEAD" } context with
+        | Ok _ -> ()
+        | Error err -> Assert.Fail($"Worktree failed: {err}")
+        let old =
+            match createTask
+                { ProjectName = "Project1"; TaskId = Some "302"
+                  Title = "Parked allocation gate"; Html = "<h1>302</h1>"; Dependencies = [] } context with
+            | Ok task -> task
+            | Error err -> failwith $"Create parked task failed: {err}"
+        match claimTask
+            { ProjectName = "Project1"; TaskId = "302"
+              ExpectedRevision = old.Task.Task.Revision; Owner = "Agent 1"; AllowReassign = false } context with
+        | Ok _ -> ()
+        | Error err -> Assert.Fail($"Claim old task failed: {err}")
+        let statePath = Path.Combine(project, "docs", "tasks", "302.json")
+        let state = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(statePath))
+        state["status"] <- System.Text.Json.Nodes.JsonValue.Create("blocked")
+        state["nextActor"] <- null
+        state["assignment"] <- null
+        File.WriteAllText(statePath, state.ToJsonString())
+        let current =
+            match createTask
+                { ProjectName = "Project1::controls-282"; TaskId = Some "282"
+                  Title = "Current controls"; Html = "<h1>282</h1>"; Dependencies = [] } context with
+            | Ok task -> task
+            | Error err -> failwith $"Create current task failed: {err}"
+        let claimed =
+            match claimTask
+                { ProjectName = "Project1::controls-282"; TaskId = "282"
+                  ExpectedRevision = current.Task.Task.Revision
+                  Owner = "Agent 1"; AllowReassign = false } context with
+            | Ok task -> task
+            | Error err -> failwith $"Parked owner wrongly blocked current task: {err}"
+        match updateTask
+            { ProjectName = "Project1::controls-282"; TaskId = "282"
+              ExpectedRevision = claimed.Task.Task.Revision
+              Title = None; Status = None; Dependencies = None; DescriptionCommit = None
+              AssignmentInstructions = None; AssignmentBaseCommit = None
+              ExpectedAssignmentRevision = None; NextActor = Some "reviewer"; ActorId = Some "reviewer" } context with
+        | Ok _ -> ()
+        | Error err -> Assert.Fail($"Reviewer handoff failed: {err}")
+        match getAgentAssignment { ProjectName = "Project1"; Agent = "Agent 1" } context with
+        | Ok found ->
+            found.Task.Id |> shouldEqual "282"
+            found.Task.NextActor |> shouldEqual (Some "reviewer")
+        | Error err -> Assert.Fail($"Parked task falsely conflicts: {err}")
+        match getOrchestrationSnapshot
+            { ProjectName = "Project1"; Status = None; Owner = None; NextActor = None
+              ReviewerOnly = false; Offset = 0; Limit = 60; IncludeRetirement = false } context with
+        | Ok snapshot ->
+            snapshot.Assignments |> List.map (fun item -> item.Task.Id) |> shouldEqual ["282"]
+            snapshot.Conflicts.IsEmpty |> shouldEqual true
+            snapshot.ReviewerTaskCount |> shouldEqual 1
+            (snapshot.Worktrees |> List.collect _.Tasks |> List.exists (fun task ->
+                task.Id = "302" && task.Status = "blocked")) |> shouldEqual true
+        | Error err -> Assert.Fail($"Snapshot failed: {err}"))
+
+[<Test>]
+let unrelatedDuplicateTaskDescriptionsDoNotBlockAssignment () =
+    withProject (fun _ project context ->
+        File.WriteAllText(Path.Combine(project, "README.md"), "initial")
+        GitCommandTests.expectGitSuccess context ["add"; "README.md"]
+        GitCommandTests.expectGitSuccess context ["commit"; "-m"; "Initial"]
+        for name in [ "historical"; "gold-pickup" ] do
+            match Client.Worktrees.createWorktree
+                { ProjectName = "Project1"; Name = name
+                  Branch = "feature/" + name; BaseRef = "HEAD" } context with
+            | Ok _ -> ()
+            | Error err -> Assert.Fail($"Worktree {name} failed: {err}")
+        let historical =
+            match Client.Worktrees.listWorktrees { ProjectName = "Project1" } context with
+            | Ok entries -> entries |> List.find (fun entry -> entry.Path.EndsWith("historical")) |> fun entry -> entry.Path
+            | Error err -> failwith $"No historical worktree: {err}"
+        let folder = Path.Combine(historical, "docs", "tasks")
+        Directory.CreateDirectory(folder) |> ignore
+        File.WriteAllText(Path.Combine(folder, "277-first.html"), "<h1>old one</h1>")
+        File.WriteAllText(Path.Combine(folder, "277-second.html"), "<h1>old two</h1>")
+        let created =
+            match createTask
+                { ProjectName = "Project1::gold-pickup"; TaskId = Some "292"
+                  Title = "Gold pickup"; Html = "<h1>Gold pickup</h1>"; Dependencies = [] } context with
+            | Ok task -> task
+            | Error err -> failwith $"Create target task failed: {err}"
+        match listTasks
+            { ProjectName = "Project1::historical"; Status = None; Owner = None
+              DependsOn = None; NextActor = None } context with
+        | Ok tasks ->
+            let old = tasks |> List.find (fun task -> task.Id = "277")
+            old.Diagnostics |> List.exists (fun item -> item.Contains("Multiple HTML")) |> shouldEqual true
+        | Error err -> Assert.Fail($"Historical task scan failed: {err}")
+        let claimed =
+            match claimTask
+                { ProjectName = "Project1::gold-pickup"; TaskId = "292"
+                  ExpectedRevision = created.Task.Task.Revision
+                  Owner = "Agent 2"; AllowReassign = false } context with
+            | Ok task -> task
+            | Error err -> failwith $"Unrelated Task277 blocked ClaimTask: {err}"
+        match assignTask
+            { ProjectName = "Project1"; Agent = "Agent 2"; TaskId = "292"
+              WorktreeName = Some "gold-pickup"; Branch = None; Instructions = "Finish Task292"
+              BaseCommit = None; ExpectedRevision = claimed.Task.Task.Revision
+              ExpectedAssignmentRevision = None; ActorId = "orchestrator" } context with
+        | Ok assigned -> assigned.Task.Task.Owner |> shouldEqual (Some "Agent 2")
+        | Error err -> Assert.Fail($"Unrelated Task277 blocked AssignTask: {err}")
+        match getOrchestrationSnapshot
+            { ProjectName = "Project1"; Status = None; Owner = None; NextActor = None
+              ReviewerOnly = false; Offset = 0; Limit = 60; IncludeRetirement = false } context with
+        | Ok snapshot ->
+            snapshot.TaskDiagnosticCount |> shouldEqual 1
+            snapshot.TaskDiagnostics.Head.Contains("277") |> shouldEqual true
+        | Error err -> Assert.Fail($"Snapshot hid task diagnostics: {err}"))
+
+[<Test>]
+let orchestrationSnapshotPagesLargeRepositoriesWithoutExceedingTransport () =
+    withProject (fun _ project context ->
+        let folder = Path.Combine(project, "docs", "tasks")
+        Directory.CreateDirectory(folder) |> ignore
+        let huge = String.replicate 3000 "x"
+        for index in 0 .. 179 do
+            let taskId = sprintf "history-%03d" index
+            let reviewer = index < 5
+            let status = if reviewer then "active" else "completed"
+            let owner = if reviewer then $"""{{"agent":"Agent {index}"}}""" else "null"
+            let actor = if reviewer then "\"reviewer\"" else "null"
+            File.WriteAllText(Path.Combine(folder, taskId + ".html"), "<h1>History</h1>")
+            let json = $"""{{"schemaVersion":1,"id":"{taskId}","title":"{huge}","status":"{status}","owner":{owner},"nextActor":{actor},"updatedAt":"2026-10-26T20:00:00Z","checkpoint":{{"summary":"{huge}"}}}}"""
+            File.WriteAllText(Path.Combine(folder, taskId + ".json"), json)
+        let query reviewer offset limit =
+            getOrchestrationSnapshot
+                { ProjectName = "Project1"; Status = None; Owner = None; NextActor = None
+                  ReviewerOnly = reviewer; Offset = offset; Limit = limit
+                  IncludeRetirement = false } context
+        match query false 0 60 with
+        | Error err -> Assert.Fail($"Large snapshot failed: {err}")
+        | Ok result ->
+            result.TotalMatches |> shouldEqual 180
+            result.NextOffset |> shouldEqual (Some 60)
+            result.Worktrees |> List.collect _.Tasks |> List.length |> shouldEqual 60
+            result.Assignments.Length |> shouldEqual 5
+            result.ReviewerTaskCount |> shouldEqual 5
+            result.RetirementInspections.IsEmpty |> shouldEqual true
+            let size = System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(result).Length
+            (size < 921600) |> shouldEqual true
+        match query true 0 15 with
+        | Error err -> Assert.Fail($"Reviewer-only snapshot failed: {err}")
+        | Ok result ->
+            result.TotalMatches |> shouldEqual 5
+            result.NextOffset |> shouldEqual None
+            result.Worktrees |> List.collect _.Tasks |> List.length |> shouldEqual 5
+        match query false 60 60 with
+        | Error err -> Assert.Fail($"Second page failed: {err}")
+        | Ok result ->
+            result.Offset |> shouldEqual 60
+            result.NextOffset |> shouldEqual (Some 120)
+            result.Worktrees |> List.collect _.Tasks |> List.length |> shouldEqual 60
+        match getOrchestrationSnapshot
+            { ProjectName = "Project1"; Status = Some "completed"; Owner = None
+              NextActor = None; ReviewerOnly = false; Offset = 0
+              Limit = 15; IncludeRetirement = false } context with
+        | Error err -> Assert.Fail($"Completed filter failed: {err}")
+        | Ok result ->
+            result.TotalMatches |> shouldEqual 175
+            result.Worktrees |> List.collect _.Tasks |> List.length |> shouldEqual 15
+        match query false 0 101 with
+        | Error(Client.ValidationError _) -> ()
+        | other -> Assert.Fail($"Unsafe page limit accepted: {other}"))

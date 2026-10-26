@@ -84,13 +84,14 @@ let fromSnapshots now (results: (string * Result<TaskStore.OrchestrationSnapshot
             | project, Error error ->
                 { Project = project
                   Worktrees = 0; PendingReviews = 0; Unacknowledged = 0
-                  RetirementCandidates = 0; Error = Some error }
+                  RetirementCandidates = 0; RetirementInspected = false; Error = Some error }
             | project, Ok snapshot ->
                 { Project = project
                   Worktrees = snapshot.Worktrees.Length
                   PendingReviews = snapshot.ReviewerTaskCount
                   Unacknowledged = snapshot.UnacknowledgedTaskCount
                   RetirementCandidates = snapshot.RetirementCandidates.Length
+                  RetirementInspected = snapshot.RetirementInspected
                   Error = None })
     { Assignments = assignments
       Projects = projects
@@ -109,7 +110,10 @@ let load rt =
     | Ok projects ->
         projects
         |> Seq.map (fun (ProjectName project) ->
-            let response = TaskStore.getOrchestrationSnapshot { ProjectName = project } rt
+            let response =
+                TaskStore.getOrchestrationSnapshot
+                    { ProjectName = project; Status = None; Owner = None; NextActor = None
+                      ReviewerOnly = false; Offset = 0; Limit = 60; IncludeRetirement = false } rt
             project, response |> Result.mapError string)
         |> Seq.toList
         |> fromSnapshots DateTimeOffset.UtcNow

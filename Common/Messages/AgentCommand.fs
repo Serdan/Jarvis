@@ -84,7 +84,15 @@ type ListTasksCommand = { ProjectName: string; Status: string option; Owner: str
 type GetTaskCommand = { ProjectName: string; TaskId: string }
 type CompareWorktreeTasksCommand = { ProjectName: string; NextActor: string option }
 type GetAgentAssignmentCommand = { ProjectName: string; Agent: string }
-type GetOrchestrationSnapshotCommand = { ProjectName: string }
+type GetOrchestrationSnapshotCommand =
+    { ProjectName: string
+      Status: string option
+      Owner: string option
+      NextActor: string option
+      ReviewerOnly: bool
+      Offset: int
+      Limit: int
+      IncludeRetirement: bool }
 type CreateTaskCommand =
     { ProjectName: string
       TaskId: string option
@@ -959,7 +967,7 @@ module AgentCommandInfo =
         | None -> invocation command
 
 module AgentProtocol =
-    let version = "3.17"
+    let version = "3.18"
     let defaultPatchFuzzyContextLines = 3
     let maxResponseBytes = 900 * 1024
     let maxImageBytes = 8 * 1024 * 1024

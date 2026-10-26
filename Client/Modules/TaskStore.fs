@@ -626,6 +626,12 @@ let private globalAssignmentMutation (projectName: string) (operation: IO<'rt, '
         let gate = projectAssignmentLocks.GetOrAdd(root, fun _ -> obj())
         lock gate (fun () -> operation rt)
 
+// A historical owner on a parked task does not represent an outstanding handoff.
+let private actionable (task: TaskSummary) =
+    task.Status <> "completed"
+    && (task.NextActor = Some "agent" || task.NextActor = Some "reviewer")
+    && task.Owner.IsSome
+
 let private ensureGlobalClaimAvailable (selector: string) (taskId: string) (agent: string) =
     effect {
         let rootName =
@@ -656,26 +662,30 @@ let private ensureGlobalClaimAvailable (selector: string) (taskId: string) (agen
                     | Error error -> failures <- (worktree.Path + ": " + string error) :: failures
                     | Ok tasks ->
                         for task in tasks do
-                            if task.Diagnostics.IsEmpty && task.Status <> "completed" then
-                                let sameTarget =
-                                    String.Equals(Path.GetFullPath selectedRoot, Path.GetFullPath worktree.Path,
-                                                  (if OperatingSystem.IsWindows() then StringComparison.OrdinalIgnoreCase else StringComparison.Ordinal))
-                                let sameTask = sameTarget && task.Id = taskId
-                                if not sameTask && (task.Owner = Some agent || (task.Id = taskId && task.Owner.IsSome)) then
-                                    conflicts <- (worktreeSelector, task) :: conflicts
-                            elif not task.Diagnostics.IsEmpty then
+                            let sameTarget =
+                                String.Equals(Path.GetFullPath selectedRoot, Path.GetFullPath worktree.Path,
+                                              (if OperatingSystem.IsWindows() then StringComparison.OrdinalIgnoreCase else StringComparison.Ordinal))
+                            let sameTask = sameTarget && task.Id = taskId
+                            if sameTask && not task.Diagnostics.IsEmpty then
                                 failures <- (worktree.Path + "/" + task.Id + ": " + String.concat "; " task.Diagnostics) :: failures
+                            elif not sameTask && actionable task &&
+                                 (task.Owner = Some agent || task.Id = taskId) then
+                                conflicts <- (worktreeSelector, task) :: conflicts
                 Ok()
         if not failures.IsEmpty then
-            let details = String.concat "; " failures
-            return! Client.ValidationError("Cannot assign task while global worktree ownership is unreadable: " + details)
+            let details =
+                failures |> List.truncate 8 |> String.concat "; "
+                |> fun summary -> if failures.Length > 8 then summary + $" (+{failures.Length - 8} more)" else summary
+            return! Client.ValidationError("Cannot validate selected task or registered worktree: " + details)
                     |> Effect.ofError
         elif not conflicts.IsEmpty then
             let details =
                 conflicts
+                |> List.truncate 8
                 |> List.map (fun (worktreeSelector, task) ->
                     worktreeSelector + "/" + task.Id + " claimed by " + (task.Owner |> Option.defaultValue "(unknown)"))
                 |> String.concat "; "
+                |> fun summary -> if conflicts.Length > 8 then summary + $" (+{conflicts.Length - 8} more)" else summary
             return! Client.ValidationError("Conflicting active global task ownership: " + details)
                     |> Effect.ofError
         else return ()
@@ -872,7 +882,7 @@ let private activeAssignments projectName agent =
                 groups
                 |> List.collect (fun group ->
                     group.Tasks
-                    |> List.filter (fun task -> task.Owner = Some agent && task.Status <> "completed")
+                    |> List.filter (fun task -> task.Owner = Some agent && actionable task)
                     |> List.map (fun task -> group.Worktree, task))
     }
 
@@ -895,7 +905,9 @@ let getAgentAssignment (cmd: GetAgentAssignmentCommand) =
                     |> List.map (fun (worktree, task) ->
                         let branch = worktree.Branch |> Option.defaultValue "detached"
                         $"{task.Id} [{branch}] {worktree.Path}")
-                let conflictDetails = String.concat "; " collisions
+                let conflictDetails =
+                    collisions |> List.truncate 8 |> String.concat "; "
+                    |> fun summary -> if collisions.Length > 8 then summary + $" (+{collisions.Length - 8} more)" else summary
                 return! Client.ValidationError(
                     $"Conflicting active assignments for agent '{cmd.Agent}': {conflictDetails}. Resolve duplicate ownership before continuing.")
                     |> Effect.ofError
@@ -1179,96 +1191,176 @@ type OrchestrationSnapshot =
       InspectionErrors: string list
       RetirementInspections: WorktreeRetirement list
       RetirementCandidates: string list
-      IntegratedTasks: IntegratedTask list }
+      IntegratedTasks: IntegratedTask list
+      TotalMatches: int
+      Offset: int
+      Limit: int
+      NextOffset: int option
+      TaskDiagnosticCount: int
+      TaskDiagnostics: string list
+      RetirementInspected: bool }
+
+let private truncateSnapshotField limit (value: string) =
+    if value.Length <= limit then value
+    else value.Substring(0, limit - 3) + "..."
+
+let private compactSnapshotTask (task: TaskSummary) =
+    let trim = Option.map (truncateSnapshotField 200)
+    { task with
+        Title = truncateSnapshotField 180 task.Title
+        DescriptionPath = truncateSnapshotField 260 task.DescriptionPath
+        StatePath = truncateSnapshotField 260 task.StatePath
+        CheckpointSummary = trim task.CheckpointSummary
+        CheckpointNextAction = trim task.CheckpointNextAction
+        CheckpointBlocker = trim task.CheckpointBlocker
+        Diagnostics = task.Diagnostics |> List.truncate 2 |> List.map (truncateSnapshotField 180) }
 
 let getOrchestrationSnapshot (cmd: GetOrchestrationSnapshotCommand) =
     effect {
-        let projectName = rootProjectName cmd.ProjectName
-        let! groups = compareWorktreeTasks { ProjectName = projectName; NextActor = None }
-        let inspectionErrors =
-            groups |> List.choose (fun group ->
-                group.Error |> Option.map (fun error -> group.Worktree.Path + ": " + error))
-        let candidates =
-            groups
-            |> List.collect (fun group ->
-                group.Tasks
-                |> List.filter (fun task -> task.Status <> "completed" && task.Owner.IsSome)
-                |> List.map (fun task -> group.Worktree, task))
-        let! assignments, detailsErrors =
-            fun rt ->
-                let mutable found = []
-                let mutable errors = []
-                for worktree, task in candidates do
-                    match assignmentForTask task.Owner.Value projectName worktree task rt with
-                    | Ok assignment -> found <- assignment :: found
-                    | Error error ->
-                        errors <- (worktree.Path + "/" + task.Id + ": " + string error) :: errors
-                Ok(List.rev found, List.rev errors)
-        let! retirementInspections, retirementErrors =
-            fun rt ->
-                let mutable inspected = []
-                let mutable errors = []
-                for group in groups |> List.filter (fun group -> not group.Worktree.IsMain) do
-                    match retireWorktree
-                        { ProjectName = projectName; WorktreePath = group.Worktree.Path
-                          TargetRef = None; DeleteBranch = false; DryRun = true } rt with
-                    | Ok inspection -> inspected <- inspection :: inspected
-                    | Error error ->
-                        errors <- (group.Worktree.Path + ": " + string error) :: errors
-                Ok(List.rev inspected, List.rev errors)
-        let ownershipConflicts =
-            assignments
-            |> List.groupBy (fun assignment -> assignment.Agent)
-            |> List.choose (fun (agent, matches) ->
-                if matches.Length > 1 then
-                    Some("Agent " + agent + " has " + string matches.Length + " active assignments: " +
-                         (matches |> List.map (fun item -> item.ProjectName + "/" + item.Task.Id) |> String.concat ", "))
-                else None)
-        let duplicateTasks =
-            assignments
-            |> List.groupBy (fun assignment -> assignment.Task.Id)
-            |> List.choose (fun (taskId, matches) ->
-                if matches.Length > 1 then
-                    Some("Task " + taskId + " is actively claimed in " + string matches.Length + " worktrees: " +
-                         (matches |> List.map (fun item -> item.ProjectName) |> String.concat ", "))
-                else None)
-        return
-            { ProjectName = projectName
-              Worktrees = groups
-              Assignments = assignments
-              Conflicts = ownershipConflicts @ duplicateTasks
-              ReviewerTaskCount = assignments |> List.filter (fun item -> item.Task.NextActor = Some "reviewer") |> List.length
-              UnacknowledgedTaskCount =
-                  assignments
-                  |> List.filter (fun item ->
-                      item.AssignmentRevision.IsSome &&
-                      item.AssignmentRevision <> item.AcknowledgedAssignmentRevision &&
-                      item.Task.NextActor = Some "agent")
-                  |> List.length
-              InspectionErrors = inspectionErrors @ detailsErrors @ retirementErrors
-              RetirementInspections = retirementInspections
-              RetirementCandidates =
-                  retirementInspections
-                  |> List.filter (fun item -> item.CanRetire)
-                  |> List.map (fun item -> item.Worktree.Path)
-              IntegratedTasks =
-                  groups
-                  |> List.collect (fun group ->
-                      let integrated =
-                          group.Worktree.IsMain ||
-                          (retirementInspections
-                           |> List.exists (fun inspection ->
-                               inspection.Worktree.Path = group.Worktree.Path &&
-                               inspection.SourceEquivalent))
-                      if not integrated then []
-                      else
-                          group.Tasks
-                          |> List.filter (fun task -> task.Status = "completed")
-                          |> List.map (fun task ->
-                              { Worktree = group.Worktree
-                                Task = task; Phase = "Integrated" })) }
+        if cmd.Offset < 0 || cmd.Limit < 1 || cmd.Limit > 100 then
+            return! Client.ValidationError "Snapshot offset must be nonnegative and limit must be between 1 and 100." |> Effect.ofError
+        else
+            let projectName = rootProjectName cmd.ProjectName
+            let! groups = compareWorktreeTasks { ProjectName = projectName; NextActor = None }
+            let allTasks =
+                groups |> List.collect (fun group ->
+                    group.Tasks |> List.map (fun task -> group.Worktree, task))
+            let actionableTasks =
+                allTasks |> List.filter (fun (_, task) -> actionable task)
+            // Historical owners and parked tasks are never live assignment conflicts.
+            let owners =
+                actionableTasks
+                |> List.groupBy (fun (_, task) -> task.Owner.Value)
+                |> List.choose (fun (owner, items) ->
+                    if items.Length < 2 then None
+                    else
+                        let examples =
+                            items |> List.truncate 4
+                            |> List.map (fun (wt, task) -> wt.Path + "/" + task.Id)
+                            |> String.concat ", "
+                        Some("Agent " + owner + " has " + string items.Length +
+                             " actionable assignments: " + examples))
+            let collisions =
+                actionableTasks
+                |> List.groupBy (fun (_, task) -> task.Id)
+                |> List.choose (fun (taskId, items) ->
+                    if items.Length < 2 then None
+                    else Some("Task " + taskId + " has " + string items.Length +
+                              " actionable claims across registered worktrees"))
+            let diagnostics =
+                allTasks
+                |> List.collect (fun (worktree, task) ->
+                    task.Diagnostics
+                    |> List.map (fun diag -> worktree.Path + "/" + task.Id + ": " + diag))
+            let inspectionErrors =
+                groups |> List.choose (fun group ->
+                    group.Error |> Option.map (fun error -> group.Worktree.Path + ": " + error))
+            let matches (_, task: TaskSummary) =
+                (cmd.Owner.IsNone || task.Owner = cmd.Owner)
+                && (cmd.Status.IsNone || Some task.Status = cmd.Status)
+                && (cmd.NextActor.IsNone || task.NextActor = cmd.NextActor)
+                && (not cmd.ReviewerOnly || task.NextActor = Some "reviewer")
+            let filtered =
+                allTasks
+                |> List.filter matches
+                |> List.sortBy (fun (worktree, task) ->
+                    (if actionable task then 0 else 1),
+                    -(task.UpdatedAt |> Option.map (fun value -> value.UtcTicks) |> Option.defaultValue 0L),
+                    worktree.Path, task.Id)
+            let page = filtered |> List.skip (min filtered.Length cmd.Offset) |> List.truncate cmd.Limit
+            let pageKeys =
+                page |> List.map (fun (wt, task) -> wt.Path, task.Id) |> Set.ofList
+            let compactGroups =
+                groups
+                |> List.map (fun group ->
+                    let tasks =
+                        group.Tasks
+                        |> List.filter (fun task -> pageKeys.Contains(group.Worktree.Path, task.Id))
+                        |> List.map compactSnapshotTask
+                    { group with Tasks = tasks })
+            let! allActionableDetails, detailErrors =
+                fun rt ->
+                    let mutable found = []
+                    let mutable errors = []
+                    for worktree, task in actionableTasks do
+                        match assignmentForTask task.Owner.Value projectName worktree task rt with
+                        | Ok assignment ->
+                            found <- assignment :: found
+                        | Error error ->
+                            if errors.Length < 8 then
+                                errors <- (worktree.Path + "/" + task.Id + ": " + string error) :: errors
+                    Ok(List.rev found, List.rev errors)
+            let selected =
+                allActionableDetails
+                |> List.filter (fun assignment ->
+                    pageKeys.Contains(assignment.Worktree.Path, assignment.Task.Id))
+                |> List.map (fun assignment ->
+                    { assignment with
+                        Task = compactSnapshotTask assignment.Task
+                        // Full instructions are available from GetAgentAssignment,
+                        // not repeated in every global snapshot page.
+                        AssignmentInstructions = None })
+            let! retirement, retirementErrors =
+                if not cmd.IncludeRetirement then fun _ -> Ok([], [])
+                else
+                    fun rt ->
+                        let mutable found = []
+                        let mutable errors = []
+                        for group in groups |> List.filter (fun group -> not group.Worktree.IsMain) do
+                            match retireWorktree
+                                { ProjectName = projectName; WorktreePath = group.Worktree.Path
+                                  TargetRef = None; DeleteBranch = false; DryRun = true } rt with
+                            | Ok inspection ->
+                                found <- { inspection with
+                                            TaskOnlyCommitsPreservedOnBranch =
+                                                inspection.TaskOnlyCommitsPreservedOnBranch |> List.truncate 8
+                                            Reasons = inspection.Reasons |> List.truncate 5 } :: found
+                            | Error error ->
+                                if errors.Length < 8 then
+                                    errors <- (group.Worktree.Path + ": " + string error) :: errors
+                        Ok(List.rev found, List.rev errors)
+            let integrated =
+                compactGroups
+                |> List.collect (fun group ->
+                    let verified =
+                        group.Worktree.IsMain ||
+                        (retirement |> List.exists (fun item ->
+                            item.Worktree.Path = group.Worktree.Path && item.SourceEquivalent))
+                    if not verified then []
+                    else
+                        group.Tasks
+                        |> List.filter (fun task -> task.Status = "completed")
+                        |> List.map (fun task ->
+                            { Worktree = group.Worktree; Task = task; Phase = "Integrated" }))
+            let count = filtered.Length
+            return
+                { ProjectName = projectName
+                  Worktrees = compactGroups
+                  Assignments = selected
+                  Conflicts = (owners @ collisions) |> List.truncate 12
+                  ReviewerTaskCount =
+                      actionableTasks
+                      |> List.filter (fun (_, task) -> task.NextActor = Some "reviewer")
+                      |> List.length
+                  UnacknowledgedTaskCount =
+                      allActionableDetails
+                      |> List.filter (fun item ->
+                          item.AssignmentRevision.IsSome
+                          && item.AssignmentRevision <> item.AcknowledgedAssignmentRevision
+                          && item.Task.NextActor = Some "agent")
+                      |> List.length
+                  InspectionErrors = (inspectionErrors @ detailErrors @ retirementErrors) |> List.truncate 12
+                  RetirementInspections = retirement
+                  RetirementCandidates = retirement |> List.filter (fun item -> item.CanRetire) |> List.map (fun item -> item.Worktree.Path)
+                  IntegratedTasks = integrated
+                  TotalMatches = count
+                  Offset = cmd.Offset
+                  Limit = cmd.Limit
+                  NextOffset = if cmd.Offset + page.Length < count then Some(cmd.Offset + page.Length) else None
+                  TaskDiagnosticCount = diagnostics.Length
+                  TaskDiagnostics = diagnostics |> List.truncate 12 |> List.map (truncateSnapshotField 260)
+                  RetirementInspected = cmd.IncludeRetirement }
     }
-
 
 let beginTask (cmd: BeginTaskCommand) =
     updateState cmd.ProjectName cmd.TaskId cmd.ExpectedRevision $"Begin task {cmd.TaskId}"

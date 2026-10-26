@@ -75,7 +75,9 @@ let snapshotAdapterPreservesAssignmentIdentityAndInspectionFailures () =
         { ProjectName = "Wayfold"; Worktrees = [group]; Assignments = [assigned]
           Conflicts = ["Agent 2 duplicate"]; ReviewerTaskCount = 0
           UnacknowledgedTaskCount = 1; InspectionErrors = ["one worktree unreadable"]
-          RetirementInspections = []; RetirementCandidates = []; IntegratedTasks = [] }
+          RetirementInspections = []; RetirementCandidates = []; IntegratedTasks = []
+          TotalMatches = 1; Offset = 0; Limit = 60; NextOffset = None
+          TaskDiagnosticCount = 0; TaskDiagnostics = []; RetirementInspected = false }
     let data = fromSnapshots DateTimeOffset.UtcNow
                     [ "Wayfold", Ok source; "NonGit", Error "not a Git repository" ]
     data.Assignments.Head.Selector |> shouldEqual "Wayfold::gold"
@@ -137,7 +139,9 @@ let completedWorkRemainsVisibleAfterActiveAssignmentDisappears () =
           InspectionErrors = []
           RetirementInspections = []
           RetirementCandidates = []
-          IntegratedTasks = [] }
+          IntegratedTasks = []
+          TotalMatches = 1; Offset = 0; Limit = 60; NextOffset = None
+          TaskDiagnosticCount = 0; TaskDiagnostics = []; RetirementInspected = false }
     let inProgress = { completedTask with Status = "active"; Revision = Some "progress"; NextActor = Some "reviewer" }
     let activeAssignment : Client.TaskStore.AgentAssignment =
         { Agent = "Agent 2"; ProjectName = "Wayfold::Wayfold-finished"

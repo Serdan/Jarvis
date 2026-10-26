@@ -855,7 +855,11 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                     Console.WriteLine(trim label (max 15 (width - 23)))
             agentSnapshot |> Option.iter (fun snapshot ->
                 Console.WriteLine ""
-                Console.WriteLine(trim $"Projects: {snapshot.Projects.Length}; retirement candidates: {snapshot.Projects |> List.sumBy _.RetirementCandidates}" width)
+                let checkedProjects = snapshot.Projects |> List.filter _.RetirementInspected
+                let candidateStatus =
+                    if checkedProjects.IsEmpty then "not inspected"
+                    else string (checkedProjects |> List.sumBy _.RetirementCandidates)
+                Console.WriteLine(trim $"Projects: {snapshot.Projects.Length}; retirement candidates: {candidateStatus}" width)
                 for project in snapshot.Projects |> List.filter (fun p -> p.Error.IsSome) |> List.truncate 3 do
                     Console.WriteLine(trim $"{project.Project}: {project.Error.Value}" width)
                 for conflict in snapshot.Conflicts |> List.truncate 3 do

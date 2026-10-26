@@ -18,7 +18,14 @@ type Assignment =
       AssignmentRevision: string option
       AcknowledgedRevision: string option
       Instructions: string option
-      BaseCommit: string option }
+      BaseCommit: string option
+      UpdatedAt: DateTimeOffset option
+      LastUpdatedBy: string option
+      CheckpointSummary: string option
+      CheckpointNextAction: string option
+      CheckpointLastCommit: string option
+      CheckpointBlocker: string option
+      CompletionFinalCommit: string option }
 
 type ProjectSummary =
     { Project: string
@@ -43,22 +50,34 @@ type AgentRow =
       Assignments: Assignment list
       Conflict: bool }
 
+let private active (item: Assignment) = item.Status <> "completed"
+
+let private dateOrder (item: Assignment) =
+    item.UpdatedAt |> Option.defaultValue DateTimeOffset.MinValue
+
 let rows (snapshot: Snapshot) =
     snapshot.Assignments
     |> List.groupBy (fun item -> item.Project, item.Agent)
-    |> List.map (fun ((project, agent), assignments) ->
+    |> List.map (fun ((project, agent), entries) ->
+        let activeAssignments = entries |> List.filter active
+        let recentCompleted =
+            entries
+            |> List.filter (active >> not)
+            |> List.sortByDescending dateOrder
+            |> List.truncate 3
+        let assignments = (activeAssignments |> List.sortByDescending dateOrder) @ recentCompleted
         let conflict =
-            assignments.Length > 1
+            activeAssignments.Length > 1
             || (snapshot.Conflicts |> List.exists (fun message ->
                 message.Contains(project, StringComparison.OrdinalIgnoreCase)
                 && (message.Contains(agent, StringComparison.OrdinalIgnoreCase)
-                    || (assignments |> List.exists (fun assignment ->
+                    || (activeAssignments |> List.exists (fun assignment ->
                         message.Contains("Task " + assignment.TaskId + " ", StringComparison.OrdinalIgnoreCase))))))
         { Key = project + "::" + agent
           Agent = agent
           Project = project
           Projects = [project]
-          Assignments = assignments |> List.sortBy (fun item -> item.TaskId, item.Worktree)
+          Assignments = assignments
           Conflict = conflict })
     |> List.sortBy (fun item ->
         (if item.Conflict then 0 else 1), item.Project.ToLowerInvariant(), item.Agent.ToLowerInvariant())
@@ -95,5 +114,28 @@ let agentSummary (row: AgentRow) =
     else
         row.Assignments
         |> List.tryHead
-        |> Option.map (fun item -> $"{item.Project}/{item.TaskId} - {phaseLabel item.Phase}")
-        |> Option.defaultValue "No active assignment"
+        |> Option.map (fun item ->
+            let additional = row.Assignments |> List.filter (active >> not) |> List.length
+            let suffix = if additional > 0 && active item then $" (+{additional} completed)" else ""
+            $"{item.Project}/{item.TaskId} - {phaseLabel item.Phase}{suffix}")
+        |> Option.defaultValue "No recent tasks"
+
+let private identity (task: Assignment) =
+    task.Project, task.Agent, task.Worktree, task.TaskId
+
+let changedAgents (before: Snapshot) (after: Snapshot) =
+    let previous =
+        before.Assignments
+        |> List.map (fun item -> identity item, item)
+        |> Map.ofList
+    after.Assignments
+    |> List.choose (fun item ->
+        match previous |> Map.tryFind (identity item) with
+        | Some prior
+            when prior.Status = item.Status
+                 && prior.Phase = item.Phase
+                 && prior.UpdatedAt = item.UpdatedAt
+                 && prior.CheckpointSummary = item.CheckpointSummary
+                 && prior.CompletionFinalCommit = item.CompletionFinalCommit -> None
+        | _ -> Some(item.Project + "::" + item.Agent))
+    |> Set.ofList

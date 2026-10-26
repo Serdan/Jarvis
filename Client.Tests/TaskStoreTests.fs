@@ -145,6 +145,10 @@ let ``claim checkpoint and completion retain committed history`` () =
             | Ok outcome -> outcome
             | Error e -> failwith $"Checkpoint failed: {e}"
         progressed.Task.StateJson.Value.Contains("Verify") |> shouldEqual true
+        progressed.Task.Task.UpdatedAt.IsSome |> shouldEqual true
+        progressed.Task.Task.CheckpointSummary |> shouldEqual (Some "Implemented first slice")
+        progressed.Task.Task.CheckpointNextAction |> shouldEqual (Some "Verify")
+        progressed.Task.Task.LastUpdatedBy |> shouldEqual (Some "agent:agent-a")
         let completed =
             match completeTask
                 { ProjectName = "Project1"; TaskId = "chain"; ExpectedRevision = progressed.Task.Task.Revision
@@ -152,6 +156,19 @@ let ``claim checkpoint and completion retain committed history`` () =
             | Ok outcome -> outcome
             | Error e -> failwith $"Complete failed: {e}"
         completed.Task.Task.Status |> shouldEqual "completed"
+        completed.Task.Task.UpdatedAt.IsSome |> shouldEqual true
+        completed.Task.Task.CheckpointSummary |> shouldEqual (Some "Implemented first slice")
+        completed.Task.Task.CompletionFinalCommit |> shouldEqual (Some "abc123")
+        match listTasks
+            { ProjectName = "Project1"; Status = None; Owner = None
+              DependsOn = None; NextActor = None } context with
+        | Ok [ item ] ->
+            item.Status |> shouldEqual "completed"
+            item.Owner |> shouldEqual (Some "agent-a")
+            item.CheckpointSummary |> shouldEqual (Some "Implemented first slice")
+            item.CompletionFinalCommit |> shouldEqual (Some "abc123")
+            item.UpdatedAt.IsSome |> shouldEqual true
+        | other -> Assert.Fail($"Completion missing from task summary: {other}")
         completed.Task.Html |> shouldEqual "<h1>Chain</h1>"
         match getTaskHistory { ProjectName = "Project1"; TaskId = "chain"; Limit = Some 20 } context with
         | Ok history ->

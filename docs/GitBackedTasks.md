@@ -89,7 +89,7 @@ Mutations reject pre-existing staged or unstaged task JSON edits, preserve unkno
 
 ## Existing checkpoint API
 
-The existing `AttachWorkTask`, `GetWorkTask`, `ListWorkTasks`, `CheckpointWorkTask` and `CompleteWorkTask` commands are supported for current callers.
+The legacy WorkTask MCP commands are retired. `ListTasks` / `GetTask` resolve committed task state; `ClaimTask` / `UpdateTask` issue ownership and revisioned assignments; `CheckpointTask` hands verified progress to the reviewer; `CompleteTask` records fully accepted work. Local `.jarvis/tasks/` files are historical data only and cannot override repository state.
 
 For canonical HTML tasks, attaching creates Git-backed JSON state, checkpointing updates it, and completion retains it. An older ignored `.jarvis/tasks/<id>.json` checkpoint for an HTML task is carried into the repository JSON at its next checkpoint update; the local record is retired only after the commit succeeds. Until migration, reads can still recover the existing checkpoint.
 

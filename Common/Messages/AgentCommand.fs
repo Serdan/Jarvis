@@ -1012,11 +1012,6 @@ module AgentProtocol =
           definition "RunCommand" "Runs a bounded local process." [ ProcessExecution ] true true false
           definition "ListProjectTasks" "Lists locally configured project tasks." [ ReadOnly ] false false false
           definition "RunProjectTask" "Runs a locally configured project task." [ ProcessExecution ] true true false
-          definition "AttachWorkTask" "Attaches local execution state to a committed task description in the project repository." [] true false false
-          definition "GetWorkTask" "Reads one persisted project work task and its current committed task description." [ ReadOnly ] false false false
-          definition "ListWorkTasks" "Lists unfinished persisted project work tasks." [ ReadOnly ] false false false
-          definition "CheckpointWorkTask" "Updates the execution checkpoint for a persisted project work task." [] true false false
-          definition "CompleteWorkTask" "Completes a persisted project work task and deletes its local execution-state file." [] true false false
           definition "ListSkills" "Lists project-local Jarvis skills." [ ReadOnly ] false false false
           definition "GetSkill" "Reads a project-local Jarvis skill." [ ReadOnly ] false false false
           definition "CreateSkill" "Creates a project-local Jarvis skill." [ WorkspaceWrite ] true true false

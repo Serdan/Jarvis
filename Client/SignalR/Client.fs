@@ -70,6 +70,8 @@ let private auditDetails command =
     match command with
     | ImportFileCommand cmd -> Some("ImportFile", Some cmd.ProjectName, [ WorkspaceWrite; NetworkAccess ], [ cmd.FilePath ], None, [])
     | UpdateClientCommand -> Some("UpdateClient", None, [ ProcessExecution; NetworkAccess; Destructive ], [], None, [])
+    | BrowserExecuteFileCommand cmd -> Some("BrowserExecuteFile", Some cmd.ProjectName, [ ProcessExecution; NetworkAccess ], [cmd.ScriptPath], None, [])
+    | BrowserExecuteJsCommand cmd -> Some("BrowserExecuteJs", None, [ ProcessExecution; NetworkAccess ], [], None, [])
     | WriteFileCommand cmd -> Some("WriteFile", Some cmd.ProjectName, [ WorkspaceWrite ], [ cmd.FilePath ], None, [])
     | PatchFileCommand cmd -> Some("PatchFile", Some cmd.ProjectName, [ WorkspaceWrite ], [ cmd.FilePath ], None, [])
     | RunCommandCommand cmd -> Some("RunCommand", Some cmd.ProjectName, [ ProcessExecution ], [], Some cmd.Executable, cmd.Args)
@@ -192,6 +194,48 @@ let private importFile (cmd: ImportFileCommand) (rt: Runtime) =
 let private dispatch (rt: Runtime) (command: AgentCommand) =
     match command with
     | ListCommandsCommand -> rt |> ProjectBrowser.listCommands |> serialize'
+    | BrowserListTabsCommand ->
+        match rt.Browser with
+        | None -> ValueTask<Result<string,EffectError>>(Error(Client.ValidationError "BridgeDisabled"))
+        | Some bridge ->
+            let result = bridge.ListTabs() |> Result.mapError Client.ValidationError
+            ValueTask<Result<string,EffectError>>(result)
+    | BrowserExecuteFileCommand cmd ->
+        ValueTask<Result<string,EffectError>>(task {
+            match rt.Browser with
+            | None -> return Error(Client.ValidationError "BridgeDisabled")
+            | Some bridge ->
+                match ProjectPaths.validateProjectRelativePath cmd.ScriptPath with
+                | Error error -> return Error error
+                | Ok _ when not (cmd.ScriptPath.EndsWith(".js", StringComparison.OrdinalIgnoreCase)) ->
+                    return Error(Client.ValidationError "Browser script must be a .js file.")
+                | Ok _ ->
+                    match ProjectPaths.resolveProjectFile cmd.ProjectName cmd.ScriptPath rt with
+                    | Error error -> return Error error
+                    | Ok(FilePath path) ->
+                        try
+                            let info = FileInfo(path)
+                            if info.Length > int64 BrowserBridge.MaxScriptBytes then
+                                return Error(Client.ValidationError "InputTooLarge: script exceeds 64 KiB.")
+                            else
+                                let source = File.ReadAllText(path, UTF8Encoding(false, true))
+                                let! outcome = bridge.Execute(cmd.TabRegistration, source, defaultArg cmd.ArgsJson "{}", defaultArg cmd.TimeoutMs 15000, false)
+                                return outcome |> Result.mapError Client.ValidationError
+                        with
+                        | :? DecoderFallbackException ->
+                            return Error(Client.ValidationError "InvalidUtf8")
+                        | :? FileNotFoundException ->
+                            return Error(Client.NotFoundError "ScriptNotFound")
+                        | ex -> return Error(Client.ExceptionError ex)
+        })
+    | BrowserExecuteJsCommand cmd ->
+        ValueTask<Result<string,EffectError>>(task {
+            match rt.Browser with
+            | None -> return Error(Client.ValidationError "BridgeDisabled")
+            | Some bridge ->
+                let! outcome = bridge.Execute(cmd.TabRegistration, cmd.Code, defaultArg cmd.ArgsJson "{}", defaultArg cmd.TimeoutMs 15000, true)
+                return outcome |> Result.mapError Client.ValidationError
+        })
     | ListWorktreesCommand cmd -> rt |> Worktrees.listWorktrees cmd |> serialize'
     | GetWorktreeCommand cmd -> rt |> Worktrees.getWorktree cmd |> serialize'
     | CreateWorktreeCommand cmd -> rt |> Worktrees.createWorktree cmd |> serialize'

@@ -46,6 +46,7 @@ let private runConfigCommand (args: string array) =
                 printfn "Trust: %s" config.TrustLevel
                 printfn "Allowed environment variables: %s" (String.concat ", " config.AllowedEnvironmentVariables)
                 printfn "Maximum import bytes: %d" config.MaxImportBytes
+                printfn "Browser bridge port: %s" (config.BrowserPort |> Option.map string |> Option.defaultValue "disabled")
                 0
         match args |> Array.toList with
         | [ "config"; "path" ] -> printfn "%s" snapshot.Path; 0
@@ -129,7 +130,7 @@ let private runClient args =
         | Ok result -> result
         | Error message ->
             eprintfn "%s" message
-            eprintfn "Usage: JarvisClient [--path <workspace>] [--machine-name <name>] [--trust none|partial|full] [--allow-env NAME]... [--max-import-bytes BYTES]"
+            eprintfn "Usage: JarvisClient [--path <workspace>] [--machine-name <name>] [--trust none|partial|full] [--allow-env NAME]... [--max-import-bytes BYTES] [--browser-port PORT]"
             exit 2
 
     let dir = effective.WorkspacePath
@@ -158,6 +159,16 @@ let private runClient args =
           Effective = effective }
     ProcessEnvironment.configureAllowedEnvironmentVariables allowedEnvironmentVariables
     let rt = Runtime(getDir dir, tui, trustLevel, maxImportBytes)
+    // Opt-in local browser bridge. The extension must authenticate and register a tab.
+    let browserPort = effective.BrowserPort
+    let browser =
+        browserPort |> Option.map (fun port ->
+            let bridge = BrowserBridge.Service(port, BrowserBridge.getOrCreateSecret())
+            bridge.Start()
+            rt.Browser <- Some bridge
+            tui.Log $"Browser bridge listening on 127.0.0.1:{port}; only manually registered tabs can be used."
+            bridge)
+
     let formatJobResult value = value |> Result.mapError (fun error -> sprintf "%A" error)
     tui.SetJobAccess
         { List = (fun () ->
@@ -261,6 +272,7 @@ let private runClient args =
                     ()
 
         cts.Cancel()
+        browser |> Option.iter (fun bridge -> (bridge :> IDisposable).Dispose())
         do! connection.DisposeAsync()
 
         activityStore
@@ -278,7 +290,15 @@ let private runClient args =
 
 [<EntryPoint>]
 let main args =
-    if args.Length = 2 && args[0] = "config" && args[1] = "path" then
+    if args.Length = 2 && args[0] = "browser" && args[1] = "pair" then
+        printfn "Pairing secret (keep private): %s" (BrowserBridge.getOrCreateSecret())
+        0
+    elif args.Length = 2 && args[0] = "browser" && args[1] = "revoke" then
+        let path = BrowserBridge.secretFile()
+        if File.Exists(path) then File.Delete(path)
+        printfn "Previous browser extension pairing revoked. Restart JarvisClient to apply."
+        0
+    elif args.Length = 2 && args[0] = "config" && args[1] = "path" then
         printfn "%s" (ClientConfig.configPath())
         0
     elif args.Length > 0 && args[0] = "config" then runConfigCommand args

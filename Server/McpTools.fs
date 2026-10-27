@@ -248,6 +248,7 @@ module McpToolHelpers =
         match command with
         | ListCommandsCommand
         | ListProjectsCommand
+        | BrowserListTabsCommand
         | ListWorktreesCommand _
         | GetWorktreeCommand _
         | InspectWorktreeRemovalCommand _
@@ -284,6 +285,8 @@ module McpToolHelpers =
         | CreateSkillCommand _
         | PatchFileCommand _ -> Auth.WorkspaceWrite
         | UpdateClientCommand -> Auth.ProcessExecute
+        | BrowserExecuteFileCommand _
+        | BrowserExecuteJsCommand _
         | RunCommandCommand _
         | RunProjectTaskCommand _
         | StartJobCommand _
@@ -1034,6 +1037,38 @@ type JarvisMcpTools =
             IncludeGlobs = includeGlobs |> Array.toList
             ExcludeGlobs = excludeGlobs |> Array.toList
             MaxResults = McpToolHelpers.optionOfNullable maxResults })
+
+    [<McpServerTool(Title = "List registered browser tabs", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false);
+      McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]""");
+      Description("List only tabs manually registered by the user in the local Jarvis browser extension.")>]
+    static member BrowserListTabs([<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http BrowserListTabsCommand
+
+    [<McpServerTool(Title = "Execute browser project script", ReadOnly = false, Destructive = true, Idempotent = false, OpenWorld = true);
+      McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["process:execute","workspace:read"]}]""");
+      Description("Execute a project-relative .js file inside a user-registered browser tab. argsJson is a JSON object. Side effects may persist even if transport times out.")>]
+    static member BrowserExecuteFile(projectName: string, scriptPath: string, tabRegistration: string,
+                                      [<Optional; DefaultParameterValue("")>] argsJson: string,
+                                      timeoutMs: Nullable<int>,
+                                      [<Optional; DefaultParameterValue("")>] deviceId: string,
+                                      client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http (BrowserExecuteFileCommand {
+            ProjectName = projectName; ScriptPath = scriptPath; TabRegistration = tabRegistration
+            ArgsJson = McpToolHelpers.optionOfString argsJson
+            TimeoutMs = McpToolHelpers.optionOfNullable timeoutMs })
+
+    [<McpServerTool(Title = "Execute browser JavaScript", ReadOnly = false, Destructive = true, Idempotent = false, OpenWorld = true);
+      McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["process:execute"]}]""");
+      Description("Execute inline JavaScript in a manually registered browser tab. Only intended for investigation; use BrowserExecuteFile for maintained scripts.")>]
+    static member BrowserExecuteJs(tabRegistration: string, code: string,
+                                    [<Optional; DefaultParameterValue("")>] argsJson: string,
+                                    timeoutMs: Nullable<int>,
+                                    [<Optional; DefaultParameterValue("")>] deviceId: string,
+                                    client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http (BrowserExecuteJsCommand {
+            TabRegistration = tabRegistration; Code = code
+            ArgsJson = McpToolHelpers.optionOfString argsJson
+            TimeoutMs = McpToolHelpers.optionOfNullable timeoutMs })
 
     [<McpServerTool(Title = "Read file", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read one project file.")>]
     static member ReadFile(projectName: string, filePath: string, startLine: Nullable<int>, endLine: Nullable<int>, includeLineNumbers: Nullable<bool>, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =

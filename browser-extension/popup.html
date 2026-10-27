@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Jarvis Browser Bridge</title>
+<style>
+body { min-width: 325px; max-width: 380px; font: 14px system-ui, sans-serif; margin: 16px; }
+h1 { font-size: 16px; margin-top: 0; }
+label { display: block; margin: 10px 0 5px; }
+input { width: 100%; box-sizing: border-box; padding: 7px; }
+button { padding: 6px 9px; margin: 7px 5px 3px 0; cursor: pointer; }
+li { margin-bottom: 10px; overflow-wrap: anywhere; }
+small, .muted { color: #666; font-size: 12px; }
+#status { padding: 6px 0; }
+#error { color: #a52323; white-space: pre-wrap; }
+</style></head><body>
+<h1>Jarvis Browser Bridge</h1>
+<div id="status">Loading...</div>
+<label for="port">Local bridge port</label><input id="port" inputmode="numeric" value="43822" />
+<label for="secret">Pairing secret (JarvisClient browser pair)</label>
+<input id="secret" type="password" autocomplete="off" placeholder="Only needed when pairing" />
+<button id="pair">Pair / connect</button><button id="disconnect">Revoke pairing</button>
+<hr><div class="muted">Current tab</div><div id="current">...</div>
+<label for="alias">Registration name</label>
+<input id="alias" placeholder="e.g. agent-7" maxlength="128" />
+<button id="register">Register / reauthorize tab</button>
+<button id="unregister">Unregister current tab</button>
+<h2 style="font-size:14px">Registered tabs</h2><ul id="tabs"></ul>
+<p id="error" role="alert"></p>
+<script src="popup.js"></script></body></html>

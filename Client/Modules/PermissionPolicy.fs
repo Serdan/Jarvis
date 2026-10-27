@@ -108,6 +108,7 @@ let private requiresConfirmation command =
     match command with
     | ListCommandsCommand
     | ListProjectsCommand
+    | BrowserListTabsCommand
     | ListWorktreesCommand _
     | GetWorktreeCommand _
     | InspectWorktreeRemovalCommand _
@@ -139,6 +140,10 @@ let private requiresConfirmation command =
     | GetJobResultCommand _
     | MessageCommand _
     | GetClientActivityCommand _ -> readOnly
+    | BrowserExecuteFileCommand cmd ->
+        confirmation "BrowserExecuteFile" (Some cmd.ProjectName) [ ProcessExecution; NetworkAccess ] [ cmd.ScriptPath ] None [] ("Execute browser script in registered tab " + cmd.TabRegistration) false
+    | BrowserExecuteJsCommand cmd ->
+        confirmation "BrowserExecuteJs" None [ ProcessExecution; NetworkAccess ] [] None [] ("Execute JavaScript in registered tab " + cmd.TabRegistration) false
     | ImportFileCommand cmd ->
         confirmation "ImportFile" (Some cmd.ProjectName) [ WorkspaceWrite; NetworkAccess ] [ cmd.FilePath ] None [] $"Import file {cmd.FilePath}" false
     | UpdateClientCommand ->
@@ -185,6 +190,8 @@ let private requiresConfirmation command =
 let private trustAllows trustLevel command =
     match trustLevel, command with
     | FullTrust, _ -> true
+    | PartialTrust, BrowserExecuteFileCommand _
+    | PartialTrust, BrowserExecuteJsCommand _
     | PartialTrust, RunCommandCommand _
     | PartialTrust, RunProjectTaskCommand _
     | PartialTrust, StartJobCommand _

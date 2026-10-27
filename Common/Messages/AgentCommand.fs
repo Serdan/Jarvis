@@ -63,6 +63,20 @@ type ListCommandsResult =
 
 type ListProjectsCommand = struct end
 
+type BrowserListTabsCommand = struct end
+type BrowserExecuteFileCommand =
+    { ProjectName: string
+      ScriptPath: string
+      TabRegistration: string
+      ArgsJson: string option
+      TimeoutMs: int option }
+type BrowserExecuteJsCommand =
+    { TabRegistration: string
+      Code: string
+      ArgsJson: string option
+      TimeoutMs: int option }
+
+
 type ListWorktreesCommand = { ProjectName: string }
 type GetWorktreeCommand = { ProjectName: string; WorktreePath: string }
 type CreateWorktreeCommand =
@@ -552,6 +566,9 @@ type AgentCommandResponse =
 type AgentCommand =
     | ListCommandsCommand
     | ListProjectsCommand
+    | BrowserListTabsCommand
+    | BrowserExecuteFileCommand of BrowserExecuteFileCommand
+    | BrowserExecuteJsCommand of BrowserExecuteJsCommand
     | ListWorktreesCommand of ListWorktreesCommand
     | GetWorktreeCommand of GetWorktreeCommand
     | CreateWorktreeCommand of CreateWorktreeCommand
@@ -609,6 +626,9 @@ module AgentCommandInfo =
     let name = function
         | ListCommandsCommand -> "ListCommandsCommand"
         | ListProjectsCommand -> "ListProjectsCommand"
+        | BrowserListTabsCommand -> "BrowserListTabsCommand"
+        | BrowserExecuteFileCommand _ -> "BrowserExecuteFileCommand"
+        | BrowserExecuteJsCommand _ -> "BrowserExecuteJsCommand"
         | ListWorktreesCommand _ -> "ListWorktreesCommand"
         | GetWorktreeCommand _ -> "GetWorktreeCommand"
         | CreateWorktreeCommand _ -> "CreateWorktreeCommand"
@@ -672,6 +692,9 @@ module AgentCommandInfo =
     let displayName = function
         | ListCommandsCommand -> "ListCommands"
         | ListProjectsCommand -> "ListProjects"
+        | BrowserListTabsCommand -> "BrowserListTabs"
+        | BrowserExecuteFileCommand _ -> "BrowserExecuteFile"
+        | BrowserExecuteJsCommand _ -> "BrowserExecuteJs"
         | ListWorktreesCommand _ -> "ListWorktrees"
         | GetWorktreeCommand _ -> "GetWorktree"
         | CreateWorktreeCommand _ -> "CreateWorktree"
@@ -728,11 +751,14 @@ module AgentCommandInfo =
     let projectName = function
         | ListCommandsCommand
         | ListProjectsCommand
+        | BrowserListTabsCommand
+        | BrowserExecuteJsCommand _
         | GetJobResultCommand _
         | CancelJobCommand _
         | UpdateClientCommand -> None
         | MessageCommand cmd -> cmd.ProjectName
         | GetClientActivityCommand cmd -> cmd.ProjectName
+        | BrowserExecuteFileCommand cmd -> Some cmd.ProjectName
         | ListWorktreesCommand cmd -> Some cmd.ProjectName
         | GetWorktreeCommand cmd -> Some cmd.ProjectName
         | CreateWorktreeCommand cmd -> Some cmd.ProjectName
@@ -817,6 +843,9 @@ module AgentCommandInfo =
         |> String.concat " "
 
     let fullDetail = function
+        | BrowserListTabsCommand -> None
+        | BrowserExecuteFileCommand cmd -> Some(cmd.ScriptPath + " -> " + cmd.TabRegistration)
+        | BrowserExecuteJsCommand cmd -> Some("registered tab " + cmd.TabRegistration)
         | ListDirectoryCommand cmd -> Some(compact cmd.FolderPath)
         | SearchFilesCommand cmd -> Some(sprintf "\"%s\"" (compact cmd.Query))
         | SearchTextCommand cmd -> Some(sprintf "\"%s\"" (compact cmd.Query))
@@ -873,6 +902,9 @@ module AgentCommandInfo =
         | ListJobsCommand _ -> None
 
     let detail = function
+        | BrowserListTabsCommand -> None
+        | BrowserExecuteFileCommand cmd -> Some(cmd.ScriptPath + " -> " + cmd.TabRegistration)
+        | BrowserExecuteJsCommand cmd -> Some("registered tab " + cmd.TabRegistration)
         | ListDirectoryCommand cmd -> Some(truncate 64 cmd.FolderPath)
         | SearchFilesCommand cmd -> Some(quoted cmd.Query)
         | SearchTextCommand cmd -> Some(quoted cmd.Query)
@@ -967,7 +999,7 @@ module AgentCommandInfo =
         | None -> invocation command
 
 module AgentProtocol =
-    let version = "3.18"
+    let version = "3.19"
     let defaultPatchFuzzyContextLines = 3
     let maxResponseBytes = 900 * 1024
     let maxImageBytes = 8 * 1024 * 1024
@@ -985,6 +1017,9 @@ module AgentProtocol =
     let commandDefinitions =
         [ definition "ListCommands" "Lists supported Jarvis commands." [ ReadOnly ] false false false
           definition "ListProjects" "Lists configured projects." [ ReadOnly ] false false false
+          definition "BrowserListTabs" "Lists only tabs manually registered in the paired extension." [ ReadOnly ] false false false
+          definition "BrowserExecuteFile" "Executes JavaScript from a bounded project file in a registered tab." [ ProcessExecution; NetworkAccess ] true true false
+          definition "BrowserExecuteJs" "Executes supplied JavaScript in a registered browser tab." [ ProcessExecution; NetworkAccess ] true true false
           definition "ListWorktrees" "Lists Git worktrees registered for a project." [ ReadOnly ] false false false
           definition "GetWorktree" "Inspects a registered Git worktree." [ ReadOnly ] false false false
           definition "CreateWorktree" "Creates an isolated Git worktree and branch." [ VersionControlWrite ] true true false

@@ -12,7 +12,8 @@ type ClientStoredConfig =
       WorkspacePath: string option
       TrustLevel: string option
       AllowedEnvironmentVariables: string list option
-      MaxImportBytes: int64 option }
+      MaxImportBytes: int64 option
+      BrowserPort: int option }
 
 type ClientConfigSnapshot =
     { Path: string
@@ -25,6 +26,7 @@ type ClientEffectiveConfig =
       TrustLevel: string
       AllowedEnvironmentVariables: string list
       MaxImportBytes: int64
+      BrowserPort: int option
       Overrides: Set<string> }
 
 module ClientConfig =
@@ -33,7 +35,8 @@ module ClientConfig =
           WorkspacePath = None
           TrustLevel = None
           AllowedEnvironmentVariables = None
-          MaxImportBytes = None }
+          MaxImportBytes = None
+          BrowserPort = None }
 
     let directoryFor (isLinux: bool) (isMac: bool) (home: string) (appData: string) (xdg: string) =
         if isLinux then
@@ -70,6 +73,7 @@ module ClientConfig =
             elif stored.TrustLevel |> Option.exists (fun v -> not (List.contains v [ "none"; "partial"; "full" ])) then Some "trustLevel must be none, partial or full."
             elif stored.AllowedEnvironmentVariables |> Option.exists (List.exists (validateVariable >> not)) then Some "allowedEnvironmentVariables contains an invalid variable name."
             elif stored.MaxImportBytes |> Option.exists (fun v -> v < 0L) then Some "maxImportBytes must be non-negative."
+            elif stored.BrowserPort |> Option.exists (fun port -> port < 1024 || port > 65535) then Some "browserPort must be between 1024 and 65535."
             else None
         match issue with
         | Some error -> Error error
@@ -123,7 +127,8 @@ module ClientConfig =
               WorkspacePath = stringProp "workspacePath"
               TrustLevel = stringProp "trustLevel"
               AllowedEnvironmentVariables = listProp "allowedEnvironmentVariables"
-              MaxImportBytes = numberProp "maxImportBytes" }
+              MaxImportBytes = numberProp "maxImportBytes"
+              BrowserPort = numberProp "browserPort" |> Option.map (fun n -> if n < 1024L || n > 65535L then failwith "Invalid browserPort." else int n) }
     let loadAt path =
         try
             let existingFile = File.Exists path
@@ -149,9 +154,10 @@ module ClientConfig =
                 for value in values do arr.Add(value)
                 arr :> JsonNode)
         | "maxImportBytes" -> stored.MaxImportBytes |> Option.map (fun value -> JsonValue.Create(value) :> JsonNode)
+        | "browserPort" -> stored.BrowserPort |> Option.map (fun value -> JsonValue.Create(value) :> JsonNode)
         | _ -> None
 
-    let keys = [ "machineName"; "workspacePath"; "trustLevel"; "allowedEnvironmentVariables"; "maxImportBytes" ]
+    let keys = [ "machineName"; "workspacePath"; "trustLevel"; "allowedEnvironmentVariables"; "maxImportBytes"; "browserPort" ]
 
     let save (snapshot: ClientConfigSnapshot) (stored: ClientStoredConfig) =
         match validate stored with
@@ -204,12 +210,13 @@ module ClientConfig =
         let workspace = stored.WorkspacePath |> Option.defaultValue defaultDir
         let trust = stored.TrustLevel |> Option.defaultValue "partial"
         let maxBytes = stored.MaxImportBytes |> Option.defaultValue Common.AgentProtocol.defaultMaxImportBytes
+        let browserPort = stored.BrowserPort
         let allowed = (stored.AllowedEnvironmentVariables |> Option.defaultValue []) @ environmentNames()
         let rec loop config overrides remaining =
             match remaining with
             | [] ->
                 let allowed = distinctVariables config.AllowedEnvironmentVariables
-                match validate { empty with MachineName = Some config.MachineName; WorkspacePath = (if String.IsNullOrWhiteSpace config.WorkspacePath then None else Some config.WorkspacePath); TrustLevel = Some config.TrustLevel; MaxImportBytes = Some config.MaxImportBytes; AllowedEnvironmentVariables = Some allowed } with
+                match validate { empty with MachineName = Some config.MachineName; WorkspacePath = (if String.IsNullOrWhiteSpace config.WorkspacePath then None else Some config.WorkspacePath); TrustLevel = Some config.TrustLevel; MaxImportBytes = Some config.MaxImportBytes; BrowserPort = config.BrowserPort; AllowedEnvironmentVariables = Some allowed } with
                 | Ok _ -> Ok { config with AllowedEnvironmentVariables = allowed; Overrides = overrides }
                 | Error e -> Error e
             | "--path" :: value :: tail -> loop { config with WorkspacePath = value } (overrides.Add "workspacePath") tail
@@ -219,12 +226,17 @@ module ClientConfig =
                 match Int64.TryParse value with
                 | true, n when n >= 0L -> loop { config with MaxImportBytes = n } (overrides.Add "maxImportBytes") tail
                 | _ -> Error "max-import-bytes must be a non-negative integer."
+            | "--browser-port" :: value :: tail ->
+                match Int32.TryParse(value) with
+                | true, port when port >= 1024 && port <= 65535 ->
+                    loop { config with BrowserPort = Some port } (overrides.Add "browserPort") tail
+                | _ -> Error "browser-port must be between 1024 and 65535."
             | "--allow-env" :: value :: tail ->
                 loop { config with AllowedEnvironmentVariables = config.AllowedEnvironmentVariables @ [ value ] } (overrides.Add "allowedEnvironmentVariables") tail
             | unknown :: _ -> Error $"Unknown or incomplete argument: {unknown}"
         let effective = 
             { MachineName = named; WorkspacePath = workspace; TrustLevel = trust
-              MaxImportBytes = maxBytes; AllowedEnvironmentVariables = allowed; Overrides = Set.empty }
+              MaxImportBytes = maxBytes; BrowserPort = browserPort; AllowedEnvironmentVariables = allowed; Overrides = Set.empty }
         let environmentOverrides =
             if environmentNames() |> List.isEmpty then Set.empty else Set.singleton "allowedEnvironmentVariables"
         loop effective environmentOverrides arguments
@@ -234,6 +246,10 @@ module ClientConfig =
         | "machine-name" -> { stored with MachineName = Some value } |> validate
         | "workspace-path" -> { stored with WorkspacePath = Some value } |> validate
         | "trust-level" -> { stored with TrustLevel = Some value } |> validate
+        | "browser-port" ->
+            match Int32.TryParse value with
+            | true, port -> { stored with BrowserPort = Some port } |> validate
+            | _ -> Error "browser-port requires an integer."
         | "max-import-bytes" ->
             match Int64.TryParse value with
             | true, n -> { stored with MaxImportBytes = Some n } |> validate
@@ -249,5 +265,6 @@ module ClientConfig =
         | "workspace-path" -> Ok { stored with WorkspacePath = None }
         | "trust-level" -> Ok { stored with TrustLevel = None }
         | "max-import-bytes" -> Ok { stored with MaxImportBytes = None }
+        | "browser-port" -> Ok { stored with BrowserPort = None }
         | "allowed-environment-variables" -> Ok { stored with AllowedEnvironmentVariables = None }
         | _ -> Error $"Unknown setting: {key}"

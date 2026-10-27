@@ -3,6 +3,7 @@
 - **IO/** — Filesystem, project, and web IO abstractions.
 - **Modules/OAuth.fs** — Auth0 native Authorization Code + PKCE login and token refresh.
 - **Modules/DeviceIdentity.fs** — Stable non-secret installation identifier.
+- **Modules/BrowserBridge.fs** — Opt-in local WebSocket bridge for a paired Chromium extension; registered-tab catalog and project script execution transport.
 - **Modules/ClientConfig.fs** — OS user-level versioned JSON client configuration, CLI resolution, atomic writes.
 - **Modules/ProjectPaths.fs** — Workspace/project containment and path safety.
 - **Modules/ProjectBrowser.fs** — Structured project/file operations.

@@ -306,3 +306,21 @@ See `docs/privacy.md`.
 ## License
 
 MIT. See `LICENSE`.
+
+
+## Browser bridge (opt-in)
+
+Jarvis can communicate with a separately installed Chromium extension to execute JavaScript in **tabs manually registered by the user**. The bridge is generic and does not contain ChatGPT-specific selectors or orchestration logic. Agents keep automation scripts in ordinary Jarvis projects and Git worktrees.
+
+The JarvisClient WebSocket listener is disabled by default and binds only to loopback. To enable it, configure and restart the local client:
+
+```sh
+JarvisClient config set browser-port 43822
+JarvisClient browser pair
+```
+
+The second command prints a local pairing secret; do **not** paste it into agent prompts or commit it to Git. Install the unpacked `browser-extension/` extension, enable Chrome's **Allow User Scripts** permission, pair with the local client, and manually register selected tabs in the extension popup. See [extension setup](browser-extension/README.md) and the [complete system specification](docs/BrowserBridgeSystem.md). The extension and JarvisClient run on the same machine.
+
+The new MCP operations are `BrowserListTabs`, `BrowserExecuteFile` (project-relative `.js` file, script's `execute(args)` entrypoint), and `BrowserExecuteJs` (inline expression). File scripts are re-read at each invocation, may be version-controlled normally, and are subject to existing project-path confinement. Scripts cannot access unrelated tabs.
+
+Browser scripts can perform authenticated and irreversible page actions. A timeout or disconnect may leave an action's result uncertain; the bridge does not retry automatically. Until tested against real Chrome/Chromium and explicitly released, this implementation is an experimental feature branch; it is not available in installed production binaries.

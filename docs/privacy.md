@@ -117,3 +117,12 @@ Users should expose only workspaces they are comfortable making available to the
 Privacy questions can be sent to admin@kehlet.dev.
 
 _Last updated: 2026-10-06_
+
+
+## Optional local browser bridge
+
+When explicitly enabled, JarvisClient hosts a loopback-only WebSocket endpoint for a separately installed browser extension. The extension must complete a local challenge-response using a per-installation pairing secret and the user must **manually register each browser tab** before any script may run there. Registrations, selected browser tab identities, and the pairing credential are stored by the extension in browser-local storage; the client stores the pairing secret in a user-private local file. Jarvis does not store these browser registrations on the server.
+
+The authenticated MCP caller can request a list of registered tab aliases, redacted URLs and availability states. Script execution requests can include inline JavaScript or the contents of a project-relative script file, and JSON arguments. Execution results can include DOM and page data. The Jarvis server forwards this material between authenticated MCP caller and selected local client (and corresponding result) through its existing command routing; it is present in transit and in process memory, and can be exposed to the MCP/AI service chosen by the user. The extension executes the supplied script in its authorized tab and returns bounded JSON results. Ordinary Jarvis telemetry does not intentionally persist JavaScript source, script arguments, DOM data, browser output or credentials.
+
+Browser host permissions alone are insufficient for access: the extension also requires an explicit user-managed registration, which can be revoked at any time. A registered tab may contain a logged-in account; arbitrary scripts can read and modify data accessible to that page and submit authenticated actions. Only register tabs and run scripts you trust. Tab identity and current URL are rechecked before injection. A page-derived script result is untrusted content. Browser extensions can be disabled or removed through Chromium's extension manager, and the browser connection can be disabled with `JarvisClient config unset browser-port` followed by restarting JarvisClient. The local pairing credential can be revoked with `JarvisClient browser revoke` followed by a client restart.

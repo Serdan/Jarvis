@@ -37,6 +37,7 @@
         <Compile Include="PathSafetyTests.fs"/>
         <Compile Include="SelfUpdateTests.fs"/>
         <Compile Include="PermissionPolicyTests.fs"/>
+        <Compile Include="BrowserBridgeTests.fs"/>
         <Compile Include="AgentCommandInfoTests.fs"/>
         <Compile Include="ActivityPresentationTests.fs"/>
         <Compile Include="Program.fs"/>

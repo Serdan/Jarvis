@@ -28,6 +28,40 @@ let private assignment (value: TaskStore.AgentAssignment) : AgentView.Assignment
       CheckpointBlocker = value.Task.CheckpointBlocker
       CompletionFinalCommit = value.Task.CompletionFinalCommit }
 
+let private historicalAssignment project (worktree: Worktrees.WorktreeInfo) (task: TaskStore.TaskSummary) phase : AgentView.Assignment =
+    let selector =
+        if worktree.IsMain then project
+        else project + "::" + System.IO.Path.GetFileName(worktree.Path)
+    { Agent = task.Owner.Value
+      Project = project
+      Selector = selector
+      TaskId = task.Id
+      Title = task.Title
+      Status = task.Status
+      Phase = phase
+      NextActor = task.NextActor
+      Worktree = worktree.Path
+      Branch = worktree.Branch
+      Head = worktree.Head
+      Clean = worktree.IsClean
+      AssignmentRevision = task.AssignmentRevision
+      AcknowledgedRevision = None
+      Instructions = None
+      BaseCommit = None
+      UpdatedAt = task.UpdatedAt
+      LastUpdatedBy = task.LastUpdatedBy
+      CheckpointSummary = task.CheckpointSummary
+      CheckpointNextAction = task.CheckpointNextAction
+      CheckpointLastCommit = task.CheckpointLastCommit
+      CheckpointBlocker = task.CheckpointBlocker
+      CompletionFinalCommit = task.CompletionFinalCommit }
+
+let private suspended (snapshot: TaskStore.OrchestrationSnapshot) =
+    snapshot.SuspendedTasks
+    |> List.map (fun entry ->
+        { historicalAssignment snapshot.ProjectName entry.Worktree entry.Task entry.Phase
+            with NextActor = None })
+
 let private completed (snapshot: TaskStore.OrchestrationSnapshot) =
     let integrated =
         snapshot.IntegratedTasks
@@ -39,37 +73,11 @@ let private completed (snapshot: TaskStore.OrchestrationSnapshot) =
         |> List.choose (fun task ->
             match task.Owner, task.Status with
             | Some agent, "completed" ->
-                let project = snapshot.ProjectName
-                let selector =
-                    if group.Worktree.IsMain then project
-                    else project + "::" + System.IO.Path.GetFileName(group.Worktree.Path)
                 let phase =
                     if Set.contains (group.Worktree.Path, task.Id) integrated then "Integrated"
                     else "Completed"
-                let completedEntry : AgentView.Assignment =
-                    { Agent = agent
-                      Project = project
-                      Selector = selector
-                      TaskId = task.Id
-                      Title = task.Title
-                      Status = task.Status
-                      Phase = phase
-                      NextActor = None
-                      Worktree = group.Worktree.Path
-                      Branch = group.Worktree.Branch
-                      Head = group.Worktree.Head
-                      Clean = group.Worktree.IsClean
-                      AssignmentRevision = task.AssignmentRevision
-                      AcknowledgedRevision = None
-                      Instructions = None
-                      BaseCommit = None
-                      UpdatedAt = task.UpdatedAt
-                      LastUpdatedBy = task.LastUpdatedBy
-                      CheckpointSummary = task.CheckpointSummary
-                      CheckpointNextAction = task.CheckpointNextAction
-                      CheckpointLastCommit = task.CheckpointLastCommit
-                      CheckpointBlocker = task.CheckpointBlocker
-                      CompletionFinalCommit = task.CompletionFinalCommit }
+                let completedEntry =
+                    historicalAssignment snapshot.ProjectName group.Worktree task phase
                 Some completedEntry
             | _ -> None))
 
@@ -77,7 +85,9 @@ let fromSnapshots now (results: (string * Result<TaskStore.OrchestrationSnapshot
     let assignments =
         results |> List.collect (function
             | _, Ok snapshot ->
-                (snapshot.Assignments |> List.map assignment) @ completed snapshot
+                (snapshot.Assignments |> List.map assignment)
+                @ suspended snapshot
+                @ completed snapshot
             | _ -> [])
     let projects : AgentView.ProjectSummary list =
         results |> List.map (function
@@ -94,6 +104,11 @@ let fromSnapshots now (results: (string * Result<TaskStore.OrchestrationSnapshot
                   RetirementInspected = snapshot.RetirementInspected
                   Error = None })
     { Assignments = assignments
+      KnownAgents =
+          results |> List.collect (function
+              | _, Ok snapshot ->
+                  snapshot.KnownAgents |> List.map (fun agent -> snapshot.ProjectName, agent)
+              | _ -> [])
       Projects = projects
       Conflicts = results |> List.collect (function
           | _, Ok snapshot -> snapshot.Conflicts |> List.map (fun issue -> snapshot.ProjectName + ": " + issue)

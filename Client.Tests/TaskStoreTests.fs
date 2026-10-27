@@ -1520,3 +1520,221 @@ let orchestrationSnapshotPagesLargeRepositoriesWithoutExceedingTransport () =
         match query false 0 101 with
         | Error(Client.ValidationError _) -> ()
         | other -> Assert.Fail($"Unsafe page limit accepted: {other}"))
+
+[<Test>]
+let parkedStatusClearsHandoffAndRequiresExplicitResume () =
+    withProject (fun _ _ context ->
+        let task =
+            match createTask
+                { ProjectName = "Project1"; TaskId = Some "308"
+                  Title = "Store milestone"; Html = "<h1>Store</h1>"; Dependencies = [] } context with
+            | Ok value -> value
+            | Error error -> failwith $"Create failed: {error}"
+        let claimed =
+            match claimTask
+                { ProjectName = "Project1"; TaskId = "308"
+                  ExpectedRevision = task.Task.Task.Revision
+                  Owner = "Agent 3"; AllowReassign = false } context with
+            | Ok value -> value
+            | Error error -> failwith $"Claim failed: {error}"
+        let change revision status nextActor =
+            updateTask
+                { ProjectName = "Project1"; TaskId = "308"
+                  ExpectedRevision = revision; Title = None; Status = Some status
+                  Dependencies = None; DescriptionCommit = None
+                  AssignmentInstructions = None; AssignmentBaseCommit = None
+                  ExpectedAssignmentRevision = None; NextActor = nextActor
+                  ActorId = Some "orchestrator" } context
+        match change claimed.Task.Task.Revision "parked" (Some "agent") with
+        | Error(Client.ValidationError _) -> ()
+        | other -> Assert.Fail($"Parked task accepted actionable handoff: {other}")
+        let paused =
+            match change claimed.Task.Task.Revision "parked" None with
+            | Ok value -> value
+            | Error error -> failwith $"Park failed: {error}"
+        paused.Task.Task.Status |> shouldEqual "parked"
+        paused.Task.Task.Owner |> shouldEqual (Some "Agent 3")
+        paused.Task.Task.NextActor |> shouldEqual None
+        match listTasks
+            { ProjectName = "Project1"; Status = Some "parked"; Owner = None
+              DependsOn = None; NextActor = None } context with
+        | Ok [task] -> task.Id |> shouldEqual "308"
+        | other -> Assert.Fail($"Parked status filtering failed: {other}")
+        match getAgentAssignment { ProjectName = "Project1"; Agent = "Agent 3" } context with
+        | Error(Client.NotFoundError _) -> ()
+        | other -> Assert.Fail($"Parked task returned as actionable: {other}")
+        match change paused.Task.Task.Revision "active" None with
+        | Error(Client.ValidationError message) ->
+            message.Contains("explicit next actor") |> shouldEqual true
+        | other -> Assert.Fail($"Silent resume accepted: {other}")
+        let resumed =
+            match change paused.Task.Task.Revision "active" (Some "agent") with
+            | Ok value -> value
+            | Error error -> failwith $"Explicit resume failed: {error}"
+        resumed.Task.Task.Status |> shouldEqual "active"
+        resumed.Task.Task.NextActor |> shouldEqual (Some "agent")
+        match getAgentAssignment { ProjectName = "Project1"; Agent = "Agent 3" } context with
+        | Ok assignment -> assignment.Task.Id |> shouldEqual "308"
+        | Error error -> Assert.Fail($"Resumed assignment not found: {error}")
+        let blocked =
+            match change resumed.Task.Task.Revision "blocked" None with
+            | Ok value -> value
+            | Error error -> failwith $"Blocked transition failed: {error}"
+        blocked.Task.Task.Owner |> shouldEqual (Some "Agent 3")
+        blocked.Task.Task.Status |> shouldEqual "blocked"
+        blocked.Task.Task.NextActor |> shouldEqual None
+        match getOrchestrationSnapshot
+            { ProjectName = "Project1"; Status = None; Owner = None; NextActor = None
+              ReviewerOnly = false; Offset = 0; Limit = 60; IncludeRetirement = false } context with
+        | Ok snapshot ->
+            snapshot.SuspendedTasks |> List.map (fun item -> item.Task.Id, item.Phase)
+            |> shouldEqual [ "308", "Blocked" ]
+            snapshot.Assignments.IsEmpty |> shouldEqual true
+            snapshot.Conflicts.IsEmpty |> shouldEqual true
+        | Error error -> Assert.Fail($"Suspended task missing from global snapshot: {error}"))
+
+[<Test>]
+let parkedAndBlockedOwnersRemainVisibleOutsideSnapshotTaskPage () =
+    withProject (fun _ project context ->
+        let folder = Path.Combine(project, "docs", "tasks")
+        Directory.CreateDirectory(folder) |> ignore
+        let state (id: string) (status: string) (owner: string option) (handoff: string option) (summary: string) (blocker: string option) =
+            File.WriteAllText(Path.Combine(folder, id + ".html"), "<h1>Task</h1>")
+            let json = System.Text.Json.Nodes.JsonObject()
+            json["schemaVersion"] <- System.Text.Json.Nodes.JsonValue.Create(1)
+            json["id"] <- System.Text.Json.Nodes.JsonValue.Create(id)
+            json["title"] <- System.Text.Json.Nodes.JsonValue.Create(id)
+            json["status"] <- System.Text.Json.Nodes.JsonValue.Create(status)
+            json["updatedAt"] <- System.Text.Json.Nodes.JsonValue.Create("2026-10-27T02:00:00Z")
+            match owner with
+            | Some agent ->
+                let record = System.Text.Json.Nodes.JsonObject()
+                record["agent"] <- System.Text.Json.Nodes.JsonValue.Create(agent)
+                json["owner"] <- record
+            | None -> ()
+            handoff |> Option.iter (fun actor -> json["nextActor"] <- System.Text.Json.Nodes.JsonValue.Create(actor))
+            let checkpoint = System.Text.Json.Nodes.JsonObject()
+            checkpoint["summary"] <- System.Text.Json.Nodes.JsonValue.Create(summary)
+            checkpoint["blocker"] <- blocker |> Option.map (fun value -> System.Text.Json.Nodes.JsonValue.Create(value)) |> Option.defaultValue null
+            checkpoint["nextAction"] <- System.Text.Json.Nodes.JsonValue.Create("Resume only when dependency accepted")
+            json["checkpoint"] <- checkpoint
+            File.WriteAllText(Path.Combine(folder, id + ".json"), json.ToJsonString())
+        for number in 0 .. 179 do
+            state (sprintf "history-%03d" number) "completed" None None "" None
+        state "308" "parked" (Some "Agent 3") None "Native benchmark accepted" None
+        state "305" "parked" (Some "Agent 6") None "Waiting on Agent 7" None
+        // Legacy blocked record may still carry a stale reviewer marker.
+        state "217m" "blocked" (Some "Agent 8") (Some "reviewer") "Policy blocked" (Some "Waiting on vision API")
+        state "282" "active" (Some "Agent 1") (Some "reviewer") "Review" None
+        state "old5" "completed" (Some "Agent 5") None "Completed old work" None
+        state "old9" "completed" (Some "Agent 9") None "Completed old work" None
+        let result =
+            match getOrchestrationSnapshot
+                { ProjectName = "Project1"; Status = Some "completed"; Owner = None
+                  NextActor = None; ReviewerOnly = false; Offset = 100
+                  Limit = 5; IncludeRetirement = false } context with
+            | Ok result -> result
+            | Error error -> failwith $"Snapshot failed: {error}"
+        (result.Worktrees |> List.collect _.Tasks |> List.exists (fun task -> task.Id = "308")) |> shouldEqual false
+        (result.SuspendedTasks |> List.map (fun item -> item.Task.Id) |> Set.ofList)
+        |> shouldEqual (set [ "308"; "305"; "217m" ])
+        (result.KnownAgents |> Set.ofList)
+        |> shouldEqual (set [ "Agent 1"; "Agent 3"; "Agent 5"; "Agent 6"; "Agent 8"; "Agent 9" ])
+        match listTasks
+            { ProjectName = "Project1"; Status = None; Owner = None
+              DependsOn = None; NextActor = Some "reviewer" } context with
+        | Ok tasks ->
+            (tasks |> List.map _.Id) |> shouldEqual [ "282" ]
+        | Error error -> Assert.Fail($"Reviewer queue failed: {error}")
+        let roster = Client.AgentDashboard.fromSnapshots DateTimeOffset.UtcNow [ "Project1", Ok result ]
+        let states =
+            Client.AgentView.rows roster
+            |> List.map (fun row -> row.Agent, (row.State, row.Conflict))
+            |> Map.ofList
+        states["Agent 3"] |> shouldEqual ("Parked", false)
+        states["Agent 6"] |> shouldEqual ("Parked", false)
+        states["Agent 8"] |> shouldEqual ("Blocked", false)
+        states["Agent 5"] |> shouldEqual ("Free", false)
+        states["Agent 9"] |> shouldEqual ("Free", false)
+        // Actionable work is global too, despite completed-only pagination.
+        states["Agent 1"] |> shouldEqual ("ReadyForReview", false)
+        let size = System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(result).Length
+        (size < 921600) |> shouldEqual true)
+
+[<Test>]
+let resumingParkedAssignmentCreatesNewRevisionAndRequiresFreshAcknowledgement () =
+    withProject (fun _ _ context ->
+        let created =
+            match createTask
+                { ProjectName = "Project1"; TaskId = Some "resumable"
+                  Title = "Resumable task"; Html = "<h1>Resume</h1>"; Dependencies = [] } context with
+            | Ok result -> result
+            | Error error -> failwith $"Create failed: {error}"
+        let claimed =
+            match claimTask
+                { ProjectName = "Project1"; TaskId = "resumable"
+                  ExpectedRevision = created.Task.Task.Revision; Owner = "Agent 6"
+                  AllowReassign = false } context with
+            | Ok result -> result
+            | Error error -> failwith $"Claim failed: {error}"
+        let update revision status nextActor instructions =
+            updateTask
+                { ProjectName = "Project1"; TaskId = "resumable"
+                  ExpectedRevision = revision; Title = None; Status = status
+                  Dependencies = None; DescriptionCommit = None
+                  AssignmentInstructions = instructions; AssignmentBaseCommit = None
+                  ExpectedAssignmentRevision = None; NextActor = nextActor
+                  ActorId = Some "orchestrator" } context
+        let issued =
+            match update claimed.Task.Task.Revision None None (Some "Initial work") with
+            | Ok result -> result
+            | Error error -> failwith $"Initial assignment failed: {error}"
+        let original = issued.Task.Task.AssignmentRevision.Value
+        let ack =
+            match acknowledgeTask
+                { ProjectName = "Project1"; TaskId = "resumable"; Agent = "Agent 6"
+                  AssignmentRevision = original; ExpectedRevision = issued.Task.Task.Revision } context with
+            | Ok result -> result
+            | Error error -> failwith $"Acknowledgement failed: {error}"
+        let started =
+            match beginTask
+                { ProjectName = "Project1"; TaskId = "resumable"; Agent = "Agent 6"
+                  AssignmentRevision = original; ExpectedRevision = ack.Task.Task.Revision } context with
+            | Ok result -> result
+            | Error error -> failwith $"Begin failed: {error}"
+        let parked =
+            match update started.Task.Task.Revision (Some "parked") None None with
+            | Ok result -> result
+            | Error error -> failwith $"Parking failed: {error}"
+        let resumed =
+            match update parked.Task.Task.Revision (Some "active") (Some "agent") None with
+            | Ok result -> result
+            | Error error -> failwith $"Resume failed: {error}"
+        let revised = resumed.Task.Task.AssignmentRevision.Value
+        (revised <> original) |> shouldEqual true
+        match getAgentAssignment { ProjectName = "Project1"; Agent = "Agent 6" } context with
+        | Ok assignment ->
+            assignment.Phase |> shouldEqual "Assigned"
+            assignment.AssignmentRevision |> shouldEqual (Some revised)
+            assignment.AcknowledgedAssignmentRevision |> shouldEqual None
+        | Error error -> Assert.Fail($"Resumed task not assigned: {error}")
+        match acknowledgeTask
+            { ProjectName = "Project1"; TaskId = "resumable"; Agent = "Agent 6"
+              AssignmentRevision = original; ExpectedRevision = resumed.Task.Task.Revision } context with
+        | Error(Client.ValidationError _) -> ()
+        | other -> Assert.Fail($"Old acknowledgement accepted after resume: {other}")
+        let parkedAgain =
+            match update resumed.Task.Task.Revision (Some "parked") None None with
+            | Ok result -> result
+            | Error error -> failwith $"Second parking failed: {error}"
+        let reclaimed =
+            match claimTask
+                { ProjectName = "Project1"; TaskId = "resumable"
+                  ExpectedRevision = parkedAgain.Task.Task.Revision
+                  Owner = "Agent 6"; AllowReassign = false } context with
+            | Ok result -> result
+            | Error error -> failwith $"Explicit reclaim failed: {error}"
+        (reclaimed.Task.Task.AssignmentRevision <> Some revised) |> shouldEqual true
+        match getAgentAssignment { ProjectName = "Project1"; Agent = "Agent 6" } context with
+        | Ok assignment -> assignment.Phase |> shouldEqual "Assigned"
+        | Error error -> Assert.Fail($"Reclaimed task not actionable: {error}"))

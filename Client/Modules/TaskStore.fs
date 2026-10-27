@@ -72,7 +72,7 @@ let private validateJson (id: string) (json: string) =
             try obj["schemaVersion"].GetValue<int>() with _ -> -1
         if version <> 1 then Error "Unsupported task state schema version."
         elif stateId <> Some id then Error "Task state id does not match its filename."
-        elif not (List.contains (defaultArg status "" |> normalizeStatus) [ "open"; "active"; "blocked"; "completed" ]) then
+        elif not (List.contains (defaultArg status "" |> normalizeStatus) [ "open"; "active"; "parked"; "blocked"; "completed" ]) then
             Error "Task state status is invalid."
         else Ok obj
     | _ -> Error "Task state must be a JSON object."
@@ -256,7 +256,9 @@ let listTasks (cmd: ListTasksCommand) =
                     (cmd.Status.IsNone || (cmd.Status |> Option.map normalizeStatus) = Some item.Status)
                     && (cmd.Owner.IsNone || item.Owner = cmd.Owner)
                     && (cmd.DependsOn.IsNone || item.Dependencies |> List.contains cmd.DependsOn.Value)
-                    && (cmd.NextActor.IsNone || (item.Status <> "completed" && item.NextActor = cmd.NextActor)))
+                    && (cmd.NextActor.IsNone ||
+                        ((item.Status = "active" || item.Status = "open")
+                         && item.NextActor = cmd.NextActor)))
     }
 
 let getTask (cmd: GetTaskCommand) =
@@ -539,7 +541,7 @@ let createTask (cmd: CreateTaskCommand) =
     } |> serializeMutations cmd.ProjectName
 
 let private validStatus status =
-    List.contains status [ "open"; "active"; "blocked"; "completed" ]
+    List.contains status [ "open"; "active"; "parked"; "blocked"; "completed" ]
 
 let private validNextActor value =
     List.contains value [ "agent"; "reviewer" ]
@@ -582,6 +584,13 @@ let updateTask (cmd: UpdateTaskCommand) =
                 Error(Client.ValidationError "Reviewer ID is required to update an assignment or handoff.")
             | _ when changesAssignment && (cmd.AssignmentInstructions |> Option.exists String.IsNullOrWhiteSpace) ->
                 Error(Client.ValidationError "Assignment instructions cannot be blank.")
+            | _ when (cmd.Status = Some "parked" || cmd.Status = Some "blocked")
+                     && cmd.NextActor.IsSome ->
+                Error(Client.ValidationError "Parked or blocked tasks cannot request an actionable handoff.")
+            | _ when (getString obj "status" |> Option.exists (fun status -> status = "parked" || status = "blocked"))
+                     && cmd.Status = Some "active"
+                     && not changesAssignment && cmd.NextActor.IsNone ->
+                Error(Client.ValidationError "Resuming parked or blocked work requires an explicit next actor or new assignment instructions.")
             | _ when cmd.ExpectedAssignmentRevision.IsSome
                      && cmd.ExpectedAssignmentRevision <> assignmentRevision obj ->
                 Error(Client.ValidationError "Assignment revision is stale.")
@@ -590,6 +599,11 @@ let updateTask (cmd: UpdateTaskCommand) =
                     match obj["assignment"] with
                     | :? JsonObject as existing -> Some existing
                     | _ -> None
+                let resumingExistingAssignment =
+                    cmd.Status = Some "active"
+                    && (getString obj "status" |> Option.exists (fun state -> state = "parked" || state = "blocked"))
+                    && cmd.NextActor.IsSome
+                    && currentAssignment.IsSome
                 if changesAssignment && currentAssignment.IsNone && cmd.AssignmentInstructions.IsNone then
                     Error(Client.ValidationError "Instructions are required for the first assignment.")
                 else
@@ -597,7 +611,7 @@ let updateTask (cmd: UpdateTaskCommand) =
                     cmd.Title |> Option.iter (fun title -> obj["title"] <- JsonValue.Create(title))
                     cmd.Dependencies |> Option.iter (fun deps -> obj["dependencies"] <- System.Text.Json.JsonSerializer.SerializeToNode(deps))
                     cmd.DescriptionCommit |> Option.iter (fun commit -> obj["descriptionCommit"] <- JsonValue.Create(commit))
-                    if changesAssignment then
+                    if changesAssignment || resumingExistingAssignment then
                         let assignment =
                             currentAssignment |> Option.defaultWith (fun () -> JsonObject())
                         cmd.AssignmentInstructions
@@ -612,7 +626,8 @@ let updateTask (cmd: UpdateTaskCommand) =
                     else
                         cmd.NextActor |> Option.iter (fun actor -> obj["nextActor"] <- JsonValue.Create(actor))
                         cmd.ActorId |> Option.iter (fun id -> recordActor obj "reviewer" id)
-                    if getString obj "status" = Some "completed" then obj["nextActor"] <- null
+                    if List.contains (getString obj "status" |> Option.defaultValue "") [ "completed"; "parked"; "blocked" ] then
+                        obj["nextActor"] <- null
                     Ok())
 
 
@@ -628,7 +643,7 @@ let private globalAssignmentMutation (projectName: string) (operation: IO<'rt, '
 
 // A historical owner on a parked task does not represent an outstanding handoff.
 let private actionable (task: TaskSummary) =
-    task.Status <> "completed"
+    (task.Status = "active" || task.Status = "open")
     && (task.NextActor = Some "agent" || task.NextActor = Some "reviewer")
     && task.Owner.IsSome
 
@@ -705,6 +720,12 @@ let claimTask (cmd: ClaimTaskCommand) =
                         | Some other when other <> cmd.Owner && not cmd.AllowReassign ->
                             Error(Client.ValidationError "Task is claimed by another agent.")
                         | _ ->
+                            if List.contains (getString obj "status" |> Option.defaultValue "") [ "parked"; "blocked" ] then
+                                match obj["assignment"] with
+                                | :? JsonObject as previous ->
+                                    previous["revision"] <- JsonValue.Create(Guid.NewGuid().ToString("N"))
+                                    previous["updatedAt"] <- JsonValue.Create(DateTimeOffset.UtcNow.ToString("O"))
+                                | _ -> ()
                             let owner = JsonObject()
                             owner["agent"] <- JsonValue.Create(cmd.Owner)
                             owner["worktree"] <- JsonValue.Create(cmd.ProjectName)
@@ -735,7 +756,9 @@ let checkpointTask (cmd: CheckpointTaskCommand) =
                     obj["checkpoint"] <- checkpoint
                     cmd.DescriptionCommit |> Option.iter (fun commit -> obj["descriptionCommit"] <- JsonValue.Create(commit))
                     obj["status"] <- JsonValue.Create(cmd.Status)
-                    obj["nextActor"] <- (if cmd.Status = "completed" then null else JsonValue.Create("reviewer"))
+                    obj["nextActor"] <-
+                        (if List.contains cmd.Status [ "completed"; "parked"; "blocked" ] then null
+                         else JsonValue.Create("reviewer"))
                     recordActor obj "agent" (cmd.ActorId |> Option.orElseWith (fun () -> ownerId obj) |> Option.defaultValue "unspecified")
                     Ok())
 
@@ -1181,10 +1204,18 @@ type IntegratedTask =
       Task: TaskSummary
       Phase: string }
 
+type SuspendedTask =
+    { Worktree: Worktrees.WorktreeInfo
+      Task: TaskSummary
+      Phase: string }
+
 type OrchestrationSnapshot =
     { ProjectName: string
       Worktrees: WorktreeTaskGroup list
       Assignments: AgentAssignment list
+      // Global roster evidence independent of the paginated task rows.
+      SuspendedTasks: SuspendedTask list
+      KnownAgents: string list
       Conflicts: string list
       ReviewerTaskCount: int
       UnacknowledgedTaskCount: int
@@ -1227,6 +1258,37 @@ let getOrchestrationSnapshot (cmd: GetOrchestrationSnapshotCommand) =
                     group.Tasks |> List.map (fun task -> group.Worktree, task))
             let actionableTasks =
                 allTasks |> List.filter (fun (_, task) -> actionable task)
+            // A task can be nonactionable without being finished. Preserve its
+            // owner and checkpoint for the roster, but never return it from
+            // GetAgentAssignment or count it as an ownership conflict.
+            let suspended =
+                allTasks
+                |> List.filter (fun (_, task) ->
+                    task.Owner.IsSome
+                    && (task.Status = "parked" || task.Status = "blocked")
+                    && task.Diagnostics.IsEmpty)
+                |> List.groupBy (fun (_, task) -> task.Owner.Value, task.Id)
+                |> List.choose (fun (_, copies) ->
+                    copies |> List.sortByDescending (fun (_, task) ->
+                        task.UpdatedAt |> Option.defaultValue DateTimeOffset.MinValue)
+                    |> List.tryHead)
+                |> List.groupBy (fun (_, task) -> task.Owner.Value)
+                |> List.collect (fun (_, tasks) ->
+                    tasks
+                    |> List.sortByDescending (fun (_, task) ->
+                        task.UpdatedAt |> Option.defaultValue DateTimeOffset.MinValue)
+                    |> List.truncate 3)
+                |> List.truncate 300
+                |> List.map (fun (worktree, task) ->
+                    ({ Worktree = worktree; Task = compactSnapshotTask task
+                       Phase = if task.Status = "parked" then "Parked" else "Blocked" }: SuspendedTask))
+            let knownAgents =
+                allTasks
+                |> List.choose (fun (_, task) -> task.Owner)
+                |> List.distinct
+                |> List.sort
+                |> List.truncate 100
+
             // Historical owners and parked tasks are never live assignment conflicts.
             let owners =
                 actionableTasks
@@ -1290,15 +1352,14 @@ let getOrchestrationSnapshot (cmd: GetOrchestrationSnapshotCommand) =
                             if errors.Length < 8 then
                                 errors <- (worktree.Path + "/" + task.Id + ": " + string error) :: errors
                     Ok(List.rev found, List.rev errors)
+            // Agent activity must not disappear when callers page/filter the
+            // task catalog. Keep a bounded, compact global actionable roster.
             let selected =
                 allActionableDetails
-                |> List.filter (fun assignment ->
-                    pageKeys.Contains(assignment.Worktree.Path, assignment.Task.Id))
+                |> List.truncate 100
                 |> List.map (fun assignment ->
                     { assignment with
                         Task = compactSnapshotTask assignment.Task
-                        // Full instructions are available from GetAgentAssignment,
-                        // not repeated in every global snapshot page.
                         AssignmentInstructions = None })
             let! retirement, retirementErrors =
                 if not cmd.IncludeRetirement then fun _ -> Ok([], [])
@@ -1331,12 +1392,14 @@ let getOrchestrationSnapshot (cmd: GetOrchestrationSnapshotCommand) =
                         group.Tasks
                         |> List.filter (fun task -> task.Status = "completed")
                         |> List.map (fun task ->
-                            { Worktree = group.Worktree; Task = task; Phase = "Integrated" }))
+                            ({ Worktree = group.Worktree; Task = task; Phase = "Integrated" }: IntegratedTask)))
             let count = filtered.Length
             return
                 { ProjectName = projectName
                   Worktrees = compactGroups
                   Assignments = selected
+                  SuspendedTasks = suspended
+                  KnownAgents = knownAgents
                   Conflicts = (owners @ collisions) |> List.truncate 12
                   ReviewerTaskCount =
                       actionableTasks

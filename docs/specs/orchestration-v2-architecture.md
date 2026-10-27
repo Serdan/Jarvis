@@ -205,6 +205,12 @@ All mutations require a stable operation ID, expected version(s), a valid actor,
 
 `BeginAttempt` is the only slot-acquisition command. It can select the top runnable assignment or a specific queued attempt/generation. Attempting to start a second attempt for the same agent fails `AgentBusy`. A reviewer returning Task 315 while Agent 3 works on Task 316 creates a new Queued generation for 315; it does not interrupt 316 or mark 315 Working.
 
+### Commit submission and reviewer decisions
+
+A SubmitForReview request must identify a **specific Git commit OID**, fully qualified source ref, review UUID, assigned reviewer, summary/evidence, current assignment generation and expected attempt version. The client verifies that the submitted object is a commit reachable from the supplied source ref; it never substitutes the current source branch tip. The review UUID and source OID become the immutable identity of that review round, retained in the ledger's Git history.
+
+Submitting atomically records the review request, transitions Working to ReadyForReview and frees the implementation agent's execution slot. A reviewer inbox is derived from Pending review records and ordered by ledger submission sequence. Reviewer decisions require the exact pending review UUID and expected review version; self-review is rejected. Accept requires that the reviewer device can access the submitted commit object and records Implemented, **not Integrated or Closed**. RequestChanges requires feedback, records that review as ChangesRequested and issues a new Queued assignment generation without preempting any other Working task. Prior review rounds and comments remain auditable. There is no automatic source push or merge; cross-device review may require the implementation branch to be explicitly pushed and fetched.
+
 An agent disappearing mid-turn leaves the slot occupied and the attempt marked Working until explicitly paused, blocked or reclaimed through a reviewer/orchestrator action with an audit reason. Checkpoints require Working so an agent cannot bypass the capacity rule by progressing an Acknowledged item without beginning it. Presence is not inferred from Git; no lease expiry or automatic stealing. Admin release must atomically revoke the old generation and free the slot, preventing a stale client from continuing authoritatively. Two simultaneous Begin calls are checked on the same remote snapshot and only one can publish a slot change.
 
 ## 5. Git write transactions, retries, and idempotency

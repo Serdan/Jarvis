@@ -19,6 +19,9 @@ type LedgerFailure =
     | OutcomeUnknown of string
     | LedgerContended
     | GitFailure of string
+    | SourceUnavailable of string
+    | AgentBusy of string
+    | ReviewAccessDenied of string
 
 type LedgerBinding =
     { RepositoryPath: string
@@ -53,7 +56,8 @@ type LedgerOperation =
       Type: string
       Actor: string
       Path: string
-      BlobOid: string }
+      BlobOid: string
+      Paths: string array }
 
 type LedgerSnapshot =
     { Commit: string
@@ -63,6 +67,17 @@ type LedgerWrite =
     { Operation: LedgerOperation
       CurrentHead: string
       AlreadyApplied: bool }
+
+type LedgerFileChange =
+    { Path: string
+      ExpectedBlobOid: string option
+      Content: string }
+
+type LedgerIntent =
+    { OperationId: Guid
+      Actor: string
+      Kind: string
+      RequestJson: string }
 
 type LedgerRecordChange =
     { OperationId: Guid
@@ -77,6 +92,7 @@ module LedgerStore =
     let private options = JsonSerializerOptions(PropertyNamingPolicy = JsonNamingPolicy.CamelCase, PropertyNameCaseInsensitive = true)
     let private oidPattern = Regex("^[0-9a-f]{40}([0-9a-f]{24})?$", RegexOptions.Compiled)
     let private recordPath = Regex("^records/[A-Za-z0-9_-]+(/[A-Za-z0-9_.-]+)*[.]json$", RegexOptions.Compiled)
+    let private ledgerPath = Regex("^(tasks/[A-Za-z0-9_-]+/(task[.]json|attempts/[a-f0-9]{32}[.]json|reviews/[a-f0-9]{32}[.]json)|agents/[A-Za-z0-9_-]+[.]json|records/[A-Za-z0-9_-]+(/[A-Za-z0-9_.-]+)*[.]json)$", RegexOptions.Compiled)
     let private remotePattern = Regex("^[A-Za-z0-9][A-Za-z0-9_.-]*$", RegexOptions.Compiled)
 
     type private GitOutput =
@@ -431,7 +447,8 @@ module LedgerStore =
                                       Type = "PutRecord"
                                       Actor = change.Actor
                                       Path = change.Path
-                                      BlobOid = contentOid }
+                                      BlobOid = contentOid
+                                      Paths = [| change.Path |] }
                                 let nextHeader = { snapshot.Header with NextSequence = sequence + 1L }
                                 match writeTree repo (Some head)
                                         [ "ledger.json", json nextHeader
@@ -464,4 +481,159 @@ module LedgerStore =
                                                 | _ ->
                                                     System.Threading.Thread.Sleep(min 800 (50 * (1 <<< retries)))
                                                     attempt (retries + 1)
+            attempt 0
+
+    // Pinned reads used by domain transitions. Never fetch a newer head mid-transaction.
+    let readAt (binding: LedgerBinding) (snapshot: LedgerSnapshot) (path: string) =
+        if not (ledgerPath.IsMatch path) || path.Contains("..") then
+            Error(InvalidBinding "Unsafe ledger entity path.")
+        else
+            match blobAt binding.RepositoryPath snapshot.Commit path with
+            | Error error -> Error error
+            | Ok None -> Ok(None, None)
+            | Ok(Some oid) ->
+                showBlob binding.RepositoryPath snapshot.Commit path
+                |> Result.map (fun content -> Some content, Some oid)
+
+    let listAt (binding: LedgerBinding) (snapshot: LedgerSnapshot) (prefix: string) =
+        if prefix <> "tasks" && prefix <> "agents" then
+            Error(InvalidBinding "Unsupported ledger enumeration prefix.")
+        else
+            run binding.RepositoryPath [ "ls-tree"; "-r"; "--name-only"; snapshot.Commit; "--"; prefix ]
+            |> Result.map (fun value ->
+                value.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                |> Array.filter (fun path -> ledgerPath.IsMatch path && not (path.Contains("..")))
+                |> Array.toList)
+
+    let verifySourceCommit (binding: LedgerBinding) (sourceRef: string) (commit: string) =
+        if not (sourceRef.StartsWith("refs/heads/", StringComparison.Ordinal))
+           || not (Regex.IsMatch(sourceRef, "^refs/heads/[A-Za-z0-9][A-Za-z0-9_./-]*$"))
+           || sourceRef.Contains("..") || sourceRef.EndsWith("/")
+           || not (oidPattern.IsMatch commit) then
+            Error(InvalidBinding "Invalid fully qualified source ref or Git commit OID.")
+        else
+            let repo = binding.RepositoryPath
+            match git repo [ "rev-parse"; "--verify"; $"{sourceRef}^{{commit}}" ] with
+            | Error error -> Error error
+            | Ok resolved when resolved.ExitCode <> 0 ->
+                Error(InvalidBinding "The source branch is unavailable in this repository.")
+            | Ok _ ->
+                match git repo [ "cat-file"; "-t"; commit ] with
+                | Ok result when result.ExitCode = 0 && result.Stdout = "commit" ->
+                    match isAncestor repo commit sourceRef with
+                    | Ok true -> Ok ()
+                    | Ok false -> Error(InvalidBinding "Submitted commit is not in the specified source branch.")
+                    | Error error -> Error error
+                | _ -> Error(InvalidBinding "Submitted OID is not a Git commit.")
+
+    let verifySourceObject (binding: LedgerBinding) (commit: string) =
+        if isNull commit || not (oidPattern.IsMatch commit) then
+            Error(InvalidBinding "Invalid source commit OID.")
+        else
+            match git binding.RepositoryPath [ "cat-file"; "-t"; commit ] with
+            | Ok result when result.ExitCode = 0 && result.Stdout = "commit" -> Ok ()
+            | _ -> Error(SourceUnavailable $"Source commit {commit} is not available on this device.")
+
+    // A transaction updates every task/attempt/agent/review file and its operation
+    // record in one ledger tree. Its planner is re-run against each new remote tip.
+    let transact (binding: LedgerBinding) (intent: LedgerIntent)
+                 (plan: LedgerSnapshot -> Result<LedgerFileChange list, LedgerFailure>) =
+        if intent.OperationId = Guid.Empty || String.IsNullOrWhiteSpace intent.Actor
+           || String.IsNullOrWhiteSpace intent.Kind || String.IsNullOrWhiteSpace intent.RequestJson
+           || encoding.GetByteCount(intent.RequestJson) > 16 * 1024 then
+            Error(InvalidBinding "Invalid transaction intent or size.")
+        else
+            let requestHash =
+                json
+                    {| schemaVersion = 2
+                       projectId = string binding.ProjectId
+                       operationId = intent.OperationId.ToString("D")
+                       actor = intent.Actor
+                       kind = intent.Kind
+                       request = intent.RequestJson |}
+                |> digest
+            let repo = binding.RepositoryPath
+            let rec attempt retry =
+                match fetch binding with
+                | Error error -> Error error
+                | Ok snapshot ->
+                    let head = snapshot.Commit
+                    match readOperation binding head intent.OperationId with
+                    | Error error -> Error error
+                    | Ok(Some applied) when applied.RequestHash = requestHash ->
+                        Ok { Operation = applied; CurrentHead = head; AlreadyApplied = true }
+                    | Ok(Some _) -> Error OperationIdReused
+                    | Ok None ->
+                        match plan snapshot with
+                        | Error error -> Error error
+                        | Ok changes ->
+                            let paths = changes |> List.map (fun change -> change.Path)
+                            if List.isEmpty changes
+                               || List.length paths <> (paths |> List.distinct |> List.length)
+                               || changes |> List.exists (fun change ->
+                                   not (ledgerPath.IsMatch change.Path) || change.Path.Contains("..")
+                                   || isNull change.Content || encoding.GetByteCount(change.Content) > 64 * 1024
+                                   || (change.ExpectedBlobOid |> Option.exists (oidPattern.IsMatch >> not))) then
+                                Error(InvalidBinding "Invalid or duplicate entity paths in ledger transaction.")
+                            else
+                                let validationFailure =
+                                    changes
+                                    |> List.tryPick (fun change ->
+                                        match blobAt repo head change.Path with
+                                        | Error error -> Some error
+                                        | Ok current when current <> change.ExpectedBlobOid ->
+                                            Some(StaleEntityVersion $"Ledger entity changed: {change.Path}")
+                                        | _ -> None)
+                                match validationFailure with
+                                | Some error -> Error error
+                                | None ->
+                                    let operation =
+                                        { OperationId = intent.OperationId.ToString("D")
+                                          RequestHash = requestHash
+                                          Sequence = snapshot.Header.NextSequence
+                                          Type = intent.Kind
+                                          Actor = intent.Actor
+                                          Path = List.head paths
+                                          BlobOid = ""
+                                          Paths = paths |> List.toArray }
+                                    let header = { snapshot.Header with NextSequence = snapshot.Header.NextSequence + 1L }
+                                    let files =
+                                        [ "ledger.json", json header
+                                          opPath intent.OperationId, json operation ]
+                                        @ (changes |> List.map (fun change -> change.Path, change.Content))
+                                    match writeTree repo (Some head) files with
+                                    | Error error -> Error error
+                                    | Ok tree ->
+                                        match commitTree repo tree (Some head)
+                                                $"Jarvis {intent.Kind}\n\nJarvis-Operation-Id: {intent.OperationId:D}\nJarvis-Request-Hash: {requestHash}" with
+                                        | Error error -> Error error
+                                        | Ok proposed ->
+                                            let pushed = git repo [ "push"; "--porcelain"; binding.RemoteName; $"{proposed}:{ledgerRef}" ]
+                                            match fetch binding with
+                                            | Error _ -> Error(OutcomeUnknown $"Cannot confirm operation {intent.OperationId:D}.")
+                                            | Ok observed ->
+                                                match readOperation binding observed.Commit intent.OperationId with
+                                                | Error error -> Error error
+                                                | Ok(Some applied) when applied.RequestHash <> requestHash ->
+                                                    Error OperationIdReused
+                                                | Ok(Some applied) ->
+                                                    match isAncestor repo proposed observed.Commit with
+                                                    | Ok true ->
+                                                        Ok { Operation = applied
+                                                             CurrentHead = observed.Commit
+                                                             AlreadyApplied = false }
+                                                    | Ok false ->
+                                                        Ok { Operation = applied
+                                                             CurrentHead = observed.Commit
+                                                             AlreadyApplied = true }
+                                                    | Error error -> Error error
+                                                | Ok None ->
+                                                    match pushed with
+                                                    | Error _ -> Error(OutcomeUnknown $"Push outcome uncertain: {intent.OperationId:D}.")
+                                                    | Ok output when output.ExitCode <> 0 && observed.Commit = head ->
+                                                        Error(GitFailure $"Ledger push failed: {output.Stderr}")
+                                                    | Ok _ when retry >= 7 -> Error LedgerContended
+                                                    | _ ->
+                                                        System.Threading.Thread.Sleep(min 800 (50 * (1 <<< retry)))
+                                                        attempt (retry + 1)
             attempt 0

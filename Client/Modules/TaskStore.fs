@@ -22,6 +22,7 @@ type TaskSummary =
       StatePath: string
       HasState: bool
       Owner: string option
+      OwnerWorktree: string option
       Dependencies: string list
       Revision: string option
       Diagnostics: string list
@@ -137,6 +138,7 @@ let private summary (relativeDir: string) (folder: string) (id: string) =
     let mutable title = id
     let mutable status = "open"
     let mutable owner = None
+    let mutable ownerWorktree = None
     let mutable dependencies = []
     let mutable nextActor = None
     let mutable lastUpdatedBy = None
@@ -169,6 +171,10 @@ let private summary (relativeDir: string) (folder: string) (id: string) =
                     owner <-
                         match obj["owner"] with
                         | :? JsonObject as ownerObj -> getString ownerObj "agent"
+                        | _ -> None
+                    ownerWorktree <-
+                        match obj["owner"] with
+                        | :? JsonObject as ownerObj -> getString ownerObj "worktree"
                         | _ -> None
                     nextActor <- getString obj "nextActor"
                     lastUpdatedBy <-
@@ -215,6 +221,7 @@ let private summary (relativeDir: string) (folder: string) (id: string) =
       StatePath = statePath
       HasState = stateExists
       Owner = owner
+      OwnerWorktree = ownerWorktree
       Dependencies = dependencies
       Revision = hash
       Diagnostics = List.rev diagnostics
@@ -248,7 +255,7 @@ let listTasks (cmd: ListTasksCommand) =
                     if validId id then summary relative folder id
                     else
                         { Id = id; Title = id; Status = "invalid"; DescriptionPath = ""; StatePath = ""
-                          HasState = false; Owner = None; Dependencies = []; Revision = None; Diagnostics = [ "Invalid task identifier." ]
+                          HasState = false; Owner = None; OwnerWorktree = None; Dependencies = []; Revision = None; Diagnostics = [ "Invalid task identifier." ]
                           NextActor = None; LastUpdatedBy = None; AssignmentRevision = None
                           UpdatedAt = None; CheckpointSummary = None; CheckpointNextAction = None
                           CheckpointLastCommit = None; CheckpointBlocker = None; CompletionFinalCommit = None })
@@ -647,6 +654,18 @@ let private actionable (task: TaskSummary) =
     && (task.NextActor = Some "agent" || task.NextActor = Some "reviewer")
     && task.Owner.IsSome
 
+// A task committed on main is inherited by new worktrees. Its original owner
+// still belongs to the recorded checkout, not every checkout containing that JSON.
+// Older task states without owner.worktree retain legacy conflict protection.
+let private ownerBelongsToWorktree (rootName: string) (worktree: Worktrees.WorktreeInfo) (task: TaskSummary) =
+    match task.OwnerWorktree with
+    | None -> true
+    | Some selector ->
+        let actual =
+            if worktree.IsMain then rootName
+            else rootName + "::" + Path.GetFileName(worktree.Path)
+        String.Equals(selector, actual, StringComparison.Ordinal)
+
 let private ensureGlobalClaimAvailable (selector: string) (taskId: string) (agent: string) =
     effect {
         let rootName =
@@ -684,6 +703,7 @@ let private ensureGlobalClaimAvailable (selector: string) (taskId: string) (agen
                             if sameTask && not task.Diagnostics.IsEmpty then
                                 failures <- (worktree.Path + "/" + task.Id + ": " + String.concat "; " task.Diagnostics) :: failures
                             elif not sameTask && actionable task &&
+                                 ownerBelongsToWorktree rootName worktree task &&
                                  (task.Owner = Some agent || task.Id = taskId) then
                                 conflicts <- (worktreeSelector, task) :: conflicts
                 Ok()
@@ -905,7 +925,9 @@ let private activeAssignments projectName agent =
                 groups
                 |> List.collect (fun group ->
                     group.Tasks
-                    |> List.filter (fun task -> task.Owner = Some agent && actionable task)
+                    |> List.filter (fun task ->
+                        task.Owner = Some agent && actionable task
+                        && ownerBelongsToWorktree projectName group.Worktree task)
                     |> List.map (fun task -> group.Worktree, task))
     }
 
@@ -1257,7 +1279,8 @@ let getOrchestrationSnapshot (cmd: GetOrchestrationSnapshotCommand) =
                 groups |> List.collect (fun group ->
                     group.Tasks |> List.map (fun task -> group.Worktree, task))
             let actionableTasks =
-                allTasks |> List.filter (fun (_, task) -> actionable task)
+                allTasks |> List.filter (fun (worktree, task) ->
+                    actionable task && ownerBelongsToWorktree projectName worktree task)
             // A task can be nonactionable without being finished. Preserve its
             // owner and checkpoint for the roster, but never return it from
             // GetAgentAssignment or count it as an ownership conflict.

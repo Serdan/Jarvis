@@ -59,7 +59,7 @@ let snapshotAdapterPreservesAssignmentIdentityAndInspectionFailures () =
     let task : Client.TaskStore.TaskSummary =
         { Id = "292"; Title = "Gold pickup"; Status = "active"
           DescriptionPath = "docs/tasks/292.html"; StatePath = "docs/tasks/292.json"
-          HasState = true; Owner = Some "Agent 2"; Dependencies = []
+          HasState = true; Owner = Some "Agent 2"; OwnerWorktree = None; Dependencies = []
           Revision = Some "taskrev"; Diagnostics = []; NextActor = Some "agent"
           LastUpdatedBy = Some "orchestrator"; AssignmentRevision = Some "revision"
           UpdatedAt = None; CheckpointSummary = None
@@ -123,7 +123,7 @@ let completedWorkRemainsVisibleAfterActiveAssignmentDisappears () =
     let completedTask : Client.TaskStore.TaskSummary =
         { Id = "292"; Title = "Gold pickup"; Status = "completed"
           DescriptionPath = "docs/tasks/292.html"; StatePath = "docs/tasks/292.json"
-          HasState = true; Owner = Some "Agent 2"; Dependencies = []
+          HasState = true; Owner = Some "Agent 2"; OwnerWorktree = None; Dependencies = []
           Revision = Some "final"; Diagnostics = []; NextActor = None
           LastUpdatedBy = Some "agent:Agent 2"; AssignmentRevision = Some "rev"
           UpdatedAt = Some(DateTimeOffset(2026, 10, 26, 16, 0, 0, TimeSpan.Zero))

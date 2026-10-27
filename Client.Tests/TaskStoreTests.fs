@@ -1040,6 +1040,68 @@ let globalAgentAssignmentRejectsTwoActiveWorktreesAndMissingAgent () =
         | other -> Assert.Fail($"Expected no assignment for Agent 4, got {other}"))
 
 [<Test>]
+let inheritedMainTaskDoesNotCreateDuplicateAgentAssignment () =
+    withProject (fun _ project context ->
+        File.WriteAllText(Path.Combine(project, "README.md"), "initial")
+        GitCommandTests.expectGitSuccess context [ "add"; "README.md" ]
+        GitCommandTests.expectGitSuccess context [ "commit"; "-m"; "Initial" ]
+        let created =
+            match createTask
+                { ProjectName = "Project1"; TaskId = Some "315"
+                  Title = "Orchestrator ledger"; Html = "<h1>315</h1>"; Dependencies = [] } context with
+            | Ok value -> value
+            | Error error -> failwith $"Create failed: {error}"
+        let claimed =
+            match claimTask
+                { ProjectName = "Project1"; TaskId = "315"
+                  ExpectedRevision = created.Task.Task.Revision
+                  Owner = "Orchestrator"; AllowReassign = false } context with
+            | Ok value -> value
+            | Error error -> failwith $"Claim failed: {error}"
+        claimed.Task.Task.OwnerWorktree |> shouldEqual (Some "Project1")
+        match Client.Worktrees.createWorktree
+            { ProjectName = "Project1"; Name = "ledger"
+              Branch = "feature/ledger"; BaseRef = "HEAD" } context with
+        | Ok _ -> ()
+        | Error error -> Assert.Fail($"Cannot create ledger worktree: {error}")
+        // The cloned Task315 JSON still names Project1 as its owner worktree.
+        let inherited =
+            match getTask { ProjectName = "Project1::ledger"; TaskId = "315" } context with
+            | Ok value -> value
+            | Error error -> failwith $"Cannot read inherited task: {error}"
+        inherited.Task.Status |> shouldEqual "active"
+        inherited.Task.OwnerWorktree |> shouldEqual (Some "Project1")
+        match getAgentAssignment { ProjectName = "Project1"; Agent = "Orchestrator" } context with
+        | Ok assignment ->
+            assignment.ProjectName |> shouldEqual "Project1"
+            assignment.Worktree.IsMain |> shouldEqual true
+            assignment.Task.Id |> shouldEqual "315"
+        | Error error -> Assert.Fail($"Inherited task caused false conflict: {error}")
+        match getOrchestrationSnapshot
+            { ProjectName = "Project1"; Status = None; Owner = None; NextActor = None
+              ReviewerOnly = false; Offset = 0; Limit = 60
+              IncludeRetirement = false } context with
+        | Ok snapshot ->
+            snapshot.Assignments |> List.map (fun x -> x.Task.Id)
+            |> shouldEqual [ "315" ]
+            snapshot.Conflicts.IsEmpty |> shouldEqual true
+        | Error error -> Assert.Fail($"Inherited task caused duplicate roster: {error}")
+        // A genuinely distinct task claimed by the same agent is still a conflict.
+        let second =
+            match createTask
+                { ProjectName = "Project1::ledger"; TaskId = Some "316"
+                  Title = "Another task"; Html = "<h1>316</h1>"; Dependencies = [] } context with
+            | Ok value -> value
+            | Error error -> failwith $"Cannot create second task: {error}"
+        match claimTask
+            { ProjectName = "Project1::ledger"; TaskId = "316"
+              ExpectedRevision = second.Task.Task.Revision
+              Owner = "Orchestrator"; AllowReassign = false } context with
+        | Error(Client.ValidationError message) ->
+            message.Contains("Conflicting active global task ownership") |> shouldEqual true
+        | other -> Assert.Fail($"Second genuine assignment was allowed: {other}"))
+
+[<Test>]
 let assignTaskCreatesWorktreeAndTracksAcknowledgementWithoutLosingCheckpoint () =
     withProject (fun _ project context ->
         let created =

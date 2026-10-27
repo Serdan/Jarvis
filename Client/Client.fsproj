@@ -57,6 +57,7 @@
         <Compile Include="Modules\JobManager.fs"/>
         <Compile Include="Modules\\Worktrees.fs"/>
         <Compile Include="Modules\\TaskStore.fs"/>
+        <Compile Include="Modules\\LedgerStore.fs"/>
         <Compile Include="Modules\AgentDashboard.fs"/>
         <Compile Include="Modules\\WorkTaskCompat.fs"/>
         <Compile Include="Runtime.fs"/>

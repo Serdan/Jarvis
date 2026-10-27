@@ -2,8 +2,26 @@
   "schemaVersion": 1,
   "id": "2026-10-26-browser-bridge-jarvis",
   "title": "Local browser bridge and MCP command routing",
-  "status": "open",
+  "status": "active",
   "dependencies": [],
   "owner": null,
-  "updatedAt": "2026-10-26T22:36:02.7181567\u002B00:00"
+  "updatedAt": "2026-10-27T00:35:47.7977362\u002B00:00",
+  "checkpoint": {
+    "summary": "Implemented generic Jarvis browser bridge and Chromium extension in commit 962f8ec. Manual tab registration/aliases, paired loopback WebSocket, bounded execution of normal project .js files, MCP commands, config and permission policies, lifecycle and privacy protections.",
+    "nextAction": "Independent review and real Chrome/Chromium 138\u002B end-to-end smoke test of extension loading, permissions, background tab execution, navigation/discard behavior and MCP routing. Do not merge or deploy before acceptance.",
+    "verified": [
+      "dotnet test Jarvis.slnx --no-restore: 60 server and 271 client tests passed",
+      "node --test browser-extension/tests/bridge.test.cjs: 5 tests passed",
+      "node --check browser-extension/background.js: passed",
+      "git diff --check: passed",
+      "commit 962f8ec; clean branch feature/browser-bridge"
+    ],
+    "blocker": null,
+    "lastCommit": "962f8ece2e4a577cc22cb74f203505447149c5fb"
+  },
+  "nextActor": "reviewer",
+  "lastUpdatedBy": {
+    "role": "agent",
+    "id": "BrowserBridge implementer"
+  }
 }

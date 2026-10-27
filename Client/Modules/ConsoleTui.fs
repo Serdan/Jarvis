@@ -847,6 +847,13 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                 Console.WriteLine "-------------"
                 writeDetailField width "Agent" row.Agent
                 writeDetailField width "Project" (ActivityFilter.projectToken row.Project)
+                writeDetailField width "Disposition" (AgentView.phaseLabel row.State)
+                if row.State = "Free" then
+                    writeDetailField width "Availability" "No actionable or suspended task recorded for this agent."
+                elif row.State = "Parked" then
+                    writeDetailField width "Availability" "Intentionally parked; not an actionable assignment."
+                elif row.State = "Blocked" then
+                    writeDetailField width "Availability" "Blocked; check the task checkpoint and dependency."
                 if row.Conflict then
                     writeDetailField width "Conflict" "Multiple actionable assignments; review ownership."
                 if agentChanged.Contains row.Key then
@@ -903,7 +910,10 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
             else ""
         Console.WriteLine $"Agents{filterSuffix}{historySuffix}"
         Console.WriteLine "------"
-        Console.WriteLine $"Tracked: {all.Length} | Review: {reviewCount} | Completed: {completedCount} | Conflicts: {conflicts}"
+        let parkedCount = all |> List.filter (fun row -> row.State = "Parked") |> List.length
+        let blockedCount = all |> List.filter (fun row -> row.State = "Blocked") |> List.length
+        let freeCount = all |> List.filter (fun row -> row.State = "Free") |> List.length
+        Console.WriteLine $"Tracked: {all.Length} | Review: {reviewCount} | Parked: {parkedCount} | Blocked: {blockedCount} | Free: {freeCount} | Completed: {completedCount} | Conflicts: {conflicts}"
         let refreshed =
             agentSnapshot
             |> Option.map (fun snap -> snap.RefreshedAt.ToLocalTime().ToString("HH:mm:ss"))

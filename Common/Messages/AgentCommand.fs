@@ -967,7 +967,7 @@ module AgentCommandInfo =
         | None -> invocation command
 
 module AgentProtocol =
-    let version = "3.18"
+    let version = "3.19"
     let defaultPatchFuzzyContextLines = 3
     let maxResponseBytes = 900 * 1024
     let maxImageBytes = 8 * 1024 * 1024
@@ -992,7 +992,7 @@ module AgentProtocol =
           definition "ListTasks" "Lists repository-backed HTML and JSON task files." [ ReadOnly ] false false false
           definition "CompareWorktreeTasks" "Summarizes tasks across registered worktrees with optional nextActor filtering." [ ReadOnly ] false false false
           definition "GetAgentAssignment" "Finds an agent assignment across all registered worktrees; rejects ambiguous active ownership." [ ReadOnly ] false false false
-          definition "GetOrchestrationSnapshot" "Summarizes agent assignments, handoff phases, ownership conflicts, and worktree states." [ ReadOnly ] false false false
+          definition "GetOrchestrationSnapshot" "Summarizes bounded cross-worktree assignments, parked/blocked owners, known agents, handoff phases, ownership conflicts and worktree states." [ ReadOnly ] false false false
           definition "AssignTask" "Atomically claims and assigns a task with global ownership checks." [ WorkspaceWrite; VersionControlWrite ] true true false
           definition "AcknowledgeTask" "Records agent receipt of the current assignment without overwriting a checkpoint." [ WorkspaceWrite; VersionControlWrite ] true true false
           definition "BeginTask" "Records work started for the exact acknowledged assignment revision." [ WorkspaceWrite; VersionControlWrite ] true true false

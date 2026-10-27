@@ -20,7 +20,7 @@ let private assignment agent project task phase =
       CheckpointBlocker = None; CompletionFinalCommit = None }
 
 let private snapshot entries conflicts =
-    { Assignments = entries; Projects = []; Conflicts = conflicts; Issues = []
+    { Assignments = entries; KnownAgents = []; Projects = []; Conflicts = conflicts; Issues = []
       RefreshedAt = DateTimeOffset.UtcNow }
 
 [<Test>]
@@ -74,6 +74,7 @@ let snapshotAdapterPreservesAssignmentIdentityAndInspectionFailures () =
         { Worktree = tree; Tasks = [task]; Error = None }
     let source : Client.TaskStore.OrchestrationSnapshot =
         { ProjectName = "Wayfold"; Worktrees = [group]; Assignments = [assigned]
+          SuspendedTasks = []; KnownAgents = [ "Agent 2" ]
           Conflicts = ["Agent 2 duplicate"]; ReviewerTaskCount = 0
           UnacknowledgedTaskCount = 1; InspectionErrors = ["one worktree unreadable"]
           RetirementInspections = []; RetirementCandidates = []; IntegratedTasks = []
@@ -134,6 +135,7 @@ let completedWorkRemainsVisibleAfterActiveAssignmentDisappears () =
         { ProjectName = "Wayfold"
           Worktrees = [ { Worktree = tree; Tasks = [ completedTask ]; Error = None } ]
           Assignments = []
+          SuspendedTasks = []; KnownAgents = [ "Agent 2" ]
           Conflicts = []
           ReviewerTaskCount = 0
           UnacknowledgedTaskCount = 0
@@ -258,3 +260,25 @@ let agentProjectAndTextFiltersMatchSameTask () =
     (visibleRows "@Wayfold::292 292" data).Length |> shouldEqual 1
     (visibleRows "@Wayfold::292 305" data).Length |> shouldEqual 0
     (visibleRows "@Wayfold::305 305" data).Length |> shouldEqual 1
+
+
+[<Test>]
+let parkedWorkIsNotAConflictWithCurrentAssignmentAndFreeTransitionIsVisible () =
+    let current = assignment "Agent 3" "Wayfold" "308" "Working"
+    let parked =
+        { (assignment "Agent 3" "Wayfold" "305" "Parked") with
+            Status = "parked"; NextActor = None
+            CheckpointNextAction = Some "Wait for API acceptance" }
+    let present = snapshot [ current; parked ] []
+    let row = (rows present).Head
+    row.State |> shouldEqual "Working"
+    row.Conflict |> shouldEqual false
+    row.Assignments.Length |> shouldEqual 2
+    (agentSummary row).Contains("parked/blocked") |> shouldEqual true
+    let onlyParked = snapshot [parked] []
+    (rows onlyParked).Head.State |> shouldEqual "Parked"
+    let free = { snapshot [] [] with KnownAgents = [ "Wayfold", "Agent 3" ] }
+    (rows free).Head.State |> shouldEqual "Free"
+    (visibleRows "free" free).Length |> shouldEqual 1
+    (changedAgents onlyParked free).Contains("Wayfold::Agent 3") |> shouldEqual true
+    (visibleRows "@Wayfold agent 3" free).Length |> shouldEqual 1

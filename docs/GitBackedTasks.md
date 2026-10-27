@@ -59,7 +59,7 @@ A typical JSON state:
 }
 ```
 
-Use `ListTasks` and `GetTask` to inspect HTML and JSON, including revision hashes and diagnostics. `ListTasks` filters by status, owner, dependency and next actor. `CompareWorktreeTasks` summarizes the task records in all Git-registered worktrees, optionally filtering by `nextActor` with the same semantics as `ListTasks`. It preserves branch-local statuses, includes worktree/branch identity alongside task ID, revision, owner and handoff fields, and returns per-worktree diagnostics when a checkout cannot be read. `CreateTask` creates and commits the HTML+JSON pair, and can resume an interrupted write when only an identical HTML description was saved. `UpdateTask` (including optional JSON-encoded dependency changes), `ClaimTask`, `CheckpointTask` and `CompleteTask` validate, write and commit JSON state. The status vocabulary is `open`, `active`, `blocked`, `completed`. Existing JSON using `in_progress` is interpreted as `active` for reading and filtering; the original JSON bytes remain unchanged until an explicit task mutation. Completion preserves task state and its Git history; `GetTaskHistory` returns bounded relevant commits and patches for both the original HTML description and JSON state.
+Use `ListTasks` and `GetTask` to inspect HTML and JSON, including revision hashes and diagnostics. `ListTasks` filters by status, owner, dependency and next actor. `CompareWorktreeTasks` summarizes the task records in all Git-registered worktrees, optionally filtering by `nextActor` with the same semantics as `ListTasks`. It preserves branch-local statuses, includes worktree/branch identity alongside task ID, revision, owner and handoff fields, and returns per-worktree diagnostics when a checkout cannot be read. `CreateTask` creates and commits the HTML+JSON pair, and can resume an interrupted write when only an identical HTML description was saved. `UpdateTask` (including optional JSON-encoded dependency changes), `ClaimTask`, `CheckpointTask` and `CompleteTask` validate, write and commit JSON state. The status vocabulary is `open`, `active`, `parked`, `blocked`, `completed`. Existing JSON using `in_progress` is interpreted as `active` for reading and filtering; the original JSON bytes remain unchanged until an explicit task mutation. Completion preserves task state and its Git history; `GetTaskHistory` returns bounded relevant commits and patches for both the original HTML description and JSON state.
 
 ### Missing task directories and Git recovery
 
@@ -104,7 +104,7 @@ Tests create disposable repositories and worktrees and exercise Git-backed task 
 
 ## Reviewer/agent handoff (protocol 3.15)
 
-Task **status** (`open`, `active`, `blocked`, `completed`) is independent of
+Task **status** (`open`, `active`, `parked`, `blocked`, `completed`) is independent of
 **turn ownership** (`nextActor`: `agent`, `reviewer`, or absent).
 The `owner` records the implementing agent; a reviewer updating an assignment
 does **not** claim or reassign ownership.
@@ -179,7 +179,7 @@ resolution. The new 3.15 command fields require a coordinated server/client
 rollout and refreshed MCP schema; updating the client can interrupt active
 agent sessions, so obtain explicit permission before invoking `UpdateClient`.
 
-## Project-wide orchestration (protocol 3.18)
+## Project-wide orchestration (protocol 3.19)
 
 Agent identity **plus the base project name** is enough to recover an agent's
 current task, regardless of which completed worktree the agent last used.
@@ -271,6 +271,34 @@ leftover checkout for manual inspection. No secondary authoritative task
 database is introduced. The new protocol requires a coordinated server/client
 deployment and refreshed MCP definitions; publishing these source changes
 alone does not update running clients.
+
+## Suspended agents and roster state (protocol 3.19)
+
+The Git-backed task status now accepts `parked` alongside `open`, `active`,
+`blocked`, and `completed`. Use **Parked** for intentionally suspended work
+awaiting a decision or milestone; use **Blocked** for a concrete dependency.
+Both retain their owner, assignment, checkpoint, and Git history. The
+existing checkpoint `blocker` and `nextAction` carry the reason and resume condition.
+
+`UpdateTask(status=parked|blocked)` clears `nextActor` and rejects a simultaneous
+agent/reviewer handoff. Resume with `AssignTask` or explicitly update
+`status=active, nextActor=agent` (with `actorId`). Status-only resume is
+rejected. Both explicit resume paths reissue an existing assignment
+revision, so stale acknowledgements cannot make resumed work appear Working.
+`ClaimTask` likewise renews the revision when reclaiming parked or blocked work.
+`CheckpointTask(status=parked|blocked)` preserves checkpoint evidence but
+clears the handoff. `GetAgentAssignment` returns only actionable owned
+active/open tasks awaiting an agent or reviewer; stale blocked reviewer
+markers remain nonactionable and outside review queues.
+
+`GetOrchestrationSnapshot` provides bounded `KnownAgents`, `SuspendedTasks`
+(up to 3 recent distinct tasks per agent, 300 total), and global compact
+`Assignments` (up to 100 actionable records), **independent of task-list
+pagination**. This supports Parked, Blocked, and Free states on the Agents
+screen without fetching thousands of historical tasks. Free means a known
+Git-backed agent identity has no current actionable or suspended work; it
+does not prove that a chat session is live or the agent is available.
+Use filtered task queries for exhaustive histories beyond the bounded roster.
 
 ## Client Agents screen
 

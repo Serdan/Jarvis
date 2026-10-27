@@ -38,6 +38,7 @@ type ProjectSummary =
 
 type Snapshot =
     { Assignments: Assignment list
+      KnownAgents: (string * string) list
       Projects: ProjectSummary list
       Conflicts: string list
       Issues: string list
@@ -49,52 +50,73 @@ type AgentRow =
       Project: string
       Projects: string list
       Assignments: Assignment list
+      State: string
       Conflict: bool }
 
-let private active (item: Assignment) = item.Status <> "completed"
+let private actionable (item: Assignment) =
+    (item.Status = "active" || item.Status = "open")
+    && (item.NextActor = Some "agent" || item.NextActor = Some "reviewer")
+
+let private suspended (item: Assignment) =
+    item.Status = "parked" || item.Status = "blocked"
 
 let private dateOrder (item: Assignment) =
     item.UpdatedAt |> Option.defaultValue DateTimeOffset.MinValue
 
 let rows (snapshot: Snapshot) =
-    snapshot.Assignments
-    |> List.groupBy (fun item -> item.Project, item.Agent)
-    |> List.map (fun ((project, agent), entries) ->
-        let activeAssignments = entries |> List.filter active
-        let recentCompleted =
+    let keys =
+        (snapshot.Assignments |> List.map (fun item -> item.Project, item.Agent))
+        @ snapshot.KnownAgents
+        |> List.distinct
+    keys
+    |> List.map (fun (project, agent) ->
+        let entries =
+            snapshot.Assignments
+            |> List.filter (fun item -> item.Project = project && item.Agent = agent)
+        let current =
+            entries |> List.filter actionable |> List.sortByDescending dateOrder
+        let paused =
+            entries |> List.filter suspended |> List.sortByDescending dateOrder
+        let completed =
             entries
-            |> List.filter (active >> not)
+            |> List.filter (fun item -> item.Status = "completed")
             |> List.sortByDescending dateOrder
             |> List.truncate 3
-        let assignments = (activeAssignments |> List.sortByDescending dateOrder) @ recentCompleted
-        let conflict =
-            activeAssignments.Length > 1
-            || (snapshot.Conflicts |> List.exists (fun message ->
+        let assignments = current @ paused @ completed
+        let state =
+            if not current.IsEmpty then current.Head.Phase
+            elif not paused.IsEmpty then paused.Head.Phase
+            else "Free"
+        let conflictFromSnapshot =
+            snapshot.Conflicts
+            |> List.exists (fun message ->
                 message.Contains(project, StringComparison.OrdinalIgnoreCase)
                 && (message.Contains(agent, StringComparison.OrdinalIgnoreCase)
-                    || (activeAssignments |> List.exists (fun assignment ->
-                        message.Contains("Task " + assignment.TaskId + " ", StringComparison.OrdinalIgnoreCase))))))
+                    || current |> List.exists (fun assignment ->
+                        message.Contains("Task " + assignment.TaskId + " ", StringComparison.OrdinalIgnoreCase))))
+        let conflict = current.Length > 1 || conflictFromSnapshot
         { Key = project + "::" + agent
           Agent = agent
           Project = project
           Projects = [project]
           Assignments = assignments
+          State = state
           Conflict = conflict })
     |> List.sortBy (fun item ->
         (if item.Conflict then 0 else 1), item.Project.ToLowerInvariant(), item.Agent.ToLowerInvariant())
 
-// Use the same token parser as Activity: text terms are ANDed, and @terms
-// select a project (including a particular registered worktree).
 let matches (filter: string) (row: AgentRow) =
     let terms = ActivityFilter.parseTerms filter
-    row.Assignments
+    (row.Assignments.IsEmpty
+     && ActivityFilter.matchesTerms terms (Some row.Project) (row.Agent + " " + row.State))
+    || (row.Assignments
     |> List.exists (fun task ->
         let searchable =
-            [ row.Agent; task.Project; task.TaskId; task.Title; task.Selector
+            [ row.Agent; row.State; task.Project; task.TaskId; task.Title; task.Selector
               task.Worktree; task.Branch |> Option.defaultValue ""; task.Phase
               task.CheckpointSummary |> Option.defaultValue "" ]
             |> String.concat " "
-        ActivityFilter.matchesTerms terms (Some task.Selector) searchable)
+        ActivityFilter.matchesTerms terms (Some task.Selector) searchable))
 
 let visibleRows filter snapshot =
     rows snapshot |> List.filter (matches filter)
@@ -109,32 +131,45 @@ let phaseLabel phase =
     | other -> other
 
 let agentSummary (row: AgentRow) =
-    if row.Conflict then $"{row.Assignments.Length} assignments - CONFLICT"
+    if row.Conflict then "Multiple actionable assignments - CONFLICT"
+    elif row.State = "Free" then
+        match row.Assignments |> List.tryHead with
+        | Some last -> $"Free (last #{last.TaskId} {phaseLabel last.Phase})"
+        | None -> "Free"
     else
-        row.Assignments
-        |> List.tryHead
-        |> Option.map (fun item ->
-            let additional = row.Assignments |> List.filter (active >> not) |> List.length
-            let suffix = if additional > 0 && active item then $" (+{additional} completed)" else ""
-            $"#{item.TaskId} - {phaseLabel item.Phase}{suffix}")
-        |> Option.defaultValue "No recent tasks"
-
-let private identity (task: Assignment) =
-    task.Project, task.Agent, task.Worktree, task.TaskId
+        match row.Assignments |> List.tryHead with
+        | None -> row.State
+        | Some item ->
+            let completedCount =
+                row.Assignments |> List.filter (fun entry -> entry.Status = "completed") |> List.length
+            let pausedCount =
+                row.Assignments |> List.filter suspended |> List.length
+            let suffix =
+                [ if completedCount > 0 then $"{completedCount} completed"
+                  if pausedCount > 0 && actionable item then $"{pausedCount} parked/blocked" ]
+                |> function
+                   | [] -> ""
+                   | values -> " (+" + String.concat ", " values + ")"
+            $"#{item.TaskId} - {phaseLabel item.Phase}{suffix}"
 
 let changedAgents (before: Snapshot) (after: Snapshot) =
     let previous =
-        before.Assignments
-        |> List.map (fun item -> identity item, item)
-        |> Map.ofList
-    after.Assignments
-    |> List.choose (fun item ->
-        match previous |> Map.tryFind (identity item) with
+        rows before |> List.map (fun row -> row.Key, row) |> Map.ofList
+    rows after
+    |> List.choose (fun row ->
+        match previous |> Map.tryFind row.Key with
         | Some prior
-            when prior.Status = item.Status
-                 && prior.Phase = item.Phase
-                 && prior.UpdatedAt = item.UpdatedAt
-                 && prior.CheckpointSummary = item.CheckpointSummary
-                 && prior.CompletionFinalCommit = item.CompletionFinalCommit -> None
-        | _ -> Some(item.Project + "::" + item.Agent))
+            when prior.State = row.State
+                 && prior.Conflict = row.Conflict
+                 && (prior.Assignments |> List.map (fun task ->
+                     task.TaskId, task.Status, task.Phase, task.UpdatedAt,
+                     task.AssignmentRevision, task.CheckpointSummary,
+                     task.CheckpointNextAction, task.CheckpointBlocker,
+                     task.CompletionFinalCommit))
+                    = (row.Assignments |> List.map (fun task ->
+                        task.TaskId, task.Status, task.Phase, task.UpdatedAt,
+                        task.AssignmentRevision, task.CheckpointSummary,
+                        task.CheckpointNextAction, task.CheckpointBlocker,
+                        task.CompletionFinalCommit)) -> None
+        | _ -> Some row.Key)
     |> Set.ofList

@@ -122,6 +122,7 @@ let v2TaskSetupAndInboxRefuseUnconfiguredCheckout () =
               Reason = ""
               BaseOid = ""
               TargetRef = ""
+              SourceRef = ""; AllowDetached = false; AllowUncommitted = false
               DecisionSequence = 0L; Evidence = "" }
         match Client.V2ReviewApi.V2TaskApi.write mutation context with
         | Error(Client.ValidationError message) ->
@@ -146,6 +147,7 @@ let v2TaskMutationsRequireGitWritePermission () =
               Title = "Task"; Html = "<h1>Task</h1>"; ExpectedVersion = 0
               ExpectedAgentVersion = 0; AssignmentGeneration = 0;
               Summary = ""; NextAction = ""; Reason = ""; BaseOid = ""; TargetRef = ""
+              SourceRef = ""; AllowDetached = false; AllowUncommitted = false
               DecisionSequence = 0L; Evidence = "" }
     match Client.PermissionPolicy.evaluate write with
     | Error(Client.ConfirmationRequired approval) ->

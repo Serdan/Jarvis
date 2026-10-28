@@ -434,6 +434,21 @@ An attempt records `source.remote`, fully-qualified branch ref, base commit, sub
 
 `BindAttemptSource` explicitly verifies the registered source repository and intended source ref/base SHA. If the source ref cannot be found, mark the binding unavailable in query results, not the agent Free. Detached/uncommitted worktrees require explicit binding; never infer a branch from an agent label or task ID. Git source operations remain on the selected device/client with existing permissions and command approval.
 
+**V2-08 implementation detail (2026-10-28):** `BindAttemptSource` pins
+source repository identity by a versioned SHA-256 fingerprint of the
+explicitly approved fetch/push endpoints, independent of project UUID and
+local checkout path. Git does not provide a globally immutable remote
+repository identifier; the fingerprint proves equality of approved endpoints,
+not hosting-provider repository attestations. The client checks Git's
+registered worktrees, the source branch and base ancestry against the
+approved remote target. `InspectAttemptSource` reports read-only local
+checkout/ref availability (including `SourceUnavailable`) without changing
+owner or execution slot. `RebindAttemptSource` explicitly changes a working
+branch at an exact attempt version/generation while preserving the frozen
+review revisions and original source base/target. Reviewer and integration
+operations verify pinned repository/endpoints but need not resolve a review
+revision's historical working branch after it has disappeared.
+
 Existing V1 task JSON must not be imported as executable current state by ordinary source reads. If a new source branch accidentally inherits V1 task JSON, current task APIs ignore it. The worktree status/retirement tooling may still report it as historical files without granting those copies authority.
 
 ## 7. Source integration and cross-ref recovery

@@ -26,6 +26,24 @@ type LedgerFailure =
     | ReviewVersionConflict of string
     | SourceReviewRefUnavailable of string
 
+[<CLIMutable>]
+type SourceRepositoryIdentity =
+    { RepositoryId: string
+      RemoteName: string
+      FetchUrl: string
+      PushUrl: string }
+
+[<CLIMutable>]
+type SourceWorktreeObservation =
+    { RepositoryId: string
+      SourceRef: string
+      SourceHead: string
+      SelectedHead: string
+      State: string
+      WorktreePresent: bool
+      SelectedWorktreeDetached: bool
+      SelectedWorktreeDirty: bool }
+
 type LedgerBinding =
     { RepositoryPath: string
       RemoteName: string
@@ -880,6 +898,102 @@ module LedgerStore =
             | Ok result when result.ExitCode = 0 && result.Stdout = "commit" -> Ok ()
             | _ -> Error(SourceUnavailable $"Source commit {commit} is not available on this device.")
 
+
+    // Source identity is independent of the orphan ledger project UUID and
+    // of any workstation path. Both approved Git endpoints are part of the
+    // fingerprint: forks and independently configured push destinations do
+    // not silently become equivalent repositories.
+    let sourceRepositoryIdentity (binding: LedgerBinding) =
+        match validate binding with
+        | Error error -> Error error
+        | Ok () ->
+            let repo = binding.RepositoryPath
+            match run repo [ "rev-parse"; "--show-toplevel" ],
+                  run repo [ "worktree"; "list"; "--porcelain" ] with
+            | Ok selectedRoot, Ok registered ->
+                let selected = Path.TrimEndingDirectorySeparator(Path.GetFullPath(selectedRoot))
+                let approved =
+                    registered.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                    |> Array.exists (fun line ->
+                        line.StartsWith("worktree ", StringComparison.Ordinal)
+                        && String.Equals(
+                            Path.TrimEndingDirectorySeparator(Path.GetFullPath(line.Substring(9))),
+                            selected, StringComparison.Ordinal))
+                if not approved then
+                    Error(InvalidBinding "Selected source checkout is not a registered Git worktree.")
+                else
+                    let fingerprint = digest ("jarvis-source-repository-v1\n"
+                                                + binding.ApprovedFetchUrl + "\n"
+                                                + binding.ApprovedPushUrl)
+                    Ok { RepositoryId = fingerprint
+                         RemoteName = binding.RemoteName
+                         FetchUrl = binding.ApprovedFetchUrl
+                         PushUrl = binding.ApprovedPushUrl }
+            | _ -> Error(SourceUnavailable "Cannot verify registered source checkout.")
+
+    // This is a read-only local observation, never authoritative ownership.
+    // Branches can survive checkout deletion; detached/dirty checkouts are
+    // reported rather than guessed to be an assigned worker's source.
+    let inspectSourceWorktree (binding: LedgerBinding) sourceRef =
+        if isNull sourceRef
+           || not (Regex.IsMatch(sourceRef, "^refs/heads/[A-Za-z0-9][A-Za-z0-9_./-]*$"))
+           || sourceRef.Contains("..") || sourceRef.EndsWith("/") then
+            Error(InvalidBinding "Fully qualified source branch required.")
+        else
+            match sourceRepositoryIdentity binding with
+            | Error error -> Error error
+            | Ok identity ->
+                let repo = binding.RepositoryPath
+                match run repo [ "worktree"; "list"; "--porcelain" ],
+                      run repo [ "rev-parse"; "--show-toplevel" ],
+                      git repo [ "show-ref"; "--verify"; "--hash"; sourceRef ],
+                      run repo [ "rev-parse"; "HEAD" ],
+                      run repo [ "status"; "--porcelain" ] with
+                | Ok trees, Ok selectedRoot, Ok source, Ok selectedHead, Ok status ->
+                    let selected = Path.TrimEndingDirectorySeparator(Path.GetFullPath(selectedRoot))
+                    let blocks = trees.Split([| "\n\n" |], StringSplitOptions.RemoveEmptyEntries)
+                    let parsed =
+                        blocks |> Array.choose (fun block ->
+                            let lines = block.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                            match lines |> Array.tryFind (fun l -> l.StartsWith("worktree ", StringComparison.Ordinal)) with
+                            | None -> None
+                            | Some path ->
+                                let root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(path.Substring(9)))
+                                // Git can keep a prunable registration after a checkout
+                                // directory was moved or deleted outside git worktree.
+                                // Such a registration is not evidence of an extant worktree.
+                                if not (Directory.Exists(root))
+                                   || (lines |> Array.exists (fun l ->
+                                       l.StartsWith("prunable ", StringComparison.Ordinal))) then
+                                    None
+                                else
+                                    let branch =
+                                        lines |> Array.tryFind (fun l -> l.StartsWith("branch ", StringComparison.Ordinal))
+                                        |> Option.map (fun l -> l.Substring(7))
+                                    Some(root, branch))
+                    let selectedBranch =
+                        parsed |> Array.tryPick (fun (root, branch) ->
+                            if root = selected then Some branch else None)
+                    let checkedOut = parsed |> Array.exists (fun (_, branch) -> branch = Some sourceRef)
+                    let branchPresent = source.ExitCode = 0
+                    let detached = selectedBranch = Some None
+                    let dirty = not (String.IsNullOrEmpty status)
+                    let state =
+                        if not branchPresent then "SourceUnavailable"
+                        elif detached && branchPresent && selectedHead <> source.Stdout then "StaleDetachedCheckout"
+                        elif detached && not checkedOut then "DetachedCheckout"
+                        elif dirty && selectedBranch = Some(Some sourceRef) then "Uncommitted"
+                        elif checkedOut then "CheckedOut"
+                        else "AvailableNoWorktree"
+                    Ok { RepositoryId = identity.RepositoryId
+                         SourceRef = sourceRef
+                         SourceHead = if branchPresent then source.Stdout else null
+                         SelectedHead = selectedHead
+                         State = state
+                         WorktreePresent = checkedOut
+                         SelectedWorktreeDetached = detached
+                         SelectedWorktreeDirty = dirty }
+                | _ -> Error(SourceUnavailable "Cannot inspect registered source worktrees.")
 
     let verifyReviewDiff (binding: LedgerBinding) (baseOid: string) (headOid: string) =
         if isNull baseOid || isNull headOid

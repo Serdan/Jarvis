@@ -89,6 +89,146 @@ type ReviewWorkflowTests() =
             Directory.Delete(root, true)
 
     [<Test>]
+    member _.SourceBindingSurvivesWorktreeRemovalAndBranchRecreationWithoutFreeingOwner() =
+        withFixture (fun one _ first second baseOid targetRef _ _ ->
+            let taskId = "960"
+            let sourceRef = "refs/heads/feature/source-960"
+            let path = Path.Combine(Path.GetDirectoryName(one), "source-960")
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Source identity" |> success |> ignore
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner" "Reviewer" |> success |> ignore
+            ReviewWorkflow.beginAttempt first (Guid.NewGuid()) taskId "Owner" 1 1 |> success |> ignore
+            git one [ "branch"; "feature/source-960"; baseOid ] |> ignore
+            git one [ "worktree"; "add"; path; "feature/source-960" ] |> ignore
+            let worktreeBinding = { first with RepositoryPath = path }
+            let sourceIdentity = LedgerStore.sourceRepositoryIdentity worktreeBinding |> success
+            Assert.That(sourceIdentity.RepositoryId, Is.Not.EqualTo(first.ProjectId.ToString("D")))
+            Assert.That((LedgerStore.sourceRepositoryIdentity second |> success).RepositoryId,
+                        Is.EqualTo(sourceIdentity.RepositoryId))
+            let initial = LedgerStore.inspectSourceWorktree worktreeBinding sourceRef |> success
+            Assert.That(initial.State, Is.EqualTo("CheckedOut"))
+            ReviewWorkflow.bindAttemptSource worktreeBinding (Guid.NewGuid()) taskId "Owner" 2 1
+                sourceRef baseOid targetRef false false |> success |> ignore
+            expectStale (ReviewWorkflow.bindAttemptSource worktreeBinding (Guid.NewGuid()) taskId
+                             "Owner" 2 1 sourceRef baseOid targetRef false false)
+            expectStale (ReviewWorkflow.rebindAttemptSource worktreeBinding (Guid.NewGuid()) taskId
+                             "Owner" 3 2 sourceRef false false)
+            let _, _, attemptOption = ReviewWorkflow.getTask second taskId |> success
+            let attempt = attemptOption.Value
+            Assert.That(attempt.SourceRepositoryId, Is.EqualTo(sourceIdentity.RepositoryId))
+            Assert.That(attempt.SourceRef, Is.EqualTo(sourceRef))
+            Assert.That(attempt.SourceRemote, Is.EqualTo(first.ApprovedFetchUrl))
+            Assert.That(attempt.SourcePushRemote, Is.EqualTo(first.ApprovedPushUrl))
+            // Filesystem moves leave prunable Git registrations; they must not
+            // be reported as a usable checkout until Git registration is repaired.
+            let movedPath = Path.Combine(Path.GetDirectoryName(one), "source-960-moved")
+            Directory.Move(path, movedPath)
+            let _, _, displaced = ReviewWorkflow.inspectAttemptSource first taskId |> success
+            Assert.That(displaced.Value.State, Is.EqualTo("AvailableNoWorktree"))
+            git one [ "worktree"; "repair"; movedPath ] |> ignore
+            let repaired = { first with RepositoryPath = movedPath }
+            let _, _, repairedView = ReviewWorkflow.inspectAttemptSource repaired taskId |> success
+            Assert.That(repairedView.Value.State, Is.EqualTo("CheckedOut"))
+            git one [ "worktree"; "remove"; movedPath ] |> ignore
+            let _, _, removed = ReviewWorkflow.inspectAttemptSource first taskId |> success
+            Assert.That(removed.Value.State, Is.EqualTo("AvailableNoWorktree"))
+            git one [ "branch"; "-D"; "feature/source-960" ] |> ignore
+            let _, _, missing = ReviewWorkflow.inspectAttemptSource first taskId |> success
+            Assert.That(missing.Value.State, Is.EqualTo("SourceUnavailable"))
+            let inbox = ReviewWorkflow.getAgentInbox second "Owner" |> success
+            Assert.That(inbox.Agent.State, Is.EqualTo("Working"))
+            Assert.That(inbox.SlotAvailable, Is.False)
+            git one [ "branch"; "feature/source-960"; baseOid ] |> ignore
+            git one [ "worktree"; "add"; path; "feature/source-960" ] |> ignore
+            File.WriteAllText(Path.Combine(path, "source.txt"), "base then restored worktree")
+            git path [ "add"; "source.txt" ] |> ignore
+            git path [ "commit"; "-m"; "Review restored feature" ] |> ignore
+            let head = git path [ "rev-parse"; "HEAD" ]
+            let request = Guid.NewGuid()
+            ReviewWorkflow.submitReview worktreeBinding (Guid.NewGuid()) taskId "Owner" 3 1
+                request sourceRef head "Restored tree" |> success |> ignore
+            let _, _, revision = ReviewWorkflow.getReview second taskId request |> success
+            Assert.That(revision.SourceRepositoryId, Is.EqualTo(sourceIdentity.RepositoryId))
+            Assert.That(revision.SourcePushRemote, Is.EqualTo(sourceIdentity.PushUrl))
+            ReviewWorkflow.claimReview second (Guid.NewGuid()) taskId request "Reviewer" 1 1 |> success |> ignore
+            // Renaming a checked-out source branch changes neither the task owner
+            // nor the immutable review revision's original source-ref evidence.
+            git path [ "branch"; "-m"; "feature/source-960-renamed" ] |> ignore
+            ReviewWorkflow.rebindAttemptSource worktreeBinding (Guid.NewGuid()) taskId "Owner" 4 1
+                "refs/heads/feature/source-960-renamed" false false |> success |> ignore
+            let _, _, afterRename = ReviewWorkflow.inspectAttemptSource worktreeBinding taskId |> success
+            Assert.That(afterRename.Value.State, Is.EqualTo("CheckedOut"))
+            let _, _, immutableRevision = ReviewWorkflow.getReview second taskId request |> success
+            Assert.That(immutableRevision.SourceRef, Is.EqualTo(sourceRef))
+            ReviewWorkflow.decide second (Guid.NewGuid()) taskId request "Reviewer" 2 Accept
+                "Reviewed before source rename" |> success |> ignore)
+
+    [<Test>]
+    member _.DetachedSourceCheckoutRequiresExplicitApproval() =
+        withFixture (fun one _ first _ baseOid targetRef newCommit _ ->
+            let taskId = "961"
+            let refName = "refs/heads/feature/source-961"
+            let path = Path.Combine(Path.GetDirectoryName(one), "detached-961")
+            git one [ "branch"; "feature/source-961"; baseOid ] |> ignore
+            git one [ "worktree"; "add"; "--detach"; path; baseOid ] |> ignore
+            let detached = { first with RepositoryPath = path }
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Detached source" |> success |> ignore
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner" "Reviewer" |> success |> ignore
+            ReviewWorkflow.beginAttempt first (Guid.NewGuid()) taskId "Owner" 1 1 |> success |> ignore
+            match ReviewWorkflow.bindAttemptSource detached (Guid.NewGuid()) taskId "Owner" 2 1
+                    refName baseOid targetRef false false with
+            | Error(SourceUnavailable _) -> ()
+            | other -> Assert.Fail(sprintf "Detached checkout must require consent: %A" other)
+            let state = LedgerStore.inspectSourceWorktree detached refName |> success
+            Assert.That(state.SelectedWorktreeDetached, Is.True)
+            // A detached checkout still needs to point at the exact selected
+            // source branch commit; allowing detached does not accept stale HEAD.
+            let newer = newCommit "Advance source" "newer source"
+            git one [ "branch"; "-f"; "feature/source-961"; newer ] |> ignore
+            let stale = LedgerStore.inspectSourceWorktree detached refName |> success
+            Assert.That(stale.State, Is.EqualTo("StaleDetachedCheckout"))
+            Assert.That(stale.SelectedHead, Is.EqualTo(baseOid))
+            match ReviewWorkflow.bindAttemptSource detached (Guid.NewGuid()) taskId "Owner" 2 1
+                    refName baseOid targetRef true false with
+            | Error(SourceUnavailable _) -> ()
+            | other -> Assert.Fail(sprintf "Explicitly allowed detached HEAD must still reject stale commit: %A" other)
+            git path [ "checkout"; "--detach"; newer ] |> ignore
+            ReviewWorkflow.bindAttemptSource detached (Guid.NewGuid()) taskId "Owner" 2 1
+                refName baseOid targetRef true false |> success |> ignore)
+
+    [<Test>]
+    member _.DirtySourceAndUnapprovedRemoteChangesAreRejected() =
+        withFixture (fun one _ first _ baseOid targetRef _ _ ->
+            let taskId = "962"
+            let refName = "refs/heads/feature/source-962"
+            let path = Path.Combine(Path.GetDirectoryName(one), "dirty-962")
+            git one [ "branch"; "feature/source-962"; baseOid ] |> ignore
+            git one [ "worktree"; "add"; path; "feature/source-962" ] |> ignore
+            let selected = { first with RepositoryPath = path }
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Dirty source" |> success |> ignore
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner" "Reviewer" |> success |> ignore
+            ReviewWorkflow.beginAttempt first (Guid.NewGuid()) taskId "Owner" 1 1 |> success |> ignore
+            File.WriteAllText(Path.Combine(path, "source.txt"), "uncommitted edit")
+            match ReviewWorkflow.bindAttemptSource selected (Guid.NewGuid()) taskId "Owner" 2 1
+                    refName baseOid targetRef false false with
+            | Error(SourceUnavailable _) -> ()
+            | other -> Assert.Fail(sprintf "Dirty checkout must require consent: %A" other)
+            ReviewWorkflow.bindAttemptSource selected (Guid.NewGuid()) taskId "Owner" 2 1
+                refName baseOid targetRef false true |> success |> ignore
+            let fork = Path.Combine(Path.GetDirectoryName(one), "unapproved.git")
+            git (Path.GetDirectoryName(one)) [ "init"; "--bare"; fork ] |> ignore
+            let altered = { selected with ApprovedPushUrl = fork }
+            match LedgerStore.sourceRepositoryIdentity altered with
+            | Error(InvalidBinding _) -> ()
+            | other -> Assert.Fail(sprintf "Unapproved push remote must fail closed: %A" other)
+            git one [ "remote"; "set-url"; "--push"; "origin"; fork ] |> ignore
+            match ReviewWorkflow.inspectAttemptSource first taskId with
+            | Error(InvalidBinding _) -> ()
+            | other -> Assert.Fail(sprintf "Changed configured source endpoint must fail: %A" other)
+            let inbox = ReviewWorkflow.getAgentInbox first "Owner"
+            match inbox with
+            | Error(InvalidBinding _) -> () // Remote drift blocks authority; it never frees the slot.
+            | other -> Assert.Fail(sprintf "Unapproved ledger endpoint must be rejected: %A" other))
+    [<Test>]
     member _.OwnerUpdatesUntilClaimThenContinuesWorking() =
         withFixture (fun one _ first second baseOid sourceRef newCommit initTask ->
             initTask "315"
@@ -468,6 +608,7 @@ type ReviewWorkflowTests() =
                       Reason = ""
                       BaseOid = ""
                       TargetRef = ""
+                      SourceRef = ""; AllowDetached = false; AllowUncommitted = false
                       DecisionSequence = 0L; Evidence = "" }
                 let run cmd =
                     Client.V2ReviewApi.V2TaskApi.write cmd ctx
@@ -1954,7 +2095,9 @@ type ReviewWorkflowTests() =
             Assert.That(request.Status, Is.EqualTo("Unclaimed"))
             Assert.That(revision1.Revision, Is.EqualTo(1))
             Assert.That(revision1.SpecBlobOid.Length, Is.EqualTo(40))
-            Assert.That(revision1.SourceRepositoryId, Is.EqualTo(first.ProjectId.ToString("D")))
+            let pinnedSource = LedgerStore.sourceRepositoryIdentity first |> success
+            Assert.That(revision1.SourceRepositoryId, Is.EqualTo(pinnedSource.RepositoryId))
+            Assert.That(revision1.SourcePushRemote, Is.EqualTo(pinnedSource.PushUrl))
             Assert.That(revision1.SourceRemote, Is.EqualTo(first.ApprovedFetchUrl))
             Assert.That(revision1.PublishedSourceOid, Is.EqualTo(c))
             Assert.That(revision1.EvidenceStatus, Is.EqualTo("OwnerReported"))

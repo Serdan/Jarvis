@@ -79,6 +79,9 @@ module private V2TaskCommands =
           Reason = ""
           BaseOid = ""
           TargetRef = ""
+          SourceRef = ""
+          AllowDetached = false
+          AllowUncommitted = false
           DecisionSequence = 0L
           Evidence = "" }
 
@@ -190,10 +193,10 @@ module McpToolHelpers =
           InputSchemaJson = None
           OutputSchemaJson = None }
 
-    let private v2TaskReadMethods = [ "V2AgentInbox"; "V2GetAssignment"; "V2GetCheckpoint" ]
+    let private v2TaskReadMethods = [ "V2AgentInbox"; "V2GetAssignment"; "V2GetCheckpoint"; "V2InspectAttemptSource" ]
     let private v2TaskWriteMethods =
         [ "V2CreateTask"; "V2ReviseTaskSpec"; "V2RegisterAgent"; "V2AssignTask"; "V2AcknowledgeAssignment"; "V2ReissueAssignment"; "V2BeginAttempt"; "V2CheckpointAttempt"
-          "V2BindReviewBase"; "V2YieldAgent"; "V2ResumeAgent"; "V2CompleteAgentWork"
+          "V2BindReviewBase"; "V2BindAttemptSource"; "V2RebindAttemptSource"; "V2YieldAgent"; "V2ResumeAgent"; "V2CompleteAgentWork"
           "V2ParkAgent"; "V2ReissueQueuedAttempt"; "V2RecoverAgentAssignment"; "V2AcknowledgeReviewFeedback" ]
 
     let private v2LedgerReadMethods = [ "V2LedgerHealth"; "V2GetOperationStatus"; "V2PendingOperations"; "V2ReconcilePendingOperations" ]
@@ -1199,6 +1202,31 @@ type JarvisMcpTools =
     static member V2BindReviewBase(projectName: string, taskId: string, ownerId: string, expectedAttemptVersion: int, assignmentGeneration: int, baseOid: string, targetRef: string, operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         let cmd = V2TaskCommands.write projectName "BindReviewBase" operationId taskId ownerId
         McpToolHelpers.send client http (V2TaskWriteCommand { cmd with ExpectedVersion = expectedAttemptVersion; AssignmentGeneration = assignmentGeneration; BaseOid = baseOid; TargetRef = targetRef })
+
+    [<McpServerTool(Title = "V2 bind attempt source", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Bind an exact Working assignment generation to the approved source repository, source branch, cumulative base and target ref. Detached or uncommitted selected worktrees require explicit consent. Checkout path never becomes agent ownership.")>]
+    static member V2BindAttemptSource(projectName: string, taskId: string, ownerId: string, expectedAttemptVersion: int, assignmentGeneration: int, sourceRef: string, baseOid: string, targetRef: string, allowDetached: bool, allowUncommitted: bool, operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        let cmd = V2TaskCommands.write projectName "BindAttemptSource" operationId taskId ownerId
+        McpToolHelpers.send client http
+            (V2TaskWriteCommand
+                { cmd with ExpectedVersion = expectedAttemptVersion; AssignmentGeneration = assignmentGeneration
+                           SourceRef = sourceRef; BaseOid = baseOid; TargetRef = targetRef
+                           AllowDetached = allowDetached; AllowUncommitted = allowUncommitted })
+
+    [<McpServerTool(Title = "V2 rebind attempt source", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Explicitly rebind the source branch of a pinned Working attempt at an exact version and assignment generation. Frozen review revisions retain their original provenance; ownership remains unchanged.")>]
+    static member V2RebindAttemptSource(projectName: string, taskId: string, ownerId: string, expectedAttemptVersion: int, assignmentGeneration: int, sourceRef: string, allowDetached: bool, allowUncommitted: bool, operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        let cmd = V2TaskCommands.write projectName "RebindAttemptSource" operationId taskId ownerId
+        McpToolHelpers.send client http
+            (V2TaskWriteCommand
+                { cmd with ExpectedVersion = expectedAttemptVersion; AssignmentGeneration = assignmentGeneration
+                           SourceRef = sourceRef; AllowDetached = allowDetached
+                           AllowUncommitted = allowUncommitted })
+
+    [<McpServerTool(Title = "V2 inspect attempt source", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read the pinned source repository/ref and current registered Git worktree observation without changing task ownership, assignment or agent state. Missing source is SourceUnavailable, not agent Free.")>]
+    static member V2InspectAttemptSource(projectName: string, taskId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http
+            (V2TaskReadCommand
+                { ProjectName = projectName; AgentId = ""; Action = "InspectAttemptSource"
+                  TaskId = taskId; AssignmentGeneration = 0; CheckpointSequence = 0L })
 
     [<McpServerTool(Title = "V2 acknowledge review feedback", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Acknowledge the exact review decision sequence without interrupting the implementation slot. Requires an explicitly bound V2 ledger; V1 tasks are unchanged.")>]
     static member V2AcknowledgeReviewFeedback(projectName: string, taskId: string, ownerId: string, decisionSequence: int64, operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =

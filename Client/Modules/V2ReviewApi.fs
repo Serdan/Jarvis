@@ -507,6 +507,17 @@ module V2PendingIntentJournal =
                     owner @ [ "ExpectedVersion", "expectedVersion"
                               "AssignmentGeneration", "generation"
                               "BaseOid", "baseOid"; "TargetRef", "targetRef" ]
+                | "V2TaskWrite", "BindAttemptSource" ->
+                    owner @ [ "ExpectedVersion", "expectedVersion"
+                              "AssignmentGeneration", "generation"
+                              "BaseOid", "baseOid"; "TargetRef", "targetRef"
+                              "SourceRef", "sourceRef"; "AllowDetached", "allowDetached"
+                              "AllowUncommitted", "allowUncommitted" ]
+                | "V2TaskWrite", "RebindAttemptSource" ->
+                    owner @ [ "ExpectedVersion", "expectedVersion"
+                              "AssignmentGeneration", "generation"
+                              "SourceRef", "sourceRef"; "AllowDetached", "allowDetached"
+                              "AllowUncommitted", "allowUncommitted" ]
                 | "V2TaskWrite", "CheckpointAttempt" ->
                     attempt @ [ "Summary", "summary"; "NextAction", "nextAction"
                                 "BaseOid", "sourceCommit"; "Evidence", "evidence" ]
@@ -970,6 +981,9 @@ module V2TaskApi =
             | "GetCheckpoint" ->
                 ReviewWorkflow.ReviewWorkflow.getCheckpoint binding cmd.TaskId cmd.CheckpointSequence
                 |> mapError |> Result.map box
+            | "InspectAttemptSource" ->
+                ReviewWorkflow.ReviewWorkflow.inspectAttemptSource binding cmd.TaskId
+                |> mapError |> Result.map box
             | _ -> Error(Client.ValidationError "Unsupported V2 task read operation."))
 
     let write (cmd: V2TaskWriteCommand) rt =
@@ -1012,6 +1026,17 @@ module V2TaskApi =
                             ReviewWorkflow.ReviewWorkflow.bindReviewBase binding operationId cmd.TaskId
                                 cmd.ActorId cmd.ExpectedVersion cmd.AssignmentGeneration
                                 cmd.BaseOid cmd.TargetRef
+                            |> mapError
+                        | "BindAttemptSource" ->
+                            ReviewWorkflow.ReviewWorkflow.bindAttemptSource binding operationId cmd.TaskId
+                                cmd.ActorId cmd.ExpectedVersion cmd.AssignmentGeneration
+                                cmd.SourceRef cmd.BaseOid cmd.TargetRef
+                                cmd.AllowDetached cmd.AllowUncommitted
+                            |> mapError
+                        | "RebindAttemptSource" ->
+                            ReviewWorkflow.ReviewWorkflow.rebindAttemptSource binding operationId cmd.TaskId
+                                cmd.ActorId cmd.ExpectedVersion cmd.AssignmentGeneration
+                                cmd.SourceRef cmd.AllowDetached cmd.AllowUncommitted
                             |> mapError
                         | "CheckpointAttempt" ->
                             ReviewWorkflow.ReviewWorkflow.checkpointAttempt binding operationId

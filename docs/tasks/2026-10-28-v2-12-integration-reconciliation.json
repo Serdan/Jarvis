@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "id": "2026-10-28-v2-12-integration-reconciliation",
+  "title": "Complete source integration proof, recovery and worktree retirement",
+  "status": "open",
+  "priority": "P1",
+  "dependencies": [
+    "2026-10-28-v2-05-checkpoint-review-evidence",
+    "2026-10-28-v2-06-reviewer-claim-recovery",
+    "2026-10-28-v2-08-source-bindings"
+  ],
+  "owner": {
+    "agent": null,
+    "worktree": null
+  },
+  "checkpoint": {
+    "summary": "V2 specification gap identified by the 2026-10-28 audit; implementation not started.",
+    "nextAction": "Implement the acceptance criteria in the paired HTML task using disposable Git repositories; do not deploy or migrate V1.",
+    "verified": [],
+    "lastCommit": null
+  },
+  "audit": {
+    "specSections": [
+      "§7",
+      "§8",
+      "RV3-03"
+    ],
+    "implementationReferences": [
+      "Client/Modules/ReviewWorkflow.fs:880-1075",
+      "Client/Modules/LedgerStore.fs:632-695"
+    ],
+    "sourceReport": "docs/reviews/2026-10-28-v2-spec-implementation-audit.md"
+  },
+  "updatedAt": "2026-10-28T00:00:00Z"
+}

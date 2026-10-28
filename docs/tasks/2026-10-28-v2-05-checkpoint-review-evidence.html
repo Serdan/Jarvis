@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Implement complete checkpoints and review submission evidence</title></head>
+<body><main>
+<h1>Implement complete checkpoints and review submission evidence</h1>
+<p><strong>Task:</strong> 2026-10-28-v2-05-checkpoint-review-evidence. <strong>Priority:</strong> P0. <strong>Status:</strong> Open.</p>
+<h2>Goal and current gap</h2>
+<p>Yield/Complete/Recovery checkpoint files exist, but CheckpointAttempt while Working and final submission checkpoint are absent; ReviewRevision stores only base/head/ref/summary and does not bind spec, source repository, checkpoint, test evidence and published source SHA.</p>
+<h2>Source of authority</h2>
+<p>Normative specification: <code>docs/specs/orchestration-v2-architecture.md</code>, sections §3, §4, §8. Current implementation: <code>Client/Modules/ReviewWorkflow.fs:70-83,124-134,380-565,578-794</code>. Audit: <code>docs/reviews/2026-10-28-v2-spec-implementation-audit.md</code>.</p>
+<h2>Acceptance criteria</h2>
+<ol>
+<li>Implement CheckpointAttempt with immutable IDs, provenance, source commit, evidence, next action, and exact generation; allow Working progress without relinquishing slot.</li>
+<li>Make SubmitForReview/UpdateReviewRequest atomically bind a final checkpoint, complete spec OID, source remote/repo identity, test evidence and pinned source ref/base/head.</li>
+<li>Enforce reviewer evidence bound to the exact claimed revision and distinguish inspected, tested, accepted and merely submitted evidence.</li>
+<li>Verify review revision r1/r2 with progress checkpoint isolation, source ref loss, stale generation, replay and no fabricated acceptance metadata.</li>
+</ol>
+<h2>Dependencies</h2>
+<ul><li><code>2026-10-28-v2-03-schema-contracts</code></li><li><code>2026-10-28-v2-04-assignment-generations</code></li></ul>
+<h2>Safety and completion</h2>
+<p>Work in an isolated Jarvis worktree; keep server stateless and task authority on the single orphan Git ref. Do not use Codex through Jarvis. Use disposable Git remotes for tests. Source-level task files here are backlog artifacts only; do not treat them as already imported into the V2 ledger. Verify behavior, review the implementation, and record tests and exact commits before closing. No production deployment or V1 cutover without explicit authorization.</p>
+</main></body></html>

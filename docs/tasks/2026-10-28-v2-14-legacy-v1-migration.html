@@ -1,0 +1,12 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Build deterministic V1 task migration inspector and approved importer</title></head><body><main>
+<h1>Build deterministic V1 task migration inspector and approved importer</h1><p><strong>Task:</strong> 2026-10-28-v2-14-legacy-v1-migration. <strong>Priority:</strong> P0. <strong>Status:</strong> Open.</p>
+<h2>Goal and current gap</h2><p>There is no InspectLegacyTaskMigration/ApplyLegacyTaskMigration. Active V1 HTML and JSON still live on source branches and worktrees; V2 has no dry-run conflict report/selected-copy manifest or historical state importer.</p>
+<h2>Source of authority</h2><p>Normative specification: <code>docs/specs/orchestration-v2-architecture.md</code>, §9, §11. Evidence in source: <code>Client/Modules/TaskStore.fs</code>; <code>Client/Modules/WorkTaskCompat.fs</code>; <code>Client/Modules/ReviewWorkflow.fs</code>.</p>
+<h2>Acceptance criteria</h2><ol><li>Enumerate every registered V1 worktree and task copy, preserve malformed/ambiguous candidates and report IDs, hashes, owners, generations, checkpoints and rejected alternates.</li>
+<li>Offer explicit conflict resolution; never choose based only on updatedAt. Produce deterministic manifest and dry-run inbox/agent states before any mutation.</li>
+<li>After approved global V1 freeze and verified backup, initialize canonical orphan root with selected tasks, provenance, history and manifest in one controlled transaction.</li>
+<li>Verify import with an independent clone, compare task/spec/roster/checkpoint hashes and show rejected copies; require no real remote mutation during dry run.</li></ol>
+<h2>Dependencies</h2><ul><li><code>2026-10-28-v2-03-schema-contracts</code></li><li><code>2026-10-28-v2-04-assignment-generations</code></li><li><code>2026-10-28-v2-07-administrative-lifecycle</code></li><li><code>2026-10-28-v2-09-task-spec-apis</code></li><li><code>2026-10-28-v2-13-ledger-backup-restore</code></li></ul>
+<h2>Safety and completion</h2><p>Work in an isolated worktree; keep Jarvis server stateless and V2 authority on the single orphan ledger ref. Never invoke Codex through Jarvis. Test against disposable Git remotes, record exact commits and verification. These source-controlled backlog files are not already imported to the canonical V2 ledger. No live deployment or V1 cutover without explicit approval.</p>
+</main></body></html>

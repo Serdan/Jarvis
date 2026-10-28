@@ -1,0 +1,37 @@
+{
+  "schemaVersion": 1,
+  "id": "2026-10-28-v2-11-security-privacy-ux",
+  "title": "Harden V2 authority, privacy, permissions and operator UX",
+  "status": "open",
+  "priority": "P0",
+  "dependencies": [
+    "2026-10-28-v2-01-ledger-trust-onboarding",
+    "2026-10-28-v2-02-durable-operations",
+    "2026-10-28-v2-03-schema-contracts",
+    "2026-10-28-v2-10-ledger-query-history"
+  ],
+  "owner": {
+    "agent": null,
+    "worktree": null
+  },
+  "checkpoint": {
+    "summary": "V2 specification gap identified by the 2026-10-28 audit; implementation not started.",
+    "nextAction": "Implement the acceptance criteria in the paired HTML task using disposable Git repositories; do not deploy or migrate V1.",
+    "verified": [],
+    "lastCommit": null
+  },
+  "audit": {
+    "specSections": [
+      "§2",
+      "§8",
+      "§9"
+    ],
+    "implementationReferences": [
+      "Server/McpTools.fs",
+      "Client/Modules/V2ReviewApi.fs:14-73",
+      "Client/Modules/PermissionPolicy.fs"
+    ],
+    "sourceReport": "docs/reviews/2026-10-28-v2-spec-implementation-audit.md"
+  },
+  "updatedAt": "2026-10-28T00:00:00Z"
+}

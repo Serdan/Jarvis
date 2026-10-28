@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Implement explicit V2 ledger initialization, binding and rebind</title></head>
+<body><main>
+<h1>Implement explicit V2 ledger initialization, binding and rebind</h1>
+<p><strong>Task:</strong> 2026-10-28-v2-01-ledger-trust-onboarding. <strong>Priority:</strong> P0. <strong>Status:</strong> Open.</p>
+<h2>Goal and current gap</h2>
+<p>A hand-authored, per-checkout enabled JSON file is required. Core initialize/fetch identity checks exist, but no approved Initialize/BindExisting/Rebind/Health workflow; trusted head is a local Git cache ref rather than an independently persisted configured anchor.</p>
+<h2>Source of authority</h2>
+<p>Normative specification: <code>docs/specs/orchestration-v2-architecture.md</code>, sections §2.1–2.2, §9. Current implementation: <code>Client/Modules/V2ReviewApi.fs:14-73</code>; <code>Client/Modules/LedgerStore.fs:159-264,375-415</code>. Audit: <code>docs/reviews/2026-10-28-v2-spec-implementation-audit.md</code>.</p>
+<h2>Acceptance criteria</h2>
+<ol>
+<li>Implement explicit InitializeLedger, BindExistingLedger, RebindLedgerRemote and GetLedgerHealth with UUID/remote verification and an approved non-implicit setup flow.</li>
+<li>Persist and verify the highest trusted ledger head across client restart/clone; require explicit operator authorization for reset/epoch/remote changes; preserve stateless server.</li>
+<li>Enforce public/unknown visibility warning, branch non-force protection diagnostics, signing constraints and no surprise ledger creation.</li>
+<li>Test divergent remotes, changed pushURL, deleted/rewritten ref, fresh clone trust, and failed init without modifying source files.</li>
+</ol>
+<h2>Dependencies</h2>
+<p>None.</p>
+<h2>Safety and completion</h2>
+<p>Work in an isolated Jarvis worktree; keep server stateless and task authority on the single orphan Git ref. Do not use Codex through Jarvis. Use disposable Git remotes for tests. Source-level task files here are backlog artifacts only; do not treat them as already imported into the V2 ledger. Verify behavior, review the implementation, and record tests and exact commits before closing. No production deployment or V1 cutover without explicit authorization.</p>
+</main></body></html>

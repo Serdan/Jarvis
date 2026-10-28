@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 1,
+  "id": "2026-10-28-v2-04-assignment-generations",
+  "title": "Persist immutable assignment generations and acknowledgment receipts",
+  "status": "open",
+  "priority": "P1",
+  "dependencies": [
+    "2026-10-28-v2-03-schema-contracts"
+  ],
+  "owner": {
+    "agent": null,
+    "worktree": null
+  },
+  "checkpoint": {
+    "summary": "Architecture gap identified by the 2026-10-28 V2 implementation audit. Not started.",
+    "nextAction": "Implement the acceptance criteria in the accompanying HTML task; use disposable Git remotes and do not deploy or migrate V1.",
+    "verified": [],
+    "lastCommit": null
+  },
+  "audit": {
+    "specSections": [
+      "§3",
+      "§4",
+      "§8"
+    ],
+    "implementationReferences": [
+      "Client/Modules/ReviewWorkflow.fs:30-52,280-377,1100-1180"
+    ],
+    "sourceReport": "docs/reviews/2026-10-28-v2-spec-implementation-audit.md"
+  },
+  "updatedAt": "2026-10-28T00:00:00Z"
+}

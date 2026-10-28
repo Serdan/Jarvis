@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "id": "2026-10-28-v2-08-source-bindings",
+  "title": "Bind source repositories and worktrees by verified identity, not ownership",
+  "status": "open",
+  "priority": "P1",
+  "dependencies": [
+    "2026-10-28-v2-01-ledger-trust-onboarding",
+    "2026-10-28-v2-04-assignment-generations"
+  ],
+  "owner": {
+    "agent": null,
+    "worktree": null
+  },
+  "checkpoint": {
+    "summary": "Architecture gap identified by the 2026-10-28 V2 implementation audit. Not started.",
+    "nextAction": "Implement the acceptance criteria in the accompanying HTML task; use disposable Git remotes and do not deploy or migrate V1.",
+    "verified": [],
+    "lastCommit": null
+  },
+  "audit": {
+    "specSections": [
+      "§6",
+      "§7"
+    ],
+    "implementationReferences": [
+      "Client/Modules/ReviewWorkflow.fs:30-52,518-625",
+      "Client/Modules/LedgerStore.fs:511-540"
+    ],
+    "sourceReport": "docs/reviews/2026-10-28-v2-spec-implementation-audit.md"
+  },
+  "updatedAt": "2026-10-28T00:00:00Z"
+}

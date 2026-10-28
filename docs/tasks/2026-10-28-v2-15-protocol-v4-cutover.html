@@ -1,0 +1,12 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Implement breaking protocol 4 writer gate, client/TUI switch and rollback policy</title></head><body><main>
+<h1>Implement breaking protocol 4 writer gate, client/TUI switch and rollback policy</h1><p><strong>Task:</strong> 2026-10-28-v2-15-protocol-v4-cutover. <strong>Priority:</strong> P0. <strong>Status:</strong> Open.</p>
+<h2>Goal and current gap</h2><p>Experimental V2 methods are additive under protocol 3.24, while V1 write tools remain routed to local TaskStore. No universal 4.0 major-version gate, migration activation flag, TUI switch or one-way rollback handling exists.</p>
+<h2>Source of authority</h2><p>Normative specification: <code>docs/specs/orchestration-v2-architecture.md</code>, §8.1–8.4, §9, §11. Evidence in source: <code>Common/Messages/AgentCommand.fs</code>; <code>Server/McpTools.fs</code>; <code>Client/SignalR/Client.fs</code>.</p>
+<h2>Acceptance criteria</h2><ol><li>Specify and enforce global stateless MCP router rejection of all V1 task mutations after explicit 4.0 activation, independent of device/client capabilities.</li>
+<li>Switch task reads, writes, reviewer/agent inbox and TUI to one canonical ledger; preserve ordinary source filesystem/Git commands.</li>
+<li>Implement controlled cutover sequence with pre-freeze/backup, client upgrade, independent clone validation, smoke test and explicit revert-before-first-V2-write policy.</li>
+<li>Verify stale 3.x task writer always fails closed after activation; source JSON cannot become a second current authority; no production change before approval.</li></ol>
+<h2>Dependencies</h2><ul><li><code>2026-10-28-v2-11-security-privacy-ux</code></li><li><code>2026-10-28-v2-12-integration-reconciliation</code></li><li><code>2026-10-28-v2-13-ledger-backup-restore</code></li><li><code>2026-10-28-v2-14-legacy-v1-migration</code></li></ul>
+<h2>Safety and completion</h2><p>Work in an isolated worktree; keep Jarvis server stateless and V2 authority on the single orphan ledger ref. Never invoke Codex through Jarvis. Test against disposable Git remotes, record exact commits and verification. These source-controlled backlog files are not already imported to the canonical V2 ledger. No live deployment or V1 cutover without explicit approval.</p>
+</main></body></html>

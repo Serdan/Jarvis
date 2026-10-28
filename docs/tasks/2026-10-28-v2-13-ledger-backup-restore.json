@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "id": "2026-10-28-v2-13-ledger-backup-restore",
+  "title": "Deliver independent mirror backup, restore verification and epoch reconciliation",
+  "status": "open",
+  "priority": "P0",
+  "dependencies": [
+    "2026-10-28-v2-01-ledger-trust-onboarding",
+    "2026-10-28-v2-02-durable-operations",
+    "2026-10-28-v2-03-schema-contracts"
+  ],
+  "owner": {
+    "agent": null,
+    "worktree": null
+  },
+  "checkpoint": {
+    "summary": "V2 specification gap identified by the 2026-10-28 audit; implementation not started.",
+    "nextAction": "Implement the acceptance criteria in the paired HTML task using disposable Git repositories; do not deploy or migrate V1.",
+    "verified": [],
+    "lastCommit": null
+  },
+  "audit": {
+    "specSections": [
+      "§2.2",
+      "§9",
+      "§11"
+    ],
+    "implementationReferences": [
+      "Client/Modules/LedgerStore.fs:230-264,375-415",
+      "Client/Modules/V2ReviewApi.fs:14-73"
+    ],
+    "sourceReport": "docs/reviews/2026-10-28-v2-spec-implementation-audit.md"
+  },
+  "updatedAt": "2026-10-28T00:00:00Z"
+}

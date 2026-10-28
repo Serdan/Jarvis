@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Implement task/attempt park, block, resume, cancel, transfer and non-source closure</title></head>
+<body><main>
+<h1>Implement task/attempt park, block, resume, cancel, transfer and non-source closure</h1>
+<p><strong>Task:</strong> 2026-10-28-v2-07-administrative-lifecycle. <strong>Priority:</strong> P1. <strong>Status:</strong> Open.</p>
+<h2>Goal and current gap</h2>
+<p>Five agent states and recovery work, but Task/Attempt Park, Block, Resume, Cancel, Abandon, reopen, ownership transfer, and documented no-source close paths are missing despite normative transitions. Existing admin actions do not cover the complete state matrix.</p>
+<h2>Source of authority</h2>
+<p>Normative specification: <code>docs/specs/orchestration-v2-architecture.md</code>, sections §3–4, §8. Current implementation: <code>Client/Modules/ReviewWorkflow.fs:245-560,800-1120</code>. Audit: <code>docs/reviews/2026-10-28-v2-spec-implementation-audit.md</code>.</p>
+<h2>Acceptance criteria</h2>
+<ol>
+<li>Implement explicit audited ParkAttempt/BlockAttempt/ResumeAttempt/CancelTask/AbandonAttempt/owner transfer with expected versions and reviewer obligations settled atomically.</li>
+<li>Keep agent-level Parked separate from blocked/parked task attempts; ensure every terminal action releases or preserves focused slot appropriately and does not leave ghost review requests.</li>
+<li>Add documented non-source completion/closure acceptance policy and explicit reopen without pretending source integration happened.</li>
+<li>Create transition-matrix fixtures across Assigned/Ready/Working/Completed, claimed/unclaimed reviews and late feedback; verify stale/unauthorized operations fail closed.</li>
+</ol>
+<h2>Dependencies</h2>
+<ul><li><code>2026-10-28-v2-04-assignment-generations</code></li><li><code>2026-10-28-v2-06-reviewer-claim-recovery</code></li></ul>
+<h2>Safety and completion</h2>
+<p>Work in an isolated Jarvis worktree; keep server stateless and task authority on the single orphan Git ref. Do not use Codex through Jarvis. Use disposable Git remotes for tests. Source-level task files here are backlog artifacts only; do not treat them as already imported into the V2 ledger. Verify behavior, review the implementation, and record tests and exact commits before closing. No production deployment or V1 cutover without explicit authorization.</p>
+</main></body></html>

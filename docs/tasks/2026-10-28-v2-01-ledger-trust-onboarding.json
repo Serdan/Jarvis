@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "id": "2026-10-28-v2-01-ledger-trust-onboarding",
+  "title": "Implement explicit V2 ledger initialization, binding and rebind",
+  "status": "open",
+  "priority": "P0",
+  "dependencies": [],
+  "owner": {
+    "agent": null,
+    "worktree": null
+  },
+  "checkpoint": {
+    "summary": "Architecture gap identified by the 2026-10-28 V2 implementation audit. Not started.",
+    "nextAction": "Implement the acceptance criteria in the accompanying HTML task; use disposable Git remotes and do not deploy or migrate V1.",
+    "verified": [],
+    "lastCommit": null
+  },
+  "audit": {
+    "specSections": [
+      "§2.1–2.2",
+      "§9"
+    ],
+    "implementationReferences": [
+      "Client/Modules/V2ReviewApi.fs:14-73",
+      "Client/Modules/LedgerStore.fs:159-264,375-415"
+    ],
+    "sourceReport": "docs/reviews/2026-10-28-v2-spec-implementation-audit.md"
+  },
+  "updatedAt": "2026-10-28T00:00:00Z"
+}

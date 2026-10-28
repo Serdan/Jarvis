@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Persist immutable assignment generations and acknowledgment receipts</title></head>
+<body><main>
+<h1>Persist immutable assignment generations and acknowledgment receipts</h1>
+<p><strong>Task:</strong> 2026-10-28-v2-04-assignment-generations. <strong>Priority:</strong> P1. <strong>Status:</strong> Open.</p>
+<h2>Goal and current gap</h2>
+<p>Attempt stores a mutable assignmentGeneration number and spec SHA but not immutable instructions/receipt/issued actor/base for each generation. AcknowledgeAssignment is absent, as are authorized reissue/adopt-spec instruction records.</p>
+<h2>Source of authority</h2>
+<p>Normative specification: <code>docs/specs/orchestration-v2-architecture.md</code>, sections §3, §4, §8. Current implementation: <code>Client/Modules/ReviewWorkflow.fs:30-52,280-377,1100-1180</code>. Audit: <code>docs/reviews/2026-10-28-v2-spec-implementation-audit.md</code>.</p>
+<h2>Acceptance criteria</h2>
+<ol>
+<li>Represent each assignment generation with immutable instructions, spec blob, source baseline, sequence, issuer, actor and receipt evidence.</li>
+<li>Implement AcknowledgeAssignment, explicit spec adoption/reissue and generation-aware Begin/Resume/Checkpoint guards without new task owners.</li>
+<li>Ensure a reviewer decision only queues new instructions when required, and already Working agents receive feedback without preemption.</li>
+<li>Test stale-generation replay, ack-before-begin, concurrent operations on different tasks, old spec pinning and restart from exact generation.</li>
+</ol>
+<h2>Dependencies</h2>
+<ul><li><code>2026-10-28-v2-03-schema-contracts</code></li></ul>
+<h2>Safety and completion</h2>
+<p>Work in an isolated Jarvis worktree; keep server stateless and task authority on the single orphan Git ref. Do not use Codex through Jarvis. Use disposable Git remotes for tests. Source-level task files here are backlog artifacts only; do not treat them as already imported into the V2 ledger. Verify behavior, review the implementation, and record tests and exact commits before closing. No production deployment or V1 cutover without explicit authorization.</p>
+</main></body></html>

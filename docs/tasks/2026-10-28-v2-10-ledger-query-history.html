@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Implement snapshot-pinned list, roster, history, operation and pagination APIs</title></head>
+<body><main>
+<h1>Implement snapshot-pinned list, roster, history, operation and pagination APIs</h1>
+<p><strong>Task:</strong> 2026-10-28-v2-10-ledger-query-history. <strong>Priority:</strong> P1. <strong>Status:</strong> Open.</p>
+<h2>Goal and current gap</h2>
+<p>GetTask/GetReview/AgentInbox/ReviewerQueue exist, but native ListTasks/GetAttempt/GetAgentRoster/GetOrchestrationSnapshot/GetTaskHistory/GetOperationStatus and snapshot pages are missing. Inbox currently scans all task records without response-page bounds.</p>
+<h2>Source of authority</h2>
+<p>Normative specification: <code>docs/specs/orchestration-v2-architecture.md</code>, sections §4, §5.4, §8, §10. Current implementation: <code>Client/Modules/ReviewWorkflow.fs:1200-1405</code>; <code>Client/Modules/LedgerStore.fs:230-291,489-510</code>. Audit: <code>docs/reviews/2026-10-28-v2-spec-implementation-audit.md</code>.</p>
+<h2>Acceptance criteria</h2>
+<ol>
+<li>Provide one-snapshot paginated ListTasks/roster/attempts/history/reviews with filter ordering, portable continuation tokens, expiry and snapshot GC pinning.</li>
+<li>Expose GetOperationStatus with original durable result; return explicit stale/fresh metadata and SnapshotUnavailable instead of substituting a newer head.</li>
+<li>Enforce 100-row/1 MiB response caps, deferred spec/evidence payloads and consistent task/roster projections across devices.</li>
+<li>Test cross-clone pagination while writers advance, missing/pruned snapshots, shallow history and large rosters, stable order and bounded latency.</li>
+</ol>
+<h2>Dependencies</h2>
+<ul><li><code>2026-10-28-v2-02-durable-operations</code></li><li><code>2026-10-28-v2-03-schema-contracts</code></li><li><code>2026-10-28-v2-09-task-spec-apis</code></li></ul>
+<h2>Safety and completion</h2>
+<p>Work in an isolated Jarvis worktree; keep server stateless and task authority on the single orphan Git ref. Do not use Codex through Jarvis. Use disposable Git remotes for tests. Source-level task files here are backlog artifacts only; do not treat them as already imported into the V2 ledger. Verify behavior, review the implementation, and record tests and exact commits before closing. No production deployment or V1 cutover without explicit authorization.</p>
+</main></body></html>

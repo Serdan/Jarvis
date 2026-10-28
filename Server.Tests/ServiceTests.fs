@@ -426,7 +426,7 @@ let ``command catalog matches AgentCommand union and MCP tools`` () =
     let v2Tools =
         set [ "V2AgentInbox"; "V2CreateTask"; "V2ReviseTaskSpec"; "V2RegisterAgent"; "V2AssignTask"; "V2BeginAttempt"
               "V2BindReviewBase"; "V2YieldAgent"; "V2ResumeAgent"; "V2CompleteAgentWork"
-              "V2ParkAgent"; "V2AcknowledgeReviewFeedback"
+              "V2ParkAgent"; "V2ReissueQueuedAttempt"; "V2RecoverAgentAssignment"; "V2AcknowledgeReviewFeedback"
               "V2ReviewTask"; "V2ReviewDetails"; "V2ReviewerInbox"
               "V2SubmitReview"; "V2ReplaceReview"; "V2ClaimReview"; "V2DecideReview"
               "V2WithdrawReview"; "V2ReassignReview"; "V2FinalizeReview" ]
@@ -448,7 +448,7 @@ let ``client-backed MCP tools expose an optional per-command deviceId`` () =
         |> Array.filter (fun methodInfo ->
             methodInfo.GetParameters()
             |> Array.exists (fun parameter -> parameter.ParameterType = typeof<ClientService>))
-    clientMethods.Length |> shouldEqual (AgentProtocol.commandDefinitions.Length - 1 + 18) // 22 MCP V2 aliases / 4 wire operations
+    clientMethods.Length |> shouldEqual (AgentProtocol.commandDefinitions.Length - 1 + 20) // 24 MCP V2 aliases / 4 wire operations
     for methodInfo in clientMethods do
         let deviceParam = methodInfo.GetParameters() |> Array.tryFind (fun parameter -> parameter.Name = "deviceId")
         match deviceParam with
@@ -661,7 +661,7 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
             [ for name in [ "V2AgentInbox" ] -> name, taskRead
               for name in [ "V2CreateTask"; "V2ReviseTaskSpec"; "V2RegisterAgent"; "V2AssignTask"; "V2BeginAttempt"
                             "V2BindReviewBase"; "V2YieldAgent"; "V2ResumeAgent"; "V2CompleteAgentWork";
-                            "V2ParkAgent"; "V2AcknowledgeReviewFeedback" ] -> name, taskWrite
+                            "V2ParkAgent"; "V2ReissueQueuedAttempt"; "V2RecoverAgentAssignment"; "V2AcknowledgeReviewFeedback" ] -> name, taskWrite
               for name in [ "V2ReviewTask"; "V2ReviewDetails"; "V2ReviewerInbox" ] ->
                   name, v2Read
               for name in [ "V2SubmitReview"; "V2ReplaceReview"; "V2ClaimReview"; "V2DecideReview"

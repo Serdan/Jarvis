@@ -80,6 +80,18 @@ type ReviewRevision =
       CreatedSequence: int64 }
 
 [<CLIMutable>]
+type ReviewFeedbackNotice =
+    { TaskId: string
+      AttemptId: string
+      RequestId: string
+      OwnerAgentId: string
+      DecisionSequence: int64
+      Status: string
+      Feedback: string
+      Acknowledged: bool
+      Version: int }
+
+[<CLIMutable>]
 type AgentCheckpoint =
     { TaskId: string
       AttemptId: string
@@ -109,6 +121,7 @@ type AgentInbox =
       AcceptedPendingIntegration: InboxTask list
       PendingReviews: ReviewRequest list
       AvailableReviews: ReviewRequest list
+      UnacknowledgedFeedback: ReviewFeedbackNotice list
       SlotAvailable: bool
       Unassigned: bool }
 
@@ -129,6 +142,7 @@ module ReviewWorkflow =
     let private checkpointPath taskId attemptId sequence =
         $"tasks/{taskId}/attempts/{attemptId}/checkpoints/{sequence}.json"
     let private requestPath taskId requestId = $"tasks/{taskId}/reviews/{requestId}/request.json"
+    let private feedbackPath taskId requestId = $"tasks/{taskId}/reviews/{requestId}/notification.json"
     let private revisionPath taskId requestId number = $"tasks/{taskId}/reviews/{requestId}/revisions/{number}.json"
     let private reviewRef taskId requestId number = $"refs/heads/jarvis-review/{taskId}/{requestId}/r{number}"
 
@@ -436,16 +450,33 @@ module ReviewWorkflow =
                            || agent.Version <> expectedAgentVersion
                            || agent.FocusAttemptId <> attempt.AttemptId || not validPhase then
                             return! Error(StaleEntityVersion "Only the current Working or Ready agent can complete this assignment.")
+                        let! lastReview =
+                            if String.IsNullOrWhiteSpace attempt.LatestReviewRequestId then Ok None
+                            else read<ReviewRequest> binding snapshot
+                                     (requestPath taskId attempt.LatestReviewRequestId)
+                        let requeue =
+                            match lastReview with
+                            | Some(review, _) ->
+                                review.Status = "ChangesRequested"
+                                && String.IsNullOrWhiteSpace attempt.ActiveReviewRequestId
+                            | None -> false
                         let checkpoint =
                             { TaskId = taskId; AttemptId = attempt.AttemptId
                               OwnerAgentId = ownerId; AssignmentGeneration = generation
                               Sequence = snapshot.Header.NextSequence
-                              Summary = summary; NextAction = "Await review or a new assignment"
+                              Summary = summary
+                              NextAction = if requeue then "Requested changes require reissuance" else "Await review or a new assignment"
                               Kind = "Completion" }
                         return
                             [ change (checkpointPath taskId attempt.AttemptId snapshot.Header.NextSequence) None checkpoint
                               change (attemptPath taskId attempt.AttemptId) (Some attemptOid)
-                                { attempt with Version = attempt.Version + 1; Phase = "Finished" }
+                                { attempt with Version = attempt.Version + 1
+                                               Phase = if requeue then "Queued" else "Finished"
+                                               AssignmentGeneration =
+                                                   if requeue then attempt.AssignmentGeneration + 1
+                                                   else attempt.AssignmentGeneration
+                                               IssuedSequence =
+                                                   if requeue then snapshot.Header.NextSequence else attempt.IssuedSequence }
                               change (agentPath ownerId) (Some agentOid)
                                 { agent with Version = agent.Version + 1
                                              State = "Completed"; ActiveAttemptId = null
@@ -692,22 +723,36 @@ module ReviewWorkflow =
                         do! LedgerStore.verifyReviewDiff binding revision.BaseCommit revision.HeadCommit
                         if revision.BaseCommit <> attempt.BaseCommit then
                             return! Error(StaleEntityVersion "Reviewed revision does not cover the pinned task base.")
+                        let requeue = verdict = RequestChanges && attempt.Phase = "Finished"
                         let nextAttempt =
                             { attempt with Version = attempt.Version + 1
+                                           Phase = if requeue then "Queued" else attempt.Phase
+                                           AssignmentGeneration =
+                                               if requeue then attempt.AssignmentGeneration + 1
+                                               else attempt.AssignmentGeneration
+                                           IssuedSequence =
+                                               if requeue then snapshot.Header.NextSequence else attempt.IssuedSequence
                                            ActiveReviewRequestId = null
                                            ReviewFeedback = feedback
                                            FeedbackSequence = snapshot.Header.NextSequence
                                            AcceptedReviewRequestId =
-                                               if verdict = Accept then id else attempt.AcceptedReviewRequestId
+                                               if verdict = Accept then id else null
                                            AcceptedReviewRevision =
-                                               if verdict = Accept then request.CurrentRevision else attempt.AcceptedReviewRevision
+                                               if verdict = Accept then request.CurrentRevision else 0
                                            AcceptedHead =
-                                               if verdict = Accept then revision.HeadCommit else attempt.AcceptedHead }
+                                               if verdict = Accept then revision.HeadCommit else null }
                         let review =
                             { request with Version = request.Version + 1; Status = status
                                            DecisionSequence = snapshot.Header.NextSequence; Feedback = feedback }
+                        let notice =
+                            { TaskId = taskId; AttemptId = attempt.AttemptId; RequestId = id
+                              OwnerAgentId = attempt.OwnerAgentId
+                              DecisionSequence = snapshot.Header.NextSequence
+                              Status = status; Feedback = feedback
+                              Acknowledged = false; Version = 1 }
                         return
                             [ change (requestPath taskId id) (Some requestOid) review
+                              change (feedbackPath taskId id) None notice
                               change (attemptPath taskId attempt.AttemptId) (Some attemptOid) nextAttempt ]
                     })
 
@@ -817,13 +862,122 @@ module ReviewWorkflow =
                 (fun snapshot ->
                     result {
                         let! _, _, attempt, attemptOid = getAttempt binding snapshot taskId
-                        if attempt.OwnerAgentId <> ownerId || attempt.FeedbackSequence <> decisionSequence
-                           || attempt.AcknowledgedFeedbackSequence >= decisionSequence then
-                            return! Error(StaleEntityVersion "Feedback is not pending at that sequence.")
+                        if attempt.OwnerAgentId <> ownerId then
+                            return! Error(ReviewAccessDenied "Only the task owner can acknowledge feedback.")
+                        let! paths = LedgerStore.listAt binding snapshot "tasks"
+                        let notices =
+                            paths |> List.filter (fun path ->
+                                path.StartsWith($"tasks/{taskId}/reviews/", StringComparison.Ordinal)
+                                && path.EndsWith("/notification.json", StringComparison.Ordinal))
+                        let mutable found = []
+                        for path in notices do
+                            let! notification, oid = required<ReviewFeedbackNotice> binding snapshot path
+                            if notification.DecisionSequence = decisionSequence then
+                                found <- (path, notification, oid) :: found
+                        match found with
+                        | [ (path, notification, oid) ] when
+                              notification.OwnerAgentId = ownerId
+                              && notification.TaskId = taskId
+                              && notification.AttemptId = attempt.AttemptId
+                              && not notification.Acknowledged ->
+                            return
+                                [ change path (Some oid)
+                                    { notification with Acknowledged = true
+                                                        Version = notification.Version + 1 }
+                                  change (attemptPath taskId attempt.AttemptId) (Some attemptOid)
+                                    { attempt with Version = attempt.Version + 1
+                                                   AcknowledgedFeedbackSequence =
+                                                       max attempt.AcknowledgedFeedbackSequence decisionSequence } ]
+                        | _ -> return! Error(StaleEntityVersion "Feedback decision was missing or already acknowledged.")
+                    })
+
+    // An earlier Finished attempt becomes Queued upon RequestChanges, but does not
+    // take over the agent's current focus. Orchestrator explicitly selects it later.
+    let reissueQueuedAttempt binding operationId taskId ownerId expectedAttemptVersion
+                             expectedAgentVersion generation reason =
+        if not (validTaskId taskId) || not (validAgent ownerId)
+           || expectedAttemptVersion < 1 || expectedAgentVersion < 1 || generation < 1
+           || not (validText 2048 reason) then
+            Error(InvalidBinding "Reissue requires versions, generation and a reason.")
+        else
+            LedgerStore.transact binding
+                (intent operationId "Orchestrator" "ReissueQueuedAttempt"
+                    {| taskId = taskId; ownerId = ownerId
+                       expectedAttemptVersion = expectedAttemptVersion
+                       expectedAgentVersion = expectedAgentVersion
+                       generation = generation; reason = reason |})
+                (fun snapshot ->
+                    result {
+                        let! task, _, attempt, attemptOid = getAttempt binding snapshot taskId
+                        let! agent, agentOid = required<ReviewAgent> binding snapshot (agentPath ownerId)
+                        if task.Lifecycle <> "InProgress" || attempt.OwnerAgentId <> ownerId
+                           || attempt.Phase <> "Queued" || attempt.Version <> expectedAttemptVersion
+                           || attempt.AssignmentGeneration <> generation
+                           || not (String.IsNullOrEmpty attempt.ActiveReviewRequestId) then
+                            return! Error(StaleEntityVersion "Task is not a current queued reissue.")
+                        if agent.Version <> expectedAgentVersion
+                           || not (List.contains agent.State [ "Parked"; "Completed" ])
+                           || not (String.IsNullOrWhiteSpace agent.ActiveAttemptId) then
+                            return! Error(AgentBusy "Cannot preempt an Assigned, Ready or Working agent.")
                         return
                             [ change (attemptPath taskId attempt.AttemptId) (Some attemptOid)
+                                { attempt with Version = attempt.Version + 1 }
+                              change (agentPath ownerId) (Some agentOid)
+                                { agent with Version = agent.Version + 1; State = "Assigned"
+                                             FocusAttemptId = attempt.AttemptId; ActiveAttemptId = null
+                                             StateReason = reason
+                                             StateSequence = snapshot.Header.NextSequence } ]
+                    })
+
+    // Operator-authorized repair: a stalled or lost session never causes this
+    // transition automatically. Rebind the SAME attempt, advance its generation,
+    // retain its source/reviews and issue an explicit operator restart.
+    let recoverAgentAssignment binding operationId taskId ownerId expectedAttemptVersion
+                               expectedAgentVersion generation reason =
+        if not (validTaskId taskId) || not (validAgent ownerId)
+           || expectedAttemptVersion < 1 || expectedAgentVersion < 1 || generation < 1
+           || not (validText 2048 reason) then
+            Error(InvalidBinding "Recovery requires exact versions and an explicit reason.")
+        else
+            LedgerStore.transact binding
+                (intent operationId "Orchestrator" "RecoverAgentAssignment"
+                    {| taskId = taskId; ownerId = ownerId
+                       expectedAttemptVersion = expectedAttemptVersion
+                       expectedAgentVersion = expectedAgentVersion
+                       generation = generation; reason = reason |})
+                (fun snapshot ->
+                    result {
+                        let! task, _, attempt, attemptOid = getAttempt binding snapshot taskId
+                        let! agent, agentOid = required<ReviewAgent> binding snapshot (agentPath ownerId)
+                        if task.Lifecycle <> "InProgress" || attempt.OwnerAgentId <> ownerId
+                           || attempt.Version <> expectedAttemptVersion
+                           || attempt.AssignmentGeneration <> generation
+                           || agent.Version <> expectedAgentVersion
+                           || agent.FocusAttemptId <> attempt.AttemptId
+                           || not (List.contains agent.State [ "Assigned"; "Ready"; "Working" ])
+                           || not (List.contains attempt.Phase [ "Queued"; "Paused"; "Working" ])
+                           || (agent.State = "Working" && agent.ActiveAttemptId <> attempt.AttemptId)
+                           || (agent.State <> "Working"
+                               && not (String.IsNullOrWhiteSpace agent.ActiveAttemptId)) then
+                            return! Error(StaleEntityVersion "Cannot recover a stale or unrelated assignment.")
+                        let checkpoint =
+                            { TaskId = taskId; AttemptId = attempt.AttemptId
+                              OwnerAgentId = ownerId; AssignmentGeneration = generation
+                              Sequence = snapshot.Header.NextSequence
+                              Summary = reason; NextAction = "Restart the same assignment"
+                              Kind = "Recovery" }
+                        return
+                            [ change (checkpointPath taskId attempt.AttemptId snapshot.Header.NextSequence)
+                                None checkpoint
+                              change (attemptPath taskId attempt.AttemptId) (Some attemptOid)
                                 { attempt with Version = attempt.Version + 1
-                                               AcknowledgedFeedbackSequence = decisionSequence } ]
+                                               AssignmentGeneration = attempt.AssignmentGeneration + 1
+                                               Phase = "Queued"; IssuedSequence = snapshot.Header.NextSequence }
+                              change (agentPath ownerId) (Some agentOid)
+                                { agent with Version = agent.Version + 1
+                                             State = "Assigned"; ActiveAttemptId = null
+                                             StateReason = reason
+                                             StateSequence = snapshot.Header.NextSequence } ]
                     })
 
     let getTaskWithSpec binding taskId =
@@ -909,10 +1063,12 @@ module ReviewWorkflow =
                 let! paths = LedgerStore.listAt binding snapshot "tasks"
                 let taskPaths = paths |> List.filter (fun path -> path.EndsWith("/task.json", StringComparison.Ordinal))
                 let reviewPaths = paths |> List.filter (fun path -> path.EndsWith("/request.json", StringComparison.Ordinal))
+                let feedbackPaths = paths |> List.filter (fun path -> path.EndsWith("/notification.json", StringComparison.Ordinal))
                 let mutable failure = None
                 let mutable owned = []
                 let mutable pending = []
                 let mutable available = []
+                let mutable feedback = []
                 for path in taskPaths do
                     if failure.IsNone then
                         match required<ReviewTask> binding snapshot path with
@@ -949,6 +1105,18 @@ module ReviewWorkflow =
                             elif request.Status = "Claimed"
                                  && (request.OwnerAgentId = agentId || request.ClaimantId = agentId) then
                                 pending <- request :: pending
+                for path in feedbackPaths do
+                    if failure.IsNone then
+                        match required<ReviewFeedbackNotice> binding snapshot path with
+                        | Error error -> failure <- Some error
+                        | Ok(notice, _) ->
+                            if not (validTaskId notice.TaskId)
+                               || path <> feedbackPath notice.TaskId notice.RequestId
+                               || notice.DecisionSequence <= 0L
+                               || not (List.contains notice.Status [ "Accepted"; "ChangesRequested" ]) then
+                                failure <- Some(LedgerIntegrityError "Invalid feedback notification in agent inbox.")
+                            elif notice.OwnerAgentId = agentId && not notice.Acknowledged then
+                                feedback <- notice :: feedback
                 match failure with
                 | Some error -> return! Error error
                 | None ->
@@ -983,7 +1151,7 @@ module ReviewWorkflow =
                             entry.Attempt.Phase = "Working"
                             && agent.ActiveAttemptId = entry.Attempt.AttemptId
                         | "Completed", Some entry ->
-                            (entry.Attempt.Phase = "Finished" || entry.Attempt.Phase = "Accepted")
+                            (List.contains entry.Attempt.Phase [ "Finished"; "Accepted"; "Queued" ])
                             && active.IsNone
                         | _ -> false
                     if not focusValid then
@@ -1009,6 +1177,7 @@ module ReviewWorkflow =
                           AcceptedPendingIntegration = accepted
                           PendingReviews = pending
                           AvailableReviews = available
+                          UnacknowledgedFeedback = feedback |> List.sortBy (fun notice -> notice.DecisionSequence)
                           SlotAvailable = active.IsNone
                           Unassigned = owned.IsEmpty && pending.IsEmpty && available.IsEmpty }
             }

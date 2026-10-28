@@ -671,3 +671,167 @@ type ReviewWorkflowTests() =
             Assert.That(after.Working.Value.Task.TaskId, Is.EqualTo("newTask"))
             Assert.That(after.AcceptedPendingIntegration.Length, Is.EqualTo(1))
             Assert.That(after.AcceptedPendingIntegration.Head.Task.TaskId, Is.EqualTo("oldTask")))
+
+
+    [<Test>]
+    member _.LateRequestedChangesQueueSameAttemptWithoutPreemptingNewWork() =
+        withFixture (fun _ _ first second baseOid sourceRef newCommit initTask ->
+            initTask "late1"
+            let firstAttempt = (ReviewWorkflow.getTask first "late1" |> success |> fun (_,_,a) -> a.Value)
+            let head = newCommit "Review candidate" "candidate A"
+            let requestId = Guid.NewGuid()
+            ReviewWorkflow.submitReview first (Guid.NewGuid()) "late1" "Owner" 3 1
+                requestId sourceRef head "Initial cumulative patch" |> success |> ignore
+            ReviewWorkflow.completeAgentWork first (Guid.NewGuid()) "late1" "Owner" 4 3 1
+                "Submitted and finished" |> success |> ignore
+            ReviewWorkflow.createTask first (Guid.NewGuid()) "late2" "Next assignment" |> success |> ignore
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) "late2" (Guid.NewGuid())
+                "Owner" "Reviewer" |> success |> ignore
+            ReviewWorkflow.beginAttempt first (Guid.NewGuid()) "late2" "Owner" 1 1 |> success |> ignore
+            ReviewWorkflow.claimReview second (Guid.NewGuid()) "late1" requestId "Reviewer" 1 1
+            |> success |> ignore
+            ReviewWorkflow.decide second (Guid.NewGuid()) "late1" requestId "Reviewer"
+                2 RequestChanges "Please fix A" |> success |> ignore
+            let busy = ReviewWorkflow.getAgentInbox first "Owner" |> success
+            Assert.That(busy.Agent.State, Is.EqualTo("Working"))
+            Assert.That(busy.Working.Value.Task.TaskId, Is.EqualTo("late2"))
+            Assert.That(busy.RunnableQueue.Length, Is.EqualTo(1))
+            Assert.That(busy.RunnableQueue.Head.Task.TaskId, Is.EqualTo("late1"))
+            Assert.That(busy.RunnableQueue.Head.Attempt.AssignmentGeneration, Is.EqualTo(2))
+            Assert.That(busy.RunnableQueue.Head.Attempt.AttemptId, Is.EqualTo(firstAttempt.AttemptId))
+            Assert.That(busy.UnacknowledgedFeedback.Length, Is.EqualTo(1))
+            let notice = busy.UnacknowledgedFeedback.Head
+            Assert.That(notice.Status, Is.EqualTo("ChangesRequested"))
+            Assert.That(notice.Feedback, Is.EqualTo("Please fix A"))
+            Assert.That(notice.DecisionSequence, Is.GreaterThan(0L))
+            match ReviewWorkflow.reissueQueuedAttempt first (Guid.NewGuid()) "late1" "Owner" 6 6 2 "Ready to fix" with
+            | Error(AgentBusy _) -> ()
+            | other -> Assert.Fail(sprintf "Reissue must not preempt another task: %A" other)
+            let acknowledgeOp = Guid.NewGuid()
+            let ack binding =
+                ReviewWorkflow.acknowledgeReviewFeedback binding acknowledgeOp
+                    "late1" "Owner" notice.DecisionSequence
+            Assert.That((ack first |> success).AlreadyApplied, Is.False)
+            Assert.That((ack second |> success).AlreadyApplied, Is.True)
+            Assert.That((ReviewWorkflow.getAgentInbox second "Owner" |> success).UnacknowledgedFeedback.Length,
+                        Is.EqualTo(0))
+            ReviewWorkflow.completeAgentWork first (Guid.NewGuid()) "late2" "Owner" 2 6 1
+                "Other task done" |> success |> ignore
+            let idle = ReviewWorkflow.getAgentInbox second "Owner" |> success
+            Assert.That(idle.Agent.State, Is.EqualTo("Completed"))
+            ReviewWorkflow.reissueQueuedAttempt first (Guid.NewGuid()) "late1" "Owner" 7 7 2
+                "Reissue requested changes" |> success |> ignore
+            let assigned = ReviewWorkflow.getAgentInbox second "Owner" |> success
+            Assert.That(assigned.Agent.State, Is.EqualTo("Assigned"))
+            Assert.That(assigned.Focused.Value.Task.TaskId, Is.EqualTo("late1"))
+            Assert.That(assigned.Focused.Value.Attempt.AttemptId, Is.EqualTo(firstAttempt.AttemptId))
+            Assert.That(assigned.Focused.Value.Attempt.AssignmentGeneration, Is.EqualTo(2))
+            match ReviewWorkflow.beginAttempt first (Guid.NewGuid()) "late1" "Owner" 7 1 with
+            | Error(StaleEntityVersion _) -> ()
+            | other -> Assert.Fail(sprintf "Old assignment generation must be rejected: %A" other)
+            ReviewWorkflow.beginAttempt first (Guid.NewGuid()) "late1" "Owner" 8 2
+            |> success |> ignore
+            Assert.That((ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent.State,
+                        Is.EqualTo("Working")))
+
+    [<Test>]
+    member _.FeedbackDecisionsStayIndividuallyActionableAcrossNewReviews() =
+        withFixture (fun _ _ first second _ sourceRef newCommit initTask ->
+            initTask "multi"
+            let firstHead = newCommit "A" "A"
+            let firstId = Guid.NewGuid()
+            ReviewWorkflow.submitReview first (Guid.NewGuid()) "multi" "Owner" 3 1 firstId
+                sourceRef firstHead "First review" |> success |> ignore
+            ReviewWorkflow.claimReview second (Guid.NewGuid()) "multi" firstId "Reviewer" 1 1
+            |> success |> ignore
+            ReviewWorkflow.decide second (Guid.NewGuid()) "multi" firstId "Reviewer" 2
+                RequestChanges "First feedback" |> success |> ignore
+            let secondHead = newCommit "B" "A and B"
+            let secondId = Guid.NewGuid()
+            ReviewWorkflow.submitReview first (Guid.NewGuid()) "multi" "Owner" 5 1 secondId
+                sourceRef secondHead "Cumulative revised review" |> success |> ignore
+            ReviewWorkflow.claimReview second (Guid.NewGuid()) "multi" secondId "Reviewer" 1 1
+            |> success |> ignore
+            ReviewWorkflow.decide second (Guid.NewGuid()) "multi" secondId "Reviewer" 2
+                Accept "Second approval" |> success |> ignore
+            let inbox = ReviewWorkflow.getAgentInbox first "Owner" |> success
+            Assert.That(inbox.UnacknowledgedFeedback.Length, Is.EqualTo(2))
+            Assert.That(inbox.UnacknowledgedFeedback.Head.Feedback, Is.EqualTo("First feedback"))
+            Assert.That(inbox.UnacknowledgedFeedback.Tail.Head.Feedback, Is.EqualTo("Second approval"))
+            let oldest = inbox.UnacknowledgedFeedback.Head
+            let latest = inbox.UnacknowledgedFeedback.Tail.Head
+            ReviewWorkflow.acknowledgeReviewFeedback first (Guid.NewGuid()) "multi"
+                "Owner" latest.DecisionSequence |> success |> ignore
+            let remaining = ReviewWorkflow.getAgentInbox second "Owner" |> success
+            Assert.That(remaining.UnacknowledgedFeedback.Length, Is.EqualTo(1))
+            Assert.That(remaining.UnacknowledgedFeedback.Head.DecisionSequence,
+                        Is.EqualTo(oldest.DecisionSequence))
+            ReviewWorkflow.acknowledgeReviewFeedback first (Guid.NewGuid()) "multi"
+                "Owner" oldest.DecisionSequence |> success |> ignore
+            Assert.That((ReviewWorkflow.getAgentInbox second "Owner" |> success).UnacknowledgedFeedback.Length,
+                        Is.EqualTo(0)))
+
+    [<Test>]
+    member _.ExplicitRecoveryReissuesSameAttemptGenerationWithCheckpoint() =
+        withFixture (fun _ _ first second _ sourceRef newCommit initTask ->
+            initTask "recover"
+            let before = ReviewWorkflow.getAgentInbox first "Owner" |> success
+            Assert.That(before.Agent.State, Is.EqualTo("Working"))
+            let attemptId = before.Working.Value.Attempt.AttemptId
+            let operationId = Guid.NewGuid()
+            let recover binding =
+                ReviewWorkflow.recoverAgentAssignment binding operationId
+                    "recover" "Owner" 3 3 1 "Explicitly recovering a lost frontend session"
+            Assert.That((recover first |> success).AlreadyApplied, Is.False)
+            Assert.That((recover second |> success).AlreadyApplied, Is.True)
+            let recovered = ReviewWorkflow.getAgentInbox second "Owner" |> success
+            Assert.That(recovered.Agent.State, Is.EqualTo("Assigned"))
+            Assert.That(recovered.OperatorActionRequired, Is.True)
+            Assert.That(recovered.SlotAvailable, Is.True)
+            Assert.That(recovered.Focused.Value.Attempt.AttemptId, Is.EqualTo(attemptId))
+            Assert.That(recovered.Focused.Value.Attempt.AssignmentGeneration, Is.EqualTo(2))
+            Assert.That(recovered.Focused.Value.Attempt.Phase, Is.EqualTo("Queued"))
+            let cpPath = $"tasks/recover/attempts/{attemptId}/checkpoints/{recovered.Agent.StateSequence}.json"
+            let checkpoint, _ =
+                LedgerStore.readAt second (LedgerStore.fetch second |> success) cpPath |> success
+            Assert.That(checkpoint.Value, Does.Contain("Recovery"))
+            match ReviewWorkflow.beginAttempt first (Guid.NewGuid()) "recover" "Owner" 4 1 with
+            | Error(StaleEntityVersion _) -> ()
+            | other -> Assert.Fail(sprintf "Old generation must not start: %A" other)
+            ReviewWorkflow.beginAttempt first (Guid.NewGuid()) "recover" "Owner" 4 2
+            |> success |> ignore
+            let head = newCommit "Continued implementation" "continued changes"
+            ReviewWorkflow.submitReview first (Guid.NewGuid()) "recover" "Owner" 5 2
+                (Guid.NewGuid()) sourceRef head "Same task, recovered generation"
+            |> success |> ignore
+            Assert.That((ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent.State,
+                        Is.EqualTo("Working")))
+
+
+    [<Test>]
+    member _.ChangesRequestedBeforeCompletionAreAlsoQueued() =
+        withFixture (fun _ _ first second _ sourceRef newCommit initTask ->
+            initTask "race"
+            let head = newCommit "Candidate" "Candidate"
+            let request = Guid.NewGuid()
+            ReviewWorkflow.submitReview first (Guid.NewGuid()) "race" "Owner" 3 1
+                request sourceRef head "Review" |> success |> ignore
+            ReviewWorkflow.claimReview second (Guid.NewGuid()) "race" request "Reviewer" 1 1
+            |> success |> ignore
+            ReviewWorkflow.decide second (Guid.NewGuid()) "race" request "Reviewer" 2
+                RequestChanges "Needs correction" |> success |> ignore
+            let mid = ReviewWorkflow.getAgentInbox first "Owner" |> success
+            Assert.That(mid.Agent.State, Is.EqualTo("Working"))
+            Assert.That(mid.Working.Value.Attempt.AssignmentGeneration, Is.EqualTo(1))
+            Assert.That(mid.UnacknowledgedFeedback.Length, Is.EqualTo(1))
+            ReviewWorkflow.completeAgentWork first (Guid.NewGuid()) "race" "Owner" 5 3 1
+                "Stopped before correction" |> success |> ignore
+            let finished = ReviewWorkflow.getAgentInbox second "Owner" |> success
+            Assert.That(finished.Agent.State, Is.EqualTo("Completed"))
+            Assert.That(finished.RunnableQueue.Length, Is.EqualTo(1))
+            Assert.That(finished.RunnableQueue.Head.Task.TaskId, Is.EqualTo("race"))
+            Assert.That(finished.RunnableQueue.Head.Attempt.AssignmentGeneration, Is.EqualTo(2))
+            ReviewWorkflow.reissueQueuedAttempt first (Guid.NewGuid()) "race" "Owner" 6 4 2
+                "Reissue before-completion rejection" |> success |> ignore
+            let assigned = ReviewWorkflow.getAgentInbox second "Owner" |> success
+            Assert.That(assigned.Agent.State, Is.EqualTo("Assigned")))

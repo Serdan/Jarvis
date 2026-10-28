@@ -233,6 +233,14 @@ module V2TaskApi =
                     | "ParkAgent" ->
                         ReviewWorkflow.ReviewWorkflow.parkAgent binding operationId
                             cmd.ActorId cmd.ExpectedAgentVersion cmd.Reason |> mapError
+                    | "ReissueQueuedAttempt" ->
+                        ReviewWorkflow.ReviewWorkflow.reissueQueuedAttempt binding operationId
+                            cmd.TaskId cmd.ActorId cmd.ExpectedVersion cmd.ExpectedAgentVersion
+                            cmd.AssignmentGeneration cmd.Reason |> mapError
+                    | "RecoverAgentAssignment" ->
+                        ReviewWorkflow.ReviewWorkflow.recoverAgentAssignment binding operationId
+                            cmd.TaskId cmd.ActorId cmd.ExpectedVersion cmd.ExpectedAgentVersion
+                            cmd.AssignmentGeneration cmd.Reason |> mapError
                     | "AcknowledgeFeedback" ->
                         ReviewWorkflow.ReviewWorkflow.acknowledgeReviewFeedback binding operationId
                             cmd.TaskId cmd.ActorId cmd.DecisionSequence

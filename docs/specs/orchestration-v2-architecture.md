@@ -252,14 +252,17 @@ All mutations require a stable operation ID, expected version(s), a valid actor,
 | ResumeAgent | Owner Ready, focused Paused attempt, exact versions/generation | Agent and attempt Working; reacquire slot, keep same assignment |
 | CompleteAgentWork | Owner Working/Ready with final summary and matching versions/generation | Immutable completion checkpoint, attempt Finished, agent Completed, release slot; review unaffected |
 | ParkAgent | Orchestrator decision, agent Completed/Parked with matching version and reason | Agent Parked, clear focus; do not preempt an unfinished assignment |
+| ReissueQueuedAttempt | Queued reviewed attempt; idle Completed/Parked owner; exact versions/generation | Focus same attempt, agent Assigned, preserve task owner and source |
+| RecoverAgentAssignment | Explicit orchestrator reason and current Assigned/Ready/Working focus | Immutable recovery checkpoint, increment attempt generation, agent Assigned; never infer from inactivity |
+| AcknowledgeReviewFeedback | Owner and exact unacknowledged decision sequence | Mark only that decision notice acknowledged |
 | CheckpointAttempt | Owner, current generation, Working | Append immutable checkpoint, advance attempt version; keep phase/slot |
 | SubmitForReview | Current Working attempt and verified publishable base/head snapshot | Publish distinct immutable source review ref; atomically create Unclaimed review request/revision with final checkpoint and keep attempt Working/slot unchanged |
 | UpdateReviewRequest | Request Unclaimed, same owner of nonterminal attempt, expected request version and current revision/generation | Publish a new immutable review ref/revision; atomically advance current revision and supersede the prior revision; keep original request ID, owner slot and original history |
 | ClaimReview | Eligible registered reviewer, request Unclaimed, exact expected request version/revision | Atomically mark Claimed, pin claimed revision/base/head/ref and claimant; no source edits or agent-slot change |
 | ReleaseReviewClaim / ReassignReviewer | Authorized reviewer/orchestrator with reason and expected version | Release or transfer claimant while keeping the claimed revision frozen; owner cannot silently replace it |
-| RequestChanges | Claimed current revision, claimant reviewer, expected version | Append decision/feedback, close this review round, notify owner; never preempt a Working agent; create updated assignment instructions only when needed to resume a nonworking agent |
+| RequestChanges | Claimed current revision, claimant reviewer, expected version | Append durable notification; leave Working/Paused attempt unchanged, or queue new generation of Finished attempt; never preempt current agent work |
 | AcceptReview | Claimed current revision, claimant reviewer, expected version, verified pinned source | Append acceptance evidence for exact frozen patch; no implicit slot change, task finalization, source merge or push |
-| FinalizeImplementation | Accepted review identified and no unreviewed required work remains, current task/attempt versions | Explicitly finish implementation and release slot if held; mark task Implemented and pin accepted review/patch for integration |
+| FinalizeImplementation | Accepted review, Finished attempt and no unreviewed work | Mark task Implemented and pin accepted review/patch; no agent-state or execution-slot change |
 | WithdrawReview | Unclaimed and current owner (or authorized cancellation); Claimed requires reviewer/orchestrator consent | Retain immutable audit evidence; invalidate reviewer queue entry without modifying attempt Working slot |
 | ParkAttempt / BlockAttempt | Queued/Acknowledged/Working with condition/blocker | Parked/Blocked; release slot if held; review requests remain independently tracked and require explicit decision when affected |
 | ResumeAttempt | Parked/Blocked and condition resolved or explicit override | New Queued assignment generation; does not automatically acquire slot or revise a claimed review |
@@ -269,7 +272,19 @@ All mutations require a stable operation ID, expected version(s), a valid actor,
 | CancelTask / AbandonAttempt | Explicit authorized cancellation and expected version | Terminal state; remove queue/slot membership; retain history |
 | BindAttemptSource | Registered project workspace, verified Git source reference | Update source observation only; never change agent owner or phase |
 
-`BeginAttempt` is the only slot-acquisition command. It can select the top runnable assignment or a specific queued attempt/generation. Attempting to start a second attempt for the same agent fails `AgentBusy`. A reviewer returning Task 315 while Agent 3 works on Task 316 creates a new Queued generation for 315; it does not interrupt 316 or mark 315 Working. A reviewer returning Task 315 while Agent 3 is already Working on Task 315 leaves that generation Working and adds durable review feedback.
+`BeginAttempt` starts an Assigned queued attempt and `ResumeAgent` resumes a Ready paused attempt; both acquire the execution slot with exact generation checks. ReissueQueuedAttempt selects the queued attempt first, without acquiring the slot. Attempting to start a second attempt for the same agent fails `AgentBusy`. A reviewer returning Task 315 after its owner Finished and began Task 316 queues a new generation of Task 315, without interrupting Task 316 or marking Task 315 Working. A reviewer returning Task 315 while Agent 3 is already Working on Task 315 leaves that generation Working and adds durable review feedback.
+
+### Reissued assignments and durable feedback
+
+Requested changes are a review outcome, not a command to take over the owner's current ChatGPT session. Every review decision creates a separate auditable notification in the canonical ledger containing owner, attempt, decision sequence, verdict and feedback. The agent inbox derives unacknowledgedFeedback from these records across all owned tasks, including Finished tasks. Later decisions do not replace earlier notifications. AcknowledgeReviewFeedback targets an exact decision sequence and atomically marks only that notice acknowledged.
+
+When the owner is Working or Ready/Paused on the reviewed attempt, RequestChanges preserves the phase, agent state, focus and slot and simply delivers feedback. If the reviewed attempt is Finished, RequestChanges increments its existing assignment generation, makes the attempt Queued, and retains the original owner, pinned spec and review base. The agent remains in its existing state, even when Working on another task.
+
+The orchestrator explicitly invokes ReissueQueuedAttempt with expected attempt version/generation, agent version and a reason. It works only for an owner in Completed or Parked with an empty execution slot. Reissue changes the agent to Assigned and focuses the same queued attempt; BeginAttempt acquires the slot. Stale prior generations are rejected.
+
+RecoverAgentAssignment is a separate explicit orchestrator repair for an Assigned, Ready or Working session chosen for restart. It writes an immutable Recovery checkpoint, advances the same attempt generation, queues that attempt, changes the agent to Assigned and clears the Working slot. This is never inferred from inactivity or frontend errors. Source and claimed review records remain intact.
+
+Review acceptance and FinalizeImplementation operate only on the pinned patch and task state, never on the agent's current slot. Finalizing a Finished attempt after its owner begins another task must not interrupt that newer assignment.
 
 ### Independent review requests and immutable review branches
 
@@ -641,6 +656,9 @@ Use disposable **bare Git remotes, at least two independent clones, and multiple
 45. Inactivity, a lost frontend connection, an unclaimed review, or a reviewer decision must not change the agent state. Stale agent/attempt versions cannot resume or complete work.
 46. A Completed agent receives another task and becomes Working while a reviewer accepts the previous task; finalization of the previous Finished attempt cannot steal the new Working slot.
 47. A ParkAgent request while Assigned, Ready, or Working fails without changing focused assignment, slot or phase; Completed to Parked succeeds with a reason.
+48. Late changes requested on Finished Task A while owner works on Task B queue the same Task A attempt with a new generation, without preempting B. Reissue becomes possible only after the owner is idle.
+49. Multiple unacknowledged review decisions remain individually discoverable; acknowledging one does not acknowledge another. Repeated operation UUIDs are idempotent.
+50. Explicit orchestrator recovery of a Working assignment records a checkpoint and invalidates the former generation without changing task ownership or source reviews.
 
 Run full client/server tests, full Git integration fixtures, format checks and an actual **backup restore** before live migration. Never simulate acceptance by a passing mock push alone.
 

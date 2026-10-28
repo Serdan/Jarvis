@@ -139,3 +139,16 @@ versions; task+agent+checkpoint changes are one canonical ledger transaction.
 These transitions were verified with disposable two-clone Git fixtures and
 the opt-in V2 command adapter. This remains isolated from V1 and has not
 been deployed or migrated.
+
+
+## Assignment reissuance and deliberate recovery (experimental protocol 3.23)
+
+Review decisions now write distinct canonical notification records under each review request. The agent inbox exposes unacknowledgedFeedback across all owned tasks; acknowledging one exact decision sequence does not hide another. The notification record and its acknowledgment are Git-ledger state, not ephemeral UI state. A retry using the same operation UUID remains idempotent.
+
+When changes are requested while the owner is Working or Ready on the same attempt, that agent keeps its focused assignment and receives a notification. If the attempt is Finished, the reviewer decision requeues **that same attempt** at assignmentGeneration + 1, preserving its owner, source base and pinned specification. It does not change the agent state or preempt work on another task.
+
+V2ReissueQueuedAttempt is an explicit orchestrator selection for a queued generation. It requires exact attempt and agent versions, the current generation, an idle agent (Completed or Parked), and a reason. The agent becomes Assigned and can be started by the operator. Reissue never creates a second owner or overwrites a newer assignment.
+
+V2RecoverAgentAssignment is an explicit orchestrator-controlled restart of an Assigned, Ready or Working agent. It writes an immutable Recovery checkpoint with the reason, advances the same attempt's assignment generation, releases the old Working slot and changes the agent to Assigned. This is not an inactivity detector or automatic response to a harness stall. Old-generation commands fail, while source and review records remain intact.
+
+Both commands are opt-in V2 Git-write MCP tools with normal stable operation UUIDs and local permissions. Migration, live V1 and production server state are untouched.

@@ -53,7 +53,11 @@ type LedgerHeader =
 
 [<CLIMutable>]
 type LedgerOperation =
-    { OperationId: string
+    { SchemaVersion: int
+      CanonicalRequestJson: string
+      OriginalResultJson: string
+      OriginalResultHash: string
+      OperationId: string
       RequestHash: string
       Sequence: int64
       Type: string
@@ -91,6 +95,12 @@ type LedgerRecordChange =
 
 module LedgerStore =
     let private ledgerRef = "refs/heads/jarvis-orchestration"
+    // Full jitter prevents synchronized clients from repeatedly colliding
+    // after an optimistic Git push loses a race.
+    let private contentionDelay retries =
+        let ceiling = min 800 (50 * (1 <<< min 6 retries))
+        RandomNumberGenerator.GetInt32(max 1 (ceiling / 2), ceiling + 1)
+
     let private encoding = UTF8Encoding(false)
     let private options = JsonSerializerOptions(PropertyNamingPolicy = JsonNamingPolicy.CamelCase, PropertyNameCaseInsensitive = true)
     let private oidPattern = Regex("^[0-9a-f]{40}([0-9a-f]{24})?$", RegexOptions.Compiled)
@@ -108,6 +118,45 @@ module LedgerStore =
         SHA256.HashData(encoding.GetBytes value)
         |> Convert.ToHexString
         |> fun value -> value.ToLowerInvariant()
+
+    // Stable logical intent hashing must not depend on JSON member order or
+    // whitespace. Duplicate (case-insensitive) members are rejected instead
+    // of letting different consumers interpret them differently.
+    let private canonicalRequestJson (raw: string) =
+        use document = JsonDocument.Parse(raw)
+        if document.RootElement.ValueKind <> JsonValueKind.Object then
+            invalidArg "raw" "Ledger intent must be a JSON object."
+        use stream = new MemoryStream()
+        use writer = new Utf8JsonWriter(stream)
+        let rec emit (element: JsonElement) =
+            match element.ValueKind with
+            | JsonValueKind.Object ->
+                let properties =
+                    element.EnumerateObject()
+                    |> Seq.sortWith (fun x y -> StringComparer.Ordinal.Compare(x.Name, y.Name))
+                    |> Seq.toArray
+                let names = System.Collections.Generic.HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                writer.WriteStartObject()
+                for property in properties do
+                    if not (names.Add property.Name) then
+                        invalidArg "raw" "Duplicate JSON member in ledger intent."
+                    writer.WritePropertyName(property.Name)
+                    emit property.Value
+                writer.WriteEndObject()
+            | JsonValueKind.Array ->
+                writer.WriteStartArray()
+                for item in element.EnumerateArray() do emit item
+                writer.WriteEndArray()
+            | _ -> element.WriteTo(writer)
+        emit document.RootElement
+        writer.Flush()
+        encoding.GetString(stream.ToArray())
+
+    let private validRequestJson raw =
+        try
+            canonicalRequestJson raw |> ignore
+            true
+        with _ -> false
 
     let private execute (repo: string) (args: string list) (input: string option) (environment: (string * string) list) =
         try
@@ -358,8 +407,13 @@ module LedgerStore =
             | Ok content ->
                 try
                     let operation = JsonSerializer.Deserialize<LedgerOperation>(content, options)
-                    if isNull (box operation) || operation.OperationId <> id.ToString("D") then
-                        Error(LedgerIntegrityError "Corrupt deduplication record.")
+                    if isNull (box operation) || operation.OperationId <> id.ToString("D")
+                       || operation.SchemaVersion <> 2
+                       || String.IsNullOrWhiteSpace operation.CanonicalRequestJson
+                       || String.IsNullOrWhiteSpace operation.OriginalResultJson
+                       || digest operation.CanonicalRequestJson <> operation.RequestHash
+                       || digest operation.OriginalResultJson <> operation.OriginalResultHash then
+                        Error(LedgerIntegrityError "Corrupt, incomplete or unsupported operation record.")
                     else
                         Ok(Some operation)
                 with ex ->
@@ -374,7 +428,17 @@ module LedgerStore =
                 readOperation binding snapshot.Commit operationId
                 |> Result.map (fun record -> snapshot, record)
 
-    let private recordHash (binding: LedgerBinding) (change: LedgerRecordChange) =
+    // A stable logical write receipt lives in the same canonical tree as the
+    // mutation. It deliberately does not contain the moving remote HEAD.
+    let private receipt operationId sequence kind changes =
+        json
+            {| schemaVersion = 1
+               operationId = operationId
+               sequence = sequence
+               kind = kind
+               changes = changes |}
+
+    let private recordInput (binding: LedgerBinding) (change: LedgerRecordChange) =
         json
             {| schemaVersion = 2
                projectId = string binding.ProjectId
@@ -384,7 +448,8 @@ module LedgerStore =
                path = change.Path
                expectedBlob = (change.ExpectedBlobOid |> Option.defaultValue "")
                contentSha256 = digest change.Content |}
-        |> digest
+
+    let private recordHash binding change = digest (recordInput binding change)
 
     let private checkDuplicate binding head change requestHash =
         match readOperation binding head change.OperationId with
@@ -465,8 +530,18 @@ module LedgerStore =
                             | Error error -> Error error
                             | Ok contentOid ->
                                 let sequence = snapshot.Header.NextSequence
+                                let originalResult =
+                                    receipt (change.OperationId.ToString("D")) sequence "PutRecord"
+                                        [| {| path = change.Path
+                                              beforeOid = change.ExpectedBlobOid
+                                              contentSha256 = digest change.Content
+                                              committedBlobOid = contentOid |} |]
                                 let operation =
-                                    { OperationId = change.OperationId.ToString("D")
+                                    { SchemaVersion = 2
+                                      CanonicalRequestJson = recordInput binding change
+                                      OriginalResultJson = originalResult
+                                      OriginalResultHash = digest originalResult
+                                      OperationId = change.OperationId.ToString("D")
                                       RequestHash = requestHash
                                       Sequence = sequence
                                       Type = "PutRecord"
@@ -504,7 +579,7 @@ module LedgerStore =
                                                     Error(GitFailure $"Ledger push rejected without remote advance: {output.Stderr}")
                                                 | Ok _ when retries >= 7 -> Error LedgerContended
                                                 | _ ->
-                                                    System.Threading.Thread.Sleep(min 800 (50 * (1 <<< retries)))
+                                                    System.Threading.Thread.Sleep(contentionDelay retries)
                                                     attempt (retries + 1)
             attempt 0
 
@@ -717,18 +792,21 @@ module LedgerStore =
                 | Ok false -> Error(InvalidBinding "Approved integration head is not a fast-forward of the planned target.")
                 | Error error -> Error error
 
-    let private intentHash (binding: LedgerBinding) (intent: LedgerIntent) =
+    let private intentInput (binding: LedgerBinding) (intent: LedgerIntent) =
         json
             {| schemaVersion = 2
                projectId = string binding.ProjectId
                operationId = intent.OperationId.ToString("D")
                actor = intent.Actor
                kind = intent.Kind
-               request = intent.RequestJson |}
-        |> digest
+               request = canonicalRequestJson intent.RequestJson |}
+
+    let private intentHash binding intent = digest (intentInput binding intent)
+
 
     let findApplied (binding: LedgerBinding) (intent: LedgerIntent) =
-        if intent.OperationId = Guid.Empty then Error(InvalidBinding "Missing transaction operation ID.")
+        if intent.OperationId = Guid.Empty || not (validRequestJson intent.RequestJson) then
+            Error(InvalidBinding "Missing operation ID or invalid canonical JSON intent.")
         else
             match fetch binding with
             | Error error -> Error error
@@ -748,7 +826,8 @@ module LedgerStore =
                  (plan: LedgerSnapshot -> Result<LedgerFileChange list, LedgerFailure>) =
         if intent.OperationId = Guid.Empty || String.IsNullOrWhiteSpace intent.Actor
            || String.IsNullOrWhiteSpace intent.Kind || String.IsNullOrWhiteSpace intent.RequestJson
-           || encoding.GetByteCount(intent.RequestJson) > 1024 * 1024 then
+           || encoding.GetByteCount(intent.RequestJson) > 1024 * 1024
+           || not (validRequestJson intent.RequestJson) then
             Error(InvalidBinding "Invalid transaction intent or size.")
         else
             let requestHash = intentHash binding intent
@@ -790,8 +869,21 @@ module LedgerStore =
                                 match validationFailure with
                                 | Some error -> Error error
                                 | None ->
+                                    let originalResult =
+                                        receipt (intent.OperationId.ToString("D"))
+                                            snapshot.Header.NextSequence intent.Kind
+                                            (changes
+                                             |> List.map (fun change ->
+                                                 {| path = change.Path
+                                                    beforeOid = change.ExpectedBlobOid
+                                                    contentSha256 = digest change.Content |})
+                                             |> List.toArray)
                                     let operation =
-                                        { OperationId = intent.OperationId.ToString("D")
+                                        { SchemaVersion = 2
+                                          CanonicalRequestJson = intentInput binding intent
+                                          OriginalResultJson = originalResult
+                                          OriginalResultHash = digest originalResult
+                                          OperationId = intent.OperationId.ToString("D")
                                           RequestHash = requestHash
                                           Sequence = snapshot.Header.NextSequence
                                           Type = intent.Kind
@@ -837,6 +929,6 @@ module LedgerStore =
                                                         Error(GitFailure $"Ledger push failed: {output.Stderr}")
                                                     | Ok _ when retry >= 7 -> Error LedgerContended
                                                     | _ ->
-                                                        System.Threading.Thread.Sleep(min 800 (50 * (1 <<< retry)))
+                                                        System.Threading.Thread.Sleep(contentionDelay retry)
                                                         attempt (retry + 1)
             attempt 0

@@ -228,3 +228,24 @@ let v2OperationStatusUsesReadOnlyTypedLedgerCommand () =
         | other -> Assert.Fail(sprintf "Unbound operation lookup must fail closed: %A" other)
         Assert.That(File.Exists(Client.V2ReviewApi.ReviewV2Binding.pathForRoot project), Is.False)
     finally Directory.Delete(root, true)
+
+
+[<Test>]
+let v2LedgerFailuresRetainTypedCodesOverWire () =
+    let cases : (Client.LedgerStore.LedgerFailure * string) list =
+        [ Client.LedgerStore.LedgerContended, "LedgerContended"
+          Client.LedgerStore.OperationIdReused, "OperationIdReused"
+          Client.LedgerStore.OutcomeUnknown "operation 123", "OutcomeUnknown"
+          Client.LedgerStore.RemoteUnavailable "offline", "RemoteUnavailable"
+          Client.LedgerStore.StaleEntityVersion "changed", "StaleEntityVersion"
+          Client.LedgerStore.LedgerIntegrityError "rewritten", "LedgerIntegrityError"
+          Client.LedgerStore.ReviewAlreadyClaimed "frozen", "ReviewAlreadyClaimed" ]
+    for failure, expected in cases do
+        match failure
+              |> Client.V2ReviewApi.V2LedgerErrors.toEffect
+              |> Client.Effect.EffectError.toAgentError with
+        | Common.AgentError.V2LedgerFailure error ->
+            Assert.That(error.Code, Is.EqualTo(expected))
+            Assert.That(error.Message, Is.Not.Empty)
+        | other ->
+            Assert.Fail(sprintf "Expected typed V2 failure, got: %A" other)

@@ -62,14 +62,65 @@ type LedgerStoreTests() =
                   Path = "records/a.json"
                   ExpectedBlobOid = None
                   Content = "{\"value\":1}" }
-            Assert.That((LedgerStore.putRecord first change |> success).AlreadyApplied, Is.False)
-            Assert.That((LedgerStore.putRecord second change |> success).AlreadyApplied, Is.True)
+            let firstWrite = LedgerStore.putRecord first change |> success
+            Assert.That(firstWrite.AlreadyApplied, Is.False)
+            let replay = LedgerStore.putRecord second change |> success
+            Assert.That(replay.AlreadyApplied, Is.True)
+            Assert.That(replay.Operation.SchemaVersion, Is.EqualTo(2))
+            Assert.That(replay.Operation.CanonicalRequestJson, Is.EqualTo(firstWrite.Operation.CanonicalRequestJson))
+            Assert.That(replay.Operation.OriginalResultJson, Is.EqualTo(firstWrite.Operation.OriginalResultJson))
+            Assert.That(replay.Operation.OriginalResultHash, Is.EqualTo(firstWrite.Operation.OriginalResultHash))
+            use initialReceipt = System.Text.Json.JsonDocument.Parse(firstWrite.Operation.OriginalResultJson)
+            Assert.That(initialReceipt.RootElement.GetProperty("sequence").GetInt64(),
+                        Is.EqualTo(firstWrite.Operation.Sequence))
+            let originalValue = initialReceipt.RootElement.GetProperty("changes")[0]
+            Assert.That(originalValue.GetProperty("path").GetString(), Is.EqualTo("records/a.json"))
+            Assert.That(originalValue.GetProperty("committedBlobOid").GetString(),
+                        Is.EqualTo(firstWrite.Operation.BlobOid))
             Assert.That((LedgerStore.readRecord second "records/a.json" |> success |> snd), Is.EqualTo(Some change.Content))
             let snapshot, record = LedgerStore.getOperationStatus second change.OperationId |> success
             Assert.That(snapshot.Commit, Is.Not.Empty)
             Assert.That(record.IsSome, Is.True)
             Assert.That(record.Value.OperationId, Is.EqualTo(change.OperationId.ToString("D")))
             Assert.That(record.Value.Sequence, Is.GreaterThan(0L))
+            Assert.That(record.Value.OriginalResultJson, Is.EqualTo(firstWrite.Operation.OriginalResultJson))
+            let unrelated =
+                { change with OperationId = Guid.NewGuid(); Path = "records/b.json"; Content = """{"value":2}""" }
+            LedgerStore.putRecord first unrelated |> success |> ignore
+            let laterReplay = LedgerStore.putRecord second change |> success
+            Assert.That(laterReplay.AlreadyApplied, Is.True)
+            Assert.That(laterReplay.CurrentHead, Is.Not.EqualTo(firstWrite.CurrentHead))
+            Assert.That(laterReplay.Operation.OriginalResultJson, Is.EqualTo(firstWrite.Operation.OriginalResultJson))
+            let canonicalId = Guid.NewGuid()
+            let canonical =
+                { OperationId = canonicalId; Actor = "Agent 1"
+                  Kind = "CanonicalJsonTest"; RequestJson = """{ "b": 2, "a": 1 }""" }
+            let canonicalWrite =
+                LedgerStore.transact first canonical (fun _ ->
+                    Ok [ { Path = "records/canonical.json"
+                           ExpectedBlobOid = None
+                           Content = """{"accepted":true}""" } ])
+                |> success
+            let reordered =
+                { canonical with RequestJson = """{"a":1,"b":2}""" }
+            let canonicalReplay =
+                LedgerStore.transact second reordered (fun _ ->
+                    Error(StaleEntityVersion "The planner must not execute on a duplicate."))
+                |> success
+            Assert.That(canonicalReplay.AlreadyApplied, Is.True)
+            Assert.That(canonicalReplay.Operation.RequestHash,
+                        Is.EqualTo(canonicalWrite.Operation.RequestHash))
+            Assert.That(canonicalReplay.Operation.CanonicalRequestJson,
+                        Is.EqualTo(canonicalWrite.Operation.CanonicalRequestJson))
+            Assert.That(canonicalReplay.Operation.OriginalResultJson,
+                        Is.EqualTo(canonicalWrite.Operation.OriginalResultJson))
+            let malformed =
+                { OperationId = Guid.NewGuid(); Actor = "Agent 1"
+                  Kind = "CanonicalJsonTest"; RequestJson = """{"a":1,"a":2}""" }
+            match LedgerStore.transact first malformed (fun _ ->
+                    Error(StaleEntityVersion "Not called")) with
+            | Error(InvalidBinding _) -> ()
+            | other -> Assert.Fail(sprintf "Duplicate JSON properties must be rejected: %A" other)
             let _, absent = LedgerStore.getOperationStatus second (Guid.NewGuid()) |> success
             Assert.That(absent.IsNone, Is.True)
 

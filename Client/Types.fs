@@ -17,6 +17,7 @@ type EffectError =
     | PermissionDenied of string
     | ConfirmationRequired of ConfirmationRequest
     | AggregatedErrors of EffectError list
+    | V2LedgerFailureError of Common.V2LedgerFailureInfo
 
 type ProjectName = ProjectName of string
 type FolderPath = FolderPath of string

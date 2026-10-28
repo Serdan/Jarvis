@@ -430,7 +430,7 @@ let ``command catalog matches AgentCommand union and MCP tools`` () =
               "V2ReviewTask"; "V2ReviewDetails"; "V2ReviewerInbox"
               "V2SubmitReview"; "V2ReplaceReview"; "V2ClaimReview"; "V2DecideReview"
               "V2WithdrawReview"; "V2ReassignReview"; "V2FinalizeReview"
-              "V2LedgerHealth"; "V2GetOperationStatus"; "V2InitializeLedger"; "V2BindExistingLedger"; "V2RebindLedgerRemote"
+              "V2LedgerHealth"; "V2GetOperationStatus"; "V2PendingOperations"; "V2InitializeLedger"; "V2BindExistingLedger"; "V2RebindLedgerRemote"
               "V2InspectIntegration"; "V2PlanIntegration"; "V2MarkIntegrationPendingPush"; "V2RecordIntegration"; "V2CloseIntegratedTask" ]
     Set.difference unionNames retired |> shouldEqual catalogNames
     Set.intersect mcpNames retired |> shouldEqual Set.empty
@@ -450,7 +450,7 @@ let ``client-backed MCP tools expose an optional per-command deviceId`` () =
         |> Array.filter (fun methodInfo ->
             methodInfo.GetParameters()
             |> Array.exists (fun parameter -> parameter.ParameterType = typeof<ClientService>))
-    clientMethods.Length |> shouldEqual (AgentProtocol.commandDefinitions.Length - 1 + 26) // 34 MCP V2 aliases / 8 wire operations
+    clientMethods.Length |> shouldEqual (AgentProtocol.commandDefinitions.Length - 1 + 27) // 35 MCP V2 aliases / 8 wire operations
     for methodInfo in clientMethods do
         let deviceParam = methodInfo.GetParameters() |> Array.tryFind (fun parameter -> parameter.Name = "deviceId")
         match deviceParam with
@@ -664,7 +664,7 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
         let v2Read = original["V2ReviewRead"]
         let v2Write = original["V2ReviewWrite"]
         let aliases =
-            [ for name in [ "V2LedgerHealth"; "V2GetOperationStatus" ] -> name, ledgerRead
+            [ for name in [ "V2LedgerHealth"; "V2GetOperationStatus"; "V2PendingOperations" ] -> name, ledgerRead
               for name in [ "V2InitializeLedger"; "V2BindExistingLedger"; "V2RebindLedgerRemote" ] -> name, ledgerWrite
               for name in [ "V2InspectIntegration" ] -> name, integrationRead
               for name in [ "V2PlanIntegration"; "V2MarkIntegrationPendingPush"; "V2RecordIntegration"; "V2CloseIntegratedTask" ] -> name, integrationWrite
@@ -894,3 +894,39 @@ let response_json_carries_typed_hierarchical_instructions () =
     Assert.That(instruction.GetProperty("Path").GetString(), Is.EqualTo("Demo/AGENTS.md"))
     Assert.That(instruction.GetProperty("Scope").GetString(), Is.EqualTo("project"))
     Assert.That(instruction.GetProperty("Content").GetString(), Is.EqualTo("# Guidance"))
+
+
+[<Test>]
+let ``MCP bridge preserves structured V2 ledger failure category`` () =
+    let problem : Common.V2LedgerFailureInfo =
+        { Code = "OutcomeUnknown"
+          Message = "Remote push response lost"
+          OperationId = Some(Guid.NewGuid().ToString("D"))
+          VerifiedLedgerHead = None }
+    let response =
+        { Result = None
+          Error = Some(Common.AgentError.V2LedgerFailure problem)
+          Instructions = [] }
+    let tool = McpToolHelpers.toCallToolResult response
+    tool.IsError |> shouldEqual (Nullable true)
+    let content = tool.Content[0] :?> TextContentBlock
+    content.Text.Contains("V2LedgerFailure(OutcomeUnknown)", StringComparison.Ordinal)
+    |> shouldEqual true
+
+[<Test>]
+let ``typed V2 ledger failures survive response JSON roundtrip`` () =
+    let operationId = Guid.NewGuid().ToString("D")
+    let source : Common.AgentCommandResponse =
+        { Result = None
+          Error =
+              Some(Common.AgentError.V2LedgerFailure
+                  { Code = "OutcomeUnknown"; Message = "Unconfirmed push"
+                    OperationId = Some operationId; VerifiedLedgerHead = None })
+          Instructions = [] }
+    let payload = JsonSerializer.Serialize(source)
+    let destination = JsonSerializer.Deserialize<Common.AgentCommandResponse>(payload)
+    match destination.Error with
+    | Some(Common.AgentError.V2LedgerFailure issue) ->
+        Assert.That(issue.Code, Is.EqualTo("OutcomeUnknown"))
+        Assert.That(issue.OperationId, Is.EqualTo(Some operationId))
+    | other -> Assert.Fail(sprintf "Lost typed V2 failure during transport: %A" other)

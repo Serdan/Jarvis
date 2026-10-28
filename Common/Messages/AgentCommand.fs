@@ -610,6 +610,12 @@ type ConfirmationRequest =
       EstimatedImpact: string
       SupportsDryRun: bool }
 
+type V2LedgerFailureInfo =
+    { Code: string
+      Message: string
+      OperationId: string option
+      VerifiedLedgerHead: string option }
+
 [<JsonConverter(typeof<UnionConverter<AgentError>>)>]
 type AgentError =
     | NotFound of string
@@ -619,6 +625,7 @@ type AgentError =
     | Conflict of string
     | ExecutionFailed of string
     | OutputTruncated of string
+    | V2LedgerFailure of V2LedgerFailureInfo
 
 type InstructionDocument =
     { Scope: string
@@ -1098,7 +1105,7 @@ module AgentCommandInfo =
         | None -> invocation command
 
 module AgentProtocol =
-    let version = "3.25"
+    let version = "3.26"
     let defaultPatchFuzzyContextLines = 3
     let maxResponseBytes = 900 * 1024
     let maxImageBytes = 8 * 1024 * 1024

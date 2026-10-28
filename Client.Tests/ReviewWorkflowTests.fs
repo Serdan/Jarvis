@@ -536,6 +536,8 @@ type ReviewWorkflowTests() =
                 Assert.That(parked.PendingReviews.Length, Is.EqualTo(1))
                 Assert.That(after.PendingReviews.Length, Is.EqualTo(1))
                 Assert.That(after.PendingReviews.Head.RequestId, Is.EqualTo(requestId.ToString("N")))
+                Assert.That((Client.V2ReviewApi.V2PendingIntentJournal.listAtRoot one |> success).Length,
+                            Is.EqualTo(0), "Verified V2 mutations must clear pending local intents.")
             finally
                 if File.Exists configPath then File.Delete configPath)
 
@@ -1018,7 +1020,7 @@ type ReviewWorkflowTests() =
             | other -> Assert.Fail(sprintf "Unapproved bind must refuse: %A" other)
             Assert.That(File.Exists path, Is.False)
             match bind true (String.replicate 40 "a") with
-            | Error(Client.ValidationError _) -> ()
+            | Error(Client.V2LedgerFailureError info) when info.Code = "LedgerHistoryUnavailable" -> ()
             | other -> Assert.Fail(sprintf "Wrong trust head must refuse: %A" other)
             Assert.That(File.Exists path, Is.False)
             let stored = bind true current |> function
@@ -1038,7 +1040,7 @@ type ReviewWorkflowTests() =
             Assert.That(config.HighestTrustedHead, Is.EqualTo(fresh))
             git one [ "remote"; "set-url"; "origin"; "file:///not-the-approved-remote.git" ] |> ignore
             match Client.V2ReviewApi.ReviewV2Binding.load "owner" ctx with
-            | Error(Client.ValidationError _) -> ()
+            | Error(Client.V2LedgerFailureError failure) when failure.Code = "InvalidBinding" -> ()
             | other -> Assert.Fail(sprintf "Changed remote must be rejected: %A" other)
             git one [ "remote"; "set-url"; "origin"; first.ApprovedFetchUrl ] |> ignore
             Assert.That((Client.V2ReviewApi.ReviewV2Binding.health "owner" ctx |> function
@@ -1080,7 +1082,7 @@ type ReviewWorkflowTests() =
             | Error(Client.ValidationError _) -> ()
             | other -> Assert.Fail(sprintf "Rebind without approval must fail: %A" other)
             match rebind true (String.replicate 40 "f") with
-            | Error(Client.ValidationError _) -> ()
+            | Error(Client.V2LedgerFailureError info) when info.Code = "LedgerHistoryUnavailable" -> ()
             | other -> Assert.Fail(sprintf "Rebind to mismatched trust must fail: %A" other)
             let rebound = rebind true created.HighestTrustedHead |> function
                 | Ok value -> value
@@ -1090,3 +1092,58 @@ type ReviewWorkflowTests() =
                          | Ok value -> value.remoteName
                          | Error error -> failwithf "Health: %A" error), Is.EqualTo("mirror"))
             File.Delete path)
+
+
+    [<Test>]
+    member _.PendingV2IntentSurvivesFailedCallAndCanReplayUnchanged() =
+        withFixture (fun one _ first _ _ _ _ _ ->
+            let operationId = Guid.NewGuid()
+            let command = {| action = "CreateTask"; taskId = "restart"; title = "Original" |}
+            let fail () : Result<int, Client.EffectError> =
+                Error(Client.GenericError "Simulated lost server response")
+            let execute f =
+                Client.V2ReviewApi.V2PendingIntentJournal.execute first operationId
+                    "V2TaskWrite" command f
+            match execute fail with
+            | Error(Client.GenericError _) -> ()
+            | other -> Assert.Fail(sprintf "Simulated unknown outcome should preserve intent: %A" other)
+            let pending () =
+                Client.V2ReviewApi.V2PendingIntentJournal.listAtRoot one |> success
+            let saved = pending ()
+            Assert.That(saved.Length, Is.EqualTo(1))
+            Assert.That(saved.Head.OperationId, Is.EqualTo(operationId.ToString("D")))
+            Assert.That(saved.Head.CommandType, Is.EqualTo("V2TaskWrite"))
+            Assert.That(saved.Head.CommandJson, Does.Contain("restart"))
+            Assert.That(saved.Head.CommandSha256.Length, Is.EqualTo(64))
+            let ctx = GitCommandTests.TestContext(Path.GetDirectoryName one)
+            let lookup : Common.V2LedgerReadCommand =
+                { ProjectName = "owner"; Action = "PendingOperations"; OperationId = "" }
+            let listing = Client.V2ReviewApi.V2LedgerApi.read lookup ctx |> success
+            let json = System.Text.Json.JsonSerializer.Serialize(listing)
+            Assert.That(json, Does.Contain(operationId.ToString("D")))
+            Assert.That(json, Does.Contain("Original"))
+            let mismatch =
+                Client.V2ReviewApi.V2PendingIntentJournal.execute first operationId
+                    "V2TaskWrite" {| action = "CreateTask"; taskId = "restart"; title = "Changed" |}
+                    (fun () -> Ok 999)
+            match mismatch with
+            | Error(Client.ValidationError _) -> ()
+            | other -> Assert.Fail(sprintf "UUID conflict must reject altered intent: %A" other)
+            Assert.That((pending ()).Length, Is.EqualTo(1))
+            let recovered = execute (fun () -> Ok 17) |> success
+            Assert.That(recovered, Is.EqualTo(17))
+            Assert.That((pending ()).Length, Is.EqualTo(0))
+            let lostId = Guid.NewGuid()
+            let retryLost f =
+                Client.V2ReviewApi.V2PendingIntentJournal.execute first lostId
+                    "V2ReviewWrite" {| action = "Decide"; requestId = "r1" |} f
+            match retryLost (fun () ->
+                    Error(Client.V2ReviewApi.V2LedgerErrors.toEffect
+                        (Client.LedgerStore.OutcomeUnknown "Network stopped after push"))) with
+            | Error(Client.V2LedgerFailureError info) ->
+                Assert.That(info.Code, Is.EqualTo("OutcomeUnknown"))
+                Assert.That(info.OperationId, Is.EqualTo(Some(lostId.ToString("D"))))
+            | other -> Assert.Fail(sprintf "Unknown result must retain typed UUID: %A" other)
+            Assert.That((pending ()).Length, Is.EqualTo(1))
+            retryLost (fun () -> Ok 19) |> success |> ignore
+            Assert.That((pending ()).Length, Is.EqualTo(0)))

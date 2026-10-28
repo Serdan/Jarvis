@@ -23,6 +23,31 @@ type ReviewV2OptIn =
       ApprovedPushUrl: string
       HighestTrustedHead: string }
 
+module V2LedgerErrors =
+    let toEffect (failure: LedgerStore.LedgerFailure) =
+        let code =
+            match failure with
+            | LedgerStore.InvalidBinding _ -> "InvalidBinding"
+            | LedgerStore.RemoteUnavailable _ -> "RemoteUnavailable"
+            | LedgerStore.LedgerIntegrityError _ -> "LedgerIntegrityError"
+            | LedgerStore.LedgerHistoryUnavailable _ -> "LedgerHistoryUnavailable"
+            | LedgerStore.StaleEntityVersion _ -> "StaleEntityVersion"
+            | LedgerStore.OperationIdReused -> "OperationIdReused"
+            | LedgerStore.OutcomeUnknown _ -> "OutcomeUnknown"
+            | LedgerStore.LedgerContended -> "LedgerContended"
+            | LedgerStore.GitFailure _ -> "GitFailure"
+            | LedgerStore.SourceUnavailable _ -> "SourceUnavailable"
+            | LedgerStore.AgentBusy _ -> "AgentBusy"
+            | LedgerStore.ReviewAccessDenied _ -> "ReviewAccessDenied"
+            | LedgerStore.ReviewAlreadyClaimed _ -> "ReviewAlreadyClaimed"
+            | LedgerStore.ReviewVersionConflict _ -> "ReviewVersionConflict"
+            | LedgerStore.SourceReviewRefUnavailable _ -> "SourceReviewRefUnavailable"
+        Client.V2LedgerFailureError
+            { Code = code
+              Message = string failure
+              OperationId = None
+              VerifiedLedgerHead = None }
+
 module ReviewV2Binding =
     let pathForRoot (root: string) =
         let baseDirectory = Path.GetDirectoryName(ClientConfig.configPath())
@@ -73,11 +98,11 @@ module ReviewV2Binding =
                                   Epoch = stored.Epoch }
                             match LedgerStore.LedgerStore.fetch binding with
                             | Error error ->
-                                Error(Client.ValidationError $"V2 ledger identity/trust verification failed: {error}")
+                                Error(V2LedgerErrors.toEffect error)
                             | Ok snapshot ->
                                 match LedgerStore.LedgerStore.verifyTrustedHead binding stored.HighestTrustedHead snapshot.Commit with
                                 | Error error ->
-                                    Error(Client.ValidationError $"V2 ledger trust anchor mismatch: {error}")
+                                    Error(V2LedgerErrors.toEffect error)
                                 | Ok () ->
                                     if stored.HighestTrustedHead <> snapshot.Commit then
                                         // Persist the new verified head independently from Git's local cache ref.
@@ -119,11 +144,11 @@ module ReviewV2Binding =
                           ProjectId = projectId; LedgerId = ledgerId; Epoch = epoch }
                     match LedgerStore.LedgerStore.fetch binding with
                     | Error failure ->
-                        Error(Client.ValidationError $"Cannot adopt V2 ledger: {failure}")
+                        Error(V2LedgerErrors.toEffect failure)
                     | Ok snapshot ->
                         match LedgerStore.LedgerStore.verifyTrustedHead binding expectedTrustedHead snapshot.Commit with
                         | Error failure ->
-                            Error(Client.ValidationError $"Trust anchor mismatch: {failure}")
+                            Error(V2LedgerErrors.toEffect failure)
                         | Ok () ->
                             let record =
                                 { SchemaVersion = 1; Enabled = true
@@ -165,7 +190,7 @@ module ReviewV2Binding =
                           ProjectId = projectId; LedgerId = ledgerId; Epoch = epoch }
                     match LedgerStore.LedgerStore.initialize binding true with
                     | Error failure ->
-                        Error(Client.ValidationError $"V2 initialization failed: {failure}")
+                        Error(V2LedgerErrors.toEffect failure)
                     | Ok snapshot ->
                         bindExisting projectName rt projectId ledgerId epoch remoteName
                             approvedFetchUrl approvedPushUrl snapshot.Commit true
@@ -174,7 +199,7 @@ module ReviewV2Binding =
         load projectName rt
         |> Result.bind (fun binding ->
             LedgerStore.LedgerStore.fetch binding
-            |> Result.mapError (fun error -> Client.ValidationError $"V2 ledger health: {error}")
+            |> Result.mapError V2LedgerErrors.toEffect
             |> Result.map (fun snapshot ->
                 {| projectId = binding.ProjectId.ToString("D")
                    ledgerId = binding.LedgerId.ToString("D")
@@ -201,11 +226,11 @@ module ReviewV2Binding =
                                ApprovedPushUrl = approvedPushUrl }
                 match LedgerStore.LedgerStore.fetch newBinding with
                 | Error failure ->
-                    Error(Client.ValidationError $"Cannot verify new V2 remote: {failure}")
+                    Error(V2LedgerErrors.toEffect failure)
                 | Ok snapshot ->
                     match LedgerStore.LedgerStore.verifyTrustedHead newBinding expectedTrustedHead snapshot.Commit with
                     | Error failure ->
-                        Error(Client.ValidationError $"New remote failed pinned trust verification: {failure}")
+                        Error(V2LedgerErrors.toEffect failure)
                     | Ok () ->
                         match ProjectPaths.resolveProjectRoot projectName rt with
                         | Error error -> Error error
@@ -237,6 +262,149 @@ module ReviewV2Binding =
                                 Error(Client.ValidationError $"V2 rebind failed: {ex.Message}")
 
 
+
+[<CLIMutable>]
+type V2PendingIntent =
+    { SchemaVersion: int
+      OperationId: string
+      ProjectId: string
+      LedgerId: string
+      Epoch: int
+      CommandType: string
+      CommandJson: string
+      CommandSha256: string
+      CreatedUtc: string }
+
+// Local crash recovery is an intent journal, not a second ledger writer.
+// The authoritative operation outcome remains on the remote orphan ref.
+module V2PendingIntentJournal =
+    let private sha (content: string) =
+        SHA256.HashData(Encoding.UTF8.GetBytes(content))
+        |> Convert.ToHexString
+
+    let private journalDirectory root =
+        let bindingPath = ReviewV2Binding.pathForRoot root
+        Path.Combine(Path.GetDirectoryName bindingPath, "pending",
+                     Path.GetFileNameWithoutExtension bindingPath)
+
+    let private filePath (binding: LedgerStore.LedgerBinding) (operationId: Guid) =
+        Path.Combine(journalDirectory binding.RepositoryPath, operationId.ToString("N") + ".json")
+
+    let private readFile (file: string) =
+        try
+            if File.GetAttributes(file).HasFlag(FileAttributes.ReparsePoint)
+               || FileInfo(file).Length > 1024L * 1024L then
+                Error(Client.ValidationError "Unsafe or oversized V2 pending intent.")
+            else
+                let record = JsonSerializer.Deserialize<V2PendingIntent>(File.ReadAllText(file))
+                if isNull (box record) || record.SchemaVersion <> 1
+                   || String.IsNullOrWhiteSpace record.OperationId
+                   || String.IsNullOrWhiteSpace record.CommandType
+                   || String.IsNullOrWhiteSpace record.CommandJson
+                   || not (String.Equals(record.CommandSha256, sha record.CommandJson, StringComparison.Ordinal)) then
+                    Error(Client.ValidationError "Invalid local pending V2 operation journal.")
+                else Ok record
+        with ex ->
+            Error(Client.ValidationError $"Cannot read local pending operation: {ex.Message}")
+
+    let persist (binding: LedgerStore.LedgerBinding) operationId commandType commandJson =
+        let file = filePath binding operationId
+        let newRecord =
+            { SchemaVersion = 1
+              OperationId = operationId.ToString("D")
+              ProjectId = binding.ProjectId.ToString("D")
+              LedgerId = binding.LedgerId.ToString("D")
+              Epoch = binding.Epoch
+              CommandType = commandType
+              CommandJson = commandJson
+              CommandSha256 = sha commandJson
+              CreatedUtc = DateTimeOffset.UtcNow.ToString("O") }
+        let matches (existing: V2PendingIntent) =
+            existing.OperationId = newRecord.OperationId
+            && existing.ProjectId = newRecord.ProjectId
+            && existing.LedgerId = newRecord.LedgerId
+            && existing.Epoch = newRecord.Epoch
+            && existing.CommandType = newRecord.CommandType
+            && existing.CommandSha256 = newRecord.CommandSha256
+            && existing.CommandJson = newRecord.CommandJson
+        try
+            if File.Exists file then
+                readFile file |> Result.bind (fun existing ->
+                    if matches existing then Ok ()
+                    else Error(Client.ValidationError "Pending V2 operation UUID reused with changed input."))
+            else
+                let directory = Path.GetDirectoryName file
+                Directory.CreateDirectory(directory) |> ignore
+                if DirectoryInfo(directory).Attributes.HasFlag(FileAttributes.ReparsePoint) then
+                    Error(Client.ValidationError "Pending V2 journal directory must not be a symbolic link.")
+                else
+                    if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
+                        File.SetUnixFileMode(directory,
+                            UnixFileMode.UserRead ||| UnixFileMode.UserWrite ||| UnixFileMode.UserExecute)
+                    let temp = file + "." + Guid.NewGuid().ToString("N") + ".tmp"
+                    try
+                        File.WriteAllText(temp, JsonSerializer.Serialize(newRecord), UTF8Encoding(false))
+                        if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
+                            File.SetUnixFileMode(temp, UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
+                        try File.Move(temp, file, false)
+                        with :? IOException when File.Exists file -> ()
+                        readFile file |> Result.bind (fun existing ->
+                            if matches existing then Ok ()
+                            else Error(Client.ValidationError "Pending V2 operation UUID reused with changed input."))
+                    finally
+                        if File.Exists temp then File.Delete temp
+        with ex ->
+            Error(Client.ValidationError $"Cannot persist local pending V2 operation: {ex.Message}")
+
+    let listAtRoot root =
+        try
+            let directory = journalDirectory root
+            if not (Directory.Exists directory) then Ok []
+            elif DirectoryInfo(directory).Attributes.HasFlag(FileAttributes.ReparsePoint) then
+                Error(Client.ValidationError "Pending V2 journal directory must not be a symbolic link.")
+            else
+                let files = Directory.GetFiles(directory, "*.json")
+                if files.Length > 1000 then
+                    Error(Client.ValidationError "Too many pending operations; manual recovery required.")
+                else
+                    files
+                    |> Array.sort
+                    |> Array.fold (fun state file ->
+                        state |> Result.bind (fun items ->
+                            readFile file |> Result.bind (fun record ->
+                                match Guid.TryParse record.OperationId with
+                                | true, id when Path.GetFileName(file) = id.ToString("N") + ".json" ->
+                                    Ok(record :: items)
+                                | _ ->
+                                    Error(Client.ValidationError "Unexpected pending operation journal filename."))))
+                        (Ok [])
+                    |> Result.map List.rev
+        with ex ->
+            Error(Client.ValidationError $"Cannot enumerate pending V2 operations: {ex.Message}")
+
+    let listForProject projectName rt =
+        ProjectPaths.resolveProjectRoot projectName rt
+        |> Result.bind (fun (FolderPath root) -> listAtRoot root)
+
+    let execute binding operationId commandType command (apply: unit -> Result<'t, EffectError>) =
+        let commandJson = JsonSerializer.Serialize(command)
+        persist binding operationId commandType commandJson
+        |> Result.bind (fun () ->
+            let outcome = apply ()
+            match outcome with
+            | Error(Client.V2LedgerFailureError failure) ->
+                // The caller-owned UUID remains recoverable even after a harness reset.
+                Error(Client.V2LedgerFailureError
+                    { failure with OperationId = Some(operationId.ToString("D")) })
+            | Error _ -> outcome // Preserve exact intent for recovery after lost response.
+            | Ok _ ->
+                try
+                    let path = filePath binding operationId
+                    if File.Exists path then File.Delete path
+                with _ -> () // A stale entry is safe: remote UUID remains authoritative.
+                outcome
+        )
+
 module V2LedgerApi =
     let private id label (raw: string) =
         match Guid.TryParse raw with
@@ -246,14 +414,27 @@ module V2LedgerApi =
     let read (cmd: V2LedgerReadCommand) rt =
         match cmd.Action with
         | "Health" -> ReviewV2Binding.health cmd.ProjectName rt |> Result.map box
+        | "PendingOperations" ->
+            V2PendingIntentJournal.listForProject cmd.ProjectName rt
+            |> Result.map (fun records ->
+                records
+                |> List.map (fun record ->
+                    {| operationId = record.OperationId
+                       projectId = record.ProjectId
+                       ledgerId = record.LedgerId
+                       epoch = record.Epoch
+                       commandType = record.CommandType
+                       commandSha256 = record.CommandSha256
+                       originalCommandJson = record.CommandJson
+                       createdUtc = record.CreatedUtc |})
+                |> box)
         | "GetOperationStatus" ->
             id "operation" cmd.OperationId
             |> Result.bind (fun operationId ->
                 ReviewV2Binding.load cmd.ProjectName rt
                 |> Result.bind (fun binding ->
                     LedgerStore.LedgerStore.getOperationStatus binding operationId
-                    |> Result.mapError (fun error ->
-                        Client.ValidationError $"V2 operation status: {error}")
+                    |> Result.mapError V2LedgerErrors.toEffect
                     |> Result.map (fun (snapshot, operation) ->
                         box {| snapshotCommit = snapshot.Commit
                                operationId = operationId.ToString("D")
@@ -295,7 +476,7 @@ module V2LedgerApi =
 
 module V2ReviewApi =
     let private mapError (result: Result<'a, LedgerStore.LedgerFailure>) : Result<'a, EffectError> =
-        result |> Result.mapError (fun failure -> Client.ValidationError $"V2 review: {failure}")
+        result |> Result.mapError V2LedgerErrors.toEffect
     let private parseId label (raw: string) =
         match Guid.TryParse raw with
         | true, value when value <> Guid.Empty -> Ok value
@@ -332,57 +513,59 @@ module V2ReviewApi =
             |> Result.bind (fun operationId ->
                 let id () = parseId "requestId" cmd.RequestId
                 let result =
-                    match cmd.Action with
-                    | "Submit" ->
-                        id ()
-                        |> Result.mapError (fun e -> e)
-                        |> Result.bind (fun reviewId ->
-                            ReviewWorkflow.ReviewWorkflow.submitReview binding operationId
-                                cmd.TaskId cmd.ActorId cmd.ExpectedVersion cmd.Generation reviewId
-                                cmd.SourceRef cmd.HeadOid cmd.Summary
-                            |> mapError)
-                    | "Update" ->
-                        id () |> Result.bind (fun reviewId ->
-                            ReviewWorkflow.ReviewWorkflow.updateReview binding operationId
-                                cmd.TaskId cmd.ActorId cmd.Generation reviewId cmd.ExpectedVersion
-                                cmd.SourceRef cmd.HeadOid cmd.Summary
-                            |> mapError)
-                    | "Claim" ->
-                        id () |> Result.bind (fun reviewId ->
-                            ReviewWorkflow.ReviewWorkflow.claimReview binding operationId
-                                cmd.TaskId reviewId cmd.ActorId cmd.ExpectedVersion cmd.Generation
-                            |> mapError)
-                    | "Decide" ->
-                        id () |> Result.bind (fun reviewId ->
-                            match cmd.Verdict with
-                            | "Accept" | "RequestChanges" as verdict ->
-                                let decision =
-                                    if verdict = "Accept" then ReviewWorkflow.Accept
-                                    else ReviewWorkflow.RequestChanges
-                                ReviewWorkflow.ReviewWorkflow.decide binding operationId
-                                    cmd.TaskId reviewId cmd.ActorId cmd.ExpectedVersion decision cmd.Feedback
-                                |> mapError
-                            | _ -> Error(Client.ValidationError "Invalid V2 review verdict."))
-                    | "Withdraw" ->
-                        id () |> Result.bind (fun reviewId ->
-                            ReviewWorkflow.ReviewWorkflow.withdrawReview binding operationId
-                                cmd.TaskId reviewId cmd.ActorId cmd.ExpectedVersion cmd.Feedback
-                            |> mapError)
-                    | "Reassign" ->
-                        id () |> Result.bind (fun reviewId ->
-                            ReviewWorkflow.ReviewWorkflow.reassignReviewer binding operationId
-                                cmd.TaskId reviewId cmd.ActorId cmd.ReviewerId cmd.ExpectedVersion
-                            |> mapError)
-                    | "Finalize" ->
-                        id () |> Result.bind (fun reviewId ->
-                            ReviewWorkflow.ReviewWorkflow.finalizeImplementation binding operationId
-                                cmd.TaskId cmd.ActorId cmd.ExpectedVersion reviewId
-                            |> mapError)
-                    | "AcknowledgeFeedback" ->
-                        ReviewWorkflow.ReviewWorkflow.acknowledgeReviewFeedback binding operationId
-                            cmd.TaskId cmd.ActorId (int64 cmd.ExpectedVersion)
-                        |> mapError
-                    | _ -> Error(Client.ValidationError "Unsupported V2 write operation.")
+                    V2PendingIntentJournal.execute binding operationId "V2ReviewWrite" cmd (fun () ->
+                        match cmd.Action with
+                        | "Submit" ->
+                            id ()
+                            |> Result.mapError (fun e -> e)
+                            |> Result.bind (fun reviewId ->
+                                ReviewWorkflow.ReviewWorkflow.submitReview binding operationId
+                                    cmd.TaskId cmd.ActorId cmd.ExpectedVersion cmd.Generation reviewId
+                                    cmd.SourceRef cmd.HeadOid cmd.Summary
+                                |> mapError)
+                        | "Update" ->
+                            id () |> Result.bind (fun reviewId ->
+                                ReviewWorkflow.ReviewWorkflow.updateReview binding operationId
+                                    cmd.TaskId cmd.ActorId cmd.Generation reviewId cmd.ExpectedVersion
+                                    cmd.SourceRef cmd.HeadOid cmd.Summary
+                                |> mapError)
+                        | "Claim" ->
+                            id () |> Result.bind (fun reviewId ->
+                                ReviewWorkflow.ReviewWorkflow.claimReview binding operationId
+                                    cmd.TaskId reviewId cmd.ActorId cmd.ExpectedVersion cmd.Generation
+                                |> mapError)
+                        | "Decide" ->
+                            id () |> Result.bind (fun reviewId ->
+                                match cmd.Verdict with
+                                | "Accept" | "RequestChanges" as verdict ->
+                                    let decision =
+                                        if verdict = "Accept" then ReviewWorkflow.Accept
+                                        else ReviewWorkflow.RequestChanges
+                                    ReviewWorkflow.ReviewWorkflow.decide binding operationId
+                                        cmd.TaskId reviewId cmd.ActorId cmd.ExpectedVersion decision cmd.Feedback
+                                    |> mapError
+                                | _ -> Error(Client.ValidationError "Invalid V2 review verdict."))
+                        | "Withdraw" ->
+                            id () |> Result.bind (fun reviewId ->
+                                ReviewWorkflow.ReviewWorkflow.withdrawReview binding operationId
+                                    cmd.TaskId reviewId cmd.ActorId cmd.ExpectedVersion cmd.Feedback
+                                |> mapError)
+                        | "Reassign" ->
+                            id () |> Result.bind (fun reviewId ->
+                                ReviewWorkflow.ReviewWorkflow.reassignReviewer binding operationId
+                                    cmd.TaskId reviewId cmd.ActorId cmd.ReviewerId cmd.ExpectedVersion
+                                |> mapError)
+                        | "Finalize" ->
+                            id () |> Result.bind (fun reviewId ->
+                                ReviewWorkflow.ReviewWorkflow.finalizeImplementation binding operationId
+                                    cmd.TaskId cmd.ActorId cmd.ExpectedVersion reviewId
+                                |> mapError)
+                        | "AcknowledgeFeedback" ->
+                            ReviewWorkflow.ReviewWorkflow.acknowledgeReviewFeedback binding operationId
+                                cmd.TaskId cmd.ActorId (int64 cmd.ExpectedVersion)
+                            |> mapError
+                        | _ -> Error(Client.ValidationError "Unsupported V2 write operation.")
+                    )
                 result |> Result.map (fun write ->
                     let dto = {| operation = write.Operation
                                  head = write.CurrentHead
@@ -394,7 +577,7 @@ module V2ReviewApi =
 // to reinterpret a request ID as a task, attempt, or agent identifier.
 module V2TaskApi =
     let private mapError (result: Result<'a, LedgerStore.LedgerFailure>) : Result<'a, EffectError> =
-        result |> Result.mapError (fun error -> Client.ValidationError $"V2 task: {error}")
+        result |> Result.mapError V2LedgerErrors.toEffect
 
     let private guid label (text: string) =
         match Guid.TryParse text with
@@ -414,59 +597,61 @@ module V2TaskApi =
             guid "operationId" cmd.OperationId
             |> Result.bind (fun operationId ->
                 let result =
-                    match cmd.Action with
-                    | "CreateTask" ->
-                        ReviewWorkflow.ReviewWorkflow.createTaskWithSpec binding operationId cmd.TaskId cmd.Title cmd.Html
-                        |> mapError
-                    | "ReviseTaskSpec" ->
-                        ReviewWorkflow.ReviewWorkflow.reviseTaskSpec binding operationId cmd.TaskId
-                            cmd.ExpectedVersion cmd.Title cmd.Html |> mapError
-                    | "RegisterAgent" ->
-                        ReviewWorkflow.ReviewWorkflow.registerAgent binding operationId cmd.ActorId
-                        |> mapError
-                    | "AssignTask" ->
-                        guid "attemptId" cmd.AttemptId
-                        |> Result.bind (fun attemptId ->
-                            ReviewWorkflow.ReviewWorkflow.assignTask binding operationId cmd.TaskId
-                                attemptId cmd.OwnerId cmd.ReviewerId
-                            |> mapError)
-                    | "BeginAttempt" ->
-                        ReviewWorkflow.ReviewWorkflow.beginAttempt binding operationId cmd.TaskId
-                            cmd.ActorId cmd.ExpectedVersion cmd.AssignmentGeneration
-                        |> mapError
-                    | "BindReviewBase" ->
-                        ReviewWorkflow.ReviewWorkflow.bindReviewBase binding operationId cmd.TaskId
-                            cmd.ActorId cmd.ExpectedVersion cmd.AssignmentGeneration
-                            cmd.BaseOid cmd.TargetRef
-                        |> mapError
-                    | "YieldAgent" ->
-                        ReviewWorkflow.ReviewWorkflow.yieldAgent binding operationId
-                            cmd.TaskId cmd.ActorId cmd.ExpectedVersion cmd.ExpectedAgentVersion
-                            cmd.AssignmentGeneration cmd.Summary cmd.NextAction |> mapError
-                    | "ResumeAgent" ->
-                        ReviewWorkflow.ReviewWorkflow.resumeAgent binding operationId
-                            cmd.TaskId cmd.ActorId cmd.ExpectedVersion cmd.ExpectedAgentVersion
-                            cmd.AssignmentGeneration |> mapError
-                    | "CompleteAgentWork" ->
-                        ReviewWorkflow.ReviewWorkflow.completeAgentWork binding operationId
-                            cmd.TaskId cmd.ActorId cmd.ExpectedVersion cmd.ExpectedAgentVersion
-                            cmd.AssignmentGeneration cmd.Summary |> mapError
-                    | "ParkAgent" ->
-                        ReviewWorkflow.ReviewWorkflow.parkAgent binding operationId
-                            cmd.ActorId cmd.ExpectedAgentVersion cmd.Reason |> mapError
-                    | "ReissueQueuedAttempt" ->
-                        ReviewWorkflow.ReviewWorkflow.reissueQueuedAttempt binding operationId
-                            cmd.TaskId cmd.ActorId cmd.ExpectedVersion cmd.ExpectedAgentVersion
-                            cmd.AssignmentGeneration cmd.Reason |> mapError
-                    | "RecoverAgentAssignment" ->
-                        ReviewWorkflow.ReviewWorkflow.recoverAgentAssignment binding operationId
-                            cmd.TaskId cmd.ActorId cmd.ExpectedVersion cmd.ExpectedAgentVersion
-                            cmd.AssignmentGeneration cmd.Reason |> mapError
-                    | "AcknowledgeFeedback" ->
-                        ReviewWorkflow.ReviewWorkflow.acknowledgeReviewFeedback binding operationId
-                            cmd.TaskId cmd.ActorId cmd.DecisionSequence
-                        |> mapError
-                    | _ -> Error(Client.ValidationError "Unsupported V2 task operation.")
+                    V2PendingIntentJournal.execute binding operationId "V2TaskWrite" cmd (fun () ->
+                        match cmd.Action with
+                        | "CreateTask" ->
+                            ReviewWorkflow.ReviewWorkflow.createTaskWithSpec binding operationId cmd.TaskId cmd.Title cmd.Html
+                            |> mapError
+                        | "ReviseTaskSpec" ->
+                            ReviewWorkflow.ReviewWorkflow.reviseTaskSpec binding operationId cmd.TaskId
+                                cmd.ExpectedVersion cmd.Title cmd.Html |> mapError
+                        | "RegisterAgent" ->
+                            ReviewWorkflow.ReviewWorkflow.registerAgent binding operationId cmd.ActorId
+                            |> mapError
+                        | "AssignTask" ->
+                            guid "attemptId" cmd.AttemptId
+                            |> Result.bind (fun attemptId ->
+                                ReviewWorkflow.ReviewWorkflow.assignTask binding operationId cmd.TaskId
+                                    attemptId cmd.OwnerId cmd.ReviewerId
+                                |> mapError)
+                        | "BeginAttempt" ->
+                            ReviewWorkflow.ReviewWorkflow.beginAttempt binding operationId cmd.TaskId
+                                cmd.ActorId cmd.ExpectedVersion cmd.AssignmentGeneration
+                            |> mapError
+                        | "BindReviewBase" ->
+                            ReviewWorkflow.ReviewWorkflow.bindReviewBase binding operationId cmd.TaskId
+                                cmd.ActorId cmd.ExpectedVersion cmd.AssignmentGeneration
+                                cmd.BaseOid cmd.TargetRef
+                            |> mapError
+                        | "YieldAgent" ->
+                            ReviewWorkflow.ReviewWorkflow.yieldAgent binding operationId
+                                cmd.TaskId cmd.ActorId cmd.ExpectedVersion cmd.ExpectedAgentVersion
+                                cmd.AssignmentGeneration cmd.Summary cmd.NextAction |> mapError
+                        | "ResumeAgent" ->
+                            ReviewWorkflow.ReviewWorkflow.resumeAgent binding operationId
+                                cmd.TaskId cmd.ActorId cmd.ExpectedVersion cmd.ExpectedAgentVersion
+                                cmd.AssignmentGeneration |> mapError
+                        | "CompleteAgentWork" ->
+                            ReviewWorkflow.ReviewWorkflow.completeAgentWork binding operationId
+                                cmd.TaskId cmd.ActorId cmd.ExpectedVersion cmd.ExpectedAgentVersion
+                                cmd.AssignmentGeneration cmd.Summary |> mapError
+                        | "ParkAgent" ->
+                            ReviewWorkflow.ReviewWorkflow.parkAgent binding operationId
+                                cmd.ActorId cmd.ExpectedAgentVersion cmd.Reason |> mapError
+                        | "ReissueQueuedAttempt" ->
+                            ReviewWorkflow.ReviewWorkflow.reissueQueuedAttempt binding operationId
+                                cmd.TaskId cmd.ActorId cmd.ExpectedVersion cmd.ExpectedAgentVersion
+                                cmd.AssignmentGeneration cmd.Reason |> mapError
+                        | "RecoverAgentAssignment" ->
+                            ReviewWorkflow.ReviewWorkflow.recoverAgentAssignment binding operationId
+                                cmd.TaskId cmd.ActorId cmd.ExpectedVersion cmd.ExpectedAgentVersion
+                                cmd.AssignmentGeneration cmd.Reason |> mapError
+                        | "AcknowledgeFeedback" ->
+                            ReviewWorkflow.ReviewWorkflow.acknowledgeReviewFeedback binding operationId
+                                cmd.TaskId cmd.ActorId cmd.DecisionSequence
+                            |> mapError
+                        | _ -> Error(Client.ValidationError "Unsupported V2 task operation.")
+                    )
                 result |> Result.map (fun write ->
                     box {| operation = write.Operation
                            head = write.CurrentHead
@@ -475,7 +660,7 @@ module V2TaskApi =
 
 module V2IntegrationApi =
     let private mapError (result: Result<'a, LedgerStore.LedgerFailure>) : Result<'a, EffectError> =
-        result |> Result.mapError (fun error -> Client.ValidationError $"V2 integration: {error}")
+        result |> Result.mapError V2LedgerErrors.toEffect
 
     let private guid label (raw: string) =
         match Guid.TryParse raw with
@@ -499,27 +684,29 @@ module V2IntegrationApi =
                 guid "integration action ID" cmd.ActionId
                 |> Result.bind (fun actionId ->
                     let result =
-                        match cmd.Action with
-                        | "PlanIntegration" ->
-                            guid "accepted review ID" cmd.RequestId
-                            |> Result.bind (fun reviewId ->
-                                ReviewWorkflow.ReviewWorkflow.planIntegration binding operationId
-                                    cmd.TaskId actionId reviewId cmd.ExpectedVersion
-                                    cmd.TargetRef cmd.ExpectedTargetHead
-                                |> mapError)
-                        | "PendingPush" ->
-                            ReviewWorkflow.ReviewWorkflow.markIntegrationPendingPush binding
-                                operationId cmd.TaskId actionId cmd.ExpectedVersion
-                            |> mapError
-                        | "RecordIntegration" ->
-                            ReviewWorkflow.ReviewWorkflow.recordIntegration binding operationId
-                                cmd.TaskId actionId cmd.ExpectedVersion
-                            |> mapError
-                        | "CloseIntegratedTask" ->
-                            ReviewWorkflow.ReviewWorkflow.closeIntegratedTask binding
-                                operationId cmd.TaskId actionId cmd.ExpectedVersion
-                            |> mapError
-                        | _ -> Error(Client.ValidationError "Unsupported V2 integration operation.")
+                        V2PendingIntentJournal.execute binding operationId "V2IntegrationWrite" cmd (fun () ->
+                            match cmd.Action with
+                            | "PlanIntegration" ->
+                                guid "accepted review ID" cmd.RequestId
+                                |> Result.bind (fun reviewId ->
+                                    ReviewWorkflow.ReviewWorkflow.planIntegration binding operationId
+                                        cmd.TaskId actionId reviewId cmd.ExpectedVersion
+                                        cmd.TargetRef cmd.ExpectedTargetHead
+                                    |> mapError)
+                            | "PendingPush" ->
+                                ReviewWorkflow.ReviewWorkflow.markIntegrationPendingPush binding
+                                    operationId cmd.TaskId actionId cmd.ExpectedVersion
+                                |> mapError
+                            | "RecordIntegration" ->
+                                ReviewWorkflow.ReviewWorkflow.recordIntegration binding operationId
+                                    cmd.TaskId actionId cmd.ExpectedVersion
+                                |> mapError
+                            | "CloseIntegratedTask" ->
+                                ReviewWorkflow.ReviewWorkflow.closeIntegratedTask binding
+                                    operationId cmd.TaskId actionId cmd.ExpectedVersion
+                                |> mapError
+                            | _ -> Error(Client.ValidationError "Unsupported V2 integration operation.")
+                        )
                     result |> Result.map (fun write ->
                         box {| operation = write.Operation; head = write.CurrentHead
                                alreadyApplied = write.AlreadyApplied |}))))

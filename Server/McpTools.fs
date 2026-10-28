@@ -136,6 +136,7 @@ module McpToolHelpers =
         | Conflict message -> $"Conflict: {message}"
         | ExecutionFailed message -> $"ExecutionFailed: {message}"
         | OutputTruncated message -> $"OutputTruncated: {message}"
+        | V2LedgerFailure failure -> $"V2LedgerFailure({failure.Code}): {failure.Message}"
 
     let private textContent text =
         TextContentBlock(Text = text) :> ContentBlock
@@ -190,7 +191,7 @@ module McpToolHelpers =
           "V2BindReviewBase"; "V2YieldAgent"; "V2ResumeAgent"; "V2CompleteAgentWork"
           "V2ParkAgent"; "V2ReissueQueuedAttempt"; "V2RecoverAgentAssignment"; "V2AcknowledgeReviewFeedback" ]
 
-    let private v2LedgerReadMethods = [ "V2LedgerHealth"; "V2GetOperationStatus" ]
+    let private v2LedgerReadMethods = [ "V2LedgerHealth"; "V2GetOperationStatus"; "V2PendingOperations" ]
     let private v2LedgerWriteMethods = [ "V2InitializeLedger"; "V2BindExistingLedger"; "V2RebindLedgerRemote" ]
     let private v2IntegrationReadMethods = [ "V2InspectIntegration" ]
     let private v2IntegrationWriteMethods =
@@ -265,6 +266,7 @@ module McpToolHelpers =
         | Conflict _ -> "Conflict"
         | ExecutionFailed _ -> "ExecutionFailed"
         | OutputTruncated _ -> "OutputTruncated"
+        | V2LedgerFailure _ -> "V2LedgerFailure"
 
     let toCallToolResult (response: AgentCommandResponse) =
         match response.Result, response.Error with
@@ -1029,6 +1031,11 @@ type JarvisMcpTools =
     [<McpServerTool(Title = "V2 ledger health", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read the verified remote V2 ledger identity, trusted head and sequence. Requires an explicit existing binding; never initializes a ledger.")>]
     static member V2LedgerHealth(projectName: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (V2LedgerReadCommand { ProjectName = projectName; Action = "Health"; OperationId = "" })
+
+    [<McpServerTool(Title = "V2 pending operations", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Inspect the local crash-persistent V2 write intent journal, including original command parameters for safe retry with the same UUID. No source or ledger mutations.")>]
+    static member V2PendingOperations(projectName: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http
+            (V2LedgerReadCommand { ProjectName = projectName; Action = "PendingOperations"; OperationId = "" })
 
     [<McpServerTool(Title = "V2 get operation status", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read a specific caller-stable V2 operation UUID from the verified remote ledger; NotFoundAtVerifiedHead is not proof that a timed-out push will never arrive.")>]
     static member V2GetOperationStatus(projectName: string, operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =

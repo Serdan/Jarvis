@@ -265,6 +265,19 @@ module LedgerStore =
             finally
                 git repo [ "update-ref"; "-d"; stage ] |> ignore
 
+    let verifyTrustedHead (binding: LedgerBinding) (expectedHead: string) (observedHead: string) =
+        if String.IsNullOrWhiteSpace expectedHead
+           || not (oidPattern.IsMatch expectedHead)
+           || not (oidPattern.IsMatch observedHead) then
+            Error(InvalidBinding "An exact trusted ledger commit OID is required.")
+        else
+            match isAncestor binding.RepositoryPath expectedHead observedHead with
+            | Ok true -> Ok ()
+            | Ok false ->
+                Error(LedgerIntegrityError "Canonical ledger head is not a descendant of the configured trust anchor.")
+            | Error _ ->
+                Error(LedgerHistoryUnavailable "Configured trusted ledger commit is missing from fetched ancestry.")
+
     let readRecord binding (path: string) =
         if not (recordPath.IsMatch path) || path.Contains("..") then
             Error(InvalidBinding "Only safe records/*.json paths are accepted by the prototype.")
@@ -351,6 +364,15 @@ module LedgerStore =
                         Ok(Some operation)
                 with ex ->
                     Error(LedgerIntegrityError $"Malformed operation record: {ex.Message}")
+
+    let getOperationStatus (binding: LedgerBinding) (operationId: Guid) =
+        if operationId = Guid.Empty then Error(InvalidBinding "Valid operation UUID required.")
+        else
+            match fetch binding with
+            | Error error -> Error error
+            | Ok snapshot ->
+                readOperation binding snapshot.Commit operationId
+                |> Result.map (fun record -> snapshot, record)
 
     let private recordHash (binding: LedgerBinding) (change: LedgerRecordChange) =
         json
@@ -726,7 +748,7 @@ module LedgerStore =
                  (plan: LedgerSnapshot -> Result<LedgerFileChange list, LedgerFailure>) =
         if intent.OperationId = Guid.Empty || String.IsNullOrWhiteSpace intent.Actor
            || String.IsNullOrWhiteSpace intent.Kind || String.IsNullOrWhiteSpace intent.RequestJson
-           || encoding.GetByteCount(intent.RequestJson) > 16 * 1024 then
+           || encoding.GetByteCount(intent.RequestJson) > 1024 * 1024 then
             Error(InvalidBinding "Invalid transaction intent or size.")
         else
             let requestHash = intentHash binding intent
@@ -750,7 +772,10 @@ module LedgerStore =
                                || List.length paths <> (paths |> List.distinct |> List.length)
                                || changes |> List.exists (fun change ->
                                    not (ledgerPath.IsMatch change.Path) || change.Path.Contains("..")
-                                   || isNull change.Content || encoding.GetByteCount(change.Content) > 64 * 1024
+                                   || isNull change.Content
+                                   || encoding.GetByteCount(change.Content) >
+                                       (if change.Path.EndsWith("/spec.html", StringComparison.Ordinal)
+                                        then 128 * 1024 else 64 * 1024)
                                    || (change.ExpectedBlobOid |> Option.exists (oidPattern.IsMatch >> not))) then
                                 Error(InvalidBinding "Invalid or duplicate entity paths in ledger transaction.")
                             else

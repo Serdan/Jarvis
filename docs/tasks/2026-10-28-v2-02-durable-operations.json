@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "2026-10-28-v2-02-durable-operations",
   "title": "Complete idempotent operation results, pending-intent recovery and typed errors",
-  "status": "open",
+  "status": "active",
   "priority": "P0",
   "dependencies": [
     "2026-10-28-v2-01-ledger-trust-onboarding"
@@ -12,9 +12,12 @@
     "worktree": null
   },
   "checkpoint": {
-    "summary": "Architecture gap identified by the 2026-10-28 V2 implementation audit. Not started.",
-    "nextAction": "Implement the acceptance criteria in the accompanying HTML task; use disposable Git remotes and do not deploy or migrate V1.",
-    "verified": [],
+    "summary": "Added verified read-only GetOperationStatus by caller operation UUID with Applied vs NotFoundAtVerifiedHead. The ledger operation index remains authoritative; complete original typed result, durable pending-intent journal and rich typed errors remain.",
+    "nextAction": "Persist original logical operation results in the same ledger commit; add crash-stable pending intent journal and typed retry/error transport.",
+    "verified": [
+      "Cross-clone operation lookup plus unknown UUID fixture",
+      "V2 read-only MCP scope and fail-closed unbound lookup fixture"
+    ],
     "lastCommit": null
   },
   "audit": {
@@ -28,5 +31,5 @@
     ],
     "sourceReport": "docs/reviews/2026-10-28-v2-spec-implementation-audit.md"
   },
-  "updatedAt": "2026-10-28T00:00:00Z"
+  "updatedAt": "2026-10-28T19:59:00+01:00"
 }

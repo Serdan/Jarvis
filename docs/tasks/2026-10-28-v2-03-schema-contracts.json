@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "2026-10-28-v2-03-schema-contracts",
   "title": "Reconcile normative ledger schema, validation and safe content limits",
-  "status": "open",
+  "status": "active",
   "priority": "P0",
   "dependencies": [],
   "owner": {
@@ -10,9 +10,13 @@
     "worktree": null
   },
   "checkpoint": {
-    "summary": "Architecture gap identified by the 2026-10-28 V2 implementation audit. Not started.",
-    "nextAction": "Implement the acceptance criteria in the accompanying HTML task; use disposable Git remotes and do not deploy or migrate V1.",
-    "verified": [],
+    "summary": "Versioned canonical entity JSON schema marker (v2), strict mandatory-field and lifecycle validation, unsafe active-HTML rejection, and an aligned 128 KiB UTF-8 task specification size gate. Further schema mapping, prototype migration and content pagination remain.",
+    "nextAction": "Complete normative schema fields/paths and validation across all entities; add prototype format migration and immutable evidence schema, plus full content retrieval contract.",
+    "verified": [
+      "128 KiB task HTML boundary and reject-before-mutation fixture",
+      "Unknown lifecycle, missing schema, missing field corruption fixtures",
+      "Existing V2 ledger/review regression fixtures"
+    ],
     "lastCommit": null
   },
   "audit": {
@@ -28,5 +32,5 @@
     ],
     "sourceReport": "docs/reviews/2026-10-28-v2-spec-implementation-audit.md"
   },
-  "updatedAt": "2026-10-28T00:00:00Z"
+  "updatedAt": "2026-10-28T19:59:00+01:00"
 }

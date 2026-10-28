@@ -118,6 +118,7 @@ let private requiresConfirmation command =
     | GetOrchestrationSnapshotCommand _
     | GetTaskHistoryCommand _
     | V2TaskReadCommand _
+    | V2LedgerReadCommand _
     | V2IntegrationReadCommand _
     | V2ReviewReadCommand _
     | GetProjectDetailsCommand _
@@ -163,6 +164,11 @@ let private requiresConfirmation command =
             [ VersionControlWrite; NetworkAccess ] [] (Some "git")
             [ cmd.TaskId; cmd.AttemptId; cmd.OperationId ]
             ("V2 ledger task " + cmd.Action) false
+    | V2LedgerWriteCommand cmd ->
+        confirmation ("V2Ledger" + cmd.Action) (Some cmd.ProjectName)
+            [ VersionControlWrite; NetworkAccess ] [] (Some "git")
+            [ cmd.RemoteName; cmd.ExpectedTrustedHead; cmd.OperationId ]
+            ("V2 ledger setup " + cmd.Action) false
     | V2IntegrationWriteCommand cmd ->
         confirmation ("V2Integration" + cmd.Action) (Some cmd.ProjectName)
             [ VersionControlWrite; NetworkAccess ] [] (Some "git")

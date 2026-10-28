@@ -203,3 +203,28 @@ let v2IntegrationMutationsNeedExplicitGitWritePermission () =
         Assert.That(approval.Permissions, Does.Contain(VersionControlWrite))
         Assert.That(approval.Permissions, Does.Contain(NetworkAccess))
     | other -> Assert.Fail(sprintf "Integration source operations require explicit approval: %A" other)
+
+
+[<Test>]
+let v2OperationStatusUsesReadOnlyTypedLedgerCommand () =
+    Client.PermissionPolicy.clearGrants ()
+    let read =
+        V2LedgerReadCommand
+            { ProjectName = "Project1"
+              Action = "GetOperationStatus"
+              OperationId = Guid.NewGuid().ToString("D") }
+    match Client.PermissionPolicy.evaluate read with
+    | Ok () -> ()
+    | other -> Assert.Fail(sprintf "Status lookup must require no mutation approval: %A" other)
+    let root, project = GitCommandTests.createTempProject ()
+    try
+        let context = GitCommandTests.TestContext root
+        GitCommandTests.initRepo context
+        match Client.V2ReviewApi.V2LedgerApi.read
+                { ProjectName = "Project1"; Action = "GetOperationStatus"
+                  OperationId = Guid.NewGuid().ToString("D") } context with
+        | Error(Client.ValidationError message) ->
+            Assert.That(message, Does.Contain("V2 ledger disabled"))
+        | other -> Assert.Fail(sprintf "Unbound operation lookup must fail closed: %A" other)
+        Assert.That(File.Exists(Client.V2ReviewApi.ReviewV2Binding.pathForRoot project), Is.False)
+    finally Directory.Delete(root, true)

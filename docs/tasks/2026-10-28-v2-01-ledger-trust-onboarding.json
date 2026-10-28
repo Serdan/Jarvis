@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "2026-10-28-v2-01-ledger-trust-onboarding",
   "title": "Implement explicit V2 ledger initialization, binding and rebind",
-  "status": "open",
+  "status": "active",
   "priority": "P0",
   "dependencies": [],
   "owner": {
@@ -10,9 +10,12 @@
     "worktree": null
   },
   "checkpoint": {
-    "summary": "Architecture gap identified by the 2026-10-28 V2 implementation audit. Not started.",
-    "nextAction": "Implement the acceptance criteria in the accompanying HTML task; use disposable Git remotes and do not deploy or migrate V1.",
-    "verified": [],
+    "summary": "Implemented explicit V2 bind-existing, initialize, rebind and verified health primitives, exposed through opt-in MCP; independently supplied trusted head is persisted and verified on subsequent reads. Disposable bare remote tests passed. Partial: cross-process anchor CAS, remote protection diagnostics and independently audited epoch/restore rebind remain.",
+    "nextAction": "Add remote host/protection diagnostics and fail-closed trusted-anchor persistence under competing processes; complete restore/epoch audit.",
+    "verified": [
+      "V2 setup/health typed MCP and OAuth catalog tests",
+      "Two-clone bind, trust-head persistence, changed URL, explicit privacy consent and rebind fixtures"
+    ],
     "lastCommit": null
   },
   "audit": {
@@ -26,5 +29,5 @@
     ],
     "sourceReport": "docs/reviews/2026-10-28-v2-spec-implementation-audit.md"
   },
-  "updatedAt": "2026-10-28T00:00:00Z"
+  "updatedAt": "2026-10-28T19:59:00+01:00"
 }

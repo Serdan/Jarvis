@@ -190,6 +190,8 @@ module McpToolHelpers =
           "V2BindReviewBase"; "V2YieldAgent"; "V2ResumeAgent"; "V2CompleteAgentWork"
           "V2ParkAgent"; "V2ReissueQueuedAttempt"; "V2RecoverAgentAssignment"; "V2AcknowledgeReviewFeedback" ]
 
+    let private v2LedgerReadMethods = [ "V2LedgerHealth"; "V2GetOperationStatus" ]
+    let private v2LedgerWriteMethods = [ "V2InitializeLedger"; "V2BindExistingLedger"; "V2RebindLedgerRemote" ]
     let private v2IntegrationReadMethods = [ "V2InspectIntegration" ]
     let private v2IntegrationWriteMethods =
         [ "V2PlanIntegration"; "V2MarkIntegrationPendingPush"
@@ -210,6 +212,8 @@ module McpToolHelpers =
 
         [ for name in v2TaskReadMethods -> fromWire "V2TaskRead" name
           for name in v2TaskWriteMethods -> fromWire "V2TaskWrite" name
+          for name in v2LedgerReadMethods -> fromWire "V2LedgerRead" name
+          for name in v2LedgerWriteMethods -> fromWire "V2LedgerWrite" name
           for name in v2IntegrationReadMethods -> fromWire "V2IntegrationRead" name
           for name in v2IntegrationWriteMethods -> fromWire "V2IntegrationWrite" name
           for name in v2ReviewMethods -> fromWire "V2ReviewRead" name
@@ -222,7 +226,8 @@ module McpToolHelpers =
              |> List.filter (fun capability ->
                  capability.Name <> "V2ReviewRead" && capability.Name <> "V2ReviewWrite"
                  && capability.Name <> "V2TaskRead" && capability.Name <> "V2TaskWrite"
-                 && capability.Name <> "V2IntegrationRead" && capability.Name <> "V2IntegrationWrite"))
+                 && capability.Name <> "V2IntegrationRead" && capability.Name <> "V2IntegrationWrite"
+                 && capability.Name <> "V2LedgerRead" && capability.Name <> "V2LedgerWrite"))
             @ v2AliasCapabilities
             @ [ serverLocalCapability
                     "GetProfile"
@@ -341,6 +346,7 @@ module McpToolHelpers =
         | GetOrchestrationSnapshotCommand _
         | GetTaskHistoryCommand _
         | V2TaskReadCommand _
+        | V2LedgerReadCommand _
         | V2IntegrationReadCommand _
         | V2ReviewReadCommand _
         | GetProjectDetailsCommand _
@@ -378,6 +384,7 @@ module McpToolHelpers =
         | CreateWorktreeCommand _
         | RemoveWorktreeCommand _
         | V2TaskWriteCommand _
+        | V2LedgerWriteCommand _
         | V2IntegrationWriteCommand _
         | V2ReviewWriteCommand _
         | CreateTaskCommand _
@@ -1018,6 +1025,42 @@ type JarvisMcpTools =
     [<McpServerTool(Title = "Remove worktree", ReadOnly = false, Destructive = true, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Safely remove a clean, integrated and unlocked linked worktree. Requires local approval.")>]
     static member RemoveWorktree(projectName: string, worktreePath: string, [<Optional; DefaultParameterValue("")>] targetRef: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (RemoveWorktreeCommand { ProjectName = projectName; WorktreePath = worktreePath; TargetRef = McpToolHelpers.optionOfString targetRef })
+
+    [<McpServerTool(Title = "V2 ledger health", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read the verified remote V2 ledger identity, trusted head and sequence. Requires an explicit existing binding; never initializes a ledger.")>]
+    static member V2LedgerHealth(projectName: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http (V2LedgerReadCommand { ProjectName = projectName; Action = "Health"; OperationId = "" })
+
+    [<McpServerTool(Title = "V2 get operation status", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read a specific caller-stable V2 operation UUID from the verified remote ledger; NotFoundAtVerifiedHead is not proof that a timed-out push will never arrive.")>]
+    static member V2GetOperationStatus(projectName: string, operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http
+            (V2LedgerReadCommand { ProjectName = projectName; Action = "GetOperationStatus"; OperationId = operationId })
+
+    [<McpServerTool(Title = "V2 initialize ledger", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Initialize a NEW orphan V2 Git ledger and bind it locally only after explicit public/unknown visibility acknowledgment and Git write approval. Refuses existing ledger refs.")>]
+    static member V2InitializeLedger(projectName: string, projectId: string, ledgerId: string, epoch: int, remoteName: string, approvedFetchUrl: string, approvedPushUrl: string, acknowledgeVisibility: bool, operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http
+            (V2LedgerWriteCommand
+                { ProjectName = projectName; Action = "InitializeLedger"; OperationId = operationId
+                  ProjectId = projectId; LedgerId = ledgerId; Epoch = epoch
+                  RemoteName = remoteName; ApprovedFetchUrl = approvedFetchUrl; ApprovedPushUrl = approvedPushUrl
+                  ExpectedTrustedHead = ""; AcknowledgeVisibility = acknowledgeVisibility })
+
+    [<McpServerTool(Title = "V2 bind existing ledger", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Bind to an existing remote orphan ledger with independently supplied expected trusted commit, project identity and explicit public/unknown visibility acknowledgment; no implicit trust or creation.")>]
+    static member V2BindExistingLedger(projectName: string, projectId: string, ledgerId: string, epoch: int, remoteName: string, approvedFetchUrl: string, approvedPushUrl: string, expectedTrustedHead: string, acknowledgeVisibility: bool, operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http
+            (V2LedgerWriteCommand
+                { ProjectName = projectName; Action = "BindExistingLedger"; OperationId = operationId
+                  ProjectId = projectId; LedgerId = ledgerId; Epoch = epoch
+                  RemoteName = remoteName; ApprovedFetchUrl = approvedFetchUrl; ApprovedPushUrl = approvedPushUrl
+                  ExpectedTrustedHead = expectedTrustedHead; AcknowledgeVisibility = acknowledgeVisibility })
+
+    [<McpServerTool(Title = "V2 rebind ledger remote", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Explicitly rebind a V2 client to a verified remote of the SAME project/ledger/epoch, with independently supplied trusted ancestry and visibility acknowledgment. Keeps previous local binding backup.")>]
+    static member V2RebindLedgerRemote(projectName: string, remoteName: string, approvedFetchUrl: string, approvedPushUrl: string, expectedTrustedHead: string, acknowledgeVisibility: bool, operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http
+            (V2LedgerWriteCommand
+                { ProjectName = projectName; Action = "RebindLedgerRemote"; OperationId = operationId
+                  ProjectId = ""; LedgerId = ""; Epoch = 0; RemoteName = remoteName
+                  ApprovedFetchUrl = approvedFetchUrl; ApprovedPushUrl = approvedPushUrl
+                  ExpectedTrustedHead = expectedTrustedHead; AcknowledgeVisibility = acknowledgeVisibility })
 
     [<McpServerTool(Title = "V2 inspect source integration", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Inspect persisted integration plan and current remote source target. Never writes source refs or ledger state; requires explicitly approved V2 binding.")>]
     static member V2InspectIntegration(projectName: string, taskId: string, actionId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =

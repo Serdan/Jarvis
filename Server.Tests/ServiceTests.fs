@@ -421,8 +421,8 @@ let ``command catalog matches AgentCommand union and MCP tools`` () =
     // Retired legacy wire cases remain internal for old-client compatibility,
     // but must never be discoverable or callable as public MCP tools.
     let retired = set [ "AttachWorkTask"; "GetWorkTask"; "ListWorkTasks"; "CheckpointWorkTask"; "CompleteWorkTask" ]
-    // Human-oriented V2 MCP tools route through six carefully scoped wire commands.
-    let v2Wire = set [ "V2TaskRead"; "V2TaskWrite"; "V2ReviewRead"; "V2ReviewWrite"; "V2IntegrationRead"; "V2IntegrationWrite" ]
+    // Human-oriented V2 MCP tools route through eight carefully scoped wire commands.
+    let v2Wire = set [ "V2TaskRead"; "V2TaskWrite"; "V2ReviewRead"; "V2ReviewWrite"; "V2IntegrationRead"; "V2IntegrationWrite"; "V2LedgerRead"; "V2LedgerWrite" ]
     let v2Tools =
         set [ "V2AgentInbox"; "V2CreateTask"; "V2ReviseTaskSpec"; "V2RegisterAgent"; "V2AssignTask"; "V2BeginAttempt"
               "V2BindReviewBase"; "V2YieldAgent"; "V2ResumeAgent"; "V2CompleteAgentWork"
@@ -430,6 +430,7 @@ let ``command catalog matches AgentCommand union and MCP tools`` () =
               "V2ReviewTask"; "V2ReviewDetails"; "V2ReviewerInbox"
               "V2SubmitReview"; "V2ReplaceReview"; "V2ClaimReview"; "V2DecideReview"
               "V2WithdrawReview"; "V2ReassignReview"; "V2FinalizeReview"
+              "V2LedgerHealth"; "V2GetOperationStatus"; "V2InitializeLedger"; "V2BindExistingLedger"; "V2RebindLedgerRemote"
               "V2InspectIntegration"; "V2PlanIntegration"; "V2MarkIntegrationPendingPush"; "V2RecordIntegration"; "V2CloseIntegratedTask" ]
     Set.difference unionNames retired |> shouldEqual catalogNames
     Set.intersect mcpNames retired |> shouldEqual Set.empty
@@ -449,7 +450,7 @@ let ``client-backed MCP tools expose an optional per-command deviceId`` () =
         |> Array.filter (fun methodInfo ->
             methodInfo.GetParameters()
             |> Array.exists (fun parameter -> parameter.ParameterType = typeof<ClientService>))
-    clientMethods.Length |> shouldEqual (AgentProtocol.commandDefinitions.Length - 1 + 23) // 29 MCP V2 aliases / 6 wire operations
+    clientMethods.Length |> shouldEqual (AgentProtocol.commandDefinitions.Length - 1 + 26) // 34 MCP V2 aliases / 8 wire operations
     for methodInfo in clientMethods do
         let deviceParam = methodInfo.GetParameters() |> Array.tryFind (fun parameter -> parameter.Name = "deviceId")
         match deviceParam with
@@ -654,6 +655,8 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
             AgentProtocol.commandDefinitions
             |> List.map (fun definition -> definition.Name, definition)
             |> Map.ofList
+        let ledgerRead = original["V2LedgerRead"]
+        let ledgerWrite = original["V2LedgerWrite"]
         let integrationRead = original["V2IntegrationRead"]
         let integrationWrite = original["V2IntegrationWrite"]
         let taskRead = original["V2TaskRead"]
@@ -661,7 +664,9 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
         let v2Read = original["V2ReviewRead"]
         let v2Write = original["V2ReviewWrite"]
         let aliases =
-            [ for name in [ "V2InspectIntegration" ] -> name, integrationRead
+            [ for name in [ "V2LedgerHealth"; "V2GetOperationStatus" ] -> name, ledgerRead
+              for name in [ "V2InitializeLedger"; "V2BindExistingLedger"; "V2RebindLedgerRemote" ] -> name, ledgerWrite
+              for name in [ "V2InspectIntegration" ] -> name, integrationRead
               for name in [ "V2PlanIntegration"; "V2MarkIntegrationPendingPush"; "V2RecordIntegration"; "V2CloseIntegratedTask" ] -> name, integrationWrite
               for name in [ "V2AgentInbox" ] -> name, taskRead
               for name in [ "V2CreateTask"; "V2ReviseTaskSpec"; "V2RegisterAgent"; "V2AssignTask"; "V2BeginAttempt"

@@ -184,6 +184,24 @@ type V2TaskWriteCommand =
       TargetRef: string
       DecisionSequence: int64 }
 
+type V2LedgerReadCommand =
+    { ProjectName: string
+      Action: string
+      OperationId: string }
+
+type V2LedgerWriteCommand =
+    { ProjectName: string
+      Action: string
+      OperationId: string
+      ProjectId: string
+      LedgerId: string
+      Epoch: int
+      RemoteName: string
+      ApprovedFetchUrl: string
+      ApprovedPushUrl: string
+      ExpectedTrustedHead: string
+      AcknowledgeVisibility: bool }
+
 type V2IntegrationReadCommand =
     { ProjectName: string
       TaskId: string
@@ -639,6 +657,8 @@ type AgentCommand =
     | GetTaskHistoryCommand of GetTaskHistoryCommand
     | V2TaskReadCommand of V2TaskReadCommand
     | V2TaskWriteCommand of V2TaskWriteCommand
+    | V2LedgerReadCommand of V2LedgerReadCommand
+    | V2LedgerWriteCommand of V2LedgerWriteCommand
     | V2IntegrationReadCommand of V2IntegrationReadCommand
     | V2IntegrationWriteCommand of V2IntegrationWriteCommand
     | V2ReviewReadCommand of V2ReviewReadCommand
@@ -702,6 +722,8 @@ module AgentCommandInfo =
         | GetTaskHistoryCommand _ -> "GetTaskHistoryCommand"
         | V2TaskReadCommand _ -> "V2TaskReadCommand"
         | V2TaskWriteCommand _ -> "V2TaskWriteCommand"
+        | V2LedgerReadCommand _ -> "V2LedgerReadCommand"
+        | V2LedgerWriteCommand _ -> "V2LedgerWriteCommand"
         | V2IntegrationReadCommand _ -> "V2IntegrationReadCommand"
         | V2IntegrationWriteCommand _ -> "V2IntegrationWriteCommand"
         | V2ReviewReadCommand _ -> "V2ReviewReadCommand"
@@ -771,6 +793,8 @@ module AgentCommandInfo =
         | GetTaskHistoryCommand _ -> "GetTaskHistory"
         | V2TaskReadCommand _ -> "V2TaskRead"
         | V2TaskWriteCommand _ -> "V2TaskWrite"
+        | V2LedgerReadCommand _ -> "V2LedgerRead"
+        | V2LedgerWriteCommand _ -> "V2LedgerWrite"
         | V2IntegrationReadCommand _ -> "V2IntegrationRead"
         | V2IntegrationWriteCommand _ -> "V2IntegrationWrite"
         | V2ReviewReadCommand _ -> "V2ReviewRead"
@@ -838,6 +862,8 @@ module AgentCommandInfo =
         | GetTaskHistoryCommand cmd -> Some cmd.ProjectName
         | V2TaskReadCommand cmd -> Some cmd.ProjectName
         | V2TaskWriteCommand cmd -> Some cmd.ProjectName
+        | V2LedgerReadCommand cmd -> Some cmd.ProjectName
+        | V2LedgerWriteCommand cmd -> Some cmd.ProjectName
         | V2IntegrationReadCommand cmd -> Some cmd.ProjectName
         | V2IntegrationWriteCommand cmd -> Some cmd.ProjectName
         | V2ReviewReadCommand cmd -> Some cmd.ProjectName
@@ -941,6 +967,8 @@ module AgentCommandInfo =
         | GetTaskHistoryCommand cmd -> Some(compact cmd.TaskId)
         | V2TaskReadCommand cmd -> Some(compact cmd.AgentId)
         | V2TaskWriteCommand cmd -> Some(compact cmd.Action)
+        | V2LedgerReadCommand cmd -> Some(compact cmd.ProjectName)
+        | V2LedgerWriteCommand cmd -> Some(compact cmd.Action)
         | V2IntegrationReadCommand cmd -> Some(compact cmd.ActionId)
         | V2IntegrationWriteCommand cmd -> Some(compact cmd.Action)
         | V2ReviewReadCommand cmd -> Some(compact cmd.Action)
@@ -1003,6 +1031,8 @@ module AgentCommandInfo =
         | GetTaskHistoryCommand cmd -> Some(truncate 64 cmd.TaskId)
         | V2TaskReadCommand cmd -> Some(truncate 64 cmd.AgentId)
         | V2TaskWriteCommand cmd -> Some(truncate 64 cmd.Action)
+        | V2LedgerReadCommand cmd -> Some(truncate 64 cmd.ProjectName)
+        | V2LedgerWriteCommand cmd -> Some(truncate 64 cmd.Action)
         | V2IntegrationReadCommand cmd -> Some(truncate 64 cmd.ActionId)
         | V2IntegrationWriteCommand cmd -> Some(truncate 64 cmd.Action)
         | V2ReviewReadCommand cmd -> Some(truncate 64 cmd.Action)
@@ -1068,7 +1098,7 @@ module AgentCommandInfo =
         | None -> invocation command
 
 module AgentProtocol =
-    let version = "3.24"
+    let version = "3.25"
     let defaultPatchFuzzyContextLines = 3
     let maxResponseBytes = 900 * 1024
     let maxImageBytes = 8 * 1024 * 1024
@@ -1107,6 +1137,8 @@ module AgentProtocol =
           definition "GetTaskHistory" "Reads Git change history for one task." [ ReadOnly ] false false false
           definition "V2TaskRead" "Reads a registered agent inbox from a single V2 ledger snapshot." [ ReadOnly; NetworkAccess ] false false false
           definition "V2TaskWrite" "Creates/assigns/starts V2 tasks and binds immutable review base." [ VersionControlWrite; NetworkAccess ] true true false
+          definition "V2LedgerRead" "Inspect the verified canonical V2 Git ledger identity and trust head." [ ReadOnly; NetworkAccess ] false false false
+          definition "V2LedgerWrite" "Explicitly bind, initialize or rebind the canonical V2 ledger with privacy acknowledgment." [ VersionControlWrite; NetworkAccess ] true true false
           definition "V2IntegrationRead" "Inspect planned source integration and read-only remote status." [ ReadOnly; NetworkAccess ] false false false
           definition "V2IntegrationWrite" "Plan or record verified source integration without implicit source push." [ VersionControlWrite; NetworkAccess ] true true false
           definition "V2ReviewRead" "Reads opt-in canonical V2 review ledger requests and reviewer inboxes." [ ReadOnly; NetworkAccess ] false false false

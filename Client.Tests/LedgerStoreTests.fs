@@ -65,6 +65,14 @@ type LedgerStoreTests() =
             Assert.That((LedgerStore.putRecord first change |> success).AlreadyApplied, Is.False)
             Assert.That((LedgerStore.putRecord second change |> success).AlreadyApplied, Is.True)
             Assert.That((LedgerStore.readRecord second "records/a.json" |> success |> snd), Is.EqualTo(Some change.Content))
+            let snapshot, record = LedgerStore.getOperationStatus second change.OperationId |> success
+            Assert.That(snapshot.Commit, Is.Not.Empty)
+            Assert.That(record.IsSome, Is.True)
+            Assert.That(record.Value.OperationId, Is.EqualTo(change.OperationId.ToString("D")))
+            Assert.That(record.Value.Sequence, Is.GreaterThan(0L))
+            let _, absent = LedgerStore.getOperationStatus second (Guid.NewGuid()) |> success
+            Assert.That(absent.IsNone, Is.True)
+
             match LedgerStore.putRecord second { change with Content = "different" } with
             | Error OperationIdReused -> ()
             | result -> Assert.Fail(sprintf "Expected OperationIdReused: %A" result)

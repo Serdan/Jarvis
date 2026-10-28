@@ -1,6 +1,6 @@
 # Jarvis Orchestration V2 — canonical remote Git ledger
 
-**Status:** Revised V2 design contract (2026-10-28). Core review request/revision/claim and cumulative coverage behavior implemented in an isolated F# prototype; production MCP/TUI, full checkpoint/spec model, integration and migration remain incomplete.
+**Status:** V2 design and implementation contract (2026-10-28). Experimental MCP exposes core task/agent/review workflow, exact fast-forward integration, and explicit ledger bind/initialize/rebind/health. Full evidence/assignment schemas, privacy and backup hardening, TUI, migration and protocol 4.0 cutover remain incomplete.
 **Branch:** `design/orchestration-v2`
 **Authority:** One append-only orphan ref, `refs/heads/jarvis-orchestration`, on a configured canonical Git remote per project.
 **Non-goals:** Server database, server-side scheduler, separate Git repository, per-task authoritative refs, source-branch task state, backward-compatible dual writers.
@@ -107,11 +107,14 @@ tasks/
     task.json                        Task lifecycle, current attempt, version
     attempts/
       <uuid>.json                    One implementation attempt and current handoff
-      <uuid>.checkpoints/
+      <uuid>/checkpoints/
         <sequence>.json              Immutable checkpoint evidence
+    integrations/
+      <action-uuid>.json             Pinned source-integration plan and proof
     reviews/
       <request-uuid>/
         request.json                Mutable current status/version/claim/current revision
+        notification.json           Independently acknowledged review decision notification
         revisions/
           <revision-number>.json    Immutable snapshot, source ref, base/head, evidence
         decisions/
@@ -170,6 +173,7 @@ Validation is strict: unknown statuses, colliding/unsafe request IDs or revision
 ```json
 {
   "task": {
+    "schemaVersion": 2,
     "id": "315",
     "version": 4,
     "lifecycle": "InProgress",
@@ -177,6 +181,7 @@ Validation is strict: unknown statuses, colliding/unsafe request IDs or revision
     "title": "Improve orchestration"
   },
   "attempt": {
+    "schemaVersion": 2,
     "attemptId": "attempt-uuid",
     "activeReviewRequestId": null,
     "version": 7,
@@ -194,6 +199,7 @@ Validation is strict: unknown statuses, colliding/unsafe request IDs or revision
     }
   },
   "agent": {
+    "schemaVersion": 2,
     "agentId": "Agent 3",
     "version": 12,
     "activeAttemptId": null,
@@ -205,7 +211,9 @@ Validation is strict: unknown statuses, colliding/unsafe request IDs or revision
 }
 ```
 
-These illustrate fields from **three separate files**, not a single combined JSON response. Implement typed records with schema validation, explicit parsers and deterministic UTF-8 serialization; reject unknown lifecycle/phase values. Non-authoritative optional extension data may be preserved but must not bypass validations.
+These illustrate fields from **three separate files**, not a single combined JSON response.
+
+**Current V2 schema hardening:** each persisted task/agent/attempt/review/notification/checkpoint/integration JSON entity is written with `schemaVersion: 2`. Readers reject missing/unsupported entity schema markers, absent required fields, duplicate JSON member names, and unknown state/phase/status values. The implementation currently permits canonical task HTML up to **128 KiB UTF-8**, which is validated at both domain and ledger-transaction boundaries; paged larger descriptions and a unified content limit remain an open implementation task. HTML is untrusted and active elements/inline event handlers are rejected at authoring, but display surfaces must still render it safely. Implement typed records with schema validation, explicit parsers and deterministic UTF-8 serialization; reject unknown lifecycle/phase values. Non-authoritative optional extension data may be preserved but must not bypass validations.
 
 ## 4. Scheduling contract and state machine
 

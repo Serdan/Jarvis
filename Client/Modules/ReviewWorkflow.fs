@@ -162,6 +162,57 @@ module ReviewWorkflow =
     let private options =
         JsonSerializerOptions(PropertyNamingPolicy = JsonNamingPolicy.CamelCase, PropertyNameCaseInsensitive = true)
     let private json value = JsonSerializer.Serialize(value, options)
+    // An entity's schema is explicit on disk without adding boilerplate to
+    // each in-memory record. Changing it requires an intentional upgrade path.
+    let private entityJson value =
+        let content = json value
+        if not (content.StartsWith("{", StringComparison.Ordinal)) then
+            invalidArg "value" "A ledger entity must be a JSON object."
+        "{\"schemaVersion\":2," + content.Substring(1)
+
+    let private validEntity<'t> (content: string) =
+        try
+            use doc = JsonDocument.Parse(content)
+            let root = doc.RootElement
+            if root.ValueKind <> JsonValueKind.Object then
+                Error "Entity must be an object."
+            else
+                let properties = root.EnumerateObject() |> Seq.toArray
+                let names = System.Collections.Generic.HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                let unique = properties |> Array.forall (fun property -> names.Add property.Name)
+                let mutable schema = Unchecked.defaultof<JsonElement>
+                let schemaValid =
+                    root.TryGetProperty("schemaVersion", &schema)
+                    && schema.ValueKind = JsonValueKind.Number && schema.GetInt32() = 2
+                let required =
+                    typeof<'t>.GetProperties()
+                    |> Array.map (fun property -> options.PropertyNamingPolicy.ConvertName(property.Name))
+                let complete =
+                    required |> Array.forall (fun property ->
+                        let mutable memberValue = Unchecked.defaultof<JsonElement>
+                        root.TryGetProperty(property, &memberValue))
+                let status (name: string) (allowed: string list) =
+                    let mutable field = Unchecked.defaultof<JsonElement>
+                    root.TryGetProperty(name, &field)
+                    && field.ValueKind = JsonValueKind.String
+                    && List.contains (field.GetString()) allowed
+                let stateValid =
+                    match typeof<'t>.Name with
+                    | "ReviewTask" -> status "lifecycle" [ "Open"; "InProgress"; "Implemented"; "Integrated"; "Closed"; "Cancelled" ]
+                    | "ReviewAgent" -> status "state" [ "Ready"; "Assigned"; "Working"; "Completed"; "Parked" ]
+                    | "ReviewAttempt" -> status "phase" [ "Queued"; "Acknowledged"; "Working"; "Paused"; "Finished"; "Parked"; "Blocked";
+                          "Accepted"; "Superseded"; "Abandoned" ]
+                    | "ReviewRequest" -> status "status" [ "Unclaimed"; "Claimed"; "Accepted"; "ChangesRequested"; "Withdrawn" ]
+                    | "ReviewIntegration" -> status "status" [ "PendingSourceAction"; "PendingPush"; "Recorded" ]
+                    | "ReviewFeedbackNotice" -> status "status" [ "Accepted"; "ChangesRequested" ]
+                    | "AgentCheckpoint" -> status "kind" [ "Yield"; "Completion"; "Recovery" ]
+                    | _ -> true
+                if not unique then Error "Duplicate entity JSON member."
+                elif not schemaValid then Error "Unsupported or missing entity schemaVersion."
+                elif not complete then Error "Missing required entity JSON member."
+                elif not stateValid then Error "Invalid entity lifecycle, state, status or evidence kind."
+                else Ok ()
+        with ex -> Error ex.Message
     let private idPattern = Regex("^[A-Za-z0-9_-]{1,80}$", RegexOptions.Compiled)
     let private refPattern = Regex("^refs/heads/[A-Za-z0-9][A-Za-z0-9_./-]*$", RegexOptions.Compiled)
 
@@ -187,6 +238,13 @@ module ReviewWorkflow =
         not (String.IsNullOrWhiteSpace agent) && Encoding.UTF8.GetByteCount(agent) <= 120
     let private validText limit (value: string) =
         not (String.IsNullOrWhiteSpace value) && Encoding.UTF8.GetByteCount(value) <= limit
+    // Canonical task specifications may contain markup, but must not embed
+    // active browser content. Display surfaces must still treat HTML as untrusted.
+    let private validTaskHtml (value: string) =
+        validText (128 * 1024) value
+        && not (Regex.IsMatch(value,
+            "<\\s*(script|iframe|object|embed|base|form|svg|math)\\b|\\bon[a-z]+\\s*=|javascript\\s*:",
+            RegexOptions.IgnoreCase ||| RegexOptions.CultureInvariant))
     let private validBranch (value: string) =
         not (isNull value) && refPattern.IsMatch value
         && not (value.Contains("..")) && not (value.EndsWith("/"))
@@ -198,7 +256,7 @@ module ReviewWorkflow =
           RequestJson = json payload }
 
     let private change path blob value =
-        { Path = path; ExpectedBlobOid = blob; Content = json value }
+        { Path = path; ExpectedBlobOid = blob; Content = entityJson value }
 
     let private read<'t> binding snapshot path : Result<('t * string) option, LedgerFailure> =
         result {
@@ -207,11 +265,15 @@ module ReviewWorkflow =
             | None, None -> return None
             | Some content, Some blobOid ->
                 try
-                    let parsed = JsonSerializer.Deserialize<'t>(content, options)
-                    if isNull (box parsed) then
-                        return! Error(LedgerIntegrityError $"Null ledger entity: {path}")
-                    else
-                        return Some(parsed, blobOid)
+                    match validEntity<'t> content with
+                    | Error message ->
+                        return! Error(LedgerIntegrityError $"Invalid ledger entity {path}: {message}")
+                    | Ok () ->
+                        let parsed = JsonSerializer.Deserialize<'t>(content, options)
+                        if isNull (box parsed) then
+                            return! Error(LedgerIntegrityError $"Null ledger entity: {path}")
+                        else
+                            return Some(parsed, blobOid)
                 with ex ->
                     return! Error(LedgerIntegrityError $"Invalid ledger entity {path}: {ex.Message}")
             | _ -> return! Error(LedgerIntegrityError $"Inconsistent ledger entity: {path}")
@@ -237,7 +299,7 @@ module ReviewWorkflow =
 
     let createTaskWithSpec binding operationId taskId title html =
         if not (validTaskId taskId) || not (validText 512 title)
-           || not (validText (128 * 1024) html) then
+           || not (validTaskHtml html) then
             Error(InvalidBinding "Invalid task ID, title or canonical HTML specification.")
         else
             LedgerStore.transact binding

@@ -20,7 +20,8 @@ type ReviewV2OptIn =
       Epoch: int
       RemoteName: string
       ApprovedFetchUrl: string
-      ApprovedPushUrl: string }
+      ApprovedPushUrl: string
+      HighestTrustedHead: string }
 
 module ReviewV2Binding =
     let pathForRoot (root: string) =
@@ -51,13 +52,15 @@ module ReviewV2Binding =
                             JsonSerializerOptions(PropertyNameCaseInsensitive = true))
                         let projectOk, projectId = Guid.TryParse(stored.ProjectId)
                         let ledgerOk, ledgerId = Guid.TryParse(stored.LedgerId)
-                        if stored.SchemaVersion <> 1 || not stored.Enabled
+                        if isNull (box stored)
+                           || stored.SchemaVersion <> 1 || not stored.Enabled
                            || not (String.Equals(stored.ProjectRoot, Path.GetFullPath(root), StringComparison.Ordinal))
                            || not projectOk || not ledgerOk || projectId = Guid.Empty || ledgerId = Guid.Empty
                            || stored.Epoch < 1
                            || String.IsNullOrWhiteSpace stored.RemoteName
                            || String.IsNullOrWhiteSpace stored.ApprovedFetchUrl
-                           || String.IsNullOrWhiteSpace stored.ApprovedPushUrl then
+                           || String.IsNullOrWhiteSpace stored.ApprovedPushUrl
+                           || String.IsNullOrWhiteSpace stored.HighestTrustedHead then
                             Error(Client.ValidationError "V2 ledger binding is not explicitly enabled with a pinned root and identity.")
                         else
                             let binding : LedgerStore.LedgerBinding =
@@ -68,9 +71,227 @@ module ReviewV2Binding =
                                   ProjectId = projectId
                                   LedgerId = ledgerId
                                   Epoch = stored.Epoch }
-                            Ok binding
+                            match LedgerStore.LedgerStore.fetch binding with
+                            | Error error ->
+                                Error(Client.ValidationError $"V2 ledger identity/trust verification failed: {error}")
+                            | Ok snapshot ->
+                                match LedgerStore.LedgerStore.verifyTrustedHead binding stored.HighestTrustedHead snapshot.Commit with
+                                | Error error ->
+                                    Error(Client.ValidationError $"V2 ledger trust anchor mismatch: {error}")
+                                | Ok () ->
+                                    if stored.HighestTrustedHead <> snapshot.Commit then
+                                        // Persist the new verified head independently from Git's local cache ref.
+                                        let next = { stored with HighestTrustedHead = snapshot.Commit }
+                                        let temp = path + "." + Guid.NewGuid().ToString("N") + ".tmp"
+                                        try
+                                            File.WriteAllText(temp, JsonSerializer.Serialize(next))
+                                            File.Move(temp, path, true)
+                                            Ok binding
+                                        finally
+                                            if File.Exists(temp) then File.Delete(temp)
+                                    else Ok binding
                 with ex ->
                     Error(Client.ValidationError $"Cannot load V2 binding: {ex.Message}")
+
+
+    // Setup is always an explicit approved action, never a side effect of a read.
+    // The expected head is a separately supplied trust anchor, not inferred
+    // from matching task IDs or the newest local branch.
+    let bindExisting projectName rt projectId ledgerId epoch remoteName
+                     approvedFetchUrl approvedPushUrl expectedTrustedHead
+                     acknowledgeVisibility =
+        if not acknowledgeVisibility then
+            Error(Client.ValidationError
+                "Explicit acknowledgment of public/unknown remote visibility is required.")
+        elif projectId = Guid.Empty || ledgerId = Guid.Empty || epoch < 1 then
+            Error(Client.ValidationError "A pinned project/ledger UUID and positive epoch are required.")
+        else
+            match ProjectPaths.resolveProjectRoot projectName rt with
+            | Error error -> Error error
+            | Ok(FolderPath root) ->
+                let path = pathForRoot root
+                if File.Exists path then
+                    Error(Client.ValidationError "V2 ledger is already bound. Use explicit rebind.")
+                else
+                    let binding : LedgerStore.LedgerBinding =
+                        { RepositoryPath = root; RemoteName = remoteName
+                          ApprovedFetchUrl = approvedFetchUrl; ApprovedPushUrl = approvedPushUrl
+                          ProjectId = projectId; LedgerId = ledgerId; Epoch = epoch }
+                    match LedgerStore.LedgerStore.fetch binding with
+                    | Error failure ->
+                        Error(Client.ValidationError $"Cannot adopt V2 ledger: {failure}")
+                    | Ok snapshot ->
+                        match LedgerStore.LedgerStore.verifyTrustedHead binding expectedTrustedHead snapshot.Commit with
+                        | Error failure ->
+                            Error(Client.ValidationError $"Trust anchor mismatch: {failure}")
+                        | Ok () ->
+                            let record =
+                                { SchemaVersion = 1; Enabled = true
+                                  ProjectRoot = Path.GetFullPath root
+                                  ProjectId = projectId.ToString("D")
+                                  LedgerId = ledgerId.ToString("D"); Epoch = epoch
+                                  RemoteName = remoteName; ApprovedFetchUrl = approvedFetchUrl
+                                  ApprovedPushUrl = approvedPushUrl
+                                  HighestTrustedHead = snapshot.Commit }
+                            try
+                                Directory.CreateDirectory(Path.GetDirectoryName path) |> ignore
+                                let temp = path + "." + Guid.NewGuid().ToString("N") + ".tmp"
+                                try
+                                    File.WriteAllText(temp, JsonSerializer.Serialize(record))
+                                    File.Move(temp, path, false)
+                                    Ok record
+                                finally
+                                    if File.Exists temp then File.Delete temp
+                            with ex ->
+                                Error(Client.ValidationError $"Cannot persist verified V2 binding: {ex.Message}")
+
+    let initializeNew projectName rt projectId ledgerId epoch remoteName
+                      approvedFetchUrl approvedPushUrl acknowledgeVisibility =
+        if not acknowledgeVisibility then
+            Error(Client.ValidationError
+                "Explicit acknowledgment of public/unknown remote visibility is required.")
+        elif projectId = Guid.Empty || ledgerId = Guid.Empty || epoch < 1 then
+            Error(Client.ValidationError "Valid new ledger identity is required.")
+        else
+            match ProjectPaths.resolveProjectRoot projectName rt with
+            | Error error -> Error error
+            | Ok(FolderPath root) ->
+                if File.Exists(pathForRoot root) then
+                    Error(Client.ValidationError "V2 ledger is already bound; refusing reinitialization.")
+                else
+                    let binding : LedgerStore.LedgerBinding =
+                        { RepositoryPath = root; RemoteName = remoteName
+                          ApprovedFetchUrl = approvedFetchUrl; ApprovedPushUrl = approvedPushUrl
+                          ProjectId = projectId; LedgerId = ledgerId; Epoch = epoch }
+                    match LedgerStore.LedgerStore.initialize binding true with
+                    | Error failure ->
+                        Error(Client.ValidationError $"V2 initialization failed: {failure}")
+                    | Ok snapshot ->
+                        bindExisting projectName rt projectId ledgerId epoch remoteName
+                            approvedFetchUrl approvedPushUrl snapshot.Commit true
+
+    let health projectName rt =
+        load projectName rt
+        |> Result.bind (fun binding ->
+            LedgerStore.LedgerStore.fetch binding
+            |> Result.mapError (fun error -> Client.ValidationError $"V2 ledger health: {error}")
+            |> Result.map (fun snapshot ->
+                {| projectId = binding.ProjectId.ToString("D")
+                   ledgerId = binding.LedgerId.ToString("D")
+                   epoch = binding.Epoch
+                   remoteName = binding.RemoteName
+                   approvedFetchUrl = binding.ApprovedFetchUrl
+                   approvedPushUrl = binding.ApprovedPushUrl
+                   trustedLedgerHead = snapshot.Commit
+                   ledgerSequence = snapshot.Header.NextSequence |}))
+
+    // Rebind only to the same logical ledger/epoch. Deliberate recovery with a
+    // new epoch is a separate backed-up restore operation.
+    let rebindRemote projectName rt remoteName approvedFetchUrl approvedPushUrl
+                     expectedTrustedHead acknowledgeVisibility =
+        if not acknowledgeVisibility then
+            Error(Client.ValidationError "Explicit rebind and remote visibility approval required.")
+        else
+            match load projectName rt with
+            | Error error -> Error error
+            | Ok old ->
+                let newBinding =
+                    { old with RemoteName = remoteName
+                               ApprovedFetchUrl = approvedFetchUrl
+                               ApprovedPushUrl = approvedPushUrl }
+                match LedgerStore.LedgerStore.fetch newBinding with
+                | Error failure ->
+                    Error(Client.ValidationError $"Cannot verify new V2 remote: {failure}")
+                | Ok snapshot ->
+                    match LedgerStore.LedgerStore.verifyTrustedHead newBinding expectedTrustedHead snapshot.Commit with
+                    | Error failure ->
+                        Error(Client.ValidationError $"New remote failed pinned trust verification: {failure}")
+                    | Ok () ->
+                        match ProjectPaths.resolveProjectRoot projectName rt with
+                        | Error error -> Error error
+                        | Ok(FolderPath root) ->
+                            let path = pathForRoot root
+                            try
+                                let previous = File.ReadAllText path
+                                let record = JsonSerializer.Deserialize<ReviewV2OptIn>(previous)
+                                if not (String.Equals(record.ProjectId, old.ProjectId.ToString("D"), StringComparison.OrdinalIgnoreCase))
+                                   || not (String.Equals(record.LedgerId, old.LedgerId.ToString("D"), StringComparison.OrdinalIgnoreCase))
+                                   || record.Epoch <> old.Epoch then
+                                    Error(Client.ValidationError "V2 binding changed during rebind.")
+                                else
+                                    let replacement =
+                                        { record with RemoteName = remoteName
+                                                      ApprovedFetchUrl = approvedFetchUrl
+                                                      ApprovedPushUrl = approvedPushUrl
+                                                      HighestTrustedHead = snapshot.Commit }
+                                    let backup = path + ".previous-" + Guid.NewGuid().ToString("N")
+                                    File.WriteAllText(backup, previous)
+                                    let temp = path + "." + Guid.NewGuid().ToString("N") + ".tmp"
+                                    try
+                                        File.WriteAllText(temp, JsonSerializer.Serialize(replacement))
+                                        File.Move(temp, path, true)
+                                        Ok replacement
+                                    finally
+                                        if File.Exists temp then File.Delete temp
+                            with ex ->
+                                Error(Client.ValidationError $"V2 rebind failed: {ex.Message}")
+
+
+module V2LedgerApi =
+    let private id label (raw: string) =
+        match Guid.TryParse raw with
+        | true, parsed when parsed <> Guid.Empty -> Ok parsed
+        | _ -> Error(Client.ValidationError $"Valid {label} UUID required.")
+
+    let read (cmd: V2LedgerReadCommand) rt =
+        match cmd.Action with
+        | "Health" -> ReviewV2Binding.health cmd.ProjectName rt |> Result.map box
+        | "GetOperationStatus" ->
+            id "operation" cmd.OperationId
+            |> Result.bind (fun operationId ->
+                ReviewV2Binding.load cmd.ProjectName rt
+                |> Result.bind (fun binding ->
+                    LedgerStore.LedgerStore.getOperationStatus binding operationId
+                    |> Result.mapError (fun error ->
+                        Client.ValidationError $"V2 operation status: {error}")
+                    |> Result.map (fun (snapshot, operation) ->
+                        box {| snapshotCommit = snapshot.Commit
+                               operationId = operationId.ToString("D")
+                               disposition = if operation.IsSome then "Applied" else "NotFoundAtVerifiedHead"
+                               operation = operation |})))
+        | _ -> Error(Client.ValidationError "Unsupported V2 ledger read action.")
+
+    let write (cmd: V2LedgerWriteCommand) rt =
+        id "operation" cmd.OperationId
+        |> Result.bind (fun _ ->
+            let bindInputs () =
+                id "project" cmd.ProjectId
+                |> Result.bind (fun projectId ->
+                    id "ledger" cmd.LedgerId
+                    |> Result.map (fun ledgerId -> projectId, ledgerId))
+            let result =
+                match cmd.Action with
+                | "BindExistingLedger" ->
+                    bindInputs ()
+                    |> Result.bind (fun (projectId,ledgerId) ->
+                        ReviewV2Binding.bindExisting cmd.ProjectName rt projectId ledgerId
+                            cmd.Epoch cmd.RemoteName cmd.ApprovedFetchUrl cmd.ApprovedPushUrl
+                            cmd.ExpectedTrustedHead cmd.AcknowledgeVisibility)
+                | "InitializeLedger" ->
+                    bindInputs ()
+                    |> Result.bind (fun (projectId,ledgerId) ->
+                        ReviewV2Binding.initializeNew cmd.ProjectName rt projectId ledgerId
+                            cmd.Epoch cmd.RemoteName cmd.ApprovedFetchUrl cmd.ApprovedPushUrl
+                            cmd.AcknowledgeVisibility)
+                | "RebindLedgerRemote" ->
+                    ReviewV2Binding.rebindRemote cmd.ProjectName rt
+                        cmd.RemoteName cmd.ApprovedFetchUrl cmd.ApprovedPushUrl
+                        cmd.ExpectedTrustedHead cmd.AcknowledgeVisibility
+                | _ -> Error(Client.ValidationError "Unsupported V2 ledger setup action.")
+            result |> Result.map (fun binding ->
+                box {| projectId = binding.ProjectId; ledgerId = binding.LedgerId
+                       epoch = binding.Epoch; remoteName = binding.RemoteName
+                       trustedLedgerHead = binding.HighestTrustedHead |}))
 
 module V2ReviewApi =
     let private mapError (result: Result<'a, LedgerStore.LedgerFailure>) : Result<'a, EffectError> =

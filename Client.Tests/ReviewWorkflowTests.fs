@@ -425,7 +425,8 @@ type ReviewWorkflowTests() =
                   Epoch = first.Epoch
                   RemoteName = first.RemoteName
                   ApprovedFetchUrl = first.ApprovedFetchUrl
-                  ApprovedPushUrl = first.ApprovedPushUrl }
+                  ApprovedPushUrl = first.ApprovedPushUrl
+                  HighestTrustedHead = (LedgerStore.fetch first |> success).Commit }
             File.WriteAllText(configPath, System.Text.Json.JsonSerializer.Serialize(approved))
             try
                 let ctx = GitCommandTests.TestContext(Path.GetDirectoryName one)
@@ -951,3 +952,141 @@ type ReviewWorkflowTests() =
                         Is.EqualTo("PendingSourceAction"))
             Assert.That(git one [ "ls-remote"; "origin"; $"refs/heads/jarvis-review/unexpected/{reviewId:N}/r1" ],
                         Does.StartWith(approvedHead)))
+
+
+    [<Test>]
+    member _.CanonicalSpecAccepts128KiBAndRejectsOversizeWithoutLedgerWrite() =
+        withFixture (fun _ _ first second _ _ _ _ ->
+            let html = "<article>" + String.replicate (128 * 1024 - 19) "x" + "</article>"
+            // The exact UTF-8 ceiling is measured on the committed HTML bytes.
+            let exact = "<p>" + String.replicate (128 * 1024 - 7) "x" + "</p>"
+            Assert.That(System.Text.Encoding.UTF8.GetByteCount exact, Is.EqualTo(128 * 1024))
+            ReviewWorkflow.createTaskWithSpec first (Guid.NewGuid()) "largehtml"
+                "Large canonical task" exact |> success |> ignore
+            let _, task, _, received, _ =
+                ReviewWorkflow.getTaskWithSpec second "largehtml" |> success
+            Assert.That(task.Lifecycle, Is.EqualTo("Open"))
+            Assert.That(received, Is.EqualTo(exact))
+            let before = (LedgerStore.fetch first |> success).Commit
+            match ReviewWorkflow.createTaskWithSpec first (Guid.NewGuid()) "tooLarge"
+                    "Oversize" (exact + "X") with
+            | Error(InvalidBinding _) -> ()
+            | other -> Assert.Fail(sprintf "Oversized HTML must fail before mutation: %A" other)
+            Assert.That((LedgerStore.fetch second |> success).Commit, Is.EqualTo(before))
+            match ReviewWorkflow.createTaskWithSpec first (Guid.NewGuid()) "activeHtml"
+                    "Active HTML" "<article onclick='alert(1)'>unsafe</article>" with
+            | Error(InvalidBinding _) -> ()
+            | other -> Assert.Fail(sprintf "Active HTML must not be published: %A" other)
+            Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(before)))
+
+    [<Test>]
+    member _.EntityReadersRejectUnknownPhaseAndMissingSchema() =
+        let mutateDocument transform =
+            withFixture (fun _ _ first second _ _ _ _ ->
+                ReviewWorkflow.createTask first (Guid.NewGuid()) "broken" "Broken" |> success |> ignore
+                let snapshot = LedgerStore.fetch first |> success
+                let path = "tasks/broken/task.json"
+                let text, blob = LedgerStore.readAt first snapshot path |> success
+                let corrupted = transform text.Value
+                let intent =
+                    { OperationId = Guid.NewGuid(); Actor = "Corruption fixture"
+                      Kind = "CorruptTaskForReadTest"; RequestJson = "{}" }
+                LedgerStore.transact first intent (fun _ ->
+                    Ok [ { Path = path; ExpectedBlobOid = blob; Content = corrupted } ])
+                |> success |> ignore
+                match ReviewWorkflow.getTaskWithSpec second "broken" with
+                | Error(LedgerIntegrityError _) -> ()
+                | other -> Assert.Fail(sprintf "Malformed entity must fail closed: %A" other))
+        mutateDocument (fun text -> text.Replace("\"lifecycle\":\"Open\"", "\"lifecycle\":\"Unknown\""))
+        mutateDocument (fun text -> text.Replace("\"schemaVersion\":2,", ""))
+        mutateDocument (fun text -> text.Replace("\"specVersion\":1,", ""))
+
+
+    [<Test>]
+    member _.LedgerBindingNeedsExplicitTrustAndPersistsVerifiedHead() =
+        withFixture (fun one _ first _ _ _ _ _ ->
+            let ctx = GitCommandTests.TestContext(Path.GetDirectoryName one)
+            let current = (LedgerStore.fetch first |> success).Commit
+            let path = Client.V2ReviewApi.ReviewV2Binding.pathForRoot one
+            if File.Exists path then File.Delete path
+            let bind approved expected =
+                Client.V2ReviewApi.ReviewV2Binding.bindExisting
+                    "owner" ctx first.ProjectId first.LedgerId first.Epoch
+                    first.RemoteName first.ApprovedFetchUrl first.ApprovedPushUrl expected approved
+            match bind false current with
+            | Error(Client.ValidationError _) -> ()
+            | other -> Assert.Fail(sprintf "Unapproved bind must refuse: %A" other)
+            Assert.That(File.Exists path, Is.False)
+            match bind true (String.replicate 40 "a") with
+            | Error(Client.ValidationError _) -> ()
+            | other -> Assert.Fail(sprintf "Wrong trust head must refuse: %A" other)
+            Assert.That(File.Exists path, Is.False)
+            let stored = bind true current |> function
+                | Ok value -> value
+                | Error error -> failwithf "Bind failed: %A" error
+            Assert.That(stored.HighestTrustedHead, Is.EqualTo(current))
+            Assert.That(File.Exists path, Is.True)
+            let extra = ReviewWorkflow.createTask first (Guid.NewGuid()) "trustTask" "Trust" |> success
+            let fresh = (LedgerStore.fetch first |> success).Commit
+            Assert.That(fresh, Is.Not.EqualTo(current))
+            let loaded = Client.V2ReviewApi.ReviewV2Binding.load "owner" ctx
+            match loaded with
+            | Ok binding -> Assert.That(binding.ProjectId, Is.EqualTo(first.ProjectId))
+            | Error error -> Assert.Fail(sprintf "Verified load failed: %A" error)
+            let config = System.Text.Json.JsonSerializer.Deserialize<Client.V2ReviewApi.ReviewV2OptIn>(
+                File.ReadAllText path)
+            Assert.That(config.HighestTrustedHead, Is.EqualTo(fresh))
+            git one [ "remote"; "set-url"; "origin"; "file:///not-the-approved-remote.git" ] |> ignore
+            match Client.V2ReviewApi.ReviewV2Binding.load "owner" ctx with
+            | Error(Client.ValidationError _) -> ()
+            | other -> Assert.Fail(sprintf "Changed remote must be rejected: %A" other)
+            git one [ "remote"; "set-url"; "origin"; first.ApprovedFetchUrl ] |> ignore
+            Assert.That((Client.V2ReviewApi.ReviewV2Binding.health "owner" ctx |> function
+                         | Ok value -> value.trustedLedgerHead
+                         | Error error -> failwithf "Health: %A" error), Is.EqualTo(fresh))
+            File.Delete path)
+
+    [<Test>]
+    member _.InitializeAndRebindRequireExplicitOperatorConsent() =
+        withFixture (fun one _ first _ _ _ _ _ ->
+            let ctx = GitCommandTests.TestContext(Path.GetDirectoryName one)
+            let root = Path.GetDirectoryName one
+            let newRemote = Path.Combine(root, "fresh-remote.git")
+            git root [ "init"; "--bare"; newRemote ] |> ignore
+            git one [ "remote"; "add"; "fresh"; newRemote ] |> ignore
+            let path = Client.V2ReviewApi.ReviewV2Binding.pathForRoot one
+            if File.Exists path then File.Delete path
+            let project = Guid.NewGuid()
+            let ledger = Guid.NewGuid()
+            let create approve =
+                Client.V2ReviewApi.ReviewV2Binding.initializeNew
+                    "owner" ctx project ledger 1 "fresh" newRemote newRemote approve
+            match create false with
+            | Error(Client.ValidationError _) -> ()
+            | other -> Assert.Fail(sprintf "Unapproved init must fail: %A" other)
+            Assert.That(git one [ "ls-remote"; "fresh"; "refs/heads/jarvis-orchestration" ], Is.Empty)
+            let created = create true |> function
+                | Ok value -> value
+                | Error error -> failwithf "Initialization failed: %A" error
+            Assert.That(created.ProjectId, Is.EqualTo(project.ToString("D")))
+            Assert.That(created.HighestTrustedHead.Length, Is.EqualTo(40))
+            let otherRemote = Path.Combine(root, "mirror.git")
+            git root [ "clone"; "--bare"; newRemote; otherRemote ] |> ignore
+            git one [ "remote"; "add"; "mirror"; otherRemote ] |> ignore
+            let rebind approved expected =
+                Client.V2ReviewApi.ReviewV2Binding.rebindRemote
+                    "owner" ctx "mirror" otherRemote otherRemote expected approved
+            match rebind false created.HighestTrustedHead with
+            | Error(Client.ValidationError _) -> ()
+            | other -> Assert.Fail(sprintf "Rebind without approval must fail: %A" other)
+            match rebind true (String.replicate 40 "f") with
+            | Error(Client.ValidationError _) -> ()
+            | other -> Assert.Fail(sprintf "Rebind to mismatched trust must fail: %A" other)
+            let rebound = rebind true created.HighestTrustedHead |> function
+                | Ok value -> value
+                | Error error -> failwithf "Rebind failed: %A" error
+            Assert.That(rebound.RemoteName, Is.EqualTo("mirror"))
+            Assert.That((Client.V2ReviewApi.ReviewV2Binding.health "owner" ctx |> function
+                         | Ok value -> value.remoteName
+                         | Error error -> failwithf "Health: %A" error), Is.EqualTo("mirror"))
+            File.Delete path)

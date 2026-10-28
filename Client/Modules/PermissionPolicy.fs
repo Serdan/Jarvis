@@ -140,6 +140,12 @@ let private requiresConfirmation command =
     | GetJobResultCommand _
     | MessageCommand _
     | GetClientActivityCommand _ -> readOnly
+    | BrowserOpenTabCommand cmd ->
+        let origin =
+            match Uri.TryCreate(cmd.Url, UriKind.Absolute) with
+            | true, uri when uri.Scheme = "https" || uri.Scheme = "http" -> uri.GetLeftPart(UriPartial.Authority)
+            | _ -> "(invalid URL)"
+        confirmation "BrowserOpenTab" None [ ProcessExecution; NetworkAccess ] [] None [] ("Open browser tab on " + origin) false
     | BrowserExecuteFileCommand cmd ->
         confirmation "BrowserExecuteFile" (Some cmd.ProjectName) [ ProcessExecution; NetworkAccess ] [ cmd.ScriptPath ] None [] ("Execute browser script in registered tab " + cmd.TabRegistration) false
     | BrowserExecuteJsCommand cmd ->
@@ -190,6 +196,7 @@ let private requiresConfirmation command =
 let private trustAllows trustLevel command =
     match trustLevel, command with
     | FullTrust, _ -> true
+    | PartialTrust, BrowserOpenTabCommand _
     | PartialTrust, BrowserExecuteFileCommand _
     | PartialTrust, BrowserExecuteJsCommand _
     | PartialTrust, RunCommandCommand _

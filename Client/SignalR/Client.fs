@@ -70,6 +70,7 @@ let private auditDetails command =
     match command with
     | ImportFileCommand cmd -> Some("ImportFile", Some cmd.ProjectName, [ WorkspaceWrite; NetworkAccess ], [ cmd.FilePath ], None, [])
     | UpdateClientCommand -> Some("UpdateClient", None, [ ProcessExecution; NetworkAccess; Destructive ], [], None, [])
+    | BrowserOpenTabCommand _ -> Some("BrowserOpenTab", None, [ ProcessExecution; NetworkAccess ], [], None, [])
     | BrowserExecuteFileCommand cmd -> Some("BrowserExecuteFile", Some cmd.ProjectName, [ ProcessExecution; NetworkAccess ], [cmd.ScriptPath], None, [])
     | BrowserExecuteJsCommand cmd -> Some("BrowserExecuteJs", None, [ ProcessExecution; NetworkAccess ], [], None, [])
     | WriteFileCommand cmd -> Some("WriteFile", Some cmd.ProjectName, [ WorkspaceWrite ], [ cmd.FilePath ], None, [])
@@ -200,6 +201,14 @@ let private dispatch (rt: Runtime) (command: AgentCommand) =
         | Some bridge ->
             let result = bridge.ListTabs() |> Result.mapError Client.ValidationError
             ValueTask<Result<string,EffectError>>(result)
+    | BrowserOpenTabCommand cmd ->
+        ValueTask<Result<string,EffectError>>(task {
+            match rt.Browser with
+            | None -> return Error(Client.ValidationError "BridgeDisabled")
+            | Some bridge ->
+                let! result = bridge.OpenTab(cmd.Url, defaultArg cmd.Alias "", defaultArg cmd.Active false)
+                return result |> Result.mapError Client.ValidationError
+        })
     | BrowserExecuteFileCommand cmd ->
         ValueTask<Result<string,EffectError>>(task {
             match rt.Browser with

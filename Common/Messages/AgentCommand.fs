@@ -64,6 +64,11 @@ type ListCommandsResult =
 type ListProjectsCommand = struct end
 
 type BrowserListTabsCommand = struct end
+type BrowserOpenTabCommand =
+    { Url: string
+      Alias: string option
+      Active: bool option }
+
 type BrowserExecuteFileCommand =
     { ProjectName: string
       ScriptPath: string
@@ -567,6 +572,7 @@ type AgentCommand =
     | ListCommandsCommand
     | ListProjectsCommand
     | BrowserListTabsCommand
+    | BrowserOpenTabCommand of BrowserOpenTabCommand
     | BrowserExecuteFileCommand of BrowserExecuteFileCommand
     | BrowserExecuteJsCommand of BrowserExecuteJsCommand
     | ListWorktreesCommand of ListWorktreesCommand
@@ -627,6 +633,7 @@ module AgentCommandInfo =
         | ListCommandsCommand -> "ListCommandsCommand"
         | ListProjectsCommand -> "ListProjectsCommand"
         | BrowserListTabsCommand -> "BrowserListTabsCommand"
+        | BrowserOpenTabCommand _ -> "BrowserOpenTabCommand"
         | BrowserExecuteFileCommand _ -> "BrowserExecuteFileCommand"
         | BrowserExecuteJsCommand _ -> "BrowserExecuteJsCommand"
         | ListWorktreesCommand _ -> "ListWorktreesCommand"
@@ -693,6 +700,7 @@ module AgentCommandInfo =
         | ListCommandsCommand -> "ListCommands"
         | ListProjectsCommand -> "ListProjects"
         | BrowserListTabsCommand -> "BrowserListTabs"
+        | BrowserOpenTabCommand _ -> "BrowserOpenTab"
         | BrowserExecuteFileCommand _ -> "BrowserExecuteFile"
         | BrowserExecuteJsCommand _ -> "BrowserExecuteJs"
         | ListWorktreesCommand _ -> "ListWorktrees"
@@ -752,6 +760,7 @@ module AgentCommandInfo =
         | ListCommandsCommand
         | ListProjectsCommand
         | BrowserListTabsCommand
+        | BrowserOpenTabCommand _
         | BrowserExecuteJsCommand _
         | GetJobResultCommand _
         | CancelJobCommand _
@@ -844,6 +853,10 @@ module AgentCommandInfo =
 
     let fullDetail = function
         | BrowserListTabsCommand -> None
+        | BrowserOpenTabCommand cmd ->
+            match Uri.TryCreate(cmd.Url, UriKind.Absolute) with
+            | true, uri when uri.Scheme = "https" || uri.Scheme = "http" -> Some(uri.GetLeftPart(UriPartial.Authority) + " (new tab)")
+            | _ -> Some "(new browser tab)"
         | BrowserExecuteFileCommand cmd -> Some(cmd.ScriptPath + " -> " + cmd.TabRegistration)
         | BrowserExecuteJsCommand cmd -> Some("registered tab " + cmd.TabRegistration)
         | ListDirectoryCommand cmd -> Some(compact cmd.FolderPath)
@@ -903,6 +916,10 @@ module AgentCommandInfo =
 
     let detail = function
         | BrowserListTabsCommand -> None
+        | BrowserOpenTabCommand cmd ->
+            match Uri.TryCreate(cmd.Url, UriKind.Absolute) with
+            | true, uri when uri.Scheme = "https" || uri.Scheme = "http" -> Some(uri.GetLeftPart(UriPartial.Authority) + " (new tab)")
+            | _ -> Some "(new browser tab)"
         | BrowserExecuteFileCommand cmd -> Some(cmd.ScriptPath + " -> " + cmd.TabRegistration)
         | BrowserExecuteJsCommand cmd -> Some("registered tab " + cmd.TabRegistration)
         | ListDirectoryCommand cmd -> Some(truncate 64 cmd.FolderPath)
@@ -999,7 +1016,7 @@ module AgentCommandInfo =
         | None -> invocation command
 
 module AgentProtocol =
-    let version = "3.19"
+    let version = "3.20"
     let defaultPatchFuzzyContextLines = 3
     let maxResponseBytes = 900 * 1024
     let maxImageBytes = 8 * 1024 * 1024
@@ -1017,7 +1034,8 @@ module AgentProtocol =
     let commandDefinitions =
         [ definition "ListCommands" "Lists supported Jarvis commands." [ ReadOnly ] false false false
           definition "ListProjects" "Lists configured projects." [ ReadOnly ] false false false
-          definition "BrowserListTabs" "Lists only tabs manually registered in the paired extension." [ ReadOnly ] false false false
+          definition "BrowserListTabs" "Lists tabs registered through the extension, including opted-in agent-created tabs." [ ReadOnly ] false false false
+          definition "BrowserOpenTab" "Opens and registers a new background tab on an explicitly user-authorized site." [ ProcessExecution; NetworkAccess ] true true false
           definition "BrowserExecuteFile" "Executes JavaScript from a bounded project file in a registered tab." [ ProcessExecution; NetworkAccess ] true true false
           definition "BrowserExecuteJs" "Executes supplied JavaScript in a registered browser tab." [ ProcessExecution; NetworkAccess ] true true false
           definition "ListWorktrees" "Lists Git worktrees registered for a project." [ ReadOnly ] false false false

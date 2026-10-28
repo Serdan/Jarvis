@@ -172,7 +172,7 @@ type Service(port: int, pairingSecret: string) =
                                     |> Seq.toList
                                 lock sync (fun () -> conn.Registrations <- parsed)
                             | _ -> ()
-                        | "result" | "error" ->
+                        | "result" | "error" | "tabOpened" ->
                             let requestId = asString doc "requestId"
                             let mutable tcs = Unchecked.defaultof<TaskCompletionSource<string>>
                             if conn.Pending.TryRemove(requestId, &tcs) then
@@ -210,6 +210,63 @@ type Service(port: int, pairingSecret: string) =
             | Some conn ->
                 let tabs = conn.Registrations |> List.map (fun x -> x.Clone())
                 Ok (serialize {| tabs = tabs |}))
+
+    member _.OpenTab(url: string, alias: string, makeActive: bool) = task {
+        let isValid =
+            match Uri.TryCreate(url, UriKind.Absolute) with
+            | true, uri ->
+                (uri.Scheme = "http" || uri.Scheme = "https") &&
+                String.IsNullOrEmpty(uri.UserInfo) &&
+                url.Length <= 2048
+            | _ -> false
+        if not isValid then return Error "InvalidTabUrl: absolute HTTP(S) URL without credentials required."
+        elif isNull alias || alias.Length > 128 || (alias |> Seq.exists Char.IsControl) then
+            return Error "InvalidTabAlias"
+        else
+            let connection = lock sync (fun () ->
+                match active with
+                | None -> Error "ExtensionDisconnected"
+                | Some conn when conn.Pending.Count >= 4 -> Error "BridgeBusy"
+                | Some conn -> Ok conn)
+            match connection with
+            | Error error -> return Error error
+            | Ok conn ->
+                let requestId = Guid.NewGuid().ToString("N")
+                let completion = TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously)
+                if not (conn.Pending.TryAdd(requestId, completion)) then
+                    return Error "DuplicateRequest"
+                else
+                    try
+                        try
+                            let frame = serialize
+                                            {| version = ProtocolVersion
+                                               kind = "openTab"
+                                               requestId = requestId
+                                               connectionId = conn.Id
+                                               url = url
+                                               alias = alias
+                                               active = makeActive |}
+                            do! send conn frame
+                            let! response = completion.Task.WaitAsync(TimeSpan.FromSeconds(15.0))
+                            if utf8.GetByteCount(response) > MaxResultBytes then
+                                return Error "OutputTooLarge"
+                            else
+                                let document = JsonNode.Parse(response)
+                                if asString document "connectionId" <> conn.Id then
+                                    return Error "ResponseIdentityMismatch"
+                                elif asString document "kind" = "error" then
+                                    return Error ("BrowserOpenTabError:" + asString document "error")
+                                elif asString document "kind" <> "tabOpened" then
+                                    return Error "UnexpectedBrowserResponse"
+                                else
+                                    return Ok response
+                        with
+                        | :? TimeoutException -> return Error "OutcomeUnknown: tab may have been opened."
+                        | ex -> return Error ("OutcomeUnknown: " + ex.GetType().Name)
+                    finally
+                        let mutable removed = Unchecked.defaultof<TaskCompletionSource<string>>
+                        conn.Pending.TryRemove(requestId, &removed) |> ignore
+    }
 
     member _.Execute(tabRegistration: string, source: string, argsJson: string, timeoutMs: int, isInline: bool) = task {
         let sourceBytes = utf8.GetByteCount(source)

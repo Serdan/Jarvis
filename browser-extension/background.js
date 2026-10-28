@@ -4,6 +4,8 @@
 const PROTOCOL = 1;
 const REGISTRY_KEY = "registrations";
 const SESSION_KEY = "browserSessionEpoch";
+const OPEN_TABS_KEY = "allowAgentCreatedTabs";
+const MAX_AGENT_TABS = 20;
 const encoder = new TextEncoder();
 
 let socket = null;
@@ -16,6 +18,8 @@ let registrations = [];
 let sessionEpoch = null;
 let configuredPort = 43822;
 let secret = "";
+let allowAgentCreatedTabs = false;
+let openQueue = Promise.resolve();
 let initPromise = null;
 
 function randomId() {
@@ -44,9 +48,10 @@ async function initialize() {
     // Keep pairing credentials and browser registrations inaccessible to page content scripts.
     await chrome.storage.local.setAccessLevel?.({ accessLevel: "TRUSTED_CONTEXTS" });
     await chrome.storage.session.setAccessLevel?.({ accessLevel: "TRUSTED_CONTEXTS" });
-    const persistent = await chrome.storage.local.get(["port", "secret", REGISTRY_KEY]);
+    const persistent = await chrome.storage.local.get(["port", "secret", REGISTRY_KEY, OPEN_TABS_KEY]);
     configuredPort = persistent.port || 43822;
     secret = persistent.secret || "";
+    allowAgentCreatedTabs = persistent[OPEN_TABS_KEY] === true;
     registrations = Array.isArray(persistent[REGISTRY_KEY]) ? persistent[REGISTRY_KEY] : [];
     const session = await chrome.storage.session.get(SESSION_KEY);
     sessionEpoch = session[SESSION_KEY] || randomId();
@@ -59,8 +64,9 @@ function safeState(r) {
   return {
     registrationId: r.registrationId,
     alias: r.alias,
+    agentCreated: r.agentCreated === true,
     displayUrl: (() => {
-      try { const url = new URL(r.boundUrl); return url.origin + url.pathname; }
+      try { const url = new URL(r.currentUrl || r.boundUrl); return url.origin + url.pathname; }
       catch { return "(unavailable)"; }
     })(),
     origin: (() => { try { return new URL(r.boundUrl).origin; } catch { return ""; } })(),
@@ -71,16 +77,46 @@ function safeState(r) {
 async function persist() {
   await chrome.storage.local.set({ [REGISTRY_KEY]: registrations });
 }
+function manualOriginAllowed(origin) {
+  return registrations.some(r =>
+    !r.agentCreated && !r.blocked && r.sessionEpoch === sessionEpoch &&
+    isAllowedUrl(r.boundUrl) && new URL(r.boundUrl).origin === origin);
+}
+async function validManualOrigin(origin) {
+  if (!manualOriginAllowed(origin)) return false;
+  for (const r of registrations) {
+    if (!r.agentCreated && !r.blocked && r.sessionEpoch === sessionEpoch &&
+        isAllowedUrl(r.boundUrl) && new URL(r.boundUrl).origin === origin) {
+      const state = await assess(r);
+      if (["ready", "loading", "discarded", "frozen"].includes(state)) return true;
+    }
+  }
+  return false;
+}
 async function assess(reg) {
   if (reg.blocked || reg.sessionEpoch !== sessionEpoch) return "needsReauthorization";
+  if (reg.agentCreated &&
+      (!allowAgentCreatedTabs || !(await validManualOrigin(reg.boundOrigin)))) {
+    reg.blocked = true;
+    await persist();
+    return "needsReauthorization";
+  }
   try {
     const tab = await chrome.tabs.get(reg.tabId);
-    if (tab.url !== reg.boundUrl) {
+    const pendingInitialNavigation = reg.agentCreated && tab.status === "loading" &&
+      tab.pendingUrl === reg.boundUrl &&
+      (!isAllowedUrl(tab.url) || tab.url === "about:blank");
+    if (pendingInitialNavigation) return "loading";
+
+    if (!isAllowedUrl(tab.url) ||
+        (reg.agentCreated
+          ? new URL(tab.url).origin !== reg.boundOrigin
+          : tab.url !== reg.boundUrl)) {
       reg.blocked = true;
       await persist();
       return "needsReauthorization";
     }
-    if (!isAllowedUrl(tab.url)) return "needsReauthorization";
+    if (reg.agentCreated) reg.currentUrl = tab.url;
     if (tab.discarded) return "discarded";
     if (tab.frozen) return "frozen";
     if (tab.status === "loading") return "loading";
@@ -130,6 +166,9 @@ async function connect() {
         await advertise();
       } else if (message.kind === "executeJs" && connected) {
         void execute(message);
+      } else if (message.kind === "openTab" && connected) {
+        // Serialize creations to enforce alias uniqueness and the tab quota.
+        openQueue = openQueue.then(() => openNewTab(message)).catch(() => {});
       } else if (message.kind === "ping") {
         send({ kind: "pong" });
       }
@@ -175,8 +214,11 @@ async function execute(message) {
   // The URL check also runs inside the frame to prevent navigation races.
   const wrapper =
     "(async () => {\n" +
-    "if (location.href !== " + JSON.stringify(registration.boundUrl) +
-    ") throw new Error('NavigationMismatch');\n" +
+    (registration.agentCreated ?
+      "if (location.origin !== " + JSON.stringify(registration.boundOrigin) +
+        ") throw new Error('NavigationMismatch');\n" :
+      "if (location.href !== " + JSON.stringify(registration.boundUrl) +
+        ") throw new Error('NavigationMismatch');\n") +
     (message.entrypoint === "expression" ?
       "return await (" + source + ");\n" :
       source + "\n" +
@@ -210,6 +252,66 @@ async function execute(message) {
   } finally { inflight--; }
 }
 
+async function openNewTab(message) {
+  const { requestId } = message;
+  const requestSocket = socket;
+  const requestConnection = connectionId;
+  const respond = payload => {
+    if (socket === requestSocket && connected && connectionId === requestConnection) {
+      send({ requestId, connectionId: requestConnection, ...payload });
+    }
+  };
+  function reject(error) { respond({ kind: "error", error }); }
+
+  if (message.connectionId !== requestConnection) return reject("ConnectionEpochMismatch");
+  if (!allowAgentCreatedTabs) return reject("AgentCreatedTabsDisabled");
+  if (typeof message.url !== "string" || message.url.length > 2048 || !isAllowedUrl(message.url)) {
+    return reject("InvalidTabUrl");
+  }
+  const target = new URL(message.url);
+  if (target.username || target.password) return reject("InvalidTabUrl");
+  const alias = message.alias || ("agent-" + randomId().slice(0, 12));
+  if (typeof alias !== "string" || alias.length > 128 || /[\u0000-\u001f]/.test(alias)) {
+    return reject("InvalidTabAlias");
+  }
+  if (registrations.some(r => r.alias === alias)) return reject("AliasAlreadyRegistered");
+  if (registrations.filter(r => r.agentCreated && !r.blocked && r.sessionEpoch === sessionEpoch).length >= MAX_AGENT_TABS) {
+    return reject("AgentTabLimitReached");
+  }
+  if (!(await validManualOrigin(target.origin))) return reject("OriginNotRegisteredByUser");
+  let tabCreated = false;
+  try {
+    const permission = await chrome.permissions.contains({ origins: [target.origin + "/*"] });
+    if (!permission) return reject("BrowserPermissionMissing");
+    if (socket !== requestSocket || !connected || connectionId !== requestConnection ||
+        !allowAgentCreatedTabs || !(await validManualOrigin(target.origin))) return;
+
+    // Creating the tab is the irreversible operation; a transport failure afterwards
+    // is reported as indeterminate and must not be blindly retried by Jarvis.
+    const tab = await chrome.tabs.create({ url: target.href, active: message.active === true });
+    tabCreated = true;
+    if (!Number.isInteger(tab?.id) || tab.incognito) {
+      if (Number.isInteger(tab?.id)) await chrome.tabs.remove(tab.id);
+      return reject("InvalidCreatedTab");
+    }
+    const registration = {
+      registrationId: randomId(), alias,
+      agentCreated: true, tabId: tab.id, boundUrl: target.href, boundOrigin: target.origin,
+      currentUrl: target.href, sessionEpoch, registrationGeneration: 1,
+      blocked: false, availability: "loading"
+    };
+    registrations.push(registration);
+    await persist();
+    await advertise();
+    respond({ kind: "tabOpened", tab: safeState(registration) });
+  } catch (e) {
+    const reason = String(e?.message || e).slice(0, 160);
+    // Once tabs.create succeeded, a storage or connection failure cannot prove that
+    // the operation did not happen. Require reconciliation before retrying.
+    reject((tabCreated ? "OutcomeUnknown:" : "TabCreateFailed:") + reason);
+  }
+}
+
 async function register(tabId, alias) {
   if (!Number.isInteger(tabId)) throw new Error("No active tab selected");
   if (typeof alias !== "string" || alias.length > 128 || /[\u0000-\u001f]/.test(alias)) {
@@ -230,6 +332,9 @@ async function register(tabId, alias) {
     old.boundUrl = tab.url;
     old.registrationGeneration++;
     old.sessionEpoch = sessionEpoch;
+    old.agentCreated = false;
+    delete old.boundOrigin;
+    delete old.currentUrl;
     old.blocked = false;
   } else {
     registrations.push({
@@ -256,6 +361,7 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
     if (message.kind === "getState") {
       await refreshRegistrations();
       return { connected, paired: Boolean(secret), port: configuredPort,
+        allowAgentCreatedTabs,
         registrations: registrations.map(r => ({ ...safeState(r), tabId: r.tabId })) };
     }
     if (message.kind === "pair") {
@@ -276,6 +382,17 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
       clearConnection();
       return {};
     }
+    if (message.kind === "setAgentCreatedTabs") {
+      if (typeof message.allowed !== "boolean") throw new Error("Invalid setting");
+      allowAgentCreatedTabs = message.allowed;
+      await chrome.storage.local.set({ [OPEN_TABS_KEY]: allowAgentCreatedTabs });
+      if (!allowAgentCreatedTabs) {
+        for (const r of registrations) if (r.agentCreated) r.blocked = true;
+        await persist();
+      }
+      await advertise();
+      return {};
+    }
     if (message.kind === "register") {
       await register(message.tabId, message.alias || "");
       return {};
@@ -292,7 +409,9 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
 async function observeNavigation(tabId, url, removed = false) {
   let changed = false;
   for (const r of registrations) {
-    if (r.tabId === tabId && (removed || (url && r.boundUrl !== url))) {
+    if (r.tabId === tabId &&
+        (removed || (url && (r.agentCreated ?
+          !isAllowedUrl(url) || new URL(url).origin !== r.boundOrigin : r.boundUrl !== url)))) {
       r.blocked = true;
       changed = true;
     }

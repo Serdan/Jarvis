@@ -22,6 +22,11 @@ small, .muted { color: #666; font-size: 12px; }
 <input id="alias" placeholder="e.g. agent-7" maxlength="128" />
 <button id="register">Register / reauthorize tab</button>
 <button id="unregister">Unregister current tab</button>
+<hr>
+<label style="display:flex;gap:9px;align-items:flex-start">
+<input id="allowAgentTabs" type="checkbox" style="width:auto;margin:3px 0 0" />
+<span><strong>Allow Jarvis to open new tabs</strong><small style="display:block">Only on sites with a manually registered tab and granted browser permission. New tabs are automatically registered; existing unregistered tabs remain private. Maximum 20 active agent-created tabs.</small></span>
+</label>
 <h2 style="font-size:14px">Registered tabs</h2><ul id="tabs"></ul>
 <p id="error" role="alert"></p>
 <script src="popup.js"></script></body></html>

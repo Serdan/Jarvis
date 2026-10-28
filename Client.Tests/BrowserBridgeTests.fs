@@ -146,8 +146,8 @@ let concurrentRequestsAndErrors () = task {
 
     let first = bridge.Execute("agent-7", "document.title", "{}", 2000, true)
     let second = bridge.Execute("agent-8", "document.title", "{}", 2000, true)
-    let! frameA = (receive socket).WaitAsync(TimeSpan.FromSeconds(3))
-    let! frameB = (receive socket).WaitAsync(TimeSpan.FromSeconds(3))
+    let! frameA = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
+    let! frameB = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
     let frames = [frameA;frameB]
     let find id = frames |> List.find (fun frame -> property frame "registrationId" = id)
     let response id value =
@@ -167,7 +167,7 @@ let concurrentRequestsAndErrors () = task {
     | _ -> Assert.Fail("Expected independent in-order results for both tabs")
 
     let errorTask = bridge.Execute("agent-7", "invalid()", "{}", 2000, true)
-    let! errorFrame = (receive socket).WaitAsync(TimeSpan.FromSeconds(3))
+    let! errorFrame = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
     let errorReply = JsonSerializer.Serialize({|
         version = 1; kind = "error"; requestId = property errorFrame "requestId"
         connectionId = connectionId; registrationId = "registered-01"
@@ -193,10 +193,62 @@ let timedOutMutationIsNotReplayed () = task {
         | Ok json -> json.Contains("agent-7")
         | _ -> false)
     let execution = bridge.Execute("agent-7", "submitSomething()", "{}", 100, true)
-    let! frame = (receive socket).WaitAsync(TimeSpan.FromSeconds(3))
+    let! frame = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
     Assert.That(property frame "kind", Is.EqualTo("executeJs"))
     let! result = execution
     match result with
     | Error e -> Assert.That(e.Contains("OutcomeUnknown"), Is.True)
     | Ok _ -> Assert.Fail("A timeout cannot claim a side-effecting action succeeded")
+}
+
+
+[<Test>]
+let openTabUsesPairedExtensionAndReturnsRegistration () = task {
+    let port = findPort()
+    use bridge = new BrowserBridge.Service(port, "test-secret")
+    bridge.Start()
+    let! client, connectionId = handshake port "test-secret"
+    use socket = client
+
+    let opening = bridge.OpenTab("https://example.test/chat/new", "agent-new", false)
+    let! request = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
+    Assert.That(property request "kind", Is.EqualTo("openTab"))
+    Assert.That(property request "url", Is.EqualTo("https://example.test/chat/new"))
+    Assert.That(property request "alias", Is.EqualTo("agent-new"))
+    use requestDoc = JsonDocument.Parse(request)
+    Assert.That(requestDoc.RootElement.GetProperty("active").GetBoolean(), Is.False)
+    let response = JsonSerializer.Serialize({|
+        version = 1; kind = "tabOpened"
+        requestId = property request "requestId"; connectionId = connectionId
+        tab = {| registrationId = "created-id-01"; alias = "agent-new"; availability = "loading"; agentCreated = true |}
+    |})
+    do! send socket response
+    let! result = opening
+    match result with
+    | Ok json -> Assert.That(json.Contains("created-id-01"), Is.True)
+    | Error error -> Assert.Fail("Expected new tab registration: " + error)
+
+    let second = bridge.OpenTab("https://example.test/chat/second", "agent-new-2", false)
+    let! request2 = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
+    do! send socket (JsonSerializer.Serialize({|
+        version = 1; kind = "error"; connectionId = connectionId
+        requestId = property request2 "requestId"; error = "AgentCreatedTabsDisabled"
+    |}))
+    let! rejected = second
+    match rejected with
+    | Error error -> Assert.That(error, Does.Contain("AgentCreatedTabsDisabled"))
+    | Ok _ -> Assert.Fail("Extension denial must not be reported as tab creation success")
+}
+
+[<Test>]
+let openTabRejectsUnsafeUrlsBeforeDispatch () = task {
+    let port = findPort()
+    use bridge = new BrowserBridge.Service(port, "test-secret")
+    bridge.Start()
+    for address in [ "javascript:alert(1)"; "file:///etc/passwd"; "https://user:secret@example.test/";
+                     "/relative"; "data:text/html,hi" ] do
+        let! result = bridge.OpenTab(address, "", false)
+        match result with
+        | Error message -> Assert.That(message, Does.StartWith("InvalidTabUrl"))
+        | Ok _ -> Assert.Fail("Unsafe URL accepted: " + address)
 }

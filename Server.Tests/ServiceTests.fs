@@ -667,12 +667,12 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
 
         let destructive =
             match methodInfo.Name with
-            | "BrowserExecuteFile" | "BrowserExecuteJs" | "ImportFile" | "UpdateClient" | "UpdateServer" | "WriteFile" | "PatchFile" | "RunCommand" | "RunProjectTask" | "StartJob" | "CancelJob" | "RemoveWorktree" | "RetireWorktree" -> true
+            | "BrowserOpenTab" | "BrowserExecuteFile" | "BrowserExecuteJs" | "ImportFile" | "UpdateClient" | "UpdateServer" | "WriteFile" | "PatchFile" | "RunCommand" | "RunProjectTask" | "StartJob" | "CancelJob" | "RemoveWorktree" | "RetireWorktree" -> true
             | _ -> false
 
         let openWorld =
             match methodInfo.Name with
-            | "BrowserExecuteFile" | "BrowserExecuteJs" | "ImportFile" | "UpdateClient" | "UpdateServer" | "RunCommand" | "RunProjectTask" | "StartJob" -> true
+            | "BrowserOpenTab" | "BrowserExecuteFile" | "BrowserExecuteJs" | "ImportFile" | "UpdateClient" | "UpdateServer" | "RunCommand" | "RunProjectTask" | "StartJob" -> true
             | _ -> false
 
         attribute.ReadOnly |> shouldEqual readOnly

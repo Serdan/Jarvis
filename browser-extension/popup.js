@@ -14,6 +14,7 @@ async function render() {
     $("status").textContent = state.connected ? "Connected to JarvisClient" :
       state.paired ? "Paired; currently disconnected" : "Not paired";
     $("port").value = String(state.port);
+    $("allowAgentTabs").checked = state.allowAgentCreatedTabs === true;
     $("current").textContent = tab ? (tab.title || "(untitled)") + " — " + (tab.url || "") : "No selected tab";
     const current = state.registrations.find(r => r.tabId === tab?.id);
     $("alias").value = current?.alias || "";
@@ -22,7 +23,7 @@ async function render() {
     for (const registration of state.registrations) {
       const item = document.createElement("li");
       const name = document.createElement("strong");
-      name.textContent = registration.alias || registration.registrationId;
+      name.textContent = (registration.alias || registration.registrationId) + (registration.agentCreated ? " (created by Jarvis)" : " (manual)");
       const info = document.createElement("small");
       info.textContent = " — " + registration.availability + " — " + registration.displayUrl;
       item.append(name, info);
@@ -48,5 +49,8 @@ $("register").onclick = () => action(async () => {
 });
 $("unregister").onclick = () => action(() => call("unregister", {
   tabId: currentTab?.id
+}));
+$("allowAgentTabs").onchange = () => action(() => call("setAgentCreatedTabs", {
+  allowed: $("allowAgentTabs").checked
 }));
 render();

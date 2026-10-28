@@ -285,6 +285,7 @@ module McpToolHelpers =
         | CreateSkillCommand _
         | PatchFileCommand _ -> Auth.WorkspaceWrite
         | UpdateClientCommand -> Auth.ProcessExecute
+        | BrowserOpenTabCommand _
         | BrowserExecuteFileCommand _
         | BrowserExecuteJsCommand _
         | RunCommandCommand _
@@ -1043,6 +1044,17 @@ type JarvisMcpTools =
       Description("List only tabs manually registered by the user in the local Jarvis browser extension.")>]
     static member BrowserListTabs([<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http BrowserListTabsCommand
+
+    [<McpServerTool(Title = "Open browser tab", ReadOnly = false, Destructive = true, Idempotent = false, OpenWorld = true);
+      McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["process:execute"]}]""");
+      Description("Open and automatically register a new browser tab on a site previously authorized by the user. Requires the extension's explicit agent-created-tabs opt-in; never grants access to existing unregistered tabs. Defaults to background. Do not blindly retry after timeout.")>]
+    static member BrowserOpenTab(url: string,
+                                  [<Optional; DefaultParameterValue("")>] alias: string,
+                                  [<Optional; DefaultParameterValue(false)>] active: bool,
+                                  [<Optional; DefaultParameterValue("")>] deviceId: string,
+                                  client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http (BrowserOpenTabCommand {
+            Url = url; Alias = McpToolHelpers.optionOfString alias; Active = Some active })
 
     [<McpServerTool(Title = "Execute browser project script", ReadOnly = false, Destructive = true, Idempotent = false, OpenWorld = true);
       McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["process:execute","workspace:read"]}]""");

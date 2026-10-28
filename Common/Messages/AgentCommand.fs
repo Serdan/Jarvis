@@ -164,7 +164,8 @@ type V2TaskReadCommand =
       AgentId: string
       Action: string
       TaskId: string
-      AssignmentGeneration: int }
+      AssignmentGeneration: int
+      CheckpointSequence: int64 }
 
 type V2TaskWriteCommand =
     { ProjectName: string
@@ -185,7 +186,8 @@ type V2TaskWriteCommand =
       Reason: string
       BaseOid: string
       TargetRef: string
-      DecisionSequence: int64 }
+      DecisionSequence: int64
+      Evidence: string }
 
 type V2LedgerReadCommand =
     { ProjectName: string
@@ -243,7 +245,11 @@ type V2ReviewWriteCommand =
       HeadOid: string
       Summary: string
       Verdict: string
-      Feedback: string }
+      Feedback: string
+      TestEvidence: string
+      Inspected: bool
+      Tested: bool
+      TestDetails: string }
 
 type GetTaskHistoryCommand =
     { ProjectName: string
@@ -1109,7 +1115,7 @@ module AgentCommandInfo =
         | None -> invocation command
 
 module AgentProtocol =
-    let version = "3.29"
+    let version = "3.30"
     let defaultPatchFuzzyContextLines = 3
     let maxResponseBytes = 900 * 1024
     let maxImageBytes = 8 * 1024 * 1024

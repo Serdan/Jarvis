@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "2026-10-28-v2-05-checkpoint-review-evidence",
   "title": "Implement complete checkpoints and review submission evidence",
-  "status": "open",
+  "status": "active",
   "priority": "P0",
   "dependencies": [
     "2026-10-28-v2-03-schema-contracts",
@@ -13,9 +13,18 @@
     "worktree": null
   },
   "checkpoint": {
-    "summary": "Architecture gap identified by the 2026-10-28 V2 implementation audit. Not started.",
-    "nextAction": "Implement the acceptance criteria in the accompanying HTML task; use disposable Git remotes and do not deploy or migrate V1.",
-    "verified": [],
+    "summary": "Implemented and verified immutable Working progress checkpoints, atomic submission/replacement final checkpoints with pinned spec/source/ref and separate owner-reported test evidence, plus immutable reviewer decision evidence for the frozen revision distinguishing inspection, reported tests and acceptance. Exposed six opt-in MCP methods, 64-bit checkpoint lookup, and safe reconciliation of old pending review commands without fabricating evidence. Full client suite 333/333 and server 62/62 passed.",
+    "nextAction": "V2-05 remains active pending V2-08 independently pinned source-repository identity, cross-remote adversarial verification and final acceptance review. Next dependency-ready implementation is V2-08 or V2-06 after coordinating source binding.",
+    "verified": [
+      "Working progress checkpoint remains Working and preserves slot, with exact sequence, source commit, owner evidence and stale-version guards",
+      "Review r1/r2 each atomically pins immutable final checkpoint, original spec OID, source ref/head, source URL and evidence status",
+      "Reviewer decision evidence binds frozen claimed revision/ref/head; acceptance without reported tests retains inspected=false/tested=false",
+      "Deleted immutable published review ref prevents claiming the revision",
+      "Checkpoint and reviewer evidence MCP command signatures and server permissions validated",
+      "Legacy pending review command without evidence reconciles only with blank/false evidence, never fabricated tested/inspected flags",
+      "Full Client.Tests 333/333 and Server.Tests 62/62 passed after targeted compatibility fix",
+      "git diff --check clean"
+    ],
     "lastCommit": null
   },
   "audit": {
@@ -29,5 +38,5 @@
     ],
     "sourceReport": "docs/reviews/2026-10-28-v2-spec-implementation-audit.md"
   },
-  "updatedAt": "2026-10-28T00:00:00Z"
+  "updatedAt": "2026-10-28T23:07:00+01:00"
 }

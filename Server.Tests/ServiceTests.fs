@@ -424,11 +424,11 @@ let ``command catalog matches AgentCommand union and MCP tools`` () =
     // Human-oriented V2 MCP tools route through eight carefully scoped wire commands.
     let v2Wire = set [ "V2TaskRead"; "V2TaskWrite"; "V2ReviewRead"; "V2ReviewWrite"; "V2IntegrationRead"; "V2IntegrationWrite"; "V2LedgerRead"; "V2LedgerWrite" ]
     let v2Tools =
-        set [ "V2AgentInbox"; "V2GetAssignment"; "V2CreateTask"; "V2ReviseTaskSpec"; "V2RegisterAgent"; "V2AssignTask"; "V2AcknowledgeAssignment"; "V2ReissueAssignment"; "V2BeginAttempt"
+        set [ "V2AgentInbox"; "V2GetAssignment"; "V2GetCheckpoint"; "V2CreateTask"; "V2ReviseTaskSpec"; "V2RegisterAgent"; "V2AssignTask"; "V2AcknowledgeAssignment"; "V2ReissueAssignment"; "V2BeginAttempt"; "V2CheckpointAttempt"
               "V2BindReviewBase"; "V2YieldAgent"; "V2ResumeAgent"; "V2CompleteAgentWork"
               "V2ParkAgent"; "V2ReissueQueuedAttempt"; "V2RecoverAgentAssignment"; "V2AcknowledgeReviewFeedback"
-              "V2ReviewTask"; "V2ReviewDetails"; "V2ReviewerInbox"
-              "V2SubmitReview"; "V2ReplaceReview"; "V2ClaimReview"; "V2DecideReview"
+              "V2ReviewTask"; "V2ReviewDetails"; "V2ReviewerInbox"; "V2ReviewDecisionEvidence"
+              "V2SubmitReview"; "V2ReplaceReview"; "V2SubmitReviewWithEvidence"; "V2ReplaceReviewWithEvidence"; "V2ClaimReview"; "V2DecideReview"; "V2DecideReviewWithEvidence"
               "V2WithdrawReview"; "V2ReassignReview"; "V2FinalizeReview"
               "V2LedgerHealth"; "V2GetOperationStatus"; "V2PendingOperations"; "V2ReconcilePendingOperations"; "V2AcknowledgePendingOperation"; "V2InitializeLedger"; "V2BindExistingLedger"; "V2RebindLedgerRemote"
               "V2InspectIntegration"; "V2PlanIntegration"; "V2MarkIntegrationPendingPush"; "V2RecordIntegration"; "V2CloseIntegratedTask" ]
@@ -450,7 +450,7 @@ let ``client-backed MCP tools expose an optional per-command deviceId`` () =
         |> Array.filter (fun methodInfo ->
             methodInfo.GetParameters()
             |> Array.exists (fun parameter -> parameter.ParameterType = typeof<ClientService>))
-    clientMethods.Length |> shouldEqual (AgentProtocol.commandDefinitions.Length - 1 + 32) // 40 MCP V2 aliases / 8 wire operations
+    clientMethods.Length |> shouldEqual (AgentProtocol.commandDefinitions.Length - 1 + 38) // 46 MCP V2 aliases / 8 wire operations
     for methodInfo in clientMethods do
         let deviceParam = methodInfo.GetParameters() |> Array.tryFind (fun parameter -> parameter.Name = "deviceId")
         match deviceParam with
@@ -668,13 +668,13 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
               for name in [ "V2InitializeLedger"; "V2BindExistingLedger"; "V2RebindLedgerRemote"; "V2AcknowledgePendingOperation" ] -> name, ledgerWrite
               for name in [ "V2InspectIntegration" ] -> name, integrationRead
               for name in [ "V2PlanIntegration"; "V2MarkIntegrationPendingPush"; "V2RecordIntegration"; "V2CloseIntegratedTask" ] -> name, integrationWrite
-              for name in [ "V2AgentInbox"; "V2GetAssignment" ] -> name, taskRead
-              for name in [ "V2CreateTask"; "V2ReviseTaskSpec"; "V2RegisterAgent"; "V2AssignTask"; "V2AcknowledgeAssignment"; "V2ReissueAssignment"; "V2BeginAttempt"
+              for name in [ "V2AgentInbox"; "V2GetAssignment"; "V2GetCheckpoint" ] -> name, taskRead
+              for name in [ "V2CreateTask"; "V2ReviseTaskSpec"; "V2RegisterAgent"; "V2AssignTask"; "V2AcknowledgeAssignment"; "V2ReissueAssignment"; "V2BeginAttempt"; "V2CheckpointAttempt"
                             "V2BindReviewBase"; "V2YieldAgent"; "V2ResumeAgent"; "V2CompleteAgentWork";
                             "V2ParkAgent"; "V2ReissueQueuedAttempt"; "V2RecoverAgentAssignment"; "V2AcknowledgeReviewFeedback" ] -> name, taskWrite
-              for name in [ "V2ReviewTask"; "V2ReviewDetails"; "V2ReviewerInbox" ] ->
+              for name in [ "V2ReviewTask"; "V2ReviewDetails"; "V2ReviewerInbox"; "V2ReviewDecisionEvidence" ] ->
                   name, v2Read
-              for name in [ "V2SubmitReview"; "V2ReplaceReview"; "V2ClaimReview"; "V2DecideReview"
+              for name in [ "V2SubmitReview"; "V2ReplaceReview"; "V2SubmitReviewWithEvidence"; "V2ReplaceReviewWithEvidence"; "V2ClaimReview"; "V2DecideReview"; "V2DecideReviewWithEvidence"
                             "V2WithdrawReview"; "V2ReassignReview"; "V2FinalizeReview" ] ->
                   name, v2Write ]
         aliases |> List.fold (fun map (key, value) -> Map.add key value map) original

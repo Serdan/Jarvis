@@ -468,7 +468,7 @@ type ReviewWorkflowTests() =
                       Reason = ""
                       BaseOid = ""
                       TargetRef = ""
-                      DecisionSequence = 0L }
+                      DecisionSequence = 0L; Evidence = "" }
                 let run cmd =
                     Client.V2ReviewApi.V2TaskApi.write cmd ctx
                     |> function
@@ -494,7 +494,7 @@ type ReviewWorkflowTests() =
                           OwnerId = "Owner"; ReviewerId = "Reviewer" } |> ignore
                 let queued =
                     Client.V2ReviewApi.V2TaskApi.read
-                        { ProjectName = "owner"; AgentId = "Owner"; Action = "AgentInbox"; TaskId = ""; AssignmentGeneration = 0 } ctx
+                        { ProjectName = "owner"; AgentId = "Owner"; Action = "AgentInbox"; TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L } ctx
                     |> function
                         | Ok value -> unbox<AgentInbox> value
                         | Error error -> failwithf "V2 inbox failed: %A" error
@@ -502,7 +502,7 @@ type ReviewWorkflowTests() =
                 Assert.That(queued.RunnableQueue.Head.Attempt.SpecBlobOid.Length, Is.EqualTo(40))
                 let generationLookup : Common.V2TaskReadCommand =
                     { ProjectName = "owner"; AgentId = ""; Action = "GetAssignment"
-                      TaskId = taskId; AssignmentGeneration = 1 }
+                      TaskId = taskId; AssignmentGeneration = 1; CheckpointSequence = 0L }
                 let snapshotAssignment =
                     Client.V2ReviewApi.V2TaskApi.read generationLookup ctx
                     |> function
@@ -552,7 +552,7 @@ type ReviewWorkflowTests() =
                           NextAction = "Resume work" } |> ignore
                 let ready =
                     Client.V2ReviewApi.V2TaskApi.read
-                        { ProjectName = "owner"; AgentId = "Owner"; Action = "AgentInbox"; TaskId = ""; AssignmentGeneration = 0 } ctx
+                        { ProjectName = "owner"; AgentId = "Owner"; Action = "AgentInbox"; TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L } ctx
                     |> function
                         | Ok value -> unbox<AgentInbox> value
                         | Error error -> failwithf "V2 Ready inbox failed: %A" error
@@ -570,13 +570,13 @@ type ReviewWorkflowTests() =
                       ActorId = "Owner"; ReviewerId = ""
                       ExpectedVersion = 5; Generation = 1
                       SourceRef = sourceRef; HeadOid = head; Summary = "Implementation ready"
-                      Verdict = ""; Feedback = "" }
+                      Verdict = ""; Feedback = ""; TestEvidence = ""; Inspected = false; Tested = false; TestDetails = "" }
                 match Client.V2ReviewApi.V2ReviewApi.write reviewCmd ctx with
                 | Ok _ -> ()
                 | Error error -> Assert.Fail(sprintf "V2 submit API failed: %A" error)
                 let after =
                     Client.V2ReviewApi.V2TaskApi.read
-                        { ProjectName = "owner"; AgentId = "Owner"; Action = "AgentInbox"; TaskId = ""; AssignmentGeneration = 0 } ctx
+                        { ProjectName = "owner"; AgentId = "Owner"; Action = "AgentInbox"; TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L } ctx
                     |> function
                         | Ok value -> unbox<AgentInbox> value
                         | Error error -> failwithf "V2 inbox failed: %A" error
@@ -1914,3 +1914,174 @@ type ReviewWorkflowTests() =
                 Assert.That(issue.OwnerAgentId, Is.EqualTo(owner))
                 Assert.That(issue.SpecBlobOid, Is.EqualTo(attempt.SpecBlobOid))
                 Assert.That(receipt.IsNone, Is.True))
+
+    [<Test>]
+    member _.WorkingCheckpointAndReviewRevisionsPreserveSeparateEvidence() =
+        withFixture (fun one _ first second baseOid sourceRef newCommit initTask ->
+            initTask "evidence"
+            let c = newCommit "Reported code" "v1"
+            let checkpointOp = Guid.NewGuid()
+            let checkpoint () =
+                ReviewWorkflow.checkpointAttempt first checkpointOp "evidence" "Owner"
+                    3 3 1 "Implemented first slice" "Continue review work"
+                    c "dotnet test: 12 passed (owner report)"
+            let progress = checkpoint () |> success
+            Assert.That(progress.AlreadyApplied, Is.False)
+            Assert.That((checkpoint () |> success).AlreadyApplied, Is.True)
+            let checkpointSeq = progress.Operation.Sequence
+            let snapshot, saved = ReviewWorkflow.getCheckpoint second "evidence" checkpointSeq |> success
+            Assert.That(saved.Kind, Is.EqualTo("Progress"))
+            Assert.That(saved.EvidenceStatus, Is.EqualTo("OwnerReported"))
+            Assert.That(saved.SourceCommit, Is.EqualTo(c))
+            Assert.That(saved.AssignmentGeneration, Is.EqualTo(1))
+            Assert.That(saved.Sequence, Is.EqualTo(checkpointSeq))
+            Assert.That(snapshot, Is.Not.Empty)
+            let inbox = ReviewWorkflow.getAgentInbox second "Owner" |> success
+            Assert.That(inbox.Agent.State, Is.EqualTo("Working"))
+            Assert.That(inbox.Working.IsSome, Is.True)
+            Assert.That(inbox.Working.Value.Attempt.Version, Is.EqualTo(4))
+            expectStale (ReviewWorkflow.checkpointAttempt second (Guid.NewGuid())
+                            "evidence" "Owner" 3 3 1 "Old" "Old" c "")
+
+            let requestId = Guid.NewGuid()
+            let submitId = Guid.NewGuid()
+            let submit () =
+                ReviewWorkflow.submitReviewWithEvidence first submitId "evidence" "Owner" 4 1
+                    requestId sourceRef c "Review v1" "12 unit tests passed (owner report)"
+            let submitted = submit () |> success
+            Assert.That((submit () |> success).AlreadyApplied, Is.True)
+            let _, request, revision1 = ReviewWorkflow.getReview second "evidence" requestId |> success
+            Assert.That(request.Status, Is.EqualTo("Unclaimed"))
+            Assert.That(revision1.Revision, Is.EqualTo(1))
+            Assert.That(revision1.SpecBlobOid.Length, Is.EqualTo(40))
+            Assert.That(revision1.SourceRepositoryId, Is.EqualTo(first.ProjectId.ToString("D")))
+            Assert.That(revision1.SourceRemote, Is.EqualTo(first.ApprovedFetchUrl))
+            Assert.That(revision1.PublishedSourceOid, Is.EqualTo(c))
+            Assert.That(revision1.EvidenceStatus, Is.EqualTo("OwnerReported"))
+            Assert.That(revision1.TestEvidence, Does.Contain("12 unit tests"))
+            let _, final1 = ReviewWorkflow.getCheckpoint second "evidence" revision1.CheckpointSequence |> success
+            Assert.That(final1.Kind, Is.EqualTo("Submission"))
+            Assert.That(final1.SourceCommit, Is.EqualTo(c))
+            Assert.That(final1.EvidenceStatus, Is.EqualTo("OwnerReported"))
+            Assert.That(final1.Sequence, Is.Not.EqualTo(checkpointSeq))
+
+            let d = newCommit "Revision v2" "v2"
+            let replacement = ReviewWorkflow.updateReviewWithEvidence first (Guid.NewGuid())
+                                  "evidence" "Owner" 1 requestId 1 sourceRef d "Review v2" ""
+                              |> success
+            let _, request2, revision2 = ReviewWorkflow.getReview second "evidence" requestId |> success
+            Assert.That(request2.CurrentRevision, Is.EqualTo(2))
+            Assert.That(revision2.Revision, Is.EqualTo(2))
+            Assert.That(revision2.HeadCommit, Is.EqualTo(d))
+            Assert.That(revision2.PublishedSourceOid, Is.EqualTo(d))
+            Assert.That(revision2.EvidenceStatus, Is.EqualTo("NotProvided"))
+            Assert.That(revision2.TestEvidence, Is.Empty)
+            Assert.That(revision2.CheckpointSequence, Is.EqualTo(replacement.Operation.Sequence))
+            let _, final2 = ReviewWorkflow.getCheckpoint second "evidence" revision2.CheckpointSequence |> success
+            Assert.That(final2.Kind, Is.EqualTo("Revision"))
+            Assert.That(final2.EvidenceStatus, Is.EqualTo("NotProvided"))
+            Assert.That(final2.SourceCommit, Is.EqualTo(d))
+            Assert.That(final2.Sequence, Is.Not.EqualTo(final1.Sequence))
+            let _, historic = ReviewWorkflow.getCheckpoint second "evidence" revision1.CheckpointSequence |> success
+            Assert.That(historic.SourceCommit, Is.EqualTo(c))
+            Assert.That((ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent.State,
+                        Is.EqualTo("Working"))
+            ReviewWorkflow.claimReview second (Guid.NewGuid()) "evidence" requestId "Reviewer" 2 2
+            |> success |> ignore
+            match ReviewWorkflow.updateReviewWithEvidence first (Guid.NewGuid()) "evidence"
+                      "Owner" 1 requestId 3 sourceRef d "Cannot replace" "not tested" with
+            | Error(ReviewAlreadyClaimed _) -> ()
+            | other -> Assert.Fail(sprintf "Frozen revision replaced: %A" other)
+            Assert.That(git one [ "status"; "--porcelain" ], Is.Empty))
+
+    [<Test>]
+    member _.ProgressCheckpointRejectsStaleGenerationAndUnverifiedSource() =
+        withFixture (fun _ _ first _ _ _ _ initTask ->
+            initTask "progressguard"
+            match ReviewWorkflow.checkpointAttempt first (Guid.NewGuid()) "progressguard" "Owner"
+                      3 3 2 "wrong generation" "continue" "" "" with
+            | Error(StaleEntityVersion _) -> ()
+            | other -> Assert.Fail(sprintf "Wrong generation accepted: %A" other)
+            match ReviewWorkflow.checkpointAttempt first (Guid.NewGuid()) "progressguard" "Owner"
+                      3 3 1 "source not present" "continue" (String.replicate 40 "e") "" with
+            | Error _ -> ()
+            | Ok _ -> Assert.Fail("Unverified source SHA accepted")
+            let _, _, attempt = ReviewWorkflow.getTask first "progressguard" |> success
+            Assert.That(attempt.Value.Version, Is.EqualTo(3)))
+
+    [<Test>]
+    member _.ReviewerEvidenceIsPinnedToClaimedRevisionAndNotInferredFromAcceptance() =
+        withFixture (fun one _ first second _ sourceRef newCommit initTask ->
+            initTask "reviewevidence"
+            let head = newCommit "Review me" "reviewed"
+            let requestId = Guid.NewGuid()
+            ReviewWorkflow.submitReviewWithEvidence first (Guid.NewGuid()) "reviewevidence"
+                "Owner" 3 1 requestId sourceRef head "Please review"
+                "owner reports test run" |> success |> ignore
+            ReviewWorkflow.claimReview second (Guid.NewGuid()) "reviewevidence"
+                requestId "Reviewer" 1 1 |> success |> ignore
+            match ReviewWorkflow.decideWithEvidence second (Guid.NewGuid()) "reviewevidence"
+                    requestId "Reviewer" 2 Accept "Accepted" true true "" with
+            | Error(InvalidBinding _) -> ()
+            | other -> Assert.Fail(sprintf "Tested requires explicit evidence: %A" other)
+            let result = ReviewWorkflow.decideWithEvidence second (Guid.NewGuid())
+                             "reviewevidence" requestId "Reviewer" 2 Accept "Accepted"
+                             true true "dotnet test: 122 passed (reviewer report)" |> success
+            let _, evidence = ReviewWorkflow.getDecisionEvidence first "reviewevidence" requestId |> success
+            Assert.That(evidence.Sequence, Is.EqualTo(result.Operation.Sequence))
+            Assert.That(evidence.Status, Is.EqualTo("Accepted"))
+            Assert.That(evidence.Revision, Is.EqualTo(1))
+            Assert.That(evidence.Inspected, Is.True)
+            Assert.That(evidence.Tested, Is.True)
+            Assert.That(evidence.ReviewedHead, Is.EqualTo(head))
+            Assert.That(evidence.ReviewRef, Does.EndWith("/r1"))
+            Assert.That(evidence.SpecBlobOid.Length, Is.EqualTo(40))
+            Assert.That(evidence.SourceRemote, Is.EqualTo(first.ApprovedFetchUrl))
+            let _, _, revision = ReviewWorkflow.getReview second "reviewevidence" requestId |> success
+            Assert.That(revision.EvidenceStatus, Is.EqualTo("OwnerReported"))
+            Assert.That(revision.Revision, Is.EqualTo(evidence.Revision))
+            let _, _, attempt = ReviewWorkflow.getTask first "reviewevidence" |> success
+            Assert.That(attempt.Value.Phase, Is.EqualTo("Working"))
+
+            // A separate accepted decision never claims testing merely because
+            // the reviewer accepted the code.
+            ReviewWorkflow.createTask first (Guid.NewGuid()) "acceptednoevidence" "Accepted no test claims"
+            |> success |> ignore
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) "acceptednoevidence"
+                (Guid.NewGuid()) "Reviewer" "Owner" |> success |> ignore
+            ReviewWorkflow.beginAttempt first (Guid.NewGuid()) "acceptednoevidence" "Reviewer" 1 1
+            |> success |> ignore
+            let baseOid = git one [ "rev-parse"; "HEAD~1" ]
+            ReviewWorkflow.bindReviewBase first (Guid.NewGuid()) "acceptednoevidence"
+                "Reviewer" 2 1 baseOid sourceRef |> success |> ignore
+            let otherId = Guid.NewGuid()
+            ReviewWorkflow.submitReview first (Guid.NewGuid()) "acceptednoevidence" "Reviewer" 3 1
+                otherId sourceRef head "Review without supplied tests" |> success |> ignore
+            ReviewWorkflow.claimReview second (Guid.NewGuid()) "acceptednoevidence" otherId "Owner" 1 1
+            |> success |> ignore
+            ReviewWorkflow.decide second (Guid.NewGuid()) "acceptednoevidence" otherId "Owner"
+                2 Accept "Accepted" |> success |> ignore
+            let _, plain = ReviewWorkflow.getDecisionEvidence second "acceptednoevidence" otherId |> success
+            Assert.That(plain.Status, Is.EqualTo("Accepted"))
+            Assert.That(plain.Inspected, Is.False)
+            Assert.That(plain.Tested, Is.False)
+            Assert.That(plain.TestDetails, Is.Null)
+            Assert.That(plain.Revision, Is.EqualTo(1)))
+
+    [<Test>]
+    member _.LostImmutableReviewRefPreventsClaimAndFalseVerification() =
+        withFixture (fun one _ first second _ sourceRef newCommit initTask ->
+            initTask "missingref"
+            let head = newCommit "Source commit" "missing review ref"
+            let req = Guid.NewGuid()
+            ReviewWorkflow.submitReviewWithEvidence first (Guid.NewGuid()) "missingref" "Owner"
+                3 1 req sourceRef head "Review C" "" |> success |> ignore
+            let reviewRef = $"refs/heads/jarvis-review/missingref/{req:N}/r1"
+            git one [ "push"; "origin"; ":" + reviewRef ] |> ignore
+            match ReviewWorkflow.claimReview second (Guid.NewGuid()) "missingref" req "Reviewer" 1 1 with
+            | Error _ -> ()
+            | Ok _ -> Assert.Fail("Missing immutable remote review ref must fail closed.")
+            let _, request, revision = ReviewWorkflow.getReview first "missingref" req |> success
+            Assert.That(request.Status, Is.EqualTo("Unclaimed"))
+            Assert.That(revision.EvidenceStatus, Is.EqualTo("NotProvided"))
+            Assert.That(revision.PublishedSourceOid, Is.EqualTo(head)))

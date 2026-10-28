@@ -507,6 +507,9 @@ module V2PendingIntentJournal =
                     owner @ [ "ExpectedVersion", "expectedVersion"
                               "AssignmentGeneration", "generation"
                               "BaseOid", "baseOid"; "TargetRef", "targetRef" ]
+                | "V2TaskWrite", "CheckpointAttempt" ->
+                    attempt @ [ "Summary", "summary"; "NextAction", "nextAction"
+                                "BaseOid", "sourceCommit"; "Evidence", "evidence" ]
                 | "V2TaskWrite", "YieldAgent" ->
                     attempt @ [ "Summary", "summary"; "NextAction", "nextAction" ]
                 | "V2TaskWrite", "ResumeAgent" -> attempt
@@ -523,15 +526,17 @@ module V2PendingIntentJournal =
                 | "V2ReviewWrite", "SubmitForReview" ->
                     owner @ [ "RequestId", "requestId"; "ExpectedVersion", "expectedVersion"
                               "Generation", "generation"; "SourceRef", "sourceRef"
-                              "HeadOid", "headOid"; "Summary", "summary" ]
+                              "HeadOid", "headOid"; "Summary", "summary"; "TestEvidence", "testEvidence" ]
                 | "V2ReviewWrite", "UpdateReviewRequest" ->
                     owner @ [ "RequestId", "requestId"; "ExpectedVersion", "expectedRequestVersion"
                               "Generation", "generation"; "SourceRef", "sourceRef"
-                              "HeadOid", "headOid"; "Summary", "summary" ]
+                              "HeadOid", "headOid"; "Summary", "summary"; "TestEvidence", "testEvidence" ]
                 | "V2ReviewWrite", "ClaimReview" ->
                     reviewer @ [ "Generation", "expectedRevision" ]
                 | "V2ReviewWrite", "ReviewDecision" ->
-                    reviewer @ [ "Verdict", "status"; "Feedback", "feedback" ]
+                    reviewer @ [ "Verdict", "status"; "Feedback", "feedback"
+                                 "Inspected", "inspected"; "Tested", "tested"
+                                 "TestDetails", "testDetails" ]
                 | "V2ReviewWrite", "WithdrawReview" ->
                     review @ [ "ActorId", "actor"; "ExpectedVersion", "expectedVersion"
                                "Feedback", "reason" ]
@@ -565,7 +570,17 @@ module V2PendingIntentJournal =
                     match Guid.TryParse localValue, Guid.TryParse remoteValue with
                     | (true, a), (true, b) -> a = b
                     | _ -> localValue = remoteValue
-                | _ -> false
+                | localValue, remoteValue ->
+                    // Older pending commands predate explicit evidence fields.
+                    // Missing evidence is equivalent only to a blank/false
+                    // declaration, never to a newly reported test or inspection.
+                    let optionalEmpty value =
+                        match value with
+                        | None -> true
+                        | Some raw -> String.IsNullOrWhiteSpace raw
+                                      || String.Equals(raw, "False", StringComparison.OrdinalIgnoreCase)
+                    List.contains source [ "TestEvidence"; "Inspected"; "Tested"; "TestDetails" ]
+                    && optionalEmpty localValue && optionalEmpty remoteValue
 
             operationKind record = Some operation.Type
             && not (List.isEmpty pairs)
@@ -854,6 +869,12 @@ module V2ReviewApi =
                     |> mapError
                     |> Result.map (fun (snapshot, request, revision) ->
                         box {| snapshotCommit = snapshot.Commit; request = request; revision = revision |}))
+            | "DecisionEvidence" ->
+                parseId "requestId" cmd.RequestId
+                |> Result.bind (fun requestId ->
+                    ReviewWorkflow.ReviewWorkflow.getDecisionEvidence binding cmd.TaskId requestId
+                    |> mapError
+                    |> Result.map box)
             | "ReviewerQueue" ->
                 ReviewWorkflow.ReviewWorkflow.reviewerQueue binding cmd.ReviewerId
                 |> mapError
@@ -874,15 +895,15 @@ module V2ReviewApi =
                             id ()
                             |> Result.mapError (fun e -> e)
                             |> Result.bind (fun reviewId ->
-                                ReviewWorkflow.ReviewWorkflow.submitReview binding operationId
+                                ReviewWorkflow.ReviewWorkflow.submitReviewWithEvidence binding operationId
                                     cmd.TaskId cmd.ActorId cmd.ExpectedVersion cmd.Generation reviewId
-                                    cmd.SourceRef cmd.HeadOid cmd.Summary
+                                    cmd.SourceRef cmd.HeadOid cmd.Summary cmd.TestEvidence
                                 |> mapError)
                         | "Update" ->
                             id () |> Result.bind (fun reviewId ->
-                                ReviewWorkflow.ReviewWorkflow.updateReview binding operationId
+                                ReviewWorkflow.ReviewWorkflow.updateReviewWithEvidence binding operationId
                                     cmd.TaskId cmd.ActorId cmd.Generation reviewId cmd.ExpectedVersion
-                                    cmd.SourceRef cmd.HeadOid cmd.Summary
+                                    cmd.SourceRef cmd.HeadOid cmd.Summary cmd.TestEvidence
                                 |> mapError)
                         | "Claim" ->
                             id () |> Result.bind (fun reviewId ->
@@ -896,8 +917,9 @@ module V2ReviewApi =
                                     let decision =
                                         if verdict = "Accept" then ReviewWorkflow.Accept
                                         else ReviewWorkflow.RequestChanges
-                                    ReviewWorkflow.ReviewWorkflow.decide binding operationId
-                                        cmd.TaskId reviewId cmd.ActorId cmd.ExpectedVersion decision cmd.Feedback
+                                    ReviewWorkflow.ReviewWorkflow.decideWithEvidence binding operationId
+                                        cmd.TaskId reviewId cmd.ActorId cmd.ExpectedVersion decision
+                                        cmd.Feedback cmd.Inspected cmd.Tested cmd.TestDetails
                                     |> mapError
                                 | _ -> Error(Client.ValidationError "Invalid V2 review verdict."))
                         | "Withdraw" ->
@@ -945,6 +967,9 @@ module V2TaskApi =
             | "GetAssignment" ->
                 ReviewWorkflow.ReviewWorkflow.getAssignment binding cmd.TaskId cmd.AssignmentGeneration
                 |> mapError |> Result.map box
+            | "GetCheckpoint" ->
+                ReviewWorkflow.ReviewWorkflow.getCheckpoint binding cmd.TaskId cmd.CheckpointSequence
+                |> mapError |> Result.map box
             | _ -> Error(Client.ValidationError "Unsupported V2 task read operation."))
 
     let write (cmd: V2TaskWriteCommand) rt =
@@ -987,6 +1012,11 @@ module V2TaskApi =
                             ReviewWorkflow.ReviewWorkflow.bindReviewBase binding operationId cmd.TaskId
                                 cmd.ActorId cmd.ExpectedVersion cmd.AssignmentGeneration
                                 cmd.BaseOid cmd.TargetRef
+                            |> mapError
+                        | "CheckpointAttempt" ->
+                            ReviewWorkflow.ReviewWorkflow.checkpointAttempt binding operationId
+                                cmd.TaskId cmd.ActorId cmd.ExpectedVersion cmd.ExpectedAgentVersion
+                                cmd.AssignmentGeneration cmd.Summary cmd.NextAction cmd.BaseOid cmd.Evidence
                             |> mapError
                         | "YieldAgent" ->
                             ReviewWorkflow.ReviewWorkflow.yieldAgent binding operationId

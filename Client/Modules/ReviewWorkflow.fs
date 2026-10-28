@@ -103,7 +103,32 @@ type ReviewRevision =
       TargetRef: string
       ReviewRef: string
       Summary: string
-      CreatedSequence: int64 }
+      CreatedSequence: int64
+      SpecBlobOid: string
+      SourceRepositoryId: string
+      SourceRemote: string
+      PublishedSourceOid: string
+      CheckpointSequence: int64
+      TestEvidence: string
+      EvidenceStatus: string }
+
+[<CLIMutable>]
+type ReviewDecisionEvidence =
+    { RequestId: string
+      Revision: int
+      TaskId: string
+      AttemptId: string
+      ReviewerId: string
+      Sequence: int64
+      Status: string
+      Inspected: bool
+      Tested: bool
+      TestDetails: string
+      Feedback: string
+      ReviewedHead: string
+      ReviewRef: string
+      SpecBlobOid: string
+      SourceRemote: string }
 
 [<CLIMutable>]
 type ReviewIntegration =
@@ -154,7 +179,10 @@ type AgentCheckpoint =
       Sequence: int64
       Summary: string
       NextAction: string
-      Kind: string }
+      Kind: string
+      SourceCommit: string
+      Evidence: string
+      EvidenceStatus: string }
 
 [<CLIMutable>]
 type InboxTask =
@@ -230,7 +258,9 @@ module ReviewWorkflow =
                     | "ReviewRequest" -> status "status" [ "Unclaimed"; "Claimed"; "Accepted"; "ChangesRequested"; "Withdrawn" ]
                     | "ReviewIntegration" -> status "status" [ "PendingSourceAction"; "PendingPush"; "Recorded" ]
                     | "ReviewFeedbackNotice" -> status "status" [ "Accepted"; "ChangesRequested" ]
-                    | "AgentCheckpoint" -> status "kind" [ "Yield"; "Completion"; "Recovery" ]
+                    | "AgentCheckpoint" -> status "kind" [ "Yield"; "Completion"; "Recovery"; "Progress"; "Submission"; "Revision" ]
+                    | "ReviewRevision" -> status "evidenceStatus" [ "NotProvided"; "OwnerReported"; "ReviewerVerified" ]
+                    | "ReviewDecisionEvidence" -> status "status" [ "Accepted"; "ChangesRequested" ]
                     | "AssignmentIssue" ->
                         status "reason" [ "Assignment"; "ReviewChanges"; "CompletionRequeue"; "Recovery"; "ExplicitReissue" ]
                     | "AssignmentReceipt" -> true
@@ -254,6 +284,8 @@ module ReviewWorkflow =
     let private receiptPath taskId attemptId generation =
         $"tasks/{taskId}/attempts/{attemptId}/assignments/{generation}.ack.json"
     let private requestPath taskId requestId = $"tasks/{taskId}/reviews/{requestId}/request.json"
+    let private decisionPath taskId requestId sequence =
+        $"tasks/{taskId}/reviews/{requestId}/decisions/{sequence}.json"
     let private integrationPath taskId actionId = $"tasks/{taskId}/integrations/{actionId}.json"
     let private feedbackPath taskId requestId = $"tasks/{taskId}/reviews/{requestId}/notification.json"
     let private revisionPath taskId requestId number = $"tasks/{taskId}/reviews/{requestId}/revisions/{number}.json"
@@ -629,7 +661,8 @@ module ReviewWorkflow =
                             { TaskId = taskId; AttemptId = attempt.AttemptId
                               OwnerAgentId = ownerId; AssignmentGeneration = generation
                               Sequence = snapshot.Header.NextSequence
-                              Summary = summary; NextAction = nextAction; Kind = "Yield" }
+                              Summary = summary; NextAction = nextAction; Kind = "Yield"
+                              SourceCommit = null; Evidence = null; EvidenceStatus = "NotProvided" }
                         return
                             [ change (checkpointPath taskId attempt.AttemptId snapshot.Header.NextSequence) None checkpoint
                               change (attemptPath taskId attempt.AttemptId) (Some attemptOid)
@@ -717,7 +750,8 @@ module ReviewWorkflow =
                               Sequence = snapshot.Header.NextSequence
                               Summary = summary
                               NextAction = if requeue then "Requested changes require reissuance" else "Await review or a new assignment"
-                              Kind = "Completion" }
+                              Kind = "Completion"
+                              SourceCommit = null; Evidence = null; EvidenceStatus = "NotProvided" }
                         return
                             [ change (checkpointPath taskId attempt.AttemptId snapshot.Header.NextSequence) None checkpoint
                               change (attemptPath taskId attempt.AttemptId) (Some attemptOid)
@@ -742,6 +776,60 @@ module ReviewWorkflow =
                                            snapshot.Header.NextSequence) ]
                                else [])
                     })
+
+    // A progress checkpoint never yields the Working execution slot. Its
+    // source/test evidence is owner-reported, not independently verified.
+    let checkpointAttempt binding operationId taskId ownerId expectedAttemptVersion
+                          expectedAgentVersion generation summary nextAction sourceCommit evidence =
+        if not (validTaskId taskId) || not (validAgent ownerId)
+           || expectedAttemptVersion < 1 || expectedAgentVersion < 1 || generation < 1
+           || not (validText 8192 summary) || not (validText 8192 nextAction)
+           || (not (String.IsNullOrEmpty evidence) && Encoding.UTF8.GetByteCount evidence > 8192) then
+            Error(InvalidBinding "Invalid Working checkpoint metadata.")
+        else
+            LedgerStore.transact binding
+                (intent operationId ownerId "CheckpointAttempt"
+                    {| taskId = taskId; ownerId = ownerId; expectedAttemptVersion = expectedAttemptVersion
+                       expectedAgentVersion = expectedAgentVersion; generation = generation
+                       summary = summary; nextAction = nextAction
+                       sourceCommit = sourceCommit; evidence = evidence |})
+                (fun snapshot ->
+                    result {
+                        let! task, _, attempt, attemptOid = getAttempt binding snapshot taskId
+                        let! agent, _ = required<ReviewAgent> binding snapshot (agentPath ownerId)
+                        if task.Lifecycle <> "InProgress" || attempt.OwnerAgentId <> ownerId
+                           || attempt.Phase <> "Working" || attempt.Version <> expectedAttemptVersion
+                           || attempt.AssignmentGeneration <> generation
+                           || agent.Version <> expectedAgentVersion || agent.State <> "Working"
+                           || agent.ActiveAttemptId <> attempt.AttemptId then
+                            return! Error(StaleEntityVersion "Checkpoint requires exact current Working versions and generation.")
+                        let! _ = requiredIssue binding snapshot taskId attempt
+                        if not (String.IsNullOrWhiteSpace sourceCommit) then
+                            do! LedgerStore.verifySourceObject binding sourceCommit
+                        let checkpoint =
+                            { TaskId = taskId; AttemptId = attempt.AttemptId
+                              OwnerAgentId = ownerId; AssignmentGeneration = generation
+                              Sequence = snapshot.Header.NextSequence; Summary = summary
+                              NextAction = nextAction; Kind = "Progress"
+                              SourceCommit = sourceCommit; Evidence = evidence
+                              EvidenceStatus = if String.IsNullOrWhiteSpace evidence then "NotProvided" else "OwnerReported" }
+                        return
+                            [ change (checkpointPath taskId attempt.AttemptId snapshot.Header.NextSequence) None checkpoint
+                              change (attemptPath taskId attempt.AttemptId) (Some attemptOid)
+                                { attempt with Version = attempt.Version + 1 } ]
+                    })
+
+    let getCheckpoint binding taskId sequence =
+        if not (validTaskId taskId) || sequence < 1L then
+            Error(InvalidBinding "Invalid checkpoint sequence.")
+        else result {
+            let! snapshot = LedgerStore.fetch binding
+            let! _, _, attempt, _ = getAttempt binding snapshot taskId
+            let! checkpoint, _ =
+                required<AgentCheckpoint> binding snapshot
+                    (checkpointPath taskId attempt.AttemptId sequence)
+            return snapshot.Commit, checkpoint
+        }
 
     let parkAgent binding operationId agentId expectedAgentVersion reason =
         if not (validAgent agentId) || expectedAgentVersion < 1 || not (validText 2048 reason) then
@@ -799,9 +887,10 @@ module ReviewWorkflow =
             return gitRef
         }
 
-    let submitReview binding operationId taskId ownerId expectedVersion generation requestId sourceRef headOid summary =
+    let submitReviewWithEvidence binding operationId taskId ownerId expectedVersion generation requestId sourceRef headOid summary testEvidence =
         if not (validTaskId taskId) || not (validAgent ownerId) || requestId = Guid.Empty
-           || expectedVersion < 1 || generation < 1 || not (validText 4096 summary) then
+           || expectedVersion < 1 || generation < 1 || not (validText 4096 summary)
+           || (not (String.IsNullOrEmpty testEvidence) && Encoding.UTF8.GetByteCount testEvidence > 8192) then
             Error(InvalidBinding "Invalid review submission.")
         else
             let requestIdText = requestId.ToString("N")
@@ -809,7 +898,7 @@ module ReviewWorkflow =
                 intent operationId ownerId "SubmitForReview"
                     {| taskId = taskId; ownerId = ownerId; expectedVersion = expectedVersion
                        generation = generation; requestId = requestId; sourceRef = sourceRef
-                       headOid = headOid; summary = summary |}
+                       headOid = headOid; summary = summary; testEvidence = testEvidence |}
             // Preflight is intentionally read-only. The ledger transition revalidates the same data.
             // The published source ref is an orphan candidate if the subsequent ledger CAS fails.
             match LedgerStore.findApplied binding action with
@@ -845,15 +934,31 @@ module ReviewWorkflow =
                                   CurrentRevision = 1; Status = "Unclaimed"; ClaimantId = null
                                   ClaimedRevision = 0; CreatedSequence = current.Header.NextSequence
                                   DecisionSequence = 0L; Feedback = null }
+                            let evidenceStatus =
+                                if String.IsNullOrWhiteSpace testEvidence then "NotProvided" else "OwnerReported"
+                            let finalCheckpoint =
+                                { TaskId = taskId; AttemptId = attempt.AttemptId
+                                  OwnerAgentId = ownerId; AssignmentGeneration = generation
+                                  Sequence = current.Header.NextSequence; Summary = summary
+                                  NextAction = "Await independent review"; Kind = "Submission"
+                                  SourceCommit = headOid; Evidence = testEvidence
+                                  EvidenceStatus = evidenceStatus }
                             let revision =
                                 { RequestId = requestIdText; Revision = 1; TaskId = taskId
                                   AttemptId = attempt.AttemptId; BaseCommit = attempt.BaseCommit
                                   HeadCommit = headOid; SourceRef = sourceRef; TargetRef = attempt.TargetRef
                                   ReviewRef = published; Summary = summary
-                                  CreatedSequence = current.Header.NextSequence }
+                                  CreatedSequence = current.Header.NextSequence
+                                  SpecBlobOid = attempt.SpecBlobOid
+                                  SourceRepositoryId = binding.ProjectId.ToString("D")
+                                  SourceRemote = binding.ApprovedFetchUrl
+                                  PublishedSourceOid = headOid
+                                  CheckpointSequence = current.Header.NextSequence
+                                  TestEvidence = testEvidence; EvidenceStatus = evidenceStatus }
                             return
                                 [ change (requestPath taskId requestIdText) None request
                                   change (revisionPath taskId requestIdText 1) None revision
+                                  change (checkpointPath taskId attempt.AttemptId current.Header.NextSequence) None finalCheckpoint
                                   change (attemptPath taskId attempt.AttemptId) (Some attemptOid)
                                     { attempt with Version = attempt.Version + 1
                                                    ActiveReviewRequestId = requestIdText
@@ -861,10 +966,15 @@ module ReviewWorkflow =
                         })
             }
 
-    let updateReview binding operationId taskId ownerId generation requestId expectedRequestVersion
-                     sourceRef headOid summary =
+    let submitReview binding operationId taskId ownerId expectedVersion generation requestId sourceRef headOid summary =
+        submitReviewWithEvidence binding operationId taskId ownerId expectedVersion generation
+            requestId sourceRef headOid summary null
+
+    let updateReviewWithEvidence binding operationId taskId ownerId generation requestId expectedRequestVersion
+                                 sourceRef headOid summary testEvidence =
         if not (validTaskId taskId) || not (validAgent ownerId) || requestId = Guid.Empty
-           || expectedRequestVersion < 1 || generation < 1 || not (validText 4096 summary) then
+           || expectedRequestVersion < 1 || generation < 1 || not (validText 4096 summary)
+           || (not (String.IsNullOrEmpty testEvidence) && Encoding.UTF8.GetByteCount testEvidence > 8192) then
             Error(InvalidBinding "Invalid review update.")
         else
             let id = requestId.ToString("N")
@@ -872,7 +982,8 @@ module ReviewWorkflow =
                 intent operationId ownerId "UpdateReviewRequest"
                     {| taskId = taskId; ownerId = ownerId; generation = generation
                        requestId = requestId; expectedRequestVersion = expectedRequestVersion
-                       sourceRef = sourceRef; headOid = headOid; summary = summary |}
+                       sourceRef = sourceRef; headOid = headOid; summary = summary
+                       testEvidence = testEvidence |}
             match LedgerStore.findApplied binding action with
             | Error failure -> Error failure
             | Ok(Some applied) -> Ok applied
@@ -908,18 +1019,39 @@ module ReviewWorkflow =
                                || liveAttempt.BaseCommit <> attempt.BaseCommit then
                                 return! Error(StaleEntityVersion "Review is no longer an editable request.")
                             do! LedgerStore.fetchReviewRef binding published headOid
+                            let evidenceStatus =
+                                if String.IsNullOrWhiteSpace testEvidence then "NotProvided" else "OwnerReported"
+                            let finalCheckpoint =
+                                { TaskId = taskId; AttemptId = liveAttempt.AttemptId
+                                  OwnerAgentId = ownerId; AssignmentGeneration = generation
+                                  Sequence = current.Header.NextSequence; Summary = summary
+                                  NextAction = "Await independent review"; Kind = "Revision"
+                                  SourceCommit = headOid; Evidence = testEvidence
+                                  EvidenceStatus = evidenceStatus }
                             let revision =
                                 { RequestId = id; Revision = nextNumber; TaskId = taskId
                                   AttemptId = liveAttempt.AttemptId; BaseCommit = liveAttempt.BaseCommit
                                   HeadCommit = headOid; SourceRef = sourceRef; TargetRef = liveAttempt.TargetRef
                                   ReviewRef = published; Summary = summary
-                                  CreatedSequence = current.Header.NextSequence }
+                                  CreatedSequence = current.Header.NextSequence
+                                  SpecBlobOid = liveAttempt.SpecBlobOid
+                                  SourceRepositoryId = binding.ProjectId.ToString("D")
+                                  SourceRemote = binding.ApprovedFetchUrl
+                                  PublishedSourceOid = headOid
+                                  CheckpointSequence = current.Header.NextSequence
+                                  TestEvidence = testEvidence; EvidenceStatus = evidenceStatus }
                             return
                                 [ change (requestPath taskId id) (Some requestOid)
                                     { request with Version = request.Version + 1; CurrentRevision = nextNumber }
-                                  change (revisionPath taskId id nextNumber) None revision ]
+                                  change (revisionPath taskId id nextNumber) None revision
+                                  change (checkpointPath taskId liveAttempt.AttemptId current.Header.NextSequence) None finalCheckpoint ]
                         })
             }
+
+    let updateReview binding operationId taskId ownerId generation requestId expectedRequestVersion
+                     sourceRef headOid summary =
+        updateReviewWithEvidence binding operationId taskId ownerId generation requestId
+            expectedRequestVersion sourceRef headOid summary null
 
     let claimReview binding operationId taskId requestId reviewerId expectedVersion expectedRevision =
         if not (validTaskId taskId) || requestId = Guid.Empty || not (validAgent reviewerId)
@@ -952,11 +1084,13 @@ module ReviewWorkflow =
                                                    ClaimedRevision = expectedRevision } ]
                     })
 
-    let decide binding operationId taskId requestId reviewerId expectedVersion verdict feedback =
+    let decideWithEvidence binding operationId taskId requestId reviewerId expectedVersion verdict feedback inspected tested testDetails =
         if not (validTaskId taskId) || requestId = Guid.Empty || not (validAgent reviewerId)
            || expectedVersion < 1
            || (verdict = RequestChanges && not (validText 4096 feedback))
-           || (not (isNull feedback) && Encoding.UTF8.GetByteCount feedback > 4096) then
+           || (not (isNull feedback) && Encoding.UTF8.GetByteCount feedback > 4096)
+           || (tested && (not (validText 8192 testDetails)))
+           || (not (isNull testDetails) && Encoding.UTF8.GetByteCount testDetails > 8192) then
             Error(InvalidBinding "Invalid review decision.")
         else
             let id = requestId.ToString("N")
@@ -964,7 +1098,8 @@ module ReviewWorkflow =
             LedgerStore.transact binding
                 (intent operationId reviewerId "ReviewDecision"
                     {| taskId = taskId; requestId = requestId; reviewerId = reviewerId
-                       expectedVersion = expectedVersion; status = status; feedback = feedback |})
+                       expectedVersion = expectedVersion; status = status; feedback = feedback
+                       inspected = inspected; tested = tested; testDetails = testDetails |})
                 (fun snapshot ->
                     result {
                         let! _, _, attempt, attemptOid = getAttempt binding snapshot taskId
@@ -1009,12 +1144,23 @@ module ReviewWorkflow =
                               DecisionSequence = snapshot.Header.NextSequence
                               Status = status; Feedback = feedback
                               Acknowledged = false; Version = 1 }
+                        let decisionEvidence =
+                            { RequestId = id; Revision = request.ClaimedRevision
+                              TaskId = taskId; AttemptId = attempt.AttemptId
+                              ReviewerId = reviewerId; Sequence = snapshot.Header.NextSequence
+                              Status = status; Inspected = inspected; Tested = tested
+                              TestDetails = testDetails; Feedback = feedback
+                              ReviewedHead = revision.HeadCommit
+                              ReviewRef = revision.ReviewRef
+                              SpecBlobOid = revision.SpecBlobOid
+                              SourceRemote = revision.SourceRemote }
                         let instructions =
                             if String.IsNullOrWhiteSpace feedback then
                                 "Address the changes requested in the review."
                             else feedback
                         return
                             [ change (requestPath taskId id) (Some requestOid) review
+                              change (decisionPath taskId id snapshot.Header.NextSequence) None decisionEvidence
                               change (feedbackPath taskId id) None notice
                               change (attemptPath taskId attempt.AttemptId) (Some attemptOid) nextAttempt ]
                             @ (if requeue then
@@ -1024,6 +1170,29 @@ module ReviewWorkflow =
                                else [])
                     })
 
+
+    let decide binding operationId taskId requestId reviewerId expectedVersion verdict feedback =
+        decideWithEvidence binding operationId taskId requestId reviewerId expectedVersion
+            verdict feedback false false null
+
+    let getDecisionEvidence binding taskId requestId =
+        if not (validTaskId taskId) || requestId = Guid.Empty then
+            Error(InvalidBinding "Invalid review evidence lookup.")
+        else result {
+            let! snapshot = LedgerStore.fetch binding
+            let id = requestId.ToString("N")
+            let! request, _ = required<ReviewRequest> binding snapshot (requestPath taskId id)
+            if request.DecisionSequence < 1L then
+                return! Error(StaleEntityVersion "Review has no decision evidence.")
+            let! evidence, _ =
+                required<ReviewDecisionEvidence> binding snapshot
+                    (decisionPath taskId id request.DecisionSequence)
+            if evidence.Revision <> request.ClaimedRevision
+               || evidence.RequestId <> id
+               || evidence.Status <> request.Status then
+                return! Error(LedgerIntegrityError "Review decision evidence disagrees with claimed revision.")
+            return snapshot.Commit, evidence
+        }
 
     let withdrawReview binding operationId taskId requestId actor expectedVersion reason =
         if not (validTaskId taskId) || requestId = Guid.Empty || not (validAgent actor)
@@ -1486,7 +1655,8 @@ module ReviewWorkflow =
                               OwnerAgentId = ownerId; AssignmentGeneration = generation
                               Sequence = snapshot.Header.NextSequence
                               Summary = reason; NextAction = "Restart the same assignment"
-                              Kind = "Recovery" }
+                              Kind = "Recovery"
+                              SourceCommit = null; Evidence = null; EvidenceStatus = "NotProvided" }
                         return
                             [ change (checkpointPath taskId attempt.AttemptId snapshot.Header.NextSequence)
                                 None checkpoint

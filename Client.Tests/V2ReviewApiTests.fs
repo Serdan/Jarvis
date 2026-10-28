@@ -38,7 +38,7 @@ let disabledV2ReadAndWriteDoNotTouchV1Tasks () =
               HeadOid = ""
               Summary = ""
               Verdict = ""
-              Feedback = "" }
+              Feedback = ""; TestEvidence = ""; Inspected = false; Tested = false; TestDetails = "" }
         match Client.V2ReviewApi.V2ReviewApi.write mutation context with
         | Error(Client.ValidationError message) ->
             Assert.That(message, Does.Contain("V2 ledger disabled"))
@@ -84,7 +84,7 @@ let v2ReviewMutationsNeedGitApprovalWhileReadsDoNot () =
               HeadOid = ""
               Summary = ""
               Verdict = ""
-              Feedback = "" }
+              Feedback = ""; TestEvidence = ""; Inspected = false; Tested = false; TestDetails = "" }
     match Client.PermissionPolicy.evaluate write with
     | Error(Client.ConfirmationRequired request) ->
         Assert.That(request.Permissions, Does.Contain(VersionControlWrite))
@@ -98,7 +98,7 @@ let v2TaskSetupAndInboxRefuseUnconfiguredCheckout () =
     try
         let context = GitCommandTests.TestContext root
         GitCommandTests.initRepo context
-        let inbox : V2TaskReadCommand = { ProjectName = "Project1"; AgentId = "Worker"; Action = "AgentInbox"; TaskId = ""; AssignmentGeneration = 0 }
+        let inbox : V2TaskReadCommand = { ProjectName = "Project1"; AgentId = "Worker"; Action = "AgentInbox"; TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L }
         match Client.V2ReviewApi.V2TaskApi.read inbox context with
         | Error(Client.ValidationError message) ->
             Assert.That(message, Does.Contain("V2 ledger disabled"))
@@ -122,7 +122,7 @@ let v2TaskSetupAndInboxRefuseUnconfiguredCheckout () =
               Reason = ""
               BaseOid = ""
               TargetRef = ""
-              DecisionSequence = 0L }
+              DecisionSequence = 0L; Evidence = "" }
         match Client.V2ReviewApi.V2TaskApi.write mutation context with
         | Error(Client.ValidationError message) ->
             Assert.That(message, Does.Contain("V2 ledger disabled"))
@@ -134,7 +134,7 @@ let v2TaskSetupAndInboxRefuseUnconfiguredCheckout () =
 [<Test>]
 let v2TaskMutationsRequireGitWritePermission () =
     Client.PermissionPolicy.clearGrants()
-    let inbox = V2TaskReadCommand { ProjectName = "Project1"; AgentId = "Worker"; Action = "AgentInbox"; TaskId = ""; AssignmentGeneration = 0 }
+    let inbox = V2TaskReadCommand { ProjectName = "Project1"; AgentId = "Worker"; Action = "AgentInbox"; TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L }
     match Client.PermissionPolicy.evaluate inbox with
     | Ok () -> ()
     | other -> Assert.Fail(sprintf "Inbox should be read-only: %A" other)
@@ -146,7 +146,7 @@ let v2TaskMutationsRequireGitWritePermission () =
               Title = "Task"; Html = "<h1>Task</h1>"; ExpectedVersion = 0
               ExpectedAgentVersion = 0; AssignmentGeneration = 0;
               Summary = ""; NextAction = ""; Reason = ""; BaseOid = ""; TargetRef = ""
-              DecisionSequence = 0L }
+              DecisionSequence = 0L; Evidence = "" }
     match Client.PermissionPolicy.evaluate write with
     | Error(Client.ConfirmationRequired approval) ->
         Assert.That(approval.Permissions, Does.Contain(VersionControlWrite))

@@ -190,6 +190,11 @@ module McpToolHelpers =
           "V2BindReviewBase"; "V2YieldAgent"; "V2ResumeAgent"; "V2CompleteAgentWork"
           "V2ParkAgent"; "V2ReissueQueuedAttempt"; "V2RecoverAgentAssignment"; "V2AcknowledgeReviewFeedback" ]
 
+    let private v2IntegrationReadMethods = [ "V2InspectIntegration" ]
+    let private v2IntegrationWriteMethods =
+        [ "V2PlanIntegration"; "V2MarkIntegrationPendingPush"
+          "V2RecordIntegration"; "V2CloseIntegratedTask" ]
+
     let private v2ReviewMethods =
         [ "V2ReviewTask"; "V2ReviewDetails"; "V2ReviewerInbox" ]
 
@@ -205,6 +210,8 @@ module McpToolHelpers =
 
         [ for name in v2TaskReadMethods -> fromWire "V2TaskRead" name
           for name in v2TaskWriteMethods -> fromWire "V2TaskWrite" name
+          for name in v2IntegrationReadMethods -> fromWire "V2IntegrationRead" name
+          for name in v2IntegrationWriteMethods -> fromWire "V2IntegrationWrite" name
           for name in v2ReviewMethods -> fromWire "V2ReviewRead" name
           for name in v2ReviewWriteMethods -> fromWire "V2ReviewWrite" name ]
 
@@ -214,7 +221,8 @@ module McpToolHelpers =
             (AgentProtocol.capabilities
              |> List.filter (fun capability ->
                  capability.Name <> "V2ReviewRead" && capability.Name <> "V2ReviewWrite"
-                 && capability.Name <> "V2TaskRead" && capability.Name <> "V2TaskWrite"))
+                 && capability.Name <> "V2TaskRead" && capability.Name <> "V2TaskWrite"
+                 && capability.Name <> "V2IntegrationRead" && capability.Name <> "V2IntegrationWrite"))
             @ v2AliasCapabilities
             @ [ serverLocalCapability
                     "GetProfile"
@@ -333,6 +341,7 @@ module McpToolHelpers =
         | GetOrchestrationSnapshotCommand _
         | GetTaskHistoryCommand _
         | V2TaskReadCommand _
+        | V2IntegrationReadCommand _
         | V2ReviewReadCommand _
         | GetProjectDetailsCommand _
         | ListDirectoryCommand _
@@ -369,6 +378,7 @@ module McpToolHelpers =
         | CreateWorktreeCommand _
         | RemoveWorktreeCommand _
         | V2TaskWriteCommand _
+        | V2IntegrationWriteCommand _
         | V2ReviewWriteCommand _
         | CreateTaskCommand _
         | UpdateTaskCommand _
@@ -1008,6 +1018,44 @@ type JarvisMcpTools =
     [<McpServerTool(Title = "Remove worktree", ReadOnly = false, Destructive = true, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Safely remove a clean, integrated and unlocked linked worktree. Requires local approval.")>]
     static member RemoveWorktree(projectName: string, worktreePath: string, [<Optional; DefaultParameterValue("")>] targetRef: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (RemoveWorktreeCommand { ProjectName = projectName; WorktreePath = worktreePath; TargetRef = McpToolHelpers.optionOfString targetRef })
+
+    [<McpServerTool(Title = "V2 inspect source integration", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Inspect persisted integration plan and current remote source target. Never writes source refs or ledger state; requires explicitly approved V2 binding.")>]
+    static member V2InspectIntegration(projectName: string, taskId: string, actionId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http
+            (V2IntegrationReadCommand { ProjectName = projectName; TaskId = taskId; ActionId = actionId })
+
+    [<McpServerTool(Title = "V2 plan source integration", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Pin the accepted review commit, source ref and expected remote target HEAD for a strictly verified fast-forward integration. No implicit merge or push.")>]
+    static member V2PlanIntegration(projectName: string, taskId: string, actionId: string, acceptedReviewId: string, expectedAttemptVersion: int, targetRef: string, expectedTargetHead: string, operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http
+            (V2IntegrationWriteCommand
+                { ProjectName = projectName; Action = "PlanIntegration"; OperationId = operationId
+                  TaskId = taskId; ActionId = actionId; RequestId = acceptedReviewId
+                  ExpectedVersion = expectedAttemptVersion; TargetRef = targetRef
+                  ExpectedTargetHead = expectedTargetHead })
+
+    [<McpServerTool(Title = "V2 integration pending push", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Explicitly mark a planned integration as awaiting a source push; does not push and cannot mark integration verified.")>]
+    static member V2MarkIntegrationPendingPush(projectName: string, taskId: string, actionId: string, expectedIntegrationVersion: int, operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http
+            (V2IntegrationWriteCommand
+                { ProjectName = projectName; Action = "PendingPush"; OperationId = operationId
+                  TaskId = taskId; ActionId = actionId; RequestId = ""
+                  ExpectedVersion = expectedIntegrationVersion; TargetRef = ""; ExpectedTargetHead = "" })
+
+    [<McpServerTool(Title = "V2 verify and record integration", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Verify remote target equals the exact accepted source commit, then atomically record integration evidence and mark task Integrated. Never pushes source code.")>]
+    static member V2RecordIntegration(projectName: string, taskId: string, actionId: string, expectedIntegrationVersion: int, operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http
+            (V2IntegrationWriteCommand
+                { ProjectName = projectName; Action = "RecordIntegration"; OperationId = operationId
+                  TaskId = taskId; ActionId = actionId; RequestId = ""
+                  ExpectedVersion = expectedIntegrationVersion; TargetRef = ""; ExpectedTargetHead = "" })
+
+    [<McpServerTool(Title = "V2 close integrated task", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Close an already Integrated V2 task at an exact task version, preserving all review and remote integration evidence.")>]
+    static member V2CloseIntegratedTask(projectName: string, taskId: string, actionId: string, expectedTaskVersion: int, operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http
+            (V2IntegrationWriteCommand
+                { ProjectName = projectName; Action = "CloseIntegratedTask"; OperationId = operationId
+                  TaskId = taskId; ActionId = actionId; RequestId = ""
+                  ExpectedVersion = expectedTaskVersion; TargetRef = ""; ExpectedTargetHead = "" })
 
     [<McpServerTool(Title = "V2 agent inbox", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Get current Working slot, runnable work, pending/available reviews, parked and accepted tasks from one Git snapshot. Requires an explicitly bound V2 ledger; V1 tasks are unchanged.")>]
     static member V2AgentInbox(projectName: string, agentId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =

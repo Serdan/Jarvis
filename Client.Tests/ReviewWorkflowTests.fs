@@ -835,3 +835,119 @@ type ReviewWorkflowTests() =
                 "Reissue before-completion rejection" |> success |> ignore
             let assigned = ReviewWorkflow.getAgentInbox second "Owner" |> success
             Assert.That(assigned.Agent.State, Is.EqualTo("Assigned")))
+
+
+    [<Test>]
+    member _.IntegrationRequiresExactRemoteApprovedHeadAndSeparateClosure() =
+        withFixture (fun one _ first second baseOid sourceRef newCommit initTask ->
+            initTask "integrate"
+            let approvedHead = newCommit "Accepted source" "accepted source tree"
+            let reviewId = Guid.NewGuid()
+            ReviewWorkflow.submitReview first (Guid.NewGuid()) "integrate" "Owner" 3 1
+                reviewId sourceRef approvedHead "Cumulative patch" |> success |> ignore
+            ReviewWorkflow.claimReview second (Guid.NewGuid()) "integrate" reviewId "Reviewer" 1 1
+            |> success |> ignore
+            ReviewWorkflow.decide second (Guid.NewGuid()) "integrate" reviewId "Reviewer" 2
+                Accept "Accepted exact change" |> success |> ignore
+            ReviewWorkflow.completeAgentWork first (Guid.NewGuid()) "integrate" "Owner" 5 3 1
+                "Completed source" |> success |> ignore
+            ReviewWorkflow.finalizeImplementation first (Guid.NewGuid()) "integrate" "Owner" 6 reviewId
+            |> success |> ignore
+            let actionId = Guid.NewGuid()
+            let planOp = Guid.NewGuid()
+            let plan binding =
+                ReviewWorkflow.planIntegration binding planOp "integrate" actionId reviewId 7
+                    sourceRef baseOid
+            Assert.That((plan first |> success).AlreadyApplied, Is.False)
+            Assert.That((plan second |> success).AlreadyApplied, Is.True)
+            let pending = ReviewWorkflow.inspectIntegration second "integrate" actionId |> success
+            Assert.That(pending.Integration.Status, Is.EqualTo("PendingSourceAction"))
+            Assert.That(pending.Integration.ApprovedHead, Is.EqualTo(approvedHead))
+            Assert.That(pending.Integration.ExpectedTargetHead, Is.EqualTo(baseOid))
+            Assert.That(pending.Integration.VerificationMethod, Is.Null)
+            Assert.That(pending.RemoteState, Is.EqualTo("PendingPush"))
+            Assert.That(pending.ObservedTargetHead, Is.EqualTo(baseOid))
+            Assert.That(git one [ "ls-remote"; "origin"; sourceRef ], Does.StartWith(baseOid))
+            match ReviewWorkflow.recordIntegration first (Guid.NewGuid()) "integrate" actionId 1 with
+            | Error(StaleEntityVersion _) -> ()
+            | other -> Assert.Fail(sprintf "Local source commit must not count as remote integration: %A" other)
+            match ReviewWorkflow.closeIntegratedTask first (Guid.NewGuid()) "integrate" actionId 3 with
+            | Error(StaleEntityVersion _) -> ()
+            | other -> Assert.Fail(sprintf "Cannot close before recorded integration: %A" other)
+            ReviewWorkflow.markIntegrationPendingPush second (Guid.NewGuid()) "integrate" actionId 1
+            |> success |> ignore
+            let waiting = ReviewWorkflow.inspectIntegration first "integrate" actionId |> success
+            Assert.That(waiting.Integration.Status, Is.EqualTo("PendingPush"))
+            Assert.That(waiting.RemoteState, Is.EqualTo("PendingPush"))
+            git one [ "push"; "origin"; $"HEAD:{sourceRef}" ] |> ignore
+            let ready = ReviewWorkflow.inspectIntegration second "integrate" actionId |> success
+            Assert.That(ready.RemoteState, Is.EqualTo("ReadyToRecord"))
+            Assert.That(ready.ObservedTargetHead, Is.EqualTo(approvedHead))
+            let recordId = Guid.NewGuid()
+            let record binding =
+                ReviewWorkflow.recordIntegration binding recordId "integrate" actionId 2
+            Assert.That((record second |> success).AlreadyApplied, Is.False)
+            Assert.That((record first |> success).AlreadyApplied, Is.True)
+            let verified = ReviewWorkflow.inspectIntegration first "integrate" actionId |> success
+            Assert.That(verified.Integration.Status, Is.EqualTo("Recorded"))
+            Assert.That(verified.Integration.Version, Is.EqualTo(3))
+            Assert.That(verified.Integration.VerificationMethod, Is.EqualTo("RemoteExactFastForwardCommit"))
+            Assert.That(verified.Integration.ObservedTargetHead, Is.EqualTo(approvedHead))
+            Assert.That(verified.Integration.VerifiedSequence, Is.GreaterThan(0L))
+            Assert.That(verified.Integration.VerifiedAtUtc, Is.Not.Null)
+            let _, integratedTask, _ = ReviewWorkflow.getTask second "integrate" |> success
+            Assert.That(integratedTask.Lifecycle, Is.EqualTo("Integrated"))
+            Assert.That((ReviewWorkflow.getAgentInbox first "Owner" |> success).AcceptedPendingIntegration.Length,
+                        Is.EqualTo(0))
+            let agentBefore = ReviewWorkflow.getAgentInbox first "Owner" |> success
+            Assert.That(agentBefore.Agent.State, Is.EqualTo("Completed"))
+            ReviewWorkflow.closeIntegratedTask first (Guid.NewGuid()) "integrate" actionId 4
+            |> success |> ignore
+            let _, closed, _ = ReviewWorkflow.getTask second "integrate" |> success
+            Assert.That(closed.Lifecycle, Is.EqualTo("Closed"))
+            Assert.That((ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent.State,
+                        Is.EqualTo("Completed"))
+            Assert.That(git one [ "status"; "--porcelain" ], Is.Empty))
+
+    [<Test>]
+    member _.IntegrationRejectsUnapprovedRemoteHeadAndStaleTargetPlan() =
+        withFixture (fun one _ first second baseOid sourceRef newCommit initTask ->
+            initTask "unexpected"
+            let approvedHead = newCommit "Reviewed patch" "reviewed changes"
+            let reviewId = Guid.NewGuid()
+            ReviewWorkflow.submitReview first (Guid.NewGuid()) "unexpected" "Owner" 3 1
+                reviewId sourceRef approvedHead "Pinned review" |> success |> ignore
+            ReviewWorkflow.claimReview second (Guid.NewGuid()) "unexpected" reviewId "Reviewer" 1 1
+            |> success |> ignore
+            ReviewWorkflow.decide second (Guid.NewGuid()) "unexpected" reviewId "Reviewer" 2
+                Accept "Approved" |> success |> ignore
+            ReviewWorkflow.completeAgentWork first (Guid.NewGuid()) "unexpected" "Owner" 5 3 1
+                "Completed" |> success |> ignore
+            ReviewWorkflow.finalizeImplementation first (Guid.NewGuid()) "unexpected" "Owner" 6 reviewId
+            |> success |> ignore
+            match ReviewWorkflow.planIntegration first (Guid.NewGuid()) "unexpected"
+                    (Guid.NewGuid()) reviewId 7 sourceRef approvedHead with
+            | Error(StaleEntityVersion _) -> ()
+            | other -> Assert.Fail(sprintf "Target OID must match remote at planning: %A" other)
+            match ReviewWorkflow.planIntegration first (Guid.NewGuid()) "unexpected"
+                    (Guid.NewGuid()) reviewId 7 "refs/heads/jarvis-orchestration" baseOid with
+            | Error(InvalidBinding _) -> ()
+            | other -> Assert.Fail(sprintf "Ledger orphan ref cannot be source target: %A" other)
+            let actionId = Guid.NewGuid()
+            ReviewWorkflow.planIntegration first (Guid.NewGuid()) "unexpected" actionId reviewId 7
+                sourceRef baseOid |> success |> ignore
+            let unapproved = newCommit "Unreviewed extra" "reviewed changes plus unapproved extra"
+            git one [ "push"; "origin"; $"HEAD:{sourceRef}" ] |> ignore
+            let observed = ReviewWorkflow.inspectIntegration second "unexpected" actionId |> success
+            Assert.That(observed.RemoteState, Is.EqualTo("TargetChanged"))
+            Assert.That(observed.ObservedTargetHead, Is.EqualTo(unapproved))
+            match ReviewWorkflow.recordIntegration second (Guid.NewGuid()) "unexpected" actionId 1 with
+            | Error(StaleEntityVersion _) -> ()
+            | other -> Assert.Fail(sprintf "Unreviewed advanced remote must be rejected: %A" other)
+            let _, task, attempt = ReviewWorkflow.getTask first "unexpected" |> success
+            Assert.That(task.Lifecycle, Is.EqualTo("Implemented"))
+            Assert.That(attempt.Value.IntegrationActionId, Is.EqualTo(actionId.ToString("N")))
+            Assert.That((ReviewWorkflow.inspectIntegration first "unexpected" actionId |> success).Integration.Status,
+                        Is.EqualTo("PendingSourceAction"))
+            Assert.That(git one [ "ls-remote"; "origin"; $"refs/heads/jarvis-review/unexpected/{reviewId:N}/r1" ],
+                        Does.StartWith(approvedHead)))

@@ -95,7 +95,7 @@ module LedgerStore =
     let private options = JsonSerializerOptions(PropertyNamingPolicy = JsonNamingPolicy.CamelCase, PropertyNameCaseInsensitive = true)
     let private oidPattern = Regex("^[0-9a-f]{40}([0-9a-f]{24})?$", RegexOptions.Compiled)
     let private recordPath = Regex("^records/[A-Za-z0-9_-]+(/[A-Za-z0-9_.-]+)*[.]json$", RegexOptions.Compiled)
-    let private ledgerPath = Regex("^(tasks/[A-Za-z0-9_-]+/(task[.]json|spec[.]html|attempts/[a-f0-9]{32}([.]json|/checkpoints/[0-9]+[.]json)|reviews/[a-f0-9]{32}/(request[.]json|notification[.]json|revisions/[0-9]+[.]json))|agents/[A-Za-z0-9_-]+[.]json|records/[A-Za-z0-9_-]+(/[A-Za-z0-9_.-]+)*[.]json)$", RegexOptions.Compiled)
+    let private ledgerPath = Regex("^(tasks/[A-Za-z0-9_-]+/(task[.]json|spec[.]html|attempts/[a-f0-9]{32}([.]json|/checkpoints/[0-9]+[.]json)|integrations/[a-f0-9]{32}[.]json|reviews/[a-f0-9]{32}/(request[.]json|notification[.]json|revisions/[0-9]+[.]json))|agents/[A-Za-z0-9_-]+[.]json|records/[A-Za-z0-9_-]+(/[A-Za-z0-9_.-]+)*[.]json)$", RegexOptions.Compiled)
     let private remotePattern = Regex("^[A-Za-z0-9][A-Za-z0-9_.-]*$", RegexOptions.Compiled)
 
     type private GitOutput =
@@ -627,6 +627,73 @@ module LedgerStore =
                     finally
                         git binding.RepositoryPath [ "update-ref"; "-d"; stage ] |> ignore
 
+
+
+    // Read-only source-remote verification. A temporary namespace is used so a
+    // local worktree, source branch and remote-tracking refs are never changed.
+    let private validTargetRef (targetRef: string) =
+        not (isNull targetRef)
+        && Regex.IsMatch(targetRef, "^refs/heads/[A-Za-z0-9][A-Za-z0-9_./-]*$")
+        && not (targetRef.Contains(".."))
+        && not (targetRef.EndsWith("/"))
+        && targetRef <> "refs/heads/jarvis-orchestration"
+        && not (targetRef.StartsWith("refs/heads/jarvis-review/", StringComparison.Ordinal))
+
+    let readRemoteTarget (binding: LedgerBinding) targetRef =
+        if not (validTargetRef targetRef) then
+            Error(InvalidBinding "Integration target must be a normal fully qualified source branch.")
+        else
+            match validate binding with
+            | Error error -> Error error
+            | Ok () ->
+                match git binding.RepositoryPath
+                        [ "ls-remote"; "--refs"; binding.RemoteName; targetRef ] with
+                | Error error -> Error error
+                | Ok result when result.ExitCode <> 0 ->
+                    Error(RemoteUnavailable $"Cannot inspect remote integration target: {result.Stderr}")
+                | Ok result when result.Stdout = "" ->
+                    Error(SourceUnavailable $"Remote integration target is missing: {targetRef}")
+                | Ok result ->
+                    let lines = result.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                    if lines.Length <> 1 then
+                        Error(LedgerIntegrityError "Remote integration target is ambiguous.")
+                    else
+                        let values = lines[0].Split('\t')
+                        if values.Length <> 2 || values[1] <> targetRef
+                           || not (oidPattern.IsMatch values[0]) then
+                            Error(LedgerIntegrityError "Remote returned a malformed target reference.")
+                        else
+                            let advertised = values[0]
+                            let stage = $"refs/jarvis/integration-verify/{Guid.NewGuid():N}"
+                            try
+                                match git binding.RepositoryPath
+                                        [ "fetch"; "--no-tags"; binding.RemoteName; $"{targetRef}:{stage}" ] with
+                                | Error error -> Error error
+                                | Ok fetched when fetched.ExitCode <> 0 ->
+                                    Error(RemoteUnavailable $"Cannot fetch remote target: {fetched.Stderr}")
+                                | Ok _ ->
+                                    match run binding.RepositoryPath [ "rev-parse"; stage ] with
+                                    | Ok actual when actual = advertised ->
+                                        match verifySourceObject binding actual with
+                                        | Ok () -> Ok actual
+                                        | Error error -> Error error
+                                    | Ok _ ->
+                                        Error(SourceUnavailable "Integration target moved during remote verification.")
+                                    | Error error -> Error error
+                            finally
+                                git binding.RepositoryPath [ "update-ref"; "-d"; stage ] |> ignore
+
+    let verifySourceAncestry (binding: LedgerBinding) earlier later =
+        match verifySourceObject binding earlier with
+        | Error error -> Error error
+        | Ok () ->
+            match verifySourceObject binding later with
+            | Error error -> Error error
+            | Ok () ->
+                match isAncestor binding.RepositoryPath earlier later with
+                | Ok true -> Ok ()
+                | Ok false -> Error(InvalidBinding "Approved integration head is not a fast-forward of the planned target.")
+                | Error error -> Error error
 
     let private intentHash (binding: LedgerBinding) (intent: LedgerIntent) =
         json

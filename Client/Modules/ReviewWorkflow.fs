@@ -45,6 +45,7 @@ type ReviewAttempt =
       AcceptedReviewRequestId: string
       AcceptedReviewRevision: int
       AcceptedHead: string
+      IntegrationActionId: string
       ReviewFeedback: string
       FeedbackSequence: int64
       AcknowledgedFeedbackSequence: int64 }
@@ -78,6 +79,34 @@ type ReviewRevision =
       ReviewRef: string
       Summary: string
       CreatedSequence: int64 }
+
+[<CLIMutable>]
+type ReviewIntegration =
+    { ActionId: string
+      TaskId: string
+      AttemptId: string
+      Version: int
+      Status: string
+      ReviewRequestId: string
+      ReviewRevision: int
+      BaseCommit: string
+      ApprovedHead: string
+      ReviewRef: string
+      TargetRef: string
+      ExpectedTargetHead: string
+      SourceRemote: string
+      PlannedSequence: int64
+      ObservedTargetHead: string
+      VerifiedSequence: int64
+      VerifiedAtUtc: string
+      VerificationMethod: string }
+
+[<CLIMutable>]
+type IntegrationInspection =
+    { LedgerCommit: string
+      Integration: ReviewIntegration
+      ObservedTargetHead: string
+      RemoteState: string }
 
 [<CLIMutable>]
 type ReviewFeedbackNotice =
@@ -142,6 +171,7 @@ module ReviewWorkflow =
     let private checkpointPath taskId attemptId sequence =
         $"tasks/{taskId}/attempts/{attemptId}/checkpoints/{sequence}.json"
     let private requestPath taskId requestId = $"tasks/{taskId}/reviews/{requestId}/request.json"
+    let private integrationPath taskId actionId = $"tasks/{taskId}/integrations/{actionId}.json"
     let private feedbackPath taskId requestId = $"tasks/{taskId}/reviews/{requestId}/notification.json"
     let private revisionPath taskId requestId number = $"tasks/{taskId}/reviews/{requestId}/revisions/{number}.json"
     let private reviewRef taskId requestId number = $"refs/heads/jarvis-review/{taskId}/{requestId}/r{number}"
@@ -304,6 +334,7 @@ module ReviewWorkflow =
                               ActiveReviewRequestId = null; LatestReviewRequestId = null
                               AcceptedReviewRequestId = null
                               AcceptedReviewRevision = 0; AcceptedHead = null
+                              IntegrationActionId = null
                               ReviewFeedback = null; FeedbackSequence = 0L
                               AcknowledgedFeedbackSequence = 0L }
                         return
@@ -852,6 +883,193 @@ module ReviewWorkflow =
                                 { attempt with Version = attempt.Version + 1; Phase = "Accepted" } ]
                     })
 
+
+    // Integration only handles the strictly provable fast-forward case. The
+    // observed remote head must equal the pinned approved review commit.
+    // Rewritten commits, merge commits and cherry-pick equivalence require a
+    // separately designed proof workflow; never assume equivalence from refs.
+    let planIntegration binding operationId taskId actionId requestId expectedAttemptVersion
+                        targetRef expectedTargetHead =
+        if not (validTaskId taskId) || actionId = Guid.Empty || requestId = Guid.Empty
+           || expectedAttemptVersion < 1
+           || not (validBranch targetRef)
+           || targetRef = "refs/heads/jarvis-orchestration"
+           || targetRef.StartsWith("refs/heads/jarvis-review/", StringComparison.Ordinal) then
+            Error(InvalidBinding "Invalid integration plan identifiers or source target.")
+        else
+            let actionText = actionId.ToString("N")
+            let reviewText = requestId.ToString("N")
+            LedgerStore.transact binding
+                (intent operationId "Orchestrator" "PlanIntegration"
+                    {| taskId = taskId; actionId = actionId; requestId = requestId
+                       expectedAttemptVersion = expectedAttemptVersion
+                       targetRef = targetRef; expectedTargetHead = expectedTargetHead |})
+                (fun snapshot ->
+                    result {
+                        let! task, _, attempt, attemptOid = getAttempt binding snapshot taskId
+                        let! request, _ =
+                            required<ReviewRequest> binding snapshot (requestPath taskId reviewText)
+                        if task.Lifecycle <> "Implemented" || attempt.Phase <> "Accepted"
+                           || attempt.Version <> expectedAttemptVersion
+                           || attempt.LatestReviewRequestId <> reviewText
+                           || attempt.AcceptedReviewRequestId <> reviewText
+                           || request.Status <> "Accepted"
+                           || attempt.AcceptedReviewRevision <> request.CurrentRevision
+                           || not (String.IsNullOrEmpty attempt.ActiveReviewRequestId)
+                           || not (String.IsNullOrEmpty attempt.IntegrationActionId)
+                           || targetRef <> attempt.TargetRef then
+                            return! Error(StaleEntityVersion "Task is not finalized with an unplanned accepted review.")
+                        let! revision, _ =
+                            required<ReviewRevision> binding snapshot
+                                (revisionPath taskId reviewText request.CurrentRevision)
+                        if revision.HeadCommit <> attempt.AcceptedHead
+                           || revision.BaseCommit <> attempt.BaseCommit
+                           || revision.TargetRef <> targetRef then
+                            return! Error(LedgerIntegrityError "Integration candidate differs from accepted cumulative review.")
+                        let! existing = read<ReviewIntegration> binding snapshot (integrationPath taskId actionText)
+                        if existing.IsSome then
+                            return! Error(StaleEntityVersion "Integration action ID is already used.")
+                        do! LedgerStore.fetchReviewRef binding revision.ReviewRef revision.HeadCommit
+                        do! LedgerStore.verifyReviewDiff binding revision.BaseCommit revision.HeadCommit
+                        let! observed = LedgerStore.readRemoteTarget binding targetRef
+                        if observed <> expectedTargetHead then
+                            return! Error(StaleEntityVersion "Remote target changed before integration planning.")
+                        do! LedgerStore.verifySourceAncestry binding revision.BaseCommit observed
+                        do! LedgerStore.verifySourceAncestry binding observed revision.HeadCommit
+                        let plan =
+                            { ActionId = actionText; TaskId = taskId; AttemptId = attempt.AttemptId
+                              Version = 1; Status = "PendingSourceAction"
+                              ReviewRequestId = reviewText; ReviewRevision = request.CurrentRevision
+                              BaseCommit = revision.BaseCommit; ApprovedHead = revision.HeadCommit
+                              ReviewRef = revision.ReviewRef; TargetRef = targetRef
+                              ExpectedTargetHead = observed; SourceRemote = binding.ApprovedFetchUrl
+                              PlannedSequence = snapshot.Header.NextSequence
+                              ObservedTargetHead = null; VerifiedSequence = 0L
+                              VerifiedAtUtc = null; VerificationMethod = null }
+                        return
+                            [ change (integrationPath taskId actionText) None plan
+                              change (attemptPath taskId attempt.AttemptId) (Some attemptOid)
+                                { attempt with Version = attempt.Version + 1; IntegrationActionId = actionText } ]
+                    })
+
+    let markIntegrationPendingPush binding operationId taskId actionId expectedVersion =
+        if not (validTaskId taskId) || actionId = Guid.Empty || expectedVersion < 1 then
+            Error(InvalidBinding "Invalid integration pending-push transition.")
+        else
+            let id = actionId.ToString("N")
+            LedgerStore.transact binding
+                (intent operationId "Orchestrator" "MarkIntegrationPendingPush"
+                    {| taskId = taskId; actionId = actionId; expectedVersion = expectedVersion |})
+                (fun snapshot ->
+                    result {
+                        let! task, _, attempt, _ = getAttempt binding snapshot taskId
+                        let! action, actionOid =
+                            required<ReviewIntegration> binding snapshot (integrationPath taskId id)
+                        if task.Lifecycle <> "Implemented" || attempt.IntegrationActionId <> id
+                           || action.Status <> "PendingSourceAction" || action.Version <> expectedVersion then
+                            return! Error(StaleEntityVersion "Integration is not awaiting an explicit source push.")
+                        return
+                            [ change (integrationPath taskId id) (Some actionOid)
+                                { action with Version = action.Version + 1; Status = "PendingPush" } ]
+                    })
+
+    let inspectIntegration binding taskId actionId =
+        if not (validTaskId taskId) || actionId = Guid.Empty then
+            Error(InvalidBinding "Invalid integration inspection identifier.")
+        else
+            result {
+                let! snapshot = LedgerStore.fetch binding
+                let! action, _ =
+                    required<ReviewIntegration> binding snapshot
+                        (integrationPath taskId (actionId.ToString("N")))
+                let! actual = LedgerStore.readRemoteTarget binding action.TargetRef
+                let state =
+                    if action.Status = "Recorded" then
+                        if actual = action.ApprovedHead then "Recorded"
+                        else "RecordedTargetMoved"
+                    elif actual = action.ApprovedHead then "ReadyToRecord"
+                    elif actual = action.ExpectedTargetHead then "PendingPush"
+                    else "TargetChanged"
+                return
+                    { LedgerCommit = snapshot.Commit
+                      Integration = action; ObservedTargetHead = actual
+                      RemoteState = state }
+            }
+
+    let recordIntegration binding operationId taskId actionId expectedVersion =
+        if not (validTaskId taskId) || actionId = Guid.Empty || expectedVersion < 1 then
+            Error(InvalidBinding "Invalid integration recording request.")
+        else
+            let id = actionId.ToString("N")
+            LedgerStore.transact binding
+                (intent operationId "Orchestrator" "RecordIntegration"
+                    {| taskId = taskId; actionId = actionId; expectedVersion = expectedVersion |})
+                (fun snapshot ->
+                    result {
+                        let! task, taskOid, attempt, _ = getAttempt binding snapshot taskId
+                        let! action, actionOid =
+                            required<ReviewIntegration> binding snapshot (integrationPath taskId id)
+                        if task.Lifecycle <> "Implemented" || attempt.Phase <> "Accepted"
+                           || attempt.IntegrationActionId <> id
+                           || action.Version <> expectedVersion
+                           || not (List.contains action.Status [ "PendingSourceAction"; "PendingPush" ])
+                           || action.SourceRemote <> binding.ApprovedFetchUrl
+                           || action.TaskId <> taskId || action.AttemptId <> attempt.AttemptId
+                           || action.ReviewRequestId <> attempt.AcceptedReviewRequestId
+                           || action.ReviewRevision <> attempt.AcceptedReviewRevision
+                           || action.ApprovedHead <> attempt.AcceptedHead
+                           || action.BaseCommit <> attempt.BaseCommit
+                           || action.TargetRef <> attempt.TargetRef then
+                            return! Error(StaleEntityVersion "Current integration no longer matches finalized task.")
+                        let! revision, _ =
+                            required<ReviewRevision> binding snapshot
+                                (revisionPath taskId action.ReviewRequestId action.ReviewRevision)
+                        if revision.HeadCommit <> action.ApprovedHead
+                           || revision.BaseCommit <> action.BaseCommit
+                           || revision.ReviewRef <> action.ReviewRef
+                           || revision.TargetRef <> action.TargetRef then
+                            return! Error(LedgerIntegrityError "Accepted revision evidence differs from integration plan.")
+                        do! LedgerStore.fetchReviewRef binding action.ReviewRef action.ApprovedHead
+                        do! LedgerStore.verifyReviewDiff binding action.BaseCommit action.ApprovedHead
+                        do! LedgerStore.verifySourceAncestry binding action.ExpectedTargetHead action.ApprovedHead
+                        let! observed = LedgerStore.readRemoteTarget binding action.TargetRef
+                        if observed <> action.ApprovedHead then
+                            return! Error(StaleEntityVersion
+                                "Remote target does not equal approved head. Push only the accepted commit and retry verification.")
+                        let integrated =
+                            { action with Version = action.Version + 1; Status = "Recorded"
+                                          ObservedTargetHead = observed
+                                          VerifiedSequence = snapshot.Header.NextSequence
+                                          VerifiedAtUtc = DateTimeOffset.UtcNow.ToString("O")
+                                          VerificationMethod = "RemoteExactFastForwardCommit" }
+                        return
+                            [ change (integrationPath taskId id) (Some actionOid) integrated
+                              change (taskPath taskId) (Some taskOid)
+                                { task with Version = task.Version + 1; Lifecycle = "Integrated" } ]
+                    })
+
+    let closeIntegratedTask binding operationId taskId actionId expectedTaskVersion =
+        if not (validTaskId taskId) || actionId = Guid.Empty || expectedTaskVersion < 1 then
+            Error(InvalidBinding "Invalid task closure request.")
+        else
+            let id = actionId.ToString("N")
+            LedgerStore.transact binding
+                (intent operationId "Orchestrator" "CloseIntegratedTask"
+                    {| taskId = taskId; actionId = actionId; expectedTaskVersion = expectedTaskVersion |})
+                (fun snapshot ->
+                    result {
+                        let! task, taskOid, attempt, _ = getAttempt binding snapshot taskId
+                        let! action, _ =
+                            required<ReviewIntegration> binding snapshot (integrationPath taskId id)
+                        if task.Version <> expectedTaskVersion || task.Lifecycle <> "Integrated"
+                           || attempt.IntegrationActionId <> id || action.Status <> "Recorded"
+                           || action.ObservedTargetHead <> action.ApprovedHead then
+                            return! Error(StaleEntityVersion "Task does not have a verified recorded integration.")
+                        return
+                            [ change (taskPath taskId) (Some taskOid)
+                                { task with Version = task.Version + 1; Lifecycle = "Closed" } ]
+                    })
+
     let acknowledgeReviewFeedback binding operationId taskId ownerId decisionSequence =
         if not (validTaskId taskId) || not (validAgent ownerId) || decisionSequence <= 0L then
             Error(InvalidBinding "Invalid review feedback acknowledgment.")
@@ -1129,7 +1347,7 @@ module ReviewWorkflow =
                             compare leftKey rightKey)
                     let working = owned |> List.filter (fun entry -> entry.Attempt.Phase = "Working")
                     let accepted = owned |> List.filter (fun entry ->
-                        entry.Attempt.Phase = "Accepted" && entry.Task.Lifecycle <> "Closed")
+                        entry.Attempt.Phase = "Accepted" && entry.Task.Lifecycle = "Implemented")
                     if working.Length > 1
                        || (match working with
                            | [ item ] -> agent.ActiveAttemptId <> item.Attempt.AttemptId
@@ -1179,5 +1397,8 @@ module ReviewWorkflow =
                           AvailableReviews = available
                           UnacknowledgedFeedback = feedback |> List.sortBy (fun notice -> notice.DecisionSequence)
                           SlotAvailable = active.IsNone
-                          Unassigned = owned.IsEmpty && pending.IsEmpty && available.IsEmpty }
+                          Unassigned =
+                              (owned |> List.forall (fun item ->
+                                  not (List.contains item.Task.Lifecycle [ "InProgress"; "Implemented" ])))
+                              && pending.IsEmpty && available.IsEmpty && feedback.IsEmpty }
             }

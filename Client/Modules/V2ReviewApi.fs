@@ -250,3 +250,55 @@ module V2TaskApi =
                     box {| operation = write.Operation
                            head = write.CurrentHead
                            alreadyApplied = write.AlreadyApplied |})))
+
+
+module V2IntegrationApi =
+    let private mapError (result: Result<'a, LedgerStore.LedgerFailure>) : Result<'a, EffectError> =
+        result |> Result.mapError (fun error -> Client.ValidationError $"V2 integration: {error}")
+
+    let private guid label (raw: string) =
+        match Guid.TryParse raw with
+        | true, parsed when parsed <> Guid.Empty -> Ok parsed
+        | _ -> Error(Client.ValidationError $"Invalid {label}: caller-stable UUID required.")
+
+    let read (cmd: V2IntegrationReadCommand) rt =
+        ReviewV2Binding.load cmd.ProjectName rt
+        |> Result.bind (fun binding ->
+            guid "integration action ID" cmd.ActionId
+            |> Result.bind (fun actionId ->
+                ReviewWorkflow.ReviewWorkflow.inspectIntegration binding cmd.TaskId actionId
+                |> mapError
+                |> Result.map box))
+
+    let write (cmd: V2IntegrationWriteCommand) rt =
+        ReviewV2Binding.load cmd.ProjectName rt
+        |> Result.bind (fun binding ->
+            guid "operation ID" cmd.OperationId
+            |> Result.bind (fun operationId ->
+                guid "integration action ID" cmd.ActionId
+                |> Result.bind (fun actionId ->
+                    let result =
+                        match cmd.Action with
+                        | "PlanIntegration" ->
+                            guid "accepted review ID" cmd.RequestId
+                            |> Result.bind (fun reviewId ->
+                                ReviewWorkflow.ReviewWorkflow.planIntegration binding operationId
+                                    cmd.TaskId actionId reviewId cmd.ExpectedVersion
+                                    cmd.TargetRef cmd.ExpectedTargetHead
+                                |> mapError)
+                        | "PendingPush" ->
+                            ReviewWorkflow.ReviewWorkflow.markIntegrationPendingPush binding
+                                operationId cmd.TaskId actionId cmd.ExpectedVersion
+                            |> mapError
+                        | "RecordIntegration" ->
+                            ReviewWorkflow.ReviewWorkflow.recordIntegration binding operationId
+                                cmd.TaskId actionId cmd.ExpectedVersion
+                            |> mapError
+                        | "CloseIntegratedTask" ->
+                            ReviewWorkflow.ReviewWorkflow.closeIntegratedTask binding
+                                operationId cmd.TaskId actionId cmd.ExpectedVersion
+                            |> mapError
+                        | _ -> Error(Client.ValidationError "Unsupported V2 integration operation.")
+                    result |> Result.map (fun write ->
+                        box {| operation = write.Operation; head = write.CurrentHead
+                               alreadyApplied = write.AlreadyApplied |}))))

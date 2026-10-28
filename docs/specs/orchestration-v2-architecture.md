@@ -267,7 +267,7 @@ All mutations require a stable operation ID, expected version(s), a valid actor,
 | ParkAttempt / BlockAttempt | Queued/Acknowledged/Working with condition/blocker | Parked/Blocked; release slot if held; review requests remain independently tracked and require explicit decision when affected |
 | ResumeAttempt | Parked/Blocked and condition resolved or explicit override | New Queued assignment generation; does not automatically acquire slot or revise a claimed review |
 | PlanIntegration | Accepted and code requires integration | Persist target ref, source commit, expected target head and actionId; pending source action |
-| RecordIntegration | Verified source evidence and current target remote ref | Persist verified integration; task Integrated; no implicit push |
+| RecordIntegration | Current planned action, verified immutable review ref, remote target exactly the accepted head | Persist verified remote evidence and method; task Integrated; no implicit source push |
 | CloseTask | Integrated or explicitly approved non-source closure policy | Closed; retain all attempts, evidence and audit |
 | CancelTask / AbandonAttempt | Explicit authorized cancellation and expected version | Terminal state; remove queue/slot membership; retain history |
 | BindAttemptSource | Registered project workspace, verified Git source reference | Update source observation only; never change agent owner or phase |
@@ -424,6 +424,50 @@ Integration progress is a separate typed substate on the Accepted attempt (`NotP
 If step 3 succeeded but the client lost its response, do **not** blindly repeat the merge/push. Re-read the source target and recognize whether the intended commit or patch is already integrated. If the source push succeeded but step 5 fails due to ledger outage, the ledger remains PendingSourceAction/Verification. On retry, verify the Git remote again and publish only the missing ledger evidence using the *same operation ID*.
 
 If a remote target has moved further, accept only if current remote evidence still demonstrates the required integration. If the target history was rewritten, require explicit operator reconciliation. No operation infers accepted/integrated status from old `status=completed` JSON, and no source push automatically marks a task Closed.
+
+### First V2 integration verifier: strict fast-forward only (2026-10-28)
+
+The isolated implementation adds a separate integration record at
+`tasks/<taskId>/integrations/<actionUuid>.json`, referenced by the accepted
+attempt's `integrationActionId`. The record contains the accepted review ID
+and revision, immutable review ref, cumulative base/head SHA, target ref, exact
+expected remote target SHA, approved source remote URL, state/version, ledger
+planning sequence and optional verification evidence. The task remains
+**Implemented** while the integration is pending; review acceptance and agent
+completion never imply a source push.
+
+`PlanIntegration` requires a Finished, finalized, Accepted attempt with no
+active review and no prior integration action. It independently re-fetches the
+immutable review ref and the live target ref from the *approved* remote; the
+caller-supplied expected target SHA must equal the advertised/fetched remote
+head. Both the pinned review base and the planned target must be ancestors of
+the accepted commit. Planning never changes the source branch, working tree,
+or the remote target. One integration action is current per task.
+
+`MarkIntegrationPendingPush` records the explicit PendingPush substate but
+does **not** push anything. `InspectIntegration` performs a fresh read-only
+remote observation and distinguishes PendingPush, ReadyToRecord, TargetChanged,
+Recorded, and RecordedTargetMoved. A commit only in the local checkout remains
+PendingPush. Remote source target fetches use temporary private refs, verified
+against their advertised OIDs, and never update a working branch.
+
+`RecordIntegration` requires the current action/version and independently
+re-verifies the exact immutable review ref and target. **The remote target must
+be exactly the accepted commit SHA.** A target with extra unreviewed commits,
+a missing ref, a rewritten or diverged target, a local-only merge, or a
+different merge/cherry-pick SHA is not accepted. The ledger transaction records
+the observed SHA, approved remote, verified UTC time, method
+`RemoteExactFastForwardCommit` and ledger sequence and changes the task to
+Integrated. Retrying with the same operation UUID does not duplicate the
+record. `CloseIntegratedTask` separately moves the task to Closed with an
+expected version; no agent state or execution slot changes.
+
+This narrow verifier intentionally does **not** yet attest equivalent merge
+commits or cherry-picked patches. Those require a separate, explicit and
+cryptographically/payload-verifiable patch-equivalence model, not an implicit
+assumption from source ancestry. A target moved after a successful recording
+is reported by later read-only inspection as RecordedTargetMoved, without
+rewriting the historical proof.
 
 ## 8. Client/server tools, security and usability
 
@@ -659,6 +703,10 @@ Use disposable **bare Git remotes, at least two independent clones, and multiple
 48. Late changes requested on Finished Task A while owner works on Task B queue the same Task A attempt with a new generation, without preempting B. Reissue becomes possible only after the owner is idle.
 49. Multiple unacknowledged review decisions remain individually discoverable; acknowledging one does not acknowledge another. Repeated operation UUIDs are idempotent.
 50. Explicit orchestrator recovery of a Working assignment records a checkpoint and invalidates the former generation without changing task ownership or source reviews.
+51. Plan accepted reviewed A..C against remote target A; ensure it does not push C and inspection reports PendingPush while remote remains at A.
+52. Pushing exact reviewed C changes inspection to ReadyToRecord; RecordIntegration re-verifies remote head and atomically records proof once; CloseTask is independently version-gated.
+53. An unapproved remote target head D following approved C is rejected, as is an incorrect expected target SHA at planning. Neither causes task Integrated, source edits or ledger evidence forgery.
+54. Source ref/target rewrite or missing ref causes fail-closed verification; verification is never inferred from a local-only commit.
 
 Run full client/server tests, full Git integration fixtures, format checks and an actual **backup restore** before live migration. Never simulate acceptance by a passing mock push alone.
 

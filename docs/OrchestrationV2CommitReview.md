@@ -152,3 +152,18 @@ V2ReissueQueuedAttempt is an explicit orchestrator selection for a queued genera
 V2RecoverAgentAssignment is an explicit orchestrator-controlled restart of an Assigned, Ready or Working agent. It writes an immutable Recovery checkpoint with the reason, advances the same attempt's assignment generation, releases the old Working slot and changes the agent to Assigned. This is not an inactivity detector or automatic response to a harness stall. Old-generation commands fail, while source and review records remain intact.
 
 Both commands are opt-in V2 Git-write MCP tools with normal stable operation UUIDs and local permissions. Migration, live V1 and production server state are untouched.
+
+
+## Explicit source integration tracking (experimental protocol 3.24)
+
+The V2 source integration flow is separate from review acceptance, agent completion and closing a task. It introduces a durable integration action record pinned to the accepted review revision and immutable source review ref, the cumulative base/head, approved remote, normal target ref and the expected remote target OID.
+
+- **V2PlanIntegration:** requires finalized Implemented task and an exact accepted review, with no existing integration action. The client verifies the approved immutable review ref, the currently advertised/fetched remote target OID and required Git ancestry, and writes a PendingSourceAction record in the canonical ledger. It does not change the source branch or push.
+- **V2MarkIntegrationPendingPush:** explicitly records that source integration is waiting for a remote push. It never pushes by itself.
+- **V2InspectIntegration:** read-only observation of the approved remote target, reporting PendingPush, ReadyToRecord, TargetChanged, Recorded or RecordedTargetMoved along with the durable plan and exact observed SHA.
+- **V2RecordIntegration:** verifies the current source remote target equals the **exact reviewed and accepted commit SHA**, and revalidates the immutable review ref before recording UTC verification time, remote OID, method and ledger sequence in one transaction. Only then does the task become Integrated.
+- **V2CloseIntegratedTask:** a distinct version-checked transition to Closed, with retained review/integration evidence and no effect on agent state.
+
+**Strict fast-forward limitation:** This initial verifier accepts only the approved commit as the exact remote target, with the planned target an ancestor of that approved head. It deliberately rejects unreviewed later commits, different merge-commit SHAs, cherry-picks and unverified patch equivalence; an explicit equivalence-proof implementation is future work. A successful local merge or unpushed commit is not evidence of remote integration. If the source push succeeds but the ledger transaction fails, callers retry verification using the *same operation ID*, not the source push. The client fetches remote branches into disposable private refs for inspection and never modifies source working trees implicitly.
+
+The five methods use separate V2IntegrationRead and V2IntegrationWrite wire contracts, with local binding validation and Git-write approval. Disposable bare-remote/two-clone tests verify the full plan/pending-push/push/record/close lifecycle, exact source refs, stale expected targets, extra unreviewed commits, idempotent replay and fail-closed opt-in. No live V1 migration or deployment was performed.

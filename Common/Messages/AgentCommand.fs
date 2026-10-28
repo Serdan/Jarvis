@@ -184,6 +184,22 @@ type V2TaskWriteCommand =
       TargetRef: string
       DecisionSequence: int64 }
 
+type V2IntegrationReadCommand =
+    { ProjectName: string
+      TaskId: string
+      ActionId: string }
+
+type V2IntegrationWriteCommand =
+    { ProjectName: string
+      Action: string
+      OperationId: string
+      TaskId: string
+      ActionId: string
+      RequestId: string
+      ExpectedVersion: int
+      TargetRef: string
+      ExpectedTargetHead: string }
+
 type V2ReviewReadCommand =
     { ProjectName: string
       Action: string
@@ -623,6 +639,8 @@ type AgentCommand =
     | GetTaskHistoryCommand of GetTaskHistoryCommand
     | V2TaskReadCommand of V2TaskReadCommand
     | V2TaskWriteCommand of V2TaskWriteCommand
+    | V2IntegrationReadCommand of V2IntegrationReadCommand
+    | V2IntegrationWriteCommand of V2IntegrationWriteCommand
     | V2ReviewReadCommand of V2ReviewReadCommand
     | V2ReviewWriteCommand of V2ReviewWriteCommand
     | GetProjectDetailsCommand of GetProjectDetailsCommand
@@ -684,6 +702,8 @@ module AgentCommandInfo =
         | GetTaskHistoryCommand _ -> "GetTaskHistoryCommand"
         | V2TaskReadCommand _ -> "V2TaskReadCommand"
         | V2TaskWriteCommand _ -> "V2TaskWriteCommand"
+        | V2IntegrationReadCommand _ -> "V2IntegrationReadCommand"
+        | V2IntegrationWriteCommand _ -> "V2IntegrationWriteCommand"
         | V2ReviewReadCommand _ -> "V2ReviewReadCommand"
         | V2ReviewWriteCommand _ -> "V2ReviewWriteCommand"
         | GetProjectDetailsCommand _ -> "GetProjectDetailsCommand"
@@ -751,6 +771,8 @@ module AgentCommandInfo =
         | GetTaskHistoryCommand _ -> "GetTaskHistory"
         | V2TaskReadCommand _ -> "V2TaskRead"
         | V2TaskWriteCommand _ -> "V2TaskWrite"
+        | V2IntegrationReadCommand _ -> "V2IntegrationRead"
+        | V2IntegrationWriteCommand _ -> "V2IntegrationWrite"
         | V2ReviewReadCommand _ -> "V2ReviewRead"
         | V2ReviewWriteCommand _ -> "V2ReviewWrite"
         | GetProjectDetailsCommand _ -> "GetProjectDetails"
@@ -816,6 +838,8 @@ module AgentCommandInfo =
         | GetTaskHistoryCommand cmd -> Some cmd.ProjectName
         | V2TaskReadCommand cmd -> Some cmd.ProjectName
         | V2TaskWriteCommand cmd -> Some cmd.ProjectName
+        | V2IntegrationReadCommand cmd -> Some cmd.ProjectName
+        | V2IntegrationWriteCommand cmd -> Some cmd.ProjectName
         | V2ReviewReadCommand cmd -> Some cmd.ProjectName
         | V2ReviewWriteCommand cmd -> Some cmd.ProjectName
         | GetProjectDetailsCommand cmd -> Some cmd.ProjectName
@@ -917,6 +941,8 @@ module AgentCommandInfo =
         | GetTaskHistoryCommand cmd -> Some(compact cmd.TaskId)
         | V2TaskReadCommand cmd -> Some(compact cmd.AgentId)
         | V2TaskWriteCommand cmd -> Some(compact cmd.Action)
+        | V2IntegrationReadCommand cmd -> Some(compact cmd.ActionId)
+        | V2IntegrationWriteCommand cmd -> Some(compact cmd.Action)
         | V2ReviewReadCommand cmd -> Some(compact cmd.Action)
         | V2ReviewWriteCommand cmd -> Some(compact cmd.Action)
         | GetGitDiffCommand cmd -> cmd.Path |> Option.map compact
@@ -977,6 +1003,8 @@ module AgentCommandInfo =
         | GetTaskHistoryCommand cmd -> Some(truncate 64 cmd.TaskId)
         | V2TaskReadCommand cmd -> Some(truncate 64 cmd.AgentId)
         | V2TaskWriteCommand cmd -> Some(truncate 64 cmd.Action)
+        | V2IntegrationReadCommand cmd -> Some(truncate 64 cmd.ActionId)
+        | V2IntegrationWriteCommand cmd -> Some(truncate 64 cmd.Action)
         | V2ReviewReadCommand cmd -> Some(truncate 64 cmd.Action)
         | V2ReviewWriteCommand cmd -> Some(truncate 64 cmd.Action)
         | GetGitDiffCommand cmd -> cmd.Path |> Option.map (truncate 64)
@@ -1040,7 +1068,7 @@ module AgentCommandInfo =
         | None -> invocation command
 
 module AgentProtocol =
-    let version = "3.23"
+    let version = "3.24"
     let defaultPatchFuzzyContextLines = 3
     let maxResponseBytes = 900 * 1024
     let maxImageBytes = 8 * 1024 * 1024
@@ -1079,6 +1107,8 @@ module AgentProtocol =
           definition "GetTaskHistory" "Reads Git change history for one task." [ ReadOnly ] false false false
           definition "V2TaskRead" "Reads a registered agent inbox from a single V2 ledger snapshot." [ ReadOnly; NetworkAccess ] false false false
           definition "V2TaskWrite" "Creates/assigns/starts V2 tasks and binds immutable review base." [ VersionControlWrite; NetworkAccess ] true true false
+          definition "V2IntegrationRead" "Inspect planned source integration and read-only remote status." [ ReadOnly; NetworkAccess ] false false false
+          definition "V2IntegrationWrite" "Plan or record verified source integration without implicit source push." [ VersionControlWrite; NetworkAccess ] true true false
           definition "V2ReviewRead" "Reads opt-in canonical V2 review ledger requests and reviewer inboxes." [ ReadOnly; NetworkAccess ] false false false
           definition "V2ReviewWrite" "Updates opt-in canonical V2 review ledger with a stable operation UUID." [ VersionControlWrite; NetworkAccess ] true true false
           definition "RemoveWorktree" "Removes a clean integrated Git worktree." [ VersionControlWrite; Destructive ] true true false

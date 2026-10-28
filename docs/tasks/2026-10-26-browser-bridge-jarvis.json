@@ -5,19 +5,19 @@
   "status": "active",
   "dependencies": [],
   "owner": null,
-  "updatedAt": "2026-10-28T20:01:29.8488454\u002B00:00",
+  "updatedAt": "2026-10-28T21:20:51.4192462\u002B00:00",
   "checkpoint": {
-    "summary": "Generic Jarvis Edge/Chromium browser bridge with manually registered tabs plus opt-in agent-created tabs. New BrowserOpenTab command opens a background tab on a manually approved origin, automatically registers it, preserves same-origin SPA navigation, and respects revocation. Latest commit 308a651 (protocol 3.20), superseding the earlier implementation checkpoint.",
-    "nextAction": "Independent security review and real Edge integration testing of popup opt-in, host permissions, BrowserOpenTab, automatic registration, same-origin navigation, JavaScript execution, reconnect and failure outcomes. Then coordinate client/server/extension release. Do not merge/deploy before acceptance.",
+    "summary": "Implemented a generic, persistent, one-shot JarvisClient browser scheduler in commit 7ef47e4. MCP ScheduleBrowserExecution/ListScheduledBrowserExecutions/CancelScheduledBrowserExecution schedule an open-tab\u002Bproject-script action by ID and delay. Jobs survive client restart; the client marks a job running before dispatch, never replays uncertain work, and needs no watchdog or agent-specific role state. Tab aliases can be generated uniquely. Browser consent remains extension-controlled.",
+    "nextAction": "Independent code review and real Edge acceptance: pair extension, manually register an origin, opt into agent-created tabs, schedule a short new-tab execution from a real project JavaScript file, verify it runs once and persists across client restart, and check revoke/cancel. Then integrate and deploy coordinated server/client/extension if accepted. No rollout yet.",
     "verified": [
-      "dotnet test Jarvis.slnx --no-restore: 60 server tests and 275 client tests passed",
-      "node --test browser-extension/tests/bridge.test.cjs: 9 tests passed",
-      "dotnet build Jarvis.slnx --no-restore: succeeded",
-      "git diff --check: clean",
-      "Commit 308a651 on feature/browser-bridge, clean worktree"
+      "dotnet test Jarvis.slnx --no-restore: 60 server and 279 client tests passed",
+      "node --test browser-extension/tests/bridge.test.cjs: 9 passed",
+      "git diff --check: passed",
+      "Commit 7ef47e4; worktree clean",
+      "Client.Tests BrowserSchedulesTests: persistence, cancellation, no-replay and validation passed"
     ],
     "blocker": null,
-    "lastCommit": "308a6514bc0c584cdd86a59caff6efd85eca65a6"
+    "lastCommit": "7ef47e41b6395d9fd1ddba12d641d53dbce90a4f"
   },
   "nextActor": "reviewer",
   "lastUpdatedBy": {

@@ -57,8 +57,85 @@ module ReviewV2Binding =
             |> fun value -> value.ToLowerInvariant()
         Path.Combine(baseDirectory, "ledger-v2", hash + ".json")
 
+    // The trust anchor is persisted independently of Git's replaceable cache.
+    // Serialize checkout-local updates across threads AND client processes.
+    let private withConfigLock (path: string) operation =
+        try
+            let dir = Path.GetDirectoryName path
+            Directory.CreateDirectory(dir) |> ignore
+            if DirectoryInfo(dir).Attributes.HasFlag(FileAttributes.ReparsePoint) then
+                Error(Client.ValidationError "V2 binding directory must not be a symlink.")
+            else
+                let lockPath = path + ".lock"
+                if File.Exists(lockPath) && File.GetAttributes(lockPath).HasFlag(FileAttributes.ReparsePoint) then
+                    Error(Client.ValidationError "V2 binding lock must not be a symlink.")
+                else
+                    let rec obtain attempts =
+                        try
+                            use held = new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite,
+                                                      FileShare.None, 4096, FileOptions.None)
+                            if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
+                                File.SetUnixFileMode(lockPath, UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
+                            operation ()
+                        with :? IOException when attempts < 50 ->
+                            System.Threading.Thread.Sleep(40)
+                            obtain (attempts + 1)
+                    obtain 0
+        with ex ->
+            Error(Client.ValidationError $"Cannot lock V2 trust binding: {ex.Message}")
+
+    let private readStored (path: string) =
+        try
+            if not (File.Exists path) then
+                Error(Client.ValidationError "V2 ledger has no approved local binding.")
+            elif File.GetAttributes(path).HasFlag(FileAttributes.ReparsePoint)
+                 || FileInfo(path).Length > 4096L then
+                Error(Client.ValidationError "V2 binding must be a regular, bounded file.")
+            else
+                let parsed = JsonSerializer.Deserialize<ReviewV2OptIn>(
+                    File.ReadAllText(path),
+                    JsonSerializerOptions(PropertyNameCaseInsensitive = true))
+                if isNull (box parsed) then
+                    Error(Client.ValidationError "Missing V2 binding record.")
+                else Ok parsed
+        with ex -> Error(Client.ValidationError $"Cannot read V2 binding: {ex.Message}")
+
+    let private writeStored (path: string) (stored: ReviewV2OptIn) overwrite =
+        let temp = path + "." + Guid.NewGuid().ToString("N") + ".tmp"
+        try
+            try
+                File.WriteAllText(temp, JsonSerializer.Serialize(stored))
+                if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
+                    File.SetUnixFileMode(temp, UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
+                File.Move(temp, path, overwrite)
+                Ok ()
+            with ex ->
+                Error(Client.ValidationError $"Cannot persist V2 binding: {ex.Message}")
+        finally
+            if File.Exists(temp) then File.Delete(temp)
+
+    let private validStored root (stored: ReviewV2OptIn) : Result<LedgerStore.LedgerBinding, EffectError> =
+        let projectOk, projectId = Guid.TryParse(stored.ProjectId)
+        let ledgerOk, ledgerId = Guid.TryParse(stored.LedgerId)
+        if stored.SchemaVersion <> 1 || not stored.Enabled
+           || not (String.Equals(stored.ProjectRoot, Path.GetFullPath(root), StringComparison.Ordinal))
+           || not projectOk || not ledgerOk || projectId = Guid.Empty || ledgerId = Guid.Empty
+           || stored.Epoch < 1
+           || String.IsNullOrWhiteSpace stored.RemoteName
+           || String.IsNullOrWhiteSpace stored.ApprovedFetchUrl
+           || String.IsNullOrWhiteSpace stored.ApprovedPushUrl
+           || String.IsNullOrWhiteSpace stored.HighestTrustedHead then
+            Error(Client.ValidationError "V2 binding is not explicitly enabled with a pinned root and identity.")
+        else
+            Ok
+                { RepositoryPath = root; RemoteName = stored.RemoteName
+                  ApprovedFetchUrl = stored.ApprovedFetchUrl
+                  ApprovedPushUrl = stored.ApprovedPushUrl
+                  ProjectId = projectId; LedgerId = ledgerId; Epoch = stored.Epoch }
+
     // Local binding is intentionally opt-in, separately from the normal Jarvis config.
-    // The read-only V2 tools also refuse to initialize or adopt a remote implicitly.
+    // A successful load never lowers its persisted trust anchor, even if another
+    // client process observes a later head during our network operation.
     let load projectName rt =
         match ProjectPaths.resolveProjectRoot projectName rt with
         | Error error -> Error error
@@ -67,56 +144,24 @@ module ReviewV2Binding =
             if not (File.Exists path) then
                 Error(Client.ValidationError $"V2 ledger disabled for this checkout. Approved binding required at {path}. No V1 fallback.")
             else
-                try
-                    let attrs = File.GetAttributes path
-                    if attrs.HasFlag(FileAttributes.ReparsePoint) || FileInfo(path).Length > 4096L then
-                        Error(Client.ValidationError "V2 binding config must be a regular, bounded file.")
-                    else
-                        let stored = JsonSerializer.Deserialize<ReviewV2OptIn>(
-                            File.ReadAllText(path),
-                            JsonSerializerOptions(PropertyNameCaseInsensitive = true))
-                        let projectOk, projectId = Guid.TryParse(stored.ProjectId)
-                        let ledgerOk, ledgerId = Guid.TryParse(stored.LedgerId)
-                        if isNull (box stored)
-                           || stored.SchemaVersion <> 1 || not stored.Enabled
-                           || not (String.Equals(stored.ProjectRoot, Path.GetFullPath(root), StringComparison.Ordinal))
-                           || not projectOk || not ledgerOk || projectId = Guid.Empty || ledgerId = Guid.Empty
-                           || stored.Epoch < 1
-                           || String.IsNullOrWhiteSpace stored.RemoteName
-                           || String.IsNullOrWhiteSpace stored.ApprovedFetchUrl
-                           || String.IsNullOrWhiteSpace stored.ApprovedPushUrl
-                           || String.IsNullOrWhiteSpace stored.HighestTrustedHead then
-                            Error(Client.ValidationError "V2 ledger binding is not explicitly enabled with a pinned root and identity.")
-                        else
-                            let binding : LedgerStore.LedgerBinding =
-                                { RepositoryPath = root
-                                  RemoteName = stored.RemoteName
-                                  ApprovedFetchUrl = stored.ApprovedFetchUrl
-                                  ApprovedPushUrl = stored.ApprovedPushUrl
-                                  ProjectId = projectId
-                                  LedgerId = ledgerId
-                                  Epoch = stored.Epoch }
-                            match LedgerStore.LedgerStore.fetch binding with
-                            | Error error ->
-                                Error(V2LedgerErrors.toEffect error)
-                            | Ok snapshot ->
-                                match LedgerStore.LedgerStore.verifyTrustedHead binding stored.HighestTrustedHead snapshot.Commit with
-                                | Error error ->
-                                    Error(V2LedgerErrors.toEffect error)
-                                | Ok () ->
-                                    if stored.HighestTrustedHead <> snapshot.Commit then
-                                        // Persist the new verified head independently from Git's local cache ref.
-                                        let next = { stored with HighestTrustedHead = snapshot.Commit }
-                                        let temp = path + "." + Guid.NewGuid().ToString("N") + ".tmp"
-                                        try
-                                            File.WriteAllText(temp, JsonSerializer.Serialize(next))
-                                            File.Move(temp, path, true)
-                                            Ok binding
-                                        finally
-                                            if File.Exists(temp) then File.Delete(temp)
-                                    else Ok binding
-                with ex ->
-                    Error(Client.ValidationError $"Cannot load V2 binding: {ex.Message}")
+                withConfigLock path (fun () ->
+                    readStored path
+                    |> Result.bind (fun stored ->
+                        validStored root stored
+                        |> Result.bind (fun binding ->
+                            LedgerStore.LedgerStore.fetch binding
+                            |> Result.mapError V2LedgerErrors.toEffect
+                            |> Result.bind (fun snapshot ->
+                                LedgerStore.LedgerStore.verifyTrustedHead binding
+                                    stored.HighestTrustedHead snapshot.Commit
+                                |> Result.mapError V2LedgerErrors.toEffect
+                                |> Result.bind (fun () ->
+                                    if stored.HighestTrustedHead = snapshot.Commit then Ok binding
+                                    else
+                                        writeStored path
+                                            { stored with HighestTrustedHead = snapshot.Commit } true
+                                        |> Result.map (fun () -> binding))))))
+
 
 
     // Setup is always an explicit approved action, never a side effect of a read.
@@ -158,17 +203,11 @@ module ReviewV2Binding =
                                   RemoteName = remoteName; ApprovedFetchUrl = approvedFetchUrl
                                   ApprovedPushUrl = approvedPushUrl
                                   HighestTrustedHead = snapshot.Commit }
-                            try
-                                Directory.CreateDirectory(Path.GetDirectoryName path) |> ignore
-                                let temp = path + "." + Guid.NewGuid().ToString("N") + ".tmp"
-                                try
-                                    File.WriteAllText(temp, JsonSerializer.Serialize(record))
-                                    File.Move(temp, path, false)
-                                    Ok record
-                                finally
-                                    if File.Exists temp then File.Delete temp
-                            with ex ->
-                                Error(Client.ValidationError $"Cannot persist verified V2 binding: {ex.Message}")
+                            withConfigLock path (fun () ->
+                                if File.Exists path then
+                                    Error(Client.ValidationError "V2 binding was concurrently created; refusing overwrite.")
+                                else
+                                    writeStored path record false |> Result.map (fun () -> record))
 
     let initializeNew projectName rt projectId ledgerId epoch remoteName
                       approvedFetchUrl approvedPushUrl acknowledgeVisibility =
@@ -200,15 +239,19 @@ module ReviewV2Binding =
         |> Result.bind (fun binding ->
             LedgerStore.LedgerStore.fetch binding
             |> Result.mapError V2LedgerErrors.toEffect
-            |> Result.map (fun snapshot ->
-                {| projectId = binding.ProjectId.ToString("D")
-                   ledgerId = binding.LedgerId.ToString("D")
-                   epoch = binding.Epoch
-                   remoteName = binding.RemoteName
-                   approvedFetchUrl = binding.ApprovedFetchUrl
-                   approvedPushUrl = binding.ApprovedPushUrl
-                   trustedLedgerHead = snapshot.Commit
-                   ledgerSequence = snapshot.Header.NextSequence |}))
+            |> Result.bind (fun snapshot ->
+                LedgerStore.LedgerStore.inspectRemotePolicy binding
+                |> Result.mapError V2LedgerErrors.toEffect
+                |> Result.map (fun protection ->
+                    {| projectId = binding.ProjectId.ToString("D")
+                       ledgerId = binding.LedgerId.ToString("D")
+                       epoch = binding.Epoch
+                       remoteName = binding.RemoteName
+                       approvedFetchUrl = binding.ApprovedFetchUrl
+                       approvedPushUrl = binding.ApprovedPushUrl
+                       trustedLedgerHead = snapshot.Commit
+                       ledgerSequence = snapshot.Header.NextSequence
+                       remoteProtection = protection |})))
 
     // Rebind only to the same logical ledger/epoch. Deliberate recovery with a
     // new epoch is a separate backed-up restore operation.
@@ -220,47 +263,53 @@ module ReviewV2Binding =
             match load projectName rt with
             | Error error -> Error error
             | Ok old ->
-                let newBinding =
-                    { old with RemoteName = remoteName
-                               ApprovedFetchUrl = approvedFetchUrl
-                               ApprovedPushUrl = approvedPushUrl }
-                match LedgerStore.LedgerStore.fetch newBinding with
-                | Error failure ->
-                    Error(V2LedgerErrors.toEffect failure)
-                | Ok snapshot ->
-                    match LedgerStore.LedgerStore.verifyTrustedHead newBinding expectedTrustedHead snapshot.Commit with
-                    | Error failure ->
-                        Error(V2LedgerErrors.toEffect failure)
-                    | Ok () ->
-                        match ProjectPaths.resolveProjectRoot projectName rt with
-                        | Error error -> Error error
-                        | Ok(FolderPath root) ->
-                            let path = pathForRoot root
-                            try
-                                let previous = File.ReadAllText path
-                                let record = JsonSerializer.Deserialize<ReviewV2OptIn>(previous)
-                                if not (String.Equals(record.ProjectId, old.ProjectId.ToString("D"), StringComparison.OrdinalIgnoreCase))
-                                   || not (String.Equals(record.LedgerId, old.LedgerId.ToString("D"), StringComparison.OrdinalIgnoreCase))
-                                   || record.Epoch <> old.Epoch then
-                                    Error(Client.ValidationError "V2 binding changed during rebind.")
+                match ProjectPaths.resolveProjectRoot projectName rt with
+                | Error error -> Error error
+                | Ok(FolderPath root) ->
+                    let path = pathForRoot root
+                    withConfigLock path (fun () ->
+                        readStored path
+                        |> Result.bind (fun stored ->
+                            validStored root stored
+                            |> Result.bind (fun current ->
+                                if current <> old then
+                                    Error(Client.ValidationError
+                                        "V2 binding changed while rebinding; reload and retry.")
                                 else
-                                    let replacement =
-                                        { record with RemoteName = remoteName
-                                                      ApprovedFetchUrl = approvedFetchUrl
-                                                      ApprovedPushUrl = approvedPushUrl
-                                                      HighestTrustedHead = snapshot.Commit }
-                                    let backup = path + ".previous-" + Guid.NewGuid().ToString("N")
-                                    File.WriteAllText(backup, previous)
-                                    let temp = path + "." + Guid.NewGuid().ToString("N") + ".tmp"
-                                    try
-                                        File.WriteAllText(temp, JsonSerializer.Serialize(replacement))
-                                        File.Move(temp, path, true)
-                                        Ok replacement
-                                    finally
-                                        if File.Exists temp then File.Delete temp
-                            with ex ->
-                                Error(Client.ValidationError $"V2 rebind failed: {ex.Message}")
-
+                                    let newBinding =
+                                        { old with RemoteName = remoteName
+                                                   ApprovedFetchUrl = approvedFetchUrl
+                                                   ApprovedPushUrl = approvedPushUrl }
+                                    LedgerStore.LedgerStore.fetch newBinding
+                                    |> Result.mapError V2LedgerErrors.toEffect
+                                    |> Result.bind (fun snapshot ->
+                                        // A caller-supplied anchor cannot replace what this
+                                        // checkout already trusted. Both must be ancestors.
+                                        LedgerStore.LedgerStore.verifyTrustedHead newBinding
+                                            stored.HighestTrustedHead snapshot.Commit
+                                        |> Result.mapError V2LedgerErrors.toEffect
+                                        |> Result.bind (fun () ->
+                                            LedgerStore.LedgerStore.verifyTrustedHead newBinding
+                                                expectedTrustedHead snapshot.Commit
+                                            |> Result.mapError V2LedgerErrors.toEffect
+                                            |> Result.bind (fun () ->
+                                                let replacement =
+                                                    { stored with RemoteName = remoteName
+                                                                  ApprovedFetchUrl = approvedFetchUrl
+                                                                  ApprovedPushUrl = approvedPushUrl
+                                                                  HighestTrustedHead = snapshot.Commit }
+                                                let backup =
+                                                    path + ".previous-" + Guid.NewGuid().ToString("N")
+                                                try
+                                                    File.WriteAllText(backup, JsonSerializer.Serialize(stored))
+                                                    if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
+                                                        File.SetUnixFileMode(backup,
+                                                            UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
+                                                    writeStored path replacement true
+                                                    |> Result.map (fun () -> replacement)
+                                                with ex ->
+                                                    Error(Client.ValidationError
+                                                        $"V2 rebind backup failed: {ex.Message}")))))))
 
 
 [<CLIMutable>]

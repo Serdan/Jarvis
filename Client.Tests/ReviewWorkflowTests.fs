@@ -1480,3 +1480,160 @@ type ReviewWorkflowTests() =
             Assert.That(recovered.Length, Is.EqualTo(1))
             Assert.That(recovered.Head.disposition, Is.EqualTo("NotFoundAtVerifiedHead"))
             Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(original)))
+
+
+    [<Test>]
+    member _.TrustBindingSerializesConcurrentReadersAndNeverRegresses() =
+        withFixture (fun one two first second _ _ _ _ ->
+            let ctx = GitCommandTests.TestContext(Path.GetDirectoryName one)
+            let anchor = (LedgerStore.fetch first |> success).Commit
+            let path = Client.V2ReviewApi.ReviewV2Binding.pathForRoot one
+            if File.Exists path then File.Delete path
+            let bind () =
+                Client.V2ReviewApi.ReviewV2Binding.bindExisting
+                    "owner" ctx first.ProjectId first.LedgerId first.Epoch
+                    first.RemoteName first.ApprovedFetchUrl first.ApprovedPushUrl anchor true
+            bind () |> function
+                | Ok _ -> ()
+                | Error error -> Assert.Fail(sprintf "Binding failed: %A" error)
+            let lockPath = path + ".lock"
+            use held = new FileStream(lockPath, FileMode.OpenOrCreate,
+                                      FileAccess.ReadWrite, FileShare.None)
+            use gate = new System.Threading.ManualResetEventSlim(false)
+            let jobs =
+                [| for _ in 1 .. 6 ->
+                    System.Threading.Tasks.Task.Run(fun () ->
+                        gate.Wait()
+                        Client.V2ReviewApi.ReviewV2Binding.load "owner" ctx) |]
+            gate.Set()
+            let newer = ReviewWorkflow.createTask second (Guid.NewGuid()) "newAnchor"
+                            "New trusted ledger head" |> success
+            let newHead = newer.CurrentHead
+            held.Dispose()
+            System.Threading.Tasks.Task.WaitAll(jobs |> Array.map (fun job -> job :> System.Threading.Tasks.Task))
+            for job in jobs do
+                match job.Result with
+                | Ok _ -> ()
+                | Error error -> Assert.Fail(sprintf "Concurrent verified load: %A" error)
+            let config = System.Text.Json.JsonSerializer.Deserialize<Client.V2ReviewApi.ReviewV2OptIn>(
+                File.ReadAllText path)
+            Assert.That(config.HighestTrustedHead, Is.EqualTo(newHead))
+            Assert.That(File.ReadAllText path, Does.Contain(newHead))
+            if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
+                let permissions = File.GetUnixFileMode(path)
+                Assert.That(permissions.HasFlag(UnixFileMode.OtherRead), Is.False)
+                Assert.That(permissions.HasFlag(UnixFileMode.GroupRead), Is.False)
+            File.Delete path)
+
+    [<Test>]
+    member _.RebindRejectsDifferentHistoryEvenWithCallerSuppliedValidHead() =
+        withFixture (fun one _ first _ _ _ _ _ ->
+            let ctx = GitCommandTests.TestContext(Path.GetDirectoryName one)
+            let trusted = (LedgerStore.fetch first |> success).Commit
+            let path = Client.V2ReviewApi.ReviewV2Binding.pathForRoot one
+            if File.Exists path then File.Delete path
+            Client.V2ReviewApi.ReviewV2Binding.bindExisting
+                "owner" ctx first.ProjectId first.LedgerId first.Epoch
+                first.RemoteName first.ApprovedFetchUrl first.ApprovedPushUrl trusted true
+            |> success |> ignore
+            let root = Path.GetDirectoryName one
+            let rogue = Path.Combine(root, "rogue.git")
+            git root [ "init"; "--bare"; rogue ] |> ignore
+            git one [ "remote"; "add"; "rogue"; rogue ] |> ignore
+            let separate = Path.Combine(root, "rogue-client")
+            git root [ "clone"; first.ApprovedFetchUrl; separate ] |> ignore
+            git separate [ "remote"; "add"; "rogue"; rogue ] |> ignore
+            let rogueBinding =
+                { first with RepositoryPath = separate; RemoteName = "rogue"
+                             ApprovedFetchUrl = rogue
+                             ApprovedPushUrl = rogue }
+            let rogueHead = LedgerStore.initialize rogueBinding true |> success
+            let rejected =
+                Client.V2ReviewApi.ReviewV2Binding.rebindRemote "owner" ctx
+                    "rogue" rogue rogue rogueHead.Commit true
+            match rejected with
+            | Error(Client.V2LedgerFailureError failure)
+                    when failure.Code = "LedgerIntegrityError" || failure.Code = "LedgerHistoryUnavailable" -> ()
+            | other -> Assert.Fail(sprintf "Independent rogue root must be rejected: %A" other)
+            let config = System.Text.Json.JsonSerializer.Deserialize<Client.V2ReviewApi.ReviewV2OptIn>(
+                File.ReadAllText path)
+            Assert.That(config.RemoteName, Is.EqualTo(first.RemoteName))
+            Assert.That(config.HighestTrustedHead, Is.EqualTo(trusted))
+            File.Delete path)
+
+
+    [<Test>]
+    member _.LocalBareRemoteProtectionDiagnosticsAreExplicitAndReadOnly() =
+        withFixture (fun one _ first _ _ _ _ _ ->
+            let original = (LedgerStore.fetch first |> success).Commit
+            let bare = first.ApprovedPushUrl
+            let initial = LedgerStore.inspectRemotePolicy first |> success
+            Assert.That(initial.RemoteKind, Is.EqualTo("LocalBareGit"))
+            Assert.That(initial.Visibility, Is.EqualTo("Unknown"))
+            Assert.That(initial.NonFastForwardRejection, Is.EqualTo("NotConfigured"))
+            Assert.That(initial.DeletionRejection, Is.EqualTo("NotConfigured"))
+            Assert.That(initial.SignedCommitRequirement, Is.EqualTo("Unknown"))
+            Assert.That(initial.Warnings.Length, Is.GreaterThan(0))
+            git one [ "--git-dir=" + bare; "config"; "receive.denyNonFastForwards"; "true" ] |> ignore
+            git one [ "--git-dir=" + bare; "config"; "receive.denyDeletes"; "true" ] |> ignore
+            let protectedRemote = LedgerStore.inspectRemotePolicy first |> success
+            Assert.That(protectedRemote.NonFastForwardRejection, Is.EqualTo("Enforced"))
+            Assert.That(protectedRemote.DeletionRejection, Is.EqualTo("Enforced"))
+            Assert.That(protectedRemote.SignedCommitRequirement, Is.EqualTo("Unknown"))
+            Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(original))
+            Assert.That(git one [ "status"; "--porcelain" ], Is.Empty))
+
+
+    [<Test>]
+    member _.BindingRejectsEmbeddedUrlCredentialsBeforeNetworkOrPersistence() =
+        withFixture (fun one _ first _ _ _ _ _ ->
+            let path = Client.V2ReviewApi.ReviewV2Binding.pathForRoot one
+            if File.Exists path then File.Delete path
+            let ctx = GitCommandTests.TestContext(Path.GetDirectoryName one)
+            let malicious = "https://user:secret@host.example/project.git?token=secret"
+            match Client.V2ReviewApi.ReviewV2Binding.bindExisting
+                      "owner" ctx first.ProjectId first.LedgerId first.Epoch first.RemoteName
+                      malicious malicious (String.replicate 40 "a") true with
+            | Error(Client.V2LedgerFailureError failure) ->
+                Assert.That(failure.Code, Is.EqualTo("InvalidBinding"))
+            | other -> Assert.Fail(sprintf "Embedded credentials must be refused: %A" other)
+            Assert.That(File.Exists path, Is.False)
+            match LedgerStore.inspectRemotePolicy
+                      { first with ApprovedFetchUrl = malicious; ApprovedPushUrl = malicious } with
+            | Error(InvalidBinding _) -> ()
+            | other -> Assert.Fail(sprintf "Remote policy must fail closed for embedded secrets: %A" other))
+
+
+    [<Test>]
+    member _.ChangedPushEndpointAndDeletedLedgerNeverResetTrustedBinding() =
+        withFixture (fun one _ first _ _ _ _ _ ->
+            let ctx = GitCommandTests.TestContext(Path.GetDirectoryName one)
+            let original = (LedgerStore.fetch first |> success).Commit
+            let path = Client.V2ReviewApi.ReviewV2Binding.pathForRoot one
+            if File.Exists path then File.Delete path
+            Client.V2ReviewApi.ReviewV2Binding.bindExisting
+                "owner" ctx first.ProjectId first.LedgerId first.Epoch
+                first.RemoteName first.ApprovedFetchUrl first.ApprovedPushUrl original true
+            |> success |> ignore
+            git one [ "remote"; "set-url"; "--push"; "origin"; "file:///not-an-approved-push.git" ] |> ignore
+            match Client.V2ReviewApi.ReviewV2Binding.load "owner" ctx with
+            | Error(Client.V2LedgerFailureError failure) ->
+                Assert.That(failure.Code, Is.EqualTo("InvalidBinding"))
+            | other -> Assert.Fail(sprintf "Changed push endpoint must reject: %A" other)
+            git one [ "remote"; "set-url"; "--push"; "origin"; first.ApprovedPushUrl ] |> ignore
+            git one [ "push"; "origin"; ":refs/heads/jarvis-orchestration" ] |> ignore
+            try
+                match Client.V2ReviewApi.ReviewV2Binding.load "owner" ctx with
+                | Error(Client.V2LedgerFailureError failure) ->
+                    Assert.That(failure.Code, Is.EqualTo("LedgerIntegrityError"))
+                | other -> Assert.Fail(sprintf "Missing ledger must not be recreated: %A" other)
+                let config = System.Text.Json.JsonSerializer.Deserialize<Client.V2ReviewApi.ReviewV2OptIn>(
+                    File.ReadAllText path)
+                Assert.That(config.HighestTrustedHead, Is.EqualTo(original))
+            finally
+                git one [ "push"; "origin"; $"{original}:refs/heads/jarvis-orchestration" ] |> ignore
+            Client.V2ReviewApi.ReviewV2Binding.load "owner" ctx |> function
+                | Ok _ -> ()
+                | Error error -> Assert.Fail(sprintf "Restored trusted ref: %A" error)
+            Assert.That(git one [ "status"; "--porcelain" ], Is.Empty)
+            File.Delete path)

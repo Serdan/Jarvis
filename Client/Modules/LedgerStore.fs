@@ -108,6 +108,15 @@ type LedgerEntityEffect =
       ReviewRef: string option
       VerifiedIntegrationSequence: int64 option }
 
+[<CLIMutable>]
+type LedgerRemotePolicy =
+    { RemoteKind: string
+      Visibility: string
+      NonFastForwardRejection: string
+      DeletionRejection: string
+      SignedCommitRequirement: string
+      Warnings: string array }
+
 type LedgerIntent =
     { OperationId: Guid
       Actor: string
@@ -233,11 +242,29 @@ module LedgerStore =
 
     let private run repo args = git repo args |> requireSuccess (String.concat " " args)
 
+    let private embedsCredentials (raw: string) =
+        let mutable uri = Unchecked.defaultof<Uri>
+        if Uri.TryCreate(raw, UriKind.Absolute, &uri) then
+            match uri.Scheme.ToLowerInvariant() with
+            | "https" | "http" ->
+                not (String.IsNullOrEmpty uri.UserInfo)
+                || not (String.IsNullOrEmpty uri.Query)
+                || not (String.IsNullOrEmpty uri.Fragment)
+            | "ssh" | "git+ssh" ->
+                uri.UserInfo.Contains(":")
+                || not (String.IsNullOrEmpty uri.Query)
+                || not (String.IsNullOrEmpty uri.Fragment)
+            | _ -> false
+        else false
+
     let private validate (binding: LedgerBinding) =
         if not (Directory.Exists binding.RepositoryPath) then
             Error(InvalidBinding "Repository path does not exist.")
         elif not (remotePattern.IsMatch binding.RemoteName) || binding.RemoteName.Contains("..") then
             Error(InvalidBinding "Invalid remote name.")
+        elif embedsCredentials binding.ApprovedFetchUrl
+             || embedsCredentials binding.ApprovedPushUrl then
+            Error(InvalidBinding "Canonical remote URLs must not embed credentials or secret-bearing query parameters.")
         elif String.IsNullOrWhiteSpace binding.ApprovedFetchUrl
              || String.IsNullOrWhiteSpace binding.ApprovedPushUrl
              || binding.ProjectId = Guid.Empty || binding.LedgerId = Guid.Empty || binding.Epoch < 1 then
@@ -249,6 +276,59 @@ module LedgerStore =
                 Ok ()
             | Ok _, Ok _ -> Error(InvalidBinding "Remote fetch or push endpoint differs from approved binding.")
             | _ -> Error(InvalidBinding "Approved remote is not configured.")
+
+    // Git's transport protocol cannot report hosting-provider branch rules
+    // or repository visibility. For local bare remotes we can check actual
+    // receive configuration; for hosted remotes we return explicit Unknown.
+    let inspectRemotePolicy (binding: LedgerBinding) =
+        match validate binding with
+        | Error error -> Error error
+        | Ok () ->
+            let path =
+                if Path.IsPathFullyQualified binding.ApprovedPushUrl then
+                    Some binding.ApprovedPushUrl
+                else
+                    let mutable url = Unchecked.defaultof<Uri>
+                    if Uri.TryCreate(binding.ApprovedPushUrl, UriKind.Absolute, &url)
+                       && url.Scheme = Uri.UriSchemeFile then Some url.LocalPath
+                    else None
+            let unknown =
+                { RemoteKind = "HostedOrUnknown"
+                  Visibility = "Unknown"
+                  NonFastForwardRejection = "Unknown"
+                  DeletionRejection = "Unknown"
+                  SignedCommitRequirement = "Unknown"
+                  Warnings = [| "Provider visibility, branch protection and commit signing cannot be verified via Git transport. Confirm them with your host before use." |] }
+            match path with
+            | None -> Ok unknown
+            | Some repo when not (Directory.Exists repo) -> Ok unknown
+            | Some repo ->
+                match git binding.RepositoryPath
+                        [ "--git-dir=" + repo; "rev-parse"; "--is-bare-repository" ] with
+                | Ok output when output.ExitCode = 0 && output.Stdout = "true" ->
+                    let setting name =
+                        match git binding.RepositoryPath
+                                [ "--git-dir=" + repo; "config"; "--bool"; "--get"; name ] with
+                        | Ok output when output.ExitCode = 0 && output.Stdout = "true" -> "Enforced"
+                        | Ok output when output.ExitCode = 0 && output.Stdout = "false" -> "NotEnforced"
+                        | Ok output when output.ExitCode = 1 -> "NotConfigured"
+                        | _ -> "Unknown"
+                    let nonFast = setting "receive.denyNonFastForwards"
+                    let deletion = setting "receive.denyDeletes"
+                    let warnings =
+                        [| if nonFast <> "Enforced" then
+                               "Local bare remote does not enforce rejecting non-fast-forward pushes."
+                           if deletion <> "Enforced" then
+                               "Local bare remote does not enforce rejecting branch deletion."
+                           "Git cannot independently verify remote repository visibility or signed-commit policy." |]
+                    Ok
+                        { RemoteKind = "LocalBareGit"
+                          Visibility = "Unknown"
+                          NonFastForwardRejection = nonFast
+                          DeletionRejection = deletion
+                          SignedCommitRequirement = "Unknown"
+                          Warnings = warnings }
+                | _ -> Ok unknown
 
     let private cacheRef (binding: LedgerBinding) =
         $"refs/jarvis/ledger-cache/{binding.ProjectId:N}"

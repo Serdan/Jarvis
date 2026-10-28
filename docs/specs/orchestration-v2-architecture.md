@@ -93,6 +93,8 @@ A brand-new clone cannot independently prove the remote's complete historical in
 
 **Privacy:** an orphan branch on a *public* Git repository is public. Initial setup must explicitly confirm exposure of task descriptions, instructions, checkpoints and retained history; warn if remote visibility cannot be verified. Refuse tokens, secrets, private keys and credentials in persisted task fields by policy/validation; history cannot be made confidential simply by deleting a later blob. For confidential projects use a private remote.
 
+**Experimental V2 trust hardening (2026-10-28):** the client serializes per-checkout binding and monotonic trusted-head updates through an exclusive cross-process lock and an atomic private binding file. Rebind verifies the previously persisted anchor **and** the independently supplied new expected anchor. Local bare Git remotes expose read-only non-fast-forward and deletion rejection diagnostics; hosted branch policies, repository visibility and signed-commit requirements are reported `Unknown` when ordinary Git transport cannot verify them. This is **not** evidence that hosted policy is enforced. Remote URLs with embedded HTTPS credentials/query parameters or SSH passwords/query parameters are refused. Implementation of provider-specific branch/signing controls, restore epoch audit and any non-implicit policy enforcement beyond explicit operator consent is still pending (V2-01/V2-11/V2-13).
+
 ## 3. Ledger tree and state ownership
 
 Every snapshot is a Git commit with a tree like:

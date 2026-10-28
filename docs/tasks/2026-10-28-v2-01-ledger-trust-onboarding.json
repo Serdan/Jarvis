@@ -10,11 +10,16 @@
     "worktree": null
   },
   "checkpoint": {
-    "summary": "Implemented explicit V2 bind-existing, initialize, rebind and verified health primitives, exposed through opt-in MCP; independently supplied trusted head is persisted and verified on subsequent reads. Disposable bare remote tests passed. Partial: cross-process anchor CAS, remote protection diagnostics and independently audited epoch/restore rebind remain.",
-    "nextAction": "Add remote host/protection diagnostics and fail-closed trusted-anchor persistence under competing processes; complete restore/epoch audit.",
+    "summary": "Explicit V2 initialization/bind/rebind/health existed. Now serialized all local binding/head advancement under a checkout-specific cross-process lock, made persisted head updates atomic/private and non-regressing, and required both prior stored trust and new caller anchor on remote rebind. Read-only health reports bare Git non-fast-forward/deletion protection accurately and hosted visibility/signing policy as Unknown. Reject credential-bearing remote URLs. Disposable tests cover concurrent readers, divergent roots, changed push URL, missing/ref-restored ledger and source-worktree preservation.",
+    "nextAction": "Finish provider-specific visibility and branch protection verification and signed-commit requirements with explicit fail-closed setup; separately implement audited restore/rebind epoch integration under V2-13. Keep V2-01 active until these acceptance criteria are verified.",
     "verified": [
       "V2 setup/health typed MCP and OAuth catalog tests",
-      "Two-clone bind, trust-head persistence, changed URL, explicit privacy consent and rebind fixtures"
+      "Two-clone bind, trust-head persistence, changed URL, explicit privacy consent and rebind fixtures",
+      "Six simultaneous readers serialize behind binding file lock; persisted highestTrustedHead advances monotonically with 0600 permissions",
+      "Rebind rejects independent same-UUID history even when caller provides an anchor from the other root",
+      "Health reports enforced/not-configured bare Git non-fast-forward and deletion policy, while marking visibility and signing unknown",
+      "Embedded HTTP/SSH URL credentials rejected before config write",
+      "Changed approved push URL and deleted remote ledger ref rejected without losing configured anchor; restoring exact head succeeds"
     ],
     "lastCommit": null
   },
@@ -29,5 +34,5 @@
     ],
     "sourceReport": "docs/reviews/2026-10-28-v2-spec-implementation-audit.md"
   },
-  "updatedAt": "2026-10-28T19:59:00+01:00"
+  "updatedAt": "2026-10-28T21:45:00+01:00"
 }

@@ -22,6 +22,9 @@ type LedgerFailure =
     | SourceUnavailable of string
     | AgentBusy of string
     | ReviewAccessDenied of string
+    | ReviewAlreadyClaimed of string
+    | ReviewVersionConflict of string
+    | SourceReviewRefUnavailable of string
 
 type LedgerBinding =
     { RepositoryPath: string
@@ -92,7 +95,7 @@ module LedgerStore =
     let private options = JsonSerializerOptions(PropertyNamingPolicy = JsonNamingPolicy.CamelCase, PropertyNameCaseInsensitive = true)
     let private oidPattern = Regex("^[0-9a-f]{40}([0-9a-f]{24})?$", RegexOptions.Compiled)
     let private recordPath = Regex("^records/[A-Za-z0-9_-]+(/[A-Za-z0-9_.-]+)*[.]json$", RegexOptions.Compiled)
-    let private ledgerPath = Regex("^(tasks/[A-Za-z0-9_-]+/(task[.]json|attempts/[a-f0-9]{32}[.]json|reviews/[a-f0-9]{32}[.]json)|agents/[A-Za-z0-9_-]+[.]json|records/[A-Za-z0-9_-]+(/[A-Za-z0-9_.-]+)*[.]json)$", RegexOptions.Compiled)
+    let private ledgerPath = Regex("^(tasks/[A-Za-z0-9_-]+/(task[.]json|attempts/[a-f0-9]{32}[.]json|reviews/[a-f0-9]{32}/(request[.]json|revisions/[0-9]+[.]json))|agents/[A-Za-z0-9_-]+[.]json|records/[A-Za-z0-9_-]+(/[A-Za-z0-9_.-]+)*[.]json)$", RegexOptions.Compiled)
     let private remotePattern = Regex("^[A-Za-z0-9][A-Za-z0-9_.-]*$", RegexOptions.Compiled)
 
     type private GitOutput =
@@ -534,6 +537,122 @@ module LedgerStore =
             | Ok result when result.ExitCode = 0 && result.Stdout = "commit" -> Ok ()
             | _ -> Error(SourceUnavailable $"Source commit {commit} is not available on this device.")
 
+
+    let verifyReviewDiff (binding: LedgerBinding) (baseOid: string) (headOid: string) =
+        if isNull baseOid || isNull headOid
+           || not (oidPattern.IsMatch baseOid) || not (oidPattern.IsMatch headOid) then
+            Error(InvalidBinding "Invalid review base/head Git object ID.")
+        else
+            match verifySourceObject binding baseOid, verifySourceObject binding headOid with
+            | Error error, _ | _, Error error -> Error error
+            | Ok (), Ok () ->
+                match isAncestor binding.RepositoryPath baseOid headOid with
+                | Error error -> Error error
+                | Ok false -> Error(InvalidBinding "Review base must be an ancestor of submitted head.")
+                | Ok true ->
+                    match git binding.RepositoryPath [ "diff"; "--quiet"; baseOid; headOid ] with
+                    | Ok output when output.ExitCode = 1 -> Ok ()
+                    | Ok output when output.ExitCode = 0 -> Error(InvalidBinding "Code review has an empty cumulative diff.")
+                    | Ok output -> Error(GitFailure $"Could not inspect review delta: {output.Stderr}")
+                    | Error error -> Error error
+
+    let private safeReviewRef (gitRef: string) =
+        not (isNull gitRef)
+        && Regex.IsMatch(gitRef, "^refs/heads/jarvis-review/[A-Za-z0-9_-]+/[a-f0-9]{32}/r[1-9][0-9]*$")
+        && not (gitRef.Contains(".."))
+
+    let private remoteReviewRef (binding: LedgerBinding) gitRef =
+        match git binding.RepositoryPath [ "ls-remote"; "--refs"; binding.RemoteName; gitRef ] with
+        | Error error -> Error error
+        | Ok response when response.ExitCode <> 0 -> Error(RemoteUnavailable response.Stderr)
+        | Ok response when response.Stdout = "" -> Ok None
+        | Ok response ->
+            let fields = response.Stdout.Split([|'\t'|], StringSplitOptions.RemoveEmptyEntries)
+            if fields.Length <> 2 || fields[1] <> gitRef || not (oidPattern.IsMatch fields[0]) then
+                Error(LedgerIntegrityError "Ambiguous or malformed remote review ref.")
+            else Ok(Some fields[0])
+
+    // The source operation is separate from the canonical ledger commit.
+    // The absent-ref lease enforces create-only publication, even for fast-forward related heads.
+    let publishReviewRef (binding: LedgerBinding) gitRef headOid =
+        if not (safeReviewRef gitRef) || isNull headOid || not (oidPattern.IsMatch headOid) then
+            Error(InvalidBinding "Invalid review source ref or head OID.")
+        else
+            match validate binding with
+            | Error error -> Error error
+            | Ok () ->
+                match verifySourceObject binding headOid with
+                | Error error -> Error error
+                | Ok () ->
+                    match remoteReviewRef binding gitRef with
+                    | Error error -> Error error
+                    | Ok(Some current) when current = headOid -> Ok ()
+                    | Ok(Some _) -> Error(SourceReviewRefUnavailable "Existing immutable review ref points to another commit.")
+                    | Ok None ->
+                        let result =
+                            git binding.RepositoryPath
+                                [ "push"; "--porcelain"; $"--force-with-lease={gitRef}:"; binding.RemoteName; $"{headOid}:{gitRef}" ]
+                        match remoteReviewRef binding gitRef with
+                        | Ok(Some observed) when observed = headOid -> Ok ()
+                        | Ok(Some _) -> Error(SourceReviewRefUnavailable "Immutable review ref changed or was claimed elsewhere.")
+                        | Ok None ->
+                            match result with
+                            | Ok output when output.ExitCode <> 0 -> Error(GitFailure $"Source publication rejected: {output.Stderr}")
+                            | _ -> Error(OutcomeUnknown $"Cannot confirm source publication at {gitRef}.")
+                        | Error _ -> Error(OutcomeUnknown $"Cannot verify source publication at {gitRef}.")
+
+    let fetchReviewRef (binding: LedgerBinding) gitRef headOid =
+        if not (safeReviewRef gitRef) || isNull headOid || not (oidPattern.IsMatch headOid) then
+            Error(InvalidBinding "Invalid review source locator.")
+        else
+            match validate binding with
+            | Error error -> Error error
+            | Ok () ->
+                match remoteReviewRef binding gitRef with
+                | Error error -> Error error
+                | Ok None -> Error(SourceReviewRefUnavailable "Pinned source review ref is missing.")
+                | Ok(Some actual) when actual <> headOid ->
+                    Error(SourceReviewRefUnavailable "Pinned source review ref no longer matches its submitted commit.")
+                | Ok(Some _) ->
+                    let stage = $"refs/jarvis/source-reviews/{Guid.NewGuid():N}"
+                    try
+                        match git binding.RepositoryPath [ "fetch"; "--no-tags"; binding.RemoteName; $"{gitRef}:{stage}" ] with
+                        | Error error -> Error error
+                        | Ok output when output.ExitCode <> 0 -> Error(SourceReviewRefUnavailable output.Stderr)
+                        | Ok _ ->
+                            match run binding.RepositoryPath [ "rev-parse"; stage ] with
+                            | Ok fetched when fetched = headOid -> Ok ()
+                            | Ok _ -> Error(SourceReviewRefUnavailable "Remote source changed while fetching.")
+                            | Error error -> Error error
+                    finally
+                        git binding.RepositoryPath [ "update-ref"; "-d"; stage ] |> ignore
+
+
+    let private intentHash (binding: LedgerBinding) (intent: LedgerIntent) =
+        json
+            {| schemaVersion = 2
+               projectId = string binding.ProjectId
+               operationId = intent.OperationId.ToString("D")
+               actor = intent.Actor
+               kind = intent.Kind
+               request = intent.RequestJson |}
+        |> digest
+
+    let findApplied (binding: LedgerBinding) (intent: LedgerIntent) =
+        if intent.OperationId = Guid.Empty then Error(InvalidBinding "Missing transaction operation ID.")
+        else
+            match fetch binding with
+            | Error error -> Error error
+            | Ok snapshot ->
+                match readOperation binding snapshot.Commit intent.OperationId with
+                | Error error -> Error error
+                | Ok None -> Ok None
+                | Ok(Some applied) when applied.RequestHash <> intentHash binding intent ->
+                    Error OperationIdReused
+                | Ok(Some applied) ->
+                    Ok(Some
+                        { Operation = applied; CurrentHead = snapshot.Commit; AlreadyApplied = true })
+
     // A transaction updates every task/attempt/agent/review file and its operation
     // record in one ledger tree. Its planner is re-run against each new remote tip.
     let transact (binding: LedgerBinding) (intent: LedgerIntent)
@@ -543,15 +662,7 @@ module LedgerStore =
            || encoding.GetByteCount(intent.RequestJson) > 16 * 1024 then
             Error(InvalidBinding "Invalid transaction intent or size.")
         else
-            let requestHash =
-                json
-                    {| schemaVersion = 2
-                       projectId = string binding.ProjectId
-                       operationId = intent.OperationId.ToString("D")
-                       actor = intent.Actor
-                       kind = intent.Kind
-                       request = intent.RequestJson |}
-                |> digest
+            let requestHash = intentHash binding intent
             let repo = binding.RepositoryPath
             let rec attempt retry =
                 match fetch binding with

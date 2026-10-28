@@ -1,50 +1,41 @@
-# Orchestration V2: independent review requests and immutable revisions
+# Orchestration V2 — independent source review workflow
 
-**Status:** Normative V2 design (2026-10-28). The existing `Client/Modules/ReviewWorkflow.fs` implementation remains an **earlier prototype**: it still uses ReadyForReview as an attempt phase, releases the Working slot at submission, lacks ClaimReview/UpdateReviewRequest, and is **not compliant** with this revised contract. Do not expose the prototype through MCP or migrate live V1 tasks until the implementation is aligned.
+**Status (2026-10-28):** The isolated F# prototype now implements the core single-owner review lifecycle and has disposable-remote tests. It is **not yet connected to MCP/TUI**, and the live V1 task system remains unchanged.
 
-The authority is the single orphan Git ref `refs/heads/jarvis-orchestration`. The server remains stateless. Review source refs live in the project's ordinary source Git repository; they are **not** alternative task ledgers.
+The authoritative orchestration state stays on one remote orphan Git ledger branch. Source review refs belong to the normal project source remote. The Jarvis server does not store review/task state.
 
-## Model
+## Core contract
 
-An implementation agent is allowed to continue Working and checkpointing after submitting a review. Review requests have independent status; review submission does **not** stop work or release the agent's slot.
+Each task has exactly one implementation owner and one current implementation attempt. The attempt pins a **review baseline** once, prior to the first review. Every subsequent review of that task, including after a rejection, covers the *entire cumulative tree delta* from the pinned baseline to its submitted head. Previously rejected changes cannot disappear by using their rejected head as a new review base.
 
-A logical review request has a stable UUID, task/attempt owner, mutable current revision/version pointer and one of:
+A review request is independent of the implementation attempt's Working state. Submitting it does not release the agent's slot. While it is Unclaimed, the sole owner may replace its revision. Once a registered, non-owner reviewer claims it, the exact revision is frozen. Claim and replacement use expected request versions and the ordinary ledger fast-forward publication race; the loser must refresh. Only one active review request per attempt is allowed.
 
-- `Unclaimed`: visible in reviewer intake. The owner can update or replace the request.
-- `Claimed`: one reviewer has claimed **one exact revision**. Its base/head, metadata, published ref and evidence are frozen.
-- `Accepted`, `ChangesRequested`, `Withdrawn`: terminal decision/outcome, retained with the whole review history. Reassignment of a Claimed request retains the frozen revision.
+Every code revision is reachable via a create-only `refs/heads/jarvis-review/<task>/<request>/r<n>` source ref. Publication verifies the actual remote OID and never advances an existing ref, even if normal Git would permit a fast-forward. A ref pushed before a losing ledger mutation is an unauthoritative orphan candidate; it must not enter reviewer queues. The source publication and ledger transaction cannot be atomic across refs. Stable operation UUIDs allow safe replay of accepted ledger changes without publishing another revision.
 
-A request can have revisions r1, r2, r3, etc. Each revision is immutable, independently published as `refs/heads/jarvis-review/<taskId>/<requestId>/r<n>`, and pins source repository/remote, source and target refs, base SHA, head SHA, spec, summary, final implementation evidence and publication verification. **Do not modify or force-update earlier revision refs.** The reviewer evaluates the final tree diff between base and head (with explicit ancestry), not only the last commit's patch.
+## Available isolated prototype operations
 
-At most one unclaimed-or-claimed request is actionable per task. Previous revisions remain auditable, and claimed work is not silently superseded.
+`CreateTask`, `RegisterAgent`, `AssignTask`, `BeginAttempt`, `BindReviewBase`, `SubmitForReview`, `UpdateReviewRequest`, `ClaimReview`, `WithdrawReview`, `ReassignReviewer`, `ReviewDecision` (Accept/RequestChanges), `FinalizeImplementation`, `AcknowledgeReviewFeedback`, `GetTask`, `GetReview`, `GetReviewerQueue`.
 
-## Workflow
+- Submit creates Unclaimed revision 1, sets `activeReviewRequestId` and keeps the owner Working. The review request and current revision are separate Git ledger records.
+- Update appends a revision while Unclaimed. The older revision/ref remains unchanged. Retries discover their prior operation first.
+- Claim is open to any *registered* reviewer except the task owner. The reviewer claims the exact version/revision and fetches the pinned source ref. Other reviewers cannot decide on it.
+- A claimant may hand off its frozen review to another registered reviewer; the owner cannot silently reopen or alter it. An unclaimed request may be withdrawn by its owner; a claimed request may be withdrawn only by its claimant.
+- Accept records approval of the exact cumulative source revision; RequestChanges records feedback. Neither transition interrupts an owner already Working. The active review pointer is cleared; earlier review history remains.
+- FinalizeImplementation is separate: it requires acceptance of the **latest** review request, no active review, and the matching pinned cumulative source head. Only then does it mark Implemented and release the Working slot. Source integration and task closure remain separate.
+- Feedback has a decision sequence and explicit acknowledgment sequence; ordinary task reads do not auto-acknowledge it.
 
-1. The agent commits code to the working branch. When it wants review, Jarvis verifies/publishes a **new immutable source review ref** on the approved source remote and verifies that the remote advertises the pinned SHA. This step never pushes main.
-2. `SubmitForReview` writes a ledger request with revision r1 and final checkpoint; its status is `Unclaimed`. The agent remains Working.
-3. Until claimed, `UpdateReviewRequest` may replace r1 with r2, including a newer commit, base, summary, test evidence, or target. It uses the same logical request ID and an expected request version/current revision. It publishes r2 as its **own** Git ref and atomically points the ledger request to r2, marking r1 superseded.
-4. A reviewer sees the latest Unclaimed revision in `GetReviewerQueue` and calls `ClaimReview` with the exact expected version and revision. Claim atomically records claimant and the frozen r2 reference, with review audit evidence.
-5. **The claim/replacement race is resolved by the ledger's ordinary fast-forward CAS.** If replacement commits first, the stale claim fails; the reviewer reloads the current revision. If claim commits first, the owner's replacement fails with `ReviewAlreadyClaimed`. Neither writer silently overwrites the other.
-6. Once Claimed, the owner cannot unilaterally alter or replace the review. Agent development can continue; later commits belong to another review. `ReleaseReviewClaim`/`ReassignReviewer` may change the reviewer **without unfreezing** that revision. Any explicit withdrawal after claim needs reviewer/orchestrator authorization.
-7. The reviewer decides on the pinned revision, giving feedback and evidence. `AcceptReview` approves only that immutable change; it does **not** stop Working, mark task Implemented, integrate, or push later changes. `RequestChanges` creates durable feedback: it updates a stopped owner's next Queued assignment, but does not interrupt a Working owner.
-8. An explicit `FinalizeImplementation` selects the accepted review as task completion basis and releases the slot when appropriate. Separate PlanIntegration/RecordIntegration must integrate the exact accepted patch (or verified equivalent), never the moving work branch head. CloseTask and source review-branch cleanup remain separate verified actions.
+## Coverage
 
-## Recovery and retention
+The fixtures run against a disposable bare Git remote and two independent clones. They verify create-only refs, cross-device claim/fetch, replacement before claim, claimed revision immutability, agent-slot retention, claim/update race, owner/reviewer separation, source-ref mismatch rejection, reviewer handoff, withdrawal, operation UUID idempotency, cumulative resubmission after rejection, stale-finalization rejection, and regular ledger concurrency/rewrite handling.
 
-Publishing the review ref and changing the ledger are two distinct Git operations. A source review ref may exist without an authoritative ledger request/revision (e.g. when Claim wins the race after a candidate r2 ref was pushed). Such a ref is an **orphan publication**, not a live review; only a separate checked cleanup operation may remove it.
+## Explicitly incomplete
 
-An ambiguous source push or ledger push is resolved by reading the exact source review ref, the canonical ledger and its idempotency operation record, using the **same operationId** on retries. Never force-move old refs to “repair” uncertainty. Do not delete a review ref still named by a claimed, accepted or pending-integration revision. A reviewer must verify that the remote ref still resolves to the pinned head, or fail closed with a source-integrity error.
+This is a **core domain prototype**, not the full protocol-4.0 feature. Do not expose it as production Jarvis task handling yet. Remaining work includes:
 
-All request updates, claims, decisions, slot transitions and evidence changes use one ledger commit per logical operation with optimistic versions and immutable operation UUIDs. Revision history is retained in ledger Git history and separate revision/decision records.
+- Full spec HTML/assignment-generation/checkpoint and reviewer-evidence schemas (currently source summary and pinned base/head are tracked, not the full final checkpoint).
+- Native MCP DTOs, reviewer/owner inbox views and tool permissions.
+- Durable client configuration/trust binding, crash-time pending intent storage, checked orphan-ref cleanup and reviewer-release/reclaim behavior.
+- Complete park/block/cancel/source integration transitions, migration and global V1 writer cutoff.
+- More adversarial tests for remote outages, host ref protection, backup/restore, source rewrites and larger contention.
 
-## Acceptance coverage
-
-- Two agents' independent source clones; an agent posts r1, updates to r2, reviewer sees only r2, and r1 remains inspectable.
-- Claim and update racing on the same expected request version: exactly one wins; no review of a silently replaced SHA.
-- Two reviewers racing ClaimReview: exactly one claimant.
-- An agent keeps Working while a review is Unclaimed/Claimed/Accepted, with no implicit slot release.
-- A reviewer accepts pinned r2 after the working branch advanced to r3; r3 remains unreviewed and cannot be integrated as part of r2.
-- Lost response after publishing r2 ref, ledger commit rejected, cross-device fetch, moved/deleted ref, and safe retention/cleanup of orphan refs.
-- Reviewer reassignment retains the frozen revision; stale decisions and owner updates cannot bypass the claim.
-
-**Implementation gap:** The previously passing prototype tests cover a different handoff model. Their success must not be interpreted as acceptance of this revised model. Add tests above and retire the old ReadyForReview/slot-release contract before any V2 task API cutover.
+The older exclusive `ReadyForReview` attempt workflow and its tests have been replaced in this isolated client prototype. The pre-cutover scope above remains intentionally excluded.

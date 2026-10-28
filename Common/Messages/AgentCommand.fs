@@ -175,7 +175,11 @@ type V2TaskWriteCommand =
       Title: string
       Html: string
       ExpectedVersion: int
+      ExpectedAgentVersion: int
       AssignmentGeneration: int
+      Summary: string
+      NextAction: string
+      Reason: string
       BaseOid: string
       TargetRef: string
       DecisionSequence: int64 }
@@ -1036,7 +1040,7 @@ module AgentCommandInfo =
         | None -> invocation command
 
 module AgentProtocol =
-    let version = "3.21"
+    let version = "3.22"
     let defaultPatchFuzzyContextLines = 3
     let maxResponseBytes = 900 * 1024
     let maxImageBytes = 8 * 1024 * 1024

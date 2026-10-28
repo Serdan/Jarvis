@@ -218,6 +218,21 @@ module V2TaskApi =
                             cmd.ActorId cmd.ExpectedVersion cmd.AssignmentGeneration
                             cmd.BaseOid cmd.TargetRef
                         |> mapError
+                    | "YieldAgent" ->
+                        ReviewWorkflow.ReviewWorkflow.yieldAgent binding operationId
+                            cmd.TaskId cmd.ActorId cmd.ExpectedVersion cmd.ExpectedAgentVersion
+                            cmd.AssignmentGeneration cmd.Summary cmd.NextAction |> mapError
+                    | "ResumeAgent" ->
+                        ReviewWorkflow.ReviewWorkflow.resumeAgent binding operationId
+                            cmd.TaskId cmd.ActorId cmd.ExpectedVersion cmd.ExpectedAgentVersion
+                            cmd.AssignmentGeneration |> mapError
+                    | "CompleteAgentWork" ->
+                        ReviewWorkflow.ReviewWorkflow.completeAgentWork binding operationId
+                            cmd.TaskId cmd.ActorId cmd.ExpectedVersion cmd.ExpectedAgentVersion
+                            cmd.AssignmentGeneration cmd.Summary |> mapError
+                    | "ParkAgent" ->
+                        ReviewWorkflow.ReviewWorkflow.parkAgent binding operationId
+                            cmd.ActorId cmd.ExpectedAgentVersion cmd.Reason |> mapError
                     | "AcknowledgeFeedback" ->
                         ReviewWorkflow.ReviewWorkflow.acknowledgeReviewFeedback binding operationId
                             cmd.TaskId cmd.ActorId cmd.DecisionSequence

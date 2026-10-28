@@ -115,7 +115,11 @@ let v2TaskSetupAndInboxRefuseUnconfiguredCheckout () =
               Title = "Task"
               Html = "<h1>Task</h1>"
               ExpectedVersion = 0
+              ExpectedAgentVersion = 0
               AssignmentGeneration = 0
+              Summary = ""
+              NextAction = ""
+              Reason = ""
               BaseOid = ""
               TargetRef = ""
               DecisionSequence = 0L }
@@ -140,7 +144,8 @@ let v2TaskMutationsRequireGitWritePermission () =
               OperationId = Guid.NewGuid().ToString("D"); TaskId = "100"
               AttemptId = ""; ActorId = "Orchestrator"; OwnerId = ""; ReviewerId = ""
               Title = "Task"; Html = "<h1>Task</h1>"; ExpectedVersion = 0
-              AssignmentGeneration = 0; BaseOid = ""; TargetRef = ""
+              ExpectedAgentVersion = 0; AssignmentGeneration = 0;
+              Summary = ""; NextAction = ""; Reason = ""; BaseOid = ""; TargetRef = ""
               DecisionSequence = 0L }
     match Client.PermissionPolicy.evaluate write with
     | Error(Client.ConfirmationRequired approval) ->

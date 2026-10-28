@@ -20,7 +20,11 @@ type ReviewTask =
 type ReviewAgent =
     { AgentId: string
       Version: int
-      ActiveAttemptId: string }
+      State: string
+      FocusAttemptId: string
+      ActiveAttemptId: string
+      StateReason: string
+      StateSequence: int64 }
 
 [<CLIMutable>]
 type ReviewAttempt =
@@ -76,6 +80,17 @@ type ReviewRevision =
       CreatedSequence: int64 }
 
 [<CLIMutable>]
+type AgentCheckpoint =
+    { TaskId: string
+      AttemptId: string
+      OwnerAgentId: string
+      AssignmentGeneration: int
+      Sequence: int64
+      Summary: string
+      NextAction: string
+      Kind: string }
+
+[<CLIMutable>]
 type InboxTask =
     { Task: ReviewTask
       Attempt: ReviewAttempt }
@@ -84,6 +99,9 @@ type InboxTask =
 type AgentInbox =
     { SnapshotCommit: string
       Agent: ReviewAgent
+      Focused: InboxTask option
+      OperatorActionRequired: bool
+      NeedsOrchestratorAssignment: bool
       Working: InboxTask option
       RunnableQueue: InboxTask list
       Parked: InboxTask list
@@ -108,6 +126,8 @@ module ReviewWorkflow =
     let private taskPath taskId = $"tasks/{taskId}/task.json"
     let private specPath taskId = $"tasks/{taskId}/spec.html"
     let private attemptPath taskId attemptId = $"tasks/{taskId}/attempts/{attemptId}.json"
+    let private checkpointPath taskId attemptId sequence =
+        $"tasks/{taskId}/attempts/{attemptId}/checkpoints/{sequence}.json"
     let private requestPath taskId requestId = $"tasks/{taskId}/reviews/{requestId}/request.json"
     let private revisionPath taskId requestId number = $"tasks/{taskId}/reviews/{requestId}/revisions/{number}.json"
     let private reviewRef taskId requestId number = $"refs/heads/jarvis-review/{taskId}/{requestId}/r{number}"
@@ -230,7 +250,11 @@ module ReviewWorkflow =
                     result {
                         let! existing = read<ReviewAgent> binding snapshot (agentPath agentId)
                         if existing.IsSome then return! Error(StaleEntityVersion "Agent already registered.")
-                        let agent = { AgentId = agentId; Version = 1; ActiveAttemptId = null }
+                        let agent =
+                            { AgentId = agentId; Version = 1; State = "Parked"
+                              FocusAttemptId = null; ActiveAttemptId = null
+                              StateReason = "Registered without an assignment"
+                              StateSequence = snapshot.Header.NextSequence }
                         return [ change (agentPath agentId) None agent ]
                     })
 
@@ -246,13 +270,16 @@ module ReviewWorkflow =
                 (fun snapshot ->
                     result {
                         let! task, taskOid = required<ReviewTask> binding snapshot (taskPath taskId)
-                        let! _ = required<ReviewAgent> binding snapshot (agentPath ownerId)
+                        let! agent, agentOid = required<ReviewAgent> binding snapshot (agentPath ownerId)
                         let! _ = required<ReviewAgent> binding snapshot (agentPath reviewerId)
                         let! specContent, specOid = LedgerStore.readAt binding snapshot (specPath taskId)
                         if specContent.IsNone || specOid.IsNone then
                             return! Error(LedgerIntegrityError "Canonical task spec is missing.")
                         if task.Lifecycle <> "Open" || not (String.IsNullOrWhiteSpace task.AttemptId) then
                             return! Error(StaleEntityVersion "Task already has an implementation owner.")
+                        if not (List.contains agent.State [ "Parked"; "Completed" ])
+                           || not (String.IsNullOrWhiteSpace agent.ActiveAttemptId) then
+                            return! Error(AgentBusy "Agent must be Parked or Completed before receiving an assignment.")
                         let attempt =
                             { TaskId = taskId; AttemptId = attemptIdText; Version = 1
                               OwnerAgentId = ownerId; ReviewerId = reviewerId; Phase = "Queued"
@@ -268,7 +295,13 @@ module ReviewWorkflow =
                         return
                             [ change (taskPath taskId) (Some taskOid)
                                 { task with Version = task.Version + 1; Lifecycle = "InProgress"; AttemptId = attemptIdText }
-                              change (attemptPath taskId attemptIdText) None attempt ]
+                              change (attemptPath taskId attemptIdText) None attempt
+                              change (agentPath ownerId) (Some agentOid)
+                                { agent with Version = agent.Version + 1; State = "Assigned"
+                                             FocusAttemptId = attemptIdText
+                                             ActiveAttemptId = null
+                                             StateReason = $"Assigned task {taskId}; awaiting operator start"
+                                             StateSequence = snapshot.Header.NextSequence } ]
                     })
 
     let beginAttempt binding operationId taskId ownerId expectedVersion generation =
@@ -286,13 +319,161 @@ module ReviewWorkflow =
                            || attempt.Version <> expectedVersion || attempt.AssignmentGeneration <> generation
                            || attempt.Phase <> "Queued" then
                             return! Error(StaleEntityVersion "Attempt is not available for Begin.")
+                        if agent.State <> "Assigned" || agent.FocusAttemptId <> attempt.AttemptId then
+                            return! Error(StaleEntityVersion "Agent has not been assigned this attempt for startup.")
                         if not (String.IsNullOrWhiteSpace agent.ActiveAttemptId) then
                             return! Error(AgentBusy "Agent is already Working.")
                         return
                             [ change (attemptPath taskId attempt.AttemptId) (Some attemptOid)
                                 { attempt with Version = attempt.Version + 1; Phase = "Working" }
                               change (agentPath ownerId) (Some agentOid)
-                                { agent with Version = agent.Version + 1; ActiveAttemptId = attempt.AttemptId } ]
+                                { agent with Version = agent.Version + 1
+                                             State = "Working"; ActiveAttemptId = attempt.AttemptId
+                                             StateReason = $"Started task {taskId}"
+                                             StateSequence = snapshot.Header.NextSequence } ]
+                    })
+
+
+    // A Ready agent has explicitly yielded at a durable checkpoint. Mere inactivity
+    // never changes agent state or frees its Working slot.
+    let yieldAgent binding operationId taskId ownerId expectedAttemptVersion expectedAgentVersion
+                   generation summary nextAction =
+        if not (validTaskId taskId) || not (validAgent ownerId)
+           || expectedAttemptVersion < 1 || expectedAgentVersion < 1 || generation < 1
+           || not (validText 8192 summary) || not (validText 8192 nextAction) then
+            Error(InvalidBinding "Yield requires current versions and a substantive checkpoint/next action.")
+        else
+            LedgerStore.transact binding
+                (intent operationId ownerId "YieldAgent"
+                    {| taskId = taskId; ownerId = ownerId
+                       expectedAttemptVersion = expectedAttemptVersion
+                       expectedAgentVersion = expectedAgentVersion; generation = generation
+                       summary = summary; nextAction = nextAction |})
+                (fun snapshot ->
+                    result {
+                        let! task, _, attempt, attemptOid = getAttempt binding snapshot taskId
+                        let! agent, agentOid = required<ReviewAgent> binding snapshot (agentPath ownerId)
+                        if task.Lifecycle <> "InProgress" || attempt.OwnerAgentId <> ownerId
+                           || attempt.Version <> expectedAttemptVersion
+                           || attempt.AssignmentGeneration <> generation
+                           || attempt.Phase <> "Working" || agent.State <> "Working"
+                           || agent.Version <> expectedAgentVersion
+                           || agent.ActiveAttemptId <> attempt.AttemptId
+                           || agent.FocusAttemptId <> attempt.AttemptId then
+                            return! Error(StaleEntityVersion "Yield requires the current Working assignment and slot.")
+                        let checkpoint =
+                            { TaskId = taskId; AttemptId = attempt.AttemptId
+                              OwnerAgentId = ownerId; AssignmentGeneration = generation
+                              Sequence = snapshot.Header.NextSequence
+                              Summary = summary; NextAction = nextAction; Kind = "Yield" }
+                        return
+                            [ change (checkpointPath taskId attempt.AttemptId snapshot.Header.NextSequence) None checkpoint
+                              change (attemptPath taskId attempt.AttemptId) (Some attemptOid)
+                                { attempt with Version = attempt.Version + 1; Phase = "Paused" }
+                              change (agentPath ownerId) (Some agentOid)
+                                { agent with Version = agent.Version + 1
+                                             State = "Ready"; ActiveAttemptId = null
+                                             StateReason = nextAction
+                                             StateSequence = snapshot.Header.NextSequence } ]
+                    })
+
+    let resumeAgent binding operationId taskId ownerId expectedAttemptVersion expectedAgentVersion generation =
+        if not (validTaskId taskId) || not (validAgent ownerId)
+           || expectedAttemptVersion < 1 || expectedAgentVersion < 1 || generation < 1 then
+            Error(InvalidBinding "Invalid ResumeAgent version or generation.")
+        else
+            LedgerStore.transact binding
+                (intent operationId ownerId "ResumeAgent"
+                    {| taskId = taskId; ownerId = ownerId
+                       expectedAttemptVersion = expectedAttemptVersion
+                       expectedAgentVersion = expectedAgentVersion; generation = generation |})
+                (fun snapshot ->
+                    result {
+                        let! task, _, attempt, attemptOid = getAttempt binding snapshot taskId
+                        let! agent, agentOid = required<ReviewAgent> binding snapshot (agentPath ownerId)
+                        if task.Lifecycle <> "InProgress" || attempt.OwnerAgentId <> ownerId
+                           || attempt.Version <> expectedAttemptVersion
+                           || attempt.AssignmentGeneration <> generation
+                           || attempt.Phase <> "Paused"
+                           || agent.State <> "Ready" || agent.Version <> expectedAgentVersion
+                           || agent.FocusAttemptId <> attempt.AttemptId
+                           || not (String.IsNullOrWhiteSpace agent.ActiveAttemptId) then
+                            return! Error(StaleEntityVersion "Resume requires the exact Ready assignment generation.")
+                        return
+                            [ change (attemptPath taskId attempt.AttemptId) (Some attemptOid)
+                                { attempt with Version = attempt.Version + 1; Phase = "Working" }
+                              change (agentPath ownerId) (Some agentOid)
+                                { agent with Version = agent.Version + 1
+                                             State = "Working"; ActiveAttemptId = attempt.AttemptId
+                                             StateReason = $"Resumed task {taskId}"
+                                             StateSequence = snapshot.Header.NextSequence } ]
+                    })
+
+    let completeAgentWork binding operationId taskId ownerId expectedAttemptVersion expectedAgentVersion
+                          generation summary =
+        if not (validTaskId taskId) || not (validAgent ownerId)
+           || expectedAttemptVersion < 1 || expectedAgentVersion < 1 || generation < 1
+           || not (validText 8192 summary) then
+            Error(InvalidBinding "Completion requires a summary and exact assignment versions.")
+        else
+            LedgerStore.transact binding
+                (intent operationId ownerId "CompleteAgentWork"
+                    {| taskId = taskId; ownerId = ownerId
+                       expectedAttemptVersion = expectedAttemptVersion
+                       expectedAgentVersion = expectedAgentVersion; generation = generation; summary = summary |})
+                (fun snapshot ->
+                    result {
+                        let! task, _, attempt, attemptOid = getAttempt binding snapshot taskId
+                        let! agent, agentOid = required<ReviewAgent> binding snapshot (agentPath ownerId)
+                        let validPhase =
+                            (agent.State = "Working" && attempt.Phase = "Working"
+                             && agent.ActiveAttemptId = attempt.AttemptId)
+                            || (agent.State = "Ready" && attempt.Phase = "Paused"
+                                && String.IsNullOrWhiteSpace agent.ActiveAttemptId)
+                        if task.Lifecycle <> "InProgress" || attempt.OwnerAgentId <> ownerId
+                           || attempt.Version <> expectedAttemptVersion
+                           || attempt.AssignmentGeneration <> generation
+                           || agent.Version <> expectedAgentVersion
+                           || agent.FocusAttemptId <> attempt.AttemptId || not validPhase then
+                            return! Error(StaleEntityVersion "Only the current Working or Ready agent can complete this assignment.")
+                        let checkpoint =
+                            { TaskId = taskId; AttemptId = attempt.AttemptId
+                              OwnerAgentId = ownerId; AssignmentGeneration = generation
+                              Sequence = snapshot.Header.NextSequence
+                              Summary = summary; NextAction = "Await review or a new assignment"
+                              Kind = "Completion" }
+                        return
+                            [ change (checkpointPath taskId attempt.AttemptId snapshot.Header.NextSequence) None checkpoint
+                              change (attemptPath taskId attempt.AttemptId) (Some attemptOid)
+                                { attempt with Version = attempt.Version + 1; Phase = "Finished" }
+                              change (agentPath ownerId) (Some agentOid)
+                                { agent with Version = agent.Version + 1
+                                             State = "Completed"; ActiveAttemptId = null
+                                             StateReason = summary
+                                             StateSequence = snapshot.Header.NextSequence } ]
+                    })
+
+    let parkAgent binding operationId agentId expectedAgentVersion reason =
+        if not (validAgent agentId) || expectedAgentVersion < 1 || not (validText 2048 reason) then
+            Error(InvalidBinding "Parking requires an agent version and reason.")
+        else
+            LedgerStore.transact binding
+                (intent operationId "Orchestrator" "ParkAgent"
+                    {| agentId = agentId; expectedAgentVersion = expectedAgentVersion
+                       reason = reason |})
+                (fun snapshot ->
+                    result {
+                        let! agent, agentOid = required<ReviewAgent> binding snapshot (agentPath agentId)
+                        if agent.Version <> expectedAgentVersion
+                           || not (List.contains agent.State [ "Completed"; "Parked" ])
+                           || not (String.IsNullOrWhiteSpace agent.ActiveAttemptId) then
+                            return! Error(StaleEntityVersion "Park may not interrupt an assigned or Working agent.")
+                        return
+                            [ change (agentPath agentId) (Some agentOid)
+                                { agent with Version = agent.Version + 1
+                                             State = "Parked"; FocusAttemptId = null
+                                             StateReason = reason
+                                             StateSequence = snapshot.Header.NextSequence } ]
                     })
 
     // The task's review base remains fixed across rejections and resubmissions.
@@ -602,11 +783,10 @@ module ReviewWorkflow =
                 (fun snapshot ->
                     result {
                         let! task, taskOid, attempt, attemptOid = getAttempt binding snapshot taskId
-                        let! agent, agentOid = required<ReviewAgent> binding snapshot (agentPath ownerId)
                         let! request, _ = required<ReviewRequest> binding snapshot (requestPath taskId id)
                         if task.Lifecycle <> "InProgress" || attempt.OwnerAgentId <> ownerId
-                           || attempt.Phase <> "Working" || attempt.Version <> expectedAttemptVersion
-                           || agent.ActiveAttemptId <> attempt.AttemptId
+                           || attempt.Phase <> "Finished"
+                           || attempt.Version <> expectedAttemptVersion
                            || not (String.IsNullOrEmpty attempt.ActiveReviewRequestId)
                            || request.Status <> "Accepted" || attempt.AcceptedReviewRequestId <> id
                            || attempt.LatestReviewRequestId <> id
@@ -618,13 +798,13 @@ module ReviewWorkflow =
                         if revision.BaseCommit <> attempt.BaseCommit || revision.HeadCommit <> attempt.AcceptedHead then
                             return! Error(LedgerIntegrityError "Finalization does not match approved cumulative patch.")
                         do! LedgerStore.fetchReviewRef binding revision.ReviewRef revision.HeadCommit
+                        // Finalization is a task/review operation, never an agent-state change.
+                        // The owner may already be Working on its next assignment.
                         return
                             [ change (taskPath taskId) (Some taskOid)
                                 { task with Version = task.Version + 1; Lifecycle = "Implemented" }
                               change (attemptPath taskId attempt.AttemptId) (Some attemptOid)
-                                { attempt with Version = attempt.Version + 1; Phase = "Accepted" }
-                              change (agentPath ownerId) (Some agentOid)
-                                { agent with Version = agent.Version + 1; ActiveAttemptId = null } ]
+                                { attempt with Version = attempt.Version + 1; Phase = "Accepted" } ]
                     })
 
     let acknowledgeReviewFeedback binding operationId taskId ownerId decisionSequence =
@@ -748,8 +928,8 @@ module ReviewWorkflow =
                                 | Ok(attempt, _) ->
                                     if attempt.TaskId <> task.TaskId || attempt.AttemptId <> task.AttemptId
                                        || not (List.contains attempt.Phase
-                                           [ "Queued"; "Acknowledged"; "Working"; "Parked"; "Blocked"
-                                             "Accepted"; "Superseded"; "Abandoned" ]) then
+                                           [ "Queued"; "Acknowledged"; "Working"; "Paused"; "Finished"
+                                             "Parked"; "Blocked"; "Accepted"; "Superseded"; "Abandoned" ]) then
                                         failure <- Some(LedgerIntegrityError "Invalid task/attempt identity or phase in inbox.")
                                     elif attempt.OwnerAgentId = agentId then
                                         owned <- { Task = task; Attempt = attempt } :: owned
@@ -789,6 +969,25 @@ module ReviewWorkflow =
                            | _ -> true) then
                         return! Error(LedgerIntegrityError "Agent slot disagrees with the task's Working attempts.")
                     let active = working |> List.tryHead
+                    let focused =
+                        owned |> List.tryFind (fun entry ->
+                            entry.Attempt.AttemptId = agent.FocusAttemptId)
+                    let focusValid =
+                        match agent.State, focused with
+                        | "Parked", None -> String.IsNullOrWhiteSpace agent.ActiveAttemptId
+                        | "Assigned", Some entry ->
+                            entry.Attempt.Phase = "Queued" && active.IsNone
+                        | "Ready", Some entry ->
+                            entry.Attempt.Phase = "Paused" && active.IsNone
+                        | "Working", Some entry ->
+                            entry.Attempt.Phase = "Working"
+                            && agent.ActiveAttemptId = entry.Attempt.AttemptId
+                        | "Completed", Some entry ->
+                            (entry.Attempt.Phase = "Finished" || entry.Attempt.Phase = "Accepted")
+                            && active.IsNone
+                        | _ -> false
+                    if not focusValid then
+                        return! Error(LedgerIntegrityError "Agent state/focused attempt mismatch.")
                     let runnable = owned |> List.filter (fun entry ->
                         entry.Attempt.Phase = "Queued" || entry.Attempt.Phase = "Acknowledged")
                     let parked = owned |> List.filter (fun entry -> entry.Attempt.Phase = "Parked")
@@ -800,6 +999,9 @@ module ReviewWorkflow =
                     return
                         { SnapshotCommit = snapshot.Commit
                           Agent = agent
+                          Focused = focused
+                          OperatorActionRequired = agent.State = "Ready" || agent.State = "Assigned"
+                          NeedsOrchestratorAssignment = agent.State = "Completed"
                           Working = active
                           RunnableQueue = runnable
                           Parked = parked

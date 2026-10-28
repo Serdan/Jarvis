@@ -102,3 +102,40 @@ V2TaskRead and V2TaskWrite are separate typed wire commands. Human-facing task a
 The new operations were exercised on a disposable bare Git remote from two clones, including an opt-in client-adapter path from task creation to review submission. No production ledger initialization, migration or deployment was performed.
 
 **Still missing before cutover:** versioned assignment instructions and receipts, durable local pending-intent journal, explicit park/block/reissue/cancel transitions, source integration evidence, full review checkpoint evidence and V1-to-V2 migration. Protocol 3.21 is an additive experimental capability, not the planned breaking protocol 4.0 deployment.
+
+
+## Explicit agent lifecycle (experimental protocol 3.22)
+
+V2 agents now have one authoritative state, independent of task phase and
+review status. A registered agent begins Parked. The orchestrator assigns a
+task to a Parked or Completed agent, atomically changing it to Assigned,
+binding its focused attempt and retaining its task-spec OID. BeginAttempt
+changes Assigned to Working and acquires the single execution slot.
+
+V2YieldAgent is an explicit Working to Ready transition. It records an
+immutable task checkpoint (summary, next action, generation, ledger sequence),
+changes the attempt to Paused and releases the execution slot. The operator
+may prompt a Ready agent to continue; V2ResumeAgent checks both the agent
+version and attempt version/generation, then restores Working on the same
+assignment. No inactivity heuristic or browser-session timeout changes state.
+
+V2CompleteAgentWork is an explicit Working/Ready to Completed transition
+with a final checkpoint. It changes the attempt to Finished, releases the
+slot and signals that the orchestrator can allocate fresh work. Review
+requests and source integration may remain outstanding. V2ParkAgent is a
+deliberate orchestrator action from Completed/Parked to Parked, with a
+reason; it refuses to steal an Assigned, Ready or Working agent.
+
+V2AgentInbox includes the focused assignment, the five-state agent record,
+operatorActionRequired (Assigned/Ready), and
+needsOrchestratorAssignment (Completed), alongside the independently
+projected task/review responsibilities. Task integration is a separate
+operation: a reviewer may finalize an accepted Finished attempt after its
+agent has already started a different task without modifying the agent's
+current Working slot. Review acceptance itself never changes agent state.
+
+Each mutation uses a caller-stable operation UUID and required expected
+versions; task+agent+checkpoint changes are one canonical ledger transaction.
+These transitions were verified with disposable two-clone Git fixtures and
+the opt-in V2 command adapter. This remains isolated from V1 and has not
+been deployed or migrated.

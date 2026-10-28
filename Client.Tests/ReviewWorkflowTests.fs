@@ -121,7 +121,9 @@ type ReviewWorkflowTests() =
             |> success |> ignore
             let _, _, acknowledged = ReviewWorkflow.getTask first "315" |> success
             Assert.That((Option.get acknowledged).AcknowledgedFeedbackSequence, Is.EqualTo(attempt.FeedbackSequence))
-            ReviewWorkflow.finalizeImplementation first (Guid.NewGuid()) "315" "Owner" 6 req
+            ReviewWorkflow.completeAgentWork first (Guid.NewGuid()) "315" "Owner" 6 3 1
+                "Implementation finished" |> success |> ignore
+            ReviewWorkflow.finalizeImplementation first (Guid.NewGuid()) "315" "Owner" 7 req
             |> success |> ignore
             let _, completedTask, completedAttempt = ReviewWorkflow.getTask first "315" |> success
             Assert.That(completedTask.Lifecycle, Is.EqualTo("Implemented"))
@@ -186,14 +188,15 @@ type ReviewWorkflowTests() =
         withFixture (fun one _ first _ _ sourceRef newCommit initTask ->
             initTask "100"
             ReviewWorkflow.createTask first (Guid.NewGuid()) "101" "101" |> success |> ignore
-            ReviewWorkflow.assignTask first (Guid.NewGuid()) "101" (Guid.NewGuid()) "Owner" "Reviewer"
-            |> success |> ignore
+            match ReviewWorkflow.assignTask first (Guid.NewGuid()) "101" (Guid.NewGuid()) "Owner" "Reviewer" with
+            | Error(AgentBusy _) -> ()
+            | other -> Assert.Fail(sprintf "Working agent must not be assigned a second task: %A" other)
             let c = newCommit "C" "C"
             ReviewWorkflow.submitReview first (Guid.NewGuid()) "100" "Owner" 3 1
                 (Guid.NewGuid()) sourceRef c "Snapshot" |> success |> ignore
-            match ReviewWorkflow.beginAttempt first (Guid.NewGuid()) "101" "Owner" 1 1 with
-            | Error(AgentBusy _) -> ()
-            | other -> Assert.Fail(sprintf "Submission should retain working slot: %A" other))
+            let current = ReviewWorkflow.getAgentInbox first "Owner" |> success
+            Assert.That(current.Agent.State, Is.EqualTo("Working"))
+            Assert.That(current.SlotAvailable, Is.False))
 
     [<Test>]
     member _.WithdrawalAndClaimedHandoffPreserveWorkingOwner() =
@@ -314,7 +317,7 @@ type ReviewWorkflowTests() =
 
     [<Test>]
     member _.AgentInboxSeparatesSlotQueueAndReviewResponsibilities() =
-        withFixture (fun _ _ first second _ sourceRef newCommit initTask ->
+        withFixture (fun _ _ first second baseOid sourceRef newCommit _ ->
             ReviewWorkflow.createTask first (Guid.NewGuid()) "102" "Queued task" |> success |> ignore
             ReviewWorkflow.assignTask first (Guid.NewGuid()) "102" (Guid.NewGuid()) "Owner" "Reviewer"
             |> success |> ignore
@@ -324,14 +327,16 @@ type ReviewWorkflowTests() =
             Assert.That(fresh.RunnableQueue.Length, Is.EqualTo(1))
             Assert.That(fresh.RunnableQueue.Head.Task.TaskId, Is.EqualTo("102"))
             Assert.That(fresh.Unassigned, Is.False)
-            initTask "101"
+            ReviewWorkflow.beginAttempt first (Guid.NewGuid()) "102" "Owner" 1 1 |> success |> ignore
+            ReviewWorkflow.bindReviewBase first (Guid.NewGuid()) "102" "Owner" 2 1 baseOid sourceRef
+            |> success |> ignore
             let working = ReviewWorkflow.getAgentInbox first "Owner" |> success
             Assert.That(working.SlotAvailable, Is.False)
-            Assert.That(working.Working.Value.Task.TaskId, Is.EqualTo("101"))
-            Assert.That(working.RunnableQueue.Length, Is.EqualTo(1))
+            Assert.That(working.Working.Value.Task.TaskId, Is.EqualTo("102"))
+            Assert.That(working.RunnableQueue.Length, Is.EqualTo(0))
             let c = newCommit "Needs review" "C"
             let requestId = Guid.NewGuid()
-            ReviewWorkflow.submitReview first (Guid.NewGuid()) "101" "Owner" 3 1
+            ReviewWorkflow.submitReview first (Guid.NewGuid()) "102" "Owner" 3 1
                 requestId sourceRef c "Review C" |> success |> ignore
             let submitting = ReviewWorkflow.getAgentInbox second "Owner" |> success
             Assert.That(submitting.PendingReviews.Length, Is.EqualTo(1))
@@ -340,22 +345,25 @@ type ReviewWorkflowTests() =
             Assert.That(reviewer.AvailableReviews.Length, Is.EqualTo(1))
             Assert.That(reviewer.PendingReviews.Length, Is.EqualTo(0))
             Assert.That(reviewer.SlotAvailable, Is.True)
-            ReviewWorkflow.claimReview second (Guid.NewGuid()) "101" requestId "Reviewer" 1 1
+            ReviewWorkflow.claimReview second (Guid.NewGuid()) "102" requestId "Reviewer" 1 1
             |> success |> ignore
             let claimed = ReviewWorkflow.getAgentInbox first "Reviewer" |> success
             Assert.That(claimed.AvailableReviews.Length, Is.EqualTo(0))
             Assert.That(claimed.PendingReviews.Length, Is.EqualTo(1))
-            ReviewWorkflow.decide second (Guid.NewGuid()) "101" requestId "Reviewer" 2 Accept "Passed"
+            ReviewWorkflow.decide second (Guid.NewGuid()) "102" requestId "Reviewer" 2 Accept "Passed"
             |> success |> ignore
             let decided = ReviewWorkflow.getAgentInbox first "Owner" |> success
             Assert.That(decided.Working.IsSome, Is.True)
             Assert.That(decided.PendingReviews.Length, Is.EqualTo(0))
-            ReviewWorkflow.finalizeImplementation first (Guid.NewGuid()) "101" "Owner" 5 requestId
+            ReviewWorkflow.completeAgentWork first (Guid.NewGuid()) "102" "Owner" 5 3 1
+                "Ready for integration" |> success |> ignore
+            ReviewWorkflow.finalizeImplementation first (Guid.NewGuid()) "102" "Owner" 6 requestId
             |> success |> ignore
             let finalized = ReviewWorkflow.getAgentInbox second "Owner" |> success
             Assert.That(finalized.SlotAvailable, Is.True)
+            Assert.That(finalized.Agent.State, Is.EqualTo("Completed"))
             Assert.That(finalized.AcceptedPendingIntegration.Length, Is.EqualTo(1))
-            Assert.That(finalized.RunnableQueue.Length, Is.EqualTo(1))
+            Assert.That(finalized.RunnableQueue.Length, Is.EqualTo(0))
             Assert.That(finalized.Unassigned, Is.False))
 
     [<Test>]
@@ -433,7 +441,11 @@ type ReviewWorkflowTests() =
                       Title = ""
                       Html = ""
                       ExpectedVersion = 0
+                      ExpectedAgentVersion = 0
                       AssignmentGeneration = 0
+                      Summary = ""
+                      NextAction = ""
+                      Reason = ""
                       BaseOid = ""
                       TargetRef = ""
                       DecisionSequence = 0L }
@@ -474,6 +486,21 @@ type ReviewWorkflowTests() =
                     Assert.That(parsed.RootElement.GetProperty("specHtml").GetString(), Is.EqualTo(html))
                     Assert.That(parsed.RootElement.GetProperty("specBlobOid").GetString(),
                                 Is.EqualTo(queued.RunnableQueue.Head.Attempt.SpecBlobOid))
+                run { template "YieldAgent" taskId with
+                          ExpectedVersion = 3; ExpectedAgentVersion = 3
+                          AssignmentGeneration = 1; Summary = "Checkpoint"
+                          NextAction = "Resume work" } |> ignore
+                let ready =
+                    Client.V2ReviewApi.V2TaskApi.read
+                        { ProjectName = "owner"; AgentId = "Owner" } ctx
+                    |> function
+                        | Ok value -> unbox<AgentInbox> value
+                        | Error error -> failwithf "V2 Ready inbox failed: %A" error
+                Assert.That(ready.Agent.State, Is.EqualTo("Ready"))
+                Assert.That(ready.OperatorActionRequired, Is.True)
+                run { template "ResumeAgent" taskId with
+                          ExpectedVersion = 4; ExpectedAgentVersion = 4
+                          AssignmentGeneration = 1 } |> ignore
                 let head = newCommit "Task 751 implementation" "code for 751"
                 let requestId = Guid.NewGuid()
                 let reviewCmd : Common.V2ReviewWriteCommand =
@@ -481,7 +508,7 @@ type ReviewWorkflowTests() =
                       OperationId = Guid.NewGuid().ToString("D")
                       TaskId = taskId; RequestId = requestId.ToString("D")
                       ActorId = "Owner"; ReviewerId = ""
-                      ExpectedVersion = 3; Generation = 1
+                      ExpectedVersion = 5; Generation = 1
                       SourceRef = sourceRef; HeadOid = head; Summary = "Implementation ready"
                       Verdict = ""; Feedback = "" }
                 match Client.V2ReviewApi.V2ReviewApi.write reviewCmd ctx with
@@ -494,7 +521,153 @@ type ReviewWorkflowTests() =
                         | Ok value -> unbox<AgentInbox> value
                         | Error error -> failwithf "V2 inbox failed: %A" error
                 Assert.That(after.SlotAvailable, Is.False)
+                Assert.That(after.Agent.State, Is.EqualTo("Working"))
+                run { template "CompleteAgentWork" taskId with
+                          ExpectedVersion = 6; ExpectedAgentVersion = 5
+                          AssignmentGeneration = 1; Summary = "Finished the implementation" } |> ignore
+                let finished = ReviewWorkflow.getAgentInbox first "Owner" |> success
+                Assert.That(finished.Agent.State, Is.EqualTo("Completed"))
+                run { template "ParkAgent" taskId with
+                          ExpectedAgentVersion = 6; Reason = "No other work" } |> ignore
+                let parked = ReviewWorkflow.getAgentInbox first "Owner" |> success
+                Assert.That(parked.Agent.State, Is.EqualTo("Parked"))
+                Assert.That(parked.Focused.IsNone, Is.True)
+                Assert.That(parked.PendingReviews.Length, Is.EqualTo(1))
                 Assert.That(after.PendingReviews.Length, Is.EqualTo(1))
                 Assert.That(after.PendingReviews.Head.RequestId, Is.EqualTo(requestId.ToString("N")))
             finally
                 if File.Exists configPath then File.Delete configPath)
+
+
+    [<Test>]
+    member _.AgentStateLifecycleAndCheckpointAreExplicit() =
+        withFixture (fun _ _ first second baseOid sourceRef newCommit _ ->
+            let initial = ReviewWorkflow.getAgentInbox first "Owner" |> success
+            Assert.That(initial.Agent.State, Is.EqualTo("Parked"))
+            Assert.That(initial.OperatorActionRequired, Is.False)
+            let taskId = "state1"
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "State test"
+            |> success |> ignore
+            let attemptId = Guid.NewGuid()
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId attemptId "Owner" "Reviewer"
+            |> success |> ignore
+            let assigned = ReviewWorkflow.getAgentInbox second "Owner" |> success
+            Assert.That(assigned.Agent.State, Is.EqualTo("Assigned"))
+            Assert.That(assigned.Agent.FocusAttemptId, Is.EqualTo(attemptId.ToString("N")))
+            Assert.That(assigned.OperatorActionRequired, Is.True)
+            Assert.That(assigned.Focused.IsSome, Is.True)
+            Assert.That(assigned.Working.IsNone, Is.True)
+            ReviewWorkflow.beginAttempt first (Guid.NewGuid()) taskId "Owner" 1 1 |> success |> ignore
+            ReviewWorkflow.bindReviewBase first (Guid.NewGuid()) taskId "Owner" 2 1 baseOid sourceRef
+            |> success |> ignore
+            let executing = ReviewWorkflow.getAgentInbox second "Owner" |> success
+            Assert.That(executing.Agent.State, Is.EqualTo("Working"))
+            Assert.That(executing.OperatorActionRequired, Is.False)
+            ReviewWorkflow.yieldAgent first (Guid.NewGuid()) taskId "Owner" 3 3 1
+                "Implemented initial behavior" "Continue with edge cases" |> success |> ignore
+            let ready = ReviewWorkflow.getAgentInbox second "Owner" |> success
+            Assert.That(ready.Agent.State, Is.EqualTo("Ready"))
+            Assert.That(ready.OperatorActionRequired, Is.True)
+            Assert.That(ready.SlotAvailable, Is.True)
+            Assert.That(ready.Focused.Value.Attempt.Phase, Is.EqualTo("Paused"))
+            let checkpointPath =
+                sprintf "tasks/%s/attempts/%s/checkpoints/%d.json"
+                    taskId (attemptId.ToString("N")) ready.Agent.StateSequence
+            let checkpoint, _ =
+                LedgerStore.readAt first (LedgerStore.fetch first |> success) checkpointPath |> success
+            Assert.That(checkpoint.Value, Does.Contain("Continue with edge cases"))
+            match ReviewWorkflow.resumeAgent first (Guid.NewGuid()) taskId "Owner" 4 3 1 with
+            | Error(StaleEntityVersion _) -> ()
+            | other -> Assert.Fail(sprintf "Stale resume must fail: %A" other)
+            ReviewWorkflow.resumeAgent first (Guid.NewGuid()) taskId "Owner" 4 4 1
+            |> success |> ignore
+            let resumed = ReviewWorkflow.getAgentInbox second "Owner" |> success
+            Assert.That(resumed.Agent.State, Is.EqualTo("Working"))
+            let c = newCommit "Finished work" "state implementation"
+            let reviewId = Guid.NewGuid()
+            ReviewWorkflow.submitReview first (Guid.NewGuid()) taskId "Owner" 5 1 reviewId
+                sourceRef c "Full cumulative review" |> success |> ignore
+            ReviewWorkflow.completeAgentWork first (Guid.NewGuid()) taskId "Owner" 6 5 1
+                "Submitted implementation for review" |> success |> ignore
+            let completed = ReviewWorkflow.getAgentInbox second "Owner" |> success
+            Assert.That(completed.Agent.State, Is.EqualTo("Completed"))
+            Assert.That(completed.NeedsOrchestratorAssignment, Is.True)
+            Assert.That(completed.SlotAvailable, Is.True)
+            Assert.That(completed.Focused.Value.Attempt.Phase, Is.EqualTo("Finished"))
+            Assert.That(completed.PendingReviews.Length, Is.EqualTo(1))
+            ReviewWorkflow.claimReview second (Guid.NewGuid()) taskId reviewId "Reviewer" 1 1
+            |> success |> ignore
+            ReviewWorkflow.decide second (Guid.NewGuid()) taskId reviewId "Reviewer" 2 Accept "Pass"
+            |> success |> ignore
+            let _, _, attempt = ReviewWorkflow.getTask second taskId |> success
+            ReviewWorkflow.finalizeImplementation first (Guid.NewGuid()) taskId "Owner" attempt.Value.Version reviewId
+            |> success |> ignore
+            let finalized = ReviewWorkflow.getAgentInbox second "Owner" |> success
+            Assert.That(finalized.Agent.State, Is.EqualTo("Completed"))
+            Assert.That(finalized.AcceptedPendingIntegration.Length, Is.EqualTo(1))
+            ReviewWorkflow.parkAgent first (Guid.NewGuid()) "Owner" 6 "No more tasks"
+            |> success |> ignore
+            let parked = ReviewWorkflow.getAgentInbox second "Owner" |> success
+            Assert.That(parked.Agent.State, Is.EqualTo("Parked"))
+            Assert.That(parked.Focused.IsNone, Is.True)
+            Assert.That(parked.OperatorActionRequired, Is.False)
+            ReviewWorkflow.createTask first (Guid.NewGuid()) "state2" "New task"
+            |> success |> ignore
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) "state2" (Guid.NewGuid())
+                "Owner" "Reviewer" |> success |> ignore
+            Assert.That((ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent.State,
+                        Is.EqualTo("Assigned")))
+
+    [<Test>]
+    member _.ParkDoesNotStealAssignedOrWorkingAgent() =
+        withFixture (fun _ _ first _ _ _ _ _ ->
+            let initial = ReviewWorkflow.getAgentInbox first "Owner" |> success
+            ReviewWorkflow.parkAgent first (Guid.NewGuid()) "Owner" initial.Agent.Version
+                "Still no work" |> success |> ignore
+            ReviewWorkflow.createTask first (Guid.NewGuid()) "park1" "Park test"
+            |> success |> ignore
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) "park1" (Guid.NewGuid())
+                "Owner" "Reviewer" |> success |> ignore
+            match ReviewWorkflow.parkAgent first (Guid.NewGuid()) "Owner" 3 "Interrupt" with
+            | Error(StaleEntityVersion _) -> ()
+            | other -> Assert.Fail(sprintf "Parking assigned work should be rejected: %A" other)
+            ReviewWorkflow.beginAttempt first (Guid.NewGuid()) "park1" "Owner" 1 1
+            |> success |> ignore
+            match ReviewWorkflow.parkAgent first (Guid.NewGuid()) "Owner" 4 "Interrupt" with
+            | Error(StaleEntityVersion _) -> ()
+            | other -> Assert.Fail(sprintf "Parking Working agent should be rejected: %A" other))
+
+
+    [<Test>]
+    member _.ReviewOfCompletedTaskDoesNotInterruptNewAssignment() =
+        withFixture (fun _ _ first second _ sourceRef newCommit initTask ->
+            initTask "oldTask"
+            let head = newCommit "Implementation" "Old task changes"
+            let reviewId = Guid.NewGuid()
+            ReviewWorkflow.submitReview first (Guid.NewGuid()) "oldTask" "Owner" 3 1
+                reviewId sourceRef head "Finished source patch" |> success |> ignore
+            ReviewWorkflow.completeAgentWork first (Guid.NewGuid()) "oldTask" "Owner" 4 3 1
+                "Submitted and finished implementation" |> success |> ignore
+            let completed = ReviewWorkflow.getAgentInbox first "Owner" |> success
+            Assert.That(completed.Agent.State, Is.EqualTo("Completed"))
+            ReviewWorkflow.createTask first (Guid.NewGuid()) "newTask" "Next task"
+            |> success |> ignore
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) "newTask" (Guid.NewGuid())
+                "Owner" "Reviewer" |> success |> ignore
+            let assigned = ReviewWorkflow.getAgentInbox second "Owner" |> success
+            Assert.That(assigned.Agent.State, Is.EqualTo("Assigned"))
+            Assert.That(assigned.Focused.Value.Task.TaskId, Is.EqualTo("newTask"))
+            ReviewWorkflow.beginAttempt first (Guid.NewGuid()) "newTask" "Owner" 1 1
+            |> success |> ignore
+            ReviewWorkflow.claimReview second (Guid.NewGuid()) "oldTask" reviewId "Reviewer" 1 1
+            |> success |> ignore
+            ReviewWorkflow.decide second (Guid.NewGuid()) "oldTask" reviewId "Reviewer" 2 Accept "Good"
+            |> success |> ignore
+            let _, _, oldAttempt = ReviewWorkflow.getTask first "oldTask" |> success
+            ReviewWorkflow.finalizeImplementation first (Guid.NewGuid()) "oldTask" "Owner"
+                oldAttempt.Value.Version reviewId |> success |> ignore
+            let after = ReviewWorkflow.getAgentInbox second "Owner" |> success
+            Assert.That(after.Agent.State, Is.EqualTo("Working"))
+            Assert.That(after.Working.Value.Task.TaskId, Is.EqualTo("newTask"))
+            Assert.That(after.AcceptedPendingIntegration.Length, Is.EqualTo(1))
+            Assert.That(after.AcceptedPendingIntegration.Head.Task.TaskId, Is.EqualTo("oldTask")))

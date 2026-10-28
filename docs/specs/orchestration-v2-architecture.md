@@ -133,7 +133,7 @@ Names use strict percent-encoded safe IDs; decoded strings can never change the 
 
 Task lifecycle values: **Open → InProgress → Implemented → Integrated → Closed**, plus **Cancelled**; progression can be reopened through explicit audited commands. `Implemented` means explicitly finalized against an Accepted review/approved evidence, not merely that a reviewer accepted a snapshot and not that code was merged. `Integrated` requires recorded source evidence; `Closed` is an explicit final administrative state. Documentation-only tasks may close via explicit approved non-source criteria and never claim a source merge.
 
-Attempt phase values: **Queued, Acknowledged, Working, Parked, Blocked, Accepted, Superseded, Abandoned**. **ReadyForReview is not an attempt phase**: implementation may remain Working while an independent review request is Unclaimed, Claimed, Accepted, ChangesRequested, Withdrawn, or Superseded. Attempts also include `ownerAgentId`, `assignmentGeneration` (monotonic per attempt), `currentSpecBlobOid`, `issuedSequence`, `priority`, `reviewerId`, `checkpointId`, `resumeTarget` and optional `source` binding (remote/ref/base/head/last commit). **No `owner.worktree`.** Review request/revision records, reviewer claims, decisions, and verified source integrations are append-only evidence within the ledger/history; they must not be confused with task/attempt phases.
+Attempt phase values: **Queued, Acknowledged, Working, Paused, Finished, Parked, Blocked, Accepted, Superseded, Abandoned**. Paused means an agent explicitly yielded at a durable checkpoint; Finished means an agent explicitly completed its implementation responsibility but review/integration may still be pending. **ReadyForReview is not an attempt phase**: implementation may remain Working while an independent review request is Unclaimed, Claimed, Accepted, ChangesRequested, Withdrawn, or Superseded. Attempts also include `ownerAgentId`, `assignmentGeneration` (monotonic per attempt), `currentSpecBlobOid`, `issuedSequence`, `priority`, `reviewerId`, `checkpointId`, `resumeTarget` and optional `source` binding (remote/ref/base/head/last commit). **No `owner.worktree`.** Review request/revision records, reviewer claims, decisions, and verified source integrations are append-only evidence within the ledger/history; they must not be confused with task/attempt phases.
 
 An assignment is **one immutable generation of instructions**, stored in the attempt's generation list or separate task-local blob, including its content, generation number, issued sequence, spec blob OID, expected base commit, actor and receipt fields. Review request status/revision/claim is a separate task-local ledger entity and does not overwrite this assignment. A stale generation never becomes current again. Reissue creates a new generation, retaining old instructions/receipts for history. Source checkout locations/paths are local observations, never owner keys.
 
@@ -196,7 +196,11 @@ Validation is strict: unknown statuses, colliding/unsafe request IDs or revision
   "agent": {
     "agentId": "Agent 3",
     "version": 12,
-    "activeAttemptId": null
+    "activeAttemptId": null,
+    "focusAttemptId": null,
+    "state": "Parked",
+    "stateReason": "No work assigned",
+    "stateSequence": 24
   }
 }
 ```
@@ -205,11 +209,29 @@ These illustrate fields from **three separate files**, not a single combined JSO
 
 ## 4. Scheduling contract and state machine
 
+### Explicit agent-level states (2026-10-28)
+
+The **agent** has exactly five authoritative states. They describe orchestration/operator obligations, **not** task or review acceptance. State, version, focused attempt, Working slot, transition reason, and ledger sequence are stored together in the canonical agent record; never infer state from silence, elapsed time, browser inactivity, or harness health.
+
+| Agent state | Meaning | Next action |
+|---|---|---|
+| **Ready** | Agent yielded an existing Working assignment with a durable checkpoint and next action | Operator prompts the agent to resume; ResumeAgent returns to Working |
+| **Assigned** | Orchestrator assigned a task, but the agent has not begun its current generation | Operator prompts the agent to start; BeginAttempt returns to Working |
+| **Working** | Agent has explicitly begun/resumed its focused assignment | Agent continues; may checkpoint/yield/complete; submitting reviews does not alter Working |
+| **Completed** | Agent explicitly completed its implementation responsibility and released the Working slot | Orchestrator assigns new work or parks agent; task/review may remain open |
+| **Parked** | Orchestrator deliberately has no work assigned to the agent | Orchestrator assigns new work; no operator action is required |
+
+Initial RegisterAgent → Parked. AssignTask transitions Parked/Completed → Assigned, binds the sole focused attempt and refuses to replace a currently Assigned, Ready or Working agent. BeginAttempt transitions Assigned → Working and occupies the one execution slot. YieldAgent is Working → Ready and **atomically** writes an immutable checkpoint (summary, next action, task/attempt and generation), changes the attempt to Paused, and clears the Working slot. ResumeAgent is Ready → Working on the **same** attempt and generation. CompleteAgentWork is Working/Ready → Completed, writes a final checkpoint, changes its attempt to Finished and clears its slot; review decisions remain independent. ParkAgent is Completed/Parked → Parked with an explicit orchestrator reason, and cannot interrupt Assigned, Ready or Working.
+
+All transitions require a caller-stable operation ID and expected agent/attempt versions (where applicable). The agent's focused attempt is its current operator-facing assignment; the execution slot is occupied **only** in Working. The old completed attempt may remain in ledger history while a new assignment is underway. A reviewer can accept/finalize the old task without preempting a different current Working assignment.
+
+Ready and Assigned both need an **operator prompt**, but Ready resumes a checkpointed assignment whereas Assigned starts a new one. Completed needs an **orchestrator assignment decision**, not an operator prompt; Parked needs no action until the orchestrator deliberately assigns work. Review requests and integration status must be projected separately and never cause implicit agent-state changes.
+
 ### Capacity and queues
 
 - Each agent has one execution slot by default. **Only Working occupies it.** A queued assignment is runnable but does not reserve the slot; Acknowledged also does not occupy it.
 - Agent workload may include many Queued, Acknowledged, Parked, Blocked or Accepted attempts alongside unclaimed, claimed and resolved review requests. No task or review automatically preempts a current Working attempt.
-- `GetAgentInbox(projectId, agentId)` returns `working` (0..1), `runnableQueue`, `pendingReview` (reviews submitted for the agent's attempts and reviews claimed by that agent), `parked`, `blocked`, `acceptedPendingIntegration`, plus `slotAvailable`, `unassigned` and optional `presence` (only with real external evidence). `slotAvailable` means the execution slot is empty; **unassigned** means no outstanding tasks, including parked/blocked/review items. These must never be confused.
+- `GetAgentInbox(projectId, agentId)` returns `agent.state`, `focused`, `operatorActionRequired`, `needsOrchestratorAssignment`, `working` (0..1), `runnableQueue`, `pendingReview` (reviews submitted for the agent's attempts and reviews claimed by that agent), `parked`, `blocked`, `acceptedPendingIntegration`, plus `slotAvailable`, `unassigned` and optional `presence` (only with real external evidence). `slotAvailable` means the execution slot is empty; **unassigned** means no outstanding tasks, including parked/blocked/review items. These must never be confused.
 - Runnable queue ordering is deterministic: **priority descending, issuedSequence ascending, taskId ordinal, attemptId ordinal**. Queued and Acknowledged are runnable; an acknowledged item still requires Begin to acquire the execution slot. ChangesRequested is a reviewer decision, not a runnable attempt phase: it creates a Queued generation only for a nonworking owner; when the owner is already Working it provides durable feedback without invalidating the current Working generation.
 - Reviewer queue is a separate projection over **current Unclaimed review requests** and claimed reviewer responsibilities, ordered by review submission sequence and task ID. Review requests must not be derived from attempt phase; claiming a review does not consume an implementation slot.
 - `GetAgentAssignment` (if retained at all) returns exactly the current Working attempt or first runnable item with an explicit `selectionKind`, never an arbitrary parked/review item. `GetAgentInbox` is canonical.
@@ -225,7 +247,11 @@ All mutations require a stable operation ID, expected version(s), a valid actor,
 | ReviseTaskSpec | Existing task and matching version | New spec blob; pin existing attempts to old spec; no automatic handoff |
 | AssignTask | Open or explicitly reopened task, agent registered, no other primary live attempt | New attempt (or explicitly selected existing one), InProgress task, Queued assignment generation, owner and issuance sequence |
 | AcknowledgeAssignment | Owner, current generation, Queued | Record receipt, phase Acknowledged; do not occupy slot |
-| BeginAttempt | Owner, current generation, Queued/Acknowledged; slot empty | Occupy agent slot; Working phase; record begunAt; acknowledge implicitly **only if caller supplies the exact generation** |
+| BeginAttempt | Owner, current generation, Queued/Acknowledged; agent Assigned/focused and slot empty | Agent Working and attempt Working; acquire slot; record begunAt |
+| YieldAgent | Owner Working, exact agent/attempt versions and generation; checkpoint and next action provided | Immutable checkpoint; agent Ready, attempt Paused, release slot and preserve focus |
+| ResumeAgent | Owner Ready, focused Paused attempt, exact versions/generation | Agent and attempt Working; reacquire slot, keep same assignment |
+| CompleteAgentWork | Owner Working/Ready with final summary and matching versions/generation | Immutable completion checkpoint, attempt Finished, agent Completed, release slot; review unaffected |
+| ParkAgent | Orchestrator decision, agent Completed/Parked with matching version and reason | Agent Parked, clear focus; do not preempt an unfinished assignment |
 | CheckpointAttempt | Owner, current generation, Working | Append immutable checkpoint, advance attempt version; keep phase/slot |
 | SubmitForReview | Current Working attempt and verified publishable base/head snapshot | Publish distinct immutable source review ref; atomically create Unclaimed review request/revision with final checkpoint and keep attempt Working/slot unchanged |
 | UpdateReviewRequest | Request Unclaimed, same owner of nonterminal attempt, expected request version and current revision/generation | Publish a new immutable review ref/revision; atomically advance current revision and supersede the prior revision; keep original request ID, owner slot and original history |
@@ -611,6 +637,10 @@ Use disposable **bare Git remotes, at least two independent clones, and multiple
 41. Claim and replacement with one implementation owner racing one reviewer use exact expected request versions; previously rejected changes cannot be hidden by selecting a new base.
 42. Register two independent reviewers and verify either eligible reviewer may claim an Unclaimed request; the loser cannot decide. Claimed revision handoff retains the same pinned head.
 43. Retrying an already accepted UpdateReviewRequest UUID after its revision is claimed returns the original durable result and does not publish an unintended next source ref.
+44. Fresh agent starts Parked, becomes Assigned on new task, Working on Begin, Ready only through a durable Yield checkpoint, Working again on Resume, Completed on explicit completion, and Parked only by orchestrator decision; verify the agent record and inbox on a second clone.
+45. Inactivity, a lost frontend connection, an unclaimed review, or a reviewer decision must not change the agent state. Stale agent/attempt versions cannot resume or complete work.
+46. A Completed agent receives another task and becomes Working while a reviewer accepts the previous task; finalization of the previous Finished attempt cannot steal the new Working slot.
+47. A ParkAgent request while Assigned, Ready, or Working fails without changing focused assignment, slot or phase; Completed to Parked succeeds with a reason.
 
 Run full client/server tests, full Git integration fixtures, format checks and an actual **backup restore** before live migration. Never simulate acceptance by a passing mock push alone.
 

@@ -11,27 +11,29 @@
 
 Keep the single canonical Git ledger, independent source review refs, claims as a freezing boundary, versioned review history, and the property that submission does not stop the implementation agent. The revised spec resolves the previous architectural concern of blocking agents during reviews.
 
-However, three P0 correctness holes remain in publication concurrency, task-level uniqueness, and approval coverage. Resolve those before replacing the old review prototype. The other findings specify handoff, validation, notification and lifecycle behavior.
+**Operating constraint:** exactly one implementation agent owns a task at a time. Jarvis does not need to support competing implementation agents independently developing or submitting the same task. The reviewer is a different actor and may claim a request while its owner updates it. Repeated calls after timeouts/resets remain possible, but should use the existing operation-ID deduplication mechanism.
 
-## P0 — RV4-01: Competing updates can reuse and advance the same source review ref
+Under this constraint, the sole critical finding is **approval coverage** (RV4-03). Source-ref publication safety and one-active-request tracking remain modest defensive invariants, not reasons to build multi-owner scheduling. The other findings concern actual review handoff, feedback delivery and lifecycle correctness.
 
-**Evidence:** Architecture §§3–4, especially the revision naming rule at approximately line 253 and the publish-before-ledger rule at lines 255–261; review contract "Workflow" steps 1–5.
+## P2 — RV4-01: Keep review refs immutable under retries, not hypothetical competing task owners
 
-The published source ref is determined by task ID, request ID and revision number: jarvis-review/315/<request>/r2. Two clients holding expected version 1 can both prepare revision 2 with different commits. Both publish their candidate to the **same** ref *before* taking the ledger's optimistic concurrency decision. A regular Git push can fast-forward an existing branch, so a losing candidate can update the ref intended to be immutable, even if its ledger update is rejected. The canonical ledger serializes its own state but cannot serialize the earlier, separate source push. The test for Claim versus Update does not cover concurrent Update versus Update.
+**Evidence:** Architecture §§3–4 define refs such as `jarvis-review/315/<request>/r2`, published before the ledger update.
 
-**Remedy:** Allocate a unique, immutable candidate ref per **logical publication operation**, for example refs/heads/jarvis-review/<task>/<request>/r2-<operationUUID> (or stable collision-resistant candidate ID). Publish using create-only semantics (must be absent or already resolve to the same intended SHA), with approved source-host ref protection when available. Never update an existing review ref to a different OID, even if Git would permit a fast-forward. A losing candidate remains an orphan publication that is never returned in review queues and is cleaned up separately. The ledger CAS chooses the one authoritative candidate. Retries with the same UUID inspect the same ref/OID.
+With a **single task owner**, two independent agents submitting different candidates as r2 is out of scope. The former P0 finding incorrectly assumed parallel implementation agents. Duplicate or late operations can still occur from retries, lost responses or a restarted client; we only need to ensure publication does not rewrite an existing ref accidentally.
 
-**Required tests:** two independent UpdateReviewRequest operations with the same expected version and different heads; a fast-forward-related pair of heads; lost source-push reply and retried same operation; no existing ref ever changes OID; loser cannot overwrite winner's published revision.
+**Simpler remedy:** Keep the existing deterministic `r1` / `r2` naming. Publish **create-only**: if the ref does not exist, create it; if it already points to the exact expected SHA, reuse it for the same logical operation; if it points elsewhere, return a conflict/integrity error and do not update it (even if Git permits a fast-forward). The canonical ledger's operation UUID remains the idempotency authority. No candidate UUID suffixes, parallel-submitter protocol, extra locks or agent-coordination layer.
 
-## P0 — RV4-02: One actionable review request per task lacks an atomic uniqueness constraint
+**Tests:** retry identical source publication after lost reply; existing ref with different SHA is never modified; owner update racing reviewer claim leaves the existing claimed ref frozen.
 
-**Evidence:** Architecture §3 describes independent tasks/<task>/reviews/<request>/request.json documents (around lines 112–118, 140–166). §4 promises "One request is actionable per task at a time" around line 257, but SubmitForReview has no specified task-level active-review pointer or equivalent atomic conflict validation.
+## P1 — RV4-02: A single active review pointer makes retry and lifecycle semantics explicit
 
-Two concurrent submissions can choose **different request UUIDs**, write different review paths, and both succeed after a non-FF replay unless the transaction explicitly checks a shared invariant. Expected version of their distinct request records does not create a conflict.
+**Evidence:** The spec promises one actionable review per task, but independent review request records do not identify the current request on the task/attempt.
 
-**Remedy:** Add a task- or attempt-level activeReviewRequestId field (or an equivalent single-slot task-local review index). Submit and terminal resolution update this slot in the **same ledger commit** as the review record. Claim and Update verify that it still refers to their request; finalization checks it. Use expected versions of this shared slot on all transitions, including replay on a new ledger head. A history of terminal reviews remains separate.
+This is **not** a multi-agent assignment race. The sole owner may nevertheless retry a call after uncertainty, start a fresh review after an earlier decision, or interact with task cancellation/finalization. A task-level pointer makes current-review selection deterministic without scanning older review history.
 
-**Required tests:** concurrent SubmitForReview with distinct request UUIDs for the same task; submit racing cancel/close/finalize; stale Submit replay after another review became active; no two actionable requests in any confirmed snapshot.
+**Simpler remedy:** Put `activeReviewRequestId` in the existing attempt (or task) record. Submit sets it when empty; update/claim preserve it; a terminal review decision clears it in the same ledger mutation. Require the current pointer to match for reviewer decisions. Operation-ID deduplication handles duplicate deliveries. Reject a second actionable request until the prior request resolves; historical reviews remain separate.
+
+**Tests:** same owner retries Submit with the same operation ID, attempts another Submit before resolution, then submits a new request after resolution; cancel/finalize clears or explicitly settles the active review. No tests for competing implementation agents on one task are required.
 
 ## P0 — RV4-03: Review scope and finalization do not prove cumulative approval coverage
 
@@ -95,8 +97,8 @@ A metadata-only revision has unchanged base/head and source objects. Repushing a
 
 ## Consolidated design changes
 
-1. Use unique publication identities per candidate revision and create-only source-ref semantics.
-2. Introduce a shared active-review slot per task/attempt and enforce it in every relevant ledger mutation.
+1. Keep deterministic per-revision source ref names with create-only/idempotent publication; do not introduce per-agent candidate coordination.
+2. Track the one active review request with a simple pointer in the task or attempt record; use it for lifecycle and retry consistency.
 3. Review cumulative change sets by default; finalization must prove approval coverage of the exact integration target.
 4. Keep revision freeze independent of reviewer occupancy; reviewers can explicitly release and hand off the frozen request.
 5. Validate pinned remote source at claim and provide recoverable blocked-review state.
@@ -108,6 +110,6 @@ No database, new authoritative task ref, server scheduler, or GitHub PR dependen
 
 ## Release gate
 
-**Do not wire the new review MCP tools or replace the prototype until RV4-01, RV4-02 and RV4-03 have concrete normative state and concurrency contracts.** Resolve RV4-04 through RV4-07 in the same design iteration because they affect operational correctness. RV4-08 is an optimization and may be deferred. Expand the acceptance tests beyond claim-vs-update to cover **two competing updates** and **two competing initial submissions**.
+**Do not wire the new review MCP tools or replace the prototype until RV4-03 (cumulative approval scope) has a normative contract.** RV4-02 needs a simple active-review pointer, and RV4-01 needs create-only source publication. Resolve RV4-04 through RV4-07 during implementation because they affect actual reviewer handoff and owner notifications. RV4-08 is optional. Focus race tests on **one owner updating versus one reviewer claiming**, duplicate operation delivery, and reviewer-versus-reviewer claims; **parallel implementation agents on the same task are explicitly out of scope**.
 
 The current V2 review prototype is knowingly based on the old exclusive ReadyForReview model; its passing tests are not evidence that the newly proposed workflow is implemented.

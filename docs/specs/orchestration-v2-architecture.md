@@ -1,6 +1,6 @@
 # Jarvis Orchestration V2 — canonical remote Git ledger
 
-**Status:** Implementation-ready design specification (2026-10-27)
+**Status:** Revised V2 design contract (2026-10-28); implementation has not yet been aligned with review claim/revision semantics.
 **Branch:** `design/orchestration-v2`
 **Authority:** One append-only orphan ref, `refs/heads/jarvis-orchestration`, on a configured canonical Git remote per project.
 **Non-goals:** Server database, server-side scheduler, separate Git repository, per-task authoritative refs, source-branch task state, backward-compatible dual writers.
@@ -19,10 +19,10 @@ Invariants:
 2. Exactly one current task record exists for each project task ID; there may be many historical Git versions and implementation attempts.
 3. Agent ownership is independent of which branch, worktree, machine, or ChatGPT conversation implements it.
 4. Worktree retirement, renaming, branch creation, source integration and rebasing never modify task ownership.
-5. One ledger commit atomically changes all related task/agent/operation records; a successful operation is **published** only after the remote accepts its commit.
+5. One ledger commit atomically changes all related task/agent/review/operation records; a successful operation is **published** only after the remote accepts its commit. Source review refs are published separately, with explicitly reconciled outcomes.
 6. No force pushes, resets, rebases, deletes, or rewrite/merge commits on the ledger ref; each normal update commit has exactly one parent, the just-fetched canonical tip.
 7. Every write has a caller-stable idempotency key and per-entity optimistic versions; a rejected push causes a **logical revalidation**, never a blind file merge.
-8. At most one **Working** attempt occupies an agent's execution slot. Multiple Queued, Parked, Blocked, review-pending and completed responsibilities may coexist.
+8. At most one **Working** attempt occupies an agent's execution slot. A Working agent may submit, update or hold a review request without yielding the slot; review lifecycle and implementation lifecycle are independent.
 9. Task implementation acceptance, source integration, source push, and worktree retirement are separately recorded facts.
 10. Remote outage or unverified history yields a typed unavailable/integrity outcome, **not** a locally committed fake success or a silent Free agent.
 11. Both task history and audit evidence are preserved in Git. Reading does not mutate source or ledger.
@@ -109,6 +109,13 @@ tasks/
       <uuid>.json                    One implementation attempt and current handoff
       <uuid>.checkpoints/
         <sequence>.json              Immutable checkpoint evidence
+    reviews/
+      <request-uuid>/
+        request.json                Mutable current status/version/claim/current revision
+        revisions/
+          <revision-number>.json    Immutable snapshot, source ref, base/head, evidence
+        decisions/
+          <sequence>.json           Immutable claim/release/decision/feedback evidence
   315/
     spec.html
     task.json
@@ -124,11 +131,39 @@ Names use strict percent-encoded safe IDs; decoded strings can never change the 
 
 `agents/<id>.json` is the **only** slot materialization, e.g. `{"agentId":"Agent 3","activeAttemptId":null,"version":12}`. It stores no redundant assignment queue. The queue is a deterministic projection of tasks/attempts in the same ledger tree; the full mutation validates that slot and attempt views agree. Registration of an agent does not establish a ChatGPT session or authenticate that label.
 
-Task lifecycle values: **Open → InProgress → Implemented → Integrated → Closed**, plus **Cancelled**; progression can be reopened through explicit audited commands. `Implemented` means accepted by a reviewer, not merged. `Integrated` requires recorded source evidence; `Closed` is an explicit final administrative state. Documentation-only tasks may close via explicit approved non-source criteria and never claim a source merge.
+Task lifecycle values: **Open → InProgress → Implemented → Integrated → Closed**, plus **Cancelled**; progression can be reopened through explicit audited commands. `Implemented` means explicitly finalized against an Accepted review/approved evidence, not merely that a reviewer accepted a snapshot and not that code was merged. `Integrated` requires recorded source evidence; `Closed` is an explicit final administrative state. Documentation-only tasks may close via explicit approved non-source criteria and never claim a source merge.
 
-Attempt phase values: **Queued, Acknowledged, Working, ReadyForReview, Parked, Blocked, Accepted, Superseded, Abandoned**. Attempts also include `ownerAgentId`, `assignmentGeneration` (monotonic per attempt), `currentSpecBlobOid`, `issuedSequence`, `priority`, `reviewerId`, `checkpointId`, `resumeTarget` and optional `source` binding (remote/ref/base/head/last commit). **No `owner.worktree`.** Reviewer decisions and verified source integrations are append-only evidence within attempt records/history; they must not be confused with task/attempt phases.
+Attempt phase values: **Queued, Acknowledged, Working, Parked, Blocked, Accepted, Superseded, Abandoned**. **ReadyForReview is not an attempt phase**: implementation may remain Working while an independent review request is Unclaimed, Claimed, Accepted, ChangesRequested, Withdrawn, or Superseded. Attempts also include `ownerAgentId`, `assignmentGeneration` (monotonic per attempt), `currentSpecBlobOid`, `issuedSequence`, `priority`, `reviewerId`, `checkpointId`, `resumeTarget` and optional `source` binding (remote/ref/base/head/last commit). **No `owner.worktree`.** Review request/revision records, reviewer claims, decisions, and verified source integrations are append-only evidence within the ledger/history; they must not be confused with task/attempt phases.
 
-An assignment is **one immutable generation of instructions**, stored in the attempt's generation list or separate task-local blob, including its content, generation number, issued sequence, spec blob OID, expected base commit, actor and receipt fields. A stale generation never becomes current again. Reissue creates a new generation, retaining old instructions/receipts for history. Source checkout locations/paths are local observations, never owner keys.
+An assignment is **one immutable generation of instructions**, stored in the attempt's generation list or separate task-local blob, including its content, generation number, issued sequence, spec blob OID, expected base commit, actor and receipt fields. Review request status/revision/claim is a separate task-local ledger entity and does not overwrite this assignment. A stale generation never becomes current again. Reissue creates a new generation, retaining old instructions/receipts for history. Source checkout locations/paths are local observations, never owner keys.
+
+### Review request / revision contract
+
+The authoritative task-local review tree has one mutable `request.json` record and append-only `revisions/<n>.json` and decision/audit records. Revision 1 is created at submission; each owner replacement appends a new immutable revision record rather than overwriting an old base/head/summary. The parent request's current revision/version is the **only actionable pointer**.
+
+A minimum current request shape is:
+
+```json
+{
+  "schemaVersion": 2,
+  "requestId": "review-request-uuid",
+  "taskId": "315",
+  "attemptId": "attempt-uuid",
+  "ownerAgentId": "Agent 3",
+  "version": 4,
+  "currentRevision": 2,
+  "status": "Unclaimed",
+  "preferredReviewerId": null,
+  "claimantId": null,
+  "claimedRevisionId": null,
+  "claimSequence": null,
+  "createdSequence": 24
+}
+```
+
+Revision records contain `requestId`, `revision`, `revisionId`, `taskId`, `attemptId`, `sourceRepositoryId`, `sourceRemote`, `sourceRef`, `targetRef`, `baseCommitOid`, `headCommitOid`, `reviewRef`, `specBlobOid`, `summary`, `checkpointId`, `evidence`, `publishedSourceOid`, `createdSequence`. The revision itself is immutable. Its effective status (current, superseded, claimed, accepted, returned) is determined from the current request and append-only decision records, never by rewriting its snapshot content. `ClaimReview` must atomically write current request status/claimant and immutable claim evidence; a reviewer can query both unclaimed queue entries and their own claimed queue entries. `UpdateReviewRequest` changes the parent request version and current revision **together**, and appends one new revision.
+
+Validation is strict: unknown statuses, colliding/unsafe request IDs or revision IDs, missing source object, absent assigned attempt, mismatched owner, incorrect generation, non-reachable base/head, or source remote differing from approved binding must fail closed. Task worktrees remain observations, not review ownership keys. Review status transitions are `Unclaimed → Claimed → Accepted | ChangesRequested | Withdrawn` and `Unclaimed → Withdrawn`; replacement keeps the request Unclaimed and supersedes the old revision. Claimed → reviewer reassignment preserves Claimed and its frozen revision. No implicit expiration or lease-based claim stealing.
 
 ### Normative JSON minimum
 
@@ -172,10 +207,10 @@ These illustrate fields from **three separate files**, not a single combined JSO
 ### Capacity and queues
 
 - Each agent has one execution slot by default. **Only Working occupies it.** A queued assignment is runnable but does not reserve the slot; Acknowledged also does not occupy it.
-- Agent workload may include many Queued, Acknowledged, Parked, Blocked, ReadyForReview or Accepted attempts. No task automatically preempts a current Working attempt.
-- `GetAgentInbox(projectId, agentId)` returns `working` (0..1), `runnableQueue`, `pendingReview`, `parked`, `blocked`, `acceptedPendingIntegration`, plus `slotAvailable`, `unassigned` and optional `presence` (only with real external evidence). `slotAvailable` means the execution slot is empty; **unassigned** means no outstanding tasks, including parked/blocked/review items. These must never be confused.
-- Runnable queue ordering is deterministic: **priority descending, issuedSequence ascending, taskId ordinal, attemptId ordinal**. Queued and Acknowledged are runnable; an acknowledged item still requires Begin to acquire the execution slot. ChangesRequested is a reviewer decision, not a runnable phase: it creates a new Queued generation.
-- Reviewer queue is a separate projection over ReadyForReview attempts, ordered by submission sequence and task ID; reviewer work does not consume the implementation agent's slot.
+- Agent workload may include many Queued, Acknowledged, Parked, Blocked or Accepted attempts alongside unclaimed, claimed and resolved review requests. No task or review automatically preempts a current Working attempt.
+- `GetAgentInbox(projectId, agentId)` returns `working` (0..1), `runnableQueue`, `pendingReview` (reviews submitted for the agent's attempts and reviews claimed by that agent), `parked`, `blocked`, `acceptedPendingIntegration`, plus `slotAvailable`, `unassigned` and optional `presence` (only with real external evidence). `slotAvailable` means the execution slot is empty; **unassigned** means no outstanding tasks, including parked/blocked/review items. These must never be confused.
+- Runnable queue ordering is deterministic: **priority descending, issuedSequence ascending, taskId ordinal, attemptId ordinal**. Queued and Acknowledged are runnable; an acknowledged item still requires Begin to acquire the execution slot. ChangesRequested is a reviewer decision, not a runnable attempt phase: it creates a Queued generation only for a nonworking owner; when the owner is already Working it provides durable feedback without invalidating the current Working generation.
+- Reviewer queue is a separate projection over **current Unclaimed review requests** and claimed reviewer responsibilities, ordered by review submission sequence and task ID. Review requests must not be derived from attempt phase; claiming a review does not consume an implementation slot.
 - `GetAgentAssignment` (if retained at all) returns exactly the current Working attempt or first runnable item with an explicit `selectionKind`, never an arbitrary parked/review item. `GetAgentInbox` is canonical.
 - Agent identity is a stable label within a project, not a credential or a live ChatGPT session. No automatic reassignment based only on staleness; interruption is recorded/acted upon explicitly by an orchestrator.
 
@@ -191,25 +226,43 @@ All mutations require a stable operation ID, expected version(s), a valid actor,
 | AcknowledgeAssignment | Owner, current generation, Queued | Record receipt, phase Acknowledged; do not occupy slot |
 | BeginAttempt | Owner, current generation, Queued/Acknowledged; slot empty | Occupy agent slot; Working phase; record begunAt; acknowledge implicitly **only if caller supplies the exact generation** |
 | CheckpointAttempt | Owner, current generation, Working | Append immutable checkpoint, advance attempt version; keep phase/slot |
-| SubmitForReview | Working, valid checkpoint and current generation | ReadyForReview; release slot; reviewer queue record through phase |
-| RequestChanges | ReadyForReview and authorized reviewer | Persist review result; new Queued generation (new instructions and issuance sequence); same agent ownership; slot remains free |
-| AcceptAttempt | ReadyForReview and authorized reviewer | Append acceptance evidence; phase Accepted; task Implemented |
-| ParkAttempt | Queued/Acknowledged/Working/ReadyForReview with reason/condition | Parked; release slot if held; record resumeTarget (agent or reviewer), checkpoint preserved |
-| BlockAttempt | Queued/Acknowledged/Working/ReadyForReview with concrete blocker | Blocked; release slot if held; record resumeTarget and dependency, checkpoint preserved |
-| ResumeAttempt | Parked/Blocked, condition resolved or explicit override | New Queued generation for agent-target; or ReadyForReview for reviewer-target; no automatic slot occupation |
+| SubmitForReview | Current Working attempt and verified publishable base/head snapshot | Publish distinct immutable source review ref; atomically create Unclaimed review request/revision with final checkpoint and keep attempt Working/slot unchanged |
+| UpdateReviewRequest | Request Unclaimed, same owner of nonterminal attempt, expected request version and current revision/generation | Publish a new immutable review ref/revision; atomically advance current revision and supersede the prior revision; keep original request ID, owner slot and original history |
+| ClaimReview | Eligible registered reviewer, request Unclaimed, exact expected request version/revision | Atomically mark Claimed, pin claimed revision/base/head/ref and claimant; no source edits or agent-slot change |
+| ReleaseReviewClaim / ReassignReviewer | Authorized reviewer/orchestrator with reason and expected version | Release or transfer claimant while keeping the claimed revision frozen; owner cannot silently replace it |
+| RequestChanges | Claimed current revision, claimant reviewer, expected version | Append decision/feedback, close this review round, notify owner; never preempt a Working agent; create updated assignment instructions only when needed to resume a nonworking agent |
+| AcceptReview | Claimed current revision, claimant reviewer, expected version, verified pinned source | Append acceptance evidence for exact frozen patch; no implicit slot change, task finalization, source merge or push |
+| FinalizeImplementation | Accepted review identified and no unreviewed required work remains, current task/attempt versions | Explicitly finish implementation and release slot if held; mark task Implemented and pin accepted review/patch for integration |
+| WithdrawReview | Unclaimed and current owner (or authorized cancellation); Claimed requires reviewer/orchestrator consent | Retain immutable audit evidence; invalidate reviewer queue entry without modifying attempt Working slot |
+| ParkAttempt / BlockAttempt | Queued/Acknowledged/Working with condition/blocker | Parked/Blocked; release slot if held; review requests remain independently tracked and require explicit decision when affected |
+| ResumeAttempt | Parked/Blocked and condition resolved or explicit override | New Queued assignment generation; does not automatically acquire slot or revise a claimed review |
 | PlanIntegration | Accepted and code requires integration | Persist target ref, source commit, expected target head and actionId; pending source action |
 | RecordIntegration | Verified source evidence and current target remote ref | Persist verified integration; task Integrated; no implicit push |
 | CloseTask | Integrated or explicitly approved non-source closure policy | Closed; retain all attempts, evidence and audit |
 | CancelTask / AbandonAttempt | Explicit authorized cancellation and expected version | Terminal state; remove queue/slot membership; retain history |
 | BindAttemptSource | Registered project workspace, verified Git source reference | Update source observation only; never change agent owner or phase |
 
-`BeginAttempt` is the only slot-acquisition command. It can select the top runnable assignment or a specific queued attempt/generation. Attempting to start a second attempt for the same agent fails `AgentBusy`. A reviewer returning Task 315 while Agent 3 works on Task 316 creates a new Queued generation for 315; it does not interrupt 316 or mark 315 Working.
+`BeginAttempt` is the only slot-acquisition command. It can select the top runnable assignment or a specific queued attempt/generation. Attempting to start a second attempt for the same agent fails `AgentBusy`. A reviewer returning Task 315 while Agent 3 works on Task 316 creates a new Queued generation for 315; it does not interrupt 316 or mark 315 Working. A reviewer returning Task 315 while Agent 3 is already Working on Task 315 leaves that generation Working and adds durable review feedback.
 
-### Commit submission and reviewer decisions
+### Independent review requests and immutable review branches
 
-A SubmitForReview request must identify a **specific Git commit OID**, fully qualified source ref, review UUID, assigned reviewer, summary/evidence, current assignment generation and expected attempt version. The client verifies that the submitted object is a commit reachable from the supplied source ref; it never substitutes the current source branch tip. The review UUID and source OID become the immutable identity of that review round, retained in the ledger's Git history.
+**Agent work does not pause on review submission.** The implementation attempt can remain Working and keep its execution slot while any review is Unclaimed or Claimed. The reviewer request is a distinct ledger entity, not a replacement attempt phase. An agent may keep committing to its working branch after a snapshot has been submitted.
 
-Submitting atomically records the review request, transitions Working to ReadyForReview and frees the implementation agent's execution slot. A reviewer inbox is derived from Pending review records and ordered by ledger submission sequence. Reviewer decisions require the exact pending review UUID and expected review version; self-review is rejected. Accept requires that the reviewer device can access the submitted commit object and records Implemented, **not Integrated or Closed**. RequestChanges requires feedback, records that review as ChangesRequested and issues a new Queued assignment generation without preempting any other Working task. Prior review rounds and comments remain auditable. There is no automatic source push or merge; cross-device review may require the implementation branch to be explicitly pushed and fetched.
+A review request has a stable `requestId`, task/attempt IDs, owner, optional preferred reviewer/eligibility policy, `version`, `currentRevision`, `status`, `createdSequence`, and optional claimant. Each revision has an immutable `revisionId` and monotonically increasing number, independent `sourceRepositoryId`, approved source remote, source/target refs, `baseCommitOid`, `headCommitOid`, pinned spec blob, final checkpoint/evidence, creation sequence, and exact **review ref**. The reviewable change is the pinned base-to-head tree delta, not just the last commit. Source refs must be sufficiently retained for a different reviewer client to fetch and verify the exact source objects.
+
+Each published revision uses a **new, immutable source Git ref**, e.g. `refs/heads/jarvis-review/315/<request-id>/r1`, `.../r2`. Its remote advertised OID must match the pinned head. A replacement never moves, force-pushes, deletes or rebases a prior review ref. These refs live in normal **source history**, not in the orphan ledger. Their publication and the ledger mutation are separate; see the crash/recovery contract below. A review ref cannot be reused for a different OID. Later cleanup is explicit, after no active or integration-dependent review references it; old ledger revision/evidence records remain immutable.
+
+**SubmitForReview:** First verify and publish the source review ref (never push to main implicitly). Then write one ledger transaction creating `Unclaimed` request revision 1 and the final implementation checkpoint. The attempt remains Working; the agent retains its slot. The reviewer queue projects only the current Unclaimed request, not an older revision.
+
+**UpdateReviewRequest / Replace:** The submitting owner may submit a newer revision (new commits, changed base/head, revised description/evidence, or revised target) **only while the request is Unclaimed**. The request keeps its stable ID and gets `version + 1`, `currentRevision + 1`; the previous revision is auditable and marked Superseded, not overwritten. The caller must supply the expected request version and current revision; updating after a claim returns `ReviewAlreadyClaimed`, with no ledger changes. Allow metadata-only replacement through the same versioned revision rule to avoid invisible changes to a reviewer's view. One request is actionable per task at a time; a Claimed request cannot be replaced unilaterally, though the agent may continue working and submit another request after the claimed review reaches a terminal decision.
+
+**ClaimReview:** A reviewer explicitly claims the latest Unclaimed revision using `requestId`, `expectedVersion` and `expectedRevision`. One ledger transaction marks it Claimed, records `claimantId`, `claimedRevisionId`, `claimSequence`, and freezes the exact base/head/ref and evidence. A preferred/assigned reviewer is **not** equivalent to a claim. A reviewer must not decide a request they have not claimed; self-review is disallowed at the logical agent-label level. The owner may update an Unclaimed request while their attempt is Working, Queued or Parked, provided it remains nonterminal and its ownership/generation is current; updating a review is **not** itself a BeginAttempt or slot acquisition. The claim does not acquire the reviewer's implementation execution slot.
+
+**Concurrency:** ClaimReview and UpdateReviewRequest compete on the same remote request record/version. If replacement publishes first, a stale claim fails and the reviewer must read the new revision. If claim publishes first, replacement fails with `ReviewAlreadyClaimed`; it must never silently create a newer active revision. Pending remote publication of a losing revision may leave a detached, immutable review ref; it is **not** an authoritative review request and can be reclaimed by a separately verified cleanup operation. All mutations use caller-stable operation UUIDs; retries check the ledger operation index before rechecking claim/revision state. Exactly one current revision may be actionable, and exactly one reviewer claim may win.
+
+**Claimed review:** From Claim, the revision remains frozen until AcceptReview, RequestChanges, explicit Withdraw with reviewer/orchestrator consent, or audited reviewer reassignment. Reassignment changes the claimant but retains `status=Claimed`, `claimedRevisionId`, and the immutable claim history. Releasing the claimant without immediate reassignment leaves the request `Claimed` with `claimantId=null` and an explicit `AwaitingReassignment` reviewer-work substate; **it does not set status back to Unclaimed** and cannot be picked up by ordinary ClaimReview. Only an authorized ReassignReviewer may select the replacement reviewer. This does **not** re-enable owner replacement; the new reviewer examines the same frozen snapshot. A decision references the claimed revision and exact pinned base/head. AcceptReview marks that review Accepted and retains its approved patch; it does **not** automatically terminate a still-Working agent or declare all subsequent unreviewed work complete. RequestChanges records findings and notifies the owner: an already Working agent keeps working, whereas a nonworking owner receives a new Queued generation to resume. FinalizeImplementation is separate and explicitly selects an accepted review as the completion/integration basis. Any later code must go through its own review and cannot ride along on a moving branch tip.
+
+**Publication/recovery:** Source review-ref push, ledger Submit/Update, and eventual source integration are **not** a cross-ref atomic transaction. On transport uncertainty, first inspect the source remote ref and then check the canonical ledger operation ID; never move an existing review ref in an attempt to “repair” a race. A ref published without a successful ledger update remains an orphan candidate and must not appear in reviewer inboxes. Verify preservation of any accepted/claimed revision before cleanup. When the reviewer fetches or accepts, it must verify the remote review ref still resolves to the pinned SHA (or fail closed with a source-integrity error); the review does not track a moving branch. Git credentials/permissions remain the trust boundary, not agent labels.
 
 An agent disappearing mid-turn leaves the slot occupied and the attempt marked Working until explicitly paused, blocked or reclaimed through a reviewer/orchestrator action with an audit reason. Checkpoints require Working so an agent cannot bypass the capacity rule by progressing an Acknowledged item without beginning it. Presence is not inferred from Git; no lease expiry or automatic stealing. Admin release must atomically revoke the old generation and free the slot, preventing a stale client from continuing authoritatively. Two simultaneous Begin calls are checked on the same remote snapshot and only one can publish a slot change.
 
@@ -317,10 +370,10 @@ Existing V1 task JSON must not be imported as executable current state by ordina
 
 **Ledger ref updates and source branch pushes are separate Git operations.** A transaction spanning both refs does not exist. Model integration as an explicit, auditable workflow:
 
-1. Reviewer **AcceptAttempt** records acceptance and the source commit(s) being approved. This does not assert that code has merged or been pushed.
-2. Orchestrator calls **PlanIntegration**, recording an integration action ID, source branch/ref, base/head OIDs, target ref, canonical source remote and expected target head in the ledger. The attempt is Accepted/PendingSourceAction.
-3. Client performs its normal explicit Git merge/rebase or equivalent source action and pushes the target as instructed by the orchestrator. **Neither the ledger nor the server performs source Git edits implicitly.**
-4. Client performs a fresh **read-only remote Git verification**: target ref and commit SHA; ancestry of accepted commits, or a separately documented patch-equivalence proof (including source and target OIDs). The verifier records which remote, timestamp, method and exact target head were inspected. A merge present only in a local checkout remains **PendingPush**, not remote-integrated.
+1. Reviewer **AcceptReview** records acceptance of a claimed immutable review revision, including base/head, reviewed patch scope and verification evidence. **FinalizeImplementation** explicitly selects an accepted revision as the task's completion basis; acceptance alone neither stops the implementation agent nor asserts merge/push.
+2. Orchestrator calls **PlanIntegration**, recording an integration action ID, **accepted review ID and revision**, its immutable review-ref/base/head OIDs, target ref, canonical source remote and expected target head in the ledger. The finalized attempt is Accepted/PendingSourceAction. A moving implementation branch tip is never the integration target.
+3. Client performs an explicit integration of only the accepted immutable review head or verified equivalent patch and pushes the target as instructed by the orchestrator. **Neither the ledger nor the server performs source Git edits implicitly.**
+4. Client performs a fresh **read-only remote Git verification**: target ref and commit SHA; evidence that the target contains the **exact approved delta and no later unreviewed source changes**, or a separately documented verified patch-equivalence proof (including source and target OIDs). The verifier records which remote, timestamp, method and exact target head were inspected. A merge present only in a local checkout remains **PendingPush**, not remote-integrated.
 5. **RecordIntegration** publishes verified **remote-target** evidence to the ledger with the original integration action ID. Only then does the task become Integrated. If source push is pending, preserve an explicit **PendingPush** integration substate and do not mark the task Integrated until the remote ref is verified.
 6. Orchestrator **CloseTask** separately when closure policy is satisfied. Worktree cleanup is its own checked Git operation with no task-state deletion.
 
@@ -344,7 +397,8 @@ ListTasks / GetTask / GetAttempt / GetTaskHistory / CreateTask / ReviseTaskSpec 
 DiffTaskSpec / ExportTaskSpec
 RegisterAgent / GetAgentRoster / GetAgentInbox / GetOrchestrationSnapshot / GetOperationStatus
 AssignTask / AcknowledgeAssignment / BeginAttempt / CheckpointAttempt
-SubmitForReview / RequestChanges / AcceptAttempt
+SubmitForReview / UpdateReviewRequest / ClaimReview / GetReviewRequest / GetReviewerQueue
+ReleaseReviewClaim / ReassignReviewer / AcceptReview / RequestChanges / WithdrawReview / FinalizeImplementation
 ParkAttempt / BlockAttempt / ResumeAttempt / CancelTask
 BindAttemptSource / PlanIntegration / RecordIntegration / CloseTask
 InspectLegacyTaskMigration / ApplyLegacyTaskMigration
@@ -415,7 +469,8 @@ A read-only `GetAgentInbox` response has this conceptual shape:
   ],
   "parked": [],
   "blocked": [],
-  "readyForReview": [],
+  "submittedReviews": [],
+  "claimedReviews": [],
   "acceptedPendingIntegration": [],
   "unassigned": false,
   "presence": "Unknown"
@@ -491,6 +546,9 @@ Typed errors must be distinguishable and preserve the requested operation ID whe
 | `InvalidTransition` | Illegal attempt/lifecycle change | Report allowed transitions |
 | `AgentBusy` | Another Working attempt holds the slot | Queue work; do not preempt |
 | `SourceUnavailable` | Bound branch/worktree cannot be verified | Repair source binding; preserve ownership |
+| `ReviewAlreadyClaimed` | Owner attempted to revise an already claimed request | Keep claimed snapshot; continue work or await reviewer outcome |
+| `ReviewVersionConflict` | Review claim/replacement targeted an obsolete request version/revision | Re-read current request and explicitly retry new intent |
+| `SourceReviewRefUnavailable` | Pinned review ref is missing or differs from published SHA | Fail closed; recover the published object/ref before review or integration |
 | `ProtocolUpgradeRequired` | Task writer uses obsolete protocol | Upgrade/reconnect client |
 
 A remote's non-FF rejection is an **internal retry event**, not a domain conflict, until logical revalidation detects one. Distinguish authentication/permission failures from transient connectivity. Failed validation must not create ledger commits.
@@ -521,14 +579,14 @@ Use disposable **bare Git remotes, at least two independent clones, and multiple
 11. Verify partial/shallow clone handling; snapshot SHA pinned through local GC; missing object produces typed error, not substitute data.
 12. Read concurrent pages from exact snapshot commit while writers push, including continuation from **a different client**: stable total, no duplicate/omitted rows, no token that can select arbitrary source-branch commits; global roster agrees with snapshot.
 13. Park Agent 3's Task 308, then assign Agent 3 Task 316; slot is available before Begin, occupied after Begin, and Task 308 remains Parked.
-14. Agent 3 works on Task 316 while reviewer returns Task 308 with a new generation; Task 308 is Queued and does not preempt 316.
+14. Agent 3 works on Task 316 while reviewer returns Task 308 with a new generation; Task 308 is Queued and does not preempt 316. Reviewer feedback on Task 316 itself does not preempt or invalidate its Working generation.
 15. Verify deterministic priority/sequence queue order, exact-generation acknowledgements and stale Begin/Checkpoint rejection after reassignment.
 16. Agent disappears mid-turn; no inferred presence or auto-reassignment. Authorized explicit reclaim invalidates old generation and releases slot.
 17. Task spec edited in a source HTML file after assignment; pinned spec blob remains unchanged until explicit revise/reissue.
 18. Task/agent checkpoint schema fuzzing: invalid IDs, paths, oversized JSON, unknown phase/status, unsafe content and incompatible schema fail without Git writes.
 19. Remote repository public/unknown visibility requires explicit consent; Git ref protection preventing normal push gives a clear setup diagnostic.
 20. Integration source push succeeds but ledger publish fails; retry verifies source target, records evidence once and never repeats merge blindly.
-21. Successful AcceptAttempt does not imply Integrated or Pushed; documented no-source task may close with separately approved closure policy.
+21. Successful AcceptReview does not imply Implemented, Integrated, Pushed or stopped Working; explicit FinalizeImplementation and PlanIntegration select exact approved revision. A documented no-source task may close with separately approved closure policy.
 22. Move/rename/delete/recreate worktree and remove source branch; assignment persists with SourceUnavailable where appropriate.
 23. Migration dry run contains all old worktree copies and conflicts; approved root import preserves exact IDs, spec contents, attempts, acknowledgements and checkpoints.
 24. After 4.0 cutover, a connected V1 task writer is rejected by stateless MCP router while ordinary read-only Git/file commands remain available.
@@ -537,18 +595,29 @@ Use disposable **bare Git remotes, at least two independent clones, and multiple
 27. Cross-platform test of alternate Git paths, long task IDs, Windows filesystem case behavior, remote URL changes, and git command argument safety.
 28. Server restart/upgrade cannot lose the task state; a client fetches the same remote ledger before and after restart.
 
+29. An agent submits revision r1, then r2 without reviewer claim. Both immutable remote review refs exist; exactly r2 appears in Unclaimed queue; old r1 evidence is readable.
+30. ClaimReview(r1/version 1) races UpdateReviewRequest(r2/version 1). Precisely one wins the ledger fast-forward race: if update wins, stale claimant must read r2; if claim wins, owner receives ReviewAlreadyClaimed and cannot overwrite the reviewed SHA.
+31. Claim is committed after r2 publication succeeded but before its ledger mutation. The unmatched r2 source ref never appears as an active review; retries do not move r1 or falsely publish r2; cleanup retains the claimed revision.
+32. The agent continues Working and checkpointing after submitting or updating a review. The reviewer claims/accepts the frozen r2 while the agent makes later commit r3; acceptance neither takes the agent's slot nor integrates unreviewed r3.
+33. Two reviewers race to claim the same request; exactly one ClaimReview succeeds. No reviewer may accept without claim; reviewer release/reassignment retains the exact claimed revision and does not re-enable owner replacement.
+34. The reviewer fetches revision r1 by its immutable published ref across independent clones and verifies exactly the pinned base/head, including a multi-commit diff. A moved/deleted review ref fails verification instead of silently using another head.
+35. Agent cancels unclaimed review, reviewer rejects claimed review, and orchestrator explicitly finalizes accepted review; resulting reviewer queue, agent slot, task lifecycle, and integration basis remain consistent across clients.
+36. Submit/Update source publication succeeds but ledger push is rejected, times out, or gets superseded by another writer. Replaying the original operation ID resolves its ledger outcome without reusing or force-moving review refs; safely identify orphaned candidate refs for later cleanup.
+37. The reviewer claims while viewing an old UI snapshot. The expected request version/revision guards the decision; stale Claim or Update gets a typed error and a fresh view, never an automatic second review.
+38. Review schema fuzzing covers invalid path encoding, duplicate revision numbers, malformed review refs, unknown status, malicious evidence, reviewer identity collisions and required source binding fields.
+
 Run full client/server tests, full Git integration fixtures, format checks and an actual **backup restore** before live migration. Never simulate acceptance by a passing mock push alone.
 
 ## 12. Implementation sequence and completion gate
 
 1. **LedgerStore prototype:** approved project remote binding; orphan init; exact fetch/read; temporary-index commit; fast-forward push; operation-index dedup; lost-response recovery; trusted ref pinning. Prove with two clones *before* exposing write tools.
-2. **Domain model:** task/attempt/agent records, transition validators, per-agent slot atomicity, deterministic inbox/reviewer queues, immutable specs/checkpoints and schema-versioned serializers.
+2. **Domain model:** task/attempt/agent and independent versioned review request/revision/claim records, transition validators, per-agent slot atomicity, deterministic inbox/reviewer queues, immutable review refs/specs/checkpoints and schema-versioned serializers.
 3. **Task tools and UI:** full MCP command surface, read snapshot pagination, spec editing/import/export, source bindings and local retry key storage for TUI; replace V1 read paths.
 4. **Integration workflow:** separately verified source and ledger commits, reviewer acceptance, pending source actions, push verification and worktree retirement.
 5. **Migration and protocol 4.0:** dry-run with explicit conflict resolution, Git mirror backup, global old-writer gate, controlled client rollout, independent clone verification and source cleanup later.
 6. **Hardening/acceptance:** forced rewrite and outage recovery, cross-platform security tests, 10-client contention, full restore drill and live smoke tests.
 
-**Ready for implementation** means the schema, transitions, tool expectations, failure behavior and migration gates above are implemented in this order. **Done** means a task can be managed from any authorized project client/worktree without branch-derived ownership duplicates; concurrent agents cannot violate slot/assignment rules; lost pushes are recoverable by operation ID; historic task Git state remains intact; and the Jarvis server contains no new orchestration database or scheduling state.
+**Ready for implementation** means the schema, transitions, tool expectations, failure behavior and migration gates above are implemented in this order. The existing V2 review prototype is known to implement the earlier exclusive ReadyForReview handoff and **must be replaced** before exposing native review commands. **Done** means a task can be managed from any authorized project client/worktree without branch-derived ownership duplicates; concurrent agents cannot violate slot/assignment rules; lost pushes are recoverable by operation ID; historic task Git state remains intact; and the Jarvis server contains no new orchestration database or scheduling state.
 
 ### Review resolution checklist
 
@@ -564,5 +633,7 @@ Run full client/server tests, full Git integration fixtures, format checks and a
 | RV2-08 — Spec authoring | `6`: Create/Revise/Import/Diff/Export with pinned blob |
 | RV2-09 — Integration recovery | `7`: explicit Plan/Verify/Record source action across refs |
 | RV2-10 — Contention | `5.2` and `10–11`: bounded retry/backoff, ten-agent test and metrics |
+
+**Review redesign (RV3):** Claimed review scope is immutable, Unclaimed request revisions are replaceable, and agent Working status is independent. RV3-01/02/03 are addressed in the *design* by pinned base/head plus durable review refs and integration restricted to accepted patch sets. RV3-04/05/06/07/08/09 are design requirements in Sections 3–4, 7–8 and tests 29–38; implementation and independent review remain pending. See `docs/reviews/2026-10-28-commit-review-spec-review.md`.
 
 **Remaining deliberate tradeoffs:** a single remote ref serializes project writes; remote connectivity is required for authoritative updates; user-controlled Git credentials—not logical agent names—define trust; no client can prove a remote's full history without previously trusted state/host protection/backups; source push and ledger push are separate, explicitly reconciled operations. These are accepted design constraints, not unresolved questions.

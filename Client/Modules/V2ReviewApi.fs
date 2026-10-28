@@ -493,6 +493,13 @@ module V2PendingIntentJournal =
                 | "V2TaskWrite", "RegisterAgent" -> [ "ActorId", "agentId" ]
                 | "V2TaskWrite", "AssignTask" ->
                     common @ [ "AttemptId", "attemptId"; "OwnerId", "ownerId"; "ReviewerId", "reviewerId" ]
+                | "V2TaskWrite", "AcknowledgeAssignment" ->
+                    owner @ [ "ExpectedVersion", "expectedVersion"; "AssignmentGeneration", "generation" ]
+                | "V2TaskWrite", "ReissueAssignment" ->
+                    owner @ [ "ExpectedVersion", "expectedAttemptVersion"
+                              "ExpectedAgentVersion", "expectedAgentVersion"
+                              "AssignmentGeneration", "generation"
+                              "Summary", "instructions"; "Html", "specHtml" ]
                 | "V2TaskWrite", "BeginAttempt" ->
                     owner @ [ "ExpectedVersion", "expectedVersion"
                               "AssignmentGeneration", "generation" ]
@@ -931,9 +938,14 @@ module V2TaskApi =
     let read (cmd: V2TaskReadCommand) rt =
         ReviewV2Binding.load cmd.ProjectName rt
         |> Result.bind (fun binding ->
-            ReviewWorkflow.ReviewWorkflow.getAgentInbox binding cmd.AgentId
-            |> mapError
-            |> Result.map box)
+            match cmd.Action with
+            | "AgentInbox" ->
+                ReviewWorkflow.ReviewWorkflow.getAgentInbox binding cmd.AgentId
+                |> mapError |> Result.map box
+            | "GetAssignment" ->
+                ReviewWorkflow.ReviewWorkflow.getAssignment binding cmd.TaskId cmd.AssignmentGeneration
+                |> mapError |> Result.map box
+            | _ -> Error(Client.ValidationError "Unsupported V2 task read operation."))
 
     let write (cmd: V2TaskWriteCommand) rt =
         ReviewV2Binding.load cmd.ProjectName rt
@@ -958,6 +970,15 @@ module V2TaskApi =
                                 ReviewWorkflow.ReviewWorkflow.assignTask binding operationId cmd.TaskId
                                     attemptId cmd.OwnerId cmd.ReviewerId
                                 |> mapError)
+                        | "ReissueAssignment" ->
+                            ReviewWorkflow.ReviewWorkflow.reissueAssignment binding operationId
+                                cmd.TaskId cmd.ActorId cmd.ExpectedVersion cmd.ExpectedAgentVersion
+                                cmd.AssignmentGeneration cmd.Summary cmd.Html
+                            |> mapError
+                        | "AcknowledgeAssignment" ->
+                            ReviewWorkflow.ReviewWorkflow.acknowledgeAssignment binding operationId
+                                cmd.TaskId cmd.ActorId cmd.ExpectedVersion cmd.AssignmentGeneration
+                            |> mapError
                         | "BeginAttempt" ->
                             ReviewWorkflow.ReviewWorkflow.beginAttempt binding operationId cmd.TaskId
                                 cmd.ActorId cmd.ExpectedVersion cmd.AssignmentGeneration

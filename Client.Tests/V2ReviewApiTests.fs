@@ -98,7 +98,7 @@ let v2TaskSetupAndInboxRefuseUnconfiguredCheckout () =
     try
         let context = GitCommandTests.TestContext root
         GitCommandTests.initRepo context
-        let inbox : V2TaskReadCommand = { ProjectName = "Project1"; AgentId = "Worker" }
+        let inbox : V2TaskReadCommand = { ProjectName = "Project1"; AgentId = "Worker"; Action = "AgentInbox"; TaskId = ""; AssignmentGeneration = 0 }
         match Client.V2ReviewApi.V2TaskApi.read inbox context with
         | Error(Client.ValidationError message) ->
             Assert.That(message, Does.Contain("V2 ledger disabled"))
@@ -134,7 +134,7 @@ let v2TaskSetupAndInboxRefuseUnconfiguredCheckout () =
 [<Test>]
 let v2TaskMutationsRequireGitWritePermission () =
     Client.PermissionPolicy.clearGrants()
-    let inbox = V2TaskReadCommand { ProjectName = "Project1"; AgentId = "Worker" }
+    let inbox = V2TaskReadCommand { ProjectName = "Project1"; AgentId = "Worker"; Action = "AgentInbox"; TaskId = ""; AssignmentGeneration = 0 }
     match Client.PermissionPolicy.evaluate inbox with
     | Ok () -> ()
     | other -> Assert.Fail(sprintf "Inbox should be read-only: %A" other)

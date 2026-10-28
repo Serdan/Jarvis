@@ -161,7 +161,10 @@ type CompleteTaskCommand =
 
 type V2TaskReadCommand =
     { ProjectName: string
-      AgentId: string }
+      AgentId: string
+      Action: string
+      TaskId: string
+      AssignmentGeneration: int }
 
 type V2TaskWriteCommand =
     { ProjectName: string
@@ -1106,7 +1109,7 @@ module AgentCommandInfo =
         | None -> invocation command
 
 module AgentProtocol =
-    let version = "3.28"
+    let version = "3.29"
     let defaultPatchFuzzyContextLines = 3
     let maxResponseBytes = 900 * 1024
     let maxImageBytes = 8 * 1024 * 1024

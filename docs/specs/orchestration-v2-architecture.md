@@ -318,6 +318,14 @@ Each published revision uses a **new, immutable source Git ref**, e.g. `refs/hea
 
 An agent disappearing mid-turn leaves the slot occupied and the attempt marked Working until explicitly paused, blocked or reclaimed through a reviewer/orchestrator action with an audit reason. Checkpoints require Working so an agent cannot bypass the capacity rule by progressing an Acknowledged item without beginning it. Presence is not inferred from Git; no lease expiry or automatic stealing. Admin release must atomically revoke the old generation and free the slot, preventing a stale client from continuing authoritatively. Two simultaneous Begin calls are checked on the same remote snapshot and only one can publish a slot change.
 
+### 4.x Immutable assignment generations and acknowledgment (experimental 3.29)
+
+The V2 ledger now stores `tasks/<task-id>/attempts/<attempt-id>/assignments/<generation>.json` as immutable instructions for each issued generation: sole owner, issuer, reason, full instructions, pinned spec SHA, optional baseline/target, prior generation, and canonical issue sequence. Initial assignment, review-requested requeue after Finished, completion requeue, recovery and explicit reissue create new records without replacing old ones. Review feedback while Working never advances the current generation or preempts the owner.
+
+`V2AcknowledgeAssignment` writes an immutable `<generation>.ack.json` receipt for the exact owner, issue sequence and pinned spec, moving Queued to Acknowledged via version/generation CAS. `BeginAttempt` accepts both Queued and Acknowledged: beginning directly from Queued **atomically creates the acknowledgment receipt**; beginning from Acknowledged verifies the existing evidence. A Working generation therefore has durable acknowledgment. `V2GetAssignment` returns historical/current issue and receipt from one verified snapshot. Begin/Resume/recovery/reissue enforce current-generation guards and do not create concurrent task owners.
+
+`V2ReissueAssignment` can replace an *unstarted Assigned* generation with new instructions and optionally a revised HTML specification. It atomically updates the task's spec version, pins the new Git blob OID to the next generation and keeps the previous generation/receipt immutable. Working and Ready agents cannot be preempted by this operation. Reading historical spec content by blob OID is delegated to V2-09; V2-04 exposes the exact historical blob identity. Permission/actor identity hardening remains V2-11; this does not activate production V2.
+
 ## 5. Git write transactions, retries, and idempotency
 
 ### 5.1 Caller-owned operation identity

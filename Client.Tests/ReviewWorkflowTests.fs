@@ -494,12 +494,23 @@ type ReviewWorkflowTests() =
                           OwnerId = "Owner"; ReviewerId = "Reviewer" } |> ignore
                 let queued =
                     Client.V2ReviewApi.V2TaskApi.read
-                        { ProjectName = "owner"; AgentId = "Owner" } ctx
+                        { ProjectName = "owner"; AgentId = "Owner"; Action = "AgentInbox"; TaskId = ""; AssignmentGeneration = 0 } ctx
                     |> function
                         | Ok value -> unbox<AgentInbox> value
                         | Error error -> failwithf "V2 inbox failed: %A" error
                 Assert.That(queued.RunnableQueue.Length, Is.EqualTo(1))
                 Assert.That(queued.RunnableQueue.Head.Attempt.SpecBlobOid.Length, Is.EqualTo(40))
+                let generationLookup : Common.V2TaskReadCommand =
+                    { ProjectName = "owner"; AgentId = ""; Action = "GetAssignment"
+                      TaskId = taskId; AssignmentGeneration = 1 }
+                let snapshotAssignment =
+                    Client.V2ReviewApi.V2TaskApi.read generationLookup ctx
+                    |> function
+                        | Ok value -> System.Text.Json.JsonSerializer.Serialize(value)
+                        | Error error -> failwithf "V2 immutable assignment read failed: %A" error
+                Assert.That(snapshotAssignment, Does.Contain("Implement task"))
+                Assert.That(snapshotAssignment, Does.Contain("Owner"))
+
                 let operationStatus : Common.V2LedgerReadCommand =
                     { ProjectName = "owner"; Action = "GetOperationStatus"
                       OperationId = createCommand.OperationId }
@@ -541,7 +552,7 @@ type ReviewWorkflowTests() =
                           NextAction = "Resume work" } |> ignore
                 let ready =
                     Client.V2ReviewApi.V2TaskApi.read
-                        { ProjectName = "owner"; AgentId = "Owner" } ctx
+                        { ProjectName = "owner"; AgentId = "Owner"; Action = "AgentInbox"; TaskId = ""; AssignmentGeneration = 0 } ctx
                     |> function
                         | Ok value -> unbox<AgentInbox> value
                         | Error error -> failwithf "V2 Ready inbox failed: %A" error
@@ -565,7 +576,7 @@ type ReviewWorkflowTests() =
                 | Error error -> Assert.Fail(sprintf "V2 submit API failed: %A" error)
                 let after =
                     Client.V2ReviewApi.V2TaskApi.read
-                        { ProjectName = "owner"; AgentId = "Owner" } ctx
+                        { ProjectName = "owner"; AgentId = "Owner"; Action = "AgentInbox"; TaskId = ""; AssignmentGeneration = 0 } ctx
                     |> function
                         | Ok value -> unbox<AgentInbox> value
                         | Error error -> failwithf "V2 inbox failed: %A" error
@@ -1637,3 +1648,269 @@ type ReviewWorkflowTests() =
                 | Error error -> Assert.Fail(sprintf "Restored trusted ref: %A" error)
             Assert.That(git one [ "status"; "--porcelain" ], Is.Empty)
             File.Delete path)
+
+    [<Test>]
+    member _.AssignmentAcknowledgmentPinsExactGenerationAndSpec() =
+        withFixture (fun _ _ first second _ _ _ _ ->
+            let taskId = "assignmentAck"
+            let html = "<h1>Exact pinned instructions</h1>"
+            ReviewWorkflow.createTaskWithSpec first (Guid.NewGuid()) taskId
+                "Acknowledged task" html |> success |> ignore
+            let attemptId = Guid.NewGuid()
+            let assigned = ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId
+                               attemptId "Owner" "Reviewer" |> success
+            let _, _, attempt, issued, prior =
+                ReviewWorkflow.getAssignment second taskId 1 |> success
+            Assert.That(issued.Generation, Is.EqualTo(1))
+            Assert.That(issued.OwnerAgentId, Is.EqualTo("Owner"))
+            Assert.That(issued.IssuerId, Is.EqualTo("Orchestrator"))
+            Assert.That(issued.SpecBlobOid, Is.EqualTo(attempt.SpecBlobOid))
+            Assert.That(issued.IssuedSequence, Is.EqualTo(assigned.Operation.Sequence))
+            Assert.That(issued.Instructions, Does.Contain(taskId))
+            Assert.That(prior.IsNone, Is.True)
+            let ackId = Guid.NewGuid()
+            let receipt = ReviewWorkflow.acknowledgeAssignment first ackId taskId "Owner" 1 1
+                          |> success
+            Assert.That(receipt.AlreadyApplied, Is.False)
+            let _, _, acknowledged, historical, evidence =
+                ReviewWorkflow.getAssignment second taskId 1 |> success
+            Assert.That(acknowledged.Phase, Is.EqualTo("Acknowledged"))
+            Assert.That(acknowledged.Version, Is.EqualTo(2))
+            Assert.That(historical, Is.EqualTo(issued))
+            Assert.That(evidence.Value.OwnerAgentId, Is.EqualTo("Owner"))
+            Assert.That(evidence.Value.SpecBlobOid, Is.EqualTo(issued.SpecBlobOid))
+            Assert.That(evidence.Value.IssueSequence, Is.EqualTo(issued.IssuedSequence))
+            Assert.That(evidence.Value.AcknowledgedSequence, Is.EqualTo(receipt.Operation.Sequence))
+            let duplicate = ReviewWorkflow.acknowledgeAssignment second ackId taskId "Owner" 1 1
+                            |> success
+            Assert.That(duplicate.AlreadyApplied, Is.True)
+            expectStale (ReviewWorkflow.beginAttempt second (Guid.NewGuid()) taskId "Owner" 1 1)
+            ReviewWorkflow.beginAttempt second (Guid.NewGuid()) taskId "Owner" 2 1
+            |> success |> ignore
+            let _, _, working, unchanged, ack =
+                ReviewWorkflow.getAssignment first taskId 1 |> success
+            Assert.That(working.Phase, Is.EqualTo("Working"))
+            Assert.That(unchanged, Is.EqualTo(issued))
+            Assert.That(ack.Value, Is.EqualTo(evidence.Value))
+            Assert.That((LedgerStore.fetch first |> success).Header.NextSequence,
+                        Is.GreaterThan(assigned.Operation.Sequence)))
+
+    [<Test>]
+    member _.RecoveryIssuesNewImmutableGenerationWithoutOverwritingPriorReceipt() =
+        withFixture (fun _ _ first second _ _ _ _ ->
+            let taskId = "generationRecovery"
+            ReviewWorkflow.createTaskWithSpec first (Guid.NewGuid()) taskId
+                "Recovery" "<h1>Spec frozen</h1>" |> success |> ignore
+            let attemptId = Guid.NewGuid()
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId attemptId "Owner" "Reviewer"
+            |> success |> ignore
+            let _, _, _, issue1, _ = ReviewWorkflow.getAssignment second taskId 1 |> success
+            ReviewWorkflow.acknowledgeAssignment first (Guid.NewGuid()) taskId "Owner" 1 1
+            |> success |> ignore
+            ReviewWorkflow.beginAttempt first (Guid.NewGuid()) taskId "Owner" 2 1
+            |> success |> ignore
+            ReviewWorkflow.yieldAgent first (Guid.NewGuid()) taskId "Owner" 3 3 1
+                "Paused at checkpoint" "Operator should resume" |> success |> ignore
+            let oldReceipt =
+                ReviewWorkflow.getAssignment second taskId 1 |> success
+                |> fun (_, _, _, _, receipt) -> receipt.Value
+            let recovered =
+                ReviewWorkflow.recoverAgentAssignment first (Guid.NewGuid())
+                    taskId "Owner" 4 4 1 "Recover stopped session" |> success
+            let _, _, attempt, issued2, nextReceipt =
+                ReviewWorkflow.getAssignment second taskId 2 |> success
+            Assert.That(issued2.Reason, Is.EqualTo("Recovery"))
+            Assert.That(issued2.IssuerId, Is.EqualTo("Orchestrator"))
+            Assert.That(issued2.Instructions, Is.EqualTo("Recover stopped session"))
+            Assert.That(issued2.IssuedSequence, Is.EqualTo(recovered.Operation.Sequence))
+            Assert.That(issued2.PreviousGeneration, Is.EqualTo(1))
+            Assert.That(issued2.SpecBlobOid, Is.EqualTo(issue1.SpecBlobOid))
+            Assert.That(attempt.AssignmentGeneration, Is.EqualTo(2))
+            Assert.That(attempt.Phase, Is.EqualTo("Queued"))
+            Assert.That(nextReceipt.IsNone, Is.True)
+            let _, _, _, oldIssue, oldAck =
+                ReviewWorkflow.getAssignment second taskId 1 |> success
+            Assert.That(oldIssue, Is.EqualTo(issue1))
+            Assert.That(oldAck.Value, Is.EqualTo(oldReceipt))
+            expectStale (ReviewWorkflow.acknowledgeAssignment first (Guid.NewGuid())
+                             taskId "Owner" 5 1)
+            expectStale (ReviewWorkflow.beginAttempt first (Guid.NewGuid()) taskId "Owner" 5 1)
+            ReviewWorkflow.acknowledgeAssignment first (Guid.NewGuid()) taskId "Owner" 5 2
+            |> success |> ignore
+            ReviewWorkflow.beginAttempt first (Guid.NewGuid()) taskId "Owner" 6 2
+            |> success |> ignore
+            let _, _, current, immutableIssue2, ack2 =
+                ReviewWorkflow.getAssignment second taskId 2 |> success
+            Assert.That(current.Phase, Is.EqualTo("Working"))
+            Assert.That(immutableIssue2, Is.EqualTo(issued2))
+            Assert.That(ack2.Value.Generation, Is.EqualTo(2))
+            Assert.That(ack2.Value.SpecBlobOid, Is.EqualTo(issue1.SpecBlobOid)))
+
+    [<Test>]
+    member _.ExplicitReissueCanAdoptNewSpecWithoutReplacingOldAssignment() =
+        withFixture (fun _ _ first second _ _ _ _ ->
+            let taskId = "specAdoption"
+            let initialHtml = "<h1>Original spec</h1>"
+            let revisedHtml = "<h1>Revised spec for future generation</h1>"
+            ReviewWorkflow.createTaskWithSpec first (Guid.NewGuid()) taskId
+                "Task with updated requirements" initialHtml |> success |> ignore
+            let attemptId = Guid.NewGuid()
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId attemptId "Owner" "Reviewer"
+            |> success |> ignore
+            let _, _, _, firstIssue, _ =
+                ReviewWorkflow.getAssignment second taskId 1 |> success
+            ReviewWorkflow.acknowledgeAssignment first (Guid.NewGuid())
+                taskId "Owner" 1 1 |> success |> ignore
+            let _, _, _, _, firstAcknowledgment =
+                ReviewWorkflow.getAssignment second taskId 1 |> success
+
+            let reissueId = Guid.NewGuid()
+            let update () =
+                ReviewWorkflow.reissueAssignment first reissueId taskId "Owner"
+                    2 2 1 "Implement revised acceptance criteria" revisedHtml
+            let reissued = update () |> success
+            let _, task, attempt, newIssue, newReceipt =
+                ReviewWorkflow.getAssignment second taskId 2 |> success
+            Assert.That(task.SpecVersion, Is.EqualTo(2))
+            Assert.That(task.Version, Is.EqualTo(3))
+            Assert.That(attempt.Phase, Is.EqualTo("Queued"))
+            Assert.That(attempt.AssignmentGeneration, Is.EqualTo(2))
+            Assert.That(attempt.SpecBlobOid, Is.EqualTo(newIssue.SpecBlobOid))
+            Assert.That(newIssue.SpecBlobOid, Is.Not.EqualTo(firstIssue.SpecBlobOid))
+            Assert.That(newIssue.PreviousGeneration, Is.EqualTo(1))
+            Assert.That(newIssue.Reason, Is.EqualTo("ExplicitReissue"))
+            Assert.That(newIssue.Instructions, Is.EqualTo("Implement revised acceptance criteria"))
+            Assert.That(newIssue.IssuedSequence, Is.EqualTo(reissued.Operation.Sequence))
+            Assert.That(newReceipt.IsNone, Is.True)
+            let _, _, _, oldIssue, oldReceipt =
+                ReviewWorkflow.getAssignment second taskId 1 |> success
+            Assert.That(oldIssue, Is.EqualTo(firstIssue))
+            Assert.That(oldReceipt.Value, Is.EqualTo(firstAcknowledgment.Value))
+            let _, _, _, currentHtml, currentSpecOid =
+                ReviewWorkflow.getTaskWithSpec second taskId |> success
+            Assert.That(currentHtml, Is.EqualTo(revisedHtml))
+            Assert.That(currentSpecOid, Is.EqualTo(newIssue.SpecBlobOid))
+            let duplicated = update () |> success
+            Assert.That(duplicated.AlreadyApplied, Is.True)
+            Assert.That(duplicated.Operation.OriginalResultJson,
+                        Is.EqualTo(reissued.Operation.OriginalResultJson))
+            expectStale (ReviewWorkflow.beginAttempt first (Guid.NewGuid()) taskId "Owner" 3 1)
+            ReviewWorkflow.acknowledgeAssignment first (Guid.NewGuid()) taskId "Owner" 3 2
+            |> success |> ignore
+            ReviewWorkflow.beginAttempt first (Guid.NewGuid()) taskId "Owner" 4 2
+            |> success |> ignore
+            let before = (LedgerStore.fetch second |> success).Commit
+            match ReviewWorkflow.reissueAssignment second (Guid.NewGuid()) taskId "Owner"
+                    5 4 2 "Should not interrupt" "<h1>Forbidden</h1>" with
+            | Error(StaleEntityVersion _) -> ()
+            | other -> Assert.Fail(sprintf "Working agent must not be preempted: %A" other)
+            Assert.That((LedgerStore.fetch second |> success).Commit, Is.EqualTo(before)))
+
+
+    [<Test>]
+    member _.ReviewChangesReissueGenerationOnlyAfterAgentFinishes() =
+        withFixture (fun _ _ first second _ sourceRef newCommit initTask ->
+            let taskId = "reviewReissue"
+            initTask taskId
+            let _, _, _, oldIssue, _ =
+                ReviewWorkflow.getAssignment first taskId 1 |> success
+            let head = newCommit "Review branch change" "ready for review"
+            let requestId = Guid.NewGuid()
+            ReviewWorkflow.submitReview first (Guid.NewGuid()) taskId "Owner" 3 1
+                requestId sourceRef head "First candidate" |> success |> ignore
+            ReviewWorkflow.claimReview second (Guid.NewGuid()) taskId requestId
+                "Reviewer" 1 1 |> success |> ignore
+            ReviewWorkflow.completeAgentWork first (Guid.NewGuid()) taskId "Owner" 4 3 1
+                "Finished original implementation" |> success |> ignore
+            ReviewWorkflow.decide second (Guid.NewGuid()) taskId requestId "Reviewer" 2
+                RequestChanges "Address missing checks" |> success |> ignore
+            let _, _, attempt, nextIssue, ack =
+                ReviewWorkflow.getAssignment first taskId 2 |> success
+            Assert.That(attempt.Phase, Is.EqualTo("Queued"))
+            Assert.That(attempt.AssignmentGeneration, Is.EqualTo(2))
+            Assert.That(nextIssue.Reason, Is.EqualTo("ReviewChanges"))
+            Assert.That(nextIssue.IssuerId, Is.EqualTo("Reviewer"))
+            Assert.That(nextIssue.Instructions, Is.EqualTo("Address missing checks"))
+            Assert.That(nextIssue.SpecBlobOid, Is.EqualTo(oldIssue.SpecBlobOid))
+            Assert.That(nextIssue.PreviousGeneration, Is.EqualTo(1))
+            Assert.That(ack.IsNone, Is.True)
+            let _, _, _, oldStill, _ =
+                ReviewWorkflow.getAssignment second taskId 1 |> success
+            Assert.That(oldStill, Is.EqualTo(oldIssue))
+            let _, inbox = ReviewWorkflow.reviewerQueue second "Reviewer" |> success
+            Assert.That(inbox, Is.Empty)
+            let ownerState = ReviewWorkflow.getAgentInbox first "Owner" |> success
+            Assert.That(ownerState.Agent.State, Is.EqualTo("Completed"))
+            let reactivated = ReviewWorkflow.reissueQueuedAttempt first (Guid.NewGuid())
+                                  taskId "Owner" 6 4 2 "Resume requested fixes" |> success
+            let _, _, currentAttempt, oldIssueAfter, _ =
+                ReviewWorkflow.getAssignment second taskId 2 |> success
+            Assert.That(currentAttempt.Version, Is.EqualTo(7))
+            Assert.That(oldIssueAfter, Is.EqualTo(nextIssue))
+            Assert.That(reactivated.Operation.Type, Is.EqualTo("ReissueQueuedAttempt"))
+            expectStale (ReviewWorkflow.beginAttempt first (Guid.NewGuid()) taskId "Owner" 7 1)
+            ReviewWorkflow.acknowledgeAssignment first (Guid.NewGuid())
+                taskId "Owner" 7 2 |> success |> ignore
+            ReviewWorkflow.beginAttempt first (Guid.NewGuid())
+                taskId "Owner" 8 2 |> success |> ignore)
+
+    [<Test>]
+    member _.BeginAttemptAtomicallyAcknowledgesQueuedGeneration() =
+        withFixture (fun _ _ first second _ _ _ _ ->
+            let taskId = "atomicBegin"
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Atomic startup"
+            |> success |> ignore
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid())
+                "Owner" "Reviewer" |> success |> ignore
+            let before = (LedgerStore.fetch first |> success).Commit
+            let beginId = Guid.NewGuid()
+            let started =
+                ReviewWorkflow.beginAttempt second beginId taskId "Owner" 1 1 |> success
+            let _, _, attempt, issue, ack =
+                ReviewWorkflow.getAssignment first taskId 1 |> success
+            Assert.That(attempt.Phase, Is.EqualTo("Working"))
+            Assert.That(ack.IsSome, Is.True)
+            Assert.That(ack.Value.AcknowledgedSequence, Is.EqualTo(started.Operation.Sequence))
+            Assert.That(ack.Value.IssueSequence, Is.EqualTo(issue.IssuedSequence))
+            Assert.That(ack.Value.SpecBlobOid, Is.EqualTo(issue.SpecBlobOid))
+            Assert.That((LedgerStore.fetch first |> success).Commit, Is.Not.EqualTo(before))
+            let duplicate =
+                ReviewWorkflow.beginAttempt first beginId taskId "Owner" 1 1 |> success
+            Assert.That(duplicate.AlreadyApplied, Is.True)
+            let _, _, _, _, sameReceipt =
+                ReviewWorkflow.getAssignment first taskId 1 |> success
+            Assert.That(sameReceipt.Value, Is.EqualTo(ack.Value))
+            expectStale (ReviewWorkflow.acknowledgeAssignment first (Guid.NewGuid())
+                             taskId "Owner" 2 1))
+
+    [<Test>]
+    member _.IndependentConcurrentAssignmentsRetainSeparateGenerations() =
+        withFixture (fun _ _ first second _ _ _ _ ->
+            ReviewWorkflow.registerAgent first (Guid.NewGuid()) "Owner2"
+            |> success |> ignore
+            for task in [ "parallelA"; "parallelB" ] do
+                ReviewWorkflow.createTask first (Guid.NewGuid()) task task
+                |> success |> ignore
+            let firstId = Guid.NewGuid()
+            let secondId = Guid.NewGuid()
+            use go = new System.Threading.ManualResetEventSlim(false)
+            let a = System.Threading.Tasks.Task.Run(fun () ->
+                go.Wait()
+                ReviewWorkflow.assignTask first firstId "parallelA" (Guid.NewGuid())
+                    "Owner" "Reviewer")
+            let b = System.Threading.Tasks.Task.Run(fun () ->
+                go.Wait()
+                ReviewWorkflow.assignTask second secondId "parallelB" (Guid.NewGuid())
+                    "Owner2" "Reviewer")
+            go.Set()
+            let firstResult = a.Result |> success
+            let secondResult = b.Result |> success
+            Assert.That(firstResult.Operation.OperationId, Is.EqualTo(firstId.ToString("D")))
+            Assert.That(secondResult.Operation.OperationId, Is.EqualTo(secondId.ToString("D")))
+            for task, owner in [ "parallelA", "Owner"; "parallelB", "Owner2" ] do
+                let _, _, attempt, issue, receipt =
+                    ReviewWorkflow.getAssignment first task 1 |> success
+                Assert.That(attempt.OwnerAgentId, Is.EqualTo(owner))
+                Assert.That(issue.OwnerAgentId, Is.EqualTo(owner))
+                Assert.That(issue.SpecBlobOid, Is.EqualTo(attempt.SpecBlobOid))
+                Assert.That(receipt.IsNone, Is.True))

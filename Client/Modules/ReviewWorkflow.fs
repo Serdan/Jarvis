@@ -51,6 +51,31 @@ type ReviewAttempt =
       AcknowledgedFeedbackSequence: int64 }
 
 [<CLIMutable>]
+type AssignmentIssue =
+    { TaskId: string
+      AttemptId: string
+      Generation: int
+      OwnerAgentId: string
+      IssuerId: string
+      IssuedSequence: int64
+      Instructions: string
+      Reason: string
+      SpecBlobOid: string
+      SourceBaseCommit: string
+      TargetRef: string
+      PreviousGeneration: int }
+
+[<CLIMutable>]
+type AssignmentReceipt =
+    { TaskId: string
+      AttemptId: string
+      Generation: int
+      OwnerAgentId: string
+      AcknowledgedSequence: int64
+      SpecBlobOid: string
+      IssueSequence: int64 }
+
+[<CLIMutable>]
 type ReviewRequest =
     { RequestId: string
       TaskId: string
@@ -206,6 +231,9 @@ module ReviewWorkflow =
                     | "ReviewIntegration" -> status "status" [ "PendingSourceAction"; "PendingPush"; "Recorded" ]
                     | "ReviewFeedbackNotice" -> status "status" [ "Accepted"; "ChangesRequested" ]
                     | "AgentCheckpoint" -> status "kind" [ "Yield"; "Completion"; "Recovery" ]
+                    | "AssignmentIssue" ->
+                        status "reason" [ "Assignment"; "ReviewChanges"; "CompletionRequeue"; "Recovery"; "ExplicitReissue" ]
+                    | "AssignmentReceipt" -> true
                     | _ -> true
                 if not unique then Error "Duplicate entity JSON member."
                 elif not schemaValid then Error "Unsupported or missing entity schemaVersion."
@@ -221,6 +249,10 @@ module ReviewWorkflow =
     let private attemptPath taskId attemptId = $"tasks/{taskId}/attempts/{attemptId}.json"
     let private checkpointPath taskId attemptId sequence =
         $"tasks/{taskId}/attempts/{attemptId}/checkpoints/{sequence}.json"
+    let private issuePath taskId attemptId generation =
+        $"tasks/{taskId}/attempts/{attemptId}/assignments/{generation}.json"
+    let private receiptPath taskId attemptId generation =
+        $"tasks/{taskId}/attempts/{attemptId}/assignments/{generation}.ack.json"
     let private requestPath taskId requestId = $"tasks/{taskId}/reviews/{requestId}/request.json"
     let private integrationPath taskId actionId = $"tasks/{taskId}/integrations/{actionId}.json"
     let private feedbackPath taskId requestId = $"tasks/{taskId}/reviews/{requestId}/notification.json"
@@ -295,6 +327,35 @@ module ReviewWorkflow =
             let! attempt, attemptOid =
                 required<ReviewAttempt> binding snapshot (attemptPath taskId task.AttemptId)
             return task, taskOid, attempt, attemptOid
+        }
+
+    let private issue taskId (attempt: ReviewAttempt) generation issuer reason
+                      instructions sequence =
+        { TaskId = taskId
+          AttemptId = attempt.AttemptId
+          Generation = generation
+          OwnerAgentId = attempt.OwnerAgentId
+          IssuerId = issuer
+          IssuedSequence = sequence
+          Instructions = instructions
+          Reason = reason
+          SpecBlobOid = attempt.SpecBlobOid
+          SourceBaseCommit = attempt.BaseCommit
+          TargetRef = attempt.TargetRef
+          PreviousGeneration = if generation = 1 then 0 else generation - 1 }
+
+    let private requiredIssue binding snapshot taskId (attempt: ReviewAttempt) =
+        result {
+            let! issuance, _ =
+                required<AssignmentIssue> binding snapshot
+                    (issuePath taskId attempt.AttemptId attempt.AssignmentGeneration)
+            if issuance.Generation <> attempt.AssignmentGeneration
+               || issuance.AttemptId <> attempt.AttemptId
+               || issuance.OwnerAgentId <> attempt.OwnerAgentId
+               || issuance.SpecBlobOid <> attempt.SpecBlobOid
+               || issuance.IssuedSequence <> attempt.IssuedSequence then
+                return! Error(LedgerIntegrityError "Current assignment generation record is inconsistent.")
+            return issuance
         }
 
     let createTaskWithSpec binding operationId taskId title html =
@@ -403,6 +464,10 @@ module ReviewWorkflow =
                             [ change (taskPath taskId) (Some taskOid)
                                 { task with Version = task.Version + 1; Lifecycle = "InProgress"; AttemptId = attemptIdText }
                               change (attemptPath taskId attemptIdText) None attempt
+                              change (issuePath taskId attemptIdText 1) None
+                                (issue taskId attempt 1 "Orchestrator" "Assignment"
+                                    $"Implement task {taskId} against the pinned task specification."
+                                    snapshot.Header.NextSequence)
                               change (agentPath ownerId) (Some agentOid)
                                 { agent with Version = agent.Version + 1; State = "Assigned"
                                              FocusAttemptId = attemptIdText
@@ -410,6 +475,75 @@ module ReviewWorkflow =
                                              StateReason = $"Assigned task {taskId}; awaiting operator start"
                                              StateSequence = snapshot.Header.NextSequence } ]
                     })
+
+    let acknowledgeAssignment binding operationId taskId ownerId expectedAttemptVersion generation =
+        if not (validTaskId taskId) || not (validAgent ownerId)
+           || expectedAttemptVersion < 1 || generation < 1 then
+            Error(InvalidBinding "Invalid assignment acknowledgment.")
+        else
+            LedgerStore.transact binding
+                (intent operationId ownerId "AcknowledgeAssignment"
+                    {| taskId = taskId; ownerId = ownerId
+                       expectedVersion = expectedAttemptVersion; generation = generation |})
+                (fun snapshot ->
+                    result {
+                        let! task, _, attempt, attemptOid = getAttempt binding snapshot taskId
+                        let! agent, _ = required<ReviewAgent> binding snapshot (agentPath ownerId)
+                        if task.Lifecycle <> "InProgress"
+                           || attempt.OwnerAgentId <> ownerId
+                           || attempt.Version <> expectedAttemptVersion
+                           || attempt.AssignmentGeneration <> generation
+                           || attempt.Phase <> "Queued"
+                           || agent.State <> "Assigned"
+                           || agent.FocusAttemptId <> attempt.AttemptId
+                           || not (String.IsNullOrWhiteSpace agent.ActiveAttemptId) then
+                            return! Error(StaleEntityVersion "Only the current queued generation can be acknowledged.")
+                        let! issuance = requiredIssue binding snapshot taskId attempt
+                        let! existing =
+                            read<AssignmentReceipt> binding snapshot
+                                (receiptPath taskId attempt.AttemptId generation)
+                        if existing.IsSome then
+                            return! Error(LedgerIntegrityError "Assignment generation already has an acknowledgment.")
+                        let receipt =
+                            { TaskId = taskId; AttemptId = attempt.AttemptId
+                              Generation = generation; OwnerAgentId = ownerId
+                              AcknowledgedSequence = snapshot.Header.NextSequence
+                              SpecBlobOid = issuance.SpecBlobOid
+                              IssueSequence = issuance.IssuedSequence }
+                        return
+                            [ change (receiptPath taskId attempt.AttemptId generation) None receipt
+                              change (attemptPath taskId attempt.AttemptId) (Some attemptOid)
+                                { attempt with Version = attempt.Version + 1; Phase = "Acknowledged" } ]
+                    })
+
+    let getAssignment binding taskId generation =
+        if not (validTaskId taskId) || generation < 1 then
+            Error(InvalidBinding "Invalid assignment generation query.")
+        else
+            result {
+                let! snapshot = LedgerStore.fetch binding
+                let! task, _, attempt, _ = getAttempt binding snapshot taskId
+                if generation > attempt.AssignmentGeneration then
+                    return! Error(StaleEntityVersion "Assignment generation has not been issued.")
+                let! issuance, _ =
+                    required<AssignmentIssue> binding snapshot
+                        (issuePath taskId attempt.AttemptId generation)
+                let! receipt =
+                    read<AssignmentReceipt> binding snapshot
+                        (receiptPath taskId attempt.AttemptId generation)
+                if issuance.TaskId <> taskId || issuance.Generation <> generation
+                   || issuance.AttemptId <> attempt.AttemptId
+                   || issuance.OwnerAgentId <> attempt.OwnerAgentId then
+                    return! Error(LedgerIntegrityError "Assignment generation does not match its task/attempt.")
+                match receipt with
+                | Some (ack, _) when ack.Generation <> generation
+                                    || ack.SpecBlobOid <> issuance.SpecBlobOid
+                                    || ack.IssueSequence <> issuance.IssuedSequence
+                                    || ack.OwnerAgentId <> issuance.OwnerAgentId ->
+                    return! Error(LedgerIntegrityError "Acknowledgment does not match immutable generation.")
+                | _ ->
+                    return snapshot, task, attempt, issuance, receipt |> Option.map fst
+            }
 
     let beginAttempt binding operationId taskId ownerId expectedVersion generation =
         if not (validTaskId taskId) || not (validAgent ownerId) || expectedVersion < 1 || generation < 1 then
@@ -424,8 +558,23 @@ module ReviewWorkflow =
                         let! agent, agentOid = required<ReviewAgent> binding snapshot (agentPath ownerId)
                         if task.Lifecycle <> "InProgress" || attempt.OwnerAgentId <> ownerId
                            || attempt.Version <> expectedVersion || attempt.AssignmentGeneration <> generation
-                           || attempt.Phase <> "Queued" then
+                           || not (List.contains attempt.Phase [ "Queued"; "Acknowledged" ]) then
                             return! Error(StaleEntityVersion "Attempt is not available for Begin.")
+                        let! issuance = requiredIssue binding snapshot taskId attempt
+                        let! existingAcknowledgment =
+                            read<AssignmentReceipt> binding snapshot
+                                (receiptPath taskId attempt.AttemptId generation)
+                        if attempt.Phase = "Acknowledged" then
+                            match existingAcknowledgment with
+                            | Some (ack, _) when
+                                ack.Generation = generation
+                                && ack.SpecBlobOid = issuance.SpecBlobOid
+                                && ack.IssueSequence = issuance.IssuedSequence
+                                && ack.OwnerAgentId = ownerId -> ()
+                            | _ ->
+                                return! Error(LedgerIntegrityError "Acknowledgment is not for the current assignment.")
+                        elif existingAcknowledgment.IsSome then
+                            return! Error(LedgerIntegrityError "Queued generation already has an acknowledgment.")
                         if agent.State <> "Assigned" || agent.FocusAttemptId <> attempt.AttemptId then
                             return! Error(StaleEntityVersion "Agent has not been assigned this attempt for startup.")
                         if not (String.IsNullOrWhiteSpace agent.ActiveAttemptId) then
@@ -438,6 +587,14 @@ module ReviewWorkflow =
                                              State = "Working"; ActiveAttemptId = attempt.AttemptId
                                              StateReason = $"Started task {taskId}"
                                              StateSequence = snapshot.Header.NextSequence } ]
+                            @ (if attempt.Phase = "Queued" then
+                                   [ change (receiptPath taskId attempt.AttemptId generation) None
+                                       { TaskId = taskId; AttemptId = attempt.AttemptId
+                                         Generation = generation; OwnerAgentId = ownerId
+                                         AcknowledgedSequence = snapshot.Header.NextSequence
+                                         SpecBlobOid = issuance.SpecBlobOid
+                                         IssueSequence = issuance.IssuedSequence } ]
+                               else [])
                     })
 
 
@@ -506,6 +663,7 @@ module ReviewWorkflow =
                            || agent.FocusAttemptId <> attempt.AttemptId
                            || not (String.IsNullOrWhiteSpace agent.ActiveAttemptId) then
                             return! Error(StaleEntityVersion "Resume requires the exact Ready assignment generation.")
+                        let! _ = requiredIssue binding snapshot taskId attempt
                         return
                             [ change (attemptPath taskId attempt.AttemptId) (Some attemptOid)
                                 { attempt with Version = attempt.Version + 1; Phase = "Working" }
@@ -575,6 +733,14 @@ module ReviewWorkflow =
                                              State = "Completed"; ActiveAttemptId = null
                                              StateReason = summary
                                              StateSequence = snapshot.Header.NextSequence } ]
+                            @ (if requeue then
+                                   [ change (issuePath taskId attempt.AttemptId
+                                                 (attempt.AssignmentGeneration + 1)) None
+                                       (issue taskId attempt (attempt.AssignmentGeneration + 1)
+                                           "Orchestrator" "CompletionRequeue"
+                                           "Complete the review-requested changes on the same task."
+                                           snapshot.Header.NextSequence) ]
+                               else [])
                     })
 
     let parkAgent binding operationId agentId expectedAgentVersion reason =
@@ -843,10 +1009,19 @@ module ReviewWorkflow =
                               DecisionSequence = snapshot.Header.NextSequence
                               Status = status; Feedback = feedback
                               Acknowledged = false; Version = 1 }
+                        let instructions =
+                            if String.IsNullOrWhiteSpace feedback then
+                                "Address the changes requested in the review."
+                            else feedback
                         return
                             [ change (requestPath taskId id) (Some requestOid) review
                               change (feedbackPath taskId id) None notice
                               change (attemptPath taskId attempt.AttemptId) (Some attemptOid) nextAttempt ]
+                            @ (if requeue then
+                                   [ change (issuePath taskId attempt.AttemptId nextAttempt.AssignmentGeneration) None
+                                       (issue taskId nextAttempt nextAttempt.AssignmentGeneration reviewerId
+                                           "ReviewChanges" instructions snapshot.Header.NextSequence) ]
+                               else [])
                     })
 
 
@@ -1209,6 +1384,72 @@ module ReviewWorkflow =
                                              StateSequence = snapshot.Header.NextSequence } ]
                     })
 
+    // Explicitly issue new instructions, optionally adopting a new canonical
+    // HTML spec, while the same owner is Assigned but has not started work.
+    // Prior issuance and acknowledgments stay immutable in ledger history.
+    let reissueAssignment binding operationId taskId ownerId expectedAttemptVersion
+                          expectedAgentVersion generation instructions newSpecHtml =
+        if not (validTaskId taskId) || not (validAgent ownerId)
+           || expectedAttemptVersion < 1 || expectedAgentVersion < 1 || generation < 1
+           || not (validText 8192 instructions)
+           || (not (String.IsNullOrEmpty newSpecHtml) && not (validTaskHtml newSpecHtml)) then
+            Error(InvalidBinding "Explicit reissue requires current versions, instructions and safe optional HTML.")
+        else
+            LedgerStore.transact binding
+                (intent operationId "Orchestrator" "ReissueAssignment"
+                    {| taskId = taskId; ownerId = ownerId
+                       expectedAttemptVersion = expectedAttemptVersion
+                       expectedAgentVersion = expectedAgentVersion
+                       generation = generation; instructions = instructions
+                       specHtml = newSpecHtml |})
+                (fun snapshot ->
+                    result {
+                        let! task, taskOid, attempt, attemptOid = getAttempt binding snapshot taskId
+                        let! agent, agentOid = required<ReviewAgent> binding snapshot (agentPath ownerId)
+                        if task.Lifecycle <> "InProgress" || attempt.OwnerAgentId <> ownerId
+                           || attempt.Version <> expectedAttemptVersion
+                           || attempt.AssignmentGeneration <> generation
+                           || not (List.contains attempt.Phase [ "Queued"; "Acknowledged" ])
+                           || agent.State <> "Assigned"
+                           || agent.Version <> expectedAgentVersion
+                           || agent.FocusAttemptId <> attempt.AttemptId
+                           || not (String.IsNullOrWhiteSpace agent.ActiveAttemptId)
+                           || not (String.IsNullOrWhiteSpace attempt.ActiveReviewRequestId) then
+                            return! Error(StaleEntityVersion "Only an unstarted Assigned generation can be reissued.")
+                        let! _ = requiredIssue binding snapshot taskId attempt
+                        let! originalSpec, specOid = LedgerStore.readAt binding snapshot (specPath taskId)
+                        if originalSpec.IsNone || specOid <> Some attempt.SpecBlobOid then
+                            return! Error(LedgerIntegrityError "Current assigned spec no longer matches the pinned blob.")
+                        let changingSpec =
+                            not (String.IsNullOrEmpty newSpecHtml)
+                            && newSpecHtml <> originalSpec.Value
+                        let! selectedOid =
+                            if changingSpec then LedgerStore.computeBlobOid binding newSpecHtml
+                            else Ok attempt.SpecBlobOid
+                        let next =
+                            { attempt with Version = attempt.Version + 1
+                                           Phase = "Queued"
+                                           AssignmentGeneration = generation + 1
+                                           IssuedSequence = snapshot.Header.NextSequence
+                                           SpecBlobOid = selectedOid }
+                        return
+                            [ change (attemptPath taskId attempt.AttemptId) (Some attemptOid) next
+                              change (issuePath taskId attempt.AttemptId (generation + 1)) None
+                                (issue taskId next (generation + 1) "Orchestrator"
+                                    "ExplicitReissue" instructions snapshot.Header.NextSequence)
+                              change (agentPath ownerId) (Some agentOid)
+                                { agent with Version = agent.Version + 1
+                                             StateReason = instructions
+                                             StateSequence = snapshot.Header.NextSequence } ]
+                            @ (if changingSpec then
+                                   [ { Path = specPath taskId
+                                       ExpectedBlobOid = specOid; Content = newSpecHtml }
+                                     change (taskPath taskId) (Some taskOid)
+                                         { task with Version = task.Version + 1
+                                                     SpecVersion = task.SpecVersion + 1 } ]
+                               else [])
+                    })
+
     // Operator-authorized repair: a stalled or lost session never causes this
     // transition automatically. Rebind the SAME attempt, advance its generation,
     // retain its source/reviews and issue an explicit operator restart.
@@ -1257,7 +1498,11 @@ module ReviewWorkflow =
                                 { agent with Version = agent.Version + 1
                                              State = "Assigned"; ActiveAttemptId = null
                                              StateReason = reason
-                                             StateSequence = snapshot.Header.NextSequence } ]
+                                             StateSequence = snapshot.Header.NextSequence }
+                              change (issuePath taskId attempt.AttemptId
+                                          (attempt.AssignmentGeneration + 1)) None
+                                (issue taskId attempt (attempt.AssignmentGeneration + 1)
+                                    "Orchestrator" "Recovery" reason snapshot.Header.NextSequence) ]
                     })
 
     let getTaskWithSpec binding taskId =
@@ -1424,7 +1669,7 @@ module ReviewWorkflow =
                         match agent.State, focused with
                         | "Parked", None -> String.IsNullOrWhiteSpace agent.ActiveAttemptId
                         | "Assigned", Some entry ->
-                            entry.Attempt.Phase = "Queued" && active.IsNone
+                            List.contains entry.Attempt.Phase [ "Queued"; "Acknowledged" ] && active.IsNone
                         | "Ready", Some entry ->
                             entry.Attempt.Phase = "Paused" && active.IsNone
                         | "Working", Some entry ->

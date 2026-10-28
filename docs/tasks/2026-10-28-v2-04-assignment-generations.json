@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "2026-10-28-v2-04-assignment-generations",
   "title": "Persist immutable assignment generations and acknowledgment receipts",
-  "status": "open",
+  "status": "completed",
   "priority": "P1",
   "dependencies": [
     "2026-10-28-v2-03-schema-contracts"
@@ -12,9 +12,18 @@
     "worktree": null
   },
   "checkpoint": {
-    "summary": "Architecture gap identified by the 2026-10-28 V2 implementation audit. Not started.",
-    "nextAction": "Implement the acceptance criteria in the accompanying HTML task; use disposable Git remotes and do not deploy or migrate V1.",
-    "verified": [],
+    "summary": "V2-04 implemented and verified: immutable per-generation assignment records (issuer, sequence, instructions, pinned spec and baseline), explicit/atomic acknowledgment receipts, historical generation read API, review-driven and recovery reissue without preemption, explicit unstarted reissue with atomic HTML spec adoption, and generation-aware stale-version guards. Existing V2 task-owner exclusivity preserved.",
+    "nextAction": "V2-04 complete. Follow-on: V2-05 immutable checkpoint/review evidence, V2-09 historical spec body retrieval, V2-11 actor permissions, and eventual V2 cutover.",
+    "verified": [
+      "Per-generation immutable assignments and receipt OIDs persist through Git-CAS and cross-clone reads",
+      "Explicit AcknowledgeAssignment and atomic BeginAttempt acknowledgment verified; stale receipt/generation rejected",
+      "Recovery appends new generation while preserving previous issuance, spec OID and acknowledgment",
+      "ReissueAssignment adopts revised canonical HTML with task SpecVersion increment and new pinned generation without interrupting Working",
+      "Reviewer ChangesRequested creates new issuance only on Finished; Working owners keep current generation",
+      "Independent concurrent assignments to different task owners preserve separate generation identities",
+      "V2GetAssignment, V2AcknowledgeAssignment and V2ReissueAssignment exposed via opt-in typed MCP capability catalog",
+      "Full Client.Tests 329/329, Server.Tests 62/62, git diff --check clean"
+    ],
     "lastCommit": null
   },
   "audit": {
@@ -28,5 +37,5 @@
     ],
     "sourceReport": "docs/reviews/2026-10-28-v2-spec-implementation-audit.md"
   },
-  "updatedAt": "2026-10-28T00:00:00Z"
+  "updatedAt": "2026-10-28T22:43:00+01:00"
 }

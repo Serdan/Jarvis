@@ -419,13 +419,17 @@ module LedgerStore =
                 with ex ->
                     Error(LedgerIntegrityError $"Malformed operation record: {ex.Message}")
 
+    let getOperationAt (binding: LedgerBinding) (snapshot: LedgerSnapshot) (operationId: Guid) =
+        if operationId = Guid.Empty then Error(InvalidBinding "Valid operation UUID required.")
+        else readOperation binding snapshot.Commit operationId
+
     let getOperationStatus (binding: LedgerBinding) (operationId: Guid) =
         if operationId = Guid.Empty then Error(InvalidBinding "Valid operation UUID required.")
         else
             match fetch binding with
             | Error error -> Error error
             | Ok snapshot ->
-                readOperation binding snapshot.Commit operationId
+                getOperationAt binding snapshot operationId
                 |> Result.map (fun record -> snapshot, record)
 
     // A stable logical write receipt lives in the same canonical tree as the

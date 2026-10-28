@@ -77,7 +77,16 @@ type ReviewWorkflowTests() =
                 ReviewWorkflow.bindReviewBase first (Guid.NewGuid()) taskId "Owner" 2 1 baseOid sourceRef
                 |> success |> ignore
             action one two first second baseOid sourceRef newCommit initTask
-        finally Directory.Delete(root, true)
+        finally
+            for checkout in [ "owner"; "reviewer" ] do
+                let pendingConfig =
+                    Client.V2ReviewApi.ReviewV2Binding.pathForRoot(
+                        Path.Combine(root, checkout))
+                let pendingDir =
+                    Path.Combine(Path.GetDirectoryName pendingConfig, "pending",
+                                 Path.GetFileNameWithoutExtension pendingConfig)
+                if Directory.Exists pendingDir then Directory.Delete(pendingDir, true)
+            Directory.Delete(root, true)
 
     [<Test>]
     member _.OwnerUpdatesUntilClaimThenContinuesWorking() =
@@ -1147,3 +1156,143 @@ type ReviewWorkflowTests() =
             Assert.That((pending ()).Length, Is.EqualTo(1))
             retryLost (fun () -> Ok 19) |> success |> ignore
             Assert.That((pending ()).Length, Is.EqualTo(0)))
+
+
+    [<Test>]
+    member _.ReconciliationNeedsVerifiedRemoteReceiptAndExplicitAcknowledgment() =
+        withFixture (fun one _ first _ _ _ _ _ ->
+            let command taskId =
+                System.Text.Json.JsonSerializer.Serialize(
+                    {| Action = "CreateTask"; TaskId = taskId
+                       Title = taskId; Html = "<h1>Task</h1>" |})
+            let acceptedId = Guid.NewGuid()
+            Client.V2ReviewApi.V2PendingIntentJournal.persist first acceptedId "V2TaskWrite" (command "accepted") |> success
+            ReviewWorkflow.createTaskWithSpec first acceptedId "accepted" "accepted" "<h1>Task</h1>"
+            |> success |> ignore
+
+            let pendingId = Guid.NewGuid()
+            Client.V2ReviewApi.V2PendingIntentJournal.persist first pendingId "V2TaskWrite" (command "notpushed") |> success
+            let mismatchedId = Guid.NewGuid()
+            Client.V2ReviewApi.V2PendingIntentJournal.persist first mismatchedId "V2TaskWrite" (command "wrongTask") |> success
+            ReviewWorkflow.createTaskWithSpec first mismatchedId "realTask" "realTask" "<h1>Task</h1>"
+            |> success |> ignore
+
+            let sameTaskDifferentPayloadId = Guid.NewGuid()
+            Client.V2ReviewApi.V2PendingIntentJournal.persist first sameTaskDifferentPayloadId
+                "V2TaskWrite" (command "sameTask") |> success
+            ReviewWorkflow.createTaskWithSpec first sameTaskDifferentPayloadId
+                "sameTask" "sameTask" "<h1>Different body</h1>" |> success |> ignore
+
+            let foreignId = Guid.NewGuid()
+            Client.V2ReviewApi.V2PendingIntentJournal.persist { first with LedgerId = Guid.NewGuid() } foreignId
+                "V2TaskWrite" (command "foreign") |> success
+
+            let before = (LedgerStore.fetch first |> success).Commit
+            let inspected = Client.V2ReviewApi.V2PendingIntentJournal.reconcile first |> success
+            Assert.That(inspected.Length, Is.EqualTo(5))
+            let status (id: Guid) =
+                inspected |> List.find (fun entry -> entry.operationId = id.ToString("D"))
+            Assert.That((status acceptedId).disposition, Is.EqualTo("Applied"))
+            Assert.That((status pendingId).disposition, Is.EqualTo("NotFoundAtVerifiedHead"))
+            Assert.That((status mismatchedId).disposition, Is.EqualTo("IdentityMismatch"))
+            Assert.That((status sameTaskDifferentPayloadId).disposition, Is.EqualTo("IdentityMismatch"))
+            Assert.That((status foreignId).disposition, Is.EqualTo("BindingMismatch"))
+            Assert.That(inspected |> List.forall (fun entry -> entry.snapshotCommit = before), Is.True)
+            let accepted = status acceptedId
+            let remoteHash = accepted.operation.Value.RequestHash
+            let acknowledge (id: Guid) requestHash =
+                Client.V2ReviewApi.V2PendingIntentJournal.acknowledge first id requestHash
+            match acknowledge acceptedId (String.replicate 64 "f") with
+            | Error(Client.ValidationError _) -> ()
+            | other -> Assert.Fail(sprintf "Wrong hash must not acknowledge: %A" other)
+            match acknowledge pendingId remoteHash with
+            | Error(Client.ValidationError _) -> ()
+            | other -> Assert.Fail(sprintf "Uncommitted operation must remain pending: %A" other)
+            match acknowledge mismatchedId (status mismatchedId).operation.Value.RequestHash with
+            | Error(Client.ValidationError _) -> ()
+            | other -> Assert.Fail(sprintf "Mismatched command must remain pending: %A" other)
+            match acknowledge sameTaskDifferentPayloadId (status sameTaskDifferentPayloadId).operation.Value.RequestHash with
+            | Error(Client.ValidationError _) -> ()
+            | other -> Assert.Fail(sprintf "Changed payload on same task must remain pending: %A" other)
+            match acknowledge foreignId remoteHash with
+            | Error(Client.ValidationError _) -> ()
+            | other -> Assert.Fail(sprintf "Wrong ledger identity must remain pending: %A" other)
+            Assert.That((Client.V2ReviewApi.V2PendingIntentJournal.listAtRoot one |> success).Length, Is.EqualTo(5))
+            let recorded = acknowledge acceptedId remoteHash |> success
+            Assert.That(recorded.acknowledged, Is.True)
+            Assert.That(recorded.verifiedLedgerHead, Is.EqualTo(before))
+            Assert.That(recorded.originalResult, Does.Contain(acceptedId.ToString("D")))
+            Assert.That(recorded.alreadyAcknowledged, Is.False)
+            let repeat = acknowledge acceptedId remoteHash |> success
+            Assert.That(repeat.alreadyAcknowledged, Is.True)
+            Assert.That(repeat.originalResult, Is.EqualTo(recorded.originalResult))
+            let remains = Client.V2ReviewApi.V2PendingIntentJournal.listAtRoot one |> success
+            Assert.That(remains.Length, Is.EqualTo(4))
+            Assert.That(remains |> List.exists (fun entry -> entry.OperationId = acceptedId.ToString("D")),
+                        Is.False)
+            Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(before))
+            Assert.That(git one [ "status"; "--porcelain" ], Is.Empty))
+
+
+    [<Test>]
+    member _.LostResponseRecoversAcceptedRemoteOperationButNeverGuessesFailure() =
+        withFixture (fun one _ first _ _ _ _ _ ->
+            let command name =
+                {| Action = "CreateTask"; TaskId = name; Title = name
+                   Html = "<h1>Original</h1>" |}
+            let operationId = Guid.NewGuid()
+            let remoteAccepted () : Result<LedgerWrite, Client.EffectError> =
+                ReviewWorkflow.createTaskWithSpec first operationId
+                    "alreadyaccepted" "alreadyaccepted" "<h1>Original</h1>"
+                |> success |> ignore
+                Error(Client.V2ReviewApi.V2LedgerErrors.toEffect
+                    (OutcomeUnknown "A source push succeeded but the response was lost"))
+            let recovered =
+                Client.V2ReviewApi.V2PendingIntentJournal.executeLedgerWrite first operationId
+                    "V2TaskWrite" (command "alreadyaccepted") remoteAccepted |> success
+            Assert.That(recovered.AlreadyApplied, Is.True)
+            Assert.That(recovered.Operation.OperationId, Is.EqualTo(operationId.ToString("D")))
+            Assert.That((Client.V2ReviewApi.V2PendingIntentJournal.listAtRoot one |> success).Length,
+                        Is.EqualTo(0))
+            let onlyPendingId = Guid.NewGuid()
+            let before = (LedgerStore.fetch first |> success).Commit
+            let neverAccepted () : Result<LedgerWrite, Client.EffectError> =
+                Error(Client.V2ReviewApi.V2LedgerErrors.toEffect
+                    (OutcomeUnknown "No remote confirmation"))
+            match Client.V2ReviewApi.V2PendingIntentJournal.executeLedgerWrite first onlyPendingId
+                    "V2TaskWrite" (command "notaccepted") neverAccepted with
+            | Error(Client.V2LedgerFailureError failure) ->
+                Assert.That(failure.Code, Is.EqualTo("OutcomeUnknown"))
+                Assert.That(failure.OperationId, Is.EqualTo(Some(onlyPendingId.ToString("D"))))
+                Assert.That(failure.VerifiedLedgerHead, Is.EqualTo(Some before))
+            | other -> Assert.Fail(sprintf "Unknown outcome must remain uncertain: %A" other)
+            let pending = Client.V2ReviewApi.V2PendingIntentJournal.reconcile first |> success
+            Assert.That(pending.Length, Is.EqualTo(1))
+            Assert.That(pending.Head.disposition, Is.EqualTo("NotFoundAtVerifiedHead"))
+            Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(before)))
+
+
+    [<Test>]
+    member _.ReviewSubmissionReconciliationMatchesExactPinnedRevision() =
+        withFixture (fun one _ first _ _ sourceRef newCommit initTask ->
+            initTask "submission"
+            let head = newCommit "Review candidate" "candidate"
+            let requestId = Guid.NewGuid()
+            let operationId = Guid.NewGuid()
+            let original =
+                {| Action = "Submit"; TaskId = "submission"; ActorId = "Owner"
+                   ExpectedVersion = 3; Generation = 1
+                   RequestId = requestId.ToString("D")
+                   SourceRef = sourceRef; HeadOid = head; Summary = "Review" |}
+            Client.V2ReviewApi.V2PendingIntentJournal.persist first operationId
+                "V2ReviewWrite" (System.Text.Json.JsonSerializer.Serialize original) |> success
+            ReviewWorkflow.submitReview first operationId "submission" "Owner"
+                3 1 requestId sourceRef head "Review" |> success |> ignore
+            let entries = Client.V2ReviewApi.V2PendingIntentJournal.reconcile first |> success
+            let item = entries |> List.find (fun entry -> entry.operationId = operationId.ToString("D"))
+            Assert.That(item.disposition, Is.EqualTo("Applied"))
+            let hash = item.operation.Value.RequestHash
+            Client.V2ReviewApi.V2PendingIntentJournal.acknowledge first operationId hash
+            |> success |> ignore
+            Assert.That((Client.V2ReviewApi.V2PendingIntentJournal.listAtRoot one |> success).Length,
+                        Is.EqualTo(0)))

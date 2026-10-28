@@ -190,3 +190,16 @@ The client now has an opt-in **pending-operation journal** for V2TaskWrite, V2Re
 Git contention now uses bounded exponential backoff with jitter. Ledger failure variants propagate through `V2LedgerFailure` typed MCP errors, retaining their code (and operation UUID on journaled mutations), instead of being collapsed to generic validation messages. The protocol is bumped to 3.26 because the AgentError schema changed.
 
 **Remaining V2-02 work:** domain-specific original result structs (e.g. checkpointId/attempt version) rather than a generic content-hash receipt; explicit operation reconciliation/acknowledgment UX and deletion of already-accepted stale journal entries; full 8-writer contention and lost-response acceptance fixtures; verified originating commit evidence and structured observed head on all errors. Tasks 01 and 03 are still active as well. All work remains on the isolated branch without production migration or deployment.
+
+## Pending-operation reconciliation and recovery (experimental protocol 3.27)
+
+The V2 operation durability contract now includes two explicit MCP actions:
+
+- `V2ReconcilePendingOperations` (read-only): verify the canonical Git ledger head once, then inspect every locally journaled V2 task/review/integration operation at exactly that head. Check project/ledger/epoch, operation UUID, canonical operation kind and all relevant command inputs. Report `Applied`, `NotFoundAtVerifiedHead`, `IdentityMismatch` or `BindingMismatch`. Do **not** rewrite or discard local pending evidence on inspection.
+- `V2AcknowledgePendingOperation` (explicit, local write): require caller-supplied operation UUID and exact confirmed remote `requestHash`, re-fetch and validate the same canonical operation, then retire only its local journal entry. Repeated acknowledgments with that proof are safe. Missing/unaccepted or mismatched operations cannot be acknowledged.
+
+Task, review and integration writes now also recover an `OutcomeUnknown` immediately if a follow-up remote fetch proves the *same* logical request was accepted (including full action input comparison). If no exact operation exists, return a structured `OutcomeUnknown` with caller UUID and the last verified canonical head while preserving the pending journal. No remote operation is inferred from a local branch or source worktree.
+
+An eight-clone disposable bare-remote contention fixture verified all independent operations and their original receipts, while source HEAD/index remained unchanged. Additional tests cover exact remote acceptance after a lost response, unaccepted pending operations, changed payload on the same task, mismatched operation identity, foreign ledger ID, explicit acknowledgment/retry, and pinned review submission.
+
+The full V2-02 task remains active until richer domain-specific result receipts, originating-commit provenance, full failure/restore acceptance, and complete operator reconciliation UX are verified. No production migration, rollout or V1 changes were performed.

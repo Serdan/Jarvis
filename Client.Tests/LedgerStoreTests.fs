@@ -182,3 +182,70 @@ type LedgerStoreTests() =
             | result -> Assert.Fail(sprintf "Expected rewrite rejection, got %A" result)
         finally
             Directory.Delete(root, true)
+
+
+    [<Test>]
+    member _.EightIndependentWritersKeepAllReceiptsAndSourceWorktreesUnchanged() =
+        let root = Path.Combine(Path.GetTempPath(), "jarvis-v2-contention-" + Guid.NewGuid().ToString("N"))
+        Directory.CreateDirectory(root) |> ignore
+        try
+            let remote = Path.Combine(root, "remote.git")
+            git root [ "init"; "--bare"; remote ] |> ignore
+            let clonePaths =
+                [ for i in 1 .. 8 do
+                    let path = Path.Combine(root, $"client{i}")
+                    git root [ "clone"; remote; path ] |> ignore
+                    git path [ "config"; "user.name"; "V2 contention fixture" ] |> ignore
+                    git path [ "config"; "user.email"; "fixture@example.test" ] |> ignore
+                    yield path ]
+            let origin = clonePaths.Head
+            File.WriteAllText(Path.Combine(origin, "source.txt"), "preserved")
+            git origin [ "add"; "source.txt" ] |> ignore
+            git origin [ "commit"; "-m"; "source head" ] |> ignore
+            git origin [ "push"; "-u"; "origin"; "HEAD" ] |> ignore
+            let sourceBranch = git origin [ "branch"; "--show-current" ]
+            for path in clonePaths.Tail do
+                git path [ "fetch"; "origin"; sourceBranch ] |> ignore
+                git path [ "checkout"; "-B"; sourceBranch; "origin/" + sourceBranch ] |> ignore
+            let projectId, ledgerId = Guid.NewGuid(), Guid.NewGuid()
+            let binding path =
+                { RepositoryPath = path; RemoteName = "origin"
+                  ApprovedFetchUrl = remote; ApprovedPushUrl = remote
+                  ProjectId = projectId; LedgerId = ledgerId; Epoch = 1 }
+            let initialized = LedgerStore.initialize (binding origin) true |> success
+            let sources = clonePaths |> List.map (fun path -> path, git path [ "rev-parse"; "HEAD" ])
+            let operations =
+                clonePaths
+                |> List.mapi (fun i path ->
+                    let opId = Guid.NewGuid()
+                    path, opId, $"records/concurrent{i}.json")
+            use gate = new System.Threading.ManualResetEventSlim(false)
+            let running =
+                operations
+                |> List.map (fun (path, opId, name) ->
+                    System.Threading.Tasks.Task.Run(fun () ->
+                        gate.Wait()
+                        LedgerStore.putRecord (binding path)
+                            { OperationId = opId; Actor = "Concurrent fixture"
+                              Path = name; ExpectedBlobOid = None
+                              Content = """{"source":"concurrent"}""" }))
+                |> List.toArray
+            gate.Set()
+            System.Threading.Tasks.Task.WaitAll(running |> Array.map (fun job -> job :> System.Threading.Tasks.Task))
+            for i in 0 .. running.Length - 1 do
+                match running[i].Result with
+                | Ok write ->
+                    Assert.That(write.Operation.Sequence, Is.GreaterThan(0L))
+                    Assert.That(write.Operation.OriginalResultJson, Does.Contain(operations[i] |> fun (_,_,name) -> name))
+                | Error error -> Assert.Fail(sprintf "Concurrent independent writer %d failed: %A" i error)
+            let verified = LedgerStore.fetch (binding origin) |> success
+            Assert.That(verified.Header.NextSequence, Is.EqualTo(initialized.Header.NextSequence + 8L))
+            for path, opId, name in operations do
+                let _, receipt = LedgerStore.getOperationStatus (binding path) opId |> success
+                Assert.That(receipt.IsSome, Is.True)
+                Assert.That(receipt.Value.Type, Is.EqualTo("PutRecord"))
+                Assert.That((LedgerStore.readRecord (binding path) name |> success |> snd).IsSome, Is.True)
+            for path, originalHead in sources do
+                Assert.That(git path [ "rev-parse"; "HEAD" ], Is.EqualTo(originalHead))
+                Assert.That(git path [ "status"; "--porcelain" ], Is.Empty)
+        finally Directory.Delete(root, true)

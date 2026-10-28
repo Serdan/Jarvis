@@ -12,13 +12,17 @@
     "worktree": null
   },
   "checkpoint": {
-    "summary": "Persisted canonical operation inputs and immutable original write receipts (path/content identities) in the same ledger commit, replayed across clones after further writes. Added private local pending-intent journaling for task/review/integration MCP mutations, offline-readable pending inbox, typed V2 ledger failure transport with operation IDs, and jittered retry. Remaining: domain-specific original results, confirmed-origin commit proof, outstanding-journal reconciliation and full contention/transport tests.",
-    "nextAction": "Finish exact domain-specific operation result schemas and journal reconciliation/acknowledgment; then test ambiguous remote push responses, 8-writer contention and structured observed-head error metadata.",
+    "summary": "Added explicit read-only reconciliation of local pending requests against one verified remote ledger snapshot, with full action payload and ledger identity matching. Added explicit hash-gated, idempotent acknowledgment that removes local evidence only when verified. Ambiguous task/review/integration write results now recheck the canonical operation index and recover accepted matching writes, otherwise preserve OutcomeUnknown, UUID and last confirmed head. Eight independent Git clients concurrently retained every receipt without modifying source HEAD/index.",
+    "nextAction": "Complete domain-specific version/checkpoint/phase result projections and originating commit evidence; verify recovery against remote outages, rewritten refs, and full 8-attempt contention bounds. Then re-audit V2-02 for closure.",
     "verified": [
       "Cross-clone idempotency, canonicalized JSON hash, duplicate-field rejection, stable receipt after unrelated writer",
       "Failed call/lost-response retained in local journal, conflicting UUID refused, replay clears journal",
       "Opt-in V2 API confirmed writes clear journal; pending intents inspectable without configured remote",
-      "Typed LedgerContended/OperationIdReused/OutcomeUnknown/etc. propagated over wire and MCP metadata verified"
+      "Typed LedgerContended/OperationIdReused/OutcomeUnknown/etc. propagated over wire and MCP metadata verified",
+      "Eight independent clones wrote separate records concurrently; every operation/receipt retained; source working trees unchanged",
+      "Read-only reconciliation distinguishes applied, absent, mismatched payload, mismatched ledger identity; local journal unchanged until explicit hash-matched acknowledgment",
+      "Lost remote response is recovered only when exact canonical operation matches; otherwise OutcomeUnknown retains caller UUID, verified head and pending intent",
+      "Review submission payload reconciled against immutable pinned review source; repeat acknowledgment is idempotent"
     ],
     "lastCommit": null
   },
@@ -33,5 +37,5 @@
     ],
     "sourceReport": "docs/reviews/2026-10-28-v2-spec-implementation-audit.md"
   },
-  "updatedAt": "2026-10-28T20:20:00+01:00"
+  "updatedAt": "2026-10-28T20:40:00+01:00"
 }

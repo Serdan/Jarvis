@@ -1409,3 +1409,74 @@ type ReviewWorkflowTests() =
             let origin = LedgerStore.getOperationOriginAt second latest replay.Operation |> success
             Assert.That(origin, Is.EqualTo(created.CurrentHead))
             Assert.That(origin, Is.Not.EqualTo(latest.Commit)))
+
+
+    [<Test>]
+    member _.RemoteOutagePreservesPendingIntentUntilVerifiedRetry() =
+        withFixture (fun one _ first _ _ _ _ _ ->
+            let operationId = Guid.NewGuid()
+            let command =
+                {| Action = "CreateTask"; TaskId = "offline"
+                   Title = "Offline"; Html = "<h1>Offline</h1>" |}
+            let attempt () : Result<LedgerWrite, Client.EffectError> =
+                ReviewWorkflow.createTaskWithSpec first operationId
+                    "offline" "Offline" "<h1>Offline</h1>"
+                |> Result.mapError Client.V2ReviewApi.V2LedgerErrors.toEffect
+            let execute () =
+                Client.V2ReviewApi.V2PendingIntentJournal.executeLedgerWrite
+                    first operationId "V2TaskWrite" command attempt
+            let unavailable = first.ApprovedFetchUrl + ".unavailable"
+            Directory.Move(first.ApprovedFetchUrl, unavailable)
+            try
+                match execute () with
+                | Error(Client.V2LedgerFailureError error) ->
+                    Assert.That(error.Code, Is.EqualTo("RemoteUnavailable"))
+                    Assert.That(error.OperationId, Is.EqualTo(Some(operationId.ToString("D"))))
+                | other -> Assert.Fail(sprintf "Unavailable remote must never accept a local write: %A" other)
+                match Client.V2ReviewApi.V2PendingIntentJournal.reconcile first with
+                | Error(Client.V2LedgerFailureError error) ->
+                    Assert.That(error.Code, Is.EqualTo("RemoteUnavailable"))
+                | other -> Assert.Fail(sprintf "Reconcile must fail closed during outage: %A" other)
+                Assert.That((Client.V2ReviewApi.V2PendingIntentJournal.listAtRoot one |> success).Length,
+                            Is.EqualTo(1), "Offline reconciliation must not delete evidence.")
+            finally Directory.Move(unavailable, first.ApprovedFetchUrl)
+
+            let before = Client.V2ReviewApi.V2PendingIntentJournal.reconcile first |> success
+            Assert.That(before.Head.disposition, Is.EqualTo("NotFoundAtVerifiedHead"))
+            let recovered = execute () |> success
+            Assert.That(recovered.AlreadyApplied, Is.False)
+            let _, recorded = LedgerStore.getOperationStatus first operationId |> success
+            Assert.That(recorded.IsSome, Is.True)
+            Assert.That(recorded.Value.OriginalResultJson,
+                        Is.EqualTo(recovered.Operation.OriginalResultJson))
+            Assert.That((Client.V2ReviewApi.V2PendingIntentJournal.listAtRoot one |> success).Length,
+                        Is.EqualTo(0)))
+
+
+    [<Test>]
+    member _.RewrittenRemoteNeverReconcilesOrDiscardsPendingIntent() =
+        withFixture (fun one _ first _ _ _ _ _ ->
+            let original = (LedgerStore.fetch first |> success).Commit
+            let id = Guid.NewGuid()
+            let command =
+                System.Text.Json.JsonSerializer.Serialize(
+                    {| Action = "CreateTask"; TaskId = "rewrite"
+                       Title = "Rewrite"; Html = "<h1>Rewrite</h1>" |})
+            Client.V2ReviewApi.V2PendingIntentJournal.persist first id "V2TaskWrite" command
+            |> success
+            let sourceHead = git one [ "rev-parse"; "HEAD" ]
+            let ledgerRef = "refs/heads/jarvis-orchestration"
+            git one [ "push"; "--force"; "origin"; $"{sourceHead}:{ledgerRef}" ] |> ignore
+            try
+                match Client.V2ReviewApi.V2PendingIntentJournal.reconcile first with
+                | Error(Client.V2LedgerFailureError failure) ->
+                    Assert.That(failure.Code, Is.EqualTo("LedgerIntegrityError"))
+                | other -> Assert.Fail(sprintf "Rewritten remote cannot authorize recovery: %A" other)
+                Assert.That((Client.V2ReviewApi.V2PendingIntentJournal.listAtRoot one |> success).Length,
+                            Is.EqualTo(1))
+            finally
+                git one [ "push"; "--force"; "origin"; $"{original}:{ledgerRef}" ] |> ignore
+            let recovered = Client.V2ReviewApi.V2PendingIntentJournal.reconcile first |> success
+            Assert.That(recovered.Length, Is.EqualTo(1))
+            Assert.That(recovered.Head.disposition, Is.EqualTo("NotFoundAtVerifiedHead"))
+            Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(original)))

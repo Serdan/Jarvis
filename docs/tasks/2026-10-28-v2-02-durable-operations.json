@@ -12,8 +12,8 @@
     "worktree": null
   },
   "checkpoint": {
-    "summary": "Implemented structured immutable domain results for task/attempt/agent/review/revision/checkpoint/integration mutations, preserving original entity versions, lifecycle/phase/state, assignment generation, checkpoint sequence, and reviewed head/ref. V2 MCP responses expose originalResult directly, and GetOperationStatus verifies originatingCommit via immutable Git history and commit trailers, distinct from the current ledger head. Previous pending reconciliation, typed errors and eight-client contention remain verified.",
-    "nextAction": "Audit V2-02 against remaining full remote outage, Git history rewrite/restore, ambiguous push and operator recovery acceptance. Then finish V2-01 trust safeguards and begin V2-04 immutable assignment generations.",
+    "summary": "Durable V2-02 operation input, typed entity-specific original result, provenance, pending-intent replay/reconciliation and bounded multi-client Git contention are implemented. Added offline-remote and forced remote rewrite acceptance tests: remote failures fail closed with typed errors, preserve pending evidence, and recover the exact operation after restoring trusted refs.",
+    "nextAction": "Re-review remaining V2-02 authorization/UX acceptance once V2-01 trust and V2-11 permission controls are complete; retain active status until cross-task security gates pass. Core development can advance to V2-01 or V2-04.",
     "verified": [
       "Cross-clone idempotency, canonicalized JSON hash, duplicate-field rejection, stable receipt after unrelated writer",
       "Failed call/lost-response retained in local journal, conflicting UUID refused, replay clears journal",
@@ -26,7 +26,9 @@
       "Original task and assignment entity results remain unchanged across cross-clone retries after later writes",
       "Original reviewer revision number, exact head SHA and immutable review ref captured in the committed receipt",
       "Yield checkpoint original sequence/kind and agent Ready/attempt Paused versions verified",
-      "GetOperationStatus exposes structured originalResult and originatingCommit separate from current ledger head; forged trailer hash rejected"
+      "GetOperationStatus exposes structured originalResult and originatingCommit separate from current ledger head; forged trailer hash rejected",
+      "Remote outage during pending write produces typed RemoteUnavailable; journal retained, then exact same UUID applied after remote restoration",
+      "Rewritten canonical ledger rejected by trust ancestry while pending journal is retained; restored head re-establishes healthy inspection"
     ],
     "lastCommit": null
   },
@@ -41,5 +43,5 @@
     ],
     "sourceReport": "docs/reviews/2026-10-28-v2-spec-implementation-audit.md"
   },
-  "updatedAt": "2026-10-28T21:25:00+01:00"
+  "updatedAt": "2026-10-28T21:29:00+01:00"
 }

@@ -213,3 +213,11 @@ Successful V2 task, review and integration MCP mutation responses expose `origin
 Disposable two-clone tests verify unchanged original task state after assignment, review revision SHA/ref identity, assignment/agent state and checkpoint sequence, replay after subsequent operations, MCP status projection, and failure on forged commit-provenance hash. Result envelope schema is additive but the experimental protocol is advanced to 3.28.
 
 **V2-02 remains active:** broader remote-failure/restore tests and a final spec acceptance audit remain. No live rollout, V1 mutation, production ledger initialization or deployment occurred.
+
+## V2-02 remote failure recovery acceptance fixtures
+
+The durable operation recovery tests now include two additional disposable-remote adversarial scenarios. First, the canonical bare remote is made unavailable during a journaled task write: Git returns a typed `RemoteUnavailable` error with the original UUID, `V2ReconcilePendingOperations` fails closed, and the original journal entry remains available for later retry. After restoring the remote, inspection reports the operation missing at the verified head; a retry with the **same UUID and original input** publishes the operation exactly once and clears the local journal only after confirmation.
+
+Second, the remote ledger branch is force-rewritten to an unrelated source commit while the local client holds a trusted ledger head and a pending write. Reconciliation refuses the rewritten branch with typed `LedgerIntegrityError`; the pending entry is retained. Restoring the trusted ledger branch permits read-only reconciliation again without importing the rewritten history or mutating a source checkout.
+
+Together with the existing eight independent writer, mismatched payload, lost-response, hash-gated acknowledgment, original domain result and provenance fixtures, these establish the core V2-02 durable recovery contract. Security/authorization and future TUI presentation remain independently tracked by V2-01 and V2-11; broader systemwide restore/cutover acceptance belongs to V2-13/V2-16. No production migration/deployment was performed.

@@ -39,3 +39,47 @@ This is a **core domain prototype**, not the full protocol-4.0 feature. Do not e
 - More adversarial tests for remote outages, host ref protection, backup/restore, source rewrites and larger contention.
 
 The older exclusive `ReadyForReview` attempt workflow and its tests have been replaced in this isolated client prototype. The pre-cutover scope above remains intentionally excluded.
+
+
+## Experimental MCP bridge (protocol 3.20)
+
+The branch includes explicit, **non-V1** MCP methods: V2ReviewTask, V2ReviewDetails,
+V2ReviewerInbox, V2SubmitReview, V2ReplaceReview, V2ClaimReview, V2DecideReview,
+V2WithdrawReview, V2ReassignReview and V2FinalizeReview. These are human-oriented
+aliases for two typed wire commands (V2ReviewRead, V2ReviewWrite). Every mutation
+takes a caller-owned **operationId** and the exact expected entity version.
+
+Client routing requires an explicit local binding, stored **outside the repository** at
+the path computed by ReviewV2Binding.pathForRoot. On Linux this is typically
+$XDG_CONFIG_HOME/Jarvis/ledger-v2/<sha256-of-absolute-checkout-path>.json
+(or ~/.config/Jarvis/... when XDG_CONFIG_HOME is not set). The config is created
+only by explicit local setup; no tool writes or guesses it automatically. Example:
+
+{
+  "schemaVersion": 1,
+  "enabled": true,
+  "projectRoot": "/absolute/path/to/a/registered/project/checkout",
+  "projectId": "existing-ledger-project-UUID",
+  "ledgerId": "existing-ledger-UUID",
+  "epoch": 1,
+  "remoteName": "origin",
+  "approvedFetchUrl": "exact-git-remote-fetch-URL",
+  "approvedPushUrl": "exact-git-remote-push-URL"
+}
+
+These identifiers must be read from an **already approved, existing** V2 ledger;
+the MCP bridge does not initialize a new remote ledger or select a source
+remote without authorization. Both V2 reads and writes fail closed if the
+binding is absent, disabled, malformed or mismatched. The client then performs
+its normal remote/identity/ancestry verification before operations.
+
+OAuth requires workspace:read for V2 query methods and git:write for V2
+mutations. The Jarvis client applies its existing local Git permission policy.
+All V1 task commands retain their original semantics; the bridge never
+falls back to worktree-local task files.
+
+This is a development capability, **not a complete V2 cutover**. Fresh projects
+still need V2 task/spec creation, agent registration, assignment, baseline
+binding and ledger initialization through the approved setup/migration workflow
+before the review commands become usable. Native reviewer/owner TUI views,
+complete checkpoint evidence schemas and protocol-4.0 migration remain pending.

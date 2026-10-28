@@ -85,6 +85,7 @@ let private auditDetails command =
     | ClaimTaskCommand cmd -> Some("ClaimTask", Some cmd.ProjectName, [ WorkspaceWrite; VersionControlWrite ], [], Some "git", [ cmd.TaskId ])
     | CheckpointTaskCommand cmd -> Some("CheckpointTask", Some cmd.ProjectName, [ WorkspaceWrite; VersionControlWrite ], [], Some "git", [ cmd.TaskId ])
     | CompleteTaskCommand cmd -> Some("CompleteTask", Some cmd.ProjectName, [ WorkspaceWrite; VersionControlWrite ], [], Some "git", [ cmd.TaskId ])
+    | V2ReviewWriteCommand cmd -> Some("V2Review" + cmd.Action, Some cmd.ProjectName, [ WorkspaceWrite; VersionControlWrite; NetworkAccess ], [], Some "git", [ cmd.TaskId; cmd.RequestId; cmd.OperationId ])
     | CreateWorktreeCommand cmd -> Some("CreateWorktree", Some cmd.ProjectName, [ VersionControlWrite ], [], Some "git", [ cmd.Branch; cmd.Name ])
     | GitCommitCommand cmd -> Some("GitCommit", Some cmd.ProjectName, [ VersionControlWrite ], cmd.Paths, Some "git", [ cmd.Message ])
     | StartJobCommand cmd -> Some("StartJob", Some cmd.ProjectName, [ ProcessExecution ], [], Some cmd.Executable, cmd.Args)
@@ -212,6 +213,8 @@ let private dispatch (rt: Runtime) (command: AgentCommand) =
     | CheckpointTaskCommand cmd -> rt |> TaskStore.checkpointTask cmd |> serialize'
     | CompleteTaskCommand cmd -> rt |> TaskStore.completeTask cmd |> serialize'
     | GetTaskHistoryCommand cmd -> rt |> TaskStore.getTaskHistory cmd |> serialize'
+    | V2ReviewReadCommand cmd -> rt |> V2ReviewApi.V2ReviewApi.read cmd |> serialize'
+    | V2ReviewWriteCommand cmd -> rt |> V2ReviewApi.V2ReviewApi.write cmd |> serialize'
     | ListProjectsCommand ->
         rt
         |> ProjectBrowser.listProjects

@@ -59,6 +59,7 @@
         <Compile Include="Modules\\TaskStore.fs"/>
         <Compile Include="Modules\\LedgerStore.fs"/>
         <Compile Include="Modules\\ReviewWorkflow.fs"/>
+        <Compile Include="Modules\\V2ReviewApi.fs"/>
         <Compile Include="Modules\AgentDashboard.fs"/>
         <Compile Include="Modules\\WorkTaskCompat.fs"/>
         <Compile Include="Runtime.fs"/>

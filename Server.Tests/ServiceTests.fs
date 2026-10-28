@@ -421,11 +421,20 @@ let ``command catalog matches AgentCommand union and MCP tools`` () =
     // Retired legacy wire cases remain internal for old-client compatibility,
     // but must never be discoverable or callable as public MCP tools.
     let retired = set [ "AttachWorkTask"; "GetWorkTask"; "ListWorkTasks"; "CheckpointWorkTask"; "CompleteWorkTask" ]
+    // Ten human-oriented V2 MCP tools route through two carefully scoped wire commands.
+    let v2Wire = set [ "V2ReviewRead"; "V2ReviewWrite" ]
+    let v2Tools =
+        set [ "V2ReviewTask"; "V2ReviewDetails"; "V2ReviewerInbox"
+              "V2SubmitReview"; "V2ReplaceReview"; "V2ClaimReview"; "V2DecideReview"
+              "V2WithdrawReview"; "V2ReassignReview"; "V2FinalizeReview" ]
     Set.difference unionNames retired |> shouldEqual catalogNames
     Set.intersect mcpNames retired |> shouldEqual Set.empty
     Set.intersect catalogNames retired |> shouldEqual Set.empty
-    Set.difference mcpNames serverLocalNames |> shouldEqual catalogNames
-    Set.difference mcpNames catalogNames |> shouldEqual serverLocalNames
+    Set.intersect mcpNames v2Tools |> shouldEqual v2Tools
+    Set.difference (Set.difference mcpNames serverLocalNames) v2Tools
+    |> shouldEqual (Set.difference catalogNames v2Wire)
+    Set.difference (Set.difference mcpNames catalogNames) v2Tools
+    |> shouldEqual serverLocalNames
 
 
 [<Test>]
@@ -436,7 +445,7 @@ let ``client-backed MCP tools expose an optional per-command deviceId`` () =
         |> Array.filter (fun methodInfo ->
             methodInfo.GetParameters()
             |> Array.exists (fun parameter -> parameter.ParameterType = typeof<ClientService>))
-    clientMethods.Length |> shouldEqual (AgentProtocol.commandDefinitions.Length - 1)
+    clientMethods.Length |> shouldEqual (AgentProtocol.commandDefinitions.Length - 1 + 8) // 10 MCP V2 aliases / 2 wire operations
     for methodInfo in clientMethods do
         let deviceParam = methodInfo.GetParameters() |> Array.tryFind (fun parameter -> parameter.Name = "deviceId")
         match deviceParam with
@@ -637,9 +646,19 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
         else Auth.WorkspaceRead
 
     let definitions =
-        AgentProtocol.commandDefinitions
-        |> List.map (fun definition -> definition.Name, definition)
-        |> Map.ofList
+        let original =
+            AgentProtocol.commandDefinitions
+            |> List.map (fun definition -> definition.Name, definition)
+            |> Map.ofList
+        let v2Read = original["V2ReviewRead"]
+        let v2Write = original["V2ReviewWrite"]
+        let aliases =
+            [ for name in [ "V2ReviewTask"; "V2ReviewDetails"; "V2ReviewerInbox" ] ->
+                  name, v2Read
+              for name in [ "V2SubmitReview"; "V2ReplaceReview"; "V2ClaimReview"; "V2DecideReview"
+                            "V2WithdrawReview"; "V2ReassignReview"; "V2FinalizeReview" ] ->
+                  name, v2Write ]
+        aliases |> List.fold (fun map (key, value) -> Map.add key value map) original
 
     let methods =
         typeof<JarvisMcpTools>.GetMethods()
@@ -658,7 +677,7 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
 
         let readOnly =
             match definition with
-            | Some definition -> definition.Permissions = [ ReadOnly ]
+            | Some definition -> not definition.MutatesState
             | None ->
                 match methodInfo.Name with
                 | "Feedback" | "UpdateFeedback" | "SelectDevice" | "UpdateServer" -> false
@@ -673,6 +692,7 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
         let openWorld =
             match methodInfo.Name with
             | "ImportFile" | "UpdateClient" | "UpdateServer" | "RunCommand" | "RunProjectTask" | "StartJob" -> true
+            | name when name.StartsWith("V2") -> true
             | _ -> false
 
         attribute.ReadOnly |> shouldEqual readOnly

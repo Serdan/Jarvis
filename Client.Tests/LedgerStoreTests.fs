@@ -91,6 +91,15 @@ type LedgerStoreTests() =
             Assert.That(laterReplay.AlreadyApplied, Is.True)
             Assert.That(laterReplay.CurrentHead, Is.Not.EqualTo(firstWrite.CurrentHead))
             Assert.That(laterReplay.Operation.OriginalResultJson, Is.EqualTo(firstWrite.Operation.OriginalResultJson))
+            let current = LedgerStore.fetch second |> success
+            let originating =
+                LedgerStore.getOperationOriginAt second current laterReplay.Operation |> success
+            Assert.That(originating, Is.EqualTo(firstWrite.CurrentHead))
+            Assert.That(originating, Is.Not.EqualTo(current.Commit))
+            match LedgerStore.getOperationOriginAt second current
+                    { laterReplay.Operation with RequestHash = String.replicate 64 "f" } with
+            | Error(LedgerIntegrityError _) -> ()
+            | other -> Assert.Fail(sprintf "Forged provenance hash must be rejected: %A" other)
             let canonicalId = Guid.NewGuid()
             let canonical =
                 { OperationId = canonicalId; Actor = "Agent 1"

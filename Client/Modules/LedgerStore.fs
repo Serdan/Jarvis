@@ -80,6 +80,34 @@ type LedgerFileChange =
       ExpectedBlobOid: string option
       Content: string }
 
+[<CLIMutable>]
+type LedgerEntityEffect =
+    { Path: string
+      EntityKind: string
+      ContentSha256: string
+      EntityVersion: int option
+      TaskId: string option
+      AttemptId: string option
+      RequestId: string option
+      AgentId: string option
+      ActionId: string option
+      Lifecycle: string option
+      State: string option
+      Phase: string option
+      Status: string option
+      AssignmentGeneration: int option
+      CheckpointSequence: int64 option
+      CheckpointKind: string option
+      CurrentReviewRevision: int option
+      ClaimedReviewRevision: int option
+      ReviewRevision: int option
+      AcceptedReviewRevision: int option
+      SpecBlobOid: string option
+      AcceptedHead: string option
+      HeadCommit: string option
+      ReviewRef: string option
+      VerifiedIntegrationSequence: int64 option }
+
 type LedgerIntent =
     { OperationId: Guid
       Actor: string
@@ -423,6 +451,45 @@ module LedgerStore =
         if operationId = Guid.Empty then Error(InvalidBinding "Valid operation UUID required.")
         else readOperation binding snapshot.Commit operationId
 
+    // Originating commit cannot be embedded in its own tree. Recover it by
+    // tracing the addition of this immutable operation file through the
+    // verified ancestry, then require the original blob and commit trailers.
+    // A rewritten operation file is never treated as the same historical fact.
+    let getOperationOriginAt (binding: LedgerBinding) (snapshot: LedgerSnapshot)
+                             (operation: LedgerOperation) =
+        match Guid.TryParse operation.OperationId with
+        | false, _ -> Error(LedgerIntegrityError "Operation has an invalid UUID.")
+        | true, id ->
+            let path = opPath id
+            match blobAt binding.RepositoryPath snapshot.Commit path with
+            | Error error -> Error error
+            | Ok None -> Error(LedgerIntegrityError "Operation record missing at verified snapshot.")
+            | Ok(Some currentOid) ->
+                match run binding.RepositoryPath
+                        [ "log"; "--first-parent"; "--diff-filter=A"; "--format=%H"
+                          snapshot.Commit; "--"; path ] with
+                | Error error -> Error error
+                | Ok history ->
+                    let origins = history.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                    if origins.Length <> 1 || not (oidPattern.IsMatch origins[0]) then
+                        Error(LedgerIntegrityError "Operation has no unique originating commit.")
+                    else
+                        let origin = origins[0]
+                        match blobAt binding.RepositoryPath origin path with
+                        | Error error -> Error error
+                        | Ok(Some addedOid) when addedOid = currentOid ->
+                            match run binding.RepositoryPath [ "show"; "-s"; "--format=%B"; origin ] with
+                            | Error error -> Error error
+                            | Ok message ->
+                                if message.Contains($"Jarvis-Operation-Id: {id:D}", StringComparison.Ordinal)
+                                   && message.Contains(
+                                       $"Jarvis-Request-Hash: {operation.RequestHash}",
+                                       StringComparison.Ordinal) then Ok origin
+                                else Error(LedgerIntegrityError
+                                    "Originating commit lacks matching operation evidence trailers.")
+                        | _ -> Error(LedgerIntegrityError
+                            "An operation record changed after its originating commit.")
+
     let getOperationStatus (binding: LedgerBinding) (operationId: Guid) =
         if operationId = Guid.Empty then Error(InvalidBinding "Valid operation UUID required.")
         else
@@ -441,6 +508,82 @@ module LedgerStore =
                sequence = sequence
                kind = kind
                changes = changes |}
+
+    let private effect (change: LedgerFileChange) =
+        let path = change.Path
+        let isSpec = path.EndsWith("/spec.html", StringComparison.Ordinal)
+        let entityKind =
+            if isSpec then "TaskSpec"
+            elif path.EndsWith("/task.json", StringComparison.Ordinal) then "Task"
+            elif path.StartsWith("agents/", StringComparison.Ordinal) then "Agent"
+            elif path.Contains("/checkpoints/", StringComparison.Ordinal) then "Checkpoint"
+            elif path.Contains("/integrations/", StringComparison.Ordinal) then "Integration"
+            elif path.Contains("/revisions/", StringComparison.Ordinal) then "ReviewRevision"
+            elif path.EndsWith("/request.json", StringComparison.Ordinal) then "ReviewRequest"
+            elif path.EndsWith("/notification.json", StringComparison.Ordinal) then "ReviewNotification"
+            elif path.Contains("/attempts/", StringComparison.Ordinal) then "Attempt"
+            else "Record"
+        let source =
+            if isSpec then None else
+                try
+                    let doc = JsonDocument.Parse(change.Content)
+                    if doc.RootElement.ValueKind = JsonValueKind.Object then Some doc
+                    else
+                        doc.Dispose()
+                        None
+                with _ -> None
+        try
+            let find (name: string) =
+                source |> Option.bind (fun doc ->
+                    let mutable found = Unchecked.defaultof<JsonElement>
+                    if doc.RootElement.TryGetProperty(name, &found) then Some found else None)
+            let str name =
+                find name |> Option.bind (fun value ->
+                    if value.ValueKind = JsonValueKind.String then Some(value.GetString()) else None)
+            let number name =
+                find name |> Option.bind (fun value ->
+                    let mutable n = 0
+                    if value.ValueKind = JsonValueKind.Number && value.TryGetInt32(&n) then Some n else None)
+            let longNumber name =
+                find name |> Option.bind (fun value ->
+                    let mutable n = 0L
+                    if value.ValueKind = JsonValueKind.Number && value.TryGetInt64(&n) then Some n else None)
+            { Path = path; EntityKind = entityKind
+              ContentSha256 = digest change.Content
+              EntityVersion = number "version"
+              TaskId = str "taskId"; AttemptId = str "attemptId"
+              RequestId = str "requestId"; AgentId = str "agentId"; ActionId = str "actionId"
+              Lifecycle = str "lifecycle"; State = str "state"
+              Phase = str "phase"; Status = str "status"
+              AssignmentGeneration = number "assignmentGeneration"
+              CheckpointSequence = if entityKind = "Checkpoint" then longNumber "sequence" else None
+              CheckpointKind = if entityKind = "Checkpoint" then str "kind" else None
+              CurrentReviewRevision =
+                  match number "currentRevision" with
+                  | Some revision -> Some revision
+                  | None -> number "revision"
+              ClaimedReviewRevision = number "claimedRevision"
+              ReviewRevision = number "reviewRevision"
+              AcceptedReviewRevision = number "acceptedReviewRevision"
+              SpecBlobOid = str "specBlobOid"
+              AcceptedHead = str "acceptedHead"
+              HeadCommit = str "headCommit"; ReviewRef = str "reviewRef"
+              VerifiedIntegrationSequence = longNumber "verifiedSequence" }
+        finally
+            source |> Option.iter (fun doc -> doc.Dispose())
+
+    let private domainReceipt operationId sequence kind (changes: LedgerFileChange list) =
+        json
+            {| schemaVersion = 2
+               operationId = operationId
+               sequence = sequence
+               kind = kind
+               changes =
+                   changes |> List.map (fun change ->
+                       {| path = change.Path
+                          beforeOid = change.ExpectedBlobOid
+                          contentSha256 = digest change.Content |}) |> List.toArray
+               entityResults = changes |> List.map effect |> List.toArray |}
 
     let private recordInput (binding: LedgerBinding) (change: LedgerRecordChange) =
         json
@@ -874,14 +1017,8 @@ module LedgerStore =
                                 | Some error -> Error error
                                 | None ->
                                     let originalResult =
-                                        receipt (intent.OperationId.ToString("D"))
-                                            snapshot.Header.NextSequence intent.Kind
-                                            (changes
-                                             |> List.map (fun change ->
-                                                 {| path = change.Path
-                                                    beforeOid = change.ExpectedBlobOid
-                                                    contentSha256 = digest change.Content |})
-                                             |> List.toArray)
+                                        domainReceipt (intent.OperationId.ToString("D"))
+                                            snapshot.Header.NextSequence intent.Kind changes
                                     let operation =
                                         { SchemaVersion = 2
                                           CanonicalRequestJson = intentInput binding intent

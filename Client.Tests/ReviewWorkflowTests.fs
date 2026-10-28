@@ -97,7 +97,17 @@ type ReviewWorkflowTests() =
             let submitOp = Guid.NewGuid()
             let submit binding =
                 ReviewWorkflow.submitReview binding submitOp "315" "Owner" 3 1 req sourceRef c "Please review C"
-            Assert.That((submit first |> success).AlreadyApplied, Is.False)
+            let submitted = submit first |> success
+            Assert.That(submitted.AlreadyApplied, Is.False)
+            use originalSubmission = System.Text.Json.JsonDocument.Parse(submitted.Operation.OriginalResultJson)
+            let publishedRevision =
+                originalSubmission.RootElement.GetProperty("entityResults").EnumerateArray()
+                |> Seq.find (fun value ->
+                    value.GetProperty("entityKind").GetString() = "ReviewRevision")
+            Assert.That(publishedRevision.GetProperty("currentReviewRevision").GetInt32(), Is.EqualTo(1))
+            Assert.That(publishedRevision.GetProperty("headCommit").GetString(), Is.EqualTo(c))
+            Assert.That(publishedRevision.GetProperty("reviewRef").GetString(),
+                        Is.EqualTo($"refs/heads/jarvis-review/315/{req:N}/r1"))
             Assert.That((submit second |> success).AlreadyApplied, Is.True)
             let _, _, attemptAtSubmission = ReviewWorkflow.getTask first "315" |> success
             Assert.That((Option.get attemptAtSubmission).Phase, Is.EqualTo("Working"))
@@ -466,8 +476,18 @@ type ReviewWorkflowTests() =
                         | Error error -> failwithf "V2 task API failed: %A" error
                 let taskId = "751"
                 let html = "<h1>Full task specification</h1><p>Acceptance: one review</p>"
-                run { template "CreateTask" taskId with
-                          Title = "Full task"; Html = html } |> ignore
+                let createCommand =
+                    { template "CreateTask" taskId with Title = "Full task"; Html = html }
+                let created = run createCommand
+                let creationJson = System.Text.Json.JsonSerializer.Serialize(created)
+                use creation = System.Text.Json.JsonDocument.Parse(creationJson)
+                let creationHead = creation.RootElement.GetProperty("head").GetString()
+                let createdEffect =
+                    creation.RootElement.GetProperty("originalResult").GetProperty("entityResults")
+                        .EnumerateArray()
+                    |> Seq.find (fun item -> item.GetProperty("entityKind").GetString() = "Task")
+                Assert.That(createdEffect.GetProperty("entityVersion").GetInt32(), Is.EqualTo(1))
+                Assert.That(createdEffect.GetProperty("lifecycle").GetString(), Is.EqualTo("Open"))
                 let attemptId = Guid.NewGuid()
                 run { template "AssignTask" taskId with
                           AttemptId = attemptId.ToString("D")
@@ -480,6 +500,25 @@ type ReviewWorkflowTests() =
                         | Error error -> failwithf "V2 inbox failed: %A" error
                 Assert.That(queued.RunnableQueue.Length, Is.EqualTo(1))
                 Assert.That(queued.RunnableQueue.Head.Attempt.SpecBlobOid.Length, Is.EqualTo(40))
+                let operationStatus : Common.V2LedgerReadCommand =
+                    { ProjectName = "owner"; Action = "GetOperationStatus"
+                      OperationId = createCommand.OperationId }
+                let operationResponse =
+                    Client.V2ReviewApi.V2LedgerApi.read operationStatus ctx
+                    |> function
+                        | Ok value -> value
+                        | Error error -> failwithf "V2 operation status failed: %A" error
+                let operationJson = System.Text.Json.JsonSerializer.Serialize(operationResponse)
+                use operationDoc = System.Text.Json.JsonDocument.Parse(operationJson)
+                Assert.That(operationDoc.RootElement.GetProperty("originatingCommit").GetString(),
+                            Is.EqualTo(creationHead))
+                Assert.That(operationDoc.RootElement.GetProperty("snapshotCommit").GetString(),
+                            Is.Not.EqualTo(creationHead))
+                let storedEffect =
+                    operationDoc.RootElement.GetProperty("originalResult").GetProperty("entityResults")
+                        .EnumerateArray()
+                    |> Seq.find (fun item -> item.GetProperty("entityKind").GetString() = "Task")
+                Assert.That(storedEffect.GetProperty("lifecycle").GetString(), Is.EqualTo("Open"))
                 run { template "BeginAttempt" taskId with
                           ExpectedVersion = 1; AssignmentGeneration = 1 } |> ignore
                 run { template "BindReviewBase" taskId with
@@ -1296,3 +1335,77 @@ type ReviewWorkflowTests() =
             |> success |> ignore
             Assert.That((Client.V2ReviewApi.V2PendingIntentJournal.listAtRoot one |> success).Length,
                         Is.EqualTo(0)))
+
+
+    [<Test>]
+    member _.DomainResultsRetainExactEntityVersionsAndCheckpointAfterReplay() =
+        withFixture (fun _ _ first second _ _ _ _ ->
+            let taskId = "domainReceipt"
+            let createId = Guid.NewGuid()
+            let created =
+                ReviewWorkflow.createTaskWithSpec first createId taskId "Domain"
+                    "<h1>Domain</h1>" |> success
+            use createdResult = System.Text.Json.JsonDocument.Parse(created.Operation.OriginalResultJson)
+            let root = createdResult.RootElement
+            Assert.That(root.GetProperty("schemaVersion").GetInt32(), Is.EqualTo(2))
+            let createdEffects = root.GetProperty("entityResults").EnumerateArray() |> Seq.toList
+            let task =
+                createdEffects |> List.find (fun row ->
+                    row.GetProperty("entityKind").GetString() = "Task")
+            Assert.That(task.GetProperty("entityVersion").GetInt32(), Is.EqualTo(1))
+            Assert.That(task.GetProperty("lifecycle").GetString(), Is.EqualTo("Open"))
+            Assert.That(task.GetProperty("taskId").GetString(), Is.EqualTo(taskId))
+            Assert.That(
+                createdEffects |> List.exists (fun row ->
+                    row.GetProperty("entityKind").GetString() = "TaskSpec"),
+                Is.True)
+
+            let assignmentId = Guid.NewGuid()
+            let attemptId = Guid.NewGuid()
+            let assigned = ReviewWorkflow.assignTask first assignmentId taskId
+                               attemptId "Owner" "Reviewer" |> success
+            use assignmentResult =
+                System.Text.Json.JsonDocument.Parse(assigned.Operation.OriginalResultJson)
+            let effects = assignmentResult.RootElement.GetProperty("entityResults").EnumerateArray() |> Seq.toList
+            let attempt =
+                effects |> List.find (fun row ->
+                    row.GetProperty("entityKind").GetString() = "Attempt")
+            let owner =
+                effects |> List.find (fun row ->
+                    row.GetProperty("entityKind").GetString() = "Agent")
+            Assert.That(attempt.GetProperty("entityVersion").GetInt32(), Is.EqualTo(1))
+            Assert.That(attempt.GetProperty("phase").GetString(), Is.EqualTo("Queued"))
+            Assert.That(attempt.GetProperty("assignmentGeneration").GetInt32(), Is.EqualTo(1))
+            Assert.That(attempt.GetProperty("attemptId").GetString(), Is.EqualTo(attemptId.ToString("N")))
+            Assert.That(owner.GetProperty("state").GetString(), Is.EqualTo("Assigned"))
+            Assert.That(owner.GetProperty("entityVersion").GetInt32(), Is.EqualTo(2))
+
+            ReviewWorkflow.beginAttempt first (Guid.NewGuid()) taskId "Owner" 1 1 |> success |> ignore
+            let pauseId = Guid.NewGuid()
+            let paused =
+                ReviewWorkflow.yieldAgent first pauseId taskId "Owner" 2 3 1
+                    "Measured current work" "Continue the implementation" |> success
+            use yieldResult = System.Text.Json.JsonDocument.Parse(paused.Operation.OriginalResultJson)
+            let yielded = yieldResult.RootElement.GetProperty("entityResults").EnumerateArray() |> Seq.toList
+            let checkpoint =
+                yielded |> List.find (fun row ->
+                    row.GetProperty("entityKind").GetString() = "Checkpoint")
+            Assert.That(checkpoint.GetProperty("checkpointKind").GetString(), Is.EqualTo("Yield"))
+            Assert.That(checkpoint.GetProperty("checkpointSequence").GetInt64(),
+                        Is.EqualTo(paused.Operation.Sequence))
+            let pausedAttempt =
+                yielded |> List.find (fun row ->
+                    row.GetProperty("entityKind").GetString() = "Attempt")
+            Assert.That(pausedAttempt.GetProperty("phase").GetString(), Is.EqualTo("Paused"))
+            Assert.That(pausedAttempt.GetProperty("entityVersion").GetInt32(), Is.EqualTo(3))
+
+            let replay =
+                ReviewWorkflow.createTaskWithSpec second createId taskId "Domain"
+                    "<h1>Domain</h1>" |> success
+            Assert.That(replay.AlreadyApplied, Is.True)
+            Assert.That(replay.Operation.OriginalResultJson, Is.EqualTo(created.Operation.OriginalResultJson))
+            Assert.That(replay.CurrentHead, Is.Not.EqualTo(created.CurrentHead))
+            let latest = LedgerStore.fetch second |> success
+            let origin = LedgerStore.getOperationOriginAt second latest replay.Operation |> success
+            Assert.That(origin, Is.EqualTo(created.CurrentHead))
+            Assert.That(origin, Is.Not.EqualTo(latest.Commit)))

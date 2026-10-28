@@ -203,3 +203,13 @@ Task, review and integration writes now also recover an `OutcomeUnknown` immedia
 An eight-clone disposable bare-remote contention fixture verified all independent operations and their original receipts, while source HEAD/index remained unchanged. Additional tests cover exact remote acceptance after a lost response, unaccepted pending operations, changed payload on the same task, mismatched operation identity, foreign ledger ID, explicit acknowledgment/retry, and pinned review submission.
 
 The full V2-02 task remains active until richer domain-specific result receipts, originating-commit provenance, full failure/restore acceptance, and complete operator reconciliation UX are verified. No production migration, rollout or V1 changes were performed.
+
+## Immutable domain result receipts and original commit provenance (experimental protocol 3.28)
+
+The V2-02 operation result contract now persists **schema-versioned entity results** together with the existing immutable operation receipt and change hashes. Each domain mutation includes a durable `entityResults` array: entity path/type; original task, attempt, agent or review version and lifecycle/phase/state; assignment generation; checkpoint kind and sequence; reviewed revision, head SHA and immutable review ref; and integration verification fields when applicable. These are captured directly from the canonical entity changes in the same transaction and **do not change** when later operations advance the ledger.
+
+Successful V2 task, review and integration MCP mutation responses expose `originalResult` as a structured value rather than requiring callers to parse `originalResultJson`. `V2GetOperationStatus` also includes the structured original result and `originatingCommit`. The origin is independently recovered from the verified Git history of the immutable operation index entry, requiring its original Git blob to remain unchanged and the commit to contain matching operation UUID and request-hash trailers. This avoids self-referential commit hashes and distinguishes the original operation commit from a newer fetched ledger head.
+
+Disposable two-clone tests verify unchanged original task state after assignment, review revision SHA/ref identity, assignment/agent state and checkpoint sequence, replay after subsequent operations, MCP status projection, and failure on forged commit-provenance hash. Result envelope schema is additive but the experimental protocol is advanced to 3.28.
+
+**V2-02 remains active:** broader remote-failure/restore tests and a final spec acceptance audit remain. No live rollout, V1 mutation, production ledger initialization or deployment occurred.

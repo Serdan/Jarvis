@@ -671,6 +671,14 @@ module V2PendingIntentJournal =
                     Error(Client.V2LedgerFailureError issue)
             | other -> other)
 
+module V2OperationResponse =
+    let present (write: LedgerStore.LedgerWrite) =
+        use document = JsonDocument.Parse(write.Operation.OriginalResultJson)
+        box {| operation = write.Operation
+               head = write.CurrentHead
+               alreadyApplied = write.AlreadyApplied
+               originalResult = document.RootElement.Clone() |}
+
 module V2LedgerApi =
     let private id label (raw: string) =
         match Guid.TryParse raw with
@@ -705,11 +713,26 @@ module V2LedgerApi =
                 |> Result.bind (fun binding ->
                     LedgerStore.LedgerStore.getOperationStatus binding operationId
                     |> Result.mapError V2LedgerErrors.toEffect
-                    |> Result.map (fun (snapshot, operation) ->
-                        box {| snapshotCommit = snapshot.Commit
-                               operationId = operationId.ToString("D")
-                               disposition = if operation.IsSome then "Applied" else "NotFoundAtVerifiedHead"
-                               operation = operation |})))
+                    |> Result.bind (fun (snapshot, operation) ->
+                        match operation with
+                        | None ->
+                            Ok(box {| snapshotCommit = snapshot.Commit
+                                      operationId = operationId.ToString("D")
+                                      disposition = "NotFoundAtVerifiedHead"
+                                      originatingCommit = None
+                                      originalResult = None
+                                      operation = operation |})
+                        | Some applied ->
+                            LedgerStore.LedgerStore.getOperationOriginAt binding snapshot applied
+                            |> Result.mapError V2LedgerErrors.toEffect
+                            |> Result.map (fun origin ->
+                                use result = JsonDocument.Parse(applied.OriginalResultJson)
+                                box {| snapshotCommit = snapshot.Commit
+                                       operationId = operationId.ToString("D")
+                                       disposition = "Applied"
+                                       originatingCommit = Some origin
+                                       originalResult = Some(result.RootElement.Clone())
+                                       operation = operation |}))))
         | _ -> Error(Client.ValidationError "Unsupported V2 ledger read action.")
 
     let write (cmd: V2LedgerWriteCommand) rt =
@@ -842,11 +865,7 @@ module V2ReviewApi =
                             |> mapError
                         | _ -> Error(Client.ValidationError "Unsupported V2 write operation.")
                     )
-                result |> Result.map (fun write ->
-                    let dto = {| operation = write.Operation
-                                 head = write.CurrentHead
-                                 alreadyApplied = write.AlreadyApplied |}
-                    box dto)))
+                result |> Result.map V2OperationResponse.present))
 
 
 // Separate typed setup/assignment contract. The review request API never has
@@ -928,10 +947,7 @@ module V2TaskApi =
                             |> mapError
                         | _ -> Error(Client.ValidationError "Unsupported V2 task operation.")
                     )
-                result |> Result.map (fun write ->
-                    box {| operation = write.Operation
-                           head = write.CurrentHead
-                           alreadyApplied = write.AlreadyApplied |})))
+                result |> Result.map V2OperationResponse.present))
 
 
 module V2IntegrationApi =
@@ -983,6 +999,4 @@ module V2IntegrationApi =
                                 |> mapError
                             | _ -> Error(Client.ValidationError "Unsupported V2 integration operation.")
                         )
-                    result |> Result.map (fun write ->
-                        box {| operation = write.Operation; head = write.CurrentHead
-                               alreadyApplied = write.AlreadyApplied |}))))
+                    result |> Result.map V2OperationResponse.present)))

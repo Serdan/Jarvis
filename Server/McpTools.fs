@@ -55,6 +55,24 @@ module private V2ReviewCommands =
           Verdict = ""
           Feedback = "" }
 
+module private V2TaskCommands =
+    let write projectName action operationId taskId actorId =
+        { ProjectName = projectName
+          Action = action
+          OperationId = operationId
+          TaskId = taskId
+          AttemptId = ""
+          ActorId = actorId
+          OwnerId = ""
+          ReviewerId = ""
+          Title = ""
+          Html = ""
+          ExpectedVersion = 0
+          AssignmentGeneration = 0
+          BaseOid = ""
+          TargetRef = ""
+          DecisionSequence = 0L }
+
 module RequestDeviceRouting =
     // Per-invocation context: never use shared defaults to represent a ChatGPT conversation.
     let private currentSession = AsyncLocal<string option>()
@@ -162,6 +180,11 @@ module McpToolHelpers =
           InputSchemaJson = None
           OutputSchemaJson = None }
 
+    let private v2TaskReadMethods = [ "V2AgentInbox" ]
+    let private v2TaskWriteMethods =
+        [ "V2CreateTask"; "V2ReviseTaskSpec"; "V2RegisterAgent"; "V2AssignTask"; "V2BeginAttempt"
+          "V2BindReviewBase"; "V2AcknowledgeReviewFeedback" ]
+
     let private v2ReviewMethods =
         [ "V2ReviewTask"; "V2ReviewDetails"; "V2ReviewerInbox" ]
 
@@ -175,7 +198,9 @@ module McpToolHelpers =
             |> List.find (fun capability -> capability.Name = wireName)
             |> fun capability -> { capability with Name = publicName }
 
-        [ for name in v2ReviewMethods -> fromWire "V2ReviewRead" name
+        [ for name in v2TaskReadMethods -> fromWire "V2TaskRead" name
+          for name in v2TaskWriteMethods -> fromWire "V2TaskWrite" name
+          for name in v2ReviewMethods -> fromWire "V2ReviewRead" name
           for name in v2ReviewWriteMethods -> fromWire "V2ReviewWrite" name ]
 
     let mcpListCommandsResult : ListCommandsResult =
@@ -183,7 +208,8 @@ module McpToolHelpers =
           Commands =
             (AgentProtocol.capabilities
              |> List.filter (fun capability ->
-                 capability.Name <> "V2ReviewRead" && capability.Name <> "V2ReviewWrite"))
+                 capability.Name <> "V2ReviewRead" && capability.Name <> "V2ReviewWrite"
+                 && capability.Name <> "V2TaskRead" && capability.Name <> "V2TaskWrite"))
             @ v2AliasCapabilities
             @ [ serverLocalCapability
                     "GetProfile"
@@ -301,6 +327,7 @@ module McpToolHelpers =
         | GetAgentAssignmentCommand _
         | GetOrchestrationSnapshotCommand _
         | GetTaskHistoryCommand _
+        | V2TaskReadCommand _
         | V2ReviewReadCommand _
         | GetProjectDetailsCommand _
         | ListDirectoryCommand _
@@ -336,6 +363,7 @@ module McpToolHelpers =
         | GitCommitCommand _
         | CreateWorktreeCommand _
         | RemoveWorktreeCommand _
+        | V2TaskWriteCommand _
         | V2ReviewWriteCommand _
         | CreateTaskCommand _
         | UpdateTaskCommand _
@@ -975,6 +1003,45 @@ type JarvisMcpTools =
     [<McpServerTool(Title = "Remove worktree", ReadOnly = false, Destructive = true, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Safely remove a clean, integrated and unlocked linked worktree. Requires local approval.")>]
     static member RemoveWorktree(projectName: string, worktreePath: string, [<Optional; DefaultParameterValue("")>] targetRef: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (RemoveWorktreeCommand { ProjectName = projectName; WorktreePath = worktreePath; TargetRef = McpToolHelpers.optionOfString targetRef })
+
+    [<McpServerTool(Title = "V2 agent inbox", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Get current Working slot, runnable work, pending/available reviews, parked and accepted tasks from one Git snapshot. Requires an explicitly bound V2 ledger; V1 tasks are unchanged.")>]
+    static member V2AgentInbox(projectName: string, agentId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http (V2TaskReadCommand { ProjectName = projectName; AgentId = agentId })
+
+    [<McpServerTool(Title = "V2 create task", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Atomically create a V2 task with its canonical HTML spec on the remote ledger. Requires an explicitly bound V2 ledger; V1 tasks are unchanged.")>]
+    static member V2CreateTask(projectName: string, taskId: string, title: string, html: string, operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        let cmd = V2TaskCommands.write projectName "CreateTask" operationId taskId "Orchestrator"
+        McpToolHelpers.send client http (V2TaskWriteCommand { cmd with Title = title; Html = html })
+
+    [<McpServerTool(Title = "V2 revise task spec", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Revise a canonical HTML spec while the V2 task is Open and unassigned; requires an exact task version and stable operation UUID.")>]
+    static member V2ReviseTaskSpec(projectName: string, taskId: string, expectedTaskVersion: int, title: string, html: string, operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        let cmd = V2TaskCommands.write projectName "ReviseTaskSpec" operationId taskId "Orchestrator"
+        McpToolHelpers.send client http (V2TaskWriteCommand { cmd with ExpectedVersion = expectedTaskVersion; Title = title; Html = html })
+
+    [<McpServerTool(Title = "V2 register agent", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Register an agent label with a single execution slot in the canonical ledger. Requires an explicitly bound V2 ledger; V1 tasks are unchanged.")>]
+    static member V2RegisterAgent(projectName: string, agentId: string, operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        let cmd = V2TaskCommands.write projectName "RegisterAgent" operationId "" agentId
+        McpToolHelpers.send client http (V2TaskWriteCommand cmd)
+
+    [<McpServerTool(Title = "V2 assign task", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Create the sole implementation attempt for an Open task and bind its owner and preferred reviewer. Requires an explicitly bound V2 ledger; V1 tasks are unchanged.")>]
+    static member V2AssignTask(projectName: string, taskId: string, attemptId: string, ownerId: string, reviewerId: string, operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        let cmd = V2TaskCommands.write projectName "AssignTask" operationId taskId "Orchestrator"
+        McpToolHelpers.send client http (V2TaskWriteCommand { cmd with AttemptId = attemptId; OwnerId = ownerId; ReviewerId = reviewerId })
+
+    [<McpServerTool(Title = "V2 begin task", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Acquire the agent Working slot for an exact queued task attempt. Requires an explicitly bound V2 ledger; V1 tasks are unchanged.")>]
+    static member V2BeginAttempt(projectName: string, taskId: string, ownerId: string, expectedAttemptVersion: int, assignmentGeneration: int, operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        let cmd = V2TaskCommands.write projectName "BeginAttempt" operationId taskId ownerId
+        McpToolHelpers.send client http (V2TaskWriteCommand { cmd with ExpectedVersion = expectedAttemptVersion; AssignmentGeneration = assignmentGeneration })
+
+    [<McpServerTool(Title = "V2 bind review baseline", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Pin the cumulative source review baseline and target branch for a Working attempt. Requires an explicitly bound V2 ledger; V1 tasks are unchanged.")>]
+    static member V2BindReviewBase(projectName: string, taskId: string, ownerId: string, expectedAttemptVersion: int, assignmentGeneration: int, baseOid: string, targetRef: string, operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        let cmd = V2TaskCommands.write projectName "BindReviewBase" operationId taskId ownerId
+        McpToolHelpers.send client http (V2TaskWriteCommand { cmd with ExpectedVersion = expectedAttemptVersion; AssignmentGeneration = assignmentGeneration; BaseOid = baseOid; TargetRef = targetRef })
+
+    [<McpServerTool(Title = "V2 acknowledge review feedback", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Acknowledge the exact review decision sequence without interrupting the implementation slot. Requires an explicitly bound V2 ledger; V1 tasks are unchanged.")>]
+    static member V2AcknowledgeReviewFeedback(projectName: string, taskId: string, ownerId: string, decisionSequence: int64, operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        let cmd = V2TaskCommands.write projectName "AcknowledgeFeedback" operationId taskId ownerId
+        McpToolHelpers.send client http (V2TaskWriteCommand { cmd with DecisionSequence = decisionSequence })
 
     [<McpServerTool(Title = "V2 task state", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read the opted-in canonical V2 task and its current implementation attempt. Requires explicit V2 client opt-in.")>]
         static member V2ReviewTask(projectName: string, taskId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =

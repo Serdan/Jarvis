@@ -85,10 +85,11 @@ module V2ReviewApi =
         |> Result.bind (fun binding ->
             match cmd.Action with
             | "GetTask" ->
-                ReviewWorkflow.ReviewWorkflow.getTask binding cmd.TaskId
+                ReviewWorkflow.ReviewWorkflow.getTaskWithSpec binding cmd.TaskId
                 |> mapError
-                |> Result.map (fun (snapshot, task, attempt) ->
-                    box {| snapshotCommit = snapshot.Commit; task = task; attempt = attempt |})
+                |> Result.map (fun (snapshot, task, attempt, html, specOid) ->
+                    box {| snapshotCommit = snapshot.Commit; task = task; attempt = attempt
+                           specHtml = html; specBlobOid = specOid |})
             | "GetReview" ->
                 parseId "requestId" cmd.RequestId
                 |> Result.bind (fun id ->
@@ -166,3 +167,63 @@ module V2ReviewApi =
                                  head = write.CurrentHead
                                  alreadyApplied = write.AlreadyApplied |}
                     box dto)))
+
+
+// Separate typed setup/assignment contract. The review request API never has
+// to reinterpret a request ID as a task, attempt, or agent identifier.
+module V2TaskApi =
+    let private mapError (result: Result<'a, LedgerStore.LedgerFailure>) : Result<'a, EffectError> =
+        result |> Result.mapError (fun error -> Client.ValidationError $"V2 task: {error}")
+
+    let private guid label (text: string) =
+        match Guid.TryParse text with
+        | true, id when id <> Guid.Empty -> Ok id
+        | _ -> Error(Client.ValidationError $"Invalid {label}: a caller-stable UUID is required.")
+
+    let read (cmd: V2TaskReadCommand) rt =
+        ReviewV2Binding.load cmd.ProjectName rt
+        |> Result.bind (fun binding ->
+            ReviewWorkflow.ReviewWorkflow.getAgentInbox binding cmd.AgentId
+            |> mapError
+            |> Result.map box)
+
+    let write (cmd: V2TaskWriteCommand) rt =
+        ReviewV2Binding.load cmd.ProjectName rt
+        |> Result.bind (fun binding ->
+            guid "operationId" cmd.OperationId
+            |> Result.bind (fun operationId ->
+                let result =
+                    match cmd.Action with
+                    | "CreateTask" ->
+                        ReviewWorkflow.ReviewWorkflow.createTaskWithSpec binding operationId cmd.TaskId cmd.Title cmd.Html
+                        |> mapError
+                    | "ReviseTaskSpec" ->
+                        ReviewWorkflow.ReviewWorkflow.reviseTaskSpec binding operationId cmd.TaskId
+                            cmd.ExpectedVersion cmd.Title cmd.Html |> mapError
+                    | "RegisterAgent" ->
+                        ReviewWorkflow.ReviewWorkflow.registerAgent binding operationId cmd.ActorId
+                        |> mapError
+                    | "AssignTask" ->
+                        guid "attemptId" cmd.AttemptId
+                        |> Result.bind (fun attemptId ->
+                            ReviewWorkflow.ReviewWorkflow.assignTask binding operationId cmd.TaskId
+                                attemptId cmd.OwnerId cmd.ReviewerId
+                            |> mapError)
+                    | "BeginAttempt" ->
+                        ReviewWorkflow.ReviewWorkflow.beginAttempt binding operationId cmd.TaskId
+                            cmd.ActorId cmd.ExpectedVersion cmd.AssignmentGeneration
+                        |> mapError
+                    | "BindReviewBase" ->
+                        ReviewWorkflow.ReviewWorkflow.bindReviewBase binding operationId cmd.TaskId
+                            cmd.ActorId cmd.ExpectedVersion cmd.AssignmentGeneration
+                            cmd.BaseOid cmd.TargetRef
+                        |> mapError
+                    | "AcknowledgeFeedback" ->
+                        ReviewWorkflow.ReviewWorkflow.acknowledgeReviewFeedback binding operationId
+                            cmd.TaskId cmd.ActorId cmd.DecisionSequence
+                        |> mapError
+                    | _ -> Error(Client.ValidationError "Unsupported V2 task operation.")
+                result |> Result.map (fun write ->
+                    box {| operation = write.Operation
+                           head = write.CurrentHead
+                           alreadyApplied = write.AlreadyApplied |})))

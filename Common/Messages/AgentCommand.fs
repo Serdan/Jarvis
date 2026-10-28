@@ -159,6 +159,27 @@ type CompleteTaskCommand =
       AcknowledgedAssignmentRevision: string option
       ActorId: string option }
 
+type V2TaskReadCommand =
+    { ProjectName: string
+      AgentId: string }
+
+type V2TaskWriteCommand =
+    { ProjectName: string
+      Action: string
+      OperationId: string
+      TaskId: string
+      AttemptId: string
+      ActorId: string
+      OwnerId: string
+      ReviewerId: string
+      Title: string
+      Html: string
+      ExpectedVersion: int
+      AssignmentGeneration: int
+      BaseOid: string
+      TargetRef: string
+      DecisionSequence: int64 }
+
 type V2ReviewReadCommand =
     { ProjectName: string
       Action: string
@@ -596,6 +617,8 @@ type AgentCommand =
     | CheckpointTaskCommand of CheckpointTaskCommand
     | CompleteTaskCommand of CompleteTaskCommand
     | GetTaskHistoryCommand of GetTaskHistoryCommand
+    | V2TaskReadCommand of V2TaskReadCommand
+    | V2TaskWriteCommand of V2TaskWriteCommand
     | V2ReviewReadCommand of V2ReviewReadCommand
     | V2ReviewWriteCommand of V2ReviewWriteCommand
     | GetProjectDetailsCommand of GetProjectDetailsCommand
@@ -655,6 +678,8 @@ module AgentCommandInfo =
         | CheckpointTaskCommand _ -> "CheckpointTaskCommand"
         | CompleteTaskCommand _ -> "CompleteTaskCommand"
         | GetTaskHistoryCommand _ -> "GetTaskHistoryCommand"
+        | V2TaskReadCommand _ -> "V2TaskReadCommand"
+        | V2TaskWriteCommand _ -> "V2TaskWriteCommand"
         | V2ReviewReadCommand _ -> "V2ReviewReadCommand"
         | V2ReviewWriteCommand _ -> "V2ReviewWriteCommand"
         | GetProjectDetailsCommand _ -> "GetProjectDetailsCommand"
@@ -720,6 +745,8 @@ module AgentCommandInfo =
         | CheckpointTaskCommand _ -> "CheckpointTask"
         | CompleteTaskCommand _ -> "CompleteTask"
         | GetTaskHistoryCommand _ -> "GetTaskHistory"
+        | V2TaskReadCommand _ -> "V2TaskRead"
+        | V2TaskWriteCommand _ -> "V2TaskWrite"
         | V2ReviewReadCommand _ -> "V2ReviewRead"
         | V2ReviewWriteCommand _ -> "V2ReviewWrite"
         | GetProjectDetailsCommand _ -> "GetProjectDetails"
@@ -783,6 +810,8 @@ module AgentCommandInfo =
         | CheckpointTaskCommand cmd -> Some cmd.ProjectName
         | CompleteTaskCommand cmd -> Some cmd.ProjectName
         | GetTaskHistoryCommand cmd -> Some cmd.ProjectName
+        | V2TaskReadCommand cmd -> Some cmd.ProjectName
+        | V2TaskWriteCommand cmd -> Some cmd.ProjectName
         | V2ReviewReadCommand cmd -> Some cmd.ProjectName
         | V2ReviewWriteCommand cmd -> Some cmd.ProjectName
         | GetProjectDetailsCommand cmd -> Some cmd.ProjectName
@@ -882,6 +911,8 @@ module AgentCommandInfo =
         | CheckpointTaskCommand cmd -> Some(compact cmd.TaskId)
         | CompleteTaskCommand cmd -> Some(compact cmd.TaskId)
         | GetTaskHistoryCommand cmd -> Some(compact cmd.TaskId)
+        | V2TaskReadCommand cmd -> Some(compact cmd.AgentId)
+        | V2TaskWriteCommand cmd -> Some(compact cmd.Action)
         | V2ReviewReadCommand cmd -> Some(compact cmd.Action)
         | V2ReviewWriteCommand cmd -> Some(compact cmd.Action)
         | GetGitDiffCommand cmd -> cmd.Path |> Option.map compact
@@ -940,6 +971,8 @@ module AgentCommandInfo =
         | CheckpointTaskCommand cmd -> Some(truncate 64 cmd.TaskId)
         | CompleteTaskCommand cmd -> Some(truncate 64 cmd.TaskId)
         | GetTaskHistoryCommand cmd -> Some(truncate 64 cmd.TaskId)
+        | V2TaskReadCommand cmd -> Some(truncate 64 cmd.AgentId)
+        | V2TaskWriteCommand cmd -> Some(truncate 64 cmd.Action)
         | V2ReviewReadCommand cmd -> Some(truncate 64 cmd.Action)
         | V2ReviewWriteCommand cmd -> Some(truncate 64 cmd.Action)
         | GetGitDiffCommand cmd -> cmd.Path |> Option.map (truncate 64)
@@ -1003,7 +1036,7 @@ module AgentCommandInfo =
         | None -> invocation command
 
 module AgentProtocol =
-    let version = "3.20"
+    let version = "3.21"
     let defaultPatchFuzzyContextLines = 3
     let maxResponseBytes = 900 * 1024
     let maxImageBytes = 8 * 1024 * 1024
@@ -1040,6 +1073,8 @@ module AgentProtocol =
           definition "CheckpointTask" "Commits agent progress and acknowledges the current assignment revision." [ WorkspaceWrite; VersionControlWrite ] true true false
           definition "CompleteTask" "Marks a task complete and commits verification." [ WorkspaceWrite; VersionControlWrite ] true true false
           definition "GetTaskHistory" "Reads Git change history for one task." [ ReadOnly ] false false false
+          definition "V2TaskRead" "Reads a registered agent inbox from a single V2 ledger snapshot." [ ReadOnly; NetworkAccess ] false false false
+          definition "V2TaskWrite" "Creates/assigns/starts V2 tasks and binds immutable review base." [ VersionControlWrite; NetworkAccess ] true true false
           definition "V2ReviewRead" "Reads opt-in canonical V2 review ledger requests and reviewer inboxes." [ ReadOnly; NetworkAccess ] false false false
           definition "V2ReviewWrite" "Updates opt-in canonical V2 review ledger with a stable operation UUID." [ VersionControlWrite; NetworkAccess ] true true false
           definition "RemoveWorktree" "Removes a clean integrated Git worktree." [ VersionControlWrite; Destructive ] true true false

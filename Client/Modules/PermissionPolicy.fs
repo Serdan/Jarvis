@@ -117,6 +117,7 @@ let private requiresConfirmation command =
     | GetAgentAssignmentCommand _
     | GetOrchestrationSnapshotCommand _
     | GetTaskHistoryCommand _
+    | V2TaskReadCommand _
     | V2ReviewReadCommand _
     | GetProjectDetailsCommand _
     | ListDirectoryCommand _
@@ -156,6 +157,11 @@ let private requiresConfirmation command =
         confirmation "RunProjectTask" (Some cmd.ProjectName) [ ProcessExecution ] [] None [ cmd.TaskName ] $"Run project task {cmd.TaskName}" false
     | RemoveWorktreeCommand cmd ->
         confirmation "RemoveWorktree" (Some cmd.ProjectName) [ VersionControlWrite; Destructive ] [] (Some "git") [ cmd.WorktreePath ] $"Remove worktree {cmd.WorktreePath}" false
+    | V2TaskWriteCommand cmd ->
+        confirmation ("V2Task" + cmd.Action) (Some cmd.ProjectName)
+            [ VersionControlWrite; NetworkAccess ] [] (Some "git")
+            [ cmd.TaskId; cmd.AttemptId; cmd.OperationId ]
+            ("V2 ledger task " + cmd.Action) false
     | V2ReviewWriteCommand cmd ->
         confirmation ("V2Review" + cmd.Action) (Some cmd.ProjectName)
             [ VersionControlWrite; NetworkAccess ] [] (Some "git")

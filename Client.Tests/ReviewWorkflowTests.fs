@@ -310,3 +310,191 @@ type ReviewWorkflowTests() =
                 Assert.That(request.CurrentRevision, Is.EqualTo(2))
                 Assert.That(revision.HeadCommit, Is.EqualTo(d))
                 expectStale claimed)
+
+
+    [<Test>]
+    member _.AgentInboxSeparatesSlotQueueAndReviewResponsibilities() =
+        withFixture (fun _ _ first second _ sourceRef newCommit initTask ->
+            ReviewWorkflow.createTask first (Guid.NewGuid()) "102" "Queued task" |> success |> ignore
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) "102" (Guid.NewGuid()) "Owner" "Reviewer"
+            |> success |> ignore
+            let fresh = ReviewWorkflow.getAgentInbox second "Owner" |> success
+            Assert.That(fresh.SlotAvailable, Is.True)
+            Assert.That(fresh.Working.IsNone, Is.True)
+            Assert.That(fresh.RunnableQueue.Length, Is.EqualTo(1))
+            Assert.That(fresh.RunnableQueue.Head.Task.TaskId, Is.EqualTo("102"))
+            Assert.That(fresh.Unassigned, Is.False)
+            initTask "101"
+            let working = ReviewWorkflow.getAgentInbox first "Owner" |> success
+            Assert.That(working.SlotAvailable, Is.False)
+            Assert.That(working.Working.Value.Task.TaskId, Is.EqualTo("101"))
+            Assert.That(working.RunnableQueue.Length, Is.EqualTo(1))
+            let c = newCommit "Needs review" "C"
+            let requestId = Guid.NewGuid()
+            ReviewWorkflow.submitReview first (Guid.NewGuid()) "101" "Owner" 3 1
+                requestId sourceRef c "Review C" |> success |> ignore
+            let submitting = ReviewWorkflow.getAgentInbox second "Owner" |> success
+            Assert.That(submitting.PendingReviews.Length, Is.EqualTo(1))
+            Assert.That(submitting.Working.IsSome, Is.True)
+            let reviewer = ReviewWorkflow.getAgentInbox second "Reviewer" |> success
+            Assert.That(reviewer.AvailableReviews.Length, Is.EqualTo(1))
+            Assert.That(reviewer.PendingReviews.Length, Is.EqualTo(0))
+            Assert.That(reviewer.SlotAvailable, Is.True)
+            ReviewWorkflow.claimReview second (Guid.NewGuid()) "101" requestId "Reviewer" 1 1
+            |> success |> ignore
+            let claimed = ReviewWorkflow.getAgentInbox first "Reviewer" |> success
+            Assert.That(claimed.AvailableReviews.Length, Is.EqualTo(0))
+            Assert.That(claimed.PendingReviews.Length, Is.EqualTo(1))
+            ReviewWorkflow.decide second (Guid.NewGuid()) "101" requestId "Reviewer" 2 Accept "Passed"
+            |> success |> ignore
+            let decided = ReviewWorkflow.getAgentInbox first "Owner" |> success
+            Assert.That(decided.Working.IsSome, Is.True)
+            Assert.That(decided.PendingReviews.Length, Is.EqualTo(0))
+            ReviewWorkflow.finalizeImplementation first (Guid.NewGuid()) "101" "Owner" 5 requestId
+            |> success |> ignore
+            let finalized = ReviewWorkflow.getAgentInbox second "Owner" |> success
+            Assert.That(finalized.SlotAvailable, Is.True)
+            Assert.That(finalized.AcceptedPendingIntegration.Length, Is.EqualTo(1))
+            Assert.That(finalized.RunnableQueue.Length, Is.EqualTo(1))
+            Assert.That(finalized.Unassigned, Is.False))
+
+    [<Test>]
+    member _.AgentInboxRejectsUnknownAgent() =
+        withFixture (fun _ _ first _ _ _ _ _ ->
+            match ReviewWorkflow.getAgentInbox first "Not registered" with
+            | Error(StaleEntityVersion _) -> ()
+            | other -> Assert.Fail(sprintf "Unknown agent should not appear in inbox: %A" other))
+
+
+    [<Test>]
+    member _.CanonicalSpecIsAtomicVersionedAndPinnedByAssignment() =
+        withFixture (fun _ _ first second _ _ _ _ ->
+            let taskId = "600"
+            let initialHtml = "<h1>First version</h1><p>Original requirements</p>"
+            let revisedHtml = "<h1>Second version</h1><p>Acceptance criteria</p>"
+            let initialOp = Guid.NewGuid()
+            let create () =
+                ReviewWorkflow.createTaskWithSpec first initialOp taskId "First version" initialHtml
+            Assert.That((create () |> success).AlreadyApplied, Is.False)
+            Assert.That((create () |> success).AlreadyApplied, Is.True)
+            let _, taskOne, _, specOne, oidOne =
+                ReviewWorkflow.getTaskWithSpec second taskId |> success
+            Assert.That(taskOne.SpecVersion, Is.EqualTo(1))
+            Assert.That(specOne, Is.EqualTo(initialHtml))
+            let editOp = Guid.NewGuid()
+            ReviewWorkflow.reviseTaskSpec first editOp taskId 1 "Second version" revisedHtml
+            |> success |> ignore
+            let _, taskTwo, _, specTwo, oidTwo =
+                ReviewWorkflow.getTaskWithSpec second taskId |> success
+            Assert.That(taskTwo.Version, Is.EqualTo(2))
+            Assert.That(taskTwo.SpecVersion, Is.EqualTo(2))
+            Assert.That(specTwo, Is.EqualTo(revisedHtml))
+            Assert.That(oidTwo, Is.Not.EqualTo(oidOne))
+            expectStale (
+                ReviewWorkflow.reviseTaskSpec second (Guid.NewGuid()) taskId 1
+                    "Stale" "<h1>Stale</h1>")
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid())
+                "Owner" "Reviewer" |> success |> ignore
+            let _, _, assigned = ReviewWorkflow.getTask second taskId |> success
+            Assert.That(assigned.Value.SpecBlobOid, Is.EqualTo(oidTwo))
+            expectStale (
+                ReviewWorkflow.reviseTaskSpec second (Guid.NewGuid()) taskId 3
+                    "Too late" "<h1>Too late</h1>"))
+
+
+    [<Test>]
+    member _.OptedInTaskApiCanCreateAssignBeginBindAndSubmit() =
+        withFixture (fun one _ first _ baseOid sourceRef newCommit _ ->
+            let configPath = Client.V2ReviewApi.ReviewV2Binding.pathForRoot one
+            let configDirectory = Path.GetDirectoryName configPath
+            Directory.CreateDirectory configDirectory |> ignore
+            let approved : Client.V2ReviewApi.ReviewV2OptIn =
+                { SchemaVersion = 1
+                  Enabled = true
+                  ProjectRoot = one
+                  ProjectId = first.ProjectId.ToString("D")
+                  LedgerId = first.LedgerId.ToString("D")
+                  Epoch = first.Epoch
+                  RemoteName = first.RemoteName
+                  ApprovedFetchUrl = first.ApprovedFetchUrl
+                  ApprovedPushUrl = first.ApprovedPushUrl }
+            File.WriteAllText(configPath, System.Text.Json.JsonSerializer.Serialize(approved))
+            try
+                let ctx = GitCommandTests.TestContext(Path.GetDirectoryName one)
+                let template (action: string) (taskId: string) : Common.V2TaskWriteCommand =
+                    { ProjectName = "owner"
+                      Action = action
+                      OperationId = Guid.NewGuid().ToString("D")
+                      TaskId = taskId
+                      AttemptId = ""
+                      ActorId = "Owner"
+                      OwnerId = ""
+                      ReviewerId = ""
+                      Title = ""
+                      Html = ""
+                      ExpectedVersion = 0
+                      AssignmentGeneration = 0
+                      BaseOid = ""
+                      TargetRef = ""
+                      DecisionSequence = 0L }
+                let run cmd =
+                    Client.V2ReviewApi.V2TaskApi.write cmd ctx
+                    |> function
+                        | Ok value -> value
+                        | Error error -> failwithf "V2 task API failed: %A" error
+                let taskId = "751"
+                let html = "<h1>Full task specification</h1><p>Acceptance: one review</p>"
+                run { template "CreateTask" taskId with
+                          Title = "Full task"; Html = html } |> ignore
+                let attemptId = Guid.NewGuid()
+                run { template "AssignTask" taskId with
+                          AttemptId = attemptId.ToString("D")
+                          OwnerId = "Owner"; ReviewerId = "Reviewer" } |> ignore
+                let queued =
+                    Client.V2ReviewApi.V2TaskApi.read
+                        { ProjectName = "owner"; AgentId = "Owner" } ctx
+                    |> function
+                        | Ok value -> unbox<AgentInbox> value
+                        | Error error -> failwithf "V2 inbox failed: %A" error
+                Assert.That(queued.RunnableQueue.Length, Is.EqualTo(1))
+                Assert.That(queued.RunnableQueue.Head.Attempt.SpecBlobOid.Length, Is.EqualTo(40))
+                run { template "BeginAttempt" taskId with
+                          ExpectedVersion = 1; AssignmentGeneration = 1 } |> ignore
+                run { template "BindReviewBase" taskId with
+                          ExpectedVersion = 2; AssignmentGeneration = 1
+                          BaseOid = baseOid; TargetRef = sourceRef } |> ignore
+                let getTask : Common.V2ReviewReadCommand =
+                    { ProjectName = "owner"; Action = "GetTask"; TaskId = taskId
+                      RequestId = ""; ReviewerId = "" }
+                match Client.V2ReviewApi.V2ReviewApi.read getTask ctx with
+                | Error error -> Assert.Fail(sprintf "V2 task read failed: %A" error)
+                | Ok value ->
+                    let resultJson = System.Text.Json.JsonSerializer.Serialize(value)
+                    use parsed = System.Text.Json.JsonDocument.Parse(resultJson)
+                    Assert.That(parsed.RootElement.GetProperty("specHtml").GetString(), Is.EqualTo(html))
+                    Assert.That(parsed.RootElement.GetProperty("specBlobOid").GetString(),
+                                Is.EqualTo(queued.RunnableQueue.Head.Attempt.SpecBlobOid))
+                let head = newCommit "Task 751 implementation" "code for 751"
+                let requestId = Guid.NewGuid()
+                let reviewCmd : Common.V2ReviewWriteCommand =
+                    { ProjectName = "owner"; Action = "Submit"
+                      OperationId = Guid.NewGuid().ToString("D")
+                      TaskId = taskId; RequestId = requestId.ToString("D")
+                      ActorId = "Owner"; ReviewerId = ""
+                      ExpectedVersion = 3; Generation = 1
+                      SourceRef = sourceRef; HeadOid = head; Summary = "Implementation ready"
+                      Verdict = ""; Feedback = "" }
+                match Client.V2ReviewApi.V2ReviewApi.write reviewCmd ctx with
+                | Ok _ -> ()
+                | Error error -> Assert.Fail(sprintf "V2 submit API failed: %A" error)
+                let after =
+                    Client.V2ReviewApi.V2TaskApi.read
+                        { ProjectName = "owner"; AgentId = "Owner" } ctx
+                    |> function
+                        | Ok value -> unbox<AgentInbox> value
+                        | Error error -> failwithf "V2 inbox failed: %A" error
+                Assert.That(after.SlotAvailable, Is.False)
+                Assert.That(after.PendingReviews.Length, Is.EqualTo(1))
+                Assert.That(after.PendingReviews.Head.RequestId, Is.EqualTo(requestId.ToString("N")))
+            finally
+                if File.Exists configPath then File.Delete configPath)

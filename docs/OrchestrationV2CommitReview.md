@@ -83,3 +83,22 @@ still need V2 task/spec creation, agent registration, assignment, baseline
 binding and ledger initialization through the approved setup/migration workflow
 before the review commands become usable. Native reviewer/owner TUI views,
 complete checkpoint evidence schemas and protocol-4.0 migration remain pending.
+
+
+## Experimental task setup and canonical agent inbox (protocol 3.21)
+
+The same opt-in project binding now exposes:
+
+- V2CreateTask atomically creates tasks/<id>/task.json and canonical tasks/<id>/spec.html in one remote ledger transaction. HTML must be nonempty and no more than 128 KiB. The caller's stable operation UUID makes retries safe.
+- V2ReviseTaskSpec edits the title and HTML at an expected task version only while the task is Open and unassigned. Assigned-task changes require an explicit future assignment generation.
+- V2RegisterAgent, V2AssignTask, and V2BeginAttempt register stable agent labels, create the sole implementation attempt, and acquire the one Working slot. The attempt pins the canonical spec blob OID and records issuance sequence and priority.
+- V2BindReviewBase pins a verified source commit and target ref against the exact Working attempt and generation, preserving one cumulative review base.
+- V2AcknowledgeReviewFeedback acknowledges a specific review decision sequence without changing Working state.
+- V2AgentInbox returns a single snapshot projection containing working, runnableQueue, pendingReviews, availableReviews, parked, blocked, acceptedPendingIntegration, slotAvailable, unassigned, the agent record and ledger commit. It cross-checks the Working slot with the authoritative agent record; runnable queue sorting is deterministic (priority descending, issued sequence ascending, task ID, attempt ID).
+- V2ReviewTask now returns the canonical spec HTML and exact blob OID alongside the task/attempt state.
+
+V2TaskRead and V2TaskWrite are separate typed wire commands. Human-facing task and inbox MCP aliases require workspace-read or Git-write permissions respectively. All reads and writes still require an explicit local V2 binding and never fall back to V1.
+
+The new operations were exercised on a disposable bare Git remote from two clones, including an opt-in client-adapter path from task creation to review submission. No production ledger initialization, migration or deployment was performed.
+
+**Still missing before cutover:** versioned assignment instructions and receipts, durable local pending-intent journal, explicit park/block/reissue/cancel transitions, source integration evidence, full review checkpoint evidence and V1-to-V2 migration. Protocol 3.21 is an additive experimental capability, not the planned breaking protocol 4.0 deployment.

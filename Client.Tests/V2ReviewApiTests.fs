@@ -90,3 +90,60 @@ let v2ReviewMutationsNeedGitApprovalWhileReadsDoNot () =
         Assert.That(request.Permissions, Does.Contain(VersionControlWrite))
         Assert.That(request.Permissions, Does.Contain(NetworkAccess))
     | other -> Assert.Fail(sprintf "Expected V2 Git-write confirmation: %A" other)
+
+
+[<Test>]
+let v2TaskSetupAndInboxRefuseUnconfiguredCheckout () =
+    let root, project = GitCommandTests.createTempProject ()
+    try
+        let context = GitCommandTests.TestContext root
+        GitCommandTests.initRepo context
+        let inbox : V2TaskReadCommand = { ProjectName = "Project1"; AgentId = "Worker" }
+        match Client.V2ReviewApi.V2TaskApi.read inbox context with
+        | Error(Client.ValidationError message) ->
+            Assert.That(message, Does.Contain("V2 ledger disabled"))
+        | other -> Assert.Fail(sprintf "Expected unconfigured V2 inbox to fail: %A" other)
+        let mutation : V2TaskWriteCommand =
+            { ProjectName = "Project1"
+              Action = "CreateTask"
+              OperationId = Guid.NewGuid().ToString("D")
+              TaskId = "100"
+              AttemptId = ""
+              ActorId = "Orchestrator"
+              OwnerId = ""
+              ReviewerId = ""
+              Title = "Task"
+              Html = "<h1>Task</h1>"
+              ExpectedVersion = 0
+              AssignmentGeneration = 0
+              BaseOid = ""
+              TargetRef = ""
+              DecisionSequence = 0L }
+        match Client.V2ReviewApi.V2TaskApi.write mutation context with
+        | Error(Client.ValidationError message) ->
+            Assert.That(message, Does.Contain("V2 ledger disabled"))
+        | other -> Assert.Fail(sprintf "Expected unconfigured V2 task write to fail: %A" other)
+        Assert.That(File.Exists(Client.V2ReviewApi.ReviewV2Binding.pathForRoot project), Is.False)
+        Assert.That(GitCommandTests.gitOutput context [ "status"; "--porcelain" ], Is.Empty)
+    finally Directory.Delete(root, true)
+
+[<Test>]
+let v2TaskMutationsRequireGitWritePermission () =
+    Client.PermissionPolicy.clearGrants()
+    let inbox = V2TaskReadCommand { ProjectName = "Project1"; AgentId = "Worker" }
+    match Client.PermissionPolicy.evaluate inbox with
+    | Ok () -> ()
+    | other -> Assert.Fail(sprintf "Inbox should be read-only: %A" other)
+    let write =
+        V2TaskWriteCommand
+            { ProjectName = "Project1"; Action = "CreateTask"
+              OperationId = Guid.NewGuid().ToString("D"); TaskId = "100"
+              AttemptId = ""; ActorId = "Orchestrator"; OwnerId = ""; ReviewerId = ""
+              Title = "Task"; Html = "<h1>Task</h1>"; ExpectedVersion = 0
+              AssignmentGeneration = 0; BaseOid = ""; TargetRef = ""
+              DecisionSequence = 0L }
+    match Client.PermissionPolicy.evaluate write with
+    | Error(Client.ConfirmationRequired approval) ->
+        Assert.That(approval.Permissions, Does.Contain(VersionControlWrite))
+        Assert.That(approval.Permissions, Does.Contain(NetworkAccess))
+    | other -> Assert.Fail(sprintf "Expected explicit Git-write confirmation: %A" other)

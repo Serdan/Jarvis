@@ -421,10 +421,12 @@ let ``command catalog matches AgentCommand union and MCP tools`` () =
     // Retired legacy wire cases remain internal for old-client compatibility,
     // but must never be discoverable or callable as public MCP tools.
     let retired = set [ "AttachWorkTask"; "GetWorkTask"; "ListWorkTasks"; "CheckpointWorkTask"; "CompleteWorkTask" ]
-    // Ten human-oriented V2 MCP tools route through two carefully scoped wire commands.
-    let v2Wire = set [ "V2ReviewRead"; "V2ReviewWrite" ]
+    // Human-oriented V2 MCP tools route through four carefully scoped wire commands.
+    let v2Wire = set [ "V2TaskRead"; "V2TaskWrite"; "V2ReviewRead"; "V2ReviewWrite" ]
     let v2Tools =
-        set [ "V2ReviewTask"; "V2ReviewDetails"; "V2ReviewerInbox"
+        set [ "V2AgentInbox"; "V2CreateTask"; "V2ReviseTaskSpec"; "V2RegisterAgent"; "V2AssignTask"; "V2BeginAttempt"
+              "V2BindReviewBase"; "V2AcknowledgeReviewFeedback"
+              "V2ReviewTask"; "V2ReviewDetails"; "V2ReviewerInbox"
               "V2SubmitReview"; "V2ReplaceReview"; "V2ClaimReview"; "V2DecideReview"
               "V2WithdrawReview"; "V2ReassignReview"; "V2FinalizeReview" ]
     Set.difference unionNames retired |> shouldEqual catalogNames
@@ -445,7 +447,7 @@ let ``client-backed MCP tools expose an optional per-command deviceId`` () =
         |> Array.filter (fun methodInfo ->
             methodInfo.GetParameters()
             |> Array.exists (fun parameter -> parameter.ParameterType = typeof<ClientService>))
-    clientMethods.Length |> shouldEqual (AgentProtocol.commandDefinitions.Length - 1 + 8) // 10 MCP V2 aliases / 2 wire operations
+    clientMethods.Length |> shouldEqual (AgentProtocol.commandDefinitions.Length - 1 + 14) // 18 MCP V2 aliases / 4 wire operations
     for methodInfo in clientMethods do
         let deviceParam = methodInfo.GetParameters() |> Array.tryFind (fun parameter -> parameter.Name = "deviceId")
         match deviceParam with
@@ -650,10 +652,15 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
             AgentProtocol.commandDefinitions
             |> List.map (fun definition -> definition.Name, definition)
             |> Map.ofList
+        let taskRead = original["V2TaskRead"]
+        let taskWrite = original["V2TaskWrite"]
         let v2Read = original["V2ReviewRead"]
         let v2Write = original["V2ReviewWrite"]
         let aliases =
-            [ for name in [ "V2ReviewTask"; "V2ReviewDetails"; "V2ReviewerInbox" ] ->
+            [ for name in [ "V2AgentInbox" ] -> name, taskRead
+              for name in [ "V2CreateTask"; "V2ReviseTaskSpec"; "V2RegisterAgent"; "V2AssignTask"; "V2BeginAttempt"
+                            "V2BindReviewBase"; "V2AcknowledgeReviewFeedback" ] -> name, taskWrite
+              for name in [ "V2ReviewTask"; "V2ReviewDetails"; "V2ReviewerInbox" ] ->
                   name, v2Read
               for name in [ "V2SubmitReview"; "V2ReplaceReview"; "V2ClaimReview"; "V2DecideReview"
                             "V2WithdrawReview"; "V2ReassignReview"; "V2FinalizeReview" ] ->

@@ -8,7 +8,7 @@ open System.Text
 open System.Text.Json
 open System.Text.RegularExpressions
 
-// Isolated V2 Git transport prototype. No MCP commands or live task state use this module.
+// V2 canonical Git transport. Experimental MCP callers require an explicit local binding; V1 remains separate.
 type LedgerFailure =
     | InvalidBinding of string
     | RemoteUnavailable of string
@@ -95,7 +95,7 @@ module LedgerStore =
     let private options = JsonSerializerOptions(PropertyNamingPolicy = JsonNamingPolicy.CamelCase, PropertyNameCaseInsensitive = true)
     let private oidPattern = Regex("^[0-9a-f]{40}([0-9a-f]{24})?$", RegexOptions.Compiled)
     let private recordPath = Regex("^records/[A-Za-z0-9_-]+(/[A-Za-z0-9_.-]+)*[.]json$", RegexOptions.Compiled)
-    let private ledgerPath = Regex("^(tasks/[A-Za-z0-9_-]+/(task[.]json|attempts/[a-f0-9]{32}[.]json|reviews/[a-f0-9]{32}/(request[.]json|revisions/[0-9]+[.]json))|agents/[A-Za-z0-9_-]+[.]json|records/[A-Za-z0-9_-]+(/[A-Za-z0-9_.-]+)*[.]json)$", RegexOptions.Compiled)
+    let private ledgerPath = Regex("^(tasks/[A-Za-z0-9_-]+/(task[.]json|spec[.]html|attempts/[a-f0-9]{32}[.]json|reviews/[a-f0-9]{32}/(request[.]json|revisions/[0-9]+[.]json))|agents/[A-Za-z0-9_-]+[.]json|records/[A-Za-z0-9_-]+(/[A-Za-z0-9_.-]+)*[.]json)$", RegexOptions.Compiled)
     let private remotePattern = Regex("^[A-Za-z0-9][A-Za-z0-9_.-]*$", RegexOptions.Compiled)
 
     type private GitOutput =

@@ -13,6 +13,7 @@ type ReviewTask =
       Title: string
       Version: int
       Lifecycle: string
+      SpecVersion: int
       AttemptId: string }
 
 [<CLIMutable>]
@@ -30,6 +31,9 @@ type ReviewAttempt =
       ReviewerId: string
       Phase: string
       AssignmentGeneration: int
+      Priority: int
+      IssuedSequence: int64
+      SpecBlobOid: string
       BaseCommit: string
       TargetRef: string
       ActiveReviewRequestId: string
@@ -71,6 +75,25 @@ type ReviewRevision =
       Summary: string
       CreatedSequence: int64 }
 
+[<CLIMutable>]
+type InboxTask =
+    { Task: ReviewTask
+      Attempt: ReviewAttempt }
+
+[<CLIMutable>]
+type AgentInbox =
+    { SnapshotCommit: string
+      Agent: ReviewAgent
+      Working: InboxTask option
+      RunnableQueue: InboxTask list
+      Parked: InboxTask list
+      Blocked: InboxTask list
+      AcceptedPendingIntegration: InboxTask list
+      PendingReviews: ReviewRequest list
+      AvailableReviews: ReviewRequest list
+      SlotAvailable: bool
+      Unassigned: bool }
+
 type ReviewVerdict =
     | Accept
     | RequestChanges
@@ -83,6 +106,7 @@ module ReviewWorkflow =
     let private refPattern = Regex("^refs/heads/[A-Za-z0-9][A-Za-z0-9_./-]*$", RegexOptions.Compiled)
 
     let private taskPath taskId = $"tasks/{taskId}/task.json"
+    let private specPath taskId = $"tasks/{taskId}/spec.html"
     let private attemptPath taskId attemptId = $"tasks/{taskId}/attempts/{attemptId}.json"
     let private requestPath taskId requestId = $"tasks/{taskId}/reviews/{requestId}/request.json"
     let private revisionPath taskId requestId number = $"tasks/{taskId}/reviews/{requestId}/revisions/{number}.json"
@@ -147,19 +171,54 @@ module ReviewWorkflow =
             return task, taskOid, attempt, attemptOid
         }
 
-    let createTask binding operationId taskId title =
-        if not (validTaskId taskId) || not (validText 512 title) then
-            Error(InvalidBinding "Invalid task title or task ID.")
+    let createTaskWithSpec binding operationId taskId title html =
+        if not (validTaskId taskId) || not (validText 512 title)
+           || not (validText (128 * 1024) html) then
+            Error(InvalidBinding "Invalid task ID, title or canonical HTML specification.")
         else
             LedgerStore.transact binding
-                (intent operationId "Orchestrator" "CreateTask" {| taskId = taskId; title = title |})
+                (intent operationId "Orchestrator" "CreateTask"
+                    {| taskId = taskId; title = title; specHtml = html |})
                 (fun snapshot ->
                     result {
                         let! existing = read<ReviewTask> binding snapshot (taskPath taskId)
                         if existing.IsSome then return! Error(StaleEntityVersion "Task already exists.")
+                        let! oldSpec, _ = LedgerStore.readAt binding snapshot (specPath taskId)
+                        if oldSpec.IsSome then return! Error(LedgerIntegrityError "Orphan task spec already exists.")
                         let task =
-                            { TaskId = taskId; Title = title; Version = 1; Lifecycle = "Open"; AttemptId = null }
-                        return [ change (taskPath taskId) None task ]
+                            { TaskId = taskId; Title = title; Version = 1
+                              Lifecycle = "Open"; SpecVersion = 1; AttemptId = null }
+                        return
+                            [ change (taskPath taskId) None task
+                              { Path = specPath taskId; ExpectedBlobOid = None; Content = html } ]
+                    })
+
+    // Core fixture compatibility: new MCP clients must supply the canonical HTML.
+    let createTask binding operationId taskId title =
+        createTaskWithSpec binding operationId taskId title
+            ($"<h1>{System.Net.WebUtility.HtmlEncode(title)}</h1>")
+
+    let reviseTaskSpec binding operationId taskId expectedTaskVersion title html =
+        if not (validTaskId taskId) || expectedTaskVersion < 1
+           || not (validText 512 title) || not (validText (128 * 1024) html) then
+            Error(InvalidBinding "Invalid task spec revision.")
+        else
+            LedgerStore.transact binding
+                (intent operationId "Orchestrator" "ReviseTaskSpec"
+                    {| taskId = taskId; expectedTaskVersion = expectedTaskVersion
+                       title = title; specHtml = html |})
+                (fun snapshot ->
+                    result {
+                        let! task, taskOid = required<ReviewTask> binding snapshot (taskPath taskId)
+                        let! _, specOid = LedgerStore.readAt binding snapshot (specPath taskId)
+                        if task.Lifecycle <> "Open" || task.Version <> expectedTaskVersion
+                           || specOid.IsNone then
+                            return! Error(StaleEntityVersion "Only an unassigned Open task's spec can be revised.")
+                        return
+                            [ change (taskPath taskId) (Some taskOid)
+                                { task with Version = task.Version + 1
+                                            SpecVersion = task.SpecVersion + 1; Title = title }
+                              { Path = specPath taskId; ExpectedBlobOid = specOid; Content = html } ]
                     })
 
     let registerAgent binding operationId agentId =
@@ -189,12 +248,18 @@ module ReviewWorkflow =
                         let! task, taskOid = required<ReviewTask> binding snapshot (taskPath taskId)
                         let! _ = required<ReviewAgent> binding snapshot (agentPath ownerId)
                         let! _ = required<ReviewAgent> binding snapshot (agentPath reviewerId)
+                        let! specContent, specOid = LedgerStore.readAt binding snapshot (specPath taskId)
+                        if specContent.IsNone || specOid.IsNone then
+                            return! Error(LedgerIntegrityError "Canonical task spec is missing.")
                         if task.Lifecycle <> "Open" || not (String.IsNullOrWhiteSpace task.AttemptId) then
                             return! Error(StaleEntityVersion "Task already has an implementation owner.")
                         let attempt =
                             { TaskId = taskId; AttemptId = attemptIdText; Version = 1
                               OwnerAgentId = ownerId; ReviewerId = reviewerId; Phase = "Queued"
-                              AssignmentGeneration = 1; BaseCommit = null; TargetRef = null
+                              AssignmentGeneration = 1; Priority = 0
+                              IssuedSequence = snapshot.Header.NextSequence
+                              SpecBlobOid = specOid.Value
+                              BaseCommit = null; TargetRef = null
                               ActiveReviewRequestId = null; LatestReviewRequestId = null
                               AcceptedReviewRequestId = null
                               AcceptedReviewRevision = 0; AcceptedHead = null
@@ -581,6 +646,25 @@ module ReviewWorkflow =
                                                AcknowledgedFeedbackSequence = decisionSequence } ]
                     })
 
+    let getTaskWithSpec binding taskId =
+        if not (validTaskId taskId) then Error(InvalidBinding "Invalid task ID.")
+        else
+            result {
+                let! snapshot = LedgerStore.fetch binding
+                let! task, _ = required<ReviewTask> binding snapshot (taskPath taskId)
+                let! html, specOid = LedgerStore.readAt binding snapshot (specPath taskId)
+                match html, specOid with
+                | None, _ | _, None ->
+                    return! Error(LedgerIntegrityError "Task lacks a canonical spec blob.")
+                | Some html, Some specOid ->
+                    if String.IsNullOrWhiteSpace task.AttemptId then
+                        return snapshot, task, None, html, specOid
+                    else
+                        let! attempt, _ =
+                            required<ReviewAttempt> binding snapshot (attemptPath taskId task.AttemptId)
+                        return snapshot, task, Some attempt, html, specOid
+            }
+
     let getTask binding taskId =
         if not (validTaskId taskId) then Error(InvalidBinding "Invalid task ID.")
         else
@@ -631,4 +715,98 @@ module ReviewWorkflow =
                 match error with
                 | Some failure -> return! Error failure
                 | None -> return snapshot, queue |> List.sortBy (fun r -> r.CreatedSequence, r.TaskId, r.RequestId)
+            }
+
+
+    // Derive every queue and slot observation from a single verified ledger commit.
+    // Queue membership is never duplicated in agent.json.
+    let getAgentInbox binding agentId =
+        if not (validAgent agentId) then Error(InvalidBinding "Invalid inbox agent ID.")
+        else
+            result {
+                let! snapshot = LedgerStore.fetch binding
+                let! agent, _ = required<ReviewAgent> binding snapshot (agentPath agentId)
+                let! paths = LedgerStore.listAt binding snapshot "tasks"
+                let taskPaths = paths |> List.filter (fun path -> path.EndsWith("/task.json", StringComparison.Ordinal))
+                let reviewPaths = paths |> List.filter (fun path -> path.EndsWith("/request.json", StringComparison.Ordinal))
+                let mutable failure = None
+                let mutable owned = []
+                let mutable pending = []
+                let mutable available = []
+                for path in taskPaths do
+                    if failure.IsNone then
+                        match required<ReviewTask> binding snapshot path with
+                        | Error error -> failure <- Some error
+                        | Ok(task, _) ->
+                            if not (validTaskId task.TaskId) || path <> taskPath task.TaskId
+                               || not (List.contains task.Lifecycle
+                                   [ "Open"; "InProgress"; "Implemented"; "Integrated"; "Closed"; "Cancelled" ]) then
+                                failure <- Some(LedgerIntegrityError "Invalid task identity or lifecycle in inbox.")
+                            elif not (String.IsNullOrWhiteSpace task.AttemptId) then
+                                match required<ReviewAttempt> binding snapshot (attemptPath task.TaskId task.AttemptId) with
+                                | Error error -> failure <- Some error
+                                | Ok(attempt, _) ->
+                                    if attempt.TaskId <> task.TaskId || attempt.AttemptId <> task.AttemptId
+                                       || not (List.contains attempt.Phase
+                                           [ "Queued"; "Acknowledged"; "Working"; "Parked"; "Blocked"
+                                             "Accepted"; "Superseded"; "Abandoned" ]) then
+                                        failure <- Some(LedgerIntegrityError "Invalid task/attempt identity or phase in inbox.")
+                                    elif attempt.OwnerAgentId = agentId then
+                                        owned <- { Task = task; Attempt = attempt } :: owned
+                for path in reviewPaths do
+                    if failure.IsNone then
+                        match required<ReviewRequest> binding snapshot path with
+                        | Error error -> failure <- Some error
+                        | Ok(request, _) ->
+                            if not (validTaskId request.TaskId)
+                               || path <> requestPath request.TaskId request.RequestId
+                               || not (List.contains request.Status
+                                   [ "Unclaimed"; "Claimed"; "Accepted"; "ChangesRequested"; "Withdrawn" ]) then
+                                failure <- Some(LedgerIntegrityError "Invalid review identity or status in inbox.")
+                            elif request.Status = "Unclaimed" then
+                                if request.OwnerAgentId = agentId then pending <- request :: pending
+                                else available <- request :: available
+                            elif request.Status = "Claimed"
+                                 && (request.OwnerAgentId = agentId || request.ClaimantId = agentId) then
+                                pending <- request :: pending
+                match failure with
+                | Some error -> return! Error error
+                | None ->
+                    let owned = owned |> List.sortWith (fun left right ->
+                        let priority = compare right.Attempt.Priority left.Attempt.Priority
+                        if priority <> 0 then priority
+                        else
+                            let leftKey = left.Attempt.IssuedSequence, left.Task.TaskId, left.Attempt.AttemptId
+                            let rightKey = right.Attempt.IssuedSequence, right.Task.TaskId, right.Attempt.AttemptId
+                            compare leftKey rightKey)
+                    let working = owned |> List.filter (fun entry -> entry.Attempt.Phase = "Working")
+                    let accepted = owned |> List.filter (fun entry ->
+                        entry.Attempt.Phase = "Accepted" && entry.Task.Lifecycle <> "Closed")
+                    if working.Length > 1
+                       || (match working with
+                           | [ item ] -> agent.ActiveAttemptId <> item.Attempt.AttemptId
+                           | [] -> not (String.IsNullOrWhiteSpace agent.ActiveAttemptId)
+                           | _ -> true) then
+                        return! Error(LedgerIntegrityError "Agent slot disagrees with the task's Working attempts.")
+                    let active = working |> List.tryHead
+                    let runnable = owned |> List.filter (fun entry ->
+                        entry.Attempt.Phase = "Queued" || entry.Attempt.Phase = "Acknowledged")
+                    let parked = owned |> List.filter (fun entry -> entry.Attempt.Phase = "Parked")
+                    let blocked = owned |> List.filter (fun entry -> entry.Attempt.Phase = "Blocked")
+                    let reviewOrder (request: ReviewRequest) =
+                        request.CreatedSequence, request.TaskId, request.RequestId
+                    let pending = pending |> List.sortBy reviewOrder
+                    let available = available |> List.sortBy reviewOrder
+                    return
+                        { SnapshotCommit = snapshot.Commit
+                          Agent = agent
+                          Working = active
+                          RunnableQueue = runnable
+                          Parked = parked
+                          Blocked = blocked
+                          AcceptedPendingIntegration = accepted
+                          PendingReviews = pending
+                          AvailableReviews = available
+                          SlotAvailable = active.IsNone
+                          Unassigned = owned.IsEmpty && pending.IsEmpty && available.IsEmpty }
             }

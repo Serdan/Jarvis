@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "2026-10-28-v2-08-source-bindings",
   "title": "Bind source repositories and worktrees by verified identity, not ownership",
-  "status": "open",
+  "status": "completed",
   "priority": "P1",
   "dependencies": [
     "2026-10-28-v2-01-ledger-trust-onboarding",
@@ -13,10 +13,19 @@
     "worktree": null
   },
   "checkpoint": {
-    "summary": "Architecture gap identified by the 2026-10-28 V2 implementation audit. Not started.",
-    "nextAction": "Implement the acceptance criteria in the accompanying HTML task; use disposable Git remotes and do not deploy or migrate V1.",
-    "verified": [],
-    "lastCommit": null
+    "summary": "V2-08 complete. Pinned independently verified source Git endpoint identity, source branch/base/target and generation, with explicit versioned source rebind and read-only registered worktree observations independent of agent ownership. Immutable review/integration provenance verifies approved source fetch/push endpoints; historical review revisions survive branch moves and rebinds. Experimental protocol 3.31. Implementation commit b4ff0dd.",
+    "nextAction": "V2-08 accepted. V2-05 independent provenance dependency is satisfied; continue V2-06 reviewer-claim recovery or V2-09 task-spec API after reviewing task dependencies. No push, deployment, ledger initialization or V1 migration was performed.",
+    "verified": [
+      "Cross-clone source endpoint fingerprint is stable and differs from ledger project UUID",
+      "BindAttemptSource verifies source ref/base ancestry against branch and fetched canonical target with CAS generation guards",
+      "Deleted or moved worktrees, prunable registrations, branch deletion, Git worktree repair and worktree recreation do not change the Working owner or release agent slot",
+      "Explicit source rebind handles branch rename without altering immutable, already-claimed review evidence",
+      "Detached/dirty worktree approval is explicit and stale detached HEAD fails closed",
+      "Remote fetch/push endpoint mismatch fails closed; review revision and integration records retain pinned identity and endpoints",
+      "Source binding conflicts, stale generations and existing checkpoint evidence regression verified",
+      "Final Client.Tests 336/336; Server.Tests 62/62; git diff --check clean"
+    ],
+    "lastCommit": "b4ff0dd70de9ef69f5d0c5c24bd558fb2aee73f5"
   },
   "audit": {
     "specSections": [
@@ -24,10 +33,13 @@
       "§7"
     ],
     "implementationReferences": [
-      "Client/Modules/ReviewWorkflow.fs:30-52,518-625",
-      "Client/Modules/LedgerStore.fs:511-540"
+      "Client/Modules/LedgerStore.fs",
+      "Client/Modules/ReviewWorkflow.fs",
+      "Client/Modules/V2ReviewApi.fs",
+      "Server/McpTools.fs",
+      "Client.Tests/ReviewWorkflowTests.fs"
     ],
-    "sourceReport": "docs/reviews/2026-10-28-v2-spec-implementation-audit.md"
+    "sourceReport": "docs/reviews/2026-10-28-v2-08-source-binding-implementation-review.md"
   },
-  "updatedAt": "2026-10-28T00:00:00Z"
+  "updatedAt": "2026-10-28T23:50:23+01:00"
 }

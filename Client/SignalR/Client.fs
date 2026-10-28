@@ -70,6 +70,8 @@ let private auditDetails command =
     match command with
     | ImportFileCommand cmd -> Some("ImportFile", Some cmd.ProjectName, [ WorkspaceWrite; NetworkAccess ], [ cmd.FilePath ], None, [])
     | UpdateClientCommand -> Some("UpdateClient", None, [ ProcessExecution; NetworkAccess; Destructive ], [], None, [])
+    | ScheduleBrowserExecutionCommand cmd -> Some("ScheduleBrowserExecution", Some cmd.ProjectName, [ ProcessExecution; NetworkAccess ], [cmd.ScriptPath], None, [])
+    | CancelScheduledBrowserExecutionCommand _ -> Some("CancelScheduledBrowserExecution", None, [ ProcessExecution ], [], None, [])
     | BrowserOpenTabCommand _ -> Some("BrowserOpenTab", None, [ ProcessExecution; NetworkAccess ], [], None, [])
     | BrowserExecuteFileCommand cmd -> Some("BrowserExecuteFile", Some cmd.ProjectName, [ ProcessExecution; NetworkAccess ], [cmd.ScriptPath], None, [])
     | BrowserExecuteJsCommand cmd -> Some("BrowserExecuteJs", None, [ ProcessExecution; NetworkAccess ], [], None, [])
@@ -201,6 +203,44 @@ let private dispatch (rt: Runtime) (command: AgentCommand) =
         | Some bridge ->
             let result = bridge.ListTabs() |> Result.mapError Client.ValidationError
             ValueTask<Result<string,EffectError>>(result)
+    | ListScheduledBrowserExecutionsCommand ->
+        match rt.BrowserScheduler with
+        | None -> ValueTask<Result<string,EffectError>>(Error(Client.ValidationError "BridgeDisabled"))
+        | Some scheduler -> ValueTask<Result<string,EffectError>>(Ok(scheduler.List()))
+    | CancelScheduledBrowserExecutionCommand cmd ->
+        match rt.BrowserScheduler with
+        | None -> ValueTask<Result<string,EffectError>>(Error(Client.ValidationError "BridgeDisabled"))
+        | Some scheduler ->
+            let result =
+                scheduler.Cancel(cmd.ScheduleId)
+                |> Result.map (fun () -> """{"canceled":true}""")
+                |> Result.mapError Client.ValidationError
+            ValueTask<Result<string,EffectError>>(result)
+    | ScheduleBrowserExecutionCommand cmd ->
+        let result =
+            match rt.BrowserScheduler with
+            | None -> Error(Client.ValidationError "BridgeDisabled")
+            | Some scheduler ->
+                match ProjectPaths.validateProjectRelativePath cmd.ScriptPath with
+                | Error error -> Error error
+                | Ok _ when not (cmd.ScriptPath.EndsWith(".js", StringComparison.OrdinalIgnoreCase)) ->
+                    Error(Client.ValidationError "Browser script must be a .js file.")
+                | Ok _ ->
+                    match ProjectPaths.resolveProjectFile cmd.ProjectName cmd.ScriptPath rt with
+                    | Error error -> Error error
+                    | Ok(FilePath filename) ->
+                        try
+                            if FileInfo(filename).Length > int64 BrowserBridge.MaxScriptBytes then
+                                Error(Client.ValidationError "InputTooLarge: script exceeds 64 KiB.")
+                            else
+                                let date = scheduler.Schedule(cmd.ScheduleId, cmd.RunAfterSeconds, cmd.Url,
+                                                cmd.ProjectName, cmd.ScriptPath, defaultArg cmd.Alias "",
+                                                defaultArg cmd.ArgsJson "{}", defaultArg cmd.Active false)
+                                date
+                                |> Result.map (fun due -> JsonSerializer.Serialize({| scheduleId = cmd.ScheduleId; dueAtUtc = due; status = "pending" |}))
+                                |> Result.mapError Client.ValidationError
+                        with ex -> Error(Client.ExceptionError ex)
+        ValueTask<Result<string,EffectError>>(result)
     | BrowserOpenTabCommand cmd ->
         ValueTask<Result<string,EffectError>>(task {
             match rt.Browser with

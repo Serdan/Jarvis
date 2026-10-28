@@ -60,6 +60,7 @@
         <Compile Include="Modules\AgentDashboard.fs"/>
         <Compile Include="Modules\\WorkTaskCompat.fs"/>
         <Compile Include="Modules\BrowserBridge.fs"/>
+        <Compile Include="Modules\BrowserSchedules.fs"/>
         <Compile Include="Runtime.fs"/>
         <Compile Include="Modules\AgentInstructions.fs"/>
         <Compile Include="Modules\SelfUpdate.fs"/>

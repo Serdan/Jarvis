@@ -3,6 +3,8 @@ module Program
 open System
 open System.IO
 open System.Reflection
+open System.Text
+open System.Text.Json
 open System.Threading
 open System.Threading.Tasks
 open Client
@@ -169,6 +171,82 @@ let private runClient args =
             tui.Log $"Browser bridge listening on 127.0.0.1:{port}; only manually registered tabs can be used."
             bridge)
 
+    // Persistent one-shot browser actions. The script always comes from an ordinary
+    // project file, re-resolved under the usual worktree/symlink restrictions at execution.
+    let scheduler =
+        browser |> Option.map (fun bridge ->
+            let executeAction (action: BrowserSchedules.ScheduledAction) = task {
+                let mutable createdRegistration = ""
+                try
+                    let script =
+                        match ProjectPaths.validateProjectRelativePath action.ScriptPath with
+                        | Error e -> Error(sprintf "%A" e)
+                        | Ok _ when not (action.ScriptPath.EndsWith(".js", StringComparison.OrdinalIgnoreCase)) ->
+                            Error "InvalidScriptPath"
+                        | Ok _ ->
+                            match ProjectPaths.resolveProjectFile action.ProjectName action.ScriptPath rt with
+                            | Error e -> Error(sprintf "%A" e)
+                            | Ok(FilePath path) ->
+                                try
+                                    let info = FileInfo(path)
+                                    if info.Length > int64 BrowserBridge.MaxScriptBytes then
+                                        Error "InputTooLarge"
+                                    else Ok(File.ReadAllText(path, UTF8Encoding(false, true)))
+                                with ex -> Error("ScriptUnavailable: " + ex.GetType().Name)
+                    match script with
+                    | Error e -> return Error ("", e)
+                    | Ok source ->
+                        // A short grace period after startup permits the extension to reconnect.
+                        let mutable connectionReady = false
+                        let mutable tries = 0
+                        while not connectionReady && tries < 60 do
+                            connectionReady <- bridge.ListTabs().IsOk
+                            if not connectionReady then
+                                tries <- tries + 1
+                                do! Task.Delay(500)
+                        if not connectionReady then return Error ("", "ExtensionDisconnected")
+                        else
+                            let! opened = bridge.OpenTab(action.Url, action.Alias, action.Active)
+                            match opened with
+                            | Error e -> return Error ("", e)
+                            | Ok response ->
+                                use doc = JsonDocument.Parse(response)
+                                let registrationId =
+                                    doc.RootElement.GetProperty("tab").GetProperty("registrationId").GetString()
+                                if String.IsNullOrWhiteSpace(registrationId) then
+                                    return Error ("", "OutcomeUnknown: new tab had no registration ID.")
+                                else
+                                    createdRegistration <- registrationId
+                                    let mutable ready = false
+                                    let mutable count = 0
+                                    while not ready && count < 60 do
+                                        match bridge.ListTabs() with
+                                        | Error _ -> ()
+                                        | Ok listing ->
+                                            use listDoc = JsonDocument.Parse(listing)
+                                            for tab in listDoc.RootElement.GetProperty("tabs").EnumerateArray() do
+                                                if tab.GetProperty("registrationId").GetString() = registrationId then
+                                                    ready <- tab.GetProperty("availability").GetString() = "ready"
+                                        if not ready then
+                                            count <- count + 1
+                                            do! Task.Delay(500)
+                                    if not ready then return Error (registrationId, "TabNotReady: no script was dispatched.")
+                                    else
+                                        let! result = bridge.Execute(registrationId, source, action.ArgsJson, 15000, false)
+                                        match result with
+                                        | Ok _ -> return Ok registrationId
+                                        | Error error ->
+                                            // A rejected script may already have affected the page.
+                                            return Error (registrationId, "OutcomeUnknown: " + error)
+                with ex ->
+                    return Error(createdRegistration, "OutcomeUnknown: " + ex.GetType().Name)
+            }
+            let store = BrowserSchedules.Service(BrowserSchedules.defaultPath(), executeAction)
+            rt.BrowserScheduler <- Some store
+            store.Start()
+            tui.Log "Persistent one-shot browser scheduler enabled (local, no automatic retries)."
+            store)
+
     let formatJobResult value = value |> Result.mapError (fun error -> sprintf "%A" error)
     tui.SetJobAccess
         { List = (fun () ->
@@ -272,6 +350,7 @@ let private runClient args =
                     ()
 
         cts.Cancel()
+        scheduler |> Option.iter (fun store -> (store :> IDisposable).Dispose())
         browser |> Option.iter (fun bridge -> (bridge :> IDisposable).Dispose())
         do! connection.DisposeAsync()
 

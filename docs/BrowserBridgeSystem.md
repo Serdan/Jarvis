@@ -383,6 +383,10 @@ A generic return value of `submitted: true` is **not** proof that the ChatGPT ag
 3. **Integrated acceptance:** run both parts against registered real browser tabs, verify security and lifecycle cases, then coordinate deployment/release. No automated execution against unregistered tabs.
 4. **Optional convenience:** explicit wake policy, DOM/screenshot/wait operations, project-side script packaging, Firefox adapter, richer browser diagnostics. All remain generic; no ChatGPT-specific server logic.
 
+## One-shot delayed browser execution
+
+In addition to direct browser commands, JarvisClient implements a generic one-shot scheduler. ScheduleBrowserExecution records a future URL, ordinary project script path, JSON arguments and runAfterSeconds delay in private user-level storage. When due, it opens a newly authorized tab and runs the current project file. Pending actions can be listed/canceled/replaced by ID. A claimed action is not automatically replayed after client restart or browser failure. An orchestrator may use this to create its next ephemeral session, but no special orchestrator role, lease, watchdog, or recurrence exists in Jarvis. See [BrowserOneShotScheduler.md](BrowserOneShotScheduler.md).
+
 ## 14. External API references
 
 - [Chrome userScripts API](https://developer.chrome.com/docs/extensions/reference/api/userScripts) — arbitrary user-supplied scripts, execution world, and Chrome 138+ user setting.

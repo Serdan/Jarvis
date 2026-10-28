@@ -109,6 +109,7 @@ let private requiresConfirmation command =
     | ListCommandsCommand
     | ListProjectsCommand
     | BrowserListTabsCommand
+    | ListScheduledBrowserExecutionsCommand
     | ListWorktreesCommand _
     | GetWorktreeCommand _
     | InspectWorktreeRemovalCommand _
@@ -140,6 +141,11 @@ let private requiresConfirmation command =
     | GetJobResultCommand _
     | MessageCommand _
     | GetClientActivityCommand _ -> readOnly
+    | ScheduleBrowserExecutionCommand cmd ->
+        confirmation "ScheduleBrowserExecution" (Some cmd.ProjectName) [ ProcessExecution; NetworkAccess ]
+            [ cmd.ScriptPath ] None [] ("Schedule browser execution " + cmd.ScheduleId) false
+    | CancelScheduledBrowserExecutionCommand cmd ->
+        confirmation "CancelScheduledBrowserExecution" None [ ProcessExecution ] [] None [] ("Cancel scheduled browser action " + cmd.ScheduleId) false
     | BrowserOpenTabCommand cmd ->
         let origin =
             match Uri.TryCreate(cmd.Url, UriKind.Absolute) with
@@ -196,6 +202,8 @@ let private requiresConfirmation command =
 let private trustAllows trustLevel command =
     match trustLevel, command with
     | FullTrust, _ -> true
+    | PartialTrust, ScheduleBrowserExecutionCommand _
+    | PartialTrust, CancelScheduledBrowserExecutionCommand _
     | PartialTrust, BrowserOpenTabCommand _
     | PartialTrust, BrowserExecuteFileCommand _
     | PartialTrust, BrowserExecuteJsCommand _

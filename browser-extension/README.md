@@ -74,3 +74,7 @@ Script execution can change authenticated webpages and submit irreversible actio
 - \`dotnet test Jarvis.slnx\`
 
 The Node tests simulate Chromium APIs and a webpage. The F# tests use a real loopback WebSocket connection. **Real Chromium integration testing is still required** before release (the initial development machine may not have a Chromium executable). See \`docs/BrowserBridgeSystem.md\` for the full design and acceptance requirements.
+
+## Scheduled execution
+
+JarvisClient can schedule a new tab plus a project-backed script using ScheduleBrowserExecution, with a runAfterSeconds delay. The extension does not schedule anything itself and its existing opt-in, manual-origin registration and host-permission checks still apply when the time arrives. Pending schedules are stored in the local JarvisClient user configuration; no external scheduler or automation service is required. See [one-shot browser scheduler](../docs/BrowserOneShotScheduler.md).

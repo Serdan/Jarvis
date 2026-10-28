@@ -64,6 +64,18 @@ type ListCommandsResult =
 type ListProjectsCommand = struct end
 
 type BrowserListTabsCommand = struct end
+type ScheduleBrowserExecutionCommand =
+    { ScheduleId: string
+      RunAfterSeconds: int
+      Url: string
+      ProjectName: string
+      ScriptPath: string
+      ArgsJson: string option
+      Alias: string option
+      Active: bool option }
+type ListScheduledBrowserExecutionsCommand = struct end
+type CancelScheduledBrowserExecutionCommand = { ScheduleId: string }
+
 type BrowserOpenTabCommand =
     { Url: string
       Alias: string option
@@ -572,6 +584,9 @@ type AgentCommand =
     | ListCommandsCommand
     | ListProjectsCommand
     | BrowserListTabsCommand
+    | ScheduleBrowserExecutionCommand of ScheduleBrowserExecutionCommand
+    | ListScheduledBrowserExecutionsCommand
+    | CancelScheduledBrowserExecutionCommand of CancelScheduledBrowserExecutionCommand
     | BrowserOpenTabCommand of BrowserOpenTabCommand
     | BrowserExecuteFileCommand of BrowserExecuteFileCommand
     | BrowserExecuteJsCommand of BrowserExecuteJsCommand
@@ -633,6 +648,9 @@ module AgentCommandInfo =
         | ListCommandsCommand -> "ListCommandsCommand"
         | ListProjectsCommand -> "ListProjectsCommand"
         | BrowserListTabsCommand -> "BrowserListTabsCommand"
+        | ScheduleBrowserExecutionCommand _ -> "ScheduleBrowserExecutionCommand"
+        | ListScheduledBrowserExecutionsCommand -> "ListScheduledBrowserExecutionsCommand"
+        | CancelScheduledBrowserExecutionCommand _ -> "CancelScheduledBrowserExecutionCommand"
         | BrowserOpenTabCommand _ -> "BrowserOpenTabCommand"
         | BrowserExecuteFileCommand _ -> "BrowserExecuteFileCommand"
         | BrowserExecuteJsCommand _ -> "BrowserExecuteJsCommand"
@@ -700,6 +718,9 @@ module AgentCommandInfo =
         | ListCommandsCommand -> "ListCommands"
         | ListProjectsCommand -> "ListProjects"
         | BrowserListTabsCommand -> "BrowserListTabs"
+        | ScheduleBrowserExecutionCommand _ -> "ScheduleBrowserExecution"
+        | ListScheduledBrowserExecutionsCommand -> "ListScheduledBrowserExecutions"
+        | CancelScheduledBrowserExecutionCommand _ -> "CancelScheduledBrowserExecution"
         | BrowserOpenTabCommand _ -> "BrowserOpenTab"
         | BrowserExecuteFileCommand _ -> "BrowserExecuteFile"
         | BrowserExecuteJsCommand _ -> "BrowserExecuteJs"
@@ -760,6 +781,8 @@ module AgentCommandInfo =
         | ListCommandsCommand
         | ListProjectsCommand
         | BrowserListTabsCommand
+        | ListScheduledBrowserExecutionsCommand
+        | CancelScheduledBrowserExecutionCommand _
         | BrowserOpenTabCommand _
         | BrowserExecuteJsCommand _
         | GetJobResultCommand _
@@ -767,6 +790,7 @@ module AgentCommandInfo =
         | UpdateClientCommand -> None
         | MessageCommand cmd -> cmd.ProjectName
         | GetClientActivityCommand cmd -> cmd.ProjectName
+        | ScheduleBrowserExecutionCommand cmd -> Some cmd.ProjectName
         | BrowserExecuteFileCommand cmd -> Some cmd.ProjectName
         | ListWorktreesCommand cmd -> Some cmd.ProjectName
         | GetWorktreeCommand cmd -> Some cmd.ProjectName
@@ -852,6 +876,9 @@ module AgentCommandInfo =
         |> String.concat " "
 
     let fullDetail = function
+        | ScheduleBrowserExecutionCommand cmd -> Some($"schedule {cmd.ScheduleId}: {cmd.ProjectName}/{cmd.ScriptPath} in {cmd.RunAfterSeconds}s")
+        | ListScheduledBrowserExecutionsCommand -> None
+        | CancelScheduledBrowserExecutionCommand cmd -> Some cmd.ScheduleId
         | BrowserListTabsCommand -> None
         | BrowserOpenTabCommand cmd ->
             match Uri.TryCreate(cmd.Url, UriKind.Absolute) with
@@ -915,6 +942,9 @@ module AgentCommandInfo =
         | ListJobsCommand _ -> None
 
     let detail = function
+        | ScheduleBrowserExecutionCommand cmd -> Some($"schedule {cmd.ScheduleId} in {cmd.RunAfterSeconds}s")
+        | ListScheduledBrowserExecutionsCommand -> None
+        | CancelScheduledBrowserExecutionCommand cmd -> Some cmd.ScheduleId
         | BrowserListTabsCommand -> None
         | BrowserOpenTabCommand cmd ->
             match Uri.TryCreate(cmd.Url, UriKind.Absolute) with
@@ -1016,7 +1046,7 @@ module AgentCommandInfo =
         | None -> invocation command
 
 module AgentProtocol =
-    let version = "3.20"
+    let version = "3.21"
     let defaultPatchFuzzyContextLines = 3
     let maxResponseBytes = 900 * 1024
     let maxImageBytes = 8 * 1024 * 1024
@@ -1035,6 +1065,9 @@ module AgentProtocol =
         [ definition "ListCommands" "Lists supported Jarvis commands." [ ReadOnly ] false false false
           definition "ListProjects" "Lists configured projects." [ ReadOnly ] false false false
           definition "BrowserListTabs" "Lists tabs registered through the extension, including opted-in agent-created tabs." [ ReadOnly ] false false false
+          definition "ScheduleBrowserExecution" "Persist a one-shot delayed action that opens a browser tab and runs a project JS file." [ ProcessExecution; NetworkAccess ] true true false
+          definition "ListScheduledBrowserExecutions" "List queued, completed and failed local browser actions without disclosing scripts or arguments." [ ReadOnly ] false false false
+          definition "CancelScheduledBrowserExecution" "Cancel a pending one-shot browser action." [ ProcessExecution ] true true false
           definition "BrowserOpenTab" "Opens and registers a new background tab on an explicitly user-authorized site." [ ProcessExecution; NetworkAccess ] true true false
           definition "BrowserExecuteFile" "Executes JavaScript from a bounded project file in a registered tab." [ ProcessExecution; NetworkAccess ] true true false
           definition "BrowserExecuteJs" "Executes supplied JavaScript in a registered browser tab." [ ProcessExecution; NetworkAccess ] true true false

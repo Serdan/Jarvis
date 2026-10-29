@@ -123,7 +123,7 @@ let v2TaskSetupAndInboxRefuseUnconfiguredCheckout () =
               BaseOid = ""
               TargetRef = ""
               SourceRef = ""; AllowDetached = false; AllowUncommitted = false
-              DecisionSequence = 0L; Evidence = "" }
+              DecisionSequence = 0L; Evidence = ""; SessionId = "" }
         match Client.V2ReviewApi.V2TaskApi.write mutation context with
         | Error(Client.ValidationError message) ->
             Assert.That(message, Does.Contain("V2 ledger disabled"))
@@ -148,7 +148,7 @@ let v2TaskMutationsRequireGitWritePermission () =
               ExpectedAgentVersion = 0; ExpectedTaskVersion = 0; AssignmentGeneration = 0;
               Summary = ""; NextAction = ""; Reason = ""; BaseOid = ""; TargetRef = ""
               SourceRef = ""; AllowDetached = false; AllowUncommitted = false
-              DecisionSequence = 0L; Evidence = "" }
+              DecisionSequence = 0L; Evidence = ""; SessionId = "" }
     match Client.PermissionPolicy.evaluate write with
     | Error(Client.ConfirmationRequired approval) ->
         Assert.That(approval.Permissions, Does.Contain(VersionControlWrite))

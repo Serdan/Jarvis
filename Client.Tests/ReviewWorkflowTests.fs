@@ -147,6 +147,62 @@ type ReviewWorkflowTests() =
                         Is.GreaterThanOrEqualTo(DateTimeOffset.Parse resumed.Agent.StateEnteredAtUtc)))
 
     [<Test>]
+    member _.WorkingSessionRecoveryRetainsHistoryResetsOnlyTurnAndSurvivesClone() =
+        withFixture (fun _ _ first second _ _ _ _ ->
+            let taskId = "session-recovery"
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Session recovery"
+            |> success |> ignore
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner" "Reviewer"
+            |> success |> ignore
+            ReviewWorkflow.beginAttemptWithSession first (Guid.NewGuid()) taskId "Owner" 1 1 "session-A"
+            |> success |> ignore
+            let initial = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
+            Assert.That(initial.AssociatedSessionIds = [ "session-A" ], Is.True)
+            Assert.That(initial.ActiveSessionId, Is.EqualTo("session-A"))
+            Assert.That(initial.WorkingTurnStartedAtUtc, Is.EqualTo(initial.StateEnteredAtUtc))
+            ReviewWorkflow.resumeAgentWithSession first (Guid.NewGuid()) taskId "Owner" 2 3 1 "session-B"
+            |> success |> ignore
+            let recovered = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
+            Assert.That(recovered.State, Is.EqualTo("Working"))
+            Assert.That(recovered.StateEnteredAtUtc, Is.EqualTo(initial.StateEnteredAtUtc))
+            Assert.That(DateTimeOffset.Parse recovered.WorkingTurnStartedAtUtc,
+                        Is.GreaterThanOrEqualTo(DateTimeOffset.Parse initial.WorkingTurnStartedAtUtc))
+            Assert.That(recovered.AssociatedSessionIds = [ "session-A"; "session-B" ], Is.True)
+            Assert.That(recovered.ActiveSessionId, Is.EqualTo("session-B"))
+            let snapshot = LedgerStore.fetch second |> success
+            let paths = LedgerStore.listAt second snapshot "tasks" |> success
+            let recoveryEvents = paths |> List.filter (fun path -> path.Contains("/events/"))
+            Assert.That(recoveryEvents.Length, Is.EqualTo(1))
+            let eventJson, _ = LedgerStore.readAt second snapshot recoveryEvents.Head |> success
+            use eventDoc = System.Text.Json.JsonDocument.Parse(eventJson.Value)
+            Assert.That(eventDoc.RootElement.GetProperty("kind").GetString(), Is.EqualTo("AgentStallRecovered"))
+            Assert.That(DateTimeOffset.Parse(eventDoc.RootElement.GetProperty("occurredAtUtc").GetString()),
+                        Is.LessThanOrEqualTo(DateTimeOffset.UtcNow))
+            // A repeated resume from the current session is not another reported stall.
+            ReviewWorkflow.resumeAgentWithSession first (Guid.NewGuid()) taskId "Owner" 2 4 1 "session-B"
+            |> success |> ignore
+            let repeated = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
+            Assert.That(repeated.WorkingTurnStartedAtUtc, Is.EqualTo(recovered.WorkingTurnStartedAtUtc))
+            Assert.That(repeated.AssociatedSessionIds = recovered.AssociatedSessionIds, Is.True)
+            let snapshot2 = LedgerStore.fetch second |> success
+            let events2 = LedgerStore.listAt second snapshot2 "tasks" |> success
+                          |> List.filter (fun path -> path.Contains("/events/"))
+            Assert.That(events2.Length, Is.EqualTo(1))
+            ReviewWorkflow.yieldAgent first (Guid.NewGuid()) taskId "Owner" 2 5 1
+                "Stopped correctly" "Continue later" |> success |> ignore
+            let ready = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
+            Assert.That(ready.State, Is.EqualTo("Ready"))
+            Assert.That(ready.ActiveSessionId, Is.Null)
+            Assert.That(ready.WorkingTurnStartedAtUtc, Is.Null)
+            Assert.That(ready.AssociatedSessionIds = [ "session-A"; "session-B" ], Is.True)
+            ReviewWorkflow.resumeAgentWithSession first (Guid.NewGuid()) taskId "Owner" 3 6 1 "session-C"
+            |> success |> ignore
+            let resumed = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
+            Assert.That(resumed.AssociatedSessionIds = [ "session-A"; "session-B"; "session-C" ], Is.True)
+            Assert.That(resumed.ActiveSessionId, Is.EqualTo("session-C"))
+            Assert.That(resumed.State, Is.EqualTo("Working")))
+
+    [<Test>]
     member _.CanonicalHtmlAcceptsExact512KiBAndRejectsLargerOrActiveMarkup() =
         withFixture (fun _ _ first second _ _ _ _ ->
             let html = "<h1>" + String('x', 512 * 1024 - 4)
@@ -1447,7 +1503,7 @@ type ReviewWorkflowTests() =
                       BaseOid = ""
                       TargetRef = ""
                       SourceRef = ""; AllowDetached = false; AllowUncommitted = false
-                      DecisionSequence = 0L; Evidence = "" }
+                      DecisionSequence = 0L; Evidence = ""; SessionId = "" }
                 let run cmd =
                     Client.V2ReviewApi.V2TaskApi.write cmd ctx
                     |> function

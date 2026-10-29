@@ -40,6 +40,7 @@ let private workingActor command =
 let private checkWorkingGuidance (rt: Runtime) sessionId command response =
     if String.IsNullOrWhiteSpace sessionId then []
     else
+        // In-memory associations are only lookup hints; current state always comes from Git.
         let candidate =
             match response, workingActor command with
             | Ok _, Some(project, agent) when not (String.IsNullOrWhiteSpace agent) ->
@@ -47,13 +48,12 @@ let private checkWorkingGuidance (rt: Runtime) sessionId command response =
             | _ -> None
         let existing =
             match workingSessions.TryGetValue sessionId with
-            | true, stored -> Some stored
+            | true, (project, agentId, _) -> Some(project, agentId)
             | _ -> None
         let binding =
-            match candidate, existing with
-            | Some(project, agent), _ -> Some(project, agent)
-            | None, Some(project, agent, _) -> Some(project, agent)
-            | _ -> None
+            match candidate with
+            | Some worker -> Some worker
+            | None -> existing
         match binding with
         | None -> []
         | Some(project, agentId) ->
@@ -61,40 +61,34 @@ let private checkWorkingGuidance (rt: Runtime) sessionId command response =
                 | Some target -> target <> project
                 | None -> false) then []
             else
-                let now = DateTimeOffset.UtcNow
-                let shouldRead =
-                    candidate.IsSome
-                    || (match existing with
-                        | Some(_, _, cached) ->
-                            WorkingTurnGuidance.instructionAt now cached |> Option.isSome
-                        | None -> false)
-                    || (match command with
-                        | V2TaskWriteCommand c when List.contains c.Action
-                            [ "YieldAgent"; "CompleteAgentWork"; "RecoverAgentAssignment";
-                              "ParkAttempt"; "BlockAttempt"; "CancelTask"; "AbandonAttempt" ] -> true
-                        | _ -> false)
-                let active =
-                    if shouldRead then
-                        match V2ReviewApi.ReviewV2Binding.load project rt with
-                        | Error _ -> None
-                        | Ok ledger ->
-                            match ReviewWorkflow.ReviewWorkflow.getAgentWorkingTurn ledger agentId with
-                            | Ok a -> Some a
-                            | Error _ -> None
-                    else
-                        existing |> Option.map (fun (_, _, a) -> a)
-                match active with
-                | Some current when current.State = "Working" ->
-                    workingSessions[sessionId] <- (project, agentId, current)
-                    match WorkingTurnGuidance.instructionAt now current with
-                    | Some content ->
-                        [ { Scope = "working-turn"; Path = "jarvis/working-turn";
-                            Sha256 = ""; Content = content } ]
-                    | None -> []
-                | Some _ ->
-                    workingSessions.TryRemove(sessionId) |> ignore
-                    []
-                | None -> []
+                match V2ReviewApi.ReviewV2Binding.load project rt with
+                | Error _ -> []
+                | Ok ledger ->
+                    match ReviewWorkflow.ReviewWorkflow.getAgentWorkingTurn ledger agentId with
+                    | Error _ -> []
+                    | Ok agent when agent.State = "Working" ->
+                        workingSessions[sessionId] <- (project, agentId, agent)
+                        if agent.ActiveSessionId = sessionId then
+                            match WorkingTurnGuidance.instructionAt DateTimeOffset.UtcNow agent with
+                            | Some content ->
+                                [ { Scope = "working-turn"; Path = "jarvis/working-turn"
+                                    Sha256 = ""; Content = content } ]
+                            | None -> []
+                        elif not (String.IsNullOrWhiteSpace agent.ActiveSessionId)
+                             && not (isNull (box agent.AssociatedSessionIds))
+                             && List.contains sessionId agent.AssociatedSessionIds then
+                            [ { Scope = "session-status"; Path = "jarvis/session-status"
+                                Sha256 = ""
+                                Content =
+                                    $"A newer session is associated with agent {agent.AgentId} on this project. " +
+                                    $"The current state is {agent.State}, focused attempt {agent.FocusAttemptId}. " +
+                                    "Stop outdated work and reread your Jarvis assignment before continuing." } ]
+                        else []
+                    | Ok agent ->
+                        // Retain only a lookup hint across a normal yield; a later session
+                        // may resume and we can then explain supersession to the old one.
+                        workingSessions[sessionId] <- (project, agentId, agent)
+                        []
 
 let private serialize<'a> (value: 'a) =
     try
@@ -462,7 +456,12 @@ let receiveCommandAndReply (connection: HubConnection) (rt: Runtime) (correlatio
         let! response =
             task {
                 try
-                    let command = JsonSerializer.Deserialize<AgentCommand>(commandJson)
+                    let incoming = JsonSerializer.Deserialize<AgentCommand>(commandJson)
+                    let command =
+                        match incoming with
+                        | V2TaskWriteCommand cmd ->
+                            V2TaskWriteCommand { cmd with SessionId = sessionId }
+                        | _ -> incoming
                     parsedCommand <- Some command
                     let! response, applicable = receiveCommandWithInstructions rt command
                     instructions <- applicable @ checkWorkingGuidance rt sessionId command response

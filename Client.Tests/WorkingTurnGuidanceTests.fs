@@ -11,7 +11,8 @@ let private agent state since =
     { AgentId = "Agent 1"; Version = 3; State = state
       FocusAttemptId = "attempt"; ActiveAttemptId = "attempt"
       StateReason = ""; StateSequence = 2L
-      StateEnteredAtUtc = since }
+      StateEnteredAtUtc = since; WorkingTurnStartedAtUtc = since
+      ActiveSessionId = null; AssociatedSessionIds = [] }
 
 [<Test>]
 let workingResponseGuidanceStartsAt25AndEscalatesAt30 () =
@@ -24,7 +25,7 @@ let workingResponseGuidanceStartsAt25AndEscalatesAt30 () =
     let hard = instructionAt (started.AddMinutes(30.0)) worker |> Option.get
     Assert.That(hard, Does.Contain("HARD STOP"))
     Assert.That(hard, Does.Contain("persist"))
-    Assert.That(hard, Does.Contain("checkpoint"))
+    Assert.That(hard, Does.Contain("yield"))
 
 [<Test>]
 let nonworkingStatesDoNotProduceTimingInstructions () =

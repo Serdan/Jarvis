@@ -84,7 +84,8 @@ module private V2TaskCommands =
           AllowDetached = false
           AllowUncommitted = false
           DecisionSequence = 0L
-          Evidence = "" }
+          Evidence = ""
+          SessionId = "" }
 
 module RequestDeviceRouting =
     // Per-invocation context: never use shared defaults to represent a ChatGPT conversation.

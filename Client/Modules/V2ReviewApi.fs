@@ -1124,8 +1124,8 @@ module V2TaskApi =
                                     cmd.TaskId cmd.ActorId cmd.ExpectedVersion cmd.AssignmentGeneration
                                 |> mapError
                             | "BeginAttempt" ->
-                                ReviewWorkflow.ReviewWorkflow.beginAttempt binding operationId cmd.TaskId
-                                    cmd.ActorId cmd.ExpectedVersion cmd.AssignmentGeneration
+                                ReviewWorkflow.ReviewWorkflow.beginAttemptWithSession binding operationId cmd.TaskId
+                                    cmd.ActorId cmd.ExpectedVersion cmd.AssignmentGeneration cmd.SessionId
                                 |> mapError
                             | "BindReviewBase" ->
                                 ReviewWorkflow.ReviewWorkflow.bindReviewBase binding operationId cmd.TaskId
@@ -1153,9 +1153,9 @@ module V2TaskApi =
                                     cmd.TaskId cmd.ActorId cmd.ExpectedVersion cmd.ExpectedAgentVersion
                                     cmd.AssignmentGeneration cmd.Summary cmd.NextAction |> mapError
                             | "ResumeAgent" ->
-                                ReviewWorkflow.ReviewWorkflow.resumeAgent binding operationId
+                                ReviewWorkflow.ReviewWorkflow.resumeAgentWithSession binding operationId
                                     cmd.TaskId cmd.ActorId cmd.ExpectedVersion cmd.ExpectedAgentVersion
-                                    cmd.AssignmentGeneration |> mapError
+                                    cmd.AssignmentGeneration cmd.SessionId |> mapError
                             | "CompleteAgentWork" ->
                                 ReviewWorkflow.ReviewWorkflow.completeAgentWork binding operationId
                                     cmd.TaskId cmd.ActorId cmd.ExpectedVersion cmd.ExpectedAgentVersion

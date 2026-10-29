@@ -169,6 +169,24 @@ type ReviewWorkflowTests() =
                         Is.GreaterThanOrEqualTo(DateTimeOffset.Parse initial.WorkingTurnStartedAtUtc))
             Assert.That(recovered.AssociatedSessionIds = [ "session-A"; "session-B" ], Is.True)
             Assert.That(recovered.ActiveSessionId, Is.EqualTo("session-B"))
+            // The second Git clone has no in-memory session cache; resolving
+            // the association and its response guidance must work anyway.
+            let coldActive = ReviewWorkflow.findWorkingAgentBySession second "session-B"
+                             |> success |> Option.get
+            Assert.That(coldActive.AgentId, Is.EqualTo("Owner"))
+            let coldOld = ReviewWorkflow.findWorkingAgentBySession second "session-A"
+                          |> success |> Option.get
+            let atCutoff = DateTimeOffset.Parse(recovered.WorkingTurnStartedAtUtc).AddMinutes(26)
+            let activeNotice = Client.WorkingTurnGuidance.forSession atCutoff "session-B" coldActive
+                               |> Option.get
+            Assert.That(fst activeNotice, Is.EqualTo("working-turn"))
+            Assert.That(snd activeNotice, Does.Contain("SOFT STOP"))
+            let oldNotice = Client.WorkingTurnGuidance.forSession atCutoff "session-A" coldOld
+                            |> Option.get
+            Assert.That(fst oldNotice, Is.EqualTo("session-status"))
+            Assert.That(snd oldNotice, Does.Contain("session-B"))
+            Assert.That(ReviewWorkflow.findWorkingAgentBySession second "unrelated-session" |> success,
+                        Is.EqualTo(None))
             let snapshot = LedgerStore.fetch second |> success
             let paths = LedgerStore.listAt second snapshot "tasks" |> success
             let recoveryEvents = paths |> List.filter (fun path -> path.Contains("/events/"))
@@ -200,7 +218,17 @@ type ReviewWorkflowTests() =
             let resumed = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
             Assert.That(resumed.AssociatedSessionIds = [ "session-A"; "session-B"; "session-C" ], Is.True)
             Assert.That(resumed.ActiveSessionId, Is.EqualTo("session-C"))
-            Assert.That(resumed.State, Is.EqualTo("Working")))
+            Assert.That(resumed.State, Is.EqualTo("Working"))
+            ReviewWorkflow.completeAgentWork first (Guid.NewGuid()) taskId "Owner" 4 7 1 "Done"
+            |> success |> ignore
+            let complete = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
+            Assert.That(complete.State, Is.EqualTo("Completed"))
+            ReviewWorkflow.parkAgent first (Guid.NewGuid()) "Owner" complete.Version "Idle"
+            |> success |> ignore
+            let parked = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
+            Assert.That(parked.State, Is.EqualTo("Parked"))
+            Assert.That(parked.AssociatedSessionIds = [ "session-A"; "session-B"; "session-C" ], Is.True)
+            Assert.That(parked.ActiveSessionId, Is.Null))
 
     [<Test>]
     member _.CanonicalHtmlAcceptsExact512KiBAndRejectsLargerOrActiveMarkup() =

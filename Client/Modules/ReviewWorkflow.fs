@@ -1333,7 +1333,7 @@ module ReviewWorkflow =
                             return! Error(StaleEntityVersion "Park may not interrupt an assigned or Working agent.")
                         return
                             [ change (agentPath agentId) (Some agentOid)
-                                { (resetSessions agent) with
+                                { agent with
                                     Version = agent.Version + 1
                                     State = "Parked"; FocusAttemptId = null
                                     StateEnteredAtUtc = if agent.State = "Parked" then agent.StateEnteredAtUtc else DateTimeOffset.UtcNow.ToString("O")
@@ -3008,6 +3008,26 @@ module ReviewWorkflow =
             let! snapshot = LedgerStore.fetch binding
             let! agent, _ = required<ReviewAgent> binding snapshot (agentPath agentId)
             return agent
+        }
+
+    // Resolve the canonical agent association when a client restarts and loses
+    // its purely optional in-memory routing hints. Only current Working agents
+    // are relevant to cutoff/supersession notices.
+    let findWorkingAgentBySession binding sessionId =
+        if String.IsNullOrWhiteSpace sessionId then Ok None
+        else result {
+            let! snapshot = LedgerStore.fetch binding
+            let! paths = LedgerStore.listAt binding snapshot "agents"
+            let mutable matches = []
+            for path in paths do
+                let! agent, _ = required<ReviewAgent> binding snapshot path
+                if agent.State = "Working"
+                   && (agent.ActiveSessionId = sessionId
+                       || (not (isNull (box agent.AssociatedSessionIds))
+                           && List.contains sessionId agent.AssociatedSessionIds)) then
+                    matches <- agent :: matches
+            // Never guess which agent owns a session if more than one matches.
+            return match matches with [ agent ] -> Some agent | _ -> None
         }
 
     let getAgentInbox binding agentId =

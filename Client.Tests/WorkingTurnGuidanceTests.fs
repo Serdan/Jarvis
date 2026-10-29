@@ -35,3 +35,32 @@ let nonworkingStatesDoNotProduceTimingInstructions () =
     Assert.That(instructionAt (started.AddHours(3)) (agent "Working" null), Is.EqualTo(None))
     Assert.That(instructionAt (started.AddMinutes(-1)) (agent "Working" (started.ToString("O"))),
                 Is.EqualTo(None))
+
+
+[<Test>]
+let currentAndSupersededSessionsReceiveDifferentInstructions () =
+    let worker =
+        { agent "Working" (started.ToString("O")) with
+            ActiveSessionId = "new-session"
+            AssociatedSessionIds = [ "old-session"; "new-session" ] }
+    let now = started.AddMinutes(26)
+    let current = forSession now "new-session" worker |> Option.get
+    Assert.That(fst current, Is.EqualTo("working-turn"))
+    Assert.That(snd current, Does.Contain("SOFT STOP"))
+    let older = forSession now "old-session" worker |> Option.get
+    Assert.That(fst older, Is.EqualTo("session-status"))
+    Assert.That(snd older, Does.Contain("new-session"))
+    Assert.That(snd older, Does.Contain("reread"))
+    Assert.That(forSession now "unrelated-session" worker, Is.EqualTo(None))
+    Assert.That(forSession now "new-session" { worker with State = "Ready" }, Is.EqualTo(None))
+
+[<Test>]
+let recoveredSessionUsesNewCutoffRatherThanStateEntry () =
+    let worker =
+        { agent "Working" (started.ToString("O")) with
+            ActiveSessionId = "recovered-session"
+            AssociatedSessionIds = [ "previous-session"; "recovered-session" ]
+            WorkingTurnStartedAtUtc = started.AddMinutes(29).ToString("O") }
+    Assert.That(forSession (started.AddMinutes(30)) "recovered-session" worker, Is.EqualTo(None))
+    let guidance = forSession (started.AddMinutes(54)) "recovered-session" worker |> Option.get
+    Assert.That(snd guidance, Does.Contain("SOFT STOP"))

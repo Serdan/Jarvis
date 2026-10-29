@@ -27,3 +27,18 @@ let instructionAt (now: DateTimeOffset) (agent: ReviewAgent) =
                       "do not begin another, persist/commit your changes, yield to Ready with the next action or complete the assignment, " +
                       "and write your response.")
             else None
+
+
+// Return advisory content to be included with the calling session's tool response.
+let forSession (now: DateTimeOffset) sessionId (agent: ReviewAgent) =
+    if agent.State <> "Working" || String.IsNullOrWhiteSpace sessionId then None
+    elif agent.ActiveSessionId = sessionId then
+        instructionAt now agent |> Option.map (fun content -> "working-turn", content)
+    elif not (String.IsNullOrWhiteSpace agent.ActiveSessionId)
+         && not (isNull (box agent.AssociatedSessionIds))
+         && List.contains sessionId agent.AssociatedSessionIds then
+        Some ("session-status",
+              $"A newer session ({agent.ActiveSessionId}) is associated with agent {agent.AgentId}. " +
+              $"Current state: {agent.State}; focused attempt: {agent.FocusAttemptId}. " +
+              "Stop outdated work and reread the Jarvis assignment before continuing.")
+    else None

@@ -21,11 +21,10 @@ let receiveMessage (rt: Runtime) message =
     rt.Tui.Log message
     Task.CompletedTask
 
-// A successful worker-owned action associates the current ChatGPT session.
-// Do not infer worker identity from inbox reads: orchestrators inspect those too.
-// This association is ephemeral; the Git agent record owns timestamps.
+// A successful worker-owned action can provide a session lookup hint.
+// Never infer ownership from inbox reads; only Git holds authoritative state.
 let private workingSessions =
-    ConcurrentDictionary<string, string * string * ReviewWorkflow.ReviewAgent>()
+    ConcurrentDictionary<string, string * string>()
 
 let private workingActor command =
     match command with
@@ -40,55 +39,50 @@ let private workingActor command =
 let private checkWorkingGuidance (rt: Runtime) sessionId command response =
     if String.IsNullOrWhiteSpace sessionId then []
     else
-        // In-memory associations are only lookup hints; current state always comes from Git.
+        // The cache is only a shortcut; a cold client can resolve a session
+        // directly from the Git ledger on its first project-scoped response.
+        let commandProject = AgentCommandInfo.projectName command
         let candidate =
             match response, workingActor command with
-            | Ok _, Some(project, agent) when not (String.IsNullOrWhiteSpace agent) ->
-                Some(project, agent)
+            | Ok _, Some(project, agentId) when not (String.IsNullOrWhiteSpace agentId) ->
+                Some(project, agentId)
             | _ -> None
-        let existing =
+        let cached =
             match workingSessions.TryGetValue sessionId with
-            | true, (project, agentId, _) -> Some(project, agentId)
+            | true, (project, agentId) when commandProject.IsNone || commandProject = Some project ->
+                Some(project, agentId)
             | _ -> None
-        let binding =
-            match candidate with
-            | Some worker -> Some worker
-            | None -> existing
-        match binding with
+        let known = candidate |> Option.orElse cached
+
+        let lookup project =
+            match V2ReviewApi.ReviewV2Binding.load project rt with
+            | Error _ -> None
+            | Ok binding ->
+                let found =
+                    match known with
+                    | Some(knownProject, agentId) when knownProject = project ->
+                        ReviewWorkflow.ReviewWorkflow.getAgentWorkingTurn binding agentId
+                        |> Result.map Some
+                    | _ ->
+                        ReviewWorkflow.ReviewWorkflow.findWorkingAgentBySession binding sessionId
+                match found with
+                | Ok(Some agent) -> Some(project, agent)
+                | _ -> None
+
+        let resolved =
+            match known, commandProject with
+            | Some(project, _), _ -> lookup project
+            | None, Some project -> lookup project
+            | None, None -> None
+        match resolved with
         | None -> []
-        | Some(project, agentId) ->
-            if (match AgentCommandInfo.projectName command with
-                | Some target -> target <> project
-                | None -> false) then []
-            else
-                match V2ReviewApi.ReviewV2Binding.load project rt with
-                | Error _ -> []
-                | Ok ledger ->
-                    match ReviewWorkflow.ReviewWorkflow.getAgentWorkingTurn ledger agentId with
-                    | Error _ -> []
-                    | Ok agent when agent.State = "Working" ->
-                        workingSessions[sessionId] <- (project, agentId, agent)
-                        if agent.ActiveSessionId = sessionId then
-                            match WorkingTurnGuidance.instructionAt DateTimeOffset.UtcNow agent with
-                            | Some content ->
-                                [ { Scope = "working-turn"; Path = "jarvis/working-turn"
-                                    Sha256 = ""; Content = content } ]
-                            | None -> []
-                        elif not (String.IsNullOrWhiteSpace agent.ActiveSessionId)
-                             && not (isNull (box agent.AssociatedSessionIds))
-                             && List.contains sessionId agent.AssociatedSessionIds then
-                            [ { Scope = "session-status"; Path = "jarvis/session-status"
-                                Sha256 = ""
-                                Content =
-                                    $"A newer session is associated with agent {agent.AgentId} on this project. " +
-                                    $"The current state is {agent.State}, focused attempt {agent.FocusAttemptId}. " +
-                                    "Stop outdated work and reread your Jarvis assignment before continuing." } ]
-                        else []
-                    | Ok agent ->
-                        // Retain only a lookup hint across a normal yield; a later session
-                        // may resume and we can then explain supersession to the old one.
-                        workingSessions[sessionId] <- (project, agentId, agent)
-                        []
+        | Some(project, agent) ->
+            workingSessions[sessionId] <- (project, agent.AgentId)
+            match WorkingTurnGuidance.forSession DateTimeOffset.UtcNow sessionId agent with
+            | Some(scope, content) ->
+                [ { Scope = scope; Path = $"jarvis/{scope}"
+                    Sha256 = ""; Content = content } ]
+            | None -> []
 
 let private serialize<'a> (value: 'a) =
     try

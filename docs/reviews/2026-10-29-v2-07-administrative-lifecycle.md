@@ -103,4 +103,4 @@ owner self-approval rejection, empty-evidence rejection, immutable approval
 lookup; and typed client protocol operations. MCP catalog and permission
 metadata are tested by the server suite.
 
-Final suite results are recorded in the backlog when verification completes.
+**Final verification:** Client.Tests **348/348 passed** on the complete TRX-captured run, Server.Tests **62/62 passed**, and git diff --check clean. Implementation commit fbd8bff, experimental protocol 3.33. Includes tested source-binding rejection for no-source closure and preservation of late feedback. No production deployment, remote push, V2 ledger import or V1 cutover.

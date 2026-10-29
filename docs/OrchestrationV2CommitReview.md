@@ -312,3 +312,32 @@ not reproduced on the full TRX rerun; do not represent it as a proven fix.
 Security remains a V2-11 concern: actor labels are not cryptographic
 authorization. V2-06 is completed in source-backed task files, not imported
 to a production orphan Git ledger. No deployment, push or cutover.
+
+## V2-07 administrative lifecycle and independent no-source closure (commit fbd8bff, protocol 3.33)
+
+Audited exact-version canonical-ledger transitions now cover
+ParkAttempt, BlockAttempt, ResumeAttempt, CancelTask, CancelOpenTask,
+AbandonAttempt, TransferOwner, CloseNonSourceTask and ReopenTask.
+Agent Completed with no focus is a valid state only with no Working slot.
+Administrative parking does not implicitly park the agent. Resume
+issues a new immutable queued generation. Terminal/transfer operations
+settle active review and agent slot changes atomically while retaining
+all immutable reviewer and source evidence. Transfer supersedes the old
+attempt and grants the successor a pinned task spec with fresh source
+binding required.
+
+Independent non-source closure requires Finished implementation,
+registered non-owner approver, substantive criteria/evidence and no
+source binding, review, approval or integration action. Its separate
+immutable approval is retrievable by sequence, and sets Closed, never
+Integrated. Reopen preserves former history without reviving stale
+assignments. Late review feedback survives cancellation even when
+its owner has a newer Working task.
+
+Disposable two-clone Git tests cover the Assigned/Acknowledged/Ready/
+Working matrix, claimed/unclaimed review cleanup, non-source closure
+and source-binding rejection, late feedback, owner transfer, stale
+generation protections, and V2 client command routing. Final
+Client.Tests 348/348, Server.Tests 62/62, diff --check clean.
+Logical actor labels are not cryptographic authorization (V2-11);
+no production push/deployment, live V2 import or V1 cutover.

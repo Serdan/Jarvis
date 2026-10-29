@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "2026-10-28-v2-07-administrative-lifecycle",
   "title": "Implement task/attempt park, block, resume, cancel, transfer and non-source closure",
-  "status": "open",
+  "status": "completed",
   "priority": "P1",
   "dependencies": [
     "2026-10-28-v2-04-assignment-generations",
@@ -13,10 +13,21 @@
     "worktree": null
   },
   "checkpoint": {
-    "summary": "Architecture gap identified by the 2026-10-28 V2 implementation audit. Not started.",
-    "nextAction": "Implement the acceptance criteria in the accompanying HTML task; use disposable Git remotes and do not deploy or migrate V1.",
-    "verified": [],
-    "lastCommit": null
+    "summary": "V2-07 implemented audited park/block/resume/cancel/abandon/reopen, atomic review settlement, explicit owner transfer with a new source binding, and independently approved no-source task closure. Source commit fbd8bff, experimental protocol 3.33.",
+    "nextAction": "V2-07 accepted. V2-09 task-spec APIs and V2-12 integration reconciliation remain ready; V2-14 migration also requires V2-09 and V2-13. No production deployment or migration.",
+    "verified": [
+      "Assigned/Acknowledged/Ready/Working park/block, Completed versus agent Parked, and explicit resume/queued generation",
+      "New generation cannot revive stale receipt or bypass orchestrator reissue",
+      "CancelTask and TransferOwner atomically withdraw active Unclaimed or Claimed reviews and audit the disposition",
+      "Cancelling previous task preserves unrelated newer Working slot and late feedback acknowledgment",
+      "Transfer retains prior source/review/spec evidence but gives successor no implicit source checkout binding",
+      "Independent no-source closure requires Finished attempt, non-owner approval, criteria/evidence and no source/review/integration",
+      "Immutable no-source approval retrievable by sequence; no claim of source integration",
+      "Open cancel, abandon, terminal reopen and fresh assignment retain historical records",
+      "End-to-end V2 client lifecycle history and cancel/reopen; MCP permissions and discovery",
+      "Final Client.Tests 348/348, Server.Tests 62/62, git diff --check clean; protocol 3.33"
+    ],
+    "lastCommit": "fbd8bffb5a989e5c4f41d70e8799054a2ec7a4d7"
   },
   "audit": {
     "specSections": [
@@ -24,9 +35,15 @@
       "§8"
     ],
     "implementationReferences": [
-      "Client/Modules/ReviewWorkflow.fs:245-560,800-1120"
+      "Client/Modules/ReviewWorkflow.fs",
+      "Client/Modules/LedgerStore.fs",
+      "Client/Modules/V2ReviewApi.fs",
+      "Common/Messages/AgentCommand.fs",
+      "Server/McpTools.fs",
+      "Client.Tests/ReviewWorkflowTests.fs",
+      "Server.Tests/ServiceTests.fs"
     ],
-    "sourceReport": "docs/reviews/2026-10-28-v2-spec-implementation-audit.md"
+    "sourceReport": "docs/reviews/2026-10-29-v2-07-administrative-lifecycle.md"
   },
-  "updatedAt": "2026-10-28T00:00:00Z"
+  "updatedAt": "2026-10-29T12:47:52+01:00"
 }

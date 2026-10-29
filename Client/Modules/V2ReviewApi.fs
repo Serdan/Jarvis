@@ -534,6 +534,22 @@ module V2PendingIntentJournal =
                 | "V2TaskWrite", "ReissueQueuedAttempt"
                 | "V2TaskWrite", "RecoverAgentAssignment" ->
                     attempt @ [ "Reason", "reason" ]
+                | "V2TaskWrite", ("ParkAttempt" | "BlockAttempt" | "ResumeAttempt"
+                                   | "AbandonAttempt" | "CancelTask") ->
+                    attempt @ [ "ExpectedTaskVersion", "expectedTaskVersion";
+                                "Reason", "reason" ]
+                | "V2TaskWrite", "CancelOpenTask" ->
+                    common @ [ "ExpectedTaskVersion", "expectedTaskVersion"; "Reason", "reason" ]
+                | "V2TaskWrite", "TransferOwner" ->
+                    attempt @ [ "ExpectedTaskVersion", "expectedTaskVersion";
+                                "AttemptId", "newAttemptId"; "OwnerId", "newOwner";
+                                "ReviewerId", "reviewer"; "Reason", "reason" ]
+                | "V2TaskWrite", "CloseNonSourceTask" ->
+                    common @ [ "ActorId", "approver"; "ExpectedTaskVersion", "expectedTaskVersion";
+                                "ExpectedVersion", "expectedAttemptVersion";
+                                "Summary", "criteria"; "Evidence", "evidence" ]
+                | "V2TaskWrite", "ReopenTask" ->
+                    common @ [ "ExpectedTaskVersion", "expectedTaskVersion"; "Reason", "reason" ]
                 | "V2TaskWrite", "AcknowledgeReviewFeedback" ->
                     owner @ [ "DecisionSequence", "decisionSequence" ]
                 | "V2ReviewWrite", "SubmitForReview" ->
@@ -1029,6 +1045,12 @@ module V2TaskApi =
             | "GetCheckpoint" ->
                 ReviewWorkflow.ReviewWorkflow.getCheckpoint binding cmd.TaskId cmd.CheckpointSequence
                 |> mapError |> Result.map box
+            | "NonSourceApproval" ->
+                ReviewWorkflow.ReviewWorkflow.getNonSourceClosureApproval binding cmd.TaskId cmd.CheckpointSequence
+                |> mapError |> Result.map box
+            | "LifecycleHistory" ->
+                ReviewWorkflow.ReviewWorkflow.getTaskLifecycleHistory binding cmd.TaskId
+                |> mapError |> Result.map box
             | "InspectAttemptSource" ->
                 ReviewWorkflow.ReviewWorkflow.inspectAttemptSource binding cmd.TaskId
                 |> mapError |> Result.map box
@@ -1103,6 +1125,28 @@ module V2TaskApi =
                             ReviewWorkflow.ReviewWorkflow.completeAgentWork binding operationId
                                 cmd.TaskId cmd.ActorId cmd.ExpectedVersion cmd.ExpectedAgentVersion
                                 cmd.AssignmentGeneration cmd.Summary |> mapError
+                        | "ParkAttempt" | "BlockAttempt" | "ResumeAttempt"
+                        | "AbandonAttempt" | "CancelTask" ->
+                            ReviewWorkflow.ReviewWorkflow.changeAttemptAdministration binding operationId
+                                cmd.TaskId cmd.Action cmd.ExpectedTaskVersion cmd.ExpectedVersion
+                                cmd.ExpectedAgentVersion cmd.AssignmentGeneration cmd.Reason |> mapError
+                        | "CancelOpenTask" ->
+                            ReviewWorkflow.ReviewWorkflow.cancelOpenTask binding operationId
+                                cmd.TaskId cmd.ExpectedTaskVersion cmd.Reason |> mapError
+                        | "TransferOwner" ->
+                            guid "newAttemptId" cmd.AttemptId
+                            |> Result.bind (fun newId ->
+                                ReviewWorkflow.ReviewWorkflow.transferAttemptOwner binding operationId
+                                    cmd.TaskId newId cmd.OwnerId cmd.ReviewerId
+                                    cmd.ExpectedTaskVersion cmd.ExpectedVersion cmd.ExpectedAgentVersion
+                                    cmd.AssignmentGeneration cmd.Reason |> mapError)
+                        | "CloseNonSourceTask" ->
+                            ReviewWorkflow.ReviewWorkflow.closeNonSourceTask binding operationId cmd.TaskId
+                                cmd.ActorId cmd.ExpectedTaskVersion cmd.ExpectedVersion
+                                cmd.Summary cmd.Evidence |> mapError
+                        | "ReopenTask" ->
+                            ReviewWorkflow.ReviewWorkflow.reopenTask binding operationId
+                                cmd.TaskId cmd.ExpectedTaskVersion cmd.Reason |> mapError
                         | "ParkAgent" ->
                             ReviewWorkflow.ReviewWorkflow.parkAgent binding operationId
                                 cmd.ActorId cmd.ExpectedAgentVersion cmd.Reason |> mapError

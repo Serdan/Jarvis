@@ -286,6 +286,30 @@ All mutations require a stable operation ID, expected version(s), a valid actor,
 
 `BeginAttempt` starts an Assigned queued attempt and `ResumeAgent` resumes a Ready paused attempt; both acquire the execution slot with exact generation checks. ReissueQueuedAttempt selects the queued attempt first, without acquiring the slot. Attempting to start a second attempt for the same agent fails `AgentBusy`. A reviewer returning Task 315 after its owner Finished and began Task 316 queues a new generation of Task 315, without interrupting Task 316 or marking Task 315 Working. A reviewer returning Task 315 while Agent 3 is already Working on Task 315 leaves that generation Working and adds durable review feedback.
 
+### V2-07 administrative implementation contract (2026-10-29)
+
+Park/Block Attempt are explicit operator-ledger transitions, never agent
+presence inference. They release a genuinely held execution slot and
+clear only matching focus; the agent becomes Completed without focus,
+not automatically agent-level Parked. Resume creates a new queued
+immutable generation and never starts an agent. Cancellation,
+abandonment and ownership transfer atomically withdraw current
+unclaimed/claimed reviews with immutable review claim events and preserve
+historical snapshots. Transfer replaces the primary attempt with a
+new owner/attempt/generation; its pinned spec is retained, while its
+Git source binding is deliberately reset. Reopen returns Closed or
+Cancelled task to Open without reviving a prior generation.
+
+Independent non-source closure is explicitly approved by a registered
+non-owner on a Finished attempt with meaningful criteria and evidence
+and no source binding, review, accepted patch or integration action.
+The immutable independent approval record sets NoSourceIntegration=true;
+the task becomes Closed, never Integrated. Administrative lifecycle
+events and approval records are separate from reviewer decision evidence.
+Late review feedback remains available when an old task is cancelled,
+including if its agent is already Working another task. Logical actor
+labels are not authentication; V2-11 owns identity hardening.
+
 ### Reissued assignments and durable feedback
 
 Requested changes are a review outcome, not a command to take over the owner's current ChatGPT session. Every review decision creates a separate auditable notification in the canonical ledger containing owner, attempt, decision sequence, verdict and feedback. The agent inbox derives unacknowledgedFeedback from these records across all owned tasks, including Finished tasks. Later decisions do not replace earlier notifications. AcknowledgeReviewFeedback targets an exact decision sequence and atomically marks only that notice acknowledged.

@@ -89,6 +89,353 @@ type ReviewWorkflowTests() =
             Directory.Delete(root, true)
 
     [<Test>]
+    member _.AdministrativeAssignedReadyAndAcknowledgedStateMatrix() =
+        for phase in [ "Queued"; "Acknowledged"; "Paused" ] do
+            withFixture (fun _ _ first second _ _ _ _ ->
+                let taskId = "state-" + phase.ToLowerInvariant()
+                ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Lifecycle states" |> success |> ignore
+                ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid())
+                    "Owner" "Reviewer" |> success |> ignore
+                if phase = "Acknowledged" then
+                    ReviewWorkflow.acknowledgeAssignment first (Guid.NewGuid()) taskId "Owner" 1 1
+                    |> success |> ignore
+                elif phase = "Paused" then
+                    ReviewWorkflow.beginAttempt first (Guid.NewGuid()) taskId "Owner" 1 1
+                    |> success |> ignore
+                    ReviewWorkflow.yieldAgent second (Guid.NewGuid()) taskId "Owner" 2 3 1
+                        "Paused at checkpoint" "Continue after administrative hold"
+                    |> success |> ignore
+                let _, task, maybeAttempt = ReviewWorkflow.getTask second taskId |> success
+                let attempt = maybeAttempt.Value
+                let agent = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
+                Assert.That(attempt.Phase, Is.EqualTo(phase))
+                let operation = if phase = "Acknowledged" then "BlockAttempt" else "ParkAttempt"
+                ReviewWorkflow.changeAttemptAdministration first (Guid.NewGuid()) taskId operation
+                    task.Version attempt.Version agent.Version attempt.AssignmentGeneration
+                    ("Administrative hold from " + phase) |> success |> ignore
+                let _, _, parked = ReviewWorkflow.getTask second taskId |> success
+                Assert.That(parked.Value.Phase,
+                            Is.EqualTo(if operation = "ParkAttempt" then "Parked" else "Blocked"))
+                let updated = ReviewWorkflow.getAgentInbox second "Owner" |> success
+                Assert.That(updated.Agent.State, Is.EqualTo("Completed"))
+                Assert.That(updated.Agent.ActiveAttemptId, Is.Null)
+                Assert.That(updated.Agent.FocusAttemptId, Is.Null)
+                Assert.That(updated.SlotAvailable, Is.True)
+                Assert.That(updated.NeedsOrchestratorAssignment, Is.True)
+                expectStale (ReviewWorkflow.changeAttemptAdministration first (Guid.NewGuid()) taskId operation
+                                 task.Version attempt.Version agent.Version attempt.AssignmentGeneration
+                                 "Stale repeated hold"))
+
+    [<Test>]
+    member _.OpenCancellationAndAbandonmentRequireExplicitReopening() =
+        withFixture (fun _ _ first second _ _ _ _ ->
+            let taskId = "admin-open"
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Unassigned" |> success |> ignore
+            let cancelId = Guid.NewGuid()
+            let cancel () = ReviewWorkflow.cancelOpenTask first cancelId taskId 1 "Not needed"
+            Assert.That((cancel () |> success).AlreadyApplied, Is.False)
+            Assert.That((cancel () |> success).AlreadyApplied, Is.True)
+            let _, cancelled, none = ReviewWorkflow.getTask second taskId |> success
+            Assert.That(cancelled.Lifecycle, Is.EqualTo("Cancelled"))
+            Assert.That(none.IsNone, Is.True)
+            expectStale (ReviewWorkflow.cancelOpenTask second (Guid.NewGuid()) taskId 1 "Stale cancel")
+            ReviewWorkflow.reopenTask first (Guid.NewGuid()) taskId cancelled.Version "Scope revived"
+            |> success |> ignore
+            ReviewWorkflow.assignTask second (Guid.NewGuid()) taskId (Guid.NewGuid())
+                "Owner" "Reviewer" |> success |> ignore
+            let _, assigned, option = ReviewWorkflow.getTask first taskId |> success
+            let agent = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
+            ReviewWorkflow.changeAttemptAdministration first (Guid.NewGuid()) taskId "AbandonAttempt"
+                assigned.Version option.Value.Version agent.Version 1 "Owner cannot continue"
+            |> success |> ignore
+            let _, reopened, abandoned = ReviewWorkflow.getTask second taskId |> success
+            Assert.That(reopened.Lifecycle, Is.EqualTo("Open"))
+            Assert.That(abandoned.IsNone, Is.True)
+            let _, history = ReviewWorkflow.getTaskLifecycleHistory second taskId |> success
+            Assert.That(history |> List.map (fun e -> e.Action),
+                        Is.EqualTo(box [ "CancelTask"; "ReopenTask"; "AbandonAttempt" ])))
+
+    [<Test>]
+    member _.AdministrativeParkResumeBlockIsIndependentOfAgentParking() =
+        withFixture (fun _ _ first second _ _ _ initTask ->
+            initTask "admin-park"
+            let taskId = "admin-park"
+            let read () =
+                let _, task, attempt = ReviewWorkflow.getTask second taskId |> success
+                let inbox = ReviewWorkflow.getAgentInbox second "Owner" |> success
+                task, attempt.Value, inbox.Agent
+            let task, attempt, agent = read ()
+            Assert.That(task.Version, Is.EqualTo(2))
+            Assert.That(attempt.Phase, Is.EqualTo("Working"))
+            let parkId = Guid.NewGuid()
+            let park () = ReviewWorkflow.changeAttemptAdministration first parkId taskId "ParkAttempt"
+                              task.Version attempt.Version agent.Version attempt.AssignmentGeneration
+                              "Hold for dependency"
+            Assert.That((park () |> success).AlreadyApplied, Is.False)
+            Assert.That((park () |> success).AlreadyApplied, Is.True)
+            let _, parkedAttempt, idle = read ()
+            Assert.That(parkedAttempt.Phase, Is.EqualTo("Parked"))
+            Assert.That(idle.State, Is.EqualTo("Completed"))
+            Assert.That(idle.FocusAttemptId, Is.Null)
+            Assert.That(idle.ActiveAttemptId, Is.Null)
+            // Agent-level parking is a separate explicit operation.
+            ReviewWorkflow.parkAgent second (Guid.NewGuid()) "Owner" idle.Version
+                "Agent idle" |> success |> ignore
+            let _, parked, agentParked = read ()
+            Assert.That(parked.Phase, Is.EqualTo("Parked"))
+            Assert.That(agentParked.State, Is.EqualTo("Parked"))
+            ReviewWorkflow.changeAttemptAdministration second (Guid.NewGuid()) taskId "ResumeAttempt"
+                task.Version parked.Version agentParked.Version 1 "Dependency resolved"
+            |> success |> ignore
+            let _, queued, stillParked = read ()
+            Assert.That(queued.Phase, Is.EqualTo("Queued"))
+            Assert.That(queued.AssignmentGeneration, Is.EqualTo(2))
+            Assert.That(stillParked.State, Is.EqualTo("Parked"))
+            // Old generations and stale versions cannot resume or begin.
+            expectStale (ReviewWorkflow.beginAttempt first (Guid.NewGuid()) taskId "Owner"
+                             queued.Version 1)
+            expectStale (ReviewWorkflow.changeAttemptAdministration first (Guid.NewGuid()) taskId
+                             "ResumeAttempt" task.Version parked.Version agentParked.Version 1 "Stale")
+            ReviewWorkflow.reissueQueuedAttempt first (Guid.NewGuid()) taskId "Owner"
+                queued.Version stillParked.Version 2 "Restart administratively resumed attempt"
+            |> success |> ignore
+            let _, reassigned, assignedAgent = read ()
+            Assert.That(assignedAgent.State, Is.EqualTo("Assigned"))
+            ReviewWorkflow.beginAttempt second (Guid.NewGuid()) taskId "Owner"
+                reassigned.Version 2 |> success |> ignore
+            let _, working, workingAgent = read ()
+            Assert.That(working.Phase, Is.EqualTo("Working"))
+            ReviewWorkflow.changeAttemptAdministration first (Guid.NewGuid()) taskId "BlockAttempt"
+                task.Version working.Version workingAgent.Version 2 "External blocker"
+            |> success |> ignore
+            let _, blocked, finishedAgent = read ()
+            Assert.That(blocked.Phase, Is.EqualTo("Blocked"))
+            Assert.That(finishedAgent.State, Is.EqualTo("Completed"))
+            Assert.That((ReviewWorkflow.getAgentInbox second "Owner" |> success).Blocked.Length,
+                        Is.EqualTo(1))
+            let _, history = ReviewWorkflow.getTaskLifecycleHistory second taskId |> success
+            Assert.That(history |> List.map (fun e -> e.Action),
+                        Is.EqualTo(box [ "ParkAttempt"; "ResumeAttempt"; "BlockAttempt" ]))
+            Assert.That(history[1].NewGeneration, Is.EqualTo(2))
+            Assert.That(history[0].PreviousGeneration, Is.EqualTo(1)))
+
+    [<Test>]
+    member _.CancellationSettlesClaimedReviewAndReopenNeverRestoresOldGeneration() =
+        withFixture (fun _ _ first second _ sourceRef newCommit initTask ->
+            initTask "admin-cancel"
+            let head = newCommit "Administrative claimed review" "review-to-cancel"
+            let requestId = Guid.NewGuid()
+            ReviewWorkflow.submitReview first (Guid.NewGuid()) "admin-cancel" "Owner"
+                3 1 requestId sourceRef head "Ready for review" |> success |> ignore
+            ReviewWorkflow.claimReview second (Guid.NewGuid()) "admin-cancel" requestId
+                "Reviewer" 1 1 |> success |> ignore
+            let _, task, attemptOption = ReviewWorkflow.getTask first "admin-cancel" |> success
+            let attempt = attemptOption.Value
+            let agent = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
+            let cancelId = Guid.NewGuid()
+            let cancel () = ReviewWorkflow.changeAttemptAdministration first cancelId "admin-cancel"
+                                "CancelTask" task.Version attempt.Version agent.Version 1
+                                "Explicitly cancelled after external approval removed"
+            Assert.That((cancel () |> success).AlreadyApplied, Is.False)
+            Assert.That((cancel () |> success).AlreadyApplied, Is.True)
+            let _, closedTask, archivedAttempt = ReviewWorkflow.getTask second "admin-cancel" |> success
+            Assert.That(closedTask.Lifecycle, Is.EqualTo("Cancelled"))
+            Assert.That(archivedAttempt.Value.Phase, Is.EqualTo("Abandoned"))
+            Assert.That(archivedAttempt.Value.ActiveReviewRequestId, Is.Null)
+            let _, withdrawn, revision = ReviewWorkflow.getReview second "admin-cancel" requestId |> success
+            Assert.That(withdrawn.Status, Is.EqualTo("Withdrawn"))
+            Assert.That(withdrawn.ClaimedRevision, Is.EqualTo(1))
+            Assert.That(revision.HeadCommit, Is.EqualTo(head))
+            let _, events = ReviewWorkflow.getReviewClaimEvents second "admin-cancel" requestId |> success
+            Assert.That(events |> List.map (fun e -> e.Action),
+                        Is.EqualTo(box [ "Claim"; "Withdraw" ]))
+            let owner = ReviewWorkflow.getAgentInbox second "Owner" |> success
+            Assert.That(owner.Agent.State, Is.EqualTo("Completed"))
+            Assert.That(owner.SlotAvailable, Is.True)
+            expectStale (ReviewWorkflow.decide second (Guid.NewGuid()) "admin-cancel" requestId
+                             "Reviewer" 3 Accept "Stale")
+            ReviewWorkflow.reopenTask first (Guid.NewGuid()) "admin-cancel"
+                closedTask.Version "New task scope approved" |> success |> ignore
+            let _, reopened, noAttempt = ReviewWorkflow.getTask second "admin-cancel" |> success
+            Assert.That(reopened.Lifecycle, Is.EqualTo("Open"))
+            Assert.That(noAttempt.IsNone, Is.True)
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) "admin-cancel" (Guid.NewGuid())
+                "Owner" "Reviewer" |> success |> ignore
+            let _, reassigned, newAttempt = ReviewWorkflow.getTask second "admin-cancel" |> success
+            Assert.That(newAttempt.Value.AssignmentGeneration, Is.EqualTo(1))
+            Assert.That(newAttempt.Value.AttemptId, Is.Not.EqualTo(attempt.AttemptId))
+            Assert.That(reassigned.Lifecycle, Is.EqualTo("InProgress"))
+            let _, history = ReviewWorkflow.getTaskLifecycleHistory second "admin-cancel" |> success
+            Assert.That(history |> List.map (fun e -> e.Action),
+                        Is.EqualTo(box [ "CancelTask"; "ReopenTask" ])))
+
+    [<Test>]
+    member _.OwnerTransferRevokesOldAssignmentAndPreservesFrozenReviewEvidence() =
+        withFixture (fun _ _ first second _ sourceRef newCommit initTask ->
+            initTask "admin-transfer"
+            ReviewWorkflow.registerAgent first (Guid.NewGuid()) "NewOwner" |> success |> ignore
+            let head = newCommit "Transfer review" "prior-work"
+            let requestId = Guid.NewGuid()
+            ReviewWorkflow.submitReview first (Guid.NewGuid()) "admin-transfer" "Owner"
+                3 1 requestId sourceRef head "Work before handoff" |> success |> ignore
+            ReviewWorkflow.claimReview second (Guid.NewGuid()) "admin-transfer" requestId "Reviewer"
+                1 1 |> success |> ignore
+            let _, task, oldOption = ReviewWorkflow.getTask second "admin-transfer" |> success
+            let oldAttempt = oldOption.Value
+            let previousOwner = (ReviewWorkflow.getAgentInbox first "Owner" |> success).Agent
+            let transferredAttemptId = Guid.NewGuid()
+            let transferId = Guid.NewGuid()
+            let transfer () =
+                ReviewWorkflow.transferAttemptOwner first transferId "admin-transfer"
+                    transferredAttemptId "NewOwner" "Reviewer" task.Version oldAttempt.Version
+                    previousOwner.Version oldAttempt.AssignmentGeneration "Team ownership changed"
+            Assert.That((transfer () |> success).AlreadyApplied, Is.False)
+            Assert.That((transfer () |> success).AlreadyApplied, Is.True)
+            let _, afterTask, afterAttempt = ReviewWorkflow.getTask second "admin-transfer" |> success
+            Assert.That(afterTask.AttemptId, Is.EqualTo(transferredAttemptId.ToString("N")))
+            Assert.That(afterAttempt.Value.OwnerAgentId, Is.EqualTo("NewOwner"))
+            Assert.That(afterAttempt.Value.AssignmentGeneration, Is.EqualTo(1))
+            Assert.That(afterAttempt.Value.Phase, Is.EqualTo("Queued"))
+            Assert.That(afterAttempt.Value.ActiveReviewRequestId, Is.Null)
+            Assert.That(afterAttempt.Value.SpecBlobOid, Is.EqualTo(oldAttempt.SpecBlobOid))
+            Assert.That(afterAttempt.Value.SourceRef, Is.Null)
+            Assert.That(afterAttempt.Value.BaseCommit, Is.Null)
+            Assert.That((ReviewWorkflow.getAgentInbox first "Owner" |> success).Agent.State,
+                        Is.EqualTo("Completed"))
+            let newOwner = ReviewWorkflow.getAgentInbox second "NewOwner" |> success
+            Assert.That(newOwner.Agent.State, Is.EqualTo("Assigned"))
+            Assert.That(newOwner.Agent.FocusAttemptId, Is.EqualTo(transferredAttemptId.ToString("N")))
+            let _, withdrawn, oldRevision = ReviewWorkflow.getReview first "admin-transfer" requestId |> success
+            Assert.That(withdrawn.Status, Is.EqualTo("Withdrawn"))
+            Assert.That(oldRevision.HeadCommit, Is.EqualTo(head))
+            let _, history = ReviewWorkflow.getTaskLifecycleHistory first "admin-transfer" |> success
+            Assert.That(history.Head.Action, Is.EqualTo("TransferOwner"))
+            Assert.That(history.Head.PreviousOwnerId, Is.EqualTo("Owner"))
+            Assert.That(history.Head.NewOwnerId, Is.EqualTo("NewOwner"))
+            expectStale (ReviewWorkflow.transferAttemptOwner second (Guid.NewGuid()) "admin-transfer"
+                             (Guid.NewGuid()) "Owner" "Reviewer" task.Version oldAttempt.Version
+                             previousOwner.Version 1 "Stale transfer")
+            expectStale (ReviewWorkflow.beginAttempt first (Guid.NewGuid()) "admin-transfer"
+                             "Owner" oldAttempt.Version 1))
+
+    [<Test>]
+    member _.CancellingPriorTaskDoesNotPreemptNewerWorkingAssignmentOrEraseLateFeedback() =
+        withFixture (fun _ _ first second _ sourceRef newCommit initTask ->
+            let oldTask = "late-feedback"
+            initTask oldTask
+            let head = newCommit "Review returned late" "needs changes"
+            let id = Guid.NewGuid()
+            ReviewWorkflow.submitReview first (Guid.NewGuid()) oldTask "Owner" 3 1
+                id sourceRef head "Needs review" |> success |> ignore
+            ReviewWorkflow.claimReview second (Guid.NewGuid()) oldTask id "Reviewer"
+                1 1 |> success |> ignore
+            ReviewWorkflow.decide second (Guid.NewGuid()) oldTask id "Reviewer"
+                2 RequestChanges "Please amend acceptance notes" |> success |> ignore
+            let inbox = ReviewWorkflow.getAgentInbox first "Owner" |> success
+            let notice = inbox.UnacknowledgedFeedback.Head
+            Assert.That(notice.Acknowledged, Is.False)
+            let _, _, beforeFinish = ReviewWorkflow.getTask first oldTask |> success
+            ReviewWorkflow.completeAgentWork first (Guid.NewGuid()) oldTask "Owner"
+                beforeFinish.Value.Version inbox.Agent.Version 1 "Completed current slice"
+            |> success |> ignore
+            ReviewWorkflow.createTask second (Guid.NewGuid()) "new-work" "A newer assignment"
+            |> success |> ignore
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) "new-work" (Guid.NewGuid())
+                "Owner" "Reviewer" |> success |> ignore
+            ReviewWorkflow.beginAttempt second (Guid.NewGuid()) "new-work" "Owner" 1 1
+            |> success |> ignore
+            let newer = ReviewWorkflow.getAgentInbox second "Owner" |> success
+            Assert.That(newer.Agent.State, Is.EqualTo("Working"))
+            let newFocused = newer.Agent.FocusAttemptId
+            let _, oldState, oldAttempt = ReviewWorkflow.getTask first oldTask |> success
+            Assert.That(oldAttempt.Value.Phase, Is.EqualTo("Queued"))
+            ReviewWorkflow.changeAttemptAdministration first (Guid.NewGuid()) oldTask "CancelTask"
+                oldState.Version oldAttempt.Value.Version newer.Agent.Version
+                oldAttempt.Value.AssignmentGeneration "Cancelled older task without preempting newer work"
+            |> success |> ignore
+            let after = ReviewWorkflow.getAgentInbox second "Owner" |> success
+            Assert.That(after.Agent.State, Is.EqualTo("Working"))
+            Assert.That(after.Agent.FocusAttemptId, Is.EqualTo(newFocused))
+            Assert.That(after.Agent.ActiveAttemptId, Is.EqualTo(newFocused))
+            Assert.That(after.UnacknowledgedFeedback.Length, Is.EqualTo(1))
+            Assert.That(after.UnacknowledgedFeedback.Head.DecisionSequence, Is.EqualTo(notice.DecisionSequence))
+            ReviewWorkflow.acknowledgeReviewFeedback second (Guid.NewGuid()) oldTask "Owner"
+                notice.DecisionSequence |> success |> ignore
+            let acknowledged = ReviewWorkflow.getAgentInbox first "Owner" |> success
+            Assert.That(acknowledged.UnacknowledgedFeedback.Length, Is.EqualTo(0))
+            Assert.That(acknowledged.Agent.State, Is.EqualTo("Working"))
+            Assert.That(acknowledged.Agent.ActiveAttemptId, Is.EqualTo(newFocused)))
+
+    [<Test>]
+    member _.NonSourceClosureCannotBypassExistingSourceBinding() =
+        withFixture (fun _ _ first second _ _ _ initTask ->
+            let taskId = "source-must-integrate"
+            initTask taskId
+            ReviewWorkflow.completeAgentWork first (Guid.NewGuid()) taskId "Owner"
+                3 3 1 "Source implementation finished" |> success |> ignore
+            let _, task, maybe = ReviewWorkflow.getTask second taskId |> success
+            Assert.That(maybe.Value.Phase, Is.EqualTo("Finished"))
+            Assert.That(maybe.Value.BaseCommit, Is.Not.Null)
+            match ReviewWorkflow.closeNonSourceTask second (Guid.NewGuid()) taskId "Reviewer"
+                    task.Version maybe.Value.Version "Approved source work" "Reviewed source code" with
+            | Error(StaleEntityVersion _) -> ()
+            | other -> Assert.Fail(sprintf "Source task must not take non-source close shortcut: %A" other)
+            let _, unchanged, _ = ReviewWorkflow.getTask first taskId |> success
+            Assert.That(unchanged.Lifecycle, Is.EqualTo("InProgress")))
+
+    [<Test>]
+    member _.IndependentNonSourceClosureIsNotIntegrationAndCanReopen() =
+        withFixture (fun _ _ first second _ _ _ _ ->
+            let taskId = "admin-doc"
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Non-source task"
+            |> success |> ignore
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner" "Reviewer"
+            |> success |> ignore
+            ReviewWorkflow.beginAttempt first (Guid.NewGuid()) taskId "Owner" 1 1
+            |> success |> ignore
+            ReviewWorkflow.completeAgentWork first (Guid.NewGuid()) taskId "Owner" 2 3 1
+                "Completed the documentation deliverable" |> success |> ignore
+            let _, task, finishedOption = ReviewWorkflow.getTask second taskId |> success
+            let finished = finishedOption.Value
+            Assert.That(finished.Phase, Is.EqualTo("Finished"))
+            match ReviewWorkflow.closeNonSourceTask second (Guid.NewGuid()) taskId "Owner"
+                    task.Version finished.Version "Document approved" "Validated manual" with
+            | Error(StaleEntityVersion _) -> ()
+            | other -> Assert.Fail(sprintf "Implementation owner self-approval must fail: %A" other)
+            match ReviewWorkflow.closeNonSourceTask second (Guid.NewGuid()) taskId "Reviewer"
+                    task.Version finished.Version "" "" with
+            | Error(InvalidBinding _) -> ()
+            | other -> Assert.Fail(sprintf "Empty evidence must fail: %A" other)
+            ReviewWorkflow.closeNonSourceTask first (Guid.NewGuid()) taskId "Reviewer"
+                task.Version finished.Version "Documentation matches acceptance criteria"
+                "Reviewed published content against agreed checklist" |> success |> ignore
+            let _, closed, preserved = ReviewWorkflow.getTask second taskId |> success
+            Assert.That(closed.Lifecycle, Is.EqualTo("Closed"))
+            Assert.That(preserved.Value.IntegrationActionId, Is.Null)
+            Assert.That(preserved.Value.AcceptedReviewRequestId, Is.Null)
+            Assert.That(preserved.Value.Phase, Is.EqualTo("Finished"))
+            let _, history = ReviewWorkflow.getTaskLifecycleHistory second taskId |> success
+            Assert.That(history.Head.Action, Is.EqualTo("CloseNonSourceTask"))
+            Assert.That(history.Head.ActorId, Is.EqualTo("Reviewer"))
+            Assert.That(history.Head.Evidence, Does.Contain("Reviewed published content"))
+            let _, approval =
+                ReviewWorkflow.getNonSourceClosureApproval second taskId history.Head.Sequence |> success
+            Assert.That(approval.NoSourceIntegration, Is.True)
+            Assert.That(approval.SpecBlobOid, Is.EqualTo(finished.SpecBlobOid))
+            Assert.That(approval.ApproverId, Is.EqualTo("Reviewer"))
+            Assert.That(approval.Evidence, Does.Contain("Reviewed published content"))
+            ReviewWorkflow.reopenTask first (Guid.NewGuid()) taskId closed.Version
+                "Updated requirements require a new attempt" |> success |> ignore
+            let _, reopened, archived = ReviewWorkflow.getTask second taskId |> success
+            Assert.That(reopened.Lifecycle, Is.EqualTo("Open"))
+            Assert.That(archived.IsNone, Is.True)
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid())
+                "Owner" "Reviewer" |> success |> ignore
+            let _, taskAgain, newAttempt = ReviewWorkflow.getTask second taskId |> success
+            Assert.That(taskAgain.Lifecycle, Is.EqualTo("InProgress"))
+            Assert.That(newAttempt.Value.AttemptId, Is.Not.EqualTo(finished.AttemptId)))
+
+    [<Test>]
     member _.SourceBindingSurvivesWorktreeRemovalAndBranchRecreationWithoutFreeingOwner() =
         withFixture (fun one _ first second baseOid targetRef _ _ ->
             let taskId = "960"
@@ -777,7 +1124,7 @@ type ReviewWorkflowTests() =
                       Title = ""
                       Html = ""
                       ExpectedVersion = 0
-                      ExpectedAgentVersion = 0
+                      ExpectedAgentVersion = 0; ExpectedTaskVersion = 0
                       AssignmentGeneration = 0
                       Summary = ""
                       NextAction = ""
@@ -983,6 +1330,26 @@ type ReviewWorkflowTests() =
                 Assert.That(parked.Focused.IsNone, Is.True)
                 Assert.That(parked.PendingReviews.Length, Is.EqualTo(1))
                 Assert.That(after.PendingReviews.Length, Is.EqualTo(1))
+                // Additional typed V2 administrative API flow is independent
+                // of source publication and the agent's previous work.
+                let adminTask = "admin-api"
+                run { template "CreateTask" adminTask with Title = "Administrative API task";
+                                                             Html = "<h1>Administrative API task</h1>" } |> ignore
+                run { template "CancelOpenTask" adminTask with
+                          ExpectedTaskVersion = 1; Reason = "Explicit cancellation" } |> ignore
+                let adminHistory : Common.V2TaskReadCommand =
+                    { ProjectName = "owner"; Action = "LifecycleHistory"; TaskId = adminTask
+                      AgentId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L }
+                match Client.V2ReviewApi.V2TaskApi.read adminHistory ctx with
+                | Ok value ->
+                    let _, events = unbox<string * TaskLifecycleEvent list> value
+                    Assert.That(events.Length, Is.EqualTo(1))
+                    Assert.That(events.Head.Action, Is.EqualTo("CancelTask"))
+                | Error error -> Assert.Fail(sprintf "Typed V2 lifecycle history failed: %A" error)
+                run { template "ReopenTask" adminTask with
+                          ExpectedTaskVersion = 2; Reason = "Explicit reopening" } |> ignore
+                let _, reopened, _ = ReviewWorkflow.getTask first adminTask |> success
+                Assert.That(reopened.Lifecycle, Is.EqualTo("Open"))
                 Assert.That(after.PendingReviews.Head.RequestId, Is.EqualTo(requestId.ToString("N")))
                 Assert.That((Client.V2ReviewApi.V2PendingIntentJournal.listAtRoot one |> success).Length,
                             Is.EqualTo(0), "Verified V2 mutations must clear pending local intents.")

@@ -163,6 +163,40 @@ type ReviewClaimEvent =
       SpecBlobOid: string }
 
 [<CLIMutable>]
+type TaskLifecycleEvent =
+    { TaskId: string
+      AttemptId: string
+      OperationId: string
+      Sequence: int64
+      Action: string
+      ActorId: string
+      Reason: string
+      PreviousLifecycle: string
+      NewLifecycle: string
+      PreviousPhase: string
+      NewPhase: string
+      PreviousOwnerId: string
+      NewOwnerId: string
+      PreviousGeneration: int
+      NewGeneration: int
+      ReviewRequestId: string
+      ReviewDisposition: string
+      Evidence: string }
+
+[<CLIMutable>]
+type NonSourceClosureApproval =
+    { TaskId: string
+      AttemptId: string
+      OperationId: string
+      Sequence: int64
+      ApproverId: string
+      OwnerAgentId: string
+      SpecBlobOid: string
+      Criteria: string
+      Evidence: string
+      NoSourceIntegration: bool }
+
+[<CLIMutable>]
 type ReviewDecisionEvidence =
     { RequestId: string
       Revision: int
@@ -315,8 +349,12 @@ module ReviewWorkflow =
                     | "ReviewDecisionEvidence" -> status "status" [ "Accepted"; "ChangesRequested" ]
                     | "ReviewClaimEvent" ->
                         status "action" [ "Claim"; "Release"; "Reassign"; "Withdraw"; "Decision" ]
+                    | "TaskLifecycleEvent" ->
+                        status "action" [ "ParkAttempt"; "BlockAttempt"; "ResumeAttempt"; "CancelTask"
+                                          "AbandonAttempt"; "TransferOwner"; "CloseNonSourceTask"; "ReopenTask" ]
+                    | "NonSourceClosureApproval" -> true
                     | "AssignmentIssue" ->
-                        status "reason" [ "Assignment"; "ReviewChanges"; "CompletionRequeue"; "Recovery"; "ExplicitReissue" ]
+                        status "reason" [ "Assignment"; "ReviewChanges"; "CompletionRequeue"; "Recovery"; "ExplicitReissue"; "AdministrativeResume"; "OwnershipTransfer" ]
                     | "AssignmentReceipt" -> true
                     | _ -> true
                 if not unique then Error "Duplicate entity JSON member."
@@ -342,6 +380,10 @@ module ReviewWorkflow =
         $"tasks/{taskId}/reviews/{requestId}/decisions/{sequence}.json"
     let private reviewEventPath taskId requestId sequence =
         $"tasks/{taskId}/reviews/{requestId}/events/{sequence}.json"
+    let private lifecycleEventPath taskId sequence =
+        $"tasks/{taskId}/lifecycle/{sequence}.json"
+    let private nonSourceApprovalPath taskId sequence =
+        $"tasks/{taskId}/approvals/non-source/{sequence}.json"
     let private orphanReservationPath taskId requestId revision =
         $"tasks/{taskId}/orphan-cleanups/{requestId}/r{revision}.json"
     let private integrationPath taskId actionId = $"tasks/{taskId}/integrations/{actionId}.json"
@@ -2190,6 +2232,359 @@ module ReviewWorkflow =
                         return snapshot, task, Some attempt, html, specOid
             }
 
+    // Administrative task lifecycle is distinct from agent Parked and reviewer
+    // state. No inactivity timer or stale frontend may implicitly invoke it.
+    let private adminEvent (task: ReviewTask) (attempt: ReviewAttempt option)
+                           (operationId: Guid) sequence action reason nextLifecycle nextPhase nextOwner reviewId reviewDisposition evidence =
+        { TaskId = task.TaskId
+          AttemptId = attempt |> Option.map (fun a -> a.AttemptId) |> Option.defaultValue null
+          OperationId = operationId.ToString("D")
+          Sequence = sequence; Action = action; ActorId = "Orchestrator"; Reason = reason
+          PreviousLifecycle = task.Lifecycle; NewLifecycle = nextLifecycle
+          PreviousPhase = attempt |> Option.map (fun a -> a.Phase) |> Option.defaultValue null
+          NewPhase = nextPhase
+          PreviousOwnerId = attempt |> Option.map (fun a -> a.OwnerAgentId) |> Option.defaultValue null
+          NewOwnerId = nextOwner
+          PreviousGeneration = attempt |> Option.map (fun a -> a.AssignmentGeneration) |> Option.defaultValue 0
+          NewGeneration = attempt |> Option.map (fun a -> a.AssignmentGeneration) |> Option.defaultValue 0
+          ReviewRequestId = reviewId; ReviewDisposition = reviewDisposition; Evidence = evidence }
+
+    // Settle an active unclaimed or frozen claimed review in the SAME ledger
+    // commit as any administrative cancellation/abandonment/transfer. Keep
+    // immutable revision and claim histories, including evidence for reviewer
+    // withdrawal without inventing an acceptance or test result.
+    let private settleAdministrativeReview binding snapshot taskId (attempt: ReviewAttempt) reason operationId =
+        result {
+            if String.IsNullOrWhiteSpace attempt.ActiveReviewRequestId then
+                return [], null, "None"
+            else
+                let reviewId = attempt.ActiveReviewRequestId
+                let! review, reviewOid = required<ReviewRequest> binding snapshot (requestPath taskId reviewId)
+                if review.AttemptId <> attempt.AttemptId
+                   || review.OwnerAgentId <> attempt.OwnerAgentId
+                   || not (List.contains review.Status [ "Unclaimed"; "Claimed" ]) then
+                    return! Error(LedgerIntegrityError "Active review does not match the task attempt.")
+                let! revision, _ = required<ReviewRevision> binding snapshot
+                                        (revisionPath taskId reviewId review.CurrentRevision)
+                let closed = { review with Version = review.Version + 1; Status = "Withdrawn";
+                                          DecisionSequence = snapshot.Header.NextSequence; Feedback = reason }
+                let audit = claimEvent taskId review revision snapshot.Header.NextSequence
+                                operationId "Withdraw" "Orchestrator" review.ClaimantId null reason
+                return [ change (requestPath taskId reviewId) (Some reviewOid) closed
+                         change (reviewEventPath taskId reviewId snapshot.Header.NextSequence) None audit ],
+                       reviewId, "Withdrawn"
+        }
+
+    // Only clear a focus that still belongs to this attempt. Never interrupt
+    // an owner's newer assignment, or turn agent Parked into an attempt phase.
+    let private clearAdministrativeFocus binding snapshot (attempt: ReviewAttempt) expectedAgentVersion reason =
+        result {
+            let! agent, agentOid = required<ReviewAgent> binding snapshot (agentPath attempt.OwnerAgentId)
+            if agent.Version <> expectedAgentVersion then
+                return! Error(StaleEntityVersion "Agent version changed before lifecycle operation.")
+            if agent.FocusAttemptId <> attempt.AttemptId then
+                if agent.ActiveAttemptId = attempt.AttemptId then
+                    return! Error(LedgerIntegrityError "Agent has active slot without matching focus.")
+                if attempt.Phase = "Working" then
+                    return! Error(LedgerIntegrityError "Working attempt has no matching agent slot.")
+                return []
+            else
+                if not (String.IsNullOrWhiteSpace agent.ActiveAttemptId)
+                   && agent.ActiveAttemptId <> attempt.AttemptId then
+                    return! Error(AgentBusy "Agent is Working on an unrelated attempt.")
+                if attempt.Phase = "Working"
+                   && (agent.State <> "Working" || agent.ActiveAttemptId <> attempt.AttemptId) then
+                    return! Error(LedgerIntegrityError "Working attempt and agent slot disagree.")
+                if agent.State = "Working"
+                   && (agent.ActiveAttemptId <> attempt.AttemptId || attempt.Phase <> "Working") then
+                    return! Error(LedgerIntegrityError "Agent Working slot disagrees with attempt phase/focus.")
+                if attempt.Phase <> "Working" && not (String.IsNullOrWhiteSpace agent.ActiveAttemptId) then
+                    return! Error(LedgerIntegrityError "Nonworking attempt unexpectedly holds an active slot.")
+                return [ change (agentPath attempt.OwnerAgentId) (Some agentOid)
+                             { agent with Version = agent.Version + 1
+                                          State = "Completed"; FocusAttemptId = null
+                                          ActiveAttemptId = null; StateReason = reason
+                                          StateSequence = snapshot.Header.NextSequence } ]
+        }
+
+    let changeAttemptAdministration binding operationId taskId action expectedTaskVersion expectedAttemptVersion
+                                    expectedAgentVersion generation reason =
+        if not (validTaskId taskId) || expectedTaskVersion < 1 || expectedAttemptVersion < 1
+           || expectedAgentVersion < 1 || generation < 1 || not (validText 2048 reason)
+           || not (List.contains action [ "ParkAttempt"; "BlockAttempt"; "ResumeAttempt"; "AbandonAttempt"; "CancelTask" ]) then
+            Error(InvalidBinding "Invalid administrative task/attempt transition.")
+        else
+            LedgerStore.transact binding
+                (intent operationId "Orchestrator" action
+                    {| taskId = taskId; expectedTaskVersion = expectedTaskVersion
+                       expectedAttemptVersion = expectedAttemptVersion
+                       expectedAgentVersion = expectedAgentVersion
+                       generation = generation; reason = reason |})
+                (fun snapshot -> result {
+                    let! task, taskOid, attempt, attemptOid = getAttempt binding snapshot taskId
+                    if task.Version <> expectedTaskVersion || task.Lifecycle <> "InProgress"
+                       || attempt.Version <> expectedAttemptVersion
+                       || attempt.AssignmentGeneration <> generation then
+                        return! Error(StaleEntityVersion "Administrative transition targets a stale task, attempt or generation.")
+                    let allowed =
+                        if action = "ResumeAttempt" then List.contains attempt.Phase [ "Parked"; "Blocked" ]
+                        else List.contains attempt.Phase [ "Queued"; "Acknowledged"; "Working"; "Paused"; "Parked"; "Blocked"; "Finished" ]
+                    if not allowed || (action = "ParkAttempt" || action = "BlockAttempt")
+                                      && not (List.contains attempt.Phase [ "Queued"; "Acknowledged"; "Working"; "Paused" ]) then
+                        return! Error(StaleEntityVersion "Attempt is not in an administratively actionable phase.")
+                    let! agent, agentOid =
+                        required<ReviewAgent> binding snapshot (agentPath attempt.OwnerAgentId)
+                    if agent.Version <> expectedAgentVersion then
+                        return! Error(StaleEntityVersion "Agent version differs from administrative precondition.")
+                    let resume = action = "ResumeAttempt"
+                    let terminal = action = "CancelTask" || action = "AbandonAttempt"
+                    let! focusChanges =
+                        if resume then
+                            if agent.ActiveAttemptId = attempt.AttemptId
+                               || agent.FocusAttemptId = attempt.AttemptId then
+                                Error(LedgerIntegrityError "Parked/Blocked attempt unexpectedly occupies agent focus or slot.")
+                            else Ok []
+                        else clearAdministrativeFocus binding snapshot attempt expectedAgentVersion reason
+                    let! reviewChanges, reviewId, disposition =
+                        if terminal then settleAdministrativeReview binding snapshot taskId attempt reason operationId
+                        else Ok ([], null, "Unchanged")
+                    let nextPhase =
+                        match action with
+                        | "ParkAttempt" -> "Parked" | "BlockAttempt" -> "Blocked"
+                        | "ResumeAttempt" -> "Queued" | _ -> "Abandoned"
+                    let nextLifecycle =
+                        match action with
+                        | "CancelTask" -> "Cancelled"
+                        | "AbandonAttempt" -> "Open"
+                        | _ -> "InProgress"
+                    let nextGen = if resume then generation + 1 else generation
+                    let nextAttempt =
+                        { attempt with Version = attempt.Version + 1; Phase = nextPhase
+                                       AssignmentGeneration = nextGen
+                                       IssuedSequence = if resume then snapshot.Header.NextSequence else attempt.IssuedSequence
+                                       ActiveReviewRequestId = if terminal then null else attempt.ActiveReviewRequestId }
+                    let audit =
+                        { adminEvent task (Some attempt) operationId snapshot.Header.NextSequence
+                              action reason nextLifecycle nextPhase attempt.OwnerAgentId reviewId disposition null
+                          with NewGeneration = nextGen }
+                    let taskUpdates =
+                        if terminal then
+                            [ change (taskPath taskId) (Some taskOid)
+                                { task with Version = task.Version + 1; Lifecycle = nextLifecycle
+                                            AttemptId = if action = "AbandonAttempt" then null else task.AttemptId } ]
+                        else []
+                    return taskUpdates
+                           @ [ change (attemptPath taskId attempt.AttemptId) (Some attemptOid) nextAttempt
+                               change (lifecycleEventPath taskId snapshot.Header.NextSequence) None audit ]
+                           @ focusChanges @ reviewChanges
+                           @ (if resume then
+                                  [ change (issuePath taskId attempt.AttemptId nextGen) None
+                                      (issue taskId nextAttempt nextGen "Orchestrator" "AdministrativeResume"
+                                          ("Resume administratively parked or blocked attempt: " + reason)
+                                          snapshot.Header.NextSequence) ]
+                              else [])
+                })
+
+    // Open tasks have no attempt/agent to revoke. Cancellation remains a
+    // distinct, audited no-source outcome, not a fabricated integration.
+    let cancelOpenTask binding operationId taskId expectedTaskVersion reason =
+        if not (validTaskId taskId) || expectedTaskVersion < 1 || not (validText 2048 reason) then
+            Error(InvalidBinding "Open-task cancellation requires exact task version and reason.")
+        else
+            LedgerStore.transact binding
+                (intent operationId "Orchestrator" "CancelTask"
+                    {| taskId = taskId; expectedTaskVersion = expectedTaskVersion; reason = reason |})
+                (fun snapshot -> result {
+                    let! task, oid = required<ReviewTask> binding snapshot (taskPath taskId)
+                    if task.Version <> expectedTaskVersion || task.Lifecycle <> "Open"
+                       || not (String.IsNullOrWhiteSpace task.AttemptId) then
+                        return! Error(StaleEntityVersion "Only an unassigned Open task can use open-task cancellation.")
+                    return [ change (taskPath taskId) (Some oid)
+                                 { task with Version = task.Version + 1; Lifecycle = "Cancelled" }
+                             change (lifecycleEventPath taskId snapshot.Header.NextSequence) None
+                                 (adminEvent task None operationId snapshot.Header.NextSequence
+                                     "CancelTask" reason "Cancelled" null null null "None" null) ]
+                })
+
+    let transferAttemptOwner binding operationId taskId newAttemptId newOwner reviewer
+                             expectedTaskVersion expectedAttemptVersion expectedAgentVersion
+                             generation reason =
+        if not (validTaskId taskId) || newAttemptId = Guid.Empty
+           || not (validAgent newOwner) || not (validAgent reviewer) || newOwner = reviewer
+           || expectedTaskVersion < 1 || expectedAttemptVersion < 1 || expectedAgentVersion < 1
+           || generation < 1 || not (validText 2048 reason) then
+            Error(InvalidBinding "Owner transfer requires distinct registered owner/reviewer, new attempt and exact versions.")
+        else
+            let newId = newAttemptId.ToString("N")
+            LedgerStore.transact binding
+                (intent operationId "Orchestrator" "TransferOwner"
+                    {| taskId = taskId; newAttemptId = newAttemptId; newOwner = newOwner
+                       reviewer = reviewer; expectedTaskVersion = expectedTaskVersion
+                       expectedAttemptVersion = expectedAttemptVersion; expectedAgentVersion = expectedAgentVersion
+                       generation = generation; reason = reason |})
+                (fun snapshot -> result {
+                    let! task, taskOid, attempt, attemptOid = getAttempt binding snapshot taskId
+                    if task.Lifecycle <> "InProgress" || task.Version <> expectedTaskVersion
+                       || attempt.Version <> expectedAttemptVersion
+                       || attempt.AssignmentGeneration <> generation
+                       || attempt.OwnerAgentId = newOwner
+                       || not (Set.contains attempt.Phase (Set.ofList
+                              [ "Queued"; "Acknowledged"; "Working"; "Paused"; "Parked"; "Blocked"; "Finished" ])) then
+                        return! Error(StaleEntityVersion "Owner transfer requires the current revocable attempt and versions.")
+                    if not (String.IsNullOrWhiteSpace attempt.IntegrationActionId)
+                       || not (String.IsNullOrWhiteSpace attempt.AcceptedReviewRequestId) then
+                        return! Error(ReviewVersionConflict "Already accepted/integrating work must be explicitly resolved before transfer.")
+                    let! successor = read<ReviewAttempt> binding snapshot (attemptPath taskId newId)
+                    if successor.IsSome then
+                        return! Error(StaleEntityVersion "Transfer attempt ID is not unique.")
+                    let! nextOwnerAgent, nextOwnerOid = required<ReviewAgent> binding snapshot (agentPath newOwner)
+                    let! _ = required<ReviewAgent> binding snapshot (agentPath reviewer)
+                    if not (List.contains nextOwnerAgent.State [ "Completed"; "Parked" ])
+                       || not (String.IsNullOrWhiteSpace nextOwnerAgent.ActiveAttemptId) then
+                        return! Error(AgentBusy "New owner is not idle.")
+                    let! previousAgentChanges =
+                        clearAdministrativeFocus binding snapshot attempt expectedAgentVersion reason
+                    let! reviewChanges, reviewId, disposition =
+                        settleAdministrativeReview binding snapshot taskId attempt reason operationId
+                    let next =
+                        { attempt with AttemptId = newId; Version = 1
+                                       OwnerAgentId = newOwner; ReviewerId = reviewer; Phase = "Queued"
+                                       AssignmentGeneration = 1; IssuedSequence = snapshot.Header.NextSequence
+                                       BaseCommit = null; TargetRef = null; SourceRepositoryId = null
+                                       SourceRemote = null; SourcePushRemote = null; SourceRef = null
+                                       ActiveReviewRequestId = null; LatestReviewRequestId = null
+                                       AcceptedReviewRequestId = null; AcceptedReviewRevision = 0
+                                       AcceptedHead = null; IntegrationActionId = null
+                                       ReviewFeedback = null; FeedbackSequence = 0L
+                                       AcknowledgedFeedbackSequence = 0L }
+                    let audit =
+                        { adminEvent task (Some attempt) operationId snapshot.Header.NextSequence
+                              "TransferOwner" reason "InProgress" "Queued" newOwner reviewId disposition null
+                          with NewGeneration = 1 }
+                    return [ change (taskPath taskId) (Some taskOid)
+                                 { task with Version = task.Version + 1; AttemptId = newId }
+                             change (attemptPath taskId attempt.AttemptId) (Some attemptOid)
+                                 { attempt with Version = attempt.Version + 1; Phase = "Superseded"
+                                                ActiveReviewRequestId = null }
+                             change (attemptPath taskId newId) None next
+                             change (issuePath taskId newId 1) None
+                                 (issue taskId next 1 "Orchestrator" "OwnershipTransfer"
+                                     ("Transfer from " + attempt.OwnerAgentId + ": " + reason)
+                                     snapshot.Header.NextSequence)
+                             change (agentPath newOwner) (Some nextOwnerOid)
+                                 { nextOwnerAgent with Version = nextOwnerAgent.Version + 1
+                                                       State = "Assigned"; FocusAttemptId = newId
+                                                       ActiveAttemptId = null; StateReason = reason
+                                                       StateSequence = snapshot.Header.NextSequence }
+                             change (lifecycleEventPath taskId snapshot.Header.NextSequence) None audit ]
+                           @ previousAgentChanges @ reviewChanges
+                })
+
+    // Independent non-source closure: no source merge/integration is asserted.
+    // A registered reviewer other than the implementation owner must explicitly
+    // approve acceptance criteria and observed evidence after owner finishes.
+    let closeNonSourceTask binding operationId taskId approver expectedTaskVersion expectedAttemptVersion
+                           criteria evidence =
+        if not (validTaskId taskId) || not (validAgent approver)
+           || expectedTaskVersion < 1 || expectedAttemptVersion < 1
+           || not (validText 2048 criteria) || not (validText 8192 evidence) then
+            Error(InvalidBinding "Non-source closure requires independent approver and substantive criteria/evidence.")
+        else
+            LedgerStore.transact binding
+                (intent operationId approver "CloseNonSourceTask"
+                    {| taskId = taskId; approver = approver; expectedTaskVersion = expectedTaskVersion
+                       expectedAttemptVersion = expectedAttemptVersion; criteria = criteria; evidence = evidence |})
+                (fun snapshot -> result {
+                    let! task, oid, attempt, _ = getAttempt binding snapshot taskId
+                    let! _ = required<ReviewAgent> binding snapshot (agentPath approver)
+                    if task.Version <> expectedTaskVersion || task.Lifecycle <> "InProgress"
+                       || attempt.Version <> expectedAttemptVersion || attempt.Phase <> "Finished"
+                       || attempt.OwnerAgentId = approver
+                       || not (String.IsNullOrWhiteSpace attempt.ActiveReviewRequestId)
+                       || not (String.IsNullOrWhiteSpace attempt.LatestReviewRequestId)
+                       || not (String.IsNullOrWhiteSpace attempt.AcceptedReviewRequestId)
+                       || not (String.IsNullOrWhiteSpace attempt.IntegrationActionId)
+                       || not (String.IsNullOrWhiteSpace attempt.BaseCommit)
+                       || not (String.IsNullOrWhiteSpace attempt.SourceRef) then
+                        return! Error(StaleEntityVersion "Non-source closure requires finished, independently approved work with no unresolved source review.")
+                    let approval = { TaskId = taskId; AttemptId = attempt.AttemptId
+                                     OperationId = operationId.ToString("D")
+                                     Sequence = snapshot.Header.NextSequence
+                                     ApproverId = approver; OwnerAgentId = attempt.OwnerAgentId
+                                     SpecBlobOid = attempt.SpecBlobOid; Criteria = criteria
+                                     Evidence = evidence; NoSourceIntegration = true }
+                    return [ change (taskPath taskId) (Some oid)
+                                 { task with Version = task.Version + 1; Lifecycle = "Closed" }
+                             change (nonSourceApprovalPath taskId snapshot.Header.NextSequence) None approval
+                             change (lifecycleEventPath taskId snapshot.Header.NextSequence) None
+                                 { adminEvent task (Some attempt) operationId snapshot.Header.NextSequence
+                                       "CloseNonSourceTask" criteria "Closed" "Finished" attempt.OwnerAgentId
+                                       null "None" evidence with ActorId = approver } ]
+                })
+
+    // Reopening never resurrects an old generation. The old attempt and
+    // review/integration evidence stay addressable by immutable paths.
+    let reopenTask binding operationId taskId expectedTaskVersion reason =
+        if not (validTaskId taskId) || expectedTaskVersion < 1
+           || not (validText 2048 reason) then
+            Error(InvalidBinding "Reopen requires terminal task version and explanation.")
+        else
+            LedgerStore.transact binding
+                (intent operationId "Orchestrator" "ReopenTask"
+                    {| taskId = taskId; expectedTaskVersion = expectedTaskVersion; reason = reason |})
+                (fun snapshot -> result {
+                    let! task, oid = required<ReviewTask> binding snapshot (taskPath taskId)
+                    if task.Version <> expectedTaskVersion
+                       || not (List.contains task.Lifecycle [ "Closed"; "Cancelled" ]) then
+                        return! Error(StaleEntityVersion "Only a Closed or Cancelled task can reopen.")
+                    let! oldAttempt =
+                        if String.IsNullOrWhiteSpace task.AttemptId then Ok None
+                        else read<ReviewAttempt> binding snapshot (attemptPath taskId task.AttemptId)
+                             |> Result.map (Option.map fst)
+                    match oldAttempt with
+                    | Some attempt when not (String.IsNullOrWhiteSpace attempt.ActiveReviewRequestId)
+                                        || List.contains attempt.Phase [ "Queued"; "Acknowledged"; "Working"; "Paused"; "Parked"; "Blocked" ] ->
+                        return! Error(LedgerIntegrityError "Cannot reopen with unresolved active work or review.")
+                    | _ -> ()
+                    return [ change (taskPath taskId) (Some oid)
+                                 { task with Version = task.Version + 1; Lifecycle = "Open"; AttemptId = null }
+                             change (lifecycleEventPath taskId snapshot.Header.NextSequence) None
+                                 (adminEvent task oldAttempt operationId snapshot.Header.NextSequence
+                                     "ReopenTask" reason "Open" null null null "None" null) ]
+                })
+
+    let getNonSourceClosureApproval binding taskId sequence =
+        if not (validTaskId taskId) || sequence < 1L then
+            Error(InvalidBinding "Non-source approval lookup requires exact task and sequence.")
+        else result {
+            let! snapshot = LedgerStore.fetch binding
+            let! approval, _ =
+                required<NonSourceClosureApproval> binding snapshot
+                    (nonSourceApprovalPath taskId sequence)
+            if approval.TaskId <> taskId || approval.Sequence <> sequence
+               || not approval.NoSourceIntegration then
+                return! Error(LedgerIntegrityError "Non-source approval record does not match its task/sequence.")
+            return snapshot.Commit, approval
+        }
+
+    let getTaskLifecycleHistory binding taskId =
+        if not (validTaskId taskId) then Error(InvalidBinding "Invalid lifecycle history task.")
+        else result {
+            let! snapshot = LedgerStore.fetch binding
+            let! _ = required<ReviewTask> binding snapshot (taskPath taskId)
+            let! paths = LedgerStore.listAt binding snapshot "tasks"
+            let events = paths |> List.filter (fun path ->
+                path.StartsWith($"tasks/{taskId}/lifecycle/", StringComparison.Ordinal)
+                && path.EndsWith(".json", StringComparison.Ordinal))
+            let mutable history = []
+            for path in events do
+                let! item, _ = required<TaskLifecycleEvent> binding snapshot path
+                if item.TaskId <> taskId || path <> lifecycleEventPath taskId item.Sequence then
+                    return! Error(LedgerIntegrityError "Invalid lifecycle event identity.")
+                history <- item :: history
+            return snapshot.Commit, history |> List.sortBy (fun item -> item.Sequence)
+        }
+
     let getTask binding taskId =
         if not (validTaskId taskId) then Error(InvalidBinding "Invalid task ID.")
         else
@@ -2341,6 +2736,8 @@ module ReviewWorkflow =
                         | "Working", Some entry ->
                             entry.Attempt.Phase = "Working"
                             && agent.ActiveAttemptId = entry.Attempt.AttemptId
+                        | "Completed", None ->
+                            active.IsNone && String.IsNullOrWhiteSpace agent.ActiveAttemptId
                         | "Completed", Some entry ->
                             (List.contains entry.Attempt.Phase [ "Finished"; "Accepted"; "Queued" ])
                             && active.IsNone

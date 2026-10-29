@@ -115,7 +115,7 @@ let v2TaskSetupAndInboxRefuseUnconfiguredCheckout () =
               Title = "Task"
               Html = "<h1>Task</h1>"
               ExpectedVersion = 0
-              ExpectedAgentVersion = 0
+              ExpectedAgentVersion = 0; ExpectedTaskVersion = 0
               AssignmentGeneration = 0
               Summary = ""
               NextAction = ""
@@ -145,7 +145,7 @@ let v2TaskMutationsRequireGitWritePermission () =
               OperationId = Guid.NewGuid().ToString("D"); TaskId = "100"
               AttemptId = ""; ActorId = "Orchestrator"; OwnerId = ""; ReviewerId = ""
               Title = "Task"; Html = "<h1>Task</h1>"; ExpectedVersion = 0
-              ExpectedAgentVersion = 0; AssignmentGeneration = 0;
+              ExpectedAgentVersion = 0; ExpectedTaskVersion = 0; AssignmentGeneration = 0;
               Summary = ""; NextAction = ""; Reason = ""; BaseOid = ""; TargetRef = ""
               SourceRef = ""; AllowDetached = false; AllowUncommitted = false
               DecisionSequence = 0L; Evidence = "" }

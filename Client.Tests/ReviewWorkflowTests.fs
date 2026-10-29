@@ -89,51 +89,62 @@ type ReviewWorkflowTests() =
             Directory.Delete(root, true)
 
     [<Test>]
-    member _.WorkingTurnsPersistAcrossClientsAndStopOnYieldCompletion() =
+    member _.AgentStateTimestampsAndImmutableWorkflowEventsSurviveAcrossClients() =
         withFixture (fun _ _ first second _ _ _ _ ->
             let taskId = "turn-timing"
             ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Timed task"
             |> success |> ignore
             ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner" "Reviewer"
             |> success |> ignore
-            let assigned = ReviewWorkflow.getAgentInbox first "Owner" |> success
+            let assigned = ReviewWorkflow.getAgentInbox second "Owner" |> success
             Assert.That(assigned.Agent.State, Is.EqualTo("Assigned"))
-            Assert.That(assigned.Agent.WorkingStartedAtUtc, Is.Null)
+            let assignedTime = DateTimeOffset.Parse assigned.Agent.StateEnteredAtUtc
+            Assert.That(assignedTime, Is.LessThanOrEqualTo(DateTimeOffset.UtcNow))
             ReviewWorkflow.beginAttempt first (Guid.NewGuid()) taskId "Owner" 1 1
             |> success |> ignore
             let working = ReviewWorkflow.getAgentInbox second "Owner" |> success
             Assert.That(working.Agent.State, Is.EqualTo("Working"))
-            Assert.That(working.Agent.WorkingTurnCount, Is.EqualTo(1))
-            let firstStart = DateTimeOffset.Parse working.Agent.WorkingStartedAtUtc
-            Assert.That(firstStart, Is.LessThanOrEqualTo(DateTimeOffset.UtcNow))
+            let startTime = DateTimeOffset.Parse working.Agent.StateEnteredAtUtc
+            Assert.That(startTime, Is.GreaterThanOrEqualTo(assignedTime))
+            let agentSnapshot = LedgerStore.fetch second |> success
+            let agentContent, _ = LedgerStore.readAt second agentSnapshot "agents/T3duZXI.json" |> success
+            use agentJson = System.Text.Json.JsonDocument.Parse(agentContent.Value)
+            for redundant in [ "lastTurnDurationSeconds"; "totalWorkingSeconds"; "workingTurnCount" ] do
+                let mutable ignored = Unchecked.defaultof<System.Text.Json.JsonElement>
+                Assert.That(agentJson.RootElement.TryGetProperty(redundant, &ignored), Is.False, redundant)
             ReviewWorkflow.checkpointAttempt first (Guid.NewGuid()) taskId "Owner" 2 3 1
                 "Mid-turn checkpoint" "Continue" null null
             |> success |> ignore
             let checkpointed = ReviewWorkflow.getAgentInbox second "Owner" |> success
-            Assert.That(checkpointed.Agent.WorkingStartedAtUtc,
-                        Is.EqualTo(working.Agent.WorkingStartedAtUtc))
-            Assert.That(checkpointed.Agent.WorkingTurnCount, Is.EqualTo(1))
-            ReviewWorkflow.yieldAgent first (Guid.NewGuid()) taskId "Owner" 3 3 1 "Done one unit" "Continue"
-            |> success |> ignore
+            Assert.That(checkpointed.Agent.StateEnteredAtUtc, Is.EqualTo(working.Agent.StateEnteredAtUtc))
+            let snapshot = LedgerStore.fetch second |> success
+            let eventPaths = LedgerStore.listAt second snapshot "tasks" |> success
+            let eventPaths = eventPaths |> List.filter (fun path ->
+                path.Contains("/checkpoints/") || path.Contains("/assignments/"))
+            Assert.That(eventPaths.Length, Is.GreaterThanOrEqualTo(2))
+            for path in eventPaths do
+                let content, _ = LedgerStore.readAt second snapshot path |> success
+                use doc = System.Text.Json.JsonDocument.Parse(content.Value)
+                let occurred = doc.RootElement.GetProperty("occurredAtUtc").GetString()
+                Assert.That(DateTimeOffset.Parse occurred, Is.LessThanOrEqualTo(DateTimeOffset.UtcNow))
+            ReviewWorkflow.yieldAgent first (Guid.NewGuid()) taskId "Owner" 3 3 1
+                "Done one unit" "Continue" |> success |> ignore
             let ready = ReviewWorkflow.getAgentInbox second "Owner" |> success
             Assert.That(ready.Agent.State, Is.EqualTo("Ready"))
-            Assert.That(ready.Agent.WorkingStartedAtUtc, Is.Null)
-            Assert.That(ready.Agent.WorkingTurnCount, Is.EqualTo(1))
-            Assert.That(ready.Agent.LastTurnEndedAtUtc, Is.Not.Null)
-            Assert.That(ready.Agent.TotalWorkingSeconds, Is.GreaterThanOrEqualTo(0L))
+            Assert.That(DateTimeOffset.Parse ready.Agent.StateEnteredAtUtc,
+                        Is.GreaterThanOrEqualTo(startTime))
             ReviewWorkflow.resumeAgent first (Guid.NewGuid()) taskId "Owner" 4 4 1
             |> success |> ignore
             let resumed = ReviewWorkflow.getAgentInbox second "Owner" |> success
             Assert.That(resumed.Agent.State, Is.EqualTo("Working"))
-            Assert.That(resumed.Agent.WorkingTurnCount, Is.EqualTo(2))
-            Assert.That(resumed.Agent.WorkingStartedAtUtc, Is.Not.Null)
+            Assert.That(DateTimeOffset.Parse resumed.Agent.StateEnteredAtUtc,
+                        Is.GreaterThanOrEqualTo(DateTimeOffset.Parse ready.Agent.StateEnteredAtUtc))
             ReviewWorkflow.completeAgentWork first (Guid.NewGuid()) taskId "Owner" 5 5 1 "Finished"
             |> success |> ignore
             let completed = ReviewWorkflow.getAgentInbox second "Owner" |> success
             Assert.That(completed.Agent.State, Is.EqualTo("Completed"))
-            Assert.That(completed.Agent.WorkingStartedAtUtc, Is.Null)
-            Assert.That(completed.Agent.WorkingTurnCount, Is.EqualTo(2))
-            Assert.That(completed.Agent.LastTurnEndedAtUtc, Is.Not.Null))
+            Assert.That(DateTimeOffset.Parse completed.Agent.StateEnteredAtUtc,
+                        Is.GreaterThanOrEqualTo(DateTimeOffset.Parse resumed.Agent.StateEnteredAtUtc)))
 
     [<Test>]
     member _.CanonicalHtmlAcceptsExact512KiBAndRejectsLargerOrActiveMarkup() =
@@ -1086,6 +1097,17 @@ type ReviewWorkflowTests() =
             | Error(ReviewAlreadyClaimed _) -> ()
             | other -> Assert.Fail(sprintf "Claim must freeze owner updates: %A" other)
             ReviewWorkflow.decide second (Guid.NewGuid()) "315" req "Reviewer" 3 Accept "Verified" |> success |> ignore
+            let reviewSnapshot = LedgerStore.fetch first |> success
+            let reviewPaths = LedgerStore.listAt first reviewSnapshot "tasks" |> success
+            let immutableReviewPaths = reviewPaths |> List.filter (fun path ->
+                path.Contains("/revisions/") || path.Contains("/events/")
+                || path.Contains("/decisions/"))
+            Assert.That(immutableReviewPaths.Length, Is.GreaterThanOrEqualTo(4))
+            for path in immutableReviewPaths do
+                let content, _ = LedgerStore.readAt first reviewSnapshot path |> success
+                use doc = System.Text.Json.JsonDocument.Parse(content.Value)
+                let occurred = doc.RootElement.GetProperty("occurredAtUtc").GetString()
+                Assert.That(DateTimeOffset.Parse occurred, Is.LessThanOrEqualTo(DateTimeOffset.UtcNow))
             let _, task, liveAttempt = ReviewWorkflow.getTask first "315" |> success
             let attempt = Option.get liveAttempt
             Assert.That(task.Lifecycle, Is.EqualTo("InProgress"))
@@ -2046,6 +2068,8 @@ type ReviewWorkflowTests() =
             Assert.That(pending.Integration.ApprovedHead, Is.EqualTo(approvedHead))
             Assert.That(pending.Integration.ExpectedTargetHead, Is.EqualTo(baseOid))
             Assert.That(pending.Integration.VerificationMethod, Is.Null)
+            Assert.That(DateTimeOffset.Parse pending.Integration.PlannedAtUtc,
+                        Is.LessThanOrEqualTo(DateTimeOffset.UtcNow))
             Assert.That(pending.RemoteState, Is.EqualTo("PendingPush"))
             Assert.That(pending.ObservedTargetHead, Is.EqualTo(baseOid))
             Assert.That(git one [ "ls-remote"; "origin"; sourceRef ], Does.StartWith(baseOid))

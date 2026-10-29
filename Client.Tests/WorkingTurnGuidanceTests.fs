@@ -11,9 +11,7 @@ let private agent state since =
     { AgentId = "Agent 1"; Version = 3; State = state
       FocusAttemptId = "attempt"; ActiveAttemptId = "attempt"
       StateReason = ""; StateSequence = 2L
-      WorkingStartedAtUtc = since; LastTurnEndedAtUtc = null
-      LastTurnDurationSeconds = 0L; TotalWorkingSeconds = 0L
-      WorkingTurnCount = 1 }
+      StateEnteredAtUtc = since }
 
 [<Test>]
 let workingResponseGuidanceStartsAt25AndEscalatesAt30 () =

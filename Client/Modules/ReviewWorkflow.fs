@@ -84,11 +84,7 @@ type ReviewAgent =
       ActiveAttemptId: string
       StateReason: string
       StateSequence: int64
-      WorkingStartedAtUtc: string
-      LastTurnEndedAtUtc: string
-      LastTurnDurationSeconds: int64
-      TotalWorkingSeconds: int64
-      WorkingTurnCount: int }
+      StateEnteredAtUtc: string }
 
 [<CLIMutable>]
 type ReviewAttempt =
@@ -296,6 +292,7 @@ type ReviewIntegration =
       SourceRemote: string
       SourcePushRemote: string
       PlannedSequence: int64
+      PlannedAtUtc: string
       ObservedTargetHead: string
       VerifiedSequence: int64
       VerifiedAtUtc: string
@@ -365,24 +362,11 @@ module ReviewWorkflow =
     let private options =
         JsonSerializerOptions(PropertyNamingPolicy = JsonNamingPolicy.CamelCase, PropertyNameCaseInsensitive = true)
     let private json value = JsonSerializer.Serialize(value, options)
-    // Entering Working starts a turn; checkpoints and reviews do not reset it.
-    let private startWorking (agent: ReviewAgent) =
-        { agent with WorkingStartedAtUtc = DateTimeOffset.UtcNow.ToString("O")
-                     WorkingTurnCount = agent.WorkingTurnCount + 1 }
-
-    let private stopWorking (agent: ReviewAgent) =
-        if agent.State <> "Working" then agent
-        else
-            let now = DateTimeOffset.UtcNow
-            let mutable started = Unchecked.defaultof<DateTimeOffset>
-            let seconds =
-                if DateTimeOffset.TryParse(agent.WorkingStartedAtUtc, &started) then
-                    max 0L (int64 (now - started).TotalSeconds)
-                else 0L
-            { agent with WorkingStartedAtUtc = null
-                         LastTurnEndedAtUtc = now.ToString("O")
-                         LastTurnDurationSeconds = seconds
-                         TotalWorkingSeconds = agent.TotalWorkingSeconds + seconds }
+    // Only record state entry boundaries; Git history preserves earlier ones.
+    let private enterState state (agent: ReviewAgent) =
+        if agent.State = state then agent
+        else { agent with State = state
+                          StateEnteredAtUtc = DateTimeOffset.UtcNow.ToString("O") }
 
     // An entity's schema is explicit on disk without adding boilerplate to
     // each in-memory record. Changing it requires an intentional upgrade path.
@@ -532,8 +516,25 @@ module ReviewWorkflow =
           Kind = kind
           RequestJson = json payload }
 
-    let private change path blob value =
-        { Path = path; ExpectedBlobOid = blob; Content = entityJson value }
+    // Immutable events receive one authoritative occurrence timestamp on creation.
+    // Normal entity updates retain their existing fields; analytics can read the
+    // event JSON directly from Git without a separate event store or counters.
+    let private change path (blob: string option) value =
+        let content = entityJson value
+        let segments = (path: string).Split('/')
+        let isEvent =
+            blob.IsNone
+            && (segments |> Array.exists (fun part ->
+                List.contains part
+                    [ "checkpoints"; "assignments"; "receipts"; "revisions"
+                      "decisions"; "events"; "lifecycle"; "approvals"
+                      "imports"; "orphan-cleanups" ]))
+        let content =
+            if isEvent then
+                content.Substring(0, content.Length - 1)
+                + ",\"occurredAtUtc\":" + json (DateTimeOffset.UtcNow.ToString("O")) + "}"
+            else content
+        { Path = path; ExpectedBlobOid = blob; Content = content }
 
     let private read<'t> binding snapshot path : Result<('t * string) option, LedgerFailure> =
         result {
@@ -891,9 +892,7 @@ module ReviewWorkflow =
                               FocusAttemptId = null; ActiveAttemptId = null
                               StateReason = "Registered without an assignment"
                               StateSequence = snapshot.Header.NextSequence
-                              WorkingStartedAtUtc = null; LastTurnEndedAtUtc = null
-                              LastTurnDurationSeconds = 0L; TotalWorkingSeconds = 0L
-                              WorkingTurnCount = 0 }
+                              StateEnteredAtUtc = DateTimeOffset.UtcNow.ToString("O") }
                         return [ change (agentPath agentId) None agent ]
                     })
 
@@ -945,6 +944,7 @@ module ReviewWorkflow =
                               change (agentPath ownerId) (Some agentOid)
                                 { agent with Version = agent.Version + 1; State = "Assigned"
                                              FocusAttemptId = attemptIdText
+                                             StateEnteredAtUtc = if agent.State = "Assigned" then agent.StateEnteredAtUtc else DateTimeOffset.UtcNow.ToString("O")
                                              ActiveAttemptId = null
                                              StateReason = $"Assigned task {taskId}; awaiting operator start"
                                              StateSequence = snapshot.Header.NextSequence } ]
@@ -1057,7 +1057,7 @@ module ReviewWorkflow =
                             [ change (attemptPath taskId attempt.AttemptId) (Some attemptOid)
                                 { attempt with Version = attempt.Version + 1; Phase = "Working" }
                               change (agentPath ownerId) (Some agentOid)
-                                (startWorking agent |> fun updated -> { updated with Version = agent.Version + 1; State = "Working"; ActiveAttemptId = attempt.AttemptId; StateReason = $"Started task {taskId}"; StateSequence = snapshot.Header.NextSequence }) ]
+                                (enterState "Working" agent |> fun updated -> { updated with Version = agent.Version + 1; State = "Working"; ActiveAttemptId = attempt.AttemptId; StateReason = $"Started task {taskId}"; StateSequence = snapshot.Header.NextSequence }) ]
                             @ (if attempt.Phase = "Queued" then
                                    [ change (receiptPath taskId attempt.AttemptId generation) None
                                        { TaskId = taskId; AttemptId = attempt.AttemptId
@@ -1107,7 +1107,7 @@ module ReviewWorkflow =
                               change (attemptPath taskId attempt.AttemptId) (Some attemptOid)
                                 { attempt with Version = attempt.Version + 1; Phase = "Paused" }
                               change (agentPath ownerId) (Some agentOid)
-                                (stopWorking agent |> fun updated -> { updated with Version = agent.Version + 1; State = "Ready"; ActiveAttemptId = null; StateReason = nextAction; StateSequence = snapshot.Header.NextSequence }) ]
+                                (enterState "Ready" agent |> fun updated -> { updated with Version = agent.Version + 1; State = "Ready"; ActiveAttemptId = null; StateReason = nextAction; StateSequence = snapshot.Header.NextSequence }) ]
                     })
 
     let resumeAgent binding operationId taskId ownerId expectedAttemptVersion expectedAgentVersion generation =
@@ -1137,7 +1137,7 @@ module ReviewWorkflow =
                             [ change (attemptPath taskId attempt.AttemptId) (Some attemptOid)
                                 { attempt with Version = attempt.Version + 1; Phase = "Working" }
                               change (agentPath ownerId) (Some agentOid)
-                                (startWorking agent |> fun updated -> { updated with Version = agent.Version + 1; State = "Working"; ActiveAttemptId = attempt.AttemptId; StateReason = $"Resumed task {taskId}"; StateSequence = snapshot.Header.NextSequence }) ]
+                                (enterState "Working" agent |> fun updated -> { updated with Version = agent.Version + 1; State = "Working"; ActiveAttemptId = attempt.AttemptId; StateReason = $"Resumed task {taskId}"; StateSequence = snapshot.Header.NextSequence }) ]
                     })
 
     let completeAgentWork binding operationId taskId ownerId expectedAttemptVersion expectedAgentVersion
@@ -1196,7 +1196,7 @@ module ReviewWorkflow =
                                                IssuedSequence =
                                                    if requeue then snapshot.Header.NextSequence else attempt.IssuedSequence }
                               change (agentPath ownerId) (Some agentOid)
-                                (stopWorking agent |> fun updated -> { updated with Version = agent.Version + 1; State = "Completed"; ActiveAttemptId = null; StateReason = summary; StateSequence = snapshot.Header.NextSequence }) ]
+                                (enterState "Completed" agent |> fun updated -> { updated with Version = agent.Version + 1; State = "Completed"; ActiveAttemptId = null; StateReason = summary; StateSequence = snapshot.Header.NextSequence }) ]
                             @ (if requeue then
                                    [ change (issuePath taskId attempt.AttemptId
                                                  (attempt.AssignmentGeneration + 1)) None
@@ -1280,6 +1280,7 @@ module ReviewWorkflow =
                             [ change (agentPath agentId) (Some agentOid)
                                 { agent with Version = agent.Version + 1
                                              State = "Parked"; FocusAttemptId = null
+                                             StateEnteredAtUtc = if agent.State = "Parked" then agent.StateEnteredAtUtc else DateTimeOffset.UtcNow.ToString("O")
                                              StateReason = reason
                                              StateSequence = snapshot.Header.NextSequence } ]
                     })
@@ -2182,6 +2183,7 @@ module ReviewWorkflow =
                               SourceRemote = revision.SourceRemote
                               SourcePushRemote = revision.SourcePushRemote
                               PlannedSequence = snapshot.Header.NextSequence
+                              PlannedAtUtc = DateTimeOffset.UtcNow.ToString("O")
                               ObservedTargetHead = null; VerifiedSequence = 0L
                               VerifiedAtUtc = null; VerificationMethod = null }
                         return
@@ -2388,6 +2390,7 @@ module ReviewWorkflow =
                               change (agentPath ownerId) (Some agentOid)
                                 { agent with Version = agent.Version + 1; State = "Assigned"
                                              FocusAttemptId = attempt.AttemptId; ActiveAttemptId = null
+                                             StateEnteredAtUtc = if agent.State = "Assigned" then agent.StateEnteredAtUtc else DateTimeOffset.UtcNow.ToString("O")
                                              StateReason = reason
                                              StateSequence = snapshot.Header.NextSequence } ]
                     })
@@ -2504,7 +2507,7 @@ module ReviewWorkflow =
                                                AssignmentGeneration = attempt.AssignmentGeneration + 1
                                                Phase = "Queued"; IssuedSequence = snapshot.Header.NextSequence }
                               change (agentPath ownerId) (Some agentOid)
-                                (stopWorking agent |> fun updated -> { updated with Version = agent.Version + 1; State = "Assigned"; ActiveAttemptId = null; StateReason = reason; StateSequence = snapshot.Header.NextSequence })
+                                (enterState "Assigned" agent |> fun updated -> { updated with Version = agent.Version + 1; State = "Assigned"; ActiveAttemptId = null; StateReason = reason; StateSequence = snapshot.Header.NextSequence })
                               change (issuePath taskId attempt.AttemptId
                                           (attempt.AssignmentGeneration + 1)) None
                                 (issue taskId attempt (attempt.AssignmentGeneration + 1)
@@ -2599,7 +2602,7 @@ module ReviewWorkflow =
                 if attempt.Phase <> "Working" && not (String.IsNullOrWhiteSpace agent.ActiveAttemptId) then
                     return! Error(LedgerIntegrityError "Nonworking attempt unexpectedly holds an active slot.")
                 return [ change (agentPath attempt.OwnerAgentId) (Some agentOid)
-                             (stopWorking agent |> fun updated -> { updated with Version = agent.Version + 1; State = "Completed"; FocusAttemptId = null; ActiveAttemptId = null; StateReason = reason; StateSequence = snapshot.Header.NextSequence }) ]
+                             (enterState "Completed" agent |> fun updated -> { updated with Version = agent.Version + 1; State = "Completed"; FocusAttemptId = null; ActiveAttemptId = null; StateReason = reason; StateSequence = snapshot.Header.NextSequence }) ]
         }
 
     let changeAttemptAdministration binding operationId taskId action expectedTaskVersion expectedAttemptVersion
@@ -2769,6 +2772,7 @@ module ReviewWorkflow =
                              change (agentPath newOwner) (Some nextOwnerOid)
                                  { nextOwnerAgent with Version = nextOwnerAgent.Version + 1
                                                        State = "Assigned"; FocusAttemptId = newId
+                                                       StateEnteredAtUtc = if nextOwnerAgent.State = "Assigned" then nextOwnerAgent.StateEnteredAtUtc else DateTimeOffset.UtcNow.ToString("O")
                                                        ActiveAttemptId = null; StateReason = reason
                                                        StateSequence = snapshot.Header.NextSequence }
                              change (lifecycleEventPath taskId snapshot.Header.NextSequence) None audit ]

@@ -85,7 +85,7 @@ Task descriptions are stored directly in the orphan branch as HTML. The assigned
 
 ### Working-turn timestamps and 25/30-minute guidance
 
-A Working turn is a contiguous period in **Working**: start at BeginAttempt or ResumeAgent; stop when the agent yields, completes, is recovered, or is administratively removed from Working. Checkpoints and review submissions do **not** restart the clock. The canonical Git agent record stores UTC start/end timestamps, the last duration, completed duration total and Working turn count. The active turn's age is derived from its start time; no server timer or database is needed.
+A Working turn is a contiguous period in **Working**: start at BeginAttempt or ResumeAgent; stop when the agent yields, completes, is recovered, or is administratively removed from Working. Checkpoints and review submissions do **not** restart the clock. The canonical Git agent record stores `stateEnteredAtUtc`: the UTC timestamp at which the current state was entered. Every earlier state boundary is retained in the history of that agent's Git record. The active Working turn's age is derived from that timestamp; no server timer or database is needed.
 
 On each subsequent MCP tool response from the associated agent conversation, check elapsed **wall-clock time** since Working began:
 
@@ -93,18 +93,26 @@ On each subsequent MCP tool response from the associated agent conversation, che
 - **30 minutes (hard stop):** Tell the agent to start no further work, use only operations necessary to persist/commit/checkpoint, and write its response promptly.
 - **Before 25 minutes, or outside Working:** Do not emit cutoff instructions. Repeated responses after a cutoff may repeat the applicable instruction. The 30-minute instruction supersedes the 25-minute instruction.
 
-These are **instructions, not forced cancellation**: tool responses are the delivery point, so a silent or stalled session cannot receive one until another tool response arrives. Neither cutoff changes agent state automatically or steals an assignment. Persistent time/stats and the current Working conversation ID are stored in the orphan-branch agent record, not in a client-memory-only mapping.
+These are **instructions, not forced cancellation**: tool responses are the delivery point, so a silent or stalled session cannot receive one until another tool response arrives. Neither cutoff changes agent state automatically or steals an assignment. The persisted state-entry timestamp and the current Working conversation ID belong in the orphan-branch agent record, not in a client-memory-only mapping.
 
 ### Working conversation identity and restart
 
 - **Persist the current conversation ID** (for example, `workingConversationId`) in the canonical agent record when an agent enters Working through `BeginAttempt` or `ResumeAgent`. Obtain it from the incoming Jarvis request/session metadata; do not ask the agent to invent one. Clear it on exit from Working.
 - The ID is expected to stay consistent over one uninterrupted agent turn, but it is **ephemeral**. A manually restarted session after a harness stall may receive a different ID. The ID is not a credential, ownership key, lease, task generation, or optimistic-concurrency precondition. Its value changing is **not** an ownership conflict.
-- **Explicit reattachment:** after a stall/manual restart, the worker first calls `ResumeAgent` (or the equivalent existing resume action) for its current task. When the agent is already **Working** on that same task/attempt, resume only updates `workingConversationId` to the request's new ID. It does **not** create a new assignment generation, change agent state, release/acquire the slot, start a new Working turn, reset `workingStartedAtUtc`, increment `workingTurnCount`, or reset duration cutoffs. It requires the current task/attempt/agent identity and usual assignment version checks, not a match with the old conversation ID. A Ready agent resuming from a deliberate yield instead follows the normal Ready → Working transition and starts a new timed Working turn.
+- **Explicit reattachment:** after a stall/manual restart, the worker first calls `ResumeAgent` (or the equivalent existing resume action) for its current task. When the agent is already **Working** on that same task/attempt, resume only updates `workingConversationId` to the request's new ID. It does **not** create a new assignment generation, change agent state, release/acquire the slot, start a new Working turn, change `stateEnteredAtUtc`, or reset duration cutoffs. It requires the current task/attempt/agent identity and usual assignment version checks, not a match with the old conversation ID. A Ready agent resuming from a deliberate yield instead follows the normal Ready → Working transition and starts a new timed Working turn.
 - The latest successful explicit start/resume association replaces the previous ID. Normal generic tool calls (`run_command`, `read_file`, job polling, etc.) **do not change the association**. An orchestrator reading an agent's inbox must not bind the orchestrator's conversation to that agent.
 - On **any** subsequent tool response, the client uses the supplied conversation ID and project to find the matching current Working agent in the canonical ledger and derives the cutoff from that agent's persisted Working start. No worker-specific tool call, in-memory conversation map, or special duration tool is necessary after association. If there is no unique match, do not guess or inject another agent's cutoff instructions. A new ID will therefore receive instructions after the explicit resume/reattachment call.
 - Git commit ordering still protects task and agent mutations; stale **assignment versions/generations** remain invalid. The old conversation ID must never be used to reject an otherwise valid agent operation or to infer that an agent is stalled. A resume call that merely changes an ID is a small state update, not task recovery or reassignment.
 
-Only the **current** conversation association needs to be materialized in the agent record. Retain timestamps and duration statistics as already specified; no conversation-ID history, session registry, server state, automatic stall detection, or compatibility mechanism is required.
+Only the **current** conversation association and state-entry timestamp need to be materialized in the agent record. No conversation-ID history, duration aggregates, turn counters, session registry, server state, automatic stall detection, or compatibility mechanism is required.
+
+### Timestamped workflow events and derived agent statistics
+
+Every new immutable assignment issue/acknowledgment, checkpoint (including recovery and completion), review revision, review claim/release/decision, and task lifecycle event stores an `occurredAtUtc` timestamp in its canonical Git record. Integration plans store `plannedAtUtc` and verified integration retains `verifiedAtUtc`. These are UTC event times recorded when the Git mutation is prepared, not proof of productive computation. Existing events remain identifiable by their ledger sequence; timestamps add elapsed-time measurements.
+
+Agent-level state changes update `stateEnteredAtUtc` only when the state actually changes; ordinary checkpoints, reviews and unrelated agent-record revisions must not reset it. Past state-entry timestamps remain recoverable through Git history.
+
+Derive completed turn durations, time spent Assigned/Ready/Parked, review queue and decision delays, task throughput, recovery counts and turn-duration percentiles on demand from these timestamps and history. **Do not persist durations, totals, averages, percentile summaries, or turn counters.** Wall-clock Working time may include tool waits and harness stalls; statistics must not present it as CPU or productive time.
 
 ## 4. Review workflow
 
@@ -174,6 +182,8 @@ The cutover is finished when these behaviors are verified:
 11. After that resume, a generic tool response to the new conversation ID receives the appropriate 25/30-minute instruction; an old or unrelated conversation ID and an orchestrator inbox read do not receive another worker's instruction.
 
 Stop when these conditions hold. Do **not** resume the superseded V2-10–V2-16 roadmap just to satisfy the old spec.
+
+12. Agent state transitions and immutable workflow events have UTC timestamps that survive cloning. A checkpoint leaves state-entry time unchanged, and no duration aggregates or turn counters are persisted.
 
 ## 9. Design rule
 

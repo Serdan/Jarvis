@@ -13,7 +13,7 @@ let instructionAt (now: DateTimeOffset) (agent: ReviewAgent) =
     if agent.State <> "Working" then None
     else
         let mutable started = Unchecked.defaultof<DateTimeOffset>
-        if not (DateTimeOffset.TryParse(agent.WorkingStartedAtUtc, &started))
+        if not (DateTimeOffset.TryParse(agent.StateEnteredAtUtc, &started))
            || now < started then None
         else
             let elapsed = now - started

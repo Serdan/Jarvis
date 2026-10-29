@@ -65,3 +65,7 @@ If the orchestration chain breaks, the human operator can start a new orchestrat
 - node --test browser-extension/tests/bridge.test.cjs
 
 Real Edge end-to-end testing of the browser extension and script behavior remains a separate acceptance requirement.
+
+## Proposed ChatGPT agent launch workflow
+
+See [ChatGPT Ephemeral Agent Launcher](ChatGPTAgentLauncher.md) for the separate, **not yet implemented** UI automation and disposable-tab design, agent bootstrap, tab-close protocol, and optional fixed-interval recurrence. This document describes the currently implemented **one-shot-only** scheduler; its command surface and behavior do not yet include recurring schedules or automatic tab closure.

@@ -112,7 +112,7 @@ Every new immutable assignment issue/acknowledgment, checkpoint (including recov
 
 Agent-level state changes update `stateEnteredAtUtc` only when the state actually changes; ordinary checkpoints, reviews and unrelated agent-record revisions must not reset it. Past state-entry timestamps remain recoverable through Git history.
 
-Derive completed turn durations, time spent Assigned/Ready/Parked, review queue and decision delays, task throughput, recovery counts and turn-duration percentiles on demand from these timestamps and history. **Do not persist durations, totals, averages, percentile summaries, or turn counters.** Wall-clock Working time may include tool waits and harness stalls; statistics must not present it as CPU or productive time.
+Derive agent statistics on demand from timestamps and Git history: time spent in each state (including operator wait in Assigned/Ready and idle time in Parked), Working-turn durations and P50/P95, checkpoints per turn and time between checkpoints, tasks completed per day, review wait/decision times and acceptance rates, time from acceptance to integration, and recovery/reattachment frequency. Group these by agent and over time as needed; no dashboard or statistics API is required for the initial cutover. **Do not persist durations, totals, averages, percentile summaries, or turn counters.** Wall-clock Working time may include tool waits and harness stalls; statistics must not present it as CPU or productive time. A changed ephemeral conversation ID is not itself evidence of a stall; only explicit recovery/reattachment events may be counted as such.
 
 ## 4. Review workflow
 
@@ -180,10 +180,9 @@ The cutover is finished when these behaviors are verified:
 9. Existing client and server test suites pass; use a disposable remote for Git workflow tests.
 10. A Working agent's current conversation ID is persisted in the orphan branch. After a simulated stall, a new conversation ID is accepted by an explicit Working-state resume without an ownership conflict, assignment-generation change, or Working timer reset.
 11. After that resume, a generic tool response to the new conversation ID receives the appropriate 25/30-minute instruction; an old or unrelated conversation ID and an orchestrator inbox read do not receive another worker's instruction.
+12. Agent state transitions and immutable workflow events have UTC timestamps that survive cloning. A checkpoint leaves state-entry time unchanged, and no duration aggregates or turn counters are persisted.
 
 Stop when these conditions hold. Do **not** resume the superseded V2-10–V2-16 roadmap just to satisfy the old spec.
-
-12. Agent state transitions and immutable workflow events have UTC timestamps that survive cloning. A checkpoint leaves state-entry time unchanged, and no duration aggregates or turn counters are persisted.
 
 ## 9. Design rule
 

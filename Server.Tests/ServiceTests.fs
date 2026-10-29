@@ -418,9 +418,13 @@ let ``command catalog matches AgentCommand union and MCP tools`` () =
     let serverLocalNames =
         set [ "GetProfile"; "Feedback"; "ListFeedback"; "GetFeedback"; "UpdateFeedback"; "GetFeedbackSummary"; "GetConnectionDiagnostics"; "ListDevices"; "SelectDevice"; "UpdateServer"; "GetServerUpdateStatus" ]
 
-    // Retired legacy wire cases remain internal for old-client compatibility,
-    // but must never be discoverable or callable as public MCP tools.
-    let retired = set [ "AttachWorkTask"; "GetWorkTask"; "ListWorkTasks"; "CheckpointWorkTask"; "CompleteWorkTask" ]
+    // Legacy task commands remain internal only; old on-disk tasks are not deleted.
+    // The orphan Git branch is the sole supported orchestration API.
+    let retired =
+        set [ "AttachWorkTask"; "GetWorkTask"; "ListWorkTasks"; "CheckpointWorkTask"; "CompleteWorkTask"
+              "ListTasks"; "GetTask"; "CreateTask"; "UpdateTask"; "ClaimTask"; "CheckpointTask"
+              "CompleteTask"; "GetTaskHistory"; "CompareWorktreeTasks"; "GetAgentAssignment"
+              "AssignTask"; "AcknowledgeTask"; "GetOrchestrationSnapshot"; "RetireWorktree"; "BeginTask" ]
     // Human-oriented V2 MCP tools route through eight carefully scoped wire commands.
     let v2Wire = set [ "V2TaskRead"; "V2TaskWrite"; "V2ReviewRead"; "V2ReviewWrite"; "V2IntegrationRead"; "V2IntegrationWrite"; "V2LedgerRead"; "V2LedgerWrite" ]
     let v2Tools =

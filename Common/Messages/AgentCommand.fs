@@ -1124,7 +1124,7 @@ module AgentCommandInfo =
         | None -> invocation command
 
 module AgentProtocol =
-    let version = "3.34"
+    let version = "3.35"
     let defaultPatchFuzzyContextLines = 3
     let maxResponseBytes = 900 * 1024
     let maxImageBytes = 8 * 1024 * 1024
@@ -1146,21 +1146,6 @@ module AgentProtocol =
           definition "GetWorktree" "Inspects a registered Git worktree." [ ReadOnly ] false false false
           definition "CreateWorktree" "Creates an isolated Git worktree and branch." [ VersionControlWrite ] true true false
           definition "InspectWorktreeRemoval" "Checks registered worktree removal safety." [ ReadOnly ] false false false
-          definition "ListTasks" "Lists repository-backed HTML and JSON task files." [ ReadOnly ] false false false
-          definition "CompareWorktreeTasks" "Summarizes tasks across registered worktrees with optional nextActor filtering." [ ReadOnly ] false false false
-          definition "GetAgentAssignment" "Finds an agent assignment across all registered worktrees; rejects ambiguous active ownership." [ ReadOnly ] false false false
-          definition "GetOrchestrationSnapshot" "Summarizes bounded cross-worktree assignments, parked/blocked owners, known agents, handoff phases, ownership conflicts and worktree states." [ ReadOnly ] false false false
-          definition "AssignTask" "Atomically claims and assigns a task with global ownership checks." [ WorkspaceWrite; VersionControlWrite ] true true false
-          definition "AcknowledgeTask" "Records agent receipt of the current assignment without overwriting a checkpoint." [ WorkspaceWrite; VersionControlWrite ] true true false
-          definition "BeginTask" "Records work started for the exact acknowledged assignment revision." [ WorkspaceWrite; VersionControlWrite ] true true false
-          definition "RetireWorktree" "Dry-run or safely retire accepted worktree while preserving task commits and branch history." [ VersionControlWrite; Destructive ] true true false
-          definition "GetTask" "Reads HTML task definition and adjacent JSON state." [ ReadOnly ] false false false
-          definition "CreateTask" "Creates and commits HTML and JSON task files." [ WorkspaceWrite; VersionControlWrite ] true true false
-          definition "UpdateTask" "Updates task metadata or reviewer assignment without changing owner or progress." [ WorkspaceWrite; VersionControlWrite ] true true false
-          definition "ClaimTask" "Claims or reassigns repository-backed task ownership." [ WorkspaceWrite; VersionControlWrite ] true true false
-          definition "CheckpointTask" "Commits agent progress and acknowledges the current assignment revision." [ WorkspaceWrite; VersionControlWrite ] true true false
-          definition "CompleteTask" "Marks a task complete and commits verification." [ WorkspaceWrite; VersionControlWrite ] true true false
-          definition "GetTaskHistory" "Reads Git change history for one task." [ ReadOnly ] false false false
           definition "V2TaskRead" "Reads a registered agent inbox from a single V2 ledger snapshot." [ ReadOnly; NetworkAccess ] false false false
           definition "V2TaskWrite" "Creates/assigns/starts V2 tasks and binds immutable review base." [ VersionControlWrite; NetworkAccess ] true true false
           definition "V2LedgerRead" "Inspect the verified canonical V2 Git ledger identity and trust head." [ ReadOnly; NetworkAccess ] false false false

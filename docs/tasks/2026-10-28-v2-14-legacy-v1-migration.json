@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "2026-10-28-v2-14-legacy-v1-migration",
   "title": "Build deterministic V1 task migration inspector and approved importer",
-  "status": "open",
+  "status": "cancelled",
   "priority": "P0",
   "dependencies": [
     "2026-10-28-v2-03-schema-contracts",
@@ -16,8 +16,8 @@
     "worktree": null
   },
   "checkpoint": {
-    "summary": "V2 specification gap identified by the 2026-10-28 audit; implementation not started.",
-    "nextAction": "Implement the acceptance criteria in the paired HTML task using disposable Git repositories; do not deploy or migrate V1.",
+    "summary": "Superseded by the 2026-10-29 minimal orphan-branch cutover decision; do not implement this roadmap task.",
+    "nextAction": "No action. Use existing disk files for any manually selected migration, and prioritize only the orphan-branch cutover.",
     "verified": [],
     "lastCommit": null
   },
@@ -33,5 +33,5 @@
     ],
     "sourceReport": "docs/reviews/2026-10-28-v2-spec-implementation-audit.md"
   },
-  "updatedAt": "2026-10-28T00:00:00Z"
+  "updatedAt": "2026-10-29T17:00:00Z"
 }

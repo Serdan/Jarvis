@@ -1,6 +1,6 @@
 <!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>Deliver independent mirror backup, restore verification and epoch reconciliation</title></head><body><main>
-<h1>Deliver independent mirror backup, restore verification and epoch reconciliation</h1><p><strong>Task:</strong> 2026-10-28-v2-13-ledger-backup-restore. <strong>Priority:</strong> P0. <strong>Status:</strong> Open.</p>
+<h1>Deliver independent mirror backup, restore verification and epoch reconciliation</h1><p><strong>Task:</strong> 2026-10-28-v2-13-ledger-backup-restore. <strong>Priority:</strong> P0. <strong>Status:</strong> Cancelled (superseded).</p>
 <h2>Goal and current gap</h2><p>Local ref cache and initial root creation exist, but ExportLedgerArchive/VerifyLedgerBackup, protected independent mirror, restore drills, trusted-head rebind/epoch changes and retention/GC guarantees are absent.</p>
 <h2>Source of authority</h2><p>Normative specification: <code>docs/specs/orchestration-v2-architecture.md</code>, §2.2, §9, §11. Evidence in source: <code>Client/Modules/LedgerStore.fs:230-264,375-415</code>; <code>Client/Modules/V2ReviewApi.fs:14-73</code>.</p>
 <h2>Acceptance criteria</h2><ol><li>Create verified Git mirror/manifest export to independent protected destination, preserving orphan ledger branch, source review refs, operation index, tasks and evidence.</li>

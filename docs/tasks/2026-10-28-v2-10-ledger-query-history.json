@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "2026-10-28-v2-10-ledger-query-history",
   "title": "Implement snapshot-pinned list, roster, history, operation and pagination APIs",
-  "status": "open",
+  "status": "cancelled",
   "priority": "P1",
   "dependencies": [
     "2026-10-28-v2-02-durable-operations",
@@ -14,8 +14,8 @@
     "worktree": null
   },
   "checkpoint": {
-    "summary": "Architecture gap identified by the 2026-10-28 V2 implementation audit. Not started.",
-    "nextAction": "Implement the acceptance criteria in the accompanying HTML task; use disposable Git remotes and do not deploy or migrate V1.",
+    "summary": "Superseded by the 2026-10-29 minimal orphan-branch cutover decision; do not implement this roadmap task.",
+    "nextAction": "No action. Use existing disk files for any manually selected migration, and prioritize only the orphan-branch cutover.",
     "verified": [],
     "lastCommit": null
   },
@@ -32,5 +32,5 @@
     ],
     "sourceReport": "docs/reviews/2026-10-28-v2-spec-implementation-audit.md"
   },
-  "updatedAt": "2026-10-28T00:00:00Z"
+  "updatedAt": "2026-10-29T17:00:00Z"
 }

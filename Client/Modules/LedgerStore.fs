@@ -44,6 +44,15 @@ type SourceWorktreeObservation =
       SelectedWorktreeDetached: bool
       SelectedWorktreeDirty: bool }
 
+[<CLIMutable>]
+type SourceSpecFile =
+    { RepositoryId: string
+      SourceRef: string
+      CommitOid: string
+      RelativePath: string
+      BlobOid: string
+      Html: string }
+
 type LedgerBinding =
     { RepositoryPath: string
       RemoteName: string
@@ -160,7 +169,7 @@ module LedgerStore =
     let private options = JsonSerializerOptions(PropertyNamingPolicy = JsonNamingPolicy.CamelCase, PropertyNameCaseInsensitive = true)
     let private oidPattern = Regex("^[0-9a-f]{40}([0-9a-f]{24})?$", RegexOptions.Compiled)
     let private recordPath = Regex("^records/[A-Za-z0-9_-]+(/[A-Za-z0-9_.-]+)*[.]json$", RegexOptions.Compiled)
-    let private ledgerPath = Regex("^(tasks/[A-Za-z0-9_-]+/(task[.]json|spec[.]html|attempts/[a-f0-9]{32}([.]json|/checkpoints/[0-9]+[.]json|/assignments/[0-9]+([.]json|[.]ack[.]json))|integrations/[a-f0-9]{32}[.]json|lifecycle/[0-9]+[.]json|approvals/non-source/[0-9]+[.]json|orphan-cleanups/[a-f0-9]{32}/r[1-9][0-9]*[.]json|reviews/[a-f0-9]{32}/(request[.]json|notification[.]json|revisions/[0-9]+[.]json|decisions/[0-9]+[.]json|events/[0-9]+[.]json))|agents/[A-Za-z0-9_-]+[.]json|records/[A-Za-z0-9_-]+(/[A-Za-z0-9_.-]+)*[.]json)$", RegexOptions.Compiled)
+    let private ledgerPath = Regex("^(tasks/[A-Za-z0-9_-]+/(task[.]json|spec[.]html|attempts/[a-f0-9]{32}([.]json|/checkpoints/[0-9]+[.]json|/assignments/[0-9]+([.]json|[.]ack[.]json))|integrations/[a-f0-9]{32}[.]json|imports/[0-9]+[.]json|lifecycle/[0-9]+[.]json|approvals/non-source/[0-9]+[.]json|orphan-cleanups/[a-f0-9]{32}/r[1-9][0-9]*[.]json|reviews/[a-f0-9]{32}/(request[.]json|notification[.]json|revisions/[0-9]+[.]json|decisions/[0-9]+[.]json|events/[0-9]+[.]json))|agents/[A-Za-z0-9_-]+[.]json|records/[A-Za-z0-9_-]+(/[A-Za-z0-9_.-]+)*[.]json)$", RegexOptions.Compiled)
     let private remotePattern = Regex("^[A-Za-z0-9][A-Za-z0-9_.-]*$", RegexOptions.Compiled)
 
     type private GitOutput =
@@ -213,7 +222,7 @@ module LedgerStore =
             true
         with _ -> false
 
-    let private execute (repo: string) (args: string list) (input: string option) (environment: (string * string) list) =
+    let private execute (repo: string) (args: string list) (input: string option) (environment: (string * string) list) (preserveStdout: bool) =
         try
             use gitProcess = new Process()
             gitProcess.StartInfo.FileName <- "git"
@@ -241,16 +250,17 @@ module LedgerStore =
                     gitProcess.Kill(true)
                     Error(RemoteUnavailable "Git command timed out.")
                 else
-                    Ok
-                        { ExitCode = gitProcess.ExitCode
-                          Stdout = stdout.GetAwaiter().GetResult().TrimEnd('\n', '\r')
-                          Stderr = stderr.GetAwaiter().GetResult() }
+                    let value = stdout.GetAwaiter().GetResult()
+                    Ok { ExitCode = gitProcess.ExitCode
+                         Stdout = if preserveStdout then value else value.TrimEnd('\n', '\r')
+                         Stderr = stderr.GetAwaiter().GetResult() }
         with ex ->
             Error(GitFailure ex.Message)
 
-    let private git repo args = execute repo args None []
-    let private gitInput repo args input = execute repo args (Some input) []
-    let private gitIndex repo index args = execute repo args None [ "GIT_INDEX_FILE", index ]
+    let private git repo args = execute repo args None [] false
+    let private gitRaw repo args = execute repo args None [] true
+    let private gitInput repo args input = execute repo args (Some input) [] false
+    let private gitIndex repo index args = execute repo args None [ "GIT_INDEX_FILE", index ] false
 
     let private requireSuccess label result =
         match result with
@@ -367,7 +377,7 @@ module LedgerStore =
         if not (oidPattern.IsMatch commit) then
             Error(LedgerHistoryUnavailable "Invalid snapshot commit OID.")
         else
-            run repo [ "show"; $"{commit}:{path}" ]
+            gitRaw repo [ "show"; $"{commit}:{path}" ] |> requireSuccess "Show exact Git blob"
 
     let private readHeader binding commit =
         match showBlob binding.RepositoryPath commit "ledger.json" with
@@ -481,7 +491,7 @@ module LedgerStore =
     // Compute a prospective canonical spec blob OID without changing the
     // checkout or writing an object. The transaction writes/validates it later.
     let computeBlobOid (binding: LedgerBinding) (content: string) =
-        if isNull content || Encoding.UTF8.GetByteCount(content) > 128 * 1024 then
+        if isNull content || Encoding.UTF8.GetByteCount(content) > 512 * 1024 then
             Error(InvalidBinding "Spec blob is missing or exceeds the canonical size cap.")
         else
             match validate binding with
@@ -931,6 +941,195 @@ module LedgerStore =
                          PushUrl = binding.ApprovedPushUrl }
             | _ -> Error(SourceUnavailable "Cannot verify registered source checkout.")
 
+    // The selected checkout must be a registered Git worktree of the
+    // already approved project; never allow an arbitrary caller-chosen root.
+    // Paths are scoped under that checkout and every existing component is
+    // inspected for symlinks before reading or writing.
+    let private checkedSourcePath (binding: LedgerBinding) (relative: string) =
+        match sourceRepositoryIdentity binding with
+        | Error error -> Error error
+        | Ok identity ->
+            if String.IsNullOrWhiteSpace relative || relative.Length > 400
+               || Path.IsPathRooted(relative) || relative.Contains('\\')
+               || relative.Contains(':') || relative.Contains('\000')
+               || relative.Split('/').Length > 20
+               || relative.Split('/') |> Array.exists (fun part ->
+                    part = "" || part = "." || part = ".." || part = ".git"
+                    || part.StartsWith(".", StringComparison.Ordinal)
+                    || part |> Seq.exists Char.IsControl)
+               || not (relative.EndsWith(".html", StringComparison.OrdinalIgnoreCase)) then
+                Error(InvalidBinding "Unsafe source HTML path.")
+            else
+                let root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(binding.RepositoryPath))
+                let path = Path.GetFullPath(Path.Combine(root, relative.Replace('/', Path.DirectorySeparatorChar)))
+                if not (path.StartsWith(root + string Path.DirectorySeparatorChar, StringComparison.Ordinal)) then
+                    Error(InvalidBinding "Source path escapes registered checkout.")
+                else
+                    let mutable current = root
+                    let mutable unsafePath = false
+                    for part in relative.Split('/') do
+                        current <- Path.Combine(current, part)
+                        if File.Exists(current) || Directory.Exists(current) then
+                            let attributes = File.GetAttributes(current)
+                            if attributes.HasFlag(FileAttributes.ReparsePoint) then unsafePath <- true
+                    if unsafePath then Error(InvalidBinding "Source path uses a symlink or reparse point.")
+                    else Ok(identity, root, path)
+
+    // Source drafts may be tracked or untracked. The blob OID denotes the
+    // exact worktree bytes, while HEAD and branch denote import provenance.
+    let readRegisteredSourceSpec (binding: LedgerBinding) relative =
+        match checkedSourcePath binding relative with
+        | Error error -> Error error
+        | Ok(identity, root, path) ->
+            try
+                if not (File.Exists(path)) then
+                    Error(SourceUnavailable "Source HTML file does not exist.")
+                elif (FileInfo(path)).Length > 512L * 1024L then
+                    Error(InvalidBinding "Source HTML exceeds 512 KiB.")
+                else
+                    match run root [ "symbolic-ref"; "-q"; "HEAD" ],
+                          run root [ "rev-parse"; "HEAD" ] with
+                    | Ok sourceRef, Ok commit when
+                        sourceRef.StartsWith("refs/heads/", StringComparison.Ordinal)
+                        && oidPattern.IsMatch commit ->
+                        let bytes = File.ReadAllBytes(path)
+                        if bytes.Length > 512 * 1024 then
+                            Error(InvalidBinding "Source HTML changed or exceeds 512 KiB.")
+                        else
+                            let html = UTF8Encoding(false, true).GetString(bytes)
+                            match computeBlobOid binding html with
+                            | Error error -> Error error
+                            | Ok blob ->
+                                Ok { RepositoryId = identity.RepositoryId; SourceRef = sourceRef
+                                     CommitOid = commit; RelativePath = relative; BlobOid = blob
+                                     Html = html }
+                    | _ -> Error(SourceUnavailable "Source worktree must have a checked-out branch and commit.")
+            with
+            | :? DecoderFallbackException ->
+                Error(InvalidBinding "Source HTML is not valid UTF-8.")
+            | :? System.IO.IOException as ex ->
+                Error(SourceUnavailable $"Source HTML unavailable: {ex.Message}")
+
+    // Called only after ledger/snapshot authority has been established.
+    // The pinned OID must actually occur at this task spec path in canonical
+    // Git ancestry; arbitrary local Git blobs or source-branch blobs are not
+    // eligible for historical task diff or paging.
+    let readHistoricalTaskSpec (binding: LedgerBinding) (snapshot: LedgerSnapshot)
+                               taskId (blobOid: string) =
+        if String.IsNullOrWhiteSpace taskId
+           || not (Regex.IsMatch(taskId, "^[A-Za-z0-9_-]{1,80}$"))
+           || isNull blobOid || not (oidPattern.IsMatch blobOid) then
+            Error(InvalidBinding "Invalid task/spec history locator.")
+        else
+            let path = $"tasks/{taskId}/spec.html"
+            match run binding.RepositoryPath
+                    [ "log"; "--format=%H"; snapshot.Commit; "--"; path ] with
+            | Error error -> Error error
+            | Ok history ->
+                let commits = history.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                let mutable found = false
+                let mutable failure = None
+                for commit in commits do
+                    if not found && failure.IsNone then
+                        match blobAt binding.RepositoryPath commit path with
+                        | Error error -> failure <- Some error
+                        | Ok oid when oid = Some blobOid -> found <- true
+                        | Ok _ -> ()
+                match failure with
+                | Some error -> Error error
+                | None when not found ->
+                    Error(InvalidBinding "Blob OID does not belong to this task's canonical spec history.")
+                | None ->
+                    match gitRaw binding.RepositoryPath [ "cat-file"; "blob"; blobOid ] with
+                    | Ok data when data.ExitCode = 0 ->
+                        try
+                            let content = data.Stdout
+                            if encoding.GetByteCount(content) > 512 * 1024 then
+                                Error(LedgerIntegrityError "Historical task specification exceeds canonical limit.")
+                            else Ok content
+                        with ex -> Error(LedgerIntegrityError ex.Message)
+                    | _ -> Error(LedgerHistoryUnavailable "Historical task spec blob is missing.")
+
+    let verifiedHistoricalSnapshot (binding: LedgerBinding) (commit: string) =
+        if isNull commit || not (oidPattern.IsMatch commit) then
+            Error(InvalidBinding "Invalid snapshot locator.")
+        else
+            match fetch binding with
+            | Error error -> Error error
+            | Ok current ->
+                match git binding.RepositoryPath [ "merge-base"; "--is-ancestor"; commit; current.Commit ] with
+                | Ok output when output.ExitCode = 0 ->
+                    readHeader binding commit
+                    |> Result.map (fun header -> { Commit = commit; Header = header })
+                | _ -> Error(LedgerHistoryUnavailable "Pinned snapshot is unavailable or no longer trusted canonical ancestry.")
+
+    let diffHistoricalTaskSpecs (binding: LedgerBinding) (snapshot: LedgerSnapshot)
+                                 taskId beforeOid afterOid =
+        match readHistoricalTaskSpec binding snapshot taskId beforeOid,
+              readHistoricalTaskSpec binding snapshot taskId afterOid with
+        | Error error, _ | _, Error error -> Error error
+        | Ok _, Ok _ ->
+            match gitRaw binding.RepositoryPath
+                    [ "diff"; "--no-ext-diff"; "--no-color"; "--unified=3"; beforeOid; afterOid ] with
+            | Ok diff when diff.ExitCode = 0 ->
+                let limit = 128 * 1024
+                let bytes = encoding.GetBytes(diff.Stdout)
+                if bytes.Length <= limit then Ok(diff.Stdout, false)
+                else
+                    let mutable count = limit
+                    while count > 0 && count < bytes.Length && (bytes[count] &&& 0xC0uy) = 0x80uy do
+                        count <- count - 1
+                    Ok(encoding.GetString(bytes, 0, count), true)
+            | _ -> Error(LedgerHistoryUnavailable "Unable to diff pinned historical spec blobs.")
+
+    // Exports are create-only, read-only authority snapshots. Validate all
+    // preconditions before the temp write and perform a no-overwrite move;
+    // failures never rewrite a pre-existing source file or canonical ledger.
+    let exportRegisteredSpec (binding: LedgerBinding) relative taskId
+                             snapshotOid blobOid (operationId: Guid) html =
+        match checkedSourcePath binding relative with
+        | Error error -> Error error
+        | Ok(_, _, destination) ->
+            let prefix =
+                $"<!-- NON-AUTHORITATIVE JARVIS V2 EXPORT; operation={operationId:D}; task={taskId}; ledger-snapshot="
+            let suffix =
+                $"; spec-blob={blobOid}; editing this copy does not change the canonical ledger. -->\n"
+            let replay () =
+                try
+                    let existing = File.ReadAllText(destination, UTF8Encoding(false, true))
+                    if existing.StartsWith(prefix, StringComparison.Ordinal) then
+                        let separator = existing.IndexOf(suffix, prefix.Length, StringComparison.Ordinal)
+                        if separator > prefix.Length
+                           && oidPattern.IsMatch(existing.Substring(prefix.Length, separator - prefix.Length))
+                           && existing.Substring(separator + suffix.Length) = html then
+                            // The operation is a replay of the exact same
+                            // content, not an overwrite of someone else's file.
+                            Ok(true)
+                        else
+                            Error(StaleEntityVersion "Export destination already exists with other content.")
+                    else Error(StaleEntityVersion "Export destination already exists with other content.")
+                with ex ->
+                    Error(SourceUnavailable $"Existing export cannot be verified: {ex.Message}")
+            if File.Exists destination then replay ()
+            elif Directory.Exists destination then
+                Error(StaleEntityVersion "Export destination is an existing directory.")
+            elif not (Directory.Exists(Path.GetDirectoryName destination)) then
+                Error(InvalidBinding "Export directory must already exist.")
+            else
+                let temp = Path.Combine(Path.GetDirectoryName destination,
+                                        $".jarvis-spec-{Guid.NewGuid():N}.tmp")
+                try
+                    try
+                        let heading = prefix + snapshotOid + suffix
+                        File.WriteAllText(temp, heading + html, UTF8Encoding(false))
+                        File.Move(temp, destination, false)
+                        Ok(false)
+                    with
+                    | :? System.IO.IOException when File.Exists destination -> replay ()
+                    | ex -> Error(SourceUnavailable $"Export was not published: {ex.Message}")
+                finally
+                    if File.Exists temp then File.Delete temp
+
     // This is a read-only local observation, never authoritative ownership.
     // Branches can survive checkout deletion; detached/dirty checkouts are
     // reported rather than guessed to be an assigned worker's source.
@@ -1279,7 +1478,7 @@ module LedgerStore =
                                    || isNull change.Content
                                    || encoding.GetByteCount(change.Content) >
                                        (if change.Path.EndsWith("/spec.html", StringComparison.Ordinal)
-                                        then 128 * 1024 else 64 * 1024)
+                                        then 512 * 1024 else 64 * 1024)
                                    || (change.ExpectedBlobOid |> Option.exists (oidPattern.IsMatch >> not))) then
                                 Error(InvalidBinding "Invalid or duplicate entity paths in ledger transaction.")
                             else

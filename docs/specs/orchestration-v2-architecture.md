@@ -464,6 +464,22 @@ Task specs live canonically at `tasks/<id>/spec.html` in the ledger tree. Existi
 - **GetTaskHistory**: page ledger commits affecting task paths, including immutable checkpoint/generation history, rather than scanning source branch HTML/JSON. Historical V1 file history remains accessible via normal Git tooling.
 - **ExportTaskSpec**: optionally write a clearly marked, **read-only-authority** HTML copy to a chosen worktree. Editing this copy never edits the live ledger until explicitly imported/revised.
 
+**V2-09 implementation detail (2026-10-29):** Canonical HTML is limited
+to 512 KiB by both the workflow and Git CAS writer; task operation request
+records store SHA-256 content fingerprints rather than duplicating HTML.
+New/imported specs require exact task/spec CAS; an InProgress canonical
+revision does not change the assigned generation. Only an explicit
+unstarted-owner AdoptTaskSpec issues a new pinned generation. Secure
+worktree import captures immutable relative-path/source-remote/branch/HEAD/
+worktree-blob provenance and rechecks source bytes inside each CAS plan.
+DiffTaskSpec proves both blob OIDs occurred at this task's canonical ledger
+path. GetTaskSpecPage produces byte-bounded (1..32768), UTF-8-safe,
+30-minute canonical-snapshot cursors; source export is explicitly
+non-authoritative, create-only and Git-write permission gated.
+Task-history and roster query pagination remain V2-10. Source filesystem
+open is protected by path-component/symlink checks and repeated hashing,
+not a cross-repository atomic lock against hostile concurrent local writes.
+
 A source HTML file may be a convenient draft, but only the ledger's committed spec blob and any explicitly selected assignment generation are authoritative. A pending assignment cannot silently adopt spec modifications. Keep HTML safe for display (no active script execution or untrusted instructions promoted to system policy).
 
 ### Source execution and worktree binding

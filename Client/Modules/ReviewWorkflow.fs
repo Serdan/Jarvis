@@ -4,6 +4,7 @@ open System
 open System.Text
 open System.Text.Json
 open System.Text.RegularExpressions
+open System.Security.Cryptography
 open FsToolkit.ErrorHandling
 open Client.LedgerStore
 
@@ -15,6 +16,64 @@ type ReviewTask =
       Lifecycle: string
       SpecVersion: int
       AttemptId: string }
+
+[<CLIMutable>]
+type TaskSpecImport =
+    { TaskId: string
+      Sequence: int64
+      OperationId: string
+      ActorId: string
+      SourceRepositoryId: string
+      SourceRef: string
+      SourceCommitOid: string
+      SourceRelativePath: string
+      SourceBlobOid: string
+      CanonicalBlobOid: string
+      TaskVersionBefore: int
+      TaskVersionAfter: int
+      SpecVersionAfter: int }
+
+[<CLIMutable>]
+type TaskSpecPage =
+    { TaskId: string
+      SnapshotCommit: string
+      SpecBlobOid: string
+      Offset: int
+      TotalBytes: int
+      Content: string
+      PageBytes: int
+      HasMore: bool
+      NextCursor: string
+      ExpiresAtUtc: string }
+
+[<CLIMutable>]
+type TaskSpecCursor =
+    { ProjectId: string
+      LedgerId: string
+      TaskId: string
+      SnapshotCommit: string
+      SpecBlobOid: string
+      Offset: int
+      ExpiresAtUtc: string }
+
+[<CLIMutable>]
+type TaskSpecDiff =
+    { TaskId: string
+      SnapshotCommit: string
+      BeforeOid: string
+      AfterOid: string
+      Diff: string
+      Truncated: bool }
+
+[<CLIMutable>]
+type TaskSpecExport =
+    { TaskId: string
+      SnapshotCommit: string
+      SpecBlobOid: string
+      RelativePath: string
+      OperationId: string
+      AlreadyApplied: bool
+      Authority: string }
 
 [<CLIMutable>]
 type ReviewAgent =
@@ -354,7 +413,7 @@ module ReviewWorkflow =
                                           "AbandonAttempt"; "TransferOwner"; "CloseNonSourceTask"; "ReopenTask" ]
                     | "NonSourceClosureApproval" -> true
                     | "AssignmentIssue" ->
-                        status "reason" [ "Assignment"; "ReviewChanges"; "CompletionRequeue"; "Recovery"; "ExplicitReissue"; "AdministrativeResume"; "OwnershipTransfer" ]
+                        status "reason" [ "Assignment"; "ReviewChanges"; "CompletionRequeue"; "Recovery"; "ExplicitReissue"; "AdministrativeResume"; "OwnershipTransfer"; "SpecAdoption" ]
                     | "AssignmentReceipt" -> true
                     | _ -> true
                 if not unique then Error "Duplicate entity JSON member."
@@ -368,6 +427,7 @@ module ReviewWorkflow =
 
     let private taskPath taskId = $"tasks/{taskId}/task.json"
     let private specPath taskId = $"tasks/{taskId}/spec.html"
+    let private importPath taskId sequence = $"tasks/{taskId}/imports/{sequence}.json"
     let private attemptPath taskId attemptId = $"tasks/{taskId}/attempts/{attemptId}.json"
     let private checkpointPath taskId attemptId sequence =
         $"tasks/{taskId}/attempts/{attemptId}/checkpoints/{sequence}.json"
@@ -428,13 +488,19 @@ module ReviewWorkflow =
     // Canonical task specifications may contain markup, but must not embed
     // active browser content. Display surfaces must still treat HTML as untrusted.
     let private validTaskHtml (value: string) =
-        validText (128 * 1024) value
+        validText (512 * 1024) value
         && not (Regex.IsMatch(value,
             "<\\s*(script|iframe|object|embed|base|form|svg|math)\\b|\\bon[a-z]+\\s*=|javascript\\s*:",
             RegexOptions.IgnoreCase ||| RegexOptions.CultureInvariant))
     let private validBranch (value: string) =
         not (isNull value) && refPattern.IsMatch value
         && not (value.Contains("..")) && not (value.EndsWith("/"))
+
+    // Content hashes, not large HTML, belong in immutable operation request
+    // records. The canonical spec still lives as the full Git blob.
+    let private specDigest (content: string) =
+        SHA256.HashData(Encoding.UTF8.GetBytes(if isNull content then "" else content))
+        |> Convert.ToHexString |> fun value -> value.ToLowerInvariant()
 
     let private intent operationId actor kind payload =
         { OperationId = operationId
@@ -524,7 +590,7 @@ module ReviewWorkflow =
         else
             LedgerStore.transact binding
                 (intent operationId "Orchestrator" "CreateTask"
-                    {| taskId = taskId; title = title; specHtml = html |})
+                    {| taskId = taskId; title = title; specSha256 = specDigest html |})
                 (fun snapshot ->
                     result {
                         let! existing = read<ReviewTask> binding snapshot (taskPath taskId)
@@ -544,28 +610,248 @@ module ReviewWorkflow =
         createTaskWithSpec binding operationId taskId title
             ($"<h1>{System.Net.WebUtility.HtmlEncode(title)}</h1>")
 
-    let reviseTaskSpec binding operationId taskId expectedTaskVersion title html =
+    let reviseTaskSpecPinned binding operationId taskId expectedTaskVersion expectedSpecBlobOid title html =
         if not (validTaskId taskId) || expectedTaskVersion < 1
-           || not (validText 512 title) || not (validText (128 * 1024) html) then
+           || not (validText 512 title) || not (validTaskHtml html) then
             Error(InvalidBinding "Invalid task spec revision.")
         else
             LedgerStore.transact binding
-                (intent operationId "Orchestrator" "ReviseTaskSpec"
+                (intent operationId "Orchestrator"
+                    (if String.IsNullOrWhiteSpace expectedSpecBlobOid then "ReviseTaskSpec" else "ReviseTaskSpecPinned")
                     {| taskId = taskId; expectedTaskVersion = expectedTaskVersion
-                       title = title; specHtml = html |})
+                       title = title; specSha256 = specDigest html
+                       expectedSpecBlobOid = expectedSpecBlobOid |})
                 (fun snapshot ->
                     result {
                         let! task, taskOid = required<ReviewTask> binding snapshot (taskPath taskId)
                         let! _, specOid = LedgerStore.readAt binding snapshot (specPath taskId)
-                        if task.Lifecycle <> "Open" || task.Version <> expectedTaskVersion
-                           || specOid.IsNone then
-                            return! Error(StaleEntityVersion "Only an unassigned Open task's spec can be revised.")
+                        if not (List.contains task.Lifecycle [ "Open"; "InProgress" ])
+                           || task.Version <> expectedTaskVersion || specOid.IsNone
+                           || (not (String.IsNullOrWhiteSpace expectedSpecBlobOid)
+                               && specOid <> Some expectedSpecBlobOid)
+                           || (task.Lifecycle = "InProgress"
+                               && String.IsNullOrWhiteSpace expectedSpecBlobOid) then
+                            return! Error(StaleEntityVersion "Task revision requires exact task/spec identity; assigned tasks require pinned spec OID.")
                         return
                             [ change (taskPath taskId) (Some taskOid)
                                 { task with Version = task.Version + 1
                                             SpecVersion = task.SpecVersion + 1; Title = title }
                               { Path = specPath taskId; ExpectedBlobOid = specOid; Content = html } ]
                     })
+
+    // Legacy Open-only revision remains compatible; in-progress revisions
+    // must supply explicit expected canonical blob via pinned tool.
+    let reviseTaskSpec binding operationId taskId expectedTaskVersion title html =
+        reviseTaskSpecPinned binding operationId taskId expectedTaskVersion null title html
+
+    // Split preflight from publication to exercise the real race boundary
+    // deterministically: every CAS retry rechecks the source snapshot.
+    let importTaskSpecPrepared binding operationId taskId expectedTaskVersion
+                               expectedSpecBlobOid expectedSourceBlobOid title relativePath
+                               (original: SourceSpecFile) =
+        if not (validTaskId taskId) || expectedTaskVersion < 1
+           || not (validText 512 title) || String.IsNullOrWhiteSpace expectedSpecBlobOid
+           || String.IsNullOrWhiteSpace relativePath || not (validTaskHtml original.Html)
+           || (not (String.IsNullOrWhiteSpace expectedSourceBlobOid)
+               && original.BlobOid <> expectedSourceBlobOid) then
+            Error(InvalidBinding "Import requires safe pinned HTML, task/spec versions and source identity.")
+        else
+                LedgerStore.transact binding
+                    (intent operationId "Orchestrator" "ImportTaskSpec"
+                        {| taskId = taskId; expectedTaskVersion = expectedTaskVersion
+                           expectedSpecBlobOid = expectedSpecBlobOid; expectedSourceBlobOid = original.BlobOid
+                           sourceRepositoryId = original.RepositoryId; sourceRef = original.SourceRef
+                           sourceCommitOid = original.CommitOid; sourceRelativePath = relativePath
+                           expectedSourceBlobOidInput = expectedSourceBlobOid
+                           title = title |})
+                    (fun snapshot -> result {
+                        let! current = LedgerStore.readRegisteredSourceSpec binding relativePath
+                        if current.RepositoryId <> original.RepositoryId
+                           || current.SourceRef <> original.SourceRef
+                           || current.CommitOid <> original.CommitOid
+                           || current.BlobOid <> original.BlobOid
+                           || current.Html <> original.Html then
+                            return! Error(SourceUnavailable "Source HTML changed between import preflight and ledger publication.")
+                        let! task, taskOid = required<ReviewTask> binding snapshot (taskPath taskId)
+                        let! _, specOid = LedgerStore.readAt binding snapshot (specPath taskId)
+                        if task.Version <> expectedTaskVersion
+                           || not (List.contains task.Lifecycle [ "Open"; "InProgress" ])
+                           || specOid <> Some expectedSpecBlobOid then
+                            return! Error(StaleEntityVersion "Import targets stale task/spec or a terminal lifecycle.")
+                        let provenance =
+                            { TaskId = taskId; Sequence = snapshot.Header.NextSequence
+                              OperationId = operationId.ToString("D"); ActorId = "Orchestrator"
+                              SourceRepositoryId = original.RepositoryId
+                              SourceRef = original.SourceRef; SourceCommitOid = original.CommitOid
+                              SourceRelativePath = relativePath; SourceBlobOid = original.BlobOid
+                              CanonicalBlobOid = original.BlobOid
+                              TaskVersionBefore = task.Version; TaskVersionAfter = task.Version + 1
+                              SpecVersionAfter = task.SpecVersion + 1 }
+                        return [
+                            change (taskPath taskId) (Some taskOid)
+                                { task with Title = title; Version = task.Version + 1
+                                            SpecVersion = task.SpecVersion + 1 }
+                            { Path = specPath taskId; ExpectedBlobOid = specOid
+                              Content = original.Html }
+                            change (importPath taskId snapshot.Header.NextSequence) None provenance ]
+                    })
+
+    let importTaskSpec binding operationId taskId expectedTaskVersion
+                       expectedSpecBlobOid expectedSourceBlobOid title relativePath =
+        result {
+            let! original = LedgerStore.readRegisteredSourceSpec binding relativePath
+            return! importTaskSpecPrepared binding operationId taskId expectedTaskVersion
+                        expectedSpecBlobOid expectedSourceBlobOid title relativePath original
+        }
+
+    // In-progress spec updates never rewrite issued instructions: only an
+    // explicit generation reissue can adopt the new canonical version.
+    let adoptTaskSpec binding operationId taskId ownerId expectedTaskVersion
+                      expectedAttemptVersion expectedAgentVersion generation
+                      expectedCurrentSpecOid instructions =
+        if not (validTaskId taskId) || not (validAgent ownerId)
+           || expectedTaskVersion < 1 || expectedAttemptVersion < 1
+           || expectedAgentVersion < 1 || generation < 1
+           || not (validText 8192 instructions)
+           || String.IsNullOrWhiteSpace expectedCurrentSpecOid then
+            Error(InvalidBinding "Spec adoption requires pinned canonical blob, exact versions and instructions.")
+        else
+            LedgerStore.transact binding
+                (intent operationId "Orchestrator" "AdoptTaskSpec"
+                    {| taskId = taskId; ownerId = ownerId
+                       expectedTaskVersion = expectedTaskVersion
+                       expectedAttemptVersion = expectedAttemptVersion
+                       expectedAgentVersion = expectedAgentVersion; generation = generation
+                       expectedCurrentSpecOid = expectedCurrentSpecOid; instructions = instructions |})
+                (fun snapshot -> result {
+                    let! task, _, attempt, attemptOid = getAttempt binding snapshot taskId
+                    let! agent, agentOid = required<ReviewAgent> binding snapshot (agentPath ownerId)
+                    let! _, specOid = LedgerStore.readAt binding snapshot (specPath taskId)
+                    if task.Lifecycle <> "InProgress" || task.Version <> expectedTaskVersion
+                       || attempt.Version <> expectedAttemptVersion
+                       || attempt.OwnerAgentId <> ownerId
+                       || attempt.AssignmentGeneration <> generation
+                       || specOid <> Some expectedCurrentSpecOid
+                       || attempt.SpecBlobOid = expectedCurrentSpecOid
+                       || not (List.contains attempt.Phase [ "Queued"; "Acknowledged" ])
+                       || agent.State <> "Assigned" || agent.Version <> expectedAgentVersion
+                       || agent.FocusAttemptId <> attempt.AttemptId
+                       || not (String.IsNullOrWhiteSpace agent.ActiveAttemptId)
+                       || not (String.IsNullOrWhiteSpace attempt.ActiveReviewRequestId)
+                       || not (String.IsNullOrWhiteSpace attempt.LatestReviewRequestId) then
+                        return! Error(StaleEntityVersion "Spec adoption requires an unstarted, unchanged Assigned attempt and exact new canonical blob.")
+                    let! _ = requiredIssue binding snapshot taskId attempt
+                    let next =
+                        { attempt with Version = attempt.Version + 1
+                                       Phase = "Queued"
+                                       AssignmentGeneration = generation + 1
+                                       IssuedSequence = snapshot.Header.NextSequence
+                                       SpecBlobOid = expectedCurrentSpecOid }
+                    return [
+                        change (attemptPath taskId attempt.AttemptId) (Some attemptOid) next
+                        change (issuePath taskId attempt.AttemptId (generation + 1)) None
+                            (issue taskId next (generation + 1) "Orchestrator" "SpecAdoption"
+                                instructions snapshot.Header.NextSequence)
+                        change (agentPath ownerId) (Some agentOid)
+                            { agent with Version = agent.Version + 1; StateReason = instructions
+                                         StateSequence = snapshot.Header.NextSequence } ]
+                })
+
+    let getTaskSpecPage binding taskId cursor pageBytes =
+        if not (validTaskId taskId) || pageBytes < 1 || pageBytes > 32768
+           || (not (String.IsNullOrEmpty cursor) && cursor.Length > 2048) then
+            Error(InvalidBinding "Spec page requires task ID and 1..32768 UTF-8 byte page size.")
+        else result {
+            let now = DateTimeOffset.UtcNow
+            let! snapshot, blobOid, offset, expiry =
+                if String.IsNullOrEmpty cursor then
+                    result {
+                        let! current = LedgerStore.fetch binding
+                        let! _ = required<ReviewTask> binding current (taskPath taskId)
+                        let! _, oid = LedgerStore.readAt binding current (specPath taskId)
+                        match oid with
+                        | Some value -> return current, value, 0, now.AddMinutes(30.0)
+                        | None -> return! Error(LedgerIntegrityError "Canonical task specification is missing.")
+                    }
+                else
+                    try
+                        let normalized = cursor.Replace('-', '+').Replace('_', '/')
+                        let data = Convert.FromBase64String(normalized.PadRight((normalized.Length + 3) / 4 * 4, '='))
+                        let token = JsonSerializer.Deserialize<TaskSpecCursor>(data, options)
+                        let mutable expires = Unchecked.defaultof<DateTimeOffset>
+                        if isNull (box token)
+                           || token.ProjectId <> binding.ProjectId.ToString("D")
+                           || token.LedgerId <> binding.LedgerId.ToString("D")
+                           || token.TaskId <> taskId || token.Offset < 0
+                           || not (DateTimeOffset.TryParse(token.ExpiresAtUtc, &expires))
+                           || expires <= now || expires > now.AddMinutes(30.0) then
+                            Error(InvalidBinding "Spec cursor expired, exceeds 30-minute lifetime or has mismatched project/task identity.")
+                        else
+                            LedgerStore.verifiedHistoricalSnapshot binding token.SnapshotCommit
+                            |> Result.map (fun pinned -> pinned, token.SpecBlobOid, token.Offset, expires)
+                    with _ -> Error(InvalidBinding "Malformed spec continuation cursor.")
+            let! content = LedgerStore.readHistoricalTaskSpec binding snapshot taskId blobOid
+            let data = Encoding.UTF8.GetBytes(content)
+            if offset > data.Length || (offset < data.Length && offset > 0
+                 && (data[offset] &&& 0xC0uy) = 0x80uy) then
+                return! Error(InvalidBinding "Spec cursor splits a UTF-8 code point.")
+            let mutable finish = min data.Length (offset + pageBytes)
+            while finish < data.Length && (data[finish] &&& 0xC0uy) = 0x80uy do
+                finish <- finish - 1
+            if finish = offset && offset < data.Length then
+                return! Error(InvalidBinding "Page size cannot hold the next UTF-8 character.")
+            let hasMore = finish < data.Length
+            let next =
+                if not hasMore then null
+                else
+                    let token =
+                        { ProjectId = binding.ProjectId.ToString("D")
+                          LedgerId = binding.LedgerId.ToString("D"); TaskId = taskId
+                          SnapshotCommit = snapshot.Commit; SpecBlobOid = blobOid
+                          Offset = finish; ExpiresAtUtc = expiry.ToString("O") }
+                    Convert.ToBase64String(Encoding.UTF8.GetBytes(json token))
+                        .TrimEnd('=').Replace('+', '-').Replace('/', '_')
+            return
+                { TaskId = taskId; SnapshotCommit = snapshot.Commit; SpecBlobOid = blobOid
+                  Offset = offset; TotalBytes = data.Length
+                  Content = Encoding.UTF8.GetString(data, offset, finish - offset)
+                  PageBytes = finish - offset; HasMore = hasMore
+                  NextCursor = next; ExpiresAtUtc = expiry.ToString("O") }
+        }
+
+    let diffTaskSpec binding taskId beforeOid afterOid =
+        if not (validTaskId taskId) then Error(InvalidBinding "Invalid diff task ID.")
+        else result {
+            let! snapshot = LedgerStore.fetch binding
+            let! _ = required<ReviewTask> binding snapshot (taskPath taskId)
+            let! diff, truncated =
+                LedgerStore.diffHistoricalTaskSpecs binding snapshot taskId beforeOid afterOid
+            return { TaskId = taskId; SnapshotCommit = snapshot.Commit
+                     BeforeOid = beforeOid; AfterOid = afterOid
+                     Diff = diff; Truncated = truncated }
+        }
+
+    let exportTaskSpecWithId binding (operationId: Guid) taskId relativePath expectedSpecOid =
+        if not (validTaskId taskId)
+           || String.IsNullOrWhiteSpace expectedSpecOid then
+            Error(InvalidBinding "Export requires task and exact expected canonical spec blob.")
+        else result {
+            let! snapshot = LedgerStore.fetch binding
+            let! _ = required<ReviewTask> binding snapshot (taskPath taskId)
+            let! html, oid = LedgerStore.readAt binding snapshot (specPath taskId)
+            if oid <> Some expectedSpecOid || html.IsNone then
+                return! Error(StaleEntityVersion "Canonical spec changed before export.")
+            let! alreadyApplied =
+                LedgerStore.exportRegisteredSpec binding relativePath taskId snapshot.Commit
+                    expectedSpecOid operationId html.Value
+            return { TaskId = taskId; SnapshotCommit = snapshot.Commit
+                     SpecBlobOid = expectedSpecOid; RelativePath = relativePath
+                     OperationId = operationId.ToString("D"); AlreadyApplied = alreadyApplied
+                     Authority = "NonAuthoritativeSourceCopy" }
+        }
+
+    let exportTaskSpec binding taskId relativePath expectedSpecOid =
+        exportTaskSpecWithId binding (Guid.NewGuid()) taskId relativePath expectedSpecOid
 
     let registerAgent binding operationId agentId =
         if not (validAgent agentId) then Error(InvalidBinding "Invalid agent ID.")
@@ -2108,7 +2394,7 @@ module ReviewWorkflow =
                        expectedAttemptVersion = expectedAttemptVersion
                        expectedAgentVersion = expectedAgentVersion
                        generation = generation; instructions = instructions
-                       specHtml = newSpecHtml |})
+                       specSha256 = specDigest newSpecHtml |})
                 (fun snapshot ->
                     result {
                         let! task, taskOid, attempt, attemptOid = getAttempt binding snapshot taskId

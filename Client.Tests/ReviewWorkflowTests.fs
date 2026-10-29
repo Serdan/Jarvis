@@ -89,6 +89,252 @@ type ReviewWorkflowTests() =
             Directory.Delete(root, true)
 
     [<Test>]
+    member _.CanonicalHtmlAcceptsExact512KiBAndRejectsLargerOrActiveMarkup() =
+        withFixture (fun _ _ first second _ _ _ _ ->
+            let html = "<h1>" + String('x', 512 * 1024 - 4)
+            Assert.That(System.Text.Encoding.UTF8.GetByteCount(html), Is.EqualTo(512 * 1024))
+            ReviewWorkflow.createTaskWithSpec first (Guid.NewGuid()) "spec-max" "Big task" html
+            |> success |> ignore
+            let firstPage = ReviewWorkflow.getTaskSpecPage second "spec-max" "" 32768 |> success
+            Assert.That(firstPage.TotalBytes, Is.EqualTo(512 * 1024))
+            Assert.That(firstPage.Content, Is.EqualTo(html.Substring(0, 32768)))
+            Assert.That(firstPage.HasMore, Is.True)
+            Assert.That(firstPage.SpecBlobOid.Length, Is.GreaterThanOrEqualTo(40))
+            match ReviewWorkflow.createTaskWithSpec first (Guid.NewGuid()) "spec-too-large"
+                    "Too large" (html + "x") with
+            | Error(InvalidBinding _) -> ()
+            | other -> Assert.Fail(sprintf "Over-limit spec accepted: %A" other)
+            match ReviewWorkflow.createTaskWithSpec first (Guid.NewGuid()) "spec-active"
+                    "Active script" "<h1>x</h1><script>alert(1)</script>" with
+            | Error(InvalidBinding _) -> ()
+            | other -> Assert.Fail(sprintf "Active script accepted: %A" other))
+
+    [<Test>]
+    member _.UnicodePagedSpecIsLosslessAndPinnedAcrossRevision() =
+        withFixture (fun _ _ first second _ _ _ _ ->
+            let taskId = "spec-unicode"
+            let original = "<h1>æøå 🦊</h1>\n<p>UTF-8 ✓ ñ 漢字</p>\n"
+            ReviewWorkflow.createTaskWithSpec first (Guid.NewGuid()) taskId "Unicode" original
+            |> success |> ignore
+            let initial = ReviewWorkflow.getTaskSpecPage second taskId "" 11 |> success
+            let firstOid = initial.SpecBlobOid
+            let firstSnapshot = initial.SnapshotCommit
+            Assert.That(initial.PageBytes, Is.EqualTo(11))
+            Assert.That(initial.Content, Does.StartWith("<h1>æø"))
+            ReviewWorkflow.reviseTaskSpecPinned first (Guid.NewGuid()) taskId 1 firstOid
+                "Unicode updated" "<h1>new version</h1>\n" |> success |> ignore
+            let mutable cursor = initial.NextCursor
+            let mutable collected = initial.Content
+            let mutable finished = false
+            let mutable segments = 1
+            while not finished do
+                let page = ReviewWorkflow.getTaskSpecPage second taskId cursor 11 |> success
+                Assert.That(page.SpecBlobOid, Is.EqualTo(firstOid))
+                Assert.That(page.SnapshotCommit, Is.EqualTo(firstSnapshot))
+                Assert.That(page.PageBytes, Is.LessThanOrEqualTo(11))
+                collected <- collected + page.Content
+                segments <- segments + 1
+                finished <- not page.HasMore
+                cursor <- page.NextCursor
+            Assert.That(collected, Is.EqualTo(original))
+            Assert.That(segments, Is.GreaterThan(3))
+            let current = ReviewWorkflow.getTaskSpecPage second taskId "" 32768 |> success
+            Assert.That(current.Content, Is.EqualTo("<h1>new version</h1>\n"))
+            Assert.That(current.SpecBlobOid, Is.Not.EqualTo(firstOid))
+            let diff = ReviewWorkflow.diffTaskSpec second taskId firstOid current.SpecBlobOid |> success
+            Assert.That(diff.Diff, Does.Contain("new version"))
+            Assert.That(diff.Diff, Does.Contain("UTF-8"))
+            Assert.That(diff.Truncated, Is.False)
+            let staleToken : TaskSpecCursor =
+                { ProjectId = first.ProjectId.ToString("D"); LedgerId = first.LedgerId.ToString("D")
+                  TaskId = taskId; SnapshotCommit = firstSnapshot; SpecBlobOid = firstOid
+                  Offset = initial.PageBytes
+                  ExpiresAtUtc = DateTimeOffset.UtcNow.AddDays(1.0).ToString("O") }
+            let futureCursor =
+                Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(
+                    System.Text.Json.JsonSerializer.Serialize(staleToken)))
+                    .TrimEnd('=').Replace('+', '-').Replace('/', '_')
+            match ReviewWorkflow.getTaskSpecPage first taskId futureCursor 11 with
+            | Error(InvalidBinding _) -> ()
+            | other -> Assert.Fail(sprintf "Unbounded forged cursor expiry accepted: %A" other)
+            match ReviewWorkflow.getTaskSpecPage first taskId "invalid-cursor" 11 with
+            | Error(InvalidBinding _) -> ()
+            | other -> Assert.Fail(sprintf "Invalid cursor accepted: %A" other)
+            match ReviewWorkflow.diffTaskSpec first taskId
+                    (String('0', 40)) current.SpecBlobOid with
+            | Error(InvalidBinding _) -> ()
+            | other -> Assert.Fail(sprintf "Non-canonical blob diff accepted: %A" other))
+
+    [<Test>]
+    member _.SourceImportAbove64KiBRoundTripsWithoutOversizedAuditRecord() =
+        withFixture (fun one _ first second _ _ _ _ ->
+            let taskId = "spec-large-import"
+            ReviewWorkflow.createTaskWithSpec first (Guid.NewGuid()) taskId "Before import"
+                "<h1>Initial</h1>" |> success |> ignore
+            let before = ReviewWorkflow.getTaskSpecPage first taskId "" 256 |> success
+            let source = "<h1>Large import 🦊</h1>\\n"
+                         + String.replicate (80 * 1024) "a"
+                         + "\\n"
+            let path = "large-draft.html"
+            File.WriteAllText(Path.Combine(one,path),source,System.Text.UTF8Encoding(false))
+            let original = LedgerStore.readRegisteredSourceSpec first path |> success
+            ReviewWorkflow.importTaskSpec first (Guid.NewGuid()) taskId 1
+                before.SpecBlobOid original.BlobOid "Large imported task" path
+            |> success |> ignore
+            let mutable cursor = ""
+            let mutable completed = false
+            let mutable assembled = ""
+            let mutable segmentCount = 0
+            while not completed do
+                let page = ReviewWorkflow.getTaskSpecPage second taskId cursor 32768 |> success
+                assembled <- assembled + page.Content
+                segmentCount <- segmentCount + 1
+                completed <- not page.HasMore
+                cursor <- page.NextCursor
+            Assert.That(System.Text.Encoding.UTF8.GetByteCount(source), Is.GreaterThan(64 * 1024))
+            Assert.That(assembled, Is.EqualTo(source))
+            Assert.That(segmentCount, Is.GreaterThan(2))
+            let _, _, _, direct, _ =
+                ReviewWorkflow.getTaskWithSpec second taskId |> success
+            Assert.That(direct, Is.EqualTo(source)))
+
+    [<Test>]
+    member _.ImportRejectsSourceMutationBetweenPreflightAndLedgerCAS() =
+        withFixture (fun one _ first second _ _ _ _ ->
+            let taskId = "spec-source-race"
+            ReviewWorkflow.createTaskWithSpec first (Guid.NewGuid()) taskId "Original"
+                "<h1>Keep me</h1>\n" |> success |> ignore
+            let baseline = ReviewWorkflow.getTaskSpecPage second taskId "" 512 |> success
+            let path = Path.Combine(one, "race.html")
+            File.WriteAllText(path, "<h2>Preflight snapshot</h2>\n")
+            let pinned = LedgerStore.readRegisteredSourceSpec first "race.html" |> success
+            File.WriteAllText(path, "<h2>Mutated after preflight</h2>\n")
+            match ReviewWorkflow.importTaskSpecPrepared first (Guid.NewGuid()) taskId 1
+                    baseline.SpecBlobOid pinned.BlobOid "Attempted stale import" "race.html" pinned with
+            | Error(SourceUnavailable _) -> ()
+            | other -> Assert.Fail(sprintf "Mutable source was published after preflight: %A" other)
+            let _, task, _ = ReviewWorkflow.getTask second taskId |> success
+            Assert.That(task.Version, Is.EqualTo(1))
+            Assert.That((ReviewWorkflow.getTaskSpecPage second taskId "" 512 |> success).SpecBlobOid,
+                        Is.EqualTo(baseline.SpecBlobOid))
+            Assert.That((LedgerStore.listAt second (LedgerStore.fetch second |> success) "tasks"
+                         |> success |> List.filter (fun path ->
+                             path.StartsWith("tasks/spec-source-race/imports/"))).Length,
+                        Is.EqualTo(0)))
+
+    [<Test>]
+    member _.AssignedSpecChangeNeedsExplicitNewGenerationAdoption() =
+        withFixture (fun _ _ first second _ _ _ _ ->
+            let taskId = "spec-adoption"
+            ReviewWorkflow.createTaskWithSpec first (Guid.NewGuid()) taskId "Initial"
+                "<h1>Old assigned contract</h1>" |> success |> ignore
+            let previous = ReviewWorkflow.getTaskSpecPage second taskId "" 1024 |> success
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner" "Reviewer"
+            |> success |> ignore
+            ReviewWorkflow.reviseTaskSpecPinned first (Guid.NewGuid()) taskId 2 previous.SpecBlobOid
+                "Updated" "<h1>New canonical contract</h1>" |> success |> ignore
+            let newPage = ReviewWorkflow.getTaskSpecPage second taskId "" 1024 |> success
+            let _, task, option = ReviewWorkflow.getTask first taskId |> success
+            let oldAttempt = option.Value
+            let owner = (ReviewWorkflow.getAgentInbox first "Owner" |> success).Agent
+            Assert.That(task.SpecVersion, Is.EqualTo(2))
+            Assert.That(oldAttempt.SpecBlobOid, Is.EqualTo(previous.SpecBlobOid))
+            Assert.That(newPage.SpecBlobOid, Is.Not.EqualTo(oldAttempt.SpecBlobOid))
+            let _, _, _, firstIssue, _ = ReviewWorkflow.getAssignment second taskId 1 |> success
+            Assert.That(firstIssue.SpecBlobOid, Is.EqualTo(previous.SpecBlobOid))
+            expectStale (ReviewWorkflow.adoptTaskSpec first (Guid.NewGuid()) taskId "Owner"
+                             task.Version oldAttempt.Version owner.Version 1 previous.SpecBlobOid
+                             "Wrong spec version")
+            ReviewWorkflow.adoptTaskSpec first (Guid.NewGuid()) taskId "Owner"
+                task.Version oldAttempt.Version owner.Version 1 newPage.SpecBlobOid
+                "Explicitly adopt the revised spec" |> success |> ignore
+            let _, unchanged, adopted = ReviewWorkflow.getTask second taskId |> success
+            Assert.That(unchanged.Version, Is.EqualTo(task.Version))
+            Assert.That(adopted.Value.AssignmentGeneration, Is.EqualTo(2))
+            Assert.That(adopted.Value.SpecBlobOid, Is.EqualTo(newPage.SpecBlobOid))
+            let _, _, _, previousIssue, _ = ReviewWorkflow.getAssignment second taskId 1 |> success
+            let _, _, _, updatedIssue, _ = ReviewWorkflow.getAssignment second taskId 2 |> success
+            Assert.That(previousIssue.SpecBlobOid, Is.EqualTo(previous.SpecBlobOid))
+            Assert.That(updatedIssue.SpecBlobOid, Is.EqualTo(newPage.SpecBlobOid))
+            Assert.That(updatedIssue.Reason, Is.EqualTo("SpecAdoption"))
+            expectStale (ReviewWorkflow.beginAttempt first (Guid.NewGuid()) taskId "Owner" 1 1)
+            let _, _, ready = ReviewWorkflow.getTask first taskId |> success
+            ReviewWorkflow.beginAttempt first (Guid.NewGuid()) taskId "Owner" ready.Value.Version 2
+            |> success |> ignore
+            let working = (ReviewWorkflow.getAgentInbox first "Owner" |> success).Agent
+            let _, currentTask, workingAttempt = ReviewWorkflow.getTask first taskId |> success
+            expectStale (ReviewWorkflow.adoptTaskSpec first (Guid.NewGuid()) taskId "Owner"
+                             currentTask.Version workingAttempt.Value.Version working.Version 2
+                             previous.SpecBlobOid "Cannot preempt Working"))
+
+    [<Test>]
+    member _.RegisteredWorktreeImportRecordsBlobCommitAndGuardsExportPaths() =
+        withFixture (fun one _ first second _ _ _ _ ->
+            let taskId = "spec-import"
+            ReviewWorkflow.createTaskWithSpec first (Guid.NewGuid()) taskId "Initial"
+                "<h1>Unimported</h1>\n" |> success |> ignore
+            let oldPage = ReviewWorkflow.getTaskSpecPage first taskId "" 512 |> success
+            let relative = "draft-source.html"
+            let source = "<h1>Imported 🦊</h1>\n<p>file provenance</p>\n"
+            File.WriteAllText(Path.Combine(one, relative), source)
+            let stable = LedgerStore.readRegisteredSourceSpec first relative |> success
+            let id = Guid.NewGuid()
+            let import () =
+                ReviewWorkflow.importTaskSpec first id taskId 1 oldPage.SpecBlobOid stable.BlobOid
+                    "Imported HTML" relative
+            Assert.That((import () |> success).AlreadyApplied, Is.False)
+            Assert.That((import () |> success).AlreadyApplied, Is.True)
+            let page = ReviewWorkflow.getTaskSpecPage second taskId "" 32768 |> success
+            Assert.That(page.Content, Is.EqualTo(source))
+            Assert.That(page.SpecBlobOid, Is.EqualTo(stable.BlobOid))
+            let snapshot = LedgerStore.fetch second |> success
+            let paths = LedgerStore.listAt second snapshot "tasks" |> success
+            let provenancePath =
+                paths |> List.find (fun path -> path.StartsWith("tasks/spec-import/imports/"))
+            let content, _ = LedgerStore.readAt second snapshot provenancePath |> success
+            let provenance = System.Text.Json.JsonSerializer.Deserialize<TaskSpecImport>(
+                                 content.Value,
+                                 System.Text.Json.JsonSerializerOptions(PropertyNameCaseInsensitive = true))
+            Assert.That(provenance.SourceRef, Is.EqualTo(stable.SourceRef))
+            Assert.That(provenance.SourceCommitOid, Is.EqualTo(stable.CommitOid))
+            Assert.That(provenance.SourceRepositoryId, Is.EqualTo(stable.RepositoryId))
+            Assert.That(provenance.SourceBlobOid, Is.EqualTo(stable.BlobOid))
+            let result = ReviewWorkflow.exportTaskSpec first taskId
+                             "exported-spec.html" page.SpecBlobOid |> success
+            Assert.That(result.Authority, Is.EqualTo("NonAuthoritativeSourceCopy"))
+            let exported = File.ReadAllText(Path.Combine(one, "exported-spec.html"))
+            Assert.That(exported, Does.Contain("NON-AUTHORITATIVE JARVIS V2 EXPORT"))
+            Assert.That(exported, Does.EndWith(source))
+            match ReviewWorkflow.exportTaskSpec first taskId "exported-spec.html" page.SpecBlobOid with
+            | Error(StaleEntityVersion _) -> ()
+            | other -> Assert.Fail(sprintf "Existing export was overwritten: %A" other)
+            Assert.That(File.ReadAllText(Path.Combine(one, "exported-spec.html")), Is.EqualTo(exported))
+            for path in [ "../escape.html"; "/tmp/escape.html"; ".git/config.html"; "a/../../b.html" ] do
+                match LedgerStore.readRegisteredSourceSpec first path with
+                | Error(InvalidBinding _) -> ()
+                | other -> Assert.Fail(sprintf "Traversal import accepted (%s): %A" path other)
+                match ReviewWorkflow.exportTaskSpec first taskId path page.SpecBlobOid with
+                | Error(InvalidBinding _) -> ()
+                | other -> Assert.Fail(sprintf "Traversal export accepted (%s): %A" path other)
+            File.CreateSymbolicLink(Path.Combine(one, "symlink.html"),
+                                    Path.Combine(one, relative)) |> ignore
+            match LedgerStore.readRegisteredSourceSpec first "symlink.html" with
+            | Error(InvalidBinding _) -> ()
+            | other -> Assert.Fail(sprintf "Symlink source accepted: %A" other)
+            match ReviewWorkflow.exportTaskSpec first taskId "symlink.html" page.SpecBlobOid with
+            | Error(InvalidBinding _) -> ()
+            | other -> Assert.Fail(sprintf "Symlink export accepted: %A" other)
+            let originalContent = File.ReadAllText(Path.Combine(one, relative))
+            File.WriteAllText(Path.Combine(one, relative), "<h1>Changed after observation</h1>")
+            match ReviewWorkflow.importTaskSpec first (Guid.NewGuid()) taskId 2 page.SpecBlobOid
+                    stable.BlobOid "Outdated import" relative with
+            | Error(InvalidBinding _) -> ()
+            | other -> Assert.Fail(sprintf "Changed source blob imported: %A" other)
+            Assert.That(File.ReadAllText(Path.Combine(one, relative)), Is.Not.EqualTo(originalContent))
+            Assert.That((ReviewWorkflow.getTaskSpecPage second taskId "" 512 |> success).SpecBlobOid,
+                        Is.EqualTo(page.SpecBlobOid)))
+
+    [<Test>]
     member _.AdministrativeAssignedReadyAndAcknowledgedStateMatrix() =
         for phase in [ "Queued"; "Acknowledged"; "Paused" ] do
             withFixture (fun _ _ first second _ _ _ _ ->
@@ -1158,7 +1404,7 @@ type ReviewWorkflowTests() =
                           OwnerId = "Owner"; ReviewerId = "Reviewer" } |> ignore
                 let queued =
                     Client.V2ReviewApi.V2TaskApi.read
-                        { ProjectName = "owner"; AgentId = "Owner"; Action = "AgentInbox"; TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L } ctx
+                        { ProjectName = "owner"; AgentId = "Owner"; Action = "AgentInbox"; TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L; Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null } ctx
                     |> function
                         | Ok value -> unbox<AgentInbox> value
                         | Error error -> failwithf "V2 inbox failed: %A" error
@@ -1166,7 +1412,7 @@ type ReviewWorkflowTests() =
                 Assert.That(queued.RunnableQueue.Head.Attempt.SpecBlobOid.Length, Is.EqualTo(40))
                 let generationLookup : Common.V2TaskReadCommand =
                     { ProjectName = "owner"; AgentId = ""; Action = "GetAssignment"
-                      TaskId = taskId; AssignmentGeneration = 1; CheckpointSequence = 0L }
+                      TaskId = taskId; AssignmentGeneration = 1; CheckpointSequence = 0L; Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null }
                 let snapshotAssignment =
                     Client.V2ReviewApi.V2TaskApi.read generationLookup ctx
                     |> function
@@ -1216,7 +1462,7 @@ type ReviewWorkflowTests() =
                           NextAction = "Resume work" } |> ignore
                 let ready =
                     Client.V2ReviewApi.V2TaskApi.read
-                        { ProjectName = "owner"; AgentId = "Owner"; Action = "AgentInbox"; TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L } ctx
+                        { ProjectName = "owner"; AgentId = "Owner"; Action = "AgentInbox"; TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L; Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null } ctx
                     |> function
                         | Ok value -> unbox<AgentInbox> value
                         | Error error -> failwithf "V2 Ready inbox failed: %A" error
@@ -1312,7 +1558,7 @@ type ReviewWorkflowTests() =
                 | Error error -> Assert.Fail(sprintf "V2 orphan tombstone inspection API failed: %A" error)
                 let after =
                     Client.V2ReviewApi.V2TaskApi.read
-                        { ProjectName = "owner"; AgentId = "Owner"; Action = "AgentInbox"; TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L } ctx
+                        { ProjectName = "owner"; AgentId = "Owner"; Action = "AgentInbox"; TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L; Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null } ctx
                     |> function
                         | Ok value -> unbox<AgentInbox> value
                         | Error error -> failwithf "V2 inbox failed: %A" error
@@ -1339,7 +1585,7 @@ type ReviewWorkflowTests() =
                           ExpectedTaskVersion = 1; Reason = "Explicit cancellation" } |> ignore
                 let adminHistory : Common.V2TaskReadCommand =
                     { ProjectName = "owner"; Action = "LifecycleHistory"; TaskId = adminTask
-                      AgentId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L }
+                      AgentId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L; Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null }
                 match Client.V2ReviewApi.V2TaskApi.read adminHistory ctx with
                 | Ok value ->
                     let _, events = unbox<string * TaskLifecycleEvent list> value
@@ -1350,6 +1596,76 @@ type ReviewWorkflowTests() =
                           ExpectedTaskVersion = 2; Reason = "Explicit reopening" } |> ignore
                 let _, reopened, _ = ReviewWorkflow.getTask first adminTask |> success
                 Assert.That(reopened.Lifecycle, Is.EqualTo("Open"))
+                // V2-09 spec commands through the opted-in client protocol:
+                // read pages/diff on read route, export on write route.
+                let specTask = "spec-api"
+                run { template "CreateTask" specTask with
+                          Title = "Spec API"; Html = "<h1>API revision one</h1>\\n" } |> ignore
+                let pageCmd : Common.V2TaskReadCommand =
+                    { ProjectName = "owner"; Action = "GetSpecPage"; TaskId = specTask
+                      AgentId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L
+                      Cursor = ""; PageSize = 128; BeforeOid = null; AfterOid = null; RelativePath = null }
+                let pageBefore =
+                    Client.V2ReviewApi.V2TaskApi.read pageCmd ctx
+                    |> function
+                       | Ok value -> unbox<TaskSpecPage> value
+                       | Error error -> failwithf "V2 spec page API failed: %A" error
+                Assert.That(pageBefore.TotalBytes, Is.GreaterThan(10))
+                let revisedHtml = "<h1>API revised 🦊</h1>\\n"
+                let revisionCmd =
+                    { template "ReviseTaskSpecPinned" specTask with
+                        ExpectedVersion = 1; BaseOid = pageBefore.SpecBlobOid
+                        Title = "Spec API updated"; Html = revisedHtml }
+                let _ = run revisionCmd
+                let retried = run revisionCmd
+                let retriedJson = System.Text.Json.JsonSerializer.Serialize(retried)
+                Assert.That(retriedJson, Does.Contain("alreadyApplied"))
+                let pageAfter =
+                    Client.V2ReviewApi.V2TaskApi.read pageCmd ctx
+                    |> function
+                       | Ok value -> unbox<TaskSpecPage> value
+                       | Error error -> failwithf "V2 revised page API failed: %A" error
+                Assert.That(pageAfter.Content, Is.EqualTo(revisedHtml))
+                let diffCmd = { pageCmd with Action = "DiffTaskSpec"; BeforeOid = pageBefore.SpecBlobOid
+                                             AfterOid = pageAfter.SpecBlobOid }
+                match Client.V2ReviewApi.V2TaskApi.read diffCmd ctx with
+                | Ok value -> Assert.That((unbox<TaskSpecDiff> value).Diff, Does.Contain("API revised"))
+                | Error error -> Assert.Fail(sprintf "V2 diff API failed: %A" error)
+                let exportCmd = { template "ExportTaskSpec" specTask with
+                                    SourceRef = "spec-api-export.html"
+                                    BaseOid = pageAfter.SpecBlobOid }
+                let exportReceipt = run exportCmd
+                Assert.That((unbox<TaskSpecExport> exportReceipt).AlreadyApplied, Is.False)
+                Assert.That((unbox<TaskSpecExport> exportReceipt).Authority,
+                            Is.EqualTo("NonAuthoritativeSourceCopy"))
+                let exportRetry = run exportCmd
+                Assert.That((unbox<TaskSpecExport> exportRetry).AlreadyApplied, Is.True)
+                let otherOperation = { exportCmd with OperationId = Guid.NewGuid().ToString("D") }
+                match Client.V2ReviewApi.V2TaskApi.write otherOperation ctx with
+                | Error _ -> ()
+                | Ok _ -> Assert.Fail("Unrelated operation overwrote existing exported HTML")
+                Assert.That(File.ReadAllText(Path.Combine(one, "spec-api-export.html")),
+                            Does.Contain("NON-AUTHORITATIVE JARVIS"))
+                match Client.V2ReviewApi.V2TaskApi.read
+                        { pageCmd with Action = "ExportTaskSpec"; RelativePath = "should-not-write.html" } ctx with
+                | Error _ -> ()
+                | Ok _ -> Assert.Fail("Export incorrectly accessible through read-only V2 API")
+                Assert.That(File.Exists(Path.Combine(one, "should-not-write.html")), Is.False)
+                File.WriteAllText(Path.Combine(one, "spec-api-import.html"),
+                                  "<h1>API imported safely</h1>\\n")
+                let sourceDraft = LedgerStore.readRegisteredSourceSpec first "spec-api-import.html" |> success
+                let importCommand =
+                    { template "ImportTaskSpec" specTask with
+                        ExpectedVersion = 2; BaseOid = pageAfter.SpecBlobOid
+                        TargetRef = sourceDraft.BlobOid; SourceRef = "spec-api-import.html"
+                        Title = "Spec API imported" }
+                run importCommand |> ignore
+                let latest =
+                    Client.V2ReviewApi.V2TaskApi.read pageCmd ctx
+                    |> function
+                       | Ok value -> unbox<TaskSpecPage> value
+                       | Error error -> failwithf "V2 imported page API failed: %A" error
+                Assert.That(latest.Content, Does.Contain("API imported safely"))
                 Assert.That(after.PendingReviews.Head.RequestId, Is.EqualTo(requestId.ToString("N")))
                 Assert.That((Client.V2ReviewApi.V2PendingIntentJournal.listAtRoot one |> success).Length,
                             Is.EqualTo(0), "Verified V2 mutations must clear pending local intents.")
@@ -1772,12 +2088,11 @@ type ReviewWorkflowTests() =
 
 
     [<Test>]
-    member _.CanonicalSpecAccepts128KiBAndRejectsOversizeWithoutLedgerWrite() =
+    member _.CanonicalSpecAccepts512KiBAndRejectsOversizeWithoutLedgerWrite() =
         withFixture (fun _ _ first second _ _ _ _ ->
-            let html = "<article>" + String.replicate (128 * 1024 - 19) "x" + "</article>"
             // The exact UTF-8 ceiling is measured on the committed HTML bytes.
-            let exact = "<p>" + String.replicate (128 * 1024 - 7) "x" + "</p>"
-            Assert.That(System.Text.Encoding.UTF8.GetByteCount exact, Is.EqualTo(128 * 1024))
+            let exact = "<p>" + String.replicate (512 * 1024 - 7) "x" + "</p>"
+            Assert.That(System.Text.Encoding.UTF8.GetByteCount exact, Is.EqualTo(512 * 1024))
             ReviewWorkflow.createTaskWithSpec first (Guid.NewGuid()) "largehtml"
                 "Large canonical task" exact |> success |> ignore
             let _, task, _, received, _ =

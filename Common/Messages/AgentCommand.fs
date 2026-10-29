@@ -165,7 +165,12 @@ type V2TaskReadCommand =
       Action: string
       TaskId: string
       AssignmentGeneration: int
-      CheckpointSequence: int64 }
+      CheckpointSequence: int64
+      Cursor: string
+      PageSize: int
+      BeforeOid: string
+      AfterOid: string
+      RelativePath: string }
 
 type V2TaskWriteCommand =
     { ProjectName: string
@@ -1119,7 +1124,7 @@ module AgentCommandInfo =
         | None -> invocation command
 
 module AgentProtocol =
-    let version = "3.33"
+    let version = "3.34"
     let defaultPatchFuzzyContextLines = 3
     let maxResponseBytes = 900 * 1024
     let maxImageBytes = 8 * 1024 * 1024

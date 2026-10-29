@@ -83,6 +83,18 @@ Changing an assignment or recovering a stalled agent must not allow an old sessi
 
 Task descriptions are stored directly in the orphan branch as HTML. The assigned agent can read its pinned instructions/spec. Editing source-side HTML does not silently edit the canonical task. Use existing spec operations where useful; do not require special import/export workflows to make tasks usable.
 
+### Working-turn timestamps and 25/30-minute guidance
+
+A Working turn is a contiguous period in **Working**: start at BeginAttempt or ResumeAgent; stop when the agent yields, completes, is recovered, or is administratively removed from Working. Checkpoints and review submissions do **not** restart the clock. The canonical Git agent record stores UTC start/end timestamps, the last duration, completed duration total and Working turn count. The active turn's age is derived from its start time; no server timer or database is needed.
+
+On each subsequent MCP tool response from the associated agent conversation, check elapsed **wall-clock time** since Working began:
+
+- **25 minutes (soft stop):** Tell the agent to finish its current small unit, avoid starting more work, persist/commit changes, checkpoint or yield with a concrete next action, and write a response.
+- **30 minutes (hard stop):** Tell the agent to start no further work, use only operations necessary to persist/commit/checkpoint, and write its response promptly.
+- **Before 25 minutes, or outside Working:** Do not emit cutoff instructions. Repeated responses after a cutoff may repeat the applicable instruction. The 30-minute instruction supersedes the 25-minute instruction.
+
+These are **instructions, not forced cancellation**: tool responses are the delivery point, so a silent or stalled session cannot receive one until another tool response arrives. Neither cutoff changes agent state automatically or steals an assignment. The client associates the conversation with a worker when that conversation performs a worker-owned lifecycle action; the association is ephemeral and must not be inferred merely because an orchestrator reads someone's inbox. Persistent time/stats are in Git, not session memory.
+
 ## 4. Review workflow
 
 Review is independent of the implementation assignment:

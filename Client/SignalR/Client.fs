@@ -2,6 +2,7 @@ module Client.SignalR.Client
 
 open System
 open System.Diagnostics
+open System.Collections.Concurrent
 open System.IO
 open System.Net
 open System.Net.Http
@@ -19,6 +20,81 @@ open FsToolkit.ErrorHandling
 let receiveMessage (rt: Runtime) message =
     rt.Tui.Log message
     Task.CompletedTask
+
+// A successful worker-owned action associates the current ChatGPT session.
+// Do not infer worker identity from inbox reads: orchestrators inspect those too.
+// This association is ephemeral; the Git agent record owns timestamps.
+let private workingSessions =
+    ConcurrentDictionary<string, string * string * ReviewWorkflow.ReviewAgent>()
+
+let private workingActor command =
+    match command with
+    | V2TaskWriteCommand c when List.contains c.Action
+        [ "BeginAttempt"; "ResumeAgent"; "CheckpointAttempt";
+          "BindReviewBase"; "BindAttemptSource"; "RebindAttemptSource" ] ->
+        Some(c.ProjectName, c.ActorId)
+    | V2ReviewWriteCommand c when List.contains c.Action [ "Submit"; "Update" ] ->
+        Some(c.ProjectName, c.ActorId)
+    | _ -> None
+
+let private checkWorkingGuidance (rt: Runtime) sessionId command response =
+    if String.IsNullOrWhiteSpace sessionId then []
+    else
+        let candidate =
+            match response, workingActor command with
+            | Ok _, Some(project, agent) when not (String.IsNullOrWhiteSpace agent) ->
+                Some(project, agent)
+            | _ -> None
+        let existing =
+            match workingSessions.TryGetValue sessionId with
+            | true, stored -> Some stored
+            | _ -> None
+        let binding =
+            match candidate, existing with
+            | Some(project, agent), _ -> Some(project, agent)
+            | None, Some(project, agent, _) -> Some(project, agent)
+            | _ -> None
+        match binding with
+        | None -> []
+        | Some(project, agentId) ->
+            if (match AgentCommandInfo.projectName command with
+                | Some target -> target <> project
+                | None -> false) then []
+            else
+                let now = DateTimeOffset.UtcNow
+                let shouldRead =
+                    candidate.IsSome
+                    || (match existing with
+                        | Some(_, _, cached) ->
+                            WorkingTurnGuidance.instructionAt now cached |> Option.isSome
+                        | None -> false)
+                    || (match command with
+                        | V2TaskWriteCommand c when List.contains c.Action
+                            [ "YieldAgent"; "CompleteAgentWork"; "RecoverAgentAssignment";
+                              "ParkAttempt"; "BlockAttempt"; "CancelTask"; "AbandonAttempt" ] -> true
+                        | _ -> false)
+                let active =
+                    if shouldRead then
+                        match V2ReviewApi.ReviewV2Binding.load project rt with
+                        | Error _ -> None
+                        | Ok ledger ->
+                            match ReviewWorkflow.ReviewWorkflow.getAgentWorkingTurn ledger agentId with
+                            | Ok a -> Some a
+                            | Error _ -> None
+                    else
+                        existing |> Option.map (fun (_, _, a) -> a)
+                match active with
+                | Some current when current.State = "Working" ->
+                    workingSessions[sessionId] <- (project, agentId, current)
+                    match WorkingTurnGuidance.instructionAt now current with
+                    | Some content ->
+                        [ { Scope = "working-turn"; Path = "jarvis/working-turn";
+                            Sha256 = ""; Content = content } ]
+                    | None -> []
+                | Some _ ->
+                    workingSessions.TryRemove(sessionId) |> ignore
+                    []
+                | None -> []
 
 let private serialize<'a> (value: 'a) =
     try
@@ -379,7 +455,7 @@ let receiveCommandWithInstructions (rt: Runtime) command =
             return response, instructions
     }
 
-let receiveCommandAndReply (connection: HubConnection) (rt: Runtime) (correlationId: string) (commandJson: string) : Task =
+let receiveCommandAndReply (connection: HubConnection) (rt: Runtime) (correlationId: string) (commandJson: string) (sessionId: string) : Task =
     task {
         let mutable parsedCommand = None
         let mutable instructions: InstructionDocument list = []
@@ -389,7 +465,7 @@ let receiveCommandAndReply (connection: HubConnection) (rt: Runtime) (correlatio
                     let command = JsonSerializer.Deserialize<AgentCommand>(commandJson)
                     parsedCommand <- Some command
                     let! response, applicable = receiveCommandWithInstructions rt command
-                    instructions <- applicable
+                    instructions <- applicable @ checkWorkingGuidance rt sessionId command response
                     return response
                 with ex ->
                     return Error(ExceptionError ex)

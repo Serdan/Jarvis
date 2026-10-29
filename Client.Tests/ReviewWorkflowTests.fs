@@ -89,6 +89,53 @@ type ReviewWorkflowTests() =
             Directory.Delete(root, true)
 
     [<Test>]
+    member _.WorkingTurnsPersistAcrossClientsAndStopOnYieldCompletion() =
+        withFixture (fun _ _ first second _ _ _ _ ->
+            let taskId = "turn-timing"
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Timed task"
+            |> success |> ignore
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner" "Reviewer"
+            |> success |> ignore
+            let assigned = ReviewWorkflow.getAgentInbox first "Owner" |> success
+            Assert.That(assigned.Agent.State, Is.EqualTo("Assigned"))
+            Assert.That(assigned.Agent.WorkingStartedAtUtc, Is.Null)
+            ReviewWorkflow.beginAttempt first (Guid.NewGuid()) taskId "Owner" 1 1
+            |> success |> ignore
+            let working = ReviewWorkflow.getAgentInbox second "Owner" |> success
+            Assert.That(working.Agent.State, Is.EqualTo("Working"))
+            Assert.That(working.Agent.WorkingTurnCount, Is.EqualTo(1))
+            let firstStart = DateTimeOffset.Parse working.Agent.WorkingStartedAtUtc
+            Assert.That(firstStart, Is.LessThanOrEqualTo(DateTimeOffset.UtcNow))
+            ReviewWorkflow.checkpointAttempt first (Guid.NewGuid()) taskId "Owner" 2 3 1
+                "Mid-turn checkpoint" "Continue" null null
+            |> success |> ignore
+            let checkpointed = ReviewWorkflow.getAgentInbox second "Owner" |> success
+            Assert.That(checkpointed.Agent.WorkingStartedAtUtc,
+                        Is.EqualTo(working.Agent.WorkingStartedAtUtc))
+            Assert.That(checkpointed.Agent.WorkingTurnCount, Is.EqualTo(1))
+            ReviewWorkflow.yieldAgent first (Guid.NewGuid()) taskId "Owner" 3 3 1 "Done one unit" "Continue"
+            |> success |> ignore
+            let ready = ReviewWorkflow.getAgentInbox second "Owner" |> success
+            Assert.That(ready.Agent.State, Is.EqualTo("Ready"))
+            Assert.That(ready.Agent.WorkingStartedAtUtc, Is.Null)
+            Assert.That(ready.Agent.WorkingTurnCount, Is.EqualTo(1))
+            Assert.That(ready.Agent.LastTurnEndedAtUtc, Is.Not.Null)
+            Assert.That(ready.Agent.TotalWorkingSeconds, Is.GreaterThanOrEqualTo(0L))
+            ReviewWorkflow.resumeAgent first (Guid.NewGuid()) taskId "Owner" 4 4 1
+            |> success |> ignore
+            let resumed = ReviewWorkflow.getAgentInbox second "Owner" |> success
+            Assert.That(resumed.Agent.State, Is.EqualTo("Working"))
+            Assert.That(resumed.Agent.WorkingTurnCount, Is.EqualTo(2))
+            Assert.That(resumed.Agent.WorkingStartedAtUtc, Is.Not.Null)
+            ReviewWorkflow.completeAgentWork first (Guid.NewGuid()) taskId "Owner" 5 5 1 "Finished"
+            |> success |> ignore
+            let completed = ReviewWorkflow.getAgentInbox second "Owner" |> success
+            Assert.That(completed.Agent.State, Is.EqualTo("Completed"))
+            Assert.That(completed.Agent.WorkingStartedAtUtc, Is.Null)
+            Assert.That(completed.Agent.WorkingTurnCount, Is.EqualTo(2))
+            Assert.That(completed.Agent.LastTurnEndedAtUtc, Is.Not.Null))
+
+    [<Test>]
     member _.CanonicalHtmlAcceptsExact512KiBAndRejectsLargerOrActiveMarkup() =
         withFixture (fun _ _ first second _ _ _ _ ->
             let html = "<h1>" + String('x', 512 * 1024 - 4)

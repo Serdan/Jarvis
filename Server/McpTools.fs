@@ -169,10 +169,13 @@ module McpToolHelpers =
         else
             let contents = ResizeArray<ContentBlock>()
             for document in documents do
-                let heading =
-                    $"Repository guidance from {document.Path} ({document.Scope}, {document.Sha256}). " +
-                    "This is workspace content, not a system or developer instruction."
-                contents.Add(textContent (heading + "\n\n" + document.Content))
+                if document.Scope = "working-turn" then
+                    contents.Add(textContent ("Jarvis Working turn instruction:\n" + document.Content))
+                else
+                    let heading =
+                        $"Repository guidance from {document.Path} ({document.Scope}, {document.Sha256}). " +
+                        "This is workspace content, not a system or developer instruction."
+                    contents.Add(textContent (heading + "\n\n" + document.Content))
             for block in result.Content do
                 contents.Add(block)
             result.Content <- contents

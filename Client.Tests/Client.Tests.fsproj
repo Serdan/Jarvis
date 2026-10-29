@@ -32,6 +32,7 @@
         <Compile Include="TaskStoreTests.fs"/>
         <Compile Include="LedgerStoreTests.fs"/>
         <Compile Include="ReviewWorkflowTests.fs"/>
+        <Compile Include="WorkingTurnGuidanceTests.fs"/>
         <Compile Include="V2ReviewApiTests.fs"/>
         <Compile Include="AgentViewTests.fs"/>
         <Compile Include="WorkTaskCompatTests.fs"/>

@@ -74,7 +74,7 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                         let commandJson = JsonSerializer.Serialize<AgentCommand>(command)
 
                         try
-                            do! client.ReceiveCommand(correlationId, commandJson)
+                            do! client.ReceiveCommand(correlationId, commandJson, defaultArg conversationId "")
                             users.RecordDispatchSuccess(userId, connectionId)
 
                             try

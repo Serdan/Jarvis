@@ -63,7 +63,7 @@ Keep the existing stable operation ID/deduplication mechanism so a retried tool 
 
 ## 3. Tasks and agents
 
-An agent is identified by its project-local label, not by a ChatGPT conversation ID, device, or worktree. **Only one implementation agent owns a task at a time.** There is no concurrent implementation of the same task to coordinate.
+An agent is identified for task ownership by its project-local label, not by a ChatGPT conversation ID, device, or worktree. The current conversation ID is only a replaceable routing hint for the Working turn. **Only one implementation agent owns a task at a time.** There is no concurrent implementation of the same task to coordinate.
 
 Retain the agreed operator-facing agent states:
 
@@ -77,7 +77,7 @@ Retain the agreed operator-facing agent states:
 
 A registered idle agent starts Parked. Each agent has at most one Working assignment. Assignment, start, checkpoint, yield, resume, completion and reassignment update the canonical orphan branch. The assignment includes the task, instructions and enough source context to continue in the correct worktree. A checkpoint carries a summary and next action so a restarted ChatGPT session can recover work.
 
-Changing an assignment or recovering a stalled agent must not allow an old session to publish work as the current owner. An orchestrator explicitly decides to recover/reassign; elapsed time alone never steals ownership.
+Changing task ownership or an assignment generation invalidates stale assignment operations. A changed **conversation ID alone** does not invalidate ownership, cause a conflict, or revoke an assignment. An orchestrator explicitly decides to recover/reassign; elapsed time alone never steals ownership.
 
 **Task completion and agent availability are different.** An agent can complete its work, receive another assignment, and still have an earlier task awaiting review or integration. No review decision interrupts the agent's newer work.
 
@@ -93,7 +93,18 @@ On each subsequent MCP tool response from the associated agent conversation, che
 - **30 minutes (hard stop):** Tell the agent to start no further work, use only operations necessary to persist/commit/checkpoint, and write its response promptly.
 - **Before 25 minutes, or outside Working:** Do not emit cutoff instructions. Repeated responses after a cutoff may repeat the applicable instruction. The 30-minute instruction supersedes the 25-minute instruction.
 
-These are **instructions, not forced cancellation**: tool responses are the delivery point, so a silent or stalled session cannot receive one until another tool response arrives. Neither cutoff changes agent state automatically or steals an assignment. The client associates the conversation with a worker when that conversation performs a worker-owned lifecycle action; the association is ephemeral and must not be inferred merely because an orchestrator reads someone's inbox. Persistent time/stats are in Git, not session memory.
+These are **instructions, not forced cancellation**: tool responses are the delivery point, so a silent or stalled session cannot receive one until another tool response arrives. Neither cutoff changes agent state automatically or steals an assignment. Persistent time/stats and the current Working conversation ID are stored in the orphan-branch agent record, not in a client-memory-only mapping.
+
+### Working conversation identity and restart
+
+- **Persist the current conversation ID** (for example, `workingConversationId`) in the canonical agent record when an agent enters Working through `BeginAttempt` or `ResumeAgent`. Obtain it from the incoming Jarvis request/session metadata; do not ask the agent to invent one. Clear it on exit from Working.
+- The ID is expected to stay consistent over one uninterrupted agent turn, but it is **ephemeral**. A manually restarted session after a harness stall may receive a different ID. The ID is not a credential, ownership key, lease, task generation, or optimistic-concurrency precondition. Its value changing is **not** an ownership conflict.
+- **Explicit reattachment:** after a stall/manual restart, the worker first calls `ResumeAgent` (or the equivalent existing resume action) for its current task. When the agent is already **Working** on that same task/attempt, resume only updates `workingConversationId` to the request's new ID. It does **not** create a new assignment generation, change agent state, release/acquire the slot, start a new Working turn, reset `workingStartedAtUtc`, increment `workingTurnCount`, or reset duration cutoffs. It requires the current task/attempt/agent identity and usual assignment version checks, not a match with the old conversation ID. A Ready agent resuming from a deliberate yield instead follows the normal Ready → Working transition and starts a new timed Working turn.
+- The latest successful explicit start/resume association replaces the previous ID. Normal generic tool calls (`run_command`, `read_file`, job polling, etc.) **do not change the association**. An orchestrator reading an agent's inbox must not bind the orchestrator's conversation to that agent.
+- On **any** subsequent tool response, the client uses the supplied conversation ID and project to find the matching current Working agent in the canonical ledger and derives the cutoff from that agent's persisted Working start. No worker-specific tool call, in-memory conversation map, or special duration tool is necessary after association. If there is no unique match, do not guess or inject another agent's cutoff instructions. A new ID will therefore receive instructions after the explicit resume/reattachment call.
+- Git commit ordering still protects task and agent mutations; stale **assignment versions/generations** remain invalid. The old conversation ID must never be used to reject an otherwise valid agent operation or to infer that an agent is stalled. A resume call that merely changes an ID is a small state update, not task recovery or reassignment.
+
+Only the **current** conversation association needs to be materialized in the agent record. Retain timestamps and duration statistics as already specified; no conversation-ID history, session registry, server state, automatic stall detection, or compatibility mechanism is required.
 
 ## 4. Review workflow
 
@@ -159,6 +170,8 @@ The cutover is finished when these behaviors are verified:
 7. All old orchestration MCP tools are absent from the public catalog and invocation surface; non-orchestration tools still work.
 8. No automated migration occurs, and legacy on-disk task files are left untouched.
 9. Existing client and server test suites pass; use a disposable remote for Git workflow tests.
+10. A Working agent's current conversation ID is persisted in the orphan branch. After a simulated stall, a new conversation ID is accepted by an explicit Working-state resume without an ownership conflict, assignment-generation change, or Working timer reset.
+11. After that resume, a generic tool response to the new conversation ID receives the appropriate 25/30-minute instruction; an old or unrelated conversation ID and an orchestrator inbox read do not receive another worker's instruction.
 
 Stop when these conditions hold. Do **not** resume the superseded V2-10–V2-16 roadmap just to satisfy the old spec.
 

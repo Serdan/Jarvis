@@ -196,30 +196,34 @@ type ReviewWorkflowTests() =
             Assert.That(eventDoc.RootElement.GetProperty("kind").GetString(), Is.EqualTo("AgentStallRecovered"))
             Assert.That(DateTimeOffset.Parse(eventDoc.RootElement.GetProperty("occurredAtUtc").GetString()),
                         Is.LessThanOrEqualTo(DateTimeOffset.UtcNow))
-            // A repeated resume from the current session is not another reported stall.
-            ReviewWorkflow.resumeAgentWithSession first (Guid.NewGuid()) taskId "Owner" 2 4 1 "session-B"
-            |> success |> ignore
+            // The low-level mutation refuses to write a duplicate recovery.
+            // The MCP API presents it as a read-only AlreadyActive response.
+            match ReviewWorkflow.resumeAgentWithSession first (Guid.NewGuid()) taskId "Owner" 2 4 1 "session-B" with
+            | Error(StaleEntityVersion message) ->
+                Assert.That(message, Does.Contain("already associated"))
+            | outcome -> Assert.Fail(sprintf "Duplicate recovery incorrectly wrote an agent record: %A" outcome)
             let repeated = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
+            Assert.That(repeated.Version, Is.EqualTo(recovered.Version))
             Assert.That(repeated.WorkingTurnStartedAtUtc, Is.EqualTo(recovered.WorkingTurnStartedAtUtc))
             Assert.That(repeated.AssociatedSessionIds = recovered.AssociatedSessionIds, Is.True)
             let snapshot2 = LedgerStore.fetch second |> success
             let events2 = LedgerStore.listAt second snapshot2 "tasks" |> success
                           |> List.filter (fun path -> path.Contains("/events/"))
             Assert.That(events2.Length, Is.EqualTo(1))
-            ReviewWorkflow.yieldAgent first (Guid.NewGuid()) taskId "Owner" 2 5 1
+            ReviewWorkflow.yieldAgent first (Guid.NewGuid()) taskId "Owner" 2 4 1
                 "Stopped correctly" "Continue later" |> success |> ignore
             let ready = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
             Assert.That(ready.State, Is.EqualTo("Ready"))
             Assert.That(ready.ActiveSessionId, Is.Null)
             Assert.That(ready.WorkingTurnStartedAtUtc, Is.Null)
             Assert.That(ready.AssociatedSessionIds = [ "session-A"; "session-B" ], Is.True)
-            ReviewWorkflow.resumeAgentWithSession first (Guid.NewGuid()) taskId "Owner" 3 6 1 "session-C"
+            ReviewWorkflow.resumeAgentWithSession first (Guid.NewGuid()) taskId "Owner" 3 5 1 "session-C"
             |> success |> ignore
             let resumed = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
             Assert.That(resumed.AssociatedSessionIds = [ "session-A"; "session-B"; "session-C" ], Is.True)
             Assert.That(resumed.ActiveSessionId, Is.EqualTo("session-C"))
             Assert.That(resumed.State, Is.EqualTo("Working"))
-            ReviewWorkflow.completeAgentWork first (Guid.NewGuid()) taskId "Owner" 4 7 1 "Done"
+            ReviewWorkflow.completeAgentWork first (Guid.NewGuid()) taskId "Owner" 4 6 1 "Done"
             |> success |> ignore
             let complete = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
             Assert.That(complete.State, Is.EqualTo("Completed"))
@@ -229,6 +233,66 @@ type ReviewWorkflowTests() =
             Assert.That(parked.State, Is.EqualTo("Parked"))
             Assert.That(parked.AssociatedSessionIds = [ "session-A"; "session-B"; "session-C" ], Is.True)
             Assert.That(parked.ActiveSessionId, Is.Null))
+
+    [<Test>]
+    member _.ResumeApiReportsCurrentAndSupersededSessionWithoutExtraCommits() =
+        withFixture (fun one _ first second _ _ _ _ ->
+            let taskId = "resume-advisory"
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Resume advisory"
+            |> success |> ignore
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner" "Reviewer"
+            |> success |> ignore
+            ReviewWorkflow.beginAttemptWithSession first (Guid.NewGuid()) taskId "Owner" 1 1 "session-A"
+            |> success |> ignore
+            let approved : Client.V2ReviewApi.ReviewV2OptIn =
+                { SchemaVersion = 1
+                  Enabled = true
+                  ProjectRoot = one
+                  ProjectId = first.ProjectId.ToString("D")
+                  LedgerId = first.LedgerId.ToString("D")
+                  Epoch = first.Epoch
+                  RemoteName = first.RemoteName
+                  ApprovedFetchUrl = first.ApprovedFetchUrl
+                  ApprovedPushUrl = first.ApprovedPushUrl
+                  HighestTrustedHead = (LedgerStore.fetch first |> success).Commit }
+            let path = Client.V2ReviewApi.ReviewV2Binding.pathForRoot one
+            Directory.CreateDirectory(Path.GetDirectoryName path) |> ignore
+            File.WriteAllText(path, System.Text.Json.JsonSerializer.Serialize(approved))
+            let ctx = GitCommandTests.TestContext(Path.GetDirectoryName one)
+            let resume (sessionId: string) expectedAgentVersion : Common.V2TaskWriteCommand =
+                { ProjectName = "owner"; Action = "ResumeAgent"
+                  OperationId = Guid.NewGuid().ToString("D")
+                  TaskId = taskId; AttemptId = ""; ActorId = "Owner"; OwnerId = ""; ReviewerId = ""
+                  Title = ""; Html = ""; ExpectedVersion = 2
+                  ExpectedAgentVersion = expectedAgentVersion; ExpectedTaskVersion = 0
+                  AssignmentGeneration = 1; Summary = ""; NextAction = ""; Reason = ""
+                  BaseOid = ""; TargetRef = ""; SourceRef = ""; AllowDetached = false
+                  AllowUncommitted = false; DecisionSequence = 0L; Evidence = ""
+                  SessionId = sessionId }
+            let api cmd =
+                match Client.V2ReviewApi.V2TaskApi.write cmd ctx with
+                | Ok value -> value
+                | Error failure -> failwithf "Unexpected resume response: %A" failure
+            let before = LedgerStore.fetch second |> success
+            let active = api (resume "session-A" 3)
+            use activeJson = System.Text.Json.JsonDocument.Parse(System.Text.Json.JsonSerializer.Serialize(active))
+            Assert.That(activeJson.RootElement.GetProperty("status").GetString(), Is.EqualTo("AlreadyActive"))
+            Assert.That((LedgerStore.fetch second |> success).Commit, Is.EqualTo(before.Commit))
+            let oldAgent = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
+            Assert.That(oldAgent.Version, Is.EqualTo(3))
+            ReviewWorkflow.resumeAgentWithSession first (Guid.NewGuid()) taskId "Owner" 2 3 1 "session-B"
+            |> success |> ignore
+            let afterRecovery = LedgerStore.fetch second |> success
+            let stale = api (resume "session-A" 4)
+            use staleJson = System.Text.Json.JsonDocument.Parse(System.Text.Json.JsonSerializer.Serialize(stale))
+            Assert.That(staleJson.RootElement.GetProperty("status").GetString(), Is.EqualTo("SupersededSession"))
+            Assert.That(staleJson.RootElement.GetProperty("activeSessionId").GetString(),
+                        Is.EqualTo("session-B"))
+            Assert.That((LedgerStore.fetch second |> success).Commit, Is.EqualTo(afterRecovery.Commit))
+            let current = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
+            Assert.That(current.ActiveSessionId, Is.EqualTo("session-B"))
+            Assert.That(current.Version, Is.EqualTo(4))
+            Assert.That(current.AssociatedSessionIds = [ "session-A"; "session-B" ], Is.True))
 
     [<Test>]
     member _.CanonicalHtmlAcceptsExact512KiBAndRejectsLargerOrActiveMarkup() =
@@ -1541,7 +1605,13 @@ type ReviewWorkflowTests() =
                 let html = "<h1>Full task specification</h1><p>Acceptance: one review</p>"
                 let createCommand =
                     { template "CreateTask" taskId with Title = "Full task"; Html = html }
-                let created = run createCommand
+                let created = run { createCommand with SessionId = "session-A" }
+                // A new execution must be able to replay the same immutable task
+                // mutation without session routing metadata changing its identity.
+                let replayed = run { createCommand with SessionId = "session-B" }
+                let replayJson = System.Text.Json.JsonSerializer.Serialize(replayed)
+                use replayDoc = System.Text.Json.JsonDocument.Parse(replayJson)
+                Assert.That(replayDoc.RootElement.GetProperty("alreadyApplied").GetBoolean(), Is.True)
                 let creationJson = System.Text.Json.JsonSerializer.Serialize(created)
                 use creation = System.Text.Json.JsonDocument.Parse(creationJson)
                 let creationHead = creation.RootElement.GetProperty("head").GetString()
@@ -1822,6 +1892,20 @@ type ReviewWorkflowTests() =
                 Assert.That(after.PendingReviews.Head.RequestId, Is.EqualTo(requestId.ToString("N")))
                 Assert.That((Client.V2ReviewApi.V2PendingIntentJournal.listAtRoot one |> success).Length,
                             Is.EqualTo(0), "Verified V2 mutations must clear pending local intents.")
+                // A failed write leaves a pending journal entry: retrying it from
+                // another session must retain the original domain error, not fail
+                // because the session metadata changed.
+                let invalid =
+                    { template "CreateTask" taskId with
+                        Title = "Duplicate"; Html = html; SessionId = "session-A" }
+                let firstError = Client.V2ReviewApi.V2TaskApi.write invalid ctx
+                let secondError =
+                    Client.V2ReviewApi.V2TaskApi.write { invalid with SessionId = "session-B" } ctx
+                match firstError, secondError with
+                | Error first, Error second ->
+                    Assert.That(sprintf "%A" second, Is.EqualTo(sprintf "%A" first))
+                    Assert.That(sprintf "%A" second, Does.Not.Contain("Pending V2 operation UUID reused"))
+                | _ -> Assert.Fail("Cross-session retry of a rejected operation changed its result.")
             finally
                 if File.Exists configPath then File.Delete configPath)
 

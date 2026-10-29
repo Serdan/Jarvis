@@ -1134,6 +1134,41 @@ module ReviewWorkflow =
                                 (enterState "Ready" agent |> fun updated -> { updated with Version = agent.Version + 1; State = "Ready"; ActiveAttemptId = null; StateReason = nextAction; StateSequence = snapshot.Header.NextSequence }) ]
                     })
 
+    // Existing sessions asking to resume an already-Working attempt only need
+    // the current association context. No ledger mutation or timer reset is needed.
+    // This is advisory, not a general-purpose session write fence.
+    let inspectWorkingResumeSession binding taskId ownerId generation sessionId =
+        if String.IsNullOrWhiteSpace sessionId then Ok None
+        else result {
+            let! snapshot = LedgerStore.fetch binding
+            let! task, _, attempt, _ = getAttempt binding snapshot taskId
+            let! agent, _ = required<ReviewAgent> binding snapshot (agentPath ownerId)
+            if task.Lifecycle = "InProgress"
+               && attempt.OwnerAgentId = ownerId
+               && attempt.AssignmentGeneration = generation
+               && agent.State = "Working"
+               && attempt.Phase = "Working"
+               && agent.FocusAttemptId = attempt.AttemptId
+               && agent.ActiveAttemptId = attempt.AttemptId
+               && (agent.ActiveSessionId = sessionId
+                   || (not (isNull (box agent.AssociatedSessionIds))
+                       && List.contains sessionId agent.AssociatedSessionIds)) then
+                let isCurrent = agent.ActiveSessionId = sessionId
+                return Some
+                    {| status = if isCurrent then "AlreadyActive" else "SupersededSession"
+                       message =
+                           if isCurrent then "This session is already active. No recovery or timer reset was recorded."
+                           else "A newer session is active. Reread the agent assignment before attempting recovery."
+                       activeSessionId = agent.ActiveSessionId
+                       associatedSessionIds = agent.AssociatedSessionIds
+                       agentState = agent.State
+                       taskId = taskId
+                       attemptId = attempt.AttemptId
+                       assignmentGeneration = generation
+                       head = snapshot.Commit |}
+            else return None
+        }
+
     let resumeAgentWithSession binding operationId taskId ownerId expectedAttemptVersion expectedAgentVersion generation sessionId =
         if not (validTaskId taskId) || not (validAgent ownerId)
            || expectedAttemptVersion < 1 || expectedAgentVersion < 1 || generation < 1 then
@@ -1171,23 +1206,31 @@ module ReviewWorkflow =
                                             StateSequence = snapshot.Header.NextSequence }) ]
                         elif agent.State = "Working" && attempt.Phase = "Working"
                              && agent.ActiveAttemptId = attempt.AttemptId then
-                            let same = String.IsNullOrWhiteSpace sessionId || agent.ActiveSessionId = sessionId
-                            let now = DateTimeOffset.UtcNow.ToString("O")
+                            // Only a new execution can report a recovery. Existing
+                            // sessions have read-only status through V2TaskApi.
+                            // Do not silently reactivate old IDs or change versions.
+                            let previous =
+                                if isNull (box agent.AssociatedSessionIds) then []
+                                else agent.AssociatedSessionIds
+                            if String.IsNullOrWhiteSpace sessionId
+                               || List.contains sessionId previous then
+                                return! Error(StaleEntityVersion
+                                    $"Session already associated (current: {agent.ActiveSessionId}); inspect current assignment before resuming.")
                             let updated =
                                 { (associateSession sessionId agent) with
                                     Version = agent.Version + 1
-                                    WorkingTurnStartedAtUtc = if same then agent.WorkingTurnStartedAtUtc else now
-                                    StateReason = if same then agent.StateReason else $"Recovered stalled task {taskId}"
-                                    StateSequence = if same then agent.StateSequence else snapshot.Header.NextSequence }
+                                    WorkingTurnStartedAtUtc = DateTimeOffset.UtcNow.ToString("O")
+                                    StateReason = $"Recovered stalled task {taskId}"
+                                    StateSequence = snapshot.Header.NextSequence }
                             return
-                                [ change (agentPath ownerId) (Some agentOid) updated ]
-                                @ (if same then [] else
-                                      [ change ($"tasks/{taskId}/attempts/{attempt.AttemptId}/events/{snapshot.Header.NextSequence}.json") None
-                                          {| taskId = taskId; attemptId = attempt.AttemptId
-                                             ownerAgentId = ownerId; assignmentGeneration = generation
-                                             kind = "AgentStallRecovered"; sessionId = sessionId
-                                             reason = "Explicit resume of Working agent"
-                                             sequence = snapshot.Header.NextSequence |} ])
+                                [ change (agentPath ownerId) (Some agentOid) updated
+                                  change ($"tasks/{taskId}/attempts/{attempt.AttemptId}/events/{snapshot.Header.NextSequence}.json") None
+                                    {| taskId = taskId; attemptId = attempt.AttemptId
+                                       ownerAgentId = ownerId; assignmentGeneration = generation
+                                       kind = "AgentStallRecovered"; sessionId = sessionId
+                                       previousSessionId = agent.ActiveSessionId
+                                       reason = "Explicit resume of Working agent"
+                                       sequence = snapshot.Header.NextSequence |} ]
                         else
                             return! Error(StaleEntityVersion "Resume requires Ready or Working on the same assignment.")
                     })

@@ -1086,120 +1086,135 @@ module V2TaskApi =
                     ReviewWorkflow.ReviewWorkflow.exportTaskSpecWithId binding operationId cmd.TaskId
                         cmd.SourceRef cmd.BaseOid |> mapError |> Result.map box
                 else
-                    let result =
-                        V2PendingIntentJournal.executeLedgerWrite binding operationId "V2TaskWrite" cmd (fun () ->
-                            match cmd.Action with
-                            | "CreateTask" ->
-                                ReviewWorkflow.ReviewWorkflow.createTaskWithSpec binding operationId cmd.TaskId cmd.Title cmd.Html
-                                |> mapError
-                            | "ReviseTaskSpec" ->
-                                ReviewWorkflow.ReviewWorkflow.reviseTaskSpec binding operationId cmd.TaskId
-                                    cmd.ExpectedVersion cmd.Title cmd.Html |> mapError
-                            | "ReviseTaskSpecPinned" ->
-                                ReviewWorkflow.ReviewWorkflow.reviseTaskSpecPinned binding operationId cmd.TaskId
-                                    cmd.ExpectedVersion cmd.BaseOid cmd.Title cmd.Html |> mapError
-                            | "ImportTaskSpec" ->
-                                ReviewWorkflow.ReviewWorkflow.importTaskSpec binding operationId cmd.TaskId
-                                    cmd.ExpectedVersion cmd.BaseOid cmd.TargetRef cmd.Title cmd.SourceRef |> mapError
-                            | "AdoptTaskSpec" ->
-                                ReviewWorkflow.ReviewWorkflow.adoptTaskSpec binding operationId cmd.TaskId
-                                    cmd.ActorId cmd.ExpectedTaskVersion cmd.ExpectedVersion
-                                    cmd.ExpectedAgentVersion cmd.AssignmentGeneration cmd.BaseOid cmd.Summary |> mapError
-                            | "RegisterAgent" ->
-                                ReviewWorkflow.ReviewWorkflow.registerAgent binding operationId cmd.ActorId
-                                |> mapError
-                            | "AssignTask" ->
-                                guid "attemptId" cmd.AttemptId
-                                |> Result.bind (fun attemptId ->
-                                    ReviewWorkflow.ReviewWorkflow.assignTask binding operationId cmd.TaskId
-                                        attemptId cmd.OwnerId cmd.ReviewerId
-                                    |> mapError)
-                            | "ReissueAssignment" ->
-                                ReviewWorkflow.ReviewWorkflow.reissueAssignment binding operationId
-                                    cmd.TaskId cmd.ActorId cmd.ExpectedVersion cmd.ExpectedAgentVersion
-                                    cmd.AssignmentGeneration cmd.Summary cmd.Html
-                                |> mapError
-                            | "AcknowledgeAssignment" ->
-                                ReviewWorkflow.ReviewWorkflow.acknowledgeAssignment binding operationId
-                                    cmd.TaskId cmd.ActorId cmd.ExpectedVersion cmd.AssignmentGeneration
-                                |> mapError
-                            | "BeginAttempt" ->
-                                ReviewWorkflow.ReviewWorkflow.beginAttemptWithSession binding operationId cmd.TaskId
-                                    cmd.ActorId cmd.ExpectedVersion cmd.AssignmentGeneration cmd.SessionId
-                                |> mapError
-                            | "BindReviewBase" ->
-                                ReviewWorkflow.ReviewWorkflow.bindReviewBase binding operationId cmd.TaskId
-                                    cmd.ActorId cmd.ExpectedVersion cmd.AssignmentGeneration
-                                    cmd.BaseOid cmd.TargetRef
-                                |> mapError
-                            | "BindAttemptSource" ->
-                                ReviewWorkflow.ReviewWorkflow.bindAttemptSource binding operationId cmd.TaskId
-                                    cmd.ActorId cmd.ExpectedVersion cmd.AssignmentGeneration
-                                    cmd.SourceRef cmd.BaseOid cmd.TargetRef
-                                    cmd.AllowDetached cmd.AllowUncommitted
-                                |> mapError
-                            | "RebindAttemptSource" ->
-                                ReviewWorkflow.ReviewWorkflow.rebindAttemptSource binding operationId cmd.TaskId
-                                    cmd.ActorId cmd.ExpectedVersion cmd.AssignmentGeneration
-                                    cmd.SourceRef cmd.AllowDetached cmd.AllowUncommitted
-                                |> mapError
-                            | "CheckpointAttempt" ->
-                                ReviewWorkflow.ReviewWorkflow.checkpointAttempt binding operationId
-                                    cmd.TaskId cmd.ActorId cmd.ExpectedVersion cmd.ExpectedAgentVersion
-                                    cmd.AssignmentGeneration cmd.Summary cmd.NextAction cmd.BaseOid cmd.Evidence
-                                |> mapError
-                            | "YieldAgent" ->
-                                ReviewWorkflow.ReviewWorkflow.yieldAgent binding operationId
-                                    cmd.TaskId cmd.ActorId cmd.ExpectedVersion cmd.ExpectedAgentVersion
-                                    cmd.AssignmentGeneration cmd.Summary cmd.NextAction |> mapError
-                            | "ResumeAgent" ->
-                                ReviewWorkflow.ReviewWorkflow.resumeAgentWithSession binding operationId
-                                    cmd.TaskId cmd.ActorId cmd.ExpectedVersion cmd.ExpectedAgentVersion
-                                    cmd.AssignmentGeneration cmd.SessionId |> mapError
-                            | "CompleteAgentWork" ->
-                                ReviewWorkflow.ReviewWorkflow.completeAgentWork binding operationId
-                                    cmd.TaskId cmd.ActorId cmd.ExpectedVersion cmd.ExpectedAgentVersion
-                                    cmd.AssignmentGeneration cmd.Summary |> mapError
-                            | "ParkAttempt" | "BlockAttempt" | "ResumeAttempt"
-                            | "AbandonAttempt" | "CancelTask" ->
-                                ReviewWorkflow.ReviewWorkflow.changeAttemptAdministration binding operationId
-                                    cmd.TaskId cmd.Action cmd.ExpectedTaskVersion cmd.ExpectedVersion
-                                    cmd.ExpectedAgentVersion cmd.AssignmentGeneration cmd.Reason |> mapError
-                            | "CancelOpenTask" ->
-                                ReviewWorkflow.ReviewWorkflow.cancelOpenTask binding operationId
-                                    cmd.TaskId cmd.ExpectedTaskVersion cmd.Reason |> mapError
-                            | "TransferOwner" ->
-                                guid "newAttemptId" cmd.AttemptId
-                                |> Result.bind (fun newId ->
-                                    ReviewWorkflow.ReviewWorkflow.transferAttemptOwner binding operationId
-                                        cmd.TaskId newId cmd.OwnerId cmd.ReviewerId
-                                        cmd.ExpectedTaskVersion cmd.ExpectedVersion cmd.ExpectedAgentVersion
-                                        cmd.AssignmentGeneration cmd.Reason |> mapError)
-                            | "CloseNonSourceTask" ->
-                                ReviewWorkflow.ReviewWorkflow.closeNonSourceTask binding operationId cmd.TaskId
-                                    cmd.ActorId cmd.ExpectedTaskVersion cmd.ExpectedVersion
-                                    cmd.Summary cmd.Evidence |> mapError
-                            | "ReopenTask" ->
-                                ReviewWorkflow.ReviewWorkflow.reopenTask binding operationId
-                                    cmd.TaskId cmd.ExpectedTaskVersion cmd.Reason |> mapError
-                            | "ParkAgent" ->
-                                ReviewWorkflow.ReviewWorkflow.parkAgent binding operationId
-                                    cmd.ActorId cmd.ExpectedAgentVersion cmd.Reason |> mapError
-                            | "ReissueQueuedAttempt" ->
-                                ReviewWorkflow.ReviewWorkflow.reissueQueuedAttempt binding operationId
-                                    cmd.TaskId cmd.ActorId cmd.ExpectedVersion cmd.ExpectedAgentVersion
-                                    cmd.AssignmentGeneration cmd.Reason |> mapError
-                            | "RecoverAgentAssignment" ->
-                                ReviewWorkflow.ReviewWorkflow.recoverAgentAssignment binding operationId
-                                    cmd.TaskId cmd.ActorId cmd.ExpectedVersion cmd.ExpectedAgentVersion
-                                    cmd.AssignmentGeneration cmd.Reason |> mapError
-                            | "AcknowledgeFeedback" ->
-                                ReviewWorkflow.ReviewWorkflow.acknowledgeReviewFeedback binding operationId
-                                    cmd.TaskId cmd.ActorId cmd.DecisionSequence
-                                |> mapError
-                            | _ -> Error(Client.ValidationError "Unsupported V2 task operation.")
-                        )
-                    result |> Result.map V2OperationResponse.present))
+                    // Session routing metadata does not change ordinary task-write
+                    // identity. Begin/Resume deliberately associate an execution.
+                    let journalCommand =
+                        if cmd.Action = "BeginAttempt" || cmd.Action = "ResumeAgent" then cmd
+                        else { cmd with SessionId = "" }
+                    let sessionStatus =
+                        if cmd.Action <> "ResumeAgent" then Ok None
+                        else
+                            ReviewWorkflow.ReviewWorkflow.inspectWorkingResumeSession binding
+                                cmd.TaskId cmd.ActorId cmd.AssignmentGeneration cmd.SessionId
+                            |> mapError
+                    match sessionStatus with
+                    | Error error -> Error error
+                    | Ok(Some status) -> Ok(box status)
+                    | Ok None ->
+                        let result =
+                            V2PendingIntentJournal.executeLedgerWrite binding operationId "V2TaskWrite" journalCommand (fun () ->
+                                match cmd.Action with
+                                | "CreateTask" ->
+                                    ReviewWorkflow.ReviewWorkflow.createTaskWithSpec binding operationId cmd.TaskId cmd.Title cmd.Html
+                                    |> mapError
+                                | "ReviseTaskSpec" ->
+                                    ReviewWorkflow.ReviewWorkflow.reviseTaskSpec binding operationId cmd.TaskId
+                                        cmd.ExpectedVersion cmd.Title cmd.Html |> mapError
+                                | "ReviseTaskSpecPinned" ->
+                                    ReviewWorkflow.ReviewWorkflow.reviseTaskSpecPinned binding operationId cmd.TaskId
+                                        cmd.ExpectedVersion cmd.BaseOid cmd.Title cmd.Html |> mapError
+                                | "ImportTaskSpec" ->
+                                    ReviewWorkflow.ReviewWorkflow.importTaskSpec binding operationId cmd.TaskId
+                                        cmd.ExpectedVersion cmd.BaseOid cmd.TargetRef cmd.Title cmd.SourceRef |> mapError
+                                | "AdoptTaskSpec" ->
+                                    ReviewWorkflow.ReviewWorkflow.adoptTaskSpec binding operationId cmd.TaskId
+                                        cmd.ActorId cmd.ExpectedTaskVersion cmd.ExpectedVersion
+                                        cmd.ExpectedAgentVersion cmd.AssignmentGeneration cmd.BaseOid cmd.Summary |> mapError
+                                | "RegisterAgent" ->
+                                    ReviewWorkflow.ReviewWorkflow.registerAgent binding operationId cmd.ActorId
+                                    |> mapError
+                                | "AssignTask" ->
+                                    guid "attemptId" cmd.AttemptId
+                                    |> Result.bind (fun attemptId ->
+                                        ReviewWorkflow.ReviewWorkflow.assignTask binding operationId cmd.TaskId
+                                            attemptId cmd.OwnerId cmd.ReviewerId
+                                        |> mapError)
+                                | "ReissueAssignment" ->
+                                    ReviewWorkflow.ReviewWorkflow.reissueAssignment binding operationId
+                                        cmd.TaskId cmd.ActorId cmd.ExpectedVersion cmd.ExpectedAgentVersion
+                                        cmd.AssignmentGeneration cmd.Summary cmd.Html
+                                    |> mapError
+                                | "AcknowledgeAssignment" ->
+                                    ReviewWorkflow.ReviewWorkflow.acknowledgeAssignment binding operationId
+                                        cmd.TaskId cmd.ActorId cmd.ExpectedVersion cmd.AssignmentGeneration
+                                    |> mapError
+                                | "BeginAttempt" ->
+                                    ReviewWorkflow.ReviewWorkflow.beginAttemptWithSession binding operationId cmd.TaskId
+                                        cmd.ActorId cmd.ExpectedVersion cmd.AssignmentGeneration cmd.SessionId
+                                    |> mapError
+                                | "BindReviewBase" ->
+                                    ReviewWorkflow.ReviewWorkflow.bindReviewBase binding operationId cmd.TaskId
+                                        cmd.ActorId cmd.ExpectedVersion cmd.AssignmentGeneration
+                                        cmd.BaseOid cmd.TargetRef
+                                    |> mapError
+                                | "BindAttemptSource" ->
+                                    ReviewWorkflow.ReviewWorkflow.bindAttemptSource binding operationId cmd.TaskId
+                                        cmd.ActorId cmd.ExpectedVersion cmd.AssignmentGeneration
+                                        cmd.SourceRef cmd.BaseOid cmd.TargetRef
+                                        cmd.AllowDetached cmd.AllowUncommitted
+                                    |> mapError
+                                | "RebindAttemptSource" ->
+                                    ReviewWorkflow.ReviewWorkflow.rebindAttemptSource binding operationId cmd.TaskId
+                                        cmd.ActorId cmd.ExpectedVersion cmd.AssignmentGeneration
+                                        cmd.SourceRef cmd.AllowDetached cmd.AllowUncommitted
+                                    |> mapError
+                                | "CheckpointAttempt" ->
+                                    ReviewWorkflow.ReviewWorkflow.checkpointAttempt binding operationId
+                                        cmd.TaskId cmd.ActorId cmd.ExpectedVersion cmd.ExpectedAgentVersion
+                                        cmd.AssignmentGeneration cmd.Summary cmd.NextAction cmd.BaseOid cmd.Evidence
+                                    |> mapError
+                                | "YieldAgent" ->
+                                    ReviewWorkflow.ReviewWorkflow.yieldAgent binding operationId
+                                        cmd.TaskId cmd.ActorId cmd.ExpectedVersion cmd.ExpectedAgentVersion
+                                        cmd.AssignmentGeneration cmd.Summary cmd.NextAction |> mapError
+                                | "ResumeAgent" ->
+                                    ReviewWorkflow.ReviewWorkflow.resumeAgentWithSession binding operationId
+                                        cmd.TaskId cmd.ActorId cmd.ExpectedVersion cmd.ExpectedAgentVersion
+                                        cmd.AssignmentGeneration cmd.SessionId |> mapError
+                                | "CompleteAgentWork" ->
+                                    ReviewWorkflow.ReviewWorkflow.completeAgentWork binding operationId
+                                        cmd.TaskId cmd.ActorId cmd.ExpectedVersion cmd.ExpectedAgentVersion
+                                        cmd.AssignmentGeneration cmd.Summary |> mapError
+                                | "ParkAttempt" | "BlockAttempt" | "ResumeAttempt"
+                                | "AbandonAttempt" | "CancelTask" ->
+                                    ReviewWorkflow.ReviewWorkflow.changeAttemptAdministration binding operationId
+                                        cmd.TaskId cmd.Action cmd.ExpectedTaskVersion cmd.ExpectedVersion
+                                        cmd.ExpectedAgentVersion cmd.AssignmentGeneration cmd.Reason |> mapError
+                                | "CancelOpenTask" ->
+                                    ReviewWorkflow.ReviewWorkflow.cancelOpenTask binding operationId
+                                        cmd.TaskId cmd.ExpectedTaskVersion cmd.Reason |> mapError
+                                | "TransferOwner" ->
+                                    guid "newAttemptId" cmd.AttemptId
+                                    |> Result.bind (fun newId ->
+                                        ReviewWorkflow.ReviewWorkflow.transferAttemptOwner binding operationId
+                                            cmd.TaskId newId cmd.OwnerId cmd.ReviewerId
+                                            cmd.ExpectedTaskVersion cmd.ExpectedVersion cmd.ExpectedAgentVersion
+                                            cmd.AssignmentGeneration cmd.Reason |> mapError)
+                                | "CloseNonSourceTask" ->
+                                    ReviewWorkflow.ReviewWorkflow.closeNonSourceTask binding operationId cmd.TaskId
+                                        cmd.ActorId cmd.ExpectedTaskVersion cmd.ExpectedVersion
+                                        cmd.Summary cmd.Evidence |> mapError
+                                | "ReopenTask" ->
+                                    ReviewWorkflow.ReviewWorkflow.reopenTask binding operationId
+                                        cmd.TaskId cmd.ExpectedTaskVersion cmd.Reason |> mapError
+                                | "ParkAgent" ->
+                                    ReviewWorkflow.ReviewWorkflow.parkAgent binding operationId
+                                        cmd.ActorId cmd.ExpectedAgentVersion cmd.Reason |> mapError
+                                | "ReissueQueuedAttempt" ->
+                                    ReviewWorkflow.ReviewWorkflow.reissueQueuedAttempt binding operationId
+                                        cmd.TaskId cmd.ActorId cmd.ExpectedVersion cmd.ExpectedAgentVersion
+                                        cmd.AssignmentGeneration cmd.Reason |> mapError
+                                | "RecoverAgentAssignment" ->
+                                    ReviewWorkflow.ReviewWorkflow.recoverAgentAssignment binding operationId
+                                        cmd.TaskId cmd.ActorId cmd.ExpectedVersion cmd.ExpectedAgentVersion
+                                        cmd.AssignmentGeneration cmd.Reason |> mapError
+                                | "AcknowledgeFeedback" ->
+                                    ReviewWorkflow.ReviewWorkflow.acknowledgeReviewFeedback binding operationId
+                                        cmd.TaskId cmd.ActorId cmd.DecisionSequence
+                                    |> mapError
+                                | _ -> Error(Client.ValidationError "Unsupported V2 task operation.")
+                            )
+                        result |> Result.map V2OperationResponse.present))
 
 
 module V2IntegrationApi =

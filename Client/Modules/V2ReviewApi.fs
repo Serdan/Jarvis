@@ -1091,12 +1091,24 @@ module V2TaskApi =
                     let journalCommand =
                         if cmd.Action = "BeginAttempt" || cmd.Action = "ResumeAgent" then cmd
                         else { cmd with SessionId = "" }
-                    let sessionStatus =
-                        if cmd.Action <> "ResumeAgent" then Ok None
+                    // An operation already recorded in Git is a retry, even when
+                    // the session is now active. Route it through the normal
+                    // receipt/journal path so its original result is returned
+                    // and a matching pending local intent is cleared.
+                    let existingResumeOperation =
+                        if cmd.Action <> "ResumeAgent" then Ok false
                         else
-                            ReviewWorkflow.ReviewWorkflow.inspectWorkingResumeSession binding
-                                cmd.TaskId cmd.ActorId cmd.AssignmentGeneration cmd.SessionId
-                            |> mapError
+                            LedgerStore.LedgerStore.getOperationStatus binding operationId
+                            |> Result.mapError V2LedgerErrors.toEffect
+                            |> Result.map (fun (_, operation) -> operation.IsSome)
+                    let sessionStatus =
+                        existingResumeOperation
+                        |> Result.bind (fun alreadyRecorded ->
+                            if cmd.Action <> "ResumeAgent" || alreadyRecorded then Ok None
+                            else
+                                ReviewWorkflow.ReviewWorkflow.inspectWorkingResumeSession binding
+                                    cmd.TaskId cmd.ActorId cmd.AssignmentGeneration cmd.SessionId
+                                |> mapError)
                     match sessionStatus with
                     | Error error -> Error error
                     | Ok(Some status) -> Ok(box status)

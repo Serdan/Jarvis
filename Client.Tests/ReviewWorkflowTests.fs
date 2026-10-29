@@ -280,9 +280,28 @@ type ReviewWorkflowTests() =
             Assert.That((LedgerStore.fetch second |> success).Commit, Is.EqualTo(before.Commit))
             let oldAgent = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
             Assert.That(oldAgent.Version, Is.EqualTo(3))
-            ReviewWorkflow.resumeAgentWithSession first (Guid.NewGuid()) taskId "Owner" 2 3 1 "session-B"
+            // Simulate Git accepting a recovery but the client losing the reply
+            // before its matching pending journal entry can be retired.
+            let recoveryCommand = resume "session-B" 3
+            let recoveryId = Guid.Parse recoveryCommand.OperationId
+            Client.V2ReviewApi.V2PendingIntentJournal.persist first recoveryId "V2TaskWrite"
+                (System.Text.Json.JsonSerializer.Serialize recoveryCommand) |> success
+            ReviewWorkflow.resumeAgentWithSession first recoveryId taskId "Owner" 2 3 1 "session-B"
             |> success |> ignore
             let afterRecovery = LedgerStore.fetch second |> success
+            Assert.That((Client.V2ReviewApi.V2PendingIntentJournal.listAtRoot one |> success).Length,
+                        Is.EqualTo(1))
+            let replay = api recoveryCommand
+            use replayJson = System.Text.Json.JsonDocument.Parse(System.Text.Json.JsonSerializer.Serialize(replay))
+            Assert.That(replayJson.RootElement.GetProperty("alreadyApplied").GetBoolean(), Is.True)
+            Assert.That(replayJson.RootElement.GetProperty("originalResult").GetProperty("kind").GetString(),
+                        Is.EqualTo("ResumeAgent"))
+            Assert.That(replayJson.RootElement.GetProperty("operation").GetProperty("OperationId").GetString(),
+                        Is.EqualTo(recoveryCommand.OperationId))
+            Assert.That((Client.V2ReviewApi.V2PendingIntentJournal.listAtRoot one |> success).Length,
+                        Is.EqualTo(0), "A confirmed replay must retire its matching pending local intent.")
+            Assert.That((LedgerStore.fetch second |> success).Commit, Is.EqualTo(afterRecovery.Commit),
+                        "Replaying an accepted recovery must not create another Git commit.")
             let stale = api (resume "session-A" 4)
             use staleJson = System.Text.Json.JsonDocument.Parse(System.Text.Json.JsonSerializer.Serialize(stale))
             Assert.That(staleJson.RootElement.GetProperty("status").GetString(), Is.EqualTo("SupersededSession"))

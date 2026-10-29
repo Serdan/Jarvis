@@ -341,3 +341,35 @@ generation protections, and V2 client command routing. Final
 Client.Tests 348/348, Server.Tests 62/62, diff --check clean.
 Logical actor labels are not cryptographic authorization (V2-11);
 no production push/deployment, live V2 import or V1 cutover.
+
+## V2-09 canonical task specifications (commit ce71f36, protocol 3.34)
+
+The task HTML Git blob is canonical up to 512 KiB; immutable ledger
+operation records store SHA-256 content digests instead of duplicating
+the entire HTML. Pinned ReviseTaskSpec uses version and blob CAS without
+silently changing any assignment generation. AdoptTaskSpec explicitly
+issues a new immutable spec-pinned generation only for an unchanged,
+unstarted Assigned owner.
+
+ImportTaskSpec operates on explicitly registered Git worktrees, with
+source repository fingerprint, branch, HEAD, relative path and worktree
+blob OID recorded as immutable provenance. Source bytes and provenance
+are rechecked at each canonical CAS planner run. Task-specific canonical
+Git history, rather than arbitrary source blobs, gates historical diffs.
+GetTaskSpecPage supplies 1..32768 UTF-8-byte pages, portable 30-minute
+project/ledger/snapshot/blob/offset cursor and explicit byte totals.
+
+ExportTaskSpec is a write-permission-gated create-only source operation,
+marked non-authoritative and idempotent for the same operation UUID and
+identical content. Unrelated collisions, traversal and symlinks fail.
+Local path-component checks and source revalidation protect the tested
+preflight/commit interval, but are not a claim of cross-repository
+filesystem/ledger atomicity. V2-10 owns task history/roster query paging.
+
+Disposable Git tests verify 512 KiB and over-limit, >64 KiB source
+import, changed-file rejection, Unicode/historical page continuation,
+cursor expiry, source OID provenance, assignment adoption, typed V2
+client API and export permissions/replay. Final 354/354 client and
+62/62 server tests passed, diff --check clean. The older 128 KiB
+regression was updated when the normative cap changed. Nothing pushed,
+deployed, imported to a production ledger or migrated from V1.

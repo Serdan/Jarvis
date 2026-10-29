@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "2026-10-28-v2-09-task-spec-apis",
   "title": "Finish canonical task specification authoring and complete content retrieval",
-  "status": "open",
+  "status": "completed",
   "priority": "P1",
   "dependencies": [
     "2026-10-28-v2-03-schema-contracts",
@@ -13,10 +13,21 @@
     "worktree": null
   },
   "checkpoint": {
-    "summary": "Architecture gap identified by the 2026-10-28 V2 implementation audit. Not started.",
-    "nextAction": "Implement the acceptance criteria in the accompanying HTML task; use disposable Git remotes and do not deploy or migrate V1.",
-    "verified": [],
-    "lastCommit": null
+    "summary": "V2-09 completed: 512 KiB canonical HTML with bounded SHA-256 audit, pinned revision and explicit unstarted assignment adoption, registered-source import and immutable provenance, canonical history diff, stable UTF-8 snapshot pages, and marked non-authoritative create-only export. Implementation commit ce71f36, protocol 3.34.",
+    "nextAction": "V2-10 ledger query/history is newly ready. V2-14 legacy migration is unblocked by V2-09 but still requires V2-13 backups. No production deployment, push or migration.",
+    "verified": [
+      "Exact 512 KiB canonical spec accepted; +1 byte and active markup rejected without ledger mutation",
+      "80 KiB registered source import and complete paged read without oversized operation audit",
+      "Unicode-safe bounded content pages stable across canonical revision with 30-minute snapshot cursor",
+      "Forged/invalid cursor rejection, historical diff verified against task-specific canonical blob OID ancestry",
+      "Source worktree identity, branch, HEAD, relative path and worktree blob OID provenance retained",
+      "Traversal and symlink checks on source import/export, CAS rejects changed source after preflight",
+      "Assigned attempt pins previous spec until explicit new immutable generation adoption; stale/Working rejected",
+      "Non-authoritative export is create-only, permission gated and same-UUID-content replay idempotent",
+      "Typed opted-in V2 API and MCP permission/discovery catalog validated",
+      "Final Client.Tests 354/354, Server.Tests 62/62, git diff --check clean, protocol 3.34"
+    ],
+    "lastCommit": "ce71f360d3fb3e32f5a4ecef370dfe13ab82bcf3"
   },
   "audit": {
     "specSections": [
@@ -25,10 +36,15 @@
       "§10"
     ],
     "implementationReferences": [
-      "Client/Modules/ReviewWorkflow.fs:235-315,1200-1240",
-      "Client/Modules/V2ReviewApi.fs:80-104"
+      "Client/Modules/LedgerStore.fs",
+      "Client/Modules/ReviewWorkflow.fs",
+      "Client/Modules/V2ReviewApi.fs",
+      "Common/Messages/AgentCommand.fs",
+      "Server/McpTools.fs",
+      "Client.Tests/ReviewWorkflowTests.fs",
+      "Server.Tests/ServiceTests.fs"
     ],
-    "sourceReport": "docs/reviews/2026-10-28-v2-spec-implementation-audit.md"
+    "sourceReport": "docs/reviews/2026-10-29-v2-09-task-spec-apis.md"
   },
-  "updatedAt": "2026-10-28T00:00:00Z"
+  "updatedAt": "2026-10-29T17:51:57+01:00"
 }

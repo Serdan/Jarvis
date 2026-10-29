@@ -90,5 +90,4 @@ UUID/idempotency behavior, explicit Assigned adoption and stale/Working
 generation rejection, and opted-in typed V2 client protocol commands.
 Server tool/catalog tests verify read-only versus Git-write tool routing.
 
-Final complete test counts and implementation commit are added after
-the full suite is verified.
+Final regression verified: Client.Tests 354/354 passed on the full TRX-captured run (v2-09-client-accepted.trx), Server.Tests 62/62 passed and git diff --check clean. Commit ce71f36, experimental protocol 3.34. An earlier 352/353 run exposed one obsolete 128 KiB size test; it was updated to test the normative 512 KiB cap without weakening the mutation guard. An intermediate full run passed 353/353, then a new 80 KiB source-import regression was added and the final suite passed 354/354. No production push, deployment, migration or cutover.

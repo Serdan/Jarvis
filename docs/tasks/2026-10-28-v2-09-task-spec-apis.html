@@ -3,7 +3,7 @@
 <head><meta charset="utf-8"><title>Finish canonical task specification authoring and complete content retrieval</title></head>
 <body><main>
 <h1>Finish canonical task specification authoring and complete content retrieval</h1>
-<p><strong>Task:</strong> 2026-10-28-v2-09-task-spec-apis. <strong>Priority:</strong> P1. <strong>Status:</strong> Open.</p>
+<p><strong>Task:</strong> 2026-10-28-v2-09-task-spec-apis. <strong>Priority:</strong> P1. <strong>Status:</strong> Completed.</p>
 <h2>Goal and current gap</h2>
 <p>Create and Open-only Revise plus GetTask spec exist; ImportTaskSpec, DiffTaskSpec, ExportTaskSpec, revision adoption and content pagination/deferred read are missing. Local task files are not V2 authority.</p>
 <h2>Source of authority</h2>
@@ -17,6 +17,7 @@
 </ol>
 <h2>Dependencies</h2>
 <ul><li><code>2026-10-28-v2-03-schema-contracts</code></li><li><code>2026-10-28-v2-08-source-bindings</code></li></ul>
+<h2>Completion record</h2><p>Implementation ce71f36, experimental protocol 3.34. Client 354/354 and server 62/62 passed on disposable Git fixtures. Review: docs/reviews/2026-10-29-v2-09-task-spec-apis.md. No production push, deployment, legacy migration or cutover.</p>
 <h2>Safety and completion</h2>
 <p>Work in an isolated Jarvis worktree; keep server stateless and task authority on the single orphan Git ref. Do not use Codex through Jarvis. Use disposable Git remotes for tests. Source-level task files here are backlog artifacts only; do not treat them as already imported into the V2 ledger. Verify behavior, review the implementation, and record tests and exact commits before closing. No production deployment or V1 cutover without explicit authorization.</p>
 </main></body></html>

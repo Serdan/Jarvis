@@ -280,3 +280,35 @@ Verification: Client.Tests 336/336, Server.Tests 62/62, git diff --check clean.
 V2-05's remaining source provenance acceptance is satisfied; both V2-05 and
 V2-08 are now completed source-backed backlog tasks. No remote push, server
 upgrade, production ledger initialization or V1 migration occurred.
+
+## V2-06 frozen review claim recovery and orphan ref cleanup (commit d518ac5, protocol 3.32)
+
+The reviewer claim may be explicitly released, with the request remaining
+Claimed and pinned to its exact original revision while awaiting orchestrator
+reassignment. Reviewer action never changes an implementation agent's
+Working execution slot. Claim, release, reassignment, withdrawal and
+decision now append immutable event records with operation UUID, actor,
+request-version precondition, revision/ref/head/spec and reason. The legacy
+reviewer handoff request form retains its original idempotency payload.
+Reviewer claim and reassignment projections are exposed in opted-in V2 MCP.
+
+An unindexed source review ref may be reserved for cleanup only by a
+successful, independent canonical ledger transaction with an exact observed
+SHA, actor and reason. This permanent tombstone prevents a delayed
+Submit/Update from later adopting that source ref. Explicit remote deletion
+is separately requested, uses a Git expected-OID lease and verifies the
+remote afterward. Claimed/accepted/withdrawn/superseded refs represented by
+immutable ledger review revisions are never orphan candidates. Inspection
+also retains the tombstone after source deletion and reports absent or
+retargeted source refs. No implicit garbage collection or broad ref deletion.
+
+Disposable Git tests cover competing reviewers, released-claim recovery
+despite missing source ref, stale decisions, immutable audit, source-ref
+retargeting, accepted-ref protection, late submission after reservation,
+source deletion retry and end-to-end opted-in client command routing.
+Final client suite **340/340**, server **62/62**, whitespace audit clean.
+The earlier quiet client suite reported one unidentified failure (339/340),
+not reproduced on the full TRX rerun; do not represent it as a proven fix.
+Security remains a V2-11 concern: actor labels are not cryptographic
+authorization. V2-06 is completed in source-backed task files, not imported
+to a production orphan Git ledger. No deployment, push or cutover.

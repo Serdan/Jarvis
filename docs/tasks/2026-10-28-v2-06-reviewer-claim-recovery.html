@@ -3,7 +3,7 @@
 <head><meta charset="utf-8"><title>Finish reviewer claim lifecycle, audit trail and source-ref cleanup</title></head>
 <body><main>
 <h1>Finish reviewer claim lifecycle, audit trail and source-ref cleanup</h1>
-<p><strong>Task:</strong> 2026-10-28-v2-06-reviewer-claim-recovery. <strong>Priority:</strong> P1. <strong>Status:</strong> Open.</p>
+<p><strong>Task:</strong> 2026-10-28-v2-06-reviewer-claim-recovery. <strong>Priority:</strong> P1. <strong>Status:</strong> Completed.</p>
 <h2>Goal and current gap</h2>
 <p>Claim and handoff exist, but no explicit release/reclaim without orchestrator, no immutable claim/release/decision audit files, and no safe cleanup of unclaimed orphan review refs after a losing ledger operation. Reviewer eligibility/reassign policies are incomplete.</p>
 <h2>Source of authority</h2>
@@ -17,6 +17,6 @@
 </ol>
 <h2>Dependencies</h2>
 <ul><li><code>2026-10-28-v2-05-checkpoint-review-evidence</code></li></ul>
-<h2>Safety and completion</h2>
+<h2>Completion record</h2><p>Implemented as <code>d518ac5</code>; verified 340/340 client and 62/62 server tests with experimental protocol 3.32. Frozen reviewer occupancy, immutable claim history, and two-phase orphan source-ref cleanup were exercised against disposable Git remotes. No production deployment, push or migration. See <code>docs/reviews/2026-10-29-v2-06-reviewer-claim-recovery.md</code>.</p><h2>Safety and completion</h2>
 <p>Work in an isolated Jarvis worktree; keep server stateless and task authority on the single orphan Git ref. Do not use Codex through Jarvis. Use disposable Git remotes for tests. Source-level task files here are backlog artifacts only; do not treat them as already imported into the V2 ledger. Verify behavior, review the implementation, and record tests and exact commits before closing. No production deployment or V1 cutover without explicit authorization.</p>
 </main></body></html>

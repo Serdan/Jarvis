@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "2026-10-28-v2-06-reviewer-claim-recovery",
   "title": "Finish reviewer claim lifecycle, audit trail and source-ref cleanup",
-  "status": "open",
+  "status": "completed",
   "priority": "P1",
   "dependencies": [
     "2026-10-28-v2-05-checkpoint-review-evidence"
@@ -12,10 +12,19 @@
     "worktree": null
   },
   "checkpoint": {
-    "summary": "Architecture gap identified by the 2026-10-28 V2 implementation audit. Not started.",
-    "nextAction": "Implement the acceptance criteria in the accompanying HTML task; use disposable Git remotes and do not deploy or migrate V1.",
-    "verified": [],
-    "lastCommit": null
+    "summary": "V2-06 completed. Reviewer release/reassignment preserves frozen Claimed revision independently of agent slots; immutable operation-id claim/release/reassignment/withdraw/decision evidence and reviewer recovery projection. Two-phase Git-ledger orphan cleanup reserves an exact source ref/SHA with permanent tombstone, then deletes by exact-OID lease only. Indexed review refs remain protected. Implementation commit d518ac5, experimental protocol 3.32.",
+    "nextAction": "V2-06 accepted. V2-07 administrative lifecycle and V2-12 integration reconciliation are now dependency-ready. V2-09 spec APIs was previously unblocked. No production deployment, push, ledger initialization or V1 migration.",
+    "verified": [
+      "Reviewer claim/release/reassign/withdraw/decide immutable events contain operation UUID, request version, actor, reason, pinned revision/ref/head and evidence",
+      "A released review stays Claimed awaiting orchestrator reassignment; owner cannot replace; reviewer occupancy change never frees a Working agent slot",
+      "Competing reviewers conflict by request CAS; disconnected/released reviewer loses decision authority; release works even if source ref disappeared",
+      "Orphan review inspection includes reserved matching, retargeted and absent states, with permanent ledger tombstone and source SHA",
+      "Two-phase reservation blocks delayed Submit/Update; source deletion requires expected SHA and rejects claimed, accepted and retargeted refs",
+      "Opted-in V2 client API tests exercise release, reassignment, audit, inspect, reserve, delete and post-deletion observation",
+      "Final Client.Tests 340/340 and Server.Tests 62/62 passed; prior quiet client run 339/340 had unidentified nonreproduced failure",
+      "git diff --check clean; protocol 3.32; no production push or deployment"
+    ],
+    "lastCommit": "d518ac5283babaa92c5e1332e91e360d7d356dd3"
   },
   "audit": {
     "specSections": [
@@ -25,10 +34,14 @@
       "RV4"
     ],
     "implementationReferences": [
-      "Client/Modules/ReviewWorkflow.fs:696-895",
-      "Client/Modules/LedgerStore.fs:559-632"
+      "Client/Modules/ReviewWorkflow.fs",
+      "Client/Modules/LedgerStore.fs",
+      "Client/Modules/V2ReviewApi.fs",
+      "Client/SignalR/Client.fs",
+      "Server/McpTools.fs",
+      "Client.Tests/ReviewWorkflowTests.fs"
     ],
-    "sourceReport": "docs/reviews/2026-10-28-v2-spec-implementation-audit.md"
+    "sourceReport": "docs/reviews/2026-10-29-v2-06-reviewer-claim-recovery.md"
   },
-  "updatedAt": "2026-10-28T00:00:00Z"
+  "updatedAt": "2026-10-29T02:26:02+01:00"
 }

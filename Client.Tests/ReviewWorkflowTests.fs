@@ -229,6 +229,182 @@ type ReviewWorkflowTests() =
             | Error(InvalidBinding _) -> () // Remote drift blocks authority; it never frees the slot.
             | other -> Assert.Fail(sprintf "Unapproved ledger endpoint must be rejected: %A" other))
     [<Test>]
+    member _.CompetingReviewersAndReleasedWithdrawalNeverReopenRevision() =
+        withFixture (fun one _ first second _ sourceRef newCommit initTask ->
+            initTask "974"
+            ReviewWorkflow.registerAgent first (Guid.NewGuid()) "Reviewer2" |> success |> ignore
+            let c = newCommit "Review race" "review-race"
+            let request = Guid.NewGuid()
+            ReviewWorkflow.submitReview first (Guid.NewGuid()) "974" "Owner" 3 1
+                request sourceRef c "Two reviewers" |> success |> ignore
+            let claim1 = ReviewWorkflow.claimReview first (Guid.NewGuid()) "974" request "Reviewer" 1 1
+            let claim2 = ReviewWorkflow.claimReview second (Guid.NewGuid()) "974" request "Reviewer2" 1 1
+            let successes = [ claim1; claim2 ] |> List.filter Result.isOk
+            Assert.That(successes.Length, Is.EqualTo(1))
+            match claim2 with
+            | Error(ReviewVersionConflict _) -> ()
+            | other -> Assert.Fail(sprintf "Second reviewer should lose claim race: %A" other)
+            // Removing a source review ref must block new claim/acceptance,
+            // but it must not permanently trap the reviewer occupancy lease.
+            let frozenRef = $"refs/heads/jarvis-review/974/{request:N}/r1"
+            git one [ "push"; "origin"; $":{frozenRef}" ] |> ignore
+            ReviewWorkflow.releaseReviewClaim second (Guid.NewGuid()) "974" request "Reviewer" 2
+                "Reviewer stepped down" |> success |> ignore
+            match ReviewWorkflow.withdrawReview first (Guid.NewGuid()) "974" request
+                    "Owner" 3 "Try reopening frozen review" with
+            | Error(ReviewAccessDenied _) -> ()
+            | other -> Assert.Fail(sprintf "Owner withdrew frozen review: %A" other)
+            ReviewWorkflow.withdrawReview first (Guid.NewGuid()) "974" request
+                "Orchestrator" 3 "Explicit cancelled review" |> success |> ignore
+            let _, archived, revision = ReviewWorkflow.getReview second "974" request |> success
+            Assert.That(archived.Status, Is.EqualTo("Withdrawn"))
+            Assert.That(archived.ClaimedRevision, Is.EqualTo(1))
+            Assert.That(revision.HeadCommit, Is.EqualTo(c))
+            let _, history = ReviewWorkflow.getReviewClaimEvents second "974" request |> success
+            Assert.That(history |> List.map (fun e -> e.Action),
+                        Is.EqualTo(box [ "Claim"; "Release"; "Withdraw" ]))
+            let inbox = ReviewWorkflow.getAgentInbox first "Owner" |> success
+            Assert.That(inbox.Agent.State, Is.EqualTo("Working"))
+            Assert.That(inbox.SlotAvailable, Is.False))
+
+    [<Test>]
+    member _.OrphanCleanupReservationBlocksLateSubmissionAndOnlyDeletesPinnedOid() =
+        withFixture (fun one _ first second _ sourceRef newCommit initTask ->
+            initTask "970"
+            let c = newCommit "Orphan candidate" "orphan-C"
+            let orphanRequest = Guid.NewGuid()
+            let orphanRef = $"refs/heads/jarvis-review/970/{orphanRequest:N}/r1"
+            LedgerStore.publishReviewRef first orphanRef c |> success |> ignore
+            let _, candidates = ReviewWorkflow.inspectOrphanReviewRefs second "970" |> success
+            Assert.That(candidates.Length, Is.EqualTo(1))
+            Assert.That(candidates.Head.ReviewRef, Is.EqualTo(orphanRef))
+            Assert.That(candidates.Head.ObservedHead, Is.EqualTo(c))
+            Assert.That(candidates.Head.Reserved, Is.False)
+            let invalidHead = String.replicate 40 "f"
+            match ReviewWorkflow.reserveOrphanReviewRef first (Guid.NewGuid()) "970"
+                    orphanRequest 1 invalidHead "Orchestrator" "Cleanup pending failed submission" with
+            | Error(SourceReviewRefUnavailable _) -> ()
+            | other -> Assert.Fail(sprintf "Wrong SHA reservation must fail: %A" other)
+            let reservationId = Guid.NewGuid()
+            let reserve () = ReviewWorkflow.reserveOrphanReviewRef first reservationId "970"
+                                orphanRequest 1 c "Orchestrator" "Abandoned review publish"
+            Assert.That((reserve () |> success).AlreadyApplied, Is.False)
+            Assert.That((reserve () |> success).AlreadyApplied, Is.True)
+            let _, pending = ReviewWorkflow.inspectOrphanReviewRefs second "970" |> success
+            Assert.That(pending.Head.Reserved, Is.True)
+            match ReviewWorkflow.submitReview first (Guid.NewGuid()) "970" "Owner" 3 1
+                    orphanRequest sourceRef c "Late owner submission" with
+            | Error(SourceReviewRefUnavailable _) -> ()
+            | other -> Assert.Fail(sprintf "Tombstoned ref must not become a review: %A" other)
+            let _, result = ReviewWorkflow.deleteReservedOrphanReviewRef second "970" orphanRequest 1 c |> success
+            Assert.That(result, Is.EqualTo("Deleted"))
+            let _, repeat = ReviewWorkflow.deleteReservedOrphanReviewRef first "970" orphanRequest 1 c |> success
+            Assert.That(repeat, Is.EqualTo("AlreadyAbsent"))
+            let _, remaining = ReviewWorkflow.inspectOrphanReviewRefs second "970" |> success
+            Assert.That(remaining.Length, Is.EqualTo(1))
+            Assert.That(remaining.Head.RemoteState, Is.EqualTo("Absent"))
+            Assert.That(remaining.Head.ObservedHead, Is.Null)
+            Assert.That(remaining.Head.ExpectedHead, Is.EqualTo(c))
+            Assert.That(remaining.Head.ReservationSequence, Is.GreaterThan(0L))
+            Assert.That(git one [ "ls-remote"; "origin"; orphanRef ], Is.Empty)
+            let inbox = ReviewWorkflow.getAgentInbox second "Owner" |> success
+            Assert.That(inbox.Agent.State, Is.EqualTo("Working"))
+            Assert.That(inbox.SlotAvailable, Is.False))
+
+    [<Test>]
+    member _.OrphanCleanupRefusesClaimedAndRetargetedRevisionRefs() =
+        withFixture (fun one _ first second _ sourceRef newCommit initTask ->
+            initTask "971"
+            let c = newCommit "C" "claimed-C"
+            let id = Guid.NewGuid()
+            ReviewWorkflow.submitReview first (Guid.NewGuid()) "971" "Owner" 3 1
+                id sourceRef c "Live review" |> success |> ignore
+            ReviewWorkflow.claimReview second (Guid.NewGuid()) "971" id "Reviewer" 1 1
+            |> success |> ignore
+            let protectedRef = $"refs/heads/jarvis-review/971/{id:N}/r1"
+            match ReviewWorkflow.reserveOrphanReviewRef first (Guid.NewGuid()) "971" id 1 c
+                    "Orchestrator" "Would accidentally delete claimed revision" with
+            | Error(ReviewAccessDenied _) -> ()
+            | other -> Assert.Fail(sprintf "Claimed ref cleanup must be rejected: %A" other)
+            let orphanRequest = Guid.NewGuid()
+            let orphanRef = $"refs/heads/jarvis-review/971/{orphanRequest:N}/r1"
+            LedgerStore.publishReviewRef first orphanRef c |> success |> ignore
+            ReviewWorkflow.reserveOrphanReviewRef first (Guid.NewGuid()) "971" orphanRequest 1 c
+                "Orchestrator" "Orphan test" |> success |> ignore
+            let d = newCommit "D" "retargeted-D"
+            git one [ "push"; "--force"; "origin"; $"{d}:{orphanRef}" ] |> ignore
+            let _, retargeted = ReviewWorkflow.inspectOrphanReviewRefs second "971" |> success
+            Assert.That(retargeted.Head.RemoteState, Is.EqualTo("Retargeted"))
+            Assert.That(retargeted.Head.ExpectedHead, Is.EqualTo(c))
+            match ReviewWorkflow.deleteReservedOrphanReviewRef first "971" orphanRequest 1 c with
+            | Error(SourceReviewRefUnavailable _) -> ()
+            | other -> Assert.Fail(sprintf "Changed review ref must remain intact: %A" other)
+            Assert.That(git one [ "ls-remote"; "origin"; orphanRef ], Does.Contain(d))
+            Assert.That(git one [ "ls-remote"; "origin"; protectedRef ], Does.Contain(c))
+            let _, review, _ = ReviewWorkflow.getReview first "971" id |> success
+            Assert.That(review.Status, Is.EqualTo("Claimed"))
+            ReviewWorkflow.decide second (Guid.NewGuid()) "971" id "Reviewer" 2 Accept "Approved" |> success |> ignore
+            match ReviewWorkflow.reserveOrphanReviewRef first (Guid.NewGuid()) "971" id 1 c
+                    "Orchestrator" "Would accidentally delete accepted revision" with
+            | Error(ReviewAccessDenied _) -> ()
+            | other -> Assert.Fail(sprintf "Accepted source ref cleanup must be rejected: %A" other))
+
+    [<Test>]
+    member _.ClaimReleaseAndReassignmentPreserveFrozenReviewAndAudit() =
+        withFixture (fun _ _ first second _ sourceRef newCommit initTask ->
+            initTask "603"
+            ReviewWorkflow.registerAgent first (Guid.NewGuid()) "Reviewer2" |> success |> ignore
+            let head = newCommit "Claimable patch" "claimable"
+            let id = Guid.NewGuid()
+            ReviewWorkflow.submitReview first (Guid.NewGuid()) "603" "Owner" 3 1 id sourceRef head "Frozen review"
+            |> success |> ignore
+            ReviewWorkflow.claimReview second (Guid.NewGuid()) "603" id "Reviewer" 1 1
+            |> success |> ignore
+            let _, before, revision = ReviewWorkflow.getReview second "603" id |> success
+            Assert.That(before.ClaimedRevision, Is.EqualTo(1))
+            let releaseId = Guid.NewGuid()
+            let release () = ReviewWorkflow.releaseReviewClaim second releaseId "603" id "Reviewer" 2 "Leaving review"
+            Assert.That((release () |> success).AlreadyApplied, Is.False)
+            Assert.That((release () |> success).AlreadyApplied, Is.True)
+            let _, released, frozen = ReviewWorkflow.getReview first "603" id |> success
+            Assert.That(released.Status, Is.EqualTo("Claimed"))
+            Assert.That(released.ClaimantId, Is.Null)
+            Assert.That(frozen.HeadCommit, Is.EqualTo(revision.HeadCommit))
+            Assert.That((ReviewWorkflow.awaitingReviewReassignment first |> success |> snd).Length, Is.EqualTo(1))
+            Assert.That((ReviewWorkflow.reviewerQueue second "Reviewer" |> success |> snd).Length, Is.EqualTo(0))
+            match ReviewWorkflow.updateReview first (Guid.NewGuid()) "603" "Owner" 1 id 3 sourceRef head "Try replacement" with
+            | Error(ReviewAlreadyClaimed _) -> ()
+            | other -> Assert.Fail(sprintf "Frozen review became replaceable: %A" other)
+            match ReviewWorkflow.claimReview first (Guid.NewGuid()) "603" id "Reviewer2" 3 1 with
+            | Error(ReviewVersionConflict _) -> ()
+            | other -> Assert.Fail(sprintf "Released review became claimable: %A" other)
+            match ReviewWorkflow.decide first (Guid.NewGuid()) "603" id "Reviewer" 3 Accept "Stale" with
+            | Error(ReviewAccessDenied _) -> ()
+            | other -> Assert.Fail(sprintf "Released claimant can still decide: %A" other)
+            match ReviewWorkflow.reassignReviewerWithReason first (Guid.NewGuid()) "603" id
+                    "Reviewer2" "Reviewer2" 3 "Self-reclaim" with
+            | Error(ReviewAccessDenied _) -> ()
+            | other -> Assert.Fail(sprintf "Self-directed reclaim must not bypass orchestrator: %A" other)
+            ReviewWorkflow.reassignReviewerWithReason first (Guid.NewGuid()) "603" id
+                "Orchestrator" "Reviewer2" 3 "Reviewer disconnected" |> success |> ignore
+            let _, handed, retained = ReviewWorkflow.getReview second "603" id |> success
+            Assert.That(handed.ClaimantId, Is.EqualTo("Reviewer2"))
+            Assert.That(handed.ClaimedRevision, Is.EqualTo(1))
+            Assert.That(retained.HeadCommit, Is.EqualTo(head))
+            ReviewWorkflow.decide second (Guid.NewGuid()) "603" id "Reviewer2" 4 Accept "Verified"
+            |> success |> ignore
+            let _, history = ReviewWorkflow.getReviewClaimEvents first "603" id |> success
+            Assert.That(history |> List.map (fun e -> e.Action),
+                        Is.EqualTo(box [ "Claim"; "Release"; "Reassign"; "Decision" ]))
+            Assert.That(history |> List.map (fun e -> e.Revision),
+                        Is.EqualTo(box [ 1; 1; 1; 1 ]))
+            Assert.That(history[1].Reason, Is.EqualTo("Leaving review"))
+            Assert.That(history[1].OperationId, Is.EqualTo(releaseId.ToString("D")))
+            let inbox = ReviewWorkflow.getAgentInbox first "Owner" |> success
+            Assert.That(inbox.Agent.State, Is.EqualTo("Working"))
+            Assert.That(inbox.SlotAvailable, Is.False))
+
+    [<Test>]
     member _.OwnerUpdatesUntilClaimThenContinuesWorking() =
         withFixture (fun one _ first second baseOid sourceRef newCommit initTask ->
             initTask "315"
@@ -715,6 +891,78 @@ type ReviewWorkflowTests() =
                 match Client.V2ReviewApi.V2ReviewApi.write reviewCmd ctx with
                 | Ok _ -> ()
                 | Error error -> Assert.Fail(sprintf "V2 submit API failed: %A" error)
+                // Exercise the client protocol rather than only invoking the
+                // workflow directly. Read/write must honor the V2 opt-in and
+                // use caller-stable operation identities for recovery.
+                ReviewWorkflow.claimReview first (Guid.NewGuid()) taskId requestId
+                    "Reviewer" 1 1 |> success |> ignore
+                let released =
+                    { reviewCmd with Action = "ReleaseClaim"; ActorId = "Reviewer"
+                                     ExpectedVersion = 2; Generation = 0
+                                     Feedback = "Reviewer unavailable"
+                                     OperationId = Guid.NewGuid().ToString("D") }
+                match Client.V2ReviewApi.V2ReviewApi.write released ctx with
+                | Ok _ -> ()
+                | Error error -> Assert.Fail(sprintf "V2 release API failed: %A" error)
+                let queueRead : Common.V2ReviewReadCommand =
+                    { ProjectName = "owner"; Action = "AwaitingReassignment"
+                      TaskId = ""; RequestId = ""; ReviewerId = "" }
+                match Client.V2ReviewApi.V2ReviewApi.read queueRead ctx with
+                | Ok value ->
+                    let _, requests = unbox<string * ReviewRequest list> value
+                    Assert.That(requests.Length, Is.EqualTo(1))
+                    Assert.That(requests.Head.ClaimantId, Is.Null)
+                | Error error -> Assert.Fail(sprintf "V2 awaiting-reassignment API failed: %A" error)
+                ReviewWorkflow.registerAgent first (Guid.NewGuid()) "Reviewer 2" |> success |> ignore
+                let handoff =
+                    { released with Action = "Reassign"; ActorId = "Orchestrator"
+                                    ReviewerId = "Reviewer 2"; ExpectedVersion = 3
+                                    Feedback = "Explicit recovery"
+                                    OperationId = Guid.NewGuid().ToString("D") }
+                match Client.V2ReviewApi.V2ReviewApi.write handoff ctx with
+                | Ok _ -> ()
+                | Error error -> Assert.Fail(sprintf "V2 reviewer reassign API failed: %A" error)
+                let historyRead = { queueRead with Action = "ClaimHistory"; TaskId = taskId
+                                                   RequestId = requestId.ToString("D") }
+                match Client.V2ReviewApi.V2ReviewApi.read historyRead ctx with
+                | Ok value ->
+                    let _, events = unbox<string * ReviewClaimEvent list> value
+                    Assert.That(events.Length, Is.EqualTo(3))
+                    Assert.That(events[2].Reason, Is.EqualTo("Explicit recovery"))
+                | Error error -> Assert.Fail(sprintf "V2 immutable event API failed: %A" error)
+                // The source-ref cleanup path also goes through the opted-in
+                // V2 client API, including a persistent tombstone and confirmed
+                // guarded removal of the remote ref.
+                let orphanId = Guid.NewGuid()
+                let orphanRef = $"refs/heads/jarvis-review/{taskId}/{orphanId:N}/r1"
+                LedgerStore.publishReviewRef first orphanRef head |> success |> ignore
+                let orphanRead =
+                    { queueRead with Action = "OrphanRefs"; TaskId = taskId }
+                match Client.V2ReviewApi.V2ReviewApi.read orphanRead ctx with
+                | Ok value ->
+                    let _, candidates = unbox<string * OrphanReviewRef list> value
+                    Assert.That(candidates |> List.exists (fun entry -> entry.ReviewRef = orphanRef), Is.True)
+                | Error error -> Assert.Fail(sprintf "V2 orphan inspection API failed: %A" error)
+                let reserve =
+                    { released with Action = "ReserveOrphan"; ActorId = "Orchestrator"
+                                    RequestId = orphanId.ToString("D"); Generation = 1
+                                    HeadOid = head; Feedback = "Abandoned publication"
+                                    OperationId = Guid.NewGuid().ToString("D") }
+                match Client.V2ReviewApi.V2ReviewApi.write reserve ctx with
+                | Ok _ -> ()
+                | Error error -> Assert.Fail(sprintf "V2 orphan reserve API failed: %A" error)
+                match Client.V2ReviewApi.V2ReviewApi.deleteReservedOrphan
+                        { reserve with Action = "DeleteReservedOrphan" } ctx with
+                | Ok value ->
+                    let json = System.Text.Json.JsonSerializer.Serialize(value)
+                    Assert.That(json, Does.Contain("Deleted"))
+                | Error error -> Assert.Fail(sprintf "V2 guarded orphan delete API failed: %A" error)
+                match Client.V2ReviewApi.V2ReviewApi.read orphanRead ctx with
+                | Ok value ->
+                    let _, candidates = unbox<string * OrphanReviewRef list> value
+                    let removed = candidates |> List.find (fun candidate -> candidate.ReviewRef = orphanRef)
+                    Assert.That(removed.RemoteState, Is.EqualTo("Absent"))
+                | Error error -> Assert.Fail(sprintf "V2 orphan tombstone inspection API failed: %A" error)
                 let after =
                     Client.V2ReviewApi.V2TaskApi.read
                         { ProjectName = "owner"; AgentId = "Owner"; Action = "AgentInbox"; TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L } ctx

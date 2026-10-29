@@ -160,7 +160,7 @@ module LedgerStore =
     let private options = JsonSerializerOptions(PropertyNamingPolicy = JsonNamingPolicy.CamelCase, PropertyNameCaseInsensitive = true)
     let private oidPattern = Regex("^[0-9a-f]{40}([0-9a-f]{24})?$", RegexOptions.Compiled)
     let private recordPath = Regex("^records/[A-Za-z0-9_-]+(/[A-Za-z0-9_.-]+)*[.]json$", RegexOptions.Compiled)
-    let private ledgerPath = Regex("^(tasks/[A-Za-z0-9_-]+/(task[.]json|spec[.]html|attempts/[a-f0-9]{32}([.]json|/checkpoints/[0-9]+[.]json|/assignments/[0-9]+([.]json|[.]ack[.]json))|integrations/[a-f0-9]{32}[.]json|reviews/[a-f0-9]{32}/(request[.]json|notification[.]json|revisions/[0-9]+[.]json|decisions/[0-9]+[.]json))|agents/[A-Za-z0-9_-]+[.]json|records/[A-Za-z0-9_-]+(/[A-Za-z0-9_.-]+)*[.]json)$", RegexOptions.Compiled)
+    let private ledgerPath = Regex("^(tasks/[A-Za-z0-9_-]+/(task[.]json|spec[.]html|attempts/[a-f0-9]{32}([.]json|/checkpoints/[0-9]+[.]json|/assignments/[0-9]+([.]json|[.]ack[.]json))|integrations/[a-f0-9]{32}[.]json|orphan-cleanups/[a-f0-9]{32}/r[1-9][0-9]*[.]json|reviews/[a-f0-9]{32}/(request[.]json|notification[.]json|revisions/[0-9]+[.]json|decisions/[0-9]+[.]json|events/[0-9]+[.]json))|agents/[A-Za-z0-9_-]+[.]json|records/[A-Za-z0-9_-]+(/[A-Za-z0-9_.-]+)*[.]json)$", RegexOptions.Compiled)
     let private remotePattern = Regex("^[A-Za-z0-9][A-Za-z0-9_.-]*$", RegexOptions.Compiled)
 
     type private GitOutput =
@@ -1057,6 +1057,71 @@ module LedgerStore =
                             | Ok output when output.ExitCode <> 0 -> Error(GitFailure $"Source publication rejected: {output.Stderr}")
                             | _ -> Error(OutcomeUnknown $"Cannot confirm source publication at {gitRef}.")
                         | Error _ -> Error(OutcomeUnknown $"Cannot verify source publication at {gitRef}.")
+
+    // Inspect the source remote without altering a local branch/worktree.
+    // Only parser-validated review refs in one task namespace are returned.
+    let listRemoteReviewRefs (binding: LedgerBinding) taskId =
+        if isNull taskId || not (Regex.IsMatch(taskId, "^[A-Za-z0-9_-]{1,80}$")) then
+            Error(InvalidBinding "Invalid orphan-review task ID.")
+        else
+            match validate binding with
+            | Error error -> Error error
+            | Ok () ->
+                let pattern = $"refs/heads/jarvis-review/{taskId}/*"
+                match git binding.RepositoryPath
+                        [ "ls-remote"; "--refs"; binding.RemoteName; pattern ] with
+                | Error error -> Error error
+                | Ok response when response.ExitCode <> 0 ->
+                    Error(RemoteUnavailable response.Stderr)
+                | Ok response ->
+                    let lines = response.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                    let mutable entries = []
+                    let mutable invalid = false
+                    for line in lines do
+                        let parts = line.Split('\t')
+                        if parts.Length <> 2 || not (oidPattern.IsMatch parts[0])
+                           || not (safeReviewRef parts[1])
+                           || not (parts[1].StartsWith($"refs/heads/jarvis-review/{taskId}/", StringComparison.Ordinal)) then
+                            invalid <- true
+                        else entries <- (parts[1], parts[0]) :: entries
+                    if invalid then Error(LedgerIntegrityError "Malformed or out-of-scope source review ref.")
+                    else Ok(entries |> List.sortBy fst)
+
+    let inspectRemoteReviewRef (binding: LedgerBinding) gitRef =
+        if not (safeReviewRef gitRef) then Error(InvalidBinding "Invalid immutable review ref.")
+        else
+            match validate binding with
+            | Error error -> Error error
+            | Ok () -> remoteReviewRef binding gitRef
+
+    // CAS source deletion is intentionally separate from ledger reservation.
+    // There is no force or 'delete all' operation; an unexpected OID is retained.
+    let deleteReservedReviewRef (binding: LedgerBinding) gitRef expectedOid =
+        if not (safeReviewRef gitRef)
+           || isNull expectedOid || not (oidPattern.IsMatch expectedOid) then
+            Error(InvalidBinding "Deletion requires exact review ref and expected SHA.")
+        else
+            inspectRemoteReviewRef binding gitRef
+            |> Result.bind (function
+                | None -> Ok "AlreadyAbsent"
+                | Some found when found <> expectedOid ->
+                    Error(SourceReviewRefUnavailable "Remote review ref no longer matches reserved orphan SHA.")
+                | Some _ ->
+                    let push = git binding.RepositoryPath
+                                    [ "push"; "--porcelain"
+                                      $"--force-with-lease={gitRef}:{expectedOid}"
+                                      binding.RemoteName; $":{gitRef}" ]
+                    inspectRemoteReviewRef binding gitRef
+                    |> Result.bind (function
+                        | None -> Ok "Deleted"
+                        | Some found when found <> expectedOid ->
+                            Error(SourceReviewRefUnavailable "Review ref changed during guarded deletion.")
+                        | Some _ ->
+                            match push with
+                            | Ok response when response.ExitCode <> 0 ->
+                                Error(GitFailure $"Guarded review deletion rejected: {response.Stderr}")
+                            | _ ->
+                                Error(OutcomeUnknown "Cannot confirm guarded review ref deletion.")))
 
     let fetchReviewRef (binding: LedgerBinding) gitRef headOid =
         if not (safeReviewRef gitRef) || isNull headOid || not (oidPattern.IsMatch headOid) then

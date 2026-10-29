@@ -457,6 +457,8 @@ module V2PendingIntentJournal =
         | "V2ReviewWrite", Some "Decide" -> Some "ReviewDecision"
         | "V2ReviewWrite", Some "Withdraw" -> Some "WithdrawReview"
         | "V2ReviewWrite", Some "Reassign" -> Some "ReassignReviewer"
+        | "V2ReviewWrite", Some "ReleaseClaim" -> Some "ReleaseReviewClaim"
+        | "V2ReviewWrite", Some "ReserveOrphan" -> Some "ReserveOrphanReviewRef"
         | "V2ReviewWrite", Some "Finalize" -> Some "FinalizeImplementation"
         | "V2ReviewWrite", Some "AcknowledgeFeedback" -> Some "AcknowledgeReviewFeedback"
         | "V2IntegrationWrite", Some "PlanIntegration" -> Some "PlanIntegration"
@@ -553,7 +555,13 @@ module V2PendingIntentJournal =
                                "Feedback", "reason" ]
                 | "V2ReviewWrite", "ReassignReviewer" ->
                     review @ [ "ActorId", "actor"; "ExpectedVersion", "expectedVersion"
-                               "ReviewerId", "nextReviewer" ]
+                               "ReviewerId", "nextReviewer"; "Feedback", "reason" ]
+                | "V2ReviewWrite", "ReleaseReviewClaim" ->
+                    review @ [ "ActorId", "actor"; "ExpectedVersion", "expectedVersion"
+                               "Feedback", "reason" ]
+                | "V2ReviewWrite", "ReserveOrphanReviewRef" ->
+                    review @ [ "ActorId", "actor"; "Generation", "revision"
+                               "HeadOid", "expectedHead"; "Feedback", "reason" ]
                 | "V2ReviewWrite", "FinalizeImplementation" ->
                     review @ [ "ActorId", "ownerId"; "ExpectedVersion", "expectedAttemptVersion" ]
                 | "V2ReviewWrite", "AcknowledgeReviewFeedback" ->
@@ -590,8 +598,11 @@ module V2PendingIntentJournal =
                         | None -> true
                         | Some raw -> String.IsNullOrWhiteSpace raw
                                       || String.Equals(raw, "False", StringComparison.OrdinalIgnoreCase)
-                    List.contains source [ "TestEvidence"; "Inspected"; "Tested"; "TestDetails" ]
-                    && optionalEmpty localValue && optionalEmpty remoteValue
+                    ((List.contains source [ "TestEvidence"; "Inspected"; "Tested"; "TestDetails" ]
+                      && optionalEmpty localValue && optionalEmpty remoteValue)
+                     || (source = "Feedback" && dest = "reason"
+                         && operation.Type = "ReassignReviewer"
+                         && optionalEmpty localValue && optionalEmpty remoteValue))
 
             operationKind record = Some operation.Type
             && not (List.isEmpty pairs)
@@ -886,12 +897,35 @@ module V2ReviewApi =
                     ReviewWorkflow.ReviewWorkflow.getDecisionEvidence binding cmd.TaskId requestId
                     |> mapError
                     |> Result.map box)
+            | "OrphanRefs" ->
+                ReviewWorkflow.ReviewWorkflow.inspectOrphanReviewRefs binding cmd.TaskId
+                |> mapError |> Result.map box
+            | "ClaimHistory" ->
+                parseId "requestId" cmd.RequestId
+                |> Result.bind (fun requestId ->
+                    ReviewWorkflow.ReviewWorkflow.getReviewClaimEvents binding cmd.TaskId requestId
+                    |> mapError |> Result.map box)
+            | "AwaitingReassignment" ->
+                ReviewWorkflow.ReviewWorkflow.awaitingReviewReassignment binding
+                |> mapError |> Result.map box
             | "ReviewerQueue" ->
                 ReviewWorkflow.ReviewWorkflow.reviewerQueue binding cmd.ReviewerId
                 |> mapError
                 |> Result.map (fun (snapshot, queue) ->
                     box {| snapshotCommit = snapshot.Commit; reviews = queue |})
             | _ -> Error(Client.ValidationError "Unsupported V2 read operation."))
+
+    // Source cleanup executes only after an immutable reservation in the Git
+    // ledger. It is separately idempotent and never claims a ledger write
+    // succeeded merely because the source ref is absent.
+    let deleteReservedOrphan (cmd: V2ReviewWriteCommand) rt =
+        ReviewV2Binding.load cmd.ProjectName rt
+        |> Result.bind (fun binding ->
+            parseId "requestId" cmd.RequestId
+            |> Result.bind (fun id ->
+                ReviewWorkflow.ReviewWorkflow.deleteReservedOrphanReviewRef binding
+                    cmd.TaskId id cmd.Generation cmd.HeadOid
+                |> mapError |> Result.map box))
 
     let write (cmd: V2ReviewWriteCommand) rt =
         ReviewV2Binding.load cmd.ProjectName rt
@@ -938,10 +972,24 @@ module V2ReviewApi =
                                 ReviewWorkflow.ReviewWorkflow.withdrawReview binding operationId
                                     cmd.TaskId reviewId cmd.ActorId cmd.ExpectedVersion cmd.Feedback
                                 |> mapError)
+                        | "ReserveOrphan" ->
+                            id () |> Result.bind (fun reviewId ->
+                                ReviewWorkflow.ReviewWorkflow.reserveOrphanReviewRef binding operationId
+                                    cmd.TaskId reviewId cmd.Generation cmd.HeadOid cmd.ActorId cmd.Feedback
+                                |> mapError)
+                        | "ReleaseClaim" ->
+                            id () |> Result.bind (fun reviewId ->
+                                ReviewWorkflow.ReviewWorkflow.releaseReviewClaim binding operationId
+                                    cmd.TaskId reviewId cmd.ActorId cmd.ExpectedVersion cmd.Feedback
+                                |> mapError)
                         | "Reassign" ->
                             id () |> Result.bind (fun reviewId ->
-                                ReviewWorkflow.ReviewWorkflow.reassignReviewer binding operationId
-                                    cmd.TaskId reviewId cmd.ActorId cmd.ReviewerId cmd.ExpectedVersion
+                                (if String.IsNullOrWhiteSpace cmd.Feedback then
+                                     ReviewWorkflow.ReviewWorkflow.reassignReviewer binding operationId
+                                         cmd.TaskId reviewId cmd.ActorId cmd.ReviewerId cmd.ExpectedVersion
+                                 else
+                                     ReviewWorkflow.ReviewWorkflow.reassignReviewerWithReason binding operationId
+                                         cmd.TaskId reviewId cmd.ActorId cmd.ReviewerId cmd.ExpectedVersion cmd.Feedback)
                                 |> mapError)
                         | "Finalize" ->
                             id () |> Result.bind (fun reviewId ->

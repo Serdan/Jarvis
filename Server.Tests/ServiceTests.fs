@@ -427,9 +427,9 @@ let ``command catalog matches AgentCommand union and MCP tools`` () =
         set [ "V2AgentInbox"; "V2GetAssignment"; "V2GetCheckpoint"; "V2InspectAttemptSource"; "V2CreateTask"; "V2ReviseTaskSpec"; "V2RegisterAgent"; "V2AssignTask"; "V2AcknowledgeAssignment"; "V2ReissueAssignment"; "V2BeginAttempt"; "V2CheckpointAttempt"
               "V2BindReviewBase"; "V2BindAttemptSource"; "V2RebindAttemptSource"; "V2YieldAgent"; "V2ResumeAgent"; "V2CompleteAgentWork"
               "V2ParkAgent"; "V2ReissueQueuedAttempt"; "V2RecoverAgentAssignment"; "V2AcknowledgeReviewFeedback"
-              "V2ReviewTask"; "V2ReviewDetails"; "V2ReviewerInbox"; "V2ReviewDecisionEvidence"
+              "V2ReviewTask"; "V2ReviewDetails"; "V2ReviewerInbox"; "V2ReviewDecisionEvidence"; "V2ReviewClaimHistory"; "V2AwaitingReviewReassignment"; "V2InspectOrphanReviewRefs"
               "V2SubmitReview"; "V2ReplaceReview"; "V2SubmitReviewWithEvidence"; "V2ReplaceReviewWithEvidence"; "V2ClaimReview"; "V2DecideReview"; "V2DecideReviewWithEvidence"
-              "V2WithdrawReview"; "V2ReassignReview"; "V2FinalizeReview"
+              "V2WithdrawReview"; "V2ReassignReview"; "V2ReleaseReviewClaim"; "V2ReassignReviewWithReason"; "V2ReserveOrphanReviewRef"; "V2DeleteReservedOrphanReviewRef"; "V2FinalizeReview"
               "V2LedgerHealth"; "V2GetOperationStatus"; "V2PendingOperations"; "V2ReconcilePendingOperations"; "V2AcknowledgePendingOperation"; "V2InitializeLedger"; "V2BindExistingLedger"; "V2RebindLedgerRemote"
               "V2InspectIntegration"; "V2PlanIntegration"; "V2MarkIntegrationPendingPush"; "V2RecordIntegration"; "V2CloseIntegratedTask" ]
     Set.difference unionNames retired |> shouldEqual catalogNames
@@ -450,7 +450,7 @@ let ``client-backed MCP tools expose an optional per-command deviceId`` () =
         |> Array.filter (fun methodInfo ->
             methodInfo.GetParameters()
             |> Array.exists (fun parameter -> parameter.ParameterType = typeof<ClientService>))
-    clientMethods.Length |> shouldEqual (AgentProtocol.commandDefinitions.Length - 1 + 41) // 46 MCP V2 aliases / 8 wire operations
+    clientMethods.Length |> shouldEqual (AgentProtocol.commandDefinitions.Length - 1 + 48) // 46 MCP V2 aliases / 8 wire operations
     for methodInfo in clientMethods do
         let deviceParam = methodInfo.GetParameters() |> Array.tryFind (fun parameter -> parameter.Name = "deviceId")
         match deviceParam with
@@ -672,10 +672,10 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
               for name in [ "V2CreateTask"; "V2ReviseTaskSpec"; "V2RegisterAgent"; "V2AssignTask"; "V2AcknowledgeAssignment"; "V2ReissueAssignment"; "V2BeginAttempt"; "V2CheckpointAttempt"
                             "V2BindReviewBase"; "V2BindAttemptSource"; "V2RebindAttemptSource"; "V2YieldAgent"; "V2ResumeAgent"; "V2CompleteAgentWork";
                             "V2ParkAgent"; "V2ReissueQueuedAttempt"; "V2RecoverAgentAssignment"; "V2AcknowledgeReviewFeedback" ] -> name, taskWrite
-              for name in [ "V2ReviewTask"; "V2ReviewDetails"; "V2ReviewerInbox"; "V2ReviewDecisionEvidence" ] ->
+              for name in [ "V2ReviewTask"; "V2ReviewDetails"; "V2ReviewerInbox"; "V2ReviewDecisionEvidence"; "V2ReviewClaimHistory"; "V2AwaitingReviewReassignment"; "V2InspectOrphanReviewRefs" ] ->
                   name, v2Read
               for name in [ "V2SubmitReview"; "V2ReplaceReview"; "V2SubmitReviewWithEvidence"; "V2ReplaceReviewWithEvidence"; "V2ClaimReview"; "V2DecideReview"; "V2DecideReviewWithEvidence"
-                            "V2WithdrawReview"; "V2ReassignReview"; "V2FinalizeReview" ] ->
+                            "V2WithdrawReview"; "V2ReassignReview"; "V2ReleaseReviewClaim"; "V2ReassignReviewWithReason"; "V2ReserveOrphanReviewRef"; "V2DeleteReservedOrphanReviewRef"; "V2FinalizeReview" ] ->
                   name, v2Write ]
         aliases |> List.fold (fun map (key, value) -> Map.add key value map) original
 
@@ -705,7 +705,7 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
 
         let destructive =
             match methodInfo.Name with
-            | "ImportFile" | "UpdateClient" | "UpdateServer" | "WriteFile" | "PatchFile" | "RunCommand" | "RunProjectTask" | "StartJob" | "CancelJob" | "RemoveWorktree" | "RetireWorktree" -> true
+            | "ImportFile" | "UpdateClient" | "UpdateServer" | "WriteFile" | "PatchFile" | "RunCommand" | "RunProjectTask" | "StartJob" | "CancelJob" | "RemoveWorktree" | "RetireWorktree" | "V2DeleteReservedOrphanReviewRef" -> true
             | _ -> false
 
         let openWorld =

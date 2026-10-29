@@ -316,6 +316,20 @@ Each published revision uses a **new, immutable source Git ref**, e.g. `refs/hea
 
 **Claimed review:** From Claim, the revision remains frozen until AcceptReview, RequestChanges, explicit Withdraw with reviewer/orchestrator consent, or audited reviewer reassignment. Reassignment changes the claimant but retains `status=Claimed`, `claimedRevisionId`, and the immutable claim history. Releasing the claimant without immediate reassignment leaves the request `Claimed` with `claimantId=null` and an explicit `AwaitingReassignment` reviewer-work substate; **it does not set status back to Unclaimed** and cannot be picked up by ordinary ClaimReview. Only an authorized ReassignReviewer may select the replacement reviewer. This does **not** re-enable owner replacement; the new reviewer examines the same frozen snapshot. A terminal review decision clears the attempt's `activeReviewRequestId` atomically with the review outcome, preserving all prior requests in Git history. A decision references the claimed revision and exact pinned base/head. AcceptReview marks that review Accepted and retains its approved patch; it does **not** automatically terminate a still-Working agent or declare all subsequent unreviewed work complete. RequestChanges records findings and notifies the owner: an already Working agent keeps working, whereas a nonworking owner receives a new Queued generation to resume. FinalizeImplementation is separate and explicitly selects an accepted review as the completion/integration basis. Any later code must go through its own review and cannot ride along on a moving branch tip.
 
+**V2-06 recovery contract (2026-10-29):** A released reviewer claim
+retains `status=Claimed`, `claimedRevision` and immutable source evidence,
+with `claimantId=null` awaiting orchestrator reassignment. Release,
+reassignment, withdrawal and decision append immutable claim events.
+`V2AwaitingReviewReassignment` reports these frozen unoccupied reviews,
+never as Unclaimed. Unindexed review refs from losing source publication
+operations require a two-phase cleanup: an immutable Git-ledger tombstone
+first, then exact-SHA source deletion by lease. Submit/Update verify no
+matching tombstone during their CAS transaction. Existing immutable
+review revisions always protect their refs from orphan deletion, even
+when withdrawn or superseded; approval/integration refs are never
+implicitly cleaned. The cleanup reservation is durable, while remote
+deletion is separately confirmed and may be retried after uncertainty.
+
 **Publication/recovery:** Source review-ref push, ledger Submit/Update, and eventual source integration are **not** a cross-ref atomic transaction. On transport uncertainty, first inspect the source remote ref and then check the canonical ledger operation ID; never move an existing review ref in an attempt to “repair” a race. A ref published without a successful ledger update remains an orphan candidate and must not appear in reviewer inboxes. Verify preservation of any accepted/claimed revision before cleanup. When the reviewer fetches or accepts, it must verify the remote review ref still resolves to the pinned SHA (or fail closed with a source-integrity error); the review does not track a moving branch. Git credentials/permissions remain the trust boundary, not agent labels.
 
 An agent disappearing mid-turn leaves the slot occupied and the attempt marked Working until explicitly paused, blocked or reclaimed through a reviewer/orchestrator action with an audit reason. Checkpoints require Working so an agent cannot bypass the capacity rule by progressing an Acknowledged item without beginning it. Presence is not inferred from Git; no lease expiry or automatic stealing. Admin release must atomically revoke the old generation and free the slot, preventing a stale client from continuing authoritatively. Two simultaneous Begin calls are checked on the same remote snapshot and only one can publish a slot change.

@@ -197,15 +197,13 @@ Projects can expose named build/test/format/lint tasks in a project-root `.jarvi
 
 The executable and arguments come from local project configuration rather than model-supplied task arguments. Jarvis resolves the task before permission approval and executes that same definition afterward.
 
-## Worktrees and repository-backed tasks
+## Worktrees and Git-backed orchestration
 
-Jarvis discovers existing worktrees using Git metadata. New worktrees use hidden sibling directories such as `~/Projects/.Wayfold-worktrees/input-config/`, and `ListProjects` groups Git worktrees under their main projects. A registered worktree can be selected for any project-scoped command using `projectName="Wayfold::input-config"`, without affecting other agents.
+Jarvis discovers worktrees using Git metadata. New worktrees use hidden sibling directories such as `~/Projects/.Wayfold-worktrees/input-config/`, and `ListProjects` groups worktrees under their main projects. A registered worktree can be selected for project-scoped commands using `projectName="Wayfold::input-config"`.
 
-Jarvis manages human-readable HTML task descriptions and adjacent version-controlled JSON state. The default canonical folder is `docs/tasks`, configurable through `"taskDirectory"` in project-root `.jarvis.json`. Commands include `CreateTask`, `ListTasks`, `GetTask`, `CompareWorktreeTasks`, `UpdateTask`, `ClaimTask`, `CheckpointTask`, `CompleteTask` and `GetTaskHistory`. Mutations commit only the affected task files on the selected branch.
+**Current task authority:** an explicitly initialized project uses one Git orphan branch, `refs/heads/jarvis-orchestration`, on its configured remote. The `V2*` MCP tools manage canonical HTML task specs, agents, assignments, reviews and integrations. The old `CreateTask`, `ListTasks`, `GetTask`, `ClaimTask`, `CheckpointTask` and other source-branch orchestration MCP tools are retired. Existing `docs/tasks/` HTML/JSON files remain reference material, not live state; upgrading Jarvis does not automatically migrate them.
 
-For task coordination, use repository-backed `ListTasks`, `GetTask`, `ClaimTask`, `UpdateTask`, `CheckpointTask`, and `CompleteTask`. The older WorkTask MCP endpoints have been retired. Historical `.jarvis/tasks/` checkpoint files are non-authoritative and must be reconciled with repository task JSON before archival or removal.
-
-See [Git worktrees and task files](docs/GitBackedTasks.md) for API details, file conventions and tests.
+See [Migration to Git-backed orchestration](docs/OrchestrationMigration.md) for initialization, selective task carry-over and recovery. The [orchestration V2 architecture](docs/specs/orchestration-v2-architecture.md) defines the authority rules. The older [Git-backed task files guide](docs/GitBackedTasks.md) describes the retired workflow.
 
 ## Automatic repository instructions
 

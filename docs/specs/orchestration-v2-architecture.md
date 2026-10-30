@@ -144,11 +144,11 @@ A task's lifecycle must not depend on what branch happened to contain an old cop
 
 ## 6. Tool surface and cutover
 
-Expose the orphan-branch operations through the **existing V2 MCP tools**, which can retain their `V2` names. We do not need to design a new public command family or force a major-protocol rollout merely to rename them.
+Expose the orphan-branch operations through **unprefixed public MCP tool names** (`CreateTask`, `AssignTask`, `AgentInbox`, `SubmitReview`, `LedgerHealth`, etc.) without `V2` compatibility aliases. The eight internal versioned wire commands retain their `V2` names; public names are independent of the transport protocol. Where a legacy public name is reused, it exclusively invokes the orphan-ledger implementation.
 
 Provide only the queries needed to operate the workflow: current tasks, a task's details/spec, agent inbox/roster, and submitted/claimed review requests. If a query is missing, add the **smallest** direct read for it. Use ordinary Git history/diff commands when historical investigation is needed. No portable cursor framework, historical search service, mirror/restore API, or extensive administrative API is required.
 
-The old public MCP task commands — `ListTasks`, `GetTask`, `CreateTask`, `UpdateTask`, `ClaimTask`, `CheckpointTask`, `CompleteTask`, `GetTaskHistory`, `CompareWorktreeTasks`, `GetAgentAssignment`, `AssignTask`, `AcknowledgeTask`, `GetOrchestrationSnapshot`, `RetireWorktree` and `BeginTask` — are **removed**, not wrapped or forwarded. The earlier `*WorkTask` tools were already retired. Their names may remain as internal dead wire cases temporarily while deleting them safely; they must not be callable, advertised or used as a compatibility path.
+The old source-branch task command implementations — including `ListTasks`, `GetTask`, `UpdateTask`, `ClaimTask`, `CheckpointTask`, `CompleteTask`, `GetTaskHistory`, `CompareWorktreeTasks`, `GetAgentAssignment`, `AcknowledgeTask`, `GetOrchestrationSnapshot`, `RetireWorktree` and `BeginTask` — are **removed**, not wrapped or forwarded. The names `CreateTask` and `AssignTask` are deliberately reused by the new orphan-ledger implementation; they must never reach the old source-branch handlers. The earlier `*WorkTask` tools were already retired. Their names may remain as internal dead wire cases temporarily while deleting them safely; they must not be callable, advertised or used as a compatibility path.
 
 The cutover is direct:
 
@@ -180,7 +180,7 @@ The cutover is finished when these behaviors are verified:
 4. Agents can submit reviews, continue working, update unclaimed reviews, and receive feedback on claimed snapshots.
 5. The reviewer can claim/decide a pinned review; recorded acceptance does not falsely imply merged code.
 6. Integration status reflects actual remote source state, not an optimistic local commit.
-7. All old orchestration MCP tools are absent from the public catalog and invocation surface; non-orchestration tools still work.
+7. All old source-branch orchestration implementations are absent from the public surface (including unprefixed name reuse); non-orchestration tools still work.
 8. No automated migration occurs, and legacy on-disk task files are left untouched.
 9. Existing client and server test suites pass; use a disposable remote for Git workflow tests.
 10. Each assignment persists its current session ID and the ordered history of associated opaque IDs. A reported stalled-Working recovery records a dated event, associates the continuing session and resets the timed-segment cutoff clock without changing task ownership, assignment generation, or state-entry timestamp.

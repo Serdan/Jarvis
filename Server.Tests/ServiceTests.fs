@@ -425,24 +425,26 @@ let ``command catalog matches AgentCommand union and MCP tools`` () =
               "ListTasks"; "GetTask"; "CreateTask"; "UpdateTask"; "ClaimTask"; "CheckpointTask"
               "CompleteTask"; "GetTaskHistory"; "CompareWorktreeTasks"; "GetAgentAssignment"
               "AssignTask"; "AcknowledgeTask"; "GetOrchestrationSnapshot"; "RetireWorktree"; "BeginTask" ]
-    // Human-oriented V2 MCP tools route through eight carefully scoped wire commands.
+    // Orphan-ledger MCP tools route through eight versioned internal wire commands.
     let v2Wire = set [ "V2TaskRead"; "V2TaskWrite"; "V2ReviewRead"; "V2ReviewWrite"; "V2IntegrationRead"; "V2IntegrationWrite"; "V2LedgerRead"; "V2LedgerWrite" ]
-    let v2Tools =
-        set [ "V2AgentInbox"; "V2GetAssignment"; "V2GetCheckpoint"; "V2InspectAttemptSource"; "V2TaskLifecycleHistory"; "V2GetNonSourceApproval"; "V2GetTaskSpecPage"; "V2DiffTaskSpec"; "V2CreateTask"; "V2ReviseTaskSpec"; "V2RegisterAgent"; "V2AssignTask"; "V2AcknowledgeAssignment"; "V2ReissueAssignment"; "V2BeginAttempt"; "V2CheckpointAttempt"
-              "V2BindReviewBase"; "V2BindAttemptSource"; "V2RebindAttemptSource"; "V2YieldAgent"; "V2ResumeAgent"; "V2CompleteAgentWork"
-              "V2ParkAgent"; "V2ReissueQueuedAttempt"; "V2RecoverAgentAssignment"; "V2AcknowledgeReviewFeedback"; "V2ParkAttempt"; "V2BlockAttempt"; "V2ResumeAttempt"; "V2AbandonAttempt"; "V2CancelTask"; "V2CancelOpenTask"; "V2TransferOwner"; "V2CloseNonSourceTask"; "V2ReopenTask"; "V2ReviseTaskSpecPinned"; "V2ImportTaskSpec"; "V2AdoptTaskSpec"; "V2ExportTaskSpec"
-              "V2ReviewTask"; "V2ReviewDetails"; "V2ReviewerInbox"; "V2ReviewDecisionEvidence"; "V2ReviewClaimHistory"; "V2AwaitingReviewReassignment"; "V2InspectOrphanReviewRefs"
-              "V2SubmitReview"; "V2ReplaceReview"; "V2SubmitReviewWithEvidence"; "V2ReplaceReviewWithEvidence"; "V2ClaimReview"; "V2DecideReview"; "V2DecideReviewWithEvidence"
-              "V2WithdrawReview"; "V2ReassignReview"; "V2ReleaseReviewClaim"; "V2ReassignReviewWithReason"; "V2ReserveOrphanReviewRef"; "V2DeleteReservedOrphanReviewRef"; "V2FinalizeReview"
-              "V2LedgerHealth"; "V2GetOperationStatus"; "V2PendingOperations"; "V2ReconcilePendingOperations"; "V2AcknowledgePendingOperation"; "V2InitializeLedger"; "V2BindExistingLedger"; "V2RebindLedgerRemote"
-              "V2InspectIntegration"; "V2PlanIntegration"; "V2MarkIntegrationPendingPush"; "V2RecordIntegration"; "V2CloseIntegratedTask" ]
+    let orchestrationTools =
+        set [ "AgentInbox"; "GetAssignment"; "GetCheckpoint"; "InspectAttemptSource"; "TaskLifecycleHistory"; "GetNonSourceApproval"; "GetTaskSpecPage"; "DiffTaskSpec"; "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "AcknowledgeAssignment"; "ReissueAssignment"; "BeginAttempt"; "CheckpointAttempt"
+              "BindReviewBase"; "BindAttemptSource"; "RebindAttemptSource"; "YieldAgent"; "ResumeAgent"; "CompleteAgentWork"
+              "ParkAgent"; "ReissueQueuedAttempt"; "RecoverAgentAssignment"; "AcknowledgeReviewFeedback"; "ParkAttempt"; "BlockAttempt"; "ResumeAttempt"; "AbandonAttempt"; "CancelTask"; "CancelOpenTask"; "TransferOwner"; "CloseNonSourceTask"; "ReopenTask"; "ReviseTaskSpecPinned"; "ImportTaskSpec"; "AdoptTaskSpec"; "ExportTaskSpec"
+              "ReviewTask"; "ReviewDetails"; "ReviewerInbox"; "ReviewDecisionEvidence"; "ReviewClaimHistory"; "AwaitingReviewReassignment"; "InspectOrphanReviewRefs"
+              "SubmitReview"; "ReplaceReview"; "SubmitReviewWithEvidence"; "ReplaceReviewWithEvidence"; "ClaimReview"; "DecideReview"; "DecideReviewWithEvidence"
+              "WithdrawReview"; "ReassignReview"; "ReleaseReviewClaim"; "ReassignReviewWithReason"; "ReserveOrphanReviewRef"; "DeleteReservedOrphanReviewRef"; "FinalizeReview"
+              "LedgerHealth"; "GetOperationStatus"; "PendingOperations"; "ReconcilePendingOperations"; "AcknowledgePendingOperation"; "InitializeLedger"; "BindExistingLedger"; "RebindLedgerRemote"
+              "InspectIntegration"; "PlanIntegration"; "MarkIntegrationPendingPush"; "RecordIntegration"; "CloseIntegratedTask" ]
+    let reusedNames = set [ "CreateTask"; "AssignTask" ]
     Set.difference unionNames retired |> shouldEqual catalogNames
-    Set.intersect mcpNames retired |> shouldEqual Set.empty
+    Set.intersect mcpNames retired |> shouldEqual reusedNames
     Set.intersect catalogNames retired |> shouldEqual Set.empty
-    Set.intersect mcpNames v2Tools |> shouldEqual v2Tools
-    Set.difference (Set.difference mcpNames serverLocalNames) v2Tools
+    Set.intersect mcpNames (set [ for name in orchestrationTools -> "V2" + name ]) |> shouldEqual Set.empty
+    Set.intersect mcpNames orchestrationTools |> shouldEqual orchestrationTools
+    Set.difference (Set.difference mcpNames serverLocalNames) orchestrationTools
     |> shouldEqual (Set.difference catalogNames v2Wire)
-    Set.difference (Set.difference mcpNames catalogNames) v2Tools
+    Set.difference (Set.difference mcpNames catalogNames) orchestrationTools
     |> shouldEqual serverLocalNames
 
 
@@ -654,6 +656,8 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
         elif definition.Permissions |> List.contains ProcessExecution then Auth.ProcessExecute
         else Auth.WorkspaceRead
 
+    let wireCommandNames = AgentProtocol.commandDefinitions |> List.map _.Name |> Set.ofList
+
     let definitions =
         let original =
             AgentProtocol.commandDefinitions
@@ -668,18 +672,18 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
         let v2Read = original["V2ReviewRead"]
         let v2Write = original["V2ReviewWrite"]
         let aliases =
-            [ for name in [ "V2LedgerHealth"; "V2GetOperationStatus"; "V2PendingOperations"; "V2ReconcilePendingOperations" ] -> name, ledgerRead
-              for name in [ "V2InitializeLedger"; "V2BindExistingLedger"; "V2RebindLedgerRemote"; "V2AcknowledgePendingOperation" ] -> name, ledgerWrite
-              for name in [ "V2InspectIntegration" ] -> name, integrationRead
-              for name in [ "V2PlanIntegration"; "V2MarkIntegrationPendingPush"; "V2RecordIntegration"; "V2CloseIntegratedTask" ] -> name, integrationWrite
-              for name in [ "V2AgentInbox"; "V2GetAssignment"; "V2GetCheckpoint"; "V2InspectAttemptSource"; "V2TaskLifecycleHistory"; "V2GetNonSourceApproval"; "V2GetTaskSpecPage"; "V2DiffTaskSpec" ] -> name, taskRead
-              for name in [ "V2CreateTask"; "V2ReviseTaskSpec"; "V2RegisterAgent"; "V2AssignTask"; "V2AcknowledgeAssignment"; "V2ReissueAssignment"; "V2BeginAttempt"; "V2CheckpointAttempt"
-                            "V2BindReviewBase"; "V2BindAttemptSource"; "V2RebindAttemptSource"; "V2YieldAgent"; "V2ResumeAgent"; "V2CompleteAgentWork";
-                            "V2ParkAgent"; "V2ReissueQueuedAttempt"; "V2RecoverAgentAssignment"; "V2AcknowledgeReviewFeedback"; "V2ParkAttempt"; "V2BlockAttempt"; "V2ResumeAttempt"; "V2AbandonAttempt"; "V2CancelTask"; "V2CancelOpenTask"; "V2TransferOwner"; "V2CloseNonSourceTask"; "V2ReopenTask"; "V2ReviseTaskSpecPinned"; "V2ImportTaskSpec"; "V2AdoptTaskSpec"; "V2ExportTaskSpec" ] -> name, taskWrite
-              for name in [ "V2ReviewTask"; "V2ReviewDetails"; "V2ReviewerInbox"; "V2ReviewDecisionEvidence"; "V2ReviewClaimHistory"; "V2AwaitingReviewReassignment"; "V2InspectOrphanReviewRefs" ] ->
+            [ for name in [ "LedgerHealth"; "GetOperationStatus"; "PendingOperations"; "ReconcilePendingOperations" ] -> name, ledgerRead
+              for name in [ "InitializeLedger"; "BindExistingLedger"; "RebindLedgerRemote"; "AcknowledgePendingOperation" ] -> name, ledgerWrite
+              for name in [ "InspectIntegration" ] -> name, integrationRead
+              for name in [ "PlanIntegration"; "MarkIntegrationPendingPush"; "RecordIntegration"; "CloseIntegratedTask" ] -> name, integrationWrite
+              for name in [ "AgentInbox"; "GetAssignment"; "GetCheckpoint"; "InspectAttemptSource"; "TaskLifecycleHistory"; "GetNonSourceApproval"; "GetTaskSpecPage"; "DiffTaskSpec" ] -> name, taskRead
+              for name in [ "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "AcknowledgeAssignment"; "ReissueAssignment"; "BeginAttempt"; "CheckpointAttempt"
+                            "BindReviewBase"; "BindAttemptSource"; "RebindAttemptSource"; "YieldAgent"; "ResumeAgent"; "CompleteAgentWork";
+                            "ParkAgent"; "ReissueQueuedAttempt"; "RecoverAgentAssignment"; "AcknowledgeReviewFeedback"; "ParkAttempt"; "BlockAttempt"; "ResumeAttempt"; "AbandonAttempt"; "CancelTask"; "CancelOpenTask"; "TransferOwner"; "CloseNonSourceTask"; "ReopenTask"; "ReviseTaskSpecPinned"; "ImportTaskSpec"; "AdoptTaskSpec"; "ExportTaskSpec" ] -> name, taskWrite
+              for name in [ "ReviewTask"; "ReviewDetails"; "ReviewerInbox"; "ReviewDecisionEvidence"; "ReviewClaimHistory"; "AwaitingReviewReassignment"; "InspectOrphanReviewRefs" ] ->
                   name, v2Read
-              for name in [ "V2SubmitReview"; "V2ReplaceReview"; "V2SubmitReviewWithEvidence"; "V2ReplaceReviewWithEvidence"; "V2ClaimReview"; "V2DecideReview"; "V2DecideReviewWithEvidence"
-                            "V2WithdrawReview"; "V2ReassignReview"; "V2ReleaseReviewClaim"; "V2ReassignReviewWithReason"; "V2ReserveOrphanReviewRef"; "V2DeleteReservedOrphanReviewRef"; "V2FinalizeReview" ] ->
+              for name in [ "SubmitReview"; "ReplaceReview"; "SubmitReviewWithEvidence"; "ReplaceReviewWithEvidence"; "ClaimReview"; "DecideReview"; "DecideReviewWithEvidence"
+                            "WithdrawReview"; "ReassignReview"; "ReleaseReviewClaim"; "ReassignReviewWithReason"; "ReserveOrphanReviewRef"; "DeleteReservedOrphanReviewRef"; "FinalizeReview" ] ->
                   name, v2Write ]
         aliases |> List.fold (fun map (key, value) -> Map.add key value map) original
 
@@ -709,13 +713,13 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
 
         let destructive =
             match methodInfo.Name with
-            | "ImportFile" | "UpdateClient" | "UpdateServer" | "WriteFile" | "PatchFile" | "RunCommand" | "RunProjectTask" | "StartJob" | "CancelJob" | "RemoveWorktree" | "RetireWorktree" | "V2DeleteReservedOrphanReviewRef" -> true
+            | "ImportFile" | "UpdateClient" | "UpdateServer" | "WriteFile" | "PatchFile" | "RunCommand" | "RunProjectTask" | "StartJob" | "CancelJob" | "RemoveWorktree" | "RetireWorktree" | "DeleteReservedOrphanReviewRef" -> true
             | _ -> false
 
         let openWorld =
             match methodInfo.Name with
             | "ImportFile" | "UpdateClient" | "UpdateServer" | "RunCommand" | "RunProjectTask" | "StartJob" -> true
-            | name when name.StartsWith("V2") -> true
+            | name when Map.containsKey name definitions && not (Set.contains name wireCommandNames) -> true
             | _ -> false
 
         attribute.ReadOnly |> shouldEqual readOnly

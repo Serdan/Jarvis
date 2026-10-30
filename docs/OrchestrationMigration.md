@@ -10,18 +10,18 @@
 | --- | --- |
 | Task HTML/JSON files (commonly `docs/tasks/`) in ordinary source branches/worktrees | Current task, agent, review and integration state in `refs/heads/jarvis-orchestration` |
 | Different worktrees may hold different copies of task state | A single canonical Git remote ref is shared by clients/worktrees |
-| `CreateTask`, `ListTasks`, `AssignTask`, `BeginTask`, `CheckpointTask`, etc. | `V2CreateTask`, `V2AgentInbox`, `V2AssignTask`, `V2BeginAttempt`, `V2CheckpointAttempt`, etc. |
+| `CreateTask`, `ListTasks`, `AssignTask`, `BeginTask`, `CheckpointTask`, etc. | `CreateTask`, `AgentInbox`, `AssignTask`, `BeginAttempt`, `CheckpointAttempt`, etc. |
 | Source worktree/branch can be confused with task ownership | Agent owner is a project-local label; source worktree/ref is separate |
 
-The old orchestration MCP commands are **removed**, not forwarded to V2. `ListProjectTasks` and `RunProjectTask` are still local command-runner tools; they are **not** replacements for the retired task APIs. Normal file, Git, worktree and job commands still work.
+The old orchestration *implementations* are **removed**, not forwarded. Where public names such as `CreateTask` and `AssignTask` are reused, they invoke the new orphan-ledger workflow rather than a legacy handler. `ListProjectTasks` and `RunProjectTask` are still local command-runner tools; they are **not** replacements for the retired task APIs. Normal file, Git, worktree and job commands still work.
 
 The orphan branch is never merged into `main` or a source branch, and no source worktree needs to check it out. The Jarvis server remains stateless; Git remote history is the authority. The old task files can remain in Git indefinitely as historical reference.
 
 ## 1. Verify the release
 
 1. Confirm the upgraded client is *responding* to `ListProjects`; a green SignalR connection alone is not sufficient.
-2. Check `ListDevices` and `ListCommands`. For this deployment, both client and server should report protocol **3.38**, and the client should advertise `V2TaskRead`, `V2TaskWrite`, `V2LedgerRead`, `V2LedgerWrite`, `V2ReviewRead`, `V2ReviewWrite`, `V2IntegrationRead` and `V2IntegrationWrite`.
-3. Confirm retired orchestration tools are absent. Do not start a migration through an out-of-date client.
+2. Check `ListDevices` and `ListCommands`. For this deployment, both client and server should report protocol **3.38**, and the client should advertise internal `V2TaskRead`, `V2TaskWrite`, `V2LedgerRead`, `V2LedgerWrite`, `V2ReviewRead`, `V2ReviewWrite`, `V2IntegrationRead` and `V2IntegrationWrite` capabilities. The public MCP names have no `V2` prefix.
+3. Confirm the old source-branch command handlers are unavailable and that the MCP catalog contains only unprefixed orchestration tools (no duplicate `V2*` aliases). Do not start a migration through an out-of-date client.
 4. Exercise the workflow on a **disposable Git remote** before initializing an important project's real ledger.
 
 A client self-update is not verified until its *new* protocol and a successful command are observed; a reported connection or requested restart is insufficient.
@@ -45,7 +45,7 @@ Do **not** migrate every completed, obsolete or cancelled task for the sake of p
 
 ## 3. Initialize the first ledger or bind an existing one
 
-**New ledger (only when the orphan ref is absent):** use `V2InitializeLedger` with:
+**New ledger (only when the orphan ref is absent):** use `InitializeLedger` with:
 
 - `projectName`: the existing Jarvis project.
 - `projectId` and `ledgerId`: fresh, stable UUIDs identifying this project and ledger.
@@ -60,8 +60,8 @@ The operation creates the orphan branch, refuses an already-existing ledger ref,
 
 1. Inspect the actual remote branch and independently verify its trusted commit.
 2. Obtain the **same** project UUID, ledger UUID and epoch from the initialized ledger; do not generate replacements.
-3. Use `V2BindExistingLedger` with those IDs, the remote identity, `expectedTrustedHead`, visibility acknowledgment and a new operation UUID.
-4. Check `V2LedgerHealth(projectName)` on each participating client and verify the same canonical project/ledger/epoch and compatible Git ancestry.
+3. Use `BindExistingLedger` with those IDs, the remote identity, `expectedTrustedHead`, visibility acknowledgment and a new operation UUID.
+4. Check `LedgerHealth(projectName)` on each participating client and verify the same canonical project/ledger/epoch and compatible Git ancestry.
 
 Jarvis stores the binding under the user's client configuration directory in `ledger-v2/`, keyed by the absolute project-root path. Bindings are **per checkout/client configuration**, not tracked source files. A different root or computer may require another explicit bind. A missing binding must cause the V2 tools to fail, never fall back to V1 data.
 
@@ -71,13 +71,13 @@ Do **not** manually create or merge the orphan branch by checking it out in a so
 
 For each task still needing work:
 
-1. **Create its current specification.** Call `V2CreateTask(projectName, taskId, title, html, operationId)` using the latest intent, acceptance criteria, and a brief reference to the old task file/branch. Keep a useful stable task ID; do not create duplicates.
-2. **Register the agents.** `V2RegisterAgent(projectName, agentId, operationId)` creates a project-local agent label. Idle agents start `Parked`. Register intended worker/reviewer labels as needed.
-3. **Assign ownership.** `V2AssignTask(projectName, taskId, attemptId, ownerId, reviewerId, operationId)` creates one implementation attempt and assigns exactly one owner. Use fresh UUIDs for `attemptId` and `operationId`.
-4. **Read the authoritative assignment.** Use `V2AgentInbox(projectName, agentId)` and `V2GetAssignment(projectName, taskId, assignmentGeneration)` for the current generation, spec, owner and versions. Use `V2AcknowledgeAssignment` when applicable.
-5. **Begin implementation.** The worker calls `V2BeginAttempt` with its current expected attempt version and assignment generation. Existing code stays in its source worktree/branch. When necessary, record the actual source ref and baseline via `V2BindAttemptSource` and `V2BindReviewBase`; do not pretend old task JSON already created a V2 attempt.
-6. **Persist progress.** `V2CheckpointAttempt` records summary, evidence and next action, but does **not** end a Working turn. Before a normal agent turn finishes, use `V2YieldAgent` to enter `Ready`, or `V2CompleteAgentWork` to enter `Completed`.
-7. **Resume deliberately.** `V2ResumeAgent` resumes a Ready agent. It also supports explicitly recovering a stalled Working session, recording its session association and recovery event without reassigning ownership.
+1. **Create its current specification.** Call `CreateTask(projectName, taskId, title, html, operationId)` using the latest intent, acceptance criteria, and a brief reference to the old task file/branch. Keep a useful stable task ID; do not create duplicates.
+2. **Register the agents.** `RegisterAgent(projectName, agentId, operationId)` creates a project-local agent label. Idle agents start `Parked`. Register intended worker/reviewer labels as needed.
+3. **Assign ownership.** `AssignTask(projectName, taskId, attemptId, ownerId, reviewerId, operationId)` creates one implementation attempt and assigns exactly one owner. Use fresh UUIDs for `attemptId` and `operationId`.
+4. **Read the authoritative assignment.** Use `AgentInbox(projectName, agentId)` and `GetAssignment(projectName, taskId, assignmentGeneration)` for the current generation, spec, owner and versions. Use `AcknowledgeAssignment` when applicable.
+5. **Begin implementation.** The worker calls `BeginAttempt` with its current expected attempt version and assignment generation. Existing code stays in its source worktree/branch. When necessary, record the actual source ref and baseline via `BindAttemptSource` and `BindReviewBase`; do not pretend old task JSON already created a V2 attempt.
+6. **Persist progress.** `CheckpointAttempt` records summary, evidence and next action, but does **not** end a Working turn. Before a normal agent turn finishes, use `YieldAgent` to enter `Ready`, or `CompleteAgentWork` to enter `Completed`.
+7. **Resume deliberately.** `ResumeAgent` resumes a Ready agent. It also supports explicitly recovering a stalled Working session, recording its session association and recovery event without reassigning ownership.
 
 Always read expected versions/generations from the latest ledger. Do not guess. Use a **new operation UUID for each new logical mutation**, but reuse the **same UUID and parameters** when retrying the *same* operation after a lost response. Provider session IDs are supplied automatically; agents must not invent them.
 
@@ -87,9 +87,9 @@ For in-progress legacy work, put the *remaining work and next action* in the new
 
 A review snapshot/ref points to a commit in ordinary **source history**. The task and review records live on the **orphan branch**.
 
-- `V2SubmitReview` publishes the exact metadata for a source snapshot. The owner may continue working and replace an **unclaimed** review with `V2ReplaceReview`.
-- Reviewers use `V2ReviewerInbox`, `V2ReviewTask`, `V2ClaimReview` and `V2DecideReview`. A claimed revision remains pinned; feedback is recorded without interrupting unrelated newer assignments.
-- Acceptance is **not** a merge or code push. Source integration must be performed explicitly with normal authorized Git operations. Use `V2PlanIntegration` and only `V2RecordIntegration` when the *remote target* is verified. Closing an integrated task is separate (`V2CloseIntegratedTask`).
+- `SubmitReview` publishes the exact metadata for a source snapshot. The owner may continue working and replace an **unclaimed** review with `ReplaceReview`.
+- Reviewers use `ReviewerInbox`, `ReviewTask`, `ClaimReview` and `DecideReview`. A claimed revision remains pinned; feedback is recorded without interrupting unrelated newer assignments.
+- Acceptance is **not** a merge or code push. Source integration must be performed explicitly with normal authorized Git operations. Use `PlanIntegration` and only `RecordIntegration` when the *remote target* is verified. Closing an integrated task is separate (`CloseIntegratedTask`).
 
 If old work is already awaiting review, verify its actual source commit and create a truthful V2 review only if review is still needed. Never fabricate historical approvals, claims or integrations.
 
@@ -100,7 +100,7 @@ Before calling a project migrated, verify:
 - Two independently bound clients see the same canonical ledger state, even from different source worktrees.
 - An agent can be assigned, begin, checkpoint, yield, resume and complete; the state survives restart.
 - Reviews can be submitted/claimed/decided without automatically merging source code.
-- The old MCP task tools are absent and the old `docs/tasks/` files remain untouched.
+- The public MCP catalog contains only unprefixed orchestration tools; reused names such as `CreateTask` operate on the orphan ledger, never on old `docs/tasks/` files.
 - The orphan branch has independent history and was never merged into source branches.
 
 Optional **read-only** Git inspection without switching branches:
@@ -117,9 +117,9 @@ Use V2 APIs for live writes; do not push hand-edited ledger JSON or force-push t
 
 ## 7. Stalls, retries and failed cutovers
 
-- **Stalled Working session:** read `V2AgentInbox` and the checkpoint before invoking an explicit `V2ResumeAgent`. Only an explicit recovery resets the Working-segment clock. Older associated sessions should reread their assignment when a newer one is active.
+- **Stalled Working session:** read `AgentInbox` and the checkpoint before invoking an explicit `ResumeAgent`. Only an explicit recovery resets the Working-segment clock. Older associated sessions should reread their assignment when a newer one is active.
 - **Long turns:** Jarvis advises a soft stop after **25 minutes** and hard stop after **30 minutes** of the current timed Working segment. These are instructions, not forced cancellation; checkpoint alone does not finish the turn.
-- **Uncertain write:** inspect `V2GetOperationStatus`, `V2PendingOperations` and `V2ReconcilePendingOperations`. A verified `Applied` receipt confirms success; `NotFoundAtVerifiedHead` does not prove a timed-out push can never arrive. Reuse the original UUID and unchanged command when retrying. If a matching pending record remains, `V2AcknowledgePendingOperation` requires its verified request hash.
+- **Uncertain write:** inspect `GetOperationStatus`, `PendingOperations` and `ReconcilePendingOperations`. A verified `Applied` receipt confirms success; `NotFoundAtVerifiedHead` does not prove a timed-out push can never arrive. Reuse the original UUID and unchanged command when retrying. If a matching pending record remains, `AcknowledgePendingOperation` requires its verified request hash.
 - **Stale version / unavailable remote:** reread the canonical assignment and stop speculative writes. Never let a timer automatically reassign a task.
 - **Migration failure:** stop new ledger writes and preserve its Git history and pending-intent records. The old task files remain readable historical material, **not** an automatically synchronized fallback.
 

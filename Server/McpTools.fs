@@ -356,12 +356,6 @@ module McpToolHelpers =
         | ListWorktreesCommand _
         | GetWorktreeCommand _
         | InspectWorktreeRemovalCommand _
-        | ListTasksCommand _
-        | GetTaskCommand _
-        | CompareWorktreeTasksCommand _
-        | GetAgentAssignmentCommand _
-        | GetOrchestrationSnapshotCommand _
-        | GetTaskHistoryCommand _
         | V2TaskReadCommand _
         | V2LedgerReadCommand _
         | V2IntegrationReadCommand _
@@ -375,11 +369,6 @@ module McpToolHelpers =
         | ReadImageCommand _
         | ExportFileCommand _
         | ListProjectTasksCommand _
-        | AttachWorkTaskCommand _
-        | GetWorkTaskCommand _
-        | ListWorkTasksCommand _
-        | CheckpointWorkTaskCommand _
-        | CompleteWorkTaskCommand _
         | ListSkillsCommand _
         | GetSkillCommand _
         | GetGitStatusCommand _
@@ -403,16 +392,7 @@ module McpToolHelpers =
         | V2TaskWriteCommand _
         | V2LedgerWriteCommand _
         | V2IntegrationWriteCommand _
-        | V2ReviewWriteCommand _
-        | CreateTaskCommand _
-        | UpdateTaskCommand _
-        | AssignTaskCommand _
-        | AcknowledgeTaskCommand _
-        | BeginTaskCommand _
-        | RetireWorktreeCommand _
-        | ClaimTaskCommand _
-        | CheckpointTaskCommand _
-        | CompleteTaskCommand _ -> Auth.GitWrite
+        | V2ReviewWriteCommand _ -> Auth.GitWrite
 
     let private oauthErrorResult (context: HttpContext) errorCode description scope =
         let response = errorResult (PermissionDenied description)
@@ -1137,11 +1117,11 @@ type JarvisMcpTools =
                   TaskId = taskId; ActionId = actionId; RequestId = ""
                   ExpectedVersion = expectedTaskVersion; TargetRef = ""; ExpectedTargetHead = "" })
 
-    [<McpServerTool(Title = "agent inbox", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Get current Working slot, runnable work, pending/available reviews, parked and accepted tasks from one Git snapshot. Requires an explicitly bound V2 ledger; V1 tasks are unchanged.")>]
+    [<McpServerTool(Title = "agent inbox", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Get current Working slot, runnable work, pending/available reviews, parked and accepted tasks from one Git snapshot. Requires an explicitly bound V2 ledger; The orphan Git ledger is the sole task authority.")>]
     static member AgentInbox(projectName: string, agentId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (V2TaskReadCommand { ProjectName = projectName; AgentId = agentId; Action = "AgentInbox"; TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L; Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null })
 
-    [<McpServerTool(Title = "create task", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Atomically create a V2 task with its canonical HTML spec on the remote ledger. Requires an explicitly bound V2 ledger; V1 tasks are unchanged.")>]
+    [<McpServerTool(Title = "create task", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Atomically create a V2 task with its canonical HTML spec on the remote ledger. Requires an explicitly bound V2 ledger; The orphan Git ledger is the sole task authority.")>]
     static member CreateTask(projectName: string, taskId: string, title: string, html: string, operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         let cmd = V2TaskCommands.write projectName "CreateTask" operationId taskId "Orchestrator"
         McpToolHelpers.send client http (V2TaskWriteCommand { cmd with Title = title; Html = html })
@@ -1151,12 +1131,12 @@ type JarvisMcpTools =
         let cmd = V2TaskCommands.write projectName "ReviseTaskSpec" operationId taskId "Orchestrator"
         McpToolHelpers.send client http (V2TaskWriteCommand { cmd with ExpectedVersion = expectedTaskVersion; Title = title; Html = html })
 
-    [<McpServerTool(Title = "register agent", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Register an agent label with a single execution slot in the canonical ledger. Requires an explicitly bound V2 ledger; V1 tasks are unchanged.")>]
+    [<McpServerTool(Title = "register agent", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Register an agent label with a single execution slot in the canonical ledger. Requires an explicitly bound V2 ledger; The orphan Git ledger is the sole task authority.")>]
     static member RegisterAgent(projectName: string, agentId: string, operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         let cmd = V2TaskCommands.write projectName "RegisterAgent" operationId "" agentId
         McpToolHelpers.send client http (V2TaskWriteCommand cmd)
 
-    [<McpServerTool(Title = "assign task", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Create the sole implementation attempt for an Open task and bind its owner and preferred reviewer. Requires an explicitly bound V2 ledger; V1 tasks are unchanged.")>]
+    [<McpServerTool(Title = "assign task", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Create the sole implementation attempt for an Open task and bind its owner and preferred reviewer. Requires an explicitly bound V2 ledger; The orphan Git ledger is the sole task authority.")>]
     static member AssignTask(projectName: string, taskId: string, attemptId: string, ownerId: string, reviewerId: string, operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         let cmd = V2TaskCommands.write projectName "AssignTask" operationId taskId "Orchestrator"
         McpToolHelpers.send client http (V2TaskWriteCommand { cmd with AttemptId = attemptId; OwnerId = ownerId; ReviewerId = reviewerId })
@@ -1200,12 +1180,12 @@ type JarvisMcpTools =
             { ProjectName = projectName; AgentId = ""; Action = "GetCheckpoint"
               TaskId = taskId; AssignmentGeneration = 0; CheckpointSequence = checkpointSequence; Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null })
 
-    [<McpServerTool(Title = "begin task", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Acquire the agent Working slot for an exact queued task attempt. Requires an explicitly bound V2 ledger; V1 tasks are unchanged.")>]
+    [<McpServerTool(Title = "begin task", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Acquire the agent Working slot for an exact queued task attempt. Requires an explicitly bound V2 ledger; The orphan Git ledger is the sole task authority.")>]
     static member BeginAttempt(projectName: string, taskId: string, ownerId: string, expectedAttemptVersion: int, assignmentGeneration: int, operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         let cmd = V2TaskCommands.write projectName "BeginAttempt" operationId taskId ownerId
         McpToolHelpers.send client http (V2TaskWriteCommand { cmd with ExpectedVersion = expectedAttemptVersion; AssignmentGeneration = assignmentGeneration })
 
-    [<McpServerTool(Title = "bind review baseline", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Pin the cumulative source review baseline and target branch for a Working attempt. Requires an explicitly bound V2 ledger; V1 tasks are unchanged.")>]
+    [<McpServerTool(Title = "bind review baseline", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Pin the cumulative source review baseline and target branch for a Working attempt. Requires an explicitly bound V2 ledger; The orphan Git ledger is the sole task authority.")>]
     static member BindReviewBase(projectName: string, taskId: string, ownerId: string, expectedAttemptVersion: int, assignmentGeneration: int, baseOid: string, targetRef: string, operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         let cmd = V2TaskCommands.write projectName "BindReviewBase" operationId taskId ownerId
         McpToolHelpers.send client http (V2TaskWriteCommand { cmd with ExpectedVersion = expectedAttemptVersion; AssignmentGeneration = assignmentGeneration; BaseOid = baseOid; TargetRef = targetRef })
@@ -1235,7 +1215,7 @@ type JarvisMcpTools =
                 { ProjectName = projectName; AgentId = ""; Action = "InspectAttemptSource"
                   TaskId = taskId; AssignmentGeneration = 0; CheckpointSequence = 0L; Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null })
 
-    [<McpServerTool(Title = "acknowledge review feedback", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Acknowledge the exact review decision sequence without interrupting the implementation slot. Requires an explicitly bound V2 ledger; V1 tasks are unchanged.")>]
+    [<McpServerTool(Title = "acknowledge review feedback", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Acknowledge the exact review decision sequence without interrupting the implementation slot. Requires an explicitly bound V2 ledger; The orphan Git ledger is the sole task authority.")>]
     static member AcknowledgeReviewFeedback(projectName: string, taskId: string, ownerId: string, decisionSequence: int64, operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         let cmd = V2TaskCommands.write projectName "AcknowledgeFeedback" operationId taskId ownerId
         McpToolHelpers.send client http (V2TaskWriteCommand { cmd with DecisionSequence = decisionSequence })

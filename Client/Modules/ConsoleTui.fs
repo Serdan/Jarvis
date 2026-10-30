@@ -307,8 +307,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         let origin =
             match command with
             | Some(GetGitStatusCommand _)
-            | Some(ListJobsCommand _)
-            | Some(ListWorkTasksCommand _) -> "Observer"
+            | Some(ListJobsCommand _) -> "Observer"
             | _ -> "Worker"
         let entry =
             { Id = nextActivityId
@@ -814,10 +813,8 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         writeMnemonic 'q' "quit"; Console.WriteLine ""
 
     let writeColoredAgentLine width marker (row: AgentView.AgentRow) =
-        let item = row.Assignments |> List.tryHead
         let timestamp =
-            item
-            |> Option.bind _.UpdatedAt
+            row.StateEnteredAt
             |> Option.map (fun updated -> updated.ToLocalTime().ToString("HH:mm:ss"))
             |> Option.defaultValue "--:--:--"
         let token = ActivityFilter.projectToken row.Project
@@ -833,7 +830,6 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
             Console.Write(token)
             Console.ForegroundColor <- original
             let rest = rendered.Substring(index + token.Length)
-            if row.Conflict then Console.ForegroundColor <- ConsoleColor.Red
             Console.WriteLine rest
             Console.ForegroundColor <- original
 
@@ -847,53 +843,29 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                 Console.WriteLine "-------------"
                 writeDetailField width "Agent" row.Agent
                 writeDetailField width "Project" (ActivityFilter.projectToken row.Project)
-                writeDetailField width "Disposition" (AgentView.phaseLabel row.State)
-                if row.State = "Free" then
-                    writeDetailField width "Availability" "No actionable or suspended task recorded for this agent."
-                elif row.State = "Parked" then
-                    writeDetailField width "Availability" "Intentionally parked; not an actionable assignment."
-                elif row.State = "Blocked" then
-                    writeDetailField width "Availability" "Blocked; check the task checkpoint and dependency."
-                if row.Conflict then
-                    writeDetailField width "Conflict" "Multiple actionable assignments; review ownership."
+                writeDetailField width "State" row.State
+                row.StateEnteredAt
+                |> Option.iter (fun value ->
+                    writeDetailField width "State since" (value.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss")))
+                row.StateReason |> Option.iter (writeDetailField width "Reason / next action")
                 if agentChanged.Contains row.Key then
-                    writeDetailField width "Updated" "Assignment state changed since previous refresh."
-                for item in row.Assignments do
-                    Console.WriteLine ""
-                    writeDetailField width "Task" (item.TaskId + " - " + item.Title)
-                    writeDetailField width "Status" (AgentView.phaseLabel item.Phase)
-                    writeDetailField width "Worktree" item.Worktree
-                    writeDetailField width "Branch" (item.Branch |> Option.defaultValue "(detached)")
-                    writeDetailField width "HEAD" item.Head
-                    item.Clean |> Option.iter (fun value -> writeDetailField width "Clean" (string value))
-                    item.NextActor |> Option.iter (writeDetailField width "Next actor")
-                    item.AssignmentRevision |> Option.iter (writeDetailField width "Revision")
-                    item.AcknowledgedRevision |> Option.iter (writeDetailField width "Ack revision")
-                    item.BaseCommit |> Option.iter (writeDetailField width "Base commit")
-                    item.Instructions |> Option.iter (writeDetailField width "Instructions")
-                    item.UpdatedAt
-                    |> Option.iter (fun value -> writeDetailField width "Updated" (value.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss")))
-                    item.LastUpdatedBy |> Option.iter (writeDetailField width "Updated by")
-                    item.CheckpointSummary |> Option.iter (writeDetailField width "Checkpoint")
-                    item.CheckpointNextAction |> Option.iter (writeDetailField width "Next action")
-                    item.CheckpointLastCommit |> Option.iter (writeDetailField width "Commit")
-                    item.CheckpointBlocker |> Option.iter (writeDetailField width "Blocker")
-                    item.CompletionFinalCommit |> Option.iter (writeDetailField width "Final commit")
+                    writeDetailField width "Updated" "Ledger state changed since previous refresh."
+                row.Focus |> Option.iter (fun task ->
+                    writeDetailField width "Task" (task.TaskId + " - " + task.Title)
+                    writeDetailField width "Lifecycle" task.Lifecycle
+                    writeDetailField width "Attempt" task.Phase
+                    writeDetailField width "Assignment generation" (string task.AssignmentGeneration)
+                    task.SourceRef |> Option.iter (writeDetailField width "Source ref")
+                    task.BaseCommit |> Option.iter (writeDetailField width "Base commit"))
                 Console.WriteLine ""
-                Console.WriteLine "Statuses reflect persisted task state, not live chat activity."
+                Console.WriteLine "Status reflects the canonical remote orchestration ledger, not live chat activity."
 
     let renderAgentsUnsafe width =
         normalizeAgentSelectionUnsafe()
         let filtered = agentListUnsafe()
         let all = agentSnapshot |> Option.map AgentView.rows |> Option.defaultValue []
-        let conflicts =
-            let reported = agentSnapshot |> Option.map (fun value -> value.Conflicts.Length) |> Option.defaultValue 0
-            max reported (all |> List.filter _.Conflict |> List.length)
         let reviewCount = agentSnapshot |> Option.map (fun snap -> snap.Projects |> List.sumBy _.PendingReviews) |> Option.defaultValue 0
-        let completedCount =
-            agentSnapshot
-            |> Option.map (fun snap -> snap.Assignments |> List.filter (fun task -> task.Status = "completed") |> List.length)
-            |> Option.defaultValue 0
+        let completedCount = all |> List.filter (fun row -> row.State = "Completed") |> List.length
         let filterSuffix =
             if String.IsNullOrWhiteSpace agentFilter then ""
             else $" [text=\"{trim (compact agentFilter) (max 20 (width - 22))}\"]"
@@ -910,10 +882,11 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
             else ""
         Console.WriteLine $"Agents{filterSuffix}{historySuffix}"
         Console.WriteLine "------"
-        let parkedCount = all |> List.filter (fun row -> row.State = "Parked") |> List.length
-        let blockedCount = all |> List.filter (fun row -> row.State = "Blocked") |> List.length
-        let freeCount = all |> List.filter (fun row -> row.State = "Free") |> List.length
-        Console.WriteLine $"Tracked: {all.Length} | Review: {reviewCount} | Parked: {parkedCount} | Blocked: {blockedCount} | Free: {freeCount} | Completed: {completedCount} | Conflicts: {conflicts}"
+        let stateCount state = all |> List.filter (fun row -> row.State = state) |> List.length
+        Console.WriteLine
+            (sprintf "Tracked: %d | Review: %d | Working: %d | Ready: %d | Assigned: %d | Completed: %d | Parked: %d"
+                all.Length reviewCount (stateCount "Working") (stateCount "Ready")
+                (stateCount "Assigned") completedCount (stateCount "Parked"))
         let refreshed =
             agentSnapshot
             |> Option.map (fun snap -> snap.RefreshedAt.ToLocalTime().ToString("HH:mm:ss"))
@@ -940,7 +913,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
             let errors =
                 snap.Projects |> List.choose (fun project ->
                     project.Error |> Option.map (fun error -> project.Project + ": " + error))
-            let issues = errors @ snap.Conflicts @ snap.Issues
+            let issues = errors @ snap.Issues
             if not issues.IsEmpty then
                 Console.WriteLine ""
                 Console.WriteLine $"Agent issues ({issues.Length})"

@@ -1,6 +1,6 @@
 # Migrating to Git-backed Jarvis orchestration
 
-**Applies to:** the orphan-branch orchestration implementation on Jarvis client/server protocol 3.38. The source of truth is [the orchestration V2 architecture](specs/orchestration-v2-architecture.md).
+**Applies to:** the orphan-branch orchestration implementation on Jarvis client/server protocol 3.39. The source of truth is [the orchestration V2 architecture](specs/orchestration-v2-architecture.md).
 
 **Scope:** Move an existing project's *active coordination* from source-branch task files to the Git-backed ledger. This is a **manual, selective cutover**. Updating Jarvis itself does not create a ledger or migrate any tasks.
 
@@ -20,7 +20,7 @@ The orphan branch is never merged into `main` or a source branch, and no source 
 ## 1. Verify the release
 
 1. Confirm the upgraded client is *responding* to `ListProjects`; a green SignalR connection alone is not sufficient.
-2. Check `ListDevices` and `ListCommands`. For this deployment, both client and server should report protocol **3.38**, and the client should advertise internal `V2TaskRead`, `V2TaskWrite`, `V2LedgerRead`, `V2LedgerWrite`, `V2ReviewRead`, `V2ReviewWrite`, `V2IntegrationRead` and `V2IntegrationWrite` capabilities. The public MCP names have no `V2` prefix.
+2. Check `ListDevices` and `ListCommands`. For this deployment, both client and server should report protocol **3.39**, and the client should advertise internal `V2TaskRead`, `V2TaskWrite`, `V2LedgerRead`, `V2LedgerWrite`, `V2ReviewRead`, `V2ReviewWrite`, `V2IntegrationRead` and `V2IntegrationWrite` capabilities. The public MCP names have no `V2` prefix.
 3. Confirm the old source-branch command handlers are unavailable and that the MCP catalog contains only unprefixed orchestration tools (no duplicate `V2*` aliases). Do not start a migration through an out-of-date client.
 4. Exercise the workflow on a **disposable Git remote** before initializing an important project's real ledger.
 

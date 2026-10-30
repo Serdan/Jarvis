@@ -1,135 +1,117 @@
 module Client.AgentDashboard
 
 open System
-open Common
+open System.IO
+open System.Text.Json
+open Client.LedgerStore
+open Client.ReviewWorkflow
 
-let private assignment (value: TaskStore.AgentAssignment) : AgentView.Assignment =
-    { Agent = value.Agent
-      Project = value.ProjectName.Split("::", StringSplitOptions.None)[0]
-      Selector = value.ProjectName
-      TaskId = value.Task.Id
-      Title = value.Task.Title
-      Status = value.Task.Status
-      Phase = value.Phase
-      NextActor = value.Task.NextActor
-      Worktree = value.Worktree.Path
-      Branch = value.Worktree.Branch
-      Head = value.Worktree.Head
-      Clean = value.Worktree.IsClean
-      AssignmentRevision = value.AssignmentRevision
-      AcknowledgedRevision = value.AcknowledgedAssignmentRevision
-      Instructions = value.AssignmentInstructions
-      BaseCommit = value.AssignmentBaseCommit
-      UpdatedAt = value.Task.UpdatedAt
-      LastUpdatedBy = value.Task.LastUpdatedBy
-      CheckpointSummary = value.Task.CheckpointSummary
-      CheckpointNextAction = value.Task.CheckpointNextAction
-      CheckpointLastCommit = value.Task.CheckpointLastCommit
-      CheckpointBlocker = value.Task.CheckpointBlocker
-      CompletionFinalCommit = value.Task.CompletionFinalCommit }
+let private options =
+    JsonSerializerOptions(PropertyNamingPolicy = JsonNamingPolicy.CamelCase, PropertyNameCaseInsensitive = true)
 
-let private historicalAssignment project (worktree: Worktrees.WorktreeInfo) (task: TaskStore.TaskSummary) phase : AgentView.Assignment =
-    let selector =
-        if worktree.IsMain then project
-        else project + "::" + System.IO.Path.GetFileName(worktree.Path)
-    { Agent = task.Owner.Value
-      Project = project
-      Selector = selector
-      TaskId = task.Id
-      Title = task.Title
-      Status = task.Status
-      Phase = phase
-      NextActor = task.NextActor
-      Worktree = worktree.Path
-      Branch = worktree.Branch
-      Head = worktree.Head
-      Clean = worktree.IsClean
-      AssignmentRevision = task.AssignmentRevision
-      AcknowledgedRevision = None
-      Instructions = None
-      BaseCommit = None
-      UpdatedAt = task.UpdatedAt
-      LastUpdatedBy = task.LastUpdatedBy
-      CheckpointSummary = task.CheckpointSummary
-      CheckpointNextAction = task.CheckpointNextAction
-      CheckpointLastCommit = task.CheckpointLastCommit
-      CheckpointBlocker = task.CheckpointBlocker
-      CompletionFinalCommit = task.CompletionFinalCommit }
+let private deserialize<'t> (text: string) =
+    try
+        let value = JsonSerializer.Deserialize<'t>(text, options)
+        if isNull (box value) then Error "Null canonical ledger entity."
+        else Ok value
+    with ex -> Error ("Invalid canonical ledger entity: " + ex.Message)
 
-let private suspended (snapshot: TaskStore.OrchestrationSnapshot) =
-    snapshot.SuspendedTasks
-    |> List.map (fun entry ->
-        { historicalAssignment snapshot.ProjectName entry.Worktree entry.Task entry.Phase
-            with NextActor = None })
+let private read<'t> binding snapshot path =
+    match LedgerStore.readAt binding snapshot path with
+    | Error error -> Error (string error)
+    | Ok (None, _) -> Error ("Missing canonical ledger entity: " + path)
+    | Ok (Some content, _) -> deserialize<'t> content
 
-let private completed (snapshot: TaskStore.OrchestrationSnapshot) =
-    let integrated =
-        snapshot.IntegratedTasks
-        |> List.map (fun item -> item.Worktree.Path, item.Task.Id)
-        |> Set.ofList
-    snapshot.Worktrees
-    |> List.collect (fun group ->
-        group.Tasks
-        |> List.choose (fun task ->
-            match task.Owner, task.Status with
-            | Some agent, "completed" ->
-                let phase =
-                    if Set.contains (group.Worktree.Path, task.Id) integrated then "Integrated"
-                    else "Completed"
-                let completedEntry =
-                    historicalAssignment snapshot.ProjectName group.Worktree task phase
-                Some completedEntry
-            | _ -> None))
+let private stateTime (agent: ReviewAgent) =
+    match DateTimeOffset.TryParse(agent.StateEnteredAtUtc) with
+    | true, value -> Some value
+    | _ -> None
 
-let fromSnapshots now (results: (string * Result<TaskStore.OrchestrationSnapshot, string>) list) : AgentView.Snapshot =
-    let assignments =
-        results |> List.collect (function
-            | _, Ok snapshot ->
-                (snapshot.Assignments |> List.map assignment)
-                @ suspended snapshot
-                @ completed snapshot
-            | _ -> [])
-    let projects : AgentView.ProjectSummary list =
-        results |> List.map (function
-            | project, Error error ->
-                { Project = project
-                  Worktrees = 0; PendingReviews = 0; Unacknowledged = 0
-                  RetirementCandidates = 0; RetirementInspected = false; Error = Some error }
-            | project, Ok snapshot ->
-                { Project = project
-                  Worktrees = snapshot.Worktrees.Length
-                  PendingReviews = snapshot.ReviewerTaskCount
-                  Unacknowledged = snapshot.UnacknowledgedTaskCount
-                  RetirementCandidates = snapshot.RetirementCandidates.Length
-                  RetirementInspected = snapshot.RetirementInspected
-                  Error = None })
-    { Assignments = assignments
-      KnownAgents =
-          results |> List.collect (function
-              | _, Ok snapshot ->
-                  snapshot.KnownAgents |> List.map (fun agent -> snapshot.ProjectName, agent)
-              | _ -> [])
-      Projects = projects
-      Conflicts = results |> List.collect (function
-          | _, Ok snapshot -> snapshot.Conflicts |> List.map (fun issue -> snapshot.ProjectName + ": " + issue)
-          | _ -> [])
-      Issues = results |> List.collect (function
-          | project, Error error -> [ project + ": " + error ]
-          | _, Ok snapshot ->
-              snapshot.InspectionErrors |> List.map (fun error -> snapshot.ProjectName + ": " + error))
-      RefreshedAt = now }
+let private stringOption value =
+    if String.IsNullOrWhiteSpace value then None else Some value
+
+let private projectSnapshot project rt =
+    match ProjectPaths.resolveProjectRoot project rt with
+    | Error error -> Error (string error)
+    | Ok (FolderPath root) ->
+        // Unbound projects have no orchestration state. Never consult V1 files.
+        if not (File.Exists(V2ReviewApi.ReviewV2Binding.pathForRoot root)) then Ok None
+        else
+            match V2ReviewApi.ReviewV2Binding.load project rt with
+            | Error error -> Error (string error)
+            | Ok binding ->
+                match LedgerStore.fetch binding with
+                | Error error -> Error (string error)
+                | Ok snapshot ->
+                    match LedgerStore.listAt binding snapshot "agents",
+                          LedgerStore.listAt binding snapshot "tasks" with
+                    | Error error, _ | _, Error error -> Error (string error)
+                    | Ok agentPaths, Ok taskPaths ->
+                        let taskRecords = taskPaths |> List.filter (fun path -> path.EndsWith("/task.json", StringComparison.Ordinal))
+                        let reviewRecords = taskPaths |> List.filter (fun path -> path.EndsWith("/request.json", StringComparison.Ordinal))
+                        let tasks = taskRecords |> List.map (read<ReviewTask> binding snapshot)
+                        let agents = agentPaths |> List.map (read<ReviewAgent> binding snapshot)
+                        let reviews = reviewRecords |> List.map (read<ReviewRequest> binding snapshot)
+                        let firstError values = values |> List.tryPick (function Error message -> Some message | Ok _ -> None)
+                        match firstError tasks, firstError agents, firstError reviews with
+                        | Some error, _, _ | _, Some error, _ | _, _, Some error -> Error error
+                        | None, None, None ->
+                            let tasks = tasks |> List.choose (function Ok item -> Some item | _ -> None)
+                            let agents = agents |> List.choose (function Ok item -> Some item | _ -> None)
+                            let reviews = reviews |> List.choose (function Ok item -> Some item | _ -> None)
+                            // A focus is an attempt ID, not a source worktree or historical task owner.
+                            let attemptForTask (task: ReviewTask) =
+                                if String.IsNullOrWhiteSpace task.AttemptId then Ok None
+                                else
+                                    let path = sprintf "tasks/%s/attempts/%s.json" task.TaskId (task.AttemptId.Replace("-", "").ToLowerInvariant())
+                                    read<ReviewAttempt> binding snapshot path |> Result.map Some
+                            let focused (agent: ReviewAgent) =
+                                if String.IsNullOrWhiteSpace agent.FocusAttemptId then Ok None
+                                else
+                                    match tasks |> List.tryFind (fun task -> task.AttemptId = agent.FocusAttemptId) with
+                                    | None -> Error ("Missing canonical focused task for agent " + agent.AgentId)
+                                    | Some task ->
+                                        match attemptForTask task with
+                                        | Error error -> Error error
+                                        | Ok None -> Error ("Missing canonical attempt for task " + task.TaskId)
+                                        | Ok (Some attempt) when attempt.OwnerAgentId <> agent.AgentId ->
+                                            Error ("Canonical agent/attempt owner mismatch for " + agent.AgentId)
+                                        | Ok (Some attempt) ->
+                                            Ok (Some ({ TaskId = task.TaskId; Title = task.Title; Lifecycle = task.Lifecycle
+                                                        Phase = attempt.Phase; SourceRef = stringOption attempt.SourceRef
+                                                        BaseCommit = stringOption attempt.BaseCommit
+                                                        AssignmentGeneration = attempt.AssignmentGeneration } : AgentView.TaskFocus))
+                            let rows : Result<AgentView.AgentRow, string> list =
+                                agents
+                                |> List.map (fun agent ->
+                                    focused agent |> Result.map (fun focus ->
+                                        ({ Key = project + "::" + agent.AgentId; Agent = agent.AgentId
+                                           Project = project; State = agent.State
+                                           StateEnteredAt = stateTime agent; StateReason = stringOption agent.StateReason
+                                           Focus = focus } : AgentView.AgentRow)))
+                            match firstError rows with
+                            | Some error -> Error error
+                            | None ->
+                                let count =
+                                    reviews |> List.filter (fun r -> r.Status = "Unclaimed" || r.Status = "Claimed") |> List.length
+                                Ok (Some (rows |> List.choose (function Ok row -> Some row | _ -> None), count))
 
 let load rt =
     match ProjectBrowser.listGitProjects rt with
-    | Error error -> Error(string error)
+    | Error error -> Error (string error)
     | Ok projects ->
-        projects
-        |> Seq.map (fun (ProjectName project) ->
-            let response =
-                TaskStore.getOrchestrationSnapshot
-                    { ProjectName = project; Status = None; Owner = None; NextActor = None
-                      ReviewerOnly = false; Offset = 0; Limit = 60; IncludeRetirement = false } rt
-            project, response |> Result.mapError string)
-        |> Seq.toList
-        |> fromSnapshots DateTimeOffset.UtcNow
-        |> Ok
+        let results =
+            projects
+            |> Seq.map (fun (ProjectName project) -> project, projectSnapshot project rt)
+            |> Seq.toList
+        let rows =
+            results |> List.collect (function _, Ok (Some (agents, _)) -> agents | _ -> [])
+        let summaries : AgentView.ProjectSummary list =
+            results |> List.choose (function
+                | project, Ok (Some (_, count)) ->
+                    Some ({ Project = project; PendingReviews = count; Error = None } : AgentView.ProjectSummary)
+                | project, Error error ->
+                    Some ({ Project = project; PendingReviews = 0; Error = Some error } : AgentView.ProjectSummary)
+                | _, Ok None -> None)
+        Ok ({ Agents = rows; Projects = summaries; Issues = []
+              RefreshedAt = DateTimeOffset.UtcNow } : AgentView.Snapshot)

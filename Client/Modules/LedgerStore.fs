@@ -8,7 +8,7 @@ open System.Text
 open System.Text.Json
 open System.Text.RegularExpressions
 
-// V2 canonical Git transport. Experimental MCP callers require an explicit local binding; V1 remains separate.
+// Canonical Git ledger transport. Every caller requires an explicitly verified local binding.
 type LedgerFailure =
     | InvalidBinding of string
     | RemoteUnavailable of string

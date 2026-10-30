@@ -111,12 +111,6 @@ let private requiresConfirmation command =
     | ListWorktreesCommand _
     | GetWorktreeCommand _
     | InspectWorktreeRemovalCommand _
-    | ListTasksCommand _
-    | GetTaskCommand _
-    | CompareWorktreeTasksCommand _
-    | GetAgentAssignmentCommand _
-    | GetOrchestrationSnapshotCommand _
-    | GetTaskHistoryCommand _
     | V2TaskReadCommand _
     | V2LedgerReadCommand _
     | V2IntegrationReadCommand _
@@ -130,11 +124,6 @@ let private requiresConfirmation command =
     | ReadImageCommand _
     | ExportFileCommand _
     | ListProjectTasksCommand _
-    | AttachWorkTaskCommand _
-    | GetWorkTaskCommand _
-    | ListWorkTasksCommand _
-    | CheckpointWorkTaskCommand _
-    | CompleteWorkTaskCommand _
     | ListSkillsCommand _
     | GetSkillCommand _
     | GetGitStatusCommand _
@@ -179,24 +168,6 @@ let private requiresConfirmation command =
             [ VersionControlWrite; NetworkAccess ] [] (Some "git")
             [ cmd.TaskId; cmd.RequestId; cmd.OperationId ]
             ("V2 canonical ledger review " + cmd.Action) false
-    | CreateTaskCommand cmd ->
-        confirmation "CreateTask" (Some cmd.ProjectName) [ WorkspaceWrite; VersionControlWrite ] [] (Some "git") [ cmd.TaskId |> Option.defaultValue "new" ] "CreateTask task" false
-    | UpdateTaskCommand cmd ->
-        confirmation "UpdateTask" (Some cmd.ProjectName) [ WorkspaceWrite; VersionControlWrite ] [] (Some "git") [ cmd.TaskId ] "UpdateTask task" false
-    | AssignTaskCommand cmd ->
-        confirmation "AssignTask" (Some cmd.ProjectName) [ WorkspaceWrite; VersionControlWrite ] [] (Some "git") [ cmd.Agent; cmd.TaskId ] "Assign task" false
-    | RetireWorktreeCommand cmd ->
-        confirmation "RetireWorktree" (Some cmd.ProjectName) [ VersionControlWrite; Destructive ] [] (Some "git") [ cmd.WorktreePath ] "Retire worktree" false
-    | BeginTaskCommand cmd ->
-        confirmation "BeginTask" (Some cmd.ProjectName) [ WorkspaceWrite; VersionControlWrite ] [] (Some "git") [ cmd.TaskId ] "Begin task" false
-    | AcknowledgeTaskCommand cmd ->
-        confirmation "AcknowledgeTask" (Some cmd.ProjectName) [ WorkspaceWrite; VersionControlWrite ] [] (Some "git") [ cmd.TaskId ] "Acknowledge assignment" false
-    | ClaimTaskCommand cmd ->
-        confirmation "ClaimTask" (Some cmd.ProjectName) [ WorkspaceWrite; VersionControlWrite ] [] (Some "git") [ cmd.TaskId ] "ClaimTask task" false
-    | CheckpointTaskCommand cmd ->
-        confirmation "CheckpointTask" (Some cmd.ProjectName) [ WorkspaceWrite; VersionControlWrite ] [] (Some "git") [ cmd.TaskId ] "CheckpointTask task" false
-    | CompleteTaskCommand cmd ->
-        confirmation "CompleteTask" (Some cmd.ProjectName) [ WorkspaceWrite; VersionControlWrite ] [] (Some "git") [ cmd.TaskId ] "CompleteTask task" false
     | CreateWorktreeCommand cmd ->
         confirmation "CreateWorktree" (Some cmd.ProjectName) [ VersionControlWrite ] [] (Some "git") [ cmd.Branch; cmd.Name ] $"Create worktree {cmd.Name}" true
     | GitCommitCommand cmd ->

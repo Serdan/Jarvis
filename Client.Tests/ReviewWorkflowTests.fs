@@ -2393,6 +2393,39 @@ type ReviewWorkflowTests() =
 
 
     [<Test>]
+    member _.AgentsDashboardReadsCanonicalReadyInsteadOfSourceBranchTaskFiles() =
+        withFixture (fun one _ first _ _ _ _ initTask ->
+            let taskId = "320"
+            initTask taskId
+            ReviewWorkflow.yieldAgent first (Guid.NewGuid()) taskId "Owner" 3 3 1
+                "Slice committed" "Review four commits" |> success |> ignore
+            let canonical = ReviewWorkflow.getAgentInbox first "Owner" |> success
+            Assert.That(canonical.Agent.State, Is.EqualTo("Ready"))
+            let context = GitCommandTests.TestContext(Path.GetDirectoryName one)
+            let configPath = Client.V2ReviewApi.ReviewV2Binding.pathForRoot one
+            try
+                let head = (LedgerStore.fetch first |> success).Commit
+                Client.V2ReviewApi.ReviewV2Binding.bindExisting
+                    "owner" context first.ProjectId first.LedgerId first.Epoch
+                    first.RemoteName first.ApprovedFetchUrl first.ApprovedPushUrl head true
+                |> function
+                   | Ok _ -> ()
+                   | Error error -> failwithf "Cannot bind canonical test project: %A" error
+                let dashboard =
+                    match Client.AgentDashboard.load context with
+                    | Ok snapshot -> snapshot
+                    | Error error -> failwithf "Cannot read canonical dashboard: %s" error
+                let owner = Client.AgentView.rows dashboard
+                            |> List.find (fun item -> item.Project = "owner" && item.Agent = "Owner")
+                Assert.That(owner.State, Is.EqualTo("Ready"))
+                Assert.That(owner.Focus.Value.TaskId, Is.EqualTo(taskId))
+                Assert.That(owner.Focus.Value.Phase, Is.EqualTo("Paused"))
+                Assert.That(owner.StateEnteredAt.Value, Is.EqualTo(DateTimeOffset.Parse(canonical.Agent.StateEnteredAtUtc)))
+                Assert.That(Client.AgentView.agentSummary owner, Is.EqualTo("#320 - Ready"))
+            finally
+                if File.Exists configPath then File.Delete configPath)
+
+    [<Test>]
     member _.LedgerBindingNeedsExplicitTrustAndPersistsVerifiedHead() =
         withFixture (fun one _ first _ _ _ _ _ ->
             let ctx = GitCommandTests.TestContext(Path.GetDirectoryName one)

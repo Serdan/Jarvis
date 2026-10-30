@@ -422,9 +422,9 @@ let ``command catalog matches AgentCommand union and MCP tools`` () =
     // The orphan Git branch is the sole supported orchestration API.
     let retired =
         set [ "AttachWorkTask"; "GetWorkTask"; "ListWorkTasks"; "CheckpointWorkTask"; "CompleteWorkTask"
-              "ListTasks"; "GetTask"; "CreateTask"; "UpdateTask"; "ClaimTask"; "CheckpointTask"
+              "ListTasks"; "GetTask"; "UpdateTask"; "ClaimTask"; "CheckpointTask"
               "CompleteTask"; "GetTaskHistory"; "CompareWorktreeTasks"; "GetAgentAssignment"
-              "AssignTask"; "AcknowledgeTask"; "GetOrchestrationSnapshot"; "RetireWorktree"; "BeginTask" ]
+              "AcknowledgeTask"; "GetOrchestrationSnapshot"; "RetireWorktree"; "BeginTask" ]
     // Orphan-ledger MCP tools route through eight versioned internal wire commands.
     let v2Wire = set [ "V2TaskRead"; "V2TaskWrite"; "V2ReviewRead"; "V2ReviewWrite"; "V2IntegrationRead"; "V2IntegrationWrite"; "V2LedgerRead"; "V2LedgerWrite" ]
     let orchestrationTools =
@@ -436,9 +436,9 @@ let ``command catalog matches AgentCommand union and MCP tools`` () =
               "WithdrawReview"; "ReassignReview"; "ReleaseReviewClaim"; "ReassignReviewWithReason"; "ReserveOrphanReviewRef"; "DeleteReservedOrphanReviewRef"; "FinalizeReview"
               "LedgerHealth"; "GetOperationStatus"; "PendingOperations"; "ReconcilePendingOperations"; "AcknowledgePendingOperation"; "InitializeLedger"; "BindExistingLedger"; "RebindLedgerRemote"
               "InspectIntegration"; "PlanIntegration"; "MarkIntegrationPendingPush"; "RecordIntegration"; "CloseIntegratedTask" ]
-    let reusedNames = set [ "CreateTask"; "AssignTask" ]
-    Set.difference unionNames retired |> shouldEqual catalogNames
-    Set.intersect mcpNames retired |> shouldEqual reusedNames
+    // Retired wire cases are deleted; public CreateTask/AssignTask are canonical ledger tools.
+    unionNames |> shouldEqual catalogNames
+    Set.intersect mcpNames retired |> shouldEqual Set.empty
     Set.intersect catalogNames retired |> shouldEqual Set.empty
     Set.intersect mcpNames (set [ for name in orchestrationTools -> "V2" + name ]) |> shouldEqual Set.empty
     Set.intersect mcpNames orchestrationTools |> shouldEqual orchestrationTools

@@ -80,85 +80,6 @@ type RemoveWorktreeCommand =
       TargetRef: string option }
 
 
-type ListTasksCommand = { ProjectName: string; Status: string option; Owner: string option; DependsOn: string option; NextActor: string option }
-type GetTaskCommand = { ProjectName: string; TaskId: string }
-type CompareWorktreeTasksCommand = { ProjectName: string; NextActor: string option }
-type GetAgentAssignmentCommand = { ProjectName: string; Agent: string }
-type GetOrchestrationSnapshotCommand =
-    { ProjectName: string
-      Status: string option
-      Owner: string option
-      NextActor: string option
-      ReviewerOnly: bool
-      Offset: int
-      Limit: int
-      IncludeRetirement: bool }
-type CreateTaskCommand =
-    { ProjectName: string
-      TaskId: string option
-      Title: string
-      Html: string
-      Dependencies: string list }
-type UpdateTaskCommand =
-    { ProjectName: string
-      TaskId: string
-      ExpectedRevision: string option
-      Title: string option
-      Status: string option
-      Dependencies: string list option
-      DescriptionCommit: string option
-      AssignmentInstructions: string option
-      AssignmentBaseCommit: string option
-      ExpectedAssignmentRevision: string option
-      NextActor: string option
-      ActorId: string option }
-type AssignTaskCommand =
-    { ProjectName: string
-      Agent: string
-      TaskId: string
-      WorktreeName: string option
-      Branch: string option
-      Instructions: string
-      BaseCommit: string option
-      ExpectedRevision: string option
-      ExpectedAssignmentRevision: string option
-      ActorId: string }
-type RetireWorktreeCommand = { ProjectName: string; WorktreePath: string; TargetRef: string option; DeleteBranch: bool; DryRun: bool }
-type BeginTaskCommand = { ProjectName: string; TaskId: string; Agent: string; AssignmentRevision: string; ExpectedRevision: string option }
-type AcknowledgeTaskCommand =
-    { ProjectName: string
-      TaskId: string
-      Agent: string
-      AssignmentRevision: string
-      ExpectedRevision: string option }
-type ClaimTaskCommand =
-    { ProjectName: string
-      TaskId: string
-      ExpectedRevision: string option
-      Owner: string
-      AllowReassign: bool }
-type CheckpointTaskCommand =
-    { ProjectName: string
-      TaskId: string
-      ExpectedRevision: string option
-      Status: string
-      Summary: string
-      NextAction: string
-      Verified: string list
-      Blocker: string option
-      LastCommit: string option
-      DescriptionCommit: string option
-      AcknowledgedAssignmentRevision: string option
-      ActorId: string option }
-type CompleteTaskCommand =
-    { ProjectName: string
-      TaskId: string
-      ExpectedRevision: string option
-      Verified: string list
-      FinalCommit: string option
-      AcknowledgedAssignmentRevision: string option
-      ActorId: string option }
-
 type V2TaskReadCommand =
     { ProjectName: string
       AgentId: string
@@ -260,13 +181,6 @@ type V2ReviewWriteCommand =
       Inspected: bool
       Tested: bool
       TestDetails: string }
-
-type GetTaskHistoryCommand =
-    { ProjectName: string
-      TaskId: string
-      Limit: int option }
-
-
 
 type GetProjectDetailsCommand = { ProjectName: string }
 
@@ -428,58 +342,6 @@ type ListProjectTasksResult =
 type RunProjectTaskCommand =
     { ProjectName: string
       TaskName: string }
-
-type AttachWorkTaskCommand =
-    { ProjectName: string
-      TaskId: string
-      TaskPath: string }
-
-type GetWorkTaskCommand =
-    { ProjectName: string
-      TaskId: string }
-
-type ListWorkTasksCommand =
-    { ProjectName: string }
-
-type CheckpointWorkTaskCommand =
-    { ProjectName: string
-      TaskId: string
-      Status: string
-      Summary: string
-      NextAction: string
-      Verified: string list
-      Blocker: string option
-      LastCommit: string option }
-
-type CompleteWorkTaskCommand =
-    { ProjectName: string
-      TaskId: string }
-
-type WorkTask =
-    { TaskId: string
-      TaskPath: string
-      TaskCommit: string
-      CurrentTaskCommit: string option
-      TaskChanged: bool
-      TaskDirty: bool
-      Status: string
-      Summary: string option
-      NextAction: string option
-      Verified: string list
-      Blocker: string option
-      CreatedAt: DateTimeOffset
-      UpdatedAt: DateTimeOffset
-      LastCommit: string option
-      TaskContent: string option }
-
-type ListWorkTasksResult = { Tasks: WorkTask list }
-
-type CompleteWorkTaskResult =
-    { TaskId: string
-      TaskPath: string
-      TaskCommit: string
-      FinalCommit: string
-      CompletedAt: DateTimeOffset }
 
 type ListSkillsCommand =
     { ProjectName: string }
@@ -667,21 +529,6 @@ type AgentCommand =
     | CreateWorktreeCommand of CreateWorktreeCommand
     | InspectWorktreeRemovalCommand of InspectWorktreeRemovalCommand
     | RemoveWorktreeCommand of RemoveWorktreeCommand
-    | ListTasksCommand of ListTasksCommand
-    | GetTaskCommand of GetTaskCommand
-    | CompareWorktreeTasksCommand of CompareWorktreeTasksCommand
-    | GetAgentAssignmentCommand of GetAgentAssignmentCommand
-    | GetOrchestrationSnapshotCommand of GetOrchestrationSnapshotCommand
-    | AssignTaskCommand of AssignTaskCommand
-    | AcknowledgeTaskCommand of AcknowledgeTaskCommand
-    | BeginTaskCommand of BeginTaskCommand
-    | RetireWorktreeCommand of RetireWorktreeCommand
-    | CreateTaskCommand of CreateTaskCommand
-    | UpdateTaskCommand of UpdateTaskCommand
-    | ClaimTaskCommand of ClaimTaskCommand
-    | CheckpointTaskCommand of CheckpointTaskCommand
-    | CompleteTaskCommand of CompleteTaskCommand
-    | GetTaskHistoryCommand of GetTaskHistoryCommand
     | V2TaskReadCommand of V2TaskReadCommand
     | V2TaskWriteCommand of V2TaskWriteCommand
     | V2LedgerReadCommand of V2LedgerReadCommand
@@ -705,11 +552,6 @@ type AgentCommand =
     | RunCommandCommand of RunCommandCommand
     | ListProjectTasksCommand of ListProjectTasksCommand
     | RunProjectTaskCommand of RunProjectTaskCommand
-    | AttachWorkTaskCommand of AttachWorkTaskCommand
-    | GetWorkTaskCommand of GetWorkTaskCommand
-    | ListWorkTasksCommand of ListWorkTasksCommand
-    | CheckpointWorkTaskCommand of CheckpointWorkTaskCommand
-    | CompleteWorkTaskCommand of CompleteWorkTaskCommand
     | ListSkillsCommand of ListSkillsCommand
     | GetSkillCommand of GetSkillCommand
     | CreateSkillCommand of CreateSkillCommand
@@ -732,21 +574,6 @@ module AgentCommandInfo =
         | CreateWorktreeCommand _ -> "CreateWorktreeCommand"
         | InspectWorktreeRemovalCommand _ -> "InspectWorktreeRemovalCommand"
         | RemoveWorktreeCommand _ -> "RemoveWorktreeCommand"
-        | ListTasksCommand _ -> "ListTasksCommand"
-        | GetTaskCommand _ -> "GetTaskCommand"
-        | CompareWorktreeTasksCommand _ -> "CompareWorktreeTasksCommand"
-        | GetAgentAssignmentCommand _ -> "GetAgentAssignmentCommand"
-        | GetOrchestrationSnapshotCommand _ -> "GetOrchestrationSnapshotCommand"
-        | AssignTaskCommand _ -> "AssignTaskCommand"
-        | AcknowledgeTaskCommand _ -> "AcknowledgeTaskCommand"
-        | BeginTaskCommand _ -> "BeginTaskCommand"
-        | RetireWorktreeCommand _ -> "RetireWorktreeCommand"
-        | CreateTaskCommand _ -> "CreateTaskCommand"
-        | UpdateTaskCommand _ -> "UpdateTaskCommand"
-        | ClaimTaskCommand _ -> "ClaimTaskCommand"
-        | CheckpointTaskCommand _ -> "CheckpointTaskCommand"
-        | CompleteTaskCommand _ -> "CompleteTaskCommand"
-        | GetTaskHistoryCommand _ -> "GetTaskHistoryCommand"
         | V2TaskReadCommand _ -> "V2TaskReadCommand"
         | V2TaskWriteCommand _ -> "V2TaskWriteCommand"
         | V2LedgerReadCommand _ -> "V2LedgerReadCommand"
@@ -770,11 +597,6 @@ module AgentCommandInfo =
         | RunCommandCommand _ -> "RunCommandCommand"
         | ListProjectTasksCommand _ -> "ListProjectTasksCommand"
         | RunProjectTaskCommand _ -> "RunProjectTaskCommand"
-        | AttachWorkTaskCommand _ -> "AttachWorkTaskCommand"
-        | GetWorkTaskCommand _ -> "GetWorkTaskCommand"
-        | ListWorkTasksCommand _ -> "ListWorkTasksCommand"
-        | CheckpointWorkTaskCommand _ -> "CheckpointWorkTaskCommand"
-        | CompleteWorkTaskCommand _ -> "CompleteWorkTaskCommand"
         | ListSkillsCommand _ -> "ListSkillsCommand"
         | GetSkillCommand _ -> "GetSkillCommand"
         | CreateSkillCommand _ -> "CreateSkillCommand"
@@ -803,21 +625,6 @@ module AgentCommandInfo =
         | CreateWorktreeCommand _ -> "CreateWorktree"
         | InspectWorktreeRemovalCommand _ -> "InspectWorktreeRemoval"
         | RemoveWorktreeCommand _ -> "RemoveWorktree"
-        | ListTasksCommand _ -> "ListTasks"
-        | GetTaskCommand _ -> "GetTask"
-        | CompareWorktreeTasksCommand _ -> "CompareWorktreeTasks"
-        | GetAgentAssignmentCommand _ -> "GetAgentAssignment"
-        | GetOrchestrationSnapshotCommand _ -> "GetOrchestrationSnapshot"
-        | AssignTaskCommand _ -> "AssignTask"
-        | AcknowledgeTaskCommand _ -> "AcknowledgeTask"
-        | BeginTaskCommand _ -> "BeginTask"
-        | RetireWorktreeCommand _ -> "RetireWorktree"
-        | CreateTaskCommand _ -> "CreateTask"
-        | UpdateTaskCommand _ -> "UpdateTask"
-        | ClaimTaskCommand _ -> "ClaimTask"
-        | CheckpointTaskCommand _ -> "CheckpointTask"
-        | CompleteTaskCommand _ -> "CompleteTask"
-        | GetTaskHistoryCommand _ -> "GetTaskHistory"
         | V2TaskReadCommand _ -> "V2TaskRead"
         | V2TaskWriteCommand _ -> "V2TaskWrite"
         | V2LedgerReadCommand _ -> "V2LedgerRead"
@@ -841,11 +648,6 @@ module AgentCommandInfo =
         | RunCommandCommand _ -> "RunCommand"
         | ListProjectTasksCommand _ -> "ListProjectTasks"
         | RunProjectTaskCommand _ -> "RunTask"
-        | AttachWorkTaskCommand _ -> "AttachWorkTask"
-        | GetWorkTaskCommand _ -> "GetWorkTask"
-        | ListWorkTasksCommand _ -> "ListWorkTasks"
-        | CheckpointWorkTaskCommand _ -> "CheckpointWorkTask"
-        | CompleteWorkTaskCommand _ -> "CompleteWorkTask"
         | ListSkillsCommand _ -> "ListSkills"
         | GetSkillCommand _ -> "GetSkill"
         | CreateSkillCommand _ -> "CreateSkill"
@@ -872,21 +674,6 @@ module AgentCommandInfo =
         | CreateWorktreeCommand cmd -> Some cmd.ProjectName
         | InspectWorktreeRemovalCommand cmd -> Some cmd.ProjectName
         | RemoveWorktreeCommand cmd -> Some cmd.ProjectName
-        | ListTasksCommand cmd -> Some cmd.ProjectName
-        | GetTaskCommand cmd -> Some cmd.ProjectName
-        | CompareWorktreeTasksCommand cmd -> Some cmd.ProjectName
-        | GetAgentAssignmentCommand cmd -> Some cmd.ProjectName
-        | GetOrchestrationSnapshotCommand cmd -> Some cmd.ProjectName
-        | AssignTaskCommand cmd -> Some cmd.ProjectName
-        | AcknowledgeTaskCommand cmd -> Some cmd.ProjectName
-        | BeginTaskCommand cmd -> Some cmd.ProjectName
-        | RetireWorktreeCommand cmd -> Some cmd.ProjectName
-        | CreateTaskCommand cmd -> Some cmd.ProjectName
-        | UpdateTaskCommand cmd -> Some cmd.ProjectName
-        | ClaimTaskCommand cmd -> Some cmd.ProjectName
-        | CheckpointTaskCommand cmd -> Some cmd.ProjectName
-        | CompleteTaskCommand cmd -> Some cmd.ProjectName
-        | GetTaskHistoryCommand cmd -> Some cmd.ProjectName
         | V2TaskReadCommand cmd -> Some cmd.ProjectName
         | V2TaskWriteCommand cmd -> Some cmd.ProjectName
         | V2LedgerReadCommand cmd -> Some cmd.ProjectName
@@ -909,11 +696,6 @@ module AgentCommandInfo =
         | RunCommandCommand cmd -> Some cmd.ProjectName
         | ListProjectTasksCommand cmd -> Some cmd.ProjectName
         | RunProjectTaskCommand cmd -> Some cmd.ProjectName
-        | AttachWorkTaskCommand cmd -> Some cmd.ProjectName
-        | GetWorkTaskCommand cmd -> Some cmd.ProjectName
-        | ListWorkTasksCommand cmd -> Some cmd.ProjectName
-        | CheckpointWorkTaskCommand cmd -> Some cmd.ProjectName
-        | CompleteWorkTaskCommand cmd -> Some cmd.ProjectName
         | ListSkillsCommand cmd -> Some cmd.ProjectName
         | GetSkillCommand cmd -> Some cmd.ProjectName
         | CreateSkillCommand cmd -> Some cmd.ProjectName
@@ -972,11 +754,6 @@ module AgentCommandInfo =
         | PatchFileCommand cmd -> Some(compact cmd.FilePath)
         | RunCommandCommand cmd -> Some(fullCommand cmd.Executable cmd.Args)
         | RunProjectTaskCommand cmd -> Some(compact cmd.TaskName)
-        | AttachWorkTaskCommand cmd -> Some(compact cmd.TaskId)
-        | GetWorkTaskCommand cmd -> Some(compact cmd.TaskId)
-        | ListWorkTasksCommand _ -> None
-        | CheckpointWorkTaskCommand cmd -> Some(compact cmd.TaskId)
-        | CompleteWorkTaskCommand cmd -> Some(compact cmd.TaskId)
         | GetSkillCommand cmd -> Some(compact cmd.SkillName)
         | CreateSkillCommand cmd -> Some(compact cmd.SkillName)
         | ListSkillsCommand _ -> None
@@ -984,14 +761,6 @@ module AgentCommandInfo =
         | CreateWorktreeCommand cmd -> Some(compact cmd.Name)
         | InspectWorktreeRemovalCommand cmd -> Some(compact cmd.WorktreePath)
         | RemoveWorktreeCommand cmd -> Some(compact cmd.WorktreePath)
-        | ListTasksCommand _ -> None
-        | GetTaskCommand cmd -> Some(compact cmd.TaskId)
-        | CreateTaskCommand cmd -> Some(compact (cmd.TaskId |> Option.defaultValue "new"))
-        | UpdateTaskCommand cmd -> Some(compact cmd.TaskId)
-        | ClaimTaskCommand cmd -> Some(compact cmd.TaskId)
-        | CheckpointTaskCommand cmd -> Some(compact cmd.TaskId)
-        | CompleteTaskCommand cmd -> Some(compact cmd.TaskId)
-        | GetTaskHistoryCommand cmd -> Some(compact cmd.TaskId)
         | V2TaskReadCommand cmd -> Some(compact cmd.AgentId)
         | V2TaskWriteCommand cmd -> Some(compact cmd.Action)
         | V2LedgerReadCommand cmd -> Some(compact cmd.ProjectName)
@@ -1010,13 +779,6 @@ module AgentCommandInfo =
         | ListCommandsCommand
         | ListProjectsCommand
         | ListWorktreesCommand _
-        | CompareWorktreeTasksCommand _
-        | GetAgentAssignmentCommand _
-        | GetOrchestrationSnapshotCommand _
-        | AssignTaskCommand _
-        | AcknowledgeTaskCommand _
-        | BeginTaskCommand _
-        | RetireWorktreeCommand _
         | GetProjectDetailsCommand _
         | ListProjectTasksCommand _
         | GetGitStatusCommand _
@@ -1036,11 +798,6 @@ module AgentCommandInfo =
         | PatchFileCommand cmd -> Some(truncate 64 cmd.FilePath)
         | RunCommandCommand cmd -> Some(commandPreview cmd.Executable cmd.Args)
         | RunProjectTaskCommand cmd -> Some(truncate 48 cmd.TaskName)
-        | AttachWorkTaskCommand cmd -> Some(truncate 48 cmd.TaskId)
-        | GetWorkTaskCommand cmd -> Some(truncate 48 cmd.TaskId)
-        | ListWorkTasksCommand _ -> None
-        | CheckpointWorkTaskCommand cmd -> Some(truncate 48 cmd.TaskId)
-        | CompleteWorkTaskCommand cmd -> Some(truncate 48 cmd.TaskId)
         | GetSkillCommand cmd -> Some(truncate 48 cmd.SkillName)
         | CreateSkillCommand cmd -> Some(truncate 48 cmd.SkillName)
         | ListSkillsCommand _ -> None
@@ -1048,14 +805,6 @@ module AgentCommandInfo =
         | CreateWorktreeCommand cmd -> Some(truncate 64 cmd.Name)
         | InspectWorktreeRemovalCommand cmd -> Some(truncate 64 cmd.WorktreePath)
         | RemoveWorktreeCommand cmd -> Some(truncate 64 cmd.WorktreePath)
-        | ListTasksCommand _ -> None
-        | GetTaskCommand cmd -> Some(truncate 64 cmd.TaskId)
-        | CreateTaskCommand cmd -> Some(truncate 64 (cmd.TaskId |> Option.defaultValue "new"))
-        | UpdateTaskCommand cmd -> Some(truncate 64 cmd.TaskId)
-        | ClaimTaskCommand cmd -> Some(truncate 64 cmd.TaskId)
-        | CheckpointTaskCommand cmd -> Some(truncate 64 cmd.TaskId)
-        | CompleteTaskCommand cmd -> Some(truncate 64 cmd.TaskId)
-        | GetTaskHistoryCommand cmd -> Some(truncate 64 cmd.TaskId)
         | V2TaskReadCommand cmd -> Some(truncate 64 cmd.AgentId)
         | V2TaskWriteCommand cmd -> Some(truncate 64 cmd.Action)
         | V2LedgerReadCommand cmd -> Some(truncate 64 cmd.ProjectName)
@@ -1074,13 +823,6 @@ module AgentCommandInfo =
         | ListCommandsCommand
         | ListProjectsCommand
         | ListWorktreesCommand _
-        | CompareWorktreeTasksCommand _
-        | GetAgentAssignmentCommand _
-        | GetOrchestrationSnapshotCommand _
-        | AssignTaskCommand _
-        | AcknowledgeTaskCommand _
-        | BeginTaskCommand _
-        | RetireWorktreeCommand _
         | GetProjectDetailsCommand _
         | ListProjectTasksCommand _
         | GetGitStatusCommand _
@@ -1125,7 +867,7 @@ module AgentCommandInfo =
         | None -> invocation command
 
 module AgentProtocol =
-    let version = "3.38"
+    let version = "3.39"
     let defaultPatchFuzzyContextLines = 3
     let maxResponseBytes = 900 * 1024
     let maxImageBytes = 8 * 1024 * 1024

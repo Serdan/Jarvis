@@ -140,15 +140,6 @@ let private auditDetails command =
     | RunProjectTaskCommand cmd -> Some("RunProjectTask", Some cmd.ProjectName, [ ProcessExecution ], [], None, [ cmd.TaskName ])
     | CreateSkillCommand cmd -> Some("CreateSkill", Some cmd.ProjectName, [ WorkspaceWrite ], [ $".jarvis/skills/{cmd.SkillName}/SKILL.md" ], None, [])
     | RemoveWorktreeCommand cmd -> Some("RemoveWorktree", Some cmd.ProjectName, [ VersionControlWrite; Destructive ], [], Some "git", [ cmd.WorktreePath ])
-    | CreateTaskCommand cmd -> Some("CreateTask", Some cmd.ProjectName, [ WorkspaceWrite; VersionControlWrite ], [], Some "git", [ cmd.TaskId |> Option.defaultValue "new" ])
-    | UpdateTaskCommand cmd -> Some("UpdateTask", Some cmd.ProjectName, [ WorkspaceWrite; VersionControlWrite ], [], Some "git", [ cmd.TaskId ])
-    | AssignTaskCommand cmd -> Some("AssignTask", Some cmd.ProjectName, [ WorkspaceWrite; VersionControlWrite ], [], Some "git", [ cmd.TaskId ])
-    | RetireWorktreeCommand cmd -> Some("RetireWorktree", Some cmd.ProjectName, [ VersionControlWrite; Destructive ], [], Some "git", [ cmd.WorktreePath ])
-    | BeginTaskCommand cmd -> Some("BeginTask", Some cmd.ProjectName, [ WorkspaceWrite; VersionControlWrite ], [], Some "git", [ cmd.TaskId ])
-    | AcknowledgeTaskCommand cmd -> Some("AcknowledgeTask", Some cmd.ProjectName, [ WorkspaceWrite; VersionControlWrite ], [], Some "git", [ cmd.TaskId ])
-    | ClaimTaskCommand cmd -> Some("ClaimTask", Some cmd.ProjectName, [ WorkspaceWrite; VersionControlWrite ], [], Some "git", [ cmd.TaskId ])
-    | CheckpointTaskCommand cmd -> Some("CheckpointTask", Some cmd.ProjectName, [ WorkspaceWrite; VersionControlWrite ], [], Some "git", [ cmd.TaskId ])
-    | CompleteTaskCommand cmd -> Some("CompleteTask", Some cmd.ProjectName, [ WorkspaceWrite; VersionControlWrite ], [], Some "git", [ cmd.TaskId ])
     | V2TaskWriteCommand cmd -> Some("V2Task" + cmd.Action, Some cmd.ProjectName, [ VersionControlWrite; NetworkAccess ], [], Some "git", [ cmd.TaskId; cmd.AttemptId; cmd.OperationId ])
     | V2LedgerWriteCommand cmd -> Some("V2Ledger" + cmd.Action, Some cmd.ProjectName, [ VersionControlWrite; NetworkAccess ], [], Some "git", [ cmd.RemoteName; cmd.ExpectedTrustedHead; cmd.OperationId ])
     | V2IntegrationWriteCommand cmd -> Some("V2Integration" + cmd.Action, Some cmd.ProjectName, [ VersionControlWrite; NetworkAccess ], [], Some "git", [ cmd.TaskId; cmd.ActionId; cmd.OperationId ])
@@ -265,21 +256,6 @@ let private dispatch (rt: Runtime) (command: AgentCommand) =
     | CreateWorktreeCommand cmd -> rt |> Worktrees.createWorktree cmd |> serialize'
     | InspectWorktreeRemovalCommand cmd -> rt |> Worktrees.inspectRemoval cmd |> serialize'
     | RemoveWorktreeCommand cmd -> rt |> Worktrees.removeWorktree cmd |> serialize'
-    | ListTasksCommand cmd -> rt |> TaskStore.listTasks cmd |> serialize'
-    | GetTaskCommand cmd -> rt |> TaskStore.getTask cmd |> serialize'
-    | CompareWorktreeTasksCommand cmd -> rt |> TaskStore.compareWorktreeTasks cmd |> serialize'
-    | GetAgentAssignmentCommand cmd -> rt |> TaskStore.getAgentAssignment cmd |> serialize'
-    | GetOrchestrationSnapshotCommand cmd -> rt |> TaskStore.getOrchestrationSnapshot cmd |> serialize'
-    | AssignTaskCommand cmd -> rt |> TaskStore.assignTask cmd |> serialize'
-    | AcknowledgeTaskCommand cmd -> rt |> TaskStore.acknowledgeTask cmd |> serialize'
-    | BeginTaskCommand cmd -> rt |> TaskStore.beginTask cmd |> serialize'
-    | RetireWorktreeCommand cmd -> rt |> TaskStore.retireWorktree cmd |> serialize'
-    | CreateTaskCommand cmd -> rt |> TaskStore.createTask cmd |> serialize'
-    | UpdateTaskCommand cmd -> rt |> TaskStore.updateTask cmd |> serialize'
-    | ClaimTaskCommand cmd -> rt |> TaskStore.claimTask cmd |> serialize'
-    | CheckpointTaskCommand cmd -> rt |> TaskStore.checkpointTask cmd |> serialize'
-    | CompleteTaskCommand cmd -> rt |> TaskStore.completeTask cmd |> serialize'
-    | GetTaskHistoryCommand cmd -> rt |> TaskStore.getTaskHistory cmd |> serialize'
     | V2TaskReadCommand cmd -> rt |> V2ReviewApi.V2TaskApi.read cmd |> serialize'
     | V2TaskWriteCommand cmd -> rt |> V2ReviewApi.V2TaskApi.write cmd |> serialize'
     | V2LedgerReadCommand cmd -> rt |> V2ReviewApi.V2LedgerApi.read cmd |> serialize'
@@ -330,11 +306,6 @@ let private dispatch (rt: Runtime) (command: AgentCommand) =
         |> serialize'
     | RunCommandCommand cmd -> rt |> ClientShell.runCommand cmd |> serialize'
     | ListProjectTasksCommand cmd -> rt |> ClientShell.listProjectTasks cmd |> serialize'
-    | AttachWorkTaskCommand cmd -> rt |> WorkTaskCompat.attachWorkTask cmd |> serialize'
-    | GetWorkTaskCommand cmd -> rt |> WorkTaskCompat.getWorkTask cmd |> serialize'
-    | ListWorkTasksCommand cmd -> rt |> WorkTaskCompat.listWorkTasks cmd |> serialize'
-    | CheckpointWorkTaskCommand cmd -> rt |> WorkTaskCompat.checkpointWorkTask cmd |> serialize'
-    | CompleteWorkTaskCommand cmd -> rt |> WorkTaskCompat.completeWorkTask cmd |> serialize'
     | RunProjectTaskCommand cmd ->
         rt
         |> ClientShell.resolveProjectTask cmd

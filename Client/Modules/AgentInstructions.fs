@@ -49,7 +49,6 @@ let private applicableTargets (rt: Runtime) command =
                 | PatchFileCommand c -> Ok(files [ c.FilePath ])
                 | RunCommandCommand c -> Ok(directories [ defaultArg c.WorkingDirectory "" ])
                 | StartJobCommand c -> Ok(directories [ defaultArg c.WorkingDirectory "" ])
-                | AttachWorkTaskCommand c -> Ok(files [ c.TaskPath ])
                 | RunProjectTaskCommand c ->
                     ClientShell.resolveProjectTask c rt
                     |> Result.map (fun definition -> directories [ defaultArg definition.WorkingDirectory "" ])

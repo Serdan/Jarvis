@@ -1280,7 +1280,7 @@ type ReviewWorkflowTests() =
             Assert.That(task.Lifecycle, Is.EqualTo("InProgress"))
             Assert.That(attempt.Phase, Is.EqualTo("Working"))
             Assert.That(attempt.ActiveReviewRequestId, Is.Null)
-            Assert.That(attempt.AcceptedHead, Is.EqualTo(d))
+            Assert.That(attempt.AcceptedReviewRequestId, Is.EqualTo(req.ToString("N")))
             ReviewWorkflow.acknowledgeReviewFeedback first (Guid.NewGuid()) "315" "Owner" attempt.FeedbackSequence
             |> success |> ignore
             let _, _, acknowledged = ReviewWorkflow.getTask first "315" |> success
@@ -1395,7 +1395,7 @@ type ReviewWorkflowTests() =
             let _, task, attemptOption = ReviewWorkflow.getTask first "800" |> success
             Assert.That(task.Lifecycle, Is.EqualTo("InProgress"))
             Assert.That((Option.get attemptOption).Phase, Is.EqualTo("Working"))
-            Assert.That((Option.get attemptOption).AcceptedHead, Is.EqualTo(d)))
+            Assert.That((Option.get attemptOption).AcceptedReviewRequestId, Is.EqualTo(replacement.ToString("N"))))
 
     [<Test>]
     member _.AnyRegisteredReviewerCanClaimWithoutPreassignment() =
@@ -1689,7 +1689,7 @@ type ReviewWorkflowTests() =
                           BaseOid = baseOid; TargetRef = sourceRef } |> ignore
                 let getTask : Common.V2ReviewReadCommand =
                     { ProjectName = "owner"; Action = "GetTask"; TaskId = taskId
-                      RequestId = ""; ReviewerId = "" }
+                      RequestId = ""; ReviewerId = ""; DocumentPath = "" }
                 match Client.V2ReviewApi.V2ReviewApi.read getTask ctx with
                 | Error error -> Assert.Fail(sprintf "V2 task read failed: %A" error)
                 | Ok value ->
@@ -1722,7 +1722,7 @@ type ReviewWorkflowTests() =
                       ActorId = "Owner"; ReviewerId = ""
                       ExpectedVersion = 5; Generation = 1
                       SourceRef = sourceRef; HeadOid = head; Summary = "Implementation ready"
-                      Verdict = ""; Feedback = ""; TestEvidence = ""; Inspected = false; Tested = false; TestDetails = "" }
+                      Verdict = ""; Feedback = ""; TestEvidence = ""; Inspected = false; Tested = false; TestDetails = ""; DocumentPath = ""; Content = ""; ExpectedBlobOid = "" }
                 match Client.V2ReviewApi.V2ReviewApi.write reviewCmd ctx with
                 | Ok _ -> ()
                 | Error error -> Assert.Fail(sprintf "V2 submit API failed: %A" error)
@@ -1731,6 +1731,29 @@ type ReviewWorkflowTests() =
                 // use caller-stable operation identities for recovery.
                 ReviewWorkflow.claimReview first (Guid.NewGuid()) taskId requestId
                     "Reviewer" 1 1 |> success |> ignore
+                let findingContent = "# Needs regression test\nPlease add coverage for this edge case."
+                let documentWrite =
+                    { reviewCmd with Action = "PutDocument"; ActorId = "Reviewer"
+                                     DocumentPath = "findings/missing-regression-test.md"
+                                     Content = findingContent; ExpectedBlobOid = ""
+                                     OperationId = Guid.NewGuid().ToString("D") }
+                match Client.V2ReviewApi.V2ReviewApi.write documentWrite ctx with
+                | Ok _ -> ()
+                | Error error -> Assert.Fail(sprintf "V2 review document write failed: %A" error)
+                let documentRead =
+                    { getTask with Action = "ReadDocument"
+                                   RequestId = requestId.ToString("D")
+                                   DocumentPath = "findings/missing-regression-test.md" }
+                match Client.V2ReviewApi.V2ReviewApi.read documentRead ctx with
+                | Ok value ->
+                    let resultJson = System.Text.Json.JsonSerializer.Serialize(value)
+                    Assert.That(resultJson, Does.Contain("Please add coverage for this edge case"))
+                | Error error -> Assert.Fail(sprintf "V2 review document read failed: %A" error)
+                match Client.V2ReviewApi.V2ReviewApi.read { documentRead with Action = "ListDocuments" } ctx with
+                | Ok value ->
+                    let resultJson = System.Text.Json.JsonSerializer.Serialize(value)
+                    Assert.That(resultJson, Does.Contain("missing-regression-test.md"))
+                | Error error -> Assert.Fail(sprintf "V2 review document list failed: %A" error)
                 let released =
                     { reviewCmd with Action = "ReleaseClaim"; ActorId = "Reviewer"
                                      ExpectedVersion = 2; Generation = 0
@@ -1741,7 +1764,7 @@ type ReviewWorkflowTests() =
                 | Error error -> Assert.Fail(sprintf "V2 release API failed: %A" error)
                 let queueRead : Common.V2ReviewReadCommand =
                     { ProjectName = "owner"; Action = "AwaitingReassignment"
-                      TaskId = ""; RequestId = ""; ReviewerId = "" }
+                      TaskId = ""; RequestId = ""; ReviewerId = ""; DocumentPath = "" }
                 match Client.V2ReviewApi.V2ReviewApi.read queueRead ctx with
                 | Ok value ->
                     let _, requests = unbox<string * ReviewRequest list> value
@@ -2508,6 +2531,70 @@ type ReviewWorkflowTests() =
             |> success |> ignore
             let _, closed, _ = ReviewWorkflow.getTask second taskId |> success
             Assert.That(closed.Lifecycle, Is.EqualTo("Closed")))
+
+    [<Test>]
+    member _.ReviewFindingsAreIndependentLargeGitDocumentsWithEditableHistory() =
+        withFixture (fun one _ first second _ sourceRef newCommit initTask ->
+            let taskId = "review-markdown"
+            initTask taskId
+            let reviewedHead = newCommit "Submit review docs fixture" "reviewed code"
+            let id = Guid.NewGuid()
+            ReviewWorkflow.submitReview first (Guid.NewGuid()) taskId "Owner" 3 1
+                id sourceRef reviewedHead "Please review code" |> success |> ignore
+            ReviewWorkflow.claimReview second (Guid.NewGuid()) taskId id "Reviewer" 1 1
+            |> success |> ignore
+
+            let summary = "# Review summary\nTwo findings to address."
+            let large = "# Allocation in hot path\n" + String.replicate 90000 "x" + "\n"
+            let summaryOperation = Guid.NewGuid()
+            let put actor name previous content operation =
+                ReviewWorkflow.putReviewDocument second operation taskId id actor name previous content
+            let created = put "Reviewer" "summary.md" "" summary summaryOperation |> success
+            Assert.That(created.AlreadyApplied, Is.False)
+            let replay = put "Reviewer" "summary.md" "" summary summaryOperation |> success
+            Assert.That(replay.AlreadyApplied, Is.True)
+            put "Reviewer" "findings/allocation-in-hot-path.md" "" large (Guid.NewGuid())
+            |> success |> ignore
+            put "Reviewer" "findings/missing-regression-test.md" "" "# Missing test\nAdd test."
+                (Guid.NewGuid()) |> success |> ignore
+
+            let _, files = ReviewWorkflow.listReviewDocuments first taskId id |> success
+            Assert.That(files |> List.map (fun f -> f.Path),
+                        Is.EqualTo(box [ "findings/allocation-in-hot-path.md"
+                                         "findings/missing-regression-test.md"; "summary.md" ]))
+            let _, firstFinding =
+                ReviewWorkflow.getReviewDocument first taskId id "findings/allocation-in-hot-path.md"
+                |> success
+            Assert.That(firstFinding.Content, Is.EqualTo(large))
+            Assert.That(firstFinding.BlobOid.Length, Is.EqualTo(40))
+            let changed = "# Allocation in hot path\nResolved by owner."
+            put "Owner" "findings/allocation-in-hot-path.md" firstFinding.BlobOid changed
+                (Guid.NewGuid()) |> success |> ignore
+            let _, updated =
+                ReviewWorkflow.getReviewDocument second taskId id "findings/allocation-in-hot-path.md"
+                |> success
+            Assert.That(updated.Content, Is.EqualTo(changed))
+            Assert.That(updated.BlobOid, Is.Not.EqualTo(firstFinding.BlobOid))
+            match put "Owner" "findings/allocation-in-hot-path.md" firstFinding.BlobOid "stale"
+                      (Guid.NewGuid()) with
+            | Error(StaleEntityVersion _) -> ()
+            | other -> Assert.Fail(sprintf "Expected a stale blob precondition: %A" other)
+            match put "Reviewer" "findings/../../outside.md" "" "invalid" (Guid.NewGuid()) with
+            | Error(InvalidBinding _) -> ()
+            | other -> Assert.Fail(sprintf "Expected invalid path rejection: %A" other)
+
+            ReviewWorkflow.decide second (Guid.NewGuid()) taskId id "Reviewer" 2
+                RequestChanges "See findings directory" |> success |> ignore
+            let _, _, revision = ReviewWorkflow.getReview first taskId id |> success
+            Assert.That(revision.HeadCommit, Is.EqualTo(reviewedHead))
+            let _, afterVerdict = ReviewWorkflow.listReviewDocuments first taskId id |> success
+            Assert.That(afterVerdict.Length, Is.EqualTo(3))
+            let snapshot = LedgerStore.fetch first |> success
+            let documentPath = $"tasks/{taskId}/reviews/{id:N}/findings/allocation-in-hot-path.md"
+            let stored, oid = LedgerStore.readAt first snapshot documentPath |> success
+            Assert.That(stored.Value, Is.EqualTo(changed))
+            Assert.That(oid.Value, Is.EqualTo(updated.BlobOid))
+            Assert.That(git one [ "status"; "--porcelain" ], Is.Empty))
 
     [<Test>]
     member _.RecordedPartialIntegrationDoesNotBlockOwnerTransfer() =
@@ -3532,7 +3619,7 @@ type ReviewWorkflowTests() =
             Assert.That(revision1.SourceRepositoryId, Is.EqualTo(pinnedSource.RepositoryId))
             Assert.That(revision1.SourcePushRemote, Is.EqualTo(pinnedSource.PushUrl))
             Assert.That(revision1.SourceRemote, Is.EqualTo(first.ApprovedFetchUrl))
-            Assert.That(revision1.PublishedSourceOid, Is.EqualTo(c))
+            LedgerStore.fetchReviewRef first revision1.ReviewRef c |> success |> ignore
             Assert.That(revision1.EvidenceStatus, Is.EqualTo("OwnerReported"))
             Assert.That(revision1.TestEvidence, Does.Contain("12 unit tests"))
             let _, final1 = ReviewWorkflow.getCheckpoint second "evidence" revision1.CheckpointSequence |> success
@@ -3549,7 +3636,7 @@ type ReviewWorkflowTests() =
             Assert.That(request2.CurrentRevision, Is.EqualTo(2))
             Assert.That(revision2.Revision, Is.EqualTo(2))
             Assert.That(revision2.HeadCommit, Is.EqualTo(d))
-            Assert.That(revision2.PublishedSourceOid, Is.EqualTo(d))
+            LedgerStore.fetchReviewRef first revision2.ReviewRef d |> success |> ignore
             Assert.That(revision2.EvidenceStatus, Is.EqualTo("NotProvided"))
             Assert.That(revision2.TestEvidence, Is.Empty)
             Assert.That(revision2.CheckpointSequence, Is.EqualTo(replacement.Operation.Sequence))
@@ -3660,4 +3747,4 @@ type ReviewWorkflowTests() =
             let _, request, revision = ReviewWorkflow.getReview first "missingref" req |> success
             Assert.That(request.Status, Is.EqualTo("Unclaimed"))
             Assert.That(revision.EvidenceStatus, Is.EqualTo("NotProvided"))
-            Assert.That(revision.PublishedSourceOid, Is.EqualTo(head)))
+            Assert.That(revision.HeadCommit, Is.EqualTo(head)))

@@ -111,7 +111,6 @@ type ReviewAttempt =
       LatestReviewRequestId: string
       AcceptedReviewRequestId: string
       AcceptedReviewRevision: int
-      AcceptedHead: string
       IntegrationActionId: string
       ReviewFeedback: string
       FeedbackSequence: int64
@@ -179,10 +178,21 @@ type ReviewRevision =
       SourceRepositoryId: string
       SourceRemote: string
       SourcePushRemote: string
-      PublishedSourceOid: string
       CheckpointSequence: int64
       TestEvidence: string
       EvidenceStatus: string }
+
+[<CLIMutable>]
+type ReviewDocumentInfo =
+    { Path: string
+      BlobOid: string
+      SizeBytes: int }
+
+[<CLIMutable>]
+type ReviewDocument =
+    { Path: string
+      BlobOid: string
+      Content: string }
 
 [<CLIMutable>]
 type OrphanReviewRef =
@@ -468,6 +478,13 @@ module ReviewWorkflow =
     let private receiptPath taskId attemptId generation =
         $"tasks/{taskId}/attempts/{attemptId}/assignments/{generation}.ack.json"
     let private requestPath taskId requestId = $"tasks/{taskId}/reviews/{requestId}/request.json"
+    let private reviewDocumentPath taskId requestId documentPath =
+        $"tasks/{taskId}/reviews/{requestId}/{documentPath}"
+    let private validReviewDocumentPath (documentPath: string) =
+        documentPath = "summary.md"
+        || (not (isNull documentPath)
+            && Regex.IsMatch(documentPath, "^findings/[a-z0-9][a-z0-9_-]{0,79}[.]md$",
+                             RegexOptions.CultureInvariant))
     let private decisionPath taskId requestId sequence =
         $"tasks/{taskId}/reviews/{requestId}/decisions/{sequence}.json"
     let private reviewEventPath taskId requestId sequence =
@@ -969,7 +986,7 @@ module ReviewWorkflow =
                               SourcePushRemote = null; SourceRef = null
                               ActiveReviewRequestId = null; LatestReviewRequestId = null
                               AcceptedReviewRequestId = null
-                              AcceptedReviewRevision = 0; AcceptedHead = null
+                              AcceptedReviewRevision = 0
                               IntegrationActionId = null
                               ReviewFeedback = null; FeedbackSequence = 0L
                               AcknowledgedFeedbackSequence = 0L }
@@ -1627,7 +1644,6 @@ module ReviewWorkflow =
                                   SourceRepositoryId = attempt.SourceRepositoryId
                                   SourceRemote = attempt.SourceRemote
                                   SourcePushRemote = attempt.SourcePushRemote
-                                  PublishedSourceOid = headOid
                                   CheckpointSequence = current.Header.NextSequence
                                   TestEvidence = testEvidence; EvidenceStatus = evidenceStatus }
                             return
@@ -1720,7 +1736,6 @@ module ReviewWorkflow =
                                   SourceRepositoryId = liveAttempt.SourceRepositoryId
                                   SourceRemote = liveAttempt.SourceRemote
                                   SourcePushRemote = liveAttempt.SourcePushRemote
-                                  PublishedSourceOid = headOid
                                   CheckpointSequence = current.Header.NextSequence
                                   TestEvidence = testEvidence; EvidenceStatus = evidenceStatus }
                             return
@@ -1958,9 +1973,7 @@ module ReviewWorkflow =
                                            AcceptedReviewRequestId =
                                                if verdict = Accept then id else null
                                            AcceptedReviewRevision =
-                                               if verdict = Accept then request.CurrentRevision else 0
-                                           AcceptedHead =
-                                               if verdict = Accept then revision.HeadCommit else null }
+                                               if verdict = Accept then request.CurrentRevision else 0 }
                         let review =
                             { request with Version = request.Version + 1; Status = status
                                            DecisionSequence = snapshot.Header.NextSequence; Feedback = feedback }
@@ -2206,8 +2219,6 @@ module ReviewWorkflow =
                         let! revision, _ =
                             required<ReviewRevision> binding snapshot
                                 (revisionPath taskId id request.CurrentRevision)
-                        if revision.HeadCommit <> attempt.AcceptedHead then
-                            return! Error(LedgerIntegrityError "Finalization does not match the accepted review.")
                         let! sourceIdentity = verifySourceRepository binding attempt
                         if revision.SourceRepositoryId <> sourceIdentity.RepositoryId
                            || revision.SourceRemote <> sourceIdentity.FetchUrl
@@ -2889,7 +2900,7 @@ module ReviewWorkflow =
                                        SourceRemote = null; SourcePushRemote = null; SourceRef = null
                                        ActiveReviewRequestId = null; LatestReviewRequestId = null
                                        AcceptedReviewRequestId = null; AcceptedReviewRevision = 0
-                                       AcceptedHead = null; IntegrationActionId = null
+                                       IntegrationActionId = null
                                        ReviewFeedback = null; FeedbackSequence = 0L
                                        AcknowledgedFeedbackSequence = 0L }
                     let audit =
@@ -3050,6 +3061,78 @@ module ReviewWorkflow =
                         (revisionPath taskId id request.CurrentRevision)
                 return snapshot, request, revision
             }
+
+    // Markdown files are regular orphan-ledger Git blobs. The review itself
+    // identifies the source snapshot, while these files contain arbitrarily
+    // detailed reviewer findings and implementation responses.
+    let listReviewDocuments binding taskId requestId =
+        if not (validTaskId taskId) || requestId = Guid.Empty then
+            Error(InvalidBinding "Invalid review document lookup.")
+        else result {
+            let! snapshot = LedgerStore.fetch binding
+            let id = requestId.ToString("N")
+            let! _ = required<ReviewRequest> binding snapshot (requestPath taskId id)
+            let! paths = LedgerStore.listAt binding snapshot "tasks"
+            let prefix = $"tasks/{taskId}/reviews/{id}/"
+            let mutable documents = []
+            for path in paths do
+                if path.StartsWith(prefix, StringComparison.Ordinal) then
+                    let relative = path.Substring(prefix.Length)
+                    if validReviewDocumentPath relative then
+                        let! content, oid = LedgerStore.readAt binding snapshot path
+                        match content, oid with
+                        | Some body, Some blob ->
+                            documents <- { Path = relative; BlobOid = blob
+                                           SizeBytes = Encoding.UTF8.GetByteCount body } :: documents
+                        | _ -> return! Error(LedgerIntegrityError "Missing review document.")
+            return snapshot.Commit, documents |> List.sortBy (fun document -> document.Path)
+        }
+
+    let getReviewDocument binding taskId requestId documentPath =
+        if not (validTaskId taskId) || requestId = Guid.Empty
+           || not (validReviewDocumentPath documentPath) then
+            Error(InvalidBinding "Invalid review document path.")
+        else result {
+            let! snapshot = LedgerStore.fetch binding
+            let id = requestId.ToString("N")
+            let! _ = required<ReviewRequest> binding snapshot (requestPath taskId id)
+            let! content, oid =
+                LedgerStore.readAt binding snapshot (reviewDocumentPath taskId id documentPath)
+            match content, oid with
+            | Some body, Some blob ->
+                return snapshot.Commit,
+                    { Path = documentPath; BlobOid = blob; Content = body }
+            | _ -> return! Error(StaleEntityVersion "Review document does not exist.")
+        }
+
+    let putReviewDocument binding operationId taskId requestId actorId documentPath
+                          expectedBlobOid (content: string) =
+        if not (validTaskId taskId) || requestId = Guid.Empty || not (validAgent actorId)
+           || not (validReviewDocumentPath documentPath)
+           || isNull content || Encoding.UTF8.GetByteCount content > 512 * 1024 then
+            Error(InvalidBinding "Invalid review document path or content (maximum 512 KiB).")
+        else
+            let id = requestId.ToString("N")
+            let expected = if String.IsNullOrWhiteSpace expectedBlobOid then None else Some expectedBlobOid
+            LedgerStore.transact binding
+                (intent operationId actorId "PutReviewDocument"
+                    {| taskId = taskId; requestId = id; documentPath = documentPath
+                       expectedBlobOid = expectedBlobOid; contentSha256 = specDigest content |})
+                (fun snapshot -> result {
+                    let! request, _ =
+                        required<ReviewRequest> binding snapshot (requestPath taskId id)
+                    if request.Status = "Withdrawn" then
+                        return! Error(StaleEntityVersion "Cannot edit a withdrawn review.")
+                    // A review document is collaborative Git content. The owner,
+                    // claimed reviewer, and assigned reviewer can update it; no
+                    // per-finding ownership or resolution protocol is introduced.
+                    if actorId <> request.OwnerAgentId
+                       && actorId <> request.ClaimantId
+                       && actorId <> request.ReviewerId then
+                        return! Error(ReviewAccessDenied "Not associated with this review.")
+                    return [ { Path = reviewDocumentPath taskId id documentPath
+                               ExpectedBlobOid = expected; Content = content } ]
+                })
 
     let reviewerQueue binding reviewerId =
         if not (validAgent reviewerId) then Error(InvalidBinding "Invalid reviewer ID.")

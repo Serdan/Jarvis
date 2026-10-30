@@ -130,7 +130,6 @@ type LedgerEntityEffect =
       ReviewRevision: int option
       AcceptedReviewRevision: int option
       SpecBlobOid: string option
-      AcceptedHead: string option
       HeadCommit: string option
       ReviewRef: string option
       VerifiedIntegrationSequence: int64 option }
@@ -169,7 +168,7 @@ module LedgerStore =
     let private options = JsonSerializerOptions(PropertyNamingPolicy = JsonNamingPolicy.CamelCase, PropertyNameCaseInsensitive = true)
     let private oidPattern = Regex("^[0-9a-f]{40}([0-9a-f]{24})?$", RegexOptions.Compiled)
     let private recordPath = Regex("^records/[A-Za-z0-9_-]+(/[A-Za-z0-9_.-]+)*[.]json$", RegexOptions.Compiled)
-    let private ledgerPath = Regex("^(tasks/[A-Za-z0-9_-]+/(task[.]json|spec[.]html|attempts/[a-f0-9]{32}([.]json|/checkpoints/[0-9]+[.]json|/events/[0-9]+[.]json|/assignments/[0-9]+([.]json|[.]ack[.]json))|integrations/[a-f0-9]{32}[.]json|imports/[0-9]+[.]json|lifecycle/[0-9]+[.]json|approvals/non-source/[0-9]+[.]json|orphan-cleanups/[a-f0-9]{32}/r[1-9][0-9]*[.]json|reviews/[a-f0-9]{32}/(request[.]json|notification[.]json|revisions/[0-9]+[.]json|decisions/[0-9]+[.]json|events/[0-9]+[.]json))|agents/[A-Za-z0-9_-]+[.]json|records/[A-Za-z0-9_-]+(/[A-Za-z0-9_.-]+)*[.]json)$", RegexOptions.Compiled)
+    let private ledgerPath = Regex("^(tasks/[A-Za-z0-9_-]+/(task[.]json|spec[.]html|attempts/[a-f0-9]{32}([.]json|/checkpoints/[0-9]+[.]json|/events/[0-9]+[.]json|/assignments/[0-9]+([.]json|[.]ack[.]json))|integrations/[a-f0-9]{32}[.]json|imports/[0-9]+[.]json|lifecycle/[0-9]+[.]json|approvals/non-source/[0-9]+[.]json|orphan-cleanups/[a-f0-9]{32}/r[1-9][0-9]*[.]json|reviews/[a-f0-9]{32}/(request[.]json|notification[.]json|summary[.]md|findings/[a-z0-9][a-z0-9_-]{0,79}[.]md|revisions/[0-9]+[.]json|decisions/[0-9]+[.]json|events/[0-9]+[.]json))|agents/[A-Za-z0-9_-]+[.]json|records/[A-Za-z0-9_-]+(/[A-Za-z0-9_.-]+)*[.]json)$", RegexOptions.Compiled)
     let private remotePattern = Regex("^[A-Za-z0-9][A-Za-z0-9_.-]*$", RegexOptions.Compiled)
 
     type private GitOutput =
@@ -693,7 +692,6 @@ module LedgerStore =
               ReviewRevision = number "reviewRevision"
               AcceptedReviewRevision = number "acceptedReviewRevision"
               SpecBlobOid = str "specBlobOid"
-              AcceptedHead = str "acceptedHead"
               HeadCommit = str "headCommit"; ReviewRef = str "reviewRef"
               VerifiedIntegrationSequence = longNumber "verifiedSequence" }
         finally
@@ -1513,8 +1511,7 @@ module LedgerStore =
                                    not (ledgerPath.IsMatch change.Path) || change.Path.Contains("..")
                                    || isNull change.Content
                                    || encoding.GetByteCount(change.Content) >
-                                       (if change.Path.EndsWith("/spec.html", StringComparison.Ordinal)
-                                        then 512 * 1024 else 64 * 1024)
+                                       (if change.Path.EndsWith("/spec.html", StringComparison.Ordinal) || change.Path.EndsWith(".md", StringComparison.Ordinal) then 512 * 1024 else 64 * 1024)
                                    || (change.ExpectedBlobOid |> Option.exists (oidPattern.IsMatch >> not))) then
                                 Error(InvalidBinding "Invalid or duplicate entity paths in ledger transaction.")
                             else

@@ -451,6 +451,7 @@ module V2PendingIntentJournal =
         match record.CommandType, action with
         | "V2TaskWrite", Some "AcknowledgeFeedback" -> Some "AcknowledgeReviewFeedback"
         | "V2TaskWrite", Some action -> Some action
+        | "V2ReviewWrite", Some "PutDocument" -> Some "PutReviewDocument"
         | "V2ReviewWrite", Some "Submit" -> Some "SubmitForReview"
         | "V2ReviewWrite", Some "Update" -> Some "UpdateReviewRequest"
         | "V2ReviewWrite", Some "Claim" -> Some "ClaimReview"
@@ -561,6 +562,9 @@ module V2PendingIntentJournal =
                     common @ [ "ExpectedTaskVersion", "expectedTaskVersion"; "Reason", "reason" ]
                 | "V2TaskWrite", "AcknowledgeReviewFeedback" ->
                     owner @ [ "DecisionSequence", "decisionSequence" ]
+                | "V2ReviewWrite", "PutReviewDocument" ->
+                    review @ [ "ActorId", "actorId"; "DocumentPath", "documentPath"
+                               "Content", "content"; "ExpectedBlobOid", "expectedBlobOid" ]
                 | "V2ReviewWrite", "SubmitForReview" ->
                     owner @ [ "RequestId", "requestId"; "ExpectedVersion", "expectedVersion"
                               "Generation", "generation"; "SourceRef", "sourceRef"
@@ -919,6 +923,20 @@ module V2ReviewApi =
                     |> mapError
                     |> Result.map (fun (snapshot, request, revision) ->
                         box {| snapshotCommit = snapshot.Commit; request = request; revision = revision |}))
+            | "ListDocuments" ->
+                parseId "requestId" cmd.RequestId
+                |> Result.bind (fun reviewId ->
+                    ReviewWorkflow.ReviewWorkflow.listReviewDocuments binding cmd.TaskId reviewId
+                    |> mapError
+                    |> Result.map (fun (head, documents) ->
+                        box {| snapshotCommit = head; documents = documents |}))
+            | "ReadDocument" ->
+                parseId "requestId" cmd.RequestId
+                |> Result.bind (fun reviewId ->
+                    ReviewWorkflow.ReviewWorkflow.getReviewDocument binding cmd.TaskId reviewId cmd.DocumentPath
+                    |> mapError
+                    |> Result.map (fun (head, document) ->
+                        box {| snapshotCommit = head; document = document |}))
             | "DecisionEvidence" ->
                 parseId "requestId" cmd.RequestId
                 |> Result.bind (fun requestId ->
@@ -964,6 +982,12 @@ module V2ReviewApi =
                 let result =
                     V2PendingIntentJournal.executeLedgerWrite binding operationId "V2ReviewWrite" cmd (fun () ->
                         match cmd.Action with
+                        | "PutDocument" ->
+                            id () |> Result.bind (fun reviewId ->
+                                ReviewWorkflow.ReviewWorkflow.putReviewDocument binding operationId
+                                    cmd.TaskId reviewId cmd.ActorId cmd.DocumentPath
+                                    cmd.ExpectedBlobOid cmd.Content
+                                |> mapError)
                         | "Submit" ->
                             id ()
                             |> Result.mapError (fun e -> e)

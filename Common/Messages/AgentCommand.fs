@@ -160,7 +160,8 @@ type V2ReviewReadCommand =
       Action: string
       TaskId: string
       RequestId: string
-      ReviewerId: string }
+      ReviewerId: string
+      DocumentPath: string }
 
 type V2ReviewWriteCommand =
     { ProjectName: string
@@ -180,7 +181,10 @@ type V2ReviewWriteCommand =
       TestEvidence: string
       Inspected: bool
       Tested: bool
-      TestDetails: string }
+      TestDetails: string
+      DocumentPath: string
+      Content: string
+      ExpectedBlobOid: string }
 
 type GetProjectDetailsCommand = { ProjectName: string }
 
@@ -867,7 +871,7 @@ module AgentCommandInfo =
         | None -> invocation command
 
 module AgentProtocol =
-    let version = "3.39"
+    let version = "3.40"
     let defaultPatchFuzzyContextLines = 3
     let maxResponseBytes = 900 * 1024
     let maxImageBytes = 8 * 1024 * 1024

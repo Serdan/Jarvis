@@ -431,9 +431,9 @@ let ``command catalog matches AgentCommand union and MCP tools`` () =
         set [ "AgentInbox"; "GetAssignment"; "GetCheckpoint"; "InspectAttemptSource"; "TaskLifecycleHistory"; "GetNonSourceApproval"; "GetTaskSpecPage"; "DiffTaskSpec"; "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "AcknowledgeAssignment"; "ReissueAssignment"; "BeginAttempt"; "CheckpointAttempt"
               "BindReviewBase"; "BindAttemptSource"; "RebindAttemptSource"; "YieldAgent"; "ResumeAgent"; "CompleteAgentWork"
               "ParkAgent"; "ReissueQueuedAttempt"; "RecoverAgentAssignment"; "AcknowledgeReviewFeedback"; "ParkAttempt"; "BlockAttempt"; "ResumeAttempt"; "AbandonAttempt"; "CancelTask"; "CancelOpenTask"; "TransferOwner"; "CloseNonSourceTask"; "ReopenTask"; "ReviseTaskSpecPinned"; "ImportTaskSpec"; "AdoptTaskSpec"; "ExportTaskSpec"
-              "ReviewTask"; "ReviewDetails"; "ReviewerInbox"; "ReviewDecisionEvidence"; "ReviewClaimHistory"; "AwaitingReviewReassignment"; "InspectOrphanReviewRefs"
+              "ReviewTask"; "ReviewDetails"; "ReviewerInbox"; "ReviewDecisionEvidence"; "ReviewClaimHistory"; "AwaitingReviewReassignment"; "InspectOrphanReviewRefs"; "ListReviewDocuments"; "ReadReviewDocument"
               "SubmitReview"; "ReplaceReview"; "SubmitReviewWithEvidence"; "ReplaceReviewWithEvidence"; "ClaimReview"; "DecideReview"; "DecideReviewWithEvidence"
-              "WithdrawReview"; "ReassignReview"; "ReleaseReviewClaim"; "ReassignReviewWithReason"; "ReserveOrphanReviewRef"; "DeleteReservedOrphanReviewRef"; "FinalizeReview"
+              "WithdrawReview"; "ReassignReview"; "ReleaseReviewClaim"; "ReassignReviewWithReason"; "ReserveOrphanReviewRef"; "DeleteReservedOrphanReviewRef"; "FinalizeReview"; "PutReviewDocument"
               "LedgerHealth"; "GetOperationStatus"; "PendingOperations"; "ReconcilePendingOperations"; "AcknowledgePendingOperation"; "InitializeLedger"; "BindExistingLedger"; "RebindLedgerRemote"
               "InspectIntegration"; "PlanIntegration"; "MarkIntegrationPendingPush"; "RecordIntegration"; "CloseIntegratedTask" ]
     // Retired wire cases are deleted; public CreateTask/AssignTask are canonical ledger tools.
@@ -456,7 +456,7 @@ let ``client-backed MCP tools expose an optional per-command deviceId`` () =
         |> Array.filter (fun methodInfo ->
             methodInfo.GetParameters()
             |> Array.exists (fun parameter -> parameter.ParameterType = typeof<ClientService>))
-    clientMethods.Length |> shouldEqual (AgentProtocol.commandDefinitions.Length - 1 + 65) // 46 MCP V2 aliases / 8 wire operations
+    clientMethods.Length |> shouldEqual (AgentProtocol.commandDefinitions.Length - 1 + 68) // public orchestration aliases / 8 wire operations
     for methodInfo in clientMethods do
         let deviceParam = methodInfo.GetParameters() |> Array.tryFind (fun parameter -> parameter.Name = "deviceId")
         match deviceParam with
@@ -680,10 +680,10 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
               for name in [ "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "AcknowledgeAssignment"; "ReissueAssignment"; "BeginAttempt"; "CheckpointAttempt"
                             "BindReviewBase"; "BindAttemptSource"; "RebindAttemptSource"; "YieldAgent"; "ResumeAgent"; "CompleteAgentWork";
                             "ParkAgent"; "ReissueQueuedAttempt"; "RecoverAgentAssignment"; "AcknowledgeReviewFeedback"; "ParkAttempt"; "BlockAttempt"; "ResumeAttempt"; "AbandonAttempt"; "CancelTask"; "CancelOpenTask"; "TransferOwner"; "CloseNonSourceTask"; "ReopenTask"; "ReviseTaskSpecPinned"; "ImportTaskSpec"; "AdoptTaskSpec"; "ExportTaskSpec" ] -> name, taskWrite
-              for name in [ "ReviewTask"; "ReviewDetails"; "ReviewerInbox"; "ReviewDecisionEvidence"; "ReviewClaimHistory"; "AwaitingReviewReassignment"; "InspectOrphanReviewRefs" ] ->
+              for name in [ "ReviewTask"; "ReviewDetails"; "ReviewerInbox"; "ReviewDecisionEvidence"; "ReviewClaimHistory"; "AwaitingReviewReassignment"; "InspectOrphanReviewRefs"; "ListReviewDocuments"; "ReadReviewDocument" ] ->
                   name, v2Read
               for name in [ "SubmitReview"; "ReplaceReview"; "SubmitReviewWithEvidence"; "ReplaceReviewWithEvidence"; "ClaimReview"; "DecideReview"; "DecideReviewWithEvidence"
-                            "WithdrawReview"; "ReassignReview"; "ReleaseReviewClaim"; "ReassignReviewWithReason"; "ReserveOrphanReviewRef"; "DeleteReservedOrphanReviewRef"; "FinalizeReview" ] ->
+                            "WithdrawReview"; "ReassignReview"; "ReleaseReviewClaim"; "ReassignReviewWithReason"; "ReserveOrphanReviewRef"; "DeleteReservedOrphanReviewRef"; "FinalizeReview"; "PutReviewDocument" ] ->
                   name, v2Write ]
         aliases |> List.fold (fun map (key, value) -> Map.add key value map) original
 

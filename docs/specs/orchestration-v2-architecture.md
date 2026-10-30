@@ -155,11 +155,33 @@ A review's base is **the relevant unintegrated work for that review**, not a per
 
 One actionable review request per task at a time is sufficient. Until claimed, the owner can replace it; after claim, the reviewer sees the original stable branch. Review metadata and decisions live in the orphan ledger; code and review branches live in ordinary source history. If publishing a review branch or recording its metadata fails, report the problem and let the agent reconcile it. No cross-ref transaction coordinator is needed.
 
+### Review files and findings
+
+**A review is a task-associated, stable Git branch with a defined review base.** Its essential identity is the task, review ref, base commit and decision. A review ref is a snapshot of source code, not the place where reviewers write findings. Git owns commit history and ancestry; the orphan ledger owns the review decision and notes. Do not invent further commit identifiers or another integration state machine merely to represent information Git already knows. The attempt does not duplicate the accepted review head, and a review revision does not duplicate its already-pinned source OID. Remaining historical provenance and integration fields in the current schema are bookkeeping for the existing workflow, not additional reviewer responsibilities.
+
+Keep extensive review prose in **separate Markdown files** on `jarvis-orchestration`, not in bounded JSON feedback strings or on the reviewed source branch. Files are ordinary Git blobs, so they can be individually diffed and edited, and their history is the orphan branch's history. For example:
+
+```text
+tasks/320/reviews/<review-id>/
+  request.json                   # existing workflow status
+  revisions/1.json               # review ref and diff base
+  summary.md                     # overall assessment (optional)
+  findings/
+    allocation-in-hot-path.md
+    missing-regression-test.md
+```
+
+Each finding is a Markdown document with a descriptive filename; the body can contain reproduction steps, code blocks, benchmarks, suggested changes and resolution notes. **No per-finding status machine, embedded finding array, or duplication in `request.json`.** The single review verdict is separate from individual findings. A reviewer can create/edit these notes while reviewing; the implementing agent can read or update the same files to document resolution. Do not tie document writes to the agent's Working slot or require a new review submission for a prose update.
+
+Expose minimal review-document commands to list filenames, read one file, and write one file on the orphan ledger. Allow `summary.md` and one-level `findings/<slug>.md`; reject arbitrary paths and traversal. Use the existing ledger's operation-id replay behavior and optional Git blob precondition for edits; creating a new file needs no existing blob. One ledger write commits one document rather than forcing extensive findings through tool parameters, verdict messages or task descriptions. A review decision need not bundle the files again. Git history provides old versions; the current branch provides current content.
+
+The reviewed diff is conceptually `git diff <base> <review-ref>`. The base is frozen for that review; the published ref is frozen after claim. Normal Git merges and rebases after review do not retroactively change its stated scope. A subsequent review starts from the remaining unmerged work, not automatically the same task-wide base.
+
 ## 5. Integration, source context and task lifecycle
 
 **Integration is per reviewed slice, not per completed task.** Accepted commits can be merged while the task is InProgress and the agent continues working. Acceptance does not itself merge code, and integration does not itself complete or reassign the agent.
 
-Jarvis should record enough to answer: which review was approved, which branch/commit was reviewed, and which target commit was produced by the merge. It must verify or observe that the actual remote target contains the integrated work before claiming it was merged. This is bookkeeping after ordinary Git operations, not a requirement to use a special source-push protocol or exact-SHA fast-forward. Remove the current `PlanIntegration`/`RecordIntegration` restrictions that require a finalized task, one fixed cumulative review base or a target SHA identical to the approved review head. Keep the simplest operation(s) necessary to record each integration and avoid recording it twice.
+Jarvis should record enough to answer: which review was approved and which source branch was integrated. Git can identify the reviewed commit and resulting merge from the refs/history. It must verify or observe that the actual remote target contains the integrated work before claiming it was merged. This is bookkeeping after ordinary Git operations, not a requirement to use a special source-push protocol or exact-SHA fast-forward. Remove the current `PlanIntegration`/`RecordIntegration` restrictions that require a finalized task, one fixed cumulative review base or a target SHA identical to the approved review head. Keep the simplest operation(s) necessary to record each integration and avoid recording it twice.
 
 The agent's working branch and worktree are **context, not authorization**. An agent may rebase, rename or reuse its branch normally. The orchestrator may update the recorded source branch/worktree when the owner is Ready, without artificially resuming it to Working and yielding again. An implementation attempt, task owner, checkpoints and existing review history persist across such changes. No new branch-rotation/handoff protocol is needed; relax the existing source-binding restrictions or replace them with ordinary editable context. Claimed review branches are unaffected.
 

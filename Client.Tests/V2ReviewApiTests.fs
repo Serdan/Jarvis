@@ -19,7 +19,7 @@ let disabledV2ReadAndWriteDoNotTouchV1Tasks () =
               Action = "ReviewerQueue"
               TaskId = ""
               RequestId = ""
-              ReviewerId = "Reviewer" }
+              ReviewerId = "Reviewer"; DocumentPath = "" }
         match Client.V2ReviewApi.V2ReviewApi.read query context with
         | Error(Client.ValidationError message) ->
             Assert.That(message, Does.Contain("V2 ledger disabled"))
@@ -38,7 +38,7 @@ let disabledV2ReadAndWriteDoNotTouchV1Tasks () =
               HeadOid = ""
               Summary = ""
               Verdict = ""
-              Feedback = ""; TestEvidence = ""; Inspected = false; Tested = false; TestDetails = "" }
+              Feedback = ""; TestEvidence = ""; Inspected = false; Tested = false; TestDetails = ""; DocumentPath = ""; Content = ""; ExpectedBlobOid = "" }
         match Client.V2ReviewApi.V2ReviewApi.write mutation context with
         | Error(Client.ValidationError message) ->
             Assert.That(message, Does.Contain("V2 ledger disabled"))
@@ -65,7 +65,7 @@ let v2ReviewMutationsNeedGitApprovalWhileReadsDoNot () =
     Client.PermissionPolicy.clearGrants ()
     let read = V2ReviewReadCommand
                     { ProjectName = "Project1"; Action = "ReviewerQueue"
-                      TaskId = ""; RequestId = ""; ReviewerId = "Reviewer" }
+                      TaskId = ""; RequestId = ""; ReviewerId = "Reviewer"; DocumentPath = "" }
     match Client.PermissionPolicy.evaluate read with
     | Ok () -> ()
     | other -> Assert.Fail(sprintf "Expected read-only V2 access, got %A" other)
@@ -84,7 +84,7 @@ let v2ReviewMutationsNeedGitApprovalWhileReadsDoNot () =
               HeadOid = ""
               Summary = ""
               Verdict = ""
-              Feedback = ""; TestEvidence = ""; Inspected = false; Tested = false; TestDetails = "" }
+              Feedback = ""; TestEvidence = ""; Inspected = false; Tested = false; TestDetails = ""; DocumentPath = ""; Content = ""; ExpectedBlobOid = "" }
     match Client.PermissionPolicy.evaluate write with
     | Error(Client.ConfirmationRequired request) ->
         Assert.That(request.Permissions, Does.Contain(VersionControlWrite))

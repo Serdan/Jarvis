@@ -37,7 +37,8 @@ module private V2ReviewCommands =
               Action = action
               TaskId = taskId
               RequestId = requestId
-              ReviewerId = reviewerId }
+              ReviewerId = reviewerId
+              DocumentPath = "" }
 
     let write projectName action operationId taskId requestId actorId expectedVersion =
         { ProjectName = projectName
@@ -57,7 +58,10 @@ module private V2ReviewCommands =
           TestEvidence = ""
           Inspected = false
           Tested = false
-          TestDetails = "" }
+          TestDetails = ""
+          DocumentPath = ""
+          Content = ""
+          ExpectedBlobOid = "" }
 
 module private V2TaskCommands =
     let write projectName action operationId taskId actorId =
@@ -214,11 +218,11 @@ module McpToolHelpers =
           "RecordIntegration"; "CloseIntegratedTask" ]
 
     let private v2ReviewMethods =
-        [ "ReviewTask"; "ReviewDetails"; "ReviewerInbox"; "ReviewDecisionEvidence"; "ReviewClaimHistory"; "AwaitingReviewReassignment"; "InspectOrphanReviewRefs" ]
+        [ "ReviewTask"; "ReviewDetails"; "ReviewerInbox"; "ReviewDecisionEvidence"; "ReviewClaimHistory"; "AwaitingReviewReassignment"; "InspectOrphanReviewRefs"; "ListReviewDocuments"; "ReadReviewDocument" ]
 
     let private v2ReviewWriteMethods =
         [ "SubmitReview"; "ReplaceReview"; "SubmitReviewWithEvidence"; "ReplaceReviewWithEvidence"; "ClaimReview"; "DecideReview"; "DecideReviewWithEvidence"
-          "WithdrawReview"; "ReassignReview"; "ReleaseReviewClaim"; "ReassignReviewWithReason"; "ReserveOrphanReviewRef"; "DeleteReservedOrphanReviewRef"; "FinalizeReview" ]
+          "WithdrawReview"; "ReassignReview"; "ReleaseReviewClaim"; "ReassignReviewWithReason"; "ReserveOrphanReviewRef"; "DeleteReservedOrphanReviewRef"; "FinalizeReview"; "PutReviewDocument" ]
 
     let private v2AliasCapabilities =
         let fromWire wireName publicName =
@@ -1377,6 +1381,25 @@ type JarvisMcpTools =
     [<McpServerTool(Title = "review details", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read the pinned source revision and current claim state of a V2 review request. Requires explicit V2 client opt-in.")>]
         static member ReviewDetails(projectName: string, taskId: string, requestId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
             McpToolHelpers.send client http (V2ReviewCommands.query projectName "GetReview" taskId requestId "")
+
+    [<McpServerTool(Title = "list review documents", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("List Markdown summary and individual findings files for a review, with Git blob IDs. No finding content is embedded in request metadata.")>]
+        static member ListReviewDocuments(projectName: string, taskId: string, requestId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+            McpToolHelpers.send client http (V2ReviewCommands.query projectName "ListDocuments" taskId requestId "")
+
+    [<McpServerTool(Title = "read review document", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read summary.md or a named findings/<slug>.md from the orphan Git ledger, including its blob ID for optional edit preconditions.")>]
+        static member ReadReviewDocument(projectName: string, taskId: string, requestId: string, documentPath: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+            McpToolHelpers.send client http
+                (V2ReviewReadCommand
+                    { ProjectName = projectName; Action = "ReadDocument"; TaskId = taskId
+                      RequestId = requestId; ReviewerId = ""; DocumentPath = documentPath })
+
+    [<McpServerTool(Title = "write review document", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Commit a Markdown review summary or individual finding to the orphan Git ledger. Supports up to 512 KiB per file. Use empty expectedBlobOid to create, or the read blob ID to replace; review status is unaffected.")>]
+        static member PutReviewDocument(projectName: string, taskId: string, requestId: string, actorId: string, documentPath: string, content: string, expectedBlobOid: string, operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+            let cmd = V2ReviewCommands.write projectName "PutDocument" operationId taskId requestId actorId 0
+            McpToolHelpers.send client http
+                (V2ReviewWriteCommand
+                    { cmd with DocumentPath = documentPath; Content = content
+                               ExpectedBlobOid = expectedBlobOid })
 
     [<McpServerTool(Title = "review decision evidence", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read the immutable evidence for a decided V2 review and its exact frozen revision, distinguishing a review verdict from separately reported inspection and test execution.")>]
         static member ReviewDecisionEvidence(projectName: string, taskId: string, requestId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =

@@ -1084,7 +1084,7 @@ type JarvisMcpTools =
         McpToolHelpers.send client http
             (V2IntegrationReadCommand { ProjectName = projectName; TaskId = taskId; ActionId = actionId })
 
-    [<McpServerTool(Title = "plan source integration", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Pin the accepted review commit, source ref and expected remote target HEAD for a strictly verified fast-forward integration. No implicit merge or push.")>]
+    [<McpServerTool(Title = "plan source integration", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Record the accepted review and expected target head before an ordinary Git merge. Supports unfinished tasks and merge commits. Does not merge or push.")>]
     static member PlanIntegration(projectName: string, taskId: string, actionId: string, acceptedReviewId: string, expectedAttemptVersion: int, targetRef: string, expectedTargetHead: string, operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http
             (V2IntegrationWriteCommand
@@ -1101,7 +1101,7 @@ type JarvisMcpTools =
                   TaskId = taskId; ActionId = actionId; RequestId = ""
                   ExpectedVersion = expectedIntegrationVersion; TargetRef = ""; ExpectedTargetHead = "" })
 
-    [<McpServerTool(Title = "verify and record integration", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Verify remote target equals the exact accepted source commit, then atomically record integration evidence and mark task Integrated. Never pushes source code.")>]
+    [<McpServerTool(Title = "verify and record integration", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Verify the remote target contains the accepted review and prior target, then record the merge result. An unfinished task remains InProgress. Never pushes source code.")>]
     static member RecordIntegration(projectName: string, taskId: string, actionId: string, expectedIntegrationVersion: int, operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http
             (V2IntegrationWriteCommand
@@ -1185,12 +1185,12 @@ type JarvisMcpTools =
         let cmd = V2TaskCommands.write projectName "BeginAttempt" operationId taskId ownerId
         McpToolHelpers.send client http (V2TaskWriteCommand { cmd with ExpectedVersion = expectedAttemptVersion; AssignmentGeneration = assignmentGeneration })
 
-    [<McpServerTool(Title = "bind review baseline", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Pin the cumulative source review baseline and target branch for a Working attempt. Requires an explicitly bound V2 ledger; The orphan Git ledger is the sole task authority.")>]
+    [<McpServerTool(Title = "bind review baseline", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Record the initial source target for a Working attempt. Each review computes its own merge-base against current target history; no task-lifetime cumulative review baseline.")>]
     static member BindReviewBase(projectName: string, taskId: string, ownerId: string, expectedAttemptVersion: int, assignmentGeneration: int, baseOid: string, targetRef: string, operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         let cmd = V2TaskCommands.write projectName "BindReviewBase" operationId taskId ownerId
         McpToolHelpers.send client http (V2TaskWriteCommand { cmd with ExpectedVersion = expectedAttemptVersion; AssignmentGeneration = assignmentGeneration; BaseOid = baseOid; TargetRef = targetRef })
 
-    [<McpServerTool(Title = "bind attempt source", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Bind an exact Working assignment generation to the approved source repository, source branch, cumulative base and target ref. Detached or uncommitted selected worktrees require explicit consent. Checkout path never becomes agent ownership.")>]
+    [<McpServerTool(Title = "bind attempt source", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Record source repository, initial target and branch context for a Working attempt. Working branches remain normal Git branches; source context is not task ownership.")>]
     static member BindAttemptSource(projectName: string, taskId: string, ownerId: string, expectedAttemptVersion: int, assignmentGeneration: int, sourceRef: string, baseOid: string, targetRef: string, allowDetached: bool, allowUncommitted: bool, operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         let cmd = V2TaskCommands.write projectName "BindAttemptSource" operationId taskId ownerId
         McpToolHelpers.send client http
@@ -1199,7 +1199,7 @@ type JarvisMcpTools =
                            SourceRef = sourceRef; BaseOid = baseOid; TargetRef = targetRef
                            AllowDetached = allowDetached; AllowUncommitted = allowUncommitted })
 
-    [<McpServerTool(Title = "rebind attempt source", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Explicitly rebind the source branch of a pinned Working attempt at an exact version and assignment generation. Frozen review revisions retain their original provenance; ownership remains unchanged.")>]
+    [<McpServerTool(Title = "rebind attempt source", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Update working-branch context while an agent is Working or Ready, without interrupting ownership or claimed review snapshots.")>]
     static member RebindAttemptSource(projectName: string, taskId: string, ownerId: string, expectedAttemptVersion: int, assignmentGeneration: int, sourceRef: string, allowDetached: bool, allowUncommitted: bool, operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         let cmd = V2TaskCommands.write projectName "RebindAttemptSource" operationId taskId ownerId
         McpToolHelpers.send client http
@@ -1387,7 +1387,7 @@ type JarvisMcpTools =
         static member ReviewerInbox(projectName: string, reviewerId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
             McpToolHelpers.send client http (V2ReviewCommands.query projectName "ReviewerQueue" "" "" reviewerId)
 
-    [<McpServerTool(Title = "Submit V2 review", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Publish an immutable source ref and submit cumulative source changes without stopping the owner. Requires explicit V2 client opt-in.")>]
+    [<McpServerTool(Title = "Submit V2 review", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Publish a stable review branch at the submitted commit; the agent keeps working. Each review covers unmerged changes since its Git merge-base.")>]
         static member SubmitReview(projectName: string, taskId: string, ownerId: string, expectedAttemptVersion: int, assignmentGeneration: int, requestId: string, sourceRef: string, headOid: string, summary: string, operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
             let cmd = V2ReviewCommands.write projectName "Submit" operationId taskId requestId ownerId expectedAttemptVersion
             McpToolHelpers.send client http (V2ReviewWriteCommand { cmd with Generation = assignmentGeneration; SourceRef = sourceRef; HeadOid = headOid; Summary = summary })
@@ -1472,7 +1472,7 @@ type JarvisMcpTools =
             let cmd = V2ReviewCommands.write projectName "DeleteReservedOrphan" "" taskId requestId "Orchestrator" 0
             McpToolHelpers.send client http (V2ReviewWriteCommand { cmd with Generation = revision; HeadOid = expectedSourceOid })
 
-    [<McpServerTool(Title = "Finalize V2 implementation", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Finalize the latest accepted cumulative review without merging or pushing source code. Requires explicit V2 client opt-in.")>]
+    [<McpServerTool(Title = "Finalize V2 implementation", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Finalize a completed implementation after its latest accepted review. Incremental review integrations can happen before this step.")>]
         static member FinalizeReview(projectName: string, taskId: string, requestId: string, ownerId: string, expectedAttemptVersion: int, operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
             let cmd = V2ReviewCommands.write projectName "Finalize" operationId taskId requestId ownerId expectedAttemptVersion
             McpToolHelpers.send client http (V2ReviewWriteCommand cmd)

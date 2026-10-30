@@ -1387,7 +1387,7 @@ module ReviewWorkflow =
 
     // Source repository identity is an endpoint fingerprint independent from
     // the ledger UUID. An agent's checkout path never enters the owner key.
-    let private verifyPinnedSource binding (attempt: ReviewAttempt) sourceRef =
+    let private verifySourceRepository binding (attempt: ReviewAttempt) =
         result {
             let! source = LedgerStore.sourceRepositoryIdentity binding
             if String.IsNullOrWhiteSpace attempt.SourceRepositoryId
@@ -1395,9 +1395,6 @@ module ReviewWorkflow =
                || attempt.SourceRemote <> source.FetchUrl
                || attempt.SourcePushRemote <> source.PushUrl then
                 return! Error(SourceUnavailable "Source repository differs from the attempt's approved identity.")
-            if not (String.IsNullOrWhiteSpace attempt.SourceRef)
-               && attempt.SourceRef <> sourceRef then
-                return! Error(SourceUnavailable "Source branch differs from pinned attempt binding.")
             return source
         }
 
@@ -1447,9 +1444,8 @@ module ReviewWorkflow =
                                                    SourceRef = sourceRef } ]
                     })
 
-    // Renaming or recreating a source branch is an explicit versioned mutation.
-    // Immutable review revisions retain their original source refs and OIDs.
-    // Neither a worktree rename nor a missing local checkout changes ownership.
+    // Source refs are editable work context, not ownership or authorization.
+    // Claimed review refs preserve their own original commit independently.
     let rebindAttemptSource binding operationId taskId ownerId expectedVersion generation
                             sourceRef allowDetached allowUncommitted =
         if not (validTaskId taskId) || not (validAgent ownerId)
@@ -1466,16 +1462,19 @@ module ReviewWorkflow =
                 (fun snapshot ->
                     result {
                         let! _, _, attempt, attemptOid = getAttempt binding snapshot taskId
+                        let! agent, _ = required<ReviewAgent> binding snapshot (agentPath ownerId)
                         if attempt.OwnerAgentId <> ownerId
-                           || attempt.Phase <> "Working"
                            || attempt.Version <> expectedVersion
                            || attempt.AssignmentGeneration <> generation
+                           || agent.FocusAttemptId <> attempt.AttemptId
+                           || not ((attempt.Phase = "Working" && agent.State = "Working"
+                                    && agent.ActiveAttemptId = attempt.AttemptId)
+                                   || (attempt.Phase = "Paused" && agent.State = "Ready"
+                                       && String.IsNullOrWhiteSpace agent.ActiveAttemptId))
                            || String.IsNullOrWhiteSpace attempt.SourceRepositoryId
-                           || String.IsNullOrWhiteSpace attempt.BaseCommit
-                           || String.IsNullOrWhiteSpace attempt.TargetRef
-                           || String.IsNullOrWhiteSpace attempt.SourceRef then
-                            return! Error(StaleEntityVersion "Only the owning Working attempt can rebind its pinned source.")
-                        let! _ = verifyPinnedSource binding attempt attempt.SourceRef
+                           || String.IsNullOrWhiteSpace attempt.TargetRef then
+                            return! Error(StaleEntityVersion "Source context can be updated by the owner or orchestrator while Working or Ready.")
+                        let! _ = verifySourceRepository binding attempt
                         let! observation = LedgerStore.inspectSourceWorktree binding sourceRef
                         if observation.State = "SourceUnavailable" then
                             return! Error(SourceUnavailable "Replacement source branch does not exist.")
@@ -1486,14 +1485,12 @@ module ReviewWorkflow =
                         if observation.SelectedWorktreeDirty && not allowUncommitted then
                             return! Error(SourceUnavailable "Uncommitted checkout requires explicit consent.")
                         do! LedgerStore.verifySourceCommit binding sourceRef observation.SourceHead
-                        do! LedgerStore.verifySourceAncestry binding attempt.BaseCommit observation.SourceHead
                         return [ change (attemptPath taskId attempt.AttemptId) (Some attemptOid)
                                     { attempt with Version = attempt.Version + 1; SourceRef = sourceRef } ]
                     })
 
-    // Legacy experimental baseline mutation retains independent remote identity
-    // without implicitly guessing the working branch. New clients bind both.
-    // The task's review base remains fixed across rejections and resubmissions.
+    // Initial source information for the attempt. Each individual review
+    // computes its own merge-base against the current target.
     let bindReviewBase binding operationId taskId ownerId expectedVersion generation baseOid targetRef =
         if not (validTaskId taskId) || not (validAgent ownerId) || not (validBranch targetRef) then
             Error(InvalidBinding "Invalid source baseline binding.")
@@ -1526,7 +1523,7 @@ module ReviewWorkflow =
             if String.IsNullOrWhiteSpace attempt.SourceRepositoryId then
                 return snapshot.Commit, attempt, None
             else
-                let! _ = verifyPinnedSource binding attempt attempt.SourceRef
+                let! _ = verifySourceRepository binding attempt
                 if String.IsNullOrWhiteSpace attempt.SourceRef then
                     return snapshot.Commit, attempt, None
                 else
@@ -1569,9 +1566,10 @@ module ReviewWorkflow =
                    || preAttempt.Phase <> "Working" || preAttempt.AssignmentGeneration <> generation
                    || not (String.IsNullOrEmpty preAttempt.ActiveReviewRequestId)
                    || String.IsNullOrEmpty preAttempt.BaseCommit then
-                    return! Error(StaleEntityVersion "Working attempt or review base is no longer available.")
-                let! _ = verifyPinnedSource binding preAttempt sourceRef
-                let! published = preparedSource binding taskId requestIdText 1 preAttempt.BaseCommit headOid sourceRef
+                    return! Error(StaleEntityVersion "Working attempt or source target is no longer available.")
+                let! _ = verifySourceRepository binding preAttempt
+                let! reviewBase = LedgerStore.reviewMergeBase binding preAttempt.TargetRef headOid
+                let! published = preparedSource binding taskId requestIdText 1 reviewBase headOid sourceRef
                 return!
                     LedgerStore.transact binding action (fun current ->
                         result {
@@ -1586,7 +1584,7 @@ module ReviewWorkflow =
                                || existing.IsSome
                                || attempt.BaseCommit <> preAttempt.BaseCommit then
                                 return! Error(StaleEntityVersion "Review submission conflicts with task state.")
-                            let! _ = verifyPinnedSource binding attempt sourceRef
+                            let! _ = verifySourceRepository binding attempt
                             do! LedgerStore.fetchReviewRef binding published headOid
                             let! retired = read<OrphanReviewReservation> binding current
                                                 (orphanReservationPath taskId requestIdText 1)
@@ -1609,7 +1607,7 @@ module ReviewWorkflow =
                                   EvidenceStatus = evidenceStatus }
                             let revision =
                                 { RequestId = requestIdText; Revision = 1; TaskId = taskId
-                                  AttemptId = attempt.AttemptId; BaseCommit = attempt.BaseCommit
+                                  AttemptId = attempt.AttemptId; BaseCommit = reviewBase
                                   HeadCommit = headOid; SourceRef = sourceRef; TargetRef = attempt.TargetRef
                                   ReviewRef = published; Summary = summary
                                   CreatedSequence = current.Header.NextSequence
@@ -1663,11 +1661,12 @@ module ReviewWorkflow =
                    || attempt.ActiveReviewRequestId <> id
                    || String.IsNullOrWhiteSpace attempt.BaseCommit then
                     return! Error(ReviewVersionConflict "Review is not the current editable request.")
-                let! _ = verifyPinnedSource binding attempt sourceRef
+                let! _ = verifySourceRepository binding attempt
+                let! reviewBase = LedgerStore.reviewMergeBase binding attempt.TargetRef headOid
                 // Source publication may precede a losing claim; it never mutates an older ref.
                 let nextNumber = expectedRequestVersion + 1
                 let! published =
-                    preparedSource binding taskId id nextNumber attempt.BaseCommit headOid sourceRef
+                    preparedSource binding taskId id nextNumber reviewBase headOid sourceRef
                 return!
                     LedgerStore.transact binding action (fun current ->
                         result {
@@ -1684,7 +1683,7 @@ module ReviewWorkflow =
                                || request.OwnerAgentId <> ownerId || request.Status <> "Unclaimed"
                                || liveAttempt.BaseCommit <> attempt.BaseCommit then
                                 return! Error(StaleEntityVersion "Review is no longer an editable request.")
-                            let! _ = verifyPinnedSource binding liveAttempt sourceRef
+                            let! _ = verifySourceRepository binding liveAttempt
                             do! LedgerStore.fetchReviewRef binding published headOid
                             let! retired = read<OrphanReviewReservation> binding current
                                                 (orphanReservationPath taskId id nextNumber)
@@ -1701,7 +1700,7 @@ module ReviewWorkflow =
                                   EvidenceStatus = evidenceStatus }
                             let revision =
                                 { RequestId = id; Revision = nextNumber; TaskId = taskId
-                                  AttemptId = liveAttempt.AttemptId; BaseCommit = liveAttempt.BaseCommit
+                                  AttemptId = liveAttempt.AttemptId; BaseCommit = reviewBase
                                   HeadCommit = headOid; SourceRef = sourceRef; TargetRef = liveAttempt.TargetRef
                                   ReviewRef = published; Summary = summary
                                   CreatedSequence = current.Header.NextSequence
@@ -1880,7 +1879,7 @@ module ReviewWorkflow =
                             return! Error(ReviewVersionConflict "Review was replaced, claimed or closed.")
                         let! revision, _ =
                             required<ReviewRevision> binding snapshot (revisionPath taskId id expectedRevision)
-                        let! sourceIdentity = verifyPinnedSource binding attempt attempt.SourceRef
+                        let! sourceIdentity = verifySourceRepository binding attempt
                         if revision.SourceRepositoryId <> sourceIdentity.RepositoryId
                            || revision.SourceRemote <> sourceIdentity.FetchUrl
                            || revision.SourcePushRemote <> sourceIdentity.PushUrl then
@@ -1925,15 +1924,13 @@ module ReviewWorkflow =
                         let! revision, _ =
                             required<ReviewRevision> binding snapshot
                                 (revisionPath taskId id request.ClaimedRevision)
-                        let! sourceIdentity = verifyPinnedSource binding attempt attempt.SourceRef
+                        let! sourceIdentity = verifySourceRepository binding attempt
                         if revision.SourceRepositoryId <> sourceIdentity.RepositoryId
                            || revision.SourceRemote <> sourceIdentity.FetchUrl
                            || revision.SourcePushRemote <> sourceIdentity.PushUrl then
                             return! Error(SourceUnavailable "Review source identity does not match the attempt.")
                         do! LedgerStore.fetchReviewRef binding revision.ReviewRef revision.HeadCommit
                         do! LedgerStore.verifyReviewDiff binding revision.BaseCommit revision.HeadCommit
-                        if revision.BaseCommit <> attempt.BaseCommit then
-                            return! Error(StaleEntityVersion "Reviewed revision does not cover the pinned task base.")
                         let requeue = verdict = RequestChanges && attempt.Phase = "Finished"
                         let nextAttempt =
                             { attempt with Version = attempt.Version + 1
@@ -2197,28 +2194,38 @@ module ReviewWorkflow =
                         let! revision, _ =
                             required<ReviewRevision> binding snapshot
                                 (revisionPath taskId id request.CurrentRevision)
-                        if revision.BaseCommit <> attempt.BaseCommit || revision.HeadCommit <> attempt.AcceptedHead then
-                            return! Error(LedgerIntegrityError "Finalization does not match approved cumulative patch.")
-                        let! sourceIdentity = verifyPinnedSource binding attempt attempt.SourceRef
+                        if revision.HeadCommit <> attempt.AcceptedHead then
+                            return! Error(LedgerIntegrityError "Finalization does not match the accepted review.")
+                        let! sourceIdentity = verifySourceRepository binding attempt
                         if revision.SourceRepositoryId <> sourceIdentity.RepositoryId
                            || revision.SourceRemote <> sourceIdentity.FetchUrl
                            || revision.SourcePushRemote <> sourceIdentity.PushUrl then
                             return! Error(SourceUnavailable "Review source identity does not match the attempt.")
                         do! LedgerStore.fetchReviewRef binding revision.ReviewRef revision.HeadCommit
-                        // Finalization is a task/review operation, never an agent-state change.
-                        // The owner may already be Working on its next assignment.
+                        // Individual reviews may already have been merged before
+                        // the agent completed its task. Finalization should not
+                        // require integrating the same source a second time.
+                        let! integratedReview =
+                            if String.IsNullOrWhiteSpace attempt.IntegrationActionId then
+                                Ok false
+                            else result {
+                                let! action, _ = required<ReviewIntegration> binding snapshot (integrationPath taskId attempt.IntegrationActionId)
+                                return action.Status = "Recorded"
+                                       && action.ReviewRequestId = id
+                                       && action.ReviewRevision = request.CurrentRevision
+                            }
+                        // Finalization is task bookkeeping, not an agent-state change.
                         return
                             [ change (taskPath taskId) (Some taskOid)
-                                { task with Version = task.Version + 1; Lifecycle = "Implemented" }
+                                { task with Version = task.Version + 1
+                                            Lifecycle = if integratedReview then "Integrated" else "Implemented" }
                               change (attemptPath taskId attempt.AttemptId) (Some attemptOid)
                                 { attempt with Version = attempt.Version + 1; Phase = "Accepted" } ]
                     })
 
 
-    // Integration only handles the strictly provable fast-forward case. The
-    // observed remote head must equal the pinned approved review commit.
-    // Rewritten commits, merge commits and cherry-pick equivalence require a
-    // separately designed proof workflow; never assume equivalence from refs.
+    // Integrate reviewed slices with ordinary Git. Each accepted review can be
+    // merged independently while the implementing agent continues the task.
     let planIntegration binding operationId taskId actionId requestId expectedAttemptVersion
                         targetRef expectedTargetHead =
         if not (validTaskId taskId) || actionId = Guid.Empty || requestId = Guid.Empty
@@ -2240,27 +2247,34 @@ module ReviewWorkflow =
                         let! task, _, attempt, attemptOid = getAttempt binding snapshot taskId
                         let! request, _ =
                             required<ReviewRequest> binding snapshot (requestPath taskId reviewText)
-                        if task.Lifecycle <> "Implemented" || attempt.Phase <> "Accepted"
+                        if not (List.contains task.Lifecycle [ "InProgress"; "Implemented" ])
                            || attempt.Version <> expectedAttemptVersion
-                           || attempt.LatestReviewRequestId <> reviewText
-                           || attempt.AcceptedReviewRequestId <> reviewText
                            || request.Status <> "Accepted"
-                           || attempt.AcceptedReviewRevision <> request.CurrentRevision
-                           || not (String.IsNullOrEmpty attempt.ActiveReviewRequestId)
-                           || not (String.IsNullOrEmpty attempt.IntegrationActionId)
+                           || request.AttemptId <> attempt.AttemptId
                            || targetRef <> attempt.TargetRef then
-                            return! Error(StaleEntityVersion "Task is not finalized with an unplanned accepted review.")
+                            return! Error(StaleEntityVersion "Review must be accepted before integration.")
                         let! revision, _ =
                             required<ReviewRevision> binding snapshot
                                 (revisionPath taskId reviewText request.CurrentRevision)
-                        if revision.HeadCommit <> attempt.AcceptedHead
-                           || revision.BaseCommit <> attempt.BaseCommit
-                           || revision.TargetRef <> targetRef then
-                            return! Error(LedgerIntegrityError "Integration candidate differs from accepted cumulative review.")
+                        if revision.TargetRef <> targetRef
+                           || revision.RequestId <> reviewText
+                           || revision.Revision <> request.CurrentRevision then
+                            return! Error(LedgerIntegrityError "Integration candidate differs from the accepted review.")
                         let! existing = read<ReviewIntegration> binding snapshot (integrationPath taskId actionText)
                         if existing.IsSome then
                             return! Error(StaleEntityVersion "Integration action ID is already used.")
-                        let! sourceIdentity = verifyPinnedSource binding attempt attempt.SourceRef
+                        // Avoid recording the same review twice. A completed
+                        // slice does not prevent a subsequent review/merge.
+                        let! paths = LedgerStore.listAt binding snapshot "tasks"
+                        for path in paths do
+                            if path.StartsWith($"tasks/{taskId}/integrations/", StringComparison.Ordinal)
+                               && path.EndsWith(".json", StringComparison.Ordinal) then
+                                let! prior, _ = required<ReviewIntegration> binding snapshot path
+                                if prior.ReviewRequestId = reviewText then
+                                    return! Error(StaleEntityVersion "This review already has an integration.")
+                                if prior.Status <> "Recorded" then
+                                    return! Error(StaleEntityVersion "Finish the pending integration before planning another.")
+                        let! sourceIdentity = verifySourceRepository binding attempt
                         if revision.SourceRepositoryId <> sourceIdentity.RepositoryId
                            || revision.SourceRemote <> sourceIdentity.FetchUrl
                            || revision.SourcePushRemote <> sourceIdentity.PushUrl then
@@ -2270,8 +2284,6 @@ module ReviewWorkflow =
                         let! observed = LedgerStore.readRemoteTarget binding targetRef
                         if observed <> expectedTargetHead then
                             return! Error(StaleEntityVersion "Remote target changed before integration planning.")
-                        do! LedgerStore.verifySourceAncestry binding revision.BaseCommit observed
-                        do! LedgerStore.verifySourceAncestry binding observed revision.HeadCommit
                         let plan =
                             { ActionId = actionText; TaskId = taskId; AttemptId = attempt.AttemptId
                               Version = 1; Status = "PendingSourceAction"
@@ -2305,7 +2317,8 @@ module ReviewWorkflow =
                         let! task, _, attempt, _ = getAttempt binding snapshot taskId
                         let! action, actionOid =
                             required<ReviewIntegration> binding snapshot (integrationPath taskId id)
-                        if task.Lifecycle <> "Implemented" || attempt.IntegrationActionId <> id
+                        if not (List.contains task.Lifecycle [ "InProgress"; "Implemented" ])
+                           || attempt.IntegrationActionId <> id
                            || action.Status <> "PendingSourceAction" || action.Version <> expectedVersion then
                             return! Error(StaleEntityVersion "Integration is not awaiting an explicit source push.")
                         return
@@ -2323,11 +2336,12 @@ module ReviewWorkflow =
                     required<ReviewIntegration> binding snapshot
                         (integrationPath taskId (actionId.ToString("N")))
                 let! actual = LedgerStore.readRemoteTarget binding action.TargetRef
+                let! containsReviewed = LedgerStore.sourceContainsCommit binding action.ApprovedHead actual
+                let! containsOriginal = LedgerStore.sourceContainsCommit binding action.ExpectedTargetHead actual
                 let state =
                     if action.Status = "Recorded" then
-                        if actual = action.ApprovedHead then "Recorded"
-                        else "RecordedTargetMoved"
-                    elif actual = action.ApprovedHead then "ReadyToRecord"
+                        if containsReviewed then "Recorded" else "RecordedTargetMoved"
+                    elif containsReviewed && containsOriginal then "ReadyToRecord"
                     elif actual = action.ExpectedTargetHead then "PendingPush"
                     else "TargetChanged"
                 return
@@ -2349,7 +2363,7 @@ module ReviewWorkflow =
                         let! task, taskOid, attempt, _ = getAttempt binding snapshot taskId
                         let! action, actionOid =
                             required<ReviewIntegration> binding snapshot (integrationPath taskId id)
-                        if task.Lifecycle <> "Implemented" || attempt.Phase <> "Accepted"
+                        if not (List.contains task.Lifecycle [ "InProgress"; "Implemented" ])
                            || attempt.IntegrationActionId <> id
                            || action.Version <> expectedVersion
                            || not (List.contains action.Status [ "PendingSourceAction"; "PendingPush" ])
@@ -2357,12 +2371,8 @@ module ReviewWorkflow =
                            || action.SourcePushRemote <> binding.ApprovedPushUrl
                            || action.SourceRepositoryId <> attempt.SourceRepositoryId
                            || action.TaskId <> taskId || action.AttemptId <> attempt.AttemptId
-                           || action.ReviewRequestId <> attempt.AcceptedReviewRequestId
-                           || action.ReviewRevision <> attempt.AcceptedReviewRevision
-                           || action.ApprovedHead <> attempt.AcceptedHead
-                           || action.BaseCommit <> attempt.BaseCommit
                            || action.TargetRef <> attempt.TargetRef then
-                            return! Error(StaleEntityVersion "Current integration no longer matches finalized task.")
+                            return! Error(StaleEntityVersion "Integration plan is no longer current.")
                         let! revision, _ =
                             required<ReviewRevision> binding snapshot
                                 (revisionPath taskId action.ReviewRequestId action.ReviewRevision)
@@ -2371,28 +2381,31 @@ module ReviewWorkflow =
                            || revision.ReviewRef <> action.ReviewRef
                            || revision.TargetRef <> action.TargetRef then
                             return! Error(LedgerIntegrityError "Accepted revision evidence differs from integration plan.")
-                        let! _ = verifyPinnedSource binding attempt attempt.SourceRef
+                        let! _ = verifySourceRepository binding attempt
                         if revision.SourceRepositoryId <> action.SourceRepositoryId
                            || revision.SourcePushRemote <> action.SourcePushRemote
                            || revision.SourceRemote <> action.SourceRemote then
                             return! Error(SourceUnavailable "Integration source differs from accepted revision.")
                         do! LedgerStore.fetchReviewRef binding action.ReviewRef action.ApprovedHead
                         do! LedgerStore.verifyReviewDiff binding action.BaseCommit action.ApprovedHead
-                        do! LedgerStore.verifySourceAncestry binding action.ExpectedTargetHead action.ApprovedHead
                         let! observed = LedgerStore.readRemoteTarget binding action.TargetRef
-                        if observed <> action.ApprovedHead then
+                        let! includesReviewed = LedgerStore.sourceContainsCommit binding action.ApprovedHead observed
+                        let! includesPrevious = LedgerStore.sourceContainsCommit binding action.ExpectedTargetHead observed
+                        if not includesReviewed || not includesPrevious then
                             return! Error(StaleEntityVersion
-                                "Remote target does not equal approved head. Push only the accepted commit and retry verification.")
+                                "Remote target does not contain the accepted review and previous target.")
                         let integrated =
                             { action with Version = action.Version + 1; Status = "Recorded"
                                           ObservedTargetHead = observed
                                           VerifiedSequence = snapshot.Header.NextSequence
                                           VerifiedAtUtc = DateTimeOffset.UtcNow.ToString("O")
-                                          VerificationMethod = "RemoteExactFastForwardCommit" }
-                        return
-                            [ change (integrationPath taskId id) (Some actionOid) integrated
-                              change (taskPath taskId) (Some taskOid)
-                                { task with Version = task.Version + 1; Lifecycle = "Integrated" } ]
+                                          VerificationMethod = "RemoteMergeContainsReviewedCommit" }
+                        let taskChanges =
+                            if task.Lifecycle = "Implemented" then
+                                [ change (taskPath taskId) (Some taskOid)
+                                    { task with Version = task.Version + 1; Lifecycle = "Integrated" } ]
+                            else []
+                        return change (integrationPath taskId id) (Some actionOid) integrated :: taskChanges
                     })
 
     let closeIntegratedTask binding operationId taskId actionId expectedTaskVersion =
@@ -2410,7 +2423,7 @@ module ReviewWorkflow =
                             required<ReviewIntegration> binding snapshot (integrationPath taskId id)
                         if task.Version <> expectedTaskVersion || task.Lifecycle <> "Integrated"
                            || attempt.IntegrationActionId <> id || action.Status <> "Recorded"
-                           || action.ObservedTargetHead <> action.ApprovedHead then
+                           || String.IsNullOrWhiteSpace action.ObservedTargetHead then
                             return! Error(StaleEntityVersion "Task does not have a verified recorded integration.")
                         return
                             [ change (taskPath taskId) (Some taskOid)
@@ -3147,8 +3160,22 @@ module ReviewWorkflow =
                             let rightKey = right.Attempt.IssuedSequence, right.Task.TaskId, right.Attempt.AttemptId
                             compare leftKey rightKey)
                     let working = owned |> List.filter (fun entry -> entry.Attempt.Phase = "Working")
-                    let accepted = owned |> List.filter (fun entry ->
-                        entry.Attempt.Phase = "Accepted" && entry.Task.Lifecycle = "Implemented")
+                    // Show accepted slices awaiting integration even while
+                    // their implementation task is still InProgress.
+                    let mutable accepted = []
+                    for entry in owned do
+                        if not (String.IsNullOrWhiteSpace entry.Attempt.AcceptedReviewRequestId)
+                           && List.contains entry.Task.Lifecycle [ "InProgress"; "Implemented" ] then
+                            let! integrated =
+                                if String.IsNullOrWhiteSpace entry.Attempt.IntegrationActionId then Ok false
+                                else result {
+                                    let! action, _ = required<ReviewIntegration> binding snapshot (integrationPath entry.Task.TaskId entry.Attempt.IntegrationActionId)
+                                    return action.Status = "Recorded"
+                                           && action.ReviewRequestId = entry.Attempt.AcceptedReviewRequestId
+                                           && action.ReviewRevision = entry.Attempt.AcceptedReviewRevision
+                                }
+                            if not integrated then accepted <- entry :: accepted
+                    accepted <- List.rev accepted
                     if working.Length > 1
                        || (match working with
                            | [ item ] -> agent.ActiveAttemptId <> item.Attempt.AttemptId

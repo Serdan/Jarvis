@@ -1208,7 +1208,7 @@ module LedgerStore =
                 | Ok true ->
                     match git binding.RepositoryPath [ "diff"; "--quiet"; baseOid; headOid ] with
                     | Ok output when output.ExitCode = 1 -> Ok ()
-                    | Ok output when output.ExitCode = 0 -> Error(InvalidBinding "Code review has an empty cumulative diff.")
+                    | Ok output when output.ExitCode = 0 -> Error(InvalidBinding "Code review has no changes relative to its merge-base.")
                     | Ok output -> Error(GitFailure $"Could not inspect review delta: {output.Stderr}")
                     | Error error -> Error error
 
@@ -1404,6 +1404,28 @@ module LedgerStore =
                             finally
                                 git binding.RepositoryPath [ "update-ref"; "-d"; stage ] |> ignore
 
+    // Use ordinary Git merge-base for each review. A previously integrated
+    // slice does not remain part of the next review merely because the task
+    // itself is still in progress.
+    let reviewMergeBase (binding: LedgerBinding) targetRef headOid =
+        readRemoteTarget binding targetRef
+        |> Result.bind (fun targetHead ->
+            verifySourceObject binding headOid
+            |> Result.bind (fun () ->
+                match git binding.RepositoryPath [ "merge-base"; targetHead; headOid ] with
+                | Ok output when output.ExitCode = 0 && oidPattern.IsMatch output.Stdout ->
+                    Ok output.Stdout
+                | Ok output ->
+                    Error(SourceUnavailable $"Cannot find a review merge-base: {output.Stderr}")
+                | Error error -> Error error))
+
+    // True when a commit is contained in the observed merge result, whether
+    // the integration used a fast-forward or an ordinary merge commit.
+    let sourceContainsCommit (binding: LedgerBinding) ancestor descendant =
+        verifySourceObject binding ancestor
+        |> Result.bind (fun () -> verifySourceObject binding descendant)
+        |> Result.bind (fun () -> isAncestor binding.RepositoryPath ancestor descendant)
+
     let verifySourceAncestry (binding: LedgerBinding) earlier later =
         match verifySourceObject binding earlier with
         | Error error -> Error error
@@ -1413,7 +1435,7 @@ module LedgerStore =
             | Ok () ->
                 match isAncestor binding.RepositoryPath earlier later with
                 | Ok true -> Ok ()
-                | Ok false -> Error(InvalidBinding "Approved integration head is not a fast-forward of the planned target.")
+                | Ok false -> Error(InvalidBinding "Source commit does not descend from the expected base.")
                 | Error error -> Error error
 
     let private intentInput (binding: LedgerBinding) (intent: LedgerIntent) =

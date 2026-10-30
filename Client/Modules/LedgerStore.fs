@@ -900,6 +900,20 @@ module LedgerStore =
                     | Error error -> Error error
                 | _ -> Error(InvalidBinding "Submitted OID is not a Git commit.")
 
+    // A branch is source context, not a particular checkout. Reading it must
+    // not depend on whether some unrelated worktree is dirty or detached.
+    let sourceBranchHead (binding: LedgerBinding) sourceRef =
+        if isNull sourceRef
+           || not (Regex.IsMatch(sourceRef, "^refs/heads/[A-Za-z0-9][A-Za-z0-9_./-]*$"))
+           || sourceRef.Contains("..") || sourceRef.EndsWith("/") then
+            Error(InvalidBinding "Invalid source branch ref.")
+        else
+            match git binding.RepositoryPath [ "rev-parse"; "--verify"; $"{sourceRef}^{{commit}}" ] with
+            | Ok output when output.ExitCode = 0 && oidPattern.IsMatch output.Stdout ->
+                Ok output.Stdout
+            | Ok _ -> Error(SourceUnavailable "Source branch does not exist.")
+            | Error error -> Error error
+
     let verifySourceObject (binding: LedgerBinding) (commit: string) =
         if isNull commit || not (oidPattern.IsMatch commit) then
             Error(InvalidBinding "Invalid source commit OID.")

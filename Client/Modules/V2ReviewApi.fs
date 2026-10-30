@@ -528,8 +528,7 @@ module V2PendingIntentJournal =
                 | "V2TaskWrite", "RebindAttemptSource" ->
                     owner @ [ "ExpectedVersion", "expectedVersion"
                               "AssignmentGeneration", "generation"
-                              "SourceRef", "sourceRef"; "AllowDetached", "allowDetached"
-                              "AllowUncommitted", "allowUncommitted" ]
+                              "SourceRef", "sourceRef" ]
                 | "V2TaskWrite", "CheckpointAttempt" ->
                     attempt @ [ "Summary", "summary"; "NextAction", "nextAction"
                                 "BaseOid", "sourceCommit"; "Evidence", "evidence" ]
@@ -1168,7 +1167,7 @@ module V2TaskApi =
                                 | "RebindAttemptSource" ->
                                     ReviewWorkflow.ReviewWorkflow.rebindAttemptSource binding operationId cmd.TaskId
                                         cmd.ActorId cmd.ExpectedVersion cmd.AssignmentGeneration
-                                        cmd.SourceRef cmd.AllowDetached cmd.AllowUncommitted
+                                        cmd.SourceRef
                                     |> mapError
                                 | "CheckpointAttempt" ->
                                     ReviewWorkflow.ReviewWorkflow.checkpointAttempt binding operationId

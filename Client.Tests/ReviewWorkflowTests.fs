@@ -929,7 +929,7 @@ type ReviewWorkflowTests() =
             expectStale (ReviewWorkflow.bindAttemptSource worktreeBinding (Guid.NewGuid()) taskId
                              "Owner" 2 1 sourceRef baseOid targetRef false false)
             expectStale (ReviewWorkflow.rebindAttemptSource worktreeBinding (Guid.NewGuid()) taskId
-                             "Owner" 3 2 sourceRef false false)
+                             "Owner" 3 2 sourceRef)
             let _, _, attemptOption = ReviewWorkflow.getTask second taskId |> success
             let attempt = attemptOption.Value
             Assert.That(attempt.SourceRepositoryId, Is.EqualTo(sourceIdentity.RepositoryId))
@@ -972,7 +972,7 @@ type ReviewWorkflowTests() =
             // nor the immutable review revision's original source-ref evidence.
             git path [ "branch"; "-m"; "feature/source-960-renamed" ] |> ignore
             ReviewWorkflow.rebindAttemptSource worktreeBinding (Guid.NewGuid()) taskId "Owner" 4 1
-                "refs/heads/feature/source-960-renamed" false false |> success |> ignore
+                "refs/heads/feature/source-960-renamed" |> success |> ignore
             let _, _, afterRename = ReviewWorkflow.inspectAttemptSource worktreeBinding taskId |> success
             Assert.That(afterRename.Value.State, Is.EqualTo("CheckedOut"))
             let _, _, immutableRevision = ReviewWorkflow.getReview second taskId request |> success
@@ -2356,7 +2356,7 @@ type ReviewWorkflowTests() =
                 "Review the current slice" "Continue on the prepared branch"
             |> success |> ignore
             ReviewWorkflow.rebindAttemptSource selected (Guid.NewGuid()) "ready-source"
-                "Owner" 4 1 "refs/heads/feature/ready-source" false false
+                "Owner" 4 1 "refs/heads/feature/ready-source"
             |> success |> ignore
             let inbox = ReviewWorkflow.getAgentInbox second "Owner" |> success
             Assert.That(inbox.Agent.State, Is.EqualTo("Ready"))
@@ -2377,7 +2377,7 @@ type ReviewWorkflowTests() =
             git one [ "worktree"; "add"; path; "feature/merge-cycles" ] |> ignore
             let selected = { first with RepositoryPath = path }
             ReviewWorkflow.rebindAttemptSource selected (Guid.NewGuid()) taskId "Owner" 3 1
-                featureRef false false |> success |> ignore
+                featureRef |> success |> ignore
             let commit (title: string) (content: string) =
                 File.WriteAllText(Path.Combine(path, "source.txt"), content)
                 git path [ "add"; "source.txt" ] |> ignore
@@ -2451,6 +2451,111 @@ type ReviewWorkflowTests() =
             let _, closed, _ = ReviewWorkflow.getTask second taskId |> success
             Assert.That(closed.Lifecycle, Is.EqualTo("Closed"))
             git one [ "worktree"; "remove"; path ] |> ignore)
+
+    [<Test>]
+    member _.AcceptedReviewsStayPendingIndependentlyAndCanIntegrateOutOfOrder() =
+        withFixture (fun one _ first second baseOid sourceRef newCommit initTask ->
+            let taskId = "independent-reviews"
+            initTask taskId
+            let firstHead = newCommit "First approval" "slice A"
+            let reviewA = Guid.NewGuid()
+            ReviewWorkflow.submitReview first (Guid.NewGuid()) taskId "Owner" 3 1
+                reviewA sourceRef firstHead "A" |> success |> ignore
+            ReviewWorkflow.claimReview second (Guid.NewGuid()) taskId reviewA "Reviewer" 1 1
+            |> success |> ignore
+            ReviewWorkflow.decide second (Guid.NewGuid()) taskId reviewA "Reviewer" 2
+                Accept "Approved A" |> success |> ignore
+            let secondHead = newCommit "Second approval" "slice A and B"
+            let reviewB = Guid.NewGuid()
+            ReviewWorkflow.submitReview first (Guid.NewGuid()) taskId "Owner" 5 1
+                reviewB sourceRef secondHead "B" |> success |> ignore
+            ReviewWorkflow.claimReview second (Guid.NewGuid()) taskId reviewB "Reviewer" 1 1
+            |> success |> ignore
+            ReviewWorkflow.decide second (Guid.NewGuid()) taskId reviewB "Reviewer" 2
+                Accept "Approved B" |> success |> ignore
+            let before = (ReviewWorkflow.getAgentInbox second "Owner" |> success).AcceptedPendingIntegration
+            Assert.That(before.Length, Is.EqualTo(2))
+            Assert.That(before |> List.map (fun entry -> entry.Review.RequestId) |> Set.ofList,
+                        Is.EqualTo(box (set [ reviewA.ToString("N"); reviewB.ToString("N") ])))
+            let actionB = Guid.NewGuid()
+            ReviewWorkflow.planIntegration first (Guid.NewGuid()) taskId actionB reviewB 7
+                sourceRef baseOid |> success |> ignore
+            let actionA = Guid.NewGuid()
+            ReviewWorkflow.planIntegration first (Guid.NewGuid()) taskId actionA reviewA 8
+                sourceRef baseOid |> success |> ignore
+            let planned = (ReviewWorkflow.getAgentInbox first "Owner" |> success).AcceptedPendingIntegration
+            Assert.That(planned.Length, Is.EqualTo(2))
+            Assert.That(planned |> List.forall (fun entry -> entry.Integration.IsSome), Is.True)
+            git one [ "push"; "origin"; $"HEAD:{sourceRef}" ] |> ignore
+            ReviewWorkflow.recordIntegration second (Guid.NewGuid()) taskId actionB 1
+            |> success |> ignore
+            let afterB = (ReviewWorkflow.getAgentInbox first "Owner" |> success).AcceptedPendingIntegration
+            Assert.That(afterB.Length, Is.EqualTo(1))
+            Assert.That(afterB.Head.Review.RequestId, Is.EqualTo(reviewA.ToString("N")))
+            ReviewWorkflow.recordIntegration first (Guid.NewGuid()) taskId actionA 1
+            |> success |> ignore
+            Assert.That((ReviewWorkflow.getAgentInbox second "Owner" |> success).AcceptedPendingIntegration.Length,
+                        Is.EqualTo(0))
+            let _, stillActive, _ = ReviewWorkflow.getTask second taskId |> success
+            Assert.That(stillActive.Lifecycle, Is.EqualTo("InProgress"))
+            ReviewWorkflow.completeAgentWork first (Guid.NewGuid()) taskId "Owner" 9 3 1
+                "All slices merged" |> success |> ignore
+            ReviewWorkflow.finalizeImplementation first (Guid.NewGuid()) taskId "Owner" 10 reviewB
+            |> success |> ignore
+            let _, finalTask, _ = ReviewWorkflow.getTask second taskId |> success
+            Assert.That(finalTask.Lifecycle, Is.EqualTo("Integrated"))
+            ReviewWorkflow.closeIntegratedTask first (Guid.NewGuid()) taskId actionB finalTask.Version
+            |> success |> ignore
+            let _, closed, _ = ReviewWorkflow.getTask second taskId |> success
+            Assert.That(closed.Lifecycle, Is.EqualTo("Closed")))
+
+    [<Test>]
+    member _.RecordedPartialIntegrationDoesNotBlockOwnerTransfer() =
+        withFixture (fun one _ first second baseOid sourceRef newCommit initTask ->
+            let taskId = "transfer-after-merge"
+            initTask taskId
+            ReviewWorkflow.registerAgent first (Guid.NewGuid()) "NextOwner" |> success |> ignore
+            let head = newCommit "Integrated slice" "merged work"
+            let review = Guid.NewGuid()
+            ReviewWorkflow.submitReview first (Guid.NewGuid()) taskId "Owner" 3 1
+                review sourceRef head "First slice" |> success |> ignore
+            ReviewWorkflow.claimReview second (Guid.NewGuid()) taskId review "Reviewer" 1 1
+            |> success |> ignore
+            ReviewWorkflow.decide second (Guid.NewGuid()) taskId review "Reviewer" 2
+                Accept "Approved" |> success |> ignore
+            let action = Guid.NewGuid()
+            ReviewWorkflow.planIntegration first (Guid.NewGuid()) taskId action review 5
+                sourceRef baseOid |> success |> ignore
+            git one [ "push"; "origin"; $"HEAD:{sourceRef}" ] |> ignore
+            ReviewWorkflow.recordIntegration first (Guid.NewGuid()) taskId action 1
+            |> success |> ignore
+            let _, task, existing = ReviewWorkflow.getTask second taskId |> success
+            let owner = (ReviewWorkflow.getAgentInbox first "Owner" |> success).Agent
+            ReviewWorkflow.transferAttemptOwner first (Guid.NewGuid()) taskId (Guid.NewGuid())
+                "NextOwner" "Reviewer" task.Version existing.Value.Version
+                owner.Version existing.Value.AssignmentGeneration "Hand off remaining work"
+            |> success |> ignore
+            let _, transferred, next = ReviewWorkflow.getTask second taskId |> success
+            Assert.That(transferred.Lifecycle, Is.EqualTo("InProgress"))
+            Assert.That(next.Value.OwnerAgentId, Is.EqualTo("NextOwner"))
+            Assert.That(next.Value.Phase, Is.EqualTo("Queued"))
+            let priorIntegration = ReviewWorkflow.inspectIntegration first taskId action |> success
+            Assert.That(priorIntegration.Integration.Status, Is.EqualTo("Recorded"))
+            let _, originalReview, _ = ReviewWorkflow.getReview second taskId review |> success
+            Assert.That(originalReview.Status, Is.EqualTo("Accepted")))
+
+    [<Test>]
+    member _.RebindingSourceContextIgnoresUnrelatedDirtyCheckout() =
+        withFixture (fun one _ first second baseOid _ _ initTask ->
+            let taskId = "rebind-dirty-unrelated"
+            initTask taskId
+            git one [ "branch"; "feature/context"; baseOid ] |> ignore
+            File.WriteAllText(Path.Combine(one, "source.txt"), "uncommitted unrelated changes")
+            ReviewWorkflow.rebindAttemptSource first (Guid.NewGuid()) taskId "Owner" 3 1
+                "refs/heads/feature/context" |> success |> ignore
+            let _, _, attempt = ReviewWorkflow.getTask second taskId |> success
+            Assert.That(attempt.Value.SourceRef, Is.EqualTo("refs/heads/feature/context"))
+            Assert.That(git one [ "status"; "--porcelain" ], Is.Not.Empty))
 
     [<Test>]
     member _.CanonicalSpecAccepts512KiBAndRejectsOversizeWithoutLedgerWrite() =

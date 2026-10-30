@@ -1200,13 +1200,12 @@ type JarvisMcpTools =
                            AllowDetached = allowDetached; AllowUncommitted = allowUncommitted })
 
     [<McpServerTool(Title = "rebind attempt source", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Update working-branch context while an agent is Working or Ready, without interrupting ownership or claimed review snapshots.")>]
-    static member RebindAttemptSource(projectName: string, taskId: string, ownerId: string, expectedAttemptVersion: int, assignmentGeneration: int, sourceRef: string, allowDetached: bool, allowUncommitted: bool, operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member RebindAttemptSource(projectName: string, taskId: string, ownerId: string, expectedAttemptVersion: int, assignmentGeneration: int, sourceRef: string, operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         let cmd = V2TaskCommands.write projectName "RebindAttemptSource" operationId taskId ownerId
         McpToolHelpers.send client http
             (V2TaskWriteCommand
                 { cmd with ExpectedVersion = expectedAttemptVersion; AssignmentGeneration = assignmentGeneration
-                           SourceRef = sourceRef; AllowDetached = allowDetached
-                           AllowUncommitted = allowUncommitted })
+                           SourceRef = sourceRef })
 
     [<McpServerTool(Title = "inspect attempt source", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read the pinned source repository/ref and current registered Git worktree observation without changing task ownership, assignment or agent state. Missing source is SourceUnavailable, not agent Free.")>]
     static member InspectAttemptSource(projectName: string, taskId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =

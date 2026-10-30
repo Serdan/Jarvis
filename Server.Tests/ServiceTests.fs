@@ -418,7 +418,7 @@ let ``command catalog matches AgentCommand union and MCP tools`` () =
     let serverLocalNames =
         set [ "GetProfile"; "Feedback"; "ListFeedback"; "GetFeedback"; "UpdateFeedback"; "GetFeedbackSummary"; "GetConnectionDiagnostics"; "ListDevices"; "SelectDevice"; "UpdateServer"; "GetServerUpdateStatus" ]
 
-    // Legacy task commands remain internal only; old on-disk tasks are not deleted.
+    // Retired task commands must not be exposed by either the wire protocol or MCP.
     // The orphan Git branch is the sole supported orchestration API.
     let retired =
         set [ "AttachWorkTask"; "GetWorkTask"; "ListWorkTasks"; "CheckpointWorkTask"; "CompleteWorkTask"

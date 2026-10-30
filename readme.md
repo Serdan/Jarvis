@@ -37,7 +37,7 @@ There is no copied session key. ChatGPT never receives a Jarvis routing secret.
 - Verified self-update for published Linux/macOS clients: the client reads `SHA256SUMS` from its configured Jarvis server, atomically swaps the standalone executable with a `.prev` rollback copy, and restarts attached to the same terminal.
 - Optimistic-concurrency writes and atomic unified-diff patches.
 - Named project tasks from `.jarvis.json`.
-- Persisted unfinished work tasks in `.jarvis/tasks` that reference committed task descriptions and carry resumable execution checkpoints.
+- Canonical Git-orphan-ledger orchestration for tasks, agents, assignments, checkpoints, reviews and integrations, shared across worktrees.
 - Project-local and workspace-global skill discovery, reading, and creation with `ListSkills`, `GetSkill`, and `CreateSkill`.
 - Bounded process execution and asynchronous jobs, with optional human-readable `reason` metadata on `RunCommand` and `StartJob`.
 - Persisted client activity and fresh-session recovery through `GetClientActivity`, with observer diagnostics excluded by default and retrievable explicitly.

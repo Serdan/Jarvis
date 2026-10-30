@@ -75,7 +75,7 @@ For each task still needing work:
 2. **Register the agents.** `RegisterAgent(projectName, agentId, operationId)` creates a project-local agent label. Idle agents start `Parked`. Register intended worker/reviewer labels as needed.
 3. **Assign ownership.** `AssignTask(projectName, taskId, attemptId, ownerId, reviewerId, operationId)` creates one implementation attempt and assigns exactly one owner. Use fresh UUIDs for `attemptId` and `operationId`.
 4. **Read the authoritative assignment.** Use `AgentInbox(projectName, agentId)` and `GetAssignment(projectName, taskId, assignmentGeneration)` for the current generation, spec, owner and versions. Use `AcknowledgeAssignment` when applicable.
-5. **Begin implementation.** The worker calls `BeginAttempt` with its current expected attempt version and assignment generation. Existing code stays in its source worktree/branch. When necessary, record the actual source ref and baseline via `BindAttemptSource` and `BindReviewBase`; do not pretend old task JSON already created a V2 attempt.
+5. **Begin implementation.** The worker calls `BeginAttempt` with its current expected attempt version and assignment generation. Existing code stays in its ordinary source branch/worktree. Any recorded source ref is context, not a permission gate: the agent may rebase or change branches and the orchestrator may update that context while the agent is Ready. Do not pin a review baseline for the entire task.
 6. **Persist progress.** `CheckpointAttempt` records summary, evidence and next action, but does **not** end a Working turn. Before a normal agent turn finishes, use `YieldAgent` to enter `Ready`, or `CompleteAgentWork` to enter `Completed`.
 7. **Resume deliberately.** `ResumeAgent` resumes a Ready agent. It also supports explicitly recovering a stalled Working session, recording its session association and recovery event without reassigning ownership.
 
@@ -83,15 +83,17 @@ Always read expected versions/generations from the latest ledger. Do not guess. 
 
 For in-progress legacy work, put the *remaining work and next action* in the new canonical spec/checkpoint. An old `done` flag is not proof of a V2 review decision or verified source integration.
 
-## 5. Reviews and integration remain distinct
+## 5. Ordinary review and merge workflow
 
-A review snapshot/ref points to a commit in ordinary **source history**. The task and review records live on the **orphan branch**.
+Working branches, review branches and merges are normal Git development operations. The orphan ledger is for coordination, not for constraining Git.
 
-- `SubmitReview` publishes the exact metadata for a source snapshot. The owner may continue working and replace an **unclaimed** review with `ReplaceReview`.
-- Reviewers use `ReviewerInbox`, `ReviewTask`, `ClaimReview` and `DecideReview`. A claimed revision remains pinned; feedback is recorded without interrupting unrelated newer assignments.
-- Acceptance is **not** a merge or code push. Source integration must be performed explicitly with normal authorized Git operations. Use `PlanIntegration` and only `RecordIntegration` when the *remote target* is verified. Closing an integrated task is separate (`CloseIntegratedTask`).
+1. The agent commits on its working branch and creates a **separate review branch** at the commit it wants reviewed. `SubmitReview` records that stable snapshot. The agent can keep working on its original branch immediately.
+2. The reviewer uses `ReviewerInbox`, `ClaimReview` and `DecideReview` to inspect and accept/request changes. A claimed review branch remains unchanged; an unclaimed request can be replaced.
+3. The orchestrator merges accepted review work into `main` with ordinary Git and pushes. **No cherry-picking.** A fast-forward or merge commit is fine. If the target moved, resolve conflicts and validate as normal. Review acceptance does not perform a Git merge.
+4. Record the actual merged remote target in the ledger. Do not require that the target SHA match the review commit or that the whole task be finalized. **Multiple review/merge cycles are normal while a task remains InProgress.**
+5. The agent keeps its working branch, rebases onto updated `main` when useful, and submits later reviews containing only work not yet merged. Rebinding source context must not require an artificial Ready-to-Working-to-Ready cycle. Only mark the task completed when its actual work is done.
 
-If old work is already awaiting review, verify its actual source commit and create a truthful V2 review only if review is still needed. Never fabricate historical approvals, claims or integrations.
+The older `PlanIntegration`, `RecordIntegration` and fixed cumulative review-baseline restrictions are existing implementation limitations, **not** requirements for the corrected workflow. Refer to [the normative spec](specs/orchestration-v2-architecture.md) until they are simplified.
 
 ## 6. Verify the cutover
 

@@ -1,5 +1,7 @@
 # Orchestration V2 — independent source review workflow
 
+**Historical implementation notes, superseded 2026-10-30.** This file documents how the earlier V2 prototype was built. Its fixed cumulative review baseline, finalized-task-only integration and exact-SHA fast-forward restrictions are **not requirements**. The current design is [the orchestration specification](specs/orchestration-v2-architecture.md): trusted agents use ordinary branches, stable review branches, merges and rebases, including incremental integration while work continues. Do not use this file as normative guidance.
+
 **Status (2026-10-28):** The isolated F# prototype now implements the core single-owner review lifecycle and has disposable-remote tests. It is **not yet connected to MCP/TUI**, and the live V1 task system remains unchanged.
 
 The authoritative orchestration state stays on one remote orphan Git ledger branch. Source review refs belong to the normal project source remote. The Jarvis server does not store review/task state.

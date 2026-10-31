@@ -33,7 +33,7 @@ Task descriptions remain readable HTML in a canonical task folder. Jarvis writes
 
 Executable build/test tasks under the existing `"tasks"` property in `.jarvis.json` are separate from the task-file system.
 
-New task IDs are collision-resistant when omitted. Existing numeric task descriptions such as `docs/tasks/305-component-authority.html` resolve as task `305`, with state at `docs/tasks/305.json`; the HTML is preserved in place. Date-prefixed task IDs such as `2026-10-24-runpod-benchmark-lifecycle` keep their complete identifiers and state filenames. A file already named `<id>.html` uses the same basename. Ambiguous numeric descriptions or invalid JSON are reported rather than silently rewritten.
+New task IDs are collision-resistant when omitted. Existing numeric task descriptions such as `docs/tasks/305-component-authority.html` resolve as task `305`, with state at `docs/tasks/305.json`; the HTML is preserved in place. Date-prefixed task IDs such as `2026-10-24-client-configuration` keep their complete identifiers and state filenames. A file already named `<id>.html` uses the same basename. Ambiguous numeric descriptions or invalid JSON are reported rather than silently rewritten.
 
 A typical JSON state:
 

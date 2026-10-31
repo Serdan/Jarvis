@@ -20,7 +20,7 @@ The orphan branch is never merged into `main` or a source branch, and no source 
 ## 1. Verify the release
 
 1. Confirm the upgraded client is *responding* to `ListProjects`; a green SignalR connection alone is not sufficient.
-2. Check `ListDevices` and `ListCommands`. For this deployment, both client and server should report protocol **3.39**, and the client should advertise internal `V2TaskRead`, `V2TaskWrite`, `V2LedgerRead`, `V2LedgerWrite`, `V2ReviewRead`, `V2ReviewWrite`, `V2IntegrationRead` and `V2IntegrationWrite` capabilities. The public MCP names have no `V2` prefix.
+2. Check `ListDevices` and `ListCommands`. For this release, the client should report protocol **3.45**, and the deployed server must expose the matching independent task/review tools. The client advertises the internal `V2TaskRead`, `V2TaskWrite`, `V2LedgerRead`, `V2LedgerWrite`, `V2ReviewRead` and `V2ReviewWrite` capabilities. The old `V2IntegrationRead`/`V2IntegrationWrite` channels and the approval-gated integration workflow are retired. Public MCP tool names have no `V2` prefix.
 3. Confirm the old source-branch command handlers are unavailable and that the MCP catalog contains only unprefixed orchestration tools (no duplicate `V2*` aliases). Do not start a migration through an out-of-date client.
 4. Exercise the workflow on a **disposable Git remote** before initializing an important project's real ledger.
 

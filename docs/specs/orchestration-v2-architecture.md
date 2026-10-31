@@ -155,37 +155,60 @@ A review's base is **the relevant unintegrated work for that review**, not a per
 
 One actionable review request per task at a time is sufficient. Until claimed, the owner can replace it; after claim, the reviewer sees the original stable branch. Review metadata and decisions live in the orphan ledger; code and review branches live in ordinary source history. If publishing a review branch or recording its metadata fails, report the problem and let the agent reconcile it. No cross-ref transaction coordinator is needed.
 
-### Review files and findings
+### Canonical branch-based review model
 
-**A review is a task-associated, stable Git branch with a defined review base.** Its essential identity is the task, review ref, base commit and decision. A review ref is a snapshot of source code, not the place where reviewers write findings. Git owns commit history and ancestry; the orphan ledger owns the review decision and notes. Do not invent further commit identifiers or another integration state machine merely to represent information Git already knows. The attempt does not duplicate the accepted review head, and a review revision does not duplicate its already-pinned source OID. Remaining historical provenance and integration fields in the current schema are bookkeeping for the existing workflow, not additional reviewer responsibilities.
+A **review is a task-associated Git branch plus a fixed diff base**. Source code, commits, rebases and merges belong to Git. The orphan ledger stores only the review's identity, assignment/claim, decision, and optional prose files. There is no separate integration plan, merge receipt or source-commit history replicated in the ledger.
 
-Keep extensive review prose in **separate Markdown files** on `jarvis-orchestration`, not in bounded JSON feedback strings or on the reviewed source branch. Files are ordinary Git blobs, so they can be individually diffed and edited, and their history is the orphan branch's history. For example:
+The single current metadata file for a review is:
 
 ```text
-tasks/320/reviews/<review-id>/
-  request.json                   # existing workflow status
-  revisions/1.json               # review ref and diff base
-  summary.md                     # overall assessment (optional)
+tasks/<task-id>/reviews/<review-id>/
+  review.json
+  summary.md                  # optional, extended assessment
   findings/
-    allocation-in-hot-path.md
-    missing-regression-test.md
+    <descriptive-slug>.md     # any number of separate review findings
 ```
 
-Each finding is a Markdown document with a descriptive filename; the body can contain reproduction steps, code blocks, benchmarks, suggested changes and resolution notes. **No per-finding status machine, embedded finding array, or duplication in `request.json`.** The single review verdict is separate from individual findings. A reviewer can create/edit these notes while reviewing; the implementing agent can read or update the same files to document resolution. Do not tie document writes to the agent's Working slot or require a new review submission for a prose update.
+The persisted `review.json` schema (camelCase, entity schemaVersion 2) is:
 
-Expose minimal review-document commands to list filenames, read one file, and write one file on the orphan ledger. Allow `summary.md` and one-level `findings/<slug>.md`; reject arbitrary paths and traversal. Use the existing ledger's operation-id replay behavior and optional Git blob precondition for edits; creating a new file needs no existing blob. One ledger write commits one document rather than forcing extensive findings through tool parameters, verdict messages or task descriptions. A review decision need not bundle the files again. Git history provides old versions; the current branch provides current content.
+```json
+{
+  "schemaVersion": 2,
+  "reviewId": "<uuid-n>",
+  "taskId": "320",
+  "attemptId": "<uuid-n>",
+  "ownerAgentId": "Agent 3",
+  "reviewRef": "refs/heads/jarvis-review/320/<uuid-n>",
+  "baseCommit": "<git-oid>",
+  "targetRef": "refs/heads/main",
+  "status": "Unclaimed",
+  "reviewerId": null,
+  "version": 1,
+  "createdSequence": 123,
+  "decisionSequence": 0,
+  "acknowledged": false
+}
+```
 
-The reviewed diff is conceptually `git diff <base> <review-ref>`. The base is frozen for that review; the published ref is frozen after claim. Normal Git merges and rebases after review do not retroactively change its stated scope. A subsequent review starts from the remaining unmerged work, not automatically the same task-wide base.
+`Unclaimed -> Claimed -> Accepted | ChangesRequested`; `Unclaimed -> Withdrawn` is also supported. `reviewerId` is the actual claimant after claim. A review has **one verdict**, not a per-finding state machine. The current file, not a separate revision, decision, notification, attempt pointer or event array, is authoritative. Git history on the orphan branch preserves prior versions, timestamps and author attribution. No free-text verdict field is needed: the reviewer writes as much Markdown as appropriate in `summary.md` and `findings/*.md`. Feedback acknowledgement is a single bit on the review itself. Keep agent assignment and work-state records independent.
 
-## 5. Integration, source context and task lifecycle
+Each finding is a standalone Markdown document. The `PutReviewDocument` operation updates exactly one Git blob with the caller's operation UUID and an optional expected blob ID (required to replace an existing file). The `ListReviewDocuments` and `ReadReviewDocument` operations expose the files without copying them into review metadata. Paths are limited to `summary.md` and one-level `findings/[a-z0-9_-]+.md`. Individual Markdown documents may be up to 512 KiB. Authors may add implementation notes to findings after the verdict; no new review needs to be opened just to update documentation.
 
-**Integration is per reviewed slice, not per completed task.** Accepted commits can be merged while the task is InProgress and the agent continues working. Acceptance does not itself merge code, and integration does not itself complete or reassign the agent.
+### Source and review lifecycle
 
-Jarvis should record enough to answer: which review was approved and which source branch was integrated. Git can identify the reviewed commit and resulting merge from the refs/history. It must verify or observe that the actual remote target contains the integrated work before claiming it was merged. This is bookkeeping after ordinary Git operations, not a requirement to use a special source-push protocol or exact-SHA fast-forward. Remove the current `PlanIntegration`/`RecordIntegration` restrictions that require a finalized task, one fixed cumulative review base or a target SHA identical to the approved review head. Keep the simplest operation(s) necessary to record each integration and avoid recording it twice.
+1. Owner works normally on its feature branch. To submit, owner provides a source branch and the commit currently being submitted. Jarvis derives `baseCommit` from the Git merge-base against the target branch and publishes a dedicated `jarvis-review/<task-id>/<review-id>` source branch at the submitted commit. It then commits one `review.json` to the orphan ledger. The source SHA is an **input to Git publishing only**, not a persisted ledger field.
+2. An unclaimed review may be replaced: the owner publishes a new review ref (or safely moves the unclaimed ref) and updates `baseCommit` and the review ref in the same `review.json`. A claimed review's ref/base must not change. A replacement uses the review's `version` as its ordinary optimistic concurrency value, without a parallel revision history in JSON.
+3. A reviewer claims an unclaimed review by updating `status` and `reviewerId`. After examining `git diff <baseCommit> <reviewRef>`, the reviewer writes `summary.md` and independently named finding files and sets `status` to `Accepted` or `ChangesRequested`. No claim event, decision evidence JSON or duplicate head ID is required. Reviewers should describe tests and outstanding concerns in Markdown, distinguishing what they personally tested from owner reports.
+4. The agent may continue work throughout the review. One actionable review per task is enough, but accepted reviews can accumulate and be integrated independently. An accepted review must remain addressable and must not disappear from the inbox merely because a subsequent review was accepted.
+5. The orchestrator fetches and merges an accepted review ref into the target with ordinary `git merge` and pushes. **Git determines whether integration happened**: fetch target, resolve the reviewed branch's head, and check whether it is an ancestor of the target. Merge commits and fast-forwards both work. There is no `PlanIntegration`, `MarkIntegrationPendingPush`, `RecordIntegration` or `InspectIntegration`; these tools and the `ReviewIntegration` ledger entity are retired.
+6. `AcceptedPendingIntegration` is derived from accepted `review.json` records whose reviewed branch commits are not yet ancestors of their targets. The read view may contain the review, task and attempt, but no synthetic integration plan.
+7. Completing the agent's work only changes the agent/attempt state. A final accepted review is required to finalize source work. `FinalizeReview` marks the task `Implemented` if the final accepted branch is not yet merged, or `Integrated` if it already is. `CloseTask` checks Git ancestry anew and closes the task after its final accepted review is merged. No integration action ID is required. Intermediate merges never complete a task.
 
-The agent's working branch and worktree are **context, not authorization**. An agent may rebase, rename or reuse its branch normally. The orchestrator may update the recorded source branch/worktree when the owner is Ready, without artificially resuming it to Working and yielding again. An implementation attempt, task owner, checkpoints and existing review history persist across such changes. No new branch-rotation/handoff protocol is needed; relax the existing source-binding restrictions or replace them with ordinary editable context. Claimed review branches are unaffected.
+### Transition from the old ledger
 
-Keep task states sufficient to distinguish **Open, InProgress, Implemented, Integrated, Closed, Cancelled**, but reserve final implementation/integration/closure status for actual **task completion**, not every intermediate merge. Individual merged slices are tracked in review/integration history. Non-code work can close without inventing source integration. Cleanup of a worktree or review branch is ordinary Git housekeeping, separate from task ownership.
+This is an **intentional breaking cutover**; no V1/MCP compatibility aliases. Existing orphan-ledger trees may contain `request.json`, `revisions/*.json`, `decisions/*.json`, `notification.json`, `events/*.json`, `integrations/*.json` and attempt-level review pointers. A one-time explicit migration must convert current reviews to `review.json` using the latest request and revision, preserve their Git review refs and all Markdown findings, and retain historical files as Git history but remove them from the current authoritative tree. If automated migration is unavailable, do not pretend historical records were migrated; report the blocker before switching a populated ledger. Do not silently reinterpret legacy data. After cutover, no new old-format paths may be written.
+
+The public API surface becomes `SubmitReview`, `ReplaceReview`, `ClaimReview`, `DecideReview`, `WithdrawReview`, `ReviewDetails`, `ReviewerInbox`, `ListReviewDocuments`, `ReadReviewDocument`, `PutReviewDocument`, `FinalizeReview`, `CloseTask`, and ordinary task/agent tools. Retire duplicate evidence/revision tools and integration APIs. Protocol and server/client tool contracts change together. Tests must cover standalone findings, Git ancestry including merge commits, parallel accepted reviews, claim immutability, feedback acknowledgement and existing-ledger migration.
 
 ## 6. Tool surface and cutover
 

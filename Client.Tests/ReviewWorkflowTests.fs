@@ -224,6 +224,7 @@ type ReviewWorkflowTests() =
             |> success |> ignore
             ReviewWorkflow.decide second (Guid.NewGuid()) taskId id "Reviewer" 2 Accept "Approved"
             |> success |> ignore
+            let historical = LedgerStore.fetch first |> success
             let migrationId = Guid.NewGuid()
             let migrated = ReviewWorkflow.migrateBranchReviews first migrationId |> success
             Assert.That(migrated.AlreadyApplied, Is.False)
@@ -231,6 +232,19 @@ type ReviewWorkflowTests() =
             let result = ReviewWorkflow.getBranchReview second taskId id |> success
             Assert.That(result.Review.Status, Is.EqualTo("Accepted"))
             Assert.That(result.HeadCommit, Is.EqualTo(head))
+            let paths = LedgerStore.listAt first (LedgerStore.fetch first |> success) "tasks" |> success
+            let reviewJsonFiles =
+                paths |> List.filter (fun path ->
+                    path.StartsWith($"tasks/{taskId}/reviews/", StringComparison.Ordinal)
+                    && path.EndsWith(".json", StringComparison.Ordinal))
+            Assert.That(reviewJsonFiles,
+                        Is.EquivalentTo([ $"tasks/{taskId}/reviews/{id:N}/review.json" ]))
+            let historicalLegacyPath = $"tasks/{taskId}/reviews/{id:N}/request.json"
+            let historicBody, _ = LedgerStore.readAt first historical historicalLegacyPath |> success
+            Assert.That(historicBody.IsSome, Is.True, "Old files must remain in Git history.")
+            let currentBody, _ =
+                LedgerStore.readAt first (LedgerStore.fetch first |> success) historicalLegacyPath |> success
+            Assert.That(currentBody.IsNone, Is.True, "Old files must not remain authoritative.")
             let _, docs = ReviewWorkflow.listReviewDocuments second taskId id |> success
             Assert.That(docs |> List.map _.Path, Does.Contain("findings/old-finding.md"))
             let _, finding = ReviewWorkflow.getReviewDocument second taskId id "findings/old-finding.md"
@@ -2790,7 +2804,7 @@ type ReviewWorkflowTests() =
                    SourceRef = sourceRef; HeadOid = head; Summary = "Review" |}
             Client.V2ReviewApi.V2PendingIntentJournal.persist first operationId
                 "V2ReviewWrite" (System.Text.Json.JsonSerializer.Serialize original) |> success
-            ReviewWorkflow.submitReview first operationId "submission" "Owner"
+            ReviewWorkflow.submitBranchReview first operationId "submission" "Owner"
                 3 1 requestId sourceRef head "Review" |> success |> ignore
             let entries = Client.V2ReviewApi.V2PendingIntentJournal.reconcile first |> success
             let item = entries |> List.find (fun entry -> entry.operationId = operationId.ToString("D"))

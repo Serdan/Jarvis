@@ -260,8 +260,6 @@ let private dispatch (rt: Runtime) (command: AgentCommand) =
     | V2LedgerReadCommand cmd -> rt |> V2ReviewApi.V2LedgerApi.read cmd |> serialize'
     | V2LedgerWriteCommand cmd -> rt |> V2ReviewApi.V2LedgerApi.write cmd |> serialize'
     | V2ReviewReadCommand cmd -> rt |> V2ReviewApi.V2ReviewApi.read cmd |> serialize'
-    | V2ReviewWriteCommand cmd when cmd.Action = "DeleteReservedOrphan" ->
-        rt |> V2ReviewApi.V2ReviewApi.deleteReservedOrphan cmd |> serialize'
     | V2ReviewWriteCommand cmd -> rt |> V2ReviewApi.V2ReviewApi.write cmd |> serialize'
     | ListProjectsCommand ->
         rt

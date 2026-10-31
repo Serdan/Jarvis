@@ -3463,19 +3463,16 @@ module ReviewWorkflow =
                     elif review.Status = "Claimed" then
                         if review.OwnerAgentId = agentId || review.ReviewerId = agentId then
                             pending <- projected :: pending
-                    elif review.Status = "Accepted" then
-                        match old.RunnableQueue @ old.Parked @ old.Blocked
-                              @ (old.Working |> Option.toList)
-                              @ (old.Focused |> Option.toList)
-                              |> List.tryFind (fun item ->
-                                  item.Task.TaskId = review.TaskId
-                                  && item.Attempt.AttemptId = review.AttemptId) with
-                        | Some item ->
+                    elif review.Status = "Accepted" && review.OwnerAgentId = agentId then
+                        let! task, _ = required<ReviewTask> binding snapshot (taskPath review.TaskId)
+                        if task.AttemptId = review.AttemptId
+                           && List.contains task.Lifecycle [ "InProgress"; "Implemented"; "Integrated" ] then
+                            let! attempt, _ =
+                                required<ReviewAttempt> binding snapshot (attemptPath review.TaskId review.AttemptId)
                             let! _, merged = branchIntegrated binding review
                             if not merged then
-                                accepted <- { Task = item.Task; Attempt = item.Attempt
+                                accepted <- { Task = task; Attempt = attempt
                                               Review = projected } :: accepted
-                        | None -> ()
                     if review.OwnerAgentId = agentId && review.DecisionSequence > 0L
                        && not review.Acknowledged
                        && List.contains review.Status [ "Accepted"; "ChangesRequested" ] then

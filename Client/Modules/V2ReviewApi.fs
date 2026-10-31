@@ -449,20 +449,19 @@ module V2PendingIntentJournal =
         let root = doc.RootElement
         let action = commandProperty root "Action"
         match record.CommandType, action with
-        | "V2TaskWrite", Some "AcknowledgeFeedback" -> Some "AcknowledgeReviewFeedback"
+        | "V2TaskWrite", Some "AcknowledgeFeedback" -> Some "AcknowledgeBranchReview"
+        | "V2TaskWrite", Some "CloseTask" -> Some "CloseBranchTask"
         | "V2TaskWrite", Some action -> Some action
         | "V2ReviewWrite", Some "Migrate" -> Some "MigrateBranchReviews"
         | "V2ReviewWrite", Some "PutDocument" -> Some "PutReviewDocument"
-        | "V2ReviewWrite", Some "Submit" -> Some "SubmitForReview"
-        | "V2ReviewWrite", Some "Update" -> Some "UpdateReviewRequest"
-        | "V2ReviewWrite", Some "Claim" -> Some "ClaimReview"
-        | "V2ReviewWrite", Some "Decide" -> Some "ReviewDecision"
-        | "V2ReviewWrite", Some "Withdraw" -> Some "WithdrawReview"
-        | "V2ReviewWrite", Some "Reassign" -> Some "ReassignReviewer"
-        | "V2ReviewWrite", Some "ReleaseClaim" -> Some "ReleaseReviewClaim"
-        | "V2ReviewWrite", Some "ReserveOrphan" -> Some "ReserveOrphanReviewRef"
-        | "V2ReviewWrite", Some "Finalize" -> Some "FinalizeImplementation"
-        | "V2ReviewWrite", Some "AcknowledgeFeedback" -> Some "AcknowledgeReviewFeedback"
+        | "V2ReviewWrite", Some "Submit" -> Some "SubmitBranchReview"
+        | "V2ReviewWrite", Some "Update" -> Some "ReplaceBranchReview"
+        | "V2ReviewWrite", Some "Claim" -> Some "ClaimBranchReview"
+        | "V2ReviewWrite", Some "Decide" -> Some "DecideBranchReview"
+        | "V2ReviewWrite", Some "Withdraw" -> Some "WithdrawBranchReview"
+
+        | "V2ReviewWrite", Some "Finalize" -> Some "FinalizeBranchReview"
+        | "V2ReviewWrite", Some "AcknowledgeFeedback" -> Some "AcknowledgeBranchReview"
         | _ -> None
 
     let private identityMatches (record: V2PendingIntent) (operation: LedgerStore.LedgerOperation) =
@@ -483,7 +482,7 @@ module V2PendingIntentJournal =
                 let review = common @ [ "RequestId", "requestId" ]
                 let reviewer = review @ [ "ActorId", "reviewerId"
                                           "ExpectedVersion", "expectedVersion" ]
-                let integration = common @ [ "ActionId", "actionId" ]
+
                 match record.CommandType, operation.Type with
                 | "V2TaskWrite", "CreateTask" ->
                     common @ [ "Title", "title"; "Html", "specSha256" ]
@@ -561,40 +560,30 @@ module V2PendingIntentJournal =
                     common @ [ "ExpectedTaskVersion", "expectedTaskVersion"; "Reason", "reason" ]
                 | "V2TaskWrite", "AcknowledgeReviewFeedback" ->
                     owner @ [ "DecisionSequence", "decisionSequence" ]
-                | "V2ReviewWrite", "MigrateBranchReviews" -> common
+                | "V2ReviewWrite", "MigrateBranchReviews" -> []
                 | "V2ReviewWrite", "PutReviewDocument" ->
-                    review @ [ "ActorId", "actorId"; "DocumentPath", "documentPath"
-                               "Content", "content"; "ExpectedBlobOid", "expectedBlobOid" ]
-                | "V2ReviewWrite", "SubmitForReview" ->
-                    owner @ [ "RequestId", "requestId"; "ExpectedVersion", "expectedVersion"
+                    common @ [ "RequestId", "requestId"; "ActorId", "actorId"
+                               "DocumentPath", "documentPath"; "Content", "contentSha256"
+                               "ExpectedBlobOid", "expectedBlobOid" ]
+                | "V2ReviewWrite", "SubmitBranchReview" ->
+                    owner @ [ "RequestId", "reviewId"; "ExpectedVersion", "expectedAttemptVersion"
                               "Generation", "generation"; "SourceRef", "sourceRef"
-                              "HeadOid", "headOid"; "Summary", "summary"; "TestEvidence", "testEvidence" ]
-                | "V2ReviewWrite", "UpdateReviewRequest" ->
-                    owner @ [ "RequestId", "requestId"; "ExpectedVersion", "expectedRequestVersion"
+                              "HeadOid", "sourceHead"; "Summary", "summary" ]
+                | "V2ReviewWrite", "ReplaceBranchReview" ->
+                    owner @ [ "RequestId", "reviewId"; "ExpectedVersion", "expectedVersion"
                               "Generation", "generation"; "SourceRef", "sourceRef"
-                              "HeadOid", "headOid"; "Summary", "summary"; "TestEvidence", "testEvidence" ]
-                | "V2ReviewWrite", "ClaimReview" ->
-                    reviewer @ [ "Generation", "expectedRevision" ]
-                | "V2ReviewWrite", "ReviewDecision" ->
-                    reviewer @ [ "Verdict", "status"; "Feedback", "feedback"
-                                 "Inspected", "inspected"; "Tested", "tested"
-                                 "TestDetails", "testDetails" ]
-                | "V2ReviewWrite", "WithdrawReview" ->
-                    review @ [ "ActorId", "actor"; "ExpectedVersion", "expectedVersion"
-                               "Feedback", "reason" ]
-                | "V2ReviewWrite", "ReassignReviewer" ->
-                    review @ [ "ActorId", "actor"; "ExpectedVersion", "expectedVersion"
-                               "ReviewerId", "nextReviewer"; "Feedback", "reason" ]
-                | "V2ReviewWrite", "ReleaseReviewClaim" ->
-                    review @ [ "ActorId", "actor"; "ExpectedVersion", "expectedVersion"
-                               "Feedback", "reason" ]
-                | "V2ReviewWrite", "ReserveOrphanReviewRef" ->
-                    review @ [ "ActorId", "actor"; "Generation", "revision"
-                               "HeadOid", "expectedHead"; "Feedback", "reason" ]
-                | "V2ReviewWrite", "FinalizeImplementation" ->
-                    review @ [ "ActorId", "ownerId"; "ExpectedVersion", "expectedAttemptVersion" ]
-                | "V2ReviewWrite", "AcknowledgeReviewFeedback" ->
-                    owner @ [ "ExpectedVersion", "decisionSequence" ]
+                              "HeadOid", "sourceHead"; "Summary", "summary" ]
+                | "V2ReviewWrite", "ClaimBranchReview" ->
+                    common @ [ "RequestId", "reviewId"; "ActorId", "reviewerId"
+                               "ExpectedVersion", "expectedVersion" ]
+                | "V2ReviewWrite", "DecideBranchReview" ->
+                    common @ [ "RequestId", "reviewId"; "ActorId", "reviewerId"
+                               "ExpectedVersion", "expectedVersion"; "Verdict", "status" ]
+                | "V2ReviewWrite", "WithdrawBranchReview" ->
+                    common @ [ "RequestId", "reviewId"; "ActorId", "actorId"
+                               "ExpectedVersion", "expectedVersion" ]
+                | "V2ReviewWrite", "FinalizeBranchReview" ->
+                    owner @ [ "RequestId", "reviewId"; "ExpectedVersion", "expectedAttemptVersion" ]
                 | _ -> []
 
             let equalField (source, dest) =
@@ -606,7 +595,7 @@ module V2PendingIntentJournal =
                             | "Accept" -> "Accepted"
                             | "RequestChanges" -> "ChangesRequested"
                             | other -> other
-                        elif source = "Html" && dest = "specSha256" then
+                        elif (source = "Html" && dest = "specSha256") || (source = "Content" && dest = "contentSha256") then
                             System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(if isNull localValue then "" else localValue))
                             |> Convert.ToHexString |> fun value -> value.ToLowerInvariant()
                         else localValue
@@ -629,7 +618,7 @@ module V2PendingIntentJournal =
                          && optionalEmpty localValue && optionalEmpty remoteValue))
 
             operationKind record = Some operation.Type
-            && not (List.isEmpty pairs)
+            && (operation.Type = "MigrateBranchReviews" || not (List.isEmpty pairs))
             && List.forall equalField pairs
         with _ -> false
 
@@ -927,41 +916,12 @@ module V2ReviewApi =
                     |> mapError
                     |> Result.map (fun (head, document) ->
                         box {| snapshotCommit = head; document = document |}))
-            | "DecisionEvidence" ->
-                parseId "requestId" cmd.RequestId
-                |> Result.bind (fun requestId ->
-                    ReviewWorkflow.ReviewWorkflow.getDecisionEvidence binding cmd.TaskId requestId
-                    |> mapError
-                    |> Result.map box)
-            | "OrphanRefs" ->
-                ReviewWorkflow.ReviewWorkflow.inspectOrphanReviewRefs binding cmd.TaskId
-                |> mapError |> Result.map box
-            | "ClaimHistory" ->
-                parseId "requestId" cmd.RequestId
-                |> Result.bind (fun requestId ->
-                    ReviewWorkflow.ReviewWorkflow.getReviewClaimEvents binding cmd.TaskId requestId
-                    |> mapError |> Result.map box)
-            | "AwaitingReassignment" ->
-                ReviewWorkflow.ReviewWorkflow.awaitingReviewReassignment binding
-                |> mapError |> Result.map box
             | "ReviewerQueue" ->
                 ReviewWorkflow.ReviewWorkflow.branchReviewerQueue binding cmd.ReviewerId
                 |> mapError
                 |> Result.map (fun (snapshot, queue) ->
                     box {| snapshotCommit = snapshot; reviews = queue |})
             | _ -> Error(Client.ValidationError "Unsupported V2 read operation."))
-
-    // Source cleanup executes only after an immutable reservation in the Git
-    // ledger. It is separately idempotent and never claims a ledger write
-    // succeeded merely because the source ref is absent.
-    let deleteReservedOrphan (cmd: V2ReviewWriteCommand) rt =
-        ReviewV2Binding.load cmd.ProjectName rt
-        |> Result.bind (fun binding ->
-            parseId "requestId" cmd.RequestId
-            |> Result.bind (fun id ->
-                ReviewWorkflow.ReviewWorkflow.deleteReservedOrphanReviewRef binding
-                    cmd.TaskId id cmd.Generation cmd.HeadOid
-                |> mapError |> Result.map box))
 
     let write (cmd: V2ReviewWriteCommand) rt =
         ReviewV2Binding.load cmd.ProjectName rt
@@ -1009,25 +969,6 @@ module V2ReviewApi =
                             id () |> Result.bind (fun reviewId ->
                                 ReviewWorkflow.ReviewWorkflow.withdrawBranchReview binding operationId
                                     cmd.TaskId reviewId cmd.ActorId cmd.ExpectedVersion |> mapError)
-                        | "ReserveOrphan" ->
-                            id () |> Result.bind (fun reviewId ->
-                                ReviewWorkflow.ReviewWorkflow.reserveOrphanReviewRef binding operationId
-                                    cmd.TaskId reviewId cmd.Generation cmd.HeadOid cmd.ActorId cmd.Feedback
-                                |> mapError)
-                        | "ReleaseClaim" ->
-                            id () |> Result.bind (fun reviewId ->
-                                ReviewWorkflow.ReviewWorkflow.releaseReviewClaim binding operationId
-                                    cmd.TaskId reviewId cmd.ActorId cmd.ExpectedVersion cmd.Feedback
-                                |> mapError)
-                        | "Reassign" ->
-                            id () |> Result.bind (fun reviewId ->
-                                (if String.IsNullOrWhiteSpace cmd.Feedback then
-                                     ReviewWorkflow.ReviewWorkflow.reassignReviewer binding operationId
-                                         cmd.TaskId reviewId cmd.ActorId cmd.ReviewerId cmd.ExpectedVersion
-                                 else
-                                     ReviewWorkflow.ReviewWorkflow.reassignReviewerWithReason binding operationId
-                                         cmd.TaskId reviewId cmd.ActorId cmd.ReviewerId cmd.ExpectedVersion cmd.Feedback)
-                                |> mapError)
                         | "Finalize" ->
                             id () |> Result.bind (fun reviewId ->
                                 ReviewWorkflow.ReviewWorkflow.finalizeBranchReview binding operationId

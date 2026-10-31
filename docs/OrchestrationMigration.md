@@ -26,6 +26,19 @@ The orphan branch is never merged into `main` or a source branch, and no source 
 
 A client self-update is not verified until its *new* protocol and a successful command are observed; a reported connection or requested restart is insufficient.
 
+## Explicit agent/attempt schema upgrade (protocol 3.46)
+
+Protocol 3.46 replaces the stored agent state enum with `currentAssignment`, `execution` and `unassignedDisposition`, and separates attempt progress (`Queued`, `Started`, `Deferred`, `Blocked`, `Finished`, `Abandoned`, `Superseded`) from execution state. `Ready`, `Working`, `NeedsWork` and `Parked` are derived for the UI. This is a **different upgrade** from migrating old source-branch task files into the orphan ledger.
+
+For a project **already using a protocol 3.45 orphan Git ledger**, its v2 agent/attempt records are not silently converted on read. After upgrading the client and server together to 3.46:
+
+1. Inspect the project's existing `LedgerHealth` and any active agents/attempts using the pre-upgrade tools; preserve the Git remote history and plan a brief pause in writes.
+2. Invoke `MigrateOrthogonalAgentState(projectName, expectedLedgerHead, operationId)` with exactly the inspected trusted head and a fresh operation UUID. It converts every v2 agent/attempt record in one verified ledger transaction. It refuses mixed versions, stale heads and ambiguous current ownership. New 3.46 ledgers need **no** conversion.
+3. Re-read `LedgerHealth`, `AgentInbox` and `TaskOverview` using the new client. Verify Ready/Working/Needs work/Parked, original assignment generations and checkpoints, and deferred/blocked attempts.
+4. Continue normal work. Reviews, source branches and task HTML are unchanged. If the conversion rejects inconsistent legacy data, inspect it and resolve the cause explicitly; do not hand-edit authoritative JSON or silently guess an owner.
+
+The source implementation and test fixtures never invoke this tool against any existing live project ledger. Production cutover remains a separate decision.
+
 ## 2. Choose the project and inspect its remote
 
 For each project to migrate:
@@ -76,7 +89,7 @@ For each task still needing work:
 3. **Assign ownership.** `AssignTask(projectName, taskId, attemptId, ownerId, operationId)` creates one implementation attempt and assigns exactly one owner. Reviewers are chosen independently when they claim an individual review; the attempt does not contain a reviewer. Use fresh UUIDs for `attemptId` and `operationId`.
 4. **Read the authoritative assignment.** Use `AgentInbox(projectName, agentId)` and `GetAssignment(projectName, taskId, assignmentGeneration)` for the current generation, spec, owner and versions. Use `AcknowledgeAssignment` when applicable.
 5. **Begin implementation.** The worker calls `BeginAttempt` with its current expected attempt version and assignment generation. Existing code stays in its ordinary source branch/worktree. Any recorded source ref is context, not a permission gate: the agent may rebase or change branches and the orchestrator may update that context while the agent is Ready. Do not pin a review baseline for the entire task.
-6. **Persist progress.** `CheckpointAttempt` records summary, evidence and next action, but does **not** end a Working turn. Before a normal agent turn finishes, use `YieldAgent` to enter `Ready`, or `CompleteAgentWork` to enter `Completed`.
+6. **Persist progress.** `CheckpointAttempt` records summary, evidence and next action, but does **not** end a Working turn. Before a normal agent turn finishes, use `YieldAgent` to stop execution and remain `Ready`, or `CompleteAgentWork` to finish the attempt, release its current assignment and become `NeedsWork`.
 7. **Resume deliberately.** `ResumeAgent` resumes a Ready agent. It also supports explicitly recovering a stalled Working session, recording its session association and recovery event without reassigning ownership.
 
 Always read expected versions/generations from the latest ledger. Do not guess. Use a **new operation UUID for each new logical mutation**, but reuse the **same UUID and parameters** when retrying the *same* operation after a lost response. Provider session IDs are supplied automatically; agents must not invent them.

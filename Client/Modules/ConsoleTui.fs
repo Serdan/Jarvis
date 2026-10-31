@@ -865,7 +865,6 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         let filtered = agentListUnsafe()
         let all = agentSnapshot |> Option.map AgentView.rows |> Option.defaultValue []
         let reviewCount = agentSnapshot |> Option.map (fun snap -> snap.Projects |> List.sumBy _.PendingReviews) |> Option.defaultValue 0
-        let completedCount = all |> List.filter (fun row -> row.State = "Completed") |> List.length
         let filterSuffix =
             if String.IsNullOrWhiteSpace agentFilter then ""
             else $" [text=\"{trim (compact agentFilter) (max 20 (width - 22))}\"]"
@@ -884,9 +883,9 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         Console.WriteLine "------"
         let stateCount state = all |> List.filter (fun row -> row.State = state) |> List.length
         Console.WriteLine
-            (sprintf "Tracked: %d | Review: %d | Working: %d | Ready: %d | Assigned: %d | Completed: %d | Parked: %d"
+            (sprintf "Tracked: %d | Review: %d | Working: %d | Ready: %d | Needs work: %d | Parked: %d"
                 all.Length reviewCount (stateCount "Working") (stateCount "Ready")
-                (stateCount "Assigned") completedCount (stateCount "Parked"))
+                (stateCount "NeedsWork") (stateCount "Parked"))
         let refreshed =
             agentSnapshot
             |> Option.map (fun snap -> snap.RefreshedAt.ToLocalTime().ToString("HH:mm:ss"))

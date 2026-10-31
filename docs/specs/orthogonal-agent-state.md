@@ -1,6 +1,6 @@
 # Orthogonal agent assignment and execution state
 
-**Status:** Approved target design; specification only, not implemented.
+**Status:** Implemented in source with protocol 3.46; not yet deployed. Existing live v2 ledgers require an explicit conversion.
 
 **Scope:** Jarvis Git-backed task/agent ledger, public task commands, inbox/TUI projections, and one-time conversion of existing ledger records.
 
@@ -200,4 +200,4 @@ Important legacy cases:
 
 No automatic task scheduling, forced work preemption, special "reviewer assignment" state, new review gate, background task monitoring, database, distributed locking, retrospective import of every historic task, or generalized migration framework.
 
-**Implementation boundary:** This document approves the new model and its behavior; it does not authorize migrating a live ledger or deploying new binaries. Implement, test and review the code separately, then explicitly decide on live cutover.
+**Deployment boundary:** Implementation and disposable two-clone conversion tests do not authorize migrating a live ledger or deploying binaries. The one-time `MigrateOrthogonalAgentState` command requires the exact previously inspected `LedgerHealth` head. Explicitly approve and perform production cutover separately.

@@ -664,12 +664,22 @@ module LedgerStore =
                 find name |> Option.bind (fun value ->
                     let mutable n = 0L
                     if value.ValueKind = JsonValueKind.Number && value.TryGetInt64(&n) then Some n else None)
+            let state =
+                if entityKind = "Agent" && (find "execution").IsSome then
+                    let assigned =
+                        find "currentAssignment"
+                        |> Option.exists (fun value -> value.ValueKind = JsonValueKind.Object)
+                    if assigned then
+                        Some (if str "execution" = Some "Working" then "Working" else "Ready")
+                    else
+                        Some (if str "unassignedDisposition" = Some "Parked" then "Parked" else "NeedsWork")
+                else str "state"
             { Path = path; EntityKind = entityKind
               ContentSha256 = digest change.Content
               EntityVersion = number "version"
               TaskId = str "taskId"; AttemptId = str "attemptId"
               RequestId = str "requestId"; AgentId = str "agentId"; ActionId = str "actionId"
-              Lifecycle = str "lifecycle"; State = str "state"
+              Lifecycle = str "lifecycle"; State = state
               Phase = str "phase"; Status = str "status"
               AssignmentGeneration = number "assignmentGeneration"
               CheckpointSequence = if entityKind = "Checkpoint" then longNumber "sequence" else None

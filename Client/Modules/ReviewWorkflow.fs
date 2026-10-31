@@ -76,18 +76,36 @@ type TaskSpecExport =
       Authority: string }
 
 [<CLIMutable>]
+type AgentAssignment =
+    { TaskId: string
+      AttemptId: string }
+
+[<CLIMutable>]
 type ReviewAgent =
     { AgentId: string
       Version: int
-      State: string
-      FocusAttemptId: string
-      ActiveAttemptId: string
+      CurrentAssignment: AgentAssignment
+      Execution: string
+      UnassignedDisposition: string
       StateReason: string
       StateSequence: int64
       StateEnteredAtUtc: string
       WorkingTurnStartedAtUtc: string
       ActiveSessionId: string
       AssociatedSessionIds: string list }
+    with
+        [<System.Text.Json.Serialization.JsonIgnore>]
+        member this.State =
+            if not (isNull (box this.CurrentAssignment)) then
+                if this.Execution = "Working" then "Working" else "Ready"
+            elif this.UnassignedDisposition = "Parked" then "Parked"
+            else "NeedsWork"
+        [<System.Text.Json.Serialization.JsonIgnore>]
+        member this.FocusAttemptId =
+            if isNull (box this.CurrentAssignment) then null else this.CurrentAssignment.AttemptId
+        [<System.Text.Json.Serialization.JsonIgnore>]
+        member this.ActiveAttemptId =
+            if this.Execution = "Working" then this.FocusAttemptId else null
 
 [<CLIMutable>]
 type ReviewAttempt =
@@ -250,12 +268,35 @@ module ReviewWorkflow =
         JsonSerializerOptions(PropertyNamingPolicy = JsonNamingPolicy.CamelCase, PropertyNameCaseInsensitive = true)
     let private json value = JsonSerializer.Serialize(value, options)
     let private enterState state (agent: ReviewAgent) =
-        if agent.State = state then agent
+        let execution = if state = "Working" then "Working" else "Stopped"
+        let assignment = if List.contains state [ "Completed"; "Parked"; "NeedsWork" ] then Unchecked.defaultof<AgentAssignment> else agent.CurrentAssignment
+        let disposition =
+            if state = "Parked" then "Parked"
+            elif isNull (box assignment) then "NeedsWork" else null
+        let sameAssignment =
+            if isNull (box agent.CurrentAssignment) then isNull (box assignment)
+            elif isNull (box assignment) then false
+            else agent.CurrentAssignment = assignment
+        let changed = agent.Execution <> execution
+                      || not sameAssignment
+                      || agent.UnassignedDisposition <> disposition
+        if not changed then agent
         else
             let now = DateTimeOffset.UtcNow.ToString("O")
-            { agent with State = state; StateEnteredAtUtc = now
-                         WorkingTurnStartedAtUtc = if state = "Working" then now else null
-                         ActiveSessionId = if state = "Working" then agent.ActiveSessionId else null }
+            { agent with Execution = execution; CurrentAssignment = assignment
+                         UnassignedDisposition = disposition; StateEnteredAtUtc = now
+                         WorkingTurnStartedAtUtc = if execution = "Working" then now else null
+                         ActiveSessionId = if execution = "Working" then agent.ActiveSessionId else null }
+
+    let private assigned taskId attemptId (agent: ReviewAgent) =
+        let current : AgentAssignment = { TaskId = taskId; AttemptId = attemptId }
+        { agent with CurrentAssignment = current; UnassignedDisposition = null
+                     Execution = "Stopped"; StateEnteredAtUtc = DateTimeOffset.UtcNow.ToString("O") }
+
+    let private matchesAssignment taskId (attempt: ReviewAttempt) (agent: ReviewAgent) =
+        not (isNull (box agent.CurrentAssignment))
+        && agent.CurrentAssignment.TaskId = taskId
+        && agent.CurrentAssignment.AttemptId = attempt.AttemptId
 
     let private associateSession (sessionId: string) (agent: ReviewAgent) =
         if String.IsNullOrWhiteSpace sessionId then agent
@@ -275,7 +316,7 @@ module ReviewWorkflow =
         let content = json value
         if not (content.StartsWith("{", StringComparison.Ordinal)) then
             invalidArg "value" "A ledger entity must be a JSON object."
-        let version = if typeof<'t>.Name = "BranchReview" then 3 else 2
+        let version = if List.contains typeof<'t>.Name [ "BranchReview"; "ReviewAgent"; "ReviewAttempt" ] then 3 else 2
         $"{{\"schemaVersion\":{version}," + content.Substring(1)
 
     let private validEntity<'t> (content: string) =
@@ -292,9 +333,11 @@ module ReviewWorkflow =
                 let schemaValid =
                     root.TryGetProperty("schemaVersion", &schema)
                     && schema.ValueKind = JsonValueKind.Number
-                    && schema.GetInt32() = (if typeof<'t>.Name = "BranchReview" then 3 else 2)
+                    && schema.GetInt32() = (if List.contains typeof<'t>.Name [ "BranchReview"; "ReviewAgent"; "ReviewAttempt" ] then 3 else 2)
                 let required =
                     typeof<'t>.GetProperties()
+                    |> Array.filter (fun property ->
+                        not (Attribute.IsDefined(property, typeof<System.Text.Json.Serialization.JsonIgnoreAttribute>)))
                     |> Array.map (fun property -> options.PropertyNamingPolicy.ConvertName(property.Name))
                 let complete =
                     required |> Array.forall (fun property ->
@@ -308,9 +351,19 @@ module ReviewWorkflow =
                 let stateValid =
                     match typeof<'t>.Name with
                     | "ReviewTask" -> status "lifecycle" [ "Open"; "InProgress"; "Implemented"; "Integrated"; "Closed"; "Cancelled" ]
-                    | "ReviewAgent" -> status "state" [ "Ready"; "Assigned"; "Working"; "Completed"; "Parked" ]
-                    | "ReviewAttempt" -> status "phase" [ "Queued"; "Acknowledged"; "Working"; "Paused"; "Finished"; "Parked"; "Blocked";
-                          "Accepted"; "Superseded"; "Abandoned" ]
+                    | "ReviewAgent" ->
+                        status "execution" [ "Stopped"; "Working" ]
+                        && (let mutable current = Unchecked.defaultof<JsonElement>
+                            let mutable disposition = Unchecked.defaultof<JsonElement>
+                            root.TryGetProperty("currentAssignment", &current)
+                            && root.TryGetProperty("unassignedDisposition", &disposition)
+                            && (if current.ValueKind = JsonValueKind.Null then
+                                    status "unassignedDisposition" [ "NeedsWork"; "Parked" ]
+                                    && status "execution" [ "Stopped" ]
+                                else current.ValueKind = JsonValueKind.Object
+                                     && disposition.ValueKind = JsonValueKind.Null))
+                    | "ReviewAttempt" -> status "phase" [ "Queued"; "Started"; "Finished"; "Deferred"; "Blocked";
+                          "Superseded"; "Abandoned" ]
                     | "BranchReview" ->
                         status "status" [ "Unclaimed"; "Claimed"; "Accepted"; "ChangesRequested"; "Withdrawn" ]
                         && (let mutable kind = Unchecked.defaultof<JsonElement>
@@ -631,8 +684,8 @@ module ReviewWorkflow =
                        || attempt.AssignmentGeneration <> generation
                        || specOid <> Some expectedCurrentSpecOid
                        || attempt.SpecBlobOid = expectedCurrentSpecOid
-                       || not (List.contains attempt.Phase [ "Queued"; "Acknowledged" ])
-                       || agent.State <> "Assigned" || agent.Version <> expectedAgentVersion
+                       || not (List.contains attempt.Phase [ "Queued" ])
+                       || agent.State <> "Ready" || agent.Version <> expectedAgentVersion
                        || agent.FocusAttemptId <> attempt.AttemptId
                        || not (String.IsNullOrWhiteSpace agent.ActiveAttemptId)
                        then
@@ -750,6 +803,112 @@ module ReviewWorkflow =
     let exportTaskSpec binding taskId relativePath expectedSpecOid =
         exportTaskSpecWithId binding (Guid.NewGuid()) taskId relativePath expectedSpecOid
 
+    // Explicit single-ledger v2 -> v3 conversion. Never run this on ordinary reads.
+    // All checks precede one normal Git transaction, so an ambiguous owner or a
+    // mixed record schema cannot produce a partially converted authoritative head.
+    let migrateOrthogonalAgentState binding operationId expectedLedgerHead =
+        if String.IsNullOrWhiteSpace expectedLedgerHead then
+            Error(InvalidBinding "Migration requires the exact previously inspected ledger head.")
+        else
+            LedgerStore.transact binding
+                (intent operationId "Orchestrator" "MigrateOrthogonalAgentState"
+                    {| taskId = ""; expectedLedgerHead = expectedLedgerHead |})
+                (fun snapshot -> result {
+                    if snapshot.Commit <> expectedLedgerHead then
+                        return! Error(StaleEntityVersion "Canonical ledger head changed; reinspect before migration.")
+                    let! agentPaths = LedgerStore.listAt binding snapshot "agents"
+                    let! taskPaths = LedgerStore.listAt binding snapshot "tasks"
+                    let mutable modifications : LedgerFileChange list = []
+                    let mutable tasks : ReviewTask list = []
+                    let mutable attempts : ReviewAttempt list = []
+                    let mutable migrationCount = 0
+                    let rawVersion (raw: string) =
+                        use doc = JsonDocument.Parse(raw)
+                        doc.RootElement.GetProperty("schemaVersion").GetInt32()
+                    let legacyField (raw: string) (name: string) =
+                        use doc = JsonDocument.Parse(raw)
+                        let mutable value = Unchecked.defaultof<JsonElement>
+                        if doc.RootElement.TryGetProperty(name, &value)
+                           && value.ValueKind = JsonValueKind.String then value.GetString()
+                        else null
+                    for path in taskPaths |> List.filter (fun path -> path.EndsWith("/task.json", StringComparison.Ordinal)) do
+                        let! task, _ = required<ReviewTask> binding snapshot path
+                        tasks <- task :: tasks
+                    for path in taskPaths |> List.filter (fun path ->
+                        let segments = path.Split('/')
+                        segments.Length = 4 && segments.[2] = "attempts"
+                        && path.EndsWith(".json", StringComparison.Ordinal)) do
+                        let! raw, oid = LedgerStore.readAt binding snapshot path
+                        match raw, oid with
+                        | Some raw, Some oid when rawVersion raw = 2 ->
+                            let attempt = JsonSerializer.Deserialize<ReviewAttempt>(raw, options)
+                            if isNull (box attempt) then
+                                return! Error(LedgerIntegrityError ("Unreadable legacy attempt: " + path))
+                            let! phase =
+                                match attempt.Phase with
+                                | "Queued" | "Acknowledged" -> Ok "Queued"
+                                | "Working" | "Paused" -> Ok "Started"
+                                | "Parked" -> Ok "Deferred"
+                                | "Blocked" | "Finished" | "Abandoned" | "Superseded" as other -> Ok other
+                                | other ->
+                                    Error(LedgerIntegrityError ("Unsupported legacy attempt phase: " + other))
+                            let next = { attempt with Phase = phase; Version = attempt.Version + 1 }
+                            attempts <- attempt :: attempts
+                            modifications <- change path (Some oid) next :: modifications
+                            migrationCount <- migrationCount + 1
+                        | Some _, Some _ -> return! Error(LedgerIntegrityError "Attempt schema is not v2; refusing mixed migration.")
+                        | _ -> return! Error(LedgerIntegrityError ("Missing legacy attempt: " + path))
+                    for path in agentPaths do
+                        let! raw, oid = LedgerStore.readAt binding snapshot path
+                        match raw, oid with
+                        | Some raw, Some oid when rawVersion raw = 2 ->
+                            let agent = JsonSerializer.Deserialize<ReviewAgent>(raw, options)
+                            if isNull (box agent) then
+                                return! Error(LedgerIntegrityError ("Unreadable legacy agent: " + path))
+                            let state = legacyField raw "state"
+                            let focusId = legacyField raw "focusAttemptId"
+                            let activeId = legacyField raw "activeAttemptId"
+                            let live =
+                                match state with
+                                | "Assigned" | "Ready" | "Working" -> true
+                                | "Completed" | "Parked" -> false
+                                | _ -> false
+                            if not (List.contains state [ "Assigned"; "Ready"; "Working"; "Completed"; "Parked" ]) then
+                                return! Error(LedgerIntegrityError ("Unknown legacy agent state: " + path))
+                            let current =
+                                if not live then Unchecked.defaultof<AgentAssignment>
+                                else
+                                    match tasks |> List.filter (fun task -> task.AttemptId = focusId) with
+                                    | [ task ] -> { TaskId = task.TaskId; AttemptId = focusId }
+                                    | _ -> Unchecked.defaultof<AgentAssignment>
+                            if live && (String.IsNullOrWhiteSpace focusId || isNull (box current)
+                                || not (attempts |> List.exists (fun attempt ->
+                                    attempt.AttemptId = current.AttemptId
+                                    && attempt.TaskId = current.TaskId
+                                    && attempt.OwnerAgentId = agent.AgentId
+                                    && (if state = "Assigned" then List.contains attempt.Phase [ "Queued"; "Acknowledged" ]
+                                        elif state = "Ready" then attempt.Phase = "Paused"
+                                        else attempt.Phase = "Working"))))
+                                || (state = "Working" && activeId <> focusId)
+                                || (state <> "Working" && not (String.IsNullOrWhiteSpace activeId)) then
+                                return! Error(LedgerIntegrityError ("Ambiguous or contradictory legacy agent assignment: " + path))
+                            let converted =
+                                { agent with
+                                    Version = agent.Version + 1
+                                    CurrentAssignment = current
+                                    Execution = if state = "Working" then "Working" else "Stopped"
+                                    UnassignedDisposition =
+                                        if live then null
+                                        elif state = "Parked" then "Parked" else "NeedsWork" }
+                            modifications <- change path (Some oid) converted :: modifications
+                            migrationCount <- migrationCount + 1
+                        | Some _, Some _ -> return! Error(LedgerIntegrityError "Agent schema is not v2; refusing mixed migration.")
+                        | _ -> return! Error(LedgerIntegrityError ("Missing legacy agent: " + path))
+                    if migrationCount = 0 then
+                        return! Error(StaleEntityVersion "No legacy agent or attempt records to convert.")
+                    return List.rev modifications
+                })
+
     let registerAgent binding operationId agentId =
         if not (validAgent agentId) then Error(InvalidBinding "Invalid agent ID.")
         else
@@ -760,8 +919,8 @@ module ReviewWorkflow =
                         let! existing = read<ReviewAgent> binding snapshot (agentPath agentId)
                         if existing.IsSome then return! Error(StaleEntityVersion "Agent already registered.")
                         let agent =
-                            { AgentId = agentId; Version = 1; State = "Parked"
-                              FocusAttemptId = null; ActiveAttemptId = null
+                            { AgentId = agentId; Version = 1; CurrentAssignment = Unchecked.defaultof<AgentAssignment>
+                              Execution = "Stopped"; UnassignedDisposition = "Parked"
                               StateReason = "Registered without an assignment"
                               StateSequence = snapshot.Header.NextSequence
                               StateEnteredAtUtc = DateTimeOffset.UtcNow.ToString("O")
@@ -788,9 +947,9 @@ module ReviewWorkflow =
                             return! Error(LedgerIntegrityError "Canonical task spec is missing.")
                         if task.Lifecycle <> "Open" || not (String.IsNullOrWhiteSpace task.AttemptId) then
                             return! Error(StaleEntityVersion "Task already has an implementation owner.")
-                        if not (List.contains agent.State [ "Parked"; "Completed" ])
+                        if not (List.contains agent.State [ "Parked"; "NeedsWork" ])
                            || not (String.IsNullOrWhiteSpace agent.ActiveAttemptId) then
-                            return! Error(AgentBusy "Agent must be Parked or Completed before receiving an assignment.")
+                            return! Error(AgentBusy "Agent must be unassigned (Needs work or Parked) before receiving an assignment.")
                         let attempt =
                             { TaskId = taskId; AttemptId = attemptIdText; Version = 1
                               OwnerAgentId = ownerId; Phase = "Queued"
@@ -810,12 +969,8 @@ module ReviewWorkflow =
                                     $"Implement task {taskId} against the pinned task specification."
                                     snapshot.Header.NextSequence)
                               change (agentPath ownerId) (Some agentOid)
-                                { (resetSessions agent) with
+                                { (assigned taskId attemptIdText (resetSessions agent)) with
                                     Version = agent.Version + 1
-                                    State = "Assigned"
-                                    FocusAttemptId = attemptIdText
-                                    StateEnteredAtUtc = if agent.State = "Assigned" then agent.StateEnteredAtUtc else DateTimeOffset.UtcNow.ToString("O")
-                                    ActiveAttemptId = null
                                     StateReason = $"Assigned task {taskId}; awaiting operator start"
                                     StateSequence = snapshot.Header.NextSequence } ]
                     })
@@ -838,7 +993,7 @@ module ReviewWorkflow =
                            || attempt.Version <> expectedAttemptVersion
                            || attempt.AssignmentGeneration <> generation
                            || attempt.Phase <> "Queued"
-                           || agent.State <> "Assigned"
+                           || agent.State <> "Ready"
                            || agent.FocusAttemptId <> attempt.AttemptId
                            || not (String.IsNullOrWhiteSpace agent.ActiveAttemptId) then
                             return! Error(StaleEntityVersion "Only the current queued generation can be acknowledged.")
@@ -857,7 +1012,7 @@ module ReviewWorkflow =
                         return
                             [ change (receiptPath taskId attempt.AttemptId generation) None receipt
                               change (attemptPath taskId attempt.AttemptId) (Some attemptOid)
-                                { attempt with Version = attempt.Version + 1; Phase = "Acknowledged" } ]
+                                { attempt with Version = attempt.Version + 1; Phase = "Queued" } ]
                     })
 
     let getAssignment binding taskId generation =
@@ -902,33 +1057,30 @@ module ReviewWorkflow =
                         let! agent, agentOid = required<ReviewAgent> binding snapshot (agentPath ownerId)
                         if task.Lifecycle <> "InProgress" || attempt.OwnerAgentId <> ownerId
                            || attempt.Version <> expectedVersion || attempt.AssignmentGeneration <> generation
-                           || not (List.contains attempt.Phase [ "Queued"; "Acknowledged" ]) then
+                           || not (List.contains attempt.Phase [ "Queued" ]) then
                             return! Error(StaleEntityVersion "Attempt is not available for Begin.")
                         let! issuance = requiredIssue binding snapshot taskId attempt
                         let! existingAcknowledgment =
                             read<AssignmentReceipt> binding snapshot
                                 (receiptPath taskId attempt.AttemptId generation)
-                        if attempt.Phase = "Acknowledged" then
-                            match existingAcknowledgment with
-                            | Some (ack, _) when
-                                ack.Generation = generation
-                                && ack.SpecBlobOid = issuance.SpecBlobOid
-                                && ack.IssueSequence = issuance.IssuedSequence
-                                && ack.OwnerAgentId = ownerId -> ()
-                            | _ ->
-                                return! Error(LedgerIntegrityError "Acknowledgment is not for the current assignment.")
-                        elif existingAcknowledgment.IsSome then
-                            return! Error(LedgerIntegrityError "Queued generation already has an acknowledgment.")
-                        if agent.State <> "Assigned" || agent.FocusAttemptId <> attempt.AttemptId then
+                        match existingAcknowledgment with
+                        | Some (ack, _) when
+                            ack.Generation <> generation
+                            || ack.SpecBlobOid <> issuance.SpecBlobOid
+                            || ack.IssueSequence <> issuance.IssuedSequence
+                            || ack.OwnerAgentId <> ownerId ->
+                            return! Error(LedgerIntegrityError "Acknowledgment is not for the current assignment.")
+                        | _ -> ()
+                        if agent.State <> "Ready" || agent.FocusAttemptId <> attempt.AttemptId then
                             return! Error(StaleEntityVersion "Agent has not been assigned this attempt for startup.")
                         if not (String.IsNullOrWhiteSpace agent.ActiveAttemptId) then
                             return! Error(AgentBusy "Agent is already Working.")
                         return
                             [ change (attemptPath taskId attempt.AttemptId) (Some attemptOid)
-                                { attempt with Version = attempt.Version + 1; Phase = "Working" }
+                                { attempt with Version = attempt.Version + 1; Phase = "Started" }
                               change (agentPath ownerId) (Some agentOid)
-                                (enterState "Working" agent |> associateSession sessionId |> fun updated -> { updated with Version = agent.Version + 1; State = "Working"; ActiveAttemptId = attempt.AttemptId; StateReason = $"Started task {taskId}"; StateSequence = snapshot.Header.NextSequence }) ]
-                            @ (if attempt.Phase = "Queued" then
+                                (enterState "Working" agent |> associateSession sessionId |> fun updated -> { updated with Version = agent.Version + 1; StateReason = $"Started task {taskId}"; StateSequence = snapshot.Header.NextSequence }) ]
+                            @ (if existingAcknowledgment.IsNone then
                                    [ change (receiptPath taskId attempt.AttemptId generation) None
                                        { TaskId = taskId; AttemptId = attempt.AttemptId
                                          Generation = generation; OwnerAgentId = ownerId
@@ -964,7 +1116,7 @@ module ReviewWorkflow =
                         if task.Lifecycle <> "InProgress" || attempt.OwnerAgentId <> ownerId
                            || attempt.Version <> expectedAttemptVersion
                            || attempt.AssignmentGeneration <> generation
-                           || attempt.Phase <> "Working" || agent.State <> "Working"
+                           || attempt.Phase <> "Started" || agent.State <> "Working"
                            || agent.Version <> expectedAgentVersion
                            || agent.ActiveAttemptId <> attempt.AttemptId
                            || agent.FocusAttemptId <> attempt.AttemptId then
@@ -978,9 +1130,9 @@ module ReviewWorkflow =
                         return
                             [ change (checkpointPath taskId attempt.AttemptId snapshot.Header.NextSequence) None checkpoint
                               change (attemptPath taskId attempt.AttemptId) (Some attemptOid)
-                                { attempt with Version = attempt.Version + 1; Phase = "Paused" }
+                                { attempt with Version = attempt.Version + 1; Phase = "Started" }
                               change (agentPath ownerId) (Some agentOid)
-                                (enterState "Ready" agent |> fun updated -> { updated with Version = agent.Version + 1; State = "Ready"; ActiveAttemptId = null; StateReason = nextAction; StateSequence = snapshot.Header.NextSequence }) ]
+                                (enterState "Ready" agent |> fun updated -> { updated with Version = agent.Version + 1; StateReason = nextAction; StateSequence = snapshot.Header.NextSequence }) ]
                     })
 
     // Existing sessions asking to resume an already-Working attempt only need
@@ -996,7 +1148,7 @@ module ReviewWorkflow =
                && attempt.OwnerAgentId = ownerId
                && attempt.AssignmentGeneration = generation
                && agent.State = "Working"
-               && attempt.Phase = "Working"
+               && attempt.Phase = "Started"
                && agent.FocusAttemptId = attempt.AttemptId
                && agent.ActiveAttemptId = attempt.AttemptId
                && (agent.ActiveSessionId = sessionId
@@ -1040,20 +1192,19 @@ module ReviewWorkflow =
                            || agent.FocusAttemptId <> attempt.AttemptId then
                             return! Error(StaleEntityVersion "Current task/attempt/owner changed; reread assignment.")
                         let! _ = requiredIssue binding snapshot taskId attempt
-                        if agent.State = "Ready" && attempt.Phase = "Paused"
+                        if agent.State = "Ready" && attempt.Phase = "Started"
                            && String.IsNullOrWhiteSpace agent.ActiveAttemptId then
                             return
                                 [ change (attemptPath taskId attempt.AttemptId) (Some attemptOid)
-                                    { attempt with Version = attempt.Version + 1; Phase = "Working" }
+                                    { attempt with Version = attempt.Version + 1; Phase = "Started" }
                                   change (agentPath ownerId) (Some agentOid)
                                     (enterState "Working" agent |> associateSession sessionId
                                      |> fun updated ->
                                         { updated with
                                             Version = agent.Version + 1
-                                            ActiveAttemptId = attempt.AttemptId
                                             StateReason = $"Resumed task {taskId}"
                                             StateSequence = snapshot.Header.NextSequence }) ]
-                        elif agent.State = "Working" && attempt.Phase = "Working"
+                        elif agent.State = "Working" && attempt.Phase = "Started"
                              && agent.ActiveAttemptId = attempt.AttemptId then
                             // Only a new execution can report a recovery. Existing
                             // sessions have read-only status through V2TaskApi.
@@ -1104,9 +1255,9 @@ module ReviewWorkflow =
                         let! task, _, attempt, attemptOid = getAttempt binding snapshot taskId
                         let! agent, agentOid = required<ReviewAgent> binding snapshot (agentPath ownerId)
                         let validPhase =
-                            (agent.State = "Working" && attempt.Phase = "Working"
+                            (agent.State = "Working" && attempt.Phase = "Started"
                              && agent.ActiveAttemptId = attempt.AttemptId)
-                            || (agent.State = "Ready" && attempt.Phase = "Paused"
+                            || (agent.State = "Ready" && attempt.Phase = "Started"
                                 && String.IsNullOrWhiteSpace agent.ActiveAttemptId)
                         if not (List.contains task.Lifecycle [ "InProgress"; "Closed" ])
                            || attempt.OwnerAgentId <> ownerId
@@ -1129,8 +1280,7 @@ module ReviewWorkflow =
                                 { attempt with Version = attempt.Version + 1; Phase = "Finished" }
                               change (agentPath ownerId) (Some agentOid)
                                 (enterState "Completed" agent |> fun updated ->
-                                    { updated with Version = agent.Version + 1; State = "Completed"
-                                                   FocusAttemptId = null; ActiveAttemptId = null
+                                    { updated with Version = agent.Version + 1
                                                    StateReason = summary; StateSequence = snapshot.Header.NextSequence }) ]
 
                     })
@@ -1156,7 +1306,7 @@ module ReviewWorkflow =
                         let! task, _, attempt, attemptOid = getAttempt binding snapshot taskId
                         let! agent, _ = required<ReviewAgent> binding snapshot (agentPath ownerId)
                         if task.Lifecycle <> "InProgress" || attempt.OwnerAgentId <> ownerId
-                           || attempt.Phase <> "Working" || attempt.Version <> expectedAttemptVersion
+                           || attempt.Phase <> "Started" || attempt.Version <> expectedAttemptVersion
                            || attempt.AssignmentGeneration <> generation
                            || agent.Version <> expectedAgentVersion || agent.State <> "Working"
                            || agent.ActiveAttemptId <> attempt.AttemptId then
@@ -1201,15 +1351,13 @@ module ReviewWorkflow =
                     result {
                         let! agent, agentOid = required<ReviewAgent> binding snapshot (agentPath agentId)
                         if agent.Version <> expectedAgentVersion
-                           || not (List.contains agent.State [ "Completed"; "Parked" ])
-                           || not (String.IsNullOrWhiteSpace agent.ActiveAttemptId) then
+                           || not (List.contains agent.State [ "NeedsWork"; "Parked" ])
+                           || not (isNull (box agent.CurrentAssignment)) then
                             return! Error(StaleEntityVersion "Park may not interrupt an assigned or Working agent.")
                         return
                             [ change (agentPath agentId) (Some agentOid)
-                                { agent with
+                                { (enterState "Parked" agent) with
                                     Version = agent.Version + 1
-                                    State = "Parked"; FocusAttemptId = null
-                                    StateEnteredAtUtc = if agent.State = "Parked" then agent.StateEnteredAtUtc else DateTimeOffset.UtcNow.ToString("O")
                                     StateReason = reason
                                     StateSequence = snapshot.Header.NextSequence
                                 } ]
@@ -1245,7 +1393,7 @@ module ReviewWorkflow =
                 (fun snapshot ->
                     result {
                         let! _, _, attempt, attemptOid = getAttempt binding snapshot taskId
-                        if attempt.OwnerAgentId <> ownerId || attempt.Phase <> "Working"
+                        if attempt.OwnerAgentId <> ownerId || attempt.Phase <> "Started"
                            || attempt.Version <> expectedVersion || attempt.AssignmentGeneration <> generation
                            || not (String.IsNullOrEmpty attempt.BaseCommit)
                            || not (String.IsNullOrEmpty attempt.SourceRepositoryId) then
@@ -1295,9 +1443,9 @@ module ReviewWorkflow =
                            || attempt.Version <> expectedVersion
                            || attempt.AssignmentGeneration <> generation
                            || agent.FocusAttemptId <> attempt.AttemptId
-                           || not ((attempt.Phase = "Working" && agent.State = "Working"
+                           || not ((attempt.Phase = "Started" && agent.State = "Working"
                                     && agent.ActiveAttemptId = attempt.AttemptId)
-                                   || (attempt.Phase = "Paused" && agent.State = "Ready"
+                                   || (attempt.Phase = "Started" && agent.State = "Ready"
                                        && String.IsNullOrWhiteSpace agent.ActiveAttemptId))
                            || String.IsNullOrWhiteSpace attempt.SourceRepositoryId
                            || String.IsNullOrWhiteSpace attempt.TargetRef then
@@ -1323,7 +1471,7 @@ module ReviewWorkflow =
                 (fun snapshot ->
                     result {
                         let! _, _, attempt, attemptOid = getAttempt binding snapshot taskId
-                        if attempt.OwnerAgentId <> ownerId || attempt.Phase <> "Working"
+                        if attempt.OwnerAgentId <> ownerId || attempt.Phase <> "Started"
                            || attempt.Version <> expectedVersion || attempt.AssignmentGeneration <> generation
                            || not (String.IsNullOrEmpty attempt.BaseCommit) then
                             return! Error(StaleEntityVersion "Review baseline already pinned or attempt not Working.")
@@ -1375,18 +1523,15 @@ module ReviewWorkflow =
                            then
                             return! Error(StaleEntityVersion "Task is not a current queued reissue.")
                         if agent.Version <> expectedAgentVersion
-                           || not (List.contains agent.State [ "Parked"; "Completed" ])
+                           || not (List.contains agent.State [ "Parked"; "NeedsWork" ])
                            || not (String.IsNullOrWhiteSpace agent.ActiveAttemptId) then
-                            return! Error(AgentBusy "Cannot preempt an Assigned, Ready or Working agent.")
+                            return! Error(AgentBusy "Cannot replace the current assignment of a Ready or Working agent.")
                         return
                             [ change (attemptPath taskId attempt.AttemptId) (Some attemptOid)
                                 { attempt with Version = attempt.Version + 1 }
                               change (agentPath ownerId) (Some agentOid)
-                                { (resetSessions agent) with
+                                { (assigned taskId attempt.AttemptId (resetSessions agent)) with
                                     Version = agent.Version + 1
-                                    State = "Assigned"
-                                    FocusAttemptId = attempt.AttemptId; ActiveAttemptId = null
-                                    StateEnteredAtUtc = if agent.State = "Assigned" then agent.StateEnteredAtUtc else DateTimeOffset.UtcNow.ToString("O")
                                     StateReason = reason
                                     StateSequence = snapshot.Header.NextSequence
                                 } ]
@@ -1417,13 +1562,13 @@ module ReviewWorkflow =
                         if task.Lifecycle <> "InProgress" || attempt.OwnerAgentId <> ownerId
                            || attempt.Version <> expectedAttemptVersion
                            || attempt.AssignmentGeneration <> generation
-                           || not (List.contains attempt.Phase [ "Queued"; "Acknowledged" ])
-                           || agent.State <> "Assigned"
+                           || not (List.contains attempt.Phase [ "Queued" ])
+                           || agent.State <> "Ready"
                            || agent.Version <> expectedAgentVersion
                            || agent.FocusAttemptId <> attempt.AttemptId
                            || not (String.IsNullOrWhiteSpace agent.ActiveAttemptId)
                            then
-                            return! Error(StaleEntityVersion "Only an unstarted Assigned generation can be reissued.")
+                            return! Error(StaleEntityVersion "Only a queued, unstarted Ready assignment can be reissued.")
                         let! _ = requiredIssue binding snapshot taskId attempt
                         let! originalSpec, specOid = LedgerStore.readAt binding snapshot (specPath taskId)
                         if originalSpec.IsNone || specOid <> Some attempt.SpecBlobOid then
@@ -1483,8 +1628,8 @@ module ReviewWorkflow =
                            || attempt.AssignmentGeneration <> generation
                            || agent.Version <> expectedAgentVersion
                            || agent.FocusAttemptId <> attempt.AttemptId
-                           || not (List.contains agent.State [ "Assigned"; "Ready"; "Working" ])
-                           || not (List.contains attempt.Phase [ "Queued"; "Paused"; "Working" ])
+                           || not (List.contains agent.State [ "Ready"; "Working" ])
+                           || not (List.contains attempt.Phase [ "Queued"; "Started" ])
                            || (agent.State = "Working" && agent.ActiveAttemptId <> attempt.AttemptId)
                            || (agent.State <> "Working"
                                && not (String.IsNullOrWhiteSpace agent.ActiveAttemptId)) then
@@ -1504,7 +1649,7 @@ module ReviewWorkflow =
                                                AssignmentGeneration = attempt.AssignmentGeneration + 1
                                                Phase = "Queued"; IssuedSequence = snapshot.Header.NextSequence }
                               change (agentPath ownerId) (Some agentOid)
-                                (enterState "Assigned" agent |> resetSessions |> fun updated -> { updated with Version = agent.Version + 1; State = "Assigned"; ActiveAttemptId = null; StateReason = reason; StateSequence = snapshot.Header.NextSequence })
+                                (enterState "Ready" (resetSessions agent) |> fun updated -> { updated with Version = agent.Version + 1; StateReason = reason; StateSequence = snapshot.Header.NextSequence })
                               change (issuePath taskId attempt.AttemptId
                                           (attempt.AssignmentGeneration + 1)) None
                                 (issue taskId attempt (attempt.AssignmentGeneration + 1)
@@ -1555,25 +1700,25 @@ module ReviewWorkflow =
             if agent.Version <> expectedAgentVersion then
                 return! Error(StaleEntityVersion "Agent version changed before lifecycle operation.")
             if agent.FocusAttemptId <> attempt.AttemptId then
+                // This is historical/deferred work. The agent may be Working on
+                // something else; explicit retirement must not touch that slot.
                 if agent.ActiveAttemptId = attempt.AttemptId then
                     return! Error(LedgerIntegrityError "Agent has active slot without matching focus.")
-                if attempt.Phase = "Working" then
-                    return! Error(LedgerIntegrityError "Working attempt has no matching agent slot.")
                 return []
             else
                 if not (String.IsNullOrWhiteSpace agent.ActiveAttemptId)
                    && agent.ActiveAttemptId <> attempt.AttemptId then
                     return! Error(AgentBusy "Agent is Working on an unrelated attempt.")
-                if attempt.Phase = "Working"
-                   && (agent.State <> "Working" || agent.ActiveAttemptId <> attempt.AttemptId) then
+                if agent.Execution = "Working"
+                   && agent.ActiveAttemptId <> attempt.AttemptId then
                     return! Error(LedgerIntegrityError "Working attempt and agent slot disagree.")
                 if agent.State = "Working"
-                   && (agent.ActiveAttemptId <> attempt.AttemptId || attempt.Phase <> "Working") then
+                   && (agent.ActiveAttemptId <> attempt.AttemptId || attempt.Phase <> "Started") then
                     return! Error(LedgerIntegrityError "Agent Working slot disagrees with attempt phase/focus.")
-                if attempt.Phase <> "Working" && not (String.IsNullOrWhiteSpace agent.ActiveAttemptId) then
+                if agent.Execution <> "Working" && not (String.IsNullOrWhiteSpace agent.ActiveAttemptId) then
                     return! Error(LedgerIntegrityError "Nonworking attempt unexpectedly holds an active slot.")
                 return [ change (agentPath attempt.OwnerAgentId) (Some agentOid)
-                             (enterState "Completed" agent |> fun updated -> { updated with Version = agent.Version + 1; State = "Completed"; FocusAttemptId = null; ActiveAttemptId = null; StateReason = reason; StateSequence = snapshot.Header.NextSequence }) ]
+                             (enterState "Completed" agent |> fun updated -> { updated with Version = agent.Version + 1; StateReason = reason; StateSequence = snapshot.Header.NextSequence }) ]
         }
 
     let changeAttemptAdministration binding operationId taskId action expectedTaskVersion expectedAttemptVersion
@@ -1598,10 +1743,10 @@ module ReviewWorkflow =
                        || attempt.AssignmentGeneration <> generation then
                         return! Error(StaleEntityVersion "Administrative transition targets a stale task, attempt or generation.")
                     let allowed =
-                        if action = "ResumeAttempt" then List.contains attempt.Phase [ "Parked"; "Blocked" ]
-                        else List.contains attempt.Phase [ "Queued"; "Acknowledged"; "Working"; "Paused"; "Parked"; "Blocked"; "Finished" ]
+                        if action = "ResumeAttempt" then List.contains attempt.Phase [ "Deferred"; "Blocked" ]
+                        else List.contains attempt.Phase [ "Queued"; "Started"; "Deferred"; "Blocked"; "Finished" ]
                     if not allowed || (action = "ParkAttempt" || action = "BlockAttempt")
-                                      && not (List.contains attempt.Phase [ "Queued"; "Acknowledged"; "Working"; "Paused" ]) then
+                                      && not (List.contains attempt.Phase [ "Queued"; "Started" ]) then
                         return! Error(StaleEntityVersion "Attempt is not in an administratively actionable phase.")
                     let! agent, agentOid =
                         required<ReviewAgent> binding snapshot (agentPath attempt.OwnerAgentId)
@@ -1611,14 +1756,18 @@ module ReviewWorkflow =
                     let terminal = action = "CancelTask" || action = "AbandonAttempt"
                     let! focusChanges =
                         if resume then
-                            if agent.ActiveAttemptId = attempt.AttemptId
-                               || agent.FocusAttemptId = attempt.AttemptId then
-                                Error(LedgerIntegrityError "Parked/Blocked attempt unexpectedly occupies agent focus or slot.")
-                            else Ok []
+                            if not (isNull (box agent.CurrentAssignment)) then
+                                Error(AgentBusy "Cannot resume deferred/blocked work while its owner has another assignment.")
+                            else
+                                Ok [ change (agentPath attempt.OwnerAgentId) (Some agentOid)
+                                         { (assigned taskId attempt.AttemptId (resetSessions agent)) with
+                                             Version = agent.Version + 1
+                                             StateReason = reason
+                                             StateSequence = snapshot.Header.NextSequence } ]
                         else clearAdministrativeFocus binding snapshot attempt expectedAgentVersion reason
                     let nextPhase =
                         match action with
-                        | "ParkAttempt" -> "Parked" | "BlockAttempt" -> "Blocked"
+                        | "ParkAttempt" -> "Deferred" | "BlockAttempt" -> "Blocked"
                         | "ResumeAttempt" -> "Queued" | _ -> "Abandoned"
                     let nextLifecycle =
                         match action with
@@ -1698,7 +1847,7 @@ module ReviewWorkflow =
                        || attempt.AssignmentGeneration <> generation
                        || (attempt.OwnerAgentId = newOwner && attempt.Phase <> "Finished")
                        || not (Set.contains attempt.Phase (Set.ofList
-                              [ "Queued"; "Acknowledged"; "Working"; "Paused"; "Parked"; "Blocked"; "Finished" ])) then
+                              [ "Queued"; "Started"; "Deferred"; "Blocked"; "Finished" ])) then
                         return! Error(StaleEntityVersion "Owner transfer requires the current revocable attempt and versions.")
                     // Reviews stay with the task across an explicit handoff. A finished
                     // worker can also be assigned again after a rejected final review.
@@ -1706,7 +1855,7 @@ module ReviewWorkflow =
                     if successor.IsSome then
                         return! Error(StaleEntityVersion "Transfer attempt ID is not unique.")
                     let! nextOwnerAgent, nextOwnerOid = required<ReviewAgent> binding snapshot (agentPath newOwner)
-                    if not (List.contains nextOwnerAgent.State [ "Completed"; "Parked" ])
+                    if not (List.contains nextOwnerAgent.State [ "NeedsWork"; "Parked" ])
                        || not (String.IsNullOrWhiteSpace nextOwnerAgent.ActiveAttemptId) then
                         return! Error(AgentBusy "New owner is not idle.")
                     let! previousAgentChanges =
@@ -1735,11 +1884,9 @@ module ReviewWorkflow =
                                      ("Transfer from " + attempt.OwnerAgentId + ": " + reason)
                                      snapshot.Header.NextSequence)
                              change (agentPath newOwner) (Some nextOwnerOid)
-                                 { (resetSessions nextOwnerAgent) with
+                                 { (assigned taskId newId (resetSessions nextOwnerAgent)) with
                                      Version = nextOwnerAgent.Version + 1
-                                     State = "Assigned"; FocusAttemptId = newId
-                                     StateEnteredAtUtc = if nextOwnerAgent.State = "Assigned" then nextOwnerAgent.StateEnteredAtUtc else DateTimeOffset.UtcNow.ToString("O")
-                                     ActiveAttemptId = null; StateReason = reason
+                                     StateReason = reason
                                      StateSequence = snapshot.Header.NextSequence
                                  }
                              change (lifecycleEventPath taskId snapshot.Header.NextSequence) None audit ]
@@ -1766,7 +1913,7 @@ module ReviewWorkflow =
                         else read<ReviewAttempt> binding snapshot (attemptPath taskId task.AttemptId)
                              |> Result.map (Option.map fst)
                     match oldAttempt with
-                    | Some attempt when List.contains attempt.Phase [ "Queued"; "Acknowledged"; "Working"; "Paused"; "Parked"; "Blocked" ] ->
+                    | Some attempt when List.contains attempt.Phase [ "Queued"; "Started"; "Deferred"; "Blocked" ] ->
                         return! Error(LedgerIntegrityError "Cannot reopen with unresolved active work or review.")
                     | _ -> ()
                     return [ change (taskPath taskId) (Some oid)
@@ -1936,8 +2083,7 @@ module ReviewWorkflow =
                                 | Ok(attempt, _) ->
                                     if attempt.TaskId <> task.TaskId || attempt.AttemptId <> task.AttemptId
                                        || not (List.contains attempt.Phase
-                                           [ "Queued"; "Acknowledged"; "Working"; "Paused"; "Finished"
-                                             "Parked"; "Blocked"; "Accepted"; "Superseded"; "Abandoned" ]) then
+                                           [ "Queued"; "Started"; "Finished"; "Deferred"; "Blocked"; "Superseded"; "Abandoned" ]) then
                                         failure <- Some(LedgerIntegrityError "Invalid task/attempt identity or phase in inbox.")
                                     elif attempt.OwnerAgentId = agentId then
                                         owned <- { Task = task; Attempt = attempt } :: owned
@@ -1970,7 +2116,10 @@ module ReviewWorkflow =
                             let leftKey = left.Attempt.IssuedSequence, left.Task.TaskId, left.Attempt.AttemptId
                             let rightKey = right.Attempt.IssuedSequence, right.Task.TaskId, right.Attempt.AttemptId
                             compare leftKey rightKey)
-                    let working = owned |> List.filter (fun entry -> entry.Attempt.Phase = "Working")
+                    let working =
+                        owned |> List.filter (fun entry ->
+                            matchesAssignment entry.Task.TaskId entry.Attempt agent
+                            && agent.Execution = "Working" && entry.Attempt.Phase = "Started")
                     if working.Length > 1
                        || (match working with
                            | [ item ] -> agent.ActiveAttemptId <> item.Attempt.AttemptId
@@ -1980,28 +2129,23 @@ module ReviewWorkflow =
                     let active = working |> List.tryHead
                     let focused =
                         owned |> List.tryFind (fun entry ->
-                            entry.Attempt.AttemptId = agent.FocusAttemptId)
+                            matchesAssignment entry.Task.TaskId entry.Attempt agent)
                     let focusValid =
                         match agent.State, focused with
-                        | "Parked", None -> String.IsNullOrWhiteSpace agent.ActiveAttemptId
-                        | "Assigned", Some entry ->
-                            List.contains entry.Attempt.Phase [ "Queued"; "Acknowledged" ] && active.IsNone
+                        | "Parked", None | "NeedsWork", None -> active.IsNone
                         | "Ready", Some entry ->
-                            entry.Attempt.Phase = "Paused" && active.IsNone
+                            List.contains entry.Attempt.Phase [ "Queued"; "Started" ] && active.IsNone
                         | "Working", Some entry ->
-                            entry.Attempt.Phase = "Working"
+                            entry.Attempt.Phase = "Started"
                             && agent.ActiveAttemptId = entry.Attempt.AttemptId
-                        | "Completed", None ->
-                            active.IsNone && String.IsNullOrWhiteSpace agent.ActiveAttemptId
-                        | "Completed", Some entry ->
-                            (List.contains entry.Attempt.Phase [ "Finished"; "Accepted"; "Queued" ])
-                            && active.IsNone
                         | _ -> false
                     if not focusValid then
                         return! Error(LedgerIntegrityError "Agent state/focused attempt mismatch.")
                     let runnable = owned |> List.filter (fun entry ->
-                        entry.Attempt.Phase = "Queued" || entry.Attempt.Phase = "Acknowledged")
-                    let parked = owned |> List.filter (fun entry -> entry.Attempt.Phase = "Parked")
+                        matchesAssignment entry.Task.TaskId entry.Attempt agent
+                        && List.contains entry.Attempt.Phase [ "Queued"; "Started" ]
+                        && agent.Execution <> "Working")
+                    let parked = owned |> List.filter (fun entry -> entry.Attempt.Phase = "Deferred")
                     let blocked = owned |> List.filter (fun entry -> entry.Attempt.Phase = "Blocked")
                     let reviewOrder (review: BranchReview) =
                         review.CreatedSequence, review.TaskId, review.ReviewId
@@ -2011,8 +2155,8 @@ module ReviewWorkflow =
                         { SnapshotCommit = snapshot.Commit
                           Agent = agent
                           Focused = focused
-                          OperatorActionRequired = agent.State = "Ready" || agent.State = "Assigned"
-                          NeedsOrchestratorAssignment = agent.State = "Completed"
+                          OperatorActionRequired = agent.State = "Ready"
+                          NeedsOrchestratorAssignment = agent.State = "NeedsWork"
                           Working = active
                           RunnableQueue = runnable
                           Parked = parked
@@ -2020,11 +2164,8 @@ module ReviewWorkflow =
                           PendingReviews = pending
                           AvailableReviews = available
                           UnacknowledgedFeedback = feedback |> List.sortBy (fun notice -> notice.DecisionSequence)
-                          SlotAvailable = active.IsNone
-                          Unassigned =
-                              (owned |> List.forall (fun item ->
-                                  not (List.contains item.Task.Lifecycle [ "InProgress"; "Implemented" ])))
-                              && pending.IsEmpty && available.IsEmpty && feedback.IsEmpty }
+                          SlotAvailable = isNull (box agent.CurrentAssignment)
+                          Unassigned = isNull (box agent.CurrentAssignment) }
             }
 
     let getBranchAgentInbox binding agentId = getAgentInbox binding agentId

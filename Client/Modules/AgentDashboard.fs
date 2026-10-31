@@ -20,7 +20,15 @@ let private read<'t> binding snapshot path =
     match LedgerStore.readAt binding snapshot path with
     | Error error -> Error (string error)
     | Ok (None, _) -> Error ("Missing canonical ledger entity: " + path)
-    | Ok (Some content, _) -> deserialize<'t> content
+    | Ok (Some content, _) ->
+        if typeof<'t>.Name = "ReviewAgent" || typeof<'t>.Name = "ReviewAttempt" then
+            try
+                use doc = System.Text.Json.JsonDocument.Parse(content)
+                if doc.RootElement.GetProperty("schemaVersion").GetInt32() <> 3 then
+                    Error "Legacy agent/attempt ledger data requires explicit MigrateOrthogonalAgentState before reading dashboard."
+                else deserialize<'t> content
+            with ex -> Error ("Invalid canonical agent/attempt JSON: " + ex.Message)
+        else deserialize<'t> content
 
 let private stateTime (agent: ReviewAgent) =
     match DateTimeOffset.TryParse(agent.StateEnteredAtUtc) with
@@ -68,7 +76,9 @@ let private projectSnapshot project rt =
                             let focused (agent: ReviewAgent) =
                                 if String.IsNullOrWhiteSpace agent.FocusAttemptId then Ok None
                                 else
-                                    match tasks |> List.tryFind (fun task -> task.AttemptId = agent.FocusAttemptId) with
+                                    match tasks |> List.tryFind (fun task ->
+                                        task.AttemptId = agent.FocusAttemptId
+                                        && task.TaskId = agent.CurrentAssignment.TaskId) with
                                     | None -> Error ("Missing canonical focused task for agent " + agent.AgentId)
                                     | Some task ->
                                         match attemptForTask task with

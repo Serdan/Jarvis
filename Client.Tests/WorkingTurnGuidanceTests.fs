@@ -8,8 +8,12 @@ open NUnit.Framework
 let private started = DateTimeOffset(2026, 10, 29, 12, 0, 0, TimeSpan.Zero)
 
 let private agent state since =
-    { AgentId = "Agent 1"; Version = 3; State = state
-      FocusAttemptId = "attempt"; ActiveAttemptId = "attempt"
+    let assignment : AgentAssignment = { TaskId = "task"; AttemptId = "attempt" }
+    { AgentId = "Agent 1"; Version = 3
+      CurrentAssignment = if List.contains state [ "Parked"; "Completed"; "NeedsWork" ] then
+                              Unchecked.defaultof<AgentAssignment> else assignment
+      Execution = if state = "Working" then "Working" else "Stopped"
+      UnassignedDisposition = if state = "Parked" then "Parked" elif state = "Completed" || state = "NeedsWork" then "NeedsWork" else null
       StateReason = ""; StateSequence = 2L
       StateEnteredAtUtc = since; WorkingTurnStartedAtUtc = since
       ActiveSessionId = null; AssociatedSessionIds = [] }
@@ -52,7 +56,7 @@ let currentAndSupersededSessionsReceiveDifferentInstructions () =
     Assert.That(snd older, Does.Contain("new-session"))
     Assert.That(snd older, Does.Contain("reread"))
     Assert.That(forSession now "unrelated-session" worker, Is.EqualTo(None))
-    Assert.That(forSession now "new-session" { worker with State = "Ready" }, Is.EqualTo(None))
+    Assert.That(forSession now "new-session" { worker with Execution = "Stopped" }, Is.EqualTo(None))
 
 [<Test>]
 let recoveredSessionUsesNewCutoffRatherThanStateEntry () =

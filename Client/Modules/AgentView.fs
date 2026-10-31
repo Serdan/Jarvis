@@ -49,10 +49,12 @@ let matches (filter: string) (row: AgentRow) =
 let visibleRows filter snapshot =
     rows snapshot |> List.filter (matches filter)
 
+let displayState state = if state = "NeedsWork" then "Needs work" else state
+
 let agentSummary (row: AgentRow) =
     match row.Focus with
-    | Some task -> sprintf "#%s - %s" task.TaskId row.State
-    | None -> row.State
+    | Some task -> sprintf "#%s - %s" task.TaskId (displayState row.State)
+    | None -> displayState row.State
 
 let changedAgents (before: Snapshot) (after: Snapshot) =
     let previous =

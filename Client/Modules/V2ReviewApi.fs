@@ -562,7 +562,7 @@ module V2PendingIntentJournal =
                                "SourceRef", "sourceRef"; "HeadOid", "sourceHead"
                                "TargetRef", "targetRef"; "Summary", "summary"; "Kind", "kind" ]
                 | "V2ReviewWrite", "ReplaceBranchReview" ->
-                    common @ [ "RequestId", "reviewId"; "ActorId", "ownerId"
+                    common @ [ "RequestId", "reviewId"; "ActorId", "requesterId"
                                "ExpectedVersion", "expectedVersion"; "SourceRef", "sourceRef"
                                "HeadOid", "sourceHead"; "Summary", "summary" ]
                 | "V2ReviewWrite", "ClaimBranchReview" ->

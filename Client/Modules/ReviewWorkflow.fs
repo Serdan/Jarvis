@@ -1591,7 +1591,9 @@ module ReviewWorkflow =
                        generation = generation; reason = reason |})
                 (fun snapshot -> result {
                     let! task, taskOid, attempt, attemptOid = getAttempt binding snapshot taskId
-                    if task.Version <> expectedTaskVersion || task.Lifecycle <> "InProgress"
+                    if task.Version <> expectedTaskVersion
+                       || not (task.Lifecycle = "InProgress"
+                               || (task.Lifecycle = "Closed" && action = "AbandonAttempt"))
                        || attempt.Version <> expectedAttemptVersion
                        || attempt.AssignmentGeneration <> generation then
                         return! Error(StaleEntityVersion "Administrative transition targets a stale task, attempt or generation.")
@@ -1621,6 +1623,7 @@ module ReviewWorkflow =
                     let nextLifecycle =
                         match action with
                         | "CancelTask" -> "Cancelled"
+                        | "AbandonAttempt" when task.Lifecycle = "Closed" -> "Closed"
                         | "AbandonAttempt" -> "Open"
                         | _ -> "InProgress"
                     let nextGen = if resume then generation + 1 else generation
@@ -1634,7 +1637,7 @@ module ReviewWorkflow =
                               action reason nextLifecycle nextPhase attempt.OwnerAgentId null "Unchanged" null
                           with NewGeneration = nextGen }
                     let taskUpdates =
-                        if terminal then
+                        if terminal && task.Lifecycle <> "Closed" then
                             [ change (taskPath taskId) (Some taskOid)
                                 { task with Version = task.Version + 1; Lifecycle = nextLifecycle
                                             AttemptId = if action = "AbandonAttempt" then null else task.AttemptId } ]

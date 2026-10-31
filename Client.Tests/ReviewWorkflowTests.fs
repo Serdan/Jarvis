@@ -240,6 +240,66 @@ type ReviewWorkflowTests() =
             Assert.That(finished.Value.Phase, Is.EqualTo("Finished")))
 
     [<Test>]
+    member _.ClosedTaskCanExplicitlyAbandonQueuedAssignmentWithoutReopening() =
+        withFixture (fun _ _ first second _ _ _ _ ->
+            let taskId = "closed-queued-assignment"
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Close before starting"
+            |> success |> ignore
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner"
+            |> success |> ignore
+            let _, task, attempt = ReviewWorkflow.getTask second taskId |> success
+            let owner = ReviewWorkflow.getAgentInbox first "Owner" |> success
+            Assert.That(owner.Agent.State, Is.EqualTo("Assigned"))
+            ReviewWorkflow.closeTask first (Guid.NewGuid()) taskId task.Version
+            |> success |> ignore
+            let _, closed, _ = ReviewWorkflow.getTask second taskId |> success
+            // Closing the task itself did not change the assignment.
+            Assert.That((ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent.State,
+                        Is.EqualTo("Assigned"))
+            ReviewWorkflow.changeAttemptAdministration first (Guid.NewGuid()) taskId "AbandonAttempt"
+                closed.Version attempt.Value.Version owner.Agent.Version 1
+                "Explicitly release an unstarted assignment after task closure"
+            |> success |> ignore
+            let _, stillClosed, abandoned = ReviewWorkflow.getTask second taskId |> success
+            let released = ReviewWorkflow.getAgentInbox second "Owner" |> success
+            Assert.That(stillClosed.Lifecycle, Is.EqualTo("Closed"))
+            Assert.That(stillClosed.Version, Is.EqualTo(closed.Version))
+            Assert.That(abandoned.Value.Phase, Is.EqualTo("Abandoned"))
+            Assert.That(released.Agent.State, Is.EqualTo("Completed"))
+            Assert.That(released.Agent.FocusAttemptId, Is.Null)
+            let _, history = ReviewWorkflow.getTaskLifecycleHistory second taskId |> success
+            let lastEvent = history |> List.last
+            Assert.That(lastEvent.Action, Is.EqualTo("AbandonAttempt"))
+            Assert.That(lastEvent.PreviousLifecycle, Is.EqualTo("Closed"))
+            Assert.That(lastEvent.NewLifecycle, Is.EqualTo("Closed"))
+            ReviewWorkflow.reopenTask first (Guid.NewGuid()) taskId stillClosed.Version
+                "New work can start after explicit abandonment" |> success |> ignore
+            let _, reopened, staleAttempt = ReviewWorkflow.getTask second taskId |> success
+            Assert.That(reopened.Lifecycle, Is.EqualTo("Open"))
+            Assert.That(staleAttempt.IsNone, Is.True))
+
+    [<Test>]
+    member _.ClosedTaskCanExplicitlyAbandonWorkingAssignmentWithoutChangingTask() =
+        withFixture (fun _ _ first second _ _ _ initTask ->
+            let taskId = "closed-working-assignment"
+            initTask taskId
+            let _, task, attempt = ReviewWorkflow.getTask second taskId |> success
+            let owner = ReviewWorkflow.getAgentInbox first "Owner" |> success
+            ReviewWorkflow.closeTask first (Guid.NewGuid()) taskId task.Version
+            |> success |> ignore
+            let _, closed, _ = ReviewWorkflow.getTask second taskId |> success
+            ReviewWorkflow.changeAttemptAdministration second (Guid.NewGuid()) taskId "AbandonAttempt"
+                closed.Version attempt.Value.Version owner.Agent.Version 1
+                "Explicitly stop work after closure" |> success |> ignore
+            let _, after, abandoned = ReviewWorkflow.getTask first taskId |> success
+            Assert.That(after.Lifecycle, Is.EqualTo("Closed"))
+            Assert.That(after.Version, Is.EqualTo(closed.Version))
+            Assert.That(abandoned.Value.Phase, Is.EqualTo("Abandoned"))
+            let agent = ReviewWorkflow.getAgentInbox first "Owner" |> success
+            Assert.That(agent.Agent.State, Is.EqualTo("Completed"))
+            Assert.That(agent.Agent.ActiveAttemptId, Is.Null))
+
+    [<Test>]
     member _.AttemptHasNoAssignedReviewerAndLegacyReviewerFieldIsIgnored() =
         withFixture (fun _ _ first second _ sourceRef newCommit initTask ->
             let taskId = "review-free-assignment"
@@ -1792,6 +1852,34 @@ type ReviewWorkflowTests() =
             Assert.That((Client.V2ReviewApi.V2PendingIntentJournal.listAtRoot one |> success).Length,
                         Is.EqualTo(0)))
 
+
+    [<Test>]
+    member _.ReviewReplacementReconciliationRecognizesAppliedOperation() =
+        withFixture (fun _ _ first second _ sourceRef newCommit _ ->
+            let taskId = "replacement-reconcile"
+            let initialHead = newCommit "Original review" "before replacement"
+            let reviewId = Guid.NewGuid()
+            ReviewWorkflow.submitBranchReview first (Guid.NewGuid()) taskId "Owner"
+                reviewId sourceRef initialHead "Original" "" "" |> success |> ignore
+            let replacementHead = newCommit "Replacement review" "after replacement"
+            let operationId = Guid.NewGuid()
+            let command =
+                {| Action = "Update"; TaskId = taskId; RequestId = reviewId.ToString("D")
+                   ActorId = "Owner"; ExpectedVersion = 1; SourceRef = sourceRef
+                   HeadOid = replacementHead; Summary = "Updated review" |}
+            Client.V2ReviewApi.V2PendingIntentJournal.persist first operationId
+                "V2ReviewWrite" (System.Text.Json.JsonSerializer.Serialize command)
+            |> success
+            ReviewWorkflow.replaceBranchReview first operationId taskId "Owner" reviewId 1
+                sourceRef replacementHead "Updated review" |> success |> ignore
+            let entries = Client.V2ReviewApi.V2PendingIntentJournal.reconcile first |> success
+            let item = entries |> List.find (fun entry ->
+                entry.operationId = operationId.ToString("D"))
+            Assert.That(item.disposition, Is.EqualTo("Applied"))
+            let current = ReviewWorkflow.getBranchReview first taskId reviewId |> success
+            Assert.That(current.HeadCommit, Is.EqualTo(replacementHead))
+            Client.V2ReviewApi.V2PendingIntentJournal.acknowledge first operationId
+                item.operation.Value.RequestHash |> success |> ignore)
 
     [<Test>]
     member _.DomainResultsRetainExactEntityVersionsAndCheckpointAfterReplay() =

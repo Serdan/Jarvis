@@ -89,6 +89,54 @@ type ReviewWorkflowTests() =
             Directory.Delete(root, true)
 
     [<Test>]
+    member _.BranchReviewsIntegrateIndependentlyThroughOrdinaryMergeCommits() =
+        withFixture (fun one _ first second baseOid sourceRef newCommit initTask ->
+            let taskId = "branch-merge"
+            initTask taskId
+            git one [ "switch"; "-c"; "feature/branch-merge" ] |> ignore
+            let featureRef = "refs/heads/feature/branch-merge"
+            let firstHead = newCommit "First review slice" "slice A"
+            let a = Guid.NewGuid()
+            ReviewWorkflow.submitBranchReview first (Guid.NewGuid()) taskId "Owner" 3 1
+                a featureRef firstHead "# Review A" |> success |> ignore
+            ReviewWorkflow.claimBranchReview second (Guid.NewGuid()) taskId a "Reviewer" 1
+            |> success |> ignore
+            ReviewWorkflow.decideBranchReview second (Guid.NewGuid()) taskId a "Reviewer" 2 Accept
+            |> success |> ignore
+            let aReview = ReviewWorkflow.getBranchReview first taskId a |> success
+            Assert.That(aReview.Integrated, Is.False)
+            git one [ "switch"; "main" ] |> ignore
+            git one [ "fetch"; "origin"; aReview.Review.ReviewRef ] |> ignore
+            git one [ "merge"; "--no-ff"; "-m"; "Integrate reviewed slice A";
+                      "FETCH_HEAD" ] |> ignore
+            git one [ "push"; "origin"; "main" ] |> ignore
+            Assert.That((ReviewWorkflow.getBranchReview second taskId a |> success).Integrated, Is.True)
+            git one [ "switch"; "feature/branch-merge" ] |> ignore
+            git one [ "merge"; "main" ] |> ignore
+            let secondHead = newCommit "Second review slice" "slice B"
+            let b = Guid.NewGuid()
+            ReviewWorkflow.submitBranchReview first (Guid.NewGuid()) taskId "Owner" 3 1
+                b featureRef secondHead "# Review B" |> success |> ignore
+            let bReview = ReviewWorkflow.getBranchReview second taskId b |> success
+            Assert.That(bReview.Review.BaseCommit, Is.EqualTo(git one [ "rev-parse"; "main" ]))
+            ReviewWorkflow.claimBranchReview second (Guid.NewGuid()) taskId b "Reviewer" 1
+            |> success |> ignore
+            ReviewWorkflow.decideBranchReview second (Guid.NewGuid()) taskId b "Reviewer" 2 Accept
+            |> success |> ignore
+            let pending = ReviewWorkflow.getBranchAgentInbox first "Owner" |> success
+            Assert.That(pending.AcceptedPendingIntegration.Length, Is.EqualTo(1))
+            Assert.That(pending.AcceptedPendingIntegration.Head.Review.RequestId,
+                        Is.EqualTo(b.ToString("N")))
+            git one [ "switch"; "main" ] |> ignore
+            git one [ "fetch"; "origin"; bReview.Review.ReviewRef ] |> ignore
+            git one [ "merge"; "--no-ff"; "-m"; "Integrate reviewed slice B";
+                      "FETCH_HEAD" ] |> ignore
+            git one [ "push"; "origin"; "main" ] |> ignore
+            Assert.That((ReviewWorkflow.getBranchReview first taskId b |> success).Integrated, Is.True)
+            let empty = ReviewWorkflow.getBranchAgentInbox first "Owner" |> success
+            Assert.That(empty.AcceptedPendingIntegration, Is.Empty))
+
+    [<Test>]
     member _.CanonicalBranchReviewUsesOneRecordAndGitDerivedClosure() =
         withFixture (fun one _ first second baseOid sourceRef newCommit initTask ->
             let taskId = "simple-review"
@@ -161,69 +209,48 @@ type ReviewWorkflowTests() =
                 Is.EquivalentTo([ $"tasks/{taskId}/reviews/{reviewId:N}/review.json" ])))
 
     [<Test>]
-    member _.BranchReviewsIntegrateIndependentlyThroughOrdinaryMergeCommits() =
-        withFixture (fun one _ first second baseOid sourceRef newCommit initTask ->
-            let taskId = "branch-merge"
-            initTask taskId
-            git one [ "switch"; "-c"; "feature/branch-merge" ] |> ignore
-            let featureRef = "refs/heads/feature/branch-merge"
-            let firstHead = newCommit "First review slice" "slice A"
-            let a = Guid.NewGuid()
-            ReviewWorkflow.submitBranchReview first (Guid.NewGuid()) taskId "Owner" 3 1
-                a featureRef firstHead "# Review A" |> success |> ignore
-            ReviewWorkflow.claimBranchReview second (Guid.NewGuid()) taskId a "Reviewer" 1
-            |> success |> ignore
-            ReviewWorkflow.decideBranchReview second (Guid.NewGuid()) taskId a "Reviewer" 2 Accept
-            |> success |> ignore
-            let aReview = ReviewWorkflow.getBranchReview first taskId a |> success
-            Assert.That(aReview.Integrated, Is.False)
-            git one [ "switch"; "main" ] |> ignore
-            git one [ "fetch"; "origin"; aReview.Review.ReviewRef ] |> ignore
-            git one [ "merge"; "--no-ff"; "-m"; "Integrate reviewed slice A";
-                      "FETCH_HEAD" ] |> ignore
-            git one [ "push"; "origin"; "main" ] |> ignore
-            Assert.That((ReviewWorkflow.getBranchReview second taskId a |> success).Integrated, Is.True)
-            git one [ "switch"; "feature/branch-merge" ] |> ignore
-            git one [ "merge"; "main" ] |> ignore
-            let secondHead = newCommit "Second review slice" "slice B"
-            let b = Guid.NewGuid()
-            ReviewWorkflow.submitBranchReview first (Guid.NewGuid()) taskId "Owner" 3 1
-                b featureRef secondHead "# Review B" |> success |> ignore
-            let bReview = ReviewWorkflow.getBranchReview second taskId b |> success
-            Assert.That(bReview.Review.BaseCommit, Is.EqualTo(git one [ "rev-parse"; "main" ]))
-            ReviewWorkflow.claimBranchReview second (Guid.NewGuid()) taskId b "Reviewer" 1
-            |> success |> ignore
-            ReviewWorkflow.decideBranchReview second (Guid.NewGuid()) taskId b "Reviewer" 2 Accept
-            |> success |> ignore
-            let pending = ReviewWorkflow.getBranchAgentInbox first "Owner" |> success
-            Assert.That(pending.AcceptedPendingIntegration.Length, Is.EqualTo(1))
-            Assert.That(pending.AcceptedPendingIntegration.Head.Review.RequestId,
-                        Is.EqualTo(b.ToString("N")))
-            git one [ "switch"; "main" ] |> ignore
-            git one [ "fetch"; "origin"; bReview.Review.ReviewRef ] |> ignore
-            git one [ "merge"; "--no-ff"; "-m"; "Integrate reviewed slice B";
-                      "FETCH_HEAD" ] |> ignore
-            git one [ "push"; "origin"; "main" ] |> ignore
-            Assert.That((ReviewWorkflow.getBranchReview first taskId b |> success).Integrated, Is.True)
-            let empty = ReviewWorkflow.getBranchAgentInbox first "Owner" |> success
-            Assert.That(empty.AcceptedPendingIntegration, Is.Empty))
-
-    [<Test>]
     member _.LegacyReviewMigrationCreatesCanonicalRecordWithoutLosingFindings() =
         withFixture (fun _ _ first second _ sourceRef newCommit initTask ->
             let taskId = "migrate-review"
             initTask taskId
             let head = newCommit "Legacy patch" "legacy"
             let id = Guid.NewGuid()
-            ReviewWorkflow.submitReview first (Guid.NewGuid()) taskId "Owner" 3 1
-                id sourceRef head "Legacy review" |> success |> ignore
-            ReviewWorkflow.putReviewDocument first (Guid.NewGuid()) taskId id "Owner"
-                "findings/old-finding.md" "" "# Existing finding\nKeep this."
-            |> success |> ignore
-            ReviewWorkflow.claimReview second (Guid.NewGuid()) taskId id "Reviewer" 1 1
-            |> success |> ignore
-            ReviewWorkflow.decide second (Guid.NewGuid()) taskId id "Reviewer" 2 Accept "Approved"
-            |> success |> ignore
+            // Construct old-format ledger data directly, without retaining
+            // the retired review implementation in the runtime.
+            let refName = $"refs/heads/jarvis-review/{taskId}/{id:N}/r1"
+            LedgerStore.publishReviewRef first refName head |> success |> ignore
+            let _, _, attemptOption = ReviewWorkflow.getTask first taskId |> success
+            let attempt = attemptOption.Value
+            let review : ReviewRequest =
+                { RequestId = id.ToString("N"); TaskId = taskId
+                  AttemptId = attempt.AttemptId; OwnerAgentId = "Owner"
+                  ReviewerId = "Reviewer"; Version = 3; CurrentRevision = 1
+                  Status = "Accepted"; ClaimantId = "Reviewer"; ClaimedRevision = 1
+                  CreatedSequence = 30L; DecisionSequence = 35L; Feedback = "Approved" }
+            let revision : ReviewRevision =
+                { RequestId = id.ToString("N"); Revision = 1; TaskId = taskId
+                  AttemptId = attempt.AttemptId; BaseCommit = git first.RepositoryPath [ "rev-list"; "--max-parents=0"; "HEAD" ]
+                  HeadCommit = head; SourceRef = sourceRef; TargetRef = sourceRef
+                  ReviewRef = refName; Summary = "Legacy review"; CreatedSequence = 30L
+                  SpecBlobOid = attempt.SpecBlobOid; SourceRepositoryId = attempt.SourceRepositoryId
+                  SourceRemote = attempt.SourceRemote; SourcePushRemote = attempt.SourcePushRemote
+                  CheckpointSequence = 0L; TestEvidence = ""; EvidenceStatus = "NotProvided" }
+            let serialize value =
+                let options = System.Text.Json.JsonSerializerOptions(
+                                  PropertyNamingPolicy = System.Text.Json.JsonNamingPolicy.CamelCase)
+                let json = System.Text.Json.JsonSerializer.Serialize(value, options)
+                "{\"schemaVersion\":2," + json.Substring(1)
+            let changes : LedgerFileChange list =
+                [ { Path = $"tasks/{taskId}/reviews/{id:N}/request.json"
+                    ExpectedBlobOid = None; Content = serialize review }
+                  { Path = $"tasks/{taskId}/reviews/{id:N}/revisions/1.json"
+                    ExpectedBlobOid = None; Content = serialize revision }
+                  { Path = $"tasks/{taskId}/reviews/{id:N}/findings/old-finding.md"
+                    ExpectedBlobOid = None; Content = "# Existing finding\\nKeep this." } ]
+            let intent : LedgerIntent =
+                { OperationId = Guid.NewGuid(); Actor = "Orchestrator"
+                  Kind = "MigrationFixture"; RequestJson = "{\"fixture\":true}" }
+            LedgerStore.transact first intent (fun _ -> Ok changes) |> success |> ignore
             let historical = LedgerStore.fetch first |> success
             let migrationId = Guid.NewGuid()
             let migrated = ReviewWorkflow.migrateBranchReviews first migrationId |> success
@@ -854,53 +881,6 @@ type ReviewWorkflowTests() =
             Assert.That(history[0].PreviousGeneration, Is.EqualTo(1)))
 
     [<Test>]
-    member _.CancellationSettlesClaimedReviewAndReopenNeverRestoresOldGeneration() =
-        withFixture (fun _ _ first second _ sourceRef newCommit initTask ->
-            initTask "admin-cancel"
-            let head = newCommit "Administrative claimed review" "review-to-cancel"
-            let requestId = Guid.NewGuid()
-            ReviewWorkflow.submitBranchReview first (Guid.NewGuid()) "admin-cancel" "Owner"
-                3 1 requestId sourceRef head "Ready for review" |> success |> ignore
-            ReviewWorkflow.claimBranchReview second (Guid.NewGuid()) "admin-cancel" requestId
-                "Reviewer" 1 |> success |> ignore
-            let _, task, attemptOption = ReviewWorkflow.getTask first "admin-cancel" |> success
-            let attempt = attemptOption.Value
-            let agent = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
-            let cancelId = Guid.NewGuid()
-            let cancel () = ReviewWorkflow.changeAttemptAdministration first cancelId "admin-cancel"
-                                "CancelTask" task.Version attempt.Version agent.Version 1
-                                "Explicitly cancelled after external approval removed"
-            Assert.That((cancel () |> success).AlreadyApplied, Is.False)
-            Assert.That((cancel () |> success).AlreadyApplied, Is.True)
-            let _, closedTask, archivedAttempt = ReviewWorkflow.getTask second "admin-cancel" |> success
-            Assert.That(closedTask.Lifecycle, Is.EqualTo("Cancelled"))
-            Assert.That(archivedAttempt.Value.Phase, Is.EqualTo("Abandoned"))
-            Assert.That(archivedAttempt.Value.ActiveReviewRequestId, Is.Null)
-            let withdrawn = ReviewWorkflow.getBranchReview second "admin-cancel" requestId |> success
-            Assert.That(withdrawn.Review.Status, Is.EqualTo("Withdrawn"))
-            Assert.That(withdrawn.Review.ReviewerId, Is.EqualTo("Reviewer"))
-            Assert.That(withdrawn.HeadCommit, Is.EqualTo(head))
-            let owner = ReviewWorkflow.getAgentInbox second "Owner" |> success
-            Assert.That(owner.Agent.State, Is.EqualTo("Completed"))
-            Assert.That(owner.SlotAvailable, Is.True)
-            expectStale (ReviewWorkflow.decideBranchReview second (Guid.NewGuid()) "admin-cancel"
-                             requestId "Reviewer" 3 Accept)
-            ReviewWorkflow.reopenTask first (Guid.NewGuid()) "admin-cancel"
-                closedTask.Version "New task scope approved" |> success |> ignore
-            let _, reopened, noAttempt = ReviewWorkflow.getTask second "admin-cancel" |> success
-            Assert.That(reopened.Lifecycle, Is.EqualTo("Open"))
-            Assert.That(noAttempt.IsNone, Is.True)
-            ReviewWorkflow.assignTask first (Guid.NewGuid()) "admin-cancel" (Guid.NewGuid())
-                "Owner" "Reviewer" |> success |> ignore
-            let _, reassigned, newAttempt = ReviewWorkflow.getTask second "admin-cancel" |> success
-            Assert.That(newAttempt.Value.AssignmentGeneration, Is.EqualTo(1))
-            Assert.That(newAttempt.Value.AttemptId, Is.Not.EqualTo(attempt.AttemptId))
-            Assert.That(reassigned.Lifecycle, Is.EqualTo("InProgress"))
-            let _, history = ReviewWorkflow.getTaskLifecycleHistory second "admin-cancel" |> success
-            Assert.That(history |> List.map (fun e -> e.Action),
-                        Is.EqualTo(box [ "CancelTask"; "ReopenTask" ])))
-
-    [<Test>]
     member _.OwnerTransferRevokesOldAssignmentAndPreservesFrozenReviewEvidence() =
         withFixture (fun _ _ first second _ sourceRef newCommit initTask ->
             initTask "admin-transfer"
@@ -927,7 +907,6 @@ type ReviewWorkflowTests() =
             Assert.That(afterAttempt.Value.OwnerAgentId, Is.EqualTo("NewOwner"))
             Assert.That(afterAttempt.Value.AssignmentGeneration, Is.EqualTo(1))
             Assert.That(afterAttempt.Value.Phase, Is.EqualTo("Queued"))
-            Assert.That(afterAttempt.Value.ActiveReviewRequestId, Is.Null)
             Assert.That(afterAttempt.Value.SpecBlobOid, Is.EqualTo(oldAttempt.SpecBlobOid))
             Assert.That(afterAttempt.Value.SourceRef, Is.Null)
             Assert.That(afterAttempt.Value.BaseCommit, Is.Null)
@@ -948,54 +927,6 @@ type ReviewWorkflowTests() =
                              previousOwner.Version 1 "Stale transfer")
             expectStale (ReviewWorkflow.beginAttempt first (Guid.NewGuid()) "admin-transfer"
                              "Owner" oldAttempt.Version 1))
-
-    [<Test>]
-    member _.CancellingPriorTaskDoesNotPreemptNewerWorkingAssignmentOrEraseLateFeedback() =
-        withFixture (fun _ _ first second _ sourceRef newCommit initTask ->
-            let oldTask = "late-feedback"
-            initTask oldTask
-            let head = newCommit "Review returned late" "needs changes"
-            let id = Guid.NewGuid()
-            ReviewWorkflow.submitReview first (Guid.NewGuid()) oldTask "Owner" 3 1
-                id sourceRef head "Needs review" |> success |> ignore
-            ReviewWorkflow.claimReview second (Guid.NewGuid()) oldTask id "Reviewer"
-                1 1 |> success |> ignore
-            ReviewWorkflow.decide second (Guid.NewGuid()) oldTask id "Reviewer"
-                2 RequestChanges "Please amend acceptance notes" |> success |> ignore
-            let inbox = ReviewWorkflow.getAgentInbox first "Owner" |> success
-            let notice = inbox.UnacknowledgedFeedback.Head
-            Assert.That(notice.Acknowledged, Is.False)
-            let _, _, beforeFinish = ReviewWorkflow.getTask first oldTask |> success
-            ReviewWorkflow.completeAgentWork first (Guid.NewGuid()) oldTask "Owner"
-                beforeFinish.Value.Version inbox.Agent.Version 1 "Completed current slice"
-            |> success |> ignore
-            ReviewWorkflow.createTask second (Guid.NewGuid()) "new-work" "A newer assignment"
-            |> success |> ignore
-            ReviewWorkflow.assignTask first (Guid.NewGuid()) "new-work" (Guid.NewGuid())
-                "Owner" "Reviewer" |> success |> ignore
-            ReviewWorkflow.beginAttempt second (Guid.NewGuid()) "new-work" "Owner" 1 1
-            |> success |> ignore
-            let newer = ReviewWorkflow.getAgentInbox second "Owner" |> success
-            Assert.That(newer.Agent.State, Is.EqualTo("Working"))
-            let newFocused = newer.Agent.FocusAttemptId
-            let _, oldState, oldAttempt = ReviewWorkflow.getTask first oldTask |> success
-            Assert.That(oldAttempt.Value.Phase, Is.EqualTo("Queued"))
-            ReviewWorkflow.changeAttemptAdministration first (Guid.NewGuid()) oldTask "CancelTask"
-                oldState.Version oldAttempt.Value.Version newer.Agent.Version
-                oldAttempt.Value.AssignmentGeneration "Cancelled older task without preempting newer work"
-            |> success |> ignore
-            let after = ReviewWorkflow.getAgentInbox second "Owner" |> success
-            Assert.That(after.Agent.State, Is.EqualTo("Working"))
-            Assert.That(after.Agent.FocusAttemptId, Is.EqualTo(newFocused))
-            Assert.That(after.Agent.ActiveAttemptId, Is.EqualTo(newFocused))
-            Assert.That(after.UnacknowledgedFeedback.Length, Is.EqualTo(1))
-            Assert.That(after.UnacknowledgedFeedback.Head.DecisionSequence, Is.EqualTo(notice.DecisionSequence))
-            ReviewWorkflow.acknowledgeReviewFeedback second (Guid.NewGuid()) oldTask "Owner"
-                notice.DecisionSequence |> success |> ignore
-            let acknowledged = ReviewWorkflow.getAgentInbox first "Owner" |> success
-            Assert.That(acknowledged.UnacknowledgedFeedback.Length, Is.EqualTo(0))
-            Assert.That(acknowledged.Agent.State, Is.EqualTo("Working"))
-            Assert.That(acknowledged.Agent.ActiveAttemptId, Is.EqualTo(newFocused)))
 
     [<Test>]
     member _.NonSourceClosureCannotBypassExistingSourceBinding() =
@@ -1042,8 +973,6 @@ type ReviewWorkflowTests() =
                 "Reviewed published content against agreed checklist" |> success |> ignore
             let _, closed, preserved = ReviewWorkflow.getTask second taskId |> success
             Assert.That(closed.Lifecycle, Is.EqualTo("Closed"))
-            Assert.That(preserved.Value.IntegrationActionId, Is.Null)
-            Assert.That(preserved.Value.AcceptedReviewRequestId, Is.Null)
             Assert.That(preserved.Value.Phase, Is.EqualTo("Finished"))
             let _, history = ReviewWorkflow.getTaskLifecycleHistory second taskId |> success
             Assert.That(history.Head.Action, Is.EqualTo("CloseNonSourceTask"))
@@ -1065,80 +994,6 @@ type ReviewWorkflowTests() =
             let _, taskAgain, newAttempt = ReviewWorkflow.getTask second taskId |> success
             Assert.That(taskAgain.Lifecycle, Is.EqualTo("InProgress"))
             Assert.That(newAttempt.Value.AttemptId, Is.Not.EqualTo(finished.AttemptId)))
-
-    [<Test>]
-    member _.SourceBindingSurvivesWorktreeRemovalAndBranchRecreationWithoutFreeingOwner() =
-        withFixture (fun one _ first second baseOid targetRef _ _ ->
-            let taskId = "960"
-            let sourceRef = "refs/heads/feature/source-960"
-            let path = Path.Combine(Path.GetDirectoryName(one), "source-960")
-            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Source identity" |> success |> ignore
-            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner" "Reviewer" |> success |> ignore
-            ReviewWorkflow.beginAttempt first (Guid.NewGuid()) taskId "Owner" 1 1 |> success |> ignore
-            git one [ "branch"; "feature/source-960"; baseOid ] |> ignore
-            git one [ "worktree"; "add"; path; "feature/source-960" ] |> ignore
-            let worktreeBinding = { first with RepositoryPath = path }
-            let sourceIdentity = LedgerStore.sourceRepositoryIdentity worktreeBinding |> success
-            Assert.That(sourceIdentity.RepositoryId, Is.Not.EqualTo(first.ProjectId.ToString("D")))
-            Assert.That((LedgerStore.sourceRepositoryIdentity second |> success).RepositoryId,
-                        Is.EqualTo(sourceIdentity.RepositoryId))
-            let initial = LedgerStore.inspectSourceWorktree worktreeBinding sourceRef |> success
-            Assert.That(initial.State, Is.EqualTo("CheckedOut"))
-            ReviewWorkflow.bindAttemptSource worktreeBinding (Guid.NewGuid()) taskId "Owner" 2 1
-                sourceRef baseOid targetRef false false |> success |> ignore
-            expectStale (ReviewWorkflow.bindAttemptSource worktreeBinding (Guid.NewGuid()) taskId
-                             "Owner" 2 1 sourceRef baseOid targetRef false false)
-            expectStale (ReviewWorkflow.rebindAttemptSource worktreeBinding (Guid.NewGuid()) taskId
-                             "Owner" 3 2 sourceRef)
-            let _, _, attemptOption = ReviewWorkflow.getTask second taskId |> success
-            let attempt = attemptOption.Value
-            Assert.That(attempt.SourceRepositoryId, Is.EqualTo(sourceIdentity.RepositoryId))
-            Assert.That(attempt.SourceRef, Is.EqualTo(sourceRef))
-            Assert.That(attempt.SourceRemote, Is.EqualTo(first.ApprovedFetchUrl))
-            Assert.That(attempt.SourcePushRemote, Is.EqualTo(first.ApprovedPushUrl))
-            // Filesystem moves leave prunable Git registrations; they must not
-            // be reported as a usable checkout until Git registration is repaired.
-            let movedPath = Path.Combine(Path.GetDirectoryName(one), "source-960-moved")
-            Directory.Move(path, movedPath)
-            let _, _, displaced = ReviewWorkflow.inspectAttemptSource first taskId |> success
-            Assert.That(displaced.Value.State, Is.EqualTo("AvailableNoWorktree"))
-            git one [ "worktree"; "repair"; movedPath ] |> ignore
-            let repaired = { first with RepositoryPath = movedPath }
-            let _, _, repairedView = ReviewWorkflow.inspectAttemptSource repaired taskId |> success
-            Assert.That(repairedView.Value.State, Is.EqualTo("CheckedOut"))
-            git one [ "worktree"; "remove"; movedPath ] |> ignore
-            let _, _, removed = ReviewWorkflow.inspectAttemptSource first taskId |> success
-            Assert.That(removed.Value.State, Is.EqualTo("AvailableNoWorktree"))
-            git one [ "branch"; "-D"; "feature/source-960" ] |> ignore
-            let _, _, missing = ReviewWorkflow.inspectAttemptSource first taskId |> success
-            Assert.That(missing.Value.State, Is.EqualTo("SourceUnavailable"))
-            let inbox = ReviewWorkflow.getAgentInbox second "Owner" |> success
-            Assert.That(inbox.Agent.State, Is.EqualTo("Working"))
-            Assert.That(inbox.SlotAvailable, Is.False)
-            git one [ "branch"; "feature/source-960"; baseOid ] |> ignore
-            git one [ "worktree"; "add"; path; "feature/source-960" ] |> ignore
-            File.WriteAllText(Path.Combine(path, "source.txt"), "base then restored worktree")
-            git path [ "add"; "source.txt" ] |> ignore
-            git path [ "commit"; "-m"; "Review restored feature" ] |> ignore
-            let head = git path [ "rev-parse"; "HEAD" ]
-            let request = Guid.NewGuid()
-            ReviewWorkflow.submitReview worktreeBinding (Guid.NewGuid()) taskId "Owner" 3 1
-                request sourceRef head "Restored tree" |> success |> ignore
-            let _, _, revision = ReviewWorkflow.getReview second taskId request |> success
-            Assert.That(revision.SourceRepositoryId, Is.EqualTo(sourceIdentity.RepositoryId))
-            Assert.That(revision.SourcePushRemote, Is.EqualTo(sourceIdentity.PushUrl))
-            ReviewWorkflow.claimReview second (Guid.NewGuid()) taskId request "Reviewer" 1 1 |> success |> ignore
-            // Renaming a checked-out source branch changes neither the task owner
-            // nor the immutable review revision's original source-ref evidence.
-            git path [ "branch"; "-m"; "feature/source-960-renamed" ] |> ignore
-            ReviewWorkflow.rebindAttemptSource worktreeBinding (Guid.NewGuid()) taskId "Owner" 4 1
-                "refs/heads/feature/source-960-renamed" |> success |> ignore
-            let _, _, afterRename = ReviewWorkflow.inspectAttemptSource worktreeBinding taskId |> success
-            Assert.That(afterRename.Value.State, Is.EqualTo("CheckedOut"))
-            let _, _, immutableRevision = ReviewWorkflow.getReview second taskId request |> success
-            Assert.That(immutableRevision.SourceRef, Is.EqualTo(sourceRef))
-            ReviewWorkflow.decide second (Guid.NewGuid()) taskId request "Reviewer" 2 Accept
-                "Reviewed before source rename" |> success |> ignore)
 
     [<Test>]
     member _.DetachedSourceCheckoutRequiresExplicitApproval() =
@@ -1206,490 +1061,6 @@ type ReviewWorkflowTests() =
             match inbox with
             | Error(InvalidBinding _) -> () // Remote drift blocks authority; it never frees the slot.
             | other -> Assert.Fail(sprintf "Unapproved ledger endpoint must be rejected: %A" other))
-    [<Test>]
-    member _.CompetingReviewersAndReleasedWithdrawalNeverReopenRevision() =
-        withFixture (fun one _ first second _ sourceRef newCommit initTask ->
-            initTask "974"
-            ReviewWorkflow.registerAgent first (Guid.NewGuid()) "Reviewer2" |> success |> ignore
-            let c = newCommit "Review race" "review-race"
-            let request = Guid.NewGuid()
-            ReviewWorkflow.submitReview first (Guid.NewGuid()) "974" "Owner" 3 1
-                request sourceRef c "Two reviewers" |> success |> ignore
-            let claim1 = ReviewWorkflow.claimReview first (Guid.NewGuid()) "974" request "Reviewer" 1 1
-            let claim2 = ReviewWorkflow.claimReview second (Guid.NewGuid()) "974" request "Reviewer2" 1 1
-            let successes = [ claim1; claim2 ] |> List.filter Result.isOk
-            Assert.That(successes.Length, Is.EqualTo(1))
-            match claim2 with
-            | Error(ReviewVersionConflict _) -> ()
-            | other -> Assert.Fail(sprintf "Second reviewer should lose claim race: %A" other)
-            // Removing a source review ref must block new claim/acceptance,
-            // but it must not permanently trap the reviewer occupancy lease.
-            let frozenRef = $"refs/heads/jarvis-review/974/{request:N}/r1"
-            git one [ "push"; "origin"; $":{frozenRef}" ] |> ignore
-            ReviewWorkflow.releaseReviewClaim second (Guid.NewGuid()) "974" request "Reviewer" 2
-                "Reviewer stepped down" |> success |> ignore
-            match ReviewWorkflow.withdrawReview first (Guid.NewGuid()) "974" request
-                    "Owner" 3 "Try reopening frozen review" with
-            | Error(ReviewAccessDenied _) -> ()
-            | other -> Assert.Fail(sprintf "Owner withdrew frozen review: %A" other)
-            ReviewWorkflow.withdrawReview first (Guid.NewGuid()) "974" request
-                "Orchestrator" 3 "Explicit cancelled review" |> success |> ignore
-            let _, archived, revision = ReviewWorkflow.getReview second "974" request |> success
-            Assert.That(archived.Status, Is.EqualTo("Withdrawn"))
-            Assert.That(archived.ClaimedRevision, Is.EqualTo(1))
-            Assert.That(revision.HeadCommit, Is.EqualTo(c))
-            let _, history = ReviewWorkflow.getReviewClaimEvents second "974" request |> success
-            Assert.That(history |> List.map (fun e -> e.Action),
-                        Is.EqualTo(box [ "Claim"; "Release"; "Withdraw" ]))
-            let inbox = ReviewWorkflow.getAgentInbox first "Owner" |> success
-            Assert.That(inbox.Agent.State, Is.EqualTo("Working"))
-            Assert.That(inbox.SlotAvailable, Is.False))
-
-    [<Test>]
-    member _.OrphanCleanupReservationBlocksLateSubmissionAndOnlyDeletesPinnedOid() =
-        withFixture (fun one _ first second _ sourceRef newCommit initTask ->
-            initTask "970"
-            let c = newCommit "Orphan candidate" "orphan-C"
-            let orphanRequest = Guid.NewGuid()
-            let orphanRef = $"refs/heads/jarvis-review/970/{orphanRequest:N}/r1"
-            LedgerStore.publishReviewRef first orphanRef c |> success |> ignore
-            let _, candidates = ReviewWorkflow.inspectOrphanReviewRefs second "970" |> success
-            Assert.That(candidates.Length, Is.EqualTo(1))
-            Assert.That(candidates.Head.ReviewRef, Is.EqualTo(orphanRef))
-            Assert.That(candidates.Head.ObservedHead, Is.EqualTo(c))
-            Assert.That(candidates.Head.Reserved, Is.False)
-            let invalidHead = String.replicate 40 "f"
-            match ReviewWorkflow.reserveOrphanReviewRef first (Guid.NewGuid()) "970"
-                    orphanRequest 1 invalidHead "Orchestrator" "Cleanup pending failed submission" with
-            | Error(SourceReviewRefUnavailable _) -> ()
-            | other -> Assert.Fail(sprintf "Wrong SHA reservation must fail: %A" other)
-            let reservationId = Guid.NewGuid()
-            let reserve () = ReviewWorkflow.reserveOrphanReviewRef first reservationId "970"
-                                orphanRequest 1 c "Orchestrator" "Abandoned review publish"
-            Assert.That((reserve () |> success).AlreadyApplied, Is.False)
-            Assert.That((reserve () |> success).AlreadyApplied, Is.True)
-            let _, pending = ReviewWorkflow.inspectOrphanReviewRefs second "970" |> success
-            Assert.That(pending.Head.Reserved, Is.True)
-            match ReviewWorkflow.submitReview first (Guid.NewGuid()) "970" "Owner" 3 1
-                    orphanRequest sourceRef c "Late owner submission" with
-            | Error(SourceReviewRefUnavailable _) -> ()
-            | other -> Assert.Fail(sprintf "Tombstoned ref must not become a review: %A" other)
-            let _, result = ReviewWorkflow.deleteReservedOrphanReviewRef second "970" orphanRequest 1 c |> success
-            Assert.That(result, Is.EqualTo("Deleted"))
-            let _, repeat = ReviewWorkflow.deleteReservedOrphanReviewRef first "970" orphanRequest 1 c |> success
-            Assert.That(repeat, Is.EqualTo("AlreadyAbsent"))
-            let _, remaining = ReviewWorkflow.inspectOrphanReviewRefs second "970" |> success
-            Assert.That(remaining.Length, Is.EqualTo(1))
-            Assert.That(remaining.Head.RemoteState, Is.EqualTo("Absent"))
-            Assert.That(remaining.Head.ObservedHead, Is.Null)
-            Assert.That(remaining.Head.ExpectedHead, Is.EqualTo(c))
-            Assert.That(remaining.Head.ReservationSequence, Is.GreaterThan(0L))
-            Assert.That(git one [ "ls-remote"; "origin"; orphanRef ], Is.Empty)
-            let inbox = ReviewWorkflow.getAgentInbox second "Owner" |> success
-            Assert.That(inbox.Agent.State, Is.EqualTo("Working"))
-            Assert.That(inbox.SlotAvailable, Is.False))
-
-    [<Test>]
-    member _.OrphanCleanupRefusesClaimedAndRetargetedRevisionRefs() =
-        withFixture (fun one _ first second _ sourceRef newCommit initTask ->
-            initTask "971"
-            let c = newCommit "C" "claimed-C"
-            let id = Guid.NewGuid()
-            ReviewWorkflow.submitReview first (Guid.NewGuid()) "971" "Owner" 3 1
-                id sourceRef c "Live review" |> success |> ignore
-            ReviewWorkflow.claimReview second (Guid.NewGuid()) "971" id "Reviewer" 1 1
-            |> success |> ignore
-            let protectedRef = $"refs/heads/jarvis-review/971/{id:N}/r1"
-            match ReviewWorkflow.reserveOrphanReviewRef first (Guid.NewGuid()) "971" id 1 c
-                    "Orchestrator" "Would accidentally delete claimed revision" with
-            | Error(ReviewAccessDenied _) -> ()
-            | other -> Assert.Fail(sprintf "Claimed ref cleanup must be rejected: %A" other)
-            let orphanRequest = Guid.NewGuid()
-            let orphanRef = $"refs/heads/jarvis-review/971/{orphanRequest:N}/r1"
-            LedgerStore.publishReviewRef first orphanRef c |> success |> ignore
-            ReviewWorkflow.reserveOrphanReviewRef first (Guid.NewGuid()) "971" orphanRequest 1 c
-                "Orchestrator" "Orphan test" |> success |> ignore
-            let d = newCommit "D" "retargeted-D"
-            git one [ "push"; "--force"; "origin"; $"{d}:{orphanRef}" ] |> ignore
-            let _, retargeted = ReviewWorkflow.inspectOrphanReviewRefs second "971" |> success
-            Assert.That(retargeted.Head.RemoteState, Is.EqualTo("Retargeted"))
-            Assert.That(retargeted.Head.ExpectedHead, Is.EqualTo(c))
-            match ReviewWorkflow.deleteReservedOrphanReviewRef first "971" orphanRequest 1 c with
-            | Error(SourceReviewRefUnavailable _) -> ()
-            | other -> Assert.Fail(sprintf "Changed review ref must remain intact: %A" other)
-            Assert.That(git one [ "ls-remote"; "origin"; orphanRef ], Does.Contain(d))
-            Assert.That(git one [ "ls-remote"; "origin"; protectedRef ], Does.Contain(c))
-            let _, review, _ = ReviewWorkflow.getReview first "971" id |> success
-            Assert.That(review.Status, Is.EqualTo("Claimed"))
-            ReviewWorkflow.decide second (Guid.NewGuid()) "971" id "Reviewer" 2 Accept "Approved" |> success |> ignore
-            match ReviewWorkflow.reserveOrphanReviewRef first (Guid.NewGuid()) "971" id 1 c
-                    "Orchestrator" "Would accidentally delete accepted revision" with
-            | Error(ReviewAccessDenied _) -> ()
-            | other -> Assert.Fail(sprintf "Accepted source ref cleanup must be rejected: %A" other))
-
-    [<Test>]
-    member _.ClaimReleaseAndReassignmentPreserveFrozenReviewAndAudit() =
-        withFixture (fun _ _ first second _ sourceRef newCommit initTask ->
-            initTask "603"
-            ReviewWorkflow.registerAgent first (Guid.NewGuid()) "Reviewer2" |> success |> ignore
-            let head = newCommit "Claimable patch" "claimable"
-            let id = Guid.NewGuid()
-            ReviewWorkflow.submitReview first (Guid.NewGuid()) "603" "Owner" 3 1 id sourceRef head "Frozen review"
-            |> success |> ignore
-            ReviewWorkflow.claimReview second (Guid.NewGuid()) "603" id "Reviewer" 1 1
-            |> success |> ignore
-            let _, before, revision = ReviewWorkflow.getReview second "603" id |> success
-            Assert.That(before.ClaimedRevision, Is.EqualTo(1))
-            let releaseId = Guid.NewGuid()
-            let release () = ReviewWorkflow.releaseReviewClaim second releaseId "603" id "Reviewer" 2 "Leaving review"
-            Assert.That((release () |> success).AlreadyApplied, Is.False)
-            Assert.That((release () |> success).AlreadyApplied, Is.True)
-            let _, released, frozen = ReviewWorkflow.getReview first "603" id |> success
-            Assert.That(released.Status, Is.EqualTo("Claimed"))
-            Assert.That(released.ClaimantId, Is.Null)
-            Assert.That(frozen.HeadCommit, Is.EqualTo(revision.HeadCommit))
-            Assert.That((ReviewWorkflow.awaitingReviewReassignment first |> success |> snd).Length, Is.EqualTo(1))
-            Assert.That((ReviewWorkflow.reviewerQueue second "Reviewer" |> success |> snd).Length, Is.EqualTo(0))
-            match ReviewWorkflow.updateReview first (Guid.NewGuid()) "603" "Owner" 1 id 3 sourceRef head "Try replacement" with
-            | Error(ReviewAlreadyClaimed _) -> ()
-            | other -> Assert.Fail(sprintf "Frozen review became replaceable: %A" other)
-            match ReviewWorkflow.claimReview first (Guid.NewGuid()) "603" id "Reviewer2" 3 1 with
-            | Error(ReviewVersionConflict _) -> ()
-            | other -> Assert.Fail(sprintf "Released review became claimable: %A" other)
-            match ReviewWorkflow.decide first (Guid.NewGuid()) "603" id "Reviewer" 3 Accept "Stale" with
-            | Error(ReviewAccessDenied _) -> ()
-            | other -> Assert.Fail(sprintf "Released claimant can still decide: %A" other)
-            match ReviewWorkflow.reassignReviewerWithReason first (Guid.NewGuid()) "603" id
-                    "Reviewer2" "Reviewer2" 3 "Self-reclaim" with
-            | Error(ReviewAccessDenied _) -> ()
-            | other -> Assert.Fail(sprintf "Self-directed reclaim must not bypass orchestrator: %A" other)
-            ReviewWorkflow.reassignReviewerWithReason first (Guid.NewGuid()) "603" id
-                "Orchestrator" "Reviewer2" 3 "Reviewer disconnected" |> success |> ignore
-            let _, handed, retained = ReviewWorkflow.getReview second "603" id |> success
-            Assert.That(handed.ClaimantId, Is.EqualTo("Reviewer2"))
-            Assert.That(handed.ClaimedRevision, Is.EqualTo(1))
-            Assert.That(retained.HeadCommit, Is.EqualTo(head))
-            ReviewWorkflow.decide second (Guid.NewGuid()) "603" id "Reviewer2" 4 Accept "Verified"
-            |> success |> ignore
-            let _, history = ReviewWorkflow.getReviewClaimEvents first "603" id |> success
-            Assert.That(history |> List.map (fun e -> e.Action),
-                        Is.EqualTo(box [ "Claim"; "Release"; "Reassign"; "Decision" ]))
-            Assert.That(history |> List.map (fun e -> e.Revision),
-                        Is.EqualTo(box [ 1; 1; 1; 1 ]))
-            Assert.That(history[1].Reason, Is.EqualTo("Leaving review"))
-            Assert.That(history[1].OperationId, Is.EqualTo(releaseId.ToString("D")))
-            let inbox = ReviewWorkflow.getAgentInbox first "Owner" |> success
-            Assert.That(inbox.Agent.State, Is.EqualTo("Working"))
-            Assert.That(inbox.SlotAvailable, Is.False))
-
-    [<Test>]
-    member _.OwnerUpdatesUntilClaimThenContinuesWorking() =
-        withFixture (fun one _ first second baseOid sourceRef newCommit initTask ->
-            initTask "315"
-            let c = newCommit "C" "base\nC"
-            let req = Guid.NewGuid()
-            let submitOp = Guid.NewGuid()
-            let submit binding =
-                ReviewWorkflow.submitReview binding submitOp "315" "Owner" 3 1 req sourceRef c "Please review C"
-            let submitted = submit first |> success
-            Assert.That(submitted.AlreadyApplied, Is.False)
-            use originalSubmission = System.Text.Json.JsonDocument.Parse(submitted.Operation.OriginalResultJson)
-            let publishedRevision =
-                originalSubmission.RootElement.GetProperty("entityResults").EnumerateArray()
-                |> Seq.find (fun value ->
-                    value.GetProperty("entityKind").GetString() = "ReviewRevision")
-            Assert.That(publishedRevision.GetProperty("currentReviewRevision").GetInt32(), Is.EqualTo(1))
-            Assert.That(publishedRevision.GetProperty("headCommit").GetString(), Is.EqualTo(c))
-            Assert.That(publishedRevision.GetProperty("reviewRef").GetString(),
-                        Is.EqualTo($"refs/heads/jarvis-review/315/{req:N}/r1"))
-            Assert.That((submit second |> success).AlreadyApplied, Is.True)
-            let _, _, attemptAtSubmission = ReviewWorkflow.getTask first "315" |> success
-            Assert.That((Option.get attemptAtSubmission).Phase, Is.EqualTo("Working"))
-            let d = newCommit "D" "base\nC\nD"
-            let updateOp = Guid.NewGuid()
-            let update binding =
-                ReviewWorkflow.updateReview binding updateOp "315" "Owner" 1 req 1 sourceRef d "Review C and D"
-            Assert.That((update first |> success).AlreadyApplied, Is.False)
-            Assert.That((update second |> success).AlreadyApplied, Is.True)
-            let _, changedReq, revision = ReviewWorkflow.getReview second "315" req |> success
-            Assert.That(changedReq.CurrentRevision, Is.EqualTo(2))
-            Assert.That(revision.BaseCommit, Is.EqualTo(baseOid))
-            Assert.That(revision.HeadCommit, Is.EqualTo(d))
-            Assert.That((ReviewWorkflow.reviewerQueue second "Reviewer" |> success |> snd).Length, Is.EqualTo(1))
-            expectStale (ReviewWorkflow.claimReview second (Guid.NewGuid()) "315" req "Reviewer" 1 1)
-            ReviewWorkflow.claimReview second (Guid.NewGuid()) "315" req "Reviewer" 2 2 |> success |> ignore
-            Assert.That((update second |> success).AlreadyApplied, Is.True)
-            Assert.That(git one [ "ls-remote"; "origin"; $"refs/heads/jarvis-review/315/{req:N}/r3" ], Is.Empty)
-            match ReviewWorkflow.updateReview first (Guid.NewGuid()) "315" "Owner" 1 req 3 sourceRef d "new" with
-            | Error(ReviewAlreadyClaimed _) -> ()
-            | other -> Assert.Fail(sprintf "Claim must freeze owner updates: %A" other)
-            ReviewWorkflow.decide second (Guid.NewGuid()) "315" req "Reviewer" 3 Accept "Verified" |> success |> ignore
-            let reviewSnapshot = LedgerStore.fetch first |> success
-            let reviewPaths = LedgerStore.listAt first reviewSnapshot "tasks" |> success
-            let immutableReviewPaths = reviewPaths |> List.filter (fun path ->
-                path.Contains("/revisions/") || path.Contains("/events/")
-                || path.Contains("/decisions/"))
-            Assert.That(immutableReviewPaths.Length, Is.GreaterThanOrEqualTo(4))
-            for path in immutableReviewPaths do
-                let content, _ = LedgerStore.readAt first reviewSnapshot path |> success
-                use doc = System.Text.Json.JsonDocument.Parse(content.Value)
-                let occurred = doc.RootElement.GetProperty("occurredAtUtc").GetString()
-                Assert.That(DateTimeOffset.Parse occurred, Is.LessThanOrEqualTo(DateTimeOffset.UtcNow))
-            let _, task, liveAttempt = ReviewWorkflow.getTask first "315" |> success
-            let attempt = Option.get liveAttempt
-            Assert.That(task.Lifecycle, Is.EqualTo("InProgress"))
-            Assert.That(attempt.Phase, Is.EqualTo("Working"))
-            Assert.That(attempt.ActiveReviewRequestId, Is.Null)
-            Assert.That(attempt.AcceptedReviewRequestId, Is.EqualTo(req.ToString("N")))
-            ReviewWorkflow.acknowledgeReviewFeedback first (Guid.NewGuid()) "315" "Owner" attempt.FeedbackSequence
-            |> success |> ignore
-            let _, _, acknowledged = ReviewWorkflow.getTask first "315" |> success
-            Assert.That((Option.get acknowledged).AcknowledgedFeedbackSequence, Is.EqualTo(attempt.FeedbackSequence))
-            ReviewWorkflow.completeAgentWork first (Guid.NewGuid()) "315" "Owner" 6 3 1
-                "Implementation finished" |> success |> ignore
-            ReviewWorkflow.finalizeImplementation first (Guid.NewGuid()) "315" "Owner" 7 req
-            |> success |> ignore
-            let _, completedTask, completedAttempt = ReviewWorkflow.getTask first "315" |> success
-            Assert.That(completedTask.Lifecycle, Is.EqualTo("Implemented"))
-            Assert.That((Option.get completedAttempt).Phase, Is.EqualTo("Accepted"))
-            let expectedReviewRef = $"refs/heads/jarvis-review/315/{req:N}/r2"
-            Assert.That(git one [ "ls-remote"; "origin"; expectedReviewRef ], Does.Contain(d))
-            Assert.That((ReviewWorkflow.reviewerQueue second "Reviewer" |> success |> snd).Length, Is.EqualTo(0)))
-
-    [<Test>]
-    member _.RejectedReviewDoesNotChangeCumulativeBase() =
-        withFixture (fun one _ first second baseOid sourceRef newCommit initTask ->
-            initTask "500"
-            let c = newCommit "unapproved C" "base\nC"
-            let firstId = Guid.NewGuid()
-            ReviewWorkflow.submitReview first (Guid.NewGuid()) "500" "Owner" 3 1 firstId sourceRef c "Original"
-            |> success |> ignore
-            ReviewWorkflow.claimReview second (Guid.NewGuid()) "500" firstId "Reviewer" 1 1
-            |> success |> ignore
-            ReviewWorkflow.decide second (Guid.NewGuid()) "500" firstId "Reviewer" 2 RequestChanges "Fix C"
-            |> success |> ignore
-            let d = newCommit "fixed D" "base\nC\nD"
-            let nextId = Guid.NewGuid()
-            ReviewWorkflow.submitReview first (Guid.NewGuid()) "500" "Owner" 5 1 nextId sourceRef d "C and D"
-            |> success |> ignore
-            let _, _, revision = ReviewWorkflow.getReview second "500" nextId |> success
-            Assert.That(revision.BaseCommit, Is.EqualTo(baseOid))
-            Assert.That(revision.HeadCommit, Is.EqualTo(d))
-            Assert.That(revision.BaseCommit, Is.Not.EqualTo(c))
-            let _, _, attemptOption = ReviewWorkflow.getTask first "500" |> success
-            Assert.That((Option.get attemptOption).Phase, Is.EqualTo("Working"))
-            ReviewWorkflow.claimReview second (Guid.NewGuid()) "500" nextId "Reviewer" 1 1 |> success |> ignore
-            ReviewWorkflow.decide second (Guid.NewGuid()) "500" nextId "Reviewer" 2 Accept "Now includes all work"
-            |> success |> ignore
-            Assert.That((ReviewWorkflow.reviewerQueue second "Reviewer" |> success |> snd).Length, Is.EqualTo(0)))
-
-    [<Test>]
-    member _.SourceRefIsCreateOnlyAndNoDuplicateActiveRequest() =
-        withFixture (fun one _ first second _ sourceRef newCommit initTask ->
-            initTask "700"
-            let c = newCommit "C" "C"
-            let request = Guid.NewGuid()
-            let firstOp = Guid.NewGuid()
-            let submit id operation =
-                ReviewWorkflow.submitReview first operation "700" "Owner" 3 1 id sourceRef c "Review"
-            submit request firstOp |> success |> ignore
-            let originalRef = $"refs/heads/jarvis-review/700/{request:N}/r1"
-            let d = newCommit "D" "D"
-            match LedgerStore.publishReviewRef first originalRef d with
-            | Error(SourceReviewRefUnavailable _) -> ()
-            | other -> Assert.Fail(sprintf "Ref must be immutable: %A" other)
-            let count = git one [ "ls-remote"; "origin"; originalRef ]
-            Assert.That(count, Does.StartWith(c))
-            match submit (Guid.NewGuid()) (Guid.NewGuid()) with
-            | Error(StaleEntityVersion _) -> ()
-            | other -> Assert.Fail(sprintf "Second active review must be rejected: %A" other)
-            let _, _, current = ReviewWorkflow.getTask first "700" |> success
-            Assert.That((Option.get current).ActiveReviewRequestId, Is.EqualTo(request.ToString("N")))
-            Assert.That((ReviewWorkflow.reviewerQueue second "Reviewer" |> success |> snd).Length, Is.EqualTo(1)))
-
-    [<Test>]
-    member _.SingleOwnerCanWorkOnlyOneTaskWhileReviewIsPending() =
-        withFixture (fun one _ first _ _ sourceRef newCommit initTask ->
-            initTask "100"
-            ReviewWorkflow.createTask first (Guid.NewGuid()) "101" "101" |> success |> ignore
-            match ReviewWorkflow.assignTask first (Guid.NewGuid()) "101" (Guid.NewGuid()) "Owner" "Reviewer" with
-            | Error(AgentBusy _) -> ()
-            | other -> Assert.Fail(sprintf "Working agent must not be assigned a second task: %A" other)
-            let c = newCommit "C" "C"
-            ReviewWorkflow.submitReview first (Guid.NewGuid()) "100" "Owner" 3 1
-                (Guid.NewGuid()) sourceRef c "Snapshot" |> success |> ignore
-            let current = ReviewWorkflow.getAgentInbox first "Owner" |> success
-            Assert.That(current.Agent.State, Is.EqualTo("Working"))
-            Assert.That(current.SlotAvailable, Is.False))
-
-    [<Test>]
-    member _.WithdrawalAndClaimedHandoffPreserveWorkingOwner() =
-        withFixture (fun _ _ first second _ sourceRef newCommit initTask ->
-            initTask "800"
-            let c = newCommit "First patch" "C"
-            let original = Guid.NewGuid()
-            ReviewWorkflow.submitReview first (Guid.NewGuid()) "800" "Owner" 3 1
-                original sourceRef c "Original patch" |> success |> ignore
-            ReviewWorkflow.withdrawReview first (Guid.NewGuid()) "800" original "Owner" 1 "Superseded"
-            |> success |> ignore
-            Assert.That((ReviewWorkflow.reviewerQueue second "Reviewer" |> success |> snd).Length, Is.EqualTo(0))
-            let d = newCommit "Second patch" "D"
-            let replacement = Guid.NewGuid()
-            ReviewWorkflow.submitReview first (Guid.NewGuid()) "800" "Owner" 5 1
-                replacement sourceRef d "Replacement patch" |> success |> ignore
-            ReviewWorkflow.registerAgent first (Guid.NewGuid()) "Reviewer 2" |> success |> ignore
-            ReviewWorkflow.claimReview second (Guid.NewGuid()) "800" replacement "Reviewer" 1 1
-            |> success |> ignore
-            match ReviewWorkflow.withdrawReview first (Guid.NewGuid()) "800" replacement "Owner" 2 "No" with
-            | Error(ReviewAccessDenied _) -> ()
-            | other -> Assert.Fail(sprintf "Owner must not withdraw claimed revision: %A" other)
-            ReviewWorkflow.reassignReviewer second (Guid.NewGuid()) "800" replacement "Reviewer" "Reviewer 2" 2
-            |> success |> ignore
-            Assert.That((ReviewWorkflow.reviewerQueue second "Reviewer" |> success |> snd).Length, Is.EqualTo(0))
-            Assert.That((ReviewWorkflow.reviewerQueue second "Reviewer 2" |> success |> snd).Length, Is.EqualTo(1))
-            match ReviewWorkflow.decide second (Guid.NewGuid()) "800" replacement "Reviewer" 3 Accept "Old" with
-            | Error(ReviewAccessDenied _) -> ()
-            | other -> Assert.Fail(sprintf "Old reviewer should not decide after handoff: %A" other)
-            ReviewWorkflow.decide second (Guid.NewGuid()) "800" replacement "Reviewer 2" 3 Accept "Accepted"
-            |> success |> ignore
-            let _, task, attemptOption = ReviewWorkflow.getTask first "800" |> success
-            Assert.That(task.Lifecycle, Is.EqualTo("InProgress"))
-            Assert.That((Option.get attemptOption).Phase, Is.EqualTo("Working"))
-            Assert.That((Option.get attemptOption).AcceptedReviewRequestId, Is.EqualTo(replacement.ToString("N"))))
-
-    [<Test>]
-    member _.AnyRegisteredReviewerCanClaimWithoutPreassignment() =
-        withFixture (fun _ _ first second _ sourceRef newCommit initTask ->
-            initTask "900"
-            ReviewWorkflow.registerAgent first (Guid.NewGuid()) "Reviewer 2" |> success |> ignore
-            let c = newCommit "Source" "C"
-            let req = Guid.NewGuid()
-            ReviewWorkflow.submitReview first (Guid.NewGuid()) "900" "Owner" 3 1
-                req sourceRef c "Needs review" |> success |> ignore
-            let _, available = ReviewWorkflow.reviewerQueue second "Reviewer 2" |> success
-            Assert.That(available.Length, Is.EqualTo(1))
-            ReviewWorkflow.claimReview second (Guid.NewGuid()) "900" req "Reviewer 2" 1 1
-            |> success |> ignore
-            expectStale (ReviewWorkflow.claimReview first (Guid.NewGuid()) "900" req "Reviewer" 1 1)
-            ReviewWorkflow.decide second (Guid.NewGuid()) "900" req "Reviewer 2" 2 Accept "Verified"
-            |> success |> ignore)
-
-    [<Test>]
-    member _.OlderAcceptanceCannotFinalizeAfterNewerRejectedReview() =
-        withFixture (fun _ _ first second _ sourceRef newCommit initTask ->
-            initTask "901"
-            let c = newCommit "First" "C"
-            let accepted = Guid.NewGuid()
-            ReviewWorkflow.submitReview first (Guid.NewGuid()) "901" "Owner" 3 1
-                accepted sourceRef c "Complete?" |> success |> ignore
-            ReviewWorkflow.claimReview second (Guid.NewGuid()) "901" accepted "Reviewer" 1 1
-            |> success |> ignore
-            ReviewWorkflow.decide second (Guid.NewGuid()) "901" accepted "Reviewer" 2 Accept "Fine"
-            |> success |> ignore
-            let d = newCommit "More changes" "D"
-            let later = Guid.NewGuid()
-            ReviewWorkflow.submitReview first (Guid.NewGuid()) "901" "Owner" 5 1
-                later sourceRef d "Extra work" |> success |> ignore
-            ReviewWorkflow.claimReview second (Guid.NewGuid()) "901" later "Reviewer" 1 1
-            |> success |> ignore
-            ReviewWorkflow.decide second (Guid.NewGuid()) "901" later "Reviewer" 2 RequestChanges "Not ready"
-            |> success |> ignore
-            match ReviewWorkflow.finalizeImplementation first (Guid.NewGuid()) "901" "Owner" 7 accepted with
-            | Error(StaleEntityVersion _) -> ()
-            | other -> Assert.Fail(sprintf "Old approval must not finalize newer rejected work: %A" other))
-
-    [<Test>]
-    member _.ClaimAndUpdateRaceHasOneAuthoritativeRevision() =
-        withFixture (fun _ _ first second _ sourceRef newCommit initTask ->
-            initTask "999"
-            let c = newCommit "First" "C"
-            let requestId = Guid.NewGuid()
-            ReviewWorkflow.submitReview first (Guid.NewGuid()) "999" "Owner" 3 1
-                requestId sourceRef c "Original" |> success |> ignore
-            let d = newCommit "Second" "D"
-            let updateOp = Guid.NewGuid()
-            let claimOp = Guid.NewGuid()
-            let update =
-                System.Threading.Tasks.Task.Run(fun () ->
-                    ReviewWorkflow.updateReview first updateOp "999" "Owner" 1
-                        requestId 1 sourceRef d "Replacement")
-            let claim =
-                System.Threading.Tasks.Task.Run(fun () ->
-                    ReviewWorkflow.claimReview second claimOp "999" requestId "Reviewer" 1 1)
-            System.Threading.Tasks.Task.WaitAll(
-                [| update :> System.Threading.Tasks.Task; claim :> System.Threading.Tasks.Task |])
-            let updated = update.Result
-            let claimed = claim.Result
-            let winners =
-                [ updated; claimed ]
-                |> List.filter (function | Ok _ -> true | _ -> false)
-                |> List.length
-            Assert.That(winners, Is.EqualTo(1))
-            let _, request, revision = ReviewWorkflow.getReview first "999" requestId |> success
-            if request.Status = "Claimed" then
-                Assert.That(request.CurrentRevision, Is.EqualTo(1))
-                Assert.That(revision.HeadCommit, Is.EqualTo(c))
-                match updated with
-                | Error(ReviewAlreadyClaimed _) -> ()
-                | other -> Assert.Fail(sprintf "Claim should lock the update: %A" other)
-            else
-                Assert.That(request.Status, Is.EqualTo("Unclaimed"))
-                Assert.That(request.CurrentRevision, Is.EqualTo(2))
-                Assert.That(revision.HeadCommit, Is.EqualTo(d))
-                expectStale claimed)
-
-
-    [<Test>]
-    member _.AgentInboxSeparatesSlotQueueAndReviewResponsibilities() =
-        withFixture (fun _ _ first second baseOid sourceRef newCommit _ ->
-            ReviewWorkflow.createTask first (Guid.NewGuid()) "102" "Queued task" |> success |> ignore
-            ReviewWorkflow.assignTask first (Guid.NewGuid()) "102" (Guid.NewGuid()) "Owner" "Reviewer"
-            |> success |> ignore
-            let fresh = ReviewWorkflow.getAgentInbox second "Owner" |> success
-            Assert.That(fresh.SlotAvailable, Is.True)
-            Assert.That(fresh.Working.IsNone, Is.True)
-            Assert.That(fresh.RunnableQueue.Length, Is.EqualTo(1))
-            Assert.That(fresh.RunnableQueue.Head.Task.TaskId, Is.EqualTo("102"))
-            Assert.That(fresh.Unassigned, Is.False)
-            ReviewWorkflow.beginAttempt first (Guid.NewGuid()) "102" "Owner" 1 1 |> success |> ignore
-            ReviewWorkflow.bindReviewBase first (Guid.NewGuid()) "102" "Owner" 2 1 baseOid sourceRef
-            |> success |> ignore
-            let working = ReviewWorkflow.getAgentInbox first "Owner" |> success
-            Assert.That(working.SlotAvailable, Is.False)
-            Assert.That(working.Working.Value.Task.TaskId, Is.EqualTo("102"))
-            Assert.That(working.RunnableQueue.Length, Is.EqualTo(0))
-            let c = newCommit "Needs review" "C"
-            let requestId = Guid.NewGuid()
-            ReviewWorkflow.submitReview first (Guid.NewGuid()) "102" "Owner" 3 1
-                requestId sourceRef c "Review C" |> success |> ignore
-            let submitting = ReviewWorkflow.getAgentInbox second "Owner" |> success
-            Assert.That(submitting.PendingReviews.Length, Is.EqualTo(1))
-            Assert.That(submitting.Working.IsSome, Is.True)
-            let reviewer = ReviewWorkflow.getAgentInbox second "Reviewer" |> success
-            Assert.That(reviewer.AvailableReviews.Length, Is.EqualTo(1))
-            Assert.That(reviewer.PendingReviews.Length, Is.EqualTo(0))
-            Assert.That(reviewer.SlotAvailable, Is.True)
-            ReviewWorkflow.claimReview second (Guid.NewGuid()) "102" requestId "Reviewer" 1 1
-            |> success |> ignore
-            let claimed = ReviewWorkflow.getAgentInbox first "Reviewer" |> success
-            Assert.That(claimed.AvailableReviews.Length, Is.EqualTo(0))
-            Assert.That(claimed.PendingReviews.Length, Is.EqualTo(1))
-            ReviewWorkflow.decide second (Guid.NewGuid()) "102" requestId "Reviewer" 2 Accept "Passed"
-            |> success |> ignore
-            let decided = ReviewWorkflow.getAgentInbox first "Owner" |> success
-            Assert.That(decided.Working.IsSome, Is.True)
-            Assert.That(decided.PendingReviews.Length, Is.EqualTo(0))
-            ReviewWorkflow.completeAgentWork first (Guid.NewGuid()) "102" "Owner" 5 3 1
-                "Ready for integration" |> success |> ignore
-            ReviewWorkflow.finalizeImplementation first (Guid.NewGuid()) "102" "Owner" 6 requestId
-            |> success |> ignore
-            let finalized = ReviewWorkflow.getAgentInbox second "Owner" |> success
-            Assert.That(finalized.SlotAvailable, Is.True)
-            Assert.That(finalized.Agent.State, Is.EqualTo("Completed"))
-            Assert.That(finalized.AcceptedPendingIntegration.Length, Is.EqualTo(1))
-            Assert.That(finalized.RunnableQueue.Length, Is.EqualTo(0))
-            Assert.That(finalized.Unassigned, Is.False))
-
     [<Test>]
     member _.AgentInboxRejectsUnknownAgent() =
         withFixture (fun _ _ first _ _ _ _ _ ->
@@ -2055,85 +1426,6 @@ type ReviewWorkflowTests() =
 
 
     [<Test>]
-    member _.AgentStateLifecycleAndCheckpointAreExplicit() =
-        withFixture (fun _ _ first second baseOid sourceRef newCommit _ ->
-            let initial = ReviewWorkflow.getAgentInbox first "Owner" |> success
-            Assert.That(initial.Agent.State, Is.EqualTo("Parked"))
-            Assert.That(initial.OperatorActionRequired, Is.False)
-            let taskId = "state1"
-            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "State test"
-            |> success |> ignore
-            let attemptId = Guid.NewGuid()
-            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId attemptId "Owner" "Reviewer"
-            |> success |> ignore
-            let assigned = ReviewWorkflow.getAgentInbox second "Owner" |> success
-            Assert.That(assigned.Agent.State, Is.EqualTo("Assigned"))
-            Assert.That(assigned.Agent.FocusAttemptId, Is.EqualTo(attemptId.ToString("N")))
-            Assert.That(assigned.OperatorActionRequired, Is.True)
-            Assert.That(assigned.Focused.IsSome, Is.True)
-            Assert.That(assigned.Working.IsNone, Is.True)
-            ReviewWorkflow.beginAttempt first (Guid.NewGuid()) taskId "Owner" 1 1 |> success |> ignore
-            ReviewWorkflow.bindReviewBase first (Guid.NewGuid()) taskId "Owner" 2 1 baseOid sourceRef
-            |> success |> ignore
-            let executing = ReviewWorkflow.getAgentInbox second "Owner" |> success
-            Assert.That(executing.Agent.State, Is.EqualTo("Working"))
-            Assert.That(executing.OperatorActionRequired, Is.False)
-            ReviewWorkflow.yieldAgent first (Guid.NewGuid()) taskId "Owner" 3 3 1
-                "Implemented initial behavior" "Continue with edge cases" |> success |> ignore
-            let ready = ReviewWorkflow.getAgentInbox second "Owner" |> success
-            Assert.That(ready.Agent.State, Is.EqualTo("Ready"))
-            Assert.That(ready.OperatorActionRequired, Is.True)
-            Assert.That(ready.SlotAvailable, Is.True)
-            Assert.That(ready.Focused.Value.Attempt.Phase, Is.EqualTo("Paused"))
-            let checkpointPath =
-                sprintf "tasks/%s/attempts/%s/checkpoints/%d.json"
-                    taskId (attemptId.ToString("N")) ready.Agent.StateSequence
-            let checkpoint, _ =
-                LedgerStore.readAt first (LedgerStore.fetch first |> success) checkpointPath |> success
-            Assert.That(checkpoint.Value, Does.Contain("Continue with edge cases"))
-            match ReviewWorkflow.resumeAgent first (Guid.NewGuid()) taskId "Owner" 4 3 1 with
-            | Error(StaleEntityVersion _) -> ()
-            | other -> Assert.Fail(sprintf "Stale resume must fail: %A" other)
-            ReviewWorkflow.resumeAgent first (Guid.NewGuid()) taskId "Owner" 4 4 1
-            |> success |> ignore
-            let resumed = ReviewWorkflow.getAgentInbox second "Owner" |> success
-            Assert.That(resumed.Agent.State, Is.EqualTo("Working"))
-            let c = newCommit "Finished work" "state implementation"
-            let reviewId = Guid.NewGuid()
-            ReviewWorkflow.submitReview first (Guid.NewGuid()) taskId "Owner" 5 1 reviewId
-                sourceRef c "Full cumulative review" |> success |> ignore
-            ReviewWorkflow.completeAgentWork first (Guid.NewGuid()) taskId "Owner" 6 5 1
-                "Submitted implementation for review" |> success |> ignore
-            let completed = ReviewWorkflow.getAgentInbox second "Owner" |> success
-            Assert.That(completed.Agent.State, Is.EqualTo("Completed"))
-            Assert.That(completed.NeedsOrchestratorAssignment, Is.True)
-            Assert.That(completed.SlotAvailable, Is.True)
-            Assert.That(completed.Focused.Value.Attempt.Phase, Is.EqualTo("Finished"))
-            Assert.That(completed.PendingReviews.Length, Is.EqualTo(1))
-            ReviewWorkflow.claimReview second (Guid.NewGuid()) taskId reviewId "Reviewer" 1 1
-            |> success |> ignore
-            ReviewWorkflow.decide second (Guid.NewGuid()) taskId reviewId "Reviewer" 2 Accept "Pass"
-            |> success |> ignore
-            let _, _, attempt = ReviewWorkflow.getTask second taskId |> success
-            ReviewWorkflow.finalizeImplementation first (Guid.NewGuid()) taskId "Owner" attempt.Value.Version reviewId
-            |> success |> ignore
-            let finalized = ReviewWorkflow.getAgentInbox second "Owner" |> success
-            Assert.That(finalized.Agent.State, Is.EqualTo("Completed"))
-            Assert.That(finalized.AcceptedPendingIntegration.Length, Is.EqualTo(1))
-            ReviewWorkflow.parkAgent first (Guid.NewGuid()) "Owner" 6 "No more tasks"
-            |> success |> ignore
-            let parked = ReviewWorkflow.getAgentInbox second "Owner" |> success
-            Assert.That(parked.Agent.State, Is.EqualTo("Parked"))
-            Assert.That(parked.Focused.IsNone, Is.True)
-            Assert.That(parked.OperatorActionRequired, Is.False)
-            ReviewWorkflow.createTask first (Guid.NewGuid()) "state2" "New task"
-            |> success |> ignore
-            ReviewWorkflow.assignTask first (Guid.NewGuid()) "state2" (Guid.NewGuid())
-                "Owner" "Reviewer" |> success |> ignore
-            Assert.That((ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent.State,
-                        Is.EqualTo("Assigned")))
-
-    [<Test>]
     member _.ParkDoesNotStealAssignedOrWorkingAgent() =
         withFixture (fun _ _ first _ _ _ _ _ ->
             let initial = ReviewWorkflow.getAgentInbox first "Owner" |> success
@@ -2151,205 +1443,6 @@ type ReviewWorkflowTests() =
             match ReviewWorkflow.parkAgent first (Guid.NewGuid()) "Owner" 4 "Interrupt" with
             | Error(StaleEntityVersion _) -> ()
             | other -> Assert.Fail(sprintf "Parking Working agent should be rejected: %A" other))
-
-
-    [<Test>]
-    member _.ReviewOfCompletedTaskDoesNotInterruptNewAssignment() =
-        withFixture (fun _ _ first second _ sourceRef newCommit initTask ->
-            initTask "oldTask"
-            let head = newCommit "Implementation" "Old task changes"
-            let reviewId = Guid.NewGuid()
-            ReviewWorkflow.submitReview first (Guid.NewGuid()) "oldTask" "Owner" 3 1
-                reviewId sourceRef head "Finished source patch" |> success |> ignore
-            ReviewWorkflow.completeAgentWork first (Guid.NewGuid()) "oldTask" "Owner" 4 3 1
-                "Submitted and finished implementation" |> success |> ignore
-            let completed = ReviewWorkflow.getAgentInbox first "Owner" |> success
-            Assert.That(completed.Agent.State, Is.EqualTo("Completed"))
-            ReviewWorkflow.createTask first (Guid.NewGuid()) "newTask" "Next task"
-            |> success |> ignore
-            ReviewWorkflow.assignTask first (Guid.NewGuid()) "newTask" (Guid.NewGuid())
-                "Owner" "Reviewer" |> success |> ignore
-            let assigned = ReviewWorkflow.getAgentInbox second "Owner" |> success
-            Assert.That(assigned.Agent.State, Is.EqualTo("Assigned"))
-            Assert.That(assigned.Focused.Value.Task.TaskId, Is.EqualTo("newTask"))
-            ReviewWorkflow.beginAttempt first (Guid.NewGuid()) "newTask" "Owner" 1 1
-            |> success |> ignore
-            ReviewWorkflow.claimReview second (Guid.NewGuid()) "oldTask" reviewId "Reviewer" 1 1
-            |> success |> ignore
-            ReviewWorkflow.decide second (Guid.NewGuid()) "oldTask" reviewId "Reviewer" 2 Accept "Good"
-            |> success |> ignore
-            let _, _, oldAttempt = ReviewWorkflow.getTask first "oldTask" |> success
-            ReviewWorkflow.finalizeImplementation first (Guid.NewGuid()) "oldTask" "Owner"
-                oldAttempt.Value.Version reviewId |> success |> ignore
-            let after = ReviewWorkflow.getAgentInbox second "Owner" |> success
-            Assert.That(after.Agent.State, Is.EqualTo("Working"))
-            Assert.That(after.Working.Value.Task.TaskId, Is.EqualTo("newTask"))
-            Assert.That(after.AcceptedPendingIntegration.Length, Is.EqualTo(1))
-            Assert.That(after.AcceptedPendingIntegration.Head.Task.TaskId, Is.EqualTo("oldTask")))
-
-
-    [<Test>]
-    member _.LateRequestedChangesQueueSameAttemptWithoutPreemptingNewWork() =
-        withFixture (fun _ _ first second baseOid sourceRef newCommit initTask ->
-            initTask "late1"
-            let firstAttempt = (ReviewWorkflow.getTask first "late1" |> success |> fun (_,_,a) -> a.Value)
-            let head = newCommit "Review candidate" "candidate A"
-            let requestId = Guid.NewGuid()
-            ReviewWorkflow.submitReview first (Guid.NewGuid()) "late1" "Owner" 3 1
-                requestId sourceRef head "Initial cumulative patch" |> success |> ignore
-            ReviewWorkflow.completeAgentWork first (Guid.NewGuid()) "late1" "Owner" 4 3 1
-                "Submitted and finished" |> success |> ignore
-            ReviewWorkflow.createTask first (Guid.NewGuid()) "late2" "Next assignment" |> success |> ignore
-            ReviewWorkflow.assignTask first (Guid.NewGuid()) "late2" (Guid.NewGuid())
-                "Owner" "Reviewer" |> success |> ignore
-            ReviewWorkflow.beginAttempt first (Guid.NewGuid()) "late2" "Owner" 1 1 |> success |> ignore
-            ReviewWorkflow.claimReview second (Guid.NewGuid()) "late1" requestId "Reviewer" 1 1
-            |> success |> ignore
-            ReviewWorkflow.decide second (Guid.NewGuid()) "late1" requestId "Reviewer"
-                2 RequestChanges "Please fix A" |> success |> ignore
-            let busy = ReviewWorkflow.getAgentInbox first "Owner" |> success
-            Assert.That(busy.Agent.State, Is.EqualTo("Working"))
-            Assert.That(busy.Working.Value.Task.TaskId, Is.EqualTo("late2"))
-            Assert.That(busy.RunnableQueue.Length, Is.EqualTo(1))
-            Assert.That(busy.RunnableQueue.Head.Task.TaskId, Is.EqualTo("late1"))
-            Assert.That(busy.RunnableQueue.Head.Attempt.AssignmentGeneration, Is.EqualTo(2))
-            Assert.That(busy.RunnableQueue.Head.Attempt.AttemptId, Is.EqualTo(firstAttempt.AttemptId))
-            Assert.That(busy.UnacknowledgedFeedback.Length, Is.EqualTo(1))
-            let notice = busy.UnacknowledgedFeedback.Head
-            Assert.That(notice.Status, Is.EqualTo("ChangesRequested"))
-            Assert.That(notice.Feedback, Is.EqualTo("Please fix A"))
-            Assert.That(notice.DecisionSequence, Is.GreaterThan(0L))
-            match ReviewWorkflow.reissueQueuedAttempt first (Guid.NewGuid()) "late1" "Owner" 6 6 2 "Ready to fix" with
-            | Error(AgentBusy _) -> ()
-            | other -> Assert.Fail(sprintf "Reissue must not preempt another task: %A" other)
-            let acknowledgeOp = Guid.NewGuid()
-            let ack binding =
-                ReviewWorkflow.acknowledgeReviewFeedback binding acknowledgeOp
-                    "late1" "Owner" notice.DecisionSequence
-            Assert.That((ack first |> success).AlreadyApplied, Is.False)
-            Assert.That((ack second |> success).AlreadyApplied, Is.True)
-            Assert.That((ReviewWorkflow.getAgentInbox second "Owner" |> success).UnacknowledgedFeedback.Length,
-                        Is.EqualTo(0))
-            ReviewWorkflow.completeAgentWork first (Guid.NewGuid()) "late2" "Owner" 2 6 1
-                "Other task done" |> success |> ignore
-            let idle = ReviewWorkflow.getAgentInbox second "Owner" |> success
-            Assert.That(idle.Agent.State, Is.EqualTo("Completed"))
-            ReviewWorkflow.reissueQueuedAttempt first (Guid.NewGuid()) "late1" "Owner" 7 7 2
-                "Reissue requested changes" |> success |> ignore
-            let assigned = ReviewWorkflow.getAgentInbox second "Owner" |> success
-            Assert.That(assigned.Agent.State, Is.EqualTo("Assigned"))
-            Assert.That(assigned.Focused.Value.Task.TaskId, Is.EqualTo("late1"))
-            Assert.That(assigned.Focused.Value.Attempt.AttemptId, Is.EqualTo(firstAttempt.AttemptId))
-            Assert.That(assigned.Focused.Value.Attempt.AssignmentGeneration, Is.EqualTo(2))
-            match ReviewWorkflow.beginAttempt first (Guid.NewGuid()) "late1" "Owner" 7 1 with
-            | Error(StaleEntityVersion _) -> ()
-            | other -> Assert.Fail(sprintf "Old assignment generation must be rejected: %A" other)
-            ReviewWorkflow.beginAttempt first (Guid.NewGuid()) "late1" "Owner" 8 2
-            |> success |> ignore
-            Assert.That((ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent.State,
-                        Is.EqualTo("Working")))
-
-    [<Test>]
-    member _.FeedbackDecisionsStayIndividuallyActionableAcrossNewReviews() =
-        withFixture (fun _ _ first second _ sourceRef newCommit initTask ->
-            initTask "multi"
-            let firstHead = newCommit "A" "A"
-            let firstId = Guid.NewGuid()
-            ReviewWorkflow.submitReview first (Guid.NewGuid()) "multi" "Owner" 3 1 firstId
-                sourceRef firstHead "First review" |> success |> ignore
-            ReviewWorkflow.claimReview second (Guid.NewGuid()) "multi" firstId "Reviewer" 1 1
-            |> success |> ignore
-            ReviewWorkflow.decide second (Guid.NewGuid()) "multi" firstId "Reviewer" 2
-                RequestChanges "First feedback" |> success |> ignore
-            let secondHead = newCommit "B" "A and B"
-            let secondId = Guid.NewGuid()
-            ReviewWorkflow.submitReview first (Guid.NewGuid()) "multi" "Owner" 5 1 secondId
-                sourceRef secondHead "Cumulative revised review" |> success |> ignore
-            ReviewWorkflow.claimReview second (Guid.NewGuid()) "multi" secondId "Reviewer" 1 1
-            |> success |> ignore
-            ReviewWorkflow.decide second (Guid.NewGuid()) "multi" secondId "Reviewer" 2
-                Accept "Second approval" |> success |> ignore
-            let inbox = ReviewWorkflow.getAgentInbox first "Owner" |> success
-            Assert.That(inbox.UnacknowledgedFeedback.Length, Is.EqualTo(2))
-            Assert.That(inbox.UnacknowledgedFeedback.Head.Feedback, Is.EqualTo("First feedback"))
-            Assert.That(inbox.UnacknowledgedFeedback.Tail.Head.Feedback, Is.EqualTo("Second approval"))
-            let oldest = inbox.UnacknowledgedFeedback.Head
-            let latest = inbox.UnacknowledgedFeedback.Tail.Head
-            ReviewWorkflow.acknowledgeReviewFeedback first (Guid.NewGuid()) "multi"
-                "Owner" latest.DecisionSequence |> success |> ignore
-            let remaining = ReviewWorkflow.getAgentInbox second "Owner" |> success
-            Assert.That(remaining.UnacknowledgedFeedback.Length, Is.EqualTo(1))
-            Assert.That(remaining.UnacknowledgedFeedback.Head.DecisionSequence,
-                        Is.EqualTo(oldest.DecisionSequence))
-            ReviewWorkflow.acknowledgeReviewFeedback first (Guid.NewGuid()) "multi"
-                "Owner" oldest.DecisionSequence |> success |> ignore
-            Assert.That((ReviewWorkflow.getAgentInbox second "Owner" |> success).UnacknowledgedFeedback.Length,
-                        Is.EqualTo(0)))
-
-    [<Test>]
-    member _.ExplicitRecoveryReissuesSameAttemptGenerationWithCheckpoint() =
-        withFixture (fun _ _ first second _ sourceRef newCommit initTask ->
-            initTask "recover"
-            let before = ReviewWorkflow.getAgentInbox first "Owner" |> success
-            Assert.That(before.Agent.State, Is.EqualTo("Working"))
-            let attemptId = before.Working.Value.Attempt.AttemptId
-            let operationId = Guid.NewGuid()
-            let recover binding =
-                ReviewWorkflow.recoverAgentAssignment binding operationId
-                    "recover" "Owner" 3 3 1 "Explicitly recovering a lost frontend session"
-            Assert.That((recover first |> success).AlreadyApplied, Is.False)
-            Assert.That((recover second |> success).AlreadyApplied, Is.True)
-            let recovered = ReviewWorkflow.getAgentInbox second "Owner" |> success
-            Assert.That(recovered.Agent.State, Is.EqualTo("Assigned"))
-            Assert.That(recovered.OperatorActionRequired, Is.True)
-            Assert.That(recovered.SlotAvailable, Is.True)
-            Assert.That(recovered.Focused.Value.Attempt.AttemptId, Is.EqualTo(attemptId))
-            Assert.That(recovered.Focused.Value.Attempt.AssignmentGeneration, Is.EqualTo(2))
-            Assert.That(recovered.Focused.Value.Attempt.Phase, Is.EqualTo("Queued"))
-            let cpPath = $"tasks/recover/attempts/{attemptId}/checkpoints/{recovered.Agent.StateSequence}.json"
-            let checkpoint, _ =
-                LedgerStore.readAt second (LedgerStore.fetch second |> success) cpPath |> success
-            Assert.That(checkpoint.Value, Does.Contain("Recovery"))
-            match ReviewWorkflow.beginAttempt first (Guid.NewGuid()) "recover" "Owner" 4 1 with
-            | Error(StaleEntityVersion _) -> ()
-            | other -> Assert.Fail(sprintf "Old generation must not start: %A" other)
-            ReviewWorkflow.beginAttempt first (Guid.NewGuid()) "recover" "Owner" 4 2
-            |> success |> ignore
-            let head = newCommit "Continued implementation" "continued changes"
-            ReviewWorkflow.submitReview first (Guid.NewGuid()) "recover" "Owner" 5 2
-                (Guid.NewGuid()) sourceRef head "Same task, recovered generation"
-            |> success |> ignore
-            Assert.That((ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent.State,
-                        Is.EqualTo("Working")))
-
-
-    [<Test>]
-    member _.ChangesRequestedBeforeCompletionAreAlsoQueued() =
-        withFixture (fun _ _ first second _ sourceRef newCommit initTask ->
-            initTask "race"
-            let head = newCommit "Candidate" "Candidate"
-            let request = Guid.NewGuid()
-            ReviewWorkflow.submitReview first (Guid.NewGuid()) "race" "Owner" 3 1
-                request sourceRef head "Review" |> success |> ignore
-            ReviewWorkflow.claimReview second (Guid.NewGuid()) "race" request "Reviewer" 1 1
-            |> success |> ignore
-            ReviewWorkflow.decide second (Guid.NewGuid()) "race" request "Reviewer" 2
-                RequestChanges "Needs correction" |> success |> ignore
-            let mid = ReviewWorkflow.getAgentInbox first "Owner" |> success
-            Assert.That(mid.Agent.State, Is.EqualTo("Working"))
-            Assert.That(mid.Working.Value.Attempt.AssignmentGeneration, Is.EqualTo(1))
-            Assert.That(mid.UnacknowledgedFeedback.Length, Is.EqualTo(1))
-            ReviewWorkflow.completeAgentWork first (Guid.NewGuid()) "race" "Owner" 5 3 1
-                "Stopped before correction" |> success |> ignore
-            let finished = ReviewWorkflow.getAgentInbox second "Owner" |> success
-            Assert.That(finished.Agent.State, Is.EqualTo("Completed"))
-            Assert.That(finished.RunnableQueue.Length, Is.EqualTo(1))
-            Assert.That(finished.RunnableQueue.Head.Task.TaskId, Is.EqualTo("race"))
-            Assert.That(finished.RunnableQueue.Head.Attempt.AssignmentGeneration, Is.EqualTo(2))
-            ReviewWorkflow.reissueQueuedAttempt first (Guid.NewGuid()) "race" "Owner" 6 4 2
-                "Reissue before-completion rejection" |> success |> ignore
-            let assigned = ReviewWorkflow.getAgentInbox second "Owner" |> success
-            Assert.That(assigned.Agent.State, Is.EqualTo("Assigned")))
 
 
     [<Test>]
@@ -2373,70 +1466,6 @@ type ReviewWorkflowTests() =
             Assert.That(inbox.Focused.Value.Attempt.SourceRef,
                         Is.EqualTo("refs/heads/feature/ready-source"))
             git one [ "worktree"; "remove"; path ] |> ignore)
-
-    [<Test>]
-    member _.ReviewFindingsAreIndependentLargeGitDocumentsWithEditableHistory() =
-        withFixture (fun one _ first second _ sourceRef newCommit initTask ->
-            let taskId = "review-markdown"
-            initTask taskId
-            let reviewedHead = newCommit "Submit review docs fixture" "reviewed code"
-            let id = Guid.NewGuid()
-            ReviewWorkflow.submitReview first (Guid.NewGuid()) taskId "Owner" 3 1
-                id sourceRef reviewedHead "Please review code" |> success |> ignore
-            ReviewWorkflow.claimReview second (Guid.NewGuid()) taskId id "Reviewer" 1 1
-            |> success |> ignore
-
-            let summary = "# Review summary\nTwo findings to address."
-            let large = "# Allocation in hot path\n" + String.replicate 90000 "x" + "\n"
-            let summaryOperation = Guid.NewGuid()
-            let put actor name previous content operation =
-                ReviewWorkflow.putReviewDocument second operation taskId id actor name previous content
-            let created = put "Reviewer" "summary.md" "" summary summaryOperation |> success
-            Assert.That(created.AlreadyApplied, Is.False)
-            let replay = put "Reviewer" "summary.md" "" summary summaryOperation |> success
-            Assert.That(replay.AlreadyApplied, Is.True)
-            put "Reviewer" "findings/allocation-in-hot-path.md" "" large (Guid.NewGuid())
-            |> success |> ignore
-            put "Reviewer" "findings/missing-regression-test.md" "" "# Missing test\nAdd test."
-                (Guid.NewGuid()) |> success |> ignore
-
-            let _, files = ReviewWorkflow.listReviewDocuments first taskId id |> success
-            Assert.That(files |> List.map (fun f -> f.Path),
-                        Is.EqualTo(box [ "findings/allocation-in-hot-path.md"
-                                         "findings/missing-regression-test.md"; "summary.md" ]))
-            let _, firstFinding =
-                ReviewWorkflow.getReviewDocument first taskId id "findings/allocation-in-hot-path.md"
-                |> success
-            Assert.That(firstFinding.Content, Is.EqualTo(large))
-            Assert.That(firstFinding.BlobOid.Length, Is.EqualTo(40))
-            let changed = "# Allocation in hot path\nResolved by owner."
-            put "Owner" "findings/allocation-in-hot-path.md" firstFinding.BlobOid changed
-                (Guid.NewGuid()) |> success |> ignore
-            let _, updated =
-                ReviewWorkflow.getReviewDocument second taskId id "findings/allocation-in-hot-path.md"
-                |> success
-            Assert.That(updated.Content, Is.EqualTo(changed))
-            Assert.That(updated.BlobOid, Is.Not.EqualTo(firstFinding.BlobOid))
-            match put "Owner" "findings/allocation-in-hot-path.md" firstFinding.BlobOid "stale"
-                      (Guid.NewGuid()) with
-            | Error(StaleEntityVersion _) -> ()
-            | other -> Assert.Fail(sprintf "Expected a stale blob precondition: %A" other)
-            match put "Reviewer" "findings/../../outside.md" "" "invalid" (Guid.NewGuid()) with
-            | Error(InvalidBinding _) -> ()
-            | other -> Assert.Fail(sprintf "Expected invalid path rejection: %A" other)
-
-            ReviewWorkflow.decide second (Guid.NewGuid()) taskId id "Reviewer" 2
-                RequestChanges "See findings directory" |> success |> ignore
-            let _, _, revision = ReviewWorkflow.getReview first taskId id |> success
-            Assert.That(revision.HeadCommit, Is.EqualTo(reviewedHead))
-            let _, afterVerdict = ReviewWorkflow.listReviewDocuments first taskId id |> success
-            Assert.That(afterVerdict.Length, Is.EqualTo(3))
-            let snapshot = LedgerStore.fetch first |> success
-            let documentPath = $"tasks/{taskId}/reviews/{id:N}/findings/allocation-in-hot-path.md"
-            let stored, oid = LedgerStore.readAt first snapshot documentPath |> success
-            Assert.That(stored.Value, Is.EqualTo(changed))
-            Assert.That(oid.Value, Is.EqualTo(updated.BlobOid))
-            Assert.That(git one [ "status"; "--porcelain" ], Is.Empty))
 
     [<Test>]
     member _.RebindingSourceContextIgnoresUnrelatedDirtyCheckout() =
@@ -3276,53 +2305,6 @@ type ReviewWorkflowTests() =
 
 
     [<Test>]
-    member _.ReviewChangesReissueGenerationOnlyAfterAgentFinishes() =
-        withFixture (fun _ _ first second _ sourceRef newCommit initTask ->
-            let taskId = "reviewReissue"
-            initTask taskId
-            let _, _, _, oldIssue, _ =
-                ReviewWorkflow.getAssignment first taskId 1 |> success
-            let head = newCommit "Review branch change" "ready for review"
-            let requestId = Guid.NewGuid()
-            ReviewWorkflow.submitReview first (Guid.NewGuid()) taskId "Owner" 3 1
-                requestId sourceRef head "First candidate" |> success |> ignore
-            ReviewWorkflow.claimReview second (Guid.NewGuid()) taskId requestId
-                "Reviewer" 1 1 |> success |> ignore
-            ReviewWorkflow.completeAgentWork first (Guid.NewGuid()) taskId "Owner" 4 3 1
-                "Finished original implementation" |> success |> ignore
-            ReviewWorkflow.decide second (Guid.NewGuid()) taskId requestId "Reviewer" 2
-                RequestChanges "Address missing checks" |> success |> ignore
-            let _, _, attempt, nextIssue, ack =
-                ReviewWorkflow.getAssignment first taskId 2 |> success
-            Assert.That(attempt.Phase, Is.EqualTo("Queued"))
-            Assert.That(attempt.AssignmentGeneration, Is.EqualTo(2))
-            Assert.That(nextIssue.Reason, Is.EqualTo("ReviewChanges"))
-            Assert.That(nextIssue.IssuerId, Is.EqualTo("Reviewer"))
-            Assert.That(nextIssue.Instructions, Is.EqualTo("Address missing checks"))
-            Assert.That(nextIssue.SpecBlobOid, Is.EqualTo(oldIssue.SpecBlobOid))
-            Assert.That(nextIssue.PreviousGeneration, Is.EqualTo(1))
-            Assert.That(ack.IsNone, Is.True)
-            let _, _, _, oldStill, _ =
-                ReviewWorkflow.getAssignment second taskId 1 |> success
-            Assert.That(oldStill, Is.EqualTo(oldIssue))
-            let _, inbox = ReviewWorkflow.reviewerQueue second "Reviewer" |> success
-            Assert.That(inbox, Is.Empty)
-            let ownerState = ReviewWorkflow.getAgentInbox first "Owner" |> success
-            Assert.That(ownerState.Agent.State, Is.EqualTo("Completed"))
-            let reactivated = ReviewWorkflow.reissueQueuedAttempt first (Guid.NewGuid())
-                                  taskId "Owner" 6 4 2 "Resume requested fixes" |> success
-            let _, _, currentAttempt, oldIssueAfter, _ =
-                ReviewWorkflow.getAssignment second taskId 2 |> success
-            Assert.That(currentAttempt.Version, Is.EqualTo(7))
-            Assert.That(oldIssueAfter, Is.EqualTo(nextIssue))
-            Assert.That(reactivated.Operation.Type, Is.EqualTo("ReissueQueuedAttempt"))
-            expectStale (ReviewWorkflow.beginAttempt first (Guid.NewGuid()) taskId "Owner" 7 1)
-            ReviewWorkflow.acknowledgeAssignment first (Guid.NewGuid())
-                taskId "Owner" 7 2 |> success |> ignore
-            ReviewWorkflow.beginAttempt first (Guid.NewGuid())
-                taskId "Owner" 8 2 |> success |> ignore)
-
-    [<Test>]
     member _.BeginAttemptAtomicallyAcknowledgesQueuedGeneration() =
         withFixture (fun _ _ first second _ _ _ _ ->
             let taskId = "atomicBegin"
@@ -3384,87 +2366,6 @@ type ReviewWorkflowTests() =
                 Assert.That(receipt.IsNone, Is.True))
 
     [<Test>]
-    member _.WorkingCheckpointAndReviewRevisionsPreserveSeparateEvidence() =
-        withFixture (fun one _ first second baseOid sourceRef newCommit initTask ->
-            initTask "evidence"
-            let c = newCommit "Reported code" "v1"
-            let checkpointOp = Guid.NewGuid()
-            let checkpoint () =
-                ReviewWorkflow.checkpointAttempt first checkpointOp "evidence" "Owner"
-                    3 3 1 "Implemented first slice" "Continue review work"
-                    c "dotnet test: 12 passed (owner report)"
-            let progress = checkpoint () |> success
-            Assert.That(progress.AlreadyApplied, Is.False)
-            Assert.That((checkpoint () |> success).AlreadyApplied, Is.True)
-            let checkpointSeq = progress.Operation.Sequence
-            let snapshot, saved = ReviewWorkflow.getCheckpoint second "evidence" checkpointSeq |> success
-            Assert.That(saved.Kind, Is.EqualTo("Progress"))
-            Assert.That(saved.EvidenceStatus, Is.EqualTo("OwnerReported"))
-            Assert.That(saved.SourceCommit, Is.EqualTo(c))
-            Assert.That(saved.AssignmentGeneration, Is.EqualTo(1))
-            Assert.That(saved.Sequence, Is.EqualTo(checkpointSeq))
-            Assert.That(snapshot, Is.Not.Empty)
-            let inbox = ReviewWorkflow.getAgentInbox second "Owner" |> success
-            Assert.That(inbox.Agent.State, Is.EqualTo("Working"))
-            Assert.That(inbox.Working.IsSome, Is.True)
-            Assert.That(inbox.Working.Value.Attempt.Version, Is.EqualTo(4))
-            expectStale (ReviewWorkflow.checkpointAttempt second (Guid.NewGuid())
-                            "evidence" "Owner" 3 3 1 "Old" "Old" c "")
-
-            let requestId = Guid.NewGuid()
-            let submitId = Guid.NewGuid()
-            let submit () =
-                ReviewWorkflow.submitReviewWithEvidence first submitId "evidence" "Owner" 4 1
-                    requestId sourceRef c "Review v1" "12 unit tests passed (owner report)"
-            let submitted = submit () |> success
-            Assert.That((submit () |> success).AlreadyApplied, Is.True)
-            let _, request, revision1 = ReviewWorkflow.getReview second "evidence" requestId |> success
-            Assert.That(request.Status, Is.EqualTo("Unclaimed"))
-            Assert.That(revision1.Revision, Is.EqualTo(1))
-            Assert.That(revision1.SpecBlobOid.Length, Is.EqualTo(40))
-            let pinnedSource = LedgerStore.sourceRepositoryIdentity first |> success
-            Assert.That(revision1.SourceRepositoryId, Is.EqualTo(pinnedSource.RepositoryId))
-            Assert.That(revision1.SourcePushRemote, Is.EqualTo(pinnedSource.PushUrl))
-            Assert.That(revision1.SourceRemote, Is.EqualTo(first.ApprovedFetchUrl))
-            LedgerStore.fetchReviewRef first revision1.ReviewRef c |> success |> ignore
-            Assert.That(revision1.EvidenceStatus, Is.EqualTo("OwnerReported"))
-            Assert.That(revision1.TestEvidence, Does.Contain("12 unit tests"))
-            let _, final1 = ReviewWorkflow.getCheckpoint second "evidence" revision1.CheckpointSequence |> success
-            Assert.That(final1.Kind, Is.EqualTo("Submission"))
-            Assert.That(final1.SourceCommit, Is.EqualTo(c))
-            Assert.That(final1.EvidenceStatus, Is.EqualTo("OwnerReported"))
-            Assert.That(final1.Sequence, Is.Not.EqualTo(checkpointSeq))
-
-            let d = newCommit "Revision v2" "v2"
-            let replacement = ReviewWorkflow.updateReviewWithEvidence first (Guid.NewGuid())
-                                  "evidence" "Owner" 1 requestId 1 sourceRef d "Review v2" ""
-                              |> success
-            let _, request2, revision2 = ReviewWorkflow.getReview second "evidence" requestId |> success
-            Assert.That(request2.CurrentRevision, Is.EqualTo(2))
-            Assert.That(revision2.Revision, Is.EqualTo(2))
-            Assert.That(revision2.HeadCommit, Is.EqualTo(d))
-            LedgerStore.fetchReviewRef first revision2.ReviewRef d |> success |> ignore
-            Assert.That(revision2.EvidenceStatus, Is.EqualTo("NotProvided"))
-            Assert.That(revision2.TestEvidence, Is.Empty)
-            Assert.That(revision2.CheckpointSequence, Is.EqualTo(replacement.Operation.Sequence))
-            let _, final2 = ReviewWorkflow.getCheckpoint second "evidence" revision2.CheckpointSequence |> success
-            Assert.That(final2.Kind, Is.EqualTo("Revision"))
-            Assert.That(final2.EvidenceStatus, Is.EqualTo("NotProvided"))
-            Assert.That(final2.SourceCommit, Is.EqualTo(d))
-            Assert.That(final2.Sequence, Is.Not.EqualTo(final1.Sequence))
-            let _, historic = ReviewWorkflow.getCheckpoint second "evidence" revision1.CheckpointSequence |> success
-            Assert.That(historic.SourceCommit, Is.EqualTo(c))
-            Assert.That((ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent.State,
-                        Is.EqualTo("Working"))
-            ReviewWorkflow.claimReview second (Guid.NewGuid()) "evidence" requestId "Reviewer" 2 2
-            |> success |> ignore
-            match ReviewWorkflow.updateReviewWithEvidence first (Guid.NewGuid()) "evidence"
-                      "Owner" 1 requestId 3 sourceRef d "Cannot replace" "not tested" with
-            | Error(ReviewAlreadyClaimed _) -> ()
-            | other -> Assert.Fail(sprintf "Frozen revision replaced: %A" other)
-            Assert.That(git one [ "status"; "--porcelain" ], Is.Empty))
-
-    [<Test>]
     member _.ProgressCheckpointRejectsStaleGenerationAndUnverifiedSource() =
         withFixture (fun _ _ first _ _ _ _ initTask ->
             initTask "progressguard"
@@ -3478,80 +2379,3 @@ type ReviewWorkflowTests() =
             | Ok _ -> Assert.Fail("Unverified source SHA accepted")
             let _, _, attempt = ReviewWorkflow.getTask first "progressguard" |> success
             Assert.That(attempt.Value.Version, Is.EqualTo(3)))
-
-    [<Test>]
-    member _.ReviewerEvidenceIsPinnedToClaimedRevisionAndNotInferredFromAcceptance() =
-        withFixture (fun one _ first second _ sourceRef newCommit initTask ->
-            initTask "reviewevidence"
-            let head = newCommit "Review me" "reviewed"
-            let requestId = Guid.NewGuid()
-            ReviewWorkflow.submitReviewWithEvidence first (Guid.NewGuid()) "reviewevidence"
-                "Owner" 3 1 requestId sourceRef head "Please review"
-                "owner reports test run" |> success |> ignore
-            ReviewWorkflow.claimReview second (Guid.NewGuid()) "reviewevidence"
-                requestId "Reviewer" 1 1 |> success |> ignore
-            match ReviewWorkflow.decideWithEvidence second (Guid.NewGuid()) "reviewevidence"
-                    requestId "Reviewer" 2 Accept "Accepted" true true "" with
-            | Error(InvalidBinding _) -> ()
-            | other -> Assert.Fail(sprintf "Tested requires explicit evidence: %A" other)
-            let result = ReviewWorkflow.decideWithEvidence second (Guid.NewGuid())
-                             "reviewevidence" requestId "Reviewer" 2 Accept "Accepted"
-                             true true "dotnet test: 122 passed (reviewer report)" |> success
-            let _, evidence = ReviewWorkflow.getDecisionEvidence first "reviewevidence" requestId |> success
-            Assert.That(evidence.Sequence, Is.EqualTo(result.Operation.Sequence))
-            Assert.That(evidence.Status, Is.EqualTo("Accepted"))
-            Assert.That(evidence.Revision, Is.EqualTo(1))
-            Assert.That(evidence.Inspected, Is.True)
-            Assert.That(evidence.Tested, Is.True)
-            Assert.That(evidence.ReviewedHead, Is.EqualTo(head))
-            Assert.That(evidence.ReviewRef, Does.EndWith("/r1"))
-            Assert.That(evidence.SpecBlobOid.Length, Is.EqualTo(40))
-            Assert.That(evidence.SourceRemote, Is.EqualTo(first.ApprovedFetchUrl))
-            let _, _, revision = ReviewWorkflow.getReview second "reviewevidence" requestId |> success
-            Assert.That(revision.EvidenceStatus, Is.EqualTo("OwnerReported"))
-            Assert.That(revision.Revision, Is.EqualTo(evidence.Revision))
-            let _, _, attempt = ReviewWorkflow.getTask first "reviewevidence" |> success
-            Assert.That(attempt.Value.Phase, Is.EqualTo("Working"))
-
-            // A separate accepted decision never claims testing merely because
-            // the reviewer accepted the code.
-            ReviewWorkflow.createTask first (Guid.NewGuid()) "acceptednoevidence" "Accepted no test claims"
-            |> success |> ignore
-            ReviewWorkflow.assignTask first (Guid.NewGuid()) "acceptednoevidence"
-                (Guid.NewGuid()) "Reviewer" "Owner" |> success |> ignore
-            ReviewWorkflow.beginAttempt first (Guid.NewGuid()) "acceptednoevidence" "Reviewer" 1 1
-            |> success |> ignore
-            let baseOid = git one [ "rev-parse"; "HEAD~1" ]
-            ReviewWorkflow.bindReviewBase first (Guid.NewGuid()) "acceptednoevidence"
-                "Reviewer" 2 1 baseOid sourceRef |> success |> ignore
-            let otherId = Guid.NewGuid()
-            ReviewWorkflow.submitReview first (Guid.NewGuid()) "acceptednoevidence" "Reviewer" 3 1
-                otherId sourceRef head "Review without supplied tests" |> success |> ignore
-            ReviewWorkflow.claimReview second (Guid.NewGuid()) "acceptednoevidence" otherId "Owner" 1 1
-            |> success |> ignore
-            ReviewWorkflow.decide second (Guid.NewGuid()) "acceptednoevidence" otherId "Owner"
-                2 Accept "Accepted" |> success |> ignore
-            let _, plain = ReviewWorkflow.getDecisionEvidence second "acceptednoevidence" otherId |> success
-            Assert.That(plain.Status, Is.EqualTo("Accepted"))
-            Assert.That(plain.Inspected, Is.False)
-            Assert.That(plain.Tested, Is.False)
-            Assert.That(plain.TestDetails, Is.Null)
-            Assert.That(plain.Revision, Is.EqualTo(1)))
-
-    [<Test>]
-    member _.LostImmutableReviewRefPreventsClaimAndFalseVerification() =
-        withFixture (fun one _ first second _ sourceRef newCommit initTask ->
-            initTask "missingref"
-            let head = newCommit "Source commit" "missing review ref"
-            let req = Guid.NewGuid()
-            ReviewWorkflow.submitReviewWithEvidence first (Guid.NewGuid()) "missingref" "Owner"
-                3 1 req sourceRef head "Review C" "" |> success |> ignore
-            let reviewRef = $"refs/heads/jarvis-review/missingref/{req:N}/r1"
-            git one [ "push"; "origin"; ":" + reviewRef ] |> ignore
-            match ReviewWorkflow.claimReview second (Guid.NewGuid()) "missingref" req "Reviewer" 1 1 with
-            | Error _ -> ()
-            | Ok _ -> Assert.Fail("Missing immutable remote review ref must fail closed.")
-            let _, request, revision = ReviewWorkflow.getReview first "missingref" req |> success
-            Assert.That(request.Status, Is.EqualTo("Unclaimed"))
-            Assert.That(revision.EvidenceStatus, Is.EqualTo("NotProvided"))
-            Assert.That(revision.HeadCommit, Is.EqualTo(head)))

@@ -433,7 +433,7 @@ let ``command catalog matches AgentCommand union and MCP tools`` () =
               "ParkAgent"; "ReissueQueuedAttempt"; "RecoverAgentAssignment"; "AcknowledgeReviewFeedback"; "ParkAttempt"; "BlockAttempt"; "ResumeAttempt"; "AbandonAttempt"; "CancelTask"; "CancelOpenTask"; "TransferOwner"; "CloseTask"; "CloseNonSourceTask"; "ReopenTask"; "ReviseTaskSpecPinned"; "ImportTaskSpec"; "AdoptTaskSpec"; "ExportTaskSpec"
               "ReviewTask"; "ReviewDetails"; "ReviewerInbox"; "ListReviewDocuments"; "ReadReviewDocument"
               "SubmitReview"; "ReplaceReview"; "ClaimReview"; "DecideReview"
-              "WithdrawReview"; "FinalizeReview"; "PutReviewDocument"; "MigrateReviews"
+              "WithdrawReview"; "FinalizeReview"; "PutReviewDocument"
               "LedgerHealth"; "GetOperationStatus"; "PendingOperations"; "ReconcilePendingOperations"; "AcknowledgePendingOperation"; "InitializeLedger"; "BindExistingLedger"; "RebindLedgerRemote"
               ]
     // Retired wire cases are deleted; public CreateTask/AssignTask are canonical ledger tools.
@@ -456,7 +456,7 @@ let ``client-backed MCP tools expose an optional per-command deviceId`` () =
         |> Array.filter (fun methodInfo ->
             methodInfo.GetParameters()
             |> Array.exists (fun parameter -> parameter.ParameterType = typeof<ClientService>))
-    clientMethods.Length |> shouldEqual (AgentProtocol.commandDefinitions.Length - 1 + 55) // public orchestration aliases / 8 wire operations
+    clientMethods.Length |> shouldEqual (AgentProtocol.commandDefinitions.Length - 1 + 54) // public orchestration aliases / 8 wire operations
     for methodInfo in clientMethods do
         let deviceParam = methodInfo.GetParameters() |> Array.tryFind (fun parameter -> parameter.Name = "deviceId")
         match deviceParam with
@@ -679,7 +679,7 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
               for name in [ "ReviewTask"; "ReviewDetails"; "ReviewerInbox"; "ListReviewDocuments"; "ReadReviewDocument" ] ->
                   name, v2Read
               for name in [ "SubmitReview"; "ReplaceReview"; "ClaimReview"; "DecideReview"
-                            "WithdrawReview"; "FinalizeReview"; "PutReviewDocument"; "MigrateReviews" ] ->
+                            "WithdrawReview"; "FinalizeReview"; "PutReviewDocument" ] ->
                   name, v2Write ]
         aliases |> List.fold (fun map (key, value) -> Map.add key value map) original
 

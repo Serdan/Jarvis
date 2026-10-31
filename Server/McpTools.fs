@@ -220,7 +220,7 @@ module McpToolHelpers =
 
     let private v2ReviewWriteMethods =
         [ "SubmitReview"; "ReplaceReview"; "ClaimReview"; "DecideReview"; "WithdrawReview"
-          "FinalizeReview"; "PutReviewDocument"; "MigrateReviews" ]
+          "FinalizeReview"; "PutReviewDocument" ]
 
     let private v2AliasCapabilities =
         let fromWire wireName publicName =
@@ -1393,11 +1393,6 @@ type JarvisMcpTools =
     [<McpServerTool(Title = "Finalize V2 implementation", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Finalize a completed implementation after its latest accepted review. Incremental review integrations can happen before this step.")>]
         static member FinalizeReview(projectName: string, taskId: string, requestId: string, ownerId: string, expectedAttemptVersion: int, operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
             let cmd = V2ReviewCommands.write projectName "Finalize" operationId taskId requestId ownerId expectedAttemptVersion
-            McpToolHelpers.send client http (V2ReviewWriteCommand cmd)
-
-    [<McpServerTool(Title = "migrate branch reviews", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Explicitly convert legacy review request and revision records to the canonical single review.json form without discarding historical files or Markdown findings. Performs no source merges.")>]
-        static member MigrateReviews(projectName: string, operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
-            let cmd = V2ReviewCommands.write projectName "Migrate" operationId "" "" "Orchestrator" 0
             McpToolHelpers.send client http (V2ReviewWriteCommand cmd)
 
     [<McpServerTool(Title = "Get project details", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Get project details, README, notes, TODO, and related special files.")>]

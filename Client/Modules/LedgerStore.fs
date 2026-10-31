@@ -125,14 +125,8 @@ type LedgerEntityEffect =
       AssignmentGeneration: int option
       CheckpointSequence: int64 option
       CheckpointKind: string option
-      CurrentReviewRevision: int option
-      ClaimedReviewRevision: int option
-      ReviewRevision: int option
-      AcceptedReviewRevision: int option
       SpecBlobOid: string option
-      HeadCommit: string option
-      ReviewRef: string option
-      VerifiedIntegrationSequence: int64 option }
+      ReviewRef: string option }
 
 [<CLIMutable>]
 type LedgerRemotePolicy =
@@ -168,7 +162,7 @@ module LedgerStore =
     let private options = JsonSerializerOptions(PropertyNamingPolicy = JsonNamingPolicy.CamelCase, PropertyNameCaseInsensitive = true)
     let private oidPattern = Regex("^[0-9a-f]{40}([0-9a-f]{24})?$", RegexOptions.Compiled)
     let private recordPath = Regex("^records/[A-Za-z0-9_-]+(/[A-Za-z0-9_.-]+)*[.]json$", RegexOptions.Compiled)
-    let private ledgerPath = Regex("^(tasks/[A-Za-z0-9_-]+/(task[.]json|spec[.]html|attempts/[a-f0-9]{32}([.]json|/checkpoints/[0-9]+[.]json|/events/[0-9]+[.]json|/assignments/[0-9]+([.]json|[.]ack[.]json))|integrations/[a-f0-9]{32}[.]json|imports/[0-9]+[.]json|lifecycle/[0-9]+[.]json|approvals/non-source/[0-9]+[.]json|orphan-cleanups/[a-f0-9]{32}/r[1-9][0-9]*[.]json|reviews/[a-f0-9]{32}/(review[.]json|request[.]json|notification[.]json|summary[.]md|findings/[a-z0-9][a-z0-9_-]{0,79}[.]md|revisions/[0-9]+[.]json|decisions/[0-9]+[.]json|events/[0-9]+[.]json))|agents/[A-Za-z0-9_-]+[.]json|records/[A-Za-z0-9_-]+(/[A-Za-z0-9_.-]+)*[.]json)$", RegexOptions.Compiled)
+    let private ledgerPath = Regex("^(tasks/[A-Za-z0-9_-]+/(task[.]json|spec[.]html|attempts/[a-f0-9]{32}([.]json|/checkpoints/[0-9]+[.]json|/events/[0-9]+[.]json|/assignments/[0-9]+([.]json|[.]ack[.]json))|imports/[0-9]+[.]json|lifecycle/[0-9]+[.]json|approvals/non-source/[0-9]+[.]json|reviews/[a-f0-9]{32}/(review[.]json|summary[.]md|findings/[a-z0-9][a-z0-9_-]{0,79}[.]md))|agents/[A-Za-z0-9_-]+[.]json|records/[A-Za-z0-9_-]+(/[A-Za-z0-9_.-]+)*[.]json)$", RegexOptions.Compiled)
     let private remotePattern = Regex("^[A-Za-z0-9][A-Za-z0-9_.-]*$", RegexOptions.Compiled)
 
     type private GitOutput =
@@ -519,18 +513,13 @@ module LedgerStore =
                 let mutable failed = None
                 for (path, content) in files do
                     if failed.IsNone then
-                        let updated =
-                            if isNull content then
-                                gitIndex repo index [ "update-index"; "--force-remove"; "--"; path ]
-                                |> requireSuccess "update-index"
-                            else
-                                hashBlob repo content
-                                |> Result.bind (fun blobOid ->
-                                    gitIndex repo index [ "update-index"; "--add"; "--cacheinfo"; $"100644,{blobOid},{path}" ]
-                                    |> requireSuccess "update-index")
-                        match updated with
+                        match hashBlob repo content with
                         | Error error -> failed <- Some error
-                        | Ok _ -> ()
+                        | Ok blobOid ->
+                            let updated = gitIndex repo index [ "update-index"; "--add"; "--cacheinfo"; $"100644,{blobOid},{path}" ]
+                            match requireSuccess "update-index" updated with
+                            | Error error -> failed <- Some error
+                            | Ok _ -> ()
                 match failed with
                 | Some error -> Error error
                 | None ->
@@ -647,12 +636,7 @@ module LedgerStore =
             elif path.EndsWith(".ack.json", StringComparison.Ordinal)
                  && path.Contains("/assignments/", StringComparison.Ordinal) then "AssignmentReceipt"
             elif path.Contains("/assignments/", StringComparison.Ordinal) then "AssignmentIssue"
-            elif path.Contains("/integrations/", StringComparison.Ordinal) then "Integration"
-            elif path.Contains("/revisions/", StringComparison.Ordinal) then "ReviewRevision"
-            elif path.Contains("/decisions/", StringComparison.Ordinal) then "ReviewDecisionEvidence"
             elif path.EndsWith("/review.json", StringComparison.Ordinal) then "BranchReview"
-            elif path.EndsWith("/request.json", StringComparison.Ordinal) then "ReviewRequest"
-            elif path.EndsWith("/notification.json", StringComparison.Ordinal) then "ReviewNotification"
             elif path.Contains("/attempts/", StringComparison.Ordinal) then "Attempt"
             else "Record"
         let source =
@@ -681,7 +665,7 @@ module LedgerStore =
                     let mutable n = 0L
                     if value.ValueKind = JsonValueKind.Number && value.TryGetInt64(&n) then Some n else None)
             { Path = path; EntityKind = entityKind
-              ContentSha256 = if isNull change.Content then null else digest change.Content
+              ContentSha256 = digest change.Content
               EntityVersion = number "version"
               TaskId = str "taskId"; AttemptId = str "attemptId"
               RequestId = str "requestId"; AgentId = str "agentId"; ActionId = str "actionId"
@@ -690,16 +674,8 @@ module LedgerStore =
               AssignmentGeneration = number "assignmentGeneration"
               CheckpointSequence = if entityKind = "Checkpoint" then longNumber "sequence" else None
               CheckpointKind = if entityKind = "Checkpoint" then str "kind" else None
-              CurrentReviewRevision =
-                  match number "currentRevision" with
-                  | Some revision -> Some revision
-                  | None -> number "revision"
-              ClaimedReviewRevision = number "claimedRevision"
-              ReviewRevision = number "reviewRevision"
-              AcceptedReviewRevision = number "acceptedReviewRevision"
               SpecBlobOid = str "specBlobOid"
-              HeadCommit = str "headCommit"; ReviewRef = str "reviewRef"
-              VerifiedIntegrationSequence = longNumber "verifiedSequence" }
+              ReviewRef = str "reviewRef" }
         finally
             source |> Option.iter (fun doc -> doc.Dispose())
 
@@ -713,7 +689,7 @@ module LedgerStore =
                    changes |> List.map (fun change ->
                        {| path = change.Path
                           beforeOid = change.ExpectedBlobOid
-                          contentSha256 = if isNull change.Content then null else digest change.Content |}) |> List.toArray
+                          contentSha256 = digest change.Content |}) |> List.toArray
                entityResults = changes |> List.map effect |> List.toArray |}
 
     let private recordInput (binding: LedgerBinding) (change: LedgerRecordChange) =
@@ -1515,14 +1491,9 @@ module LedgerStore =
                                || List.length paths <> (paths |> List.distinct |> List.length)
                                || changes |> List.exists (fun change ->
                                    not (ledgerPath.IsMatch change.Path) || change.Path.Contains("..")
-                                   || (isNull change.Content
-                                       && (change.ExpectedBlobOid.IsNone
-                                           || not (change.Path.Contains("/reviews/", StringComparison.Ordinal)
-                                                   || change.Path.Contains("/integrations/", StringComparison.Ordinal)
-                                                   || change.Path.Contains("/orphan-cleanups/", StringComparison.Ordinal))))
-                                   || (not (isNull change.Content)
-                                       && encoding.GetByteCount(change.Content) >
-                                           (if change.Path.EndsWith("/spec.html", StringComparison.Ordinal) || change.Path.EndsWith(".md", StringComparison.Ordinal) then 512 * 1024 else 64 * 1024))
+                                   || isNull change.Content
+                                   || encoding.GetByteCount(change.Content) >
+                                       (if change.Path.EndsWith("/spec.html", StringComparison.Ordinal) || change.Path.EndsWith(".md", StringComparison.Ordinal) then 512 * 1024 else 64 * 1024)
                                    || (change.ExpectedBlobOid |> Option.exists (oidPattern.IsMatch >> not))) then
                                 Error(InvalidBinding "Invalid or duplicate entity paths in ledger transaction.")
                             else

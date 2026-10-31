@@ -178,7 +178,7 @@ The persisted `review.json` schema (camelCase, entity schemaVersion 2) is:
   "taskId": "320",
   "attemptId": "<uuid-n>",
   "ownerAgentId": "Agent 3",
-  "reviewRef": "refs/heads/jarvis-review/320/<uuid-n>",
+  "reviewRef": "refs/heads/jarvis-review/320/<uuid-n>/r1",
   "baseCommit": "<git-oid>",
   "targetRef": "refs/heads/main",
   "status": "Unclaimed",
@@ -196,7 +196,7 @@ Each finding is a standalone Markdown document. The `PutReviewDocument` operatio
 
 ### Source and review lifecycle
 
-1. Owner works normally on its feature branch. To submit, owner provides a source branch and the commit currently being submitted. Jarvis derives `baseCommit` from the Git merge-base against the target branch and publishes a dedicated `jarvis-review/<task-id>/<review-id>` source branch at the submitted commit. It then commits one `review.json` to the orphan ledger. The source SHA is an **input to Git publishing only**, not a persisted ledger field.
+1. Owner works normally on its feature branch. To submit, owner provides a source branch and the commit currently being submitted. Jarvis derives `baseCommit` from the Git merge-base against the target branch and publishes a dedicated `jarvis-review/<task-id>/<review-id>/r1` source branch at the submitted commit. It then commits one `review.json` to the orphan ledger. The source SHA is an **input to Git publishing only**, not a persisted ledger field.
 2. An unclaimed review may be replaced: the owner publishes a new review ref (or safely moves the unclaimed ref) and updates `baseCommit` and the review ref in the same `review.json`. A claimed review's ref/base must not change. A replacement uses the review's `version` as its ordinary optimistic concurrency value, without a parallel revision history in JSON.
 3. A reviewer claims an unclaimed review by updating `status` and `reviewerId`. After examining `git diff <baseCommit> <reviewRef>`, the reviewer writes `summary.md` and independently named finding files and sets `status` to `Accepted` or `ChangesRequested`. No claim event, decision evidence JSON or duplicate head ID is required. Reviewers should describe tests and outstanding concerns in Markdown, distinguishing what they personally tested from owner reports.
 4. The agent may continue work throughout the review. One actionable review per task is enough, but accepted reviews can accumulate and be integrated independently. An accepted review must remain addressable and must not disappear from the inbox merely because a subsequent review was accepted.
@@ -204,15 +204,15 @@ Each finding is a standalone Markdown document. The `PutReviewDocument` operatio
 6. `AcceptedPendingIntegration` is derived from accepted `review.json` records whose reviewed branch commits are not yet ancestors of their targets. The read view may contain the review, task and attempt, but no synthetic integration plan.
 7. Completing the agent's work only changes the agent/attempt state. A final accepted review is required to finalize source work. `FinalizeReview` marks the task `Implemented` if the final accepted branch is not yet merged, or `Integrated` if it already is. `CloseTask` checks Git ancestry anew and closes the task after its final accepted review is merged. No integration action ID is required. Intermediate merges never complete a task.
 
-### Transition from the old ledger
+### Cutover status (31 October 2026)
 
-This is an **intentional breaking cutover**; no V1/MCP compatibility aliases. Existing orphan-ledger trees may contain `request.json`, `revisions/*.json`, `decisions/*.json`, `notification.json`, `events/*.json`, `integrations/*.json` and attempt-level review pointers. A one-time explicit migration must convert current reviews to `review.json` using the latest request and revision, preserve their Git review refs and all Markdown findings, and retain historical files as Git history but remove them from the current authoritative tree. If automated migration is unavailable, do not pretend historical records were migrated; report the blocker before switching a populated ledger. Do not silently reinterpret legacy data. After cutover, no new old-format paths may be written.
+The review schema change is an **intentional breaking cutover** without legacy readers or migration APIs in the active server/client. The live Wayfold orphan ledger at `3e1a117bf12e07d17fb2344b4754676e2a81e91e` (sequence 118) was inspected after the protocol 3.41 deployment and contains **no review, integration or orphan-cleanup records**. There were no old-format reviews to migrate, and no migration commit was needed. Existing tasks, attempts, agents and checkpoints remain unchanged. The obsolete `MigrateReviews` tool and its temporary old-record readers were removed from the next release.
 
-The public API surface becomes `SubmitReview`, `ReplaceReview`, `ClaimReview`, `DecideReview`, `WithdrawReview`, `ReviewDetails`, `ReviewerInbox`, `ListReviewDocuments`, `ReadReviewDocument`, `PutReviewDocument`, `FinalizeReview`, `CloseTask`, and ordinary task/agent tools. Retire duplicate evidence/revision tools and integration APIs. Protocol and server/client tool contracts change together. Tests must cover standalone findings, Git ancestry including merge commits, parallel accepted reviews, claim immutability, feedback acknowledgement and existing-ledger migration.
+The public review API is `SubmitReview`, `ReplaceReview`, `ClaimReview`, `DecideReview`, `WithdrawReview`, `ReviewDetails`, `ReviewerInbox`, `ListReviewDocuments`, `ReadReviewDocument`, `PutReviewDocument`, `FinalizeReview`, `CloseTask`, and ordinary task/agent operations. No integration plans, merge receipts or review-revision/decision ledger entities are created. Tests cover Markdown findings, normal Git merge commits, accepted reviews integrated independently, claim immutability and feedback acknowledgement.
 
 ## 6. Tool surface and cutover
 
-Expose the orphan-branch operations through **unprefixed public MCP tool names** (`CreateTask`, `AssignTask`, `AgentInbox`, `SubmitReview`, `LedgerHealth`, etc.) without `V2` compatibility aliases. The eight internal versioned wire commands retain their `V2` names; public names are independent of the transport protocol. Where a legacy public name is reused, it exclusively invokes the orphan-ledger implementation.
+Expose the orphan-branch operations through **unprefixed public MCP tool names** (`CreateTask`, `AssignTask`, `AgentInbox`, `SubmitReview`, `LedgerHealth`, etc.) without `V2` compatibility aliases. The internal versioned task/ledger/review wire commands retain their `V2` names; public names are independent of the transport protocol. Where a legacy public name is reused, it exclusively invokes the orphan-ledger implementation.
 
 Provide only the queries needed to operate the workflow: current tasks, a task's details/spec, agent inbox/roster, and submitted/claimed review requests. If a query is missing, add the **smallest** direct read for it. Use ordinary Git history/diff commands when historical investigation is needed. No portable cursor framework, historical search service, mirror/restore API, or extensive administrative API is required.
 

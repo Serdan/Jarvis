@@ -452,7 +452,6 @@ module V2PendingIntentJournal =
         | "V2TaskWrite", Some "AcknowledgeFeedback" -> Some "AcknowledgeBranchReview"
         | "V2TaskWrite", Some "CloseTask" -> Some "CloseBranchTask"
         | "V2TaskWrite", Some action -> Some action
-        | "V2ReviewWrite", Some "Migrate" -> Some "MigrateBranchReviews"
         | "V2ReviewWrite", Some "PutDocument" -> Some "PutReviewDocument"
         | "V2ReviewWrite", Some "Submit" -> Some "SubmitBranchReview"
         | "V2ReviewWrite", Some "Update" -> Some "ReplaceBranchReview"
@@ -560,7 +559,6 @@ module V2PendingIntentJournal =
                     common @ [ "ExpectedTaskVersion", "expectedTaskVersion"; "Reason", "reason" ]
                 | "V2TaskWrite", "AcknowledgeReviewFeedback" ->
                     owner @ [ "DecisionSequence", "decisionSequence" ]
-                | "V2ReviewWrite", "MigrateBranchReviews" -> []
                 | "V2ReviewWrite", "PutReviewDocument" ->
                     common @ [ "RequestId", "requestId"; "ActorId", "actorId"
                                "DocumentPath", "documentPath"; "Content", "contentSha256"
@@ -618,7 +616,7 @@ module V2PendingIntentJournal =
                          && optionalEmpty localValue && optionalEmpty remoteValue))
 
             operationKind record = Some operation.Type
-            && (operation.Type = "MigrateBranchReviews" || not (List.isEmpty pairs))
+            && not (List.isEmpty pairs)
             && List.forall equalField pairs
         with _ -> false
 
@@ -938,9 +936,6 @@ module V2ReviewApi =
                                     cmd.TaskId reviewId cmd.ActorId cmd.DocumentPath
                                     cmd.ExpectedBlobOid cmd.Content
                                 |> mapError)
-                        | "Migrate" ->
-                            ReviewWorkflow.ReviewWorkflow.migrateBranchReviews binding operationId
-                            |> mapError
                         | "Submit" ->
                             id () |> Result.bind (fun reviewId ->
                                 ReviewWorkflow.ReviewWorkflow.submitBranchReview binding operationId

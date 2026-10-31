@@ -125,7 +125,7 @@ type ReviewWorkflowTests() =
             |> success |> ignore
             let pending = ReviewWorkflow.getBranchAgentInbox first "Owner" |> success
             Assert.That(pending.AcceptedPendingIntegration.Length, Is.EqualTo(1))
-            Assert.That(pending.AcceptedPendingIntegration.Head.Review.RequestId,
+            Assert.That(pending.AcceptedPendingIntegration.Head.Review.ReviewId,
                         Is.EqualTo(b.ToString("N")))
             git one [ "switch"; "main" ] |> ignore
             git one [ "fetch"; "origin"; bReview.Review.ReviewRef ] |> ignore
@@ -207,76 +207,6 @@ type ReviewWorkflowTests() =
             Assert.That(paths |> List.filter (fun path ->
                 path.StartsWith($"tasks/{taskId}/reviews/") && path.EndsWith(".json")),
                 Is.EquivalentTo([ $"tasks/{taskId}/reviews/{reviewId:N}/review.json" ])))
-
-    [<Test>]
-    member _.LegacyReviewMigrationCreatesCanonicalRecordWithoutLosingFindings() =
-        withFixture (fun _ _ first second _ sourceRef newCommit initTask ->
-            let taskId = "migrate-review"
-            initTask taskId
-            let head = newCommit "Legacy patch" "legacy"
-            let id = Guid.NewGuid()
-            // Construct old-format ledger data directly, without retaining
-            // the retired review implementation in the runtime.
-            let refName = $"refs/heads/jarvis-review/{taskId}/{id:N}/r1"
-            LedgerStore.publishReviewRef first refName head |> success |> ignore
-            let _, _, attemptOption = ReviewWorkflow.getTask first taskId |> success
-            let attempt = attemptOption.Value
-            let review : ReviewRequest =
-                { RequestId = id.ToString("N"); TaskId = taskId
-                  AttemptId = attempt.AttemptId; OwnerAgentId = "Owner"
-                  ReviewerId = "Reviewer"; Version = 3; CurrentRevision = 1
-                  Status = "Accepted"; ClaimantId = "Reviewer"; ClaimedRevision = 1
-                  CreatedSequence = 30L; DecisionSequence = 35L; Feedback = "Approved" }
-            let revision : ReviewRevision =
-                { RequestId = id.ToString("N"); Revision = 1; TaskId = taskId
-                  AttemptId = attempt.AttemptId; BaseCommit = git first.RepositoryPath [ "rev-list"; "--max-parents=0"; "HEAD" ]
-                  HeadCommit = head; SourceRef = sourceRef; TargetRef = sourceRef
-                  ReviewRef = refName; Summary = "Legacy review"; CreatedSequence = 30L
-                  SpecBlobOid = attempt.SpecBlobOid; SourceRepositoryId = attempt.SourceRepositoryId
-                  SourceRemote = attempt.SourceRemote; SourcePushRemote = attempt.SourcePushRemote
-                  CheckpointSequence = 0L; TestEvidence = ""; EvidenceStatus = "NotProvided" }
-            let serialize value =
-                let options = System.Text.Json.JsonSerializerOptions(
-                                  PropertyNamingPolicy = System.Text.Json.JsonNamingPolicy.CamelCase)
-                let json = System.Text.Json.JsonSerializer.Serialize(value, options)
-                "{\"schemaVersion\":2," + json.Substring(1)
-            let changes : LedgerFileChange list =
-                [ { Path = $"tasks/{taskId}/reviews/{id:N}/request.json"
-                    ExpectedBlobOid = None; Content = serialize review }
-                  { Path = $"tasks/{taskId}/reviews/{id:N}/revisions/1.json"
-                    ExpectedBlobOid = None; Content = serialize revision }
-                  { Path = $"tasks/{taskId}/reviews/{id:N}/findings/old-finding.md"
-                    ExpectedBlobOid = None; Content = "# Existing finding\\nKeep this." } ]
-            let intent : LedgerIntent =
-                { OperationId = Guid.NewGuid(); Actor = "Orchestrator"
-                  Kind = "MigrationFixture"; RequestJson = "{\"fixture\":true}" }
-            LedgerStore.transact first intent (fun _ -> Ok changes) |> success |> ignore
-            let historical = LedgerStore.fetch first |> success
-            let migrationId = Guid.NewGuid()
-            let migrated = ReviewWorkflow.migrateBranchReviews first migrationId |> success
-            Assert.That(migrated.AlreadyApplied, Is.False)
-            Assert.That((ReviewWorkflow.migrateBranchReviews first migrationId |> success).AlreadyApplied, Is.True)
-            let result = ReviewWorkflow.getBranchReview second taskId id |> success
-            Assert.That(result.Review.Status, Is.EqualTo("Accepted"))
-            Assert.That(result.HeadCommit, Is.EqualTo(head))
-            let paths = LedgerStore.listAt first (LedgerStore.fetch first |> success) "tasks" |> success
-            let reviewJsonFiles =
-                paths |> List.filter (fun path ->
-                    path.StartsWith($"tasks/{taskId}/reviews/", StringComparison.Ordinal)
-                    && path.EndsWith(".json", StringComparison.Ordinal))
-            Assert.That(reviewJsonFiles,
-                        Is.EquivalentTo([ $"tasks/{taskId}/reviews/{id:N}/review.json" ]))
-            let historicalLegacyPath = $"tasks/{taskId}/reviews/{id:N}/request.json"
-            let historicBody, _ = LedgerStore.readAt first historical historicalLegacyPath |> success
-            Assert.That(historicBody.IsSome, Is.True, "Old files must remain in Git history.")
-            let currentBody, _ =
-                LedgerStore.readAt first (LedgerStore.fetch first |> success) historicalLegacyPath |> success
-            Assert.That(currentBody.IsNone, Is.True, "Old files must not remain authoritative.")
-            let _, docs = ReviewWorkflow.listReviewDocuments second taskId id |> success
-            Assert.That(docs |> List.map _.Path, Does.Contain("findings/old-finding.md"))
-            let _, finding = ReviewWorkflow.getReviewDocument second taskId id "findings/old-finding.md"
-                             |> success
-            Assert.That(finding.Content, Does.Contain("Keep this.")))
 
     [<Test>]
     member _.AgentStateTimestampsAndImmutableWorkflowEventsSurviveAcrossClients() =
@@ -1404,7 +1334,7 @@ type ReviewWorkflowTests() =
                        | Ok value -> unbox<TaskSpecPage> value
                        | Error error -> failwithf "V2 imported page API failed: %A" error
                 Assert.That(latest.Content, Does.Contain("API imported safely"))
-                Assert.That(after.AcceptedPendingIntegration.Head.Review.RequestId, Is.EqualTo(requestId.ToString("N")))
+                Assert.That(after.AcceptedPendingIntegration.Head.Review.ReviewId, Is.EqualTo(requestId.ToString("N")))
                 Assert.That((Client.V2ReviewApi.V2PendingIntentJournal.listAtRoot one |> success).Length,
                             Is.EqualTo(0), "Verified V2 mutations must clear pending local intents.")
                 // A failed write leaves a pending journal entry: retrying it from

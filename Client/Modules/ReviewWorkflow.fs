@@ -138,43 +138,6 @@ type AssignmentReceipt =
       IssueSequence: int64 }
 
 [<CLIMutable>]
-type ReviewRequest =
-    { RequestId: string
-      TaskId: string
-      AttemptId: string
-      OwnerAgentId: string
-      ReviewerId: string
-      Version: int
-      CurrentRevision: int
-      Status: string
-      ClaimantId: string
-      ClaimedRevision: int
-      CreatedSequence: int64
-      DecisionSequence: int64
-      Feedback: string }
-
-[<CLIMutable>]
-type ReviewRevision =
-    { RequestId: string
-      Revision: int
-      TaskId: string
-      AttemptId: string
-      BaseCommit: string
-      HeadCommit: string
-      SourceRef: string
-      TargetRef: string
-      ReviewRef: string
-      Summary: string
-      CreatedSequence: int64
-      SpecBlobOid: string
-      SourceRepositoryId: string
-      SourceRemote: string
-      SourcePushRemote: string
-      CheckpointSequence: int64
-      TestEvidence: string
-      EvidenceStatus: string }
-
-[<CLIMutable>]
 type BranchReview =
     { ReviewId: string
       TaskId: string
@@ -278,7 +241,7 @@ type InboxTask =
 type PendingIntegration =
     { Task: ReviewTask
       Attempt: ReviewAttempt
-      Review: ReviewRequest }
+      Review: BranchReview }
 
 [<CLIMutable>]
 type AgentInbox =
@@ -292,8 +255,8 @@ type AgentInbox =
       Parked: InboxTask list
       Blocked: InboxTask list
       AcceptedPendingIntegration: PendingIntegration list
-      PendingReviews: ReviewRequest list
-      AvailableReviews: ReviewRequest list
+      PendingReviews: BranchReview list
+      AvailableReviews: BranchReview list
       UnacknowledgedFeedback: ReviewFeedbackNotice list
       SlotAvailable: bool
       Unassigned: bool }
@@ -367,10 +330,8 @@ module ReviewWorkflow =
                     | "ReviewAttempt" -> status "phase" [ "Queued"; "Acknowledged"; "Working"; "Paused"; "Finished"; "Parked"; "Blocked";
                           "Accepted"; "Superseded"; "Abandoned" ]
                     | "BranchReview" -> status "status" [ "Unclaimed"; "Claimed"; "Accepted"; "ChangesRequested"; "Withdrawn" ]
-                    | "ReviewRequest" -> status "status" [ "Unclaimed"; "Claimed"; "Accepted"; "ChangesRequested"; "Withdrawn" ]
                     | "ReviewFeedbackNotice" -> status "status" [ "Accepted"; "ChangesRequested" ]
                     | "AgentCheckpoint" -> status "kind" [ "Yield"; "Completion"; "Recovery"; "Progress"; "Submission"; "Revision" ]
-                    | "ReviewRevision" -> status "evidenceStatus" [ "NotProvided"; "OwnerReported"; "ReviewerVerified" ]
                     | "TaskLifecycleEvent" ->
                         status "action" [ "ParkAttempt"; "BlockAttempt"; "ResumeAttempt"; "CancelTask"
                                           "AbandonAttempt"; "TransferOwner"; "CloseNonSourceTask"; "ReopenTask" ]
@@ -398,7 +359,6 @@ module ReviewWorkflow =
         $"tasks/{taskId}/attempts/{attemptId}/assignments/{generation}.json"
     let private receiptPath taskId attemptId generation =
         $"tasks/{taskId}/attempts/{attemptId}/assignments/{generation}.ack.json"
-    let private requestPath taskId requestId = $"tasks/{taskId}/reviews/{requestId}/request.json"
     let private branchReviewPath taskId reviewId = $"tasks/{taskId}/reviews/{reviewId}/review.json"
     let private reviewDocumentPath taskId requestId documentPath =
         $"tasks/{taskId}/reviews/{requestId}/{documentPath}"
@@ -411,8 +371,6 @@ module ReviewWorkflow =
         $"tasks/{taskId}/lifecycle/{sequence}.json"
     let private nonSourceApprovalPath taskId sequence =
         $"tasks/{taskId}/approvals/non-source/{sequence}.json"
-    let private feedbackPath taskId requestId = $"tasks/{taskId}/reviews/{requestId}/notification.json"
-    let private revisionPath taskId requestId number = $"tasks/{taskId}/reviews/{requestId}/revisions/{number}.json"
     let private reviewRef taskId requestId number = $"refs/heads/jarvis-review/{taskId}/{requestId}/r{number}"
     let private agentPath (agentId: string) =
         let safe =
@@ -1972,8 +1930,6 @@ module ReviewWorkflow =
     // Markdown files are regular orphan-ledger Git blobs. The review itself
     // identifies the source snapshot, while these files contain arbitrarily
     // detailed reviewer findings and implementation responses.
-    // During the explicit cutover, read legacy review identities only for
-    // documents created before the canonical branch-review schema.
     let private requireDocumentReview binding snapshot taskId id =
         result {
             let! review, _ = required<BranchReview> binding snapshot (branchReviewPath taskId id)
@@ -2077,14 +2033,6 @@ module ReviewWorkflow =
             return match matches with [ agent ] -> Some agent | _ -> None
         }
 
-    let private projectBranchRequest (review: BranchReview) =
-        { RequestId = review.ReviewId; TaskId = review.TaskId; AttemptId = review.AttemptId
-          OwnerAgentId = review.OwnerAgentId; ReviewerId = review.ReviewerId
-          Version = review.Version; CurrentRevision = 1; Status = review.Status
-          ClaimantId = review.ReviewerId; ClaimedRevision = if review.ReviewerId = null then 0 else 1
-          CreatedSequence = review.CreatedSequence; DecisionSequence = review.DecisionSequence
-          Feedback = null }
-
     let getAgentInbox binding agentId =
         if not (validAgent agentId) then Error(InvalidBinding "Invalid inbox agent ID.")
         else
@@ -2125,13 +2073,12 @@ module ReviewWorkflow =
                        || path <> branchReviewPath review.TaskId review.ReviewId then
                         failure <- Some(LedgerIntegrityError "Invalid canonical review identity.")
                     else
-                        let projected = projectBranchRequest review
                         if review.Status = "Unclaimed" then
-                            if review.OwnerAgentId = agentId then pending <- projected :: pending
-                            else available <- projected :: available
+                            if review.OwnerAgentId = agentId then pending <- review :: pending
+                            else available <- review :: available
                         elif review.Status = "Claimed"
                              && (review.OwnerAgentId = agentId || review.ReviewerId = agentId) then
-                            pending <- projected :: pending
+                            pending <- review :: pending
                         if review.OwnerAgentId = agentId && review.DecisionSequence > 0L
                            && not review.Acknowledged
                            && List.contains review.Status [ "Accepted"; "ChangesRequested" ] then
@@ -2169,9 +2116,9 @@ module ReviewWorkflow =
                                     let! integrated = LedgerStore.sourceContainsCommit binding reviewedHead targetHead
                                     if not integrated then
                                         accepted <- { Task = entry.Task; Attempt = entry.Attempt
-                                                      Review = projectBranchRequest review } :: accepted
+                                                      Review = review } :: accepted
                     accepted <- accepted |> List.sortBy (fun item ->
-                        item.Review.CreatedSequence, item.Task.TaskId, item.Review.RequestId)
+                        item.Review.CreatedSequence, item.Task.TaskId, item.Review.ReviewId)
                     if working.Length > 1
                        || (match working with
                            | [ item ] -> agent.ActiveAttemptId <> item.Attempt.AttemptId
@@ -2204,8 +2151,8 @@ module ReviewWorkflow =
                         entry.Attempt.Phase = "Queued" || entry.Attempt.Phase = "Acknowledged")
                     let parked = owned |> List.filter (fun entry -> entry.Attempt.Phase = "Parked")
                     let blocked = owned |> List.filter (fun entry -> entry.Attempt.Phase = "Blocked")
-                    let reviewOrder (request: ReviewRequest) =
-                        request.CreatedSequence, request.TaskId, request.RequestId
+                    let reviewOrder (review: BranchReview) =
+                        review.CreatedSequence, review.TaskId, review.ReviewId
                     let pending = pending |> List.sortBy reviewOrder
                     let available = available |> List.sortBy reviewOrder
                     return
@@ -2541,69 +2488,3 @@ module ReviewWorkflow =
                                     { task with Version = task.Version + 1; Lifecycle = "Closed" } ]
                     | _ -> return! Error(ReviewVersionConflict "No final accepted review.")
                 })
-
-    // Explicit one-time conversion of legacy review requests. Historical JSON
-    // files are left as Git artifacts; new operations only read review.json.
-    let migrateBranchReviews binding operationId =
-        LedgerStore.transact binding
-            (intent operationId "Orchestrator" "MigrateBranchReviews" {| migration = 1 |})
-            (fun snapshot -> result {
-                let! paths = LedgerStore.listAt binding snapshot "tasks"
-                let mutable changes = []
-                for path in paths do
-                    if path.EndsWith("/request.json", StringComparison.Ordinal) then
-                        let! legacy, _ = required<ReviewRequest> binding snapshot path
-                        let reviewPath = branchReviewPath legacy.TaskId legacy.RequestId
-                        let! exists = read<BranchReview> binding snapshot reviewPath
-                        if exists.IsNone then
-                            let! revision, _ =
-                                required<ReviewRevision> binding snapshot
-                                    (revisionPath legacy.TaskId legacy.RequestId legacy.CurrentRevision)
-                            let! notice =
-                                read<ReviewFeedbackNotice> binding snapshot
-                                    (feedbackPath legacy.TaskId legacy.RequestId)
-                            let reviewedBy =
-                                if String.IsNullOrWhiteSpace legacy.ClaimantId then legacy.ReviewerId
-                                else legacy.ClaimantId
-                            let migrated =
-                                { ReviewId = legacy.RequestId; TaskId = legacy.TaskId
-                                  AttemptId = legacy.AttemptId; OwnerAgentId = legacy.OwnerAgentId
-                                  ReviewRef = revision.ReviewRef; BaseCommit = revision.BaseCommit
-                                  TargetRef = revision.TargetRef; Status = legacy.Status
-                                  ReviewerId = if legacy.Status = "Unclaimed" then null else reviewedBy
-                                  Version = legacy.Version; CreatedSequence = legacy.CreatedSequence
-                                  DecisionSequence = legacy.DecisionSequence
-                                  Acknowledged = notice |> Option.exists (fun (value, _) -> value.Acknowledged) }
-                            changes <- change reviewPath None migrated :: changes
-                            let summaryPath = reviewDocumentPath legacy.TaskId legacy.RequestId "summary.md"
-                            let! summary, _ = LedgerStore.readAt binding snapshot summaryPath
-                            if summary.IsNone then
-                                changes <- { Path = summaryPath; ExpectedBlobOid = None
-                                             Content = if String.IsNullOrWhiteSpace legacy.Feedback
-                                                       then revision.Summary else legacy.Feedback } :: changes
-                // Delete superseded representations from the CURRENT tree.
-                // Their full history remains available on the orphan Git branch.
-                let legacySuffixes =
-                    [ "/request.json"; "/notification.json" ]
-                let legacySegments = [ "/revisions/"; "/decisions/"; "/events/" ]
-                for path in paths do
-                    let reviewPrefix = path.Contains("/reviews/", StringComparison.Ordinal)
-                    let oldReviewFile =
-                        reviewPrefix
-                        && (legacySuffixes |> List.exists (fun suffix ->
-                                path.EndsWith(suffix, StringComparison.Ordinal))
-                            || legacySegments |> List.exists (fun segment ->
-                                path.Contains(segment, StringComparison.Ordinal)))
-                    let oldIntegration = path.Contains("/integrations/", StringComparison.Ordinal)
-                    let oldOrphanCleanup = path.Contains("/orphan-cleanups/", StringComparison.Ordinal)
-                    if oldReviewFile || oldIntegration || oldOrphanCleanup then
-                        let! _, oid = LedgerStore.readAt binding snapshot path
-                        match oid with
-                        | Some existing ->
-                            changes <- { Path = path; ExpectedBlobOid = Some existing
-                                         Content = null } :: changes
-                        | None -> return! Error(LedgerIntegrityError "Missing legacy metadata blob.")
-                if List.isEmpty changes then
-                    return! Error(StaleEntityVersion "There are no unmigrated reviews.")
-                return changes
-            })

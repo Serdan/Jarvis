@@ -81,7 +81,7 @@ For each task still needing work:
 
 Always read expected versions/generations from the latest ledger. Do not guess. Use a **new operation UUID for each new logical mutation**, but reuse the **same UUID and parameters** when retrying the *same* operation after a lost response. Provider session IDs are supplied automatically; agents must not invent them.
 
-For in-progress legacy work, put the *remaining work and next action* in the new canonical spec/checkpoint. An old `done` flag is not proof of a V2 review decision or verified source integration.
+For in-progress legacy work, put the *remaining work and next action* in the canonical spec/checkpoint. An old `done` flag is not proof of a review decision or source integration. Existing attempt JSON may retain old reviewer and integration fields; they are historical data, not new review assignments or mandatory workflow gates. No bulk rewrite of legacy records is required.
 
 ## 5. Task and review tools are independent
 
@@ -117,16 +117,16 @@ git show FETCH_HEAD:ledger.json
 git show FETCH_HEAD:tasks/TASK_ID/task.json
 ```
 
-Use V2 APIs for live writes; do not push hand-edited ledger JSON or force-push the orphan branch.
+Use the unprefixed canonical task/review tools for live writes; do not push hand-edited ledger JSON or force-push the orphan branch.
 
 ## 7. Stalls, retries and failed cutovers
 
 - **Stalled Working session:** read `AgentInbox` and the checkpoint before invoking an explicit `ResumeAgent`. Only an explicit recovery resets the Working-segment clock. Older associated sessions should reread their assignment when a newer one is active.
 - **Long turns:** Jarvis advises a soft stop after **25 minutes** and hard stop after **30 minutes** of the current timed Working segment. These are instructions, not forced cancellation; checkpoint alone does not finish the turn.
-- **Uncertain write:** inspect `GetOperationStatus`, `PendingOperations` and `ReconcilePendingOperations`. A verified `Applied` receipt confirms success; `NotFoundAtVerifiedHead` does not prove a timed-out push can never arrive. Reuse the original UUID and unchanged command when retrying. If a matching pending record remains, `AcknowledgePendingOperation` requires its verified request hash.
+- **Uncertain write:** inspect `GetOperationStatus`, `PendingOperations` and `ReconcilePendingOperations`. A verified `Applied` receipt confirms success; `NotFoundAtVerifiedHead` does not prove a timed-out push can never arrive. Reuse the original UUID and unchanged command when retrying. If a matching **applied** pending record remains, `AcknowledgePendingOperation` requires its verified request hash. For a `NotFoundAtVerifiedHead` entry, the tool cannot acknowledge success. Resolve its outcome before any manual archival of a superseded local intent; do not replay it blindly or modify the canonical task merely to clear a journal entry.
 - **Stale version / unavailable remote:** reread the canonical assignment and stop speculative writes. Never let a timer automatically reassign a task.
 - **Migration failure:** stop new ledger writes and preserve its Git history and pending-intent records. The old task files remain readable historical material, **not** an automatically synchronized fallback.
 
-A project is migrated when its canonical ledger is bound, its **relevant active tasks** are recreated, agents use V2 for all new orchestration writes, and participating clients agree on its state. Other projects can migrate independently. Updating the Jarvis client/server by itself does not complete this per-project step.
+A project is migrated when its canonical ledger is bound, its **relevant active tasks** are recreated, agents use the orphan-ledger tools for all new orchestration writes, and participating clients agree on its state. Other projects can migrate independently. Updating the Jarvis client/server by itself does not complete this per-project step.
 
 See the [architecture spec](specs/orchestration-v2-architecture.md). The older [Git-backed tasks guide](GitBackedTasks.md) describes the retired source-branch workflow.

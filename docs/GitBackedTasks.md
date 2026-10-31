@@ -1,5 +1,13 @@
 # Git worktrees and repository task files
 
+> **Historical protocol 3.14-3.19 documentation (retired).** The repository-local
+> task JSON workflow and automatic `nextActor` reviewer handoffs described below
+> are no longer available. Current task and review authority is the orphan
+> `refs/heads/jarvis-orchestration` ledger. Read the
+> [current capability specification](specs/orchestration-v2-architecture.md) or
+> [migration guide](OrchestrationMigration.md). Ordinary Git worktree tools remain.
+
+
 Jarvis uses the local Git repository to manage worktrees and task state. These commands are introduced with agent protocol 3.14. All operations run on the authenticated client and use the normal local permission policy. The server routes native MCP commands.
 
 ## Worktrees

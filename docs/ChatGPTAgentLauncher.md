@@ -3,11 +3,11 @@
 **Status:** Proposed; specification only, not implemented or deployed  
 **Worktree:** `Jarvis::browser-bridge` (`feature/browser-bridge`)  
 **Depends on:** [Browser bridge](BrowserBridgeSystem.md), [implemented one-shot scheduler](BrowserOneShotScheduler.md)  
-**Scope:** Project-owned ChatGPT UI automation; minimal generic browser-bridge and scheduler changes needed to support reliable launch, tab cleanup, and optional recurring execution.
+**Scope:** User-registered browser-window targets, a generic immediate open/execute/close operation, project-owned ChatGPT UI automation, and optional scheduled repetition. These additions are specified here but **not yet implemented**.
 
 ## 1. Objective
 
-Use an authenticated Edge/Chromium tab as a **short-lived launcher** for fresh ChatGPT agent conversations. A JarvisClient schedule or an existing agent creates a tab, navigates to the chosen ChatGPT entry URL, enters and submits a bootstrap prompt through the real web UI, captures the resulting conversation URL, and closes the tab. ChatGPT execution is expected to continue server-side after tab closure; no browser polling for the agent's later progress is required.
+Use an authenticated Edge/Chromium tab as a **short-lived launcher** for fresh ChatGPT agent conversations. The user explicitly registers a **browser window** in the extension. An orchestrator invokes one generic Jarvis browser-script workflow, or a JarvisClient schedule invokes that same workflow: it creates a tab **in the registered window**, navigates to the chosen ChatGPT entry URL, enters and submits a bootstrap prompt through the real web UI, captures the resulting conversation URL, and closes only that created tab. ChatGPT execution is expected to continue server-side after tab closure; no browser polling for the agent's later progress is required.
 
 The logical worker/orchestrator is durable in **Jarvis tasks, assignments, Git history, specifications, and checkpoints**, not in any particular ChatGPT conversation. Fresh sessions reconstruct that ground truth, minimizing drift and dependence on long-running conversations. The browser is a launcher and optional diagnostic viewer, not the runtime, orchestrator, or task database.
 
@@ -18,9 +18,9 @@ This is primarily a **project-owned script** on the generic browser bridge, not 
 1. **UI only:** interact with the DOM and normal user interface; do not send requests to internal ChatGPT APIs, forge `conversation`/`prepare` messages, or depend on private network payload schemas.
 2. **One submission per launch:** after the script may have clicked Send, failures/timeouts are outcome-uncertain; never blindly replay a prompt or retry a launch with a new tab.
 3. **Disposable tabs:** close only tabs created for this launch by Jarvis, never user-registered or unrelated tabs. Closing a tab is not a request to cancel the running ChatGPT conversation.
-4. **Separation of responsibilities:** scheduler knows only due time, site URL, project file, arguments, and optional cleanup; the ChatGPT script knows DOM selectors and submission semantics; agents know tasks and assignments.
+4. **Separation of responsibilities:** the orchestrator chooses the logical agent and calls one generic immediate launcher; the optional scheduler chooses **when** to call the same launcher; the browser extension owns registered windows/new-tab lifecycle; the project script knows DOM selectors and submission semantics; agents know tasks and assignments.
 5. **No new agent orchestration state machine:** Jarvis remains Git/task/activity-driven. The launcher cannot infer successful task completion from successful prompt submission.
-6. **Security stays layered:** ChatGPT app authorization, Jarvis MCP permissions, JarvisClient trust, extension pairing, browser host permissions, and manual origin anchor are independent. No automation bypasses consent dialogs.
+6. **Security stays layered:** ChatGPT app authorization, Jarvis MCP permissions, JarvisClient trust, extension pairing, **user window registration**, and browser host permissions are independent. Registering a window is not permission to inspect its existing tabs. No automation bypasses consent dialogs.
 7. **Fresh bootstraps are self-contained:** the prompt specifies role and how to find current Jarvis truth, not a copied snapshot of potentially stale instructions.
 
 ## 2. Existing implementation and required additions
@@ -28,8 +28,8 @@ This is primarily a **project-owned script** on the generic browser bridge, not 
 ### Already implemented in the browser-bridge worktree
 
 - Local authenticated Chromium/Edge MV3 extension paired to JarvisClient.
-- Explicit manual registration and host permission for a site; separate **Allow Jarvis to open new tabs** extension opt-in.
-- `BrowserOpenTab` creates an agent-owned background tab only on an approved/manual-registration origin. Agent-created registrations remain origin-bound during same-site SPA navigation.
+- Explicit manual **tab** registration and host permission for the corresponding site; separate **Allow Jarvis to open new tabs** extension opt-in. **Window registration is not implemented yet.**
+- Current `BrowserOpenTab` creates an agent-owned background tab only on an origin with an existing manually registered tab. The new design **replaces that origin-anchor requirement** with an explicit window registration plus host permission; it is not yet implemented.
 - `BrowserExecuteFile` runs a real `.js` file from an ordinary Jarvis project; exported contract is `async function execute(args)`.
 - `ScheduleBrowserExecution` runs an **one-shot** delayed open-tab + execute-file action; schedule persisted locally through client restarts; no automatic replay after an uncertain dispatch. `ListScheduledBrowserExecutions` and `CancelScheduledBrowserExecution` exist.
 - A limit of **20 currently registered agent-created tabs** exists; without tab cleanup, frequent launches eventually hit that limit.
@@ -37,55 +37,61 @@ This is primarily a **project-owned script** on the generic browser bridge, not 
 ### New work required by this specification
 
 1. A project-owned, reusable `chatgpt/launchAgent.js` UI automation script and tests/fixtures. This path is illustrative; no special Jarvis directory is required.
-2. **Agent-created tab close capability** in the generic extension bridge, and schedule-level post-execution cleanup. Design as `BrowserCloseTab(tabRegistration, deviceId?)` or an equivalent typed extension close request. Do not inject `window.close()` as a substitute.
-3. A durable **launch result** with submission status, optional resulting conversation URL, cleanup outcome, and schedule/attempt correlation, without persisting prompt contents in activity/log listings.
-4. Optional **recurring fixed-interval schedules** for an orchestrator or other role; existing one-shot behavior remains the default.
-5. Documentation and regression tests spanning UI changes, restart, duplicate dispatch, permissions, registration capacity, and live Edge.
+2. **User-registered browser windows:** extension UI for Register/Unregister window and user-approved site host permissions. New tabs are created only inside a specified live registered window; no manually registered tab on the destination origin is needed.
+3. **Generic immediate workflow:** `BrowserRunInNewTab(windowRegistration, url, projectName, scriptPath, argsJson?, active?, closeTabAfterExecution?, deviceId?)` performs open → wait → execute script → close in one call, so an orchestrator doesn't have to coordinate three separate MCP operations.
+4. **Agent-created tab close capability** via `BrowserCloseTab(tabRegistration, deviceId?)` and safe cleanup. Do not inject `window.close()` as a substitute.
+5. A durable **launch result** with submission status, optional conversation URL, cleanup outcome, and attempt correlation, without persisting prompt contents in activity/log listings.
+6. Existing one-shot scheduling gains `windowRegistration`, uses the shared immediate workflow, and optional **recurring fixed-interval schedules** may launch later. Scheduling is not needed for immediate orchestrator handoffs.
+7. Documentation and regression tests spanning UI changes, window revocation/restart, duplicate dispatch, permissions, registration capacity, and live Edge.
 
 Do **not** mark these additions as present until implemented and verified. No deployment, merge, or rollout is implied by accepting this spec.
 
 ## 3. Architecture and ownership
 
 ```text
-Existing agent / human operator
-    | create / update / cancel one-shot or optional recurring schedule
+User: extension popup -> Register window "agents" + approve chatgpt.com host access
+                                    |
+Orchestrator / worker / human        |  explicit window destination
+    | BrowserRunInNewTab(windowRegistration, URL, script, bootstrap args)
+    | (or schedule same operation for later)
     v
-JarvisClient local scheduler (persistent JSON)
-    | due action: choose URL, project/script, JSON args
+Jarvis server -> JarvisClient (one generic composite workflow)
+    | extension opens new tab in chosen, still-registered window
     v
-Authenticated local browser bridge
-    | BrowserOpenTab (user-approved origin; auto-registration)
-    v
-Fresh Edge/Chromium tab -> ChatGPT frontend
-    | BrowserExecuteFile: project-owned ChatGPT launcher
+New Edge/Chromium tab -> ChatGPT frontend
+    | BrowserExecuteFile: project-owned ChatGPT UI launcher
     |   find composer -> insert prompt -> wait for Send -> click
-    |   observe launch acknowledgement + capture conversation URL
+    |   observe submission acknowledgement + capture conversation URL
     v
-JarvisClient: persist launch metadata, best-effort close agent-owned tab
+JarvisClient: record launch metadata, close **only new agent-owned tab**
     |
-    +-> new ChatGPT conversation continues on backend
-              | first steps: invoke Jarvis, read assignment/spec/task
+    +-> new ChatGPT backend conversation continues independently
+              | fresh agent: invoke Jarvis, read assignment/spec/task
               v
          Task work, Git commits, checkpoints, activity
 ```
 
-**Jarvis server** remains stateless and routes existing MCP calls; it must not host browser sessions, store persistent scheduler state, or know how ChatGPT works. **JarvisClient** owns local schedule persistence, execution orchestration, tab cleanup, and structured metadata. **Extension** enforces pairing and tab authorization and executes close requests. **Project-owned script** owns selectors, insertion, click, and UI confirmation. **Agent bootstrap text** owns role instructions and reconciliation with Jarvis state.
+The **registered window** is a placement/consent target, not a registered collection of tabs. The extension must never expose preexisting tabs merely because the window was registered. **Browser host permission** independently authorizes the destination site. The currently implemented manually registered *tab* remains supported for generic inspection, but it is **not** required for new ChatGPT launches in this new design.
+
+**Orchestrator** chooses the logical agent and performs **one immediate browser workflow call**, with no need to create a schedule for an immediate resume. **Jarvis server** stays stateless and routes existing MCP calls; no browser sessions or tasks are stored there. **JarvisClient** orchestrates open/execute/close, retries only safe readiness polls, and owns optional local schedules and sanitized results. **Extension** validates live window registration, host permissions and tab provenance. **Project-owned script** owns selectors, insertion, click, and UI confirmation. **Agent bootstrap text** owns role instructions and reconciliation with Jarvis state.
+
+A new browser window registration is identified by opaque ID or unique alias per paired device/profile; its actual Chromium window ID and browser-session epoch are private extension state. On close/restart, it becomes unavailable until explicitly re-registered. Jarvis must never silently select another window, infer the window from an active tab, or migrate a stale schedule to a different window.
 
 ## 4. Configuration and launch request
 
-A launch is expressible as a normal scheduled browser execution whose script/arguments are ChatGPT-specific. No new ChatGPT MCP endpoint.
+A launch is primarily an **immediate** `BrowserRunInNewTab` call from the orchestrator, with no ChatGPT-specific MCP endpoint. The same generic service can be triggered later by `ScheduleBrowserExecution` for worker self-continuation or recurring orchestration. Both operations require a **user-registered window** and permission for the destination site.
 
-Illustrative one-shot invocation using the existing command:
+Illustrative **new immediate command** (not yet implemented):
 
 ```json
 {
-  "scheduleId": "worker-3-next",
-  "runAfterSeconds": 300,
+  "windowRegistration": "agents",
   "url": "https://chatgpt.com/",
   "projectName": "Userscripts",
   "scriptPath": "chatgpt/launchAgent.js",
   "argsJson": "{\"role\":\"worker\",\"agentId\":\"3\",\"projectName\":\"Wayfold\",\"prompt\":\"You are Worker 3. Read the latest Jarvis assignment, relevant AGENTS.md, task and spec. Follow current instructions and continue the assigned work; do not assume previous conversation state. End with the required checkpoint/Next line.\"}",
-  "active": false
+  "active": false,
+  "closeTabAfterExecution": true
 }
 ```
 
@@ -103,7 +109,7 @@ Recommended argument contract:
 | `postSubmitWaitMs` | No | Small bounded grace interval before returning, for SPA navigation to settle |
 | `debug` | No | Opt-in diagnostics; do not leak draft text by default |
 
-Scheduling parameters, **not** script arguments, control `active`, `closeTabAfterExecution`, device selection, repeat interval, and cleanup on failure.
+Jarvis browser-workflow parameters, **not** ChatGPT script arguments, control `windowRegistration`, `active`, `closeTabAfterExecution`, and device selection. Only **scheduled** calls have delay and repeat interval. An orchestrator normally invokes the immediate workflow, rather than scheduling a zero-delay job.
 
 For ChatGPT **Projects**, a supported, explicitly chosen ChatGPT landing URL should be passed as `url`. It must be a known user-selected entry URL that opens a fresh conversation in the intended project. For other contexts, `https://chatgpt.com/` may suffice. Do not infer project identity from a display name, fabricate project URLs, or assume the selected GPT/Project context follows from a prior conversation. When a project, model, or thinking-effort selection is required, UI automation must verify or explicitly select it using discoverable controls. The launch must fail if the required context cannot be established; do not silently send in the wrong context.
 
@@ -115,7 +121,7 @@ Prefer the account's already configured UI defaults when the caller does not spe
 
 ### 5.1 Tab readiness
 
-- Open a **new** agent-created tab on the already approved `chatgpt.com` origin. Do not claim existing unregistered tabs.
+- Open a **new** agent-created tab **in the specified user-registered browser window** on the separately approved `chatgpt.com` origin. Do not claim, enumerate, or alter existing unregistered tabs.
 - Await a ready registration/document; the extension rechecks current origin and identity before execution.
 - The script must wait for React/ProseMirror hydration and composer availability with a bounded deadline; merely finding a DOM node before hydration is insufficient.
 - Support background tabs by default, but test behavior under Chromium background throttling. Configurable `active=true` exists for diagnostics or an identified site limitation; don't steal focus unconditionally.
@@ -235,14 +241,14 @@ BrowserCloseTab(tabRegistration, deviceId?)
 
 Contract:
 - Only accept a currently registered tab marked **agentCreated=true** on the paired extension.
-- Validate session epoch, exact tab ID, registration generation, and provenance immediately before closing; never close a manually registered tab, arbitrary tab ID, or URL-matched replacement.
+- Validate parent window registration, session epoch, exact tab ID, registration generation, and provenance immediately before closing; never close a manually registered tab, arbitrary tab ID, or URL-matched replacement.
 - Reject absent/disconnected/revoked/mismatched registrations with typed errors. “Tab already closed” may be an idempotent cleanup success **only when identity is provable**.
 - Closing unregisters the agent-created tab and promptly releases its capacity slot.
-- The manually registered ChatGPT origin anchor remains open and unaffected.
+- The user-registered **browser window** remains open, and all preexisting tabs in it remain untouched. Closing a created tab does not revoke the window registration.
 - Audit only operation metadata. Separate close authorization from script execution and preserve the extension's own consent boundary.
 - No mechanism for an agent to enumerate and close unrelated browser tabs.
 
-Extend generic scheduled execution with optional `closeTabAfterExecution` (false for legacy caller compatibility; **true for the ChatGPT agent-launching convention**) and optional debug `keepTabOpen`. The close action is managed by the client/extension, never by the page script, and should use the exact registration ID returned by the immediately preceding open.
+The **immediate** generic `BrowserRunInNewTab` command and the delayed scheduler both expose optional `closeTabAfterExecution` (false when omitted for legacy generic callers; **true for this ChatGPT launching convention**) and a debug option to keep the tab open. JarvisClient manages cleanup using the exact registration returned by its own open; the page script never invokes privileged tab/window APIs. Both call paths share the same implementation, not duplicated open/execute/close logic.
 
 **Default launcher behavior:** after confirmed submission and a short, bounded grace period, perform best-effort tab close. For a definitive pre-submit failure, close the owned tab unless a diagnostic flag requests preservation. For an outcome-unknown post-click, **do not auto-resubmit**; prefer retaining the tab for inspection rather than risking interruption of an in-flight submission, with its registration/URL available for manual cleanup. A later safe retention policy may be added only with explicit semantics.
 
@@ -254,7 +260,9 @@ No request to close a ChatGPT tab should be interpreted as asking ChatGPT to can
 
 ### 8.1 Existing one-shot scheduling
 
-Retain existing `ScheduleBrowserExecution(scheduleId, runAfterSeconds, url, projectName, scriptPath, argsJson?, alias?, active?, deviceId?)`, validation, private on-disk persistence, one-shot dispatch and explicit `outcomeUnknown` on restart after claiming work. The script is re-read at execution time. One-shot work is **never automatically replayed** if it may have submitted a message.
+Retain the existing one-shot scheduling semantics and private on-disk persistence, but extend the command to `ScheduleBrowserExecution(scheduleId, runAfterSeconds, windowRegistration, url, projectName, scriptPath, argsJson?, alias?, active?, closeTabAfterExecution?, deviceId?)`. Scheduled execution uses the same generic `BrowserRunInNewTab` service as immediate launches. The target is the **explicit registered window**, not a tab-origin anchor; site host permissions remain required. Preexisting persisted schedules without a window target must be flagged for explicit reconfiguration, never silently moved into an active window. One-shot work is **never automatically replayed** after a possible message submission.
+
+**Immediate orchestrator resumption does not require scheduling:** `BrowserRunInNewTab` opens the next agent session now. The scheduler exists for deliberate delayed worker continuations and fixed-interval orchestration.
 
 ### 8.2 Optional fixed-interval recurring schedules (new)
 
@@ -265,6 +273,7 @@ Add an explicit repeat mode (e.g. `repeatEverySeconds`) without changing one-sho
   "scheduleId": "hourly-orchestrator",
   "runAfterSeconds": 3600,
   "repeatEverySeconds": 3600,
+  "windowRegistration": "agents",
   "url": "https://chatgpt.com/",
   "projectName": "Userscripts",
   "scriptPath": "chatgpt/launchAgent.js",
@@ -281,7 +290,7 @@ Required semantics:
 - On success, failure or uncertain outcome, continue at the **next scheduled interval**, except an explicitly disabled/canceled schedule. Never retry the same uncertain occurrence.
 - After client downtime, **skip missed occurrences** and schedule the next future interval; do not launch a backlog of hourly orchestrators. If a due attempt was interrupted, record it as uncertain and advance past it.
 - No overlapping **local dispatches of the same schedule ID**. If an invocation is still running at its next interval, skip that interval instead of queueing another copy.
-- Repeated attempts must use fresh tabs and unique/generated aliases. Do not reuse a previous conversation or registration.
+- Repeated attempts must target the explicitly selected, **currently registered window**, use fresh tabs with unique/generated tab aliases, and never reuse a previous conversation. If that window was closed/revoked or the browser restarted, fail/report until the user explicitly re-registers/rebinds; do not choose a substitute window.
 - Cancellation prevents future occurrences; it does not undo a submitted ChatGPT run or retroactively revoke one already dispatched. Editing/replacing an active schedule is atomic between occurrences and may be rejected while an occurrence is currently being claimed.
 - Define sensible min/max interval bounds and capacity limits; do not interpret `repeatEverySeconds` omitted as an implicit repeat.
 - Display status as schedule enabled/disabled, next due, and **last launch outcome** separately. “Recurring” is not a terminal launch status.
@@ -309,7 +318,7 @@ For diagnosis, expose optional coarse timings (tab ready, composer ready, text a
 ## 10. Security and permission boundaries
 
 1. The ChatGPT browser session must already be authenticated as the intended account. UI launcher must not collect or store ChatGPT credentials.
-2. Extension is paired to the local JarvisClient, site host permission granted, a live **manual ChatGPT origin anchor** registered, and **Allow Jarvis to open new tabs** enabled. This does **not** authorize arbitrary existing tabs or origins.
+2. Extension is paired to the local JarvisClient, a **specific live browser window was registered by the user**, the destination site's host permission was granted separately, and **Allow Jarvis to open new tabs** is enabled. Registering a window does **not** authorize arbitrary existing tabs or unpermitted origins.
 3. An MCP caller must possess the necessary workspace/browser execution permissions. ChatGPT itself may ask the user to approve individual Jarvis operations; client-side full trust does not change ChatGPT's app permission behavior.
 4. A persistent ChatGPT app-specific permission setting, if the workspace exposes it, is the intended route for unattended operation; the launcher must not simulate clicks on permission approval, account recovery, security challenges, or other consent dialogs.
 5. The origin, requested context, composer and clicked Send control must be verified on the **agent-created** tab. No stale alias or URL match is sufficient authorization.
@@ -320,7 +329,8 @@ For diagnosis, expose optional coarse timings (tab ready, composer ready, text a
 
 | Scenario | Launch classification | Recovery |
 | --- | --- | --- |
-| No pairing/manual origin anchor/extension opt-in | `notSubmitted` | Operator resolves consent/configuration |
+| No pairing/registered window/host permission/extension opt-in | `notSubmitted` | Operator resolves consent/configuration; no alternate-window fallback |
+| Registered window closed, moved, or stale after browser restart | `notSubmitted` | Explicitly re-register/rebind window; do not target another window |
 | Page fails to load; login/challenge/incorrect project | `notSubmitted` | Report typed reason; no automatic bypass |
 | Composer missing or contains restored draft | `notSubmitted` | Leave draft unchanged; report/diagnose |
 | Text insertion fails exact verification; Send never enabled | `notSubmitted` | No click; safe to inspect/fix script |
@@ -337,12 +347,13 @@ For diagnosis, expose optional coarse timings (tab ready, composer ready, text a
 
 ## 12. Implementation boundaries and sequence
 
-1. **Script and fixtures:** create the reusable project-owned launcher with semantic selectors, ProseMirror insertion, single-click guard, UI acknowledgement contract, structured results and DOM-mutation tests. Include a dedicated freshly created chat fixture and a project-context fixture.
-2. **Generic tab close:** add extension protocol + client command/service, agent-owned identity/revocation checks, tab-limit release, and tests. Keep manual tab registration controls unchanged.
-3. **Schedule launch result and cleanup:** add `closeTabAfterExecution` and safe result metadata to the generic scheduler without changing existing one-shot guarantees. Existing consumers with no close option should behave exactly as before.
-4. **Optional repeat:** implement fixed-interval schedule persistence, per-occurrence journal, skip-missed behavior, restart semantics, edit/cancel/list and tests. No orchestrator-specific code.
-5. **Manual real Edge verification:** pair the extension, register a ChatGPT tab, enable agent-created tabs, and perform one actual fresh-conversation launch with a deliberately harmless prompt, confirm the returned URL and post-close backend continuation. Verify fresh project context/tool availability and permission behavior separately. Test a repeated schedule long enough to establish that tabs do not accumulate.
-6. **Only after verification:** update usage docs, review and integrate coordinated extension/client/server changes, deploy through the normal Jarvis release sequence if authorized.
+1. **Register windows in extension:** add user-gesture Register/Unregister window, window alias/ID validation and lifecycle, explicit destination host permission UI, and no adoption of any preexisting tab. Preserve existing manual-tab functionality.
+2. **Generic open/execute/close:** add safe `BrowserCloseTab`, then `BrowserRunInNewTab` that owns the whole immediate workflow with one MCP call; keep all page-specific behavior in project JavaScript. Verify window selection, site permission, identity and tab-limit release.
+3. **Script and fixtures:** create the reusable ChatGPT UI launcher with semantic selectors, ProseMirror insertion, single-click guard, submission acknowledgement, structured results and DOM tests.
+4. **Scheduled reuse:** add `windowRegistration`, `closeTabAfterExecution` and safe launch metadata to one-shot schedules, and reuse the same generic workflow. Existing schedules missing a window must require explicit reconfiguration, never silent retargeting.
+5. **Optional recurrence:** implement fixed-interval schedule persistence, per-occurrence journal, skip-missed behavior, restart semantics, edit/cancel/list and tests. No orchestrator-specific code.
+6. **Manual real Edge verification:** pair extension, register a **browser window**, grant `chatgpt.com` host permission and enable agent-created tabs. From an orchestrator, invoke `BrowserRunInNewTab` once with a harmless new-session prompt; verify correct target window, URL, tab close, and post-close continuation. Confirm context/tool availability separately; exercise delayed/recurring launches as needed.
+7. **Only after verification:** review and integrate coordinated changes, then deploy through the normal release sequence if authorized.
 
 No new task database, browser automation engine, direct HTTP ChatGPT integration, API token extraction, generic page credential handling, or Codex-through-Jarvis flow.
 
@@ -357,15 +368,17 @@ No new task database, browser automation engine, direct HTTP ChatGPT integration
 - URL sanitization, prompt redaction, validation, bounded JSON and timeout behavior are covered.
 
 **Bridge/scheduler tests**
-- Only freshly agent-created registered tabs can be closed; manual anchors, wrong-generation IDs, navigated/reused tab IDs, unregistered tabs and unrelated tabs cannot be closed.
+- Registering one window permits **only new-tab creation in that window**; it does not register or expose any existing tab. A different window, a closed/reused window ID, stale generation, or unapproved site is rejected.
+- Only freshly agent-created registered tabs can be closed; manually registered tabs, wrong-generation IDs, navigated/reused tab IDs, unregistered tabs and unrelated tabs cannot be closed.
 - Open → execute → confirmed submission → close releases one of 20 agent-tab slots; repeated cycles do not accumulate. On close error, success of the submission remains recorded.
-- Existing one-shot schedules keep their previous behavior when new optional fields are omitted.
+- Existing one-shot timing and no-replay behavior is preserved; stored schedules without a window target require explicit reconfiguration, not a guessed active window.
+- An orchestrator issues **one** immediate `BrowserRunInNewTab` call that opens in the chosen registered window, executes the script and closes its own created tab; scheduler uses exactly the same underlying service.
 - Interrupted submission is not replayed; client shutdown/restart marks claimed occurrence uncertain.
 - Recurring schedule fires on interval, is persistent across restart, skips missed intervals, never overlaps a local invocation for the same ID, and continues after a failed/uncertain attempt at its next interval. Cancel prevents future launches.
 - Schedule listing and logs show metadata but not prompts, network tokens, or ChatGPT private payloads.
 
 **Manual end-to-end (Edge / real ChatGPT)**
-- With an authenticated session and normal extension consent, a fresh ChatGPT conversation receives the exact bootstrap prompt via UI, a usable conversation URL is recorded, and its agent-created tab closes while the manually registered anchor remains.
+- With an authenticated session and normal extension consent, a window is manually registered without registering any existing tabs. An orchestrator immediately starts a fresh ChatGPT conversation through one browser workflow call, the exact bootstrap prompt is submitted via UI, a usable conversation URL is recorded, and **only its new tab closes**; the registered window and all existing tabs remain.
 - The resulting agent can access Jarvis in the chosen project/context and reconstruct its task and checkpoint. If ChatGPT asks for MCP approval, the documented limitation is observed, not bypassed.
 - A successful run is not marked as a completed Jarvis task until the agent actually checkpoints/completes it.
 - Repeated hourly launches can run without a buildup of agent-created tabs, and the new orchestrator performs an activity check before assuming ownership.
@@ -378,7 +391,9 @@ No new task database, browser automation engine, direct HTTP ChatGPT integration
 - **No backend-liveness probe** from the launcher: agents may work long after tab closure; activity/task state is inspected by other agents/operators, not by browser polling.
 - **Persistent logical agents, ephemeral ChatGPT sessions**: fresh instructions from current Jarvis/project truth on each run.
 - **Workers may schedule one-shot continuations**; a recurring orchestrator may run hourly even when another appears active, and must itself check current activity.
-- **ChatGPT specifics remain in project script**; generic browser bridge adds only tab-close and scheduler capabilities.
+- **ChatGPT specifics remain in project script**; the generic browser bridge gains a registered-window target, safe tab close and a single immediate open/execute/close command, reused by the scheduler.
+- **Window registration is distinct from individual tab registration**; site host permission remains an independent requirement, but a manually registered same-origin tab is no longer required to launch new tabs.
+- **Orchestrator handoffs are immediate** through the generic workflow; schedules are for intentional delayed/recurring launches.
 - **No automatic retry after possible Send**, no exactly-once promises, no orchestration leases, and no spoofing of user permission controls.
 
 ## 15. Explicitly deferred

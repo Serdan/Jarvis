@@ -66,6 +66,32 @@ If the orchestration chain breaks, the human operator can start a new orchestrat
 
 Real Edge end-to-end testing of the browser extension and script behavior remains a separate acceptance requirement.
 
-## Proposed ChatGPT agent launch workflow
+## Proposed replacement: registered-window launch targets (not implemented)
 
-See [ChatGPT Ephemeral Agent Launcher](ChatGPTAgentLauncher.md) for the separate, **not yet implemented** UI automation and disposable-tab design, agent bootstrap, tab-close protocol, and optional fixed-interval recurrence. This document describes the currently implemented **one-shot-only** scheduler; its command surface and behavior do not yet include recurring schedules or automatic tab closure.
+The sections above document the **implemented** one-shot scheduler and its current origin-anchor requirement. The **new target** replaces that requirement with a **user-registered browser window** plus separately granted destination-site host permission. A manually registered same-origin tab is no longer needed to create fresh tabs. Existing unregistered tabs in the registered window remain inaccessible.
+
+An orchestrator uses **`BrowserRunInNewTab`** to launch a new agent **immediately**, in one operation: open a tab in the designated window, execute a normal project-owned ChatGPT UI script, capture the result, and close only the created tab. **A schedule is not needed for immediate agent resumption.**
+
+For deliberate delayed worker continuation, extend the current `ScheduleBrowserExecution` with `windowRegistration` and optional `closeTabAfterExecution`. The delayed run invokes exactly the same generic open/execute/close service as the immediate call. The scheduler must not silently pick the current window; old persisted schedules with no window target require explicit reconfiguration. Window closure, revocation or browser restart makes the binding unavailable until the user re-registers/rebinds.
+
+For optional recurring orchestration, a fixed interval such as `repeatEverySeconds: 3600` causes **new launch attempts**, with one claimed attempt at a time, no backlog after downtime and no replay of uncertain submissions. The newly started orchestrator checks Jarvis activity for an already active orchestrator instead of using leases or hard locks.
+
+Illustrative future delayed launch (fields unavailable today):
+
+```json
+{
+  "scheduleId": "worker-3-next",
+  "runAfterSeconds": 300,
+  "windowRegistration": "agents",
+  "url": "https://chatgpt.com/",
+  "projectName": "Userscripts",
+  "scriptPath": "chatgpt/launchAgent.js",
+  "argsJson": "{\"role\":\"worker\",\"prompt\":\"Read your current Jarvis assignment and continue in this fresh session.\"}",
+  "closeTabAfterExecution": true,
+  "active": false
+}
+```
+
+The extension must enforce agent-created tab provenance before closing and preserve the registered window and all existing tabs. See [ChatGPT Ephemeral Agent Launcher](ChatGPTAgentLauncher.md) for the full immediate workflow, bootstrap contract, DOM selectors, result semantics, and acceptance tests.
+
+**No registered-window functionality, tab closure, one-call launcher or recurrence has been implemented in this worktree yet.**

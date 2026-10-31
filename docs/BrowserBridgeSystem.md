@@ -1,24 +1,24 @@
 # Jarvis Browser Bridge — System Specification
 
-**Status:** Proposed system design (not implemented)  
+**Status:** Browser bridge and one-shot scheduling implemented on this unmerged worktree; **registered-window launch and tab close are proposed, not implemented**
 **Scope:** Jarvis server, JarvisClient, Chromium extension, and project-owned JavaScript scripts  
 **Initial implementation worktree:** `Jarvis::browser-bridge` (`feature/browser-bridge`)  
 **Related task:** [Local browser bridge and MCP command routing](tasks/2026-10-26-browser-bridge-jarvis.html)
 
 ## 1. Purpose
 
-Provide an authenticated Jarvis agent with a general-purpose way to inspect and manipulate **browser tabs manually registered by the user or newly created under an explicit extension opt-in**. The agent can execute JavaScript sourced from normal files in normal Jarvis projects, optionally passing JSON arguments and receiving a bounded result.
+Provide an authenticated Jarvis agent with a general-purpose way to inspect and manipulate **tabs explicitly registered by the user or created by Jarvis in a user-registered browser window**. The agent can execute JavaScript sourced from normal files in normal Jarvis projects, optionally passing JSON arguments and receiving a bounded result.
 
 The browser bridge has **no knowledge of ChatGPT, agent identities, conversations, workflows, or task orchestration**. Those behaviors live in agent-authored project scripts and the existing Jarvis task system.
 
-A motivating use case is an orchestrator using Jarvis's existing task tools to integrate an agent's work, then running a project script against a registered ChatGPT conversation tab to submit a continuation prompt. This is an application of the generic capability, not a built-in Jarvis workflow.
+A motivating use case is an orchestrator starting a **new ChatGPT session** for a logical worker: Jarvis creates a disposable tab in a user-registered browser window, runs a project-owned UI script to submit the bootstrap message, and closes only that new tab. The agent reconstructs its assignment from Jarvis. This is an application of the generic capability, not a built-in Jarvis workflow. See [ChatGPT Agent Launcher](ChatGPTAgentLauncher.md).
 
 ### Principles
 
-1. **User-owned targets:** existing tabs may be registered only by the user in the extension. After a separate explicit opt-in, Jarvis may create and automatically register **new** tabs only on sites with a valid manually registered tab and browser host permission. No MCP operation can claim an arbitrary existing tab.
+1. **User-owned targets and launch windows:** the user registers an existing **browser window** as an allowed destination and separately grants browser host permission for sites Jarvis may automate. Jarvis may create and automatically register **new tabs only in that registered window**. Existing tabs remain inaccessible unless individually registered by the user. No MCP operation can claim an arbitrary existing tab.
 2. **Project-owned scripts:** scripts are regular `.js` files in Jarvis projects and Git worktrees; no Jarvis script database, dedicated script directory, or script registration.
 3. **Browser-independent Jarvis API:** only the extension implements Chromium behavior. Jarvis passes typed commands and returns typed results.
-4. **Explicit boundaries:** device authentication, browser-extension pairing, tab registration, and permission to execute are separate checks.
+4. **Explicit boundaries:** device authentication, extension pairing, user window registration, site host permission, tab registration, and permission to execute are separate checks.
 5. **Fail closed:** missing, navigated, frozen, discarded, disconnected, or ambiguously restored tabs never cause silent retargeting.
 6. **No exactly-once fiction:** a timeout or disconnect can leave the result of a page action uncertain. Jarvis must never blindly replay it.
 
@@ -27,7 +27,7 @@ A motivating use case is an orchestrator using Jarvis's existing task tools to i
 ```text
 Agent / MCP caller
    |
-   | BrowserListTabs / BrowserOpenTab / BrowserExecuteFile / BrowserExecuteJs
+   | BrowserListWindows / BrowserOpenTab / BrowserRunInNewTab / BrowserExecuteFile / BrowserCloseTab
    v
 Jarvis server (OAuth scopes, device routing, SignalR)
    |
@@ -37,7 +37,7 @@ JarvisClient on selected device (F# / .NET)
    |  hosts authenticated WebSocket on 127.0.0.1
    v
 Paired Chromium extension (Manifest V3 service worker)
-   |  owns user-managed tab registry and browser permissions
+   |  owns user window/tab registries and browser permissions
    |  validates registration against real tab and URL
    v
 Chrome userScripts.execute() -> explicitly registered tab
@@ -52,8 +52,8 @@ JSON-compatible result -> extension -> client -> server -> agent
 | --- | --- | --- |
 | Jarvis server | OAuth authorization, authenticated MCP routing, per-conversation device selection, request correlation | Know browser tabs or store scripts/registrations |
 | JarvisClient | Loopback listener, extension pairing, permission policy, script-file reading, protocol correlation, bounds and diagnostics | Enumerate browser tabs independently or bypass extension consent |
-| Extension service worker | Browser connection, user tab registry, URL/permission validation, script injection, tab lifecycle handling | Read project files, accept arbitrary registration from Jarvis, grant access to unregistered tabs |
-| Extension UI | Pairing, register/rename/unregister tab, show availability and connection, revoke access | Automatically opt tabs into control without a user gesture |
+| Extension service worker | Browser connection, user-registered windows and tabs, host permission checks, creation/closure of agent-created tabs, script injection | Read project files, let Jarvis register windows or claim existing tabs |
+| Extension UI | Pairing, explicit register/rename/unregister **window or existing tab**, site permissions, availability and revocation | Opt existing tabs or windows into control without a user gesture |
 | Jarvis project | JavaScript files, optional helper/build system, Git history, app-specific logic | Require changes to Jarvis or extension to target a new website |
 
 The browser and its JarvisClient must be running on the **same machine**: the browser extension connects to that client over loopback, never to the public Jarvis server. Multiple devices may host independent clients and browser instances. Existing Jarvis `deviceId` selection applies. No mutable global “current tab” or “current agent conversation” exists at server level.
@@ -65,30 +65,40 @@ The browser and its JarvisClient must be running on the **same machine**: the br
 1. Enable the browser bridge in JarvisClient's **user-level configuration**. Its listener is disabled by default.
 2. Install the extension in a supported Chromium browser. Enable Chrome's required **Allow User Scripts** setting.
 3. Pair that extension with the local JarvisClient through a user-approved pairing flow.
-4. In the target tab, click the extension and choose **Register tab**, optionally supplying a stable alias such as `agent-7`.
-5. Use Jarvis's browser tools with that alias or the returned opaque registration ID.
-6. **Optional:** enable **Allow Jarvis to open new tabs** in the extension. This authorizes `BrowserOpenTab` only on the origins of existing, valid manually registered tabs. New tabs are registered automatically with a distinct agent-created provenance; the default is a background tab and at most 20 active agent-created tabs. Switching the option off invalidates auto-created registrations, but does not close their tabs.
+4. In the intended Edge/Chromium window, open the extension and choose **Register window**; name it (for example `agents`) and receive a window registration ID. This action **does not register any existing tab** in the window.
+5. In the extension UI, grant browser host permission for destinations to automate (for example `https://chatgpt.com/*`). Window registration determines **where** to open tabs; host permission determines **which origins** scripts can access. Neither alone authorizes access to existing tabs.
+6. Enable the separate **Allow Jarvis to open new tabs** opt-in. `BrowserOpenTab` or `BrowserRunInNewTab` requires both the target window registration and the destination site's host permission. New tabs are automatically registered with agent-created provenance, open in the background by default, and count toward the 20-active-agent-tab cap until closed.
+7. Optionally register a particular existing tab with **Register tab** to use ordinary `BrowserExecuteFile` against that exact URL; this is independent of window registration and not required to launch new tabs.
 
-Example extension registry:
+Example extension registries:
 
-| Alias | Bound page | Availability |
+| Window alias | Binding | Availability |
 | --- | --- | --- |
-| `orchestrator` | One explicitly selected conversation URL | ready |
-| `agent-7` | Another selected conversation URL | background/ready |
-| `agent-8` | Another selected conversation URL | discarded |
-| `reference` | One selected documentation URL | needsReauthorization |
+| `agents` | User-selected browser window | ready |
+| `debug` | Another user-selected window | closed / needsReauthorization |
 
-An alias is unique within the selected device's currently paired browser registrations; duplicate aliases are rejected or exposed as an explicit ambiguity error, never resolved by guesswork. Internally the stable opaque registration ID is preferred.
+| Tab alias | Binding | Availability |
+| --- | --- | --- |
+| `agent-launch-42` | New tab created in `agents`, origin-bound | background/ready |
+| `reference` | Manually registered documentation tab, exact URL | ready |
 
-The extension UI shows the registered target, URL binding, whether browser permission exists, connection/paired state, and an obvious **Unregister** action. A registered tab can be manipulated while not selected, provided its JavaScript context is usable.
+Window aliases and tab aliases are distinct namespaces, each unique per paired browser profile/device. Prefer opaque IDs. No implicit global 'current window' or arbitrary active-window fallback: an ambiguous or missing window target fails. The extension UI shows window bindings and origin host permissions separately from tab registrations, and provides explicit **Unregister window** and **Unregister tab** actions. A registered tab can be manipulated while not selected, provided its JavaScript context is usable.
 
 ### Non-goals
 
 No ChatGPT-specific MCP tools; no automatic discovery of ChatGPT agents; no unattended registration of all tabs; no remote browser process management; no CDP debugger; no general network interception; no file access from browser scripts; no headless Chromium service; and no guarantee that a web application will process requests in a background tab.
 
-## 4. Manual registration and identity
+## 4. Window and tab registration and identity
 
-Registration is an **explicit consent record**. Existing tabs can only be registered by a user gesture in the extension. The second, opt-in route permits Jarvis to **create** a new tab on an already manually approved origin and automatically register that newly created tab, without claiming any pre-existing tab. It is not a bookmark, an all-sites allowlist, or an inferred match. Pairing the extension alone does not register or create tabs.
+Registration is an **explicit consent record**. The user can register a browser **window** as a location where Jarvis may open new tabs. Window registration never exposes or registers its preexisting tabs. Existing individual tabs can separately be registered through a user gesture in the extension and remain exact-URL-bound. After opt-in, Jarvis may create a tab in a registered window **only if the destination's browser host permission is already approved**; the extension auto-registers only that newly created tab. Pairing the extension alone grants neither window access nor site access.
+
+### Window record (new)
+
+An opaque `windowRegistration` (or unique window alias) identifies a particular browser window on the paired extension/device. Store `windowId`, profile/session epoch, registration generation, friendly alias and current availability in extension-local storage. Browser window IDs may be reused: validate the live window and generation on every create; window close or browser restart invalidates the registration until the user explicitly registers or reauthorizes a window. A service-worker restart within the same browser session may restore the binding if the identity remains verifiable. Never auto-bind a restored/new window by matching name, URL or position.
+
+Only extension UI gestures may create, rename, reauthorize or revoke window registrations; MCP calls cannot register or silently switch windows. Unregistering the window blocks further new-tab creation and any further script injection into tabs whose authorization depends on that window; it does **not** silently close existing user or agent tabs. Close of a formerly created tab may need manual intervention after revocation.
+
+### Tab records (existing + agent-created)
 
 Persist the following locally using extension storage:
 
@@ -110,7 +120,7 @@ This is an illustrative internal record, not a mandate to send all fields to Jar
 
 **Binding rules:**
 
-- **Manually registered** tabs are bound to their exact page URL. **Agent-created** tabs are bound to the created tab ID and approved origin, so SPA navigation and assignment of a new conversation URL within that origin remain usable. Cross-origin navigation invalidates the registration.
+- **Manually registered** tabs are bound to their exact page URL. **Agent-created** tabs are bound to the created tab ID, its registered parent window, and approved origin, so SPA navigation and assignment of a new conversation URL within that origin remain usable. Cross-origin navigation invalidates the registration.
 - Reloading that URL in the same tab preserves the registration, but a new document must be rechecked before injection.
 - A same-origin SPA route change, query change, or fragment change that changes the bound URL suspends execution until the user explicitly updates the binding. Watch `tabs.onUpdated`, `webNavigation` (including History API navigation), and inspect the target immediately before injection.
 - Do not silently transfer a binding to a newly opened tab with the same URL or the same title.
@@ -118,9 +128,9 @@ This is an illustrative internal record, not a mandate to send all fields to Jar
 - Browser restart and session restoration require stronger continuity evidence than a matching URL alone. If continuity cannot be proven, retain the registration as **needsReauthorization**, and require the user to rebind it.
 - Closing a tab, explicitly unregistering it, or losing the required browser permission must immediately prevent further execution; an in-flight operation must be canceled where possible and reported as indeterminate if cancellation cannot undo an already dispatched page effect.
 - Registry data remains local to the extension; JarvisClient caches the connected extension's advertised registry only for its connection lifetime.
-- The extension revalidates the registration's generation, tab ID, URL, required browser permission, and current document immediately before every execution. The client also validates the opaque registration against the current advertised catalog. Neither check replaces the other.
+- The extension revalidates the registration's generation, tab ID, URL, required browser permission, and current document immediately before every execution. For agent-created tabs it also validates that the parent window is still registered and the tab remains in it; moving the tab to another window revokes execution until user intervention. The client also validates the opaque registration against the current advertised catalog. Neither check replaces the other.
 
-Never accept a script-supplied registration event as equivalent to the user clicking **Register tab**. Disallow `chrome://`, extension pages, privileged schemes, incognito/private contexts, and other restricted targets by default.
+Never accept a script-supplied registration event as equivalent to the user clicking **Register window** or **Register tab**. Disallow `chrome://`, extension pages, privileged schemes, incognito/private contexts, and other restricted targets by default.
 
 ## 5. Browser lifecycle and availability
 
@@ -147,19 +157,25 @@ The extension itself is browser-wide, not attached to a page. Manifest V3 servic
 
 Target Chromium Manifest V3, initially **Chrome/Chromium 138+** (also test supported Edge builds); this version includes `chrome.userScripts.execute()` and the per-extension **Allow User Scripts** UI. Use `chrome.userScripts.execute({target:{tabId},js:[{code}],world:"USER_SCRIPT"})` for dynamically supplied script text. The script executes in an isolated user-script world with DOM access; do not default to `MAIN` world. Promise results must be awaited.
 
-The extension requires `userScripts`, tab inspection/lifecycle capabilities, and host access for pages registered by the user. Favor permissions requested during registration for a specific site/origin instead of broad permanent all-sites host access. Browser host permissions are generally **origin-wide**, not per-tab: the extension's own per-tab registry provides the stricter authorization. A registration requires both browser permission and extension-level user consent. `activeTab` access alone should not be assumed sufficient for durable background automation.
+The extension requires `userScripts`, tab/window inspection and lifecycle capabilities, and host access for sites explicitly approved by the user. The extension UI must support requesting/revoking an intended site's optional host permission without requiring a manually registered anchor tab. Avoid broad permanent all-sites host access. Browser host permissions are generally **origin-wide**, not per-tab: the extension's own per-tab registry provides the stricter authorization. A registration requires both browser permission and extension-level user consent. `activeTab` access alone should not be assumed sufficient for durable background automation.
 
 The extension popup/options view supports:
 
 - Pair/disconnect and diagnostic connection state.
-- Register the currently selected tab and choose/rename a friendly alias.
-- List registered tabs with availability and permission state.
-- Unregister or reauthorize a tab, with immediate invalidation of outstanding handles.
+- Register/rename/unregister the **current window**; list window aliases/IDs and availability.
+- Grant/revoke **site host permissions** separately from choosing a window.
+- Optionally register the currently selected **existing tab** for exact-URL inspection or execution.
+- List/revoke manual and agent-created tab registrations with provenance and availability.
+- On revocation, invalidate outstanding operations and prevent scripts in unauthorized tabs.
 - Display errors for disabled user scripts, missing host permission, unsupported pages, or disconnected JarvisClient.
 
 Do not rely on unrestricted page-level `eval` or dynamically injecting scripts through `chrome.scripting.executeScript({func})` to handle arbitrary script source. The `userScripts` API is designed for user-provided code.
 
 ## 7. MCP command surface
+
+### BrowserListWindows (new, read-only)
+
+`BrowserListWindows(deviceId?)` returns **only user-registered windows**, each with opaque `windowRegistration`, alias, availability and its paired device/profile context (no enumeration of unrelated windows or tabs). Window creation/registration remains extension-UI-only. The caller must choose the returned registration ID or unique alias when opening a tab; never silently use the active window.
 
 ### BrowserListTabs
 
@@ -192,6 +208,7 @@ Sensitive URL components are omitted or redacted. A disconnected extension may y
 
 ```json
 {
+  "windowRegistration": "agents",
   "url": "https://example.test/chat/new",
   "alias": "new-agent",
   "active": false,
@@ -199,11 +216,43 @@ Sensitive URL components are omitted or redacted. A disconnected extension may y
 }
 ```
 
-Creates a **new browser tab**, not a claim on any existing unregistered tab. This uses Chromium/Edge's `chrome.tabs.create({url, active})`, with `active=false` by default. It requires the paired extension's separate **Allow Jarvis to open new tabs** setting, an existing valid *manually registered* tab on the destination origin, and existing browser host permission for that site. The extension enforces a 20-active-agent-tab limit. Requests for non-HTTP(S) URLs, embedded credentials, ambiguous aliases, unapproved origins, or restricted pages fail before tab creation.
+Creates a **new browser tab inside the explicitly registered window**, not a claim on any existing tab. The extension calls `chrome.tabs.create({windowId, url, active})` with `active=false` by default. It requires the extension's **Allow Jarvis to open new tabs** opt-in, a live registered `windowRegistration`, and previously granted browser host permission for that destination origin; no manually registered tab on that origin is required. The extension enforces a 20-active-agent-tab limit. Requests for non-HTTP(S) URLs, embedded credentials, stale window registrations, unapproved host permissions, ambiguous aliases, or restricted pages fail before creation.
 
-The extension automatically registers the newly created tab and returns a unique `registrationId`, alias, origin and availability, usually `loading`. Agents can poll `BrowserListTabs` until `ready`, then invoke `BrowserExecuteFile` or `BrowserExecuteJs`. The new tab remains origin-bound across same-origin page changes; manual registrations keep the stricter exact-URL binding. The extension labels agent-created registrations distinctly and allows the user to unregister them. Disabling the opt-in invalidates their access but does not close the tabs.
+The extension automatically registers the new tab with its parent `windowRegistration`, tab ID, generation, origin and agent-created provenance; it returns a unique `registrationId` and availability, usually `loading`. Agents can wait/poll until ready, then invoke `BrowserExecuteFile` or `BrowserExecuteJs`. Same-origin SPA navigation is allowed for new tabs; cross-origin navigation or moving a tab outside its registered window invalidates authorization. Existing manually registered tabs remain exact-URL-bound. Disabling the new-tab opt-in invalidates future creation and any still-dependent agent-created registration; it does not close tabs.
 
 This is a side-effecting, non-idempotent operation: a network failure after creation can leave a new tab open even if the client did not receive its registration ID. **Do not automatically retry** when the result is uncertain. MCP authorization uses `process:execute` and the local execution confirmation policy; extension consent remains mandatory even under full trust.
+
+
+### BrowserCloseTab (new, effectful)
+
+```json
+{ "tabRegistration": "new-agent", "deviceId": null }
+```
+
+Closes **only a tab created by Jarvis in a registered window**, using the exact opaque auto-created registration. The extension validates agent-created provenance, session/profile, window identity, tab ID and generation immediately before `chrome.tabs.remove(tabId)`. It **never** closes a manually registered tab, all tabs in a window, the registered window itself, or an unrelated tab inferred from URL/title. It unregisters the closed tab and releases its capacity slot. Close is independently authorized and audited. A close failure after a successful browser script must not cause a second script execution. A tab whose registration became stale is not closed by guesswork.
+
+### BrowserRunInNewTab (new, preferred immediate workflow)
+
+```json
+{
+  "windowRegistration": "agents",
+  "url": "https://chatgpt.com/",
+  "projectName": "Userscripts",
+  "scriptPath": "chatgpt/launchAgent.js",
+  "argsJson": "{\"prompt\":\"Start a new session and read current Jarvis assignment.\"}",
+  "active": false,
+  "closeTabAfterExecution": true,
+  "deviceId": null
+}
+```
+
+This **generic** composite command is the preferred single call for an orchestrator that wants to launch a fresh agent immediately. JarvisClient performs `open → await ready → execute project script → capture result → close created tab`, using the same extension validation as the separate tools. The page JavaScript **does not** need privileged window/tab APIs and cannot choose or close arbitrary browser tabs.
+
+The client distinguishes `notSubmitted`, `submitted`, and `outcomeUnknown` **when the project script exposes those semantics**; for a generic script, use completed/failed/uncertain execution results without pretending it submitted ChatGPT content. After confirmed completion, close the newly created tab when `closeTabAfterExecution` is true. On a definitive pre-dispatch failure, cleanup is safe; after an ambiguous send, preserve the tab for inspection unless an explicit separate close is requested. Report script outcome and cleanup outcome separately. Never automatically repeat a possible page-side effect.
+
+`closeTabAfterExecution` defaults **false** for compatibility with existing generic operations, but the ChatGPT launcher supplies **true**. A successful submission is **not** a completed Jarvis task.
+
+The delayed scheduler's due-time callback should reuse the same underlying open/execute/close service rather than reimplementing a second browser launcher. `ScheduleBrowserExecution` gains `windowRegistration` and optional `closeTabAfterExecution`; new schedules must name an authorized window. Existing persisted schedules without a window target must surface a clear reconfiguration-needed state, not silently select the active window.
 
 ### BrowserExecuteFile (primary)
 
@@ -285,8 +334,8 @@ Message envelope (illustrative; the protocol implementation will publish the fin
 Responses use the same `requestId`, `connectionId` and registration generation with either `result` or structured `error`. Define these message kinds:
 
 - Handshake: `hello`, `challenge`, `authenticate`, `ready`, `protocolError`.
-- Registry: `registrations` snapshot, `tabRegistered`, `tabUpdated`, `tabUnregistered`.
-- Invocation: `executeJs`, `result`, `error`, `cancel`.
+- Registry: `registrations` snapshot, `tabRegistered`, `tabUpdated`, `tabUnregistered`; **new** `windows` snapshot, `windowRegistered`, `windowUpdated`, `windowUnregistered`.
+- Invocation: `executeJs`, `openTab`, **new** `closeTab`, `result`, `error`, `cancel`. New-tab creation carries the opaque window registration and is revalidated in the extension. The generic composite run is orchestrated by JarvisClient, not a new page-executed script privilege.
 - Connection: `ping` and `pong`.
 
 All frames carry an explicit version and bounded length. A new authenticated connection gets a new connection epoch. The client drops responses with a mismatched epoch or unknown request ID, rejects duplicate in-flight IDs, and closes/clears pending operations on disconnect.
@@ -317,7 +366,7 @@ A local JarvisClient pairing action displays a one-time, short-lived user-mediat
 
 1. **MCP caller:** authenticated via existing OAuth, routed only to its selected Jarvis device. Define browser-list/inspect and browser-execute permissions (recommended distinct OAuth scopes `browser:read` and `browser:execute`; coordinate Auth0/API registration and deployment). `BrowserExecuteFile` additionally needs project `workspace:read`.
 2. **JarvisClient:** existing local trust/confirmation policy applies; executing JS is classified as an effectful operation, not read-only. In `partial` mode it should require local approval unless an explicit scoped session grant has been issued; `full` may suppress Jarvis prompts but cannot bypass paired-extension and registered-tab checks.
-3. **Extension:** user-initiated pairing + explicit tab registration + live browser host permission + exact target URL/identity validation on every invocation. No remote agent can change registry membership or broaden its page scope through MCP.
+3. **Extension:** user-initiated pairing + explicit **window registration** for new tabs (or individual tab registration for existing tabs) + live browser host permission + exact window/tab identity and URL/origin checks. No remote agent can create window registrations, adopt existing tabs, change registry membership, or grant site access through MCP.
 
 Scripts can read and change anything available to their page's permitted DOM context, potentially submitting authenticated actions and exposing sensitive data. Isolated execution worlds do **not** make arbitrary JS safe. Treat scripts as trusted local executable code, do not run project files from untrusted sources without review, and avoid giving them privileged extension APIs. Page-derived results are untrusted content; the agent must not treat page text as higher-priority instructions.
 
@@ -335,13 +384,13 @@ A general-purpose browser script may send a message, purchase an item, submit a 
 - The extension reports successful JavaScript evaluation, **not** proof that a remote web application's business action was committed. App-specific scripts own assertions and completion checks.
 
 Define stable error codes including:
-`BridgeDisabled`, `ExtensionDisconnected`, `PairingRequired`, `ScopeDenied`, `LocalConfirmationRequired`, `TabNotRegistered`, `AliasAmbiguous`, `RegistrationStale`, `NavigationMismatch`, `BrowserPermissionMissing`, `TabFrozen`, `TabDiscarded`, `TabMissing`, `ScriptNotFound`, `UnsafePath`, `InvalidUtf8`, `InvalidScript`, `ResultNotJson`, `InputTooLarge`, `OutputTooLarge`, `ExecutionError`, `Timeout`, `Canceled`, and `OutcomeUnknown`.
+`BridgeDisabled`, `ExtensionDisconnected`, `PairingRequired`, `ScopeDenied`, `LocalConfirmationRequired`, **`WindowNotRegistered`, `WindowUnavailable`, `WindowRegistrationStale`, `WindowAmbiguous`**, `TabNotRegistered`, `AliasAmbiguous`, `RegistrationStale`, `NavigationMismatch`, `BrowserPermissionMissing`, `TabFrozen`, `TabDiscarded`, `TabMissing`, `ScriptNotFound`, `UnsafePath`, `InvalidUtf8`, `InvalidScript`, `ResultNotJson`, `InputTooLarge`, `OutputTooLarge`, `ExecutionError`, `Timeout`, `Canceled`, and `OutcomeUnknown`.
 
-## 11. Motivating orchestration workflow (not Jarvis functionality)
+## 11. Motivating orchestration workflow (generic bridge, ChatGPT-specific project script)
 
-An orchestrator can use existing Jarvis tools to inspect the agent queue and worktrees, review results, integrate branches, and issue new revisioned assignments. It can then choose a manually registered tab, or (if the user explicitly enabled agent-created tabs) use `BrowserOpenTab` to start a fresh same-origin conversation and receive its new registration ID. It calls a project script through `BrowserExecuteFile` to automate the selected application.
+An orchestrator can use existing Jarvis tools to inspect the agent queue and worktrees, review results, integrate branches, and issue new assignments. For a worker resumption, it calls **`BrowserRunInNewTab` once**, supplying a user-registered browser-window handle, the ChatGPT URL, a project-owned UI script path, and a bootstrap prompt identifying the logical worker. JarvisClient opens the tab **in that registered window**, executes the script, records the launch outcome and closes the newly created tab. The new ChatGPT session reconstructs its task from Jarvis. Existing tabs are untouched, and no scheduled job is necessary for an immediate handoff.
 
-For example, a project script `chatgpt/sendMessage.js` may inspect the app's editor, send a message, and verify it is present in the conversation. Another project script could read conversation state or detect whether a response is complete. The scripts can be version controlled, revised when the web UI changes, and run independently from Jarvis's generic infrastructure.
+For example, a project script `chatgpt/launchAgent.js` may inspect the app's editor, enter the prompt, click Send once, and verify submission. The script can be version-controlled and revised when the UI changes. The existing generic `BrowserExecuteFile` still works against separately manually registered tabs for other applications. A **delayed** worker continuation or hourly orchestrator may invoke the very same generic composite service through the scheduler. See [ChatGPT Ephemeral Agent Launcher](ChatGPTAgentLauncher.md).
 
 A generic return value of `submitted: true` is **not** proof that the ChatGPT agent actually finished its turn or accepted its new task. The orchestrator must distinguish browser dispatch, visible message submission, agent response, and repository-backed task progress. Agent task ownership and assignment revisions continue to come from Jarvis's existing task APIs. No attempt is made to impersonate ChatGPT's internal session state or use an undocumented ChatGPT backend API.
 
@@ -350,17 +399,19 @@ A generic return value of `submitted: true` is **not** proof that the ChatGPT ag
 ### Security and registration
 
 - Fresh installation exposes no tabs; pairing by itself exposes no tabs.
-- Agent tab creation is disabled by default; manual origin registration, browser host permission and separate explicit opt-in are required. An agent can never register a pre-existing tab.
-- Only a user click in the extension can register, rename, reauthorize, or unregister a tab.
+- Agent tab creation is disabled by default; a **user-registered window**, destination browser host permission and separate explicit new-tab opt-in are required. An agent can never register a pre-existing tab.
+- Only a user gesture in the extension can register, rename, reauthorize or unregister a **window** or a manually registered tab. Window registration does not expose existing tabs.
 - Unregistered, renamed-away, wrong-device, ambiguous-alias, navigated, closed, and browser-restored-without-proof targets never execute.
-- Browser host permission does not supersede per-tab registration.
+- Browser host permission does not register existing tabs or authorize a window. The auto-created tab's own registration is derived only from creation in a still-registered window; manually registered tabs still require explicit tab registration.
 - Invalid extension origin, bad pairing credentials, missing OAuth scope, or denied local permission are rejected; `--trust full` cannot manufacture a registration.
 - Revoking a registration blocks subsequent calls, including a delayed reply from an earlier generation.
 
 ### Execution and lifecycle
 
 - A registered loaded background tab executes without being focused.
-- A new tab opens in the background by default, receives a distinct registration ID, remains usable across same-origin SPA navigation, and becomes unavailable on cross-origin navigation or when the opt-in is revoked.
+- A new tab opens **inside the selected registered window** in the background by default, receives a distinct auto-registration, remains usable across same-origin SPA navigation, and becomes unavailable on cross-origin navigation, window revocation/move, or opt-in revocation.
+- Revoking/closing a window or restarting the browser cannot silently retarget or restore a window registration by matching its name, last-used URL or numeric ID.
+- The generic `BrowserRunInNewTab` performs open/execute/optional close in one caller-visible operation; closing only the new tab releases capacity. Never close a window or its existing tabs.
 - A registered frozen/discarded tab returns the correct availability error without a default wake-up.
 - Reloading the same tab/URL and restarting the MV3 service worker preserve valid registration; browser restart with uncertain tab identity does not silently rebind.
 - `BrowserExecuteFile` reads scripts from an ordinary project and from a registered Git worktree, without extra registration or relocation.
@@ -378,14 +429,31 @@ A generic return value of `submitted: true` is **not** proof that the ChatGPT ag
 
 ## 13. Implementation phases
 
-1. **Jarvis foundation (current task):** shared commands, scoped MCP routes, local loopback transport and pairing, project-file execution, registry-aware mock extension, tests, schema and diagnostics. No real browser extension is required to complete this stage.
-2. **Chromium extension:** Manifest V3 UI, permissions, persistent manual registrations, connection/pairing, lifecycle handling, actual `chrome.userScripts.execute`, real-browser tests.
-3. **Integrated acceptance:** run both parts against registered real browser tabs, verify security and lifecycle cases, then coordinate deployment/release. No automated execution against unregistered tabs.
-4. **Optional convenience:** explicit wake policy, DOM/screenshot/wait operations, project-side script packaging, Firefox adapter, richer browser diagnostics. All remain generic; no ChatGPT-specific server logic.
+1. **Existing on branch (not deployed):** generic MCP bridge, pairing, manual tab registry, project-file execution, agent-created tabs constrained by same-origin manual anchor, and one-shot scheduler. See runtime extension README for current operational commands.
+2. **New window-target work:** extension Register/Unregister window UI and local window registry, site host-permission UI, `BrowserListWindows`, `BrowserOpenTab(windowRegistration, ...)`, generation/window checks, and `BrowserCloseTab` with agent-owned-only enforcement.
+3. **One-call immediate workflow:** `BrowserRunInNewTab`, shared open/execute/close service, launch outcome and cleanup reporting; scheduled execution gains `windowRegistration` and uses that same service.
+4. **Project UI script and tests:** application-specific ChatGPT launcher in an ordinary project, live Edge test for open → submit → close, no access to existing tabs.
+5. **Optional recurrence and conveniences:** fixed-interval scheduler, wake policy, screenshots, diagnostics. No ChatGPT-specific server logic.
+6. **Review and release separately** once verified. No deployment or merge is implied by the spec.
 
 ## One-shot delayed browser execution
 
 In addition to direct browser commands, JarvisClient implements a generic one-shot scheduler. ScheduleBrowserExecution records a future URL, ordinary project script path, JSON arguments and runAfterSeconds delay in private user-level storage. When due, it opens a newly authorized tab and runs the current project file. Pending actions can be listed/canceled/replaced by ID. A claimed action is not automatically replayed after client restart or browser failure. An orchestrator may use this to create its next ephemeral session, but no special orchestrator role, lease, watchdog, or recurrence exists in Jarvis. See [BrowserOneShotScheduler.md](BrowserOneShotScheduler.md).
+
+
+### Registered-window launch workflow (new target)
+
+The target behavior for starting a fresh logical agent is **one immediate composite call**, not a chain of agent-visible browser tool calls:
+
+```text
+Orchestrator -> BrowserRunInNewTab(windowRegistration, URL, JS file, bootstrap args)
+               -> extension opens a new tab in that registered window
+               -> client executes the project-owned ChatGPT DOM script
+               -> extension closes only the newly created tab
+               -> new ChatGPT conversation continues server-side
+```
+
+The registered window is a destination, **not permission to inspect every tab inside it**. A new tab receives its own origin-bound auto-registration; pre-existing tabs remain unregistered. A separate app-specific script may automate ChatGPT, while the bridge stays generic. If the caller wants a delayed launch, the current one-shot scheduler and planned recurring scheduling call the same open/execute/close service. See [ChatGPTAgentLauncher.md](ChatGPTAgentLauncher.md). Window registration and this composite operation are **not yet implemented**.
 
 ## 14. External API references
 

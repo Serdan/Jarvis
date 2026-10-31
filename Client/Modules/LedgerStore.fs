@@ -1188,24 +1188,6 @@ module LedgerStore =
                          SelectedWorktreeDirty = dirty }
                 | _ -> Error(SourceUnavailable "Cannot inspect registered source worktrees.")
 
-    let verifyReviewDiff (binding: LedgerBinding) (baseOid: string) (headOid: string) =
-        if isNull baseOid || isNull headOid
-           || not (oidPattern.IsMatch baseOid) || not (oidPattern.IsMatch headOid) then
-            Error(InvalidBinding "Invalid review base/head Git object ID.")
-        else
-            match verifySourceObject binding baseOid, verifySourceObject binding headOid with
-            | Error error, _ | _, Error error -> Error error
-            | Ok (), Ok () ->
-                match isAncestor binding.RepositoryPath baseOid headOid with
-                | Error error -> Error error
-                | Ok false -> Error(InvalidBinding "Review base must be an ancestor of submitted head.")
-                | Ok true ->
-                    match git binding.RepositoryPath [ "diff"; "--quiet"; baseOid; headOid ] with
-                    | Ok output when output.ExitCode = 1 -> Ok ()
-                    | Ok output when output.ExitCode = 0 -> Error(InvalidBinding "Code review has no changes relative to its merge-base.")
-                    | Ok output -> Error(GitFailure $"Could not inspect review delta: {output.Stderr}")
-                    | Error error -> Error error
-
     let private safeReviewRef (gitRef: string) =
         not (isNull gitRef)
         && Regex.IsMatch(gitRef, "^refs/heads/jarvis-review/[A-Za-z0-9_-]+/[a-f0-9]{32}/r[1-9][0-9]*$")
@@ -1412,13 +1394,6 @@ module LedgerStore =
                 | Ok output ->
                     Error(SourceUnavailable $"Cannot find a review merge-base: {output.Stderr}")
                 | Error error -> Error error))
-
-    // True when a commit is contained in the observed merge result, whether
-    // the integration used a fast-forward or an ordinary merge commit.
-    let sourceContainsCommit (binding: LedgerBinding) ancestor descendant =
-        verifySourceObject binding ancestor
-        |> Result.bind (fun () -> verifySourceObject binding descendant)
-        |> Result.bind (fun () -> isAncestor binding.RepositoryPath ancestor descendant)
 
     let verifySourceAncestry (binding: LedgerBinding) earlier later =
         match verifySourceObject binding earlier with

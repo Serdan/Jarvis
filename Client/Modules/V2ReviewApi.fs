@@ -450,7 +450,6 @@ module V2PendingIntentJournal =
         let action = commandProperty root "Action"
         match record.CommandType, action with
         | "V2TaskWrite", Some "AcknowledgeFeedback" -> Some "AcknowledgeBranchReview"
-        | "V2TaskWrite", Some "CloseTask" -> Some "CloseBranchTask"
         | "V2TaskWrite", Some action -> Some action
         | "V2ReviewWrite", Some "PutDocument" -> Some "PutReviewDocument"
         | "V2ReviewWrite", Some "Submit" -> Some "SubmitBranchReview"
@@ -458,6 +457,7 @@ module V2PendingIntentJournal =
         | "V2ReviewWrite", Some "Claim" -> Some "ClaimBranchReview"
         | "V2ReviewWrite", Some "Decide" -> Some "DecideBranchReview"
         | "V2ReviewWrite", Some "Withdraw" -> Some "WithdrawBranchReview"
+        | "V2ReviewWrite", Some "Release" -> Some "ReleaseBranchReview"
 
         | "V2ReviewWrite", Some "AcknowledgeFeedback" -> Some "AcknowledgeBranchReview"
         | _ -> None
@@ -547,12 +547,8 @@ module V2PendingIntentJournal =
                 | "V2TaskWrite", "TransferOwner" ->
                     attempt @ [ "ExpectedTaskVersion", "expectedTaskVersion";
                                 "AttemptId", "newAttemptId"; "OwnerId", "newOwner"; "Reason", "reason" ]
-                | "V2TaskWrite", "CloseBranchTask" ->
+                | "V2TaskWrite", "CloseTask" ->
                     common @ [ "ExpectedTaskVersion", "expectedTaskVersion" ]
-                | "V2TaskWrite", "CloseNonSourceTask" ->
-                    common @ [ "ActorId", "approver"; "ExpectedTaskVersion", "expectedTaskVersion";
-                                "ExpectedVersion", "expectedAttemptVersion";
-                                "Summary", "criteria"; "Evidence", "evidence" ]
                 | "V2TaskWrite", "ReopenTask" ->
                     common @ [ "ExpectedTaskVersion", "expectedTaskVersion"; "Reason", "reason" ]
                 | "V2TaskWrite", "AcknowledgeReviewFeedback" ->
@@ -562,20 +558,20 @@ module V2PendingIntentJournal =
                                "DocumentPath", "documentPath"; "Content", "contentSha256"
                                "ExpectedBlobOid", "expectedBlobOid" ]
                 | "V2ReviewWrite", "SubmitBranchReview" ->
-                    owner @ [ "RequestId", "reviewId"; "ExpectedVersion", "expectedAttemptVersion"
-                              "Generation", "generation"; "SourceRef", "sourceRef"
-                              "HeadOid", "sourceHead"; "Summary", "summary"; "Kind", "kind" ]
+                    common @ [ "RequestId", "reviewId"; "ActorId", "ownerId"
+                               "SourceRef", "sourceRef"; "HeadOid", "sourceHead"
+                               "TargetRef", "targetRef"; "Summary", "summary"; "Kind", "kind" ]
                 | "V2ReviewWrite", "ReplaceBranchReview" ->
-                    owner @ [ "RequestId", "reviewId"; "ExpectedVersion", "expectedVersion"
-                              "Generation", "generation"; "SourceRef", "sourceRef"
-                              "HeadOid", "sourceHead"; "Summary", "summary"; "Kind", "kind" ]
+                    common @ [ "RequestId", "reviewId"; "ActorId", "ownerId"
+                               "ExpectedVersion", "expectedVersion"; "SourceRef", "sourceRef"
+                               "HeadOid", "sourceHead"; "Summary", "summary" ]
                 | "V2ReviewWrite", "ClaimBranchReview" ->
                     common @ [ "RequestId", "reviewId"; "ActorId", "reviewerId"
                                "ExpectedVersion", "expectedVersion" ]
                 | "V2ReviewWrite", "DecideBranchReview" ->
                     common @ [ "RequestId", "reviewId"; "ActorId", "reviewerId"
                                "ExpectedVersion", "expectedVersion"; "Verdict", "status" ]
-                | "V2ReviewWrite", "WithdrawBranchReview" ->
+                | "V2ReviewWrite", ("WithdrawBranchReview" | "ReleaseBranchReview") ->
                     common @ [ "RequestId", "reviewId"; "ActorId", "actorId"
                                "ExpectedVersion", "expectedVersion" ]
                 | _ -> []
@@ -937,13 +933,13 @@ module V2ReviewApi =
                                 |> mapError)
                         | "Submit" ->
                             id () |> Result.bind (fun reviewId ->
-                                ReviewWorkflow.ReviewWorkflow.submitBranchReviewKind binding operationId
-                                    cmd.TaskId cmd.ActorId cmd.ExpectedVersion cmd.Generation reviewId
-                                    cmd.SourceRef cmd.HeadOid cmd.Summary cmd.Kind |> mapError)
+                                ReviewWorkflow.ReviewWorkflow.submitBranchReview binding operationId
+                                    cmd.TaskId cmd.ActorId reviewId
+                                    cmd.SourceRef cmd.HeadOid cmd.Summary cmd.Kind cmd.TargetRef |> mapError)
                         | "Update" ->
                             id () |> Result.bind (fun reviewId ->
                                 ReviewWorkflow.ReviewWorkflow.replaceBranchReview binding operationId
-                                    cmd.TaskId cmd.ActorId reviewId cmd.ExpectedVersion cmd.Generation
+                                    cmd.TaskId cmd.ActorId reviewId cmd.ExpectedVersion
                                     cmd.SourceRef cmd.HeadOid cmd.Summary |> mapError)
                         | "Claim" ->
                             id () |> Result.bind (fun reviewId ->
@@ -959,6 +955,10 @@ module V2ReviewApi =
                                     ReviewWorkflow.ReviewWorkflow.decideBranchReview binding operationId
                                         cmd.TaskId reviewId cmd.ActorId cmd.ExpectedVersion decision |> mapError
                                 | _ -> Error(Client.ValidationError "Invalid V2 review verdict."))
+                        | "Release" ->
+                            id () |> Result.bind (fun reviewId ->
+                                ReviewWorkflow.ReviewWorkflow.releaseBranchReview binding operationId
+                                    cmd.TaskId reviewId cmd.ActorId cmd.ExpectedVersion |> mapError)
                         | "Withdraw" ->
                             id () |> Result.bind (fun reviewId ->
                                 ReviewWorkflow.ReviewWorkflow.withdrawBranchReview binding operationId
@@ -1000,9 +1000,6 @@ module V2TaskApi =
                 |> mapError |> Result.map box
             | "GetCheckpoint" ->
                 ReviewWorkflow.ReviewWorkflow.getCheckpoint binding cmd.TaskId cmd.CheckpointSequence
-                |> mapError |> Result.map box
-            | "NonSourceApproval" ->
-                ReviewWorkflow.ReviewWorkflow.getNonSourceClosureApproval binding cmd.TaskId cmd.CheckpointSequence
                 |> mapError |> Result.map box
             | "LifecycleHistory" ->
                 ReviewWorkflow.ReviewWorkflow.getTaskLifecycleHistory binding cmd.TaskId
@@ -1130,7 +1127,7 @@ module V2TaskApi =
                                         cmd.TaskId cmd.Action cmd.ExpectedTaskVersion cmd.ExpectedVersion
                                         cmd.ExpectedAgentVersion cmd.AssignmentGeneration cmd.Reason |> mapError
                                 | "CloseTask" ->
-                                    ReviewWorkflow.ReviewWorkflow.closeBranchTask binding operationId
+                                    ReviewWorkflow.ReviewWorkflow.closeTask binding operationId
                                         cmd.TaskId cmd.ExpectedTaskVersion |> mapError
                                 | "CancelOpenTask" ->
                                     ReviewWorkflow.ReviewWorkflow.cancelOpenTask binding operationId
@@ -1142,10 +1139,6 @@ module V2TaskApi =
                                             cmd.TaskId newId cmd.OwnerId
                                             cmd.ExpectedTaskVersion cmd.ExpectedVersion cmd.ExpectedAgentVersion
                                             cmd.AssignmentGeneration cmd.Reason |> mapError)
-                                | "CloseNonSourceTask" ->
-                                    ReviewWorkflow.ReviewWorkflow.closeNonSourceTask binding operationId cmd.TaskId
-                                        cmd.ActorId cmd.ExpectedTaskVersion cmd.ExpectedVersion
-                                        cmd.Summary cmd.Evidence |> mapError
                                 | "ReopenTask" ->
                                     ReviewWorkflow.ReviewWorkflow.reopenTask binding operationId
                                         cmd.TaskId cmd.ExpectedTaskVersion cmd.Reason |> mapError

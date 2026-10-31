@@ -428,12 +428,12 @@ let ``command catalog matches AgentCommand union and MCP tools`` () =
     // Orphan-ledger MCP tools route through eight versioned internal wire commands.
     let v2Wire = set [ "V2TaskRead"; "V2TaskWrite"; "V2ReviewRead"; "V2ReviewWrite"; "V2LedgerRead"; "V2LedgerWrite" ]
     let orchestrationTools =
-        set [ "AgentInbox"; "GetAssignment"; "GetCheckpoint"; "InspectAttemptSource"; "TaskLifecycleHistory"; "GetNonSourceApproval"; "GetTaskSpecPage"; "DiffTaskSpec"; "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "AcknowledgeAssignment"; "ReissueAssignment"; "BeginAttempt"; "CheckpointAttempt"
+        set [ "AgentInbox"; "GetAssignment"; "GetCheckpoint"; "InspectAttemptSource"; "TaskLifecycleHistory"; "GetTaskSpecPage"; "DiffTaskSpec"; "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "AcknowledgeAssignment"; "ReissueAssignment"; "BeginAttempt"; "CheckpointAttempt"
               "BindReviewBase"; "BindAttemptSource"; "RebindAttemptSource"; "YieldAgent"; "ResumeAgent"; "CompleteAgentWork"
-              "ParkAgent"; "ReissueQueuedAttempt"; "RecoverAgentAssignment"; "AcknowledgeReviewFeedback"; "ParkAttempt"; "BlockAttempt"; "ResumeAttempt"; "AbandonAttempt"; "CancelTask"; "CancelOpenTask"; "TransferOwner"; "CloseTask"; "CloseNonSourceTask"; "ReopenTask"; "ReviseTaskSpecPinned"; "ImportTaskSpec"; "AdoptTaskSpec"; "ExportTaskSpec"
+              "ParkAgent"; "ReissueQueuedAttempt"; "RecoverAgentAssignment"; "AcknowledgeReviewFeedback"; "ParkAttempt"; "BlockAttempt"; "ResumeAttempt"; "AbandonAttempt"; "CancelTask"; "CancelOpenTask"; "TransferOwner"; "CloseTask"; "ReopenTask"; "ReviseTaskSpecPinned"; "ImportTaskSpec"; "AdoptTaskSpec"; "ExportTaskSpec"
               "ReviewTask"; "TaskOverview"; "ReviewDetails"; "ReviewerInbox"; "ListReviewDocuments"; "ReadReviewDocument"
               "SubmitReview"; "ReplaceReview"; "ClaimReview"; "DecideReview"
-              "WithdrawReview"; "PutReviewDocument"
+              "ReleaseReview"; "WithdrawReview"; "PutReviewDocument"
               "LedgerHealth"; "GetOperationStatus"; "PendingOperations"; "ReconcilePendingOperations"; "AcknowledgePendingOperation"; "InitializeLedger"; "BindExistingLedger"; "RebindLedgerRemote"
               ]
     // Retired wire cases are deleted; public CreateTask/AssignTask are canonical ledger tools.
@@ -452,7 +452,7 @@ let ``command catalog matches AgentCommand union and MCP tools`` () =
 let ``public orchestration tool metadata describes canonical branch reviews without V2 terminology`` () =
     let reviewMethods =
         set [ "ReviewTask"; "ReviewDetails"; "ReviewerInbox"; "SubmitReview"
-              "ReplaceReview"; "ClaimReview"; "DecideReview"; "WithdrawReview"
+              "ReplaceReview"; "ClaimReview"; "DecideReview"; "ReleaseReview"; "WithdrawReview"
               "TaskOverview"; "ListReviewDocuments"; "ReadReviewDocument"
               "PutReviewDocument" ]
     for methodInfo in typeof<JarvisMcpTools>.GetMethods() do
@@ -474,10 +474,25 @@ let ``public orchestration tool metadata describes canonical branch reviews with
         let methodInfo = typeof<JarvisMcpTools>.GetMethod(methodName)
         (methodInfo.GetCustomAttributes(typeof<System.ComponentModel.DescriptionAttribute>, false)[0]
          :?> System.ComponentModel.DescriptionAttribute).Description
-    Assert.That(reviewDescription "ReviewDetails", Does.Contain("never merged"))
+    Assert.That(reviewDescription "ReviewDetails", Does.Contain("independent"))
     Assert.That(reviewDescription "ClaimReview", Does.Contain("Git branch"))
     Assert.That(reviewDescription "DecideReview", Does.Contain("Markdown"))
-    Assert.That(reviewDescription "SubmitReview", Does.Contain("never merged"))
+    Assert.That(reviewDescription "SubmitReview", Does.Contain("No assignment"))
+
+[<Test>]
+let ``public SubmitReview accepts arbitrary commit and optional context without worker phase`` () =
+    let parameters =
+        typeof<JarvisMcpTools>.GetMethod("SubmitReview").GetParameters()
+    let names = parameters |> Array.map _.Name
+    for oldField in [ "expectedAttemptVersion"; "assignmentGeneration"; "reviewKind"; "ownerId" ] do
+        Assert.That(names, Does.Not.Contain(oldField))
+    for contextField in [ "taskId"; "sourceRef"; "targetRef"; "purpose"; "summary" ] do
+        let field = parameters |> Array.find (fun p -> p.Name = contextField)
+        Assert.That(field.IsOptional, Is.True, contextField)
+    let close = typeof<JarvisMcpTools>.GetMethod("CloseTask")
+    Assert.That(close, Is.Not.Null)
+    Assert.That(typeof<JarvisMcpTools>.GetMethod("CloseNonSourceTask"), Is.Null)
+    Assert.That(typeof<JarvisMcpTools>.GetMethod("ReleaseReview"), Is.Not.Null)
 
 [<Test>]
 let ``task assignment and owner transfer do not accept reviewer IDs`` () =
@@ -498,7 +513,7 @@ let ``client-backed MCP tools expose an optional per-command deviceId`` () =
         |> Array.filter (fun methodInfo ->
             methodInfo.GetParameters()
             |> Array.exists (fun parameter -> parameter.ParameterType = typeof<ClientService>))
-    clientMethods.Length |> shouldEqual (AgentProtocol.commandDefinitions.Length - 1 + 54) // public orchestration aliases / 8 wire operations
+    clientMethods.Length |> shouldEqual (AgentProtocol.commandDefinitions.Length - 1 + 53) // public orchestration aliases / 8 wire operations
     for methodInfo in clientMethods do
         let deviceParam = methodInfo.GetParameters() |> Array.tryFind (fun parameter -> parameter.Name = "deviceId")
         match deviceParam with
@@ -714,14 +729,14 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
         let aliases =
             [ for name in [ "LedgerHealth"; "GetOperationStatus"; "PendingOperations"; "ReconcilePendingOperations" ] -> name, ledgerRead
               for name in [ "InitializeLedger"; "BindExistingLedger"; "RebindLedgerRemote"; "AcknowledgePendingOperation" ] -> name, ledgerWrite
-              for name in [ "AgentInbox"; "GetAssignment"; "GetCheckpoint"; "InspectAttemptSource"; "TaskLifecycleHistory"; "GetNonSourceApproval"; "GetTaskSpecPage"; "DiffTaskSpec" ] -> name, taskRead
+              for name in [ "AgentInbox"; "GetAssignment"; "GetCheckpoint"; "InspectAttemptSource"; "TaskLifecycleHistory"; "GetTaskSpecPage"; "DiffTaskSpec" ] -> name, taskRead
               for name in [ "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "AcknowledgeAssignment"; "ReissueAssignment"; "BeginAttempt"; "CheckpointAttempt"
                             "BindReviewBase"; "BindAttemptSource"; "RebindAttemptSource"; "YieldAgent"; "ResumeAgent"; "CompleteAgentWork";
-                            "ParkAgent"; "ReissueQueuedAttempt"; "RecoverAgentAssignment"; "AcknowledgeReviewFeedback"; "ParkAttempt"; "BlockAttempt"; "ResumeAttempt"; "AbandonAttempt"; "CancelTask"; "CancelOpenTask"; "TransferOwner"; "CloseTask"; "CloseNonSourceTask"; "ReopenTask"; "ReviseTaskSpecPinned"; "ImportTaskSpec"; "AdoptTaskSpec"; "ExportTaskSpec" ] -> name, taskWrite
+                            "ParkAgent"; "ReissueQueuedAttempt"; "RecoverAgentAssignment"; "AcknowledgeReviewFeedback"; "ParkAttempt"; "BlockAttempt"; "ResumeAttempt"; "AbandonAttempt"; "CancelTask"; "CancelOpenTask"; "TransferOwner"; "CloseTask"; "ReopenTask"; "ReviseTaskSpecPinned"; "ImportTaskSpec"; "AdoptTaskSpec"; "ExportTaskSpec" ] -> name, taskWrite
               for name in [ "ReviewTask"; "TaskOverview"; "ReviewDetails"; "ReviewerInbox"; "ListReviewDocuments"; "ReadReviewDocument" ] ->
                   name, v2Read
               for name in [ "SubmitReview"; "ReplaceReview"; "ClaimReview"; "DecideReview"
-                            "WithdrawReview"; "PutReviewDocument" ] ->
+                            "ReleaseReview"; "WithdrawReview"; "PutReviewDocument" ] ->
                   name, v2Write ]
         aliases |> List.fold (fun map (key, value) -> Map.add key value map) original
 

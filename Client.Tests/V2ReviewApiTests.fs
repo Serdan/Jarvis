@@ -33,13 +33,13 @@ let disabledV2ReadAndWriteDoNotTouchV1Tasks () =
               ActorId = "Reviewer"
               ReviewerId = ""
               ExpectedVersion = 1
-              Generation = 1
               Kind = "Progress"
               SourceRef = ""
               HeadOid = ""
+              TargetRef = ""
               Summary = ""
               Verdict = ""
-              Feedback = ""; TestEvidence = ""; Inspected = false; Tested = false; TestDetails = ""; DocumentPath = ""; Content = ""; ExpectedBlobOid = "" }
+              DocumentPath = ""; Content = ""; ExpectedBlobOid = "" }
         match Client.V2ReviewApi.V2ReviewApi.write mutation context with
         | Error(Client.ValidationError message) ->
             Assert.That(message, Does.Contain("V2 ledger disabled"))
@@ -80,13 +80,13 @@ let v2ReviewMutationsNeedGitApprovalWhileReadsDoNot () =
               ActorId = "Reviewer"
               ReviewerId = ""
               ExpectedVersion = 1
-              Generation = 1
               Kind = "Progress"
               SourceRef = ""
               HeadOid = ""
+              TargetRef = ""
               Summary = ""
               Verdict = ""
-              Feedback = ""; TestEvidence = ""; Inspected = false; Tested = false; TestDetails = ""; DocumentPath = ""; Content = ""; ExpectedBlobOid = "" }
+              DocumentPath = ""; Content = ""; ExpectedBlobOid = "" }
     match Client.PermissionPolicy.evaluate write with
     | Error(Client.ConfirmationRequired request) ->
         Assert.That(request.Permissions, Does.Contain(VersionControlWrite))

@@ -155,17 +155,12 @@ type V2ReviewWriteCommand =
       ActorId: string
       ReviewerId: string
       ExpectedVersion: int
-      Generation: int
       Kind: string
       SourceRef: string
       HeadOid: string
+      TargetRef: string
       Summary: string
       Verdict: string
-      Feedback: string
-      TestEvidence: string
-      Inspected: bool
-      Tested: bool
-      TestDetails: string
       DocumentPath: string
       Content: string
       ExpectedBlobOid: string }
@@ -843,7 +838,7 @@ module AgentCommandInfo =
         | None -> invocation command
 
 module AgentProtocol =
-    let version = "3.44"
+    let version = "3.45"
     let defaultPatchFuzzyContextLines = 3
     let maxResponseBytes = 900 * 1024
     let maxImageBytes = 8 * 1024 * 1024

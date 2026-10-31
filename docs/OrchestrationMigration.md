@@ -1,6 +1,6 @@
 # Migrating to Git-backed Jarvis orchestration
 
-**Applies to:** the orphan-branch orchestration implementation on Jarvis client/server protocol 3.39. The source of truth is [the orchestration V2 architecture](specs/orchestration-v2-architecture.md).
+**Applies to:** the orphan-branch coordination implementation (task/review capability protocol 3.45). The source of truth is [the orchestration V2 architecture](specs/orchestration-v2-architecture.md).
 
 **Scope:** Move an existing project's *active coordination* from source-branch task files to the Git-backed ledger. This is a **manual, selective cutover**. Updating Jarvis itself does not create a ledger or migrate any tasks.
 
@@ -8,7 +8,7 @@
 
 | Old workflow | New workflow |
 | --- | --- |
-| Task HTML/JSON files (commonly `docs/tasks/`) in ordinary source branches/worktrees | Current task, agent, review and integration state in `refs/heads/jarvis-orchestration` |
+| Task HTML/JSON files (commonly `docs/tasks/`) in ordinary source branches/worktrees | Current task, agent and review records in `refs/heads/jarvis-orchestration` |
 | Different worktrees may hold different copies of task state | A single canonical Git remote ref is shared by clients/worktrees |
 | `CreateTask`, `ListTasks`, `AssignTask`, `BeginTask`, `CheckpointTask`, etc. | `CreateTask`, `AgentInbox`, `AssignTask`, `BeginAttempt`, `CheckpointAttempt`, etc. |
 | Source worktree/branch can be confused with task ownership | Agent owner is a project-local label; source worktree/ref is separate |
@@ -83,18 +83,19 @@ Always read expected versions/generations from the latest ledger. Do not guess. 
 
 For in-progress legacy work, put the *remaining work and next action* in the new canonical spec/checkpoint. An old `done` flag is not proof of a V2 review decision or verified source integration.
 
-## 5. Ordinary task branch and review workflow
+## 5. Task and review tools are independent
 
-Jarvis only exposes coordination state and explicit tools. The orchestrator makes the decisions and performs normal Git operations. **Review branches are immutable inspection snapshots and are never merged; only the mutable task branch is merged into main.**
+**Jarvis is a set of tools, not an implementation or review workflow.** Individual projects define their own coordination, review, merge and closure practices in agent instructions (e.g. AGENTS.md or agent skills).
 
-1. While Working, the agent may call `SubmitReview` with `reviewKind=Progress`. Jarvis publishes a named snapshot at the specified commit; the worker may continue modifying, rebasing or rewriting the task branch.
-2. A reviewer uses `ReviewerInbox`, `ReviewDetails`, `ClaimReview`, `ListReviewDocuments`, `ReadReviewDocument`, `PutReviewDocument` and `DecideReview`. Findings are independent Markdown documents. Accepting a Progress review is informational, not an integration decision.
-3. When implementation is done, the worker calls `CompleteAgentWork` to release its slot. The orchestrator may park the worker or assign another task. The finished task awaits a `Final` review snapshot, submitted through `SubmitReview` with `reviewKind=Final`.
-4. If the Final review requests changes, Jarvis only records the findings. The orchestrator explicitly selects/assigns a worker to continue the **same task branch**. It must not interrupt a worker already doing another task. The worker fixes the code and later requests a new Final review.
-5. If the Final review is accepted, the orchestrator inspects the task branch relative to the accepted review snapshot, merges the **task branch** into the target using normal Git, validates and pushes. `CloseTask` verifies that the task branch is now integrated. Jarvis does not initiate assignment, rework or merging.
-6. Use `TaskOverview` for a project-wide canonical list of tasks and reviews, including finished tasks without a currently focused worker. `FinalizeReview` and `AcceptedPendingIntegration` are retired. A rebase is normal Git work; changed commit SHA alone does not demand a new review if the result is equivalent.
+- `TaskOverview` and `ReviewTask` read the canonical task ledger; `AgentInbox` reads an agent's assignment/availability. `AssignTask` and `TransferOwner` explicitly record who owns work. `CompleteAgentWork` releases the worker's slot, and `CloseTask` records that a task is closed. These tools do not infer or require a review decision, source merge or particular task-branch state.
+- `SubmitReview` publishes a new named review snapshot at a supplied Git commit; it does **not** require an active task or Working/Finished agent. Use optional `taskId` to associate it with a task, or omit it for the shared `_reviews` namespace. Optional `sourceRef`, `targetRef`, `purpose` and `summary` are review context, not permission gates. `purpose` is an arbitrary label, not a special Progress/Final review type.
+- `ReviewDetails`, `ReviewerInbox`, `ClaimReview`, `ReleaseReview`, `ReplaceReview`, `WithdrawReview`, `DecideReview`, `ListReviewDocuments`, `ReadReviewDocument` and `PutReviewDocument` manage review records and separate Markdown findings. Claims and verdicts affect the review, not its associated task or worker.
+- Multiple reviews may coexist for a task. An explicit task-owner transfer, task cancellation or task closure never automatically withdraws a review. Releasing a claim leaves the same snapshot available for another reviewer.
+- Git branching, rebasing, comparing, publishing and merging are ordinary agent-controlled operations. Agents choose what to review, what branches to merge and when to close a task; Jarvis neither enforces a "final review" gate nor verifies ancestry on `CloseTask`.
 
-The review record has a `kind` (`Progress` or `Final`), source task ref, read-only review ref, fixed base, verdict and optional Markdown documents. The canonical ledger remains the authority for tasks and decisions. See the [normative spec](specs/orchestration-v2-architecture.md).
+The review namespace under `tasks/<id>/reviews/` is an indexing convention, not an ownership or lifecycle dependency. The immutable review refs created by the review tools are useful checkpoints that remain reachable across a task-branch rewrite. A missing source ref does not erase persisted review metadata or findings.
+
+There is no `FinalizeReview` operation, no `AcceptedPendingIntegration` queue, and no separate approval-gated `CloseNonSourceTask` route. See the [normative capabilities specification](specs/orchestration-v2-architecture.md).
 
 ## 6. Verify the cutover
 

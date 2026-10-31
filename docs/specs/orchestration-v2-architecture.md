@@ -177,16 +177,11 @@ A project's `AGENTS.md`, agent skills or other agent instructions define its rev
 
 ## 5. Implementation alignment (31 October 2026)
 
-**This is the intended capability contract, not a claim that the code already conforms.** The implementation at `42e060d` encodes review workflow policy that must be **removed**, not strengthened:
+The capability-only implementation removes the earlier workflow gates. Review creation no longer depends on an assignment or worker phase, and no mandatory `Progress`/`Final` distinction or one-active-review-per-task limit remains. Review claims, decisions and Markdown documents can be managed independently. Ownership transfer and administrative task actions do not withdraw reviews. `CloseTask` records an explicit task-state update without reading review verdicts or calculating Git integration ancestry.
 
-- Drop mandatory `Progress`/`Final` review kinds and phase-dependent submission rules. Treat purpose as optional context at most.
-- Remove the "one active review per task" restriction and checks tying review claimant/submitter to task-owner identity.
-- Stop automatically withdrawing reviews during ownership transfer, cancellation or other task administration. Review changes must be requested explicitly.
-- Make `CloseTask` an explicit task-state update without final-review, attempt-finished, source-ref or Git-ancestry prerequisites. Eliminate the idea of review acceptance as integration authorization.
-- Preserve simple review claim/decision/document operations; add an explicit claim-release operation if needed to hand a snapshot to a different reviewer. Keep claim/version conflict handling local to the review record.
-- Ensure task-wide reads and historical review documents stay available across handoffs; do not synthesize automatic review queues or task transitions based on verdicts.
+Review purposes are optional free-text metadata (represented by the existing `kind` storage field, not an enum). An unassociated review uses the `_reviews` namespace under the existing ledger tree; source ref, comparison target and summary are optional. `ReleaseReview` explicitly reopens a claim for another reviewer. The specialized approval-gated non-source closure and obsolete review-phase wire fields have been retired.
 
-Do not add new state machines or helper services to compensate for removing these rules. Prefer deleting branches of conditional logic and reusing existing record updates. The shared orphan ledger, ordinary Git tools, agent-slot tracking, and separate Markdown findings remain. Implementation, test changes and deployment require separate instructions; editing this spec authorizes none of them.
+The existing Git orphan ledger, task/agent records and separate Markdown findings remain the authoritative data. The client/server protocol is version **3.45**. Deployment and any changes to project-specific agent instructions are separate actions; no production deployment or live ledger migration is implied by this implementation.
 
 ## 6. Tool surface and cutover
 

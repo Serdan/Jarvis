@@ -87,13 +87,13 @@ For in-progress legacy work, put the *remaining work and next action* in the new
 
 Working branches, review branches and merges are normal Git development operations. The orphan ledger is for coordination, not for constraining Git.
 
-1. The agent commits on its working branch and creates a **separate review branch** at the commit it wants reviewed. `SubmitReview` records that stable snapshot. The agent can keep working on its original branch immediately.
-2. The reviewer uses `ReviewerInbox`, `ClaimReview` and `DecideReview` to inspect and accept/request changes. A claimed review branch remains unchanged; an unclaimed request can be replaced.
-3. The orchestrator merges accepted review work into `main` with ordinary Git and pushes. **No cherry-picking.** A fast-forward or merge commit is fine. If the target moved, resolve conflicts and validate as normal. Review acceptance does not perform a Git merge.
-4. Record the actual merged remote target in the ledger. Do not require that the target SHA match the review commit or that the whole task be finalized. **Multiple review/merge cycles are normal while a task remains InProgress.**
-5. The agent keeps its working branch, rebases onto updated `main` when useful, and submits later reviews containing only work not yet merged. Rebinding source context must not require an artificial Ready-to-Working-to-Ready cycle. Only mark the task completed when its actual work is done.
+1. The agent commits on its working branch and calls `SubmitReview` with the submitted commit and source ref. Jarvis publishes a dedicated stable review branch and records the Git merge-base against the target. The agent can continue on its original branch.
+2. The reviewer uses `ReviewerInbox`, `ReviewDetails`, and `ClaimReview`. Once claimed, the review ref is frozen; an unclaimed review can be replaced. The reviewer writes an optional `summary.md` and detailed individual `findings/<slug>.md` files using `ListReviewDocuments`, `ReadReviewDocument` and `PutReviewDocument`, then calls `DecideReview`.
+3. The orchestrator fetches the accepted review ref, merges it into `main` with ordinary Git, validates and pushes **without force**. A fast-forward or normal merge commit is fine; merge conflicts require the usual engineering review.
+4. **Git ancestry is the integration record.** Do not call `PlanIntegration`, `RecordIntegration` or any retired integration actions. Multiple accepted review branches can be merged independently while the task is still `InProgress`. `AcceptedPendingIntegration` in the agent inbox is computed from Git.
+5. The agent keeps working/rebasing and can submit later review slices without including already merged work. When finished, use `CompleteAgentWork` and `FinalizeReview` after the final review is accepted. Use `CloseTask` when its accepted review branch has been integrated; ordinary intermediate merges do not close the task.
 
-The older `PlanIntegration`, `RecordIntegration` and fixed cumulative review-baseline restrictions are existing implementation limitations, **not** requirements for the corrected workflow. Refer to [the normative spec](specs/orchestration-v2-architecture.md) until they are simplified.
+The review schema is now a single `review.json` per task-associated review, plus separate Markdown findings. The Wayfold live orphan ledger had no old review or integration records at the protocol 3.41 cutover, so no migration was required; temporary migration support was removed in protocol 3.42. See the [normative spec](specs/orchestration-v2-architecture.md).
 
 ## 6. Verify the cutover
 

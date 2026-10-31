@@ -2,6 +2,7 @@
 
 **Status:** Revised 2026-10-31. This is the normative **Jarvis capability** specification. A particular development/review/merge workflow is defined in agent instructions, not in Jarvis. Existing implementation and older V2 notes are superseded where they impose workflow rules; implementation alignment is separate.
 **Authority:** `refs/heads/jarvis-orchestration`, an orphan branch of each project's existing Git remote.
+**Agent-state redesign:** [Orthogonal agent assignment and execution state](orthogonal-agent-state.md) specifies the **approved target** for agent/attempt states and their conversions. The five-state agent model and corresponding attempt-phase descriptions below document the currently implemented behavior only; the new design supersedes those parts **once implemented**. Its one-time conversion of existing *orphan-ledger records* is not a migration of source-branch task files or a new migration framework.
 
 ## 1. Goal and boundary
 

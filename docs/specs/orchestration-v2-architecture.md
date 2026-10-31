@@ -192,6 +192,7 @@ The authoritative `review.json` uses the existing simple identity/claim/verdict 
   "attemptId": "<uuid-n>",
   "ownerAgentId": "Agent 3",
   "kind": "Progress",
+  "taskRef": "refs/heads/task/320",
   "reviewRef": "refs/heads/jarvis-review/320/<uuid-n>/r1",
   "baseCommit": "<git-oid>",
   "targetRef": "refs/heads/main",

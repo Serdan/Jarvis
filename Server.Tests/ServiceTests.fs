@@ -431,9 +431,9 @@ let ``command catalog matches AgentCommand union and MCP tools`` () =
         set [ "AgentInbox"; "GetAssignment"; "GetCheckpoint"; "InspectAttemptSource"; "TaskLifecycleHistory"; "GetNonSourceApproval"; "GetTaskSpecPage"; "DiffTaskSpec"; "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "AcknowledgeAssignment"; "ReissueAssignment"; "BeginAttempt"; "CheckpointAttempt"
               "BindReviewBase"; "BindAttemptSource"; "RebindAttemptSource"; "YieldAgent"; "ResumeAgent"; "CompleteAgentWork"
               "ParkAgent"; "ReissueQueuedAttempt"; "RecoverAgentAssignment"; "AcknowledgeReviewFeedback"; "ParkAttempt"; "BlockAttempt"; "ResumeAttempt"; "AbandonAttempt"; "CancelTask"; "CancelOpenTask"; "TransferOwner"; "CloseTask"; "CloseNonSourceTask"; "ReopenTask"; "ReviseTaskSpecPinned"; "ImportTaskSpec"; "AdoptTaskSpec"; "ExportTaskSpec"
-              "ReviewTask"; "ReviewDetails"; "ReviewerInbox"; "ListReviewDocuments"; "ReadReviewDocument"
+              "ReviewTask"; "TaskOverview"; "ReviewDetails"; "ReviewerInbox"; "ListReviewDocuments"; "ReadReviewDocument"
               "SubmitReview"; "ReplaceReview"; "ClaimReview"; "DecideReview"
-              "WithdrawReview"; "FinalizeReview"; "PutReviewDocument"
+              "WithdrawReview"; "PutReviewDocument"
               "LedgerHealth"; "GetOperationStatus"; "PendingOperations"; "ReconcilePendingOperations"; "AcknowledgePendingOperation"; "InitializeLedger"; "BindExistingLedger"; "RebindLedgerRemote"
               ]
     // Retired wire cases are deleted; public CreateTask/AssignTask are canonical ledger tools.
@@ -453,7 +453,7 @@ let ``public orchestration tool metadata describes canonical branch reviews with
     let reviewMethods =
         set [ "ReviewTask"; "ReviewDetails"; "ReviewerInbox"; "SubmitReview"
               "ReplaceReview"; "ClaimReview"; "DecideReview"; "WithdrawReview"
-              "FinalizeReview"; "ListReviewDocuments"; "ReadReviewDocument"
+              "TaskOverview"; "ListReviewDocuments"; "ReadReviewDocument"
               "PutReviewDocument" ]
     for methodInfo in typeof<JarvisMcpTools>.GetMethods() do
         let toolAttributes =
@@ -474,10 +474,10 @@ let ``public orchestration tool metadata describes canonical branch reviews with
         let methodInfo = typeof<JarvisMcpTools>.GetMethod(methodName)
         (methodInfo.GetCustomAttributes(typeof<System.ComponentModel.DescriptionAttribute>, false)[0]
          :?> System.ComponentModel.DescriptionAttribute).Description
-    Assert.That(reviewDescription "ReviewDetails", Does.Contain("Git-derived integration"))
+    Assert.That(reviewDescription "ReviewDetails", Does.Contain("never merged"))
     Assert.That(reviewDescription "ClaimReview", Does.Contain("Git branch"))
     Assert.That(reviewDescription "DecideReview", Does.Contain("Markdown"))
-    Assert.That(reviewDescription "FinalizeReview", Does.Contain("Git ancestry"))
+    Assert.That(reviewDescription "SubmitReview", Does.Contain("never merged"))
 
 [<Test>]
 let ``task assignment and owner transfer do not accept reviewer IDs`` () =
@@ -718,10 +718,10 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
               for name in [ "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "AcknowledgeAssignment"; "ReissueAssignment"; "BeginAttempt"; "CheckpointAttempt"
                             "BindReviewBase"; "BindAttemptSource"; "RebindAttemptSource"; "YieldAgent"; "ResumeAgent"; "CompleteAgentWork";
                             "ParkAgent"; "ReissueQueuedAttempt"; "RecoverAgentAssignment"; "AcknowledgeReviewFeedback"; "ParkAttempt"; "BlockAttempt"; "ResumeAttempt"; "AbandonAttempt"; "CancelTask"; "CancelOpenTask"; "TransferOwner"; "CloseTask"; "CloseNonSourceTask"; "ReopenTask"; "ReviseTaskSpecPinned"; "ImportTaskSpec"; "AdoptTaskSpec"; "ExportTaskSpec" ] -> name, taskWrite
-              for name in [ "ReviewTask"; "ReviewDetails"; "ReviewerInbox"; "ListReviewDocuments"; "ReadReviewDocument" ] ->
+              for name in [ "ReviewTask"; "TaskOverview"; "ReviewDetails"; "ReviewerInbox"; "ListReviewDocuments"; "ReadReviewDocument" ] ->
                   name, v2Read
               for name in [ "SubmitReview"; "ReplaceReview"; "ClaimReview"; "DecideReview"
-                            "WithdrawReview"; "FinalizeReview"; "PutReviewDocument" ] ->
+                            "WithdrawReview"; "PutReviewDocument" ] ->
                   name, v2Write ]
         aliases |> List.fold (fun map (key, value) -> Map.add key value map) original
 

@@ -89,124 +89,204 @@ type ReviewWorkflowTests() =
             Directory.Delete(root, true)
 
     [<Test>]
-    member _.BranchReviewsIntegrateIndependentlyThroughOrdinaryMergeCommits() =
-        withFixture (fun one _ first second baseOid sourceRef newCommit initTask ->
-            let taskId = "branch-merge"
+    member _.ProgressSnapshotSurvivesRewriteAndOnlyTaskBranchCanBeMerged() =
+        withFixture (fun one _ first second baseOid _ newCommit initTask ->
+            let taskId = "task-branch-only"
             initTask taskId
-            git one [ "switch"; "-c"; "feature/branch-merge" ] |> ignore
-            let featureRef = "refs/heads/feature/branch-merge"
-            let firstHead = newCommit "First review slice" "slice A"
-            let a = Guid.NewGuid()
+            git one [ "switch"; "-c"; "task/branch-only" ] |> ignore
+            let taskRef = "refs/heads/task/branch-only"
+            let oldHead = newCommit "Progress snapshot" "old implementation"
+            let progress = Guid.NewGuid()
             ReviewWorkflow.submitBranchReview first (Guid.NewGuid()) taskId "Owner" 3 1
-                a featureRef firstHead "# Review A" |> success |> ignore
-            ReviewWorkflow.claimBranchReview second (Guid.NewGuid()) taskId a "Reviewer" 1
+                progress taskRef oldHead "Progress review" |> success |> ignore
+            ReviewWorkflow.claimBranchReview second (Guid.NewGuid()) taskId progress "Reviewer" 1
             |> success |> ignore
-            ReviewWorkflow.decideBranchReview second (Guid.NewGuid()) taskId a "Reviewer" 2 Accept
+            ReviewWorkflow.decideBranchReview second (Guid.NewGuid()) taskId progress "Reviewer" 2 Accept
             |> success |> ignore
-            let aReview = ReviewWorkflow.getBranchReview first taskId a |> success
-            Assert.That(aReview.Integrated, Is.False)
-            git one [ "switch"; "main" ] |> ignore
-            git one [ "fetch"; "origin"; aReview.Review.ReviewRef ] |> ignore
-            git one [ "merge"; "--no-ff"; "-m"; "Integrate reviewed slice A";
-                      "FETCH_HEAD" ] |> ignore
-            git one [ "push"; "origin"; "main" ] |> ignore
-            Assert.That((ReviewWorkflow.getBranchReview second taskId a |> success).Integrated, Is.True)
-            git one [ "switch"; "feature/branch-merge" ] |> ignore
-            git one [ "merge"; "main" ] |> ignore
-            let secondHead = newCommit "Second review slice" "slice B"
-            let b = Guid.NewGuid()
-            ReviewWorkflow.submitBranchReview first (Guid.NewGuid()) taskId "Owner" 3 1
-                b featureRef secondHead "# Review B" |> success |> ignore
-            let bReview = ReviewWorkflow.getBranchReview second taskId b |> success
-            Assert.That(bReview.Review.BaseCommit, Is.EqualTo(git one [ "rev-parse"; "main" ]))
-            ReviewWorkflow.claimBranchReview second (Guid.NewGuid()) taskId b "Reviewer" 1
-            |> success |> ignore
-            ReviewWorkflow.decideBranchReview second (Guid.NewGuid()) taskId b "Reviewer" 2 Accept
-            |> success |> ignore
-            let pending = ReviewWorkflow.getBranchAgentInbox first "Owner" |> success
-            Assert.That(pending.AcceptedPendingIntegration.Length, Is.EqualTo(1))
-            Assert.That(pending.AcceptedPendingIntegration.Head.Review.ReviewId,
-                        Is.EqualTo(b.ToString("N")))
-            git one [ "switch"; "main" ] |> ignore
-            git one [ "fetch"; "origin"; bReview.Review.ReviewRef ] |> ignore
-            git one [ "merge"; "--no-ff"; "-m"; "Integrate reviewed slice B";
-                      "FETCH_HEAD" ] |> ignore
-            git one [ "push"; "origin"; "main" ] |> ignore
-            Assert.That((ReviewWorkflow.getBranchReview first taskId b |> success).Integrated, Is.True)
-            let empty = ReviewWorkflow.getBranchAgentInbox first "Owner" |> success
-            Assert.That(empty.AcceptedPendingIntegration, Is.Empty))
-
-    [<Test>]
-    member _.CanonicalBranchReviewUsesOneRecordAndGitDerivedClosure() =
-        withFixture (fun one _ first second baseOid sourceRef newCommit initTask ->
-            let taskId = "simple-review"
-            initTask taskId
-            let firstHead = newCommit "First submitted patch" "first slice"
-            let reviewId = Guid.NewGuid()
-            let sent = ReviewWorkflow.submitBranchReview first (Guid.NewGuid()) taskId
-                            "Owner" 3 1 reviewId sourceRef firstHead "# Scope\nFirst slice"
-                       |> success
-            Assert.That(sent.AlreadyApplied, Is.False)
-            let details = ReviewWorkflow.getBranchReview second taskId reviewId |> success
-            Assert.That(details.Review.BaseCommit, Is.EqualTo(baseOid))
-            Assert.That(details.Review.ReviewRef, Does.Contain(reviewId.ToString("N")))
-            Assert.That(details.Review.Status, Is.EqualTo("Unclaimed"))
-            Assert.That(details.Integrated, Is.False)
-            let _, files = ReviewWorkflow.listReviewDocuments second taskId reviewId |> success
-            Assert.That(files |> List.map _.Path, Does.Contain("summary.md"))
-            let replacement = newCommit "Updated submitted patch" "second slice"
-            ReviewWorkflow.replaceBranchReview first (Guid.NewGuid()) taskId "Owner"
-                reviewId 1 1 sourceRef replacement "# Scope\nReplacement"
-            |> success |> ignore
-            let current = ReviewWorkflow.getBranchReview second taskId reviewId |> success
-            Assert.That(current.Review.Version, Is.EqualTo(2))
-            Assert.That(current.HeadCommit, Is.EqualTo(replacement))
-            ReviewWorkflow.claimBranchReview second (Guid.NewGuid()) taskId reviewId "Reviewer" 2
-            |> success |> ignore
-            match ReviewWorkflow.replaceBranchReview first (Guid.NewGuid()) taskId "Owner"
-                    reviewId 3 1 sourceRef replacement "Too late" with
-            | Error(ReviewAlreadyClaimed _) -> ()
-            | other -> Assert.Fail(sprintf "Claimed branch must not be replaced: %A" other)
-            ReviewWorkflow.putReviewDocument second (Guid.NewGuid()) taskId reviewId "Reviewer"
-                "findings/test-coverage.md" "" "# Test coverage\nReviewed."
-            |> success |> ignore
-            ReviewWorkflow.decideBranchReview second (Guid.NewGuid()) taskId reviewId "Reviewer" 3 Accept
-            |> success |> ignore
-            let acceptedInbox = ReviewWorkflow.getBranchAgentInbox first "Owner" |> success
-            Assert.That(acceptedInbox.AcceptedPendingIntegration.Length, Is.EqualTo(1))
-            Assert.That(acceptedInbox.UnacknowledgedFeedback.Length, Is.EqualTo(1))
-            let notice = acceptedInbox.UnacknowledgedFeedback.Head
-            ReviewWorkflow.acknowledgeBranchReview first (Guid.NewGuid()) taskId "Owner"
-                notice.DecisionSequence |> success |> ignore
-            let acknowledged = ReviewWorkflow.getBranchAgentInbox first "Owner" |> success
-            Assert.That(acknowledged.UnacknowledgedFeedback.Length, Is.EqualTo(0))
-            let _, task, attempt = ReviewWorkflow.getTask first taskId |> success
-            let agent = acknowledged.Agent
+            // The worker rewrites the task branch. Its previously reviewed commit
+            // must remain reachable from the immutable named review branch.
+            git one [ "reset"; "--hard"; baseOid ] |> ignore
+            let newHead = newCommit "Rewritten task result" "new implementation"
+            Assert.That(newHead, Is.Not.EqualTo(oldHead))
+            let oldReview = ReviewWorkflow.getBranchReview second taskId progress |> success
+            Assert.That(oldReview.HeadCommit, Is.EqualTo(oldHead))
+            Assert.That(oldReview.Review.Kind, Is.EqualTo("Progress"))
+            Assert.That(oldReview.Review.TaskRef, Is.EqualTo(taskRef))
+            let snapshot = LedgerStore.fetch first |> success
+            let reviewJson, _ =
+                LedgerStore.readAt first snapshot ($"tasks/{taskId}/reviews/{progress:N}/review.json")
+                |> success
+            Assert.That(reviewJson.Value, Does.Contain("\"schemaVersion\":3"))
+            let inbox = ReviewWorkflow.getAgentInbox first "Owner" |> success
+            Assert.That(inbox.UnacknowledgedFeedback.Length, Is.EqualTo(1))
+            let _, _, active = ReviewWorkflow.getTask first taskId |> success
             ReviewWorkflow.completeAgentWork first (Guid.NewGuid()) taskId "Owner"
-                attempt.Value.Version agent.Version attempt.Value.AssignmentGeneration "Done"
+                active.Value.Version inbox.Agent.Version active.Value.AssignmentGeneration "Worker finished"
             |> success |> ignore
-            let _, _, finished = ReviewWorkflow.getTask first taskId |> success
-            ReviewWorkflow.finalizeBranchReview first (Guid.NewGuid()) taskId "Owner"
-                finished.Value.Version reviewId |> success |> ignore
-            let _, beforeMerge, _ = ReviewWorkflow.getTask first taskId |> success
-            Assert.That(beforeMerge.Lifecycle, Is.EqualTo("Implemented"))
-            match ReviewWorkflow.closeBranchTask first (Guid.NewGuid()) taskId beforeMerge.Version with
-            | Error(StaleEntityVersion _) -> ()
-            | other -> Assert.Fail(sprintf "Cannot close unmerged patch: %A" other)
-            git one [ "push"; "origin"; "HEAD:" + sourceRef ] |> ignore
-            let integrated = ReviewWorkflow.getBranchReview second taskId reviewId |> success
-            Assert.That(integrated.Integrated, Is.True)
-            let finalInbox = ReviewWorkflow.getBranchAgentInbox first "Owner" |> success
-            Assert.That(finalInbox.AcceptedPendingIntegration.Length, Is.EqualTo(0))
-            ReviewWorkflow.closeBranchTask first (Guid.NewGuid()) taskId beforeMerge.Version
+            let completed = ReviewWorkflow.getAgentInbox first "Owner" |> success
+            Assert.That(completed.Agent.State, Is.EqualTo("Completed"))
+            let _, task, finished = ReviewWorkflow.getTask first taskId |> success
+            Assert.That(task.Lifecycle, Is.EqualTo("InProgress"))
+            Assert.That(finished.Value.Phase, Is.EqualTo("Finished"))
+            let finalId = Guid.NewGuid()
+            ReviewWorkflow.submitBranchReviewKind first (Guid.NewGuid()) taskId "Owner"
+                finished.Value.Version finished.Value.AssignmentGeneration
+                finalId taskRef newHead "Final review" "Final" |> success |> ignore
+            ReviewWorkflow.claimBranchReview second (Guid.NewGuid()) taskId finalId "Reviewer" 1
+            |> success |> ignore
+            ReviewWorkflow.decideBranchReview second (Guid.NewGuid()) taskId finalId "Reviewer" 2 Accept
+            |> success |> ignore
+            let board = ReviewWorkflow.listProjectTasks first |> success
+            Assert.That(board.Reviews.Length, Is.EqualTo(2))
+            Assert.That(board.Reviews |> List.map _.Kind, Is.EquivalentTo([ "Progress"; "Final" ]))
+            // Withdrawing a later final review does not supersede an earlier
+            // accepted final decision.
+            let withdrawnFinal = Guid.NewGuid()
+            ReviewWorkflow.submitBranchReviewKind first (Guid.NewGuid()) taskId "Owner"
+                finished.Value.Version 1 withdrawnFinal taskRef newHead
+                "Unneeded second final review" "Final" |> success |> ignore
+            ReviewWorkflow.withdrawBranchReview first (Guid.NewGuid()) taskId
+                withdrawnFinal "Owner" 1 |> success |> ignore
+            // Acceptance is not an automatic integration or closure.
+            match ReviewWorkflow.closeBranchTask first (Guid.NewGuid()) taskId task.Version with
+            | Error(SourceUnavailable _) | Error(StaleEntityVersion _) -> ()
+            | other -> Assert.Fail(sprintf "Cannot close unmerged task branch: %A" other)
+            git one [ "push"; "-u"; "origin"; "task/branch-only" ] |> ignore
+            git one [ "switch"; "main" ] |> ignore
+            git one [ "merge"; "--no-ff"; "-m"; "Merge task branch"; "task/branch-only" ] |> ignore
+            git one [ "push"; "origin"; "main" ] |> ignore
+            // Deleting review refs after the task merge cannot prevent closure.
+            let finalReview = ReviewWorkflow.getBranchReview second taskId finalId |> success
+            git one [ "push"; "origin"; "--delete"; finalReview.Review.ReviewRef ] |> ignore
+            git one [ "push"; "origin"; "--delete"; oldReview.Review.ReviewRef ] |> ignore
+            Assert.That((ReviewWorkflow.getBranchReview second taskId finalId |> success).HeadCommit,
+                        Is.Null)
+            ReviewWorkflow.closeBranchTask first (Guid.NewGuid()) taskId task.Version
             |> success |> ignore
             let _, closed, _ = ReviewWorkflow.getTask first taskId |> success
             Assert.That(closed.Lifecycle, Is.EqualTo("Closed"))
-            let snapshot = LedgerStore.fetch first |> success
-            let paths = LedgerStore.listAt first snapshot "tasks" |> success
-            Assert.That(paths |> List.filter (fun path ->
-                path.StartsWith($"tasks/{taskId}/reviews/") && path.EndsWith(".json")),
-                Is.EquivalentTo([ $"tasks/{taskId}/reviews/{reviewId:N}/review.json" ])))
+            // Review branches can disappear after integration without invalidating
+            // their canonical review metadata and independently stored findings.
+            let oldAfter = ReviewWorkflow.getBranchReview second taskId progress |> success
+            Assert.That(oldAfter.Review.Status, Is.EqualTo("Accepted")))
+
+    [<Test>]
+    member _.FailedFinalReviewRequiresExplicitWorkerReassignment() =
+        withFixture (fun one _ first second _ _ newCommit initTask ->
+            let taskId = "final-rework"
+            initTask taskId
+            git one [ "switch"; "-c"; "task/final-rework" ] |> ignore
+            let taskRef = "refs/heads/task/final-rework"
+            let head = newCommit "Original task code" "buggy implementation"
+            let initial = ReviewWorkflow.getAgentInbox first "Owner" |> success
+            let _, task, attempt = ReviewWorkflow.getTask first taskId |> success
+            ReviewWorkflow.completeAgentWork first (Guid.NewGuid()) taskId "Owner"
+                attempt.Value.Version initial.Agent.Version 1 "Ready for final review"
+            |> success |> ignore
+            let _, _, finished = ReviewWorkflow.getTask first taskId |> success
+            let firstFinal = Guid.NewGuid()
+            ReviewWorkflow.submitBranchReviewKind first (Guid.NewGuid()) taskId "Owner"
+                finished.Value.Version 1 firstFinal taskRef head "Initial final" "Final"
+            |> success |> ignore
+            ReviewWorkflow.claimBranchReview second (Guid.NewGuid()) taskId firstFinal "Reviewer" 1
+            |> success |> ignore
+            ReviewWorkflow.putReviewDocument second (Guid.NewGuid()) taskId firstFinal "Reviewer"
+                "findings/bug.md" "" "# Bug found" |> success |> ignore
+            ReviewWorkflow.decideBranchReview second (Guid.NewGuid()) taskId firstFinal "Reviewer" 2
+                RequestChanges |> success |> ignore
+            // The review verdict changes neither the agent slot nor the task owner.
+            let _, afterVerdict, noAutomaticReissue = ReviewWorkflow.getTask first taskId |> success
+            Assert.That(afterVerdict.Lifecycle, Is.EqualTo("InProgress"))
+            Assert.That(noAutomaticReissue.Value.Phase, Is.EqualTo("Finished"))
+            Assert.That(noAutomaticReissue.Value.OwnerAgentId, Is.EqualTo("Owner"))
+            let original = ReviewWorkflow.getAgentInbox first "Owner" |> success
+            Assert.That(original.Agent.State, Is.EqualTo("Completed"))
+            match ReviewWorkflow.closeBranchTask first (Guid.NewGuid()) taskId afterVerdict.Version with
+            | Error(ReviewVersionConflict _) -> ()
+            | other -> Assert.Fail(sprintf "Rejected final cannot close task: %A" other)
+            // Orchestrator deliberately transfers the task; the old reviewer
+            // findings stay accessible and the original worker is untouched.
+            ReviewWorkflow.registerAgent first (Guid.NewGuid()) "NewOwner" |> success |> ignore
+            ReviewWorkflow.transferAttemptOwner first (Guid.NewGuid()) taskId (Guid.NewGuid())
+                "NewOwner" afterVerdict.Version noAutomaticReissue.Value.Version
+                original.Agent.Version 1 "Orchestrator assigns rework"
+            |> success |> ignore
+            let _, _, newAssigned = ReviewWorkflow.getTask second taskId |> success
+            Assert.That(newAssigned.Value.TargetRef, Is.EqualTo("refs/heads/main"))
+            Assert.That((ReviewWorkflow.getAgentInbox first "Owner" |> success).Agent.State,
+                        Is.EqualTo("Completed"))
+            ReviewWorkflow.beginAttempt first (Guid.NewGuid()) taskId "NewOwner"
+                newAssigned.Value.Version 1 |> success |> ignore
+            let fixedHead = newCommit "Fix final review finding" "corrected implementation"
+            let working = ReviewWorkflow.getAgentInbox first "NewOwner" |> success
+            let _, _, current = ReviewWorkflow.getTask first taskId |> success
+            ReviewWorkflow.completeAgentWork first (Guid.NewGuid()) taskId "NewOwner"
+                current.Value.Version working.Agent.Version 1 "Fix completed"
+            |> success |> ignore
+            let _, _, fixedAttempt = ReviewWorkflow.getTask first taskId |> success
+            let newFinal = Guid.NewGuid()
+            ReviewWorkflow.submitBranchReviewKind first (Guid.NewGuid()) taskId "NewOwner"
+                fixedAttempt.Value.Version 1 newFinal taskRef fixedHead "Revised final" "Final"
+            |> success |> ignore
+            ReviewWorkflow.claimBranchReview second (Guid.NewGuid()) taskId newFinal "Reviewer" 1
+            |> success |> ignore
+            ReviewWorkflow.decideBranchReview second (Guid.NewGuid()) taskId newFinal "Reviewer" 2
+                Accept |> success |> ignore
+            ReviewWorkflow.putReviewDocument first (Guid.NewGuid()) taskId firstFinal "NewOwner"
+                "findings/fix-response.md" "" "# Corrected in the task branch"
+            |> success |> ignore
+            let _, files = ReviewWorkflow.listReviewDocuments first taskId firstFinal |> success
+            Assert.That(files |> List.map _.Path, Does.Contain("findings/bug.md"))
+            Assert.That(files |> List.map _.Path, Does.Contain("findings/fix-response.md"))
+            git one [ "push"; "-u"; "origin"; "task/final-rework" ] |> ignore
+            git one [ "switch"; "main" ] |> ignore
+            git one [ "merge"; "--no-ff"; "-m"; "Merge accepted task"; "task/final-rework" ] |> ignore
+            git one [ "push"; "origin"; "main" ] |> ignore
+            let _, newTask, _ = ReviewWorkflow.getTask first taskId |> success
+            ReviewWorkflow.closeBranchTask first (Guid.NewGuid()) taskId newTask.Version
+            |> success |> ignore
+            let _, closed, _ = ReviewWorkflow.getTask first taskId |> success
+            Assert.That(closed.Lifecycle, Is.EqualTo("Closed")))
+
+    [<Test>]
+    member _.OrchestratorCanExplicitlyReassignRejectedFinalToOriginalWorker() =
+        withFixture (fun one _ first second _ sourceRef newCommit initTask ->
+            let taskId = "same-owner-final-rework"
+            initTask taskId
+            git one [ "switch"; "-c"; "task/same-owner-rework" ] |> ignore
+            let workRef = "refs/heads/task/same-owner-rework"
+            let head = newCommit "Final review candidate" "requires more work"
+            let _, _, current = ReviewWorkflow.getTask first taskId |> success
+            let worker = ReviewWorkflow.getAgentInbox first "Owner" |> success
+            ReviewWorkflow.completeAgentWork first (Guid.NewGuid()) taskId "Owner"
+                current.Value.Version worker.Agent.Version 1 "Ready for final review"
+            |> success |> ignore
+            let _, task, finished = ReviewWorkflow.getTask first taskId |> success
+            let review = Guid.NewGuid()
+            ReviewWorkflow.submitBranchReviewKind first (Guid.NewGuid()) taskId "Owner"
+                finished.Value.Version 1 review workRef head "Final check" "Final"
+            |> success |> ignore
+            ReviewWorkflow.claimBranchReview second (Guid.NewGuid()) taskId review "Reviewer" 1
+            |> success |> ignore
+            ReviewWorkflow.decideBranchReview second (Guid.NewGuid()) taskId review "Reviewer" 2
+                RequestChanges |> success |> ignore
+            let before = ReviewWorkflow.getAgentInbox first "Owner" |> success
+            Assert.That(before.Agent.State, Is.EqualTo("Completed"))
+            Assert.That((ReviewWorkflow.getTask first taskId |> success |> fun (_, _, a) -> a.Value.Phase),
+                        Is.EqualTo("Finished"))
+            // No automatic reissue: the orchestrator explicitly chooses this worker.
+            ReviewWorkflow.transferAttemptOwner first (Guid.NewGuid()) taskId (Guid.NewGuid())
+                "Owner" task.Version finished.Value.Version before.Agent.Version 1
+                "Retry after final review findings" |> success |> ignore
+            let _, _, reassigned = ReviewWorkflow.getTask second taskId |> success
+            Assert.That(reassigned.Value.OwnerAgentId, Is.EqualTo("Owner"))
+            Assert.That(reassigned.Value.Phase, Is.EqualTo("Queued"))
+            Assert.That(reassigned.Value.TargetRef, Is.EqualTo(finished.Value.TargetRef))
+            let queued = ReviewWorkflow.getAgentInbox first "Owner" |> success
+            Assert.That(queued.Agent.State, Is.EqualTo("Assigned"))
+            Assert.That(queued.RunnableQueue.Length, Is.EqualTo(1))
+            let reviewed = ReviewWorkflow.getBranchReview first taskId review |> success
+            Assert.That(reviewed.Review.Status, Is.EqualTo("ChangesRequested")))
 
     [<Test>]
     member _.AttemptHasNoAssignedReviewerAndLegacyReviewerFieldIsIgnored() =
@@ -871,7 +951,7 @@ type ReviewWorkflowTests() =
             Assert.That(afterAttempt.Value.Phase, Is.EqualTo("Queued"))
             Assert.That(afterAttempt.Value.SpecBlobOid, Is.EqualTo(oldAttempt.SpecBlobOid))
             Assert.That(afterAttempt.Value.SourceRef, Is.Null)
-            Assert.That(afterAttempt.Value.BaseCommit, Is.Null)
+            Assert.That(afterAttempt.Value.BaseCommit, Is.EqualTo(oldAttempt.BaseCommit))
             Assert.That((ReviewWorkflow.getAgentInbox first "Owner" |> success).Agent.State,
                         Is.EqualTo("Completed"))
             let newOwner = ReviewWorkflow.getAgentInbox second "NewOwner" |> success
@@ -1212,7 +1292,7 @@ type ReviewWorkflowTests() =
                       OperationId = Guid.NewGuid().ToString("D")
                       TaskId = taskId; RequestId = requestId.ToString("D")
                       ActorId = "Owner"; ReviewerId = ""
-                      ExpectedVersion = 5; Generation = 1
+                      ExpectedVersion = 5; Generation = 1; Kind = "Progress"
                       SourceRef = sourceRef; HeadOid = head; Summary = "Implementation ready"
                       Verdict = ""; Feedback = ""; TestEvidence = ""; Inspected = false; Tested = false; TestDetails = ""; DocumentPath = ""; Content = ""; ExpectedBlobOid = "" }
                 match Client.V2ReviewApi.V2ReviewApi.write reviewCmd ctx with
@@ -1251,9 +1331,9 @@ type ReviewWorkflowTests() =
                 | Error error -> Assert.Fail(sprintf "Branch decision failed: %A" error)
                 let inspected = ReviewWorkflow.getBranchReview first taskId requestId |> success
                 Assert.That(inspected.Review.Status, Is.EqualTo("Accepted"))
-                Assert.That(inspected.Integrated, Is.False)
+                Assert.That(inspected.Review.Kind, Is.EqualTo("Progress"))
                 let ownerInbox = ReviewWorkflow.getBranchAgentInbox first "Owner" |> success
-                Assert.That(ownerInbox.AcceptedPendingIntegration.Length, Is.EqualTo(1))
+                Assert.That(ownerInbox.UnacknowledgedFeedback.Length, Is.EqualTo(1))
                 let after =
                     Client.V2ReviewApi.V2TaskApi.read
                         { ProjectName = "owner"; AgentId = "Owner"; Action = "AgentInbox"; TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L; Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null } ctx
@@ -1274,7 +1354,7 @@ type ReviewWorkflowTests() =
                 Assert.That(parked.Focused.IsNone, Is.True)
                 Assert.That(parked.PendingReviews.Length, Is.EqualTo(0))
                 Assert.That(after.PendingReviews.Length, Is.EqualTo(0))
-                Assert.That(after.AcceptedPendingIntegration.Length, Is.EqualTo(1))
+
                 // Additional typed V2 administrative API flow is independent
                 // of source publication and the agent's previous work.
                 let adminTask = "admin-api"
@@ -1365,7 +1445,7 @@ type ReviewWorkflowTests() =
                        | Ok value -> unbox<TaskSpecPage> value
                        | Error error -> failwithf "V2 imported page API failed: %A" error
                 Assert.That(latest.Content, Does.Contain("API imported safely"))
-                Assert.That(after.AcceptedPendingIntegration.Head.Review.ReviewId, Is.EqualTo(requestId.ToString("N")))
+
                 Assert.That((Client.V2ReviewApi.V2PendingIntentJournal.listAtRoot one |> success).Length,
                             Is.EqualTo(0), "Verified V2 mutations must clear pending local intents.")
                 // A failed write leaves a pending journal entry: retrying it from
@@ -1791,7 +1871,7 @@ type ReviewWorkflowTests() =
                 {| Action = "Submit"; TaskId = "submission"; ActorId = "Owner"
                    ExpectedVersion = 3; Generation = 1
                    RequestId = requestId.ToString("D")
-                   SourceRef = sourceRef; HeadOid = head; Summary = "Review" |}
+                   SourceRef = sourceRef; HeadOid = head; Summary = "Review"; Kind = "Progress" |}
             Client.V2ReviewApi.V2PendingIntentJournal.persist first operationId
                 "V2ReviewWrite" (System.Text.Json.JsonSerializer.Serialize original) |> success
             ReviewWorkflow.submitBranchReview first operationId "submission" "Owner"

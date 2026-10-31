@@ -83,17 +83,18 @@ Always read expected versions/generations from the latest ledger. Do not guess. 
 
 For in-progress legacy work, put the *remaining work and next action* in the new canonical spec/checkpoint. An old `done` flag is not proof of a V2 review decision or verified source integration.
 
-## 5. Ordinary review and merge workflow
+## 5. Ordinary task branch and review workflow
 
-Working branches, review branches and merges are normal Git development operations. The orphan ledger is for coordination, not for constraining Git.
+Jarvis only exposes coordination state and explicit tools. The orchestrator makes the decisions and performs normal Git operations. **Review branches are immutable inspection snapshots and are never merged; only the mutable task branch is merged into main.**
 
-1. The agent commits on its working branch and calls `SubmitReview` with the submitted commit and source ref. Jarvis publishes a dedicated stable review branch and records the Git merge-base against the target. The agent can continue on its original branch.
-2. The reviewer uses `ReviewerInbox`, `ReviewDetails`, and `ClaimReview`. Once claimed, the review ref is frozen; an unclaimed review can be replaced. The reviewer writes an optional `summary.md` and detailed individual `findings/<slug>.md` files using `ListReviewDocuments`, `ReadReviewDocument` and `PutReviewDocument`, then calls `DecideReview`.
-3. The orchestrator fetches the accepted review ref, merges it into `main` with ordinary Git, validates and pushes **without force**. A fast-forward or normal merge commit is fine; merge conflicts require the usual engineering review.
-4. **Git ancestry is the integration record.** Do not call `PlanIntegration`, `RecordIntegration` or any retired integration actions. Multiple accepted review branches can be merged independently while the task is still `InProgress`. `AcceptedPendingIntegration` in the agent inbox is computed from Git.
-5. The agent keeps working/rebasing and can submit later review slices without including already merged work. When finished, use `CompleteAgentWork` and `FinalizeReview` after the final review is accepted. Use `CloseTask` when its accepted review branch has been integrated; ordinary intermediate merges do not close the task.
+1. While Working, the agent may call `SubmitReview` with `reviewKind=Progress`. Jarvis publishes a named snapshot at the specified commit; the worker may continue modifying, rebasing or rewriting the task branch.
+2. A reviewer uses `ReviewerInbox`, `ReviewDetails`, `ClaimReview`, `ListReviewDocuments`, `ReadReviewDocument`, `PutReviewDocument` and `DecideReview`. Findings are independent Markdown documents. Accepting a Progress review is informational, not an integration decision.
+3. When implementation is done, the worker calls `CompleteAgentWork` to release its slot. The orchestrator may park the worker or assign another task. The finished task awaits a `Final` review snapshot, submitted through `SubmitReview` with `reviewKind=Final`.
+4. If the Final review requests changes, Jarvis only records the findings. The orchestrator explicitly selects/assigns a worker to continue the **same task branch**. It must not interrupt a worker already doing another task. The worker fixes the code and later requests a new Final review.
+5. If the Final review is accepted, the orchestrator inspects the task branch relative to the accepted review snapshot, merges the **task branch** into the target using normal Git, validates and pushes. `CloseTask` verifies that the task branch is now integrated. Jarvis does not initiate assignment, rework or merging.
+6. Use `TaskOverview` for a project-wide canonical list of tasks and reviews, including finished tasks without a currently focused worker. `FinalizeReview` and `AcceptedPendingIntegration` are retired. A rebase is normal Git work; changed commit SHA alone does not demand a new review if the result is equivalent.
 
-The review schema is now a single `review.json` per task-associated review, plus separate Markdown findings. The Wayfold live orphan ledger had no old review or integration records at the protocol 3.41 cutover, so no migration was required; temporary migration support was removed in protocol 3.42. See the [normative spec](specs/orchestration-v2-architecture.md).
+The review record has a `kind` (`Progress` or `Final`), source task ref, read-only review ref, fixed base, verdict and optional Markdown documents. The canonical ledger remains the authority for tasks and decisions. See the [normative spec](specs/orchestration-v2-architecture.md).
 
 ## 6. Verify the cutover
 

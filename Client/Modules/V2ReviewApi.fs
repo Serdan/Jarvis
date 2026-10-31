@@ -459,7 +459,6 @@ module V2PendingIntentJournal =
         | "V2ReviewWrite", Some "Decide" -> Some "DecideBranchReview"
         | "V2ReviewWrite", Some "Withdraw" -> Some "WithdrawBranchReview"
 
-        | "V2ReviewWrite", Some "Finalize" -> Some "FinalizeBranchReview"
         | "V2ReviewWrite", Some "AcknowledgeFeedback" -> Some "AcknowledgeBranchReview"
         | _ -> None
 
@@ -565,11 +564,11 @@ module V2PendingIntentJournal =
                 | "V2ReviewWrite", "SubmitBranchReview" ->
                     owner @ [ "RequestId", "reviewId"; "ExpectedVersion", "expectedAttemptVersion"
                               "Generation", "generation"; "SourceRef", "sourceRef"
-                              "HeadOid", "sourceHead"; "Summary", "summary" ]
+                              "HeadOid", "sourceHead"; "Summary", "summary"; "Kind", "kind" ]
                 | "V2ReviewWrite", "ReplaceBranchReview" ->
                     owner @ [ "RequestId", "reviewId"; "ExpectedVersion", "expectedVersion"
                               "Generation", "generation"; "SourceRef", "sourceRef"
-                              "HeadOid", "sourceHead"; "Summary", "summary" ]
+                              "HeadOid", "sourceHead"; "Summary", "summary"; "Kind", "kind" ]
                 | "V2ReviewWrite", "ClaimBranchReview" ->
                     common @ [ "RequestId", "reviewId"; "ActorId", "reviewerId"
                                "ExpectedVersion", "expectedVersion" ]
@@ -579,8 +578,6 @@ module V2PendingIntentJournal =
                 | "V2ReviewWrite", "WithdrawBranchReview" ->
                     common @ [ "RequestId", "reviewId"; "ActorId", "actorId"
                                "ExpectedVersion", "expectedVersion" ]
-                | "V2ReviewWrite", "FinalizeBranchReview" ->
-                    owner @ [ "RequestId", "reviewId"; "ExpectedVersion", "expectedAttemptVersion" ]
                 | _ -> []
 
             let equalField (source, dest) =
@@ -888,6 +885,9 @@ module V2ReviewApi =
         ReviewV2Binding.load cmd.ProjectName rt
         |> Result.bind (fun binding ->
             match cmd.Action with
+            | "ListProjectTasks" ->
+                ReviewWorkflow.ReviewWorkflow.listProjectTasks binding
+                |> mapError |> Result.map box
             | "GetTask" ->
                 ReviewWorkflow.ReviewWorkflow.getTaskWithSpec binding cmd.TaskId
                 |> mapError
@@ -937,9 +937,9 @@ module V2ReviewApi =
                                 |> mapError)
                         | "Submit" ->
                             id () |> Result.bind (fun reviewId ->
-                                ReviewWorkflow.ReviewWorkflow.submitBranchReview binding operationId
+                                ReviewWorkflow.ReviewWorkflow.submitBranchReviewKind binding operationId
                                     cmd.TaskId cmd.ActorId cmd.ExpectedVersion cmd.Generation reviewId
-                                    cmd.SourceRef cmd.HeadOid cmd.Summary |> mapError)
+                                    cmd.SourceRef cmd.HeadOid cmd.Summary cmd.Kind |> mapError)
                         | "Update" ->
                             id () |> Result.bind (fun reviewId ->
                                 ReviewWorkflow.ReviewWorkflow.replaceBranchReview binding operationId
@@ -963,10 +963,6 @@ module V2ReviewApi =
                             id () |> Result.bind (fun reviewId ->
                                 ReviewWorkflow.ReviewWorkflow.withdrawBranchReview binding operationId
                                     cmd.TaskId reviewId cmd.ActorId cmd.ExpectedVersion |> mapError)
-                        | "Finalize" ->
-                            id () |> Result.bind (fun reviewId ->
-                                ReviewWorkflow.ReviewWorkflow.finalizeBranchReview binding operationId
-                                    cmd.TaskId cmd.ActorId cmd.ExpectedVersion reviewId |> mapError)
                         | "AcknowledgeFeedback" ->
                             ReviewWorkflow.ReviewWorkflow.acknowledgeBranchReview binding operationId
                                 cmd.TaskId cmd.ActorId (int64 cmd.ExpectedVersion) |> mapError

@@ -5,6 +5,22 @@ open System.Threading
 open System.Threading.Tasks
 open Common
 open Client
+open Client.TerminalMouse
+open Client.TerminalLayout
+
+type private MouseTarget =
+    | SwitchActivity
+    | SwitchAgents
+    | SwitchJobs
+    | SwitchSettings
+    | SelectAgent of string
+    | SelectActivity of int
+    | SelectJob of string
+    | SelectPermission of int
+    | SelectSetting of int
+
+type private MouseHit =
+    { Rect: Rect; Target: MouseTarget }
 
 type ClientConnectionState =
     | Connecting
@@ -95,7 +111,9 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
     let mutable agentFilter = ""
     let mutable agentOriginalFilter = ""
     let mutable agentScroll = 0
-    let mutable showAgentDetails = false
+    let mutable showAgentDetails = true
+    let mouseHits = ResizeArray<MouseHit>()
+    let mutable lastMouseClick: (MouseTarget * DateTimeOffset) option = None
     let mutable agentError: string option = None
     let mutable agentRefreshing = false
     let mutable agentLastPoll = DateTimeOffset.MinValue
@@ -127,6 +145,40 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
     let mutable serverHost = "-"
     let maxHistory = 500
     let visibleActivityRows = 12
+
+    let registerMouseHit x width target =
+        if not Console.IsOutputRedirected && width > 0 then
+            try
+                let y = Console.CursorTop
+                if y >= 0 && y < Console.WindowHeight then
+                    mouseHits.Add({ Rect = { X = x; Y = y; Width = width; Height = 1 }
+                                    Target = target })
+            with _ -> ()
+
+    let agentViewportRows () =
+        if Console.IsOutputRedirected then visibleActivityRows
+        else
+            try
+                TerminalLayout.agentViewportRows Console.WindowHeight Console.WindowWidth showAgentDetails
+            with _ -> visibleActivityRows
+
+    let currentModeIs tab =
+        match tab, mode with
+        | SwitchActivity, (ActivityMode | FilterMode | CopyRecentMode | PermissionMode) -> true
+        | SwitchAgents, (AgentsMode | AgentFilterMode) -> true
+        | SwitchJobs, (JobsMode | JobDetailsMode | JobCancelMode | JobFilterMode) -> true
+        | SwitchSettings, (SettingsMode | SettingsEditMode | SettingsConfirmMode) -> true
+        | _ -> false
+
+    let writeNavigation () =
+        for label, target in
+            [ "Activity", SwitchActivity; "Agents", SwitchAgents
+              "Jobs", SwitchJobs; "Settings", SwitchSettings ] do
+            let x = Console.CursorLeft
+            let text = if currentModeIs target then $"[{label}] " else $" {label}  "
+            registerMouseHit x text.Length target
+            Console.Write text
+        Console.WriteLine()
 
     let trim value maxLength =
         if String.IsNullOrEmpty value || value.Length <= maxLength then value
@@ -568,6 +620,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                 let marker =
                     if mode = PermissionMode && index = selectedPrompt then ">"
                     else " "
+                registerMouseHit 0 width (SelectPermission index)
                 Console.Write $"{marker} #{prompt.Id} {prompt.Request.CommandName}"
                 match prompt.Request.ProjectName with
                 | Some projectName ->
@@ -725,6 +778,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                     let elapsed = JobView.duration DateTimeOffset.UtcNow job
                     let status = JobView.statusText job.Status
                     let reason = job.Reason |> Option.defaultValue (String.concat " " (job.Executable :: job.Args))
+                    registerMouseHit 0 width (SelectJob job.JobId)
                     Console.Write(marker + " ")
                     let previous = Console.ForegroundColor
                     Console.ForegroundColor <- projectColor job.ProjectName
@@ -786,10 +840,11 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         let items = agentListUnsafe()
         if items.Length > 0 then
             let bounded = max 0 (min (items.Length - 1) index)
+            let viewport = agentViewportRows()
             agentSelected <- Some items[bounded].Key
             if bounded < agentScroll then agentScroll <- bounded
-            elif bounded >= agentScroll + visibleActivityRows then
-                agentScroll <- bounded - visibleActivityRows + 1
+            elif bounded >= agentScroll + viewport then
+                agentScroll <- bounded - viewport + 1
 
     let moveAgentSelectionUnsafe delta =
         let items = agentListUnsafe()
@@ -810,17 +865,17 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         writeMnemonic 'r' "refresh"; Console.Write ", "
         writeMnemonic 'p' "permissions"; Console.Write ", "
         writeHotkeyToken "Esc"; Console.Write " activity, "
-        writeMnemonic 'q' "quit"; Console.WriteLine ""
+        writeMnemonic 'q' "quit"; Console.WriteLine "  • mouse: click/select, double-click/details, wheel/scroll"
 
     let writeColoredAgentLine width marker (row: AgentView.AgentRow) =
-        let timestamp =
-            row.StateEnteredAt
-            |> Option.map (fun updated -> updated.ToLocalTime().ToString("HH:mm:ss"))
-            |> Option.defaultValue "--:--:--"
+        let timestamp = AgentView.stateAge DateTimeOffset.UtcNow row
         let token = ActivityFilter.projectToken row.Project
         let flag = if Set.contains row.Key agentChanged then "*" else " "
-        let status = AgentView.agentSummary row |> compact
-        let rendered = trim $"{marker}{flag} {timestamp} {token} {row.Agent}: {status}" width
+        let status =
+            match row.Focus with
+            | Some task -> $"{AgentView.displayState row.State} · #{task.TaskId} {task.Title}"
+            | None -> AgentView.displayState row.State
+        let rendered = trim $"{marker}{flag} {timestamp,-4} {token} {row.Agent}: {compact status}" width
         let index = rendered.IndexOf(token, StringComparison.Ordinal)
         if index < 0 then Console.WriteLine rendered
         else
@@ -869,14 +924,15 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
             if String.IsNullOrWhiteSpace agentFilter then ""
             else $" [text=\"{trim (compact agentFilter) (max 20 (width - 22))}\"]"
         let selected = filtered |> Array.tryFindIndex (fun row -> Some row.Key = agentSelected) |> Option.defaultValue 0
-        agentScroll <- max 0 (min agentScroll (max 0 (filtered.Length - visibleActivityRows)))
+        let viewport = agentViewportRows()
+        agentScroll <- max 0 (min agentScroll (max 0 (filtered.Length - viewport)))
         if filtered.Length > 0 && selected < agentScroll then agentScroll <- selected
-        if filtered.Length > 0 && selected >= agentScroll + visibleActivityRows then
-            agentScroll <- selected - visibleActivityRows + 1
-        let last = min filtered.Length (agentScroll + visibleActivityRows)
+        if filtered.Length > 0 && selected >= agentScroll + viewport then
+            agentScroll <- selected - viewport + 1
+        let last = min filtered.Length (agentScroll + viewport)
         let historySuffix =
             if filtered.Length = 0 then $" [0 of {all.Length}]"
-            elif filtered.Length > visibleActivityRows || filtered.Length <> all.Length then
+            elif filtered.Length > viewport || filtered.Length <> all.Length then
                 $" [{agentScroll + 1}-{last} of {filtered.Length} / {all.Length} total]"
             else ""
         Console.WriteLine $"Agents{filterSuffix}{historySuffix}"
@@ -901,12 +957,39 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         elif filtered.Length = 0 then
             Console.WriteLine "No matching agents."
         else
+            let pane = TerminalLayout.agentPane width
+            let rowWidth = pane |> Option.map (fun (listWidth, _, _) -> listWidth)
+                                |> Option.defaultValue width
+            let startY = if Console.IsOutputRedirected then 0 else Console.CursorTop
             for index = agentScroll to last - 1 do
                 let row = filtered[index]
                 let marker = if mode = AgentsMode && Some row.Key = agentSelected then ">" else " "
-                writeColoredAgentLine width marker row
-
-        renderAgentDetailsUnsafe width
+                registerMouseHit 0 rowWidth (SelectAgent row.Key)
+                writeColoredAgentLine rowWidth marker row
+            if pane.IsSome && showAgentDetails && not Console.IsOutputRedirected then
+                match selectedAgentUnsafe() with
+                | None -> ()
+                | Some row ->
+                    let bottom = Console.CursorTop
+                    let _, left, paneWidth = pane.Value
+                    let lines =
+                        [ $"Agent: {row.Agent}"
+                          $"Project: {row.Project}"
+                          $"Status: {AgentView.displayState row.State} ({AgentView.stateAge DateTimeOffset.UtcNow row})"
+                          "Next: " + (row.StateReason |> Option.defaultValue "-") ]
+                        @ (match row.Focus with
+                           | None -> ["Assignment: none"]
+                           | Some task ->
+                               [ $"Task: #{task.TaskId} {task.Title}"
+                                 $"Progress: {task.Phase} · gen {task.AssignmentGeneration}"
+                                 "Branch: " + (task.SourceRef |> Option.defaultValue "-") ])
+                    for i, line in lines |> List.indexed do
+                        let y = startY + i
+                        if y < Console.WindowHeight - 1 then
+                            Console.SetCursorPosition(left, y)
+                            Console.Write(trim (compact line) paneWidth)
+                    Console.SetCursorPosition(0, max bottom (min (Console.WindowHeight - 2) (startY + lines.Length)))
+        if width < 105 then renderAgentDetailsUnsafe width
 
         agentSnapshot |> Option.iter (fun snap ->
             let errors =
@@ -1000,6 +1083,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                         | _ -> "maxImportBytes") -> " [startup override]"
                     | _ -> ""
                 let marker = if settingsSelected = index then ">" else " "
+                registerMouseHit 0 width (SelectSetting index)
                 Console.WriteLine(trim (safe $"{marker} {settingLabels[index]}: {value}{source}") width)
             match effective with
             | Some e ->
@@ -1029,6 +1113,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
     let renderUnsafe () =
         try
             Console.Clear()
+            mouseHits.Clear()
             let width = Math.Max(20, Console.WindowWidth - 1)
 
             Console.WriteLine "Jarvis Client"
@@ -1039,6 +1124,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
             Console.ForegroundColor <- previous
             Console.WriteLine $" • {serverHost}"
             Console.WriteLine $"Key: {key}"
+            writeNavigation()
             match mode with
             | ActivityMode ->
                 writeActivityHotkeys()
@@ -1095,6 +1181,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                         let marker =
                             if mode = ActivityMode && selectedActivityId = Some filtered[index].Id then ">"
                             else " "
+                        registerMouseHit 0 width (SelectActivity filtered[index].Id)
                         writeColoredProjectLine width marker filtered[index]
 
                 renderActivityDetailsUnsafe width
@@ -1130,6 +1217,64 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                     | Error error ->
                         agentError <- Some error
                     renderUnsafe()))) |> ignore
+
+    let handleMouseUnsafe mouse =
+        match mouse with
+        | Scroll(direction, _, _) ->
+            match mode with
+            | AgentsMode -> moveAgentSelectionUnsafe (direction * 3)
+            | ActivityMode -> moveActivitySelectionUnsafe (direction * 3)
+            | JobsMode -> moveJobSelectionUnsafe (direction * 3)
+            | JobDetailsMode ->
+                jobFollow <- false
+                jobOutputScroll <- max 0 (min (max 0 (jobOutputLines.Length - 1)) (jobOutputScroll - direction * 3))
+                if jobOutputScroll = 0 then jobFollow <- true
+            | PermissionMode -> selectedPrompt <- max 0 (min (prompts.Count - 1) (selectedPrompt + direction))
+            | _ -> ()
+        | Click(x, y) ->
+            // Never let a click abandon a modal edit/approval confirmation.
+            if not (List.contains mode [ SettingsEditMode; SettingsConfirmMode
+                                         JobCancelMode; CopyRecentMode
+                                         AgentFilterMode; JobFilterMode; FilterMode ]) then
+                mouseHits
+                |> Seq.tryFind (fun hit -> TerminalLayout.contains x y hit.Rect)
+                |> Option.iter (fun hit ->
+                    let now = DateTimeOffset.UtcNow
+                    let isDouble =
+                        match lastMouseClick with
+                        | Some(previous, at) when previous = hit.Target
+                                                  && now - at <= TimeSpan.FromMilliseconds(400.) -> true
+                        | _ -> false
+                    lastMouseClick <- Some(hit.Target, now)
+                    match hit.Target with
+                    | SwitchActivity -> mode <- ActivityMode
+                    | SwitchAgents ->
+                        mode <- AgentsMode
+                        normalizeAgentSelectionUnsafe()
+                        startAgentRefreshUnsafe()
+                    | SwitchJobs ->
+                        mode <- JobsMode
+                        pollJobsUnsafe()
+                    | SwitchSettings -> openSettingsUnsafe()
+                    | SelectAgent id when mode = AgentsMode ->
+                        agentSelected <- Some id
+                        if isDouble then showAgentDetails <- true
+                    | SelectActivity id when mode = ActivityMode ->
+                        selectedActivityId <- Some id
+                        if isDouble then showActivityDetails <- true
+                    | SelectJob id when mode = JobsMode ->
+                        jobSelectedId <- Some id
+                        if isDouble then openJobDetailsUnsafe()
+                    | SelectPermission i when mode = PermissionMode ->
+                        selectedPrompt <- i
+                    | SelectSetting i when mode = SettingsMode ->
+                        settingsSelected <- i
+                        if isDouble then
+                            settingsEditing <- settingsValue settingKeys[settingsSelected] settingsStaged
+                                               |> Option.defaultValue ""
+                            settingsError <- None
+                            mode <- SettingsEditMode
+                    | _ -> ())
 
     let render () = lock syncRoot renderUnsafe
 
@@ -1359,6 +1504,8 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
 
     member _.RunInputLoop(cancellationToken: CancellationToken) =
         task {
+            let decoder = Decoder()
+            use tracking = Tracking.enable()
             render()
 
             while not shouldQuit && not cancellationToken.IsCancellationRequested do
@@ -1371,338 +1518,347 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                     if (mode = AgentsMode || mode = AgentFilterMode)
                        && DateTimeOffset.UtcNow - agentLastPoll > TimeSpan.FromSeconds(45.) then
                         lock syncRoot (fun () -> startAgentRefreshUnsafe())
-                    if Console.KeyAvailable then
-                        let keyInfo = Console.ReadKey(intercept = true)
-
-                        if mode = SettingsEditMode then
+                    let now = DateTimeOffset.UtcNow
+                    let events =
+                        if Console.KeyAvailable then
+                            decoder.Feed(now, Console.ReadKey(intercept = true))
+                        else decoder.Flush(now)
+                    for input in events do
+                        match input with
+                        | Mouse mouse ->
                             lock syncRoot (fun () ->
-                                match keyInfo.Key with
-                                | ConsoleKey.Enter -> applySettingsEditUnsafe()
-                                | ConsoleKey.Escape -> mode <- SettingsMode
-                                | ConsoleKey.Backspace when settingsEditing.Length > 0 ->
-                                    settingsEditing <- settingsEditing.Substring(0, settingsEditing.Length - 1)
-                                | _ when not (Char.IsControl keyInfo.KeyChar) ->
-                                    settingsEditing <- settingsEditing + string keyInfo.KeyChar
-                                | _ -> ()
+                                handleMouseUnsafe mouse
                                 renderUnsafe())
-                        elif mode = SettingsConfirmMode then
-                            lock syncRoot (fun () ->
-                                match keyInfo.Key with
-                                | ConsoleKey.Y -> saveSettingsUnsafe(); mode <- SettingsMode
-                                | ConsoleKey.N | ConsoleKey.Escape -> mode <- SettingsMode
-                                | _ -> ()
-                                renderUnsafe())
-                        elif mode = JobFilterMode then
-                            lock syncRoot (fun () ->
-                                match keyInfo.Key with
-                                | ConsoleKey.Enter -> mode <- JobsMode
-                                | ConsoleKey.Escape ->
-                                    jobProjectFilter <- jobOriginalFilter
-                                    mode <- JobsMode
-                                | ConsoleKey.Backspace when jobProjectFilter.Length > 0 ->
-                                    jobProjectFilter <- jobProjectFilter.Substring(0, jobProjectFilter.Length - 1)
-                                | _ when not (Char.IsControl keyInfo.KeyChar) ->
-                                    jobProjectFilter <- jobProjectFilter + string keyInfo.KeyChar
-                                | _ -> ()
-                                let items = jobListUnsafe()
-                                jobSelectedId <- items |> List.tryHead |> Option.map _.JobId
-                                jobListScroll <- 0
-                                renderUnsafe())
-                        elif mode = AgentFilterMode then
-                            lock syncRoot (fun () ->
-                                match keyInfo.Key with
-                                | ConsoleKey.Enter -> mode <- AgentsMode; normalizeAgentSelectionUnsafe()
-                                | ConsoleKey.Escape ->
-                                    agentFilter <- agentOriginalFilter
-                                    mode <- AgentsMode
-                                    normalizeAgentSelectionUnsafe()
-                                | ConsoleKey.Backspace when agentFilter.Length > 0 ->
-                                    agentFilter <- agentFilter.Substring(0, agentFilter.Length - 1)
-                                    normalizeAgentSelectionUnsafe()
-                                | _ when not (Char.IsControl keyInfo.KeyChar) ->
-                                    agentFilter <- agentFilter + string keyInfo.KeyChar
-                                    normalizeAgentSelectionUnsafe()
-                                | _ -> ()
-                                renderUnsafe())
-                        elif mode = JobCancelMode then
-                            lock syncRoot (fun () ->
-                                match keyInfo.Key with
-                                | ConsoleKey.Y -> confirmJobCancellationUnsafe()
-                                | ConsoleKey.N | ConsoleKey.Escape -> mode <- jobCancelReturnMode
-                                | _ -> ()
-                                renderUnsafe())
-                        elif mode = CopyRecentMode then
-                            match keyInfo.Key with
-                            | ConsoleKey.Backspace ->
+                        | Key keyInfo ->
+                            if mode = SettingsEditMode then
                                 lock syncRoot (fun () ->
-                                    copyRecentCountEdited <- true
-                                    if copyRecentCountText.Length > 0 then
-                                        copyRecentCountText <- copyRecentCountText.Substring(0, copyRecentCountText.Length - 1)
-                                    renderUnsafe())
-                            | ConsoleKey.Enter ->
-                                let request =
-                                    lock syncRoot (fun () ->
-                                        match Int32.TryParse copyRecentCountText with
-                                        | true, requested when requested > 0 ->
-                                            let count = min maxHistory requested
-                                            let actual = recentCommandCountUnsafe count
-                                            let text =
-                                                if actual = 0 then None
-                                                else Some(recentCommandExportUnsafe count)
-                                            mode <- ActivityMode
-                                            renderUnsafe()
-                                            Some(actual, text)
-                                        | _ -> None)
-
-                                match request with
-                                | Some(0, _) ->
-                                    lock syncRoot (fun () ->
-                                        addActivityUnsafe None "No command activity to copy." None Informational |> ignore
-                                        renderUnsafe())
-                                | Some(actual, Some text) ->
-                                    let result = Clipboard.copyText text
-                                    lock syncRoot (fun () ->
-                                        let message =
-                                            match result with
-                                            | Ok provider -> $"Copied {actual} recent commands to clipboard via {provider}."
-                                            | Error error -> $"Clipboard copy failed: {error}"
-                                        addActivityUnsafe None message None Informational |> ignore
-                                        renderUnsafe())
-                                | _ -> ()
-                            | ConsoleKey.Escape ->
-                                lock syncRoot (fun () ->
-                                    mode <- ActivityMode
-                                    renderUnsafe())
-                            | _ when Char.IsDigit keyInfo.KeyChar ->
-                                lock syncRoot (fun () ->
-                                    let digit = string keyInfo.KeyChar
-                                    if not copyRecentCountEdited then
-                                        copyRecentCountText <- digit
-                                        copyRecentCountEdited <- true
-                                    elif copyRecentCountText.Length < 3 then
-                                        copyRecentCountText <- copyRecentCountText + digit
-                                    renderUnsafe())
-                            | _ -> ()
-                        elif mode = FilterMode then
-                            match keyInfo.Key with
-                            | ConsoleKey.Backspace ->
-                                lock syncRoot (fun () ->
-                                    if activityFilterText.Length > 0 then
-                                        updateFilterTextUnsafe (activityFilterText.Substring(0, activityFilterText.Length - 1))
-                                    renderUnsafe())
-                            | ConsoleKey.Enter ->
-                                lock syncRoot (fun () ->
-                                    mode <- ActivityMode
-                                    renderUnsafe())
-                            | ConsoleKey.Escape ->
-                                lock syncRoot (fun () ->
-                                    activityFilterText <- filterOriginalText
-                                    mode <- ActivityMode
-                                    resetFilteredViewUnsafe()
-                                    renderUnsafe())
-                            | _ when not (Char.IsControl keyInfo.KeyChar) ->
-                                lock syncRoot (fun () ->
-                                    updateFilterTextUnsafe (activityFilterText + string keyInfo.KeyChar)
-                                    renderUnsafe())
-                            | _ -> ()
-                        else
-                            match keyInfo.KeyChar, keyInfo.Key with
-                            | '/', _ when mode = ActivityMode ->
-                                lock syncRoot (fun () ->
-                                    beginFilterUnsafe ""
-                                    renderUnsafe())
-                            | '@', _ when mode = ActivityMode ->
-                                lock syncRoot (fun () ->
-                                    beginFilterUnsafe "@"
-                                    renderUnsafe())
-                            | _, ConsoleKey.UpArrow ->
-                                lock syncRoot (fun () ->
-                                    match mode with
-                                    | ActivityMode -> moveActivitySelectionUnsafe -1
-                                    | PermissionMode ->
-                                        selectedPrompt <- max 0 (selectedPrompt - 1)
-                                    | SettingsMode -> settingsSelected <- max 0 (settingsSelected - 1)
-                                    | AgentsMode -> moveAgentSelectionUnsafe -1
-                                    | JobsMode -> moveJobSelectionUnsafe -1
-                                    | JobDetailsMode ->
-                                        jobFollow <- false
-                                        jobOutputScroll <- min (jobOutputLines.Length - 1 |> max 0) (jobOutputScroll + 1)
+                                    match keyInfo.Key with
+                                    | ConsoleKey.Enter -> applySettingsEditUnsafe()
+                                    | ConsoleKey.Escape -> mode <- SettingsMode
+                                    | ConsoleKey.Backspace when settingsEditing.Length > 0 ->
+                                        settingsEditing <- settingsEditing.Substring(0, settingsEditing.Length - 1)
+                                    | _ when not (Char.IsControl keyInfo.KeyChar) ->
+                                        settingsEditing <- settingsEditing + string keyInfo.KeyChar
                                     | _ -> ()
                                     renderUnsafe())
-                            | _, ConsoleKey.DownArrow ->
+                            elif mode = SettingsConfirmMode then
                                 lock syncRoot (fun () ->
-                                    match mode with
-                                    | ActivityMode -> moveActivitySelectionUnsafe 1
-                                    | PermissionMode ->
-                                        selectedPrompt <- min (prompts.Count - 1) (selectedPrompt + 1)
-                                        selectedPrompt <- max 0 selectedPrompt
-                                    | SettingsMode -> settingsSelected <- min (settingKeys.Length - 1) (settingsSelected + 1)
-                                    | AgentsMode -> moveAgentSelectionUnsafe 1
-                                    | JobsMode -> moveJobSelectionUnsafe 1
-                                    | JobDetailsMode ->
-                                        jobOutputScroll <- max 0 (jobOutputScroll - 1)
-                                        if jobOutputScroll = 0 then jobFollow <- true
+                                    match keyInfo.Key with
+                                    | ConsoleKey.Y -> saveSettingsUnsafe(); mode <- SettingsMode
+                                    | ConsoleKey.N | ConsoleKey.Escape -> mode <- SettingsMode
                                     | _ -> ()
                                     renderUnsafe())
-                            | _, ConsoleKey.PageUp ->
+                            elif mode = JobFilterMode then
                                 lock syncRoot (fun () ->
-                                    match mode with
-                                    | ActivityMode -> moveActivitySelectionUnsafe -visibleActivityRows
-                                    | AgentsMode -> moveAgentSelectionUnsafe -visibleActivityRows
-                                    | JobsMode -> moveJobSelectionUnsafe -12
-                                    | JobDetailsMode ->
-                                        jobFollow <- false
-                                        jobOutputScroll <- min (jobOutputLines.Length - 1 |> max 0) (jobOutputScroll + 10)
+                                    match keyInfo.Key with
+                                    | ConsoleKey.Enter -> mode <- JobsMode
+                                    | ConsoleKey.Escape ->
+                                        jobProjectFilter <- jobOriginalFilter
+                                        mode <- JobsMode
+                                    | ConsoleKey.Backspace when jobProjectFilter.Length > 0 ->
+                                        jobProjectFilter <- jobProjectFilter.Substring(0, jobProjectFilter.Length - 1)
+                                    | _ when not (Char.IsControl keyInfo.KeyChar) ->
+                                        jobProjectFilter <- jobProjectFilter + string keyInfo.KeyChar
                                     | _ -> ()
-                                    renderUnsafe())
-                            | _, ConsoleKey.PageDown ->
-                                lock syncRoot (fun () ->
-                                    match mode with
-                                    | ActivityMode -> moveActivitySelectionUnsafe visibleActivityRows
-                                    | AgentsMode -> moveAgentSelectionUnsafe visibleActivityRows
-                                    | JobsMode -> moveJobSelectionUnsafe 12
-                                    | JobDetailsMode ->
-                                        jobOutputScroll <- max 0 (jobOutputScroll - 10)
-                                        if jobOutputScroll = 0 then jobFollow <- true
-                                    | _ -> ()
-                                    renderUnsafe())
-                            | _, ConsoleKey.End ->
-                                lock syncRoot (fun () ->
-                                    let filtered = filteredActivityUnsafe()
-                                    if mode = ActivityMode && filtered.Length > 0 then
-                                        selectActivityIndexUnsafe (filtered.Length - 1)
-                                    elif mode = AgentsMode then
-                                        selectAgentIndexUnsafe ((agentListUnsafe()).Length - 1)
-                                    renderUnsafe())
-                            | _, ConsoleKey.Enter ->
-                                lock syncRoot (fun () ->
-                                    if mode = ActivityMode && (filteredActivityUnsafe()).Length > 0 then
-                                        showActivityDetails <- not showActivityDetails
-                                    elif mode = AgentsMode && agentSelected.IsSome then showAgentDetails <- not showAgentDetails
-                                    elif mode = JobsMode then openJobDetailsUnsafe()
-                                    elif mode = SettingsMode then
-                                        settingsEditing <- settingsValue settingKeys[settingsSelected] settingsStaged
-                                                           |> Option.defaultValue ""
-                                        settingsError <- None
-                                        mode <- SettingsEditMode
-                                    renderUnsafe())
-                            | _, ConsoleKey.G when mode = ActivityMode || mode = JobsMode || mode = AgentsMode ->
-                                lock syncRoot (fun () ->
-                                    openSettingsUnsafe()
-                                    renderUnsafe())
-                            | _, ConsoleKey.U when mode = SettingsMode ->
-                                lock syncRoot (fun () ->
-                                    match ClientConfig.unsetKey settingKeys[settingsSelected] settingsStaged with
-                                    | Ok stored -> settingsStaged <- stored; settingsError <- None
-                                    | Error error -> settingsError <- Some error
-                                    renderUnsafe())
-                            | _, ConsoleKey.S when mode = SettingsMode ->
-                                lock syncRoot (fun () ->
-                                    let original = settingsSnapshot |> Option.map (fun snap -> snap.Stored.TrustLevel)
-                                    if settingsStaged.TrustLevel = Some "full" && original <> Some (Some "full") then
-                                        mode <- SettingsConfirmMode
-                                    else saveSettingsUnsafe()
-                                    renderUnsafe())
-                            | _, ConsoleKey.Escape when mode = SettingsMode ->
-                                lock syncRoot (fun () ->
-                                    mode <- settingsReturnMode
-                                    renderUnsafe())
-                            | _, ConsoleKey.A when mode = ActivityMode || mode = JobsMode ->
-                                lock syncRoot (fun () ->
-                                    mode <- AgentsMode
-                                    normalizeAgentSelectionUnsafe()
-                                    startAgentRefreshUnsafe()
-                                    renderUnsafe())
-                            | ('/', _) | (_, ConsoleKey.F) when mode = AgentsMode ->
-                                lock syncRoot (fun () ->
-                                    agentOriginalFilter <- agentFilter
-                                    mode <- AgentFilterMode
-                                    renderUnsafe())
-                            | '@', _ when mode = AgentsMode ->
-                                lock syncRoot (fun () ->
-                                    agentOriginalFilter <- agentFilter
-                                    agentFilter <- "@"
-                                    normalizeAgentSelectionUnsafe()
-                                    mode <- AgentFilterMode
-                                    renderUnsafe())
-                            | _, ConsoleKey.R when mode = AgentsMode ->
-                                lock syncRoot (fun () ->
-                                    startAgentRefreshUnsafe()
-                                    renderUnsafe())
-                            | _, ConsoleKey.Escape when mode = AgentsMode ->
-                                lock syncRoot (fun () -> mode <- ActivityMode; renderUnsafe())
-                            | _, ConsoleKey.J when mode = ActivityMode ->
-                                lock syncRoot (fun () ->
-                                    mode <- JobsMode
-                                    pollJobsUnsafe()
-                                    renderUnsafe())
-                            | _, ConsoleKey.F when mode = JobsMode ->
-                                lock syncRoot (fun () ->
-                                    jobOriginalFilter <- jobProjectFilter
-                                    mode <- JobFilterMode
-                                    renderUnsafe())
-                            | _, ConsoleKey.T when mode = JobsMode ->
-                                lock syncRoot (fun () ->
-                                    jobIncludeCompleted <- not jobIncludeCompleted
                                     let items = jobListUnsafe()
-                                    if not (items |> List.exists (fun job -> Some job.JobId = jobSelectedId)) then
-                                        jobSelectedId <- items |> List.tryHead |> Option.map _.JobId
+                                    jobSelectedId <- items |> List.tryHead |> Option.map _.JobId
+                                    jobListScroll <- 0
                                     renderUnsafe())
-                            | _, ConsoleKey.B when mode = JobDetailsMode ->
+                            elif mode = AgentFilterMode then
                                 lock syncRoot (fun () ->
-                                    jobFollow <- true
-                                    jobOutputScroll <- 0
+                                    match keyInfo.Key with
+                                    | ConsoleKey.Enter -> mode <- AgentsMode; normalizeAgentSelectionUnsafe()
+                                    | ConsoleKey.Escape ->
+                                        agentFilter <- agentOriginalFilter
+                                        mode <- AgentsMode
+                                        normalizeAgentSelectionUnsafe()
+                                    | ConsoleKey.Backspace when agentFilter.Length > 0 ->
+                                        agentFilter <- agentFilter.Substring(0, agentFilter.Length - 1)
+                                        normalizeAgentSelectionUnsafe()
+                                    | _ when not (Char.IsControl keyInfo.KeyChar) ->
+                                        agentFilter <- agentFilter + string keyInfo.KeyChar
+                                        normalizeAgentSelectionUnsafe()
+                                    | _ -> ()
                                     renderUnsafe())
-                            | _, ConsoleKey.C when mode = JobsMode || mode = JobDetailsMode ->
+                            elif mode = JobCancelMode then
                                 lock syncRoot (fun () ->
-                                    beginJobCancellationUnsafe()
+                                    match keyInfo.Key with
+                                    | ConsoleKey.Y -> confirmJobCancellationUnsafe()
+                                    | ConsoleKey.N | ConsoleKey.Escape -> mode <- jobCancelReturnMode
+                                    | _ -> ()
                                     renderUnsafe())
-                            | _, ConsoleKey.Escape when mode = JobDetailsMode ->
-                                lock syncRoot (fun () ->
-                                    mode <- JobsMode
-                                    jobDetailId <- None
-                                    renderUnsafe())
-                            | _, ConsoleKey.Escape when mode = JobsMode ->
-                                lock syncRoot (fun () ->
-                                    mode <- ActivityMode
-                                    renderUnsafe())
-                            | _, ConsoleKey.P when mode = ActivityMode || mode = AgentsMode || mode = JobsMode || mode = JobDetailsMode || mode = SettingsMode ->
-                                lock syncRoot (fun () ->
-                                    permissionReturnMode <- mode
-                                    mode <- PermissionMode
-                                    showActivityDetails <- false
-                                    renderUnsafe())
-                            | _, ConsoleKey.Escape when mode = PermissionMode ->
-                                lock syncRoot (fun () ->
-                                    mode <- permissionReturnMode
-                                    renderUnsafe())
-                            | _, ConsoleKey.A when mode = PermissionMode ->
-                                completeSelected AllowOnce
-                            | _, ConsoleKey.S when mode = PermissionMode ->
-                                completeSelected AllowExactForSession
-                            | _, ConsoleKey.S when mode = ActivityMode ->
-                                lock syncRoot (fun () ->
-                                    cycleStatusFilterUnsafe()
-                                    renderUnsafe())
-                            | _, ConsoleKey.C when mode = ActivityMode ->
-                                lock syncRoot (fun () ->
-                                    clearFiltersUnsafe()
-                                    renderUnsafe())
-                            | _, ConsoleKey.R when mode = ActivityMode ->
-                                lock syncRoot (fun () ->
-                                    copyRecentCountText <- "20"
-                                    copyRecentCountEdited <- false
-                                    mode <- CopyRecentMode
-                                    showActivityDetails <- false
-                                    renderUnsafe())
-                            | _, ConsoleKey.E when mode = PermissionMode ->
-                                completeSelected AllowExecutableForSession
-                            | _, ConsoleKey.D when mode = PermissionMode ->
-                                completeSelected Deny
-                            | _, ConsoleKey.Q -> shouldQuit <- true
-                            | _ -> ()
-                    else
-                        do! Task.Delay(50, cancellationToken)
+                            elif mode = CopyRecentMode then
+                                match keyInfo.Key with
+                                | ConsoleKey.Backspace ->
+                                    lock syncRoot (fun () ->
+                                        copyRecentCountEdited <- true
+                                        if copyRecentCountText.Length > 0 then
+                                            copyRecentCountText <- copyRecentCountText.Substring(0, copyRecentCountText.Length - 1)
+                                        renderUnsafe())
+                                | ConsoleKey.Enter ->
+                                    let request =
+                                        lock syncRoot (fun () ->
+                                            match Int32.TryParse copyRecentCountText with
+                                            | true, requested when requested > 0 ->
+                                                let count = min maxHistory requested
+                                                let actual = recentCommandCountUnsafe count
+                                                let text =
+                                                    if actual = 0 then None
+                                                    else Some(recentCommandExportUnsafe count)
+                                                mode <- ActivityMode
+                                                renderUnsafe()
+                                                Some(actual, text)
+                                            | _ -> None)
+
+                                    match request with
+                                    | Some(0, _) ->
+                                        lock syncRoot (fun () ->
+                                            addActivityUnsafe None "No command activity to copy." None Informational |> ignore
+                                            renderUnsafe())
+                                    | Some(actual, Some text) ->
+                                        let result = Clipboard.copyText text
+                                        lock syncRoot (fun () ->
+                                            let message =
+                                                match result with
+                                                | Ok provider -> $"Copied {actual} recent commands to clipboard via {provider}."
+                                                | Error error -> $"Clipboard copy failed: {error}"
+                                            addActivityUnsafe None message None Informational |> ignore
+                                            renderUnsafe())
+                                    | _ -> ()
+                                | ConsoleKey.Escape ->
+                                    lock syncRoot (fun () ->
+                                        mode <- ActivityMode
+                                        renderUnsafe())
+                                | _ when Char.IsDigit keyInfo.KeyChar ->
+                                    lock syncRoot (fun () ->
+                                        let digit = string keyInfo.KeyChar
+                                        if not copyRecentCountEdited then
+                                            copyRecentCountText <- digit
+                                            copyRecentCountEdited <- true
+                                        elif copyRecentCountText.Length < 3 then
+                                            copyRecentCountText <- copyRecentCountText + digit
+                                        renderUnsafe())
+                                | _ -> ()
+                            elif mode = FilterMode then
+                                match keyInfo.Key with
+                                | ConsoleKey.Backspace ->
+                                    lock syncRoot (fun () ->
+                                        if activityFilterText.Length > 0 then
+                                            updateFilterTextUnsafe (activityFilterText.Substring(0, activityFilterText.Length - 1))
+                                        renderUnsafe())
+                                | ConsoleKey.Enter ->
+                                    lock syncRoot (fun () ->
+                                        mode <- ActivityMode
+                                        renderUnsafe())
+                                | ConsoleKey.Escape ->
+                                    lock syncRoot (fun () ->
+                                        activityFilterText <- filterOriginalText
+                                        mode <- ActivityMode
+                                        resetFilteredViewUnsafe()
+                                        renderUnsafe())
+                                | _ when not (Char.IsControl keyInfo.KeyChar) ->
+                                    lock syncRoot (fun () ->
+                                        updateFilterTextUnsafe (activityFilterText + string keyInfo.KeyChar)
+                                        renderUnsafe())
+                                | _ -> ()
+                            else
+                                match keyInfo.KeyChar, keyInfo.Key with
+                                | '/', _ when mode = ActivityMode ->
+                                    lock syncRoot (fun () ->
+                                        beginFilterUnsafe ""
+                                        renderUnsafe())
+                                | '@', _ when mode = ActivityMode ->
+                                    lock syncRoot (fun () ->
+                                        beginFilterUnsafe "@"
+                                        renderUnsafe())
+                                | _, ConsoleKey.UpArrow ->
+                                    lock syncRoot (fun () ->
+                                        match mode with
+                                        | ActivityMode -> moveActivitySelectionUnsafe -1
+                                        | PermissionMode ->
+                                            selectedPrompt <- max 0 (selectedPrompt - 1)
+                                        | SettingsMode -> settingsSelected <- max 0 (settingsSelected - 1)
+                                        | AgentsMode -> moveAgentSelectionUnsafe -1
+                                        | JobsMode -> moveJobSelectionUnsafe -1
+                                        | JobDetailsMode ->
+                                            jobFollow <- false
+                                            jobOutputScroll <- min (jobOutputLines.Length - 1 |> max 0) (jobOutputScroll + 1)
+                                        | _ -> ()
+                                        renderUnsafe())
+                                | _, ConsoleKey.DownArrow ->
+                                    lock syncRoot (fun () ->
+                                        match mode with
+                                        | ActivityMode -> moveActivitySelectionUnsafe 1
+                                        | PermissionMode ->
+                                            selectedPrompt <- min (prompts.Count - 1) (selectedPrompt + 1)
+                                            selectedPrompt <- max 0 selectedPrompt
+                                        | SettingsMode -> settingsSelected <- min (settingKeys.Length - 1) (settingsSelected + 1)
+                                        | AgentsMode -> moveAgentSelectionUnsafe 1
+                                        | JobsMode -> moveJobSelectionUnsafe 1
+                                        | JobDetailsMode ->
+                                            jobOutputScroll <- max 0 (jobOutputScroll - 1)
+                                            if jobOutputScroll = 0 then jobFollow <- true
+                                        | _ -> ()
+                                        renderUnsafe())
+                                | _, ConsoleKey.PageUp ->
+                                    lock syncRoot (fun () ->
+                                        match mode with
+                                        | ActivityMode -> moveActivitySelectionUnsafe -visibleActivityRows
+                                        | AgentsMode -> moveAgentSelectionUnsafe -visibleActivityRows
+                                        | JobsMode -> moveJobSelectionUnsafe -12
+                                        | JobDetailsMode ->
+                                            jobFollow <- false
+                                            jobOutputScroll <- min (jobOutputLines.Length - 1 |> max 0) (jobOutputScroll + 10)
+                                        | _ -> ()
+                                        renderUnsafe())
+                                | _, ConsoleKey.PageDown ->
+                                    lock syncRoot (fun () ->
+                                        match mode with
+                                        | ActivityMode -> moveActivitySelectionUnsafe visibleActivityRows
+                                        | AgentsMode -> moveAgentSelectionUnsafe visibleActivityRows
+                                        | JobsMode -> moveJobSelectionUnsafe 12
+                                        | JobDetailsMode ->
+                                            jobOutputScroll <- max 0 (jobOutputScroll - 10)
+                                            if jobOutputScroll = 0 then jobFollow <- true
+                                        | _ -> ()
+                                        renderUnsafe())
+                                | _, ConsoleKey.End ->
+                                    lock syncRoot (fun () ->
+                                        let filtered = filteredActivityUnsafe()
+                                        if mode = ActivityMode && filtered.Length > 0 then
+                                            selectActivityIndexUnsafe (filtered.Length - 1)
+                                        elif mode = AgentsMode then
+                                            selectAgentIndexUnsafe ((agentListUnsafe()).Length - 1)
+                                        renderUnsafe())
+                                | _, ConsoleKey.Enter ->
+                                    lock syncRoot (fun () ->
+                                        if mode = ActivityMode && (filteredActivityUnsafe()).Length > 0 then
+                                            showActivityDetails <- not showActivityDetails
+                                        elif mode = AgentsMode && agentSelected.IsSome then showAgentDetails <- not showAgentDetails
+                                        elif mode = JobsMode then openJobDetailsUnsafe()
+                                        elif mode = SettingsMode then
+                                            settingsEditing <- settingsValue settingKeys[settingsSelected] settingsStaged
+                                                               |> Option.defaultValue ""
+                                            settingsError <- None
+                                            mode <- SettingsEditMode
+                                        renderUnsafe())
+                                | _, ConsoleKey.G when mode = ActivityMode || mode = JobsMode || mode = AgentsMode ->
+                                    lock syncRoot (fun () ->
+                                        openSettingsUnsafe()
+                                        renderUnsafe())
+                                | _, ConsoleKey.U when mode = SettingsMode ->
+                                    lock syncRoot (fun () ->
+                                        match ClientConfig.unsetKey settingKeys[settingsSelected] settingsStaged with
+                                        | Ok stored -> settingsStaged <- stored; settingsError <- None
+                                        | Error error -> settingsError <- Some error
+                                        renderUnsafe())
+                                | _, ConsoleKey.S when mode = SettingsMode ->
+                                    lock syncRoot (fun () ->
+                                        let original = settingsSnapshot |> Option.map (fun snap -> snap.Stored.TrustLevel)
+                                        if settingsStaged.TrustLevel = Some "full" && original <> Some (Some "full") then
+                                            mode <- SettingsConfirmMode
+                                        else saveSettingsUnsafe()
+                                        renderUnsafe())
+                                | _, ConsoleKey.Escape when mode = SettingsMode ->
+                                    lock syncRoot (fun () ->
+                                        mode <- settingsReturnMode
+                                        renderUnsafe())
+                                | _, ConsoleKey.A when mode = ActivityMode || mode = JobsMode ->
+                                    lock syncRoot (fun () ->
+                                        mode <- AgentsMode
+                                        normalizeAgentSelectionUnsafe()
+                                        startAgentRefreshUnsafe()
+                                        renderUnsafe())
+                                | ('/', _) | (_, ConsoleKey.F) when mode = AgentsMode ->
+                                    lock syncRoot (fun () ->
+                                        agentOriginalFilter <- agentFilter
+                                        mode <- AgentFilterMode
+                                        renderUnsafe())
+                                | '@', _ when mode = AgentsMode ->
+                                    lock syncRoot (fun () ->
+                                        agentOriginalFilter <- agentFilter
+                                        agentFilter <- "@"
+                                        normalizeAgentSelectionUnsafe()
+                                        mode <- AgentFilterMode
+                                        renderUnsafe())
+                                | _, ConsoleKey.R when mode = AgentsMode ->
+                                    lock syncRoot (fun () ->
+                                        startAgentRefreshUnsafe()
+                                        renderUnsafe())
+                                | _, ConsoleKey.Escape when mode = AgentsMode ->
+                                    lock syncRoot (fun () -> mode <- ActivityMode; renderUnsafe())
+                                | _, ConsoleKey.J when mode = ActivityMode ->
+                                    lock syncRoot (fun () ->
+                                        mode <- JobsMode
+                                        pollJobsUnsafe()
+                                        renderUnsafe())
+                                | _, ConsoleKey.F when mode = JobsMode ->
+                                    lock syncRoot (fun () ->
+                                        jobOriginalFilter <- jobProjectFilter
+                                        mode <- JobFilterMode
+                                        renderUnsafe())
+                                | _, ConsoleKey.T when mode = JobsMode ->
+                                    lock syncRoot (fun () ->
+                                        jobIncludeCompleted <- not jobIncludeCompleted
+                                        let items = jobListUnsafe()
+                                        if not (items |> List.exists (fun job -> Some job.JobId = jobSelectedId)) then
+                                            jobSelectedId <- items |> List.tryHead |> Option.map _.JobId
+                                        renderUnsafe())
+                                | _, ConsoleKey.B when mode = JobDetailsMode ->
+                                    lock syncRoot (fun () ->
+                                        jobFollow <- true
+                                        jobOutputScroll <- 0
+                                        renderUnsafe())
+                                | _, ConsoleKey.C when mode = JobsMode || mode = JobDetailsMode ->
+                                    lock syncRoot (fun () ->
+                                        beginJobCancellationUnsafe()
+                                        renderUnsafe())
+                                | _, ConsoleKey.Escape when mode = JobDetailsMode ->
+                                    lock syncRoot (fun () ->
+                                        mode <- JobsMode
+                                        jobDetailId <- None
+                                        renderUnsafe())
+                                | _, ConsoleKey.Escape when mode = JobsMode ->
+                                    lock syncRoot (fun () ->
+                                        mode <- ActivityMode
+                                        renderUnsafe())
+                                | _, ConsoleKey.P when mode = ActivityMode || mode = AgentsMode || mode = JobsMode || mode = JobDetailsMode || mode = SettingsMode ->
+                                    lock syncRoot (fun () ->
+                                        permissionReturnMode <- mode
+                                        mode <- PermissionMode
+                                        showActivityDetails <- false
+                                        renderUnsafe())
+                                | _, ConsoleKey.Escape when mode = PermissionMode ->
+                                    lock syncRoot (fun () ->
+                                        mode <- permissionReturnMode
+                                        renderUnsafe())
+                                | _, ConsoleKey.A when mode = PermissionMode ->
+                                    completeSelected AllowOnce
+                                | _, ConsoleKey.S when mode = PermissionMode ->
+                                    completeSelected AllowExactForSession
+                                | _, ConsoleKey.S when mode = ActivityMode ->
+                                    lock syncRoot (fun () ->
+                                        cycleStatusFilterUnsafe()
+                                        renderUnsafe())
+                                | _, ConsoleKey.C when mode = ActivityMode ->
+                                    lock syncRoot (fun () ->
+                                        clearFiltersUnsafe()
+                                        renderUnsafe())
+                                | _, ConsoleKey.R when mode = ActivityMode ->
+                                    lock syncRoot (fun () ->
+                                        copyRecentCountText <- "20"
+                                        copyRecentCountEdited <- false
+                                        mode <- CopyRecentMode
+                                        showActivityDetails <- false
+                                        renderUnsafe())
+                                | _, ConsoleKey.E when mode = PermissionMode ->
+                                    completeSelected AllowExecutableForSession
+                                | _, ConsoleKey.D when mode = PermissionMode ->
+                                    completeSelected Deny
+                                | _, ConsoleKey.Q -> shouldQuit <- true
+                                | _ -> ()
+                    if events.IsEmpty then
+                        do! Task.Delay(35, cancellationToken)
                 with
                 | :? OperationCanceledException -> ()
                 | ex ->

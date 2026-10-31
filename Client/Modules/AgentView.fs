@@ -31,9 +31,28 @@ type Snapshot =
       Issues: string list
       RefreshedAt: DateTimeOffset }
 
+let attentionRank state =
+    match state with
+    | "Ready" -> 0
+    | "NeedsWork" -> 1
+    | "Working" -> 2
+    | "Parked" -> 3
+    | _ -> 4
+
 let rows (snapshot: Snapshot) =
     snapshot.Agents
-    |> List.sortBy (fun item -> item.Project.ToLowerInvariant(), item.Agent.ToLowerInvariant())
+    |> List.sortBy (fun item ->
+        attentionRank item.State, item.Project.ToLowerInvariant(), item.Agent.ToLowerInvariant())
+
+let stateAge (now: DateTimeOffset) (agent: AgentRow) =
+    agent.StateEnteredAt
+    |> Option.map (fun entered ->
+        let elapsed = max TimeSpan.Zero (now - entered)
+        if elapsed.TotalDays >= 1.0 then sprintf "%.0fd" (floor elapsed.TotalDays)
+        elif elapsed.TotalHours >= 1.0 then sprintf "%.0fh" (floor elapsed.TotalHours)
+        elif elapsed.TotalMinutes >= 1.0 then sprintf "%.0fm" (floor elapsed.TotalMinutes)
+        else sprintf "%.0fs" (floor elapsed.TotalSeconds))
+    |> Option.defaultValue "—"
 
 let matches (filter: string) (row: AgentRow) =
     let terms = ActivityFilter.parseTerms filter

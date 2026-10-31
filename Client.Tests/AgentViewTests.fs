@@ -40,15 +40,15 @@ let canonicalReadyStateIsNotInferredFromPausedAttempt () =
     output.Head.StateEnteredAt |> shouldEqual agent.StateEnteredAt
 
 [<Test>]
-let allFiveLedgerStatesAndUnassignedAgentsAreRepresented () =
+let allFourDerivedStatesAndUnassignedAgentsAreRepresented () =
     let agents =
-        ["Ready"; "Assigned"; "Working"; "Completed"; "Parked"]
+        ["Ready"; "Working"; "NeedsWork"; "Parked"]
         |> List.mapi (fun index state ->
             record "Wayfold" ("Agent " + string index) state
-                (if state = "Parked" then None else Some focused))
+                (if state = "Parked" || state = "NeedsWork" then None else Some focused))
     let result = rows (snapshot agents)
-    result |> List.map _.State |> shouldEqual ["Ready"; "Assigned"; "Working"; "Completed"; "Parked"]
-    agentSummary result[4] |> shouldEqual "Parked"
+    result |> List.map _.State |> shouldEqual ["Ready"; "NeedsWork"; "Working"; "Parked"]
+    agentSummary result[3] |> shouldEqual "Parked"
 
 [<Test>]
 let canonicalAgentSearchUsesProjectStatusTaskAndSourceRef () =
@@ -77,4 +77,21 @@ let agentNamesAreScopedToTheirCanonicalProjects () =
     let a = record "Wayfold" "Agent 3" "Ready" None
     let b = record "Jarvis" "Agent 3" "Parked" None
     rows (snapshot [a;b]) |> List.map _.Key
-    |> shouldEqual ["Jarvis::Agent 3"; "Wayfold::Agent 3"]
+    |> shouldEqual ["Wayfold::Agent 3"; "Jarvis::Agent 3"]
+
+[<Test>]
+let agentOrderingPrioritizesActionableWorkOverAlphabeticalProjectName () =
+    let agents =
+        [ record "AAA" "Idle" "Parked" None
+          record "ZZZ" "Ready" "Ready" (Some focused)
+          record "MMM" "Working" "Working" (Some focused)
+          record "CCC" "Unassigned" "NeedsWork" None ]
+    rows (snapshot agents) |> List.map _.State
+    |> shouldEqual ["Ready"; "NeedsWork"; "Working"; "Parked"]
+
+[<Test>]
+let relativeStateAgeUsesTimestampNotLastRefreshTime () =
+    let now = DateTimeOffset(2026, 10, 31, 16, 0, 0, TimeSpan.Zero)
+    let agent = { record "Jarvis" "Agent" "Ready" None with StateEnteredAt = Some(now.AddMinutes(-14.)) }
+    stateAge now agent |> shouldEqual "14m"
+    stateAge now { agent with StateEnteredAt = None } |> shouldEqual "—"

@@ -1,6 +1,6 @@
-# Jarvis orchestration — orphan-branch cutover
+# Jarvis coordination capabilities — Git-backed ledger
 
-**Status:** Revised 2026-10-31. This is the normative orchestration specification. Existing implementation and older V2 notes are historical wherever they conflict with this corrected task/review workflow; implementation alignment is separate.
+**Status:** Revised 2026-10-31. This is the normative **Jarvis capability** specification. A particular development/review/merge workflow is defined in agent instructions, not in Jarvis. Existing implementation and older V2 notes are superseded where they impose workflow rules; implementation alignment is separate.
 **Authority:** `refs/heads/jarvis-orchestration`, an orphan branch of each project's existing Git remote.
 
 ## 1. Goal and boundary
@@ -11,9 +11,9 @@ The problem is simple: when tasks and assignment metadata live in normal source 
 
 This is a **replacement**, not an additive V1/V2 compatibility system.
 
-**The agents are trusted developers.** Jarvis helps them coordinate an ordinary team workflow; it does not govern how they use Git. Branching, committing, rebasing, reviewing, resolving conflicts and merging are normal Git operations performed by the agent or orchestrator. Jarvis records assignments, availability, checkpoints and review outcomes. Do not invent authorization rituals, source ancestry protocols or task lifecycle gates for actions a developer can already perform with Git.
+**Agents are trusted developers.** Jarvis provides useful, independent operations on tasks, agents, reviews and Git-backed records. Agents perform ordinary Git work directly. Jarvis does not decide which operations are appropriate in a development workflow, or require a task to pass through a prescribed review sequence.
 
-**Responsibility boundary:** Jarvis is a passive coordination service with explicit read/write tools, not an autonomous orchestrator. The **orchestrator agent** decides when to review, who should review, whether rework is needed, who should do it, when to assign/resume a worker, and when to merge. Jarvis only records state changes in response to explicit tool calls and exposes state for the orchestrator to interpret. No automatic worker selection, assignment, review dispatch, rework scheduling, task resumption, Git merge, or branch cleanup.
+**Responsibility boundary:** Jarvis is a passive coordination service exposing explicit operations, **not a workflow engine**. The **orchestrator and other agents**, following their own instructions, decide when to start or close a task, request or withdraw a review, interpret findings, assign work, rebase or merge. Jarvis records what agents explicitly ask it to record. It never automatically selects workers, starts work, dispatches reviews, requests rework, withdraws reviews on handoff, infers approval, merges branches or cleans up source refs. Rules such as *review before merge*, *only merge the task branch* and *request a final review* belong in agent instructions, not API preconditions.
 
 - Remove the old repository-local task and cross-worktree orchestration MCP tools from the public surface. Do not make them forward to the new system. Do not preserve fallback readers, dual writers or a per-project compatibility toggle.
 - Keep normal Git, worktree, file, job and client tools. They are not legacy orchestration tools.
@@ -28,7 +28,7 @@ For each project, use exactly one configured remote and one canonical orphan ref
 ```text
 refs/heads/main                       ordinary source code
 refs/heads/feature/...                mutable task implementation branches
-refs/heads/jarvis-review/...          read-only review snapshots, NEVER merged
+refs/heads/jarvis-review/...          review snapshot refs published by review tools
 refs/heads/jarvis-orchestration       orphan branch, task authority
 ```
 
@@ -46,7 +46,7 @@ tasks/<task-id>/reviews/...
 ops/...
 ```
 
-Exactly one current record for each task; Git history retains prior versions. Task IDs are stable within the project. Task records reference their implementation attempts and review requests. A source branch or worktree path is an implementation detail, **not the task owner's identity**. Agents and the orchestrator can move between branches/worktrees at normal handoffs without changing task ownership or restarting the assignment.
+Exactly one current record for each task; Git history retains prior versions. Task IDs are stable within the project. Task records reference implementation attempts; reviews can carry a task ID as **correlation metadata**, not as a lifecycle dependency. Review records remain independently addressable after ownership changes, completion or closure. A source branch or worktree path is context, **not the task owner's identity**.
 
 The Git remote is the sole source of truth. Local binding/configuration and caches exist only to choose and verify the remote; they are not alternative task stores. Existing explicit initialize/bind/health operations are sufficient.
 
@@ -55,7 +55,7 @@ The Git remote is the sole source of truth. Local binding/configuration and cach
 Every logical mutation:
 
 1. Fetches the current canonical ref and reads the state at that commit.
-2. Validates the affected record(s) and current owner/review state.
+2. Checks record shape, exact expected versions and the local consistency of the requested operation (for example, an atomic review claim). It does **not** impose cross-resource workflow rules.
 3. Writes one new Git commit with the fetched head as parent.
 4. Pushes without force. On a non-fast-forward rejection, refetches, rechecks the intended change and retries or returns a conflict.
 
@@ -77,13 +77,13 @@ Retain the agreed operator-facing agent states:
 | **Completed** | Agent finished its responsibility and is available | Orchestrator assigns work |
 | **Parked** | Orchestrator has no work for this agent | Nobody until reassignment |
 
-An implementation attempt records an owner, not a reviewer. `AssignTask` accepts the task ID, fresh attempt ID, owner ID and operation UUID; `TransferOwner` likewise selects only the new owner. No reviewer is assigned with the task. Any registered agent other than the owner may claim an unclaimed review; only that review's `reviewerId` identifies the claimant. Existing attempt JSON containing the historical reviewer field is readable, but new attempt writes omit it.
+An implementation attempt records its owner, not a reviewer. `AssignTask` accepts the task ID, fresh attempt ID, owner ID and operation UUID; `TransferOwner` changes that ownership only when explicitly called. No reviewer is assigned with the task. `ClaimReview` independently records a reviewer on a review request. **Review tools do not check task ownership or worker phase to decide who may request, claim, comment on or decide a review.** Agent instructions can recommend independent reviewers. Existing attempt JSON containing the historical reviewer field is readable, but new attempt writes omit it.
 
 A registered idle agent starts Parked. Each agent has at most one Working assignment. Assignment, start, checkpoint, yield, resume, completion and reassignment update the canonical orphan branch. The assignment includes the task, instructions and enough source context to continue in the correct worktree. A checkpoint carries a summary and next action so a restarted agent session can recover work.
 
 Changing task ownership or an assignment generation invalidates stale task-scoped mutations: reject writes against an outdated owner/attempt/version and explain the current assignment so the agent can stop or reassess. A changed **session ID alone** does not change task ownership, assignment generation, or whether an otherwise valid task mutation is authorized. An orchestrator explicitly decides to recover/reassign; elapsed time alone never steals ownership. Do not attempt to enforce execution discipline through generic file, job or command tools.
 
-**Worker completion and task acceptance are independent.** A worker can finish implementation, become Completed or Parked, or start another task while the original task awaits final review. Final rejection never preempts that newer assignment: Jarvis merely records the verdict and findings. The orchestrator decides whether, when and whom to assign for rework, then makes the necessary explicit calls.
+**Agent availability, task state and review state are independent.** `CompleteAgentWork` finishes that agent's attempt and frees their slot; it does **not** approve, close or otherwise change the task because of a review. `CloseTask` explicitly records a task as closed, whether or not the task has reviews. Review decisions do not reassign workers, reopen tasks or interrupt newer assignments. What counts as 'done' and whether review/merge is required are agent-instruction decisions.
 
 Task descriptions are stored directly in the orphan branch as HTML. The assigned agent can read its pinned instructions/spec. Editing source-side HTML does not silently edit the canonical task. Use existing spec operations where useful; do not require special import/export workflows to make tasks usable.
 
@@ -117,63 +117,40 @@ Git gives durable history and orders successful association changes. No separate
 
 ### Timestamped workflow events and derived agent statistics
 
-Every new immutable assignment issue/acknowledgment, checkpoint (including recovery and completion), explicit `AgentStallRecovered` event, review submission/replacement/claim/release/decision, and task lifecycle event stores an `occurredAtUtc` timestamp in its canonical Git record. Task closure records the time the task-branch merge was confirmed. These are UTC event times recorded when the Git mutation is prepared, not proof of productive computation. Existing events remain identifiable by their ledger sequence; timestamps add elapsed-time measurements.
+Every new immutable assignment issue/acknowledgment, checkpoint (including recovery and completion), explicit `AgentStallRecovered` event, review creation/replacement/claim/release/decision and task-state update records `occurredAtUtc` in its canonical Git record. Task closure records **when the explicit closure operation occurred**, not a claimed review result or Git integration time. These are UTC event times recorded when the Git mutation is prepared, not proof of productive computation. Git sequence still identifies existing events.
 
 Agent-level state changes update `stateEnteredAtUtc` only when the state actually changes. Entering Working also sets `workingTurnStartedAtUtc`; only an explicit recorded stall recovery may reset that clock without a state transition. Ordinary checkpoints, reviews and unrelated revisions must reset neither. Prior boundaries remain recoverable through Git history.
 
-Derive agent statistics on demand from timestamps and Git history: time spent in each state (including operator wait in Assigned/Ready and idle time in Parked), timed Working-segment durations and P50/P95, checkpoints per segment and time between checkpoints, tasks completed per day, review wait/decision times and acceptance rates by progress/final review type, time from final acceptance to task-branch merge, and explicit stall-recovery frequency. Group these by agent and over time as needed; no dashboard or statistics API is required for the initial cutover. **Do not persist durations, totals, averages, percentile summaries, or turn counters.** State occupancy and timed execution segments are distinct: a stalled Working interval may contain downtime whose start is unknown. Wall-clock metrics must not be presented as CPU or productive time. A changed opaque session ID is not itself evidence of a stall; count only explicit recovery events.
+Derive agent statistics on demand from timestamps and Git history: time spent in each state (including operator wait in Assigned/Ready and idle time in Parked), timed Working-segment durations and P50/P95, checkpoints per segment and time between checkpoints, tasks completed per day, review wait/decision times and verdict counts without assuming a review's purpose, explicit task close events, and explicit stall-recovery frequency. Group these by agent and over time as needed; no dashboard or statistics API is required for the initial cutover. **Do not persist durations, totals, averages, percentile summaries, or turn counters.** State occupancy and timed execution segments are distinct: a stalled Working interval may contain downtime whose start is unknown. Wall-clock metrics must not be presented as CPU or productive time. A changed opaque session ID is not itself evidence of a stall; count only explicit recovery events.
 
-## 4. Ordinary Git workflow, review snapshots and final acceptance
+## 4. Independent task, review and Git capabilities
 
-**Only task branches are merged into the integration target. Review branches are immutable, read-only checkpoints for inspection; they are NEVER merged.** Jarvis coordinates trusted developers using ordinary Git, rather than managing source history or introducing a new integration protocol.
+**Jarvis provides operations; agent instructions provide the workflow.** A review is a useful tool for examining a stable snapshot and recording feedback. It is **not** a lifecycle phase of a task. Tasks, agent slots, reviews and source branches are separate things.
 
-### Task and review lifecycle
+### Tasks and agent slots
 
-1. **Develop.** One worker owns implementation at a time and works on a normal **task branch**. The branch is mutable: workers may amend, squash, rebase, rename, or rewrite history. Jarvis records the current task-branch ref/source context when explicitly supplied, so the orchestrator can arrange a later handoff; branch identity is not agent identity.
-2. **Progress review.** At any point the worker can publish a new review branch at the task branch's current commit and record a `Progress` request with its diff base. This branch is a stable, named, read-only checkpoint. The worker may immediately continue, including rebasing or rewriting the task branch. A review branch must never be automatically updated to follow the task branch.
-3. **Progress feedback.** A reviewer claims the checkpoint, inspects it and writes `summary.md` and separate `findings/*.md`. `Accepted` means no issues in *that snapshot*, not that the task is complete. `ChangesRequested` records findings for the worker and orchestrator to read. The worker can address them **on the task branch** and optionally submit another progress review; Jarvis does not dispatch work or messages automatically. Neither progress verdict authorizes a merge.
-4. **Worker completion.** When the worker believes the task is done, they commit their work and call `CompleteAgentWork`. The worker's execution slot is released; the orchestrator can explicitly park them or assign another task. The task remains **awaiting final review** (the existing `Implemented` label can represent this stage). Completion is not approval or integration.
-5. **Final review.** Publish a distinct `Final` review branch from the completed task branch. Its scope is the **entire task change relative to the target**, not just changes since the last progress review. The original worker need not be available. Review findings remain attached to the task even if the worker changes.
-6. **Final accepted.** A `Final` verdict of `Accepted` is recorded as approval for integration. The orchestrator decides when to proceed, examines the **current task branch** against the accepted final snapshot, uses normal Git to merge the **task branch** into the target, validates and pushes, then explicitly closes the task after confirming the result. Jarvis does not initiate any of these actions. Never merge the review branch.
-7. **Final changes requested.** A `Final` verdict of `ChangesRequested` records rejection and findings; **it does not automatically reopen, reassign or resume anything**. The orchestrator decides how to proceed and explicitly assigns an available worker to continue the **same task branch** when appropriate. This may be the previous worker if available, but never steals a new assignment. Any task-state transition for rework is driven by that explicit orchestrator action. After corrections, the worker finishes again and submits a **new final review**.
-8. **Retention.** Preserve decisions and Markdown findings in the orphan ledger. Preserve the accepted final review branch through integration verification. Review branches may be cleaned up afterward; deleting a review branch must not discard an accepted decision or make a completed, merged task impossible to close.
+- `CreateTask`, `AssignTask`, `TransferOwner`, `CheckpointAttempt`, `CompleteAgentWork`, `CloseTask` and related tools change only the records explicitly named by their operations. Keep normal task/agent ownership and state consistency (e.g. do not assign a second Working slot to the same agent, or silently overwrite a stale version).
+- **`CloseTask` records an explicit close request.** It does not require the worker to be Finished, any review to exist, a particular review verdict, a particular Git branch or an integrated commit. In particular, do not fetch source branches or run Git ancestry comparisons as prerequisites to recording task closure. The caller decides whether the work is ready to close.
+- Finishing an assignment frees the agent's execution slot; it neither closes the task nor creates a mandatory review. The orchestrator may subsequently assign other work or explicitly transfer an earlier task for further work.
+- An owner transfer changes task/assignment ownership and its associated agent slot only. **It must not change, withdraw, decide or invalidate reviews.** Claim and decision records outlive the attempt or agent that initially prompted the review. The orchestrator can explicitly manage a review separately if desired.
+- A task's recorded source branch is useful handoff context, not a dependency on a particular Git history. Agents may rebase, amend, squash, switch branches or rewrite history using ordinary Git.
 
-A *review branch*, rather than a bare commit ID, keeps a reviewed snapshot reachable and discoverable after a task-branch rebase, squash or forced update. Each snapshot has a distinct ref. Even an unclaimed request is replaced by creating a **new** ref and updating its metadata; do not move historical snapshot refs. Claimed snapshots never change. The orchestrator may explicitly release or withdraw an abandoned claimed review via Jarvis tools without changing task ownership or losing findings. There is no time-based automatic theft.
+### Reviews as a standalone tool
 
-Example (ordinary Git operations, not Jarvis-controlled procedures):
+A review request captures **a named, stable Git snapshot plus optional context and Markdown findings**. It can be associated with a task for organization, but neither its creation nor its subsequent management is conditional on the task's lifecycle, owner, attempt phase, completion status or existing verdicts.
 
-```bash
-# Worker on task/320: snapshot while continuing task development
-git branch jarvis-review/320/progress-1 HEAD
-git push origin jarvis-review/320/progress-1
-# The worker may now amend, squash, or rebase task/320
-git rebase origin/main
+The review tool surface needs to support the following ordinary actions:
 
-# Worker has finished; publish a SEPARATE final snapshot
-git branch jarvis-review/320/final-1 HEAD
-git push origin jarvis-review/320/final-1
+1. **Create** a review at a supplied source commit. Publish a **new** review ref without overwriting existing refs, record the ref and available context (source ref, target ref, optional comparison base, related task ID/notes) and return the request identity. A review may be requested while an agent is working, after completion or for any other reason.
+2. **List/read** requests and their metadata independently of the currently assigned worker, including requests associated with a task whose owner changed or which has closed.
+3. **Replace** an unclaimed request's snapshot by creating another ref and changing that request's reference. Never move an existing snapshot ref through this tool; claimed requests remain stable.
+4. **Claim** a review so agents can avoid accidental duplicate reviewing, and allow the claimant to **decide** or explicitly **release** the claim for another reviewer. An explicit withdraw operation can cancel an unwanted request; neither release nor withdrawal is triggered by a task change.
+5. **Record feedback** as individually named Markdown findings plus an optional summary. List, read and update those documents independently of current task ownership. Review decisions and findings are persistent review history, not side effects that automatically modify tasks.
+6. **Read current state** with versions and useful associations so an agent can decide what to do next. Optimistic version checks protect conflicting edits to *the same record*, not the surrounding development process.
 
-# After final acceptance, orchestrator merges the TASK branch, never review refs
-git fetch origin
-git switch main
-git merge --no-ff origin/task/320
-# Validate/resolve conflicts and push the real task result
-git push origin main
-```
+There is **no Jarvis-enforced `Progress`/`Final` distinction**. A reason, purpose or free-text label may be included for the agents' convenience, but it must never select different submission permissions, verdict semantics, task transitions or closure requirements. One task may have any number of actionable reviews if agents find that useful; do not enforce one-active-review-per-task. Review tools do not forbid a task's current owner from opening, claiming or deciding a review; independent review is a convention the agents can choose to follow.
 
-Names are illustrative; Jarvis may use review UUIDs. The mutable task branch must be fetchable by whoever integrates it, and its association with the unfinished task must remain discoverable even if the former worker has another assignment. A reviewer should not assume the task branch still points to the reviewed commit.
-
-### Review scope, history rewriting and final merge
-
-A review has a fixed `baseCommit` and a read-only `reviewRef`. For a progress review, the base may be a preceding snapshot to focus on new changes, or an appropriate merge-base against the target. For a **final review**, the base must expose the *entire* not-yet-integrated task result relative to the intended target. Earlier progress reviews do not subtract portions of the task from final review, because none of them were merged.
-
-Final acceptance identifies **reviewed content**, not a permanent task-branch SHA. A rebase or squash may change commit hashes without materially changing the code. Compare using ordinary Git, e.g. tree/diff inspection between the final snapshot and the task branch. Do not require identical SHA identities or create a new Git-equivalence protocol. If the task branch has materially changed after final approval, obtain another final review before merging. If changes to the target create substantive conflict-resolution edits, review those edits appropriately. Only then push the task-branch merge. Never cherry-pick an intermediate review snapshot into the target as a shortcut.
-
-A task's `InProgress` state permits any number of decided progress reviews over its lifetime, but one *actionable* review at a time is enough. Withdrawn and superseded snapshots do not invalidate earlier findings or decisions; they must not block final acceptance. No progress review is an integration candidate.
-
-### Canonical review record and findings
-
-Keep the existing orphan-branch storage model:
+The stored review format should be kept small, reusing the existing ledger and file layout rather than introducing a new workflow database. For compatibility with the current organization, a task-correlated review can remain at:
 
 ```text
 tasks/<task-id>/reviews/<review-id>/
@@ -182,52 +159,40 @@ tasks/<task-id>/reviews/<review-id>/
   findings/<descriptive-slug>.md
 ```
 
-The authoritative `review.json` uses the existing simple identity/claim/verdict record, with a new review `kind` (Progress or Final; bump schema version as appropriate):
+That path is an **indexing choice**, not a rule that a task must be Working or Finished to create a review, or that changing the task owner affects reviews. Fields such as `taskId`, `attemptId`, `ownerAgentId` or a caller-provided purpose are informative links only. Remove mandatory `kind = Progress|Final` and its special logic; keep the core ref, optional diff base, review status/claimant, record version and document paths. Do not introduce new mandatory metadata when a simple note suffices.
 
-```json
-{
-  "schemaVersion": 3,
-  "reviewId": "<uuid-n>",
-  "taskId": "320",
-  "attemptId": "<uuid-n>",
-  "ownerAgentId": "Agent 3",
-  "kind": "Progress",
-  "taskRef": "refs/heads/task/320",
-  "reviewRef": "refs/heads/jarvis-review/320/<uuid-n>/r1",
-  "baseCommit": "<git-oid>",
-  "targetRef": "refs/heads/main",
-  "status": "Unclaimed",
-  "reviewerId": null,
-  "version": 1,
-  "createdSequence": 123,
-  "decisionSequence": 0,
-  "acknowledged": false
-}
-```
+Keep the existing bounded document operations (`PutReviewDocument`, `ListReviewDocuments`, `ReadReviewDocument`), stable operation UUIDs and expected blob OIDs for replacing files. These protect file integrity, not review policy. A decided review's documents remain readable, and authorized participants may append responses without changing the decision. The simple review verdicts `Accepted` and `ChangesRequested` are **feedback labels**; neither is authorization for a Git merge or a task-state transition.
 
-`Unclaimed -> Claimed -> Accepted | ChangesRequested` and `Unclaimed -> Withdrawn` are normal transitions. Permit explicit orchestrator release/reassignment of a stuck claim, preserving its findings. The current record contains the reviewer identity, one verdict, ordinary optimistic version and feedback acknowledgment; Git history supplies earlier versions. No independent revision/decision entities, reviewer assignment at task creation, or duplicate stored snapshot SHA are needed. `reviewRef` keeps reviewed commits reachable even if task history is rewritten.
+### Git and snapshot behavior
 
-Each review can contain any number of independent Markdown findings. `PutReviewDocument` updates one blob with a stable operation UUID and expected blob OID for replacements; `ListReviewDocuments` and `ReadReviewDocument` expose them. Paths are `summary.md` and `findings/[a-z0-9_-]+.md`, max 512 KiB per file. Implementation responses may be added after verdict. Findings are durable **task history**, not owned by the agent's current work slot. Keep review acknowledgment as a single field on the review.
+Normal Git remains available for developers and orchestrators. Jarvis may provide convenience operations to publish and inspect review refs, but does not control whether, when or how agents merge or rebase branches. An immutable review **snapshot ref published by Jarvis** means its publish/replace tools will not move an existing ref; it is not an instruction forbidding arbitrary normal Git commands.
 
-### Task completion, visibility and cleanup
+A branch ref keeps a snapshot discoverable through a task-branch history rewrite. The ref identifies the reviewed source; the base commit helps a reviewer construct a diff. The tool should reject malformed refs and report missing/unavailable source objects, but **not implement a Git-equivalence protocol**, police post-review task-branch modifications or compare review snapshots with Git merge results at task closure. Agents perform whatever comparisons their instructions and the circumstances warrant.
 
-- `CompleteAgentWork` releases the worker and records implementation completion; it does not imply acceptance. `Implemented` can denote awaiting final review/merge; `Closed` is the terminal state after final acceptance and the **task-branch** merge.
-- `DecideReview` on a final request is the final acceptance decision. The extra `FinalizeReview` step is redundant and should be **retired**, rather than imposed as a second gate. `CloseTask` checks the final accepted review, current task branch and actual pushed target outcome; review-branch ancestry is **never** the integration test. If historical `Integrated` remains readable, it must not be derived from a review branch.
-- Final `ChangesRequested` is visible to the orchestrator as a reason to consider rework; it causes no automatic assignment, reopening or resumption, and never interrupts a worker's newer task. Preserve the same task branch, review files and task history across ownership transfers. Worker replacement is not a new source project.
-- The project task listing must reveal tasks awaiting final review, with requested final changes, and accepted final reviews awaiting **task-branch merge**, independently of agent focus. Provide a small read-only canonical task/review listing API if absent. Do not retain `AcceptedPendingIntegration` as a queue of accepted progress-review refs.
-- A review branch may be deleted after its usefulness ends. Missing ref contents are an error **when a new inspection needs them**, but do not retroactively invalidate a recorded verdict or block closure when the real task branch has already been merged. Publication and ledger updates are separate; preflight and best-effort cleanup of failed review publication are sufficient. No cross-ref transaction coordinator, merge receipt or integration-plan ledger entity.
+Publishing a snapshot and recording review metadata are separate Git operations. Minimize dangling review refs using straightforward preflight checks and best-effort cleanup after a known failed write. A safe cleanup tool can be exposed for explicit use. Do not invent a distributed transaction coordinator, backup registry, proof-of-review, integration receipt or comprehensive ref-monitoring system.
+
+### Workflow instructions (outside Jarvis)
+
+A project's `AGENTS.md`, agent skills or other agent instructions define its review policy, acceptable evidence, Git merge practices and completion criteria. These are **not Jarvis configuration or data-model rules**. Jarvis does not parse them to authorize or deny task/review operations. Neither a review verdict nor Git state automatically alters task lifecycle.
 
 ## 5. Implementation alignment (31 October 2026)
 
-**This document defines the intended behavior, not the current deployed implementation.** Current code incorrectly treats accepted review branches as independently mergeable; `AcceptedPendingIntegration`, `FinalizeReview` and `CloseTask` assume review-branch ancestry. It also does not distinguish Progress/Final reviews and can obscure previous reviews after owner changes. Update client/server commands, read views, tests and Wayfold agent instructions accordingly as a **separate implementation task**. Remove the obsolete merge semantics instead of layering special cases on them.
+**This is the intended capability contract, not a claim that the code already conforms.** The implementation at `42e060d` encodes review workflow policy that must be **removed**, not strengthened:
 
-The Wayfold ledger was previously inspected at sequence 118 with no review/integration records at that point. Do not build an elaborate review migration protocol or revive retired V2 work solely for this correction. Preserve canonical orphan Git authority, unprefixed public task tools and separate Markdown findings. Updating this spec **does not** authorize a code deployment, remote ledger mutation or data migration.
+- Drop mandatory `Progress`/`Final` review kinds and phase-dependent submission rules. Treat purpose as optional context at most.
+- Remove the "one active review per task" restriction and checks tying review claimant/submitter to task-owner identity.
+- Stop automatically withdrawing reviews during ownership transfer, cancellation or other task administration. Review changes must be requested explicitly.
+- Make `CloseTask` an explicit task-state update without final-review, attempt-finished, source-ref or Git-ancestry prerequisites. Eliminate the idea of review acceptance as integration authorization.
+- Preserve simple review claim/decision/document operations; add an explicit claim-release operation if needed to hand a snapshot to a different reviewer. Keep claim/version conflict handling local to the review record.
+- Ensure task-wide reads and historical review documents stay available across handoffs; do not synthesize automatic review queues or task transitions based on verdicts.
+
+Do not add new state machines or helper services to compensate for removing these rules. Prefer deleting branches of conditional logic and reusing existing record updates. The shared orphan ledger, ordinary Git tools, agent-slot tracking, and separate Markdown findings remain. Implementation, test changes and deployment require separate instructions; editing this spec authorizes none of them.
 
 ## 6. Tool surface and cutover
 
 Expose the orphan-branch operations through **unprefixed public MCP tool names** (`CreateTask`, `AssignTask`, `AgentInbox`, `SubmitReview`, `LedgerHealth`, etc.) without `V2` compatibility aliases. The internal versioned task/ledger/review wire commands retain their `V2` names; public names are independent of the transport protocol. Where a legacy public name is reused, it exclusively invokes the orphan-ledger implementation.
 
-Provide only the queries needed to operate the workflow: current project task listing/details/spec, agent inbox/roster, and progress/final review queues and findings. Show final reviews awaiting assignment, rework or task-branch merge independently of agent focus. If a query is missing, add the **smallest** direct read for it. Use ordinary Git history/diff commands when historical investigation is needed. No portable cursor framework, historical search service, mirror/restore API, or extensive administrative API is required.
+Expose straightforward reads for tasks/details/specs, agent inbox/roster and review requests/findings, including reviews whose associated task has no current worker. Do not compute 'awaiting final review', 'needs rework' or 'pending integration' as mandatory Jarvis workflow states. If a query is missing, add the **smallest** direct read for it. Use ordinary Git history/diff commands when historical investigation is needed. No portable cursor framework, historical search service, mirror/restore API, or extensive administrative API is required.
 
 The old source-branch task command implementations — including `ListTasks`, `GetTask`, `UpdateTask`, `ClaimTask`, `CheckpointTask`, `CompleteTask`, `GetTaskHistory`, `CompareWorktreeTasks`, `GetAgentAssignment`, `AcknowledgeTask`, `GetOrchestrationSnapshot`, `RetireWorktree` and `BeginTask` — are **removed**, not wrapped or forwarded. The names `CreateTask` and `AssignTask` are deliberately reused by the new orphan-ledger implementation; they must never reach the old source-branch handlers. The earlier `*WorkTask` tools were already retired. Their names may remain as internal dead wire cases temporarily while deleting them safely; they must not be callable, advertised or used as a compatibility path.
 
@@ -253,26 +218,20 @@ Do not add security/availability machinery unrelated to the actual Git workflow.
 
 ## 8. Acceptance criteria
 
-The cutover is finished when these behaviors are verified:
+The capability cutover is complete when these independent behaviors are verified:
 
-1. The orphan ref exists independently of source branches; tasks are stored/read there and do not vary by source worktree.
-2. Two clients see the same authoritative tasks. Concurrent writes cannot silently overwrite each other.
-3. An agent can be assigned, begin, checkpoint, yield/resume and complete work; its current task survives restart/session loss.
-4. Workers can create immutable named progress snapshots, continue rebasing/squashing/amending task branches and replace unclaimed requests with new immutable refs without changing claimed snapshots.
-5. Progress review decisions deliver findings to workers and never authorize merging; subsequent progress reviews preserve earlier findings.
-6. Worker completion releases the slot while the task awaits a whole-task final review; a worker can be Parked or assigned new work without losing the old task's source context or review evidence.
-7. A failed final review records findings for the orchestrator, which can explicitly assign an available worker to rework the same task branch without preempting existing work; Jarvis performs no automatic assignment or rework scheduling. A new final review follows the fixes.
-8. The orchestrator merges **only the task branch** after accepted final review, verifies the pushed target, and closes the task. No review branch is merged. Rebases that alter hashes but not code do not automatically invalidate review; material changes require re-review.
-9. Review ref deletion cannot block closure of an accepted, merged task. Stuck review claims can be explicitly released, withdrawn requests do not block final review, and project-level listings expose work regardless of current agent focus.
-10. Test in disposable Git remotes: progress feedback, final accept/reject, reassignment, rebases, task-branch merge, review-ref cleanup and closure. Existing client/server tests pass; no automatic migration occurs and legacy task files stay untouched.
-11. Each assignment persists its current session ID and the ordered history of associated opaque IDs. A reported stalled-Working recovery records a dated event, associates the continuing session and resets the timed-segment cutoff clock without changing task ownership, assignment generation, or state-entry timestamp.
-12. Where project/session context is available, the current Working session receives its 25/30-minute guidance and an earlier associated session is told about the newer execution and advised to stop outdated work. Generic calls and orchestrator inbox reads never create session associations; projectless tools do not require a special cross-project resolver.
-13. Agent state transitions and immutable workflow events have UTC timestamps that survive cloning. Checkpoints leave both Working timers unchanged; correctly ending a Working segment requires leaving Working except for explicit stall recovery. No duration aggregates or turn counters are persisted.
+1. The canonical orphan ref stores task, agent and review records consistently across ordinary source branches, worktrees and connected clients. Conflicting updates to the **same record** cannot overwrite each other silently.
+2. Agents can explicitly create, assign, transfer, checkpoint, yield/resume, complete and **close** tasks. `CloseTask` does not consult reviews or Git source ancestry, and a review decision cannot start, stop, assign, close or reopen a task.
+3. Any usable source commit can be published as a new review snapshot regardless of the associated task's agent state. Claimed snapshots remain stable under the review tool's own operations; task branches may be freely rewritten.
+4. Agents can have multiple outstanding reviews on the same task, and reviews can remain active through task-owner changes or task closure. Handoff never automatically withdraws a review.
+5. Reviews can be listed, claimed, released, withdrawn, decided and documented with separate Markdown files. Versions protect conflicting edits to the review record; a reviewer decision changes only that review.
+6. A missing or deleted snapshot ref is reported when its contents are requested, but the canonical review verdict/findings and explicit task closure remain readable. Known failed publications receive best-effort cleanup, not a new transaction framework.
+7. Git branching, rebasing, review comparisons and merging are performed normally by agents. Jarvis does not enforce a final-review gate, a review kind, a merge target, commit-SHA equivalence or post-merge verification before task closure.
+8. Tests in disposable remotes cover independent operations, multiple reviews, owner transfer with claimed reviews, explicit closure without reviews, rewritten task branches and persisted findings. Existing client and server suites pass.
+9. Agent assignment state, session associations, explicit reported-stall recovery, timestamps and existing 25/30-minute execution guidance remain functional; none of them becomes a review or merge policy. No automatic legacy task migration occurs.
 
-14. A task mutation against a reassigned or stale owner/attempt/version fails with clear current-assignment context. Session association changes alone do not impose a blanket write fence; agents can read the current session history and decide how to resume. Completing Task A does not prevent ordinary review bookkeeping for A while the same agent works on Task B.
-
-Stop when these conditions hold. Do **not** resume the superseded V2-10–V2-16 roadmap just to satisfy the old spec.
+Stop when these conditions hold. Do not revive retired V2 roadmaps or build a generalized workflow engine to satisfy the acceptance criteria.
 
 ## 9. Design rule
 
-**Jarvis makes an ordinary team workflow easy for trusted agents.** Preserve canonical task state and useful coordination, but never block normal Git branching, rebasing, reviewing or merging merely to satisfy Jarvis-specific protocol constraints. Prefer removing restrictions over building new mechanisms around them. A new abstraction, API or validation layer must solve a concrete demonstrated problem. Git already handles source history, reviews and merges.
+**Jarvis is a toolbox, not a process manager.** Keep individual operations predictable and records durable. Enforce data integrity **within** an operation; do not infer obligations **between** tasks, reviews, agent slots and Git commits. The orchestrator/worker/reviewer instructions choose a process and call the tools. When in doubt, remove a cross-resource precondition rather than building machinery to enforce it.

@@ -71,7 +71,7 @@ type ReviewWorkflowTests() =
             let initTask taskId =
                 ReviewWorkflow.createTask first (Guid.NewGuid()) taskId taskId |> success |> ignore
                 let attemptId = Guid.NewGuid()
-                ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId attemptId "Owner" "Reviewer"
+                ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId attemptId "Owner"
                 |> success |> ignore
                 ReviewWorkflow.beginAttempt first (Guid.NewGuid()) taskId "Owner" 1 1 |> success |> ignore
                 ReviewWorkflow.bindReviewBase first (Guid.NewGuid()) taskId "Owner" 2 1 baseOid sourceRef
@@ -209,12 +209,44 @@ type ReviewWorkflowTests() =
                 Is.EquivalentTo([ $"tasks/{taskId}/reviews/{reviewId:N}/review.json" ])))
 
     [<Test>]
+    member _.AttemptHasNoAssignedReviewerAndLegacyReviewerFieldIsIgnored() =
+        withFixture (fun _ _ first second _ sourceRef newCommit initTask ->
+            let taskId = "review-free-assignment"
+            initTask taskId
+            let _, _, active = ReviewWorkflow.getTask second taskId |> success
+            let attempt = active.Value
+            let snapshot = LedgerStore.fetch first |> success
+            let path = $"tasks/{taskId}/attempts/{attempt.AttemptId}.json"
+            let stored, _ = LedgerStore.readAt first snapshot path |> success
+            let raw = stored.Value
+            use parsed = System.Text.Json.JsonDocument.Parse(raw)
+            let mutable ignored = Unchecked.defaultof<System.Text.Json.JsonElement>
+            Assert.That(parsed.RootElement.TryGetProperty("reviewerId", &ignored), Is.False)
+            // Historical attempt blobs already contain reviewerId. The new model
+            // ignores it when reading; a subsequent write drops the unused field.
+            let oldFormat = raw.Substring(0, raw.Length - 1) + ",\"reviewerId\":\"Reviewer\"}"
+            let legacy = System.Text.Json.JsonSerializer.Deserialize<ReviewAttempt>(
+                oldFormat, System.Text.Json.JsonSerializerOptions(PropertyNameCaseInsensitive = true))
+            Assert.That(legacy.AttemptId, Is.EqualTo(attempt.AttemptId))
+            Assert.That(legacy.OwnerAgentId, Is.EqualTo("Owner"))
+            ReviewWorkflow.registerAgent first (Guid.NewGuid()) "IndependentReviewer"
+            |> success |> ignore
+            let head = newCommit "Review without assignment-level reviewer" "reviewer-free"
+            let reviewId = Guid.NewGuid()
+            ReviewWorkflow.submitBranchReview first (Guid.NewGuid()) taskId "Owner" 3 1
+                reviewId sourceRef head "Independent review" |> success |> ignore
+            ReviewWorkflow.claimBranchReview second (Guid.NewGuid()) taskId reviewId
+                "IndependentReviewer" 1 |> success |> ignore
+            let claimed = ReviewWorkflow.getBranchReview first taskId reviewId |> success
+            Assert.That(claimed.Review.ReviewerId, Is.EqualTo("IndependentReviewer")))
+
+    [<Test>]
     member _.AgentStateTimestampsAndImmutableWorkflowEventsSurviveAcrossClients() =
         withFixture (fun _ _ first second _ _ _ _ ->
             let taskId = "turn-timing"
             ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Timed task"
             |> success |> ignore
-            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner" "Reviewer"
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner"
             |> success |> ignore
             let assigned = ReviewWorkflow.getAgentInbox second "Owner" |> success
             Assert.That(assigned.Agent.State, Is.EqualTo("Assigned"))
@@ -272,7 +304,7 @@ type ReviewWorkflowTests() =
             let taskId = "session-recovery"
             ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Session recovery"
             |> success |> ignore
-            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner" "Reviewer"
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner"
             |> success |> ignore
             ReviewWorkflow.beginAttemptWithSession first (Guid.NewGuid()) taskId "Owner" 1 1 "session-A"
             |> success |> ignore
@@ -360,7 +392,7 @@ type ReviewWorkflowTests() =
             let taskId = "resume-advisory"
             ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Resume advisory"
             |> success |> ignore
-            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner" "Reviewer"
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner"
             |> success |> ignore
             ReviewWorkflow.beginAttemptWithSession first (Guid.NewGuid()) taskId "Owner" 1 1 "session-A"
             |> success |> ignore
@@ -382,7 +414,7 @@ type ReviewWorkflowTests() =
             let resume (sessionId: string) expectedAgentVersion : Common.V2TaskWriteCommand =
                 { ProjectName = "owner"; Action = "ResumeAgent"
                   OperationId = Guid.NewGuid().ToString("D")
-                  TaskId = taskId; AttemptId = ""; ActorId = "Owner"; OwnerId = ""; ReviewerId = ""
+                  TaskId = taskId; AttemptId = ""; ActorId = "Owner"; OwnerId = ""
                   Title = ""; Html = ""; ExpectedVersion = 2
                   ExpectedAgentVersion = expectedAgentVersion; ExpectedTaskVersion = 0
                   AssignmentGeneration = 1; Summary = ""; NextAction = ""; Reason = ""
@@ -574,7 +606,7 @@ type ReviewWorkflowTests() =
             ReviewWorkflow.createTaskWithSpec first (Guid.NewGuid()) taskId "Initial"
                 "<h1>Old assigned contract</h1>" |> success |> ignore
             let previous = ReviewWorkflow.getTaskSpecPage second taskId "" 1024 |> success
-            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner" "Reviewer"
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner"
             |> success |> ignore
             ReviewWorkflow.reviseTaskSpecPinned first (Guid.NewGuid()) taskId 2 previous.SpecBlobOid
                 "Updated" "<h1>New canonical contract</h1>" |> success |> ignore
@@ -686,7 +718,7 @@ type ReviewWorkflowTests() =
                 let taskId = "state-" + phase.ToLowerInvariant()
                 ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Lifecycle states" |> success |> ignore
                 ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid())
-                    "Owner" "Reviewer" |> success |> ignore
+                    "Owner" |> success |> ignore
                 if phase = "Acknowledged" then
                     ReviewWorkflow.acknowledgeAssignment first (Guid.NewGuid()) taskId "Owner" 1 1
                     |> success |> ignore
@@ -733,7 +765,7 @@ type ReviewWorkflowTests() =
             ReviewWorkflow.reopenTask first (Guid.NewGuid()) taskId cancelled.Version "Scope revived"
             |> success |> ignore
             ReviewWorkflow.assignTask second (Guid.NewGuid()) taskId (Guid.NewGuid())
-                "Owner" "Reviewer" |> success |> ignore
+                "Owner" |> success |> ignore
             let _, assigned, option = ReviewWorkflow.getTask first taskId |> success
             let agent = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
             ReviewWorkflow.changeAttemptAdministration first (Guid.NewGuid()) taskId "AbandonAttempt"
@@ -828,7 +860,7 @@ type ReviewWorkflowTests() =
             let transferId = Guid.NewGuid()
             let transfer () =
                 ReviewWorkflow.transferAttemptOwner first transferId "admin-transfer"
-                    transferredAttemptId "NewOwner" "Reviewer" task.Version oldAttempt.Version
+                    transferredAttemptId "NewOwner" task.Version oldAttempt.Version
                     previousOwner.Version oldAttempt.AssignmentGeneration "Team ownership changed"
             Assert.That((transfer () |> success).AlreadyApplied, Is.False)
             Assert.That((transfer () |> success).AlreadyApplied, Is.True)
@@ -853,7 +885,7 @@ type ReviewWorkflowTests() =
             Assert.That(history.Head.PreviousOwnerId, Is.EqualTo("Owner"))
             Assert.That(history.Head.NewOwnerId, Is.EqualTo("NewOwner"))
             expectStale (ReviewWorkflow.transferAttemptOwner second (Guid.NewGuid()) "admin-transfer"
-                             (Guid.NewGuid()) "Owner" "Reviewer" task.Version oldAttempt.Version
+                             (Guid.NewGuid()) "Owner" task.Version oldAttempt.Version
                              previousOwner.Version 1 "Stale transfer")
             expectStale (ReviewWorkflow.beginAttempt first (Guid.NewGuid()) "admin-transfer"
                              "Owner" oldAttempt.Version 1))
@@ -881,7 +913,7 @@ type ReviewWorkflowTests() =
             let taskId = "admin-doc"
             ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Non-source task"
             |> success |> ignore
-            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner" "Reviewer"
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner"
             |> success |> ignore
             ReviewWorkflow.beginAttempt first (Guid.NewGuid()) taskId "Owner" 1 1
             |> success |> ignore
@@ -920,7 +952,7 @@ type ReviewWorkflowTests() =
             Assert.That(reopened.Lifecycle, Is.EqualTo("Open"))
             Assert.That(archived.IsNone, Is.True)
             ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid())
-                "Owner" "Reviewer" |> success |> ignore
+                "Owner" |> success |> ignore
             let _, taskAgain, newAttempt = ReviewWorkflow.getTask second taskId |> success
             Assert.That(taskAgain.Lifecycle, Is.EqualTo("InProgress"))
             Assert.That(newAttempt.Value.AttemptId, Is.Not.EqualTo(finished.AttemptId)))
@@ -935,7 +967,7 @@ type ReviewWorkflowTests() =
             git one [ "worktree"; "add"; "--detach"; path; baseOid ] |> ignore
             let detached = { first with RepositoryPath = path }
             ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Detached source" |> success |> ignore
-            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner" "Reviewer" |> success |> ignore
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner" |> success |> ignore
             ReviewWorkflow.beginAttempt first (Guid.NewGuid()) taskId "Owner" 1 1 |> success |> ignore
             match ReviewWorkflow.bindAttemptSource detached (Guid.NewGuid()) taskId "Owner" 2 1
                     refName baseOid targetRef false false with
@@ -968,7 +1000,7 @@ type ReviewWorkflowTests() =
             git one [ "worktree"; "add"; path; "feature/source-962" ] |> ignore
             let selected = { first with RepositoryPath = path }
             ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Dirty source" |> success |> ignore
-            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner" "Reviewer" |> success |> ignore
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner" |> success |> ignore
             ReviewWorkflow.beginAttempt first (Guid.NewGuid()) taskId "Owner" 1 1 |> success |> ignore
             File.WriteAllText(Path.Combine(path, "source.txt"), "uncommitted edit")
             match ReviewWorkflow.bindAttemptSource selected (Guid.NewGuid()) taskId "Owner" 2 1
@@ -1027,7 +1059,7 @@ type ReviewWorkflowTests() =
                 ReviewWorkflow.reviseTaskSpec second (Guid.NewGuid()) taskId 1
                     "Stale" "<h1>Stale</h1>")
             ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid())
-                "Owner" "Reviewer" |> success |> ignore
+                "Owner" |> success |> ignore
             let _, _, assigned = ReviewWorkflow.getTask second taskId |> success
             Assert.That(assigned.Value.SpecBlobOid, Is.EqualTo(oidTwo))
             expectStale (
@@ -1063,7 +1095,6 @@ type ReviewWorkflowTests() =
                       AttemptId = ""
                       ActorId = "Owner"
                       OwnerId = ""
-                      ReviewerId = ""
                       Title = ""
                       Html = ""
                       ExpectedVersion = 0
@@ -1104,7 +1135,7 @@ type ReviewWorkflowTests() =
                 let attemptId = Guid.NewGuid()
                 run { template "AssignTask" taskId with
                           AttemptId = attemptId.ToString("D")
-                          OwnerId = "Owner"; ReviewerId = "Reviewer" } |> ignore
+                          OwnerId = "Owner" } |> ignore
                 let queued =
                     Client.V2ReviewApi.V2TaskApi.read
                         { ProjectName = "owner"; AgentId = "Owner"; Action = "AgentInbox"; TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L; Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null } ctx
@@ -1364,7 +1395,7 @@ type ReviewWorkflowTests() =
             ReviewWorkflow.createTask first (Guid.NewGuid()) "park1" "Park test"
             |> success |> ignore
             ReviewWorkflow.assignTask first (Guid.NewGuid()) "park1" (Guid.NewGuid())
-                "Owner" "Reviewer" |> success |> ignore
+                "Owner" |> success |> ignore
             match ReviewWorkflow.parkAgent first (Guid.NewGuid()) "Owner" 3 "Interrupt" with
             | Error(StaleEntityVersion _) -> ()
             | other -> Assert.Fail(sprintf "Parking assigned work should be rejected: %A" other)
@@ -1801,7 +1832,7 @@ type ReviewWorkflowTests() =
             let assignmentId = Guid.NewGuid()
             let attemptId = Guid.NewGuid()
             let assigned = ReviewWorkflow.assignTask first assignmentId taskId
-                               attemptId "Owner" "Reviewer" |> success
+                               attemptId "Owner" |> success
             use assignmentResult =
                 System.Text.Json.JsonDocument.Parse(assigned.Operation.OriginalResultJson)
             let effects = assignmentResult.RootElement.GetProperty("entityResults").EnumerateArray() |> Seq.toList
@@ -2085,7 +2116,7 @@ type ReviewWorkflowTests() =
                 "Acknowledged task" html |> success |> ignore
             let attemptId = Guid.NewGuid()
             let assigned = ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId
-                               attemptId "Owner" "Reviewer" |> success
+                               attemptId "Owner" |> success
             let _, _, attempt, issued, prior =
                 ReviewWorkflow.getAssignment second taskId 1 |> success
             Assert.That(issued.Generation, Is.EqualTo(1))
@@ -2129,7 +2160,7 @@ type ReviewWorkflowTests() =
             ReviewWorkflow.createTaskWithSpec first (Guid.NewGuid()) taskId
                 "Recovery" "<h1>Spec frozen</h1>" |> success |> ignore
             let attemptId = Guid.NewGuid()
-            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId attemptId "Owner" "Reviewer"
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId attemptId "Owner"
             |> success |> ignore
             let _, _, _, issue1, _ = ReviewWorkflow.getAssignment second taskId 1 |> success
             ReviewWorkflow.acknowledgeAssignment first (Guid.NewGuid()) taskId "Owner" 1 1
@@ -2182,7 +2213,7 @@ type ReviewWorkflowTests() =
             ReviewWorkflow.createTaskWithSpec first (Guid.NewGuid()) taskId
                 "Task with updated requirements" initialHtml |> success |> ignore
             let attemptId = Guid.NewGuid()
-            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId attemptId "Owner" "Reviewer"
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId attemptId "Owner"
             |> success |> ignore
             let _, _, _, firstIssue, _ =
                 ReviewWorkflow.getAssignment second taskId 1 |> success
@@ -2241,7 +2272,7 @@ type ReviewWorkflowTests() =
             ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Atomic startup"
             |> success |> ignore
             ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid())
-                "Owner" "Reviewer" |> success |> ignore
+                "Owner" |> success |> ignore
             let before = (LedgerStore.fetch first |> success).Commit
             let beginId = Guid.NewGuid()
             let started =
@@ -2277,11 +2308,11 @@ type ReviewWorkflowTests() =
             let a = System.Threading.Tasks.Task.Run(fun () ->
                 go.Wait()
                 ReviewWorkflow.assignTask first firstId "parallelA" (Guid.NewGuid())
-                    "Owner" "Reviewer")
+                    "Owner")
             let b = System.Threading.Tasks.Task.Run(fun () ->
                 go.Wait()
                 ReviewWorkflow.assignTask second secondId "parallelB" (Guid.NewGuid())
-                    "Owner2" "Reviewer")
+                    "Owner2")
             go.Set()
             let firstResult = a.Result |> success
             let secondResult = b.Result |> success

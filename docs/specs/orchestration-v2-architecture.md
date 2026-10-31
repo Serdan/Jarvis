@@ -76,6 +76,8 @@ Retain the agreed operator-facing agent states:
 | **Completed** | Agent finished its responsibility and is available | Orchestrator assigns work |
 | **Parked** | Orchestrator has no work for this agent | Nobody until reassignment |
 
+An implementation attempt records an owner, not a reviewer. `AssignTask` accepts the task ID, fresh attempt ID, owner ID and operation UUID; `TransferOwner` likewise selects only the new owner. No reviewer is assigned with the task. Any registered agent other than the owner may claim an unclaimed review; only that review's `reviewerId` identifies the claimant. Existing attempt JSON containing the historical reviewer field is readable, but new attempt writes omit it.
+
 A registered idle agent starts Parked. Each agent has at most one Working assignment. Assignment, start, checkpoint, yield, resume, completion and reassignment update the canonical orphan branch. The assignment includes the task, instructions and enough source context to continue in the correct worktree. A checkpoint carries a summary and next action so a restarted agent session can recover work.
 
 Changing task ownership or an assignment generation invalidates stale task-scoped mutations: reject writes against an outdated owner/attempt/version and explain the current assignment so the agent can stop or reassess. A changed **session ID alone** does not change task ownership, assignment generation, or whether an otherwise valid task mutation is authorized. An orchestrator explicitly decides to recover/reassign; elapsed time alone never steals ownership. Do not attempt to enforce execution discipline through generic file, job or command tools.

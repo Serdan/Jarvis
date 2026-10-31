@@ -72,7 +72,6 @@ module private V2TaskCommands =
           AttemptId = ""
           ActorId = actorId
           OwnerId = ""
-          ReviewerId = ""
           Title = ""
           Html = ""
           ExpectedVersion = 0
@@ -1100,10 +1099,10 @@ type JarvisMcpTools =
         let cmd = V2TaskCommands.write projectName "RegisterAgent" operationId "" agentId
         McpToolHelpers.send client http (V2TaskWriteCommand cmd)
 
-    [<McpServerTool(Title = "assign task", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Create the sole implementation attempt for an Open task and bind its owner and preferred reviewer. Requires an existing bound orphan Git ledger.")>]
-    static member AssignTask(projectName: string, taskId: string, attemptId: string, ownerId: string, reviewerId: string, operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    [<McpServerTool(Title = "assign task", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Assign a registered implementation owner to an Open task. A reviewer is selected later by claiming an individual review.")>]
+    static member AssignTask(projectName: string, taskId: string, attemptId: string, ownerId: string, operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         let cmd = V2TaskCommands.write projectName "AssignTask" operationId taskId "Orchestrator"
-        McpToolHelpers.send client http (V2TaskWriteCommand { cmd with AttemptId = attemptId; OwnerId = ownerId; ReviewerId = reviewerId })
+        McpToolHelpers.send client http (V2TaskWriteCommand { cmd with AttemptId = attemptId; OwnerId = ownerId })
 
     [<McpServerTool(Title = "get assignment generation", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read an immutable assignment generation with the pinned spec OID, instructions, source baseline and optional acknowledgment receipt. Older generations remain readable after reissue or recovery.")>]
     static member GetAssignment(projectName: string, taskId: string, assignmentGeneration: int, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
@@ -1259,10 +1258,10 @@ type JarvisMcpTools =
         McpToolHelpers.send client http (V2TaskWriteCommand { cmd with ExpectedTaskVersion = expectedTaskVersion; Reason = reason })
 
     [<McpServerTool(Title = "transfer attempt owner", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Transfer ownership of an attempt to another registered agent, withdrawing active unclaimed or claimed reviews while preserving accepted review history.")>]
-    static member TransferOwner(projectName: string, taskId: string, newAttemptId: string, newOwnerId: string, reviewerId: string, expectedTaskVersion: int, expectedAttemptVersion: int, expectedAgentVersion: int, assignmentGeneration: int, reason: string, operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member TransferOwner(projectName: string, taskId: string, newAttemptId: string, newOwnerId: string, expectedTaskVersion: int, expectedAttemptVersion: int, expectedAgentVersion: int, assignmentGeneration: int, reason: string, operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         let cmd = V2TaskCommands.write projectName "TransferOwner" operationId taskId "Orchestrator"
         McpToolHelpers.send client http (V2TaskWriteCommand
-            { cmd with AttemptId = newAttemptId; OwnerId = newOwnerId; ReviewerId = reviewerId
+            { cmd with AttemptId = newAttemptId; OwnerId = newOwnerId
                        ExpectedTaskVersion = expectedTaskVersion; ExpectedVersion = expectedAttemptVersion
                        ExpectedAgentVersion = expectedAgentVersion; AssignmentGeneration = assignmentGeneration
                        Reason = reason })

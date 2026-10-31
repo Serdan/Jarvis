@@ -500,7 +500,7 @@ module V2PendingIntentJournal =
                                 "BaseOid", "expectedCurrentSpecOid"; "Summary", "instructions" ]
                 | "V2TaskWrite", "RegisterAgent" -> [ "ActorId", "agentId" ]
                 | "V2TaskWrite", "AssignTask" ->
-                    common @ [ "AttemptId", "attemptId"; "OwnerId", "ownerId"; "ReviewerId", "reviewerId" ]
+                    common @ [ "AttemptId", "attemptId"; "OwnerId", "ownerId" ]
                 | "V2TaskWrite", "AcknowledgeAssignment" ->
                     owner @ [ "ExpectedVersion", "expectedVersion"; "AssignmentGeneration", "generation" ]
                 | "V2TaskWrite", "ReissueAssignment" ->
@@ -547,8 +547,7 @@ module V2PendingIntentJournal =
                     common @ [ "ExpectedTaskVersion", "expectedTaskVersion"; "Reason", "reason" ]
                 | "V2TaskWrite", "TransferOwner" ->
                     attempt @ [ "ExpectedTaskVersion", "expectedTaskVersion";
-                                "AttemptId", "newAttemptId"; "OwnerId", "newOwner";
-                                "ReviewerId", "reviewer"; "Reason", "reason" ]
+                                "AttemptId", "newAttemptId"; "OwnerId", "newOwner"; "Reason", "reason" ]
                 | "V2TaskWrite", "CloseBranchTask" ->
                     common @ [ "ExpectedTaskVersion", "expectedTaskVersion" ]
                 | "V2TaskWrite", "CloseNonSourceTask" ->
@@ -1081,7 +1080,7 @@ module V2TaskApi =
                                     guid "attemptId" cmd.AttemptId
                                     |> Result.bind (fun attemptId ->
                                         ReviewWorkflow.ReviewWorkflow.assignTask binding operationId cmd.TaskId
-                                            attemptId cmd.OwnerId cmd.ReviewerId
+                                            attemptId cmd.OwnerId
                                         |> mapError)
                                 | "ReissueAssignment" ->
                                     ReviewWorkflow.ReviewWorkflow.reissueAssignment binding operationId
@@ -1144,7 +1143,7 @@ module V2TaskApi =
                                     guid "newAttemptId" cmd.AttemptId
                                     |> Result.bind (fun newId ->
                                         ReviewWorkflow.ReviewWorkflow.transferAttemptOwner binding operationId
-                                            cmd.TaskId newId cmd.OwnerId cmd.ReviewerId
+                                            cmd.TaskId newId cmd.OwnerId
                                             cmd.ExpectedTaskVersion cmd.ExpectedVersion cmd.ExpectedAgentVersion
                                             cmd.AssignmentGeneration cmd.Reason |> mapError)
                                 | "CloseNonSourceTask" ->

@@ -95,7 +95,6 @@ type ReviewAttempt =
       AttemptId: string
       Version: int
       OwnerAgentId: string
-      ReviewerId: string
       Phase: string
       AssignmentGeneration: int
       Priority: int
@@ -787,20 +786,19 @@ module ReviewWorkflow =
                         return [ change (agentPath agentId) None agent ]
                     })
 
-    let assignTask binding operationId taskId attemptId ownerId reviewerId =
+    let assignTask binding operationId taskId attemptId ownerId =
         if not (validTaskId taskId) || attemptId = Guid.Empty
-           || not (validAgent ownerId) || not (validAgent reviewerId) || ownerId = reviewerId then
+           || not (validAgent ownerId) then
             Error(InvalidBinding "Invalid task assignment.")
         else
             let attemptIdText = attemptId.ToString("N")
             LedgerStore.transact binding
                 (intent operationId "Orchestrator" "AssignTask"
-                    {| taskId = taskId; attemptId = attemptId; ownerId = ownerId; reviewerId = reviewerId |})
+                    {| taskId = taskId; attemptId = attemptId; ownerId = ownerId |})
                 (fun snapshot ->
                     result {
                         let! task, taskOid = required<ReviewTask> binding snapshot (taskPath taskId)
                         let! agent, agentOid = required<ReviewAgent> binding snapshot (agentPath ownerId)
-                        let! _ = required<ReviewAgent> binding snapshot (agentPath reviewerId)
                         let! specContent, specOid = LedgerStore.readAt binding snapshot (specPath taskId)
                         if specContent.IsNone || specOid.IsNone then
                             return! Error(LedgerIntegrityError "Canonical task spec is missing.")
@@ -811,7 +809,7 @@ module ReviewWorkflow =
                             return! Error(AgentBusy "Agent must be Parked or Completed before receiving an assignment.")
                         let attempt =
                             { TaskId = taskId; AttemptId = attemptIdText; Version = 1
-                              OwnerAgentId = ownerId; ReviewerId = reviewerId; Phase = "Queued"
+                              OwnerAgentId = ownerId; Phase = "Queued"
                               AssignmentGeneration = 1; Priority = 0
                               IssuedSequence = snapshot.Header.NextSequence
                               SpecBlobOid = specOid.Value
@@ -1741,20 +1739,20 @@ module ReviewWorkflow =
                                      "CancelTask" reason "Cancelled" null null null "None" null) ]
                 })
 
-    let transferAttemptOwner binding operationId taskId newAttemptId newOwner reviewer
+    let transferAttemptOwner binding operationId taskId newAttemptId newOwner
                              expectedTaskVersion expectedAttemptVersion expectedAgentVersion
                              generation reason =
         if not (validTaskId taskId) || newAttemptId = Guid.Empty
-           || not (validAgent newOwner) || not (validAgent reviewer) || newOwner = reviewer
+           || not (validAgent newOwner)
            || expectedTaskVersion < 1 || expectedAttemptVersion < 1 || expectedAgentVersion < 1
            || generation < 1 || not (validText 2048 reason) then
-            Error(InvalidBinding "Owner transfer requires distinct registered owner/reviewer, new attempt and exact versions.")
+            Error(InvalidBinding "Owner transfer requires a registered new owner, new attempt and exact versions.")
         else
             let newId = newAttemptId.ToString("N")
             LedgerStore.transact binding
                 (intent operationId "Orchestrator" "TransferOwner"
                     {| taskId = taskId; newAttemptId = newAttemptId; newOwner = newOwner
-                       reviewer = reviewer; expectedTaskVersion = expectedTaskVersion
+                       expectedTaskVersion = expectedTaskVersion
                        expectedAttemptVersion = expectedAttemptVersion; expectedAgentVersion = expectedAgentVersion
                        generation = generation; reason = reason |})
                 (fun snapshot -> result {
@@ -1772,7 +1770,6 @@ module ReviewWorkflow =
                     if successor.IsSome then
                         return! Error(StaleEntityVersion "Transfer attempt ID is not unique.")
                     let! nextOwnerAgent, nextOwnerOid = required<ReviewAgent> binding snapshot (agentPath newOwner)
-                    let! _ = required<ReviewAgent> binding snapshot (agentPath reviewer)
                     if not (List.contains nextOwnerAgent.State [ "Completed"; "Parked" ])
                        || not (String.IsNullOrWhiteSpace nextOwnerAgent.ActiveAttemptId) then
                         return! Error(AgentBusy "New owner is not idle.")
@@ -1782,7 +1779,7 @@ module ReviewWorkflow =
                         settleAdministrativeReview binding snapshot taskId attempt reason operationId
                     let next =
                         { attempt with AttemptId = newId; Version = 1
-                                       OwnerAgentId = newOwner; ReviewerId = reviewer; Phase = "Queued"
+                                       OwnerAgentId = newOwner; Phase = "Queued"
                                        AssignmentGeneration = 1; IssuedSequence = snapshot.Header.NextSequence
                                        BaseCommit = null; TargetRef = null; SourceRepositoryId = null
                                        SourceRemote = null; SourcePushRemote = null; SourceRef = null

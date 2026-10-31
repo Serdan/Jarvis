@@ -480,6 +480,17 @@ let ``public orchestration tool metadata describes canonical branch reviews with
     Assert.That(reviewDescription "FinalizeReview", Does.Contain("Git ancestry"))
 
 [<Test>]
+let ``task assignment and owner transfer do not accept reviewer IDs`` () =
+    for methodName in [ "AssignTask"; "TransferOwner" ] do
+        let methodInfo = typeof<JarvisMcpTools>.GetMethod(methodName)
+        Assert.That(methodInfo, Is.Not.Null, methodName)
+        let parameterNames = methodInfo.GetParameters() |> Array.map _.Name
+        Assert.That(parameterNames, Does.Contain("operationId"), methodName)
+        Assert.That(parameterNames, Does.Not.Contain("reviewerId"), methodName)
+    let claim = typeof<JarvisMcpTools>.GetMethod("ClaimReview")
+    Assert.That(claim.GetParameters() |> Array.map _.Name, Does.Contain("reviewerId"))
+
+[<Test>]
 let ``client-backed MCP tools expose an optional per-command deviceId`` () =
     let methods = typeof<JarvisMcpTools>.GetMethods()
     let clientMethods =

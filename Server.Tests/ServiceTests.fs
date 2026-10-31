@@ -449,6 +449,37 @@ let ``command catalog matches AgentCommand union and MCP tools`` () =
 
 
 [<Test>]
+let ``public orchestration tool metadata describes canonical branch reviews without V2 terminology`` () =
+    let reviewMethods =
+        set [ "ReviewTask"; "ReviewDetails"; "ReviewerInbox"; "SubmitReview"
+              "ReplaceReview"; "ClaimReview"; "DecideReview"; "WithdrawReview"
+              "FinalizeReview"; "ListReviewDocuments"; "ReadReviewDocument"
+              "PutReviewDocument" ]
+    for methodInfo in typeof<JarvisMcpTools>.GetMethods() do
+        let toolAttributes =
+            methodInfo.GetCustomAttributes(typeof<McpServerToolAttribute>, false)
+        if toolAttributes.Length = 1 then
+            let tool = toolAttributes[0] :?> McpServerToolAttribute
+            let descriptions =
+                methodInfo.GetCustomAttributes(typeof<System.ComponentModel.DescriptionAttribute>, false)
+            Assert.That(descriptions.Length, Is.EqualTo(1), methodInfo.Name)
+            let description =
+                (descriptions[0] :?> System.ComponentModel.DescriptionAttribute).Description
+            Assert.That(tool.Title, Does.Not.Contain("V2"), methodInfo.Name)
+            Assert.That(description, Does.Not.Contain("V2"), methodInfo.Name)
+            if reviewMethods.Contains methodInfo.Name then
+                Assert.That(description, Does.Not.Contain("review revision"), methodInfo.Name)
+                Assert.That(description, Does.Not.Contain("client opt-in"), methodInfo.Name)
+    let reviewDescription methodName =
+        let methodInfo = typeof<JarvisMcpTools>.GetMethod(methodName)
+        (methodInfo.GetCustomAttributes(typeof<System.ComponentModel.DescriptionAttribute>, false)[0]
+         :?> System.ComponentModel.DescriptionAttribute).Description
+    Assert.That(reviewDescription "ReviewDetails", Does.Contain("Git-derived integration"))
+    Assert.That(reviewDescription "ClaimReview", Does.Contain("Git branch"))
+    Assert.That(reviewDescription "DecideReview", Does.Contain("Markdown"))
+    Assert.That(reviewDescription "FinalizeReview", Does.Contain("Git ancestry"))
+
+[<Test>]
 let ``client-backed MCP tools expose an optional per-command deviceId`` () =
     let methods = typeof<JarvisMcpTools>.GetMethods()
     let clientMethods =

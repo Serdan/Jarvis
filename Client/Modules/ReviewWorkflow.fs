@@ -183,6 +183,29 @@ type ReviewRevision =
       EvidenceStatus: string }
 
 [<CLIMutable>]
+type BranchReview =
+    { ReviewId: string
+      TaskId: string
+      AttemptId: string
+      OwnerAgentId: string
+      ReviewRef: string
+      BaseCommit: string
+      TargetRef: string
+      Status: string
+      ReviewerId: string
+      Version: int
+      CreatedSequence: int64
+      DecisionSequence: int64
+      Acknowledged: bool }
+
+[<CLIMutable>]
+type BranchReviewInspection =
+    { SnapshotCommit: string
+      Review: BranchReview
+      HeadCommit: string
+      Integrated: bool }
+
+[<CLIMutable>]
 type ReviewDocumentInfo =
     { Path: string
       BlobOid: string
@@ -288,37 +311,6 @@ type ReviewDecisionEvidence =
       SourceRemote: string }
 
 [<CLIMutable>]
-type ReviewIntegration =
-    { ActionId: string
-      TaskId: string
-      AttemptId: string
-      Version: int
-      Status: string
-      ReviewRequestId: string
-      ReviewRevision: int
-      BaseCommit: string
-      ApprovedHead: string
-      ReviewRef: string
-      TargetRef: string
-      ExpectedTargetHead: string
-      SourceRepositoryId: string
-      SourceRemote: string
-      SourcePushRemote: string
-      PlannedSequence: int64
-      PlannedAtUtc: string
-      ObservedTargetHead: string
-      VerifiedSequence: int64
-      VerifiedAtUtc: string
-      VerificationMethod: string }
-
-[<CLIMutable>]
-type IntegrationInspection =
-    { LedgerCommit: string
-      Integration: ReviewIntegration
-      ObservedTargetHead: string
-      RemoteState: string }
-
-[<CLIMutable>]
 type ReviewFeedbackNotice =
     { TaskId: string
       AttemptId: string
@@ -353,8 +345,7 @@ type InboxTask =
 type PendingIntegration =
     { Task: ReviewTask
       Attempt: ReviewAttempt
-      Review: ReviewRequest
-      Integration: ReviewIntegration option }
+      Review: ReviewRequest }
 
 [<CLIMutable>]
 type AgentInbox =
@@ -442,8 +433,8 @@ module ReviewWorkflow =
                     | "ReviewAgent" -> status "state" [ "Ready"; "Assigned"; "Working"; "Completed"; "Parked" ]
                     | "ReviewAttempt" -> status "phase" [ "Queued"; "Acknowledged"; "Working"; "Paused"; "Finished"; "Parked"; "Blocked";
                           "Accepted"; "Superseded"; "Abandoned" ]
+                    | "BranchReview" -> status "status" [ "Unclaimed"; "Claimed"; "Accepted"; "ChangesRequested"; "Withdrawn" ]
                     | "ReviewRequest" -> status "status" [ "Unclaimed"; "Claimed"; "Accepted"; "ChangesRequested"; "Withdrawn" ]
-                    | "ReviewIntegration" -> status "status" [ "PendingSourceAction"; "PendingPush"; "Recorded" ]
                     | "ReviewFeedbackNotice" -> status "status" [ "Accepted"; "ChangesRequested" ]
                     | "AgentCheckpoint" -> status "kind" [ "Yield"; "Completion"; "Recovery"; "Progress"; "Submission"; "Revision" ]
                     | "ReviewRevision" -> status "evidenceStatus" [ "NotProvided"; "OwnerReported"; "ReviewerVerified" ]
@@ -478,6 +469,7 @@ module ReviewWorkflow =
     let private receiptPath taskId attemptId generation =
         $"tasks/{taskId}/attempts/{attemptId}/assignments/{generation}.ack.json"
     let private requestPath taskId requestId = $"tasks/{taskId}/reviews/{requestId}/request.json"
+    let private branchReviewPath taskId reviewId = $"tasks/{taskId}/reviews/{reviewId}/review.json"
     let private reviewDocumentPath taskId requestId documentPath =
         $"tasks/{taskId}/reviews/{requestId}/{documentPath}"
     let private validReviewDocumentPath (documentPath: string) =
@@ -604,20 +596,6 @@ module ReviewWorkflow =
             match value with
             | Some record -> return record
             | None -> return! Error(StaleEntityVersion $"Missing ledger entity: {path}")
-        }
-
-    // Integrations are keyed by review/action, not by an attempt's latest pointer.
-    // Read them from the canonical ledger when coordinating multiple review slices.
-    let private integrationsForTask binding snapshot taskId =
-        result {
-            let! paths = LedgerStore.listAt binding snapshot "tasks"
-            let mutable actions = []
-            for path in paths do
-                if path.StartsWith($"tasks/{taskId}/integrations/", StringComparison.Ordinal)
-                   && path.EndsWith(".json", StringComparison.Ordinal) then
-                    let! action, _ = required<ReviewIntegration> binding snapshot path
-                    actions <- action :: actions
-            return actions
         }
 
     let private getAttempt binding snapshot taskId =
@@ -1303,16 +1281,33 @@ module ReviewWorkflow =
                            || agent.Version <> expectedAgentVersion
                            || agent.FocusAttemptId <> attempt.AttemptId || not validPhase then
                             return! Error(StaleEntityVersion "Only the current Working or Ready agent can complete this assignment.")
-                        let! lastReview =
-                            if String.IsNullOrWhiteSpace attempt.LatestReviewRequestId then Ok None
+                        let! paths = LedgerStore.listAt binding snapshot "tasks"
+                        let mutable branchReviews = []
+                        for path in paths do
+                            if path.StartsWith($"tasks/{taskId}/reviews/", StringComparison.Ordinal)
+                               && path.EndsWith("/review.json", StringComparison.Ordinal) then
+                                let! review, _ = required<BranchReview> binding snapshot path
+                                if review.AttemptId = attempt.AttemptId then
+                                    branchReviews <- review :: branchReviews
+                        let latest = branchReviews |> List.sortBy (fun review ->
+                            review.CreatedSequence, review.ReviewId) |> List.tryLast
+                        let! legacy =
+                            if latest.IsSome || String.IsNullOrWhiteSpace attempt.LatestReviewRequestId
+                            then Ok None
                             else read<ReviewRequest> binding snapshot
                                      (requestPath taskId attempt.LatestReviewRequestId)
                         let requeue =
-                            match lastReview with
-                            | Some(review, _) ->
+                            match latest with
+                            | Some review ->
                                 review.Status = "ChangesRequested"
-                                && String.IsNullOrWhiteSpace attempt.ActiveReviewRequestId
-                            | None -> false
+                                && not (branchReviews |> List.exists (fun item ->
+                                    List.contains item.Status [ "Unclaimed"; "Claimed" ]))
+                            | None ->
+                                match legacy with
+                                | Some(review, _) ->
+                                    review.Status = "ChangesRequested"
+                                    && String.IsNullOrWhiteSpace attempt.ActiveReviewRequestId
+                                | None -> false
                         let checkpoint =
                             { TaskId = taskId; AttemptId = attempt.AttemptId
                               OwnerAgentId = ownerId; AssignmentGeneration = generation
@@ -2225,14 +2220,9 @@ module ReviewWorkflow =
                            || revision.SourcePushRemote <> sourceIdentity.PushUrl then
                             return! Error(SourceUnavailable "Review source identity does not match the attempt.")
                         do! LedgerStore.fetchReviewRef binding revision.ReviewRef revision.HeadCommit
-                        // Completion is independent of intermediate integrations.
-                        let! integrations = integrationsForTask binding snapshot taskId
-                        let integratedReview =
-                            integrations |> List.exists (fun action ->
-                                action.Status = "Recorded"
-                                && action.AttemptId = attempt.AttemptId
-                                && action.ReviewRequestId = id
-                                && action.ReviewRevision = request.CurrentRevision)
+                        // Git is the source of truth for the merged review.
+                        let! targetHead = LedgerStore.readRemoteTarget binding revision.TargetRef
+                        let! integratedReview = LedgerStore.sourceContainsCommit binding revision.HeadCommit targetHead
                         // Finalization is task bookkeeping, not an agent-state change.
                         return
                             [ change (taskPath taskId) (Some taskOid)
@@ -2245,209 +2235,6 @@ module ReviewWorkflow =
 
     // Integrate reviewed slices with ordinary Git. Each accepted review can be
     // merged independently while the implementing agent continues the task.
-    let planIntegration binding operationId taskId actionId requestId expectedAttemptVersion
-                        targetRef expectedTargetHead =
-        if not (validTaskId taskId) || actionId = Guid.Empty || requestId = Guid.Empty
-           || expectedAttemptVersion < 1
-           || not (validBranch targetRef)
-           || targetRef = "refs/heads/jarvis-orchestration"
-           || targetRef.StartsWith("refs/heads/jarvis-review/", StringComparison.Ordinal) then
-            Error(InvalidBinding "Invalid integration plan identifiers or source target.")
-        else
-            let actionText = actionId.ToString("N")
-            let reviewText = requestId.ToString("N")
-            LedgerStore.transact binding
-                (intent operationId "Orchestrator" "PlanIntegration"
-                    {| taskId = taskId; actionId = actionId; requestId = requestId
-                       expectedAttemptVersion = expectedAttemptVersion
-                       targetRef = targetRef; expectedTargetHead = expectedTargetHead |})
-                (fun snapshot ->
-                    result {
-                        let! task, _, attempt, attemptOid = getAttempt binding snapshot taskId
-                        let! request, _ =
-                            required<ReviewRequest> binding snapshot (requestPath taskId reviewText)
-                        if not (List.contains task.Lifecycle [ "InProgress"; "Implemented" ])
-                           || attempt.Version <> expectedAttemptVersion
-                           || request.Status <> "Accepted"
-                           || request.AttemptId <> attempt.AttemptId
-                           || targetRef <> attempt.TargetRef then
-                            return! Error(StaleEntityVersion "Review must be accepted before integration.")
-                        let! revision, _ =
-                            required<ReviewRevision> binding snapshot
-                                (revisionPath taskId reviewText request.CurrentRevision)
-                        if revision.TargetRef <> targetRef
-                           || revision.RequestId <> reviewText
-                           || revision.Revision <> request.CurrentRevision then
-                            return! Error(LedgerIntegrityError "Integration candidate differs from the accepted review.")
-                        let! existing = read<ReviewIntegration> binding snapshot (integrationPath taskId actionText)
-                        if existing.IsSome then
-                            return! Error(StaleEntityVersion "Integration action ID is already used.")
-                        // Different accepted reviews have independent integration
-                        // records. Only a duplicate plan for this review is invalid.
-                        let! integrations = integrationsForTask binding snapshot taskId
-                        if integrations |> List.exists (fun prior ->
-                            prior.AttemptId = attempt.AttemptId && prior.ReviewRequestId = reviewText) then
-                            return! Error(StaleEntityVersion "This review already has an integration.")
-                        let! sourceIdentity = verifySourceRepository binding attempt
-                        if revision.SourceRepositoryId <> sourceIdentity.RepositoryId
-                           || revision.SourceRemote <> sourceIdentity.FetchUrl
-                           || revision.SourcePushRemote <> sourceIdentity.PushUrl then
-                            return! Error(SourceUnavailable "Review source identity does not match the attempt.")
-                        do! LedgerStore.fetchReviewRef binding revision.ReviewRef revision.HeadCommit
-                        do! LedgerStore.verifyReviewDiff binding revision.BaseCommit revision.HeadCommit
-                        let! observed = LedgerStore.readRemoteTarget binding targetRef
-                        if observed <> expectedTargetHead then
-                            return! Error(StaleEntityVersion "Remote target changed before integration planning.")
-                        let plan =
-                            { ActionId = actionText; TaskId = taskId; AttemptId = attempt.AttemptId
-                              Version = 1; Status = "PendingSourceAction"
-                              ReviewRequestId = reviewText; ReviewRevision = request.CurrentRevision
-                              BaseCommit = revision.BaseCommit; ApprovedHead = revision.HeadCommit
-                              ReviewRef = revision.ReviewRef; TargetRef = targetRef
-                              ExpectedTargetHead = observed
-                              SourceRepositoryId = revision.SourceRepositoryId
-                              SourceRemote = revision.SourceRemote
-                              SourcePushRemote = revision.SourcePushRemote
-                              PlannedSequence = snapshot.Header.NextSequence
-                              PlannedAtUtc = DateTimeOffset.UtcNow.ToString("O")
-                              ObservedTargetHead = null; VerifiedSequence = 0L
-                              VerifiedAtUtc = null; VerificationMethod = null }
-                        return
-                            [ change (integrationPath taskId actionText) None plan
-                              change (attemptPath taskId attempt.AttemptId) (Some attemptOid)
-                                { attempt with Version = attempt.Version + 1; IntegrationActionId = actionText } ]
-                    })
-
-    let markIntegrationPendingPush binding operationId taskId actionId expectedVersion =
-        if not (validTaskId taskId) || actionId = Guid.Empty || expectedVersion < 1 then
-            Error(InvalidBinding "Invalid integration pending-push transition.")
-        else
-            let id = actionId.ToString("N")
-            LedgerStore.transact binding
-                (intent operationId "Orchestrator" "MarkIntegrationPendingPush"
-                    {| taskId = taskId; actionId = actionId; expectedVersion = expectedVersion |})
-                (fun snapshot ->
-                    result {
-                        let! task, _, attempt, _ = getAttempt binding snapshot taskId
-                        let! action, actionOid =
-                            required<ReviewIntegration> binding snapshot (integrationPath taskId id)
-                        if not (List.contains task.Lifecycle [ "InProgress"; "Implemented" ])
-                           || action.AttemptId <> attempt.AttemptId
-                           || action.Status <> "PendingSourceAction" || action.Version <> expectedVersion then
-                            return! Error(StaleEntityVersion "Integration is not awaiting an explicit source push.")
-                        return
-                            [ change (integrationPath taskId id) (Some actionOid)
-                                { action with Version = action.Version + 1; Status = "PendingPush" } ]
-                    })
-
-    let inspectIntegration binding taskId actionId =
-        if not (validTaskId taskId) || actionId = Guid.Empty then
-            Error(InvalidBinding "Invalid integration inspection identifier.")
-        else
-            result {
-                let! snapshot = LedgerStore.fetch binding
-                let! action, _ =
-                    required<ReviewIntegration> binding snapshot
-                        (integrationPath taskId (actionId.ToString("N")))
-                let! actual = LedgerStore.readRemoteTarget binding action.TargetRef
-                let! containsReviewed = LedgerStore.sourceContainsCommit binding action.ApprovedHead actual
-                let! containsOriginal = LedgerStore.sourceContainsCommit binding action.ExpectedTargetHead actual
-                let state =
-                    if action.Status = "Recorded" then
-                        if containsReviewed then "Recorded" else "RecordedTargetMoved"
-                    elif containsReviewed && containsOriginal then "ReadyToRecord"
-                    elif actual = action.ExpectedTargetHead then "PendingPush"
-                    else "TargetChanged"
-                return
-                    { LedgerCommit = snapshot.Commit
-                      Integration = action; ObservedTargetHead = actual
-                      RemoteState = state }
-            }
-
-    let recordIntegration binding operationId taskId actionId expectedVersion =
-        if not (validTaskId taskId) || actionId = Guid.Empty || expectedVersion < 1 then
-            Error(InvalidBinding "Invalid integration recording request.")
-        else
-            let id = actionId.ToString("N")
-            LedgerStore.transact binding
-                (intent operationId "Orchestrator" "RecordIntegration"
-                    {| taskId = taskId; actionId = actionId; expectedVersion = expectedVersion |})
-                (fun snapshot ->
-                    result {
-                        let! task, taskOid, attempt, _ = getAttempt binding snapshot taskId
-                        let! action, actionOid =
-                            required<ReviewIntegration> binding snapshot (integrationPath taskId id)
-                        if not (List.contains task.Lifecycle [ "InProgress"; "Implemented" ])
-                           || action.Version <> expectedVersion
-                           || not (List.contains action.Status [ "PendingSourceAction"; "PendingPush" ])
-                           || action.SourceRemote <> binding.ApprovedFetchUrl
-                           || action.SourcePushRemote <> binding.ApprovedPushUrl
-                           || action.SourceRepositoryId <> attempt.SourceRepositoryId
-                           || action.TaskId <> taskId || action.AttemptId <> attempt.AttemptId
-                           || action.TargetRef <> attempt.TargetRef then
-                            return! Error(StaleEntityVersion "Integration plan is no longer current.")
-                        let! revision, _ =
-                            required<ReviewRevision> binding snapshot
-                                (revisionPath taskId action.ReviewRequestId action.ReviewRevision)
-                        if revision.HeadCommit <> action.ApprovedHead
-                           || revision.BaseCommit <> action.BaseCommit
-                           || revision.ReviewRef <> action.ReviewRef
-                           || revision.TargetRef <> action.TargetRef then
-                            return! Error(LedgerIntegrityError "Accepted revision evidence differs from integration plan.")
-                        let! _ = verifySourceRepository binding attempt
-                        if revision.SourceRepositoryId <> action.SourceRepositoryId
-                           || revision.SourcePushRemote <> action.SourcePushRemote
-                           || revision.SourceRemote <> action.SourceRemote then
-                            return! Error(SourceUnavailable "Integration source differs from accepted revision.")
-                        do! LedgerStore.fetchReviewRef binding action.ReviewRef action.ApprovedHead
-                        do! LedgerStore.verifyReviewDiff binding action.BaseCommit action.ApprovedHead
-                        let! observed = LedgerStore.readRemoteTarget binding action.TargetRef
-                        let! includesReviewed = LedgerStore.sourceContainsCommit binding action.ApprovedHead observed
-                        let! includesPrevious = LedgerStore.sourceContainsCommit binding action.ExpectedTargetHead observed
-                        if not includesReviewed || not includesPrevious then
-                            return! Error(StaleEntityVersion
-                                "Remote target does not contain the accepted review and previous target.")
-                        let integrated =
-                            { action with Version = action.Version + 1; Status = "Recorded"
-                                          ObservedTargetHead = observed
-                                          VerifiedSequence = snapshot.Header.NextSequence
-                                          VerifiedAtUtc = DateTimeOffset.UtcNow.ToString("O")
-                                          VerificationMethod = "RemoteMergeContainsReviewedCommit" }
-                        let taskChanges =
-                            if task.Lifecycle = "Implemented"
-                               && action.ReviewRequestId = attempt.AcceptedReviewRequestId
-                               && action.ReviewRevision = attempt.AcceptedReviewRevision then
-                                [ change (taskPath taskId) (Some taskOid)
-                                    { task with Version = task.Version + 1; Lifecycle = "Integrated" } ]
-                            else []
-                        return change (integrationPath taskId id) (Some actionOid) integrated :: taskChanges
-                    })
-
-    let closeIntegratedTask binding operationId taskId actionId expectedTaskVersion =
-        if not (validTaskId taskId) || actionId = Guid.Empty || expectedTaskVersion < 1 then
-            Error(InvalidBinding "Invalid task closure request.")
-        else
-            let id = actionId.ToString("N")
-            LedgerStore.transact binding
-                (intent operationId "Orchestrator" "CloseIntegratedTask"
-                    {| taskId = taskId; actionId = actionId; expectedTaskVersion = expectedTaskVersion |})
-                (fun snapshot ->
-                    result {
-                        let! task, taskOid, attempt, _ = getAttempt binding snapshot taskId
-                        let! action, _ =
-                            required<ReviewIntegration> binding snapshot (integrationPath taskId id)
-                        if task.Version <> expectedTaskVersion || task.Lifecycle <> "Integrated"
-                           || action.AttemptId <> attempt.AttemptId
-                           || action.ReviewRequestId <> attempt.AcceptedReviewRequestId
-                           || action.ReviewRevision <> attempt.AcceptedReviewRevision
-                           || action.Status <> "Recorded"
-                           || String.IsNullOrWhiteSpace action.ObservedTargetHead then
-                            return! Error(StaleEntityVersion "Task does not have a verified recorded integration.")
-                        return
-                            [ change (taskPath taskId) (Some taskOid)
-                                { task with Version = task.Version + 1; Lifecycle = "Closed" } ]
-                    })
-
     let acknowledgeReviewFeedback binding operationId taskId ownerId decisionSequence =
         if not (validTaskId taskId) || not (validAgent ownerId) || decisionSequence <= 0L then
             Error(InvalidBinding "Invalid review feedback acknowledgment.")
@@ -2688,26 +2475,24 @@ module ReviewWorkflow =
     // commit as any administrative cancellation/abandonment/transfer. Keep
     // immutable revision and claim histories, including evidence for reviewer
     // withdrawal without inventing an acceptance or test result.
+    // Administrative handoffs withdraw the active canonical review in the
+    // same ledger commit. Accepted historical reviews remain untouched.
     let private settleAdministrativeReview binding snapshot taskId (attempt: ReviewAttempt) reason operationId =
         result {
-            if String.IsNullOrWhiteSpace attempt.ActiveReviewRequestId then
-                return [], null, "None"
-            else
-                let reviewId = attempt.ActiveReviewRequestId
-                let! review, reviewOid = required<ReviewRequest> binding snapshot (requestPath taskId reviewId)
-                if review.AttemptId <> attempt.AttemptId
-                   || review.OwnerAgentId <> attempt.OwnerAgentId
-                   || not (List.contains review.Status [ "Unclaimed"; "Claimed" ]) then
-                    return! Error(LedgerIntegrityError "Active review does not match the task attempt.")
-                let! revision, _ = required<ReviewRevision> binding snapshot
-                                        (revisionPath taskId reviewId review.CurrentRevision)
-                let closed = { review with Version = review.Version + 1; Status = "Withdrawn";
-                                          DecisionSequence = snapshot.Header.NextSequence; Feedback = reason }
-                let audit = claimEvent taskId review revision snapshot.Header.NextSequence
-                                operationId "Withdraw" "Orchestrator" review.ClaimantId null reason
-                return [ change (requestPath taskId reviewId) (Some reviewOid) closed
-                         change (reviewEventPath taskId reviewId snapshot.Header.NextSequence) None audit ],
-                       reviewId, "Withdrawn"
+            let! paths = LedgerStore.listAt binding snapshot "tasks"
+            let mutable changes = []
+            let mutable withdrawn = []
+            for path in paths do
+                if path.StartsWith($"tasks/{taskId}/reviews/", StringComparison.Ordinal)
+                   && path.EndsWith("/review.json", StringComparison.Ordinal) then
+                    let! review, oid = required<BranchReview> binding snapshot path
+                    if review.AttemptId = attempt.AttemptId
+                       && List.contains review.Status [ "Unclaimed"; "Claimed" ] then
+                        changes <- change path (Some oid)
+                            { review with Version = review.Version + 1; Status = "Withdrawn" } :: changes
+                        withdrawn <- review.ReviewId :: withdrawn
+            return changes, (withdrawn |> List.tryHead |> Option.defaultValue null),
+                   (if List.isEmpty withdrawn then "None" else "Withdrawn")
         }
 
     // Only clear a focus that still belongs to this attempt. Never interrupt
@@ -2863,23 +2648,8 @@ module ReviewWorkflow =
                        || not (Set.contains attempt.Phase (Set.ofList
                               [ "Queued"; "Acknowledged"; "Working"; "Paused"; "Parked"; "Blocked"; "Finished" ])) then
                         return! Error(StaleEntityVersion "Owner transfer requires the current revocable attempt and versions.")
-                    // Previously merged slices are part of ordinary task history,
-                    // not a reason to prevent another developer taking ownership.
-                    // Only accepted reviews still awaiting integration need resolving.
-                    let! integrations = integrationsForTask binding snapshot taskId
-                    let! paths = LedgerStore.listAt binding snapshot "tasks"
-                    let mutable outstanding = integrations |> List.exists (fun item ->
-                        item.AttemptId = attempt.AttemptId && item.Status <> "Recorded")
-                    for path in paths do
-                        if path.StartsWith($"tasks/{taskId}/reviews/", StringComparison.Ordinal)
-                           && path.EndsWith("/request.json", StringComparison.Ordinal) then
-                            let! request, _ = required<ReviewRequest> binding snapshot path
-                            if request.AttemptId = attempt.AttemptId && request.Status = "Accepted"
-                               && not (integrations |> List.exists (fun item ->
-                                   item.ReviewRequestId = request.RequestId && item.Status = "Recorded")) then
-                                outstanding <- true
-                    if outstanding then
-                        return! Error(ReviewVersionConflict "Integrate accepted reviews before transferring ownership.")
+                    // Reviews belong to the task and do not block an owner handoff.
+                    // The new owner can inspect outstanding accepted branches in Git.
                     let! successor = read<ReviewAttempt> binding snapshot (attemptPath taskId newId)
                     if successor.IsSome then
                         return! Error(StaleEntityVersion "Transfer attempt ID is not unique.")
@@ -3065,13 +2835,26 @@ module ReviewWorkflow =
     // Markdown files are regular orphan-ledger Git blobs. The review itself
     // identifies the source snapshot, while these files contain arbitrarily
     // detailed reviewer findings and implementation responses.
+    // During the explicit cutover, read legacy review identities only for
+    // documents created before the canonical branch-review schema.
+    let private requireDocumentReview binding snapshot taskId id =
+        result {
+            let! current = read<BranchReview> binding snapshot (branchReviewPath taskId id)
+            match current with
+            | Some(review, _) ->
+                return review.Status, review.OwnerAgentId, review.ReviewerId, review.ReviewerId
+            | None ->
+                let! legacy, _ = required<ReviewRequest> binding snapshot (requestPath taskId id)
+                return legacy.Status, legacy.OwnerAgentId, legacy.ClaimantId, legacy.ReviewerId
+        }
+
     let listReviewDocuments binding taskId requestId =
         if not (validTaskId taskId) || requestId = Guid.Empty then
             Error(InvalidBinding "Invalid review document lookup.")
         else result {
             let! snapshot = LedgerStore.fetch binding
             let id = requestId.ToString("N")
-            let! _ = required<ReviewRequest> binding snapshot (requestPath taskId id)
+            let! _ = requireDocumentReview binding snapshot taskId id
             let! paths = LedgerStore.listAt binding snapshot "tasks"
             let prefix = $"tasks/{taskId}/reviews/{id}/"
             let mutable documents = []
@@ -3095,7 +2878,7 @@ module ReviewWorkflow =
         else result {
             let! snapshot = LedgerStore.fetch binding
             let id = requestId.ToString("N")
-            let! _ = required<ReviewRequest> binding snapshot (requestPath taskId id)
+            let! _ = requireDocumentReview binding snapshot taskId id
             let! content, oid =
                 LedgerStore.readAt binding snapshot (reviewDocumentPath taskId id documentPath)
             match content, oid with
@@ -3119,16 +2902,13 @@ module ReviewWorkflow =
                     {| taskId = taskId; requestId = id; documentPath = documentPath
                        expectedBlobOid = expectedBlobOid; contentSha256 = specDigest content |})
                 (fun snapshot -> result {
-                    let! request, _ =
-                        required<ReviewRequest> binding snapshot (requestPath taskId id)
-                    if request.Status = "Withdrawn" then
+                    let! status, ownerId, claimantId, assignedReviewer =
+                        requireDocumentReview binding snapshot taskId id
+                    if status = "Withdrawn" then
                         return! Error(StaleEntityVersion "Cannot edit a withdrawn review.")
-                    // A review document is collaborative Git content. The owner,
-                    // claimed reviewer, and assigned reviewer can update it; no
-                    // per-finding ownership or resolution protocol is introduced.
-                    if actorId <> request.OwnerAgentId
-                       && actorId <> request.ClaimantId
-                       && actorId <> request.ReviewerId then
+                    if actorId <> ownerId
+                       && actorId <> claimantId
+                       && actorId <> assignedReviewer then
                         return! Error(ReviewAccessDenied "Not associated with this review.")
                     return [ { Path = reviewDocumentPath taskId id documentPath
                                ExpectedBlobOid = expected; Content = content } ]
@@ -3276,13 +3056,14 @@ module ReviewWorkflow =
                                 && List.contains entry.Task.Lifecycle [ "InProgress"; "Implemented" ]) with
                             | None -> ()
                             | Some entry ->
-                                let! integrations = integrationsForTask binding snapshot review.TaskId
-                                let matching = integrations |> List.tryFind (fun action ->
-                                    action.ReviewRequestId = review.RequestId
-                                    && action.AttemptId = review.AttemptId)
-                                if matching |> Option.exists (fun action -> action.Status = "Recorded") |> not then
+                                let! revision, _ =
+                                    required<ReviewRevision> binding snapshot
+                                        (revisionPath review.TaskId review.RequestId review.CurrentRevision)
+                                let! targetHead = LedgerStore.readRemoteTarget binding revision.TargetRef
+                                let! merged = LedgerStore.sourceContainsCommit binding revision.HeadCommit targetHead
+                                if not merged then
                                     accepted <- { Task = entry.Task; Attempt = entry.Attempt
-                                                  Review = review; Integration = matching } :: accepted
+                                                  Review = review } :: accepted
                     accepted <- accepted |> List.sortBy (fun item ->
                         item.Review.CreatedSequence, item.Task.TaskId, item.Review.RequestId)
                     if working.Length > 1
@@ -3341,3 +3122,440 @@ module ReviewWorkflow =
                                   not (List.contains item.Task.Lifecycle [ "InProgress"; "Implemented" ])))
                               && pending.IsEmpty && available.IsEmpty && feedback.IsEmpty }
             }
+
+    // Branch-first reviews: one canonical record, with source integration
+    // inferred from Git rather than duplicated as ledger state.
+    let private branchReviewsForTask binding snapshot taskId =
+        result {
+            let! paths = LedgerStore.listAt binding snapshot "tasks"
+            let prefix = $"tasks/{taskId}/reviews/"
+            let mutable found = []
+            for path in paths do
+                if path.StartsWith(prefix, StringComparison.Ordinal)
+                   && path.EndsWith("/review.json", StringComparison.Ordinal) then
+                    let! record, _ = required<BranchReview> binding snapshot path
+                    if record.TaskId <> taskId || path <> branchReviewPath taskId record.ReviewId then
+                        return! Error(LedgerIntegrityError "Invalid branch review identity.")
+                    found <- record :: found
+            return found |> List.sortBy (fun entry -> entry.CreatedSequence, entry.ReviewId)
+        }
+
+    let private branchHead binding (review: BranchReview) =
+        result {
+            let! advertised = LedgerStore.inspectRemoteReviewRef binding review.ReviewRef
+            match advertised with
+            | None -> return! Error(SourceReviewRefUnavailable "Review branch no longer exists.")
+            | Some oid ->
+                do! LedgerStore.fetchReviewRef binding review.ReviewRef oid
+                do! LedgerStore.verifyReviewDiff binding review.BaseCommit oid
+                return oid
+        }
+
+    let private branchIntegrated binding (review: BranchReview) =
+        result {
+            let! head = branchHead binding review
+            let! target = LedgerStore.readRemoteTarget binding review.TargetRef
+            let! integrated = LedgerStore.sourceContainsCommit binding head target
+            return head, integrated
+        }
+
+    let getBranchReview binding taskId reviewId =
+        if not (validTaskId taskId) || reviewId = Guid.Empty then
+            Error(InvalidBinding "Invalid review identifier.")
+        else result {
+            let! snapshot = LedgerStore.fetch binding
+            let! review, _ = required<BranchReview> binding snapshot
+                                (branchReviewPath taskId (reviewId.ToString("N")))
+            let! head, integrated = branchIntegrated binding review
+            return { SnapshotCommit = snapshot.Commit; Review = review
+                     HeadCommit = head; Integrated = integrated }
+        }
+
+    let submitBranchReview binding operationId taskId ownerId expectedAttemptVersion generation
+                           reviewId sourceRef sourceHead summary =
+        if not (validTaskId taskId) || reviewId = Guid.Empty || not (validAgent ownerId)
+           || expectedAttemptVersion < 1 || generation < 1
+           || not (validBranch sourceRef) || not (validText 4096 summary) then
+            Error(InvalidBinding "Invalid branch review submission.")
+        else
+            let id = reviewId.ToString("N")
+            let refName = reviewRef taskId id 1
+            let action = intent operationId ownerId "SubmitBranchReview"
+                            {| taskId = taskId; reviewId = id; ownerId = ownerId
+                               expectedAttemptVersion = expectedAttemptVersion; generation = generation
+                               sourceRef = sourceRef; sourceHead = sourceHead; summary = summary |}
+            match LedgerStore.findApplied binding action with
+            | Error failure -> Error failure
+            | Ok(Some applied) -> Ok applied
+            | Ok None -> result {
+                let! snapshot = LedgerStore.fetch binding
+                let! _, _, attempt, _ = getAttempt binding snapshot taskId
+                if attempt.OwnerAgentId <> ownerId || attempt.Version <> expectedAttemptVersion
+                   || attempt.AssignmentGeneration <> generation || attempt.Phase <> "Working"
+                   || attempt.TargetRef = null then
+                    return! Error(StaleEntityVersion "Task owner or source context changed.")
+                let! baseOid = LedgerStore.reviewMergeBase binding attempt.TargetRef sourceHead
+                do! LedgerStore.verifySourceCommit binding sourceRef sourceHead
+                do! LedgerStore.verifyReviewDiff binding baseOid sourceHead
+                do! LedgerStore.publishReviewRef binding refName sourceHead
+                return!
+                    LedgerStore.transact binding action (fun current -> result {
+                        let! task, _, active, _ = getAttempt binding current taskId
+                        if task.Lifecycle <> "InProgress" || active.Version <> expectedAttemptVersion
+                           || active.OwnerAgentId <> ownerId || active.Phase <> "Working"
+                           || active.AssignmentGeneration <> generation
+                           || active.TargetRef <> attempt.TargetRef then
+                            return! Error(StaleEntityVersion "Review submission is stale.")
+                        let! existing = read<BranchReview> binding current (branchReviewPath taskId id)
+                        if existing.IsSome then
+                            return! Error(StaleEntityVersion "Review ID already exists.")
+                        let! reviews = branchReviewsForTask binding current taskId
+                        if reviews |> List.exists (fun review ->
+                            review.AttemptId = active.AttemptId
+                            && List.contains review.Status [ "Unclaimed"; "Claimed" ]) then
+                            return! Error(ReviewVersionConflict "Another review is active on this task.")
+                        let review =
+                            { ReviewId = id; TaskId = taskId; AttemptId = active.AttemptId
+                              OwnerAgentId = ownerId; ReviewRef = refName; BaseCommit = baseOid
+                              TargetRef = active.TargetRef; Status = "Unclaimed"; ReviewerId = null
+                              Version = 1; CreatedSequence = current.Header.NextSequence
+                              DecisionSequence = 0L; Acknowledged = false }
+                        return [ change (branchReviewPath taskId id) None review
+                                 { Path = reviewDocumentPath taskId id "summary.md"
+                                   ExpectedBlobOid = None; Content = summary } ]
+                    })
+            }
+
+    let replaceBranchReview binding operationId taskId ownerId reviewId expectedVersion
+                            generation sourceRef sourceHead summary =
+        if not (validTaskId taskId) || reviewId = Guid.Empty || not (validAgent ownerId)
+           || expectedVersion < 1 || generation < 1 || not (validBranch sourceRef)
+           || not (validText 4096 summary) then
+            Error(InvalidBinding "Invalid replacement review.")
+        else
+            let id = reviewId.ToString("N")
+            let refName = reviewRef taskId id (expectedVersion + 1)
+            let action = intent operationId ownerId "ReplaceBranchReview"
+                            {| taskId = taskId; reviewId = id; ownerId = ownerId
+                               expectedVersion = expectedVersion; generation = generation
+                               sourceRef = sourceRef; sourceHead = sourceHead; summary = summary |}
+            match LedgerStore.findApplied binding action with
+            | Error failure -> Error failure
+            | Ok(Some applied) -> Ok applied
+            | Ok None -> result {
+                let! snapshot = LedgerStore.fetch binding
+                let! existing, _ = required<BranchReview> binding snapshot (branchReviewPath taskId id)
+                if existing.Version <> expectedVersion || existing.Status <> "Unclaimed"
+                   || existing.OwnerAgentId <> ownerId then
+                    return! Error(ReviewAlreadyClaimed "Only the owner can replace an unclaimed review.")
+                let! _, _, attempt, _ = getAttempt binding snapshot taskId
+                if attempt.AssignmentGeneration <> generation || attempt.AttemptId <> existing.AttemptId
+                   || attempt.Phase <> "Working" then
+                    return! Error(StaleEntityVersion "Source attempt has changed.")
+                let! baseOid = LedgerStore.reviewMergeBase binding existing.TargetRef sourceHead
+                do! LedgerStore.verifySourceCommit binding sourceRef sourceHead
+                do! LedgerStore.verifyReviewDiff binding baseOid sourceHead
+                do! LedgerStore.publishReviewRef binding refName sourceHead
+                return!
+                    LedgerStore.transact binding action (fun current -> result {
+                        let! review, reviewOid =
+                            required<BranchReview> binding current (branchReviewPath taskId id)
+                        if review.Version <> expectedVersion || review.Status <> "Unclaimed" then
+                            return! Error(ReviewAlreadyClaimed "Review was claimed or replaced.")
+                        let! _, summaryOid =
+                            LedgerStore.readAt binding current (reviewDocumentPath taskId id "summary.md")
+                        return [ change (branchReviewPath taskId id) (Some reviewOid)
+                                   { review with Version = review.Version + 1
+                                                 ReviewRef = refName; BaseCommit = baseOid }
+                                 { Path = reviewDocumentPath taskId id "summary.md"
+                                   ExpectedBlobOid = summaryOid; Content = summary } ]
+                    })
+            }
+
+    let claimBranchReview binding operationId taskId reviewId reviewerId expectedVersion =
+        if not (validTaskId taskId) || reviewId = Guid.Empty || not (validAgent reviewerId)
+           || expectedVersion < 1 then Error(InvalidBinding "Invalid review claim.")
+        else
+            let id = reviewId.ToString("N")
+            LedgerStore.transact binding
+                (intent operationId reviewerId "ClaimBranchReview"
+                    {| taskId = taskId; reviewId = id; reviewerId = reviewerId
+                       expectedVersion = expectedVersion |})
+                (fun snapshot -> result {
+                    let! review, oid = required<BranchReview> binding snapshot (branchReviewPath taskId id)
+                    if review.Version <> expectedVersion || review.Status <> "Unclaimed" then
+                        return! Error(ReviewAlreadyClaimed "Review is no longer unclaimed.")
+                    if reviewerId = review.OwnerAgentId then
+                        return! Error(ReviewAccessDenied "Owner cannot review own work.")
+                    let! _ = required<ReviewAgent> binding snapshot (agentPath reviewerId)
+                    let! _ = branchHead binding review
+                    return [ change (branchReviewPath taskId id) (Some oid)
+                                { review with Status = "Claimed"; ReviewerId = reviewerId
+                                              Version = review.Version + 1 } ]
+                })
+
+    let decideBranchReview binding operationId taskId reviewId reviewerId expectedVersion verdict =
+        if not (validTaskId taskId) || reviewId = Guid.Empty || not (validAgent reviewerId)
+           || expectedVersion < 1 then Error(InvalidBinding "Invalid review decision.")
+        else
+            let status = match verdict with Accept -> "Accepted" | RequestChanges -> "ChangesRequested"
+            let id = reviewId.ToString("N")
+            LedgerStore.transact binding
+                (intent operationId reviewerId "DecideBranchReview"
+                    {| taskId = taskId; reviewId = id; reviewerId = reviewerId
+                       expectedVersion = expectedVersion; status = status |})
+                (fun snapshot -> result {
+                    let! review, oid = required<BranchReview> binding snapshot (branchReviewPath taskId id)
+                    if review.Status <> "Claimed" || review.Version <> expectedVersion
+                       || review.ReviewerId <> reviewerId then
+                        return! Error(ReviewVersionConflict "Review claim has changed.")
+                    let! _ = branchHead binding review
+                    return [ change (branchReviewPath taskId id) (Some oid)
+                                { review with Version = review.Version + 1; Status = status
+                                              DecisionSequence = snapshot.Header.NextSequence
+                                              Acknowledged = false } ]
+                })
+
+    let acknowledgeBranchReview binding operationId taskId ownerId decisionSequence =
+        if not (validTaskId taskId) || not (validAgent ownerId) || decisionSequence < 1L then
+            Error(InvalidBinding "Invalid review acknowledgement.")
+        else
+            LedgerStore.transact binding
+                (intent operationId ownerId "AcknowledgeBranchReview"
+                    {| taskId = taskId; ownerId = ownerId; decisionSequence = decisionSequence |})
+                (fun snapshot -> result {
+                    let! reviews = branchReviewsForTask binding snapshot taskId
+                    match reviews |> List.filter (fun review ->
+                        review.DecisionSequence = decisionSequence
+                        && review.OwnerAgentId = ownerId
+                        && List.contains review.Status [ "Accepted"; "ChangesRequested" ]) with
+                    | [ review ] when not review.Acknowledged ->
+                        let! _, oid = required<BranchReview> binding snapshot
+                                         (branchReviewPath taskId review.ReviewId)
+                        return [ change (branchReviewPath taskId review.ReviewId) (Some oid)
+                                    { review with Acknowledged = true; Version = review.Version + 1 } ]
+                    | _ -> return! Error(StaleEntityVersion "No unacknowledged review matches the sequence.")
+                })
+
+    let withdrawBranchReview binding operationId taskId reviewId actorId expectedVersion =
+        if not (validTaskId taskId) || reviewId = Guid.Empty || not (validAgent actorId)
+           || expectedVersion < 1 then Error(InvalidBinding "Invalid review withdrawal.")
+        else
+            let id = reviewId.ToString("N")
+            LedgerStore.transact binding
+                (intent operationId actorId "WithdrawBranchReview"
+                    {| taskId = taskId; reviewId = id; actorId = actorId
+                       expectedVersion = expectedVersion |})
+                (fun snapshot -> result {
+                    let! review, oid = required<BranchReview> binding snapshot (branchReviewPath taskId id)
+                    if review.Version <> expectedVersion
+                       || not (List.contains review.Status [ "Unclaimed"; "Claimed" ])
+                       || (review.Status = "Unclaimed" && actorId <> review.OwnerAgentId)
+                       || (review.Status = "Claimed" && actorId <> review.ReviewerId) then
+                        return! Error(ReviewAccessDenied "Only the owner or claimed reviewer can withdraw an active review.")
+                    return [ change (branchReviewPath taskId id) (Some oid)
+                                { review with Version = review.Version + 1; Status = "Withdrawn" } ]
+                })
+
+    let branchReviewerQueue binding reviewerId =
+        if not (validAgent reviewerId) then Error(InvalidBinding "Invalid reviewer.")
+        else result {
+            let! snapshot = LedgerStore.fetch binding
+            let! _ = required<ReviewAgent> binding snapshot (agentPath reviewerId)
+            let! paths = LedgerStore.listAt binding snapshot "tasks"
+            let mutable reviews = []
+            for path in paths do
+                if path.EndsWith("/review.json", StringComparison.Ordinal) then
+                    let! review, _ = required<BranchReview> binding snapshot path
+                    if review.OwnerAgentId <> reviewerId
+                       && (review.Status = "Unclaimed"
+                           || (review.Status = "Claimed" && review.ReviewerId = reviewerId)) then
+                        reviews <- review :: reviews
+            return snapshot.Commit, reviews |> List.sortBy (fun review ->
+                review.CreatedSequence, review.TaskId, review.ReviewId)
+        }
+
+    let finalizeBranchReview binding operationId taskId ownerId expectedAttemptVersion reviewId =
+        if not (validTaskId taskId) || not (validAgent ownerId) || expectedAttemptVersion < 1
+           || reviewId = Guid.Empty then Error(InvalidBinding "Invalid final review.")
+        else
+            let id = reviewId.ToString("N")
+            LedgerStore.transact binding
+                (intent operationId ownerId "FinalizeBranchReview"
+                    {| taskId = taskId; ownerId = ownerId; expectedAttemptVersion = expectedAttemptVersion
+                       reviewId = id |})
+                (fun snapshot -> result {
+                    let! task, taskOid, attempt, attemptOid = getAttempt binding snapshot taskId
+                    if task.Lifecycle <> "InProgress" || attempt.Version <> expectedAttemptVersion
+                       || attempt.OwnerAgentId <> ownerId || attempt.Phase <> "Finished" then
+                        return! Error(StaleEntityVersion "Task is not ready for final review.")
+                    let! review, _ = required<BranchReview> binding snapshot (branchReviewPath taskId id)
+                    if review.AttemptId <> attempt.AttemptId || review.OwnerAgentId <> ownerId
+                       || review.Status <> "Accepted" then
+                        return! Error(ReviewVersionConflict "Final review is not accepted for this attempt.")
+                    let! reviews = branchReviewsForTask binding snapshot taskId
+                    let latest =
+                        reviews |> List.filter (fun item -> item.AttemptId = attempt.AttemptId)
+                                |> List.tryLast
+                    if latest |> Option.exists (fun item -> item.ReviewId = id) |> not then
+                        return! Error(ReviewVersionConflict "A later review supersedes this final review.")
+                    let! _, integrated = branchIntegrated binding review
+                    return [ change (taskPath taskId) (Some taskOid)
+                                { task with Version = task.Version + 1
+                                            Lifecycle = if integrated then "Integrated" else "Implemented" }
+                             change (attemptPath taskId attempt.AttemptId) (Some attemptOid)
+                                { attempt with Version = attempt.Version + 1; Phase = "Accepted" } ]
+                })
+
+    let closeBranchTask binding operationId taskId expectedTaskVersion =
+        if not (validTaskId taskId) || expectedTaskVersion < 1 then
+            Error(InvalidBinding "Invalid source task closure.")
+        else
+            LedgerStore.transact binding
+                (intent operationId "Orchestrator" "CloseBranchTask"
+                    {| taskId = taskId; expectedTaskVersion = expectedTaskVersion |})
+                (fun snapshot -> result {
+                    let! task, taskOid, attempt, _ = getAttempt binding snapshot taskId
+                    if task.Version <> expectedTaskVersion
+                       || not (List.contains task.Lifecycle [ "Implemented"; "Integrated" ])
+                       || attempt.Phase <> "Accepted" then
+                        return! Error(StaleEntityVersion "Task has not passed final review.")
+                    let! reviews = branchReviewsForTask binding snapshot taskId
+                    let latest =
+                        reviews |> List.filter (fun item -> item.AttemptId = attempt.AttemptId)
+                                |> List.tryLast
+                    match latest with
+                    | Some review when review.Status = "Accepted" ->
+                        let! _, integrated = branchIntegrated binding review
+                        if not integrated then
+                            return! Error(StaleEntityVersion "Final accepted branch has not been merged into target.")
+                        return [ change (taskPath taskId) (Some taskOid)
+                                    { task with Version = task.Version + 1; Lifecycle = "Closed" } ]
+                    | _ -> return! Error(ReviewVersionConflict "No final accepted review.")
+                })
+
+    let private projectBranchRequest (review: BranchReview) =
+        { RequestId = review.ReviewId; TaskId = review.TaskId; AttemptId = review.AttemptId
+          OwnerAgentId = review.OwnerAgentId; ReviewerId = review.ReviewerId
+          Version = review.Version; CurrentRevision = 1; Status = review.Status
+          ClaimantId = review.ReviewerId; ClaimedRevision = if review.ReviewerId = null then 0 else 1
+          CreatedSequence = review.CreatedSequence; DecisionSequence = review.DecisionSequence
+          Feedback = null }
+
+    // Keep the established inbox response shape while using only one canonical
+    // branch-review record per review. Integration is computed from Git.
+    let getBranchAgentInbox binding agentId =
+        result {
+            let! old = getAgentInbox binding agentId
+            let! snapshot = LedgerStore.fetch binding
+            let! paths = LedgerStore.listAt binding snapshot "tasks"
+            let mutable pending = []
+            let mutable available = []
+            let mutable accepted = []
+            let mutable notices = []
+            for path in paths do
+                if path.EndsWith("/review.json", StringComparison.Ordinal) then
+                    let! review, _ = required<BranchReview> binding snapshot path
+                    let projected = projectBranchRequest review
+                    if review.Status = "Unclaimed" then
+                        if review.OwnerAgentId = agentId then pending <- projected :: pending
+                        else available <- projected :: available
+                    elif review.Status = "Claimed" then
+                        if review.OwnerAgentId = agentId || review.ReviewerId = agentId then
+                            pending <- projected :: pending
+                    elif review.Status = "Accepted" then
+                        match old.RunnableQueue @ old.Parked @ old.Blocked
+                              @ (old.Working |> Option.toList)
+                              @ (old.Focused |> Option.toList)
+                              |> List.tryFind (fun item ->
+                                  item.Task.TaskId = review.TaskId
+                                  && item.Attempt.AttemptId = review.AttemptId) with
+                        | Some item ->
+                            let! _, merged = branchIntegrated binding review
+                            if not merged then
+                                accepted <- { Task = item.Task; Attempt = item.Attempt
+                                              Review = projected } :: accepted
+                        | None -> ()
+                    if review.OwnerAgentId = agentId && review.DecisionSequence > 0L
+                       && not review.Acknowledged
+                       && List.contains review.Status [ "Accepted"; "ChangesRequested" ] then
+                        notices <- { TaskId = review.TaskId; AttemptId = review.AttemptId
+                                     RequestId = review.ReviewId; OwnerAgentId = review.OwnerAgentId
+                                     DecisionSequence = review.DecisionSequence; Status = review.Status
+                                     Feedback = null; Acknowledged = false; Version = review.Version } :: notices
+            let reviewSort (review: ReviewRequest) =
+                review.CreatedSequence, review.TaskId, review.RequestId
+            return { old with SnapshotCommit = snapshot.Commit
+                              PendingReviews = pending |> List.sortBy reviewSort
+                              AvailableReviews = available |> List.sortBy reviewSort
+                              AcceptedPendingIntegration =
+                                  accepted |> List.sortBy (fun item -> reviewSort item.Review)
+                              UnacknowledgedFeedback =
+                                  notices |> List.sortBy (fun item -> item.DecisionSequence) }
+        }
+
+    // Explicit one-time conversion of legacy review requests. Historical JSON
+    // files are left as Git artifacts; new operations only read review.json.
+    let migrateBranchReviews binding operationId =
+        LedgerStore.transact binding
+            (intent operationId "Orchestrator" "MigrateBranchReviews" {| migration = 1 |})
+            (fun snapshot -> result {
+                let! paths = LedgerStore.listAt binding snapshot "tasks"
+                let mutable changes = []
+                for path in paths do
+                    if path.EndsWith("/request.json", StringComparison.Ordinal) then
+                        let! legacy, _ = required<ReviewRequest> binding snapshot path
+                        let reviewPath = branchReviewPath legacy.TaskId legacy.RequestId
+                        let! exists = read<BranchReview> binding snapshot reviewPath
+                        if exists.IsNone then
+                            let! revision, _ =
+                                required<ReviewRevision> binding snapshot
+                                    (revisionPath legacy.TaskId legacy.RequestId legacy.CurrentRevision)
+                            let! notice =
+                                read<ReviewFeedbackNotice> binding snapshot
+                                    (feedbackPath legacy.TaskId legacy.RequestId)
+                            let reviewedBy =
+                                if String.IsNullOrWhiteSpace legacy.ClaimantId then legacy.ReviewerId
+                                else legacy.ClaimantId
+                            let migrated =
+                                { ReviewId = legacy.RequestId; TaskId = legacy.TaskId
+                                  AttemptId = legacy.AttemptId; OwnerAgentId = legacy.OwnerAgentId
+                                  ReviewRef = revision.ReviewRef; BaseCommit = revision.BaseCommit
+                                  TargetRef = revision.TargetRef; Status = legacy.Status
+                                  ReviewerId = if legacy.Status = "Unclaimed" then null else reviewedBy
+                                  Version = legacy.Version; CreatedSequence = legacy.CreatedSequence
+                                  DecisionSequence = legacy.DecisionSequence
+                                  Acknowledged = notice |> Option.exists (fun (value, _) -> value.Acknowledged) }
+                            changes <- change reviewPath None migrated :: changes
+                            let summaryPath = reviewDocumentPath legacy.TaskId legacy.RequestId "summary.md"
+                            let! summary, _ = LedgerStore.readAt binding snapshot summaryPath
+                            if summary.IsNone then
+                                changes <- { Path = summaryPath; ExpectedBlobOid = None
+                                             Content = if String.IsNullOrWhiteSpace legacy.Feedback
+                                                       then revision.Summary else legacy.Feedback } :: changes
+                // Delete superseded representations from the CURRENT tree.
+                // Their full history remains available on the orphan Git branch.
+                let legacySuffixes =
+                    [ "/request.json"; "/notification.json" ]
+                let legacySegments = [ "/revisions/"; "/decisions/"; "/events/" ]
+                for path in paths do
+                    let reviewPrefix = path.Contains("/reviews/", StringComparison.Ordinal)
+                    let oldReviewFile =
+                        reviewPrefix
+                        && (legacySuffixes |> List.exists (fun suffix ->
+                                path.EndsWith(suffix, StringComparison.Ordinal))
+                            || legacySegments |> List.exists (fun segment ->
+                                path.Contains(segment, StringComparison.Ordinal)))
+                    let oldIntegration = path.Contains("/integrations/", StringComparison.Ordinal)
+                    let oldOrphanCleanup = path.Contains("/orphan-cleanups/", StringComparison.Ordinal)
+                    if oldReviewFile || oldIntegration || oldOrphanCleanup then
+                        let! _, oid = LedgerStore.readAt binding snapshot path
+                        match oid with
+                        | Some existing ->
+                            changes <- { Path = path; ExpectedBlobOid = Some existing
+                                         Content = null } :: changes
+                        | None -> return! Error(LedgerIntegrityError "Missing legacy metadata blob.")
+                if List.isEmpty changes then
+                    return! Error(StaleEntityVersion "There are no unmigrated reviews.")
+                return changes
+            })

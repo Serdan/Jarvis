@@ -48,10 +48,10 @@ let private projectSnapshot project rt =
                     | Error error, _ | _, Error error -> Error (string error)
                     | Ok agentPaths, Ok taskPaths ->
                         let taskRecords = taskPaths |> List.filter (fun path -> path.EndsWith("/task.json", StringComparison.Ordinal))
-                        let reviewRecords = taskPaths |> List.filter (fun path -> path.EndsWith("/request.json", StringComparison.Ordinal))
+                        let reviewRecords = taskPaths |> List.filter (fun path -> path.EndsWith("/review.json", StringComparison.Ordinal))
                         let tasks = taskRecords |> List.map (read<ReviewTask> binding snapshot)
                         let agents = agentPaths |> List.map (read<ReviewAgent> binding snapshot)
-                        let reviews = reviewRecords |> List.map (read<ReviewRequest> binding snapshot)
+                        let reviews = reviewRecords |> List.map (read<BranchReview> binding snapshot)
                         let firstError values = values |> List.tryPick (function Error message -> Some message | Ok _ -> None)
                         match firstError tasks, firstError agents, firstError reviews with
                         | Some error, _, _ | _, Some error, _ | _, _, Some error -> Error error

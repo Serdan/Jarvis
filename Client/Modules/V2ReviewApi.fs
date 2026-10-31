@@ -451,6 +451,7 @@ module V2PendingIntentJournal =
         match record.CommandType, action with
         | "V2TaskWrite", Some "AcknowledgeFeedback" -> Some "AcknowledgeReviewFeedback"
         | "V2TaskWrite", Some action -> Some action
+        | "V2ReviewWrite", Some "Migrate" -> Some "MigrateBranchReviews"
         | "V2ReviewWrite", Some "PutDocument" -> Some "PutReviewDocument"
         | "V2ReviewWrite", Some "Submit" -> Some "SubmitForReview"
         | "V2ReviewWrite", Some "Update" -> Some "UpdateReviewRequest"
@@ -462,10 +463,6 @@ module V2PendingIntentJournal =
         | "V2ReviewWrite", Some "ReserveOrphan" -> Some "ReserveOrphanReviewRef"
         | "V2ReviewWrite", Some "Finalize" -> Some "FinalizeImplementation"
         | "V2ReviewWrite", Some "AcknowledgeFeedback" -> Some "AcknowledgeReviewFeedback"
-        | "V2IntegrationWrite", Some "PlanIntegration" -> Some "PlanIntegration"
-        | "V2IntegrationWrite", Some "PendingPush" -> Some "MarkIntegrationPendingPush"
-        | "V2IntegrationWrite", Some "RecordIntegration" -> Some "RecordIntegration"
-        | "V2IntegrationWrite", Some "CloseIntegratedTask" -> Some "CloseIntegratedTask"
         | _ -> None
 
     let private identityMatches (record: V2PendingIntent) (operation: LedgerStore.LedgerOperation) =
@@ -554,6 +551,8 @@ module V2PendingIntentJournal =
                     attempt @ [ "ExpectedTaskVersion", "expectedTaskVersion";
                                 "AttemptId", "newAttemptId"; "OwnerId", "newOwner";
                                 "ReviewerId", "reviewer"; "Reason", "reason" ]
+                | "V2TaskWrite", "CloseBranchTask" ->
+                    common @ [ "ExpectedTaskVersion", "expectedTaskVersion" ]
                 | "V2TaskWrite", "CloseNonSourceTask" ->
                     common @ [ "ActorId", "approver"; "ExpectedTaskVersion", "expectedTaskVersion";
                                 "ExpectedVersion", "expectedAttemptVersion";
@@ -562,6 +561,7 @@ module V2PendingIntentJournal =
                     common @ [ "ExpectedTaskVersion", "expectedTaskVersion"; "Reason", "reason" ]
                 | "V2TaskWrite", "AcknowledgeReviewFeedback" ->
                     owner @ [ "DecisionSequence", "decisionSequence" ]
+                | "V2ReviewWrite", "MigrateBranchReviews" -> common
                 | "V2ReviewWrite", "PutReviewDocument" ->
                     review @ [ "ActorId", "actorId"; "DocumentPath", "documentPath"
                                "Content", "content"; "ExpectedBlobOid", "expectedBlobOid" ]
@@ -595,14 +595,6 @@ module V2PendingIntentJournal =
                     review @ [ "ActorId", "ownerId"; "ExpectedVersion", "expectedAttemptVersion" ]
                 | "V2ReviewWrite", "AcknowledgeReviewFeedback" ->
                     owner @ [ "ExpectedVersion", "decisionSequence" ]
-                | "V2IntegrationWrite", "PlanIntegration" ->
-                    integration @ [ "RequestId", "requestId"; "ExpectedVersion", "expectedAttemptVersion"
-                                    "TargetRef", "targetRef"; "ExpectedTargetHead", "expectedTargetHead" ]
-                | "V2IntegrationWrite", "MarkIntegrationPendingPush"
-                | "V2IntegrationWrite", "RecordIntegration" ->
-                    integration @ [ "ExpectedVersion", "expectedVersion" ]
-                | "V2IntegrationWrite", "CloseIntegratedTask" ->
-                    integration @ [ "ExpectedVersion", "expectedTaskVersion" ]
                 | _ -> []
 
             let equalField (source, dest) =
@@ -919,10 +911,8 @@ module V2ReviewApi =
             | "GetReview" ->
                 parseId "requestId" cmd.RequestId
                 |> Result.bind (fun id ->
-                    ReviewWorkflow.ReviewWorkflow.getReview binding cmd.TaskId id
-                    |> mapError
-                    |> Result.map (fun (snapshot, request, revision) ->
-                        box {| snapshotCommit = snapshot.Commit; request = request; revision = revision |}))
+                    ReviewWorkflow.ReviewWorkflow.getBranchReview binding cmd.TaskId id
+                    |> mapError |> Result.map box)
             | "ListDocuments" ->
                 parseId "requestId" cmd.RequestId
                 |> Result.bind (fun reviewId ->
@@ -955,10 +945,10 @@ module V2ReviewApi =
                 ReviewWorkflow.ReviewWorkflow.awaitingReviewReassignment binding
                 |> mapError |> Result.map box
             | "ReviewerQueue" ->
-                ReviewWorkflow.ReviewWorkflow.reviewerQueue binding cmd.ReviewerId
+                ReviewWorkflow.ReviewWorkflow.branchReviewerQueue binding cmd.ReviewerId
                 |> mapError
                 |> Result.map (fun (snapshot, queue) ->
-                    box {| snapshotCommit = snapshot.Commit; reviews = queue |})
+                    box {| snapshotCommit = snapshot; reviews = queue |})
             | _ -> Error(Client.ValidationError "Unsupported V2 read operation."))
 
     // Source cleanup executes only after an immutable reservation in the Git
@@ -988,25 +978,23 @@ module V2ReviewApi =
                                     cmd.TaskId reviewId cmd.ActorId cmd.DocumentPath
                                     cmd.ExpectedBlobOid cmd.Content
                                 |> mapError)
+                        | "Migrate" ->
+                            ReviewWorkflow.ReviewWorkflow.migrateBranchReviews binding operationId
+                            |> mapError
                         | "Submit" ->
-                            id ()
-                            |> Result.mapError (fun e -> e)
-                            |> Result.bind (fun reviewId ->
-                                ReviewWorkflow.ReviewWorkflow.submitReviewWithEvidence binding operationId
+                            id () |> Result.bind (fun reviewId ->
+                                ReviewWorkflow.ReviewWorkflow.submitBranchReview binding operationId
                                     cmd.TaskId cmd.ActorId cmd.ExpectedVersion cmd.Generation reviewId
-                                    cmd.SourceRef cmd.HeadOid cmd.Summary cmd.TestEvidence
-                                |> mapError)
+                                    cmd.SourceRef cmd.HeadOid cmd.Summary |> mapError)
                         | "Update" ->
                             id () |> Result.bind (fun reviewId ->
-                                ReviewWorkflow.ReviewWorkflow.updateReviewWithEvidence binding operationId
-                                    cmd.TaskId cmd.ActorId cmd.Generation reviewId cmd.ExpectedVersion
-                                    cmd.SourceRef cmd.HeadOid cmd.Summary cmd.TestEvidence
-                                |> mapError)
+                                ReviewWorkflow.ReviewWorkflow.replaceBranchReview binding operationId
+                                    cmd.TaskId cmd.ActorId reviewId cmd.ExpectedVersion cmd.Generation
+                                    cmd.SourceRef cmd.HeadOid cmd.Summary |> mapError)
                         | "Claim" ->
                             id () |> Result.bind (fun reviewId ->
-                                ReviewWorkflow.ReviewWorkflow.claimReview binding operationId
-                                    cmd.TaskId reviewId cmd.ActorId cmd.ExpectedVersion cmd.Generation
-                                |> mapError)
+                                ReviewWorkflow.ReviewWorkflow.claimBranchReview binding operationId
+                                    cmd.TaskId reviewId cmd.ActorId cmd.ExpectedVersion |> mapError)
                         | "Decide" ->
                             id () |> Result.bind (fun reviewId ->
                                 match cmd.Verdict with
@@ -1014,16 +1002,13 @@ module V2ReviewApi =
                                     let decision =
                                         if verdict = "Accept" then ReviewWorkflow.Accept
                                         else ReviewWorkflow.RequestChanges
-                                    ReviewWorkflow.ReviewWorkflow.decideWithEvidence binding operationId
-                                        cmd.TaskId reviewId cmd.ActorId cmd.ExpectedVersion decision
-                                        cmd.Feedback cmd.Inspected cmd.Tested cmd.TestDetails
-                                    |> mapError
+                                    ReviewWorkflow.ReviewWorkflow.decideBranchReview binding operationId
+                                        cmd.TaskId reviewId cmd.ActorId cmd.ExpectedVersion decision |> mapError
                                 | _ -> Error(Client.ValidationError "Invalid V2 review verdict."))
                         | "Withdraw" ->
                             id () |> Result.bind (fun reviewId ->
-                                ReviewWorkflow.ReviewWorkflow.withdrawReview binding operationId
-                                    cmd.TaskId reviewId cmd.ActorId cmd.ExpectedVersion cmd.Feedback
-                                |> mapError)
+                                ReviewWorkflow.ReviewWorkflow.withdrawBranchReview binding operationId
+                                    cmd.TaskId reviewId cmd.ActorId cmd.ExpectedVersion |> mapError)
                         | "ReserveOrphan" ->
                             id () |> Result.bind (fun reviewId ->
                                 ReviewWorkflow.ReviewWorkflow.reserveOrphanReviewRef binding operationId
@@ -1045,13 +1030,11 @@ module V2ReviewApi =
                                 |> mapError)
                         | "Finalize" ->
                             id () |> Result.bind (fun reviewId ->
-                                ReviewWorkflow.ReviewWorkflow.finalizeImplementation binding operationId
-                                    cmd.TaskId cmd.ActorId cmd.ExpectedVersion reviewId
-                                |> mapError)
+                                ReviewWorkflow.ReviewWorkflow.finalizeBranchReview binding operationId
+                                    cmd.TaskId cmd.ActorId cmd.ExpectedVersion reviewId |> mapError)
                         | "AcknowledgeFeedback" ->
-                            ReviewWorkflow.ReviewWorkflow.acknowledgeReviewFeedback binding operationId
-                                cmd.TaskId cmd.ActorId (int64 cmd.ExpectedVersion)
-                            |> mapError
+                            ReviewWorkflow.ReviewWorkflow.acknowledgeBranchReview binding operationId
+                                cmd.TaskId cmd.ActorId (int64 cmd.ExpectedVersion) |> mapError
                         | _ -> Error(Client.ValidationError "Unsupported V2 write operation.")
                     )
                 result |> Result.map V2OperationResponse.present))
@@ -1079,7 +1062,7 @@ module V2TaskApi =
                 ReviewWorkflow.ReviewWorkflow.diffTaskSpec binding cmd.TaskId cmd.BeforeOid cmd.AfterOid
                 |> mapError |> Result.map box
             | "AgentInbox" ->
-                ReviewWorkflow.ReviewWorkflow.getAgentInbox binding cmd.AgentId
+                ReviewWorkflow.ReviewWorkflow.getBranchAgentInbox binding cmd.AgentId
                 |> mapError |> Result.map box
             | "GetAssignment" ->
                 ReviewWorkflow.ReviewWorkflow.getAssignment binding cmd.TaskId cmd.AssignmentGeneration
@@ -1215,6 +1198,9 @@ module V2TaskApi =
                                     ReviewWorkflow.ReviewWorkflow.changeAttemptAdministration binding operationId
                                         cmd.TaskId cmd.Action cmd.ExpectedTaskVersion cmd.ExpectedVersion
                                         cmd.ExpectedAgentVersion cmd.AssignmentGeneration cmd.Reason |> mapError
+                                | "CloseTask" ->
+                                    ReviewWorkflow.ReviewWorkflow.closeBranchTask binding operationId
+                                        cmd.TaskId cmd.ExpectedTaskVersion |> mapError
                                 | "CancelOpenTask" ->
                                     ReviewWorkflow.ReviewWorkflow.cancelOpenTask binding operationId
                                         cmd.TaskId cmd.ExpectedTaskVersion cmd.Reason |> mapError
@@ -1244,61 +1230,9 @@ module V2TaskApi =
                                         cmd.TaskId cmd.ActorId cmd.ExpectedVersion cmd.ExpectedAgentVersion
                                         cmd.AssignmentGeneration cmd.Reason |> mapError
                                 | "AcknowledgeFeedback" ->
-                                    ReviewWorkflow.ReviewWorkflow.acknowledgeReviewFeedback binding operationId
+                                    ReviewWorkflow.ReviewWorkflow.acknowledgeBranchReview binding operationId
                                         cmd.TaskId cmd.ActorId cmd.DecisionSequence
                                     |> mapError
                                 | _ -> Error(Client.ValidationError "Unsupported V2 task operation.")
                             )
                         result |> Result.map V2OperationResponse.present))
-
-
-module V2IntegrationApi =
-    let private mapError (result: Result<'a, LedgerStore.LedgerFailure>) : Result<'a, EffectError> =
-        result |> Result.mapError V2LedgerErrors.toEffect
-
-    let private guid label (raw: string) =
-        match Guid.TryParse raw with
-        | true, parsed when parsed <> Guid.Empty -> Ok parsed
-        | _ -> Error(Client.ValidationError $"Invalid {label}: caller-stable UUID required.")
-
-    let read (cmd: V2IntegrationReadCommand) rt =
-        ReviewV2Binding.load cmd.ProjectName rt
-        |> Result.bind (fun binding ->
-            guid "integration action ID" cmd.ActionId
-            |> Result.bind (fun actionId ->
-                ReviewWorkflow.ReviewWorkflow.inspectIntegration binding cmd.TaskId actionId
-                |> mapError
-                |> Result.map box))
-
-    let write (cmd: V2IntegrationWriteCommand) rt =
-        ReviewV2Binding.load cmd.ProjectName rt
-        |> Result.bind (fun binding ->
-            guid "operation ID" cmd.OperationId
-            |> Result.bind (fun operationId ->
-                guid "integration action ID" cmd.ActionId
-                |> Result.bind (fun actionId ->
-                    let result =
-                        V2PendingIntentJournal.executeLedgerWrite binding operationId "V2IntegrationWrite" cmd (fun () ->
-                            match cmd.Action with
-                            | "PlanIntegration" ->
-                                guid "accepted review ID" cmd.RequestId
-                                |> Result.bind (fun reviewId ->
-                                    ReviewWorkflow.ReviewWorkflow.planIntegration binding operationId
-                                        cmd.TaskId actionId reviewId cmd.ExpectedVersion
-                                        cmd.TargetRef cmd.ExpectedTargetHead
-                                    |> mapError)
-                            | "PendingPush" ->
-                                ReviewWorkflow.ReviewWorkflow.markIntegrationPendingPush binding
-                                    operationId cmd.TaskId actionId cmd.ExpectedVersion
-                                |> mapError
-                            | "RecordIntegration" ->
-                                ReviewWorkflow.ReviewWorkflow.recordIntegration binding operationId
-                                    cmd.TaskId actionId cmd.ExpectedVersion
-                                |> mapError
-                            | "CloseIntegratedTask" ->
-                                ReviewWorkflow.ReviewWorkflow.closeIntegratedTask binding
-                                    operationId cmd.TaskId actionId cmd.ExpectedVersion
-                                |> mapError
-                            | _ -> Error(Client.ValidationError "Unsupported V2 integration operation.")
-                        )
-                    result |> Result.map V2OperationResponse.present)))

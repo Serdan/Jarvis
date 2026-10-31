@@ -426,16 +426,16 @@ let ``command catalog matches AgentCommand union and MCP tools`` () =
               "CompleteTask"; "GetTaskHistory"; "CompareWorktreeTasks"; "GetAgentAssignment"
               "AcknowledgeTask"; "GetOrchestrationSnapshot"; "RetireWorktree"; "BeginTask" ]
     // Orphan-ledger MCP tools route through eight versioned internal wire commands.
-    let v2Wire = set [ "V2TaskRead"; "V2TaskWrite"; "V2ReviewRead"; "V2ReviewWrite"; "V2IntegrationRead"; "V2IntegrationWrite"; "V2LedgerRead"; "V2LedgerWrite" ]
+    let v2Wire = set [ "V2TaskRead"; "V2TaskWrite"; "V2ReviewRead"; "V2ReviewWrite"; "V2LedgerRead"; "V2LedgerWrite" ]
     let orchestrationTools =
         set [ "AgentInbox"; "GetAssignment"; "GetCheckpoint"; "InspectAttemptSource"; "TaskLifecycleHistory"; "GetNonSourceApproval"; "GetTaskSpecPage"; "DiffTaskSpec"; "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "AcknowledgeAssignment"; "ReissueAssignment"; "BeginAttempt"; "CheckpointAttempt"
               "BindReviewBase"; "BindAttemptSource"; "RebindAttemptSource"; "YieldAgent"; "ResumeAgent"; "CompleteAgentWork"
-              "ParkAgent"; "ReissueQueuedAttempt"; "RecoverAgentAssignment"; "AcknowledgeReviewFeedback"; "ParkAttempt"; "BlockAttempt"; "ResumeAttempt"; "AbandonAttempt"; "CancelTask"; "CancelOpenTask"; "TransferOwner"; "CloseNonSourceTask"; "ReopenTask"; "ReviseTaskSpecPinned"; "ImportTaskSpec"; "AdoptTaskSpec"; "ExportTaskSpec"
-              "ReviewTask"; "ReviewDetails"; "ReviewerInbox"; "ReviewDecisionEvidence"; "ReviewClaimHistory"; "AwaitingReviewReassignment"; "InspectOrphanReviewRefs"; "ListReviewDocuments"; "ReadReviewDocument"
-              "SubmitReview"; "ReplaceReview"; "SubmitReviewWithEvidence"; "ReplaceReviewWithEvidence"; "ClaimReview"; "DecideReview"; "DecideReviewWithEvidence"
-              "WithdrawReview"; "ReassignReview"; "ReleaseReviewClaim"; "ReassignReviewWithReason"; "ReserveOrphanReviewRef"; "DeleteReservedOrphanReviewRef"; "FinalizeReview"; "PutReviewDocument"
+              "ParkAgent"; "ReissueQueuedAttempt"; "RecoverAgentAssignment"; "AcknowledgeReviewFeedback"; "ParkAttempt"; "BlockAttempt"; "ResumeAttempt"; "AbandonAttempt"; "CancelTask"; "CancelOpenTask"; "TransferOwner"; "CloseTask"; "CloseNonSourceTask"; "ReopenTask"; "ReviseTaskSpecPinned"; "ImportTaskSpec"; "AdoptTaskSpec"; "ExportTaskSpec"
+              "ReviewTask"; "ReviewDetails"; "ReviewerInbox"; "ListReviewDocuments"; "ReadReviewDocument"
+              "SubmitReview"; "ReplaceReview"; "ClaimReview"; "DecideReview"
+              "WithdrawReview"; "FinalizeReview"; "PutReviewDocument"; "MigrateReviews"
               "LedgerHealth"; "GetOperationStatus"; "PendingOperations"; "ReconcilePendingOperations"; "AcknowledgePendingOperation"; "InitializeLedger"; "BindExistingLedger"; "RebindLedgerRemote"
-              "InspectIntegration"; "PlanIntegration"; "MarkIntegrationPendingPush"; "RecordIntegration"; "CloseIntegratedTask" ]
+              ]
     // Retired wire cases are deleted; public CreateTask/AssignTask are canonical ledger tools.
     unionNames |> shouldEqual catalogNames
     Set.intersect mcpNames retired |> shouldEqual Set.empty
@@ -456,7 +456,7 @@ let ``client-backed MCP tools expose an optional per-command deviceId`` () =
         |> Array.filter (fun methodInfo ->
             methodInfo.GetParameters()
             |> Array.exists (fun parameter -> parameter.ParameterType = typeof<ClientService>))
-    clientMethods.Length |> shouldEqual (AgentProtocol.commandDefinitions.Length - 1 + 68) // public orchestration aliases / 8 wire operations
+    clientMethods.Length |> shouldEqual (AgentProtocol.commandDefinitions.Length - 1 + 55) // public orchestration aliases / 8 wire operations
     for methodInfo in clientMethods do
         let deviceParam = methodInfo.GetParameters() |> Array.tryFind (fun parameter -> parameter.Name = "deviceId")
         match deviceParam with
@@ -665,8 +665,6 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
             |> Map.ofList
         let ledgerRead = original["V2LedgerRead"]
         let ledgerWrite = original["V2LedgerWrite"]
-        let integrationRead = original["V2IntegrationRead"]
-        let integrationWrite = original["V2IntegrationWrite"]
         let taskRead = original["V2TaskRead"]
         let taskWrite = original["V2TaskWrite"]
         let v2Read = original["V2ReviewRead"]
@@ -674,16 +672,14 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
         let aliases =
             [ for name in [ "LedgerHealth"; "GetOperationStatus"; "PendingOperations"; "ReconcilePendingOperations" ] -> name, ledgerRead
               for name in [ "InitializeLedger"; "BindExistingLedger"; "RebindLedgerRemote"; "AcknowledgePendingOperation" ] -> name, ledgerWrite
-              for name in [ "InspectIntegration" ] -> name, integrationRead
-              for name in [ "PlanIntegration"; "MarkIntegrationPendingPush"; "RecordIntegration"; "CloseIntegratedTask" ] -> name, integrationWrite
               for name in [ "AgentInbox"; "GetAssignment"; "GetCheckpoint"; "InspectAttemptSource"; "TaskLifecycleHistory"; "GetNonSourceApproval"; "GetTaskSpecPage"; "DiffTaskSpec" ] -> name, taskRead
               for name in [ "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "AcknowledgeAssignment"; "ReissueAssignment"; "BeginAttempt"; "CheckpointAttempt"
                             "BindReviewBase"; "BindAttemptSource"; "RebindAttemptSource"; "YieldAgent"; "ResumeAgent"; "CompleteAgentWork";
-                            "ParkAgent"; "ReissueQueuedAttempt"; "RecoverAgentAssignment"; "AcknowledgeReviewFeedback"; "ParkAttempt"; "BlockAttempt"; "ResumeAttempt"; "AbandonAttempt"; "CancelTask"; "CancelOpenTask"; "TransferOwner"; "CloseNonSourceTask"; "ReopenTask"; "ReviseTaskSpecPinned"; "ImportTaskSpec"; "AdoptTaskSpec"; "ExportTaskSpec" ] -> name, taskWrite
-              for name in [ "ReviewTask"; "ReviewDetails"; "ReviewerInbox"; "ReviewDecisionEvidence"; "ReviewClaimHistory"; "AwaitingReviewReassignment"; "InspectOrphanReviewRefs"; "ListReviewDocuments"; "ReadReviewDocument" ] ->
+                            "ParkAgent"; "ReissueQueuedAttempt"; "RecoverAgentAssignment"; "AcknowledgeReviewFeedback"; "ParkAttempt"; "BlockAttempt"; "ResumeAttempt"; "AbandonAttempt"; "CancelTask"; "CancelOpenTask"; "TransferOwner"; "CloseTask"; "CloseNonSourceTask"; "ReopenTask"; "ReviseTaskSpecPinned"; "ImportTaskSpec"; "AdoptTaskSpec"; "ExportTaskSpec" ] -> name, taskWrite
+              for name in [ "ReviewTask"; "ReviewDetails"; "ReviewerInbox"; "ListReviewDocuments"; "ReadReviewDocument" ] ->
                   name, v2Read
-              for name in [ "SubmitReview"; "ReplaceReview"; "SubmitReviewWithEvidence"; "ReplaceReviewWithEvidence"; "ClaimReview"; "DecideReview"; "DecideReviewWithEvidence"
-                            "WithdrawReview"; "ReassignReview"; "ReleaseReviewClaim"; "ReassignReviewWithReason"; "ReserveOrphanReviewRef"; "DeleteReservedOrphanReviewRef"; "FinalizeReview"; "PutReviewDocument" ] ->
+              for name in [ "SubmitReview"; "ReplaceReview"; "ClaimReview"; "DecideReview"
+                            "WithdrawReview"; "FinalizeReview"; "PutReviewDocument"; "MigrateReviews" ] ->
                   name, v2Write ]
         aliases |> List.fold (fun map (key, value) -> Map.add key value map) original
 

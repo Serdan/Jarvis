@@ -139,22 +139,6 @@ type V2LedgerWriteCommand =
       ExpectedRequestHash: string
       AcknowledgeVisibility: bool }
 
-type V2IntegrationReadCommand =
-    { ProjectName: string
-      TaskId: string
-      ActionId: string }
-
-type V2IntegrationWriteCommand =
-    { ProjectName: string
-      Action: string
-      OperationId: string
-      TaskId: string
-      ActionId: string
-      RequestId: string
-      ExpectedVersion: int
-      TargetRef: string
-      ExpectedTargetHead: string }
-
 type V2ReviewReadCommand =
     { ProjectName: string
       Action: string
@@ -537,8 +521,6 @@ type AgentCommand =
     | V2TaskWriteCommand of V2TaskWriteCommand
     | V2LedgerReadCommand of V2LedgerReadCommand
     | V2LedgerWriteCommand of V2LedgerWriteCommand
-    | V2IntegrationReadCommand of V2IntegrationReadCommand
-    | V2IntegrationWriteCommand of V2IntegrationWriteCommand
     | V2ReviewReadCommand of V2ReviewReadCommand
     | V2ReviewWriteCommand of V2ReviewWriteCommand
     | GetProjectDetailsCommand of GetProjectDetailsCommand
@@ -582,8 +564,6 @@ module AgentCommandInfo =
         | V2TaskWriteCommand _ -> "V2TaskWriteCommand"
         | V2LedgerReadCommand _ -> "V2LedgerReadCommand"
         | V2LedgerWriteCommand _ -> "V2LedgerWriteCommand"
-        | V2IntegrationReadCommand _ -> "V2IntegrationReadCommand"
-        | V2IntegrationWriteCommand _ -> "V2IntegrationWriteCommand"
         | V2ReviewReadCommand _ -> "V2ReviewReadCommand"
         | V2ReviewWriteCommand _ -> "V2ReviewWriteCommand"
         | GetProjectDetailsCommand _ -> "GetProjectDetailsCommand"
@@ -633,8 +613,6 @@ module AgentCommandInfo =
         | V2TaskWriteCommand _ -> "V2TaskWrite"
         | V2LedgerReadCommand _ -> "V2LedgerRead"
         | V2LedgerWriteCommand _ -> "V2LedgerWrite"
-        | V2IntegrationReadCommand _ -> "V2IntegrationRead"
-        | V2IntegrationWriteCommand _ -> "V2IntegrationWrite"
         | V2ReviewReadCommand _ -> "V2ReviewRead"
         | V2ReviewWriteCommand _ -> "V2ReviewWrite"
         | GetProjectDetailsCommand _ -> "GetProjectDetails"
@@ -682,8 +660,6 @@ module AgentCommandInfo =
         | V2TaskWriteCommand cmd -> Some cmd.ProjectName
         | V2LedgerReadCommand cmd -> Some cmd.ProjectName
         | V2LedgerWriteCommand cmd -> Some cmd.ProjectName
-        | V2IntegrationReadCommand cmd -> Some cmd.ProjectName
-        | V2IntegrationWriteCommand cmd -> Some cmd.ProjectName
         | V2ReviewReadCommand cmd -> Some cmd.ProjectName
         | V2ReviewWriteCommand cmd -> Some cmd.ProjectName
         | GetProjectDetailsCommand cmd -> Some cmd.ProjectName
@@ -769,8 +745,6 @@ module AgentCommandInfo =
         | V2TaskWriteCommand cmd -> Some(compact cmd.Action)
         | V2LedgerReadCommand cmd -> Some(compact cmd.ProjectName)
         | V2LedgerWriteCommand cmd -> Some(compact cmd.Action)
-        | V2IntegrationReadCommand cmd -> Some(compact cmd.ActionId)
-        | V2IntegrationWriteCommand cmd -> Some(compact cmd.Action)
         | V2ReviewReadCommand cmd -> Some(compact cmd.Action)
         | V2ReviewWriteCommand cmd -> Some(compact cmd.Action)
         | GetGitDiffCommand cmd -> cmd.Path |> Option.map compact
@@ -813,8 +787,6 @@ module AgentCommandInfo =
         | V2TaskWriteCommand cmd -> Some(truncate 64 cmd.Action)
         | V2LedgerReadCommand cmd -> Some(truncate 64 cmd.ProjectName)
         | V2LedgerWriteCommand cmd -> Some(truncate 64 cmd.Action)
-        | V2IntegrationReadCommand cmd -> Some(truncate 64 cmd.ActionId)
-        | V2IntegrationWriteCommand cmd -> Some(truncate 64 cmd.Action)
         | V2ReviewReadCommand cmd -> Some(truncate 64 cmd.Action)
         | V2ReviewWriteCommand cmd -> Some(truncate 64 cmd.Action)
         | GetGitDiffCommand cmd -> cmd.Path |> Option.map (truncate 64)
@@ -871,7 +843,7 @@ module AgentCommandInfo =
         | None -> invocation command
 
 module AgentProtocol =
-    let version = "3.40"
+    let version = "3.41"
     let defaultPatchFuzzyContextLines = 3
     let maxResponseBytes = 900 * 1024
     let maxImageBytes = 8 * 1024 * 1024
@@ -897,8 +869,6 @@ module AgentProtocol =
           definition "V2TaskWrite" "Creates/assigns/starts V2 tasks and binds immutable review base." [ VersionControlWrite; NetworkAccess ] true true false
           definition "V2LedgerRead" "Inspect the verified canonical V2 Git ledger identity and trust head." [ ReadOnly; NetworkAccess ] false false false
           definition "V2LedgerWrite" "Explicitly bind, initialize or rebind the canonical V2 ledger with privacy acknowledgment." [ VersionControlWrite; NetworkAccess ] true true false
-          definition "V2IntegrationRead" "Inspect planned source integration and read-only remote status." [ ReadOnly; NetworkAccess ] false false false
-          definition "V2IntegrationWrite" "Plan or record verified source integration without implicit source push." [ VersionControlWrite; NetworkAccess ] true true false
           definition "V2ReviewRead" "Reads opt-in canonical V2 review ledger requests and reviewer inboxes." [ ReadOnly; NetworkAccess ] false false false
           definition "V2ReviewWrite" "Updates opt-in canonical V2 review ledger with a stable operation UUID." [ VersionControlWrite; NetworkAccess ] true true false
           definition "RemoveWorktree" "Removes a clean integrated Git worktree." [ VersionControlWrite; Destructive ] true true false

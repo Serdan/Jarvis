@@ -157,57 +157,6 @@ let v2TaskMutationsRequireGitWritePermission () =
 
 
 [<Test>]
-let v2IntegrationReadWriteRequireExplicitLedgerBinding () =
-    let root, project = GitCommandTests.createTempProject ()
-    try
-        let context = GitCommandTests.TestContext root
-        GitCommandTests.initRepo context
-        let read : V2IntegrationReadCommand =
-            { ProjectName = "Project1"; TaskId = "integration"
-              ActionId = Guid.NewGuid().ToString("D") }
-        match Client.V2ReviewApi.V2IntegrationApi.read read context with
-        | Error(Client.ValidationError message) ->
-            Assert.That(message, Does.Contain("V2 ledger disabled"))
-        | other -> Assert.Fail(sprintf "Integration inspection must fail closed: %A" other)
-        let write : V2IntegrationWriteCommand =
-            { ProjectName = "Project1"; Action = "RecordIntegration"
-              OperationId = Guid.NewGuid().ToString("D"); TaskId = "integration"
-              ActionId = Guid.NewGuid().ToString("D"); RequestId = ""
-              ExpectedVersion = 1; TargetRef = ""; ExpectedTargetHead = "" }
-        match Client.V2ReviewApi.V2IntegrationApi.write write context with
-        | Error(Client.ValidationError message) ->
-            Assert.That(message, Does.Contain("V2 ledger disabled"))
-        | other -> Assert.Fail(sprintf "Integration recording must fail closed: %A" other)
-        Assert.That(File.Exists(Client.V2ReviewApi.ReviewV2Binding.pathForRoot project), Is.False)
-        Assert.That(GitCommandTests.gitOutput context [ "status"; "--porcelain" ], Is.Empty)
-    finally Directory.Delete(root, true)
-
-[<Test>]
-let v2IntegrationMutationsNeedExplicitGitWritePermission () =
-    Client.PermissionPolicy.clearGrants ()
-    let read =
-        V2IntegrationReadCommand
-            { ProjectName = "Project1"; TaskId = "reviewed"
-              ActionId = Guid.NewGuid().ToString("D") }
-    match Client.PermissionPolicy.evaluate read with
-    | Ok () -> ()
-    | other -> Assert.Fail(sprintf "Integration inspection should be read-only: %A" other)
-    let write =
-        V2IntegrationWriteCommand
-            { ProjectName = "Project1"; Action = "PlanIntegration"
-              OperationId = Guid.NewGuid().ToString("D"); TaskId = "reviewed"
-              ActionId = Guid.NewGuid().ToString("D")
-              RequestId = Guid.NewGuid().ToString("D")
-              ExpectedVersion = 1; TargetRef = "refs/heads/main"
-              ExpectedTargetHead = String.replicate 40 "a" }
-    match Client.PermissionPolicy.evaluate write with
-    | Error(Client.ConfirmationRequired approval) ->
-        Assert.That(approval.Permissions, Does.Contain(VersionControlWrite))
-        Assert.That(approval.Permissions, Does.Contain(NetworkAccess))
-    | other -> Assert.Fail(sprintf "Integration source operations require explicit approval: %A" other)
-
-
-[<Test>]
 let v2OperationStatusUsesReadOnlyTypedLedgerCommand () =
     Client.PermissionPolicy.clearGrants ()
     let read =

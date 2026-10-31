@@ -113,7 +113,6 @@ let private requiresConfirmation command =
     | InspectWorktreeRemovalCommand _
     | V2TaskReadCommand _
     | V2LedgerReadCommand _
-    | V2IntegrationReadCommand _
     | V2ReviewReadCommand _
     | GetProjectDetailsCommand _
     | ListDirectoryCommand _
@@ -158,11 +157,6 @@ let private requiresConfirmation command =
             [ VersionControlWrite; NetworkAccess ] [] (Some "git")
             [ cmd.RemoteName; cmd.ExpectedTrustedHead; cmd.OperationId ]
             ("V2 ledger setup " + cmd.Action) false
-    | V2IntegrationWriteCommand cmd ->
-        confirmation ("V2Integration" + cmd.Action) (Some cmd.ProjectName)
-            [ VersionControlWrite; NetworkAccess ] [] (Some "git")
-            [ cmd.TaskId; cmd.ActionId; cmd.OperationId ]
-            ("V2 source integration " + cmd.Action) false
     | V2ReviewWriteCommand cmd ->
         confirmation ("V2Review" + cmd.Action) (Some cmd.ProjectName)
             [ VersionControlWrite; NetworkAccess ] [] (Some "git")

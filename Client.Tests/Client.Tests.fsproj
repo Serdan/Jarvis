@@ -36,6 +36,7 @@
         <Compile Include="AgentViewTests.fs"/>
         <Compile Include="TerminalMouseTests.fs"/>
         <Compile Include="TerminalLayoutTests.fs"/>
+        <Compile Include="TerminalFrameTests.fs"/>
         <Compile Include="HashAndPatchTests.fs"/>
         <Compile Include="PathSafetyTests.fs"/>
         <Compile Include="SelfUpdateTests.fs"/>

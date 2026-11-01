@@ -7,6 +7,7 @@ open Common
 open Client
 open Client.TerminalMouse
 open Client.TerminalLayout
+open Client.TerminalFrame
 
 type private MouseTarget =
     | SwitchActivity
@@ -145,12 +146,28 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
     let mutable serverHost = "-"
     let maxHistory = 500
     let visibleActivityRows = 12
+    let mutable draw = Frame(80, 24)
+    let mutable previousFrame: Frame option = None
+    let mutable frameSize = (0, 0)
+    let mutable lastRenderError: string option = None
+
+    let jobViewportRows () =
+        let reserved = if draw.Height < 22 then 7 else 10
+        max 1 (min 12 (draw.Height - reserved))
+
+    let activityViewportRows () =
+        let reserved =
+            if draw.Height < 22 then
+                if showActivityDetails then 9 else 7
+            elif showActivityDetails then 14
+            else 11
+        max 1 (min visibleActivityRows (draw.Height - reserved))
 
     let registerMouseHit x width target =
-        if not Console.IsOutputRedirected && width > 0 then
+        if width > 0 then
             try
-                let y = Console.CursorTop
-                if y >= 0 && y < Console.WindowHeight then
+                let y = draw.CursorTop
+                if y >= 0 && y < draw.Height then
                     mouseHits.Add({ Rect = { X = x; Y = y; Width = width; Height = 1 }
                                     Target = target })
             with _ -> ()
@@ -159,7 +176,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         if Console.IsOutputRedirected then visibleActivityRows
         else
             try
-                TerminalLayout.agentViewportRows Console.WindowHeight Console.WindowWidth showAgentDetails
+                TerminalLayout.agentViewportRows draw.Height draw.Width showAgentDetails
             with _ -> visibleActivityRows
 
     let currentModeIs tab =
@@ -174,11 +191,11 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         for label, target in
             [ "Activity", SwitchActivity; "Agents", SwitchAgents
               "Jobs", SwitchJobs; "Settings", SwitchSettings ] do
-            let x = Console.CursorLeft
+            let x = draw.CursorLeft
             let text = if currentModeIs target then $"[{label}] " else $" {label}  "
             registerMouseHit x text.Length target
-            Console.Write text
-        Console.WriteLine()
+            draw.Write text
+        draw.WriteLine()
 
     let trim value maxLength =
         if String.IsNullOrEmpty value || value.Length <= maxLength then value
@@ -247,7 +264,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         |> Seq.toArray
 
     let maxScrollOffsetUnsafe () =
-        max 0 ((filteredActivityUnsafe()).Length - visibleActivityRows)
+        max 0 ((filteredActivityUnsafe()).Length - activityViewportRows())
 
     let clampScrollOffsetUnsafe () =
         activityScrollOffset <- activityScrollOffset |> max 0 |> min (maxScrollOffsetUnsafe())
@@ -271,7 +288,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
             activityScrollOffset <-
                 ActivityNavigation.scrollOffsetForSelection
                     filtered.Length
-                    visibleActivityRows
+                    (activityViewportRows())
                     activityScrollOffset
                     selectedIndex
 
@@ -422,92 +439,92 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         let rendered = $"{marker} {activityText entry}" |> fun value -> trim value width
 
         match entry.ProjectName with
-        | None -> Console.WriteLine rendered
+        | None -> draw.WriteLine rendered
         | Some projectName ->
             let token = ActivityFilter.projectToken projectName
             let index = rendered.IndexOf(token, StringComparison.Ordinal)
 
             if index < 0 then
-                Console.WriteLine rendered
+                draw.WriteLine rendered
             else
-                let previous = Console.ForegroundColor
-                Console.Write(rendered.Substring(0, index))
-                Console.ForegroundColor <- projectColor projectName
-                Console.Write(token)
-                Console.ForegroundColor <- previous
-                Console.WriteLine(rendered.Substring(index + token.Length))
+                let previous = draw.ForegroundColor
+                draw.Write(rendered.Substring(0, index))
+                draw.ForegroundColor <- projectColor projectName
+                draw.Write(token)
+                draw.ForegroundColor <- previous
+                draw.WriteLine(rendered.Substring(index + token.Length))
 
     let writeColoredProject projectName =
-        let previous = Console.ForegroundColor
-        Console.ForegroundColor <- projectColor projectName
-        Console.Write(ActivityFilter.projectToken projectName)
-        Console.ForegroundColor <- previous
+        let previous = draw.ForegroundColor
+        draw.ForegroundColor <- projectColor projectName
+        draw.Write(ActivityFilter.projectToken projectName)
+        draw.ForegroundColor <- previous
 
     let hotkeyColor = ConsoleColor.Cyan
 
     let writeHotkeyToken (token: string) =
-        let previous = Console.ForegroundColor
-        Console.ForegroundColor <- hotkeyColor
-        Console.Write token
-        Console.ForegroundColor <- previous
+        let previous = draw.ForegroundColor
+        draw.ForegroundColor <- hotkeyColor
+        draw.Write token
+        draw.ForegroundColor <- previous
 
     let writeMnemonic hotkey (label: string) =
         let hotkeyText = string hotkey
         let index = label.IndexOf(hotkeyText, StringComparison.OrdinalIgnoreCase)
 
         if index < 0 then
-            Console.Write label
+            draw.Write label
         else
-            Console.Write(label.Substring(0, index))
+            draw.Write(label.Substring(0, index))
             writeHotkeyToken (label.Substring(index, 1))
-            Console.Write(label.Substring(index + 1))
+            draw.Write(label.Substring(index + 1))
 
     let writeActivityHotkeys () =
-        Console.Write "Keys: "
-        writeHotkeyToken "↑/↓"; Console.Write " activity, "
-        writeHotkeyToken "PgUp/PgDn"; Console.Write " page, "
-        writeHotkeyToken "End"; Console.Write " latest, "
-        writeHotkeyToken "Enter"; Console.Write " details, "
-        writeHotkeyToken "/"; Console.Write " filter, "
-        writeHotkeyToken "@"; Console.Write " project, "
-        writeMnemonic 's' "status"; Console.Write ", "
-        writeMnemonic 'c' "clear"; Console.Write ", "
-        writeMnemonic 'p' "permissions"; Console.Write ", "
-        writeMnemonic 'j' "jobs"; Console.Write ", "
-        writeMnemonic 'a' "agents"; Console.Write ", "
-        writeMnemonic 'g' "settings"; Console.Write ", "
-        writeMnemonic 'r' "copy recent"; Console.Write ", "
-        writeMnemonic 'o' (if showObservers then "hide observers" else "show observers"); Console.Write ", "
-        writeMnemonic 'q' "quit"; Console.WriteLine ""
+        draw.Write "Keys: "
+        writeHotkeyToken "↑/↓"; draw.Write " activity, "
+        writeHotkeyToken "PgUp/PgDn"; draw.Write " page, "
+        writeHotkeyToken "End"; draw.Write " latest, "
+        writeHotkeyToken "Enter"; draw.Write " details, "
+        writeHotkeyToken "/"; draw.Write " filter, "
+        writeHotkeyToken "@"; draw.Write " project, "
+        writeMnemonic 's' "status"; draw.Write ", "
+        writeMnemonic 'c' "clear"; draw.Write ", "
+        writeMnemonic 'p' "permissions"; draw.Write ", "
+        writeMnemonic 'j' "jobs"; draw.Write ", "
+        writeMnemonic 'a' "agents"; draw.Write ", "
+        writeMnemonic 'g' "settings"; draw.Write ", "
+        writeMnemonic 'r' "copy recent"; draw.Write ", "
+        writeMnemonic 'o' (if showObservers then "hide observers" else "show observers"); draw.Write ", "
+        writeMnemonic 'q' "quit"; draw.WriteLine ""
 
     let writePermissionHotkeys () =
-        Console.Write "Keys: "
-        writeHotkeyToken "↑/↓"; Console.Write " permission, "
-        writeMnemonic 'a' "allow once"; Console.Write ", "
-        writeMnemonic 's' "allow exact for session"; Console.Write ", "
-        writeMnemonic 'e' "executable"; Console.Write ", "
-        writeMnemonic 'd' "deny"; Console.Write ", "
-        writeHotkeyToken "Esc"; Console.Write " activity, "
-        writeMnemonic 'q' "quit"; Console.WriteLine ""
+        draw.Write "Keys: "
+        writeHotkeyToken "↑/↓"; draw.Write " permission, "
+        writeMnemonic 'a' "allow once"; draw.Write ", "
+        writeMnemonic 's' "allow exact for session"; draw.Write ", "
+        writeMnemonic 'e' "executable"; draw.Write ", "
+        writeMnemonic 'd' "deny"; draw.Write ", "
+        writeHotkeyToken "Esc"; draw.Write " activity, "
+        writeMnemonic 'q' "quit"; draw.WriteLine ""
 
     let writeFilterHotkeys () =
-        Console.Write "Filter: type text; "
-        writeHotkeyToken "@"; Console.Write "term filters project, "
-        writeHotkeyToken "Backspace"; Console.Write " edits, "
-        writeHotkeyToken "Enter"; Console.Write " applies, "
-        writeHotkeyToken "Esc"; Console.WriteLine " cancels"
+        draw.Write "Filter: type text; "
+        writeHotkeyToken "@"; draw.Write "term filters project, "
+        writeHotkeyToken "Backspace"; draw.Write " edits, "
+        writeHotkeyToken "Enter"; draw.Write " applies, "
+        writeHotkeyToken "Esc"; draw.WriteLine " cancels"
 
     let writeCopyRecentHotkeys () =
-        Console.Write $"Copy recent commands: {copyRecentCountText}"
-        Console.Write "  "
-        writeHotkeyToken "Enter"; Console.Write " copies, "
-        writeHotkeyToken "Esc"; Console.WriteLine " cancels"
+        draw.Write $"Copy recent commands: {copyRecentCountText}"
+        draw.Write "  "
+        writeHotkeyToken "Enter"; draw.Write " copies, "
+        writeHotkeyToken "Esc"; draw.WriteLine " cancels"
 
     let activityRangeUnsafe () =
         let filtered = filteredActivityUnsafe()
         clampScrollOffsetUnsafe()
         let endExclusive = filtered.Length - activityScrollOffset
-        let start = max 0 (endExclusive - visibleActivityRows)
+        let start = max 0 (endExclusive - activityViewportRows())
         filtered, start, endExclusive
 
     let wrappedLines width (detail: string) =
@@ -564,21 +581,21 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         let lines = wrappedLines available value
 
         match lines with
-        | [] -> Console.WriteLine($"{label,-11}")
+        | [] -> draw.WriteLine($"{label,-11}")
         | first :: rest ->
-            Console.WriteLine($"{label,-11}{first}")
+            draw.WriteLine($"{label,-11}{first}")
             let indent = String.replicate labelWidth " "
             for line in rest do
-                Console.WriteLine($"{indent}{line}")
+                draw.WriteLine($"{indent}{line}")
 
     let renderActivityDetailsUnsafe width =
         if showActivityDetails then
             match selectedActivityUnsafe() with
             | None -> ()
             | Some entry ->
-                Console.WriteLine ""
-                Console.WriteLine "Activity details"
-                Console.WriteLine "----------------"
+                draw.WriteLine ""
+                draw.WriteLine "Activity details"
+                draw.WriteLine "----------------"
                 writeDetailField width "Time" entry.Timestamp
                 entry.ProjectName
                 |> Option.map ActivityFilter.projectToken
@@ -606,33 +623,41 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                 |> Option.iter (writeDetailField width "Error")
 
     let renderPermissionRequestsUnsafe width =
-        Console.WriteLine ""
+        draw.WriteLine ""
         let permissionSuffix =
             if prompts.Count = 0 then ""
             else $" ({prompts.Count})"
-        Console.WriteLine $"Permission requests{permissionSuffix}"
-        Console.WriteLine "-------------------"
+        draw.WriteLine $"Permission requests{permissionSuffix}"
+        draw.WriteLine "-------------------"
         if prompts.Count = 0 then
-            Console.WriteLine "No pending permission requests."
+            draw.WriteLine "No pending permission requests."
         else
-            for index = 0 to prompts.Count - 1 do
+            // Each request takes 2-3 rows; leave room for a footer and never
+            // render off-screen requests as if they could be selected.
+            let available = max 0 (draw.Height - draw.CursorTop - 2)
+            let capacity = min prompts.Count (available / 3)
+            let start =
+                if mode = PermissionMode then
+                    max 0 (min (prompts.Count - capacity) (selectedPrompt - capacity + 1))
+                else 0
+            for index = start to start + capacity - 1 do
                 let prompt = prompts[index]
                 let marker =
                     if mode = PermissionMode && index = selectedPrompt then ">"
                     else " "
                 registerMouseHit 0 width (SelectPermission index)
-                Console.Write $"{marker} #{prompt.Id} {prompt.Request.CommandName}"
+                draw.Write $"{marker} #{prompt.Id} {prompt.Request.CommandName}"
                 match prompt.Request.ProjectName with
                 | Some projectName ->
-                    Console.Write " "
+                    draw.Write " "
                     writeColoredProject projectName
                 | None -> ()
-                Console.WriteLine ""
-                Console.WriteLine $"    {trim prompt.Request.Summary (Math.Max(20, width - 4))}"
+                draw.WriteLine ""
+                draw.WriteLine $"    {trim prompt.Request.Summary (Math.Max(20, width - 4))}"
                 AgentCommandInfo.reason prompt.Command
                 |> Option.iter (fun reason ->
-                    Console.WriteLine $"    Reason: {trim reason (Math.Max(20, width - 12))}")
-        Console.WriteLine ""
+                    draw.WriteLine $"    Reason: {trim reason (Math.Max(20, width - 12))}")
+        draw.WriteLine ""
 
     let jobListUnsafe () =
         JobView.visibleJobs jobIncludeCompleted jobProjectFilter jobSummaries
@@ -649,7 +674,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         else
             let bounded = max 0 (min (items.Length - 1) index)
             jobSelectedId <- Some items[bounded].JobId
-            let maxRows = 12
+            let maxRows = jobViewportRows()
             if bounded < jobListScroll then jobListScroll <- bounded
             elif bounded >= jobListScroll + maxRows then jobListScroll <- bounded - maxRows + 1
 
@@ -744,30 +769,30 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         pollJobsUnsafe()
 
     let writeJobsHotkeys () =
-        Console.WriteLine "Keys: Up/Down select, PgUp/PgDn page, Enter output, t toggle completed,"
-        Console.WriteLine "      f filter project, c cancel, p permissions, Esc activity, q quit"
+        draw.WriteLine "Keys: Up/Down select, PgUp/PgDn page, Enter output, t toggle completed,"
+        draw.WriteLine "      f filter project, c cancel, p permissions, Esc activity, q quit"
 
     let writeJobDetailsHotkeys () =
-        Console.WriteLine "Keys: Up/Down/PgUp/PgDn scroll output, b follow/bottom, c cancel,"
-        Console.WriteLine "      p permissions, Esc jobs, q quit"
+        draw.WriteLine "Keys: Up/Down/PgUp/PgDn scroll output, b follow/bottom, c cancel,"
+        draw.WriteLine "      p permissions, Esc jobs, q quit"
 
     let renderJobsUnsafe width =
         let items = jobListUnsafe() |> List.toArray
         let running = jobSummaries |> List.filter JobView.isRunning |> List.length
         let finished = jobSummaries.Length - running
         let safe value = JobView.safeLine value
-        Console.WriteLine $"Jobs: {running} running, {finished} recent completed"
+        draw.WriteLine $"Jobs: {running} running, {finished} recent completed"
         let filterLabel = if jobProjectFilter = "" then "(all)" else safe jobProjectFilter
         let completedLabel = if jobIncludeCompleted then "shown" else "hidden"
-        Console.WriteLine $"Project filter: {filterLabel} | Finished: {completedLabel}"
-        jobError |> Option.iter (fun error -> Console.WriteLine($"Error: {trim (safe error) (width - 7)}"))
+        draw.WriteLine $"Project filter: {filterLabel} | Finished: {completedLabel}"
+        jobError |> Option.iter (fun error -> draw.WriteLine($"Error: {trim (safe error) (width - 7)}"))
         match mode with
         | JobsMode | JobFilterMode ->
-            if mode = JobFilterMode then Console.WriteLine $"Filter project: {safe jobProjectFilter} (Enter apply, Esc revert)"
-            if items.Length = 0 then Console.WriteLine "No matching jobs."
+            if mode = JobFilterMode then draw.WriteLine $"Filter project: {safe jobProjectFilter} (Enter apply, Esc revert)"
+            if items.Length = 0 then draw.WriteLine "No matching jobs."
             else
                 let selected = items |> Array.tryFindIndex (fun job -> Some job.JobId = jobSelectedId) |> Option.defaultValue 0
-                let maxRows = 12
+                let maxRows = jobViewportRows()
                 jobListScroll <- max 0 (min jobListScroll (max 0 (items.Length - maxRows)))
                 if selected < jobListScroll then jobListScroll <- selected
                 if selected >= jobListScroll + maxRows then jobListScroll <- selected - maxRows + 1
@@ -779,47 +804,48 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                     let status = JobView.statusText job.Status
                     let reason = job.Reason |> Option.defaultValue (String.concat " " (job.Executable :: job.Args))
                     registerMouseHit 0 width (SelectJob job.JobId)
-                    Console.Write(marker + " ")
-                    let previous = Console.ForegroundColor
-                    Console.ForegroundColor <- projectColor job.ProjectName
-                    Console.Write(safe (ActivityFilter.projectToken job.ProjectName))
-                    Console.ForegroundColor <- previous
-                    Console.WriteLine (" " + trim (safe ($"{status} | {elapsed} | {reason}")) (max 15 (width - (ActivityFilter.projectToken job.ProjectName).Length - 3)))
+                    draw.Write(marker + " ")
+                    let previous = draw.ForegroundColor
+                    draw.ForegroundColor <- projectColor job.ProjectName
+                    draw.Write(safe (ActivityFilter.projectToken job.ProjectName))
+                    draw.ForegroundColor <- previous
+                    draw.WriteLine (" " + trim (safe ($"{status} | {elapsed} | {reason}")) (max 15 (width - (ActivityFilter.projectToken job.ProjectName).Length - 3)))
         | JobDetailsMode | JobCancelMode ->
             match jobDetailId |> Option.bind (fun id -> jobSummaries |> List.tryFind (fun job -> job.JobId = id)) with
-            | None -> Console.WriteLine "Job no longer retained by the client."
+            | None -> draw.WriteLine "Job no longer retained by the client."
             | Some job ->
-                let field name value = Console.WriteLine(trim (safe ($"{name}: {value}")) width)
+                let field name value = draw.WriteLine(trim (safe ($"{name}: {value}")) width)
                 field "Id" job.JobId
                 field "Project" job.ProjectName
-                field "Reason" (job.Reason |> Option.defaultValue "(none)")
-                field "Command" (String.concat " " (job.Executable :: job.Args))
-                field "Directory" (job.WorkingDirectory |> Option.defaultValue "(project root)")
-                field "Started" (job.StartedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss"))
-                field "Finished" (job.CompletedAt |> Option.map (fun value -> value.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss")) |> Option.defaultValue "-")
-                field "Duration" (JobView.duration DateTimeOffset.UtcNow job)
+                if draw.Height >= 22 then
+                    field "Reason" (job.Reason |> Option.defaultValue "(none)")
+                    field "Command" (String.concat " " (job.Executable :: job.Args))
+                    field "Directory" (job.WorkingDirectory |> Option.defaultValue "(project root)")
+                    field "Started" (job.StartedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss"))
+                    field "Finished" (job.CompletedAt |> Option.map (fun value -> value.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss")) |> Option.defaultValue "-")
+                    field "Duration" (JobView.duration DateTimeOffset.UtcNow job)
                 field "Status" (JobView.statusText job.Status)
-                if jobOutputTruncated then Console.WriteLine "Output capture truncated at the job's byte limit."
-                Console.WriteLine (if jobFollow then "Output (following)" else "Output (scroll paused; b to follow)")
-                Console.WriteLine "---------------------"
+                if jobOutputTruncated then draw.WriteLine "Output capture truncated at the job's byte limit."
+                draw.WriteLine (if jobFollow then "Output (following)" else "Output (scroll paused; b to follow)")
+                draw.WriteLine "---------------------"
                 let lines = jobOutputLines |> List.toArray
-                let rows = max 3 (min 15 (Console.WindowHeight - 19))
+                let rows = max 1 (min 15 (draw.Height - draw.CursorTop - 2))
                 jobOutputScroll <- max 0 (min jobOutputScroll (max 0 (lines.Length - rows)))
                 let finish = max 0 (lines.Length - jobOutputScroll)
                 let start = max 0 (finish - rows)
                 for i = start to finish - 1 do
                     let line = lines[i]
                     let prefix = if line.Stream = JobOutputStream.StdErr then "ERR " else "OUT "
-                    Console.WriteLine(trim (prefix + line.Text) width)
-                if lines.Length = 0 then Console.WriteLine "(no output captured)"
-                if jobOutputScroll > 0 then Console.WriteLine $"({jobOutputScroll} lines below)"
+                    draw.WriteLine(trim (prefix + line.Text) width)
+                if lines.Length = 0 then draw.WriteLine "(no output captured)"
+                if jobOutputScroll > 0 then draw.WriteLine $"({jobOutputScroll} lines below)"
                 if mode = JobCancelMode then
-                    Console.WriteLine ""
-                    Console.WriteLine $"Cancel running job {job.JobId} for {safe job.ProjectName}?"
-                    Console.WriteLine "y confirms; n/Esc returns."
+                    draw.WriteLine ""
+                    draw.WriteLine $"Cancel running job {job.JobId} for {safe job.ProjectName}?"
+                    draw.WriteLine "y confirms; n/Esc returns."
         | _ -> ()
-        Console.WriteLine ""
-        if prompts.Count > 0 then Console.WriteLine $"{prompts.Count} pending permission request(s): press p to review."
+        draw.WriteLine ""
+        if prompts.Count > 0 then draw.WriteLine $"{prompts.Count} pending permission request(s): press p to review."
 
     let agentListUnsafe () =
         agentSnapshot
@@ -855,17 +881,17 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
             selectAgentIndexUnsafe (index + delta)
 
     let writeAgentHotkeys () =
-        Console.Write "Keys: "
-        writeHotkeyToken "↑/↓"; Console.Write " agent, "
-        writeHotkeyToken "PgUp/PgDn"; Console.Write " page, "
-        writeHotkeyToken "End"; Console.Write " last, "
-        writeHotkeyToken "Enter"; Console.Write " details, "
-        writeHotkeyToken "/"; Console.Write " filter, "
-        writeHotkeyToken "@"; Console.Write " project, "
-        writeMnemonic 'r' "refresh"; Console.Write ", "
-        writeMnemonic 'p' "permissions"; Console.Write ", "
-        writeHotkeyToken "Esc"; Console.Write " activity, "
-        writeMnemonic 'q' "quit"; Console.WriteLine "  • mouse: click/select, double-click/details, wheel/scroll"
+        draw.Write "Keys: "
+        writeHotkeyToken "↑/↓"; draw.Write " agent, "
+        writeHotkeyToken "PgUp/PgDn"; draw.Write " page, "
+        writeHotkeyToken "End"; draw.Write " last, "
+        writeHotkeyToken "Enter"; draw.Write " details, "
+        writeHotkeyToken "/"; draw.Write " filter, "
+        writeHotkeyToken "@"; draw.Write " project, "
+        writeMnemonic 'r' "refresh"; draw.Write ", "
+        writeMnemonic 'p' "permissions"; draw.Write ", "
+        writeHotkeyToken "Esc"; draw.Write " activity, "
+        writeMnemonic 'q' "quit"; draw.WriteLine "  • mouse: click/select, double-click/details, wheel/scroll"
 
     let writeColoredAgentLine width marker (row: AgentView.AgentRow) =
         let timestamp = AgentView.stateAge DateTimeOffset.UtcNow row
@@ -877,25 +903,25 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
             | None -> AgentView.displayState row.State
         let rendered = trim $"{marker}{flag} {timestamp,-4} {token} {row.Agent}: {compact status}" width
         let index = rendered.IndexOf(token, StringComparison.Ordinal)
-        if index < 0 then Console.WriteLine rendered
+        if index < 0 then draw.WriteLine rendered
         else
-            let original = Console.ForegroundColor
-            Console.Write(rendered.Substring(0, index))
-            Console.ForegroundColor <- projectColor row.Project
-            Console.Write(token)
-            Console.ForegroundColor <- original
+            let original = draw.ForegroundColor
+            draw.Write(rendered.Substring(0, index))
+            draw.ForegroundColor <- projectColor row.Project
+            draw.Write(token)
+            draw.ForegroundColor <- original
             let rest = rendered.Substring(index + token.Length)
-            Console.WriteLine rest
-            Console.ForegroundColor <- original
+            draw.WriteLine rest
+            draw.ForegroundColor <- original
 
     let renderAgentDetailsUnsafe width =
         if showAgentDetails then
             match selectedAgentUnsafe () with
             | None -> ()
             | Some row ->
-                Console.WriteLine ""
-                Console.WriteLine "Agent details"
-                Console.WriteLine "-------------"
+                draw.WriteLine ""
+                draw.WriteLine "Agent details"
+                draw.WriteLine "-------------"
                 writeDetailField width "Agent" row.Agent
                 writeDetailField width "Project" (ActivityFilter.projectToken row.Project)
                 writeDetailField width "State" row.State
@@ -912,8 +938,8 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                     writeDetailField width "Assignment generation" (string task.AssignmentGeneration)
                     task.SourceRef |> Option.iter (writeDetailField width "Source ref")
                     task.BaseCommit |> Option.iter (writeDetailField width "Base commit"))
-                Console.WriteLine ""
-                Console.WriteLine "Status reflects the canonical remote orchestration ledger, not live chat activity."
+                draw.WriteLine ""
+                draw.WriteLine "Status reflects the canonical remote orchestration ledger, not live chat activity."
 
     let renderAgentsUnsafe width =
         normalizeAgentSelectionUnsafe()
@@ -935,42 +961,45 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
             elif filtered.Length > viewport || filtered.Length <> all.Length then
                 $" [{agentScroll + 1}-{last} of {filtered.Length} / {all.Length} total]"
             else ""
-        Console.WriteLine $"Agents{filterSuffix}{historySuffix}"
-        Console.WriteLine "------"
+        draw.WriteLine $"Agents{filterSuffix}{historySuffix}"
         let stateCount state = all |> List.filter (fun row -> row.State = state) |> List.length
-        Console.WriteLine
-            (sprintf "Tracked: %d | Review: %d | Working: %d | Ready: %d | Needs work: %d | Parked: %d"
-                all.Length reviewCount (stateCount "Working") (stateCount "Ready")
-                (stateCount "NeedsWork") (stateCount "Parked"))
+        if draw.Height >= 22 then
+            draw.WriteLine "------"
+            draw.WriteLine
+                (sprintf "Tracked: %d | Review: %d | Working: %d | Ready: %d | Needs work: %d | Parked: %d"
+                    all.Length reviewCount (stateCount "Working") (stateCount "Ready")
+                    (stateCount "NeedsWork") (stateCount "Parked"))
+        else
+            draw.WriteLine (sprintf "Ready %d · Needs work %d · Working %d · Parked %d" (stateCount "Ready") (stateCount "NeedsWork") (stateCount "Working") (stateCount "Parked"))
         let refreshed =
             agentSnapshot
             |> Option.map (fun snap -> snap.RefreshedAt.ToLocalTime().ToString("HH:mm:ss"))
             |> Option.defaultValue "never"
         let refreshingSuffix = if agentRefreshing then " (refreshing...)" else ""
-        Console.WriteLine $"Snapshot: {refreshed}{refreshingSuffix}"
-        if not agentChanged.IsEmpty then
-            Console.WriteLine $"Updated agents: {agentChanged.Count} (*)"
-        agentError |> Option.iter (fun error -> Console.WriteLine(trim ("Error: " + compact error) width))
-        if mode = AgentFilterMode then Console.WriteLine $"Filter: {trim (compact agentFilter) (max 20 (width - 9))}"
+        if draw.Height >= 22 then draw.WriteLine $"Snapshot: {refreshed}{refreshingSuffix}"
+        if draw.Height >= 22 && not agentChanged.IsEmpty then
+            draw.WriteLine $"Updated agents: {agentChanged.Count} (*)"
+        agentError |> Option.iter (fun error -> draw.WriteLine(trim ("Error: " + compact error) width))
+        if mode = AgentFilterMode then draw.WriteLine $"Filter: {trim (compact agentFilter) (max 20 (width - 9))}"
         if agentSnapshot.IsNone && not agentRefreshing then
-            Console.WriteLine "No snapshot loaded. Press r to refresh."
+            draw.WriteLine "No snapshot loaded. Press r to refresh."
         elif filtered.Length = 0 then
-            Console.WriteLine "No matching agents."
+            draw.WriteLine "No matching agents."
         else
             let pane = TerminalLayout.agentPane width
             let rowWidth = pane |> Option.map (fun (listWidth, _, _) -> listWidth)
                                 |> Option.defaultValue width
-            let startY = if Console.IsOutputRedirected then 0 else Console.CursorTop
+            let startY = draw.CursorTop
             for index = agentScroll to last - 1 do
                 let row = filtered[index]
                 let marker = if mode = AgentsMode && Some row.Key = agentSelected then ">" else " "
                 registerMouseHit 0 rowWidth (SelectAgent row.Key)
                 writeColoredAgentLine rowWidth marker row
-            if pane.IsSome && showAgentDetails && not Console.IsOutputRedirected then
+            if pane.IsSome && showAgentDetails then
                 match selectedAgentUnsafe() with
                 | None -> ()
                 | Some row ->
-                    let bottom = Console.CursorTop
+                    let bottom = draw.CursorTop
                     let _, left, paneWidth = pane.Value
                     let lines =
                         [ $"Agent: {row.Agent}"
@@ -985,10 +1014,10 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                                  "Branch: " + (task.SourceRef |> Option.defaultValue "-") ])
                     for i, line in lines |> List.indexed do
                         let y = startY + i
-                        if y < Console.WindowHeight - 1 then
-                            Console.SetCursorPosition(left, y)
-                            Console.Write(trim (compact line) paneWidth)
-                    Console.SetCursorPosition(0, max bottom (min (Console.WindowHeight - 2) (startY + lines.Length)))
+                        if y < draw.Height - 1 then
+                            draw.SetCursorPosition(left, y)
+                            draw.Write(trim (compact line) paneWidth)
+                    draw.SetCursorPosition(0, max bottom (min (draw.Height - 2) (startY + lines.Length)))
         if width < 105 then renderAgentDetailsUnsafe width
 
         agentSnapshot |> Option.iter (fun snap ->
@@ -997,11 +1026,11 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                     project.Error |> Option.map (fun error -> project.Project + ": " + error))
             let issues = errors @ snap.Issues
             if not issues.IsEmpty then
-                Console.WriteLine ""
-                Console.WriteLine $"Agent issues ({issues.Length})"
-                Console.WriteLine "------------"
+                draw.WriteLine ""
+                draw.WriteLine $"Agent issues ({issues.Length})"
+                draw.WriteLine "------------"
                 for issue in issues |> List.truncate 5 do
-                    Console.WriteLine(trim (compact issue) width))
+                    draw.WriteLine(trim (compact issue) width))
 
         renderPermissionRequestsUnsafe width
 
@@ -1062,12 +1091,12 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
 
     let renderSettingsUnsafe width =
         let safe = JobView.safeLine
-        Console.WriteLine "Settings (user-level configuration)"
-        Console.WriteLine "-----------------------------------"
+        draw.WriteLine "Settings (user-level configuration)"
+        draw.WriteLine "-----------------------------------"
         match settingsSnapshot with
-        | None -> Console.WriteLine "Config unavailable."
+        | None -> draw.WriteLine "Config unavailable."
         | Some snapshot ->
-            Console.WriteLine(trim (safe snapshot.Path) width)
+            draw.WriteLine(trim (safe snapshot.Path) width)
             let effective = settingsAccess |> Option.map _.Effective
             for index = 0 to settingKeys.Length - 1 do
                 let key = settingKeys[index]
@@ -1084,69 +1113,81 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                     | _ -> ""
                 let marker = if settingsSelected = index then ">" else " "
                 registerMouseHit 0 width (SelectSetting index)
-                Console.WriteLine(trim (safe $"{marker} {settingLabels[index]}: {value}{source}") width)
+                draw.WriteLine(trim (safe $"{marker} {settingLabels[index]}: {value}{source}") width)
             match effective with
             | Some e ->
-                Console.WriteLine ""
-                Console.WriteLine "Startup effective values (changes may require restart):"
+                draw.WriteLine ""
+                draw.WriteLine "Startup effective values (changes may require restart):"
                 for index = 0 to settingKeys.Length - 1 do
-                    Console.WriteLine(trim (safe $"{settingLabels[index]}: {settingsEffective settingKeys[index] e}") width)
+                    draw.WriteLine(trim (safe $"{settingLabels[index]}: {settingsEffective settingKeys[index] e}") width)
             | None -> ()
-        Console.WriteLine ""
+        draw.WriteLine ""
         if mode = SettingsEditMode then
-            Console.WriteLine(trim (safe $"Editing {settingLabels[settingsSelected]}: {settingsEditing}") width)
-            Console.WriteLine "Enter accepts field, Esc cancels edit."
+            draw.WriteLine(trim (safe $"Editing {settingLabels[settingsSelected]}: {settingsEditing}") width)
+            draw.WriteLine "Enter accepts field, Esc cancels edit."
             if settingsSelected = 3 then
-                Console.WriteLine "Warning: allowlisted variables can expose credentials to processes started by agents."
+                draw.WriteLine "Warning: allowlisted variables can expose credentials to processes started by agents."
         elif mode = SettingsConfirmMode then
-            Console.WriteLine "WARNING: Full trust disables local confirmation for agent operations."
-            Console.WriteLine "Press y to save, n/Esc to cancel."
+            draw.WriteLine "WARNING: Full trust disables local confirmation for agent operations."
+            draw.WriteLine "Press y to save, n/Esc to cancel."
         else
-            Console.WriteLine "Up/Down select, Enter edit, u restore default, s save, Esc back."
-            Console.WriteLine "Saved changes to workspace, trust and limits require restart."
+            draw.WriteLine "Up/Down select, Enter edit, u restore default, s save, Esc back."
+            draw.WriteLine "Saved changes to workspace, trust and limits require restart."
             let originalVariables = settingsSnapshot |> Option.bind (fun s -> s.Stored.AllowedEnvironmentVariables)
             if originalVariables <> settingsStaged.AllowedEnvironmentVariables then
-                Console.WriteLine "Warning: environment allowlist changes can expose credential variables."
-        settingsError |> Option.iter (fun error -> Console.WriteLine(trim (safe error) width))
-        if prompts.Count > 0 then Console.WriteLine $"{prompts.Count} permission requests pending (p to review)."
+                draw.WriteLine "Warning: environment allowlist changes can expose credential variables."
+        settingsError |> Option.iter (fun error -> draw.WriteLine(trim (safe error) width))
+        if prompts.Count > 0 then draw.WriteLine $"{prompts.Count} permission requests pending (p to review)."
 
     let renderUnsafe () =
+        let width, height =
+            try
+                if Console.IsOutputRedirected then (80, 24)
+                else (max 1 (Console.WindowWidth - 1), max 1 Console.WindowHeight)
+            with _ -> (80, 24)
+        draw <- Frame(width, height)
+        mouseHits.Clear()
         try
-            Console.Clear()
-            mouseHits.Clear()
-            let width = Math.Max(20, Console.WindowWidth - 1)
+            lastRenderError |> Option.iter (fun error -> draw.WriteLine ("Render warning: " + error))
+            let compactHeader = draw.Height < 22
+            if compactHeader then
+                draw.WriteLine $"Jarvis · {connectionLabel connectionState} · {serverHost}"
+                writeNavigation()
+            else
+                draw.WriteLine "Jarvis Client"
+                draw.WriteLine "============="
+                let previous = draw.ForegroundColor
+                draw.ForegroundColor <- connectionColor connectionState
+                draw.Write(connectionLabel connectionState)
+                draw.ForegroundColor <- previous
+                draw.WriteLine $" • {serverHost}"
+                draw.WriteLine $"Key: {key}"
+                writeNavigation()
+            if not compactHeader then
+                match mode with
+                | ActivityMode ->
+                    writeActivityHotkeys()
+                | PermissionMode ->
+                    writePermissionHotkeys()
+                | FilterMode ->
+                    writeFilterHotkeys()
+                | CopyRecentMode ->
+                    writeCopyRecentHotkeys()
+                | AgentsMode ->
+                    writeAgentHotkeys()
+                | AgentFilterMode ->
+                    writeFilterHotkeys()
+                | JobsMode | JobFilterMode ->
+                    writeJobsHotkeys()
+                | JobDetailsMode | JobCancelMode ->
+                    writeJobDetailsHotkeys()
+                | SettingsMode | SettingsEditMode | SettingsConfirmMode ->
+                    draw.WriteLine "Settings: fields, save, defaults, permissions"
+            draw.WriteLine ""
 
-            Console.WriteLine "Jarvis Client"
-            Console.WriteLine "============="
-            let previous = Console.ForegroundColor
-            Console.ForegroundColor <- connectionColor connectionState
-            Console.Write(connectionLabel connectionState)
-            Console.ForegroundColor <- previous
-            Console.WriteLine $" • {serverHost}"
-            Console.WriteLine $"Key: {key}"
-            writeNavigation()
             match mode with
-            | ActivityMode ->
-                writeActivityHotkeys()
             | PermissionMode ->
-                writePermissionHotkeys()
-            | FilterMode ->
-                writeFilterHotkeys()
-            | CopyRecentMode ->
-                writeCopyRecentHotkeys()
-            | AgentsMode ->
-                writeAgentHotkeys()
-            | AgentFilterMode ->
-                writeFilterHotkeys()
-            | JobsMode | JobFilterMode ->
-                writeJobsHotkeys()
-            | JobDetailsMode | JobCancelMode ->
-                writeJobDetailsHotkeys()
-            | SettingsMode | SettingsEditMode | SettingsConfirmMode ->
-                Console.WriteLine "Settings: fields, save, defaults, permissions"
-            Console.WriteLine ""
-
-            match mode with
+                renderPermissionRequestsUnsafe width
             | AgentsMode | AgentFilterMode ->
                 renderAgentsUnsafe width
             | JobsMode | JobDetailsMode | JobCancelMode | JobFilterMode ->
@@ -1159,7 +1200,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                 let historySuffix =
                     if filtered.Length = 0 then
                         $" [0 of {activity.Count}]"
-                    elif filtered.Length > visibleActivityRows || filtered.Length <> activity.Count then
+                    elif filtered.Length > activityViewportRows() || filtered.Length <> activity.Count then
                         $" [{startIndex + 1}-{endExclusive} of {filtered.Length} / {activity.Count} total]"
                     else
                         ""
@@ -1169,13 +1210,13 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                     let status = if statusFilter = ActivityFilter.All then "" else $" status={ActivityFilter.statusLabel statusFilter}"
                     if text = "" && status = "" then "" else $" [{text.Trim()}{status}]"
 
-                Console.WriteLine $"Activity{filterSuffix}{historySuffix}"
-                Console.WriteLine "--------"
+                draw.WriteLine $"Activity{filterSuffix}{historySuffix}"
+                draw.WriteLine "--------"
 
                 if activity.Count = 0 then
-                    Console.WriteLine "No activity yet."
+                    draw.WriteLine "No activity yet."
                 elif filtered.Length = 0 then
-                    Console.WriteLine "No matching activity."
+                    draw.WriteLine "No matching activity."
                 else
                     for index = startIndex to endExclusive - 1 do
                         let marker =
@@ -1187,8 +1228,20 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                 renderActivityDetailsUnsafe width
 
                 renderPermissionRequestsUnsafe width
-        with _ ->
-            ()
+            if draw.Present(previousFrame) then
+                previousFrame <- Some draw
+                frameSize <- width, height
+                lastRenderError <- None
+            else
+                // No hit region is considered valid until the frame is presented.
+                mouseHits.Clear()
+                previousFrame <- None
+                frameSize <- 0, 0
+        with ex ->
+            mouseHits.Clear()
+            previousFrame <- None
+            frameSize <- 0, 0
+            lastRenderError <- Some ex.Message
 
     // Git-backed inspection can take time. Do not block the terminal or UI lock.
     let startAgentRefreshUnsafe () =
@@ -1265,8 +1318,11 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                     | SelectJob id when mode = JobsMode ->
                         jobSelectedId <- Some id
                         if isDouble then openJobDetailsUnsafe()
-                    | SelectPermission i when mode = PermissionMode ->
+                    | SelectPermission i when prompts.Count > i && i >= 0 ->
+                        if mode <> PermissionMode then permissionReturnMode <- mode
                         selectedPrompt <- i
+                        mode <- PermissionMode
+                        showActivityDetails <- false
                     | SelectSetting i when mode = SettingsMode ->
                         settingsSelected <- i
                         if isDouble then
@@ -1510,6 +1566,10 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
 
             while not shouldQuit && not cancellationToken.IsCancellationRequested do
                 try
+                    if not Console.IsOutputRedirected then
+                        let size = (max 1 (Console.WindowWidth - 1), max 1 Console.WindowHeight)
+                        if size <> frameSize then
+                            lock syncRoot renderUnsafe
                     if (mode = JobsMode || mode = JobDetailsMode || mode = JobCancelMode || mode = JobFilterMode)
                        && DateTimeOffset.UtcNow - jobLastPoll > TimeSpan.FromMilliseconds(750.) then
                         lock syncRoot (fun () ->
@@ -1703,9 +1763,9 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                                 | _, ConsoleKey.PageUp ->
                                     lock syncRoot (fun () ->
                                         match mode with
-                                        | ActivityMode -> moveActivitySelectionUnsafe -visibleActivityRows
+                                        | ActivityMode -> moveActivitySelectionUnsafe -(activityViewportRows())
                                         | AgentsMode -> moveAgentSelectionUnsafe -visibleActivityRows
-                                        | JobsMode -> moveJobSelectionUnsafe -12
+                                        | JobsMode -> moveJobSelectionUnsafe -(jobViewportRows())
                                         | JobDetailsMode ->
                                             jobFollow <- false
                                             jobOutputScroll <- min (jobOutputLines.Length - 1 |> max 0) (jobOutputScroll + 10)
@@ -1714,9 +1774,9 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                                 | _, ConsoleKey.PageDown ->
                                     lock syncRoot (fun () ->
                                         match mode with
-                                        | ActivityMode -> moveActivitySelectionUnsafe visibleActivityRows
+                                        | ActivityMode -> moveActivitySelectionUnsafe (activityViewportRows())
                                         | AgentsMode -> moveAgentSelectionUnsafe visibleActivityRows
-                                        | JobsMode -> moveJobSelectionUnsafe 12
+                                        | JobsMode -> moveJobSelectionUnsafe (jobViewportRows())
                                         | JobDetailsMode ->
                                             jobOutputScroll <- max 0 (jobOutputScroll - 10)
                                             if jobOutputScroll = 0 then jobFollow <- true

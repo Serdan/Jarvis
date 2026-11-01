@@ -11,3 +11,11 @@ The Agents screen prioritizes Ready, Needs work, Working and Parked, while keepi
 Mouse clicks are decoded only from complete, well-formed SGR reports, and mapped against the hit regions registered during the last rendered frame. Invalid, non-left-button, release, and mouse-move reports are ignored. Escape remains a working keyboard key (a short decode grace period allows distinguishing it from an ANSI report). Modal edits/confirmations cannot be dismissed inadvertently by clicking another tab.
 
 Mouse support depends on terminal capabilities (particularly on Windows). The automatic `1000/1006` setup has been unit-tested with simulated SGR reports but not end-to-end validated against every terminal emulator. Most terminals allow selecting text while tracking is enabled by holding Shift while dragging. There is no need for a native desktop window, mouse driver or external TUI framework.
+
+## Buffered rendering and resize behavior
+
+The TUI now renders into a bounded terminal-cell frame rather than calling `Console.Clear()` and writing directly during each update. The renderer compares consecutive frames and writes only changed spans; a full clear occurs only when a new size requires a fresh frame. Each frame clips writes to the terminal bounds (one physical column is reserved to avoid bottom-right auto-scroll), preserving the click coordinates recorded during drawing. A failed presentation clears the active hit map and triggers a fresh frame on the next input-loop iteration.
+
+On short terminals the header becomes compact, list page sizes shrink with the available height, and job details suppress secondary metadata so output remains accessible. Permission requests have their own paged screen. Clicking a visible request on Activity or Agents navigates to the permission screen and selects it; clicking **never** approves or denies anything. The normal keyboard shortcuts remain available.
+
+Pure frame clipping/color/Unicode tests and a pseudo-terminal frame-presentation check cover the underlying renderer. Interactive terminal-emulator testing is still advised after installing a new client; nothing in this change deploys or updates a running client.

@@ -19,3 +19,7 @@ The TUI now renders into a bounded terminal-cell frame rather than calling `Cons
 On short terminals the header becomes compact, list page sizes shrink with the available height, and job details suppress secondary metadata so output remains accessible. Permission requests have their own paged screen. Clicking a visible request on Activity or Agents navigates to the permission screen and selects it; clicking **never** approves or denies anything. The normal keyboard shortcuts remain available.
 
 Pure frame clipping/color/Unicode tests and a pseudo-terminal frame-presentation check cover the underlying renderer. Interactive terminal-emulator testing is still advised after installing a new client; nothing in this change deploys or updates a running client.
+
+## Automatic page sizes
+
+Activity, Agents, and Jobs now use the available terminal height rather than a fixed 12-row limit. Page Up and Page Down move by the **current rendered page size**, including on the Agents screen. Job-output paging likewise uses the visible number of output rows instead of a fixed step. Resizing the terminal recalculates each page size; open details and diagnostic panels reserve their rendered space. Ordinary Activity/Agents pages keep only a compact, clickable permission preview when requests are pending, with the full request details in the dedicated permission screen. No page-size configuration is needed.

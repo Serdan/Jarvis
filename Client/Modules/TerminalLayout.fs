@@ -15,6 +15,8 @@ let agentPane terminalWidth =
         let divider = terminalWidth * 55 / 100
         Some (divider - 2, divider, max 15 (terminalWidth - divider - 2))
 
-let agentViewportRows terminalHeight terminalWidth detailsExpanded =
-    let reserved = 15 + (if detailsExpanded && terminalWidth < 105 then 10 else 0)
-    max 3 (min 12 (terminalHeight - reserved))
+/// Remaining single-line items after the header and reserved lower panels.
+/// At least one row is retained for navigation even in very short terminals;
+/// the bounded renderer clips that row if the terminal cannot display it.
+let availableRows terminalHeight firstRow reservedRows =
+    max 1 (terminalHeight - firstRow - max 0 reservedRows)

@@ -145,23 +145,20 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
     let mutable connectionState = Disconnected
     let mutable serverHost = "-"
     let maxHistory = 500
-    let visibleActivityRows = 12
     let mutable draw = Frame(80, 24)
     let mutable previousFrame: Frame option = None
     let mutable frameSize = (0, 0)
     let mutable lastRenderError: string option = None
+    let mutable activityPageRows = 1
+    let mutable agentPageRows = 1
+    let mutable jobPageRows = 1
+    let mutable jobOutputPageRows = 1
 
-    let jobViewportRows () =
-        let reserved = if draw.Height < 22 then 7 else 10
-        max 1 (min 12 (draw.Height - reserved))
-
-    let activityViewportRows () =
-        let reserved =
-            if draw.Height < 22 then
-                if showActivityDetails then 9 else 7
-            elif showActivityDetails then 14
-            else 11
-        max 1 (min visibleActivityRows (draw.Height - reserved))
+    // Navigation uses the capacity recorded for the most recently displayed
+    // frame. Rendering computes that capacity from actual header and footer space.
+    let activityViewportRows () = activityPageRows
+    let agentViewportRows () = agentPageRows
+    let jobViewportRows () = jobPageRows
 
     let registerMouseHit x width target =
         if width > 0 then
@@ -171,13 +168,6 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                     mouseHits.Add({ Rect = { X = x; Y = y; Width = width; Height = 1 }
                                     Target = target })
             with _ -> ()
-
-    let agentViewportRows () =
-        if Console.IsOutputRedirected then visibleActivityRows
-        else
-            try
-                TerminalLayout.agentViewportRows draw.Height draw.Width showAgentDetails
-            with _ -> visibleActivityRows
 
     let currentModeIs tab =
         match tab, mode with
@@ -622,6 +612,14 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                 entry.FailureDetail
                 |> Option.iter (writeDetailField width "Error")
 
+    let measureRows (renderContent: unit -> unit) =
+        let original = draw
+        try
+            draw <- Frame(original.Width, original.Height)
+            renderContent()
+            draw.CursorTop
+        finally draw <- original
+
     let renderPermissionRequestsUnsafe width =
         draw.WriteLine ""
         let permissionSuffix =
@@ -658,6 +656,16 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                 |> Option.iter (fun reason ->
                     draw.WriteLine $"    Reason: {trim reason (Math.Max(20, width - 12))}")
         draw.WriteLine ""
+
+    // Ordinary list screens use a small clickable preview. The full request
+    // list, summaries and reasons remain in the paged Permission screen.
+    let renderPermissionPreviewUnsafe width =
+        if prompts.Count > 0 then
+            draw.WriteLine ""
+            draw.WriteLine $"Permission requests ({prompts.Count}; p to review)"
+            let first = prompts[0]
+            registerMouseHit 0 width (SelectPermission 0)
+            draw.WriteLine(trim $"  #{first.Id} {first.Request.CommandName}" width)
 
     let jobListUnsafe () =
         JobView.visibleJobs jobIncludeCompleted jobProjectFilter jobSummaries
@@ -789,6 +797,9 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         match mode with
         | JobsMode | JobFilterMode ->
             if mode = JobFilterMode then draw.WriteLine $"Filter project: {safe jobProjectFilter} (Enter apply, Esc revert)"
+            jobPageRows <-
+                TerminalLayout.availableRows draw.Height draw.CursorTop
+                    (if prompts.Count > 0 then 2 else 1)
             if items.Length = 0 then draw.WriteLine "No matching jobs."
             else
                 let selected = items |> Array.tryFindIndex (fun job -> Some job.JobId = jobSelectedId) |> Option.defaultValue 0
@@ -829,7 +840,10 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                 draw.WriteLine (if jobFollow then "Output (following)" else "Output (scroll paused; b to follow)")
                 draw.WriteLine "---------------------"
                 let lines = jobOutputLines |> List.toArray
-                let rows = max 1 (min 15 (draw.Height - draw.CursorTop - 2))
+                jobOutputPageRows <-
+                    TerminalLayout.availableRows draw.Height draw.CursorTop
+                        (if mode = JobCancelMode then 5 else 2)
+                let rows = jobOutputPageRows
                 jobOutputScroll <- max 0 (min jobOutputScroll (max 0 (lines.Length - rows)))
                 let finish = max 0 (lines.Length - jobOutputScroll)
                 let start = max 0 (finish - rows)
@@ -950,6 +964,28 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
             if String.IsNullOrWhiteSpace agentFilter then ""
             else $" [text=\"{trim (compact agentFilter) (max 20 (width - 22))}\"]"
         let selected = filtered |> Array.tryFindIndex (fun row -> Some row.Key = agentSelected) |> Option.defaultValue 0
+        let issues =
+            agentSnapshot
+            |> Option.map (fun snap ->
+                (snap.Projects |> List.choose (fun project ->
+                    project.Error |> Option.map (fun error -> project.Project + ": " + error)))
+                @ snap.Issues)
+            |> Option.defaultValue []
+        let headerRows =
+            if draw.Height >= 22 then 4 + (if agentChanged.IsEmpty then 0 else 1)
+            else 2
+        let headerRows = headerRows + (if agentError.IsSome then 1 else 0)
+                                    + (if mode = AgentFilterMode then 1 else 0)
+        let inlineDetails =
+            if width < 105 && showAgentDetails then
+                measureRows (fun () -> renderAgentDetailsUnsafe width)
+            else 0
+        let footerRows =
+            1 + inlineDetails
+            + (if issues.IsEmpty then 0 else 3 + min 5 issues.Length)
+            + (if prompts.Count = 0 then 0 else 3)
+        agentPageRows <-
+            TerminalLayout.availableRows draw.Height (draw.CursorTop + headerRows) footerRows
         let viewport = agentViewportRows()
         agentScroll <- max 0 (min agentScroll (max 0 (filtered.Length - viewport)))
         if filtered.Length > 0 && selected < agentScroll then agentScroll <- selected
@@ -1020,19 +1056,14 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                     draw.SetCursorPosition(0, max bottom (min (draw.Height - 2) (startY + lines.Length)))
         if width < 105 then renderAgentDetailsUnsafe width
 
-        agentSnapshot |> Option.iter (fun snap ->
-            let errors =
-                snap.Projects |> List.choose (fun project ->
-                    project.Error |> Option.map (fun error -> project.Project + ": " + error))
-            let issues = errors @ snap.Issues
-            if not issues.IsEmpty then
-                draw.WriteLine ""
-                draw.WriteLine $"Agent issues ({issues.Length})"
-                draw.WriteLine "------------"
-                for issue in issues |> List.truncate 5 do
-                    draw.WriteLine(trim (compact issue) width))
+        if not issues.IsEmpty then
+            draw.WriteLine ""
+            draw.WriteLine $"Agent issues ({issues.Length})"
+            draw.WriteLine "------------"
+            for issue in issues |> List.truncate 5 do
+                draw.WriteLine(trim (compact issue) width)
 
-        renderPermissionRequestsUnsafe width
+        renderPermissionPreviewUnsafe width
 
     let settingKeys = [| "machine-name"; "workspace-path"; "trust-level"; "allowed-environment-variables"; "max-import-bytes" |]
     let settingLabels = [| "Machine name"; "Workspace directory"; "Trust level"; "Allowed environment variables"; "Maximum import bytes" |]
@@ -1195,6 +1226,10 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
             | SettingsMode | SettingsEditMode | SettingsConfirmMode ->
                 renderSettingsUnsafe width
             | _ ->
+                let detailsRows = measureRows (fun () -> renderActivityDetailsUnsafe width)
+                activityPageRows <-
+                    TerminalLayout.availableRows draw.Height (draw.CursorTop + 2)
+                        (1 + detailsRows + (if prompts.Count > 0 then 3 else 0))
                 ensureActivitySelectionUnsafe() |> ignore
                 let filtered, startIndex, endExclusive = activityRangeUnsafe()
                 let historySuffix =
@@ -1227,7 +1262,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
 
                 renderActivityDetailsUnsafe width
 
-                renderPermissionRequestsUnsafe width
+                renderPermissionPreviewUnsafe width
             if draw.Present(previousFrame) then
                 previousFrame <- Some draw
                 frameSize <- width, height
@@ -1764,21 +1799,21 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                                     lock syncRoot (fun () ->
                                         match mode with
                                         | ActivityMode -> moveActivitySelectionUnsafe -(activityViewportRows())
-                                        | AgentsMode -> moveAgentSelectionUnsafe -visibleActivityRows
+                                        | AgentsMode -> moveAgentSelectionUnsafe -(agentViewportRows())
                                         | JobsMode -> moveJobSelectionUnsafe -(jobViewportRows())
                                         | JobDetailsMode ->
                                             jobFollow <- false
-                                            jobOutputScroll <- min (jobOutputLines.Length - 1 |> max 0) (jobOutputScroll + 10)
+                                            jobOutputScroll <- min (jobOutputLines.Length - 1 |> max 0) (jobOutputScroll + jobOutputPageRows)
                                         | _ -> ()
                                         renderUnsafe())
                                 | _, ConsoleKey.PageDown ->
                                     lock syncRoot (fun () ->
                                         match mode with
                                         | ActivityMode -> moveActivitySelectionUnsafe (activityViewportRows())
-                                        | AgentsMode -> moveAgentSelectionUnsafe visibleActivityRows
+                                        | AgentsMode -> moveAgentSelectionUnsafe (agentViewportRows())
                                         | JobsMode -> moveJobSelectionUnsafe (jobViewportRows())
                                         | JobDetailsMode ->
-                                            jobOutputScroll <- max 0 (jobOutputScroll - 10)
+                                            jobOutputScroll <- max 0 (jobOutputScroll - jobOutputPageRows)
                                             if jobOutputScroll = 0 then jobFollow <- true
                                         | _ -> ()
                                         renderUnsafe())

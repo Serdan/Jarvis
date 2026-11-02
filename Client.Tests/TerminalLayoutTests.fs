@@ -23,9 +23,14 @@ let wideTerminalsProvideASidePaneAndNarrowOnesDoNot () =
     | None -> Assert.Fail("Wide terminal lost agent details pane.")
 
 [<Test>]
-let narrowExpandedDetailsReserveViewportHeight () =
-    let normal = agentViewportRows 30 80 false
-    let expanded = agentViewportRows 30 80 true
-    Assert.That(expanded, Is.LessThan(normal))
-    Assert.That(agentViewportRows 10 80 true, Is.EqualTo(3))
-    Assert.That(agentViewportRows 50 140 true, Is.EqualTo(12))
+let availableRowsFillTheTerminalWithoutAnArbitraryPageCap () =
+    Assert.That(availableRows 24 9 3, Is.EqualTo(12))
+    Assert.That(availableRows 52 9 3, Is.EqualTo(40))
+    Assert.That(availableRows 80 11 7, Is.EqualTo(62))
+
+[<Test>]
+let availableRowsAccountForPanelsAndTinyTerminals () =
+    Assert.That(availableRows 35 10 4, Is.EqualTo(21))
+    Assert.That(availableRows 35 10 13, Is.EqualTo(12))
+    Assert.That(availableRows 8 12 5, Is.EqualTo(1))
+    Assert.That(availableRows 30 7 -4, Is.EqualTo(23))

@@ -1,6 +1,6 @@
 # Jarvis Browser Bridge — System Specification
 
-**Status:** Browser bridge and one-shot scheduling implemented on this unmerged worktree; **registered-window launch and tab close are proposed, not implemented**
+**Status:** Browser bridge, registered-window launch, safe tab close, and one-shot/recurring scheduling implemented on this unmerged worktree; **live Edge acceptance and deployment pending**
 **Scope:** Jarvis server, JarvisClient, Chromium extension, and project-owned JavaScript scripts  
 **Initial implementation worktree:** `Jarvis::browser-bridge` (`feature/browser-bridge`)  
 **Related task:** [Local browser bridge and MCP command routing](tasks/2026-10-26-browser-bridge-jarvis.html)
@@ -429,11 +429,11 @@ A generic return value of `submitted: true` is **not** proof that the ChatGPT ag
 
 ## 13. Implementation phases
 
-1. **Existing on branch (not deployed):** generic MCP bridge, pairing, manual tab registry, project-file execution, agent-created tabs constrained by same-origin manual anchor, and one-shot scheduler. See runtime extension README for current operational commands.
-2. **New window-target work:** extension Register/Unregister window UI and local window registry, site host-permission UI, `BrowserListWindows`, `BrowserOpenTab(windowRegistration, ...)`, generation/window checks, and `BrowserCloseTab` with agent-owned-only enforcement.
-3. **One-call immediate workflow:** `BrowserRunInNewTab`, shared open/execute/close service, launch outcome and cleanup reporting; scheduled execution gains `windowRegistration` and uses that same service.
-4. **Project UI script and tests:** application-specific ChatGPT launcher in an ordinary project, live Edge test for open → submit → close, no access to existing tabs.
-5. **Optional recurrence and conveniences:** fixed-interval scheduler, wake policy, screenshots, diagnostics. No ChatGPT-specific server logic.
+1. **Implemented on branch (not deployed):** generic MCP bridge, pairing, manual tab registry, registered browser windows, project-file execution, window-targeted agent tabs, safe tab close, immediate open/execute/close workflow and one-shot/recurring scheduler. See runtime extension README for current operational commands.
+2. **Implemented window-target work:** extension Register/Unregister window UI and local window registry, site host-permission UI, `BrowserListWindows`, `BrowserOpenTab(windowRegistration, ...)`, generation/window checks, and `BrowserCloseTab` with agent-owned-only enforcement.
+3. **Implemented immediate workflow:** `BrowserRunInNewTab`, shared open/execute/close service, launch outcome and cleanup reporting; scheduled execution takes `windowRegistration` and uses that same service.
+4. **Project UI script implemented; live test pending:** ChatGPT launcher at `browser-scripts/chatgpt/launchAgent.js` and Node DOM tests. Real Edge open → submit → close remains an acceptance requirement.
+5. **Recurrence implemented; other conveniences deferred:** fixed-interval scheduler with skipped missed occurrences is implemented. Wake policy and screenshots remain deferred. No ChatGPT-specific server logic.
 6. **Review and release separately** once verified. No deployment or merge is implied by the spec.
 
 ## One-shot delayed browser execution
@@ -453,7 +453,7 @@ Orchestrator -> BrowserRunInNewTab(windowRegistration, URL, JS file, bootstrap a
                -> new ChatGPT conversation continues server-side
 ```
 
-The registered window is a destination, **not permission to inspect every tab inside it**. A new tab receives its own origin-bound auto-registration; pre-existing tabs remain unregistered. A separate app-specific script may automate ChatGPT, while the bridge stays generic. If the caller wants a delayed launch, the current one-shot scheduler and planned recurring scheduling call the same open/execute/close service. See [ChatGPTAgentLauncher.md](ChatGPTAgentLauncher.md). Window registration and this composite operation are **not yet implemented**.
+The registered window is a destination, **not permission to inspect every tab inside it**. A new tab receives its own origin-bound auto-registration; pre-existing tabs remain unregistered. A separate app-specific script may automate ChatGPT, while the bridge stays generic. If the caller wants a delayed launch, the current one-shot scheduler and planned recurring scheduling call the same open/execute/close service. See [ChatGPTAgentLauncher.md](ChatGPTAgentLauncher.md). Window registration, tab closure, and this composite operation are implemented on the feature branch; live Edge verification and deployment are pending.
 
 ## 14. External API references
 

@@ -1,6 +1,6 @@
 # ChatGPT Ephemeral Agent Launcher — Design Specification
 
-**Status:** Proposed; specification only, not implemented or deployed  
+**Status:** Implemented on `feature/browser-bridge`; **not yet deployed or verified in live Edge/ChatGPT**
 **Worktree:** `Jarvis::browser-bridge` (`feature/browser-bridge`)  
 **Depends on:** [Browser bridge](BrowserBridgeSystem.md), [implemented one-shot scheduler](BrowserOneShotScheduler.md)  
 **Scope:** User-registered browser-window targets, a generic immediate open/execute/close operation, project-owned ChatGPT UI automation, and optional scheduled repetition. These additions are specified here but **not yet implemented**.
@@ -25,16 +25,16 @@ This is primarily a **project-owned script** on the generic browser bridge, not 
 
 ## 2. Existing implementation and required additions
 
-### Already implemented in the browser-bridge worktree
+### Initial browser-bridge implementation
 
 - Local authenticated Chromium/Edge MV3 extension paired to JarvisClient.
-- Explicit manual **tab** registration and host permission for the corresponding site; separate **Allow Jarvis to open new tabs** extension opt-in. **Window registration is not implemented yet.**
-- Current `BrowserOpenTab` creates an agent-owned background tab only on an origin with an existing manually registered tab. The new design **replaces that origin-anchor requirement** with an explicit window registration plus host permission; it is not yet implemented.
+- Explicit manual **tab** registration and host permission for the corresponding site; separate **Allow Jarvis to open new tabs** extension opt-in. Window registration is implemented later on this branch.
+- Current `BrowserOpenTab` creates an agent-owned background tab only on an origin with an existing manually registered tab. The new design **replaces that origin-anchor requirement** with an explicit window registration plus host permission; it is implemented on this branch.
 - `BrowserExecuteFile` runs a real `.js` file from an ordinary Jarvis project; exported contract is `async function execute(args)`.
 - `ScheduleBrowserExecution` runs an **one-shot** delayed open-tab + execute-file action; schedule persisted locally through client restarts; no automatic replay after an uncertain dispatch. `ListScheduledBrowserExecutions` and `CancelScheduledBrowserExecution` exist.
 - A limit of **20 currently registered agent-created tabs** exists; without tab cleanup, frequent launches eventually hit that limit.
 
-### New work required by this specification
+### Implementation deliverables (completed on this branch unless explicitly deferred)
 
 1. A project-owned, reusable `chatgpt/launchAgent.js` UI automation script and tests/fixtures. This path is illustrative; no special Jarvis directory is required.
 2. **User-registered browser windows:** extension UI for Register/Unregister window and user-approved site host permissions. New tabs are created only inside a specified live registered window; no manually registered tab on the destination origin is needed.
@@ -44,7 +44,7 @@ This is primarily a **project-owned script** on the generic browser bridge, not 
 6. Existing one-shot scheduling gains `windowRegistration`, uses the shared immediate workflow, and optional **recurring fixed-interval schedules** may launch later. Scheduling is not needed for immediate orchestrator handoffs.
 7. Documentation and regression tests spanning UI changes, window revocation/restart, duplicate dispatch, permissions, registration capacity, and live Edge.
 
-Do **not** mark these additions as present until implemented and verified. No deployment, merge, or rollout is implied by accepting this spec.
+The registered-window workflow, immediate composite operation, safe tab-close and recurrence are implemented with simulated tests. **Live Edge/ChatGPT acceptance is not yet complete; no deployment, merge or rollout has occurred.**
 
 ## 3. Architecture and ownership
 
@@ -81,7 +81,7 @@ A new browser window registration is identified by opaque ID or unique alias per
 
 A launch is primarily an **immediate** `BrowserRunInNewTab` call from the orchestrator, with no ChatGPT-specific MCP endpoint. The same generic service can be triggered later by `ScheduleBrowserExecution` for worker self-continuation or recurring orchestration. Both operations require a **user-registered window** and permission for the destination site.
 
-Illustrative **new immediate command** (not yet implemented):
+Example **implemented immediate command**:
 
 ```json
 {

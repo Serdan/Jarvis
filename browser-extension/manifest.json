@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Jarvis Browser Bridge",
-  "version": "0.1.0",
-  "description": "User-authorized tab bridge for Jarvis.",
+  "version": "0.2.0",
+  "description": "Registered-window browser automation bridge for Jarvis.",
   "minimum_chrome_version": "138",
   "permissions": [
     "storage",

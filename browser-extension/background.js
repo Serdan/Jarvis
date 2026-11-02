@@ -1,8 +1,9 @@
 // Jarvis Browser Bridge - Manifest V3 service worker.
 // Only the extension popup may create, update, or remove registrations.
 // The public MCP server has no browser access without this paired local bridge.
-const PROTOCOL = 1;
+const PROTOCOL = 2;
 const REGISTRY_KEY = "registrations";
+const WINDOW_KEY = "registeredWindows";
 const SESSION_KEY = "browserSessionEpoch";
 const OPEN_TABS_KEY = "allowAgentCreatedTabs";
 const MAX_AGENT_TABS = 20;
@@ -15,6 +16,7 @@ let heartbeat = null;
 let retry = null;
 let inflight = 0;
 let registrations = [];
+let registeredWindows = [];
 let sessionEpoch = null;
 let configuredPort = 43822;
 let secret = "";
@@ -48,14 +50,16 @@ async function initialize() {
     // Keep pairing credentials and browser registrations inaccessible to page content scripts.
     await chrome.storage.local.setAccessLevel?.({ accessLevel: "TRUSTED_CONTEXTS" });
     await chrome.storage.session.setAccessLevel?.({ accessLevel: "TRUSTED_CONTEXTS" });
-    const persistent = await chrome.storage.local.get(["port", "secret", REGISTRY_KEY, OPEN_TABS_KEY]);
+    const persistent = await chrome.storage.local.get(["port", "secret", REGISTRY_KEY, WINDOW_KEY, OPEN_TABS_KEY]);
     configuredPort = persistent.port || 43822;
     secret = persistent.secret || "";
     allowAgentCreatedTabs = persistent[OPEN_TABS_KEY] === true;
     registrations = Array.isArray(persistent[REGISTRY_KEY]) ? persistent[REGISTRY_KEY] : [];
+    registeredWindows = Array.isArray(persistent[WINDOW_KEY]) ? persistent[WINDOW_KEY] : [];
     const session = await chrome.storage.session.get(SESSION_KEY);
     sessionEpoch = session[SESSION_KEY] || randomId();
     if (!session[SESSION_KEY]) await chrome.storage.session.set({ [SESSION_KEY]: sessionEpoch });
+    await refreshWindows();
     await refreshRegistrations();
   })();
   return initPromise;
@@ -65,6 +69,7 @@ function safeState(r) {
     registrationId: r.registrationId,
     alias: r.alias,
     agentCreated: r.agentCreated === true,
+    windowRegistration: r.agentCreated ? r.windowRegistration : undefined,
     displayUrl: (() => {
       try { const url = new URL(r.currentUrl || r.boundUrl); return url.origin + url.pathname; }
       catch { return "(unavailable)"; }
@@ -77,26 +82,40 @@ function safeState(r) {
 async function persist() {
   await chrome.storage.local.set({ [REGISTRY_KEY]: registrations });
 }
-function manualOriginAllowed(origin) {
-  return registrations.some(r =>
-    !r.agentCreated && !r.blocked && r.sessionEpoch === sessionEpoch &&
-    isAllowedUrl(r.boundUrl) && new URL(r.boundUrl).origin === origin);
+function windowState(w) {
+  return { windowRegistration: w.registrationId, alias: w.alias,
+    availability: w.availability, registrationGeneration: w.generation };
 }
-async function validManualOrigin(origin) {
-  if (!manualOriginAllowed(origin)) return false;
-  for (const r of registrations) {
-    if (!r.agentCreated && !r.blocked && r.sessionEpoch === sessionEpoch &&
-        isAllowedUrl(r.boundUrl) && new URL(r.boundUrl).origin === origin) {
-      const state = await assess(r);
-      if (["ready", "loading", "discarded", "frozen"].includes(state)) return true;
-    }
-  }
-  return false;
+async function assessWindow(w) {
+  if (w.blocked || w.sessionEpoch !== sessionEpoch) return "needsReauthorization";
+  try {
+    const window = await chrome.windows.get(w.windowId);
+    return window?.incognito ? "needsReauthorization" : "ready";
+  } catch { return "missing"; }
 }
+async function refreshWindows() {
+  for (const w of registeredWindows) w.availability = await assessWindow(w);
+}
+async function validWindow(id) {
+  const matches = registeredWindows.filter(w => w.registrationId === id || w.alias === id);
+  if (matches.length !== 1) return null;
+  const w = matches[0];
+  if (await assessWindow(w) !== "ready") return null;
+  return w;
+}
+async function persistWindows() {
+  await chrome.storage.local.set({ [WINDOW_KEY]: registeredWindows });
+}
+async function advertiseWindows() {
+  await refreshWindows();
+  if (connected) send({ kind: "windows", windows: registeredWindows.map(windowState) });
+}
+
 async function assess(reg) {
   if (reg.blocked || reg.sessionEpoch !== sessionEpoch) return "needsReauthorization";
   if (reg.agentCreated &&
-      (!allowAgentCreatedTabs || !(await validManualOrigin(reg.boundOrigin)))) {
+      (!allowAgentCreatedTabs || !reg.windowRegistration ||
+       !(await validWindow(reg.windowRegistration)))) {
     reg.blocked = true;
     await persist();
     return "needsReauthorization";
@@ -112,6 +131,11 @@ async function assess(reg) {
         (reg.agentCreated
           ? new URL(tab.url).origin !== reg.boundOrigin
           : tab.url !== reg.boundUrl)) {
+      reg.blocked = true;
+      await persist();
+      return "needsReauthorization";
+    }
+    if (reg.agentCreated && tab.windowId !== (await validWindow(reg.windowRegistration))?.windowId) {
       reg.blocked = true;
       await persist();
       return "needsReauthorization";
@@ -164,11 +188,14 @@ async function connect() {
         if (heartbeat) clearInterval(heartbeat);
         heartbeat = setInterval(() => send({ kind: "ping" }), 20000);
         await advertise();
+        await advertiseWindows();
       } else if (message.kind === "executeJs" && connected) {
         void execute(message);
       } else if (message.kind === "openTab" && connected) {
         // Serialize creations to enforce alias uniqueness and the tab quota.
         openQueue = openQueue.then(() => openNewTab(message)).catch(() => {});
+      } else if (message.kind === "closeTab" && connected) {
+        openQueue = openQueue.then(() => closeCreatedTab(message)).catch(() => {});
       } else if (message.kind === "ping") {
         send({ kind: "pong" });
       }
@@ -278,25 +305,27 @@ async function openNewTab(message) {
   if (registrations.filter(r => r.agentCreated && !r.blocked && r.sessionEpoch === sessionEpoch).length >= MAX_AGENT_TABS) {
     return reject("AgentTabLimitReached");
   }
-  if (!(await validManualOrigin(target.origin))) return reject("OriginNotRegisteredByUser");
+  const window = await validWindow(message.windowRegistration);
+  if (!window) return reject("WindowNotRegistered");
   let tabCreated = false;
   try {
     const permission = await chrome.permissions.contains({ origins: [target.origin + "/*"] });
     if (!permission) return reject("BrowserPermissionMissing");
     if (socket !== requestSocket || !connected || connectionId !== requestConnection ||
-        !allowAgentCreatedTabs || !(await validManualOrigin(target.origin))) return;
+        !allowAgentCreatedTabs || !(await validWindow(window.registrationId))) return;
 
     // Creating the tab is the irreversible operation; a transport failure afterwards
     // is reported as indeterminate and must not be blindly retried by Jarvis.
-    const tab = await chrome.tabs.create({ url: target.href, active: message.active === true });
+    const tab = await chrome.tabs.create({ windowId: window.windowId, url: target.href, active: message.active === true });
     tabCreated = true;
-    if (!Number.isInteger(tab?.id) || tab.incognito) {
+    if (!Number.isInteger(tab?.id) || tab.incognito || tab.windowId !== window.windowId) {
       if (Number.isInteger(tab?.id)) await chrome.tabs.remove(tab.id);
       return reject("InvalidCreatedTab");
     }
     const registration = {
       registrationId: randomId(), alias,
-      agentCreated: true, tabId: tab.id, boundUrl: target.href, boundOrigin: target.origin,
+      agentCreated: true, tabId: tab.id, windowRegistration: window.registrationId,
+      boundUrl: target.href, boundOrigin: target.origin,
       currentUrl: target.href, sessionEpoch, registrationGeneration: 1,
       blocked: false, availability: "loading"
     };
@@ -310,6 +339,64 @@ async function openNewTab(message) {
     // the operation did not happen. Require reconciliation before retrying.
     reject((tabCreated ? "OutcomeUnknown:" : "TabCreateFailed:") + reason);
   }
+}
+
+async function closeCreatedTab(message) {
+  const { requestId, registrationId, registrationGeneration } = message;
+  const requestSocket = socket;
+  const requestConnection = connectionId;
+  const respond = payload => {
+    if (socket === requestSocket && connected && connectionId === requestConnection) {
+      send({ requestId, connectionId: requestConnection,
+        registrationId, registrationGeneration, ...payload });
+    }
+  };
+  const reject = error => respond({ kind: "error", error });
+  if (message.connectionId !== requestConnection) return reject("ConnectionEpochMismatch");
+  const reg = registrations.find(r => r.registrationId === registrationId);
+  if (!reg || !reg.agentCreated || reg.registrationGeneration !== registrationGeneration)
+    return reject("TabNotAgentCreated");
+  const availability = await assess(reg);
+  if (availability !== "ready" && availability !== "loading")
+    return reject("RegistrationStale");
+  const parent = await validWindow(reg.windowRegistration);
+  if (!parent) return reject("WindowNotRegistered");
+  let tab;
+  try { tab = await chrome.tabs.get(reg.tabId); } catch { return reject("TabMissing"); }
+  if (tab.windowId !== parent.windowId) return reject("WindowMismatch");
+  try {
+    await chrome.tabs.remove(reg.tabId);
+    registrations = registrations.filter(r => r !== reg);
+    await persist();
+    await advertise();
+    respond({ kind: "tabClosed" });
+  } catch { reject("OutcomeUnknown:TabCloseFailed"); }
+}
+
+async function registerWindow(windowId, alias) {
+  if (!Number.isInteger(windowId) || typeof alias !== "string" ||
+      alias.length > 128 || /[\u0000-\u001f]/.test(alias))
+    throw new Error("Invalid window registration");
+  const window = await chrome.windows.get(windowId);
+  if (!window || window.incognito) throw new Error("Cannot register this window");
+  if (alias && registeredWindows.some(w => w.alias === alias && w.windowId !== windowId))
+    throw new Error("Window alias already registered");
+  const old = registeredWindows.find(w => w.windowId === windowId);
+  if (old) {
+    old.alias = alias; old.generation++; old.blocked = false;
+    old.sessionEpoch = sessionEpoch;
+  } else {
+    registeredWindows.push({ registrationId: randomId(), alias, windowId,
+      sessionEpoch, generation: 1, blocked: false, availability: "ready" });
+  }
+  await persistWindows();
+  await advertiseWindows();
+}
+async function unregisterWindow(windowId) {
+  registeredWindows = registeredWindows.filter(w => w.windowId !== windowId);
+  for (const r of registrations) if (r.agentCreated &&
+    !registeredWindows.some(w => w.registrationId === r.windowRegistration)) r.blocked = true;
+  await persistWindows(); await persist(); await advertiseWindows(); await advertise();
 }
 
 async function register(tabId, alias) {
@@ -362,7 +449,8 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
       await refreshRegistrations();
       return { connected, paired: Boolean(secret), port: configuredPort,
         allowAgentCreatedTabs,
-        registrations: registrations.map(r => ({ ...safeState(r), tabId: r.tabId })) };
+        registrations: registrations.map(r => ({ ...safeState(r), tabId: r.tabId })),
+        windows: registeredWindows.map(w => ({ ...windowState(w), windowId: w.windowId })) };
     }
     if (message.kind === "pair") {
       if (!Number.isInteger(message.port) || message.port < 1024 || message.port > 65535 ||
@@ -393,6 +481,14 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
       await advertise();
       return {};
     }
+    if (message.kind === "registerWindow") {
+      await registerWindow(message.windowId, message.alias || "");
+      return {};
+    }
+    if (message.kind === "unregisterWindow") {
+      await unregisterWindow(message.windowId);
+      return {};
+    }
     if (message.kind === "register") {
       await register(message.tabId, message.alias || "");
       return {};
@@ -421,6 +517,11 @@ async function observeNavigation(tabId, url, removed = false) {
 }
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   void observeNavigation(tabId, changeInfo.url);
+  if (changeInfo.windowId !== undefined) void advertise();
+});
+chrome.windows.onRemoved.addListener(windowId => {
+  for (const w of registeredWindows) if (w.windowId === windowId) w.blocked = true;
+  void persistWindows(); void advertiseWindows(); void advertise();
 });
 chrome.tabs.onRemoved.addListener((tabId) => {
   void observeNavigation(tabId, null, true);

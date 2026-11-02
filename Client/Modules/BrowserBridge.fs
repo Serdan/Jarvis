@@ -13,7 +13,7 @@ open System.Threading
 open System.Threading.Tasks
 
 [<Literal>]
-let ProtocolVersion = 1
+let ProtocolVersion = 2
 [<Literal>]
 let MaxScriptBytes = 65536
 [<Literal>]
@@ -65,7 +65,8 @@ type private Connection =
       Id: string
       SendLock: SemaphoreSlim
       Pending: ConcurrentDictionary<string, TaskCompletionSource<string>>
-      mutable Registrations: JsonElement list }
+      mutable Registrations: JsonElement list
+      mutable Windows: JsonElement list }
 
 type Service(port: int, pairingSecret: string) =
     let listener = new HttpListener()
@@ -139,7 +140,7 @@ type Service(port: int, pairingSecret: string) =
                 { Socket = socket; Id = Guid.NewGuid().ToString("N")
                   SendLock = new SemaphoreSlim(1, 1)
                   Pending = ConcurrentDictionary()
-                  Registrations = [] }
+                  Registrations = []; Windows = [] }
             try
                 try
                     do! authenticated conn
@@ -172,7 +173,19 @@ type Service(port: int, pairingSecret: string) =
                                     |> Seq.toList
                                 lock sync (fun () -> conn.Registrations <- parsed)
                             | _ -> ()
-                        | "result" | "error" | "tabOpened" ->
+                        | "windows" ->
+                            match doc["windows"] with
+                            | :? JsonArray as windows when windows.Count <= 100 ->
+                                let parsed = windows |> Seq.choose (fun w ->
+                                    if isNull w then None
+                                    else
+                                        let id = asString w "windowRegistration"
+                                        let alias = asString w "alias"
+                                        if id.Length < 8 || id.Length > 128 || alias.Length > 128 then None
+                                        else Some(JsonSerializer.SerializeToElement(w))) |> Seq.toList
+                                lock sync (fun () -> conn.Windows <- parsed)
+                            | _ -> ()
+                        | "result" | "error" | "tabOpened" | "tabClosed" ->
                             let requestId = asString doc "requestId"
                             let mutable tcs = Unchecked.defaultof<TaskCompletionSource<string>>
                             if conn.Pending.TryRemove(requestId, &tcs) then
@@ -211,7 +224,13 @@ type Service(port: int, pairingSecret: string) =
                 let tabs = conn.Registrations |> List.map (fun x -> x.Clone())
                 Ok (serialize {| tabs = tabs |}))
 
-    member _.OpenTab(url: string, alias: string, makeActive: bool) = task {
+    member _.ListWindows() =
+        lock sync (fun () ->
+            match active with
+            | None -> Error "ExtensionDisconnected"
+            | Some conn -> Ok (serialize {| windows = conn.Windows |> List.map (fun x -> x.Clone()) |}))
+
+    member _.OpenTab(windowRegistration: string, url: string, alias: string, makeActive: bool) = task {
         let isValid =
             match Uri.TryCreate(url, UriKind.Absolute) with
             | true, uri ->
@@ -219,7 +238,8 @@ type Service(port: int, pairingSecret: string) =
                 String.IsNullOrEmpty(uri.UserInfo) &&
                 url.Length <= 2048
             | _ -> false
-        if not isValid then return Error "InvalidTabUrl: absolute HTTP(S) URL without credentials required."
+        if String.IsNullOrWhiteSpace(windowRegistration) then return Error "WindowNotRegistered"
+        elif not isValid then return Error "InvalidTabUrl: absolute HTTP(S) URL without credentials required."
         elif isNull alias || alias.Length > 128 || (alias |> Seq.exists Char.IsControl) then
             return Error "InvalidTabAlias"
         else
@@ -244,6 +264,7 @@ type Service(port: int, pairingSecret: string) =
                                                requestId = requestId
                                                connectionId = conn.Id
                                                url = url
+                                               windowRegistration = windowRegistration
                                                alias = alias
                                                active = makeActive |}
                             do! send conn frame
@@ -266,6 +287,58 @@ type Service(port: int, pairingSecret: string) =
                     finally
                         let mutable removed = Unchecked.defaultof<TaskCompletionSource<string>>
                         conn.Pending.TryRemove(requestId, &removed) |> ignore
+    }
+
+    member _.CloseTab(tabRegistration: string) = task {
+        let resolved = lock sync (fun () ->
+            match active with
+            | None -> Error "ExtensionDisconnected"
+            | Some conn ->
+                match conn.Registrations |> List.filter (fun tab ->
+                    tab.GetProperty("registrationId").GetString() = tabRegistration ||
+                    (match tab.TryGetProperty("alias") with | true, a -> a.GetString() = tabRegistration | _ -> false)) with
+                | [] -> Error "TabNotRegistered"
+                | [tab] ->
+                    let agentCreated =
+                        match tab.TryGetProperty("agentCreated") with
+                        | true, value -> value.GetBoolean()
+                        | _ -> false
+                    if not agentCreated then Error "TabNotAgentCreated"
+                    elif conn.Pending.Count >= 4 then Error "BridgeBusy"
+                    else Ok(conn, tab)
+                | _ -> Error "AliasAmbiguous")
+        match resolved with
+        | Error e -> return Error e
+        | Ok(conn, tab) ->
+            let requestId = Guid.NewGuid().ToString("N")
+            let registrationId = tab.GetProperty("registrationId").GetString()
+            let generation = tab.GetProperty("registrationGeneration").GetInt32()
+            let completion = TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously)
+            if not (conn.Pending.TryAdd(requestId, completion)) then return Error "DuplicateRequest"
+            else
+                try
+                    try
+                        do! send conn (serialize
+                            {| version = ProtocolVersion; kind = "closeTab"
+                               requestId = requestId; connectionId = conn.Id
+                               registrationId = registrationId; registrationGeneration = generation |})
+                        let! response = completion.Task.WaitAsync(TimeSpan.FromSeconds(15.0))
+                        let root = JsonNode.Parse(response)
+                        if asString root "connectionId" <> conn.Id ||
+                           asString root "registrationId" <> registrationId ||
+                           asInt root "registrationGeneration" <> generation then
+                            return Error "ResponseIdentityMismatch"
+                        elif asString root "kind" = "error" then
+                            return Error ("BrowserCloseTabError:" + asString root "error")
+                        elif asString root "kind" <> "tabClosed" then
+                            return Error "UnexpectedBrowserResponse"
+                        else return Ok """{"closed":true}"""
+                    with
+                    | :? TimeoutException -> return Error "OutcomeUnknown: tab may have been closed."
+                    | ex -> return Error ("OutcomeUnknown: " + ex.GetType().Name)
+                finally
+                    let mutable removed = Unchecked.defaultof<TaskCompletionSource<string>>
+                    conn.Pending.TryRemove(requestId, &removed) |> ignore
     }
 
     member _.Execute(tabRegistration: string, source: string, argsJson: string, timeoutMs: int, isInline: bool) = task {
@@ -360,3 +433,69 @@ type Service(port: int, pairingSecret: string) =
                 active |> Option.iter (fun conn -> conn.Socket.Abort())
                 active <- None)
             cancellation.Dispose()
+
+
+// Generic one-call browser workflow shared by immediate agent handoffs and scheduled actions.
+// Project scripts own site-specific semantics; Jarvis only owns created-tab lifecycle.
+let runInNewTab (bridge: Service) (windowRegistration: string) (url: string)
+                (alias: string) (makeActive: bool) (source: string) (argsJson: string)
+                (timeoutMs: int) (closeAfterExecution: bool) = task {
+    let mutable registrationId = ""
+    try
+        let! opened = bridge.OpenTab(windowRegistration, url, alias, makeActive)
+        match opened with
+        | Error e -> return Error("", e)
+        | Ok response ->
+            use openDoc = JsonDocument.Parse(response)
+            registrationId <- openDoc.RootElement.GetProperty("tab").GetProperty("registrationId").GetString()
+            if String.IsNullOrWhiteSpace(registrationId) then
+                return Error("", "OutcomeUnknown: created tab response lacked registration ID")
+            else
+                let mutable ready = false
+                let mutable attempts = 0
+                while not ready && attempts < 60 do
+                    match bridge.ListTabs() with
+                    | Ok listing ->
+                        use listDoc = JsonDocument.Parse(listing)
+                        ready <- listDoc.RootElement.GetProperty("tabs").EnumerateArray()
+                                 |> Seq.exists (fun tab ->
+                                     tab.GetProperty("registrationId").GetString() = registrationId &&
+                                     tab.GetProperty("availability").GetString() = "ready")
+                    | Error _ -> ()
+                    if not ready then
+                        attempts <- attempts + 1
+                        do! Task.Delay(500)
+                if not ready then
+                    // No script was sent; the newly created tab may be retained for inspection.
+                    return Error(registrationId, "TabNotReady")
+                else
+                    let! script = bridge.Execute(registrationId, source, argsJson, timeoutMs, false)
+                    match script with
+                    | Error e -> return Error(registrationId, "OutcomeUnknown: " + e)
+                    | Ok result ->
+                        use doc = JsonDocument.Parse(result)
+                        let payload = doc.RootElement.GetProperty("result")
+                        let status =
+                            match payload.ValueKind with
+                            | JsonValueKind.Object ->
+                                match payload.TryGetProperty("status") with
+                                | true, x when x.ValueKind = JsonValueKind.String -> x.GetString()
+                                | _ -> "completed"
+                            | _ -> "completed"
+                        if status = "outcomeUnknown" then
+                            return Error(registrationId, "OutcomeUnknown: page submission was not confirmed")
+                        else
+                            let mutable cleanup = "retained"
+                            if closeAfterExecution then
+                                let! closed = bridge.CloseTab(registrationId)
+                                cleanup <- match closed with
+                                           | Ok _ -> "closed"
+                                           | Error e -> "cleanupFailed:" + (if e.Length > 100 then e.Substring(0, 100) else e)
+                            return Ok(JsonSerializer.Serialize(
+                                {| registrationId = registrationId
+                                   status = status
+                                   scriptResult = payload.Clone()
+                                   cleanup = cleanup |}))
+    with e ->
+        return Error(registrationId, "OutcomeUnknown: " + e.GetType().Name)
+}

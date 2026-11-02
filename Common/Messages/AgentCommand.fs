@@ -64,6 +64,7 @@ type ListCommandsResult =
 type ListProjectsCommand = struct end
 
 type BrowserListTabsCommand = struct end
+type BrowserListWindowsCommand = struct end
 type ScheduleBrowserExecutionCommand =
     { ScheduleId: string
       RunAfterSeconds: int
@@ -72,14 +73,29 @@ type ScheduleBrowserExecutionCommand =
       ScriptPath: string
       ArgsJson: string option
       Alias: string option
-      Active: bool option }
+      Active: bool option
+      WindowRegistration: string option
+      CloseTabAfterExecution: bool option
+      RepeatEverySeconds: int option }
 type ListScheduledBrowserExecutionsCommand = struct end
 type CancelScheduledBrowserExecutionCommand = { ScheduleId: string }
 
 type BrowserOpenTabCommand =
-    { Url: string
+    { WindowRegistration: string
+      Url: string
       Alias: string option
       Active: bool option }
+
+type BrowserCloseTabCommand = { TabRegistration: string }
+type BrowserRunInNewTabCommand =
+    { WindowRegistration: string
+      Url: string
+      ProjectName: string
+      ScriptPath: string
+      ArgsJson: string option
+      Active: bool option
+      CloseTabAfterExecution: bool option
+      TimeoutMs: int option }
 
 type BrowserExecuteFileCommand =
     { ProjectName: string
@@ -584,6 +600,9 @@ type AgentCommand =
     | ListCommandsCommand
     | ListProjectsCommand
     | BrowserListTabsCommand
+    | BrowserListWindowsCommand
+    | BrowserCloseTabCommand of BrowserCloseTabCommand
+    | BrowserRunInNewTabCommand of BrowserRunInNewTabCommand
     | ScheduleBrowserExecutionCommand of ScheduleBrowserExecutionCommand
     | ListScheduledBrowserExecutionsCommand
     | CancelScheduledBrowserExecutionCommand of CancelScheduledBrowserExecutionCommand
@@ -648,6 +667,9 @@ module AgentCommandInfo =
         | ListCommandsCommand -> "ListCommandsCommand"
         | ListProjectsCommand -> "ListProjectsCommand"
         | BrowserListTabsCommand -> "BrowserListTabsCommand"
+        | BrowserListWindowsCommand -> "BrowserListWindowsCommand"
+        | BrowserCloseTabCommand _ -> "BrowserCloseTabCommand"
+        | BrowserRunInNewTabCommand _ -> "BrowserRunInNewTabCommand"
         | ScheduleBrowserExecutionCommand _ -> "ScheduleBrowserExecutionCommand"
         | ListScheduledBrowserExecutionsCommand -> "ListScheduledBrowserExecutionsCommand"
         | CancelScheduledBrowserExecutionCommand _ -> "CancelScheduledBrowserExecutionCommand"
@@ -718,6 +740,9 @@ module AgentCommandInfo =
         | ListCommandsCommand -> "ListCommands"
         | ListProjectsCommand -> "ListProjects"
         | BrowserListTabsCommand -> "BrowserListTabs"
+        | BrowserListWindowsCommand -> "BrowserListWindows"
+        | BrowserCloseTabCommand _ -> "BrowserCloseTab"
+        | BrowserRunInNewTabCommand _ -> "BrowserRunInNewTab"
         | ScheduleBrowserExecutionCommand _ -> "ScheduleBrowserExecution"
         | ListScheduledBrowserExecutionsCommand -> "ListScheduledBrowserExecutions"
         | CancelScheduledBrowserExecutionCommand _ -> "CancelScheduledBrowserExecution"
@@ -781,6 +806,8 @@ module AgentCommandInfo =
         | ListCommandsCommand
         | ListProjectsCommand
         | BrowserListTabsCommand
+        | BrowserListWindowsCommand
+        | BrowserCloseTabCommand _
         | ListScheduledBrowserExecutionsCommand
         | CancelScheduledBrowserExecutionCommand _
         | BrowserOpenTabCommand _
@@ -791,6 +818,7 @@ module AgentCommandInfo =
         | MessageCommand cmd -> cmd.ProjectName
         | GetClientActivityCommand cmd -> cmd.ProjectName
         | ScheduleBrowserExecutionCommand cmd -> Some cmd.ProjectName
+        | BrowserRunInNewTabCommand cmd -> Some cmd.ProjectName
         | BrowserExecuteFileCommand cmd -> Some cmd.ProjectName
         | ListWorktreesCommand cmd -> Some cmd.ProjectName
         | GetWorktreeCommand cmd -> Some cmd.ProjectName
@@ -880,6 +908,9 @@ module AgentCommandInfo =
         | ListScheduledBrowserExecutionsCommand -> None
         | CancelScheduledBrowserExecutionCommand cmd -> Some cmd.ScheduleId
         | BrowserListTabsCommand -> None
+        | BrowserListWindowsCommand -> None
+        | BrowserCloseTabCommand cmd -> Some("agent-created tab " + cmd.TabRegistration)
+        | BrowserRunInNewTabCommand cmd -> Some(cmd.ProjectName + "/" + cmd.ScriptPath + " -> " + cmd.WindowRegistration)
         | BrowserOpenTabCommand cmd ->
             match Uri.TryCreate(cmd.Url, UriKind.Absolute) with
             | true, uri when uri.Scheme = "https" || uri.Scheme = "http" -> Some(uri.GetLeftPart(UriPartial.Authority) + " (new tab)")
@@ -1046,7 +1077,7 @@ module AgentCommandInfo =
         | None -> invocation command
 
 module AgentProtocol =
-    let version = "3.21"
+    let version = "3.22"
     let defaultPatchFuzzyContextLines = 3
     let maxResponseBytes = 900 * 1024
     let maxImageBytes = 8 * 1024 * 1024
@@ -1064,11 +1095,14 @@ module AgentProtocol =
     let commandDefinitions =
         [ definition "ListCommands" "Lists supported Jarvis commands." [ ReadOnly ] false false false
           definition "ListProjects" "Lists configured projects." [ ReadOnly ] false false false
+          definition "BrowserListWindows" "Lists user-registered browser windows, without exposing unrelated windows or tabs." [ ReadOnly ] false false false
+          definition "BrowserCloseTab" "Closes only a Jarvis-created tab with verified identity." [ ProcessExecution ] true true false
+          definition "BrowserRunInNewTab" "Creates a tab in a registered window, runs a project script, and optionally closes the tab." [ ProcessExecution; NetworkAccess ] true true false
           definition "BrowserListTabs" "Lists tabs registered through the extension, including opted-in agent-created tabs." [ ReadOnly ] false false false
-          definition "ScheduleBrowserExecution" "Persist a one-shot delayed action that opens a browser tab and runs a project JS file." [ ProcessExecution; NetworkAccess ] true true false
+          definition "ScheduleBrowserExecution" "Persist a one-shot or recurring action that runs a project JS file in a new tab in a registered window." [ ProcessExecution; NetworkAccess ] true true false
           definition "ListScheduledBrowserExecutions" "List queued, completed and failed local browser actions without disclosing scripts or arguments." [ ReadOnly ] false false false
-          definition "CancelScheduledBrowserExecution" "Cancel a pending one-shot browser action." [ ProcessExecution ] true true false
-          definition "BrowserOpenTab" "Opens and registers a new background tab on an explicitly user-authorized site." [ ProcessExecution; NetworkAccess ] true true false
+          definition "CancelScheduledBrowserExecution" "Cancel a pending one-shot or recurring browser action." [ ProcessExecution ] true true false
+          definition "BrowserOpenTab" "Opens a new background tab in a user-registered window on an explicitly permitted site." [ ProcessExecution; NetworkAccess ] true true false
           definition "BrowserExecuteFile" "Executes JavaScript from a bounded project file in a registered tab." [ ProcessExecution; NetworkAccess ] true true false
           definition "BrowserExecuteJs" "Executes supplied JavaScript in a registered browser tab." [ ProcessExecution; NetworkAccess ] true true false
           definition "ListWorktrees" "Lists Git worktrees registered for a project." [ ReadOnly ] false false false

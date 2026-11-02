@@ -15,7 +15,7 @@ let private temp () =
 
 let private add (service: BrowserSchedules.Service) id seconds =
     service.Schedule(id, seconds, "https://example.test/chat", "Scripts", "start.js",
-        "agent-next", """{"token":"private-args"}""", false)
+        "agent-next", """{"token":"private-args"}""", false, windowRegistration="agents")
 
 let private status (service: BrowserSchedules.Service) id =
     use doc = JsonDocument.Parse(service.List())
@@ -111,11 +111,45 @@ let inputValidation () =
     try
         use store = new BrowserSchedules.Service(path, action)
         let invalid delay url args =
-            store.Schedule("orchestrator", delay, url, "Scripts", "start.js", "", args, false).IsError
+            store.Schedule("orchestrator", delay, url, "Scripts", "start.js", "", args, false, windowRegistration="agents").IsError
         Assert.That(invalid 0 "https://example.test/" "{}", Is.True)
         Assert.That(invalid 600 "file:///etc/passwd" "{}", Is.True)
         Assert.That(invalid 600 "https://user:pass@example.test/" "{}", Is.True)
         Assert.That(invalid 600 "https://example.test/" "bad-json", Is.True)
-        Assert.That(store.Schedule("../escape",600,"https://example.test/","Scripts","start.js","","{}",false).IsError, Is.True)
+        Assert.That(store.Schedule("../escape",600,"https://example.test/","Scripts","start.js","","{}",false, windowRegistration="agents").IsError, Is.True)
     finally
         Directory.Delete(dir, true)
+
+
+[<Test>]
+let recurrenceSkipsMissedIntervalsOnRestart () = task {
+    let dir,path = temp()
+    let mutable clock = DateTimeOffset.UtcNow
+    let mutable called = 0
+    let action (_:BrowserSchedules.ScheduledAction) = task {
+        called <- called + 1
+        return Ok """{"registrationId":"agent-tab-01","status":"submitted","scriptResult":{"conversationUrl":"https://chatgpt.com/c/123"},"cleanup":"closed"}"""
+    }
+    try
+        let first = new BrowserSchedules.Service(path, action, now=(fun () -> clock), pollMs=25)
+        Assert.That(first.Schedule("hourly",600,"https://chatgpt.com/","Scripts","launch.js","",
+            "{}" ,false,windowRegistration="agents",closeAfter=true,repeatEverySeconds=3600).IsOk, Is.True)
+        first.Start()
+        clock <- clock.AddSeconds(601.)
+        do! awaitStatus (fun () -> called = 1 && status first "hourly" = "pending")
+        Assert.That(first.List(), Does.Contain("https://chatgpt.com/c/123"))
+        Assert.That(first.List(), Does.Contain("closed"))
+        Assert.That(first.List(), Does.Contain("attemptId"))
+        (first :> IDisposable).Dispose()
+        clock <- clock.AddHours(5.)
+        use restored = new BrowserSchedules.Service(path, action, now=(fun () -> clock), pollMs=25)
+        restored.Start()
+        do! Task.Delay(150)
+        Assert.That(called, Is.EqualTo(1), "Missed occurrences must not pile up after restart")
+        Assert.That(status restored "hourly", Is.EqualTo("pending"))
+        use listed = JsonDocument.Parse(restored.List())
+        Assert.That(listed.RootElement[0].GetProperty("dueAtUtc").GetDateTimeOffset(), Is.GreaterThan(clock))
+        Assert.That(restored.Cancel("hourly").IsOk, Is.True)
+    finally
+        Directory.Delete(dir, true)
+}

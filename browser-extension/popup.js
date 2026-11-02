@@ -15,6 +15,16 @@ async function render() {
       state.paired ? "Paired; currently disconnected" : "Not paired";
     $("port").value = String(state.port);
     $("allowAgentTabs").checked = state.allowAgentCreatedTabs === true;
+    const window = await chrome.windows.getCurrent();
+    $("currentWindow").textContent = "Window " + window.id;
+    $("windowAlias").value = state.windows.find(w => w.windowId === window.id)?.alias || "";
+    const windowList = $("windows");
+    windowList.replaceChildren();
+    for (const entry of state.windows) {
+      const item = document.createElement("li");
+      item.textContent = (entry.alias || entry.windowRegistration) + " — " + entry.availability;
+      windowList.append(item);
+    }
     $("current").textContent = tab ? (tab.title || "(untitled)") + " — " + (tab.url || "") : "No selected tab";
     const current = state.registrations.find(r => r.tabId === tab?.id);
     $("alias").value = current?.alias || "";
@@ -50,6 +60,20 @@ $("register").onclick = () => action(async () => {
 $("unregister").onclick = () => action(() => call("unregister", {
   tabId: currentTab?.id
 }));
+$("registerWindow").onclick = () => action(async () => {
+  const window = await chrome.windows.getCurrent();
+  await call("registerWindow", { windowId: window.id, alias: $("windowAlias").value.trim() });
+});
+$("unregisterWindow").onclick = () => action(async () => {
+  const window = await chrome.windows.getCurrent();
+  await call("unregisterWindow", { windowId: window.id });
+});
+$("grantOrigin").onclick = () => action(async () => {
+  const url = new URL($("siteOrigin").value);
+  if (!["https:", "http:"].includes(url.protocol) || url.username || url.password) throw Error("Invalid site origin");
+  const granted = await chrome.permissions.request({ origins: [url.origin + "/*"] });
+  if (!granted) throw Error("Site permission denied");
+});
 $("allowAgentTabs").onchange = () => action(() => call("setAgentCreatedTabs", {
   allowed: $("allowAgentTabs").checked
 }));

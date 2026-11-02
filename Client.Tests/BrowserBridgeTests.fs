@@ -49,7 +49,7 @@ let private handshake (port: int) (secret: string) = task {
     use hmac = new HMACSHA256(Encoding.UTF8.GetBytes(secret))
     let signature =
         Convert.ToHexString(hmac.ComputeHash(Encoding.UTF8.GetBytes(nonce))).ToLowerInvariant()
-    do! send socket (JsonSerializer.Serialize({| version = 1; kind = "authenticate"; proof = signature |}))
+    do! send socket (JsonSerializer.Serialize({| version = 2; kind = "authenticate"; proof = signature |}))
     let! ready = receive socket
     Assert.That(property ready "kind", Is.EqualTo("ready"))
     return socket, property ready "connectionId"
@@ -71,7 +71,7 @@ let pairingAndExecution () = task {
     Assert.That(bridge.ListTabs().IsError, Is.True)
     let! client, connectionId = handshake port "test-secret"
     use socket = client
-    do! send socket """{"version":1,"kind":"registrations","tabs":[{"registrationId":"registered-01","alias":"agent-7","availability":"ready","registrationGeneration":1,"boundUrl":"https://example.test/one"},{"registrationId":"registered-02","alias":"agent-8","availability":"discarded","registrationGeneration":1,"boundUrl":"https://example.test/two"}]}"""
+    do! send socket """{"version":2,"kind":"registrations","tabs":[{"registrationId":"registered-01","alias":"agent-7","availability":"ready","registrationGeneration":1,"boundUrl":"https://example.test/one"},{"registrationId":"registered-02","alias":"agent-8","availability":"discarded","registrationGeneration":1,"boundUrl":"https://example.test/two"}]}"""
     do! waitUntil (fun () ->
         match bridge.ListTabs() with
         | Ok json -> json.Contains("agent-7") && json.Contains("agent-8")
@@ -83,7 +83,7 @@ let pairingAndExecution () = task {
     Assert.That(property invocation "entrypoint", Is.EqualTo("execute"))
     let requestId = property invocation "requestId"
     let result = JsonSerializer.Serialize({|
-        version = 1; kind = "result"; requestId = requestId
+        version = 2; kind = "result"; requestId = requestId
         connectionId = connectionId
         registrationId = "registered-01"; registrationGeneration = 1
         status = "completed"; result = {| title = "Test page" |}
@@ -113,7 +113,7 @@ let invalidPairing () = task {
     do! client.ConnectAsync(Uri("ws://127.0.0.1:" + string port + "/"), CancellationToken.None)
     let! challenge = receive client
     Assert.That(property challenge "kind", Is.EqualTo("challenge"))
-    do! send client """{"version":1,"kind":"authenticate","proof":"not-a-proof"}"""
+    do! send client """{"version":2,"kind":"authenticate","proof":"not-a-proof"}"""
     do! Task.Delay(50)
     Assert.That(bridge.ListTabs().IsError, Is.True)
 }
@@ -138,7 +138,7 @@ let concurrentRequestsAndErrors () = task {
     bridge.Start()
     let! client, connectionId = handshake port "test-secret"
     use socket = client
-    do! send socket """{"version":1,"kind":"registrations","tabs":[{"registrationId":"registered-01","alias":"agent-7","availability":"ready","registrationGeneration":1},{"registrationId":"registered-02","alias":"agent-8","availability":"ready","registrationGeneration":1}]}"""
+    do! send socket """{"version":2,"kind":"registrations","tabs":[{"registrationId":"registered-01","alias":"agent-7","availability":"ready","registrationGeneration":1},{"registrationId":"registered-02","alias":"agent-8","availability":"ready","registrationGeneration":1}]}"""
     do! waitUntil (fun () ->
         match bridge.ListTabs() with
         | Ok json -> json.Contains("agent-7") && json.Contains("agent-8")
@@ -152,7 +152,7 @@ let concurrentRequestsAndErrors () = task {
     let find id = frames |> List.find (fun frame -> property frame "registrationId" = id)
     let response id value =
         JsonSerializer.Serialize({|
-            version = 1; kind = "result"; requestId = property (find id) "requestId"
+            version = 2; kind = "result"; requestId = property (find id) "requestId"
             connectionId = connectionId; registrationId = id; registrationGeneration = 1
             status = "completed"; result = value
         |})
@@ -169,7 +169,7 @@ let concurrentRequestsAndErrors () = task {
     let errorTask = bridge.Execute("agent-7", "invalid()", "{}", 2000, true)
     let! errorFrame = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
     let errorReply = JsonSerializer.Serialize({|
-        version = 1; kind = "error"; requestId = property errorFrame "requestId"
+        version = 2; kind = "error"; requestId = property errorFrame "requestId"
         connectionId = connectionId; registrationId = "registered-01"
         registrationGeneration = 1; error = "ScriptError:Failed"
     |})
@@ -187,7 +187,7 @@ let timedOutMutationIsNotReplayed () = task {
     bridge.Start()
     let! client, _ = handshake port "test-secret"
     use socket = client
-    do! send socket """{"version":1,"kind":"registrations","tabs":[{"registrationId":"registered-01","alias":"agent-7","availability":"ready","registrationGeneration":1}]}"""
+    do! send socket """{"version":2,"kind":"registrations","tabs":[{"registrationId":"registered-01","alias":"agent-7","availability":"ready","registrationGeneration":1}]}"""
     do! waitUntil (fun () ->
         match bridge.ListTabs() with
         | Ok json -> json.Contains("agent-7")
@@ -210,15 +210,16 @@ let openTabUsesPairedExtensionAndReturnsRegistration () = task {
     let! client, connectionId = handshake port "test-secret"
     use socket = client
 
-    let opening = bridge.OpenTab("https://example.test/chat/new", "agent-new", false)
+    let opening = bridge.OpenTab("agents", "https://example.test/chat/new", "agent-new", false)
     let! request = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
     Assert.That(property request "kind", Is.EqualTo("openTab"))
     Assert.That(property request "url", Is.EqualTo("https://example.test/chat/new"))
+    Assert.That(property request "windowRegistration", Is.EqualTo("agents"))
     Assert.That(property request "alias", Is.EqualTo("agent-new"))
     use requestDoc = JsonDocument.Parse(request)
     Assert.That(requestDoc.RootElement.GetProperty("active").GetBoolean(), Is.False)
     let response = JsonSerializer.Serialize({|
-        version = 1; kind = "tabOpened"
+        version = 2; kind = "tabOpened"
         requestId = property request "requestId"; connectionId = connectionId
         tab = {| registrationId = "created-id-01"; alias = "agent-new"; availability = "loading"; agentCreated = true |}
     |})
@@ -228,10 +229,10 @@ let openTabUsesPairedExtensionAndReturnsRegistration () = task {
     | Ok json -> Assert.That(json.Contains("created-id-01"), Is.True)
     | Error error -> Assert.Fail("Expected new tab registration: " + error)
 
-    let second = bridge.OpenTab("https://example.test/chat/second", "agent-new-2", false)
+    let second = bridge.OpenTab("agents", "https://example.test/chat/second", "agent-new-2", false)
     let! request2 = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
     do! send socket (JsonSerializer.Serialize({|
-        version = 1; kind = "error"; connectionId = connectionId
+        version = 2; kind = "error"; connectionId = connectionId
         requestId = property request2 "requestId"; error = "AgentCreatedTabsDisabled"
     |}))
     let! rejected = second
@@ -247,8 +248,58 @@ let openTabRejectsUnsafeUrlsBeforeDispatch () = task {
     bridge.Start()
     for address in [ "javascript:alert(1)"; "file:///etc/passwd"; "https://user:secret@example.test/";
                      "/relative"; "data:text/html,hi" ] do
-        let! result = bridge.OpenTab(address, "", false)
+        let! result = bridge.OpenTab("agents", address, "", false)
         match result with
         | Error message -> Assert.That(message, Does.StartWith("InvalidTabUrl"))
         | Ok _ -> Assert.Fail("Unsafe URL accepted: " + address)
+}
+
+
+[<Test>]
+let immediateLaunchUsesRegisteredWindowAndClosesOnlyCreatedTab () = task {
+    let port = findPort()
+    use bridge = new BrowserBridge.Service(port, "test-secret")
+    bridge.Start()
+    let! client, connectionId = handshake port "test-secret"
+    use socket = client
+    do! send socket """{"version":2,"kind":"windows","windows":[{"windowRegistration":"window-01","alias":"agents","availability":"ready","registrationGeneration":1}]}"""
+    do! waitUntil (fun () ->
+        match bridge.ListWindows() with
+        | Ok json -> json.Contains("agents")
+        | _ -> false)
+    let launch = BrowserBridge.runInNewTab bridge "agents" "https://chatgpt.com/" "" false
+                     "async function execute(args) { return {status:'submitted'}; }" """{"prompt":"Go"}""" 5000 true
+    let! openedRequest = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
+    Assert.That(property openedRequest "kind", Is.EqualTo("openTab"))
+    Assert.That(property openedRequest "windowRegistration", Is.EqualTo("agents"))
+    do! send socket """{"version":2,"kind":"registrations","tabs":[{"registrationId":"created-tab-01","alias":"agent-new","agentCreated":true,"availability":"ready","registrationGeneration":1}]}"""
+    do! send socket (JsonSerializer.Serialize({|
+        version = 2; kind = "tabOpened"; requestId = property openedRequest "requestId"
+        connectionId = connectionId
+        tab = {| registrationId = "created-tab-01"; availability = "ready"; agentCreated = true |}
+    |}))
+    let! executeFrame = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
+    Assert.That(property executeFrame "kind", Is.EqualTo("executeJs"))
+    Assert.That(property executeFrame "registrationId", Is.EqualTo("created-tab-01"))
+    do! send socket (JsonSerializer.Serialize({|
+        version = 2; kind = "result"; requestId = property executeFrame "requestId"
+        connectionId = connectionId; registrationId = "created-tab-01"
+        registrationGeneration = 1; status = "completed"
+        result = {| status = "submitted"; conversationUrl = "https://chatgpt.com/c/test" |}
+    |}))
+    let! closeFrame = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
+    Assert.That(property closeFrame "kind", Is.EqualTo("closeTab"))
+    Assert.That(property closeFrame "registrationId", Is.EqualTo("created-tab-01"))
+    do! send socket (JsonSerializer.Serialize({|
+        version = 2; kind = "tabClosed"; requestId = property closeFrame "requestId"
+        connectionId = connectionId; registrationId = "created-tab-01"
+        registrationGeneration = 1
+    |}))
+    let! result = launch
+    match result with
+    | Error (_, reason) -> Assert.Fail("Expected successful launch: " + reason)
+    | Ok json ->
+        Assert.That(json, Does.Contain("submitted"))
+        Assert.That(json, Does.Contain("closed"))
+        Assert.That(json, Does.Contain("https://chatgpt.com/c/test"))
 }

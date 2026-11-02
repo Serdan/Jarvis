@@ -249,6 +249,7 @@ module McpToolHelpers =
         | ListCommandsCommand
         | ListProjectsCommand
         | BrowserListTabsCommand
+        | BrowserListWindowsCommand
         | ListScheduledBrowserExecutionsCommand
         | ListWorktreesCommand _
         | GetWorktreeCommand _
@@ -289,6 +290,8 @@ module McpToolHelpers =
         | ScheduleBrowserExecutionCommand _
         | CancelScheduledBrowserExecutionCommand _
         | BrowserOpenTabCommand _
+        | BrowserCloseTabCommand _
+        | BrowserRunInNewTabCommand _
         | BrowserExecuteFileCommand _
         | BrowserExecuteJsCommand _
         | RunCommandCommand _
@@ -1048,31 +1051,42 @@ type JarvisMcpTools =
     static member BrowserListTabs([<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http BrowserListTabsCommand
 
-    [<McpServerTool(Title = "Schedule one-shot browser execution", ReadOnly = false, Destructive = true, Idempotent = false, OpenWorld = true);
+    [<McpServerTool(Title = "List registered browser windows", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false);
+      McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]""");
+      Description("List only browser windows explicitly registered through the extension.")>]
+    static member BrowserListWindows([<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http BrowserListWindowsCommand
+
+    [<McpServerTool(Title = "Schedule browser execution", ReadOnly = false, Destructive = true, Idempotent = false, OpenWorld = true);
       McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["process:execute","workspace:read"]}]""");
-      Description("Persist a one-shot browser action on the selected JarvisClient. When due, open a new authorized tab and run a .js file from an ordinary project. Replaces a pending schedule with the same ID; no retry or watchdog. Default background tab.")>]
+      Description("Persist one-shot or repeating browser launch in an explicitly registered window, executing a project JavaScript file with optional cleanup. No replay of uncertain occurrences.")>]
     static member ScheduleBrowserExecution(scheduleId: string, runAfterSeconds: int, url: string, projectName: string, scriptPath: string,
                                            [<Optional; DefaultParameterValue("")>] argsJson: string,
                                            [<Optional; DefaultParameterValue("")>] alias: string,
                                            [<Optional; DefaultParameterValue(false)>] active: bool,
                                            [<Optional; DefaultParameterValue("")>] deviceId: string,
+                                           [<Optional; DefaultParameterValue("")>] windowRegistration: string,
+                                           [<Optional; DefaultParameterValue(false)>] closeTabAfterExecution: bool,
+                                           repeatEverySeconds: Nullable<int>,
                                            client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (ScheduleBrowserExecutionCommand {
             ScheduleId = scheduleId; RunAfterSeconds = runAfterSeconds; Url = url
             ProjectName = projectName; ScriptPath = scriptPath
             ArgsJson = McpToolHelpers.optionOfString argsJson
             Alias = McpToolHelpers.optionOfString alias
-            Active = Some active })
+            Active = Some active; WindowRegistration = McpToolHelpers.optionOfString windowRegistration
+            CloseTabAfterExecution = Some closeTabAfterExecution
+            RepeatEverySeconds = McpToolHelpers.optionOfNullable repeatEverySeconds })
 
     [<McpServerTool(Title = "List scheduled browser executions", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false);
       McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]""");
-      Description("List local one-shot browser actions, due times and status, without returning script arguments or page data.")>]
+      Description("List local one-shot and recurring browser actions, next due times and last launch status, without revealing script arguments.")>]
     static member ListScheduledBrowserExecutions([<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http ListScheduledBrowserExecutionsCommand
 
     [<McpServerTool(Title = "Cancel pending browser execution", ReadOnly = false, Destructive = true, Idempotent = false, OpenWorld = false);
       McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["process:execute"]}]""");
-      Description("Cancel a pending one-shot local browser action. Already-running actions cannot be canceled through this tool.")>]
+      Description("Cancel a pending local browser schedule (including recurring); an in-progress occurrence cannot be undone.")>]
     static member CancelScheduledBrowserExecution(scheduleId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (CancelScheduledBrowserExecutionCommand { ScheduleId = scheduleId })
 
@@ -1083,9 +1097,33 @@ type JarvisMcpTools =
                                   [<Optional; DefaultParameterValue("")>] alias: string,
                                   [<Optional; DefaultParameterValue(false)>] active: bool,
                                   [<Optional; DefaultParameterValue("")>] deviceId: string,
+                                  [<Optional; DefaultParameterValue("")>] windowRegistration: string,
                                   client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (BrowserOpenTabCommand {
+            WindowRegistration = windowRegistration
             Url = url; Alias = McpToolHelpers.optionOfString alias; Active = Some active })
+
+    [<McpServerTool(Title = "Close Jarvis-created browser tab", ReadOnly = false, Destructive = true, Idempotent = false, OpenWorld = false);
+      McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["process:execute"]}]""");
+      Description("Close only a verified Jarvis-created tab, never a manually registered tab or browser window.")>]
+    static member BrowserCloseTab(tabRegistration: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http (BrowserCloseTabCommand { TabRegistration = tabRegistration })
+
+    [<McpServerTool(Title = "Run project script in a new browser tab", ReadOnly = false, Destructive = true, Idempotent = false, OpenWorld = true);
+      McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["process:execute","workspace:read"]}]""");
+      Description("Create a new tab in a registered browser window, run a project .js file, and optionally close it. Never retries uncertain page effects.")>]
+    static member BrowserRunInNewTab(windowRegistration: string, url: string, projectName: string, scriptPath: string,
+                                      [<Optional; DefaultParameterValue("")>] argsJson: string,
+                                      [<Optional; DefaultParameterValue(false)>] active: bool,
+                                      [<Optional; DefaultParameterValue(true)>] closeTabAfterExecution: bool,
+                                      timeoutMs: Nullable<int>,
+                                      [<Optional; DefaultParameterValue("")>] deviceId: string,
+                                      client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http (BrowserRunInNewTabCommand {
+            WindowRegistration = windowRegistration; Url = url; ProjectName = projectName
+            ScriptPath = scriptPath; ArgsJson = McpToolHelpers.optionOfString argsJson
+            Active = Some active; CloseTabAfterExecution = Some closeTabAfterExecution
+            TimeoutMs = McpToolHelpers.optionOfNullable timeoutMs })
 
     [<McpServerTool(Title = "Execute browser project script", ReadOnly = false, Destructive = true, Idempotent = false, OpenWorld = true);
       McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["process:execute","workspace:read"]}]""");

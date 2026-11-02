@@ -7,7 +7,7 @@ open System.Text.Json
 open System.Threading
 open System.Threading.Tasks
 
-// A one-shot, client-local queue. A claimed action is never replayed after restart.
+// A client-local browser action queue. A claimed occurrence is never replayed after restart.
 [<CLIMutable>]
 type ScheduledAction =
     { Id: string
@@ -18,8 +18,14 @@ type ScheduledAction =
       Alias: string
       ArgsJson: string
       Active: bool
+      WindowRegistration: string
+      CloseTabAfterExecution: bool
+      RepeatEverySeconds: int
       Status: string
       RegistrationId: string
+      ConversationUrl: string
+      Cleanup: string
+      AttemptId: string
       Error: string
       UpdatedAtUtc: DateTimeOffset }
 
@@ -40,7 +46,7 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
             use file = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None)
             if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
                 File.SetUnixFileMode(temp, UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
-            let bytes = JsonSerializer.SerializeToUtf8Bytes({| schemaVersion = 1; actions = items |})
+            let bytes = JsonSerializer.SerializeToUtf8Bytes({| schemaVersion = 2; actions = items |})
             file.Write(bytes)
             file.Flush(true)
             file.Close()
@@ -59,14 +65,51 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
         persist bounded
         actions <- bounded
 
-    let update id status registrationId error =
+    let update id status (rawResult: string) error =
+        // Accept legacy registration-only results and structured browser workflow results.
+        let registrationId, conversationUrl, cleanup, effectiveStatus =
+            try
+                use doc = JsonDocument.Parse(rawResult)
+                let root = doc.RootElement
+                let prop (name: string) =
+                    match root.TryGetProperty(name) with
+                    | true, value when value.ValueKind = JsonValueKind.String -> value.GetString()
+                    | _ -> ""
+                let state = prop "status"
+                let url =
+                    match root.TryGetProperty("scriptResult") with
+                    | true, payload when payload.ValueKind = JsonValueKind.Object ->
+                        match payload.TryGetProperty("conversationUrl") with
+                        | true, value when value.ValueKind = JsonValueKind.String -> value.GetString()
+                        | _ -> ""
+                    | _ -> ""
+                let safeUrl =
+                    match Uri.TryCreate(url, UriKind.Absolute) with
+                    | true, uri when uri.Scheme = "https" || uri.Scheme = "http" ->
+                        uri.GetLeftPart(UriPartial.Path)
+                    | _ -> ""
+                prop "registrationId", safeUrl, prop "cleanup",
+                (if state = "notSubmitted" then "failed" else status)
+            with _ -> rawResult, "", "", status
         lock gate (fun () ->
             match actions |> List.tryFind (fun a -> a.Id = id && a.Status = "running") with
             | None -> ()
             | Some _ ->
                 setActions (actions |> List.map (fun a ->
                     if a.Id = id && a.Status = "running" then
-                        { a with Status = status; RegistrationId = registrationId; Error = error; UpdatedAtUtc = clock() }
+                        if a.RepeatEverySeconds > 0 then
+                            let current = clock()
+                            let seconds = float a.RepeatEverySeconds
+                            let elapsed = max 0.0 (current - a.DueAtUtc).TotalSeconds
+                            let skipped = floor(elapsed / seconds) + 1.0
+                            { a with Status = "pending"; DueAtUtc = a.DueAtUtc.AddSeconds(skipped * seconds)
+                                     RegistrationId = registrationId; ConversationUrl = conversationUrl
+                                     Cleanup = cleanup; Error = effectiveStatus + ": " + error
+                                     UpdatedAtUtc = current }
+                        else
+                            { a with Status = effectiveStatus; RegistrationId = registrationId
+                                     ConversationUrl = conversationUrl; Cleanup = cleanup
+                                     Error = error; UpdatedAtUtc = clock() }
                     else a)))
 
     do
@@ -79,7 +122,8 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
                     invalidOp "Browser schedules state file permissions are too broad."
             use data = JsonDocument.Parse(File.ReadAllText(path))
             let root = data.RootElement
-            if root.GetProperty("schemaVersion").GetInt32() <> 1 then
+            if root.GetProperty("schemaVersion").GetInt32() <> 1 &&
+               root.GetProperty("schemaVersion").GetInt32() <> 2 then
                 invalidOp "Unsupported browser schedules state schema."
             let restored =
                 JsonSerializer.Deserialize<ScheduledAction list>(root.GetProperty("actions").GetRawText())
@@ -87,17 +131,44 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
                 restored
                 |> List.map (fun action ->
                     if action.Status = "running" then
-                        { action with
-                            Status = "outcomeUnknown"
-                            Error = "JarvisClient stopped after claiming this one-shot action; it was not replayed."
-                            UpdatedAtUtc = clock() }
+                        if action.RepeatEverySeconds > 0 then
+                            let now = clock()
+                            let seconds = float action.RepeatEverySeconds
+                            let elapsed = max 0.0 (now - action.DueAtUtc).TotalSeconds
+                            let skipped = floor(elapsed / seconds) + 1.0
+                            { action with Status = "pending"
+                                          DueAtUtc = action.DueAtUtc.AddSeconds(skipped * seconds)
+                                          Error = "outcomeUnknown: previous occurrence interrupted; never replayed."
+                                          UpdatedAtUtc = now }
+                        else
+                            { action with Status = "outcomeUnknown"
+                                          Error = "JarvisClient stopped after claiming this one-shot action; it was not replayed."
+                                          UpdatedAtUtc = clock() }
+                    elif action.Status = "pending" && action.RepeatEverySeconds > 0 &&
+                         action.DueAtUtc < clock() then
+                        let now = clock()
+                        let seconds = float action.RepeatEverySeconds
+                        let elapsed = (now - action.DueAtUtc).TotalSeconds
+                        { action with DueAtUtc = action.DueAtUtc.AddSeconds((floor(elapsed / seconds) + 1.0) * seconds)
+                                      UpdatedAtUtc = now }
+                    elif action.Status = "pending" && String.IsNullOrWhiteSpace(action.WindowRegistration) then
+                        { action with Status = "failed"
+                                      Error = "WindowRegistrationRequired: reconfigure old browser schedule."
+                                      UpdatedAtUtc = clock() }
                     else action)
             if restored <> actions then persist actions
 
-    member _.Schedule(id: string, seconds: int, url: string, project: string, script: string, alias: string, args: string, active: bool) =
+    member _.Schedule(id: string, seconds: int, url: string, project: string, script: string, alias: string, args: string, active: bool, ?windowRegistration: string, ?closeAfter: bool, ?repeatEverySeconds: int) =
+        let window = defaultArg windowRegistration ""
+        let closeAfter = defaultArg closeAfter false
+        let repeat = defaultArg repeatEverySeconds 0
         if String.IsNullOrWhiteSpace(id) || id.Length > 64 ||
            (id |> Seq.exists (fun c -> not (Char.IsLetterOrDigit(c) || c = '-' || c = '_'))) then
             Error "InvalidScheduleId: use 1-64 letters, numbers, - or _."
+        elif String.IsNullOrWhiteSpace(window) || window.Length > 128 then
+            Error "WindowRegistrationRequired"
+        elif repeat <> 0 && (repeat < 60 || repeat > 30 * 24 * 60 * 60) then
+            Error "InvalidRepeatInterval: must be 60 seconds to 30 days."
         elif seconds < 5 || seconds > 30 * 24 * 60 * 60 then
             Error "InvalidDelay: must be between 5 seconds and 30 days."
         elif String.IsNullOrWhiteSpace(project) || String.IsNullOrWhiteSpace(script) then
@@ -129,8 +200,11 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
                             let entry =
                                 { Id = id; DueAtUtc = time.AddSeconds(float seconds); Url = url
                                   ProjectName = project; ScriptPath = script; Alias = alias
-                                  ArgsJson = args; Active = active; Status = "pending"
-                                  RegistrationId = ""; Error = ""; UpdatedAtUtc = time }
+                                  ArgsJson = args; Active = active; WindowRegistration = window
+                                  CloseTabAfterExecution = closeAfter; RepeatEverySeconds = repeat
+                                  Status = "pending"
+                                  RegistrationId = ""; ConversationUrl = ""; Cleanup = ""
+                                  AttemptId = ""; Error = ""; UpdatedAtUtc = time }
                             setActions (entry :: (actions |> List.filter (fun x -> x.Id <> id)))
                             Ok entry.DueAtUtc)
             with :? JsonException -> Error "InvalidArgumentsJson"
@@ -158,7 +232,13 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
                    scriptPath = a.ScriptPath
                    origin = (Uri(a.Url)).GetLeftPart(UriPartial.Authority)
                    alias = a.Alias
+                   windowRegistration = a.WindowRegistration
+                   repeatEverySeconds = a.RepeatEverySeconds
+                   closeTabAfterExecution = a.CloseTabAfterExecution
                    registrationId = a.RegistrationId
+                   conversationUrl = a.ConversationUrl
+                   cleanup = a.Cleanup
+                   attemptId = a.AttemptId
                    error = a.Error
                    updatedAtUtc = a.UpdatedAtUtc |})
             |> JsonSerializer.Serialize)
@@ -183,7 +263,7 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
                                 | Some entry ->
                                     setActions (actions |> List.map (fun a ->
                                         if a.Id = entry.Id then
-                                            { a with Status = "running"; UpdatedAtUtc = clock() }
+                                            { a with Status = "running"; AttemptId = Guid.NewGuid().ToString("N"); UpdatedAtUtc = clock() }
                                         else a))
                                     Some entry)
                         match next with

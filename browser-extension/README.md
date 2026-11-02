@@ -1,80 +1,88 @@
-# Jarvis Browser Bridge — Chromium extension
+# Jarvis browser bridge — Chromium/Edge extension
 
-A generic local browser bridge. Jarvis **does not** know anything about ChatGPT, agents, or websites; it only executes JavaScript in tabs that the user explicitly registers here.
+The extension pairs with a **local JarvisClient** over authenticated loopback WebSocket and executes ordinary project-owned JavaScript in registered tabs. Jarvis's server knows no website-specific automation. **The registered-window and disposable-tab workflow is implemented on `feature/browser-bridge` but has not been deployed or verified in live Edge yet.**
 
-## Installation (Chrome / Chromium 138+)
+## Local setup
 
-1. In JarvisClient's user-level config, enable the listener:
-   \`JarvisClient config set browser-port 43822\`
-   Restart JarvisClient. Alternatively start it with \`--browser-port 43822\`. The listener binds to \`127.0.0.1\`, not the public network.
-2. Run \`JarvisClient browser pair\` **locally**. It prints the randomly generated pairing secret. Do not put this secret in Git, chat messages or agent-facing scripts.
-3. Open \`chrome://extensions\`, enable Developer mode to load unpacked code, then select **Load unpacked** and choose this \`browser-extension\` folder.
-4. In the extension's details page, enable **Allow User Scripts**. Chrome 138+ requires this for runtime-provided scripts.
-5. Pin/click the extension icon, enter port and pairing secret, and click **Pair / connect**. Pairing is with the JarvisClient on this same machine.
-6. Open the desired page, click the extension, supply a unique optional alias (e.g. \`agent-7\`), and choose **Register tab**. Approve its site permission when prompted.
+1. Enable JarvisClient browser listener: `JarvisClient config set browser-port 43822` (or `--browser-port 43822`) and restart the client. It binds to `127.0.0.1` only.
+2. Run `JarvisClient browser pair` locally to get the private pairing key.
+3. Load the unpacked `browser-extension` folder in `edge://extensions` or `chrome://extensions` (Developer mode). Enable **Allow User Scripts** in the extension details.
+4. Open the extension popup. Enter the local port/key and pair.
+5. In the browser window that should receive agent launches, click **Register / reauthorize window**, optionally naming it `agents`. This grants **placement**, not access to its existing tabs.
+6. Under **Site to authorize for new tabs**, enter `https://chatgpt.com` and click **Grant site permission**. Browser host permission is independent of window registration.
+7. Enable **Allow Jarvis to open new tabs**. New tabs open in the chosen window and are automatically registered. Existing tabs in the window remain inaccessible unless explicitly registered separately.
 
-Only tabs registered in the extension appear to \`BrowserListTabs\`. A browser host permission does not by itself register any tab. Use **Unregister current tab** to revoke one tab or **Revoke pairing** to disconnect the extension.
+The extension accepts only registered windows; neither Jarvis nor a webpage may register an arbitrary window. A browser restart or closed window invalidates the window registration until you reauthorize it from the popup. Moving a created tab outside its registered window suspends script execution.
 
-Registration persists through ordinary reloads, MV3 service worker restarts, and tab discards. It remains unavailable when the tab is discarded/frozen. Navigation to a different URL, closing a tab, or browser restart invalidates the binding until manually reauthorized in the extension. It is never silently matched by URL to a different tab.
+Manually registering a **tab** is still supported for existing-page inspections, and those registrations are bound to the exact URL. A manual tab is **not required** for creating agent tabs. **Unregister window** blocks new launches and revokes the permissions derived from that window, but does not close its tabs. **Unregister current tab** applies only to that tab.
 
+## Browser commands
 
-### Opening new tabs from Jarvis (optional)
+| MCP command | Purpose |
+| --- | --- |
+| `BrowserListWindows(deviceId?)` | Lists only user-registered windows, with alias, ID and availability |
+| `BrowserListTabs(deviceId?)` | Lists only manually registered and Jarvis-created tabs |
+| `BrowserOpenTab(url, windowRegistration, alias?, active?, deviceId?)` | Opens an agent-created tab in the selected window, default background |
+| `BrowserExecuteFile(projectName, scriptPath, tabRegistration, argsJson?, timeoutMs?, deviceId?)` | Runs a regular project-relative UTF-8 `.js` file in a registered tab |
+| `BrowserCloseTab(tabRegistration, deviceId?)` | Closes **only** a Jarvis-created tab with matching identity |
+| `BrowserRunInNewTab(windowRegistration, url, projectName, scriptPath, argsJson?, active?, closeTabAfterExecution?, timeoutMs?, deviceId?)` | One-call open → ready → execute → optional close, for immediate agent handoffs |
+| `ScheduleBrowserExecution(scheduleId, runAfterSeconds, url, projectName, scriptPath, windowRegistration, argsJson?, closeTabAfterExecution?, repeatEverySeconds?, ...)` | One-shot or recurring future invocation of the same workflow |
+| `ListScheduledBrowserExecutions` / `CancelScheduledBrowserExecution` | Inspect/cancel local future launches |
 
-In the extension popup, check **Allow Jarvis to open new tabs**. This is disabled by default and is independent of pairing. The extension accepts BrowserOpenTab only when you have **manually registered an existing tab on the destination site** and granted its host permission. It creates a *new* tab and automatically registers it; it never adopts an unrelated existing tab. New tabs open in the background by default. The extension limits active auto-created registrations to 20.
+`BrowserOpenTab` requires the separate new-tab opt-in, registered window, and destination host permission. Extension caps active Jarvis-created registrations at 20. Agent-created tabs remain authorized across same-origin SPA navigation but not cross-origin navigation. Never retry a timed-out open or execution blindly, because the page may already have been modified.
 
-New tabs are origin-bound rather than exact-URL-bound, so ChatGPT and other apps may change their route after a conversation starts. Cross-origin navigation invalidates the registration. Unchecking the switch invalidates agent-created registrations without closing those browser tabs.
+`BrowserRunInNewTab` and scheduling **do not run a ChatGPT backend API**. They execute the project script in the actual UI. Generic scripts use `async function execute(args)`. The composite operation returns structured script result + registration + cleanup status. If a script indicates `outcomeUnknown`, the created tab is retained for investigation rather than automatically resubmitting.
 
-Example BrowserOpenTab arguments:
+## Start a fresh ChatGPT agent immediately
 
-    { "url": "https://chatgpt.com/", "alias": "agent-new", "active": false }
+A reusable DOM-based launcher is included in this repository at:
 
-The reply contains a newly generated registration ID and availability, often loading. Poll BrowserListTabs until ready before executing scripts. An optional active=true may select the newly created tab. If Jarvis loses its response, the tab may still be open; do not retry blindly.
+```text
+browser-scripts/chatgpt/launchAgent.js
+```
 
-## Jarvis commands
+Use it through a normal Jarvis project selector (for example `Jarvis::browser-bridge` when working in this development worktree). Its main argument is `prompt`; optional timeouts and `expectedOrigin` are supported. It selects the contenteditable ProseMirror editor, inserts text through normal editing behavior, waits for the enabled **Send** button (which replaces **Start voice**), clicks once, and checks UI evidence of submission. It does not rely on ChatGPT's private network API.
 
-The client sends JavaScript source to the extension, not file paths. Scripts can live in **any** ordinary Jarvis project or its Git worktrees, and changes are picked up on every invocation.
+Example command arguments:
 
-\`BrowserListTabs(deviceId?)\` lists registered aliases, opaque identifiers, manual/agent-created provenance and availability.
-
-\`BrowserExecuteFile(projectName, scriptPath, tabRegistration, argsJson?, timeoutMs?, deviceId?)\` executes a UTF-8 \`.js\` file (64 KiB max), with an optional JSON argument string (64 KiB max) and JSON result (256 KiB max including envelope). Default timeout: 15 s; maximum 30 s.
-
-Example project file, at \`Userscripts/inspect/title.js\`:
-
-\`\`\`javascript
-async function execute(args) {
-  return { title: document.title, marker: args.marker };
-}
-\`\`\`
-
-Example MCP arguments:
-
-\`\`\`json
+```json
 {
-  "projectName": "Userscripts",
-  "scriptPath": "inspect/title.js",
-  "tabRegistration": "agent-7",
-  "argsJson": "{\"marker\":\"test\"}"
+  "windowRegistration": "agents",
+  "url": "https://chatgpt.com/",
+  "projectName": "Jarvis::browser-bridge",
+  "scriptPath": "browser-scripts/chatgpt/launchAgent.js",
+  "argsJson": "{\"prompt\":\"You are Worker 3. Read your current Jarvis assignment and AGENTS.md, task, spec, and checkpoint. Continue the assigned work in this fresh session.\"}",
+  "active": false,
+  "closeTabAfterExecution": true
 }
-\`\`\`
+```
 
-\`BrowserExecuteJs(tabRegistration, code, argsJson?, timeoutMs?, deviceId?)\` is available for **expression** evaluation, such as \`document.title\`. For multi-statement or reusable logic, use a file with an \`execute(args)\` entrypoint. There is no module resolver or persistent injected state in MVP.
+The logical agent is persistent **in Jarvis**, not the ChatGPT tab. The new chat continues backend execution after the temporary tab closes, as observed by the operator. A successful launch means the bootstrap message was submitted, **not** that the agent completed the assignment. Retrieve progress through Jarvis task/activity tools, not UI polling.
 
-## Permissions and limits
+When a specific ChatGPT Project/GPT or model is required, start from a user-verified new-conversation URL and inspect the chosen context in the UI before using it unattended. Automatic model/thinking-effort selection is not implemented.
 
-Jarvis MCP calls require \`workspace:read\` to list tabs, and \`process:execute\` (plus \`workspace:read\` to load a project file) to execute code. In default \`partial\` trust, JarvisClient prompts for script execution; \`full\` trust skips that client prompt but does **not** override extension pairing, user registration, or Chrome permission checks.
+## Delayed and recurring launches
 
-The listener is **off by default** until a browser port is configured. Revoke the key with \`JarvisClient browser revoke\`, then restart the client. Disable the listener with \`JarvisClient config unset browser-port\`, then restart.
+JarvisClient saves browser schedules in user-private `browser-schedules.json`. `ScheduleBrowserExecution` requires `windowRegistration`. Pre-existing entries created before window support must be reconfigured; they are never silently retargeted.
 
-Script execution can change authenticated webpages and submit irreversible actions. An operation that times out or loses its connection may already have taken effect. Jarvis never automatically retries such an operation. A successful JavaScript result is not proof that the web application completed a background task.
+Omit `repeatEverySeconds` for one-shot scheduling. For hourly orchestration, set `repeatEverySeconds: 3600` and choose a first `runAfterSeconds` delay. The scheduler skips missed intervals after client downtime, and does not retry a claimed occurrence if the client is interrupted. It records the most recent attempt ID, submission URL if reported, cleanup state, and last outcome. A fresh orchestrator should inspect Jarvis activity before beginning work to avoid overlap; no automatic singleton lease is imposed.
 
-## Development and tests
+Immediate orchestrator handoff **does not need a schedule**: call `BrowserRunInNewTab`.
 
-- \`node --check browser-extension/background.js\`
-- \`node --test browser-extension/tests/bridge.test.cjs\`
-- \`dotnet test Jarvis.slnx\`
+## Security and limits
 
-The Node tests simulate Chromium APIs and a webpage. The F# tests use a real loopback WebSocket connection. **Real Chromium integration testing is still required** before release (the initial development machine may not have a Chromium executable). See \`docs/BrowserBridgeSystem.md\` for the full design and acceptance requirements.
+- MCP needs `workspace:read` for project scripts/read actions and `process:execute` for browser effects; the Jarvis local permission policy still applies.
+- ChatGPT's **own plugin permission prompts are separate**. This launcher does not click or bypass approval, login, CAPTCHA, or security controls.
+- Pairing and extension registries remain local. Cookies and tokens are not exposed to Jarvis. Scheduled prompt arguments are stored locally in a user-private JSON file and omitted from list/audit output.
+- Script input maximum 64 KiB, JSON args maximum 64 KiB, result maximum 256 KiB, script timeout maximum 30 seconds. Prompt has a lower explicit size limit in the ChatGPT script.
+- Only the extension UI registers windows or existing tabs. MCP cannot adopt preexisting tabs, switch to an arbitrary active window, or close a registered browser window.
+- Versioned bridge protocol is **v2**; new extension and JarvisClient must be installed together.
 
-## Scheduled execution
+## Tests
 
-JarvisClient can schedule a new tab plus a project-backed script using ScheduleBrowserExecution, with a runAfterSeconds delay. The extension does not schedule anything itself and its existing opt-in, manual-origin registration and host-permission checks still apply when the time arrives. Pending schedules are stored in the local JarvisClient user configuration; no external scheduler or automation service is required. See [one-shot browser scheduler](../docs/BrowserOneShotScheduler.md).
+```bash
+dotnet test Jarvis.slnx --no-restore
+node --test browser-extension/tests/bridge.test.cjs browser-extension/tests/chatgpt-launcher.test.cjs
+```
+
+The extension uses simulated Chromium APIs in Node tests; the F# client tests exercise a real loopback WebSocket. **A live Edge/ChatGPT acceptance run remains necessary** before deploying to normal use. See `docs/BrowserBridgeSystem.md` and `docs/ChatGPTAgentLauncher.md` for the detailed specifications.

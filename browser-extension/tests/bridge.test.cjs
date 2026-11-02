@@ -12,8 +12,8 @@ function createHarness(initialStorage = {}, initialSession = {}) {
   const storage = new Map(Object.entries(initialStorage));
   const session = new Map(Object.entries(initialSession));
   const tabs = new Map([
-    [17, { id: 17, url: "https://example.test/chat/7", title: "Agent 7", status: "complete" }],
-    [18, { id: 18, url: "https://example.test/other", title: "Unregistered", status: "complete" }]
+    [17, { id: 17, url: "https://example.test/chat/7", title: "Agent 7", status: "complete", windowId: 1 }],
+    [18, { id: 18, url: "https://example.test/other", title: "Unregistered", status: "complete", windowId: 1 }]
   ]);
   const listeners = {};
   const sockets = [];
@@ -55,7 +55,7 @@ function createHarness(initialStorage = {}, initialSession = {}) {
       create: async properties => {
         const tab = {
           id: nextCreatedId++, url: "about:blank", pendingUrl: properties.url,
-          status: "loading", incognito: false, active: properties.active
+          status: "loading", incognito: false, active: properties.active, windowId: properties.windowId
         };
         tabs.set(tab.id, tab);
         createdTabs.push(tab);
@@ -68,6 +68,10 @@ function createHarness(initialStorage = {}, initialSession = {}) {
       },
       onUpdated: { addListener: cb => { listeners.updated = cb; } },
       onRemoved: { addListener: cb => { listeners.removed = cb; } }
+    },
+    windows: {
+      get: async id => { if (id !== 1) throw Error("Missing window"); return { id: 1, incognito: false }; },
+      onRemoved: { addListener: cb => { listeners.windowRemoved = cb; } }
     },
     webNavigation: { onHistoryStateUpdated: { addListener: cb => { listeners.history = cb; } } },
     permissions: { contains: async () => true },
@@ -94,7 +98,7 @@ function createHarness(initialStorage = {}, initialSession = {}) {
   const message = (kind, extra = {}, sender = { id: chrome.runtime.id }) =>
     new Promise(resolve => listeners.message({ kind, ...extra }, sender, resolve));
   const deliver = async (socket, value) => {
-    await socket.onmessage({ data: JSON.stringify({ version: 1, ...value }) });
+    await socket.onmessage({ data: JSON.stringify({ version: 2, ...value }) });
     await tick(); await tick();
   };
   return { storage, session, tabs, createdTabs, sockets, calls, listeners, message, deliver, userScripts: chrome.userScripts };
@@ -232,7 +236,7 @@ test("browser restart leaves old registrations unavailable without user reauthor
   assert.equal((await second.message("getState")).registrations[0].availability, "ready");
 });
 
-test("opening tabs requires extension opt-in and an existing manually registered origin", async () => {
+test("opening tabs requires registered window and explicit opt-in", async () => {
   const h = createHarness();
   await tick(); await tick();
   const key = "deadbeef".padEnd(64, "0");
@@ -242,25 +246,26 @@ test("opening tabs requires extension opt-in and an existing manually registered
   await h.deliver(ws, { kind: "challenge", nonce: "a".repeat(64) });
   await h.deliver(ws, { kind: "ready", connectionId: "epoch-1" });
   const request = (requestId, url, alias = "") => h.deliver(ws, {
-    kind: "openTab", connectionId: "epoch-1", requestId, url, alias, active: false
+    kind: "openTab", connectionId: "epoch-1", requestId, url, alias, windowRegistration: "agents", active: false
   });
   await request("disabled", "https://example.test/chat/new");
   assert.equal(ws.sent.find(m => m.requestId === "disabled").error, "AgentCreatedTabsDisabled");
   await h.message("setAgentCreatedTabs", { allowed: true });
-  await request("no-grant", "https://example.test/chat/new");
-  assert.equal(ws.sent.find(m => m.requestId === "no-grant").error, "OriginNotRegisteredByUser");
-  await h.message("register", { tabId: 17, alias: "original" });
-  await request("other-origin", "https://another.test/chat");
-  assert.equal(ws.sent.find(m => m.requestId === "other-origin").error, "OriginNotRegisteredByUser");
+  await request("no-window", "https://example.test/chat/new");
+  assert.equal(ws.sent.find(m => m.requestId === "no-window").error, "WindowNotRegistered");
+  await h.message("registerWindow", { windowId: 1, alias: "agents" });
+  await request("allowed", "https://another.test/chat");
+  assert.equal(ws.sent.find(m => m.requestId === "allowed").kind, "tabOpened");
   await request("bad-scheme", "javascript:alert(1)");
   assert.equal(ws.sent.find(m => m.requestId === "bad-scheme").error, "InvalidTabUrl");
-  assert.equal(h.createdTabs.length, 0);
+  assert.equal(h.createdTabs.length, 1);
+  assert.equal(h.createdTabs[0].windowId, 1);
 });
 
 test("agent-created tab is registered and controllable across same-origin navigation", async () => {
   const h = createHarness();
   await tick(); await tick();
-  await h.message("register", { tabId: 17, alias: "original" });
+  await h.message("registerWindow", { windowId: 1, alias: "agents" });
   await h.message("setAgentCreatedTabs", { allowed: true });
   const key = "deadbeef".padEnd(64, "0");
   await h.message("pair", { port: 43822, secret: key });
@@ -269,7 +274,7 @@ test("agent-created tab is registered and controllable across same-origin naviga
   await h.deliver(ws, { kind: "challenge", nonce: "b".repeat(64) });
   await h.deliver(ws, { kind: "ready", connectionId: "epoch-1" });
   const requestOpen = (requestId, url, alias) => h.deliver(ws, {
-    kind: "openTab", connectionId: "epoch-1", requestId, url, alias, active: false
+    kind: "openTab", connectionId: "epoch-1", requestId, url, alias, windowRegistration: "agents", active: false
   });
   await requestOpen("new", "https://example.test/chat/new", "agent-new");
   await tick(); await tick();
@@ -321,7 +326,7 @@ test("agent-created tab is registered and controllable across same-origin naviga
 test("disabling automatic tab creation revokes access to all agent-created tabs", async () => {
   const h = createHarness();
   await tick(); await tick();
-  await h.message("register", { tabId: 17, alias: "original" });
+  await h.message("registerWindow", { windowId: 1, alias: "agents" });
   await h.message("setAgentCreatedTabs", { allowed: true });
   const key = "deadbeef".padEnd(64, "0");
   await h.message("pair", { port: 43822, secret: key });
@@ -331,7 +336,7 @@ test("disabling automatic tab creation revokes access to all agent-created tabs"
   await h.deliver(ws, { kind: "ready", connectionId: "epoch-1" });
   await h.deliver(ws, {
     kind: "openTab", requestId: "new", connectionId: "epoch-1",
-    url: "https://example.test/chat/new", alias: "agent-auto", active: false
+    url: "https://example.test/chat/new", alias: "agent-auto", windowRegistration: "agents", active: false
   });
   await tick(); await tick();
   const tab = ws.sent.find(m => m.requestId === "new").tab;
@@ -344,10 +349,10 @@ test("disabling automatic tab creation revokes access to all agent-created tabs"
   assert.equal(state.registrations.find(r => r.registrationId === tab.registrationId).availability, "needsReauthorization");
 });
 
-test("removing the last manually approved tab revokes the agent-created tab's authority", async () => {
+test("revoking registered window revokes created tab authority", async () => {
   const h = createHarness();
   await tick(); await tick();
-  await h.message("register", { tabId: 17, alias: "manual" });
+  await h.message("registerWindow", { windowId: 1, alias: "agents" });
   await h.message("setAgentCreatedTabs", { allowed: true });
   const key = "deadbeef".padEnd(64, "0");
   await h.message("pair", { port: 43822, secret: key });
@@ -357,7 +362,7 @@ test("removing the last manually approved tab revokes the agent-created tab's au
   await h.deliver(ws, { kind: "ready", connectionId: "epoch-1" });
   await h.deliver(ws, {
     kind: "openTab", requestId: "opened", connectionId: "epoch-1",
-    url: "https://example.test/chat/new", alias: "auto", active: false
+    url: "https://example.test/chat/new", alias: "auto", windowRegistration: "agents", active: false
   });
   await tick(); await tick();
   const opened = ws.sent.find(m => m.requestId === "opened" && m.kind === "tabOpened");
@@ -365,14 +370,43 @@ test("removing the last manually approved tab revokes the agent-created tab's au
   h.createdTabs[0].url = "https://example.test/chat/new";
   h.createdTabs[0].status = "complete";
   delete h.createdTabs[0].pendingUrl;
-  await h.message("unregister", { tabId: 17 });
+  await h.message("unregisterWindow", { windowId: 1 });
   const state = await h.message("getState");
   assert.equal(state.registrations.find(t => t.registrationId === opened.tab.registrationId).availability,
     "needsReauthorization");
   await h.deliver(ws, {
     kind: "openTab", requestId: "blocked", connectionId: "epoch-1",
-    url: "https://example.test/chat/another", alias: "another", active: false
+    url: "https://example.test/chat/another", alias: "another", windowRegistration: "agents", active: false
   });
-  assert.equal(ws.sent.find(m => m.requestId === "blocked").error, "OriginNotRegisteredByUser");
+  assert.equal(ws.sent.find(m => m.requestId === "blocked").error, "WindowNotRegistered");
   assert.equal(h.createdTabs.length, 1);
+});
+
+test("only agent-created tabs can be closed, preserving the window and manual tabs", async () => {
+  const h = createHarness();
+  await tick(); await tick();
+  await h.message("registerWindow", { windowId: 1, alias: "agents" });
+  await h.message("register", { tabId: 17, alias: "manual" });
+  await h.message("setAgentCreatedTabs", { allowed: true });
+  const key = "deadbeef".padEnd(64, "0");
+  await h.message("pair", { port: 43822, secret: key });
+  await tick(); await tick();
+  const ws = h.sockets[0];
+  await h.deliver(ws, { kind: "challenge", nonce: "f".repeat(64) });
+  await h.deliver(ws, { kind: "ready", connectionId: "epoch-1" });
+  assert.equal(ws.sent.find(m => m.kind === "windows").windows[0].alias, "agents");
+  await h.deliver(ws, { kind: "openTab", requestId: "open", connectionId: "epoch-1",
+    windowRegistration: "agents", url: "https://example.test/chat/new", active: false });
+  const created = ws.sent.find(m => m.requestId === "open").tab;
+  const manual = (await h.message("getState")).registrations.find(r => r.alias === "manual");
+  await h.deliver(ws, { kind: "closeTab", requestId: "not-ours", connectionId: "epoch-1",
+    registrationId: manual.registrationId, registrationGeneration: manual.registrationGeneration });
+  assert.equal(ws.sent.find(m => m.requestId === "not-ours").error, "TabNotAgentCreated");
+  await h.deliver(ws, { kind: "closeTab", requestId: "close", connectionId: "epoch-1",
+    registrationId: created.registrationId, registrationGeneration: created.registrationGeneration });
+  assert.equal(ws.sent.find(m => m.requestId === "close").kind, "tabClosed");
+  assert.equal(h.tabs.size, 2);
+  assert.ok(h.tabs.has(17));
+  assert.equal((await h.message("getState")).windows[0].alias, "agents");
+  assert.equal((await h.message("getState")).registrations.length, 1);
 });

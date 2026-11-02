@@ -109,6 +109,7 @@ let private requiresConfirmation command =
     | ListCommandsCommand
     | ListProjectsCommand
     | BrowserListTabsCommand
+    | BrowserListWindowsCommand
     | ListScheduledBrowserExecutionsCommand
     | ListWorktreesCommand _
     | GetWorktreeCommand _
@@ -152,6 +153,11 @@ let private requiresConfirmation command =
             | true, uri when uri.Scheme = "https" || uri.Scheme = "http" -> uri.GetLeftPart(UriPartial.Authority)
             | _ -> "(invalid URL)"
         confirmation "BrowserOpenTab" None [ ProcessExecution; NetworkAccess ] [] None [] ("Open browser tab on " + origin) false
+    | BrowserCloseTabCommand cmd ->
+        confirmation "BrowserCloseTab" None [ ProcessExecution ] [] None [] ("Close Jarvis-created tab " + cmd.TabRegistration) false
+    | BrowserRunInNewTabCommand cmd ->
+        confirmation "BrowserRunInNewTab" (Some cmd.ProjectName) [ ProcessExecution; NetworkAccess ] [cmd.ScriptPath] None []
+            ("Open browser tab in " + cmd.WindowRegistration + " and execute " + cmd.ScriptPath) false
     | BrowserExecuteFileCommand cmd ->
         confirmation "BrowserExecuteFile" (Some cmd.ProjectName) [ ProcessExecution; NetworkAccess ] [ cmd.ScriptPath ] None [] ("Execute browser script in registered tab " + cmd.TabRegistration) false
     | BrowserExecuteJsCommand cmd ->
@@ -205,6 +211,8 @@ let private trustAllows trustLevel command =
     | PartialTrust, ScheduleBrowserExecutionCommand _
     | PartialTrust, CancelScheduledBrowserExecutionCommand _
     | PartialTrust, BrowserOpenTabCommand _
+    | PartialTrust, BrowserCloseTabCommand _
+    | PartialTrust, BrowserRunInNewTabCommand _
     | PartialTrust, BrowserExecuteFileCommand _
     | PartialTrust, BrowserExecuteJsCommand _
     | PartialTrust, RunCommandCommand _

@@ -230,7 +230,10 @@ let configureApp (app: WebApplication) =
     |> fun endpoint -> endpoint.RequireRateLimiting(rateLimiterPolicy)
     |> ignore
 
-    app.MapMcp("/mcp") |> ignore
+    // Authenticate MCP initialization/discovery at the HTTP boundary so clients
+    // receive an OAuth Bearer challenge before accessing tools. Tool-specific
+    // scope checks continue to run independently inside McpTools.
+    app.MapMcp("/mcp").RequireAuthorization() |> ignore
 
     app
 

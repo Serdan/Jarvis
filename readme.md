@@ -177,6 +177,12 @@ Imported files default to a 32 MiB local maximum. Override it when launching the
 
 `0` means unlimited. A tool call may request a lower per-import limit, but cannot raise the client-configured maximum.
 
+### MCP OAuth discovery
+
+`POST /mcp` requires a valid OAuth bearer token from the first MCP request, including `initialize` and `tools/list`. Anonymous requests receive **HTTP 401** with a `WWW-Authenticate: Bearer` challenge pointing to the public `/.well-known/oauth-protected-resource` metadata document. MCP clients should use that metadata to start OAuth/PKCE with the configured Auth0 authorization server, and supply the resulting access token in the HTTP `Authorization` header. The MCP route does not accept bearer tokens from query parameters. Individual tools still enforce their existing OAuth scope requirements; endpoint authentication does not replace authorization.
+
+For new third-party MCP clients (such as LM Studio), the Auth0 application configuration must allow the client's real redirect/callback URI and requested scopes. A correct HTTP challenge establishes OAuth discovery; it does not guarantee a client's OAuth registration or login flow is configured correctly.
+
 ## Project tasks
 
 Projects can expose named build/test/format/lint tasks in a project-root `.jarvis.json`:

@@ -53,6 +53,7 @@ let configureServices (services: IServiceCollection) (configuration: IConfigurat
         .AddJwtBearer(fun options ->
             options.Authority <- Auth.issuer configured
             options.Audience <- configured.Audience
+            options.TokenValidationParameters.ValidAudiences <- Auth.validAudiences configured
             options.MapInboundClaims <- false
             options.RequireHttpsMetadata <- true
 

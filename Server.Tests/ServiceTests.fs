@@ -674,6 +674,18 @@ let auth_issuer_normalizes_auth0_domain () =
     Auth.issuer options |> shouldEqual "https://dev-kn4j3jz3qv2cvw05.eu.auth0.com/"
 
 [<Test>]
+let auth_accepts_exactly_the_legacy_and_trailing_slash_api_audiences () =
+    let options =
+        { Auth0Domain = "example.eu.auth0.com"
+          Audience = "https://jarvis2.kehlet.dev"
+          OpenAIAppsChallenge = "" }
+    Auth.validAudiences options
+    |> shouldEqual [| "https://jarvis2.kehlet.dev"; "https://jarvis2.kehlet.dev/" |]
+
+    Auth.validAudiences { options with Audience = "https://jarvis2.kehlet.dev/" }
+    |> shouldEqual (Auth.validAudiences options)
+
+[<Test>]
 let auth_scope_lookup_handles_space_separated_scope_claim () =
     let identity =
         System.Security.Claims.ClaimsIdentity(

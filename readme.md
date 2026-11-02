@@ -183,6 +183,35 @@ Imported files default to a 32 MiB local maximum. Override it when launching the
 
 For new third-party MCP clients (such as LM Studio), the Auth0 application configuration must allow the client's real redirect/callback URI and requested scopes. A correct HTTP challenge establishes OAuth discovery; it does not guarantee a client's OAuth registration or login flow is configured correctly.
 
+#### LM Studio: slash-suffixed OAuth resource
+
+LM Studio may issue `resource=https://jarvis2.kehlet.dev/` even when the public
+protected-resource metadata advertises `https://jarvis2.kehlet.dev`. Auth0
+considers these **different API identifiers** and rejects the slash-suffixed
+request with `error=access_denied` / `Service not found` before login.
+
+Preserve the existing API and ChatGPT/native client credentials. In the same
+Auth0 tenant, add a **second API** with identifier
+`https://jarvis2.kehlet.dev/` (trailing slash) and grant it the same
+`workspace:read`, `workspace:write`, `process:execute`, and `git:write`
+permissions. Use RS256 signing (matching the existing API). Under
+Applications, ensure the native application used by LM Studio authorizes this
+new API and lists `http://127.0.0.1:33389/mcp-oauth-callback` among its allowed
+callback URLs. LM Studio may use the existing public native client ID; it
+does not need a client secret for Authorization Code + PKCE.
+
+Jarvis validates access tokens for **both exact API identifiers** from the
+same trusted issuer; it still checks the signature, expiration, authenticated
+subject, and per-tool scopes. Do not change the existing Audience setting or
+delete the original Auth0 API. Resource metadata intentionally continues to
+advertise the original identifier for existing MCP clients.
+
+To diagnose the authorization redirect, use a fresh test request to Auth0
+`/authorize` and inspect the `Location` header: a successful pre-login
+validation redirects to Auth0's login page, rather than the LM Studio callback
+with `error=access_denied`. A successful browser login and subsequent
+authenticated tool call must still be verified separately.
+
 ## Project tasks
 
 Projects can expose named build/test/format/lint tasks in a project-root `.jarvis.json`:

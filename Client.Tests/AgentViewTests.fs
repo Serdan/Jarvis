@@ -117,7 +117,7 @@ let agentStatesHaveDistinctReadableColors () =
         [ "Working", ConsoleColor.Green
           "Ready", ConsoleColor.Yellow
           "Assigned", ConsoleColor.Cyan
-          "NeedsWork", ConsoleColor.Cyan
+          "NeedsWork", ConsoleColor.Magenta
           "Completed", ConsoleColor.Blue
           "Parked", ConsoleColor.DarkGray
           "Unexpected", ConsoleColor.Gray ]

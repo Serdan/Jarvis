@@ -915,7 +915,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
             match row.Focus with
             | Some task -> $"{AgentView.displayState row.State} · #{task.TaskId} {task.Title}"
             | None -> AgentView.displayState row.State
-        let unread = if row.PendingNotifications = 0 then "" else $" [{row.PendingNotifications} unread]"
+        let unread = if row.PendingNotifications = 0 then "" else $" [{row.PendingNotifications}]"
         let rendered = trim $"{marker}{flag} {timestamp,-4} {token} {row.Agent}{unread}: {compact status}" width
         let index = rendered.IndexOf(token, StringComparison.Ordinal)
         if index < 0 then draw.WriteLine rendered

@@ -930,15 +930,15 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         draw.WriteLine(trim header width)
         draw.ForegroundColor <- previous
 
-    let writeColoredAgentLine width marker striped (row: AgentView.AgentRow) =
+    let writeColoredAgentLine width marker (row: AgentView.AgentRow) =
         let original = draw.ForegroundColor
         let originalBackground = draw.BackgroundColor
         let projectWidth, agentWidth = agentColumnWidths width
-        let background =
-            if mode = AgentsMode && Some row.Key = agentSelected then ConsoleColor.DarkCyan
-            elif striped then ConsoleColor.DarkBlue
-            else ConsoleColor.Black
+        let selected = mode = AgentsMode && Some row.Key = agentSelected
+        let background = if selected then ConsoleColor.DarkGray else ConsoleColor.Black
+        let normalForeground = if selected then ConsoleColor.White else original
         draw.BackgroundColor <- background
+        draw.ForegroundColor <- normalForeground
         let timestamp = AgentView.stateAge DateTimeOffset.UtcNow row
         let flag = if Set.contains row.Key agentChanged then "*" else " "
         let mail = if row.PendingNotifications = 0 then "" else $"[{row.PendingNotifications}]"
@@ -952,29 +952,30 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
             draw.Write(agentColumn value cellWidth)
         // Two selection/change markers and a space form the leftmost gutter.
         draw.Write(marker + flag + " ")
-        writeCell timestamp 4 original
+        writeCell timestamp 4 normalForeground
         draw.Write(" ")
         let projectForeground =
-            match projectColor row.Project, background with
-            | ConsoleColor.Blue, ConsoleColor.DarkBlue
-            | ConsoleColor.DarkCyan, ConsoleColor.DarkCyan -> ConsoleColor.Cyan
-            | ConsoleColor.DarkGreen, ConsoleColor.DarkCyan -> ConsoleColor.Green
+            match projectColor row.Project, selected with
+            | ConsoleColor.Blue, true -> ConsoleColor.Cyan
+            | ConsoleColor.DarkCyan, true -> ConsoleColor.Cyan
+            | ConsoleColor.DarkGreen, true -> ConsoleColor.Green
+            | ConsoleColor.DarkMagenta, true -> ConsoleColor.Magenta
             | color, _ -> color
         writeCell (ActivityFilter.projectToken row.Project) projectWidth projectForeground
-        draw.ForegroundColor <- original
+        draw.ForegroundColor <- normalForeground
         draw.Write(" ")
-        writeCell row.Agent agentWidth original
+        writeCell row.Agent agentWidth normalForeground
         draw.Write(" ")
-        writeCell mail 5 (if row.PendingNotifications > 0 then ConsoleColor.Yellow else original)
-        draw.ForegroundColor <- original
+        writeCell mail 5 (if row.PendingNotifications > 0 then ConsoleColor.Yellow else normalForeground)
+        draw.ForegroundColor <- normalForeground
         draw.Write(" ")
-        writeCell state 10 (AgentView.stateColor row.State)
-        draw.ForegroundColor <- original
+        writeCell state 10 (if selected && row.State = "Completed" then ConsoleColor.Cyan else AgentView.stateColor row.State)
+        draw.ForegroundColor <- normalForeground
         draw.Write(" ")
         let remaining = max 0 (width - draw.CursorLeft)
         draw.Write(agentColumn task remaining)
-        // Explicitly fill the row so the alternating background extends across
-        // the full available width even for agents with no task.
+        // Fill the row so the selection highlight spans the available width
+        // even for agents with no task.
         let padding = max 0 (width - draw.CursorLeft)
         if padding > 0 then draw.Write(String(' ', padding))
         draw.WriteLine()
@@ -1087,7 +1088,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                 let row = filtered[index]
                 let marker = if mode = AgentsMode && Some row.Key = agentSelected then ">" else " "
                 registerMouseHit 0 rowWidth (SelectAgent row.Key)
-                writeColoredAgentLine rowWidth marker (index % 2 = 1) row
+                writeColoredAgentLine rowWidth marker row
         if showAgentDetails then renderAgentDetailsUnsafe width
 
         if not issues.IsEmpty then

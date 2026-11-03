@@ -150,3 +150,24 @@ let parkedAgentsAreHiddenFromTheTuiButRemainInTheLedgerSnapshot () =
     let resumed = { parked with State = "Ready" }
     visibleRows "" (snapshot [ resumed; active ]) |> List.map _.Agent
     |> shouldEqual ["Lead"; "Orchestrator"]
+
+
+[<Test>]
+let agentTableColumnsFollowVisibleContentInsteadOfTerminalWidth () =
+    let wayfold =
+        [| record "Wayfold" "Agent 1" "Working" None
+           record "Wayfold" "Agent 10" "Ready" None |]
+    columnWidths 120 wayfold |> shouldEqual (8, 8)
+    columnWidths 80 wayfold |> shouldEqual (8, 8)
+    let mixed = Array.append wayfold [| record "Longer Project" "GUI Agent" "Ready" None |]
+    columnWidths 120 mixed |> shouldEqual (15, 9)
+    columnWidths 55 mixed |> shouldEqual (11, 9)
+
+[<Test>]
+let narrowAgentTablesKeepColumnsWithinAvailableWidth () =
+    let agents = [| record "A very long project name" "A very long agent name" "Working" None |]
+    for width in [20; 30; 40; 50; 120] do
+        let project, agent = columnWidths width agents
+        Assert.That(project, Is.GreaterThanOrEqualTo(0))
+        Assert.That(agent, Is.GreaterThanOrEqualTo(0))
+        Assert.That(project + agent, Is.LessThanOrEqualTo(max 0 (width - 27 - 8)))

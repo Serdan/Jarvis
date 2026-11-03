@@ -907,19 +907,11 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         writeHotkeyToken "Esc"; draw.Write " activity, "
         writeMnemonic 'q' "quit"; draw.WriteLine "  • mouse: click/select, double-click/details, wheel/scroll"
 
-    // Keep column positions stable across rows, independent of values and scrolling.
-    let agentColumnWidths width =
-        let available = max 0 (width - 27)
-        let project = min 18 (max 7 (available / 3))
-        let agent = min 18 (max 7 (available / 3))
-        project, agent
-
     let agentColumn value width =
         if width <= 0 then ""
         else (trim (compact value) width).PadRight(width)
 
-    let writeAgentTableHeader width =
-        let projectWidth, agentWidth = agentColumnWidths width
+    let writeAgentTableHeader width projectWidth agentWidth =
         let header =
             "   Age  " + agentColumn "Project" projectWidth + " "
             + agentColumn "Agent" agentWidth + " "
@@ -930,10 +922,9 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         draw.WriteLine(trim header width)
         draw.ForegroundColor <- previous
 
-    let writeColoredAgentLine width marker (row: AgentView.AgentRow) =
+    let writeColoredAgentLine width projectWidth agentWidth marker (row: AgentView.AgentRow) =
         let original = draw.ForegroundColor
         let originalBackgroundRgb = draw.BackgroundRgb
-        let projectWidth, agentWidth = agentColumnWidths width
         let selected = mode = AgentsMode && Some row.Key = agentSelected
         let normalForeground = if selected then ConsoleColor.White else original
         draw.BackgroundRgb <- if selected then Some(38uy, 38uy, 38uy) else Some(16uy, 16uy, 16uy)
@@ -1082,12 +1073,13 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
             // Agent rows always use the available width. A details-pane
             // breakpoint formerly cut rows to ~55 columns at width 105.
             let rowWidth = TerminalLayout.agentListWidth width
-            writeAgentTableHeader rowWidth
+            let projectWidth, agentWidth = AgentView.columnWidths rowWidth filtered
+            writeAgentTableHeader rowWidth projectWidth agentWidth
             for index = agentScroll to last - 1 do
                 let row = filtered[index]
                 let marker = if mode = AgentsMode && Some row.Key = agentSelected then ">" else " "
                 registerMouseHit 0 rowWidth (SelectAgent row.Key)
-                writeColoredAgentLine rowWidth marker row
+                writeColoredAgentLine rowWidth projectWidth agentWidth marker row
         if showAgentDetails then renderAgentDetailsUnsafe width
 
         if not issues.IsEmpty then

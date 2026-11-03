@@ -49,6 +49,22 @@ let rows (snapshot: Snapshot) =
     |> List.sortBy (fun item ->
         item.Project.ToLowerInvariant(), agentSortKey item.Agent, item.Key)
 
+/// Content-sized roster columns, capped to preserve space for task details.
+/// Use the full filtered list so scrolling never changes column positions.
+let columnWidths width (agents: AgentRow array) =
+    let maxLength minimum projection =
+        agents
+        |> Array.fold (fun length row -> max length (projection row |> String.length)) minimum
+        |> min 24
+    let project = maxLength 7 (fun row -> ActivityFilter.projectToken row.Project)
+    let agent = maxLength 5 (fun row -> row.Agent)
+    let available = max 0 (width - 27 - 8)
+    if project + agent <= available then project, agent
+    else
+        let projectWidth = min project (available / 2)
+        let agentWidth = min agent (available - projectWidth)
+        min project (available - agentWidth), agentWidth
+
 let stateAge (now: DateTimeOffset) (agent: AgentRow) =
     agent.StateEnteredAt
     |> Option.map (fun entered ->

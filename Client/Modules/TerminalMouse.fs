@@ -116,8 +116,8 @@ let coalesceWheelEvents (events: InputEvent list) =
         | [] -> List.rev (flush pending acc)
     loop None [] events
 
-/// Request normal-button + wheel reports with SGR coordinates. No mouse state is
-/// retained by Jarvis; the terminal is restored even on cancellation/exception.
+/// Request normal-button + wheel reports with SGR coordinates and hide the
+/// cursor while the TUI runs. Restore both modes on cancellation/exception.
 module Tracking =
     let enable () : IDisposable =
         if Console.IsInputRedirected || Console.IsOutputRedirected
@@ -125,12 +125,12 @@ module Tracking =
             { new IDisposable with member _.Dispose() = () }
         else
             try
-                Console.Write("\u001b[?1000h\u001b[?1006h")
+                Console.Write("\u001b[?25l\u001b[?1000h\u001b[?1006h")
                 Console.Out.Flush()
                 { new IDisposable with
                     member _.Dispose() =
                         try
-                            Console.Write("\u001b[?1006l\u001b[?1000l")
+                            Console.Write("\u001b[?1006l\u001b[?1000l\u001b[?25h")
                             Console.Out.Flush()
                         with _ -> () }
             with _ ->

@@ -19,7 +19,7 @@ function harness(options = {}) {
   const send = { click() {
     clicks++;
     if (options.noAcknowledgement) return;
-    site.href = "https://chatgpt.com/c/00000000-0000-0000-0000-000000000001";
+    if (!options.noRoute) setTimeout(() => { site.href = "https://chatgpt.com/c/00000000-0000-0000-0000-000000000001"; }, options.routeDelayMs || 0);
     content = "";
     userTurns++;
   }};
@@ -42,7 +42,7 @@ function harness(options = {}) {
   const ctx = vm.createContext({ document, location: site, setTimeout, Date, URL });
   const run = async (prompt = "Start fresh\nRead Jarvis assignment") =>
     await vm.runInContext(source + "\nexecute(" + JSON.stringify({
-      prompt, uiReadyTimeoutMs: 100, submitTimeoutMs: 100
+      prompt, timeoutMs: options.timeoutMs || 350
     }) + ")", ctx);
   return { run, site, get clicks() { return clicks; }, get content() { return content; } };
 }
@@ -95,4 +95,20 @@ test("rejects an existing conversation rather than appending a bootstrap message
   assert.equal(result.status, "notSubmitted");
   assert.equal(result.reason, "UnexpectedStartUrl");
   assert.equal(h.clicks, 0);
+});
+
+test("waits for the conversation URL after the user turn appears", async () => {
+  const h = harness({ routeDelayMs: 150 });
+  const result = await h.run();
+  assert.equal(result.status, "submitted");
+  assert.equal(result.conversationUrl, h.site.href);
+  assert.equal(h.clicks, 1);
+});
+
+test("keeps the submission uncertain when route never appears", async () => {
+  const h = harness({ noRoute: true, timeoutMs: 125 });
+  const result = await h.run();
+  assert.equal(result.status, "outcomeUnknown");
+  assert.equal(result.reason, "ConversationUrlUnavailable");
+  assert.equal(h.clicks, 1);
 });

@@ -103,9 +103,7 @@ Recommended argument contract:
 | --- | --- | --- |
 | `prompt` | Yes | Exact bootstrap text to submit; nonempty, bounded, may contain newlines |
 | `role` / `agentId` / `projectName` | No | Caller-owned metadata for logs/correlation; **not** alternative sources of instructions |
-| `uiReadyTimeoutMs` | No | Bounded wait for textbox/controls after hydration |
-| `submitTimeoutMs` | No | Bounded wait for evidence of a submitted turn |
-| `postSubmitWaitMs` | No | Small bounded grace interval before returning, for SPA navigation to settle |
+| `timeoutMs` | No | One overall UI deadline for hydration, insertion, submission confirmation and conversation URL capture (defaults to 13 s; capped at 14 s) |
 | `debug` | No | Opt-in diagnostics; do not leak draft text by default |
 
 Jarvis browser-workflow parameters, **not** ChatGPT script arguments, control `windowRegistration`, `active`, `closeTabAfterExecution`, and device selection. Only **scheduled** calls have delay and repeat interval. An orchestrator normally invokes the immediate workflow, rather than scheduling a zero-delay job.
@@ -183,14 +181,14 @@ Allow narrowly scoped, ordered fallback selectors only when empirically verified
 
 ### 5.5 Launch acknowledgement and conversation URL
 
-After the click, wait a bounded interval for **positive UI evidence** that the turn was accepted. Examples to verify in live Edge:
+After the click, wait within the **single overall UI deadline** for positive evidence that the turn was accepted. Examples to verify in live Edge:
 - A new ChatGPT conversation route becomes visible in `location.href`, including project/GPT-specific route shapes (not exclusively `/c/<id>`).
 - A new user-message turn appears in the conversation and the composer has transitioned to a submitted/empty or generating state.
 - Other observable stable UI transition proven to indicate submission, not merely a button click.
 
 A changing URL alone can mean routing without submission, so route change is **not** proof unless accompanied by an appropriate post-submit state. Similarly, the editor clearing alone should not be treated as the only proof. The implementation should define an evidence precedence and test it against live ChatGPT.
 
-On success return:
+After submission evidence, **continue waiting for the actual new `/c/<conversation-id>` URL** before returning `submitted` or allowing automatic tab closure. An acknowledged user turn without a stable route is `outcomeUnknown` (`ConversationUrlUnavailable`) and retains the tab; never invent a URL or resubmit. On success return:
 
 ```json
 {
@@ -201,13 +199,13 @@ On success return:
 }
 ```
 
-The URL above is illustrative; use the actual observed route without constructing one. A valid same-origin URL is recorded for later human reopening; strip fragments, credentials, and sensitive query parameters when storing or displaying it. If submission is confirmed but no stable conversation URL is available, return `submitted` with `conversationUrl: null` and an evidence category. Do not turn that into a second submission.
+The URL above is illustrative; use the actual observed route without constructing one. A valid same-origin URL is recorded for later human reopening; strip fragments, credentials, and sensitive query parameters when storing or displaying it. If submission appears confirmed but no stable conversation URL is available before the overall deadline, return `outcomeUnknown` and retain the created tab for inspection. Do not turn this into a second submission.
 
 If success cannot be proven after a possible click, return `outcomeUnknown` with sanitized evidence/error; never silently classify as a definitive failure.
 
 ### 5.6 Timeouts and result boundary
 
-A browser script runs within the existing bridge's timeout limits (15 s default; 30 s maximum); UI waits + post-submission grace must fit inside the overall execution bound. Distinguish:
+The ChatGPT UI script uses one deadline across all UI phases (13 s default, capped at 14 s), fitting the generic bridge's default 15 s execution limit. When overriding bridge timeouts, configure the script's `timeoutMs` lower than the bridge timeout. Distinguish:
 - `notSubmitted`: definitively failed before any possible send.
 - `submitted`: observed accepted turn, regardless of later agent outcome.
 - `outcomeUnknown`: clicked/possibly clicked but acceptance not conclusively observed.

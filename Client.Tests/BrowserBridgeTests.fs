@@ -303,3 +303,66 @@ let immediateLaunchUsesRegisteredWindowAndClosesOnlyCreatedTab () = task {
         Assert.That(json, Does.Contain("closed"))
         Assert.That(json, Does.Contain("https://chatgpt.com/c/test"))
 }
+
+[<Test>]
+let compositeLaunchRejectsInvalidInputsBeforeOpeningTab () = task {
+    let port = findPort()
+    use bridge = new BrowserBridge.Service(port, "test-secret")
+    bridge.Start()
+    let cases =
+        [ "not-json", 15000, "InvalidArgumentsJson"
+          "{}", 0, "InvalidTimeout"
+          "{}", 30001, "InvalidTimeout"
+          String.replicate 65537 "x", 15000, "InputTooLarge" ]
+    for args, timeout, expected in cases do
+        let! outcome = BrowserBridge.runInNewTab bridge "agents" "https://chatgpt.com/" "" false "async function execute(args) { return args; }" args timeout true
+        match outcome with
+        | Error (registrationId, reason) ->
+            Assert.That(registrationId, Is.Empty)
+            Assert.That(reason, Does.Contain(expected))
+        | Ok _ -> Assert.Fail("Invalid composite launch was accepted")
+}
+
+[<TestCase("notSubmitted", true)>]
+[<TestCase("outcomeUnknown", false)>]
+let compositeLaunchKeepsUncertainTabButClosesDefinitiveFailure (scriptStatus: string, shouldClose: bool) = task {
+    let port = findPort()
+    use bridge = new BrowserBridge.Service(port, "test-secret")
+    bridge.Start()
+    let! client, connectionId = handshake port "test-secret"
+    use socket = client
+    let launch = BrowserBridge.runInNewTab bridge "agents" "https://chatgpt.com/" "" false
+                     "async function execute(args) { return args; }" "{}" 5000 true
+    let! openFrame = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
+    do! send socket """{"version":2,"kind":"registrations","tabs":[{"registrationId":"created-tab-02","alias":"new","agentCreated":true,"availability":"ready","registrationGeneration":1}]}"""
+    do! send socket (JsonSerializer.Serialize({|
+        version = 2; kind = "tabOpened"; requestId = property openFrame "requestId"
+        connectionId = connectionId
+        tab = {| registrationId = "created-tab-02"; availability = "ready"; agentCreated = true |}
+    |}))
+    let! executeFrame = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
+    Assert.That(property executeFrame "kind", Is.EqualTo("executeJs"))
+    do! send socket (JsonSerializer.Serialize({|
+        version = 2; kind = "result"; requestId = property executeFrame "requestId"
+        connectionId = connectionId; registrationId = "created-tab-02"
+        registrationGeneration = 1; status = "completed"
+        result = {| status = scriptStatus |}
+    |}))
+    if shouldClose then
+        let! closeFrame = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
+        Assert.That(property closeFrame "kind", Is.EqualTo("closeTab"))
+        do! send socket (JsonSerializer.Serialize({|
+            version = 2; kind = "tabClosed"; requestId = property closeFrame "requestId"
+            connectionId = connectionId; registrationId = "created-tab-02"
+            registrationGeneration = 1
+        |}))
+    let! result = launch
+    match result with
+    | Ok response when shouldClose ->
+        Assert.That(response, Does.Contain("notSubmitted"))
+        Assert.That(response, Does.Contain("closed"))
+    | Error (registrationId, reason) when not shouldClose ->
+        Assert.That(registrationId, Is.EqualTo("created-tab-02"))
+        Assert.That(reason, Does.Contain("OutcomeUnknown"))
+    | _ -> Assert.Fail("Unexpected script failure handling")
+}

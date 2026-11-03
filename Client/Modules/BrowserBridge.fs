@@ -440,62 +440,79 @@ type Service(port: int, pairingSecret: string) =
 let runInNewTab (bridge: Service) (windowRegistration: string) (url: string)
                 (alias: string) (makeActive: bool) (source: string) (argsJson: string)
                 (timeoutMs: int) (closeAfterExecution: bool) = task {
-    let mutable registrationId = ""
-    try
-        let! opened = bridge.OpenTab(windowRegistration, url, alias, makeActive)
-        match opened with
-        | Error e -> return Error("", e)
-        | Ok response ->
-            use openDoc = JsonDocument.Parse(response)
-            registrationId <- openDoc.RootElement.GetProperty("tab").GetProperty("registrationId").GetString()
-            if String.IsNullOrWhiteSpace(registrationId) then
-                return Error("", "OutcomeUnknown: created tab response lacked registration ID")
-            else
-                let mutable ready = false
-                let mutable attempts = 0
-                while not ready && attempts < 60 do
-                    match bridge.ListTabs() with
-                    | Ok listing ->
-                        use listDoc = JsonDocument.Parse(listing)
-                        ready <- listDoc.RootElement.GetProperty("tabs").EnumerateArray()
-                                 |> Seq.exists (fun tab ->
-                                     tab.GetProperty("registrationId").GetString() = registrationId &&
-                                     tab.GetProperty("availability").GetString() = "ready")
-                    | Error _ -> ()
-                    if not ready then
-                        attempts <- attempts + 1
-                        do! Task.Delay(500)
-                if not ready then
-                    // No script was sent; the newly created tab may be retained for inspection.
-                    return Error(registrationId, "TabNotReady")
+    let invalid =
+        if String.IsNullOrWhiteSpace(windowRegistration) then Some "WindowNotRegistered"
+        elif utf8.GetByteCount(source) > MaxScriptBytes then Some "InputTooLarge: script exceeds 64 KiB"
+        elif utf8.GetByteCount(argsJson) > MaxArgumentsBytes then Some "InputTooLarge: arguments exceed 64 KiB"
+        elif timeoutMs < 1 || timeoutMs > 30000 then Some "InvalidTimeout"
+        else
+            try
+                use doc = JsonDocument.Parse(argsJson)
+                if doc.RootElement.ValueKind <> JsonValueKind.Object then Some "InvalidArgumentsJson"
+                else None
+            with :? JsonException -> Some "InvalidArgumentsJson"
+    match invalid with
+    | Some reason -> return Error("", reason)
+    | None ->
+        let mutable registrationId = ""
+        try
+            let! opened = bridge.OpenTab(windowRegistration, url, alias, makeActive)
+            match opened with
+            | Error e -> return Error("", e)
+            | Ok response ->
+                use openDoc = JsonDocument.Parse(response)
+                registrationId <- openDoc.RootElement.GetProperty("tab").GetProperty("registrationId").GetString()
+                if String.IsNullOrWhiteSpace(registrationId) then
+                    return Error("", "OutcomeUnknown: created tab response lacked registration ID")
                 else
-                    let! script = bridge.Execute(registrationId, source, argsJson, timeoutMs, false)
-                    match script with
-                    | Error e -> return Error(registrationId, "OutcomeUnknown: " + e)
-                    | Ok result ->
-                        use doc = JsonDocument.Parse(result)
-                        let payload = doc.RootElement.GetProperty("result")
-                        let status =
-                            match payload.ValueKind with
-                            | JsonValueKind.Object ->
-                                match payload.TryGetProperty("status") with
-                                | true, x when x.ValueKind = JsonValueKind.String -> x.GetString()
+                    let mutable ready = false
+                    let mutable attempts = 0
+                    while not ready && attempts < 60 do
+                        match bridge.ListTabs() with
+                        | Ok listing ->
+                            use listDoc = JsonDocument.Parse(listing)
+                            ready <- listDoc.RootElement.GetProperty("tabs").EnumerateArray()
+                                     |> Seq.exists (fun tab ->
+                                         tab.GetProperty("registrationId").GetString() = registrationId &&
+                                         tab.GetProperty("availability").GetString() = "ready")
+                        | Error _ -> ()
+                        if not ready then
+                            attempts <- attempts + 1
+                            do! Task.Delay(500)
+                    if not ready then
+                        // No page script was dispatched; cleanup cannot interrupt a submission.
+                        if closeAfterExecution then
+                            let! _ = bridge.CloseTab(registrationId)
+                            ()
+                        return Error(registrationId, "TabNotReady")
+                    else
+                        let! script = bridge.Execute(registrationId, source, argsJson, timeoutMs, false)
+                        match script with
+                        | Error e -> return Error(registrationId, "OutcomeUnknown: " + e)
+                        | Ok result ->
+                            use doc = JsonDocument.Parse(result)
+                            let payload = doc.RootElement.GetProperty("result")
+                            let status =
+                                match payload.ValueKind with
+                                | JsonValueKind.Object ->
+                                    match payload.TryGetProperty("status") with
+                                    | true, x when x.ValueKind = JsonValueKind.String -> x.GetString()
+                                    | _ -> "completed"
                                 | _ -> "completed"
-                            | _ -> "completed"
-                        if status = "outcomeUnknown" then
-                            return Error(registrationId, "OutcomeUnknown: page submission was not confirmed")
-                        else
-                            let mutable cleanup = "retained"
-                            if closeAfterExecution then
-                                let! closed = bridge.CloseTab(registrationId)
-                                cleanup <- match closed with
-                                           | Ok _ -> "closed"
-                                           | Error e -> "cleanupFailed:" + (if e.Length > 100 then e.Substring(0, 100) else e)
-                            return Ok(JsonSerializer.Serialize(
-                                {| registrationId = registrationId
-                                   status = status
-                                   scriptResult = payload.Clone()
-                                   cleanup = cleanup |}))
-    with e ->
-        return Error(registrationId, "OutcomeUnknown: " + e.GetType().Name)
+                            if status = "outcomeUnknown" then
+                                return Error(registrationId, "OutcomeUnknown: page submission was not confirmed")
+                            else
+                                let mutable cleanup = "retained"
+                                if closeAfterExecution then
+                                    let! closed = bridge.CloseTab(registrationId)
+                                    cleanup <- match closed with
+                                               | Ok _ -> "closed"
+                                               | Error e -> "cleanupFailed:" + (if e.Length > 100 then e.Substring(0, 100) else e)
+                                return Ok(JsonSerializer.Serialize(
+                                    {| registrationId = registrationId
+                                       status = status
+                                       scriptResult = payload.Clone()
+                                       cleanup = cleanup |}))
+        with e ->
+            return Error(registrationId, "OutcomeUnknown: " + e.GetType().Name)
 }

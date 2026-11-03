@@ -289,7 +289,11 @@ let private dispatch (rt: Runtime) (command: AgentCommand) =
                                 use validatedArgs = JsonDocument.Parse(args)
                                 let! result = BrowserBridge.runInNewTab bridge cmd.WindowRegistration cmd.Url "" (defaultArg cmd.Active false) source args (defaultArg cmd.TimeoutMs 15000) (defaultArg cmd.CloseTabAfterExecution false)
                                 return result
-                                       |> Result.mapError (fun (_,error) -> Client.ValidationError error)
+                                       |> Result.mapError (fun (registrationId,error) ->
+                                           let detail =
+                                               if String.IsNullOrWhiteSpace(registrationId) then error
+                                               else error + " [tabRegistration=" + registrationId + "]"
+                                           Client.ValidationError detail)
                         with
                         | :? DecoderFallbackException -> return Error(Client.ValidationError "InvalidUtf8")
                         | :? JsonException -> return Error(Client.ValidationError "InvalidArgumentsJson")

@@ -31,7 +31,7 @@ Manually registering a **tab** is still supported for existing-page inspections,
 
 `BrowserOpenTab` requires the separate new-tab opt-in, registered window, and destination host permission. Extension caps active Jarvis-created registrations at 20. Agent-created tabs remain authorized across same-origin SPA navigation but not cross-origin navigation. Never retry a timed-out open or execution blindly, because the page may already have been modified.
 
-`BrowserRunInNewTab` and scheduling **do not run a ChatGPT backend API**. They execute the project script in the actual UI. Generic scripts use `async function execute(args)`. The composite operation returns structured script result + registration + cleanup status. If a script indicates `outcomeUnknown`, the created tab is retained for investigation rather than automatically resubmitting.
+`BrowserRunInNewTab` and scheduling **do not run a ChatGPT backend API**. They execute the project script in the actual UI. Generic scripts use `async function execute(args)`. The composite operation returns structured script result + registration + cleanup status. If a script indicates `outcomeUnknown`, the created tab is retained for investigation rather than automatically resubmitting. Returned errors include the created tab registration ID where known. A definitive `notSubmitted` result may close its unused tab. The ChatGPT script waits for an actual conversation URL within one 13-second default deadline before reporting success.
 
 ## Start a fresh ChatGPT agent immediately
 
@@ -41,7 +41,7 @@ A reusable DOM-based launcher is included in this repository at:
 browser-scripts/chatgpt/launchAgent.js
 ```
 
-Use it through a normal Jarvis project selector (for example `Jarvis::browser-bridge` when working in this development worktree). Its main argument is `prompt`; optional timeouts are supported. The entry URL is fixed to `https://chatgpt.com/`, and the script rejects any different starting URL (including an existing `/c/...` conversation). It selects the contenteditable ProseMirror editor, inserts text through normal editing behavior, waits for the enabled **Send** button (which replaces **Start voice**), clicks once, and checks UI evidence of submission. It does not rely on ChatGPT's private network API.
+Use it through a normal Jarvis project selector (for example `Jarvis::browser-bridge` when working in this development worktree). Its main argument is `prompt`; an optional overall UI timeout is supported. The entry URL is fixed to `https://chatgpt.com/`, and the script rejects any different starting URL (including an existing `/c/...` conversation). It selects the contenteditable ProseMirror editor, inserts text through normal editing behavior, waits for the enabled **Send** button (which replaces **Start voice**), clicks once, and checks UI evidence of submission. It does not rely on ChatGPT's private network API.
 
 Example command arguments:
 

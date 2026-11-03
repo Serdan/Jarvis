@@ -926,7 +926,17 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
             draw.Write(token)
             draw.ForegroundColor <- original
             let rest = rendered.Substring(index + token.Length)
-            draw.WriteLine rest
+            let stateLabel = AgentView.displayState row.State
+            let stateMarker = ": " + stateLabel
+            let stateIndex = rest.LastIndexOf(stateMarker, StringComparison.Ordinal)
+            if stateIndex < 0 then draw.WriteLine rest
+            else
+                let stateStart = stateIndex + 2
+                draw.Write(rest.Substring(0, stateStart))
+                draw.ForegroundColor <- AgentView.stateColor row.State
+                draw.Write(stateLabel)
+                draw.ForegroundColor <- original
+                draw.WriteLine(rest.Substring(stateStart + stateLabel.Length))
             draw.ForegroundColor <- original
 
     let renderAgentDetailsUnsafe width =

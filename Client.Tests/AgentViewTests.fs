@@ -110,3 +110,17 @@ let unreadNotificationsTakePriorityAndTriggerRefresh () =
     rows after |> List.head |> fun row -> row.Agent |> shouldEqual "Agent 7"
     changedAgents before after |> shouldEqual (set ["Wayfold::Agent 7"])
     changedAgents after after |> shouldEqual Set.empty
+
+[<Test>]
+let agentStatesHaveDistinctReadableColors () =
+    let states =
+        [ "Working", ConsoleColor.Green
+          "Ready", ConsoleColor.Yellow
+          "Assigned", ConsoleColor.Cyan
+          "NeedsWork", ConsoleColor.Cyan
+          "Completed", ConsoleColor.Blue
+          "Parked", ConsoleColor.DarkGray
+          "Unexpected", ConsoleColor.Gray ]
+    for state, expected in states do
+        stateColor state |> shouldEqual expected
+    displayState "NeedsWork" |> shouldEqual "Needs work"

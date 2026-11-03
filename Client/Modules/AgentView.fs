@@ -72,6 +72,17 @@ let visibleRows filter snapshot =
 
 let displayState state = if state = "NeedsWork" then "Needs work" else state
 
+/// Consistent colors for the canonical ledger states. Labels remain visible
+/// so the Agents screen is readable without color.
+let stateColor = function
+    | "Working" -> ConsoleColor.Green
+    | "Ready" -> ConsoleColor.Yellow
+    | "Assigned" -> ConsoleColor.Cyan
+    | "NeedsWork" -> ConsoleColor.Cyan
+    | "Completed" -> ConsoleColor.Blue
+    | "Parked" -> ConsoleColor.DarkGray
+    | _ -> ConsoleColor.Gray
+
 let agentSummary (row: AgentRow) =
     match row.Focus with
     | Some task -> sprintf "#%s - %s" task.TaskId (displayState row.State)

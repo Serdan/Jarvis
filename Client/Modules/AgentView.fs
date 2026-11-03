@@ -71,7 +71,8 @@ let matches (filter: string) (row: AgentRow) =
     ActivityFilter.matchesTerms terms (Some row.Project) searchable
 
 let visibleRows filter snapshot =
-    rows snapshot |> List.filter (matches filter)
+    rows snapshot
+    |> List.filter (fun row -> row.State <> "Parked" && matches filter row)
 
 let displayState state = if state = "NeedsWork" then "Needs work" else state
 

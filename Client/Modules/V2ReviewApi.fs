@@ -994,6 +994,9 @@ module V2TaskApi =
             | "DiffTaskSpec" ->
                 ReviewWorkflow.ReviewWorkflow.diffTaskSpec binding cmd.TaskId cmd.BeforeOid cmd.AfterOid
                 |> mapError |> Result.map box
+            | "GetIntegrationSubmissions" ->
+                ReviewWorkflow.ReviewWorkflow.getIntegrationSubmissions binding cmd.TaskId
+                |> mapError |> Result.map box
             | "AgentInbox" ->
                 ReviewWorkflow.ReviewWorkflow.getBranchAgentInbox binding cmd.AgentId
                 |> mapError |> Result.map box
@@ -1052,6 +1055,17 @@ module V2TaskApi =
                         let result =
                             V2PendingIntentJournal.executeLedgerWrite binding operationId "V2TaskWrite" journalCommand (fun () ->
                                 match cmd.Action with
+                                | "SubmitIntegration" ->
+                                    guid "submissionId" cmd.AttemptId
+                                    |> Result.bind (fun submissionId ->
+                                        ReviewWorkflow.ReviewWorkflow.submitIntegration binding operationId
+                                            cmd.TaskId cmd.ActorId submissionId cmd.SourceRef cmd.BaseOid
+                                            cmd.TargetRef cmd.Reason |> mapError)
+                                | "CompleteIntegration" ->
+                                    guid "submissionId" cmd.AttemptId
+                                    |> Result.bind (fun submissionId ->
+                                        ReviewWorkflow.ReviewWorkflow.completeIntegration binding operationId
+                                            cmd.TaskId cmd.ActorId submissionId cmd.BaseOid |> mapError)
                                 | "NotifyAgent" ->
                                     ReviewWorkflow.ReviewWorkflow.notifyAgent binding operationId
                                         cmd.ActorId cmd.OwnerId cmd.TaskId cmd.Summary |> mapError

@@ -234,6 +234,26 @@ type AgentNotification =
       AcknowledgedAtUtc: string }
 
 [<CLIMutable>]
+type IntegrationSubmission =
+    { SubmissionId: string
+      TaskId: string
+      ActorId: string
+      SourceRef: string
+      SubmittedCommit: string
+      ReviewId: string
+      TargetRef: string
+      Status: string
+      CreatedSequence: int64
+      IntegratedCommit: string
+      CompletedAtUtc: string }
+
+[<CLIMutable>]
+type IntegrationSummary =
+    { SnapshotCommit: string
+      Latest: IntegrationSubmission option
+      Submissions: IntegrationSubmission list }
+
+[<CLIMutable>]
 type AgentCheckpoint =
     { TaskId: string
       AttemptId: string
@@ -267,6 +287,7 @@ type AgentInbox =
       AvailableReviews: BranchReview list
       UnacknowledgedFeedback: ReviewFeedbackNotice list
       PendingNotifications: AgentNotification list
+      IntegrationSubmissions: IntegrationSubmission list
       SlotAvailable: bool
       Unassigned: bool }
 
@@ -379,6 +400,7 @@ module ReviewWorkflow =
                         status "status" [ "Unclaimed"; "Claimed"; "Accepted"; "ChangesRequested"; "Withdrawn" ]
                         && (let mutable kind = Unchecked.defaultof<JsonElement>
                             root.TryGetProperty("kind", &kind) && kind.ValueKind = JsonValueKind.String)
+                    | "IntegrationSubmission" -> status "status" [ "Pending"; "Integrated" ]
                     | "ReviewFeedbackNotice" -> status "status" [ "Accepted"; "ChangesRequested" ]
                     | "AgentCheckpoint" -> status "kind" [ "Yield"; "Completion"; "Recovery"; "Progress"; "Submission"; "Revision" ]
                     | "TaskLifecycleEvent" ->
@@ -417,6 +439,9 @@ module ReviewWorkflow =
                              RegexOptions.CultureInvariant))
     let private lifecycleEventPath taskId sequence =
         $"tasks/{taskId}/lifecycle/{sequence}.json"
+
+    let private integrationPath taskId (submissionId: Guid) =
+        $"tasks/{taskId}/integrations/" + submissionId.ToString("N") + ".json"
 
     let private notificationPath (notificationId: Guid) =
         "notifications/" + notificationId.ToString("N") + ".json"
@@ -922,6 +947,119 @@ module ReviewWorkflow =
                         return! Error(StaleEntityVersion "No legacy agent or attempt records to convert.")
                     return List.rev modifications
                 })
+
+    let private integrationSubmissionsAt binding snapshot taskId = result {
+        let! paths = LedgerStore.listAt binding snapshot "tasks"
+        let prefix = $"tasks/{taskId}/integrations/"
+        let mutable submissions = []
+        for path in paths do
+            if path.StartsWith(prefix, StringComparison.Ordinal)
+               && path.EndsWith(".json", StringComparison.Ordinal) then
+                let! submission, _ = required<IntegrationSubmission> binding snapshot path
+                match Guid.TryParseExact(submission.SubmissionId, "N") with
+                | true, id when submission.TaskId = taskId
+                                && path = integrationPath taskId id ->
+                    submissions <- submission :: submissions
+                | _ -> return! Error(LedgerIntegrityError "Invalid integration submission identity.")
+        return submissions |> List.sortBy (fun s -> s.CreatedSequence, s.SubmissionId)
+    }
+
+    let getIntegrationSubmissions binding taskId =
+        if not (validTaskId taskId) then Error(InvalidBinding "Invalid task ID.")
+        else result {
+            let! snapshot = LedgerStore.fetch binding
+            let! _ = required<ReviewTask> binding snapshot (taskPath taskId)
+            let! submissions = integrationSubmissionsAt binding snapshot taskId
+            return { SnapshotCommit = snapshot.Commit
+                     Latest = submissions |> List.tryLast
+                     Submissions = submissions }
+        }
+
+    let submitIntegration binding operationId taskId actorId submissionId
+                          sourceRef submittedCommit reviewId targetRef =
+        if not (validTaskId taskId) || not (validAgent actorId)
+           || submissionId = Guid.Empty || not (validBranch sourceRef)
+           || not (validBranch targetRef)
+           || (not (String.IsNullOrWhiteSpace reviewId)
+               && not (match Guid.TryParseExact(reviewId, "N") with true, _ -> true | _ -> false)) then
+            Error(InvalidBinding "Invalid integration submission.")
+        else
+            let reviewId = if isNull reviewId then "" else reviewId
+            let action = intent operationId actorId "SubmitIntegration"
+                            {| taskId = taskId; submissionId = submissionId
+                               sourceRef = sourceRef; submittedCommit = submittedCommit
+                               reviewId = reviewId; targetRef = targetRef |}
+            match LedgerStore.findApplied binding action with
+            | Error failure -> Error failure
+            | Ok(Some applied) -> Ok applied
+            | Ok None -> result {
+                do! LedgerStore.verifySourceCommit binding sourceRef submittedCommit
+                let! snapshot = LedgerStore.fetch binding
+                let! _ = required<ReviewTask> binding snapshot (taskPath taskId)
+                if reviewId <> "" then
+                    let! review, _ = required<BranchReview> binding snapshot
+                                        (branchReviewPath taskId reviewId)
+                    if review.TaskRef <> sourceRef then
+                        return! Error(InvalidBinding "Review belongs to another source branch.")
+                    let! reviewed = LedgerStore.inspectRemoteReviewRef binding review.ReviewRef
+                    if reviewed <> Some submittedCommit then
+                        return! Error(InvalidBinding "Submitted commit differs from the frozen review snapshot.")
+                return! LedgerStore.transact binding action (fun current -> result {
+                    let! _ = required<ReviewTask> binding current (taskPath taskId)
+                    let! _ = required<ReviewAgent> binding current (agentPath actorId)
+                    let path = integrationPath taskId submissionId
+                    let! previous = read<IntegrationSubmission> binding current path
+                    if previous.IsSome then
+                        return! Error(StaleEntityVersion "Integration submission ID already exists.")
+                    let! submissions = integrationSubmissionsAt binding current taskId
+                    let branchSubmissions =
+                        submissions |> List.filter (fun item -> item.SourceRef = sourceRef)
+                    // A newer submission must preserve every older unintegrated slice;
+                    // the branch cannot silently rewrite a pending integration boundary.
+                    for prior in branchSubmissions do
+                        if prior.Status = "Pending" then
+                            do! LedgerStore.verifySourceAncestry binding prior.SubmittedCommit submittedCommit
+                    let record =
+                        { SubmissionId = submissionId.ToString("N")
+                          TaskId = taskId; ActorId = actorId
+                          SourceRef = sourceRef; SubmittedCommit = submittedCommit
+                          ReviewId = reviewId; TargetRef = targetRef
+                          Status = "Pending"; CreatedSequence = current.Header.NextSequence
+                          IntegratedCommit = null; CompletedAtUtc = null }
+                    return [ change path None record ]
+                })
+            }
+
+    let completeIntegration binding operationId taskId actorId submissionId integratedCommit =
+        if not (validTaskId taskId) || not (validAgent actorId)
+           || submissionId = Guid.Empty then
+            Error(InvalidBinding "Invalid integration completion.")
+        else
+            let action = intent operationId actorId "CompleteIntegration"
+                           {| taskId = taskId; submissionId = submissionId
+                              integratedCommit = integratedCommit |}
+            match LedgerStore.findApplied binding action with
+            | Error failure -> Error failure
+            | Ok(Some applied) -> Ok applied
+            | Ok None -> result {
+                let! snapshot = LedgerStore.fetch binding
+                let path = integrationPath taskId submissionId
+                let! currentRecord, _ = required<IntegrationSubmission> binding snapshot path
+                if currentRecord.Status <> "Pending" then
+                    return! Error(StaleEntityVersion "Integration submission is already completed.")
+                do! LedgerStore.verifyIntegrationOnRemote binding currentRecord.TargetRef
+                        currentRecord.SubmittedCommit integratedCommit
+                return! LedgerStore.transact binding action (fun current -> result {
+                    let! _ = required<ReviewAgent> binding current (agentPath actorId)
+                    let! existing, oid = required<IntegrationSubmission> binding current path
+                    if existing.Status <> "Pending" then
+                        return! Error(StaleEntityVersion "Integration submission is already completed.")
+                    return [ change path (Some oid)
+                                { existing with Status = "Integrated"
+                                                IntegratedCommit = integratedCommit
+                                                CompletedAtUtc = DateTimeOffset.UtcNow.ToString("O") } ]
+                })
+            }
 
     let notifyAgent binding operationId fromAgentId toAgentId taskId message =
         if not (validAgent fromAgentId) || not (validAgent toAgentId)
@@ -2138,6 +2276,20 @@ module ReviewWorkflow =
                 let! snapshot = LedgerStore.fetch binding
                 let! agent, _ = required<ReviewAgent> binding snapshot (agentPath agentId)
                 let! notifications = pendingNotifications binding snapshot agentId
+                let! allIntegrationPaths = LedgerStore.listAt binding snapshot "tasks"
+                let mutable integrationRecords = []
+                for path in allIntegrationPaths do
+                    if path.Contains("/integrations/", StringComparison.Ordinal)
+                       && path.EndsWith(".json", StringComparison.Ordinal) then
+                        let! record, _ = required<IntegrationSubmission> binding snapshot path
+                        match Guid.TryParseExact(record.SubmissionId, "N") with
+                        | true, id when path = integrationPath record.TaskId id ->
+                            if record.ActorId = agentId
+                               || (not (isNull (box agent.CurrentAssignment))
+                                   && agent.CurrentAssignment.TaskId = record.TaskId) then
+                                integrationRecords <- record :: integrationRecords
+                        | _ -> return! Error(LedgerIntegrityError "Invalid integration submission identity.")
+
                 let! paths = LedgerStore.listAt binding snapshot "tasks"
                 let taskPaths = paths |> List.filter (fun path -> path.EndsWith("/task.json", StringComparison.Ordinal))
                 let reviewPaths = paths |> List.filter (fun path -> path.EndsWith("/review.json", StringComparison.Ordinal))
@@ -2243,6 +2395,7 @@ module ReviewWorkflow =
                           AvailableReviews = available
                           UnacknowledgedFeedback = feedback |> List.sortBy (fun notice -> notice.DecisionSequence)
                           PendingNotifications = notifications
+                          IntegrationSubmissions = integrationRecords |> List.sortBy (fun item -> item.CreatedSequence)
                           SlotAvailable = isNull (box agent.CurrentAssignment)
                           Unassigned = isNull (box agent.CurrentAssignment) }
             }

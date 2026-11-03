@@ -1259,6 +1259,90 @@ type ReviewWorkflowTests() =
             | Error(InvalidBinding _) -> () // Remote drift blocks authority; it never frees the slot.
             | other -> Assert.Fail(sprintf "Unapproved ledger endpoint must be rejected: %A" other))
     [<Test>]
+    member _.IntegrationSubmissionsProtectExactCommitsWhenBranchAdvances() =
+        withFixture (fun one _ first second baseOid _ newCommit _ ->
+            let mainBranch = git one [ "branch"; "--show-current" ]
+            let target = "refs/heads/" + mainBranch
+            let source = "refs/heads/feature/integration-boundary"
+            ReviewWorkflow.createTask first (Guid.NewGuid()) "boundary" "Boundary"
+            |> success |> ignore
+            git one [ "checkout"; "-b"; "feature/integration-boundary" ] |> ignore
+            let firstCommit = newCommit "First reviewed slice" "first"
+            let reviewId = Guid.NewGuid()
+            ReviewWorkflow.submitBranchReview first (Guid.NewGuid()) "boundary" "Owner"
+                reviewId source firstCommit "Frozen first slice" "Intermediate" target
+            |> success |> ignore
+            let submission1 = Guid.NewGuid()
+            let operation1 = Guid.NewGuid()
+            let submit1 () =
+                ReviewWorkflow.submitIntegration first operation1 "boundary" "Owner"
+                    submission1 source firstCommit (reviewId.ToString("N")) target
+            Assert.That((submit1 () |> success).AlreadyApplied, Is.False)
+            Assert.That((submit1 () |> success).AlreadyApplied, Is.True)
+            let secondCommit = newCommit "Further work in progress" "second"
+            match ReviewWorkflow.submitIntegration first (Guid.NewGuid()) "boundary" "Owner"
+                    (Guid.NewGuid()) source secondCommit (reviewId.ToString("N")) target with
+            | Error(InvalidBinding _) -> ()
+            | other -> Assert.Fail(sprintf "Submitted commit must match frozen review: %A" other)
+            let submission2 = Guid.NewGuid()
+            ReviewWorkflow.submitIntegration first (Guid.NewGuid()) "boundary" "Owner"
+                submission2 source secondCommit "" target |> success |> ignore
+            let initial = ReviewWorkflow.getIntegrationSubmissions first "boundary" |> success
+            Assert.That(initial.Submissions.Length, Is.EqualTo(2))
+            Assert.That(initial.Latest.Value.SubmittedCommit, Is.EqualTo(secondCommit))
+            Assert.That(initial.Submissions.Head.SubmittedCommit, Is.EqualTo(firstCommit))
+            Assert.That(initial.Submissions |> List.forall (fun s -> s.Status = "Pending"), Is.True)
+            match ReviewWorkflow.completeIntegration first (Guid.NewGuid()) "boundary" "Reviewer"
+                    submission1 firstCommit with
+            | Error(InvalidBinding _) -> ()
+            | other -> Assert.Fail(sprintf "Must verify remote integration before completion: %A" other)
+            git one [ "checkout"; mainBranch ] |> ignore
+            git one [ "merge"; "--no-ff"; "-m"; "Integrate only first reviewed slice"; firstCommit ] |> ignore
+            let integrationCommit = git one [ "rev-parse"; "HEAD" ]
+            git one [ "push"; "origin"; mainBranch ] |> ignore
+            let completionId = Guid.NewGuid()
+            let complete () =
+                ReviewWorkflow.completeIntegration second completionId "boundary" "Reviewer"
+                    submission1 integrationCommit
+            Assert.That((complete () |> success).AlreadyApplied, Is.False)
+            Assert.That((complete () |> success).AlreadyApplied, Is.True)
+            let after = ReviewWorkflow.getIntegrationSubmissions second "boundary" |> success
+            Assert.That(after.Submissions.Length, Is.EqualTo(2))
+            Assert.That(after.Submissions.Head.Status, Is.EqualTo("Integrated"))
+            Assert.That(after.Submissions.Head.IntegratedCommit, Is.EqualTo(integrationCommit))
+            Assert.That(after.Submissions[1].Status, Is.EqualTo("Pending"))
+            Assert.That(after.Latest.Value.SubmittedCommit, Is.EqualTo(secondCommit))
+            Assert.That(after.Latest.Value.Status, Is.EqualTo("Pending"))
+            Assert.That((ReviewWorkflow.getAgentInbox first "Owner" |> success).IntegrationSubmissions.Length,
+                        Is.EqualTo(2))
+            let targetUnchanged = git one [ "rev-parse"; mainBranch ]
+            Assert.That(targetUnchanged, Is.EqualTo(integrationCommit))
+            )
+
+    [<Test>]
+    member _.IntegrationRejectsBranchHistoryRewriteWhileEarlierSubmissionPending() =
+        withFixture (fun one _ first _ baseOid _ newCommit _ ->
+            let mainBranch = git one [ "branch"; "--show-current" ]
+            let target = "refs/heads/" + mainBranch
+            let source = "refs/heads/feature/force-rewritten"
+            ReviewWorkflow.createTask first (Guid.NewGuid()) "rewrite" "Rewrite"
+            |> success |> ignore
+            git one [ "checkout"; "-b"; "feature/force-rewritten" ] |> ignore
+            let firstCommit = newCommit "Committed slice" "one"
+            ReviewWorkflow.submitIntegration first (Guid.NewGuid()) "rewrite" "Owner"
+                (Guid.NewGuid()) source firstCommit "" target |> success |> ignore
+            git one [ "reset"; "--hard"; baseOid ] |> ignore
+            let replacement = newCommit "Unrelated replacement" "replacement"
+            match ReviewWorkflow.submitIntegration first (Guid.NewGuid()) "rewrite" "Owner"
+                    (Guid.NewGuid()) source replacement "" target with
+            | Error(InvalidBinding _) -> ()
+            | other -> Assert.Fail(sprintf "Pending submitted history cannot silently be replaced: %A" other)
+            let latest = ReviewWorkflow.getIntegrationSubmissions first "rewrite" |> success
+            Assert.That(latest.Submissions.Length, Is.EqualTo(1))
+            Assert.That(latest.Latest.Value.SubmittedCommit, Is.EqualTo(firstCommit))
+            )
+
+    [<Test>]
     member _.AgentNotificationIsDurableAndAcknowledgedByRecipientOnly() =
         withFixture (fun _ _ first second _ _ _ _ ->
             ReviewWorkflow.createTask first (Guid.NewGuid()) "notify-task" "Coordination"

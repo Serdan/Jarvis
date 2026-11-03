@@ -240,6 +240,24 @@ Jarvis discovers worktrees using Git metadata. New worktrees use hidden sibling 
 
 **Current task authority:** an explicitly initialized project uses one Git orphan branch, `refs/heads/jarvis-orchestration`, on its configured remote. The unprefixed orchestration MCP tools manage canonical HTML task specs, agents, assignments, reviews and integrations. The former source-branch task handlers are retired. Names such as `CreateTask` and `AssignTask` now refer exclusively to orphan-ledger operations; old commands such as `ListTasks` and `CheckpointTask` are not available. Existing `docs/tasks/` HTML/JSON files remain reference material, not live state; upgrading Jarvis does not automatically migrate them.
 
+**Exact integration boundaries:** `submit_integration` records the exact
+submitted commit SHA, fully qualified source and target branches, optional
+frozen review request ID, and caller-stable submission/operation UUIDs in the
+canonical Git-orphan ledger. It does **not** merge, pause or reassign work.
+Each submission is retained independently; `get_integration_submissions`
+returns the latest boundary and full pending/integrated history for a task,
+while `agent_inbox` exposes the submission records to their owner. A newer
+submission on the same branch must descend from earlier pending submitted
+commits; Jarvis refuses a replacement that rewrites the still-pending slice.
+When associated with a review, the submitted commit must match the review's
+frozen snapshot exactly. The Lead may integrate only the submitted SHA even
+when the task branch has advanced. After publishing integration, use
+`complete_integration` with that submission ID and the resulting integration
+commit. Jarvis verifies that the **remote target branch** contains the claimed
+integration commit and that it descends from the submitted commit before
+recording `Integrated`. Other submissions remain pending. Jarvis does not
+block direct external Git force-pushes, and never automatically merges.
+
 **Agent coordination notifications:** `notify_agent` records a durable
 message on the canonical orphan Git ledger, with sender, recipient, optional
 task reference, message and caller-stable `operationId` UUID (also the

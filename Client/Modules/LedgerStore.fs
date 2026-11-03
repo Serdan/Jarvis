@@ -162,7 +162,7 @@ module LedgerStore =
     let private options = JsonSerializerOptions(PropertyNamingPolicy = JsonNamingPolicy.CamelCase, PropertyNameCaseInsensitive = true)
     let private oidPattern = Regex("^[0-9a-f]{40}([0-9a-f]{24})?$", RegexOptions.Compiled)
     let private recordPath = Regex("^records/[A-Za-z0-9_-]+(/[A-Za-z0-9_.-]+)*[.]json$", RegexOptions.Compiled)
-    let private ledgerPath = Regex("^(tasks/[A-Za-z0-9_-]+/(task[.]json|spec[.]html|attempts/[a-f0-9]{32}([.]json|/checkpoints/[0-9]+[.]json|/events/[0-9]+[.]json|/assignments/[0-9]+([.]json|[.]ack[.]json))|imports/[0-9]+[.]json|lifecycle/[0-9]+[.]json|approvals/non-source/[0-9]+[.]json|reviews/[a-f0-9]{32}/(review[.]json|summary[.]md|findings/[a-z0-9][a-z0-9_-]{0,79}[.]md))|agents/[A-Za-z0-9_-]+[.]json|notifications/[a-f0-9]{32}[.]json|records/[A-Za-z0-9_-]+(/[A-Za-z0-9_.-]+)*[.]json)$", RegexOptions.Compiled)
+    let private ledgerPath = Regex("^(tasks/[A-Za-z0-9_-]+/(task[.]json|spec[.]html|attempts/[a-f0-9]{32}([.]json|/checkpoints/[0-9]+[.]json|/events/[0-9]+[.]json|/assignments/[0-9]+([.]json|[.]ack[.]json))|imports/[0-9]+[.]json|lifecycle/[0-9]+[.]json|approvals/non-source/[0-9]+[.]json|reviews/[a-f0-9]{32}/(review[.]json|summary[.]md|findings/[a-z0-9][a-z0-9_-]{0,79}[.]md)|integrations/[a-f0-9]{32}[.]json)|agents/[A-Za-z0-9_-]+[.]json|notifications/[a-f0-9]{32}[.]json|records/[A-Za-z0-9_-]+(/[A-Za-z0-9_.-]+)*[.]json)$", RegexOptions.Compiled)
     let private remotePattern = Regex("^[A-Za-z0-9][A-Za-z0-9_.-]*$", RegexOptions.Compiled)
 
     type private GitOutput =
@@ -1404,6 +1404,22 @@ module LedgerStore =
                 | Ok output ->
                     Error(SourceUnavailable $"Cannot find a review merge-base: {output.Stderr}")
                 | Error error -> Error error))
+
+    // A completion claim is valid only when the remotely advertised target
+    // contains both the submitted commit and the claimed integration commit.
+    let verifyIntegrationOnRemote (binding: LedgerBinding) targetRef submittedCommit integratedCommit =
+        readRemoteTarget binding targetRef
+        |> Result.bind (fun remoteHead ->
+            verifySourceObject binding submittedCommit
+            |> Result.bind (fun () ->
+                verifySourceObject binding integratedCommit
+                |> Result.bind (fun () ->
+                    match isAncestor binding.RepositoryPath submittedCommit integratedCommit,
+                          isAncestor binding.RepositoryPath integratedCommit remoteHead with
+                    | Ok true, Ok true -> Ok ()
+                    | Ok false, _ -> Error(InvalidBinding "Integration commit does not contain the submitted commit.")
+                    | _, Ok false -> Error(InvalidBinding "Integration commit is not on remote target.")
+                    | Error error, _ | _, Error error -> Error error)))
 
     let verifySourceAncestry (binding: LedgerBinding) earlier later =
         match verifySourceObject binding earlier with

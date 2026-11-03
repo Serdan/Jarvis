@@ -96,6 +96,26 @@ type Decoder() =
 
     member _.HasPending = pending.Count > 0
 
+/// Merge adjacent wheel reports before the costly whole-screen redraw.
+/// Key presses and clicks are barriers: their relative order must remain intact.
+let coalesceWheelEvents (events: InputEvent list) =
+    let flush pending acc =
+        match pending with
+        | Some (delta, x, y) when delta <> 0 -> Mouse(Scroll(delta, x, y)) :: acc
+        | _ -> acc
+    let rec loop pending acc remaining =
+        match remaining with
+        | Mouse(Scroll(direction, x, y)) :: tail ->
+            let delta =
+                match pending with
+                | Some (previous, _, _) -> previous + direction
+                | None -> direction
+            loop (Some(delta, x, y)) acc tail
+        | event :: tail ->
+            loop None (event :: flush pending acc) tail
+        | [] -> List.rev (flush pending acc)
+    loop None [] events
+
 /// Request normal-button + wheel reports with SGR coordinates. No mouse state is
 /// retained by Jarvis; the terminal is restored even on cancellation/exception.
 module Tracking =

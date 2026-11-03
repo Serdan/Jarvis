@@ -1594,11 +1594,21 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                     if (mode = AgentsMode || mode = AgentFilterMode)
                        && DateTimeOffset.UtcNow - agentLastPoll > TimeSpan.FromSeconds(45.) then
                         lock syncRoot (fun () -> startAgentRefreshUnsafe())
-                    let now = DateTimeOffset.UtcNow
-                    let events =
-                        if Console.KeyAvailable then
-                            decoder.Feed(now, Console.ReadKey(intercept = true))
-                        else decoder.Flush(now)
+                    // SGR wheel reports are multi-character sequences. Reading a
+                    // single character followed by a 35 ms delay can leave a huge
+                    // input backlog; rendering for every completed report makes it
+                    // worse. Drain a bounded burst, then render once per wheel run.
+                    let buffered = ResizeArray<InputEvent>()
+                    let mutable consumed = 0
+                    while consumed < 2048 && Console.KeyAvailable do
+                        let key = Console.ReadKey(intercept = true)
+                        consumed <- consumed + 1
+                        for event in decoder.Feed(DateTimeOffset.UtcNow, key) do
+                            buffered.Add event
+                    if consumed = 0 then
+                        for event in decoder.Flush(DateTimeOffset.UtcNow) do
+                            buffered.Add event
+                    let events = buffered |> Seq.toList |> coalesceWheelEvents
                     for input in events do
                         match input with
                         | Mouse mouse ->
@@ -1933,8 +1943,8 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                                     completeSelected Deny
                                 | _, ConsoleKey.Q -> shouldQuit <- true
                                 | _ -> ()
-                    if events.IsEmpty then
-                        do! Task.Delay(35, cancellationToken)
+                    if consumed = 0 && events.IsEmpty then
+                        do! Task.Delay(15, cancellationToken)
                 with
                 | :? OperationCanceledException -> ()
                 | ex ->

@@ -58,3 +58,37 @@ let malformedSequenceIsBoundedAndDecoderRecovers () =
     let observed = feed decoder malformed
     Assert.That(observed |> List.exists (function Mouse _ -> true | _ -> false), Is.False)
     equalEvents [Key(key 'x')] (decoder.Feed(DateTimeOffset.UtcNow, key 'x'))
+
+[<Test>]
+let adjacentWheelEventsCombineAndPreserveNavigationBoundaries () =
+    let key = Key(ConsoleKeyInfo('x', ConsoleKey.X, false, false, false))
+    let result =
+        coalesceWheelEvents
+            [ Mouse(Scroll(-1, 1, 2))
+              Mouse(Scroll(-1, 2, 3))
+              Mouse(Scroll(-1, 3, 4))
+              key
+              Mouse(Scroll(1, 8, 9))
+              Mouse(Click(5, 6))
+              Mouse(Scroll(-1, 7, 8)) ]
+    Assert.That(result, Is.EqualTo(
+        [ Mouse(Scroll(-3, 3, 4))
+          key
+          Mouse(Scroll(1, 8, 9))
+          Mouse(Click(5, 6))
+          Mouse(Scroll(-1, 7, 8)) ] :> obj))
+
+[<Test>]
+let alternatingWheelDeltasCancelWithoutSkippingKeyEvents () =
+    let key = Key(ConsoleKeyInfo('a', ConsoleKey.A, false, false, false))
+    Assert.That(
+        coalesceWheelEvents
+            [ Mouse(Scroll(1, 0, 0)); Mouse(Scroll(-1, 0, 0)); key;
+              Mouse(Scroll(1, 1, 1)); Mouse(Scroll(1, 1, 1)) ],
+        Is.EqualTo([ key; Mouse(Scroll(2, 1, 1)) ] :> obj))
+
+[<Test>]
+let largeMouseWheelBurstCollapsesToOneEvent () =
+    let burst = List.replicate 512 (Mouse(Scroll(-1, 1, 1)))
+    Assert.That(coalesceWheelEvents burst,
+                Is.EqualTo([ Mouse(Scroll(-512, 1, 1)) ] :> obj))

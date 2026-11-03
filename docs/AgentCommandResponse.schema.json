@@ -26,7 +26,7 @@
     },
     "Instructions": {
       "type": "array",
-      "maxItems": 16,
+      "maxItems": 35,
       "description": "Applicable instructions ordered from workspace to project root to deeper directories; empty for no applicable guidance.",
       "items": {
         "$ref": "#/$defs/InstructionDocument"
@@ -48,7 +48,10 @@
           "type": "string",
           "enum": [
             "workspace",
-            "project"
+            "project",
+            "working-turn",
+            "write-warning",
+            "instruction-warning"
           ]
         },
         "Path": {
@@ -62,7 +65,7 @@
         },
         "Content": {
           "type": "string",
-          "description": "Original UTF-8 Markdown. The 16 KiB/file and 32 KiB combined UTF-8 byte limits are enforced by the client, not by JSON Schema."
+          "description": "UTF-8 Markdown or a labeled incomplete prefix with original byte counts and full hash. Bounded delivery is enforced by the client, not JSON Schema."
         }
       },
       "additionalProperties": false

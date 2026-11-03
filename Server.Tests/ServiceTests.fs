@@ -928,6 +928,18 @@ let mcp_guidance_blocks_precede_result_without_changing_success () =
     Assert.That(operation.Text, Is.EqualTo("""{"result":"ok"}"""))
 
 [<Test>]
+let mcp_agency_write_warning_precedes_success_without_marking_error () =
+    let notes =
+        [ { Scope = "write-warning"; Path = "Demo/AGENTS.md"; Sha256 = ""
+            Content = "WARNING: Demo/AGENTS.md is unusually large. The write succeeded." } ]
+    let response = { Result = Some """{"ok":true}"""; Error = None; Instructions = notes }
+    let shown = response |> McpToolHelpers.toCallToolResult |> McpToolHelpers.attachInstructions notes
+    Assert.That(shown.IsError, Is.EqualTo(Nullable false))
+    Assert.That(shown.Content.Count, Is.EqualTo(2))
+    Assert.That((shown.Content[0] :?> TextContentBlock).Text, Does.StartWith("Jarvis instruction notice:"))
+    Assert.That((shown.Content[1] :?> TextContentBlock).Text, Is.EqualTo("""{"ok":true}"""))
+
+[<Test>]
 let mcp_guidance_preserves_errors_and_non_text_blocks () =
     let instructions =
         [ { Scope = "workspace"

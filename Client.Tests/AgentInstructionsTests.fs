@@ -69,29 +69,70 @@ let missing_empty_and_changed_files () =
         Assert.That(second.Sha256, Is.Not.EqualTo(first.Sha256)))
 
 [<Test>]
-let invalid_encoding_and_size_fail () =
+let invalid_encoding_fails_but_oversized_content_truncates () =
     workspace (fun root rt ->
         let path = create root "Demo/AGENTS.md" "valid"
         File.WriteAllBytes(path, [| 0xffuy; 0xfeuy |])
         match resolve rt (command "a.cs") with
         | Error(Client.ValidationError msg) -> Assert.That(msg, Does.Contain("UTF-8"))
         | other -> Assert.Fail(sprintf "Expected invalid UTF-8: %A" other)
-        File.WriteAllText(path, String('a', 32 * 1024))
-        Assert.That((docs rt (command "a.cs")).Head.Content.Length, Is.EqualTo(32 * 1024))
+        // Larger files now return a bounded, explicitly incomplete prefix.
         File.WriteAllText(path, String('a', 256 * 1024 + 1))
-        match resolve rt (command "a.cs") with
-        | Error(Client.ValidationError msg) -> Assert.That(msg, Does.Contain("262144"))
-        | other -> Assert.Fail(sprintf "Expected file limit: %A" other))
+        let document = (docs rt (command "a.cs")).Head
+        Assert.That(document.Content, Does.Contain("INCOMPLETE REPOSITORY INSTRUCTIONS"))
+        Assert.That(document.Content, Does.Contain("262145"))
+        Assert.That(document.Content, Does.Contain("read_file"))
+        Assert.That(document.Content, Does.Contain("Delivered: 65536"))
+        Assert.That(document.Sha256.StartsWith("sha256:"), Is.True)
+        Assert.That(document.Content.Length, Is.LessThan(68000)))
 
 [<Test>]
-let combined_limit_fail () =
+let malformed_utf8_in_omitted_suffix_is_still_rejected () =
+    workspace (fun root rt ->
+        let path = create root "Demo/AGENTS.md" "initial"
+        let content = Array.append (Array.create (64 * 1024 + 200) 97uy) [| 0xffuy |]
+        File.WriteAllBytes(path, content)
+        match resolve rt (command "x.fs") with
+        | Error(Client.ValidationError msg) -> Assert.That(msg, Does.Contain("UTF-8"))
+        | other -> Assert.Fail(sprintf "Expected invalid suffix rejection: %A" other))
+
+[<Test>]
+let hierarchy_preserves_descendants_and_bounds_combined_payload () =
     workspace (fun root rt ->
         create root "AGENTS.md" (String('a', 200000)) |> ignore
         create root "Demo/AGENTS.md" (String('b', 200000)) |> ignore
         create root "Demo/src/AGENTS.md" (String('c', 200000)) |> ignore
-        match resolve rt (command "src/a.cs") with
-        | Error(Client.ValidationError msg) -> Assert.That(msg, Does.Contain("524288"))
-        | other -> Assert.Fail(sprintf "Expected total size limit: %A" other))
+        let result = docs rt (command "src/a.cs")
+        Assert.That(result |> List.map (fun d -> d.Path),
+                    Is.EqualTo([ "AGENTS.md"; "Demo/AGENTS.md"; "Demo/src/AGENTS.md" ] :> obj))
+        Assert.That(result |> List.forall (fun d -> d.Content.Contains("TRUNCATED")), Is.True)
+        Assert.That(result |> List.sumBy (fun d -> System.Text.Encoding.UTF8.GetByteCount(d.Content)),
+                    Is.LessThan(150000))
+        Assert.That(result[2].Content, Does.Contain("cccc")))
+
+[<Test>]
+let excess_instruction_document_count_reports_omissions_without_failing () =
+    workspace (fun root rt ->
+        let mutable path = ""
+        for i in 1 .. 34 do
+            path <- Path.Combine(path, "d" + string i)
+            create root (Path.Combine("Demo", path, "AGENTS.md")) ("instructions " + string i) |> ignore
+        let result = docs rt (command (Path.Combine(path, "source.fs")))
+        Assert.That(result.Length, Is.EqualTo(33))
+        Assert.That(result[32].Scope, Is.EqualTo("instruction-warning"))
+        Assert.That(result[32].Content, Does.Contain("omitted"))
+        Assert.That(result[32].Content, Does.Contain("read_file")))
+
+[<Test>]
+let multibyte_instruction_truncation_preserves_valid_utf8 () =
+    workspace (fun root rt ->
+        let source = String.replicate 30000 "⚙"
+        create root "Demo/AGENTS.md" source |> ignore
+        let result = (docs rt (command "x.fs")).Head
+        Assert.That(result.Content, Does.Contain("INCOMPLETE REPOSITORY INSTRUCTIONS"))
+        Assert.That(result.Content, Does.Contain("⚙⚙"))
+        Assert.That(result.Content, Does.Not.Contain("�"))
+        Assert.That(result.Sha256, Is.EqualTo("sha256:" + (System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(source)) |> Convert.ToHexString).ToLowerInvariant())))
 
 [<Test>]
 let reject_symlinked_agents () =
@@ -108,27 +149,78 @@ let reject_symlinked_agents () =
         | other -> Assert.Fail(sprintf "Expected link rejection: %A" other))
 
 [<Test>]
-let invalid_instruction_prevents_file_write () =
+let oversized_instruction_does_not_prevent_file_write () =
     task {
         let root = Path.Combine(Path.GetTempPath(), "jarvis-instructions-" + Guid.NewGuid().ToString("N"))
         Directory.CreateDirectory(Path.Combine(root, "Demo")) |> ignore
         try
             create root "Demo/AGENTS.md" (String('x', 256 * 1024 + 1)) |> ignore
-            let target = Path.Combine(root, "Demo", "should-not-exist.txt")
-            let command =
+            let target = Path.Combine(root, "Demo", "written.txt")
+            let cmd =
                 WriteFileCommand
-                    { ProjectName = "Demo"
-                      FilePath = "should-not-exist.txt"
-                      Content = "side effect"
-                      FileWriteMode = FileWriteMode.Write
-                      ExpectedHash = None
-                      CreateParents = None }
-            let! outcome, _ = Client.SignalR.Client.receiveCommandWithInstructions (Runtime(root)) command
+                    { ProjectName = "Demo"; FilePath = "written.txt"
+                      Content = "side effect"; FileWriteMode = FileWriteMode.Write
+                      ExpectedHash = None; CreateParents = None }
+            let! outcome, instructions = Client.SignalR.Client.receiveCommandWithInstructions (Runtime(root)) cmd
             match outcome with
-            | Error(Client.ValidationError message) ->
-                Assert.That(message, Does.Contain("AGENTS.md"))
-            | other -> Assert.Fail(sprintf "Expected instruction validation error: %A" other)
-            Assert.That(File.Exists(target), Is.False)
+            | Ok _ -> ()
+            | other -> Assert.Fail(sprintf "Truncated instruction cannot block write: %A" other)
+            Assert.That(File.ReadAllText(target), Is.EqualTo("side effect"))
+            Assert.That(instructions.Head.Content, Does.Contain("INCOMPLETE REPOSITORY INSTRUCTIONS"))
+        finally if Directory.Exists root then Directory.Delete(root, true)
+    }
+
+[<Test>]
+let large_agents_write_warns_without_rejecting_and_small_write_does_not () =
+    task {
+        let root = Path.Combine(Path.GetTempPath(), "jarvis-instructions-" + Guid.NewGuid().ToString("N"))
+        Directory.CreateDirectory(Path.Combine(root, "Demo")) |> ignore
+        try
+            let rt = Runtime(root)
+            let cmd content =
+                WriteFileCommand
+                    { ProjectName = "Demo"; FilePath = "AGENTS.md"
+                      Content = content; FileWriteMode = FileWriteMode.Write
+                      ExpectedHash = None; CreateParents = None }
+            let! smallResult, smallDocs =
+                Client.SignalR.Client.receiveCommandWithInstructions rt (cmd "short")
+            Assert.That(smallResult.IsOk, Is.True)
+            Assert.That(smallDocs |> List.exists (fun d -> d.Scope = "write-warning"), Is.False)
+            let huge = String('x', 33000)
+            let! largeResult, largeDocs =
+                Client.SignalR.Client.receiveCommandWithInstructions rt (cmd huge)
+            Assert.That(largeResult.IsOk, Is.True)
+            let warning = largeDocs |> List.find (fun d -> d.Scope = "write-warning")
+            Assert.That(warning.Content, Does.Contain("33000"))
+            Assert.That(warning.Content, Does.Contain("32 KiB"))
+            Assert.That(warning.Content, Does.Contain("write succeeded"))
+            Assert.That(File.ReadAllText(Path.Combine(root, "Demo", "AGENTS.md")), Is.EqualTo(huge))
+        finally if Directory.Exists root then Directory.Delete(root, true)
+    }
+
+[<Test>]
+let patch_agents_warns_on_write_but_not_dry_run () =
+    task {
+        let root = Path.Combine(Path.GetTempPath(), "jarvis-instructions-" + Guid.NewGuid().ToString("N"))
+        Directory.CreateDirectory(Path.Combine(root, "Demo")) |> ignore
+        try
+            let initial = "first line\n" + String('y', 34000) + "\n"
+            create root "Demo/AGENTS.md" initial |> ignore
+            let patch = "--- a/AGENTS.md\n+++ b/AGENTS.md\n@@ -1,2 +1,2 @@\n-first line\n+revised line\n " + String('y', 34000) + "\n"
+            let cmd dryRun =
+                PatchFileCommand
+                    { ProjectName = "Demo"; FilePath = "AGENTS.md"
+                      ExpectedHash = None; Format = PatchFormat.UnifiedDiff
+                      Patch = patch; DryRun = Some dryRun
+                      FuzzyContextLines = None; ReturnContent = None }
+            let rt = Runtime(root)
+            let! preview, previewDocs = Client.SignalR.Client.receiveCommandWithInstructions rt (cmd true)
+            Assert.That(preview.IsOk, Is.True)
+            Assert.That(previewDocs |> List.exists (fun d -> d.Scope = "write-warning"), Is.False)
+            let! result, notices = Client.SignalR.Client.receiveCommandWithInstructions rt (cmd false)
+            Assert.That(result.IsOk, Is.True)
+            Assert.That(notices |> List.exists (fun d -> d.Scope = "write-warning"), Is.True)
+            Assert.That(File.ReadAllText(Path.Combine(root, "Demo", "AGENTS.md")), Does.StartWith("revised line"))
         finally if Directory.Exists root then Directory.Delete(root, true)
     }
 
@@ -151,9 +243,8 @@ let oversized_or_invalid_guidance_does_not_block_ledger_status_operations () =
                   TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L
                   Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null
                   RelativePath = null }), Is.Empty)
-        match resolve rt (command "source.fs") with
-        | Error(Client.ValidationError msg) -> Assert.That(msg, Does.Contain("262144"))
-        | other -> Assert.Fail(sprintf "Expected source instruction validation: %A" other)
+        Assert.That((docs rt (command "source.fs")).Head.Content,
+                    Does.Contain("INCOMPLETE REPOSITORY INSTRUCTIONS"))
         File.WriteAllBytes(path, [| 0xffuy |])
         Assert.That(docs rt stateCommand, Is.Empty)
         match resolve rt (command "source.fs") with

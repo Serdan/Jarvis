@@ -406,7 +406,7 @@ let receiveCommandWithInstructions (rt: Runtime) command =
         | Error error -> return Error error, []
         | Ok instructions ->
             let! response = receiveCommand rt command
-            return response, instructions
+            return response, instructions @ AgentInstructions.writeWarnings rt command response
     }
 
 let receiveCommandAndReply (connection: HubConnection) (rt: Runtime) (correlationId: string) (commandJson: string) (sessionId: string) : Task =

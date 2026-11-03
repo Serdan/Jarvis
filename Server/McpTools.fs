@@ -171,6 +171,8 @@ module McpToolHelpers =
             for document in documents do
                 if document.Scope = "working-turn" then
                     contents.Add(textContent ("Jarvis Working turn instruction:\n" + document.Content))
+                elif document.Scope = "write-warning" || document.Scope = "instruction-warning" then
+                    contents.Add(textContent ("Jarvis instruction notice:\n" + document.Content))
                 else
                     let heading =
                         $"Repository guidance from {document.Path} ({document.Scope}, {document.Sha256}). " +

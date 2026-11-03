@@ -72,9 +72,11 @@ This delivery mechanism applies to the existing stateless MCP transport. The ini
 ### Error and size policy
 
 - Missing files: continue without that document.
-- Unreadable, unsafe, malformed UTF-8, or oversized applicable instruction files: return a clear error naming the relative path; **do not execute** the source-work operation. Do not silently truncate instructions or pretend they were loaded. Covered read-only source commands also fail.
+- Invalid UTF-8 in delivered content, unsafe paths and symlink instruction sources still fail validation.
+- If an applicable instruction file exceeds the automatic delivery budget, **truncate its delivered prefix rather than rejecting the original command**. Mark the response as incomplete prominently; show its original source path, complete-file SHA-256, delivered/original UTF-8 byte counts and explicit instructions to use `read_file` for the complete source. Do not claim the omitted portion was loaded. Trim on valid UTF-8 boundaries.
+- Allocate at most **64 KiB of source content per instruction file** and **128 KiB combined**, reserving capacity for more-specific descendant instruction files. Include a warning if the **32-document delivery limit** is reached rather than aborting the operation. The files on disk are never truncated.
+- `write_file` and successful non-dry-run `patch_file` operations targeting `AGENTS.md` **warn, without failing**, when the resulting file exceeds **32 KiB**. The warning recommends keeping the entrypoint concise and moving detail into referenced documents; no arbitrary size limit is imposed on the actual file by this mechanism.
 - **Do not load source instructions for canonical Git-ledger-only operations** (agent inbox, assignments, checkpoints, yields, reviews, notifications). These never mutate the source tree. Task-spec import and export still load source instructions.
-- Bound each instruction file to **256 KiB**, combined instruction content to **512 KiB**, and applicable document count to **32**. These are transport-safety limits rather than a style requirement for AGENTS.md and do not override MCP/SignalR message-size or result-size limits.
 - An explicit request to read `AGENTS.md` through ordinary file tools still follows normal file-read behavior; automatic inclusion does not substitute for the regular file API.
 - Check limits before constructing the response and include actionable diagnostics (source path and violated limit).
 

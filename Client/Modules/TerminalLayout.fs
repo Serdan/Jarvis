@@ -8,12 +8,9 @@ let contains x y rect =
     && x >= rect.X && x < rect.X + rect.Width
     && y >= rect.Y && y < rect.Y + rect.Height
 
-/// Wide terminals use a persistent details pane; narrow ones use inline details.
-let agentPane terminalWidth =
-    if terminalWidth < 105 then None
-    else
-        let divider = terminalWidth * 55 / 100
-        Some (divider - 2, divider, max 15 (terminalWidth - divider - 2))
+/// Agents always use the full available width for list rows. Selected
+/// details are rendered beneath the list, independent of terminal width.
+let agentListWidth terminalWidth = max 1 terminalWidth
 
 /// Remaining single-line items after the header and reserved lower panels.
 /// At least one row is retained for navigation even in very short terminals;

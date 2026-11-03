@@ -982,7 +982,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         let headerRows = headerRows + (if agentError.IsSome then 1 else 0)
                                     + (if mode = AgentFilterMode then 1 else 0)
         let inlineDetails =
-            if width < 105 && showAgentDetails then
+            if showAgentDetails then
                 measureRows (fun () -> renderAgentDetailsUnsafe width)
             else 0
         let footerRows =
@@ -1027,41 +1027,15 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         elif filtered.Length = 0 then
             draw.WriteLine "No matching agents."
         else
-            let pane = TerminalLayout.agentPane width
-            let rowWidth = pane |> Option.map (fun (listWidth, _, _) -> listWidth)
-                                |> Option.defaultValue width
-            let startY = draw.CursorTop
+            // Agent rows always use the available width. A details-pane
+            // breakpoint formerly cut rows to ~55 columns at width 105.
+            let rowWidth = TerminalLayout.agentListWidth width
             for index = agentScroll to last - 1 do
                 let row = filtered[index]
                 let marker = if mode = AgentsMode && Some row.Key = agentSelected then ">" else " "
                 registerMouseHit 0 rowWidth (SelectAgent row.Key)
                 writeColoredAgentLine rowWidth marker row
-            if pane.IsSome && showAgentDetails then
-                match selectedAgentUnsafe() with
-                | None -> ()
-                | Some row ->
-                    let bottom = draw.CursorTop
-                    let _, left, paneWidth = pane.Value
-                    let lines =
-                        [ $"Agent: {row.Agent}"
-                          $"Project: {row.Project}"
-                          $"Status: {AgentView.displayState row.State} ({AgentView.stateAge DateTimeOffset.UtcNow row})"
-                          $"Unread: {row.PendingNotifications}"
-                          "Latest: " + (row.LatestNotification |> Option.defaultValue "-")
-                          "Next: " + (row.StateReason |> Option.defaultValue "-") ]
-                        @ (match row.Focus with
-                           | None -> ["Assignment: none"]
-                           | Some task ->
-                               [ $"Task: #{task.TaskId} {task.Title}"
-                                 $"Progress: {task.Phase} · gen {task.AssignmentGeneration}"
-                                 "Branch: " + (task.SourceRef |> Option.defaultValue "-") ])
-                    for i, line in lines |> List.indexed do
-                        let y = startY + i
-                        if y < draw.Height - 1 then
-                            draw.SetCursorPosition(left, y)
-                            draw.Write(trim (compact line) paneWidth)
-                    draw.SetCursorPosition(0, max bottom (min (draw.Height - 2) (startY + lines.Length)))
-        if width < 105 then renderAgentDetailsUnsafe width
+        if showAgentDetails then renderAgentDetailsUnsafe width
 
         if not issues.IsEmpty then
             draw.WriteLine ""

@@ -70,3 +70,20 @@ let backgroundColorIsStoredWithCellsAndRestoredForFollowingRows () =
     Assert.That(frame.GetCell(0, 6).Background, Is.EqualTo(System.ConsoleColor.DarkBlue))
     Assert.That(frame.GetCell(1, 0).Background, Is.EqualTo(System.ConsoleColor.Black))
     Assert.That(frame.GetCell(0, 7).Background, Is.EqualTo(System.ConsoleColor.Black))
+
+
+[<Test>]
+let trueColorBackgroundCoversBlankCellsAndCanReturnToPalette () =
+    let frame = Frame(8, 3)
+    let dark = Some(16uy, 16uy, 16uy)
+    let selected = Some(38uy, 38uy, 38uy)
+    Assert.That(frame.GetCell(0, 7).BackgroundRgb, Is.EqualTo(dark))
+    frame.BackgroundRgb <- selected
+    frame.WriteLine("selected")
+    Assert.That(frame.GetCell(0, 0).BackgroundRgb, Is.EqualTo(selected))
+    frame.BackgroundRgb <- dark
+    frame.Write("normal")
+    Assert.That(frame.GetCell(1, 0).BackgroundRgb, Is.EqualTo(dark))
+    frame.BackgroundColor <- System.ConsoleColor.Black
+    frame.Write("x")
+    Assert.That(frame.GetCell(1, 6).BackgroundRgb, Is.EqualTo(None))

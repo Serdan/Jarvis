@@ -6,19 +6,21 @@ open System.IO
 open System.Text
 
 [<Struct; StructuralEquality; StructuralComparison>]
-type Cell = { Text: string; Color: ConsoleColor; Background: ConsoleColor }
+type Cell = { Text: string; Color: ConsoleColor; Background: ConsoleColor; BackgroundRgb: (byte * byte * byte) option }
 
 /// A fixed-size terminal frame. Drawing past the right or bottom edge is clipped,
 /// never wrapped into a different hit-test row or scrolled on the real terminal.
 type Frame(width: int, height: int) =
     let width = max 1 width
     let height = max 1 height
-    let blank = { Text = " "; Color = ConsoleColor.Gray; Background = ConsoleColor.Black }
+    let defaultRgb = Some(16uy, 16uy, 16uy)
+    let blank = { Text = " "; Color = ConsoleColor.Gray; Background = ConsoleColor.Black; BackgroundRgb = defaultRgb }
     let cells = Array2D.create height width blank
     let mutable x = 0
     let mutable y = 0
     let mutable color = ConsoleColor.Gray
     let mutable background = ConsoleColor.Black
+    let mutable backgroundRgb = defaultRgb
 
     member _.Width = width
     member _.Height = height
@@ -31,7 +33,14 @@ type Frame(width: int, height: int) =
 
     member _.BackgroundColor
         with get() = background
-        and set value = background <- value
+        and set value =
+            background <- value
+            backgroundRgb <- None
+
+    /// True-color backgrounds allow genuinely subtle dark-theme shades.
+    member _.BackgroundRgb
+        with get() = backgroundRgb
+        and set value = backgroundRgb <- value
 
     member _.GetCell(row, column) = cells[row, column]
 
@@ -70,9 +79,9 @@ type Frame(width: int, height: int) =
                     else
                         let cellWidth = if wide then 2 else 1
                         if y < height && x + cellWidth <= width then
-                            cells[y, x] <- { Text = rune.ToString(); Color = color; Background = background }
+                            cells[y, x] <- { Text = rune.ToString(); Color = color; Background = background; BackgroundRgb = backgroundRgb }
                             if cellWidth = 2 then
-                                cells[y, x + 1] <- { Text = ""; Color = color; Background = background }
+                                cells[y, x + 1] <- { Text = ""; Color = color; Background = background; BackgroundRgb = backgroundRgb }
                         x <- x + cellWidth
 
     member this.WriteLine(value: string) =
@@ -95,6 +104,7 @@ type Frame(width: int, height: int) =
                 previous |> Option.forall (fun old -> old.Width <> width || old.Height <> height)
             let mutable initialColor = ConsoleColor.Gray
             let mutable initialBackground = ConsoleColor.Black
+            let mutable activeRgb = None
             try
                 if full then Console.Clear()
                 initialColor <- Console.ForegroundColor
@@ -109,10 +119,12 @@ type Frame(width: int, height: int) =
                             let runStart = col
                             let runColor = current.Color
                             let runBackground = current.Background
+                            let runRgb = current.BackgroundRgb
                             let text = StringBuilder()
                             while col < width
                                   && cells[row, col].Color = runColor
                                   && cells[row, col].Background = runBackground
+                                  && cells[row, col].BackgroundRgb = runRgb
                                   && (full || (previous |> Option.exists (fun old -> old.GetCell(row, col) <> cells[row, col]))) do
                                 let part = cells[row, col].Text
                                 if part <> "" then text.Append(part) |> ignore
@@ -122,8 +134,19 @@ type Frame(width: int, height: int) =
                                     raise (InvalidOperationException("Terminal resized during presentation."))
                                 Console.SetCursorPosition(runStart, row)
                                 if Console.ForegroundColor <> runColor then Console.ForegroundColor <- runColor
-                                if Console.BackgroundColor <> runBackground then Console.BackgroundColor <- runBackground
+                                match runRgb with
+                                | Some(r, g, b) when activeRgb <> runRgb ->
+                                    Console.Write($"\u001b[48;2;{r};{g};{b}m")
+                                    activeRgb <- runRgb
+                                | Some _ -> ()
+                                | None ->
+                                    if activeRgb.IsSome then
+                                        Console.Write("\u001b[49m")
+                                        activeRgb <- None
+                                    if Console.BackgroundColor <> runBackground then
+                                        Console.BackgroundColor <- runBackground
                                 Console.Write(text.ToString())
+                if activeRgb.IsSome then Console.Write("\u001b[49m")
                 Console.ForegroundColor <- initialColor
                 Console.BackgroundColor <- initialBackground
                 Console.SetCursorPosition(0, 0)
@@ -133,6 +156,7 @@ type Frame(width: int, height: int) =
             | :? IOException
             | :? InvalidOperationException ->
                 try
+                    if activeRgb.IsSome then Console.Write("\u001b[49m")
                     Console.ForegroundColor <- initialColor
                     Console.BackgroundColor <- initialBackground
                 with _ -> ()

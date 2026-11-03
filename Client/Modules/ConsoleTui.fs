@@ -932,12 +932,11 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
 
     let writeColoredAgentLine width marker (row: AgentView.AgentRow) =
         let original = draw.ForegroundColor
-        let originalBackground = draw.BackgroundColor
+        let originalBackgroundRgb = draw.BackgroundRgb
         let projectWidth, agentWidth = agentColumnWidths width
         let selected = mode = AgentsMode && Some row.Key = agentSelected
-        let background = if selected then ConsoleColor.DarkGray else ConsoleColor.Black
         let normalForeground = if selected then ConsoleColor.White else original
-        draw.BackgroundColor <- background
+        draw.BackgroundRgb <- if selected then Some(38uy, 38uy, 38uy) else Some(16uy, 16uy, 16uy)
         draw.ForegroundColor <- normalForeground
         let timestamp = AgentView.stateAge DateTimeOffset.UtcNow row
         let flag = if Set.contains row.Key agentChanged then "*" else " "
@@ -980,7 +979,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         if padding > 0 then draw.Write(String(' ', padding))
         draw.WriteLine()
         draw.ForegroundColor <- original
-        draw.BackgroundColor <- originalBackground
+        draw.BackgroundRgb <- originalBackgroundRgb
 
     let renderAgentDetailsUnsafe width =
         if showAgentDetails then

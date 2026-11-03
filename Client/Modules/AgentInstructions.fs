@@ -13,11 +13,27 @@ type private Target =
     | FileTarget of string
     | ExistingTarget of string
 
-let private limits = 16 * 1024, 32 * 1024, 16
+// Guidance is bounded as a response payload, not as an artificial 16 KiB
+// restriction on repository documentation. 512 KiB total stays below
+// AgentProtocol.maxResponseBytes even when a command also returns data.
+let private limits = 256 * 1024, 512 * 1024, 32
 let private utf8 = UTF8Encoding(false, true)
 
 let private applicableTargets (rt: Runtime) command =
     match command with
+    // Orchestration ledger operations are independent of repository source
+    // instructions. In particular, a malformed or long AGENTS.md must never
+    // prevent an agent from checkpointing, yielding or acknowledging work.
+    | V2TaskReadCommand _
+    | V2LedgerReadCommand _
+    | V2LedgerWriteCommand _
+    | V2ReviewReadCommand _
+    | V2ReviewWriteCommand _ -> Ok None
+    // These actions modify only the independently versioned Git ledger.
+    // ExportTaskSpec and ImportTaskSpec touch source-tree files and therefore
+    // retain normal source instruction validation.
+    | V2TaskWriteCommand cmd when cmd.Action <> "ExportTaskSpec"
+                                  && cmd.Action <> "ImportTaskSpec" -> Ok None
     | ListCommandsCommand
     | ListProjectsCommand
     | UpdateClientCommand

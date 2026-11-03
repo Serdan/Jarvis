@@ -76,19 +76,21 @@ let invalid_encoding_and_size_fail () =
         match resolve rt (command "a.cs") with
         | Error(Client.ValidationError msg) -> Assert.That(msg, Does.Contain("UTF-8"))
         | other -> Assert.Fail(sprintf "Expected invalid UTF-8: %A" other)
-        File.WriteAllText(path, String('a', 16385))
+        File.WriteAllText(path, String('a', 32 * 1024))
+        Assert.That((docs rt (command "a.cs")).Head.Content.Length, Is.EqualTo(32 * 1024))
+        File.WriteAllText(path, String('a', 256 * 1024 + 1))
         match resolve rt (command "a.cs") with
-        | Error(Client.ValidationError msg) -> Assert.That(msg, Does.Contain("16384"))
+        | Error(Client.ValidationError msg) -> Assert.That(msg, Does.Contain("262144"))
         | other -> Assert.Fail(sprintf "Expected file limit: %A" other))
 
 [<Test>]
 let combined_limit_fail () =
     workspace (fun root rt ->
-        create root "AGENTS.md" (String('a', 12000)) |> ignore
-        create root "Demo/AGENTS.md" (String('b', 12000)) |> ignore
-        create root "Demo/src/AGENTS.md" (String('c', 12000)) |> ignore
+        create root "AGENTS.md" (String('a', 200000)) |> ignore
+        create root "Demo/AGENTS.md" (String('b', 200000)) |> ignore
+        create root "Demo/src/AGENTS.md" (String('c', 200000)) |> ignore
         match resolve rt (command "src/a.cs") with
-        | Error(Client.ValidationError msg) -> Assert.That(msg, Does.Contain("32768"))
+        | Error(Client.ValidationError msg) -> Assert.That(msg, Does.Contain("524288"))
         | other -> Assert.Fail(sprintf "Expected total size limit: %A" other))
 
 [<Test>]
@@ -111,7 +113,7 @@ let invalid_instruction_prevents_file_write () =
         let root = Path.Combine(Path.GetTempPath(), "jarvis-instructions-" + Guid.NewGuid().ToString("N"))
         Directory.CreateDirectory(Path.Combine(root, "Demo")) |> ignore
         try
-            create root "Demo/AGENTS.md" (String('x', 16385)) |> ignore
+            create root "Demo/AGENTS.md" (String('x', 256 * 1024 + 1)) |> ignore
             let target = Path.Combine(root, "Demo", "should-not-exist.txt")
             let command =
                 WriteFileCommand
@@ -127,6 +129,58 @@ let invalid_instruction_prevents_file_write () =
                 Assert.That(message, Does.Contain("AGENTS.md"))
             | other -> Assert.Fail(sprintf "Expected instruction validation error: %A" other)
             Assert.That(File.Exists(target), Is.False)
+        finally if Directory.Exists root then Directory.Delete(root, true)
+    }
+
+[<Test>]
+let oversized_or_invalid_guidance_does_not_block_ledger_status_operations () =
+    workspace (fun root rt ->
+        let path = create root "Demo/AGENTS.md" (String('x', 256 * 1024 + 1))
+        let stateCommand =
+            V2TaskWriteCommand
+                { ProjectName = "Demo"; Action = "YieldAgent"; OperationId = Guid.NewGuid().ToString("D")
+                  TaskId = "252"; ActorId = "Agent 7"; AttemptId = ""; OwnerId = ""
+                  Title = ""; Html = ""; ExpectedVersion = 1; ExpectedAgentVersion = 1
+                  ExpectedTaskVersion = 1; AssignmentGeneration = 1
+                  Summary = ""; NextAction = ""; Reason = ""; BaseOid = ""; TargetRef = ""
+                  SourceRef = ""; AllowDetached = false; AllowUncommitted = false
+                  DecisionSequence = 0L; Evidence = ""; SessionId = "" }
+        Assert.That(docs rt stateCommand, Is.Empty)
+        Assert.That(docs rt (V2TaskReadCommand
+                { ProjectName = "Demo"; AgentId = "Agent 7"; Action = "AgentInbox"
+                  TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L
+                  Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null
+                  RelativePath = null }), Is.Empty)
+        match resolve rt (command "source.fs") with
+        | Error(Client.ValidationError msg) -> Assert.That(msg, Does.Contain("262144"))
+        | other -> Assert.Fail(sprintf "Expected source instruction validation: %A" other)
+        File.WriteAllBytes(path, [| 0xffuy |])
+        Assert.That(docs rt stateCommand, Is.Empty)
+        match resolve rt (command "source.fs") with
+        | Error(Client.ValidationError msg) -> Assert.That(msg, Does.Contain("UTF-8"))
+        | other -> Assert.Fail(sprintf "Expected invalid UTF-8 for source command: %A" other))
+
+[<Test>]
+let oversized_guidance_does_not_preempt_real_ledger_status_error () =
+    task {
+        let root = Path.Combine(Path.GetTempPath(), "jarvis-instructions-" + Guid.NewGuid().ToString("N"))
+        Directory.CreateDirectory(Path.Combine(root, "Demo")) |> ignore
+        try
+            create root "Demo/AGENTS.md" (String('x', 256 * 1024 + 1)) |> ignore
+            let command =
+                V2TaskReadCommand
+                    { ProjectName = "Demo"; AgentId = "Agent 7"; Action = "AgentInbox"
+                      TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L
+                      Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null
+                      RelativePath = null }
+            let! response, guidance =
+                Client.SignalR.Client.receiveCommandWithInstructions (Runtime(root)) command
+            Assert.That(guidance, Is.Empty)
+            match response with
+            | Error(Client.ValidationError message) when message.Contains("AGENTS.md") ->
+                Assert.Fail("Ledger read was blocked by instruction source validation.")
+            | Error _ -> () // Unbound test ledger must fail for its actual cause.
+            | Ok _ -> Assert.Fail("Test project unexpectedly has a bound orchestration ledger.")
         finally if Directory.Exists root then Directory.Delete(root, true)
     }
 

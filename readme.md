@@ -277,6 +277,8 @@ See [Migration to Git-backed orchestration](docs/OrchestrationMigration.md) for 
 
 Jarvis automatically loads applicable AGENTS.md files on project-scoped commands. Guidance is discovered from the local workspace root, the project root, and ancestor folders of the targeted file or working directory. The client includes the ordered source paths, hashes, and original Markdown in an Instructions array on its command response. The MCP server presents these as labeled content blocks before the ordinary result; it also advertises the contract through static MCP initialization instructions.
 
+Instruction transport is bounded at 256 KiB per file, 512 KiB combined and 32 applicable documents. Canonical Git-ledger-only commands (including inbox, checkpoint and yield) bypass source instruction loading, so an invalid or oversized `AGENTS.md` cannot prevent state recovery. Source-work commands still load and validate applicable repository guidance.
+
 Instruction sources remain project data and never grant permissions. Missing files are normal; unsafe, unreadable, or oversized applicable files reject a command before side effects. Instructions are currently supplied on every applicable call rather than being session-cached.
 
 See [Automatic Agent Instructions](docs/AgentInstructions.md) and the [response JSON Schema](docs/AgentCommandResponse.schema.json) for hierarchy, limits, and the wire envelope.

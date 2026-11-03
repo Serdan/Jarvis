@@ -34,7 +34,7 @@ Keep initialization guidance independent of device selection, project identity a
 
 ### Covered operations
 
-Attach instruction context to **every project-scoped filesystem or project-work MCP command** without requiring a separate discovery call. In particular:
+Attach instruction context to **project-scoped filesystem and source-work MCP commands** without requiring a separate discovery call. Canonical Git-ledger reads and state changes (assignments, checkpoints, agent yields, reviews and notifications) are independent of source instruction loading and remain available even when a source guidance file is invalid. In particular:
 
 | Operation kind | Paths used to resolve applicable instructions |
 | --- | --- |
@@ -72,8 +72,9 @@ This delivery mechanism applies to the existing stateless MCP transport. The ini
 ### Error and size policy
 
 - Missing files: continue without that document.
-- Unreadable, unsafe, malformed UTF-8, or oversized applicable instruction files: return a clear error naming the relative path; **do not execute** the requested project mutation/process. Do not silently truncate instructions or pretend they were loaded. For simplicity, fail the covered read-only command as well.
-- Bound each instruction file to **16 KiB**, combined instruction content to **32 KiB**, and applicable document count to **16**. These are limits for this feature, not permission to exceed the MCP/SignalR message-size or existing result-size limits.
+- Unreadable, unsafe, malformed UTF-8, or oversized applicable instruction files: return a clear error naming the relative path; **do not execute** the source-work operation. Do not silently truncate instructions or pretend they were loaded. Covered read-only source commands also fail.
+- **Do not load source instructions for canonical Git-ledger-only operations** (agent inbox, assignments, checkpoints, yields, reviews, notifications). These never mutate the source tree. Task-spec import and export still load source instructions.
+- Bound each instruction file to **256 KiB**, combined instruction content to **512 KiB**, and applicable document count to **32**. These are transport-safety limits rather than a style requirement for AGENTS.md and do not override MCP/SignalR message-size or result-size limits.
 - An explicit request to read `AGENTS.md` through ordinary file tools still follows normal file-read behavior; automatic inclusion does not substitute for the regular file API.
 - Check limits before constructing the response and include actionable diagnostics (source path and violated limit).
 

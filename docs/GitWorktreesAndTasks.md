@@ -3,7 +3,7 @@
 > **Superseded design proposal (23 October 2026).** The source-side task-file
 > lifecycle in this document is not the current API. Live tasks, assignments
 > and reviews are stored in the orphan Git ledger; ordinary worktrees remain
-> implementation context. See the [current capability specification](specs/orchestration-v2-architecture.md)
+> implementation context. See the [current capability specification](specs/orchestration-architecture.md)
 > and [migration guide](OrchestrationMigration.md). Retained for historical context.
 
 

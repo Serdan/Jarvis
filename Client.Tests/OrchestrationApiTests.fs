@@ -1,4 +1,4 @@
-module V2ReviewApiTests
+module OrchestrationApiTests
 
 open System
 open System.IO
@@ -7,12 +7,12 @@ open Common
 open NUnit.Framework
 
 [<Test>]
-let disabledV2ReadAndWriteDoNotTouchV1Tasks () =
+let disabledReadAndWriteDoNotTouchV1Tasks () =
     let root, project = GitCommandTests.createTempProject ()
     try
         let context = GitCommandTests.TestContext root
         GitCommandTests.initRepo context
-        let bindingPath = Client.V2ReviewApi.ReviewV2Binding.pathForRoot project
+        let bindingPath = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot project
         Assert.That(File.Exists(bindingPath), Is.False)
         let query =
             { ProjectName = "Project1"
@@ -20,10 +20,10 @@ let disabledV2ReadAndWriteDoNotTouchV1Tasks () =
               TaskId = ""
               RequestId = ""
               ReviewerId = "Reviewer"; DocumentPath = "" }
-        match Client.V2ReviewApi.V2ReviewApi.read query context with
+        match Client.OrchestrationApi.OrchestrationApi.read query context with
         | Error(Client.ValidationError message) ->
-            Assert.That(message, Does.Contain("V2 ledger disabled"))
-        | other -> Assert.Fail(sprintf "Expected disabled V2 read, got %A" other)
+            Assert.That(message, Does.Contain(" ledger disabled"))
+        | other -> Assert.Fail(sprintf "Expected disabled  read, got %A" other)
         let mutation =
             { ProjectName = "Project1"
               Action = "Claim"
@@ -40,10 +40,10 @@ let disabledV2ReadAndWriteDoNotTouchV1Tasks () =
               Summary = ""
               Verdict = ""
               DocumentPath = ""; Content = ""; ExpectedBlobOid = "" }
-        match Client.V2ReviewApi.V2ReviewApi.write mutation context with
+        match Client.OrchestrationApi.OrchestrationApi.write mutation context with
         | Error(Client.ValidationError message) ->
-            Assert.That(message, Does.Contain("V2 ledger disabled"))
-        | other -> Assert.Fail(sprintf "Expected disabled V2 write, got %A" other)
+            Assert.That(message, Does.Contain(" ledger disabled"))
+        | other -> Assert.Fail(sprintf "Expected disabled  write, got %A" other)
         Assert.That(File.Exists(bindingPath), Is.False)
         Assert.That(Directory.Exists(Path.Combine(project, "docs", "tasks")), Is.False)
         Assert.That(GitCommandTests.gitOutput context [ "status"; "--porcelain" ], Is.Empty)
@@ -51,10 +51,10 @@ let disabledV2ReadAndWriteDoNotTouchV1Tasks () =
         Directory.Delete(root, true)
 
 [<Test>]
-let v2BindingsStayInUserConfigAndAreCheckoutSpecific () =
-    let first = Client.V2ReviewApi.ReviewV2Binding.pathForRoot(
+let ledgerBindingsStayInUserConfigAndAreCheckoutSpecific () =
+    let first = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot(
         Path.Combine(Path.GetTempPath(), "jarvis-test-" + Guid.NewGuid().ToString("N")))
-    let second = Client.V2ReviewApi.ReviewV2Binding.pathForRoot(
+    let second = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot(
         Path.Combine(Path.GetTempPath(), "jarvis-test-" + Guid.NewGuid().ToString("N")))
     Assert.That(first, Is.Not.EqualTo(second))
     Assert.That(Path.GetDirectoryName(first), Is.EqualTo(Path.Combine(
@@ -62,16 +62,16 @@ let v2BindingsStayInUserConfigAndAreCheckoutSpecific () =
     Assert.That(Path.GetFileName(first), Does.EndWith(".json"))
 
 [<Test>]
-let v2ReviewMutationsNeedGitApprovalWhileReadsDoNot () =
+let ledgerReviewMutationsNeedGitApprovalWhileReadsDoNot () =
     Client.PermissionPolicy.clearGrants ()
-    let read = V2ReviewReadCommand
+    let read = ReviewReadCommand
                     { ProjectName = "Project1"; Action = "ReviewerQueue"
                       TaskId = ""; RequestId = ""; ReviewerId = "Reviewer"; DocumentPath = "" }
     match Client.PermissionPolicy.evaluate read with
     | Ok () -> ()
-    | other -> Assert.Fail(sprintf "Expected read-only V2 access, got %A" other)
+    | other -> Assert.Fail(sprintf "Expected read-only  access, got %A" other)
     let write =
-        V2ReviewWriteCommand
+        ReviewWriteCommand
             { ProjectName = "Project1"
               Action = "Claim"
               OperationId = Guid.NewGuid().ToString("D")
@@ -91,21 +91,21 @@ let v2ReviewMutationsNeedGitApprovalWhileReadsDoNot () =
     | Error(Client.ConfirmationRequired request) ->
         Assert.That(request.Permissions, Does.Contain(VersionControlWrite))
         Assert.That(request.Permissions, Does.Contain(NetworkAccess))
-    | other -> Assert.Fail(sprintf "Expected V2 Git-write confirmation: %A" other)
+    | other -> Assert.Fail(sprintf "Expected  Git-write confirmation: %A" other)
 
 
 [<Test>]
-let v2TaskSetupAndInboxRefuseUnconfiguredCheckout () =
+let ledgerTaskSetupAndInboxRefuseUnconfiguredCheckout () =
     let root, project = GitCommandTests.createTempProject ()
     try
         let context = GitCommandTests.TestContext root
         GitCommandTests.initRepo context
-        let inbox : V2TaskReadCommand = { ProjectName = "Project1"; AgentId = "Worker"; Action = "AgentInbox"; TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L; Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null }
-        match Client.V2ReviewApi.V2TaskApi.read inbox context with
+        let inbox : TaskReadCommand = { ProjectName = "Project1"; AgentId = "Worker"; Action = "AgentInbox"; TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L; Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null }
+        match Client.OrchestrationApi.TaskApi.read inbox context with
         | Error(Client.ValidationError message) ->
-            Assert.That(message, Does.Contain("V2 ledger disabled"))
-        | other -> Assert.Fail(sprintf "Expected unconfigured V2 inbox to fail: %A" other)
-        let mutation : V2TaskWriteCommand =
+            Assert.That(message, Does.Contain(" ledger disabled"))
+        | other -> Assert.Fail(sprintf "Expected unconfigured  inbox to fail: %A" other)
+        let mutation : TaskWriteCommand =
             { ProjectName = "Project1"
               Action = "CreateTask"
               OperationId = Guid.NewGuid().ToString("D")
@@ -125,23 +125,23 @@ let v2TaskSetupAndInboxRefuseUnconfiguredCheckout () =
               TargetRef = ""
               SourceRef = ""; AllowDetached = false; AllowUncommitted = false
               DecisionSequence = 0L; Evidence = ""; SessionId = "" }
-        match Client.V2ReviewApi.V2TaskApi.write mutation context with
+        match Client.OrchestrationApi.TaskApi.write mutation context with
         | Error(Client.ValidationError message) ->
-            Assert.That(message, Does.Contain("V2 ledger disabled"))
-        | other -> Assert.Fail(sprintf "Expected unconfigured V2 task write to fail: %A" other)
-        Assert.That(File.Exists(Client.V2ReviewApi.ReviewV2Binding.pathForRoot project), Is.False)
+            Assert.That(message, Does.Contain(" ledger disabled"))
+        | other -> Assert.Fail(sprintf "Expected unconfigured  task write to fail: %A" other)
+        Assert.That(File.Exists(Client.OrchestrationApi.LedgerBindingConfig.pathForRoot project), Is.False)
         Assert.That(GitCommandTests.gitOutput context [ "status"; "--porcelain" ], Is.Empty)
     finally Directory.Delete(root, true)
 
 [<Test>]
-let v2TaskMutationsRequireGitWritePermission () =
+let ledgerTaskMutationsRequireGitWritePermission () =
     Client.PermissionPolicy.clearGrants()
-    let inbox = V2TaskReadCommand { ProjectName = "Project1"; AgentId = "Worker"; Action = "AgentInbox"; TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L; Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null }
+    let inbox = TaskReadCommand { ProjectName = "Project1"; AgentId = "Worker"; Action = "AgentInbox"; TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L; Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null }
     match Client.PermissionPolicy.evaluate inbox with
     | Ok () -> ()
     | other -> Assert.Fail(sprintf "Inbox should be read-only: %A" other)
     let write =
-        V2TaskWriteCommand
+        TaskWriteCommand
             { ProjectName = "Project1"; Action = "CreateTask"
               OperationId = Guid.NewGuid().ToString("D"); TaskId = "100"
               AttemptId = ""; ActorId = "Orchestrator"; OwnerId = ""
@@ -158,10 +158,10 @@ let v2TaskMutationsRequireGitWritePermission () =
 
 
 [<Test>]
-let v2OperationStatusUsesReadOnlyTypedLedgerCommand () =
+let ledgerOperationStatusUsesReadOnlyTypedLedgerCommand () =
     Client.PermissionPolicy.clearGrants ()
     let read =
-        V2LedgerReadCommand
+        LedgerReadCommand
             { ProjectName = "Project1"
               Action = "GetOperationStatus"
               OperationId = Guid.NewGuid().ToString("D") }
@@ -172,18 +172,18 @@ let v2OperationStatusUsesReadOnlyTypedLedgerCommand () =
     try
         let context = GitCommandTests.TestContext root
         GitCommandTests.initRepo context
-        match Client.V2ReviewApi.V2LedgerApi.read
+        match Client.OrchestrationApi.LedgerApi.read
                 { ProjectName = "Project1"; Action = "GetOperationStatus"
                   OperationId = Guid.NewGuid().ToString("D") } context with
         | Error(Client.ValidationError message) ->
-            Assert.That(message, Does.Contain("V2 ledger disabled"))
+            Assert.That(message, Does.Contain(" ledger disabled"))
         | other -> Assert.Fail(sprintf "Unbound operation lookup must fail closed: %A" other)
-        Assert.That(File.Exists(Client.V2ReviewApi.ReviewV2Binding.pathForRoot project), Is.False)
+        Assert.That(File.Exists(Client.OrchestrationApi.LedgerBindingConfig.pathForRoot project), Is.False)
     finally Directory.Delete(root, true)
 
 
 [<Test>]
-let v2LedgerFailuresRetainTypedCodesOverWire () =
+let ledgerFailuresRetainTypedCodesOverWire () =
     let cases : (Client.LedgerStore.LedgerFailure * string) list =
         [ Client.LedgerStore.LedgerContended, "LedgerContended"
           Client.LedgerStore.OperationIdReused, "OperationIdReused"
@@ -194,10 +194,20 @@ let v2LedgerFailuresRetainTypedCodesOverWire () =
           Client.LedgerStore.ReviewAlreadyClaimed "frozen", "ReviewAlreadyClaimed" ]
     for failure, expected in cases do
         match failure
-              |> Client.V2ReviewApi.V2LedgerErrors.toEffect
+              |> Client.OrchestrationApi.LedgerErrors.toEffect
               |> Client.Effect.EffectError.toAgentError with
-        | Common.AgentError.V2LedgerFailure error ->
+        | Common.AgentError.LedgerFailure error ->
             Assert.That(error.Code, Is.EqualTo(expected))
             Assert.That(error.Message, Is.Not.Empty)
         | other ->
-            Assert.Fail(sprintf "Expected typed V2 failure, got: %A" other)
+            Assert.Fail(sprintf "Expected typed  failure, got: %A" other)
+
+
+[<Test>]
+let historicalPendingJournalKindsRemainRecognizedAfterRenaming () =
+    let normalize = Client.OrchestrationApi.PendingIntentJournal.normalizeCommandType
+    Assert.That(normalize "V2TaskWrite", Is.EqualTo("TaskWrite"))
+    Assert.That(normalize "V2ReviewWrite", Is.EqualTo("ReviewWrite"))
+    Assert.That(normalize "V2LedgerWrite", Is.EqualTo("LedgerWrite"))
+    Assert.That(normalize "TaskWrite", Is.EqualTo("TaskWrite"))
+    Assert.That(normalize "Other", Is.EqualTo("Other"))

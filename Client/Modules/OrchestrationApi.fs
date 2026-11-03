@@ -1,4 +1,4 @@
-module Client.V2ReviewApi
+module Client.OrchestrationApi
 
 open System
 open System.IO
@@ -11,7 +11,7 @@ open Client.IO
 open Client.Effect
 
 [<CLIMutable>]
-type ReviewV2OptIn =
+type LedgerTrustBinding =
     { SchemaVersion: int
       Enabled: bool
       ProjectRoot: string
@@ -23,7 +23,7 @@ type ReviewV2OptIn =
       ApprovedPushUrl: string
       HighestTrustedHead: string }
 
-module V2LedgerErrors =
+module LedgerErrors =
     let toEffect (failure: LedgerStore.LedgerFailure) =
         let code =
             match failure with
@@ -42,13 +42,13 @@ module V2LedgerErrors =
             | LedgerStore.ReviewAlreadyClaimed _ -> "ReviewAlreadyClaimed"
             | LedgerStore.ReviewVersionConflict _ -> "ReviewVersionConflict"
             | LedgerStore.SourceReviewRefUnavailable _ -> "SourceReviewRefUnavailable"
-        Client.V2LedgerFailureError
+        Client.LedgerFailureError
             { Code = code
               Message = string failure
               OperationId = None
               VerifiedLedgerHead = None }
 
-module ReviewV2Binding =
+module LedgerBindingConfig =
     let pathForRoot (root: string) =
         let baseDirectory = Path.GetDirectoryName(ClientConfig.configPath())
         let hash =
@@ -64,11 +64,11 @@ module ReviewV2Binding =
             let dir = Path.GetDirectoryName path
             Directory.CreateDirectory(dir) |> ignore
             if DirectoryInfo(dir).Attributes.HasFlag(FileAttributes.ReparsePoint) then
-                Error(Client.ValidationError "V2 binding directory must not be a symlink.")
+                Error(Client.ValidationError " binding directory must not be a symlink.")
             else
                 let lockPath = path + ".lock"
                 if File.Exists(lockPath) && File.GetAttributes(lockPath).HasFlag(FileAttributes.ReparsePoint) then
-                    Error(Client.ValidationError "V2 binding lock must not be a symlink.")
+                    Error(Client.ValidationError " binding lock must not be a symlink.")
                 else
                     let rec obtain attempts =
                         try
@@ -82,25 +82,25 @@ module ReviewV2Binding =
                             obtain (attempts + 1)
                     obtain 0
         with ex ->
-            Error(Client.ValidationError $"Cannot lock V2 trust binding: {ex.Message}")
+            Error(Client.ValidationError $"Cannot lock  trust binding: {ex.Message}")
 
     let private readStored (path: string) =
         try
             if not (File.Exists path) then
-                Error(Client.ValidationError "V2 ledger has no approved local binding.")
+                Error(Client.ValidationError " ledger has no approved local binding.")
             elif File.GetAttributes(path).HasFlag(FileAttributes.ReparsePoint)
                  || FileInfo(path).Length > 4096L then
-                Error(Client.ValidationError "V2 binding must be a regular, bounded file.")
+                Error(Client.ValidationError " binding must be a regular, bounded file.")
             else
-                let parsed = JsonSerializer.Deserialize<ReviewV2OptIn>(
+                let parsed = JsonSerializer.Deserialize<LedgerTrustBinding>(
                     File.ReadAllText(path),
                     JsonSerializerOptions(PropertyNameCaseInsensitive = true))
                 if isNull (box parsed) then
-                    Error(Client.ValidationError "Missing V2 binding record.")
+                    Error(Client.ValidationError "Missing  binding record.")
                 else Ok parsed
-        with ex -> Error(Client.ValidationError $"Cannot read V2 binding: {ex.Message}")
+        with ex -> Error(Client.ValidationError $"Cannot read  binding: {ex.Message}")
 
-    let private writeStored (path: string) (stored: ReviewV2OptIn) overwrite =
+    let private writeStored (path: string) (stored: LedgerTrustBinding) overwrite =
         let temp = path + "." + Guid.NewGuid().ToString("N") + ".tmp"
         try
             try
@@ -110,11 +110,11 @@ module ReviewV2Binding =
                 File.Move(temp, path, overwrite)
                 Ok ()
             with ex ->
-                Error(Client.ValidationError $"Cannot persist V2 binding: {ex.Message}")
+                Error(Client.ValidationError $"Cannot persist  binding: {ex.Message}")
         finally
             if File.Exists(temp) then File.Delete(temp)
 
-    let private validStored root (stored: ReviewV2OptIn) : Result<LedgerStore.LedgerBinding, EffectError> =
+    let private validStored root (stored: LedgerTrustBinding) : Result<LedgerStore.LedgerBinding, EffectError> =
         let projectOk, projectId = Guid.TryParse(stored.ProjectId)
         let ledgerOk, ledgerId = Guid.TryParse(stored.LedgerId)
         if stored.SchemaVersion <> 1 || not stored.Enabled
@@ -125,7 +125,7 @@ module ReviewV2Binding =
            || String.IsNullOrWhiteSpace stored.ApprovedFetchUrl
            || String.IsNullOrWhiteSpace stored.ApprovedPushUrl
            || String.IsNullOrWhiteSpace stored.HighestTrustedHead then
-            Error(Client.ValidationError "V2 binding is not explicitly enabled with a pinned root and identity.")
+            Error(Client.ValidationError " binding is not explicitly enabled with a pinned root and identity.")
         else
             Ok
                 { RepositoryPath = root; RemoteName = stored.RemoteName
@@ -142,7 +142,7 @@ module ReviewV2Binding =
         | Ok(FolderPath root) ->
             let path = pathForRoot root
             if not (File.Exists path) then
-                Error(Client.ValidationError $"V2 ledger disabled for this checkout. Approved binding required at {path}. No V1 fallback.")
+                Error(Client.ValidationError $" ledger disabled for this checkout. Approved binding required at {path}. No V1 fallback.")
             else
                 withConfigLock path (fun () ->
                     readStored path
@@ -150,11 +150,11 @@ module ReviewV2Binding =
                         validStored root stored
                         |> Result.bind (fun binding ->
                             LedgerStore.LedgerStore.fetch binding
-                            |> Result.mapError V2LedgerErrors.toEffect
+                            |> Result.mapError LedgerErrors.toEffect
                             |> Result.bind (fun snapshot ->
                                 LedgerStore.LedgerStore.verifyTrustedHead binding
                                     stored.HighestTrustedHead snapshot.Commit
-                                |> Result.mapError V2LedgerErrors.toEffect
+                                |> Result.mapError LedgerErrors.toEffect
                                 |> Result.bind (fun () ->
                                     if stored.HighestTrustedHead = snapshot.Commit then Ok binding
                                     else
@@ -181,7 +181,7 @@ module ReviewV2Binding =
             | Ok(FolderPath root) ->
                 let path = pathForRoot root
                 if File.Exists path then
-                    Error(Client.ValidationError "V2 ledger is already bound. Use explicit rebind.")
+                    Error(Client.ValidationError " ledger is already bound. Use explicit rebind.")
                 else
                     let binding : LedgerStore.LedgerBinding =
                         { RepositoryPath = root; RemoteName = remoteName
@@ -189,11 +189,11 @@ module ReviewV2Binding =
                           ProjectId = projectId; LedgerId = ledgerId; Epoch = epoch }
                     match LedgerStore.LedgerStore.fetch binding with
                     | Error failure ->
-                        Error(V2LedgerErrors.toEffect failure)
+                        Error(LedgerErrors.toEffect failure)
                     | Ok snapshot ->
                         match LedgerStore.LedgerStore.verifyTrustedHead binding expectedTrustedHead snapshot.Commit with
                         | Error failure ->
-                            Error(V2LedgerErrors.toEffect failure)
+                            Error(LedgerErrors.toEffect failure)
                         | Ok () ->
                             let record =
                                 { SchemaVersion = 1; Enabled = true
@@ -205,7 +205,7 @@ module ReviewV2Binding =
                                   HighestTrustedHead = snapshot.Commit }
                             withConfigLock path (fun () ->
                                 if File.Exists path then
-                                    Error(Client.ValidationError "V2 binding was concurrently created; refusing overwrite.")
+                                    Error(Client.ValidationError " binding was concurrently created; refusing overwrite.")
                                 else
                                     writeStored path record false |> Result.map (fun () -> record))
 
@@ -221,7 +221,7 @@ module ReviewV2Binding =
             | Error error -> Error error
             | Ok(FolderPath root) ->
                 if File.Exists(pathForRoot root) then
-                    Error(Client.ValidationError "V2 ledger is already bound; refusing reinitialization.")
+                    Error(Client.ValidationError " ledger is already bound; refusing reinitialization.")
                 else
                     let binding : LedgerStore.LedgerBinding =
                         { RepositoryPath = root; RemoteName = remoteName
@@ -229,7 +229,7 @@ module ReviewV2Binding =
                           ProjectId = projectId; LedgerId = ledgerId; Epoch = epoch }
                     match LedgerStore.LedgerStore.initialize binding true with
                     | Error failure ->
-                        Error(V2LedgerErrors.toEffect failure)
+                        Error(LedgerErrors.toEffect failure)
                     | Ok snapshot ->
                         bindExisting projectName rt projectId ledgerId epoch remoteName
                             approvedFetchUrl approvedPushUrl snapshot.Commit true
@@ -238,20 +238,20 @@ module ReviewV2Binding =
         load projectName rt
         |> Result.bind (fun binding ->
             LedgerStore.LedgerStore.fetch binding
-            |> Result.mapError V2LedgerErrors.toEffect
+            |> Result.mapError LedgerErrors.toEffect
             |> Result.bind (fun snapshot ->
                 LedgerStore.LedgerStore.inspectRemotePolicy binding
-                |> Result.mapError V2LedgerErrors.toEffect
+                |> Result.mapError LedgerErrors.toEffect
                 |> Result.map (fun protection ->
                     {| projectId = binding.ProjectId.ToString("D")
-                       ledgerId = binding.LedgerId.ToString("D")
-                       epoch = binding.Epoch
-                       remoteName = binding.RemoteName
-                       approvedFetchUrl = binding.ApprovedFetchUrl
-                       approvedPushUrl = binding.ApprovedPushUrl
-                       trustedLedgerHead = snapshot.Commit
-                       ledgerSequence = snapshot.Header.NextSequence
-                       remoteProtection = protection |})))
+                      ledgerId = binding.LedgerId.ToString("D")
+                      epoch = binding.Epoch
+                      remoteName = binding.RemoteName
+                      approvedFetchUrl = binding.ApprovedFetchUrl
+                      approvedPushUrl = binding.ApprovedPushUrl
+                      trustedLedgerHead = snapshot.Commit
+                      ledgerSequence = snapshot.Header.NextSequence
+                      remoteProtection = protection |})))
 
     // Rebind only to the same logical ledger/epoch. Deliberate recovery with a
     // new epoch is a separate backed-up restore operation.
@@ -274,24 +274,24 @@ module ReviewV2Binding =
                             |> Result.bind (fun current ->
                                 if current <> old then
                                     Error(Client.ValidationError
-                                        "V2 binding changed while rebinding; reload and retry.")
+                                        " binding changed while rebinding; reload and retry.")
                                 else
                                     let newBinding =
                                         { old with RemoteName = remoteName
                                                    ApprovedFetchUrl = approvedFetchUrl
                                                    ApprovedPushUrl = approvedPushUrl }
                                     LedgerStore.LedgerStore.fetch newBinding
-                                    |> Result.mapError V2LedgerErrors.toEffect
+                                    |> Result.mapError LedgerErrors.toEffect
                                     |> Result.bind (fun snapshot ->
                                         // A caller-supplied anchor cannot replace what this
                                         // checkout already trusted. Both must be ancestors.
                                         LedgerStore.LedgerStore.verifyTrustedHead newBinding
                                             stored.HighestTrustedHead snapshot.Commit
-                                        |> Result.mapError V2LedgerErrors.toEffect
+                                        |> Result.mapError LedgerErrors.toEffect
                                         |> Result.bind (fun () ->
                                             LedgerStore.LedgerStore.verifyTrustedHead newBinding
                                                 expectedTrustedHead snapshot.Commit
-                                            |> Result.mapError V2LedgerErrors.toEffect
+                                            |> Result.mapError LedgerErrors.toEffect
                                             |> Result.bind (fun () ->
                                                 let replacement =
                                                     { stored with RemoteName = remoteName
@@ -309,11 +309,11 @@ module ReviewV2Binding =
                                                     |> Result.map (fun () -> replacement)
                                                 with ex ->
                                                     Error(Client.ValidationError
-                                                        $"V2 rebind backup failed: {ex.Message}")))))))
+                                                        $" rebind backup failed: {ex.Message}")))))))
 
 
 [<CLIMutable>]
-type V2PendingIntent =
+type PendingIntent =
     { SchemaVersion: int
       OperationId: string
       ProjectId: string
@@ -326,13 +326,22 @@ type V2PendingIntent =
 
 // Local crash recovery is an intent journal, not a second ledger writer.
 // The authoritative operation outcome remains on the remote orphan ref.
-module V2PendingIntentJournal =
+module PendingIntentJournal =
+    // Old clients may have unfinished intents carrying the prior wire command names.
+    // Normalize for reconciliation without altering persisted records or their hashes.
+    let normalizeCommandType value =
+        match value with
+        | "V2TaskWrite" -> "TaskWrite"
+        | "V2ReviewWrite" -> "ReviewWrite"
+        | "V2LedgerWrite" -> "LedgerWrite"
+        | other -> other
+
     let private sha (content: string) =
         SHA256.HashData(Encoding.UTF8.GetBytes(content))
         |> Convert.ToHexString
 
     let private journalDirectory root =
-        let bindingPath = ReviewV2Binding.pathForRoot root
+        let bindingPath = LedgerBindingConfig.pathForRoot root
         Path.Combine(Path.GetDirectoryName bindingPath, "pending",
                      Path.GetFileNameWithoutExtension bindingPath)
 
@@ -343,15 +352,15 @@ module V2PendingIntentJournal =
         try
             if File.GetAttributes(file).HasFlag(FileAttributes.ReparsePoint)
                || FileInfo(file).Length > 1024L * 1024L then
-                Error(Client.ValidationError "Unsafe or oversized V2 pending intent.")
+                Error(Client.ValidationError "Unsafe or oversized  pending intent.")
             else
-                let record = JsonSerializer.Deserialize<V2PendingIntent>(File.ReadAllText(file))
+                let record = JsonSerializer.Deserialize<PendingIntent>(File.ReadAllText(file))
                 if isNull (box record) || record.SchemaVersion <> 1
                    || String.IsNullOrWhiteSpace record.OperationId
                    || String.IsNullOrWhiteSpace record.CommandType
                    || String.IsNullOrWhiteSpace record.CommandJson
                    || not (String.Equals(record.CommandSha256, sha record.CommandJson, StringComparison.Ordinal)) then
-                    Error(Client.ValidationError "Invalid local pending V2 operation journal.")
+                    Error(Client.ValidationError "Invalid local pending  operation journal.")
                 else Ok record
         with ex ->
             Error(Client.ValidationError $"Cannot read local pending operation: {ex.Message}")
@@ -368,24 +377,24 @@ module V2PendingIntentJournal =
               CommandJson = commandJson
               CommandSha256 = sha commandJson
               CreatedUtc = DateTimeOffset.UtcNow.ToString("O") }
-        let matches (existing: V2PendingIntent) =
+        let matches (existing: PendingIntent) =
             existing.OperationId = newRecord.OperationId
             && existing.ProjectId = newRecord.ProjectId
             && existing.LedgerId = newRecord.LedgerId
             && existing.Epoch = newRecord.Epoch
-            && existing.CommandType = newRecord.CommandType
+            && normalizeCommandType existing.CommandType = normalizeCommandType newRecord.CommandType
             && existing.CommandSha256 = newRecord.CommandSha256
             && existing.CommandJson = newRecord.CommandJson
         try
             if File.Exists file then
                 readFile file |> Result.bind (fun existing ->
                     if matches existing then Ok ()
-                    else Error(Client.ValidationError "Pending V2 operation UUID reused with changed input."))
+                    else Error(Client.ValidationError "Pending  operation UUID reused with changed input."))
             else
                 let directory = Path.GetDirectoryName file
                 Directory.CreateDirectory(directory) |> ignore
                 if DirectoryInfo(directory).Attributes.HasFlag(FileAttributes.ReparsePoint) then
-                    Error(Client.ValidationError "Pending V2 journal directory must not be a symbolic link.")
+                    Error(Client.ValidationError "Pending  journal directory must not be a symbolic link.")
                 else
                     if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
                         File.SetUnixFileMode(directory,
@@ -399,18 +408,18 @@ module V2PendingIntentJournal =
                         with :? IOException when File.Exists file -> ()
                         readFile file |> Result.bind (fun existing ->
                             if matches existing then Ok ()
-                            else Error(Client.ValidationError "Pending V2 operation UUID reused with changed input."))
+                            else Error(Client.ValidationError "Pending  operation UUID reused with changed input."))
                     finally
                         if File.Exists temp then File.Delete temp
         with ex ->
-            Error(Client.ValidationError $"Cannot persist local pending V2 operation: {ex.Message}")
+            Error(Client.ValidationError $"Cannot persist local pending  operation: {ex.Message}")
 
     let listAtRoot root =
         try
             let directory = journalDirectory root
             if not (Directory.Exists directory) then Ok []
             elif DirectoryInfo(directory).Attributes.HasFlag(FileAttributes.ReparsePoint) then
-                Error(Client.ValidationError "Pending V2 journal directory must not be a symbolic link.")
+                Error(Client.ValidationError "Pending  journal directory must not be a symbolic link.")
             else
                 let files = Directory.GetFiles(directory, "*.json")
                 if files.Length > 1000 then
@@ -429,7 +438,7 @@ module V2PendingIntentJournal =
                         (Ok [])
                     |> Result.map List.rev
         with ex ->
-            Error(Client.ValidationError $"Cannot enumerate pending V2 operations: {ex.Message}")
+            Error(Client.ValidationError $"Cannot enumerate pending  operations: {ex.Message}")
 
     let listForProject projectName rt =
         ProjectPaths.resolveProjectRoot projectName rt
@@ -444,25 +453,25 @@ module V2PendingIntentJournal =
         |> Seq.tryFind (fun prop -> String.Equals(prop.Name, name, StringComparison.OrdinalIgnoreCase))
         |> Option.map (fun prop -> prop.Value.ToString())
 
-    let private operationKind (record: V2PendingIntent) =
+    let private operationKind (record: PendingIntent) =
         use doc = JsonDocument.Parse(record.CommandJson)
         let root = doc.RootElement
         let action = commandProperty root "Action"
-        match record.CommandType, action with
-        | "V2TaskWrite", Some "AcknowledgeFeedback" -> Some "AcknowledgeBranchReview"
-        | "V2TaskWrite", Some action -> Some action
-        | "V2ReviewWrite", Some "PutDocument" -> Some "PutReviewDocument"
-        | "V2ReviewWrite", Some "Submit" -> Some "SubmitBranchReview"
-        | "V2ReviewWrite", Some "Update" -> Some "ReplaceBranchReview"
-        | "V2ReviewWrite", Some "Claim" -> Some "ClaimBranchReview"
-        | "V2ReviewWrite", Some "Decide" -> Some "DecideBranchReview"
-        | "V2ReviewWrite", Some "Withdraw" -> Some "WithdrawBranchReview"
-        | "V2ReviewWrite", Some "Release" -> Some "ReleaseBranchReview"
+        match normalizeCommandType record.CommandType, action with
+        | "TaskWrite", Some "AcknowledgeFeedback" -> Some "AcknowledgeBranchReview"
+        | "TaskWrite", Some action -> Some action
+        | "ReviewWrite", Some "PutDocument" -> Some "PutReviewDocument"
+        | "ReviewWrite", Some "Submit" -> Some "SubmitBranchReview"
+        | "ReviewWrite", Some "Update" -> Some "ReplaceBranchReview"
+        | "ReviewWrite", Some "Claim" -> Some "ClaimBranchReview"
+        | "ReviewWrite", Some "Decide" -> Some "DecideBranchReview"
+        | "ReviewWrite", Some "Withdraw" -> Some "WithdrawBranchReview"
+        | "ReviewWrite", Some "Release" -> Some "ReleaseBranchReview"
 
-        | "V2ReviewWrite", Some "AcknowledgeFeedback" -> Some "AcknowledgeBranchReview"
+        | "ReviewWrite", Some "AcknowledgeFeedback" -> Some "AcknowledgeBranchReview"
         | _ -> None
 
-    let private identityMatches (record: V2PendingIntent) (operation: LedgerStore.LedgerOperation) =
+    let private identityMatches (record: PendingIntent) (operation: LedgerStore.LedgerOperation) =
         try
             use local = JsonDocument.Parse(record.CommandJson)
             use full = JsonDocument.Parse(operation.CanonicalRequestJson)
@@ -481,99 +490,99 @@ module V2PendingIntentJournal =
                 let reviewer = review @ [ "ActorId", "reviewerId"
                                           "ExpectedVersion", "expectedVersion" ]
 
-                match record.CommandType, operation.Type with
-                | "V2TaskWrite", "CreateTask" ->
+                match normalizeCommandType record.CommandType, operation.Type with
+                | "TaskWrite", "CreateTask" ->
                     common @ [ "Title", "title"; "Html", "specSha256" ]
-                | "V2TaskWrite", "ReviseTaskSpec" ->
+                | "TaskWrite", "ReviseTaskSpec" ->
                     common @ [ "Title", "title"; "Html", "specSha256"
                                "ExpectedVersion", "expectedTaskVersion" ]
-                | "V2TaskWrite", "ReviseTaskSpecPinned" ->
+                | "TaskWrite", "ReviseTaskSpecPinned" ->
                     common @ [ "Title", "title"; "Html", "specSha256"
                                "ExpectedVersion", "expectedTaskVersion"; "BaseOid", "expectedSpecBlobOid" ]
-                | "V2TaskWrite", "ImportTaskSpec" ->
+                | "TaskWrite", "ImportTaskSpec" ->
                     common @ [ "ExpectedVersion", "expectedTaskVersion"; "BaseOid", "expectedSpecBlobOid"
                                "TargetRef", "expectedSourceBlobOidInput"; "SourceRef", "sourceRelativePath"
                                "Title", "title" ]
-                | "V2TaskWrite", "AdoptTaskSpec" ->
+                | "TaskWrite", "AdoptTaskSpec" ->
                     attempt @ [ "ExpectedTaskVersion", "expectedTaskVersion"
                                 "BaseOid", "expectedCurrentSpecOid"; "Summary", "instructions" ]
-                | "V2TaskWrite", "MigrateOrthogonalAgentState" ->
+                | "TaskWrite", "MigrateOrthogonalAgentState" ->
                     common @ [ "BaseOid", "expectedLedgerHead" ]
-                | "V2TaskWrite", "RegisterAgent" -> [ "ActorId", "agentId" ]
-                | "V2TaskWrite", "AssignTask" ->
+                | "TaskWrite", "RegisterAgent" -> [ "ActorId", "agentId" ]
+                | "TaskWrite", "AssignTask" ->
                     common @ [ "AttemptId", "attemptId"; "OwnerId", "ownerId" ]
-                | "V2TaskWrite", "AcknowledgeAssignment" ->
+                | "TaskWrite", "AcknowledgeAssignment" ->
                     owner @ [ "ExpectedVersion", "expectedVersion"; "AssignmentGeneration", "generation" ]
-                | "V2TaskWrite", "ReissueAssignment" ->
+                | "TaskWrite", "ReissueAssignment" ->
                     owner @ [ "ExpectedVersion", "expectedAttemptVersion"
                               "ExpectedAgentVersion", "expectedAgentVersion"
                               "AssignmentGeneration", "generation"
                               "Summary", "instructions"; "Html", "specSha256" ]
-                | "V2TaskWrite", "BeginAttempt" ->
+                | "TaskWrite", "BeginAttempt" ->
                     owner @ [ "ExpectedVersion", "expectedVersion"
                               "AssignmentGeneration", "generation" ]
-                | "V2TaskWrite", "BindReviewBase" ->
+                | "TaskWrite", "BindReviewBase" ->
                     owner @ [ "ExpectedVersion", "expectedVersion"
                               "AssignmentGeneration", "generation"
                               "BaseOid", "baseOid"; "TargetRef", "targetRef" ]
-                | "V2TaskWrite", "BindAttemptSource" ->
+                | "TaskWrite", "BindAttemptSource" ->
                     owner @ [ "ExpectedVersion", "expectedVersion"
                               "AssignmentGeneration", "generation"
                               "BaseOid", "baseOid"; "TargetRef", "targetRef"
                               "SourceRef", "sourceRef"; "AllowDetached", "allowDetached"
                               "AllowUncommitted", "allowUncommitted" ]
-                | "V2TaskWrite", "RebindAttemptSource" ->
+                | "TaskWrite", "RebindAttemptSource" ->
                     owner @ [ "ExpectedVersion", "expectedVersion"
                               "AssignmentGeneration", "generation"
                               "SourceRef", "sourceRef" ]
-                | "V2TaskWrite", "CheckpointAttempt" ->
+                | "TaskWrite", "CheckpointAttempt" ->
                     attempt @ [ "Summary", "summary"; "NextAction", "nextAction"
                                 "BaseOid", "sourceCommit"; "Evidence", "evidence" ]
-                | "V2TaskWrite", "YieldAgent" ->
+                | "TaskWrite", "YieldAgent" ->
                     attempt @ [ "Summary", "summary"; "NextAction", "nextAction" ]
-                | "V2TaskWrite", "ResumeAgent" -> attempt
-                | "V2TaskWrite", "CompleteAgentWork" ->
+                | "TaskWrite", "ResumeAgent" -> attempt
+                | "TaskWrite", "CompleteAgentWork" ->
                     attempt @ [ "Summary", "summary" ]
-                | "V2TaskWrite", "ParkAgent" ->
+                | "TaskWrite", "ParkAgent" ->
                     [ "ActorId", "agentId"; "ExpectedAgentVersion", "expectedAgentVersion"
                       "Reason", "reason" ]
-                | "V2TaskWrite", "ReissueQueuedAttempt"
-                | "V2TaskWrite", "RecoverAgentAssignment" ->
+                | "TaskWrite", "ReissueQueuedAttempt"
+                | "TaskWrite", "RecoverAgentAssignment" ->
                     attempt @ [ "Reason", "reason" ]
-                | "V2TaskWrite", ("ParkAttempt" | "BlockAttempt" | "ResumeAttempt"
+                | "TaskWrite", ("ParkAttempt" | "BlockAttempt" | "ResumeAttempt"
                                    | "AbandonAttempt" | "CancelTask") ->
                     attempt @ [ "ExpectedTaskVersion", "expectedTaskVersion";
                                 "Reason", "reason" ]
-                | "V2TaskWrite", "CancelOpenTask" ->
+                | "TaskWrite", "CancelOpenTask" ->
                     common @ [ "ExpectedTaskVersion", "expectedTaskVersion"; "Reason", "reason" ]
-                | "V2TaskWrite", "TransferOwner" ->
+                | "TaskWrite", "TransferOwner" ->
                     attempt @ [ "ExpectedTaskVersion", "expectedTaskVersion";
                                 "AttemptId", "newAttemptId"; "OwnerId", "newOwner"; "Reason", "reason" ]
-                | "V2TaskWrite", "CloseTask" ->
+                | "TaskWrite", "CloseTask" ->
                     common @ [ "ExpectedTaskVersion", "expectedTaskVersion" ]
-                | "V2TaskWrite", "ReopenTask" ->
+                | "TaskWrite", "ReopenTask" ->
                     common @ [ "ExpectedTaskVersion", "expectedTaskVersion"; "Reason", "reason" ]
-                | "V2TaskWrite", "AcknowledgeReviewFeedback" ->
+                | "TaskWrite", "AcknowledgeReviewFeedback" ->
                     owner @ [ "DecisionSequence", "decisionSequence" ]
-                | "V2ReviewWrite", "PutReviewDocument" ->
+                | "ReviewWrite", "PutReviewDocument" ->
                     common @ [ "RequestId", "requestId"; "ActorId", "actorId"
                                "DocumentPath", "documentPath"; "Content", "contentSha256"
                                "ExpectedBlobOid", "expectedBlobOid" ]
-                | "V2ReviewWrite", "SubmitBranchReview" ->
+                | "ReviewWrite", "SubmitBranchReview" ->
                     common @ [ "RequestId", "reviewId"; "ActorId", "ownerId"
                                "SourceRef", "sourceRef"; "HeadOid", "sourceHead"
                                "TargetRef", "targetRef"; "Summary", "summary"; "Kind", "kind" ]
-                | "V2ReviewWrite", "ReplaceBranchReview" ->
+                | "ReviewWrite", "ReplaceBranchReview" ->
                     common @ [ "RequestId", "reviewId"; "ActorId", "requesterId"
                                "ExpectedVersion", "expectedVersion"; "SourceRef", "sourceRef"
                                "HeadOid", "sourceHead"; "Summary", "summary" ]
-                | "V2ReviewWrite", "ClaimBranchReview" ->
+                | "ReviewWrite", "ClaimBranchReview" ->
                     common @ [ "RequestId", "reviewId"; "ActorId", "reviewerId"
                                "ExpectedVersion", "expectedVersion" ]
-                | "V2ReviewWrite", "DecideBranchReview" ->
+                | "ReviewWrite", "DecideBranchReview" ->
                     common @ [ "RequestId", "reviewId"; "ActorId", "reviewerId"
                                "ExpectedVersion", "expectedVersion"; "Verdict", "status" ]
-                | "V2ReviewWrite", ("WithdrawBranchReview" | "ReleaseBranchReview") ->
+                | "ReviewWrite", ("WithdrawBranchReview" | "ReleaseBranchReview") ->
                     common @ [ "RequestId", "reviewId"; "ActorId", "actorId"
                                "ExpectedVersion", "expectedVersion" ]
                 | _ -> []
@@ -614,7 +623,7 @@ module V2PendingIntentJournal =
             && List.forall equalField pairs
         with _ -> false
 
-    let private checkBinding (binding: LedgerStore.LedgerBinding) (record: V2PendingIntent) =
+    let private checkBinding (binding: LedgerStore.LedgerBinding) (record: PendingIntent) =
         record.ProjectId = binding.ProjectId.ToString("D")
         && record.LedgerId = binding.LedgerId.ToString("D")
         && record.Epoch = binding.Epoch
@@ -623,7 +632,7 @@ module V2PendingIntentJournal =
         listAtRoot binding.RepositoryPath
         |> Result.bind (fun records ->
             LedgerStore.LedgerStore.fetch binding
-            |> Result.mapError V2LedgerErrors.toEffect
+            |> Result.mapError LedgerErrors.toEffect
             |> Result.bind (fun snapshot ->
                 let inspection record =
                     if not (checkBinding binding record) then
@@ -636,7 +645,7 @@ module V2PendingIntentJournal =
                         match Guid.TryParse record.OperationId with
                         | true, id ->
                             LedgerStore.LedgerStore.getOperationAt binding snapshot id
-                            |> Result.mapError V2LedgerErrors.toEffect
+                            |> Result.mapError LedgerErrors.toEffect
                             |> Result.map (fun operation ->
                                 {| operationId = record.OperationId
                                    disposition =
@@ -671,7 +680,7 @@ module V2PendingIntentJournal =
                     // Explicit acknowledgments may be retried after deletion.
                     // Require the same exact remote operation proof again.
                     LedgerStore.LedgerStore.getOperationStatus binding operationId
-                    |> Result.mapError V2LedgerErrors.toEffect
+                    |> Result.mapError LedgerErrors.toEffect
                     |> Result.bind (fun (snapshot, remote) ->
                         match remote with
                         | Some applied when applied.RequestHash = expectedRequestHash ->
@@ -687,7 +696,7 @@ module V2PendingIntentJournal =
                     Error(Client.ValidationError "Pending intent belongs to another ledger identity.")
                 | Some entry ->
                     LedgerStore.LedgerStore.getOperationStatus binding operationId
-                    |> Result.mapError V2LedgerErrors.toEffect
+                    |> Result.mapError LedgerErrors.toEffect
                     |> Result.bind (fun (snapshot, remote) ->
                         match remote with
                         | Some applied when applied.RequestHash = expectedRequestHash
@@ -720,9 +729,9 @@ module V2PendingIntentJournal =
         |> Result.bind (fun () ->
             let outcome = apply ()
             match outcome with
-            | Error(Client.V2LedgerFailureError failure) ->
+            | Error(Client.LedgerFailureError failure) ->
                 // The caller-owned UUID remains recoverable even after a harness reset.
-                Error(Client.V2LedgerFailureError
+                Error(Client.LedgerFailureError
                     { failure with OperationId = Some(operationId.ToString("D")) })
             | Error _ -> outcome // Preserve exact intent for recovery after lost response.
             | Ok _ ->
@@ -741,7 +750,7 @@ module V2PendingIntentJournal =
                            (apply: unit -> Result<LedgerStore.LedgerWrite, EffectError>) =
         execute binding operationId commandType command (fun () ->
             match apply () with
-            | Error(Client.V2LedgerFailureError issue) when issue.Code = "OutcomeUnknown" ->
+            | Error(Client.LedgerFailureError issue) when issue.Code = "OutcomeUnknown" ->
                 match LedgerStore.LedgerStore.getOperationStatus binding operationId with
                 | Ok(snapshot, Some applied) ->
                     let originalJson = JsonSerializer.Serialize(command)
@@ -760,16 +769,16 @@ module V2PendingIntentJournal =
                             { Operation = applied; CurrentHead = snapshot.Commit; AlreadyApplied = true }
                         Ok verified
                     else
-                        Error(Client.V2LedgerFailureError
+                        Error(Client.LedgerFailureError
                             { issue with VerifiedLedgerHead = Some snapshot.Commit })
                 | Ok(snapshot, None) ->
-                    Error(Client.V2LedgerFailureError
+                    Error(Client.LedgerFailureError
                         { issue with VerifiedLedgerHead = Some snapshot.Commit })
                 | Error _ ->
-                    Error(Client.V2LedgerFailureError issue)
+                    Error(Client.LedgerFailureError issue)
             | other -> other)
 
-module V2OperationResponse =
+module OperationResponse =
     let present (write: LedgerStore.LedgerWrite) =
         use document = JsonDocument.Parse(write.Operation.OriginalResultJson)
         box {| operation = write.Operation
@@ -777,40 +786,40 @@ module V2OperationResponse =
                alreadyApplied = write.AlreadyApplied
                originalResult = document.RootElement.Clone() |}
 
-module V2LedgerApi =
+module LedgerApi =
     let private id label (raw: string) =
         match Guid.TryParse raw with
         | true, parsed when parsed <> Guid.Empty -> Ok parsed
         | _ -> Error(Client.ValidationError $"Valid {label} UUID required.")
 
-    let read (cmd: V2LedgerReadCommand) rt =
+    let read (cmd: LedgerReadCommand) rt =
         match cmd.Action with
-        | "Health" -> ReviewV2Binding.health cmd.ProjectName rt |> Result.map box
+        | "Health" -> LedgerBindingConfig.health cmd.ProjectName rt |> Result.map box
         | "PendingOperations" ->
-            V2PendingIntentJournal.listForProject cmd.ProjectName rt
+            PendingIntentJournal.listForProject cmd.ProjectName rt
             |> Result.map (fun records ->
                 records
                 |> List.map (fun record ->
                     {| operationId = record.OperationId
-                       projectId = record.ProjectId
-                       ledgerId = record.LedgerId
-                       epoch = record.Epoch
-                       commandType = record.CommandType
-                       commandSha256 = record.CommandSha256
-                       originalCommandJson = record.CommandJson
-                       createdUtc = record.CreatedUtc |})
+                      projectId = record.ProjectId
+                      ledgerId = record.LedgerId
+                      epoch = record.Epoch
+                      commandType = record.CommandType
+                      commandSha256 = record.CommandSha256
+                      originalCommandJson = record.CommandJson
+                      createdUtc = record.CreatedUtc |})
                 |> box)
         | "ReconcilePendingOperations" ->
-            ReviewV2Binding.load cmd.ProjectName rt
-            |> Result.bind V2PendingIntentJournal.reconcile
+            LedgerBindingConfig.load cmd.ProjectName rt
+            |> Result.bind PendingIntentJournal.reconcile
             |> Result.map box
         | "GetOperationStatus" ->
             id "operation" cmd.OperationId
             |> Result.bind (fun operationId ->
-                ReviewV2Binding.load cmd.ProjectName rt
+                LedgerBindingConfig.load cmd.ProjectName rt
                 |> Result.bind (fun binding ->
                     LedgerStore.LedgerStore.getOperationStatus binding operationId
-                    |> Result.mapError V2LedgerErrors.toEffect
+                    |> Result.mapError LedgerErrors.toEffect
                     |> Result.bind (fun (snapshot, operation) ->
                         match operation with
                         | None ->
@@ -822,7 +831,7 @@ module V2LedgerApi =
                                       operation = operation |})
                         | Some applied ->
                             LedgerStore.LedgerStore.getOperationOriginAt binding snapshot applied
-                            |> Result.mapError V2LedgerErrors.toEffect
+                            |> Result.mapError LedgerErrors.toEffect
                             |> Result.map (fun origin ->
                                 use result = JsonDocument.Parse(applied.OriginalResultJson)
                                 box {| snapshotCommit = snapshot.Commit
@@ -831,15 +840,15 @@ module V2LedgerApi =
                                        originatingCommit = Some origin
                                        originalResult = Some(result.RootElement.Clone())
                                        operation = operation |}))))
-        | _ -> Error(Client.ValidationError "Unsupported V2 ledger read action.")
+        | _ -> Error(Client.ValidationError "Unsupported  ledger read action.")
 
-    let write (cmd: V2LedgerWriteCommand) rt =
+    let write (cmd: LedgerWriteCommand) rt =
         id "operation" cmd.OperationId
         |> Result.bind (fun operationId ->
             if cmd.Action = "AcknowledgePendingOperation" then
-                ReviewV2Binding.load cmd.ProjectName rt
+                LedgerBindingConfig.load cmd.ProjectName rt
                 |> Result.bind (fun binding ->
-                    V2PendingIntentJournal.acknowledge binding operationId
+                    PendingIntentJournal.acknowledge binding operationId
                         cmd.ExpectedRequestHash |> Result.map box)
             else
                 let bindInputs () =
@@ -852,35 +861,35 @@ module V2LedgerApi =
                     | "BindExistingLedger" ->
                         bindInputs ()
                         |> Result.bind (fun (projectId, ledgerId) ->
-                            ReviewV2Binding.bindExisting cmd.ProjectName rt projectId ledgerId
+                            LedgerBindingConfig.bindExisting cmd.ProjectName rt projectId ledgerId
                                 cmd.Epoch cmd.RemoteName cmd.ApprovedFetchUrl cmd.ApprovedPushUrl
                                 cmd.ExpectedTrustedHead cmd.AcknowledgeVisibility)
                     | "InitializeLedger" ->
                         bindInputs ()
                         |> Result.bind (fun (projectId, ledgerId) ->
-                            ReviewV2Binding.initializeNew cmd.ProjectName rt projectId ledgerId
+                            LedgerBindingConfig.initializeNew cmd.ProjectName rt projectId ledgerId
                                 cmd.Epoch cmd.RemoteName cmd.ApprovedFetchUrl cmd.ApprovedPushUrl
                                 cmd.AcknowledgeVisibility)
                     | "RebindLedgerRemote" ->
-                        ReviewV2Binding.rebindRemote cmd.ProjectName rt
+                        LedgerBindingConfig.rebindRemote cmd.ProjectName rt
                             cmd.RemoteName cmd.ApprovedFetchUrl cmd.ApprovedPushUrl
                             cmd.ExpectedTrustedHead cmd.AcknowledgeVisibility
-                    | _ -> Error(Client.ValidationError "Unsupported V2 ledger setup action.")
+                    | _ -> Error(Client.ValidationError "Unsupported  ledger setup action.")
                 result |> Result.map (fun binding ->
                     box {| projectId = binding.ProjectId; ledgerId = binding.LedgerId
                            epoch = binding.Epoch; remoteName = binding.RemoteName
                            trustedLedgerHead = binding.HighestTrustedHead |}))
 
-module V2ReviewApi =
+module OrchestrationApi =
     let private mapError (result: Result<'a, LedgerStore.LedgerFailure>) : Result<'a, EffectError> =
-        result |> Result.mapError V2LedgerErrors.toEffect
+        result |> Result.mapError LedgerErrors.toEffect
     let private parseId label (raw: string) =
         match Guid.TryParse raw with
         | true, value when value <> Guid.Empty -> Ok value
         | _ -> Error(Client.ValidationError $"Invalid {label}: caller-stable UUID required.")
 
-    let read (cmd: V2ReviewReadCommand) rt =
-        ReviewV2Binding.load cmd.ProjectName rt
+    let read (cmd: ReviewReadCommand) rt =
+        LedgerBindingConfig.load cmd.ProjectName rt
         |> Result.bind (fun binding ->
             match cmd.Action with
             | "ListProjectTasks" ->
@@ -916,16 +925,16 @@ module V2ReviewApi =
                 |> mapError
                 |> Result.map (fun (snapshot, queue) ->
                     box {| snapshotCommit = snapshot; reviews = queue |})
-            | _ -> Error(Client.ValidationError "Unsupported V2 read operation."))
+            | _ -> Error(Client.ValidationError "Unsupported  read operation."))
 
-    let write (cmd: V2ReviewWriteCommand) rt =
-        ReviewV2Binding.load cmd.ProjectName rt
+    let write (cmd: ReviewWriteCommand) rt =
+        LedgerBindingConfig.load cmd.ProjectName rt
         |> Result.bind (fun binding ->
             parseId "operationId" cmd.OperationId
             |> Result.bind (fun operationId ->
                 let id () = parseId "requestId" cmd.RequestId
                 let result =
-                    V2PendingIntentJournal.executeLedgerWrite binding operationId "V2ReviewWrite" cmd (fun () ->
+                    PendingIntentJournal.executeLedgerWrite binding operationId "ReviewWrite" cmd (fun () ->
                         match cmd.Action with
                         | "PutDocument" ->
                             id () |> Result.bind (fun reviewId ->
@@ -956,7 +965,7 @@ module V2ReviewApi =
                                         else ReviewWorkflow.RequestChanges
                                     ReviewWorkflow.ReviewWorkflow.decideBranchReview binding operationId
                                         cmd.TaskId reviewId cmd.ActorId cmd.ExpectedVersion decision |> mapError
-                                | _ -> Error(Client.ValidationError "Invalid V2 review verdict."))
+                                | _ -> Error(Client.ValidationError "Invalid  review verdict."))
                         | "Release" ->
                             id () |> Result.bind (fun reviewId ->
                                 ReviewWorkflow.ReviewWorkflow.releaseBranchReview binding operationId
@@ -968,24 +977,24 @@ module V2ReviewApi =
                         | "AcknowledgeFeedback" ->
                             ReviewWorkflow.ReviewWorkflow.acknowledgeBranchReview binding operationId
                                 cmd.TaskId cmd.ActorId (int64 cmd.ExpectedVersion) |> mapError
-                        | _ -> Error(Client.ValidationError "Unsupported V2 write operation.")
+                        | _ -> Error(Client.ValidationError "Unsupported  write operation.")
                     )
-                result |> Result.map V2OperationResponse.present))
+                result |> Result.map OperationResponse.present))
 
 
 // Separate typed setup/assignment contract. The review request API never has
 // to reinterpret a request ID as a task, attempt, or agent identifier.
-module V2TaskApi =
+module TaskApi =
     let private mapError (result: Result<'a, LedgerStore.LedgerFailure>) : Result<'a, EffectError> =
-        result |> Result.mapError V2LedgerErrors.toEffect
+        result |> Result.mapError LedgerErrors.toEffect
 
     let private guid label (text: string) =
         match Guid.TryParse text with
         | true, id when id <> Guid.Empty -> Ok id
         | _ -> Error(Client.ValidationError $"Invalid {label}: a caller-stable UUID is required.")
 
-    let read (cmd: V2TaskReadCommand) rt =
-        ReviewV2Binding.load cmd.ProjectName rt
+    let read (cmd: TaskReadCommand) rt =
+        LedgerBindingConfig.load cmd.ProjectName rt
         |> Result.bind (fun binding ->
             match cmd.Action with
             | "GetSpecPage" ->
@@ -1012,16 +1021,16 @@ module V2TaskApi =
             | "InspectAttemptSource" ->
                 ReviewWorkflow.ReviewWorkflow.inspectAttemptSource binding cmd.TaskId
                 |> mapError |> Result.map box
-            | _ -> Error(Client.ValidationError "Unsupported V2 task read operation."))
+            | _ -> Error(Client.ValidationError "Unsupported  task read operation."))
 
-    let write (cmd: V2TaskWriteCommand) rt =
-        ReviewV2Binding.load cmd.ProjectName rt
+    let write (cmd: TaskWriteCommand) rt =
+        LedgerBindingConfig.load cmd.ProjectName rt
         |> Result.bind (fun binding ->
             guid "operationId" cmd.OperationId
             |> Result.bind (fun operationId ->
                 if cmd.Action = "ExportTaskSpec" then
                     // Filesystem mutation must use the write permission route,
-                    // not the V2TaskRead protocol or its read-only capability.
+                    // not the TaskRead protocol or its read-only capability.
                     ReviewWorkflow.ReviewWorkflow.exportTaskSpecWithId binding operationId cmd.TaskId
                         cmd.SourceRef cmd.BaseOid |> mapError |> Result.map box
                 else
@@ -1038,7 +1047,7 @@ module V2TaskApi =
                         if cmd.Action <> "ResumeAgent" then Ok false
                         else
                             LedgerStore.LedgerStore.getOperationStatus binding operationId
-                            |> Result.mapError V2LedgerErrors.toEffect
+                            |> Result.mapError LedgerErrors.toEffect
                             |> Result.map (fun (_, operation) -> operation.IsSome)
                     let sessionStatus =
                         existingResumeOperation
@@ -1053,7 +1062,7 @@ module V2TaskApi =
                     | Ok(Some status) -> Ok(box status)
                     | Ok None ->
                         let result =
-                            V2PendingIntentJournal.executeLedgerWrite binding operationId "V2TaskWrite" journalCommand (fun () ->
+                            PendingIntentJournal.executeLedgerWrite binding operationId "TaskWrite" journalCommand (fun () ->
                                 match cmd.Action with
                                 | "SubmitIntegration" ->
                                     guid "submissionId" cmd.AttemptId
@@ -1184,6 +1193,6 @@ module V2TaskApi =
                                     ReviewWorkflow.ReviewWorkflow.acknowledgeBranchReview binding operationId
                                         cmd.TaskId cmd.ActorId cmd.DecisionSequence
                                     |> mapError
-                                | _ -> Error(Client.ValidationError "Unsupported V2 task operation.")
+                                | _ -> Error(Client.ValidationError "Unsupported  task operation.")
                             )
-                        result |> Result.map V2OperationResponse.present))
+                        result |> Result.map OperationResponse.present))

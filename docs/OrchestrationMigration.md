@@ -1,6 +1,10 @@
 # Migrating to Git-backed Jarvis orchestration
 
-**Applies to:** the orphan-branch coordination implementation (task/review capability protocol 3.45). The source of truth is [the orchestration V2 architecture](specs/orchestration-v2-architecture.md).
+
+> **Current release note (protocol 3.47):** Internal command types are now `TaskRead`, `TaskWrite`, `LedgerRead`, `LedgerWrite`, `ReviewRead` and `ReviewWrite`; the version-prefixed command identifiers are no longer advertised. Public MCP names are unchanged. The historical protocol 3.45/3.46 cutover instructions below document previous migrations, not additional installed APIs. Trust bindings remain in `ledger-v2/` and previously saved pending operation journals remain readable. Upgrade server and client together, after operator approval.
+
+
+**Applies to:** the orphan-branch coordination implementation (task/review capability protocol 3.47). The source of truth is [the canonical orchestration architecture](specs/orchestration-architecture.md).
 
 **Scope:** Move an existing project's *active coordination* from source-branch task files to the Git-backed ledger. This is a **manual, selective cutover**. Updating Jarvis itself does not create a ledger or migrate any tasks.
 
@@ -20,7 +24,7 @@ The orphan branch is never merged into `main` or a source branch, and no source 
 ## 1. Verify the release
 
 1. Confirm the upgraded client is *responding* to `ListProjects`; a green SignalR connection alone is not sufficient.
-2. Check `ListDevices` and `ListCommands`. For this release, the client should report protocol **3.45**, and the deployed server must expose the matching independent task/review tools. The client advertises the internal `V2TaskRead`, `V2TaskWrite`, `V2LedgerRead`, `V2LedgerWrite`, `V2ReviewRead` and `V2ReviewWrite` capabilities. The old `V2IntegrationRead`/`V2IntegrationWrite` channels and the approval-gated integration workflow are retired. Public MCP tool names have no `V2` prefix.
+2. Check `ListDevices` and `ListCommands`. For this release, the client should report protocol **3.47**, and the deployed server must expose the matching independent task/review tools. The current client advertises `TaskRead`, `TaskWrite`, `LedgerRead`, `LedgerWrite`, `ReviewRead` and `ReviewWrite` (the original 3.45 implementation used version-prefixed internal commands). The old `V2IntegrationRead`/`V2IntegrationWrite` channels and the approval-gated integration workflow are retired. Public MCP tool names have no `V2` prefix.
 3. Confirm the old source-branch command handlers are unavailable and that the MCP catalog contains only unprefixed orchestration tools (no duplicate `V2*` aliases). Do not start a migration through an out-of-date client.
 4. Exercise the workflow on a **disposable Git remote** before initializing an important project's real ledger.
 
@@ -30,7 +34,7 @@ A client self-update is not verified until its *new* protocol and a successful c
 
 Protocol 3.46 replaces the stored agent state enum with `currentAssignment`, `execution` and `unassignedDisposition`, and separates attempt progress (`Queued`, `Started`, `Deferred`, `Blocked`, `Finished`, `Abandoned`, `Superseded`) from execution state. `Ready`, `Working`, `NeedsWork` and `Parked` are derived for the UI. This is a **different upgrade** from migrating old source-branch task files into the orphan ledger.
 
-For a project **already using a protocol 3.45 orphan Git ledger**, its v2 agent/attempt records are not silently converted on read. After upgrading the client and server together to 3.46:
+For a project **already using a protocol 3.47 orphan Git ledger**, its v2 agent/attempt records are not silently converted on read. After upgrading the client and server together to 3.46:
 
 1. Inspect the project's existing `LedgerHealth` and any active agents/attempts using the pre-upgrade tools; preserve the Git remote history and plan a brief pause in writes.
 2. Invoke `MigrateOrthogonalAgentState(projectName, expectedLedgerHead, operationId)` with exactly the inspected trusted head and a fresh operation UUID. It converts every v2 agent/attempt record in one verified ledger transaction. It refuses mixed versions, stale heads and ambiguous current ownership. New 3.46 ledgers need **no** conversion.
@@ -54,7 +58,7 @@ For each project to migrate:
    If it exists, **bind** it; do not initialize another one. If Git reports a network/authorization error, resolve that first rather than interpreting the result as an empty branch.
 4. Inventory just the work worth carrying forward: IDs, up-to-date HTML specs, owners, current branches/worktrees/commits, pending reviews and next steps. Look in source-side `docs/tasks/`, Git history and agent checkpoints.
 
-Do **not** migrate every completed, obsolete or cancelled task for the sake of preserving history. Do not delete or silently rewrite the original task files. There is no automated importer, V1/V2 synchronization or compatibility fallback.
+Do **not** migrate every completed, obsolete or cancelled task for the sake of preserving history. Do not delete or silently rewrite the original task files. There is no automated importer, legacy task-state synchronization or compatibility fallback.
 
 ## 3. Initialize the first ledger or bind an existing one
 
@@ -76,7 +80,7 @@ The operation creates the orphan branch, refuses an already-existing ledger ref,
 3. Use `BindExistingLedger` with those IDs, the remote identity, `expectedTrustedHead`, visibility acknowledgment and a new operation UUID.
 4. Check `LedgerHealth(projectName)` on each participating client and verify the same canonical project/ledger/epoch and compatible Git ancestry.
 
-Jarvis stores the binding under the user's client configuration directory in `ledger-v2/`, keyed by the absolute project-root path. Bindings are **per checkout/client configuration**, not tracked source files. A different root or computer may require another explicit bind. A missing binding must cause the V2 tools to fail, never fall back to V1 data.
+Jarvis stores the binding under the user's client configuration directory in `ledger-v2/`, keyed by the absolute project-root path. Bindings are **per checkout/client configuration**, not tracked source files. A different root or computer may require another explicit bind. A missing binding must cause the canonical ledger tools to fail, never fall back to V1 data.
 
 Do **not** manually create or merge the orphan branch by checking it out in a source worktree.
 
@@ -108,7 +112,7 @@ For in-progress legacy work, put the *remaining work and next action* in the can
 
 The review namespace under `tasks/<id>/reviews/` is an indexing convention, not an ownership or lifecycle dependency. The immutable review refs created by the review tools are useful checkpoints that remain reachable across a task-branch rewrite. A missing source ref does not erase persisted review metadata or findings.
 
-There is no `FinalizeReview` operation, no `AcceptedPendingIntegration` queue, and no separate approval-gated `CloseNonSourceTask` route. See the [normative capabilities specification](specs/orchestration-v2-architecture.md).
+There is no `FinalizeReview` operation, no `AcceptedPendingIntegration` queue, and no separate approval-gated `CloseNonSourceTask` route. See the [normative capabilities specification](specs/orchestration-architecture.md).
 
 ## 6. Verify the cutover
 
@@ -142,4 +146,4 @@ Use the unprefixed canonical task/review tools for live writes; do not push hand
 
 A project is migrated when its canonical ledger is bound, its **relevant active tasks** are recreated, agents use the orphan-ledger tools for all new orchestration writes, and participating clients agree on its state. Other projects can migrate independently. Updating the Jarvis client/server by itself does not complete this per-project step.
 
-See the [architecture spec](specs/orchestration-v2-architecture.md). The older [Git-backed tasks guide](GitBackedTasks.md) describes the retired source-branch workflow.
+See the [architecture spec](specs/orchestration-architecture.md). The older [Git-backed tasks guide](GitBackedTasks.md) describes the retired source-branch workflow.

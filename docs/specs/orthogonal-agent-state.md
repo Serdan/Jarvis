@@ -4,7 +4,7 @@
 
 **Scope:** Jarvis Git-backed task/agent ledger, public task commands, inbox/TUI projections, and one-time conversion of existing ledger records.
 
-**Related architecture:** [orchestration-v2-architecture.md](orchestration-v2-architecture.md), especially section 3 and its working-session rules.
+**Related architecture:** [orchestration-architecture.md](orchestration-architecture.md), especially section 3 and its working-session rules.
 
 ## 1. Decision
 

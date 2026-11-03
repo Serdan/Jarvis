@@ -27,7 +27,7 @@ type LedgerStoreTests() =
 
     [<Test>]
     member _.CrossCloneIdempotency() =
-        let root = Path.Combine(Path.GetTempPath(), "jarvis-v2-" + Guid.NewGuid().ToString("N"))
+        let root = Path.Combine(Path.GetTempPath(), "jarvis-ledger-" + Guid.NewGuid().ToString("N"))
         Directory.CreateDirectory(root) |> ignore
         try
             let bare = Path.Combine(root, "remote.git")
@@ -144,7 +144,7 @@ type LedgerStoreTests() =
 
     [<Test>]
     member _.ConcurrentWritersAndRewriteDetection() =
-        let root = Path.Combine(Path.GetTempPath(), "jarvis-v2-" + Guid.NewGuid().ToString("N"))
+        let root = Path.Combine(Path.GetTempPath(), "jarvis-ledger-" + Guid.NewGuid().ToString("N"))
         Directory.CreateDirectory(root) |> ignore
         try
             let bare = Path.Combine(root, "remote.git")
@@ -195,7 +195,7 @@ type LedgerStoreTests() =
 
     [<Test>]
     member _.EightIndependentWritersKeepAllReceiptsAndSourceWorktreesUnchanged() =
-        let root = Path.Combine(Path.GetTempPath(), "jarvis-v2-contention-" + Guid.NewGuid().ToString("N"))
+        let root = Path.Combine(Path.GetTempPath(), "jarvis-ledger-contention-" + Guid.NewGuid().ToString("N"))
         Directory.CreateDirectory(root) |> ignore
         try
             let remote = Path.Combine(root, "remote.git")
@@ -204,7 +204,7 @@ type LedgerStoreTests() =
                 [ for i in 1 .. 8 do
                     let path = Path.Combine(root, $"client{i}")
                     git root [ "clone"; remote; path ] |> ignore
-                    git path [ "config"; "user.name"; "V2 contention fixture" ] |> ignore
+                    git path [ "config"; "user.name"; " contention fixture" ] |> ignore
                     git path [ "config"; "user.email"; "fixture@example.test" ] |> ignore
                     yield path ]
             let origin = clonePaths.Head

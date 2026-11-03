@@ -26,15 +26,15 @@ let private applicableTargets (rt: Runtime) command =
     // Orchestration ledger operations are independent of repository source
     // instructions. In particular, a malformed or long AGENTS.md must never
     // prevent an agent from checkpointing, yielding or acknowledging work.
-    | V2TaskReadCommand _
-    | V2LedgerReadCommand _
-    | V2LedgerWriteCommand _
-    | V2ReviewReadCommand _
-    | V2ReviewWriteCommand _ -> Ok None
+    | TaskReadCommand _
+    | LedgerReadCommand _
+    | LedgerWriteCommand _
+    | ReviewReadCommand _
+    | ReviewWriteCommand _ -> Ok None
     // These actions modify only the independently versioned Git ledger.
     // ExportTaskSpec and ImportTaskSpec touch source-tree files and therefore
     // retain normal source instruction validation.
-    | V2TaskWriteCommand cmd when cmd.Action <> "ExportTaskSpec"
+    | TaskWriteCommand cmd when cmd.Action <> "ExportTaskSpec"
                                   && cmd.Action <> "ImportTaskSpec" -> Ok None
     | ListCommandsCommand
     | ListProjectsCommand

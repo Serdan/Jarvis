@@ -80,7 +80,7 @@ type RemoveWorktreeCommand =
       TargetRef: string option }
 
 
-type V2TaskReadCommand =
+type TaskReadCommand =
     { ProjectName: string
       AgentId: string
       Action: string
@@ -93,7 +93,7 @@ type V2TaskReadCommand =
       AfterOid: string
       RelativePath: string }
 
-type V2TaskWriteCommand =
+type TaskWriteCommand =
     { ProjectName: string
       Action: string
       OperationId: string
@@ -119,12 +119,12 @@ type V2TaskWriteCommand =
       Evidence: string
       SessionId: string }
 
-type V2LedgerReadCommand =
+type LedgerReadCommand =
     { ProjectName: string
       Action: string
       OperationId: string }
 
-type V2LedgerWriteCommand =
+type LedgerWriteCommand =
     { ProjectName: string
       Action: string
       OperationId: string
@@ -138,7 +138,7 @@ type V2LedgerWriteCommand =
       ExpectedRequestHash: string
       AcknowledgeVisibility: bool }
 
-type V2ReviewReadCommand =
+type ReviewReadCommand =
     { ProjectName: string
       Action: string
       TaskId: string
@@ -146,7 +146,7 @@ type V2ReviewReadCommand =
       ReviewerId: string
       DocumentPath: string }
 
-type V2ReviewWriteCommand =
+type ReviewWriteCommand =
     { ProjectName: string
       Action: string
       OperationId: string
@@ -475,7 +475,7 @@ type ConfirmationRequest =
       EstimatedImpact: string
       SupportsDryRun: bool }
 
-type V2LedgerFailureInfo =
+type LedgerFailureInfo =
     { Code: string
       Message: string
       OperationId: string option
@@ -490,7 +490,7 @@ type AgentError =
     | Conflict of string
     | ExecutionFailed of string
     | OutputTruncated of string
-    | V2LedgerFailure of V2LedgerFailureInfo
+    | LedgerFailure of LedgerFailureInfo
 
 type InstructionDocument =
     { Scope: string
@@ -512,12 +512,12 @@ type AgentCommand =
     | CreateWorktreeCommand of CreateWorktreeCommand
     | InspectWorktreeRemovalCommand of InspectWorktreeRemovalCommand
     | RemoveWorktreeCommand of RemoveWorktreeCommand
-    | V2TaskReadCommand of V2TaskReadCommand
-    | V2TaskWriteCommand of V2TaskWriteCommand
-    | V2LedgerReadCommand of V2LedgerReadCommand
-    | V2LedgerWriteCommand of V2LedgerWriteCommand
-    | V2ReviewReadCommand of V2ReviewReadCommand
-    | V2ReviewWriteCommand of V2ReviewWriteCommand
+    | TaskReadCommand of TaskReadCommand
+    | TaskWriteCommand of TaskWriteCommand
+    | LedgerReadCommand of LedgerReadCommand
+    | LedgerWriteCommand of LedgerWriteCommand
+    | ReviewReadCommand of ReviewReadCommand
+    | ReviewWriteCommand of ReviewWriteCommand
     | GetProjectDetailsCommand of GetProjectDetailsCommand
     | ListDirectoryCommand of ListDirectoryCommand
     | SearchFilesCommand of SearchFilesCommand
@@ -555,12 +555,12 @@ module AgentCommandInfo =
         | CreateWorktreeCommand _ -> "CreateWorktreeCommand"
         | InspectWorktreeRemovalCommand _ -> "InspectWorktreeRemovalCommand"
         | RemoveWorktreeCommand _ -> "RemoveWorktreeCommand"
-        | V2TaskReadCommand _ -> "V2TaskReadCommand"
-        | V2TaskWriteCommand _ -> "V2TaskWriteCommand"
-        | V2LedgerReadCommand _ -> "V2LedgerReadCommand"
-        | V2LedgerWriteCommand _ -> "V2LedgerWriteCommand"
-        | V2ReviewReadCommand _ -> "V2ReviewReadCommand"
-        | V2ReviewWriteCommand _ -> "V2ReviewWriteCommand"
+        | TaskReadCommand _ -> "TaskReadCommand"
+        | TaskWriteCommand _ -> "TaskWriteCommand"
+        | LedgerReadCommand _ -> "LedgerReadCommand"
+        | LedgerWriteCommand _ -> "LedgerWriteCommand"
+        | ReviewReadCommand _ -> "ReviewReadCommand"
+        | ReviewWriteCommand _ -> "ReviewWriteCommand"
         | GetProjectDetailsCommand _ -> "GetProjectDetailsCommand"
         | ListDirectoryCommand _ -> "ListDirectoryCommand"
         | SearchFilesCommand _ -> "SearchFilesCommand"
@@ -604,12 +604,12 @@ module AgentCommandInfo =
         | CreateWorktreeCommand _ -> "CreateWorktree"
         | InspectWorktreeRemovalCommand _ -> "InspectWorktreeRemoval"
         | RemoveWorktreeCommand _ -> "RemoveWorktree"
-        | V2TaskReadCommand _ -> "V2TaskRead"
-        | V2TaskWriteCommand _ -> "V2TaskWrite"
-        | V2LedgerReadCommand _ -> "V2LedgerRead"
-        | V2LedgerWriteCommand _ -> "V2LedgerWrite"
-        | V2ReviewReadCommand _ -> "V2ReviewRead"
-        | V2ReviewWriteCommand _ -> "V2ReviewWrite"
+        | TaskReadCommand _ -> "TaskRead"
+        | TaskWriteCommand _ -> "TaskWrite"
+        | LedgerReadCommand _ -> "LedgerRead"
+        | LedgerWriteCommand _ -> "LedgerWrite"
+        | ReviewReadCommand _ -> "ReviewRead"
+        | ReviewWriteCommand _ -> "ReviewWrite"
         | GetProjectDetailsCommand _ -> "GetProjectDetails"
         | ListDirectoryCommand _ -> "ListDirectory"
         | SearchFilesCommand _ -> "SearchFiles"
@@ -651,12 +651,12 @@ module AgentCommandInfo =
         | CreateWorktreeCommand cmd -> Some cmd.ProjectName
         | InspectWorktreeRemovalCommand cmd -> Some cmd.ProjectName
         | RemoveWorktreeCommand cmd -> Some cmd.ProjectName
-        | V2TaskReadCommand cmd -> Some cmd.ProjectName
-        | V2TaskWriteCommand cmd -> Some cmd.ProjectName
-        | V2LedgerReadCommand cmd -> Some cmd.ProjectName
-        | V2LedgerWriteCommand cmd -> Some cmd.ProjectName
-        | V2ReviewReadCommand cmd -> Some cmd.ProjectName
-        | V2ReviewWriteCommand cmd -> Some cmd.ProjectName
+        | TaskReadCommand cmd -> Some cmd.ProjectName
+        | TaskWriteCommand cmd -> Some cmd.ProjectName
+        | LedgerReadCommand cmd -> Some cmd.ProjectName
+        | LedgerWriteCommand cmd -> Some cmd.ProjectName
+        | ReviewReadCommand cmd -> Some cmd.ProjectName
+        | ReviewWriteCommand cmd -> Some cmd.ProjectName
         | GetProjectDetailsCommand cmd -> Some cmd.ProjectName
         | ListDirectoryCommand cmd -> Some cmd.ProjectName
         | SearchFilesCommand cmd -> Some cmd.ProjectName
@@ -736,12 +736,12 @@ module AgentCommandInfo =
         | CreateWorktreeCommand cmd -> Some(compact cmd.Name)
         | InspectWorktreeRemovalCommand cmd -> Some(compact cmd.WorktreePath)
         | RemoveWorktreeCommand cmd -> Some(compact cmd.WorktreePath)
-        | V2TaskReadCommand cmd -> Some(compact cmd.AgentId)
-        | V2TaskWriteCommand cmd -> Some(compact cmd.Action)
-        | V2LedgerReadCommand cmd -> Some(compact cmd.ProjectName)
-        | V2LedgerWriteCommand cmd -> Some(compact cmd.Action)
-        | V2ReviewReadCommand cmd -> Some(compact cmd.Action)
-        | V2ReviewWriteCommand cmd -> Some(compact cmd.Action)
+        | TaskReadCommand cmd -> Some(compact cmd.AgentId)
+        | TaskWriteCommand cmd -> Some(compact cmd.Action)
+        | LedgerReadCommand cmd -> Some(compact cmd.ProjectName)
+        | LedgerWriteCommand cmd -> Some(compact cmd.Action)
+        | ReviewReadCommand cmd -> Some(compact cmd.Action)
+        | ReviewWriteCommand cmd -> Some(compact cmd.Action)
         | GetGitDiffCommand cmd -> cmd.Path |> Option.map compact
         | GitCommitCommand cmd -> Some(compact cmd.Message)
         | StartJobCommand cmd -> Some(fullCommand cmd.Executable cmd.Args)
@@ -778,12 +778,12 @@ module AgentCommandInfo =
         | CreateWorktreeCommand cmd -> Some(truncate 64 cmd.Name)
         | InspectWorktreeRemovalCommand cmd -> Some(truncate 64 cmd.WorktreePath)
         | RemoveWorktreeCommand cmd -> Some(truncate 64 cmd.WorktreePath)
-        | V2TaskReadCommand cmd -> Some(truncate 64 cmd.AgentId)
-        | V2TaskWriteCommand cmd -> Some(truncate 64 cmd.Action)
-        | V2LedgerReadCommand cmd -> Some(truncate 64 cmd.ProjectName)
-        | V2LedgerWriteCommand cmd -> Some(truncate 64 cmd.Action)
-        | V2ReviewReadCommand cmd -> Some(truncate 64 cmd.Action)
-        | V2ReviewWriteCommand cmd -> Some(truncate 64 cmd.Action)
+        | TaskReadCommand cmd -> Some(truncate 64 cmd.AgentId)
+        | TaskWriteCommand cmd -> Some(truncate 64 cmd.Action)
+        | LedgerReadCommand cmd -> Some(truncate 64 cmd.ProjectName)
+        | LedgerWriteCommand cmd -> Some(truncate 64 cmd.Action)
+        | ReviewReadCommand cmd -> Some(truncate 64 cmd.Action)
+        | ReviewWriteCommand cmd -> Some(truncate 64 cmd.Action)
         | GetGitDiffCommand cmd -> cmd.Path |> Option.map (truncate 64)
         | GitCommitCommand cmd -> Some(quoted cmd.Message)
         | StartJobCommand cmd -> Some(commandPreview cmd.Executable cmd.Args)
@@ -838,7 +838,7 @@ module AgentCommandInfo =
         | None -> invocation command
 
 module AgentProtocol =
-    let version = "3.46"
+    let version = "3.47"
     let defaultPatchFuzzyContextLines = 3
     let maxResponseBytes = 900 * 1024
     let maxImageBytes = 8 * 1024 * 1024
@@ -860,12 +860,12 @@ module AgentProtocol =
           definition "GetWorktree" "Inspects a registered Git worktree." [ ReadOnly ] false false false
           definition "CreateWorktree" "Creates an isolated Git worktree and branch." [ VersionControlWrite ] true true false
           definition "InspectWorktreeRemoval" "Checks registered worktree removal safety." [ ReadOnly ] false false false
-          definition "V2TaskRead" "Reads a registered agent inbox from a single V2 ledger snapshot." [ ReadOnly; NetworkAccess ] false false false
-          definition "V2TaskWrite" "Creates/assigns/starts V2 tasks and binds immutable review base." [ VersionControlWrite; NetworkAccess ] true true false
-          definition "V2LedgerRead" "Inspect the verified canonical V2 Git ledger identity and trust head." [ ReadOnly; NetworkAccess ] false false false
-          definition "V2LedgerWrite" "Explicitly bind, initialize or rebind the canonical V2 ledger with privacy acknowledgment." [ VersionControlWrite; NetworkAccess ] true true false
-          definition "V2ReviewRead" "Reads opt-in canonical V2 review ledger requests and reviewer inboxes." [ ReadOnly; NetworkAccess ] false false false
-          definition "V2ReviewWrite" "Updates opt-in canonical V2 review ledger with a stable operation UUID." [ VersionControlWrite; NetworkAccess ] true true false
+          definition "TaskRead" "Reads a registered agent inbox from a single ledger snapshot." [ ReadOnly; NetworkAccess ] false false false
+          definition "TaskWrite" "Creates/assigns/starts tasks and binds immutable review base." [ VersionControlWrite; NetworkAccess ] true true false
+          definition "LedgerRead" "Inspect the verified canonical Git ledger identity and trust head." [ ReadOnly; NetworkAccess ] false false false
+          definition "LedgerWrite" "Explicitly bind, initialize or rebind the canonical ledger with privacy acknowledgment." [ VersionControlWrite; NetworkAccess ] true true false
+          definition "ReviewRead" "Reads opt-in canonical review ledger requests and reviewer inboxes." [ ReadOnly; NetworkAccess ] false false false
+          definition "ReviewWrite" "Updates opt-in canonical review ledger with a stable operation UUID." [ VersionControlWrite; NetworkAccess ] true true false
           definition "RemoveWorktree" "Removes a clean integrated Git worktree." [ VersionControlWrite; Destructive ] true true false
           definition "GetProjectDetails" "Reads project summary details and special files." [ ReadOnly ] false false false
           definition "ListDirectory" "Lists files and folders in a project directory." [ ReadOnly ] false false false

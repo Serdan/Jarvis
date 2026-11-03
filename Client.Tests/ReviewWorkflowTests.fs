@@ -32,7 +32,7 @@ type ReviewWorkflowTests() =
         | other -> Assert.Fail(sprintf "Expected stale/version conflict: %A" other)
 
     let withFixture action =
-        let root = Path.Combine(Path.GetTempPath(), "jarvis-review-v2-" + Guid.NewGuid().ToString("N"))
+        let root = Path.Combine(Path.GetTempPath(), "jarvis-review-ledger-" + Guid.NewGuid().ToString("N"))
         Directory.CreateDirectory(root) |> ignore
         try
             let bare = Path.Combine(root, "remote.git")
@@ -41,14 +41,14 @@ type ReviewWorkflowTests() =
             git root [ "init"; "--bare"; bare ] |> ignore
             git root [ "clone"; bare; one ] |> ignore
             for clone in [ one ] do
-                git clone [ "config"; "user.name"; "V2 Fixture" ] |> ignore
+                git clone [ "config"; "user.name"; " Fixture" ] |> ignore
                 git clone [ "config"; "user.email"; "fixture@example.test" ] |> ignore
             File.WriteAllText(Path.Combine(one, "source.txt"), "base")
             git one [ "add"; "source.txt" ] |> ignore
             git one [ "commit"; "-m"; "task base" ] |> ignore
             git one [ "push"; "-u"; "origin"; "HEAD" ] |> ignore
             git root [ "clone"; bare; two ] |> ignore
-            git two [ "config"; "user.name"; "V2 Fixture" ] |> ignore
+            git two [ "config"; "user.name"; " Fixture" ] |> ignore
             git two [ "config"; "user.email"; "fixture@example.test" ] |> ignore
             let projectId = Guid.NewGuid()
             let ledgerId = Guid.NewGuid()
@@ -80,7 +80,7 @@ type ReviewWorkflowTests() =
         finally
             for checkout in [ "owner"; "reviewer" ] do
                 let pendingConfig =
-                    Client.V2ReviewApi.ReviewV2Binding.pathForRoot(
+                    Client.OrchestrationApi.LedgerBindingConfig.pathForRoot(
                         Path.Combine(root, checkout))
                 let pendingDir =
                     Path.Combine(Path.GetDirectoryName pendingConfig, "pending",
@@ -166,7 +166,7 @@ type ReviewWorkflowTests() =
     [<Test>]
     member _.ExplicitOrthogonalMigrationPreservesHistoryAndRejectsStaleHead() =
         withFixture (fun _ _ first second _ _ _ _ ->
-            let taskId = "legacy-v2-migration"
+            let taskId = "legacy-ledger-migration"
             ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Legacy task" |> success |> ignore
             ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner"
             |> success |> ignore
@@ -679,7 +679,7 @@ type ReviewWorkflowTests() =
             |> success |> ignore
             ReviewWorkflow.beginAttemptWithSession first (Guid.NewGuid()) taskId "Owner" 1 1 "session-A"
             |> success |> ignore
-            let approved : Client.V2ReviewApi.ReviewV2OptIn =
+            let approved : Client.OrchestrationApi.LedgerTrustBinding =
                 { SchemaVersion = 1
                   Enabled = true
                   ProjectRoot = one
@@ -690,11 +690,11 @@ type ReviewWorkflowTests() =
                   ApprovedFetchUrl = first.ApprovedFetchUrl
                   ApprovedPushUrl = first.ApprovedPushUrl
                   HighestTrustedHead = (LedgerStore.fetch first |> success).Commit }
-            let path = Client.V2ReviewApi.ReviewV2Binding.pathForRoot one
+            let path = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
             Directory.CreateDirectory(Path.GetDirectoryName path) |> ignore
             File.WriteAllText(path, System.Text.Json.JsonSerializer.Serialize(approved))
             let ctx = GitCommandTests.TestContext(Path.GetDirectoryName one)
-            let resume (sessionId: string) expectedAgentVersion : Common.V2TaskWriteCommand =
+            let resume (sessionId: string) expectedAgentVersion : Common.TaskWriteCommand =
                 { ProjectName = "owner"; Action = "ResumeAgent"
                   OperationId = Guid.NewGuid().ToString("D")
                   TaskId = taskId; AttemptId = ""; ActorId = "Owner"; OwnerId = ""
@@ -705,7 +705,7 @@ type ReviewWorkflowTests() =
                   AllowUncommitted = false; DecisionSequence = 0L; Evidence = ""
                   SessionId = sessionId }
             let api cmd =
-                match Client.V2ReviewApi.V2TaskApi.write cmd ctx with
+                match Client.OrchestrationApi.TaskApi.write cmd ctx with
                 | Ok value -> value
                 | Error failure -> failwithf "Unexpected resume response: %A" failure
             let before = LedgerStore.fetch second |> success
@@ -719,12 +719,12 @@ type ReviewWorkflowTests() =
             // before its matching pending journal entry can be retired.
             let recoveryCommand = resume "session-B" 3
             let recoveryId = Guid.Parse recoveryCommand.OperationId
-            Client.V2ReviewApi.V2PendingIntentJournal.persist first recoveryId "V2TaskWrite"
+            Client.OrchestrationApi.PendingIntentJournal.persist first recoveryId "TaskWrite"
                 (System.Text.Json.JsonSerializer.Serialize recoveryCommand) |> success
             ReviewWorkflow.resumeAgentWithSession first recoveryId taskId "Owner" 2 3 1 "session-B"
             |> success |> ignore
             let afterRecovery = LedgerStore.fetch second |> success
-            Assert.That((Client.V2ReviewApi.V2PendingIntentJournal.listAtRoot one |> success).Length,
+            Assert.That((Client.OrchestrationApi.PendingIntentJournal.listAtRoot one |> success).Length,
                         Is.EqualTo(1))
             let replay = api recoveryCommand
             use replayJson = System.Text.Json.JsonDocument.Parse(System.Text.Json.JsonSerializer.Serialize(replay))
@@ -733,7 +733,7 @@ type ReviewWorkflowTests() =
                         Is.EqualTo("ResumeAgent"))
             Assert.That(replayJson.RootElement.GetProperty("operation").GetProperty("OperationId").GetString(),
                         Is.EqualTo(recoveryCommand.OperationId))
-            Assert.That((Client.V2ReviewApi.V2PendingIntentJournal.listAtRoot one |> success).Length,
+            Assert.That((Client.OrchestrationApi.PendingIntentJournal.listAtRoot one |> success).Length,
                         Is.EqualTo(0), "A confirmed replay must retire its matching pending local intent.")
             Assert.That((LedgerStore.fetch second |> success).Commit, Is.EqualTo(afterRecovery.Commit),
                         "Replaying an accepted recovery must not create another Git commit.")
@@ -963,7 +963,7 @@ type ReviewWorkflowTests() =
                              "exported-spec.html" page.SpecBlobOid |> success
             Assert.That(result.Authority, Is.EqualTo("NonAuthoritativeSourceCopy"))
             let exported = File.ReadAllText(Path.Combine(one, "exported-spec.html"))
-            Assert.That(exported, Does.Contain("NON-AUTHORITATIVE JARVIS V2 EXPORT"))
+            Assert.That(exported, Does.Contain("NON-AUTHORITATIVE JARVIS TASK EXPORT"))
             Assert.That(exported, Does.EndWith(source))
             match ReviewWorkflow.exportTaskSpec first taskId "exported-spec.html" page.SpecBlobOid with
             | Error(StaleEntityVersion _) -> ()
@@ -1445,10 +1445,10 @@ type ReviewWorkflowTests() =
     [<Test>]
     member _.OptedInTaskApiCanCreateAssignBeginBindAndSubmit() =
         withFixture (fun one _ first _ baseOid sourceRef newCommit _ ->
-            let configPath = Client.V2ReviewApi.ReviewV2Binding.pathForRoot one
+            let configPath = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
             let configDirectory = Path.GetDirectoryName configPath
             Directory.CreateDirectory configDirectory |> ignore
-            let approved : Client.V2ReviewApi.ReviewV2OptIn =
+            let approved : Client.OrchestrationApi.LedgerTrustBinding =
                 { SchemaVersion = 1
                   Enabled = true
                   ProjectRoot = one
@@ -1462,7 +1462,7 @@ type ReviewWorkflowTests() =
             File.WriteAllText(configPath, System.Text.Json.JsonSerializer.Serialize(approved))
             try
                 let ctx = GitCommandTests.TestContext(Path.GetDirectoryName one)
-                let template (action: string) (taskId: string) : Common.V2TaskWriteCommand =
+                let template (action: string) (taskId: string) : Common.TaskWriteCommand =
                     { ProjectName = "owner"
                       Action = action
                       OperationId = Guid.NewGuid().ToString("D")
@@ -1483,10 +1483,10 @@ type ReviewWorkflowTests() =
                       SourceRef = ""; AllowDetached = false; AllowUncommitted = false
                       DecisionSequence = 0L; Evidence = ""; SessionId = "" }
                 let run cmd =
-                    Client.V2ReviewApi.V2TaskApi.write cmd ctx
+                    Client.OrchestrationApi.TaskApi.write cmd ctx
                     |> function
                         | Ok value -> value
-                        | Error error -> failwithf "V2 task API failed: %A" error
+                        | Error error -> failwithf "Task API failed: %A" error
                 let taskId = "751"
                 let html = "<h1>Full task specification</h1><p>Acceptance: one review</p>"
                 let createCommand =
@@ -1512,32 +1512,32 @@ type ReviewWorkflowTests() =
                           AttemptId = attemptId.ToString("D")
                           OwnerId = "Owner" } |> ignore
                 let queued =
-                    Client.V2ReviewApi.V2TaskApi.read
+                    Client.OrchestrationApi.TaskApi.read
                         { ProjectName = "owner"; AgentId = "Owner"; Action = "AgentInbox"; TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L; Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null } ctx
                     |> function
                         | Ok value -> unbox<AgentInbox> value
-                        | Error error -> failwithf "V2 inbox failed: %A" error
+                        | Error error -> failwithf " inbox failed: %A" error
                 Assert.That(queued.RunnableQueue.Length, Is.EqualTo(1))
                 Assert.That(queued.RunnableQueue.Head.Attempt.SpecBlobOid.Length, Is.EqualTo(40))
-                let generationLookup : Common.V2TaskReadCommand =
+                let generationLookup : Common.TaskReadCommand =
                     { ProjectName = "owner"; AgentId = ""; Action = "GetAssignment"
                       TaskId = taskId; AssignmentGeneration = 1; CheckpointSequence = 0L; Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null }
                 let snapshotAssignment =
-                    Client.V2ReviewApi.V2TaskApi.read generationLookup ctx
+                    Client.OrchestrationApi.TaskApi.read generationLookup ctx
                     |> function
                         | Ok value -> System.Text.Json.JsonSerializer.Serialize(value)
-                        | Error error -> failwithf "V2 immutable assignment read failed: %A" error
+                        | Error error -> failwithf " immutable assignment read failed: %A" error
                 Assert.That(snapshotAssignment, Does.Contain("Implement task"))
                 Assert.That(snapshotAssignment, Does.Contain("Owner"))
 
-                let operationStatus : Common.V2LedgerReadCommand =
+                let operationStatus : Common.LedgerReadCommand =
                     { ProjectName = "owner"; Action = "GetOperationStatus"
                       OperationId = createCommand.OperationId }
                 let operationResponse =
-                    Client.V2ReviewApi.V2LedgerApi.read operationStatus ctx
+                    Client.OrchestrationApi.LedgerApi.read operationStatus ctx
                     |> function
                         | Ok value -> value
-                        | Error error -> failwithf "V2 operation status failed: %A" error
+                        | Error error -> failwithf " operation status failed: %A" error
                 let operationJson = System.Text.Json.JsonSerializer.Serialize(operationResponse)
                 use operationDoc = System.Text.Json.JsonDocument.Parse(operationJson)
                 Assert.That(operationDoc.RootElement.GetProperty("originatingCommit").GetString(),
@@ -1554,11 +1554,11 @@ type ReviewWorkflowTests() =
                 run { template "BindReviewBase" taskId with
                           ExpectedVersion = 2; AssignmentGeneration = 1
                           BaseOid = baseOid; TargetRef = sourceRef } |> ignore
-                let getTask : Common.V2ReviewReadCommand =
+                let getTask : Common.ReviewReadCommand =
                     { ProjectName = "owner"; Action = "GetTask"; TaskId = taskId
                       RequestId = ""; ReviewerId = ""; DocumentPath = "" }
-                match Client.V2ReviewApi.V2ReviewApi.read getTask ctx with
-                | Error error -> Assert.Fail(sprintf "V2 task read failed: %A" error)
+                match Client.OrchestrationApi.ReviewApi.read getTask ctx with
+                | Error error -> Assert.Fail(sprintf "Task read failed: %A" error)
                 | Ok value ->
                     let resultJson = System.Text.Json.JsonSerializer.Serialize(value)
                     use parsed = System.Text.Json.JsonDocument.Parse(resultJson)
@@ -1570,11 +1570,11 @@ type ReviewWorkflowTests() =
                           AssignmentGeneration = 1; Summary = "Checkpoint"
                           NextAction = "Resume work" } |> ignore
                 let ready =
-                    Client.V2ReviewApi.V2TaskApi.read
+                    Client.OrchestrationApi.TaskApi.read
                         { ProjectName = "owner"; AgentId = "Owner"; Action = "AgentInbox"; TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L; Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null } ctx
                     |> function
                         | Ok value -> unbox<AgentInbox> value
-                        | Error error -> failwithf "V2 Ready inbox failed: %A" error
+                        | Error error -> failwithf " Ready inbox failed: %A" error
                 Assert.That(ready.Agent.State, Is.EqualTo("Ready"))
                 Assert.That(ready.OperatorActionRequired, Is.True)
                 run { template "ResumeAgent" taskId with
@@ -1582,7 +1582,7 @@ type ReviewWorkflowTests() =
                           AssignmentGeneration = 1 } |> ignore
                 let head = newCommit "Task 751 implementation" "code for 751"
                 let requestId = Guid.NewGuid()
-                let reviewCmd : Common.V2ReviewWriteCommand =
+                let reviewCmd : Common.ReviewWriteCommand =
                     { ProjectName = "owner"; Action = "Submit"
                       OperationId = Guid.NewGuid().ToString("D")
                       TaskId = taskId; RequestId = requestId.ToString("D")
@@ -1590,14 +1590,14 @@ type ReviewWorkflowTests() =
                       ExpectedVersion = 5; Kind = "Progress"
                       SourceRef = sourceRef; HeadOid = head; TargetRef = ""; Summary = "Implementation ready"
                       Verdict = ""; DocumentPath = ""; Content = ""; ExpectedBlobOid = "" }
-                match Client.V2ReviewApi.V2ReviewApi.write reviewCmd ctx with
+                match Client.OrchestrationApi.ReviewApi.write reviewCmd ctx with
                 | Ok _ -> ()
-                | Error error -> Assert.Fail(sprintf "V2 submit API failed: %A" error)
+                | Error error -> Assert.Fail(sprintf " submit API failed: %A" error)
                 // Exercise the canonical branch review via the same typed API.
                 let claim = { reviewCmd with Action = "Claim"; ActorId = "Reviewer"
                                              ExpectedVersion = 1
                                              OperationId = Guid.NewGuid().ToString("D") }
-                match Client.V2ReviewApi.V2ReviewApi.write claim ctx with
+                match Client.OrchestrationApi.ReviewApi.write claim ctx with
                 | Ok _ -> ()
                 | Error error -> Assert.Fail(sprintf "Branch claim failed: %A" error)
                 let findingContent = "# Needs regression test\nPlease add coverage for this edge case."
@@ -1606,14 +1606,14 @@ type ReviewWorkflowTests() =
                                      DocumentPath = "findings/missing-regression-test.md"
                                      Content = findingContent; ExpectedBlobOid = ""
                                      OperationId = Guid.NewGuid().ToString("D") }
-                match Client.V2ReviewApi.V2ReviewApi.write documentWrite ctx with
+                match Client.OrchestrationApi.ReviewApi.write documentWrite ctx with
                 | Ok _ -> ()
                 | Error error -> Assert.Fail(sprintf "Review document write failed: %A" error)
                 let documentRead =
                     { getTask with Action = "ReadDocument"
                                    RequestId = requestId.ToString("D")
                                    DocumentPath = "findings/missing-regression-test.md" }
-                match Client.V2ReviewApi.V2ReviewApi.read documentRead ctx with
+                match Client.OrchestrationApi.ReviewApi.read documentRead ctx with
                 | Ok value ->
                     let resultJson = System.Text.Json.JsonSerializer.Serialize(value)
                     Assert.That(resultJson, Does.Contain("Please add coverage for this edge case"))
@@ -1621,7 +1621,7 @@ type ReviewWorkflowTests() =
                 let decided = { claim with Action = "Decide"; Verdict = "Accept";
                                           ExpectedVersion = 2;
                                           OperationId = Guid.NewGuid().ToString("D") }
-                match Client.V2ReviewApi.V2ReviewApi.write decided ctx with
+                match Client.OrchestrationApi.ReviewApi.write decided ctx with
                 | Ok _ -> ()
                 | Error error -> Assert.Fail(sprintf "Branch decision failed: %A" error)
                 let inspected = ReviewWorkflow.getBranchReview first taskId requestId |> success
@@ -1630,11 +1630,11 @@ type ReviewWorkflowTests() =
                 let ownerInbox = ReviewWorkflow.getBranchAgentInbox first "Owner" |> success
                 Assert.That(ownerInbox.UnacknowledgedFeedback.Length, Is.EqualTo(1))
                 let after =
-                    Client.V2ReviewApi.V2TaskApi.read
+                    Client.OrchestrationApi.TaskApi.read
                         { ProjectName = "owner"; AgentId = "Owner"; Action = "AgentInbox"; TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L; Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null } ctx
                     |> function
                         | Ok value -> unbox<AgentInbox> value
-                        | Error error -> failwithf "V2 inbox failed: %A" error
+                        | Error error -> failwithf " inbox failed: %A" error
                 Assert.That(after.SlotAvailable, Is.False)
                 Assert.That(after.Agent.State, Is.EqualTo("Working"))
                 run { template "CompleteAgentWork" taskId with
@@ -1650,40 +1650,40 @@ type ReviewWorkflowTests() =
                 Assert.That(parked.PendingReviews.Length, Is.EqualTo(0))
                 Assert.That(after.PendingReviews.Length, Is.EqualTo(0))
 
-                // Additional typed V2 administrative API flow is independent
+                // Additional typed  administrative API flow is independent
                 // of source publication and the agent's previous work.
                 let adminTask = "admin-api"
                 run { template "CreateTask" adminTask with Title = "Administrative API task";
                                                              Html = "<h1>Administrative API task</h1>" } |> ignore
                 run { template "CancelOpenTask" adminTask with
                           ExpectedTaskVersion = 1; Reason = "Explicit cancellation" } |> ignore
-                let adminHistory : Common.V2TaskReadCommand =
+                let adminHistory : Common.TaskReadCommand =
                     { ProjectName = "owner"; Action = "LifecycleHistory"; TaskId = adminTask
                       AgentId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L; Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null }
-                match Client.V2ReviewApi.V2TaskApi.read adminHistory ctx with
+                match Client.OrchestrationApi.TaskApi.read adminHistory ctx with
                 | Ok value ->
                     let _, events = unbox<string * TaskLifecycleEvent list> value
                     Assert.That(events.Length, Is.EqualTo(1))
                     Assert.That(events.Head.Action, Is.EqualTo("CancelTask"))
-                | Error error -> Assert.Fail(sprintf "Typed V2 lifecycle history failed: %A" error)
+                | Error error -> Assert.Fail(sprintf "Typed  lifecycle history failed: %A" error)
                 run { template "ReopenTask" adminTask with
                           ExpectedTaskVersion = 2; Reason = "Explicit reopening" } |> ignore
                 let _, reopened, _ = ReviewWorkflow.getTask first adminTask |> success
                 Assert.That(reopened.Lifecycle, Is.EqualTo("Open"))
-                // V2-09 spec commands through the opted-in client protocol:
+                // Canonical task spec commands through the opted-in client protocol:
                 // read pages/diff on read route, export on write route.
                 let specTask = "spec-api"
                 run { template "CreateTask" specTask with
                           Title = "Spec API"; Html = "<h1>API revision one</h1>\\n" } |> ignore
-                let pageCmd : Common.V2TaskReadCommand =
+                let pageCmd : Common.TaskReadCommand =
                     { ProjectName = "owner"; Action = "GetSpecPage"; TaskId = specTask
                       AgentId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L
                       Cursor = ""; PageSize = 128; BeforeOid = null; AfterOid = null; RelativePath = null }
                 let pageBefore =
-                    Client.V2ReviewApi.V2TaskApi.read pageCmd ctx
+                    Client.OrchestrationApi.TaskApi.read pageCmd ctx
                     |> function
                        | Ok value -> unbox<TaskSpecPage> value
-                       | Error error -> failwithf "V2 spec page API failed: %A" error
+                       | Error error -> failwithf " spec page API failed: %A" error
                 Assert.That(pageBefore.TotalBytes, Is.GreaterThan(10))
                 let revisedHtml = "<h1>API revised 🦊</h1>\\n"
                 let revisionCmd =
@@ -1695,16 +1695,16 @@ type ReviewWorkflowTests() =
                 let retriedJson = System.Text.Json.JsonSerializer.Serialize(retried)
                 Assert.That(retriedJson, Does.Contain("alreadyApplied"))
                 let pageAfter =
-                    Client.V2ReviewApi.V2TaskApi.read pageCmd ctx
+                    Client.OrchestrationApi.TaskApi.read pageCmd ctx
                     |> function
                        | Ok value -> unbox<TaskSpecPage> value
-                       | Error error -> failwithf "V2 revised page API failed: %A" error
+                       | Error error -> failwithf " revised page API failed: %A" error
                 Assert.That(pageAfter.Content, Is.EqualTo(revisedHtml))
                 let diffCmd = { pageCmd with Action = "DiffTaskSpec"; BeforeOid = pageBefore.SpecBlobOid
                                              AfterOid = pageAfter.SpecBlobOid }
-                match Client.V2ReviewApi.V2TaskApi.read diffCmd ctx with
+                match Client.OrchestrationApi.TaskApi.read diffCmd ctx with
                 | Ok value -> Assert.That((unbox<TaskSpecDiff> value).Diff, Does.Contain("API revised"))
-                | Error error -> Assert.Fail(sprintf "V2 diff API failed: %A" error)
+                | Error error -> Assert.Fail(sprintf " diff API failed: %A" error)
                 let exportCmd = { template "ExportTaskSpec" specTask with
                                     SourceRef = "spec-api-export.html"
                                     BaseOid = pageAfter.SpecBlobOid }
@@ -1715,15 +1715,15 @@ type ReviewWorkflowTests() =
                 let exportRetry = run exportCmd
                 Assert.That((unbox<TaskSpecExport> exportRetry).AlreadyApplied, Is.True)
                 let otherOperation = { exportCmd with OperationId = Guid.NewGuid().ToString("D") }
-                match Client.V2ReviewApi.V2TaskApi.write otherOperation ctx with
+                match Client.OrchestrationApi.TaskApi.write otherOperation ctx with
                 | Error _ -> ()
                 | Ok _ -> Assert.Fail("Unrelated operation overwrote existing exported HTML")
                 Assert.That(File.ReadAllText(Path.Combine(one, "spec-api-export.html")),
                             Does.Contain("NON-AUTHORITATIVE JARVIS"))
-                match Client.V2ReviewApi.V2TaskApi.read
+                match Client.OrchestrationApi.TaskApi.read
                         { pageCmd with Action = "ExportTaskSpec"; RelativePath = "should-not-write.html" } ctx with
                 | Error _ -> ()
-                | Ok _ -> Assert.Fail("Export incorrectly accessible through read-only V2 API")
+                | Ok _ -> Assert.Fail("Export incorrectly accessible through read-only  API")
                 Assert.That(File.Exists(Path.Combine(one, "should-not-write.html")), Is.False)
                 File.WriteAllText(Path.Combine(one, "spec-api-import.html"),
                                   "<h1>API imported safely</h1>\\n")
@@ -1735,27 +1735,27 @@ type ReviewWorkflowTests() =
                         Title = "Spec API imported" }
                 run importCommand |> ignore
                 let latest =
-                    Client.V2ReviewApi.V2TaskApi.read pageCmd ctx
+                    Client.OrchestrationApi.TaskApi.read pageCmd ctx
                     |> function
                        | Ok value -> unbox<TaskSpecPage> value
-                       | Error error -> failwithf "V2 imported page API failed: %A" error
+                       | Error error -> failwithf " imported page API failed: %A" error
                 Assert.That(latest.Content, Does.Contain("API imported safely"))
 
-                Assert.That((Client.V2ReviewApi.V2PendingIntentJournal.listAtRoot one |> success).Length,
-                            Is.EqualTo(0), "Verified V2 mutations must clear pending local intents.")
+                Assert.That((Client.OrchestrationApi.PendingIntentJournal.listAtRoot one |> success).Length,
+                            Is.EqualTo(0), "Verified  mutations must clear pending local intents.")
                 // A failed write leaves a pending journal entry: retrying it from
                 // another session must retain the original domain error, not fail
                 // because the session metadata changed.
                 let invalid =
                     { template "CreateTask" taskId with
                         Title = "Duplicate"; Html = html; SessionId = "session-A" }
-                let firstError = Client.V2ReviewApi.V2TaskApi.write invalid ctx
+                let firstError = Client.OrchestrationApi.TaskApi.write invalid ctx
                 let secondError =
-                    Client.V2ReviewApi.V2TaskApi.write { invalid with SessionId = "session-B" } ctx
+                    Client.OrchestrationApi.TaskApi.write { invalid with SessionId = "session-B" } ctx
                 match firstError, secondError with
                 | Error first, Error second ->
                     Assert.That(sprintf "%A" second, Is.EqualTo(sprintf "%A" first))
-                    Assert.That(sprintf "%A" second, Does.Not.Contain("Pending V2 operation UUID reused"))
+                    Assert.That(sprintf "%A" second, Does.Not.Contain("Pending  operation UUID reused"))
                 | _ -> Assert.Fail("Cross-session retry of a rejected operation changed its result.")
             finally
                 if File.Exists configPath then File.Delete configPath)
@@ -1876,10 +1876,10 @@ type ReviewWorkflowTests() =
             let canonical = ReviewWorkflow.getAgentInbox first "Owner" |> success
             Assert.That(canonical.Agent.State, Is.EqualTo("Ready"))
             let context = GitCommandTests.TestContext(Path.GetDirectoryName one)
-            let configPath = Client.V2ReviewApi.ReviewV2Binding.pathForRoot one
+            let configPath = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
             try
                 let head = (LedgerStore.fetch first |> success).Commit
-                Client.V2ReviewApi.ReviewV2Binding.bindExisting
+                Client.OrchestrationApi.LedgerBindingConfig.bindExisting
                     "owner" context first.ProjectId first.LedgerId first.Epoch
                     first.RemoteName first.ApprovedFetchUrl first.ApprovedPushUrl head true
                 |> function
@@ -1906,10 +1906,10 @@ type ReviewWorkflowTests() =
         withFixture (fun one _ first _ _ _ _ _ ->
             let ctx = GitCommandTests.TestContext(Path.GetDirectoryName one)
             let current = (LedgerStore.fetch first |> success).Commit
-            let path = Client.V2ReviewApi.ReviewV2Binding.pathForRoot one
+            let path = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
             if File.Exists path then File.Delete path
             let bind approved expected =
-                Client.V2ReviewApi.ReviewV2Binding.bindExisting
+                Client.OrchestrationApi.LedgerBindingConfig.bindExisting
                     "owner" ctx first.ProjectId first.LedgerId first.Epoch
                     first.RemoteName first.ApprovedFetchUrl first.ApprovedPushUrl expected approved
             match bind false current with
@@ -1917,7 +1917,7 @@ type ReviewWorkflowTests() =
             | other -> Assert.Fail(sprintf "Unapproved bind must refuse: %A" other)
             Assert.That(File.Exists path, Is.False)
             match bind true (String.replicate 40 "a") with
-            | Error(Client.V2LedgerFailureError info) when info.Code = "LedgerHistoryUnavailable" -> ()
+            | Error(Client.LedgerFailureError info) when info.Code = "LedgerHistoryUnavailable" -> ()
             | other -> Assert.Fail(sprintf "Wrong trust head must refuse: %A" other)
             Assert.That(File.Exists path, Is.False)
             let stored = bind true current |> function
@@ -1928,19 +1928,19 @@ type ReviewWorkflowTests() =
             let extra = ReviewWorkflow.createTask first (Guid.NewGuid()) "trustTask" "Trust" |> success
             let fresh = (LedgerStore.fetch first |> success).Commit
             Assert.That(fresh, Is.Not.EqualTo(current))
-            let loaded = Client.V2ReviewApi.ReviewV2Binding.load "owner" ctx
+            let loaded = Client.OrchestrationApi.LedgerBindingConfig.load "owner" ctx
             match loaded with
             | Ok binding -> Assert.That(binding.ProjectId, Is.EqualTo(first.ProjectId))
             | Error error -> Assert.Fail(sprintf "Verified load failed: %A" error)
-            let config = System.Text.Json.JsonSerializer.Deserialize<Client.V2ReviewApi.ReviewV2OptIn>(
+            let config = System.Text.Json.JsonSerializer.Deserialize<Client.OrchestrationApi.LedgerTrustBinding>(
                 File.ReadAllText path)
             Assert.That(config.HighestTrustedHead, Is.EqualTo(fresh))
             git one [ "remote"; "set-url"; "origin"; "file:///not-the-approved-remote.git" ] |> ignore
-            match Client.V2ReviewApi.ReviewV2Binding.load "owner" ctx with
-            | Error(Client.V2LedgerFailureError failure) when failure.Code = "InvalidBinding" -> ()
+            match Client.OrchestrationApi.LedgerBindingConfig.load "owner" ctx with
+            | Error(Client.LedgerFailureError failure) when failure.Code = "InvalidBinding" -> ()
             | other -> Assert.Fail(sprintf "Changed remote must be rejected: %A" other)
             git one [ "remote"; "set-url"; "origin"; first.ApprovedFetchUrl ] |> ignore
-            Assert.That((Client.V2ReviewApi.ReviewV2Binding.health "owner" ctx |> function
+            Assert.That((Client.OrchestrationApi.LedgerBindingConfig.health "owner" ctx |> function
                          | Ok value -> value.trustedLedgerHead
                          | Error error -> failwithf "Health: %A" error), Is.EqualTo(fresh))
             File.Delete path)
@@ -1953,12 +1953,12 @@ type ReviewWorkflowTests() =
             let newRemote = Path.Combine(root, "fresh-remote.git")
             git root [ "init"; "--bare"; newRemote ] |> ignore
             git one [ "remote"; "add"; "fresh"; newRemote ] |> ignore
-            let path = Client.V2ReviewApi.ReviewV2Binding.pathForRoot one
+            let path = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
             if File.Exists path then File.Delete path
             let project = Guid.NewGuid()
             let ledger = Guid.NewGuid()
             let create approve =
-                Client.V2ReviewApi.ReviewV2Binding.initializeNew
+                Client.OrchestrationApi.LedgerBindingConfig.initializeNew
                     "owner" ctx project ledger 1 "fresh" newRemote newRemote approve
             match create false with
             | Error(Client.ValidationError _) -> ()
@@ -1973,55 +1973,55 @@ type ReviewWorkflowTests() =
             git root [ "clone"; "--bare"; newRemote; otherRemote ] |> ignore
             git one [ "remote"; "add"; "mirror"; otherRemote ] |> ignore
             let rebind approved expected =
-                Client.V2ReviewApi.ReviewV2Binding.rebindRemote
+                Client.OrchestrationApi.LedgerBindingConfig.rebindRemote
                     "owner" ctx "mirror" otherRemote otherRemote expected approved
             match rebind false created.HighestTrustedHead with
             | Error(Client.ValidationError _) -> ()
             | other -> Assert.Fail(sprintf "Rebind without approval must fail: %A" other)
             match rebind true (String.replicate 40 "f") with
-            | Error(Client.V2LedgerFailureError info) when info.Code = "LedgerHistoryUnavailable" -> ()
+            | Error(Client.LedgerFailureError info) when info.Code = "LedgerHistoryUnavailable" -> ()
             | other -> Assert.Fail(sprintf "Rebind to mismatched trust must fail: %A" other)
             let rebound = rebind true created.HighestTrustedHead |> function
                 | Ok value -> value
                 | Error error -> failwithf "Rebind failed: %A" error
             Assert.That(rebound.RemoteName, Is.EqualTo("mirror"))
-            Assert.That((Client.V2ReviewApi.ReviewV2Binding.health "owner" ctx |> function
+            Assert.That((Client.OrchestrationApi.LedgerBindingConfig.health "owner" ctx |> function
                          | Ok value -> value.remoteName
                          | Error error -> failwithf "Health: %A" error), Is.EqualTo("mirror"))
             File.Delete path)
 
 
     [<Test>]
-    member _.PendingV2IntentSurvivesFailedCallAndCanReplayUnchanged() =
+    member _.PendingIntentSurvivesFailedCallAndCanReplayUnchanged() =
         withFixture (fun one _ first _ _ _ _ _ ->
             let operationId = Guid.NewGuid()
             let command = {| action = "CreateTask"; taskId = "restart"; title = "Original" |}
             let fail () : Result<int, Client.EffectError> =
                 Error(Client.GenericError "Simulated lost server response")
             let execute f =
-                Client.V2ReviewApi.V2PendingIntentJournal.execute first operationId
-                    "V2TaskWrite" command f
+                Client.OrchestrationApi.PendingIntentJournal.execute first operationId
+                    "TaskWrite" command f
             match execute fail with
             | Error(Client.GenericError _) -> ()
             | other -> Assert.Fail(sprintf "Simulated unknown outcome should preserve intent: %A" other)
             let pending () =
-                Client.V2ReviewApi.V2PendingIntentJournal.listAtRoot one |> success
+                Client.OrchestrationApi.PendingIntentJournal.listAtRoot one |> success
             let saved = pending ()
             Assert.That(saved.Length, Is.EqualTo(1))
             Assert.That(saved.Head.OperationId, Is.EqualTo(operationId.ToString("D")))
-            Assert.That(saved.Head.CommandType, Is.EqualTo("V2TaskWrite"))
+            Assert.That(saved.Head.CommandType, Is.EqualTo("TaskWrite"))
             Assert.That(saved.Head.CommandJson, Does.Contain("restart"))
             Assert.That(saved.Head.CommandSha256.Length, Is.EqualTo(64))
             let ctx = GitCommandTests.TestContext(Path.GetDirectoryName one)
-            let lookup : Common.V2LedgerReadCommand =
+            let lookup : Common.LedgerReadCommand =
                 { ProjectName = "owner"; Action = "PendingOperations"; OperationId = "" }
-            let listing = Client.V2ReviewApi.V2LedgerApi.read lookup ctx |> success
+            let listing = Client.OrchestrationApi.LedgerApi.read lookup ctx |> success
             let json = System.Text.Json.JsonSerializer.Serialize(listing)
             Assert.That(json, Does.Contain(operationId.ToString("D")))
             Assert.That(json, Does.Contain("Original"))
             let mismatch =
-                Client.V2ReviewApi.V2PendingIntentJournal.execute first operationId
-                    "V2TaskWrite" {| action = "CreateTask"; taskId = "restart"; title = "Changed" |}
+                Client.OrchestrationApi.PendingIntentJournal.execute first operationId
+                    "TaskWrite" {| action = "CreateTask"; taskId = "restart"; title = "Changed" |}
                     (fun () -> Ok 999)
             match mismatch with
             | Error(Client.ValidationError _) -> ()
@@ -2032,12 +2032,12 @@ type ReviewWorkflowTests() =
             Assert.That((pending ()).Length, Is.EqualTo(0))
             let lostId = Guid.NewGuid()
             let retryLost f =
-                Client.V2ReviewApi.V2PendingIntentJournal.execute first lostId
-                    "V2ReviewWrite" {| action = "Decide"; requestId = "r1" |} f
+                Client.OrchestrationApi.PendingIntentJournal.execute first lostId
+                    "ReviewWrite" {| action = "Decide"; requestId = "r1" |} f
             match retryLost (fun () ->
-                    Error(Client.V2ReviewApi.V2LedgerErrors.toEffect
+                    Error(Client.OrchestrationApi.LedgerErrors.toEffect
                         (Client.LedgerStore.OutcomeUnknown "Network stopped after push"))) with
-            | Error(Client.V2LedgerFailureError info) ->
+            | Error(Client.LedgerFailureError info) ->
                 Assert.That(info.Code, Is.EqualTo("OutcomeUnknown"))
                 Assert.That(info.OperationId, Is.EqualTo(Some(lostId.ToString("D"))))
             | other -> Assert.Fail(sprintf "Unknown result must retain typed UUID: %A" other)
@@ -2054,29 +2054,29 @@ type ReviewWorkflowTests() =
                     {| Action = "CreateTask"; TaskId = taskId
                        Title = taskId; Html = "<h1>Task</h1>" |})
             let acceptedId = Guid.NewGuid()
-            Client.V2ReviewApi.V2PendingIntentJournal.persist first acceptedId "V2TaskWrite" (command "accepted") |> success
+            Client.OrchestrationApi.PendingIntentJournal.persist first acceptedId "TaskWrite" (command "accepted") |> success
             ReviewWorkflow.createTaskWithSpec first acceptedId "accepted" "accepted" "<h1>Task</h1>"
             |> success |> ignore
 
             let pendingId = Guid.NewGuid()
-            Client.V2ReviewApi.V2PendingIntentJournal.persist first pendingId "V2TaskWrite" (command "notpushed") |> success
+            Client.OrchestrationApi.PendingIntentJournal.persist first pendingId "TaskWrite" (command "notpushed") |> success
             let mismatchedId = Guid.NewGuid()
-            Client.V2ReviewApi.V2PendingIntentJournal.persist first mismatchedId "V2TaskWrite" (command "wrongTask") |> success
+            Client.OrchestrationApi.PendingIntentJournal.persist first mismatchedId "TaskWrite" (command "wrongTask") |> success
             ReviewWorkflow.createTaskWithSpec first mismatchedId "realTask" "realTask" "<h1>Task</h1>"
             |> success |> ignore
 
             let sameTaskDifferentPayloadId = Guid.NewGuid()
-            Client.V2ReviewApi.V2PendingIntentJournal.persist first sameTaskDifferentPayloadId
-                "V2TaskWrite" (command "sameTask") |> success
+            Client.OrchestrationApi.PendingIntentJournal.persist first sameTaskDifferentPayloadId
+                "TaskWrite" (command "sameTask") |> success
             ReviewWorkflow.createTaskWithSpec first sameTaskDifferentPayloadId
                 "sameTask" "sameTask" "<h1>Different body</h1>" |> success |> ignore
 
             let foreignId = Guid.NewGuid()
-            Client.V2ReviewApi.V2PendingIntentJournal.persist { first with LedgerId = Guid.NewGuid() } foreignId
-                "V2TaskWrite" (command "foreign") |> success
+            Client.OrchestrationApi.PendingIntentJournal.persist { first with LedgerId = Guid.NewGuid() } foreignId
+                "TaskWrite" (command "foreign") |> success
 
             let before = (LedgerStore.fetch first |> success).Commit
-            let inspected = Client.V2ReviewApi.V2PendingIntentJournal.reconcile first |> success
+            let inspected = Client.OrchestrationApi.PendingIntentJournal.reconcile first |> success
             Assert.That(inspected.Length, Is.EqualTo(5))
             let status (id: Guid) =
                 inspected |> List.find (fun entry -> entry.operationId = id.ToString("D"))
@@ -2089,7 +2089,7 @@ type ReviewWorkflowTests() =
             let accepted = status acceptedId
             let remoteHash = accepted.operation.Value.RequestHash
             let acknowledge (id: Guid) requestHash =
-                Client.V2ReviewApi.V2PendingIntentJournal.acknowledge first id requestHash
+                Client.OrchestrationApi.PendingIntentJournal.acknowledge first id requestHash
             match acknowledge acceptedId (String.replicate 64 "f") with
             | Error(Client.ValidationError _) -> ()
             | other -> Assert.Fail(sprintf "Wrong hash must not acknowledge: %A" other)
@@ -2105,7 +2105,7 @@ type ReviewWorkflowTests() =
             match acknowledge foreignId remoteHash with
             | Error(Client.ValidationError _) -> ()
             | other -> Assert.Fail(sprintf "Wrong ledger identity must remain pending: %A" other)
-            Assert.That((Client.V2ReviewApi.V2PendingIntentJournal.listAtRoot one |> success).Length, Is.EqualTo(5))
+            Assert.That((Client.OrchestrationApi.PendingIntentJournal.listAtRoot one |> success).Length, Is.EqualTo(5))
             let recorded = acknowledge acceptedId remoteHash |> success
             Assert.That(recorded.acknowledged, Is.True)
             Assert.That(recorded.verifiedLedgerHead, Is.EqualTo(before))
@@ -2114,7 +2114,7 @@ type ReviewWorkflowTests() =
             let repeat = acknowledge acceptedId remoteHash |> success
             Assert.That(repeat.alreadyAcknowledged, Is.True)
             Assert.That(repeat.originalResult, Is.EqualTo(recorded.originalResult))
-            let remains = Client.V2ReviewApi.V2PendingIntentJournal.listAtRoot one |> success
+            let remains = Client.OrchestrationApi.PendingIntentJournal.listAtRoot one |> success
             Assert.That(remains.Length, Is.EqualTo(4))
             Assert.That(remains |> List.exists (fun entry -> entry.OperationId = acceptedId.ToString("D")),
                         Is.False)
@@ -2133,28 +2133,28 @@ type ReviewWorkflowTests() =
                 ReviewWorkflow.createTaskWithSpec first operationId
                     "alreadyaccepted" "alreadyaccepted" "<h1>Original</h1>"
                 |> success |> ignore
-                Error(Client.V2ReviewApi.V2LedgerErrors.toEffect
+                Error(Client.OrchestrationApi.LedgerErrors.toEffect
                     (OutcomeUnknown "A source push succeeded but the response was lost"))
             let recovered =
-                Client.V2ReviewApi.V2PendingIntentJournal.executeLedgerWrite first operationId
-                    "V2TaskWrite" (command "alreadyaccepted") remoteAccepted |> success
+                Client.OrchestrationApi.PendingIntentJournal.executeLedgerWrite first operationId
+                    "TaskWrite" (command "alreadyaccepted") remoteAccepted |> success
             Assert.That(recovered.AlreadyApplied, Is.True)
             Assert.That(recovered.Operation.OperationId, Is.EqualTo(operationId.ToString("D")))
-            Assert.That((Client.V2ReviewApi.V2PendingIntentJournal.listAtRoot one |> success).Length,
+            Assert.That((Client.OrchestrationApi.PendingIntentJournal.listAtRoot one |> success).Length,
                         Is.EqualTo(0))
             let onlyPendingId = Guid.NewGuid()
             let before = (LedgerStore.fetch first |> success).Commit
             let neverAccepted () : Result<LedgerWrite, Client.EffectError> =
-                Error(Client.V2ReviewApi.V2LedgerErrors.toEffect
+                Error(Client.OrchestrationApi.LedgerErrors.toEffect
                     (OutcomeUnknown "No remote confirmation"))
-            match Client.V2ReviewApi.V2PendingIntentJournal.executeLedgerWrite first onlyPendingId
-                    "V2TaskWrite" (command "notaccepted") neverAccepted with
-            | Error(Client.V2LedgerFailureError failure) ->
+            match Client.OrchestrationApi.PendingIntentJournal.executeLedgerWrite first onlyPendingId
+                    "TaskWrite" (command "notaccepted") neverAccepted with
+            | Error(Client.LedgerFailureError failure) ->
                 Assert.That(failure.Code, Is.EqualTo("OutcomeUnknown"))
                 Assert.That(failure.OperationId, Is.EqualTo(Some(onlyPendingId.ToString("D"))))
                 Assert.That(failure.VerifiedLedgerHead, Is.EqualTo(Some before))
             | other -> Assert.Fail(sprintf "Unknown outcome must remain uncertain: %A" other)
-            let pending = Client.V2ReviewApi.V2PendingIntentJournal.reconcile first |> success
+            let pending = Client.OrchestrationApi.PendingIntentJournal.reconcile first |> success
             Assert.That(pending.Length, Is.EqualTo(1))
             Assert.That(pending.Head.disposition, Is.EqualTo("NotFoundAtVerifiedHead"))
             Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(before)))
@@ -2172,17 +2172,17 @@ type ReviewWorkflowTests() =
                    ExpectedVersion = 3; Generation = 1
                    RequestId = requestId.ToString("D")
                    SourceRef = sourceRef; HeadOid = head; TargetRef = ""; Summary = "Review"; Kind = "" |}
-            Client.V2ReviewApi.V2PendingIntentJournal.persist first operationId
-                "V2ReviewWrite" (System.Text.Json.JsonSerializer.Serialize original) |> success
+            Client.OrchestrationApi.PendingIntentJournal.persist first operationId
+                "ReviewWrite" (System.Text.Json.JsonSerializer.Serialize original) |> success
             ReviewWorkflow.submitBranchReview first operationId "submission"  "Owner"
                 requestId sourceRef head "Review" "" "" |> success |> ignore
-            let entries = Client.V2ReviewApi.V2PendingIntentJournal.reconcile first |> success
+            let entries = Client.OrchestrationApi.PendingIntentJournal.reconcile first |> success
             let item = entries |> List.find (fun entry -> entry.operationId = operationId.ToString("D"))
             Assert.That(item.disposition, Is.EqualTo("Applied"))
             let hash = item.operation.Value.RequestHash
-            Client.V2ReviewApi.V2PendingIntentJournal.acknowledge first operationId hash
+            Client.OrchestrationApi.PendingIntentJournal.acknowledge first operationId hash
             |> success |> ignore
-            Assert.That((Client.V2ReviewApi.V2PendingIntentJournal.listAtRoot one |> success).Length,
+            Assert.That((Client.OrchestrationApi.PendingIntentJournal.listAtRoot one |> success).Length,
                         Is.EqualTo(0)))
 
 
@@ -2200,18 +2200,18 @@ type ReviewWorkflowTests() =
                 {| Action = "Update"; TaskId = taskId; RequestId = reviewId.ToString("D")
                    ActorId = "Owner"; ExpectedVersion = 1; SourceRef = sourceRef
                    HeadOid = replacementHead; Summary = "Updated review" |}
-            Client.V2ReviewApi.V2PendingIntentJournal.persist first operationId
-                "V2ReviewWrite" (System.Text.Json.JsonSerializer.Serialize command)
+            Client.OrchestrationApi.PendingIntentJournal.persist first operationId
+                "ReviewWrite" (System.Text.Json.JsonSerializer.Serialize command)
             |> success
             ReviewWorkflow.replaceBranchReview first operationId taskId "Owner" reviewId 1
                 sourceRef replacementHead "Updated review" |> success |> ignore
-            let entries = Client.V2ReviewApi.V2PendingIntentJournal.reconcile first |> success
+            let entries = Client.OrchestrationApi.PendingIntentJournal.reconcile first |> success
             let item = entries |> List.find (fun entry ->
                 entry.operationId = operationId.ToString("D"))
             Assert.That(item.disposition, Is.EqualTo("Applied"))
             let current = ReviewWorkflow.getBranchReview first taskId reviewId |> success
             Assert.That(current.HeadCommit, Is.EqualTo(replacementHead))
-            Client.V2ReviewApi.V2PendingIntentJournal.acknowledge first operationId
+            Client.OrchestrationApi.PendingIntentJournal.acknowledge first operationId
                 item.operation.Value.RequestHash |> success |> ignore)
 
     [<Test>]
@@ -2298,27 +2298,27 @@ type ReviewWorkflowTests() =
             let attempt () : Result<LedgerWrite, Client.EffectError> =
                 ReviewWorkflow.createTaskWithSpec first operationId
                     "offline" "Offline" "<h1>Offline</h1>"
-                |> Result.mapError Client.V2ReviewApi.V2LedgerErrors.toEffect
+                |> Result.mapError Client.OrchestrationApi.LedgerErrors.toEffect
             let execute () =
-                Client.V2ReviewApi.V2PendingIntentJournal.executeLedgerWrite
-                    first operationId "V2TaskWrite" command attempt
+                Client.OrchestrationApi.PendingIntentJournal.executeLedgerWrite
+                    first operationId "TaskWrite" command attempt
             let unavailable = first.ApprovedFetchUrl + ".unavailable"
             Directory.Move(first.ApprovedFetchUrl, unavailable)
             try
                 match execute () with
-                | Error(Client.V2LedgerFailureError error) ->
+                | Error(Client.LedgerFailureError error) ->
                     Assert.That(error.Code, Is.EqualTo("RemoteUnavailable"))
                     Assert.That(error.OperationId, Is.EqualTo(Some(operationId.ToString("D"))))
                 | other -> Assert.Fail(sprintf "Unavailable remote must never accept a local write: %A" other)
-                match Client.V2ReviewApi.V2PendingIntentJournal.reconcile first with
-                | Error(Client.V2LedgerFailureError error) ->
+                match Client.OrchestrationApi.PendingIntentJournal.reconcile first with
+                | Error(Client.LedgerFailureError error) ->
                     Assert.That(error.Code, Is.EqualTo("RemoteUnavailable"))
                 | other -> Assert.Fail(sprintf "Reconcile must fail closed during outage: %A" other)
-                Assert.That((Client.V2ReviewApi.V2PendingIntentJournal.listAtRoot one |> success).Length,
+                Assert.That((Client.OrchestrationApi.PendingIntentJournal.listAtRoot one |> success).Length,
                             Is.EqualTo(1), "Offline reconciliation must not delete evidence.")
             finally Directory.Move(unavailable, first.ApprovedFetchUrl)
 
-            let before = Client.V2ReviewApi.V2PendingIntentJournal.reconcile first |> success
+            let before = Client.OrchestrationApi.PendingIntentJournal.reconcile first |> success
             Assert.That(before.Head.disposition, Is.EqualTo("NotFoundAtVerifiedHead"))
             let recovered = execute () |> success
             Assert.That(recovered.AlreadyApplied, Is.False)
@@ -2326,7 +2326,7 @@ type ReviewWorkflowTests() =
             Assert.That(recorded.IsSome, Is.True)
             Assert.That(recorded.Value.OriginalResultJson,
                         Is.EqualTo(recovered.Operation.OriginalResultJson))
-            Assert.That((Client.V2ReviewApi.V2PendingIntentJournal.listAtRoot one |> success).Length,
+            Assert.That((Client.OrchestrationApi.PendingIntentJournal.listAtRoot one |> success).Length,
                         Is.EqualTo(0)))
 
 
@@ -2339,21 +2339,21 @@ type ReviewWorkflowTests() =
                 System.Text.Json.JsonSerializer.Serialize(
                     {| Action = "CreateTask"; TaskId = "rewrite"
                        Title = "Rewrite"; Html = "<h1>Rewrite</h1>" |})
-            Client.V2ReviewApi.V2PendingIntentJournal.persist first id "V2TaskWrite" command
+            Client.OrchestrationApi.PendingIntentJournal.persist first id "TaskWrite" command
             |> success
             let sourceHead = git one [ "rev-parse"; "HEAD" ]
             let ledgerRef = "refs/heads/jarvis-orchestration"
             git one [ "push"; "--force"; "origin"; $"{sourceHead}:{ledgerRef}" ] |> ignore
             try
-                match Client.V2ReviewApi.V2PendingIntentJournal.reconcile first with
-                | Error(Client.V2LedgerFailureError failure) ->
+                match Client.OrchestrationApi.PendingIntentJournal.reconcile first with
+                | Error(Client.LedgerFailureError failure) ->
                     Assert.That(failure.Code, Is.EqualTo("LedgerIntegrityError"))
                 | other -> Assert.Fail(sprintf "Rewritten remote cannot authorize recovery: %A" other)
-                Assert.That((Client.V2ReviewApi.V2PendingIntentJournal.listAtRoot one |> success).Length,
+                Assert.That((Client.OrchestrationApi.PendingIntentJournal.listAtRoot one |> success).Length,
                             Is.EqualTo(1))
             finally
                 git one [ "push"; "--force"; "origin"; $"{original}:{ledgerRef}" ] |> ignore
-            let recovered = Client.V2ReviewApi.V2PendingIntentJournal.reconcile first |> success
+            let recovered = Client.OrchestrationApi.PendingIntentJournal.reconcile first |> success
             Assert.That(recovered.Length, Is.EqualTo(1))
             Assert.That(recovered.Head.disposition, Is.EqualTo("NotFoundAtVerifiedHead"))
             Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(original)))
@@ -2364,10 +2364,10 @@ type ReviewWorkflowTests() =
         withFixture (fun one two first second _ _ _ _ ->
             let ctx = GitCommandTests.TestContext(Path.GetDirectoryName one)
             let anchor = (LedgerStore.fetch first |> success).Commit
-            let path = Client.V2ReviewApi.ReviewV2Binding.pathForRoot one
+            let path = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
             if File.Exists path then File.Delete path
             let bind () =
-                Client.V2ReviewApi.ReviewV2Binding.bindExisting
+                Client.OrchestrationApi.LedgerBindingConfig.bindExisting
                     "owner" ctx first.ProjectId first.LedgerId first.Epoch
                     first.RemoteName first.ApprovedFetchUrl first.ApprovedPushUrl anchor true
             bind () |> function
@@ -2381,7 +2381,7 @@ type ReviewWorkflowTests() =
                 [| for _ in 1 .. 6 ->
                     System.Threading.Tasks.Task.Run(fun () ->
                         gate.Wait()
-                        Client.V2ReviewApi.ReviewV2Binding.load "owner" ctx) |]
+                        Client.OrchestrationApi.LedgerBindingConfig.load "owner" ctx) |]
             gate.Set()
             let newer = ReviewWorkflow.createTask second (Guid.NewGuid()) "newAnchor"
                             "New trusted ledger head" |> success
@@ -2392,7 +2392,7 @@ type ReviewWorkflowTests() =
                 match job.Result with
                 | Ok _ -> ()
                 | Error error -> Assert.Fail(sprintf "Concurrent verified load: %A" error)
-            let config = System.Text.Json.JsonSerializer.Deserialize<Client.V2ReviewApi.ReviewV2OptIn>(
+            let config = System.Text.Json.JsonSerializer.Deserialize<Client.OrchestrationApi.LedgerTrustBinding>(
                 File.ReadAllText path)
             Assert.That(config.HighestTrustedHead, Is.EqualTo(newHead))
             Assert.That(File.ReadAllText path, Does.Contain(newHead))
@@ -2407,9 +2407,9 @@ type ReviewWorkflowTests() =
         withFixture (fun one _ first _ _ _ _ _ ->
             let ctx = GitCommandTests.TestContext(Path.GetDirectoryName one)
             let trusted = (LedgerStore.fetch first |> success).Commit
-            let path = Client.V2ReviewApi.ReviewV2Binding.pathForRoot one
+            let path = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
             if File.Exists path then File.Delete path
-            Client.V2ReviewApi.ReviewV2Binding.bindExisting
+            Client.OrchestrationApi.LedgerBindingConfig.bindExisting
                 "owner" ctx first.ProjectId first.LedgerId first.Epoch
                 first.RemoteName first.ApprovedFetchUrl first.ApprovedPushUrl trusted true
             |> success |> ignore
@@ -2426,13 +2426,13 @@ type ReviewWorkflowTests() =
                              ApprovedPushUrl = rogue }
             let rogueHead = LedgerStore.initialize rogueBinding true |> success
             let rejected =
-                Client.V2ReviewApi.ReviewV2Binding.rebindRemote "owner" ctx
+                Client.OrchestrationApi.LedgerBindingConfig.rebindRemote "owner" ctx
                     "rogue" rogue rogue rogueHead.Commit true
             match rejected with
-            | Error(Client.V2LedgerFailureError failure)
+            | Error(Client.LedgerFailureError failure)
                     when failure.Code = "LedgerIntegrityError" || failure.Code = "LedgerHistoryUnavailable" -> ()
             | other -> Assert.Fail(sprintf "Independent rogue root must be rejected: %A" other)
-            let config = System.Text.Json.JsonSerializer.Deserialize<Client.V2ReviewApi.ReviewV2OptIn>(
+            let config = System.Text.Json.JsonSerializer.Deserialize<Client.OrchestrationApi.LedgerTrustBinding>(
                 File.ReadAllText path)
             Assert.That(config.RemoteName, Is.EqualTo(first.RemoteName))
             Assert.That(config.HighestTrustedHead, Is.EqualTo(trusted))
@@ -2464,14 +2464,14 @@ type ReviewWorkflowTests() =
     [<Test>]
     member _.BindingRejectsEmbeddedUrlCredentialsBeforeNetworkOrPersistence() =
         withFixture (fun one _ first _ _ _ _ _ ->
-            let path = Client.V2ReviewApi.ReviewV2Binding.pathForRoot one
+            let path = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
             if File.Exists path then File.Delete path
             let ctx = GitCommandTests.TestContext(Path.GetDirectoryName one)
             let malicious = "https://user:secret@host.example/project.git?token=secret"
-            match Client.V2ReviewApi.ReviewV2Binding.bindExisting
+            match Client.OrchestrationApi.LedgerBindingConfig.bindExisting
                       "owner" ctx first.ProjectId first.LedgerId first.Epoch first.RemoteName
                       malicious malicious (String.replicate 40 "a") true with
-            | Error(Client.V2LedgerFailureError failure) ->
+            | Error(Client.LedgerFailureError failure) ->
                 Assert.That(failure.Code, Is.EqualTo("InvalidBinding"))
             | other -> Assert.Fail(sprintf "Embedded credentials must be refused: %A" other)
             Assert.That(File.Exists path, Is.False)
@@ -2486,30 +2486,30 @@ type ReviewWorkflowTests() =
         withFixture (fun one _ first _ _ _ _ _ ->
             let ctx = GitCommandTests.TestContext(Path.GetDirectoryName one)
             let original = (LedgerStore.fetch first |> success).Commit
-            let path = Client.V2ReviewApi.ReviewV2Binding.pathForRoot one
+            let path = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
             if File.Exists path then File.Delete path
-            Client.V2ReviewApi.ReviewV2Binding.bindExisting
+            Client.OrchestrationApi.LedgerBindingConfig.bindExisting
                 "owner" ctx first.ProjectId first.LedgerId first.Epoch
                 first.RemoteName first.ApprovedFetchUrl first.ApprovedPushUrl original true
             |> success |> ignore
             git one [ "remote"; "set-url"; "--push"; "origin"; "file:///not-an-approved-push.git" ] |> ignore
-            match Client.V2ReviewApi.ReviewV2Binding.load "owner" ctx with
-            | Error(Client.V2LedgerFailureError failure) ->
+            match Client.OrchestrationApi.LedgerBindingConfig.load "owner" ctx with
+            | Error(Client.LedgerFailureError failure) ->
                 Assert.That(failure.Code, Is.EqualTo("InvalidBinding"))
             | other -> Assert.Fail(sprintf "Changed push endpoint must reject: %A" other)
             git one [ "remote"; "set-url"; "--push"; "origin"; first.ApprovedPushUrl ] |> ignore
             git one [ "push"; "origin"; ":refs/heads/jarvis-orchestration" ] |> ignore
             try
-                match Client.V2ReviewApi.ReviewV2Binding.load "owner" ctx with
-                | Error(Client.V2LedgerFailureError failure) ->
+                match Client.OrchestrationApi.LedgerBindingConfig.load "owner" ctx with
+                | Error(Client.LedgerFailureError failure) ->
                     Assert.That(failure.Code, Is.EqualTo("LedgerIntegrityError"))
                 | other -> Assert.Fail(sprintf "Missing ledger must not be recreated: %A" other)
-                let config = System.Text.Json.JsonSerializer.Deserialize<Client.V2ReviewApi.ReviewV2OptIn>(
+                let config = System.Text.Json.JsonSerializer.Deserialize<Client.OrchestrationApi.LedgerTrustBinding>(
                     File.ReadAllText path)
                 Assert.That(config.HighestTrustedHead, Is.EqualTo(original))
             finally
                 git one [ "push"; "origin"; $"{original}:refs/heads/jarvis-orchestration" ] |> ignore
-            Client.V2ReviewApi.ReviewV2Binding.load "owner" ctx |> function
+            Client.OrchestrationApi.LedgerBindingConfig.load "owner" ctx |> function
                 | Ok _ -> ()
                 | Error error -> Assert.Fail(sprintf "Restored trusted ref: %A" error)
             Assert.That(git one [ "status"; "--porcelain" ], Is.Empty)

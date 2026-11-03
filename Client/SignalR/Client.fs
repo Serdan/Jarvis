@@ -28,11 +28,11 @@ let private workingSessions =
 
 let private workingActor command =
     match command with
-    | V2TaskWriteCommand c when List.contains c.Action
+    | TaskWriteCommand c when List.contains c.Action
         [ "BeginAttempt"; "ResumeAgent"; "CheckpointAttempt";
           "BindReviewBase"; "BindAttemptSource"; "RebindAttemptSource" ] ->
         Some(c.ProjectName, c.ActorId)
-    | V2ReviewWriteCommand c when List.contains c.Action [ "Submit"; "Update" ] ->
+    | ReviewWriteCommand c when List.contains c.Action [ "Submit"; "Update" ] ->
         Some(c.ProjectName, c.ActorId)
     | _ -> None
 
@@ -55,7 +55,7 @@ let private checkWorkingGuidance (rt: Runtime) sessionId command response =
         let known = candidate |> Option.orElse cached
 
         let lookup project =
-            match V2ReviewApi.ReviewV2Binding.load project rt with
+            match OrchestrationApi.LedgerBindingConfig.load project rt with
             | Error _ -> None
             | Ok binding ->
                 let found =
@@ -140,9 +140,9 @@ let private auditDetails command =
     | RunProjectTaskCommand cmd -> Some("RunProjectTask", Some cmd.ProjectName, [ ProcessExecution ], [], None, [ cmd.TaskName ])
     | CreateSkillCommand cmd -> Some("CreateSkill", Some cmd.ProjectName, [ WorkspaceWrite ], [ $".jarvis/skills/{cmd.SkillName}/SKILL.md" ], None, [])
     | RemoveWorktreeCommand cmd -> Some("RemoveWorktree", Some cmd.ProjectName, [ VersionControlWrite; Destructive ], [], Some "git", [ cmd.WorktreePath ])
-    | V2TaskWriteCommand cmd -> Some("V2Task" + cmd.Action, Some cmd.ProjectName, [ VersionControlWrite; NetworkAccess ], [], Some "git", [ cmd.TaskId; cmd.AttemptId; cmd.OperationId ])
-    | V2LedgerWriteCommand cmd -> Some("V2Ledger" + cmd.Action, Some cmd.ProjectName, [ VersionControlWrite; NetworkAccess ], [], Some "git", [ cmd.RemoteName; cmd.ExpectedTrustedHead; cmd.OperationId ])
-    | V2ReviewWriteCommand cmd -> Some("V2Review" + cmd.Action, Some cmd.ProjectName, [ WorkspaceWrite; VersionControlWrite; NetworkAccess ], [], Some "git", [ cmd.TaskId; cmd.RequestId; cmd.OperationId ])
+    | TaskWriteCommand cmd -> Some("Task" + cmd.Action, Some cmd.ProjectName, [ VersionControlWrite; NetworkAccess ], [], Some "git", [ cmd.TaskId; cmd.AttemptId; cmd.OperationId ])
+    | LedgerWriteCommand cmd -> Some("Ledger" + cmd.Action, Some cmd.ProjectName, [ VersionControlWrite; NetworkAccess ], [], Some "git", [ cmd.RemoteName; cmd.ExpectedTrustedHead; cmd.OperationId ])
+    | ReviewWriteCommand cmd -> Some("Review" + cmd.Action, Some cmd.ProjectName, [ WorkspaceWrite; VersionControlWrite; NetworkAccess ], [], Some "git", [ cmd.TaskId; cmd.RequestId; cmd.OperationId ])
     | CreateWorktreeCommand cmd -> Some("CreateWorktree", Some cmd.ProjectName, [ VersionControlWrite ], [], Some "git", [ cmd.Branch; cmd.Name ])
     | GitCommitCommand cmd -> Some("GitCommit", Some cmd.ProjectName, [ VersionControlWrite ], cmd.Paths, Some "git", [ cmd.Message ])
     | StartJobCommand cmd -> Some("StartJob", Some cmd.ProjectName, [ ProcessExecution ], [], Some cmd.Executable, cmd.Args)
@@ -255,12 +255,12 @@ let private dispatch (rt: Runtime) (command: AgentCommand) =
     | CreateWorktreeCommand cmd -> rt |> Worktrees.createWorktree cmd |> serialize'
     | InspectWorktreeRemovalCommand cmd -> rt |> Worktrees.inspectRemoval cmd |> serialize'
     | RemoveWorktreeCommand cmd -> rt |> Worktrees.removeWorktree cmd |> serialize'
-    | V2TaskReadCommand cmd -> rt |> V2ReviewApi.V2TaskApi.read cmd |> serialize'
-    | V2TaskWriteCommand cmd -> rt |> V2ReviewApi.V2TaskApi.write cmd |> serialize'
-    | V2LedgerReadCommand cmd -> rt |> V2ReviewApi.V2LedgerApi.read cmd |> serialize'
-    | V2LedgerWriteCommand cmd -> rt |> V2ReviewApi.V2LedgerApi.write cmd |> serialize'
-    | V2ReviewReadCommand cmd -> rt |> V2ReviewApi.V2ReviewApi.read cmd |> serialize'
-    | V2ReviewWriteCommand cmd -> rt |> V2ReviewApi.V2ReviewApi.write cmd |> serialize'
+    | TaskReadCommand cmd -> rt |> OrchestrationApi.TaskApi.read cmd |> serialize'
+    | TaskWriteCommand cmd -> rt |> OrchestrationApi.TaskApi.write cmd |> serialize'
+    | LedgerReadCommand cmd -> rt |> OrchestrationApi.LedgerApi.read cmd |> serialize'
+    | LedgerWriteCommand cmd -> rt |> OrchestrationApi.LedgerApi.write cmd |> serialize'
+    | ReviewReadCommand cmd -> rt |> OrchestrationApi.OrchestrationApi.read cmd |> serialize'
+    | ReviewWriteCommand cmd -> rt |> OrchestrationApi.OrchestrationApi.write cmd |> serialize'
     | ListProjectsCommand ->
         rt
         |> ProjectBrowser.listProjects
@@ -419,8 +419,8 @@ let receiveCommandAndReply (connection: HubConnection) (rt: Runtime) (correlatio
                     let incoming = JsonSerializer.Deserialize<AgentCommand>(commandJson)
                     let command =
                         match incoming with
-                        | V2TaskWriteCommand cmd ->
-                            V2TaskWriteCommand { cmd with SessionId = sessionId }
+                        | TaskWriteCommand cmd ->
+                            TaskWriteCommand { cmd with SessionId = sessionId }
                         | _ -> incoming
                     parsedCommand <- Some command
                     let! response, applicable = receiveCommandWithInstructions rt command

@@ -43,9 +43,9 @@ let private projectSnapshot project rt =
     | Error error -> Error (string error)
     | Ok (FolderPath root) ->
         // Unbound projects have no orchestration state. Never consult V1 files.
-        if not (File.Exists(V2ReviewApi.ReviewV2Binding.pathForRoot root)) then Ok None
+        if not (File.Exists(OrchestrationApi.LedgerBindingConfig.pathForRoot root)) then Ok None
         else
-            match V2ReviewApi.ReviewV2Binding.load project rt with
+            match OrchestrationApi.LedgerBindingConfig.load project rt with
             | Error error -> Error (string error)
             | Ok binding ->
                 match LedgerStore.fetch binding with

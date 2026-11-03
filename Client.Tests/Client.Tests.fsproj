@@ -32,7 +32,7 @@
         <Compile Include="LedgerStoreTests.fs"/>
         <Compile Include="ReviewWorkflowTests.fs"/>
         <Compile Include="WorkingTurnGuidanceTests.fs"/>
-        <Compile Include="V2ReviewApiTests.fs"/>
+        <Compile Include="OrchestrationApiTests.fs"/>
         <Compile Include="AgentViewTests.fs"/>
         <Compile Include="TerminalMouseTests.fs"/>
         <Compile Include="TerminalLayoutTests.fs"/>

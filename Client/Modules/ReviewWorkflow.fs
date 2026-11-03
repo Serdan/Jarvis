@@ -842,7 +842,7 @@ module ReviewWorkflow =
     let exportTaskSpec binding taskId relativePath expectedSpecOid =
         exportTaskSpecWithId binding (Guid.NewGuid()) taskId relativePath expectedSpecOid
 
-    // Explicit single-ledger v2 -> v3 conversion. Never run this on ordinary reads.
+    // Explicit single-ledger ledger -> v3 conversion. Never run this on ordinary reads.
     // All checks precede one normal Git transaction, so an ambiguous owner or a
     // mixed record schema cannot produce a partially converted authoritative head.
     let migrateOrthogonalAgentState binding operationId expectedLedgerHead =
@@ -895,7 +895,7 @@ module ReviewWorkflow =
                             attempts <- attempt :: attempts
                             modifications <- change path (Some oid) next :: modifications
                             migrationCount <- migrationCount + 1
-                        | Some _, Some _ -> return! Error(LedgerIntegrityError "Attempt schema is not v2; refusing mixed migration.")
+                        | Some _, Some _ -> return! Error(LedgerIntegrityError "Attempt schema is not ledger; refusing mixed migration.")
                         | _ -> return! Error(LedgerIntegrityError ("Missing legacy attempt: " + path))
                     for path in agentPaths do
                         let! raw, oid = LedgerStore.readAt binding snapshot path
@@ -941,7 +941,7 @@ module ReviewWorkflow =
                                         elif state = "Parked" then "Parked" else "NeedsWork" }
                             modifications <- change path (Some oid) converted :: modifications
                             migrationCount <- migrationCount + 1
-                        | Some _, Some _ -> return! Error(LedgerIntegrityError "Agent schema is not v2; refusing mixed migration.")
+                        | Some _, Some _ -> return! Error(LedgerIntegrityError "Agent schema is not ledger; refusing mixed migration.")
                         | _ -> return! Error(LedgerIntegrityError ("Missing legacy agent: " + path))
                     if migrationCount = 0 then
                         return! Error(StaleEntityVersion "No legacy agent or attempt records to convert.")
@@ -1422,7 +1422,7 @@ module ReviewWorkflow =
                         elif agent.State = "Working" && attempt.Phase = "Started"
                              && agent.ActiveAttemptId = attempt.AttemptId then
                             // Only a new execution can report a recovery. Existing
-                            // sessions have read-only status through V2TaskApi.
+                            // sessions have read-only status through TaskApi.
                             // Do not silently reactivate old IDs or change versions.
                             let previous =
                                 if isNull (box agent.AssociatedSessionIds) then []

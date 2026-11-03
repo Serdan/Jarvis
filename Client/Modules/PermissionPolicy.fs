@@ -111,9 +111,9 @@ let private requiresConfirmation command =
     | ListWorktreesCommand _
     | GetWorktreeCommand _
     | InspectWorktreeRemovalCommand _
-    | V2TaskReadCommand _
-    | V2LedgerReadCommand _
-    | V2ReviewReadCommand _
+    | TaskReadCommand _
+    | LedgerReadCommand _
+    | ReviewReadCommand _
     | GetProjectDetailsCommand _
     | ListDirectoryCommand _
     | SearchFilesCommand _
@@ -147,21 +147,21 @@ let private requiresConfirmation command =
         confirmation "RunProjectTask" (Some cmd.ProjectName) [ ProcessExecution ] [] None [ cmd.TaskName ] $"Run project task {cmd.TaskName}" false
     | RemoveWorktreeCommand cmd ->
         confirmation "RemoveWorktree" (Some cmd.ProjectName) [ VersionControlWrite; Destructive ] [] (Some "git") [ cmd.WorktreePath ] $"Remove worktree {cmd.WorktreePath}" false
-    | V2TaskWriteCommand cmd ->
-        confirmation ("V2Task" + cmd.Action) (Some cmd.ProjectName)
+    | TaskWriteCommand cmd ->
+        confirmation ("Task" + cmd.Action) (Some cmd.ProjectName)
             [ VersionControlWrite; NetworkAccess ] [] (Some "git")
             [ cmd.TaskId; cmd.AttemptId; cmd.OperationId ]
-            ("V2 ledger task " + cmd.Action) false
-    | V2LedgerWriteCommand cmd ->
-        confirmation ("V2Ledger" + cmd.Action) (Some cmd.ProjectName)
+            (" ledger task " + cmd.Action) false
+    | LedgerWriteCommand cmd ->
+        confirmation ("Ledger" + cmd.Action) (Some cmd.ProjectName)
             [ VersionControlWrite; NetworkAccess ] [] (Some "git")
             [ cmd.RemoteName; cmd.ExpectedTrustedHead; cmd.OperationId ]
-            ("V2 ledger setup " + cmd.Action) false
-    | V2ReviewWriteCommand cmd ->
-        confirmation ("V2Review" + cmd.Action) (Some cmd.ProjectName)
+            (" ledger setup " + cmd.Action) false
+    | ReviewWriteCommand cmd ->
+        confirmation ("Review" + cmd.Action) (Some cmd.ProjectName)
             [ VersionControlWrite; NetworkAccess ] [] (Some "git")
             [ cmd.TaskId; cmd.RequestId; cmd.OperationId ]
-            ("V2 canonical ledger review " + cmd.Action) false
+            (" canonical ledger review " + cmd.Action) false
     | CreateWorktreeCommand cmd ->
         confirmation "CreateWorktree" (Some cmd.ProjectName) [ VersionControlWrite ] [] (Some "git") [ cmd.Branch; cmd.Name ] $"Create worktree {cmd.Name}" true
     | GitCommitCommand cmd ->

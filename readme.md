@@ -271,7 +271,9 @@ idempotent on retry. The message remains in Git history after acknowledgment.
 
 The client **Agents** screen reads only explicitly bound canonical ledgers and shows the persisted agent state and transition time; it never scans source-side task files. Unbound projects do not contribute invented agent state, while bound-ledger read failures are surfaced as errors.
 
-See [Migration to Git-backed orchestration](docs/OrchestrationMigration.md) for initialization, selective task carry-over and recovery. The [orchestration V2 architecture](docs/specs/orchestration-v2-architecture.md) defines the authority rules. The older [Git-backed task files guide](docs/GitBackedTasks.md) describes the retired workflow.
+**Current protocol (3.47):** Internal transports are `TaskRead`, `TaskWrite`, `LedgerRead`, `LedgerWrite`, `ReviewRead` and `ReviewWrite`. Public MCP tools retain existing unprefixed names. The client module is `OrchestrationApi`; there are no parallel versioned orchestration handlers. This wire rename requires a coordinated client/server deployment after explicit operator approval. Existing checkout trust bindings remain in `ledger-v2/`, and pending journals written by previous clients remain recognizable. Archived review and migration documents retain their historical version terminology.
+
+See [Migration to Git-backed orchestration](docs/OrchestrationMigration.md) for initialization, selective task carry-over and recovery. The [orchestration architecture](docs/specs/orchestration-architecture.md) defines the authority rules. The older [Git-backed task files guide](docs/GitBackedTasks.md) describes the retired workflow.
 
 ## Automatic repository instructions
 

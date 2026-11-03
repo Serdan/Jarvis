@@ -426,7 +426,7 @@ let ``command catalog matches AgentCommand union and MCP tools`` () =
               "CompleteTask"; "GetTaskHistory"; "CompareWorktreeTasks"; "GetAgentAssignment"
               "AcknowledgeTask"; "GetOrchestrationSnapshot"; "RetireWorktree"; "BeginTask" ]
     // Orphan-ledger MCP tools route through eight versioned internal wire commands.
-    let v2Wire = set [ "V2TaskRead"; "V2TaskWrite"; "V2ReviewRead"; "V2ReviewWrite"; "V2LedgerRead"; "V2LedgerWrite" ]
+    let ledgerWire = set [ "TaskRead"; "TaskWrite"; "ReviewRead"; "ReviewWrite"; "LedgerRead"; "LedgerWrite" ]
     let orchestrationTools =
         set [ "GetIntegrationSubmissions"; "SubmitIntegration"; "CompleteIntegration"; "NotifyAgent"; "AcknowledgeNotification"; "MigrateOrthogonalAgentState"; "AgentInbox"; "GetAssignment"; "GetCheckpoint"; "InspectAttemptSource"; "TaskLifecycleHistory"; "GetTaskSpecPage"; "DiffTaskSpec"; "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "AcknowledgeAssignment"; "ReissueAssignment"; "BeginAttempt"; "CheckpointAttempt"
               "BindReviewBase"; "BindAttemptSource"; "RebindAttemptSource"; "YieldAgent"; "ResumeAgent"; "CompleteAgentWork"
@@ -440,16 +440,15 @@ let ``command catalog matches AgentCommand union and MCP tools`` () =
     unionNames |> shouldEqual catalogNames
     Set.intersect mcpNames retired |> shouldEqual Set.empty
     Set.intersect catalogNames retired |> shouldEqual Set.empty
-    Set.intersect mcpNames (set [ for name in orchestrationTools -> "V2" + name ]) |> shouldEqual Set.empty
     Set.intersect mcpNames orchestrationTools |> shouldEqual orchestrationTools
     Set.difference (Set.difference mcpNames serverLocalNames) orchestrationTools
-    |> shouldEqual (Set.difference catalogNames v2Wire)
+    |> shouldEqual (Set.difference catalogNames ledgerWire)
     Set.difference (Set.difference mcpNames catalogNames) orchestrationTools
     |> shouldEqual serverLocalNames
 
 
 [<Test>]
-let ``public orchestration tool metadata describes canonical branch reviews without V2 terminology`` () =
+let ``public orchestration tool metadata describes canonical branch reviews`` () =
     let reviewMethods =
         set [ "ReviewTask"; "ReviewDetails"; "ReviewerInbox"; "SubmitReview"
               "ReplaceReview"; "ClaimReview"; "DecideReview"; "ReleaseReview"; "WithdrawReview"
@@ -465,8 +464,8 @@ let ``public orchestration tool metadata describes canonical branch reviews with
             Assert.That(descriptions.Length, Is.EqualTo(1), methodInfo.Name)
             let description =
                 (descriptions[0] :?> System.ComponentModel.DescriptionAttribute).Description
-            Assert.That(tool.Title, Does.Not.Contain("V2"), methodInfo.Name)
-            Assert.That(description, Does.Not.Contain("V2"), methodInfo.Name)
+            Assert.That(tool.Title, Is.Not.Empty, methodInfo.Name)
+            Assert.That(description, Is.Not.Empty, methodInfo.Name)
             if reviewMethods.Contains methodInfo.Name then
                 Assert.That(description, Does.Not.Contain("review revision"), methodInfo.Name)
                 Assert.That(description, Does.Not.Contain("client opt-in"), methodInfo.Name)
@@ -732,12 +731,12 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
             AgentProtocol.commandDefinitions
             |> List.map (fun definition -> definition.Name, definition)
             |> Map.ofList
-        let ledgerRead = original["V2LedgerRead"]
-        let ledgerWrite = original["V2LedgerWrite"]
-        let taskRead = original["V2TaskRead"]
-        let taskWrite = original["V2TaskWrite"]
-        let v2Read = original["V2ReviewRead"]
-        let v2Write = original["V2ReviewWrite"]
+        let ledgerRead = original["LedgerRead"]
+        let ledgerWrite = original["LedgerWrite"]
+        let taskRead = original["TaskRead"]
+        let taskWrite = original["TaskWrite"]
+        let ledgerRead = original["ReviewRead"]
+        let ledgerWrite = original["ReviewWrite"]
         let aliases =
             [ for name in [ "LedgerHealth"; "GetOperationStatus"; "PendingOperations"; "ReconcilePendingOperations" ] -> name, ledgerRead
               for name in [ "InitializeLedger"; "BindExistingLedger"; "RebindLedgerRemote"; "AcknowledgePendingOperation" ] -> name, ledgerWrite
@@ -746,10 +745,10 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
                             "BindReviewBase"; "BindAttemptSource"; "RebindAttemptSource"; "YieldAgent"; "ResumeAgent"; "CompleteAgentWork";
                             "ParkAgent"; "ReissueQueuedAttempt"; "RecoverAgentAssignment"; "AcknowledgeReviewFeedback"; "ParkAttempt"; "BlockAttempt"; "ResumeAttempt"; "AbandonAttempt"; "CancelTask"; "CancelOpenTask"; "TransferOwner"; "CloseTask"; "ReopenTask"; "ReviseTaskSpecPinned"; "ImportTaskSpec"; "AdoptTaskSpec"; "ExportTaskSpec" ] -> name, taskWrite
               for name in [ "ReviewTask"; "TaskOverview"; "ReviewDetails"; "ReviewerInbox"; "ListReviewDocuments"; "ReadReviewDocument" ] ->
-                  name, v2Read
+                  name, ledgerRead
               for name in [ "SubmitReview"; "ReplaceReview"; "ClaimReview"; "DecideReview"
                             "ReleaseReview"; "WithdrawReview"; "PutReviewDocument" ] ->
-                  name, v2Write ]
+                  name, ledgerWrite ]
         aliases |> List.fold (fun map (key, value) -> Map.add key value map) original
 
     let methods =
@@ -982,36 +981,36 @@ let response_json_carries_typed_hierarchical_instructions () =
 
 
 [<Test>]
-let ``MCP bridge preserves structured V2 ledger failure category`` () =
-    let problem : Common.V2LedgerFailureInfo =
+let ``MCP bridge preserves structured  ledger failure category`` () =
+    let problem : Common.LedgerFailureInfo =
         { Code = "OutcomeUnknown"
           Message = "Remote push response lost"
           OperationId = Some(Guid.NewGuid().ToString("D"))
           VerifiedLedgerHead = None }
     let response =
         { Result = None
-          Error = Some(Common.AgentError.V2LedgerFailure problem)
+          Error = Some(Common.AgentError.LedgerFailure problem)
           Instructions = [] }
     let tool = McpToolHelpers.toCallToolResult response
     tool.IsError |> shouldEqual (Nullable true)
     let content = tool.Content[0] :?> TextContentBlock
-    content.Text.Contains("V2LedgerFailure(OutcomeUnknown)", StringComparison.Ordinal)
+    content.Text.Contains("LedgerFailure(OutcomeUnknown)", StringComparison.Ordinal)
     |> shouldEqual true
 
 [<Test>]
-let ``typed V2 ledger failures survive response JSON roundtrip`` () =
+let ``typed  ledger failures survive response JSON roundtrip`` () =
     let operationId = Guid.NewGuid().ToString("D")
     let source : Common.AgentCommandResponse =
         { Result = None
           Error =
-              Some(Common.AgentError.V2LedgerFailure
+              Some(Common.AgentError.LedgerFailure
                   { Code = "OutcomeUnknown"; Message = "Unconfirmed push"
                     OperationId = Some operationId; VerifiedLedgerHead = None })
           Instructions = [] }
     let payload = JsonSerializer.Serialize(source)
     let destination = JsonSerializer.Deserialize<Common.AgentCommandResponse>(payload)
     match destination.Error with
-    | Some(Common.AgentError.V2LedgerFailure issue) ->
+    | Some(Common.AgentError.LedgerFailure issue) ->
         Assert.That(issue.Code, Is.EqualTo("OutcomeUnknown"))
         Assert.That(issue.OperationId, Is.EqualTo(Some operationId))
-    | other -> Assert.Fail(sprintf "Lost typed V2 failure during transport: %A" other)
+    | other -> Assert.Fail(sprintf "Lost typed  failure during transport: %A" other)

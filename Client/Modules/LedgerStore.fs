@@ -765,7 +765,7 @@ module LedgerStore =
                                     | Ok false -> Error(OutcomeUnknown "Remote did not retain initialization commit.")
                                     | Error error -> Error error
 
-    // V2 prototype's generic record mutation. Task transitions are intentionally not yet wired.
+    //  prototype's generic record mutation. Task transitions are intentionally not yet wired.
     let putRecord (binding: LedgerBinding) (change: LedgerRecordChange) =
         if change.OperationId = Guid.Empty || String.IsNullOrWhiteSpace change.Actor
            || not (recordPath.IsMatch change.Path) || change.Path.Contains("..")
@@ -1095,7 +1095,7 @@ module LedgerStore =
         | Error error -> Error error
         | Ok(_, _, destination) ->
             let prefix =
-                $"<!-- NON-AUTHORITATIVE JARVIS V2 EXPORT; operation={operationId:D}; task={taskId}; ledger-snapshot="
+                $"<!-- NON-AUTHORITATIVE JARVIS TASK EXPORT; operation={operationId:D}; task={taskId}; ledger-snapshot="
             let suffix =
                 $"; spec-blob={blobOid}; editing this copy does not change the canonical ledger. -->\n"
             let replay () =

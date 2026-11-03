@@ -10,7 +10,7 @@ The problem is simple: when tasks and assignment metadata live in normal source 
 
 **Fix that by storing all live orchestration state in one orphan Git branch.** Ordinary source branches and worktrees contain source code, not authoritative task state. Multiple Jarvis clients fetch/update the same branch. The Jarvis server stays stateless and routes commands to the connected client.
 
-This is a **replacement**, not an additive V1/V2 compatibility system.
+This is a **replacement**, not an additive legacy-version compatibility system.
 
 **Agents are trusted developers.** Jarvis provides useful, independent operations on tasks, agents, reviews and Git-backed records. Agents perform ordinary Git work directly. Jarvis does not decide which operations are appropriate in a development workflow, or require a task to pass through a prescribed review sequence.
 
@@ -201,7 +201,7 @@ The cutover is direct:
 4. Initialize/bind the project's orphan branch when ready.
 5. An agent manually recreates any old task worth carrying forward, using existing files as reference. Do not delete those files as a prerequisite.
 
-No automatic migration, staged compatibility period, global V1-to-V2 data conversion, protocol-4 writer gate, or elaborate rollout policy. There is no need to migrate completed or obsolete tasks.
+No automatic migration, staged compatibility period, global legacy-to-canonical data conversion, protocol-4 writer gate, or elaborate rollout policy. There is no need to migrate completed or obsolete tasks.
 
 **Implementation and deployment are separate.** This spec does not authorize a production push, deployment, initialization, or migration without the user's instruction.
 
@@ -227,7 +227,7 @@ The capability cutover is complete when these independent behaviors are verified
 8. Tests in disposable remotes cover independent operations, multiple reviews, owner transfer with claimed reviews, explicit closure without reviews, rewritten task branches and persisted findings. Existing client and server suites pass.
 9. Agent assignment state, session associations, explicit reported-stall recovery, timestamps and existing 25/30-minute execution guidance remain functional; none of them becomes a review or merge policy. No automatic legacy task migration occurs.
 
-Stop when these conditions hold. Do not revive retired V2 roadmaps or build a generalized workflow engine to satisfy the acceptance criteria.
+Stop when these conditions hold. Do not revive retired implementation roadmaps or build a generalized workflow engine to satisfy the acceptance criteria.
 
 ## 9. Design rule
 

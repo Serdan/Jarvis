@@ -4,7 +4,7 @@
 > task JSON workflow and automatic `nextActor` reviewer handoffs described below
 > are no longer available. Current task and review authority is the orphan
 > `refs/heads/jarvis-orchestration` ledger. Read the
-> [current capability specification](specs/orchestration-v2-architecture.md) or
+> [current capability specification](specs/orchestration-architecture.md) or
 > [migration guide](OrchestrationMigration.md). Ordinary Git worktree tools remain.
 
 

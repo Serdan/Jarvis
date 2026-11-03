@@ -229,7 +229,7 @@ let oversized_or_invalid_guidance_does_not_block_ledger_status_operations () =
     workspace (fun root rt ->
         let path = create root "Demo/AGENTS.md" (String('x', 256 * 1024 + 1))
         let stateCommand =
-            V2TaskWriteCommand
+            TaskWriteCommand
                 { ProjectName = "Demo"; Action = "YieldAgent"; OperationId = Guid.NewGuid().ToString("D")
                   TaskId = "252"; ActorId = "Agent 7"; AttemptId = ""; OwnerId = ""
                   Title = ""; Html = ""; ExpectedVersion = 1; ExpectedAgentVersion = 1
@@ -238,7 +238,7 @@ let oversized_or_invalid_guidance_does_not_block_ledger_status_operations () =
                   SourceRef = ""; AllowDetached = false; AllowUncommitted = false
                   DecisionSequence = 0L; Evidence = ""; SessionId = "" }
         Assert.That(docs rt stateCommand, Is.Empty)
-        Assert.That(docs rt (V2TaskReadCommand
+        Assert.That(docs rt (TaskReadCommand
                 { ProjectName = "Demo"; AgentId = "Agent 7"; Action = "AgentInbox"
                   TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L
                   Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null
@@ -259,7 +259,7 @@ let oversized_guidance_does_not_preempt_real_ledger_status_error () =
         try
             create root "Demo/AGENTS.md" (String('x', 256 * 1024 + 1)) |> ignore
             let command =
-                V2TaskReadCommand
+                TaskReadCommand
                     { ProjectName = "Demo"; AgentId = "Agent 7"; Action = "AgentInbox"
                       TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L
                       Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null

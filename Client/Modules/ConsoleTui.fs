@@ -907,37 +907,79 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         writeHotkeyToken "Esc"; draw.Write " activity, "
         writeMnemonic 'q' "quit"; draw.WriteLine "  • mouse: click/select, double-click/details, wheel/scroll"
 
-    let writeColoredAgentLine width marker (row: AgentView.AgentRow) =
+    // Keep column positions stable across rows, independent of values and scrolling.
+    let agentColumnWidths width =
+        let available = max 0 (width - 27)
+        let project = min 18 (max 7 (available / 3))
+        let agent = min 18 (max 7 (available / 3))
+        project, agent
+
+    let agentColumn value width =
+        if width <= 0 then ""
+        else (trim (compact value) width).PadRight(width)
+
+    let writeAgentTableHeader width =
+        let projectWidth, agentWidth = agentColumnWidths width
+        let header =
+            "   Age  " + agentColumn "Project" projectWidth + " "
+            + agentColumn "Agent" agentWidth + " "
+            + agentColumn "Mail" 5 + " "
+            + agentColumn "State" 10 + " Task"
+        let previous = draw.ForegroundColor
+        draw.ForegroundColor <- ConsoleColor.DarkGray
+        draw.WriteLine(trim header width)
+        draw.ForegroundColor <- previous
+
+    let writeColoredAgentLine width marker striped (row: AgentView.AgentRow) =
+        let original = draw.ForegroundColor
+        let originalBackground = draw.BackgroundColor
+        let projectWidth, agentWidth = agentColumnWidths width
+        let background =
+            if mode = AgentsMode && Some row.Key = agentSelected then ConsoleColor.DarkCyan
+            elif striped then ConsoleColor.DarkBlue
+            else ConsoleColor.Black
+        draw.BackgroundColor <- background
         let timestamp = AgentView.stateAge DateTimeOffset.UtcNow row
-        let token = ActivityFilter.projectToken row.Project
         let flag = if Set.contains row.Key agentChanged then "*" else " "
-        let status =
-            match row.Focus with
-            | Some task -> $"{AgentView.displayState row.State} · #{task.TaskId} {task.Title}"
-            | None -> AgentView.displayState row.State
-        let unread = if row.PendingNotifications = 0 then "" else $" [{row.PendingNotifications}]"
-        let rendered = trim $"{marker}{flag} {timestamp,-4} {token} {row.Agent}{unread}: {compact status}" width
-        let index = rendered.IndexOf(token, StringComparison.Ordinal)
-        if index < 0 then draw.WriteLine rendered
-        else
-            let original = draw.ForegroundColor
-            draw.Write(rendered.Substring(0, index))
-            draw.ForegroundColor <- projectColor row.Project
-            draw.Write(token)
-            draw.ForegroundColor <- original
-            let rest = rendered.Substring(index + token.Length)
-            let stateLabel = AgentView.displayState row.State
-            let stateMarker = ": " + stateLabel
-            let stateIndex = rest.LastIndexOf(stateMarker, StringComparison.Ordinal)
-            if stateIndex < 0 then draw.WriteLine rest
-            else
-                let stateStart = stateIndex + 2
-                draw.Write(rest.Substring(0, stateStart))
-                draw.ForegroundColor <- AgentView.stateColor row.State
-                draw.Write(stateLabel)
-                draw.ForegroundColor <- original
-                draw.WriteLine(rest.Substring(stateStart + stateLabel.Length))
-            draw.ForegroundColor <- original
+        let mail = if row.PendingNotifications = 0 then "" else $"[{row.PendingNotifications}]"
+        let state = AgentView.displayState row.State
+        let task =
+            row.Focus
+            |> Option.map (fun focus -> $"#{focus.TaskId} {focus.Title}")
+            |> Option.defaultValue ""
+        let writeCell value cellWidth color =
+            draw.ForegroundColor <- color
+            draw.Write(agentColumn value cellWidth)
+        // Two selection/change markers and a space form the leftmost gutter.
+        draw.Write(marker + flag + " ")
+        writeCell timestamp 4 original
+        draw.Write(" ")
+        let projectForeground =
+            match projectColor row.Project, background with
+            | ConsoleColor.Blue, ConsoleColor.DarkBlue
+            | ConsoleColor.DarkCyan, ConsoleColor.DarkCyan -> ConsoleColor.Cyan
+            | ConsoleColor.DarkGreen, ConsoleColor.DarkCyan -> ConsoleColor.Green
+            | color, _ -> color
+        writeCell (ActivityFilter.projectToken row.Project) projectWidth projectForeground
+        draw.ForegroundColor <- original
+        draw.Write(" ")
+        writeCell row.Agent agentWidth original
+        draw.Write(" ")
+        writeCell mail 5 (if row.PendingNotifications > 0 then ConsoleColor.Yellow else original)
+        draw.ForegroundColor <- original
+        draw.Write(" ")
+        writeCell state 10 (AgentView.stateColor row.State)
+        draw.ForegroundColor <- original
+        draw.Write(" ")
+        let remaining = max 0 (width - draw.CursorLeft)
+        draw.Write(agentColumn task remaining)
+        // Explicitly fill the row so the alternating background extends across
+        // the full available width even for agents with no task.
+        let padding = max 0 (width - draw.CursorLeft)
+        if padding > 0 then draw.Write(String(' ', padding))
+        draw.WriteLine()
+        draw.ForegroundColor <- original
+        draw.BackgroundColor <- originalBackground
 
     let renderAgentDetailsUnsafe width =
         if showAgentDetails then
@@ -989,7 +1031,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         let headerRows =
             if draw.Height >= 22 then 4 + (if agentChanged.IsEmpty then 0 else 1)
             else 2
-        let headerRows = headerRows + (if agentError.IsSome then 1 else 0)
+        let headerRows = headerRows + 1 + (if agentError.IsSome then 1 else 0)
                                     + (if mode = AgentFilterMode then 1 else 0)
         let inlineDetails =
             if showAgentDetails then
@@ -1040,11 +1082,12 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
             // Agent rows always use the available width. A details-pane
             // breakpoint formerly cut rows to ~55 columns at width 105.
             let rowWidth = TerminalLayout.agentListWidth width
+            writeAgentTableHeader rowWidth
             for index = agentScroll to last - 1 do
                 let row = filtered[index]
                 let marker = if mode = AgentsMode && Some row.Key = agentSelected then ">" else " "
                 registerMouseHit 0 rowWidth (SelectAgent row.Key)
-                writeColoredAgentLine rowWidth marker row
+                writeColoredAgentLine rowWidth marker (index % 2 = 1) row
         if showAgentDetails then renderAgentDetailsUnsafe width
 
         if not issues.IsEmpty then

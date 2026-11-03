@@ -6,18 +6,19 @@ open System.IO
 open System.Text
 
 [<Struct; StructuralEquality; StructuralComparison>]
-type Cell = { Text: string; Color: ConsoleColor }
+type Cell = { Text: string; Color: ConsoleColor; Background: ConsoleColor }
 
 /// A fixed-size terminal frame. Drawing past the right or bottom edge is clipped,
 /// never wrapped into a different hit-test row or scrolled on the real terminal.
 type Frame(width: int, height: int) =
     let width = max 1 width
     let height = max 1 height
-    let blank = { Text = " "; Color = ConsoleColor.Gray }
+    let blank = { Text = " "; Color = ConsoleColor.Gray; Background = ConsoleColor.Black }
     let cells = Array2D.create height width blank
     let mutable x = 0
     let mutable y = 0
     let mutable color = ConsoleColor.Gray
+    let mutable background = ConsoleColor.Black
 
     member _.Width = width
     member _.Height = height
@@ -27,6 +28,10 @@ type Frame(width: int, height: int) =
     member _.ForegroundColor
         with get() = color
         and set value = color <- value
+
+    member _.BackgroundColor
+        with get() = background
+        and set value = background <- value
 
     member _.GetCell(row, column) = cells[row, column]
 
@@ -65,9 +70,9 @@ type Frame(width: int, height: int) =
                     else
                         let cellWidth = if wide then 2 else 1
                         if y < height && x + cellWidth <= width then
-                            cells[y, x] <- { Text = rune.ToString(); Color = color }
+                            cells[y, x] <- { Text = rune.ToString(); Color = color; Background = background }
                             if cellWidth = 2 then
-                                cells[y, x + 1] <- { Text = ""; Color = color }
+                                cells[y, x + 1] <- { Text = ""; Color = color; Background = background }
                         x <- x + cellWidth
 
     member this.WriteLine(value: string) =
@@ -89,9 +94,11 @@ type Frame(width: int, height: int) =
             let full =
                 previous |> Option.forall (fun old -> old.Width <> width || old.Height <> height)
             let mutable initialColor = ConsoleColor.Gray
+            let mutable initialBackground = ConsoleColor.Black
             try
                 if full then Console.Clear()
                 initialColor <- Console.ForegroundColor
+                initialBackground <- Console.BackgroundColor
                 for row in 0 .. height - 1 do
                     let mutable col = 0
                     while col < width do
@@ -101,9 +108,11 @@ type Frame(width: int, height: int) =
                         else
                             let runStart = col
                             let runColor = current.Color
+                            let runBackground = current.Background
                             let text = StringBuilder()
                             while col < width
                                   && cells[row, col].Color = runColor
+                                  && cells[row, col].Background = runBackground
                                   && (full || (previous |> Option.exists (fun old -> old.GetCell(row, col) <> cells[row, col]))) do
                                 let part = cells[row, col].Text
                                 if part <> "" then text.Append(part) |> ignore
@@ -113,13 +122,18 @@ type Frame(width: int, height: int) =
                                     raise (InvalidOperationException("Terminal resized during presentation."))
                                 Console.SetCursorPosition(runStart, row)
                                 if Console.ForegroundColor <> runColor then Console.ForegroundColor <- runColor
+                                if Console.BackgroundColor <> runBackground then Console.BackgroundColor <- runBackground
                                 Console.Write(text.ToString())
                 Console.ForegroundColor <- initialColor
+                Console.BackgroundColor <- initialBackground
                 Console.SetCursorPosition(0, 0)
                 true
             with
             | :? ArgumentOutOfRangeException
             | :? IOException
             | :? InvalidOperationException ->
-                try Console.ForegroundColor <- initialColor with _ -> ()
+                try
+                    Console.ForegroundColor <- initialColor
+                    Console.BackgroundColor <- initialBackground
+                with _ -> ()
                 false

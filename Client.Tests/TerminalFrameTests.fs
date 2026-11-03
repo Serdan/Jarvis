@@ -57,3 +57,16 @@ let untrustedTextCannotInjectTerminalEscapeSequences () =
     Assert.That(line, Does.Contain("task[2Jtitle"))
     Assert.That(line |> Seq.exists (fun c -> int c = 27), Is.False)
     Assert.That(line |> Seq.exists (fun c -> int c = 7), Is.False)
+
+[<Test>]
+let backgroundColorIsStoredWithCellsAndRestoredForFollowingRows () =
+    let frame = Frame(8, 3)
+    frame.BackgroundColor <- System.ConsoleColor.DarkBlue
+    frame.Write("colored")
+    frame.BackgroundColor <- System.ConsoleColor.Black
+    frame.WriteLine()
+    frame.Write("normal")
+    Assert.That(frame.GetCell(0, 0).Background, Is.EqualTo(System.ConsoleColor.DarkBlue))
+    Assert.That(frame.GetCell(0, 6).Background, Is.EqualTo(System.ConsoleColor.DarkBlue))
+    Assert.That(frame.GetCell(1, 0).Background, Is.EqualTo(System.ConsoleColor.Black))
+    Assert.That(frame.GetCell(0, 7).Background, Is.EqualTo(System.ConsoleColor.Black))

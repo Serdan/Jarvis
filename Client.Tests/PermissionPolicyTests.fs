@@ -490,7 +490,7 @@ let create_skill_requires_workspace_write_confirmation () =
     | Error(Client.ConfirmationRequired request) ->
         request.CommandName |> shouldEqual "CreateSkill"
         request.Permissions |> shouldEqual [ WorkspaceWrite ]
-        request.Paths |> shouldEqual [ ".jarvis/skills/release/SKILL.md" ]
+        request.Paths |> shouldEqual [ ".agents/skills/release/SKILL.md" ]
     | other -> Assert.Fail($"Expected ConfirmationRequired, got {other}")
 
 [<Test>]

@@ -389,7 +389,7 @@ Public WorkTask MCP endpoints have been retired. Repository-backed tasks and the
 
 `ListSkills(projectName)` discovers project-local skill names and descriptions. `GetSkill(projectName, skillName)` returns the full Markdown. Both are read-only and require `workspace:read`.
 
-`CreateSkill(projectName, skillName, content, overwrite=false)` writes `.jarvis/skills/<skill-name>/SKILL.md`. It requires `workspace:write` and follows the local trust policy; existing skills require explicit overwrite. Skills are procedural guidance, not executable operations or permission grants. See [Jarvis Skills](Skills.md) for the authoritative layout, validation, and result details.
+`CreateSkill(projectName, skillName, content, overwrite=false)` writes `.agents/skills/<skill-name>/SKILL.md`. It requires `workspace:write` and follows the local trust policy; existing skills require explicit overwrite. Skills are procedural guidance, not executable operations or permission grants. See [Jarvis Skills](Skills.md) for the authoritative layout, validation, and result details.
 
 ## Git Commands
 

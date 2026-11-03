@@ -287,7 +287,7 @@ See [Automatic Agent Instructions](docs/AgentInstructions.md) and the [response 
 
 ## Project and global skills
 
-Projects store instructions at `<project>/.jarvis/skills/<skill-name>/SKILL.md`. The shared workspace skill scope uses `<workspace>/.jarvis/skills/<skill-name>/SKILL.md`.
+Projects store instructions at `<project>/.agents/skills/<skill-name>/SKILL.md`. The shared workspace skill scope uses `<workspace>/.agents/skills/<skill-name>/SKILL.md`.
 
 `ListSkills(projectName)` returns local and global skills with an explicit scope. Use `projectName="@global"` for `GetSkill` or `CreateSkill` when targeting the global scope. Existing skills require `overwrite=true`.
 
@@ -376,3 +376,4 @@ See `docs/privacy.md`.
 ## License
 
 MIT. See `LICENSE`.
+\nLegacy skills can be moved safely with `python3 scripts/migrate-skills.py /path/to/workspace` (preview), followed by `--apply` after reviewing conflicts.\n

@@ -7,13 +7,13 @@ Jarvis skills are project-local or workspace-global procedural instructions that
 Store project-local skills under:
 
 ```text
-<project>/.jarvis/skills/<skill-name>/SKILL.md
+<project>/.agents/skills/<skill-name>/SKILL.md
 ```
 
 Global skills shared by every project under a client's selected workspace live at:
 
 ```text
-<workspace>/.jarvis/skills/<skill-name>/SKILL.md
+<workspace>/.agents/skills/<skill-name>/SKILL.md
 ```
 
 Global skills belong to the current local workspace, not to every device or unrelated workspace.
@@ -32,7 +32,7 @@ Wayfold/
         SKILL.md
 ```
 
-A skill is ordinary Markdown. The directory name is its Jarvis skill name. `ListSkills` uses the first non-empty, non-heading line as a short discovery description when one is available.
+A skill is ordinary Markdown. The directory name is its skill name. `ListSkills` prefers the `description:` entry in standard YAML frontmatter (`---` delimiters), falling back to the first non-empty, non-heading body line for older files.
 
 ```markdown
 # Add opcode
@@ -63,3 +63,7 @@ Skills are guidance, not capabilities. Instructions inside a skill that require 
 `CreateSkill` persists only the skill content supplied by the caller. It does not execute the skill, grant the skill additional authority, or alter the permissions of later commands.
 
 The `@global` name is a reserved project selector for the shared workspace skill scope. The global scope grants no additional execution authority.
+
+## Migrating existing skills
+
+Use `python3 scripts/migrate-skills.py /path/to/workspace` to preview moves from both the workspace-global and individual project `.jarvis/skills/` directories. Add `--apply` to move them into `.agents/skills/`. The utility preserves skill contents and other directory files, skips destination conflicts and symlinks, and never overwrites an existing skill. Review skipped entries and resolve conflicts manually. Read commands never silently mutate old skill locations.

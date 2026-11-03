@@ -378,7 +378,7 @@ module private Core =
             Ok(skillName.Trim())
 
     let private skillPath skillName fileName =
-        Path.Combine(".jarvis", "skills", skillName, fileName)
+        Path.Combine(".agents", "skills", skillName, fileName)
 
     let private readSkillContent parsedProject skillName =
         fun rt ->
@@ -401,22 +401,42 @@ module private Core =
                   skillPath skillName "skill.md" ]
 
     let private skillDescription (Content content) =
-        content.Replace("\r\n", "\n").Split('\n')
-        |> Seq.map (fun line -> line.Trim())
-        |> Seq.filter (String.IsNullOrWhiteSpace >> not)
-        |> Seq.tryFind (fun line ->
-            not (line.StartsWith("#", StringComparison.Ordinal))
-            && line <> "---")
-        |> Option.map (fun line ->
-            if line.Length <= 240 then line
-            else line.Substring(0, 239) + "…")
+        let lines = content.Replace("\r\n", "\n").Split('\n')
+        let first = lines |> Array.tryFindIndex (fun line -> not (String.IsNullOrWhiteSpace line))
+        let frontmatter =
+            match first with
+            | Some index when lines[index].Trim() = "---" ->
+                lines
+                |> Array.skip (index + 1)
+                |> Array.takeWhile (fun line -> line.Trim() <> "---")
+                |> Array.tryPick (fun line ->
+                    let trimmed = line.Trim()
+                    if trimmed.StartsWith("description:", StringComparison.OrdinalIgnoreCase) then
+                        let value = trimmed.Substring("description:".Length).Trim().Trim('"', '\'')
+                        if String.IsNullOrWhiteSpace value then None else Some value
+                    else None)
+            | _ -> None
+        let fallback =
+            lines
+            |> Seq.map (fun line -> line.Trim())
+            |> Seq.filter (String.IsNullOrWhiteSpace >> not)
+            |> Seq.tryFind (fun line ->
+                not (line.StartsWith("#", StringComparison.Ordinal))
+                && line <> "---"
+                && not (line.StartsWith("name:", StringComparison.OrdinalIgnoreCase))
+                && not (line.StartsWith("description:", StringComparison.OrdinalIgnoreCase)))
+        frontmatter
+        |> Option.orElse fallback
+        |> Option.map (fun value ->
+            if value.Length <= 240 then value
+            else value.Substring(0, 239) + "…")
 
     let private listProjectSkills projectName =
         fun rt ->
             match parseProjectName projectName rt with
             | Error error -> Error error
             | Ok parsedProject ->
-                let skillsPath = Path.Combine(".jarvis", "skills")
+                let skillsPath = Path.Combine(".agents", "skills")
 
                 match parseFolderPath skillsPath parsedProject rt with
                 | Error(NotFoundError _) -> Ok { Skills = [] }
@@ -502,7 +522,7 @@ module private Core =
     let private globalScope = "@global"
 
     let private globalSkillPath skillName fileName =
-        ProjectPaths.resolveWorkspacePath [ ".jarvis"; "skills"; skillName; fileName ]
+        ProjectPaths.resolveWorkspacePath [ ".agents"; "skills"; skillName; fileName ]
 
     let private readGlobalSkill skillName =
         fun rt ->
@@ -516,7 +536,7 @@ module private Core =
             find [ "SKILL.md"; "skill.md" ]
 
     let private listGlobalSkills rt =
-        match ProjectPaths.resolveWorkspacePath [ ".jarvis"; "skills" ] rt with
+        match ProjectPaths.resolveWorkspacePath [ ".agents"; "skills" ] rt with
         | Error error -> Error error
         | Ok directory when not (Directory.Exists directory) -> Ok []
         | Ok directory ->
@@ -588,7 +608,7 @@ module private Core =
                     return
                         { Name = valid
                           Scope = "global"
-                          Path = $".jarvis/skills/{valid}/SKILL.md"
+                          Path = $".agents/skills/{valid}/SKILL.md"
                           Hash = Hash.sha256 content
                           Overwritten = overwritten }
             }

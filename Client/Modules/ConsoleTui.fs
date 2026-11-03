@@ -1,6 +1,7 @@
 module Client.ConsoleTui
 
 open System
+open System.Collections.Generic
 open System.Threading
 open System.Threading.Tasks
 open Common
@@ -89,6 +90,13 @@ type SettingsUiAccess =
 type ConsoleTui(?activityLog: ActivityLog.Store) =
     let syncRoot = obj()
     let activity = ResizeArray<ActivityEntry>()
+    let agentSeen = Dictionary<string, DateTimeOffset>(StringComparer.OrdinalIgnoreCase)
+    let persistedAgentSeen = Dictionary<string, DateTimeOffset>(StringComparer.OrdinalIgnoreCase)
+    do
+        activityLog |> Option.iter (fun store ->
+            for key, timestamp in store.LoadAgentSeen() do
+                agentSeen[key] <- timestamp
+                persistedAgentSeen[key] <- timestamp)
     let prompts = ResizeArray<PendingPrompt>()
     let mutable selectedPrompt = 0
     let mutable nextActivityId = 1
@@ -916,11 +924,13 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
             "   Age  " + agentColumn "Project" projectWidth + " "
             + agentColumn "Agent" agentWidth + " "
             + agentColumn "Mail" 5 + " "
-            + agentColumn "State" 10 + " " + agentColumn "Last seen" 9 + " Task"
+            + agentColumn "State" 10 + " " + agentColumn "Seen" 9 + " Task"
         let previous = draw.ForegroundColor
         draw.ForegroundColor <- ConsoleColor.DarkGray
         draw.WriteLine(trim header width)
         draw.ForegroundColor <- previous
+
+    let seenAt (row: AgentView.AgentRow) = AgentView.lastSeenAt row agentSeen
 
     let writeColoredAgentLine width projectWidth agentWidth marker lastSeen (row: AgentView.AgentRow) =
         let original = draw.ForegroundColor
@@ -985,12 +995,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                 writeDetailField width "Agent" row.Agent
                 writeDetailField width "Project" (ActivityFilter.projectToken row.Project)
                 writeDetailField width "State" (AgentView.displayState row.State)
-                let messages =
-                    activity
-                    |> Seq.filter (fun entry -> entry.CommandName.IsNone)
-                    |> Seq.choose (fun entry ->
-                        entry.ProjectName |> Option.map (fun project -> project, entry.Message, entry.StartedAt))
-                AgentView.lastSeenAt row messages
+                seenAt row
                 |> Option.iter (fun seen -> writeDetailField width "Last seen" (seen.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss")))
                 if row.PendingNotifications > 0 then
                     writeDetailField width "Unread notifications" (string row.PendingNotifications)
@@ -1083,18 +1088,12 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
             // breakpoint formerly cut rows to ~55 columns at width 105.
             let rowWidth = TerminalLayout.agentListWidth width
             let projectWidth, agentWidth = AgentView.columnWidths rowWidth filtered
-            let messages =
-                activity
-                |> Seq.filter (fun entry -> entry.CommandName.IsNone)
-                |> Seq.choose (fun entry ->
-                    entry.ProjectName |> Option.map (fun project -> project, entry.Message, entry.StartedAt))
-                |> Seq.toArray
             writeAgentTableHeader rowWidth projectWidth agentWidth
             for index = agentScroll to last - 1 do
                 let row = filtered[index]
                 let marker = if mode = AgentsMode && Some row.Key = agentSelected then ">" else " "
                 registerMouseHit 0 rowWidth (SelectAgent row.Key)
-                writeColoredAgentLine rowWidth projectWidth agentWidth marker (AgentView.lastSeenAt row messages) row
+                writeColoredAgentLine rowWidth projectWidth agentWidth marker (seenAt row) row
         if showAgentDetails then renderAgentDetailsUnsafe width
 
         if not issues.IsEmpty then
@@ -1502,6 +1501,22 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
 
     member _.SetJobAccess(access: JobUiAccess) =
         lock syncRoot (fun () -> jobsAccess <- Some access)
+
+    member _.RecordAgentSeen(project: string, agentId: string) =
+        if not (String.IsNullOrWhiteSpace project || String.IsNullOrWhiteSpace agentId) then
+            lock syncRoot (fun () ->
+                let now = DateTimeOffset.UtcNow
+                let key = project + "::" + agentId
+                agentSeen[key] <- now
+                let persist =
+                    match persistedAgentSeen.TryGetValue key with
+                    | true, previous -> now - previous >= TimeSpan.FromSeconds(10.)
+                    | _ -> true
+                if persist then
+                    activityLog |> Option.iter (fun store ->
+                        store.SaveAgentSeen(agentSeen |> Seq.map (fun entry -> entry.Key, entry.Value)))
+                    persistedAgentSeen[key] <- now
+                if mode = AgentsMode || mode = AgentFilterMode then renderUnsafe())
 
     member _.SetAgentAccess(access: AgentUiAccess) =
         lock syncRoot (fun () -> agentAccess <- Some access)

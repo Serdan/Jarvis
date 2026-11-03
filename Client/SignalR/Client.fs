@@ -64,7 +64,7 @@ let private checkWorkingGuidance (rt: Runtime) sessionId command response =
                         ReviewWorkflow.ReviewWorkflow.getAgentWorkingTurn binding agentId
                         |> Result.map Some
                     | _ ->
-                        ReviewWorkflow.ReviewWorkflow.findWorkingAgentBySession binding sessionId
+                        ReviewWorkflow.ReviewWorkflow.findAgentBySession binding sessionId
                 match found with
                 | Ok(Some agent) -> Some(project, agent)
                 | _ -> None
@@ -74,10 +74,18 @@ let private checkWorkingGuidance (rt: Runtime) sessionId command response =
             | Some(project, _), _ -> lookup project
             | None, Some project -> lookup project
             | None, None -> None
+        // A known session remains attributable even when the agent's
+        // canonical state changes away from Working.
+        let identity =
+            match resolved with
+            | Some(project, agent) -> Some(project, agent.AgentId)
+            | None -> known
+        identity |> Option.iter (fun (project, agentId) ->
+            workingSessions[sessionId] <- (project, agentId)
+            rt.Tui.RecordAgentSeen(project, agentId))
         match resolved with
         | None -> []
         | Some(project, agent) ->
-            workingSessions[sessionId] <- (project, agent.AgentId)
             match WorkingTurnGuidance.forSession DateTimeOffset.UtcNow sessionId agent with
             | Some(scope, content) ->
                 [ { Scope = scope; Path = $"jarvis/{scope}"

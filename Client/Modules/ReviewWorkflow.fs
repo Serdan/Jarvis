@@ -2249,10 +2249,9 @@ module ReviewWorkflow =
             return agent
         }
 
-    // Resolve the canonical agent association when a client restarts and loses
-    // its purely optional in-memory routing hints. Only current Working agents
-    // are relevant to cutoff/supersession notices.
-    let findWorkingAgentBySession binding sessionId =
+    // Resolve agent association from the canonical ledger even after a client
+    // restart. This is identity for activity tracking, not evidence of Working.
+    let private findAgentBySessionWhere accepts binding sessionId =
         if String.IsNullOrWhiteSpace sessionId then Ok None
         else result {
             let! snapshot = LedgerStore.fetch binding
@@ -2260,14 +2259,21 @@ module ReviewWorkflow =
             let mutable matches = []
             for path in paths do
                 let! agent, _ = required<ReviewAgent> binding snapshot path
-                if agent.State = "Working"
+                if accepts agent
                    && (agent.ActiveSessionId = sessionId
                        || (not (isNull (box agent.AssociatedSessionIds))
                            && List.contains sessionId agent.AssociatedSessionIds)) then
                     matches <- agent :: matches
-            // Never guess which agent owns a session if more than one matches.
+            // Never guess which agent owns a session if multiple records match.
             return match matches with [ agent ] -> Some agent | _ -> None
         }
+
+    let findAgentBySession binding sessionId =
+        findAgentBySessionWhere (fun _ -> true) binding sessionId
+
+    // Existing Working-only lookup remains available for time cutoff guidance.
+    let findWorkingAgentBySession binding sessionId =
+        findAgentBySessionWhere (fun agent -> agent.State = "Working") binding sessionId
 
     let getAgentInbox binding agentId =
         if not (validAgent agentId) then Error(InvalidBinding "Invalid inbox agent ID.")

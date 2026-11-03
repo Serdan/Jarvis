@@ -174,20 +174,15 @@ let narrowAgentTablesKeepColumnsWithinAvailableWidth () =
 
 
 [<Test>]
-let lastSeenUsesOnlyIdentifiableAgentMessages () =
+let lastSeenUsesSessionAttributedAgentKeyOnly () =
     let agent = record "Wayfold" "Agent 8" "Working" None
-    let start = DateTimeOffset(2026, 11, 3, 16, 0, 0, TimeSpan.Zero)
-    let messages =
-        [ "Wayfold", "Agent 8 Task217m: finished validation", start
-          "Wayfold", "Agent8: checkpointed findings", start.AddMinutes(10.)
-          "Wayfold", "Agent 80: unrelated", start.AddMinutes(20.)
-          "Jarvis", "Agent 8: other project", start.AddMinutes(30.)
-          "Wayfold", "Task217m completed by Agent 8", start.AddMinutes(40.)
-          "Wayfold", "Lead Task217m for Agent 8", start.AddMinutes(50.) ]
-    lastSeenAt agent messages |> shouldEqual (Some(start.AddMinutes(10.)))
-    lastSeenAt agent Seq.empty |> shouldEqual None
-    messageFromAgent "Lead" "Lead Task303 for Agent2" |> shouldEqual true
-    messageFromAgent "Lead" "Leadership summary" |> shouldEqual false
+    let timestamp = DateTimeOffset(2026, 11, 3, 16, 0, 0, TimeSpan.Zero)
+    let seen = System.Collections.Generic.Dictionary<string, DateTimeOffset>(StringComparer.OrdinalIgnoreCase)
+    seen["Wayfold::Agent 8"] <- timestamp
+    seen["Wayfold::Agent 80"] <- timestamp.AddMinutes(10.)
+    seen["Jarvis::Agent 8"] <- timestamp.AddMinutes(20.)
+    lastSeenAt agent seen |> shouldEqual (Some timestamp)
+    lastSeenAt agent (System.Collections.Generic.Dictionary<string, DateTimeOffset>()) |> shouldEqual None
 
 [<Test>]
 let lastSeenDisplaysRelativeAgeWithoutInferringPresence () =

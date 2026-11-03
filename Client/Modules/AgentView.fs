@@ -1,7 +1,7 @@
 module Client.AgentView
 
 open System
-open System.Text.RegularExpressions
+open System.Collections.Generic
 
 type TaskFocus =
     { TaskId: string
@@ -79,28 +79,11 @@ let relativeAge (now: DateTimeOffset) (timestamp: DateTimeOffset option) =
 let stateAge (now: DateTimeOffset) (agent: AgentRow) =
     relativeAge now agent.StateEnteredAt
 
-/// Attribute only messages that explicitly begin with the agent's identity.
-/// Generic tool calls do not contain a reliable actor identifier.
-let messageFromAgent (agentName: string) (message: string) =
-    if String.IsNullOrWhiteSpace(agentName) || String.IsNullOrWhiteSpace(message) then false
-    else
-        let namePattern =
-            agentName.Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries)
-            |> Array.map Regex.Escape
-            |> String.concat @"\s*"
-        Regex.IsMatch(message, @"^\s*" + namePattern + @"(?=$|[^\p{L}\p{N}])",
-            RegexOptions.IgnoreCase ||| RegexOptions.CultureInvariant)
-
-let lastSeenAt (agent: AgentRow) (messages: seq<string * string * DateTimeOffset>) =
-    messages
-    |> Seq.choose (fun (project, message, timestamp) ->
-        if String.Equals(project, agent.Project, StringComparison.OrdinalIgnoreCase)
-           && messageFromAgent agent.Agent message then Some timestamp
-        else None)
-    |> Seq.fold (fun latest timestamp ->
-        match latest with
-        | Some prior when prior >= timestamp -> latest
-        | _ -> Some timestamp) None
+/// Seen timestamps come from session-attributed tool calls, not parsed messages.
+let lastSeenAt (agent: AgentRow) (seen: IDictionary<string, DateTimeOffset>) =
+    match seen.TryGetValue agent.Key with
+    | true, timestamp -> Some timestamp
+    | _ -> None
 
 let matches (filter: string) (row: AgentRow) =
     let terms = ActivityFilter.parseTerms filter

@@ -53,6 +53,7 @@ type Store(settings: Settings) =
     let mutable currentDate = ""
     let mutable currentStream: FileStream option = None
     let mutable currentWriter: StreamWriter option = None
+    let seenPath = Path.Combine(settings.DirectoryPath, "agent-seen.json")
 
     let closeWriter () =
         currentWriter |> Option.iter (fun writer -> writer.Dispose())
@@ -134,6 +135,35 @@ type Store(settings: Settings) =
                     ()
             with _ ->
                 closeWriter ())
+
+    /// Session-attributed agent activity, separate from human-readable activity messages.
+    /// The file survives client self-updates and normal restarts.
+    member _.LoadAgentSeen() =
+        lock syncRoot (fun () ->
+            try
+                if File.Exists seenPath then
+                    JsonSerializer.Deserialize<Dictionary<string, DateTimeOffset>>(File.ReadAllText seenPath)
+                    |> fun values ->
+                        if isNull values then [] else
+                        values |> Seq.map (fun entry -> entry.Key, entry.Value) |> Seq.toList
+                else []
+            with _ -> [])
+
+    member _.SaveAgentSeen(values: seq<string * DateTimeOffset>) =
+        lock syncRoot (fun () ->
+            let temporary = seenPath + "." + Guid.NewGuid().ToString("N") + ".tmp"
+            try
+                try
+                    let snapshot = Dictionary<string, DateTimeOffset>(StringComparer.OrdinalIgnoreCase)
+                    for key, value in values do
+                        snapshot[key] <- value
+                    File.WriteAllText(temporary, JsonSerializer.Serialize(snapshot))
+                    File.Move(temporary, seenPath, true)
+                with _ -> ()
+            finally
+                try
+                    if File.Exists temporary then File.Delete temporary
+                with _ -> ())
 
     member _.LoadRecent(maxEntries: int) =
         lock syncRoot (fun () ->

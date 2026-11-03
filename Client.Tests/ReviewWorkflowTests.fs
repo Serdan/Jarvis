@@ -652,6 +652,9 @@ type ReviewWorkflowTests() =
             Assert.That(ready.ActiveSessionId, Is.Null)
             Assert.That(ready.WorkingTurnStartedAtUtc, Is.Null)
             Assert.That(ready.AssociatedSessionIds = [ "session-A"; "session-B" ], Is.True)
+            let seenWhileReady = ReviewWorkflow.findAgentBySession second "session-A" |> success |> Option.get
+            Assert.That(seenWhileReady.AgentId, Is.EqualTo("Owner"))
+            Assert.That(ReviewWorkflow.findWorkingAgentBySession second "session-A" |> success, Is.EqualTo(None))
             ReviewWorkflow.resumeAgentWithSession first (Guid.NewGuid()) taskId "Owner" 3 5 1 "session-C"
             |> success |> ignore
             let resumed = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
@@ -667,6 +670,8 @@ type ReviewWorkflowTests() =
             let parked = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
             Assert.That(parked.State, Is.EqualTo("Parked"))
             Assert.That(parked.AssociatedSessionIds = [ "session-A"; "session-B"; "session-C" ], Is.True)
+            let seenWhileParked = ReviewWorkflow.findAgentBySession second "session-C" |> success |> Option.get
+            Assert.That(seenWhileParked.AgentId, Is.EqualTo("Owner"))
             Assert.That(parked.ActiveSessionId, Is.Null))
 
     [<Test>]

@@ -92,3 +92,35 @@ let ``old activity log files are pruned`` () =
         File.Exists(oldPath) |> shouldEqual false
     finally
         Directory.Delete(path, true)
+
+
+[<Test>]
+let ``agent last seen survives reopening the activity store`` () =
+    let path = tempDirectory ()
+    let timestamp = DateTimeOffset(2026, 11, 3, 20, 0, 0, TimeSpan.Zero)
+    try
+        do
+            use store = new Store(settings path (1024L * 1024L))
+            store.SaveAgentSeen [ "Wayfold::Agent 8", timestamp ]
+        use reopened = new Store(settings path (1024L * 1024L))
+        reopened.LoadAgentSeen() |> Map.ofList |> Map.tryFind "Wayfold::Agent 8"
+        |> shouldEqual (Some timestamp)
+        reopened.SaveAgentSeen [ "Wayfold::Agent 8", timestamp.AddMinutes(2.) ]
+        reopened.LoadAgentSeen() |> Map.ofList |> Map.tryFind "Wayfold::Agent 8"
+        |> shouldEqual (Some(timestamp.AddMinutes(2.)))
+    finally
+        Directory.Delete(path, true)
+
+
+[<Test>]
+let ``agent seen is persisted by the TUI on first attributed call`` () =
+    let path = tempDirectory ()
+    try
+        use store = new Store(settings path (1024L * 1024L))
+        let tui = Client.ConsoleTui.ConsoleTui(activityLog = store)
+        tui.RecordAgentSeen("Wayfold", "Agent 8")
+        let recorded = store.LoadAgentSeen() |> Map.ofList
+        Assert.That(recorded.ContainsKey "Wayfold::Agent 8", Is.True)
+        Assert.That(recorded["Wayfold::Agent 8"], Is.LessThanOrEqualTo(DateTimeOffset.UtcNow))
+    finally
+        Directory.Delete(path, true)

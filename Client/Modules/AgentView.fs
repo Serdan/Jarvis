@@ -1,6 +1,7 @@
 module Client.AgentView
 
 open System
+open System.Text.RegularExpressions
 
 type TaskFocus =
     { TaskId: string
@@ -58,15 +59,15 @@ let columnWidths width (agents: AgentRow array) =
         |> min 24
     let project = maxLength 7 (fun row -> ActivityFilter.projectToken row.Project)
     let agent = maxLength 5 (fun row -> row.Agent)
-    let available = max 0 (width - 27 - 8)
+    let available = max 0 (width - 27 - 8 - 10)
     if project + agent <= available then project, agent
     else
         let projectWidth = min project (available / 2)
         let agentWidth = min agent (available - projectWidth)
         min project (available - agentWidth), agentWidth
 
-let stateAge (now: DateTimeOffset) (agent: AgentRow) =
-    agent.StateEnteredAt
+let relativeAge (now: DateTimeOffset) (timestamp: DateTimeOffset option) =
+    timestamp
     |> Option.map (fun entered ->
         let elapsed = max TimeSpan.Zero (now - entered)
         if elapsed.TotalDays >= 1.0 then sprintf "%.0fd" (floor elapsed.TotalDays)
@@ -74,6 +75,32 @@ let stateAge (now: DateTimeOffset) (agent: AgentRow) =
         elif elapsed.TotalMinutes >= 1.0 then sprintf "%.0fm" (floor elapsed.TotalMinutes)
         else sprintf "%.0fs" (floor elapsed.TotalSeconds))
     |> Option.defaultValue "—"
+
+let stateAge (now: DateTimeOffset) (agent: AgentRow) =
+    relativeAge now agent.StateEnteredAt
+
+/// Attribute only messages that explicitly begin with the agent's identity.
+/// Generic tool calls do not contain a reliable actor identifier.
+let messageFromAgent (agentName: string) (message: string) =
+    if String.IsNullOrWhiteSpace(agentName) || String.IsNullOrWhiteSpace(message) then false
+    else
+        let namePattern =
+            agentName.Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries)
+            |> Array.map Regex.Escape
+            |> String.concat @"\s*"
+        Regex.IsMatch(message, @"^\s*" + namePattern + @"(?=$|[^\p{L}\p{N}])",
+            RegexOptions.IgnoreCase ||| RegexOptions.CultureInvariant)
+
+let lastSeenAt (agent: AgentRow) (messages: seq<string * string * DateTimeOffset>) =
+    messages
+    |> Seq.choose (fun (project, message, timestamp) ->
+        if String.Equals(project, agent.Project, StringComparison.OrdinalIgnoreCase)
+           && messageFromAgent agent.Agent message then Some timestamp
+        else None)
+    |> Seq.fold (fun latest timestamp ->
+        match latest with
+        | Some prior when prior >= timestamp -> latest
+        | _ -> Some timestamp) None
 
 let matches (filter: string) (row: AgentRow) =
     let terms = ActivityFilter.parseTerms filter

@@ -161,7 +161,7 @@ let agentTableColumnsFollowVisibleContentInsteadOfTerminalWidth () =
     columnWidths 80 wayfold |> shouldEqual (8, 8)
     let mixed = Array.append wayfold [| record "Longer Project" "GUI Agent" "Ready" None |]
     columnWidths 120 mixed |> shouldEqual (15, 9)
-    columnWidths 55 mixed |> shouldEqual (11, 9)
+    columnWidths 55 mixed |> shouldEqual (5, 5)
 
 [<Test>]
 let narrowAgentTablesKeepColumnsWithinAvailableWidth () =
@@ -170,4 +170,28 @@ let narrowAgentTablesKeepColumnsWithinAvailableWidth () =
         let project, agent = columnWidths width agents
         Assert.That(project, Is.GreaterThanOrEqualTo(0))
         Assert.That(agent, Is.GreaterThanOrEqualTo(0))
-        Assert.That(project + agent, Is.LessThanOrEqualTo(max 0 (width - 27 - 8)))
+        Assert.That(project + agent, Is.LessThanOrEqualTo(max 0 (width - 27 - 8 - 10)))
+
+
+[<Test>]
+let lastSeenUsesOnlyIdentifiableAgentMessages () =
+    let agent = record "Wayfold" "Agent 8" "Working" None
+    let start = DateTimeOffset(2026, 11, 3, 16, 0, 0, TimeSpan.Zero)
+    let messages =
+        [ "Wayfold", "Agent 8 Task217m: finished validation", start
+          "Wayfold", "Agent8: checkpointed findings", start.AddMinutes(10.)
+          "Wayfold", "Agent 80: unrelated", start.AddMinutes(20.)
+          "Jarvis", "Agent 8: other project", start.AddMinutes(30.)
+          "Wayfold", "Task217m completed by Agent 8", start.AddMinutes(40.)
+          "Wayfold", "Lead Task217m for Agent 8", start.AddMinutes(50.) ]
+    lastSeenAt agent messages |> shouldEqual (Some(start.AddMinutes(10.)))
+    lastSeenAt agent Seq.empty |> shouldEqual None
+    messageFromAgent "Lead" "Lead Task303 for Agent2" |> shouldEqual true
+    messageFromAgent "Lead" "Leadership summary" |> shouldEqual false
+
+[<Test>]
+let lastSeenDisplaysRelativeAgeWithoutInferringPresence () =
+    let now = DateTimeOffset(2026, 11, 3, 20, 0, 0, TimeSpan.Zero)
+    relativeAge now None |> shouldEqual "—"
+    relativeAge now (Some(now.AddMinutes(-9.))) |> shouldEqual "9m"
+    relativeAge now (Some(now.AddHours(-2.))) |> shouldEqual "2h"

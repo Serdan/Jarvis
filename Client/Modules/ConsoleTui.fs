@@ -916,13 +916,13 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
             "   Age  " + agentColumn "Project" projectWidth + " "
             + agentColumn "Agent" agentWidth + " "
             + agentColumn "Mail" 5 + " "
-            + agentColumn "State" 10 + " Task"
+            + agentColumn "State" 10 + " " + agentColumn "Last seen" 9 + " Task"
         let previous = draw.ForegroundColor
         draw.ForegroundColor <- ConsoleColor.DarkGray
         draw.WriteLine(trim header width)
         draw.ForegroundColor <- previous
 
-    let writeColoredAgentLine width projectWidth agentWidth marker (row: AgentView.AgentRow) =
+    let writeColoredAgentLine width projectWidth agentWidth marker lastSeen (row: AgentView.AgentRow) =
         let original = draw.ForegroundColor
         let originalBackgroundRgb = draw.BackgroundRgb
         let selected = mode = AgentsMode && Some row.Key = agentSelected
@@ -962,6 +962,8 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         writeCell state 10 (if selected && row.State = "Completed" then ConsoleColor.Cyan else AgentView.stateColor row.State)
         draw.ForegroundColor <- normalForeground
         draw.Write(" ")
+        writeCell (AgentView.relativeAge DateTimeOffset.UtcNow lastSeen) 9 normalForeground
+        draw.Write(" ")
         let remaining = max 0 (width - draw.CursorLeft)
         draw.Write(agentColumn task remaining)
         // Fill the row so the selection highlight spans the available width
@@ -983,6 +985,13 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                 writeDetailField width "Agent" row.Agent
                 writeDetailField width "Project" (ActivityFilter.projectToken row.Project)
                 writeDetailField width "State" (AgentView.displayState row.State)
+                let messages =
+                    activity
+                    |> Seq.filter (fun entry -> entry.CommandName.IsNone)
+                    |> Seq.choose (fun entry ->
+                        entry.ProjectName |> Option.map (fun project -> project, entry.Message, entry.StartedAt))
+                AgentView.lastSeenAt row messages
+                |> Option.iter (fun seen -> writeDetailField width "Last seen" (seen.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss")))
                 if row.PendingNotifications > 0 then
                     writeDetailField width "Unread notifications" (string row.PendingNotifications)
                     row.LatestNotification |> Option.iter (writeDetailField width "Latest message")
@@ -1074,12 +1083,18 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
             // breakpoint formerly cut rows to ~55 columns at width 105.
             let rowWidth = TerminalLayout.agentListWidth width
             let projectWidth, agentWidth = AgentView.columnWidths rowWidth filtered
+            let messages =
+                activity
+                |> Seq.filter (fun entry -> entry.CommandName.IsNone)
+                |> Seq.choose (fun entry ->
+                    entry.ProjectName |> Option.map (fun project -> project, entry.Message, entry.StartedAt))
+                |> Seq.toArray
             writeAgentTableHeader rowWidth projectWidth agentWidth
             for index = agentScroll to last - 1 do
                 let row = filtered[index]
                 let marker = if mode = AgentsMode && Some row.Key = agentSelected then ">" else " "
                 registerMouseHit 0 rowWidth (SelectAgent row.Key)
-                writeColoredAgentLine rowWidth projectWidth agentWidth marker row
+                writeColoredAgentLine rowWidth projectWidth agentWidth marker (AgentView.lastSeenAt row messages) row
         if showAgentDetails then renderAgentDetailsUnsafe width
 
         if not issues.IsEmpty then

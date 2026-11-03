@@ -49,7 +49,7 @@ let allFourDerivedStatesAndUnassignedAgentsAreRepresented () =
             record "Wayfold" ("Agent " + string index) state
                 (if state = "Parked" || state = "NeedsWork" then None else Some focused))
     let result = rows (snapshot agents)
-    result |> List.map _.State |> shouldEqual ["Ready"; "NeedsWork"; "Working"; "Parked"]
+    result |> List.map _.State |> shouldEqual ["Ready"; "Working"; "NeedsWork"; "Parked"]
     agentSummary result[3] |> shouldEqual "Parked"
 
 [<Test>]
@@ -79,17 +79,17 @@ let agentNamesAreScopedToTheirCanonicalProjects () =
     let a = record "Wayfold" "Agent 3" "Ready" None
     let b = record "Jarvis" "Agent 3" "Parked" None
     rows (snapshot [a;b]) |> List.map _.Key
-    |> shouldEqual ["Wayfold::Agent 3"; "Jarvis::Agent 3"]
+    |> shouldEqual ["Jarvis::Agent 3"; "Wayfold::Agent 3"]
 
 [<Test>]
-let agentOrderingPrioritizesActionableWorkOverAlphabeticalProjectName () =
+let agentOrderingUsesProjectThenAgentRatherThanState () =
     let agents =
         [ record "AAA" "Idle" "Parked" None
           record "ZZZ" "Ready" "Ready" (Some focused)
           record "MMM" "Working" "Working" (Some focused)
           record "CCC" "Unassigned" "NeedsWork" None ]
     rows (snapshot agents) |> List.map _.State
-    |> shouldEqual ["Ready"; "NeedsWork"; "Working"; "Parked"]
+    |> shouldEqual ["Parked"; "NeedsWork"; "Working"; "Ready"]
 
 [<Test>]
 let relativeStateAgeUsesTimestampNotLastRefreshTime () =
@@ -99,7 +99,7 @@ let relativeStateAgeUsesTimestampNotLastRefreshTime () =
     stateAge now { agent with StateEnteredAt = None } |> shouldEqual "—"
 
 [<Test>]
-let unreadNotificationsTakePriorityAndTriggerRefresh () =
+let unreadNotificationsDoNotReorderAgentsButTriggerRefresh () =
     let quiet = record "Wayfold" "Agent 2" "Ready" None
     let notified =
         { record "Wayfold" "Agent 7" "Parked" None with
@@ -107,7 +107,7 @@ let unreadNotificationsTakePriorityAndTriggerRefresh () =
             LatestNotification = Some "Agent 3 #304: Agree on the interface" }
     let before = snapshot [ quiet; { notified with PendingNotifications = 0; LatestNotification = None } ]
     let after = snapshot [ quiet; notified ]
-    rows after |> List.head |> fun row -> row.Agent |> shouldEqual "Agent 7"
+    rows after |> List.map _.Agent |> shouldEqual ["Agent 2"; "Agent 7"]
     changedAgents before after |> shouldEqual (set ["Wayfold::Agent 7"])
     changedAgents after after |> shouldEqual Set.empty
 
@@ -124,3 +124,15 @@ let agentStatesHaveDistinctReadableColors () =
     for state, expected in states do
         stateColor state |> shouldEqual expected
     displayState "NeedsWork" |> shouldEqual "Needs work"
+
+
+[<Test>]
+let numericAgentSortingIsStableAcrossStateAndNotificationChanges () =
+    let names = ["Agent 10"; "Agent 2"; "Lead"; "Agent 1"; "Agent 11"]
+    let agents = names |> List.map (fun name -> record "Wayfold" name "Working" None)
+    let expected = ["Agent 1"; "Agent 2"; "Agent 10"; "Agent 11"; "Lead"]
+    rows (snapshot agents) |> List.map _.Agent |> shouldEqual expected
+    let modified =
+        agents |> List.map (fun agent ->
+            { agent with State = "Ready"; PendingNotifications = 3 })
+    rows (snapshot modified) |> List.map _.Agent |> shouldEqual expected

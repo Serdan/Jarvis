@@ -33,18 +33,21 @@ type Snapshot =
       Issues: string list
       RefreshedAt: DateTimeOffset }
 
-let attentionRank state =
-    match state with
-    | "Ready" -> 0
-    | "NeedsWork" -> 1
-    | "Working" -> 2
-    | "Parked" -> 3
-    | _ -> 4
+let private agentSortKey (name: string) =
+    let name = name.Trim().ToLowerInvariant()
+    let digits = name |> Seq.rev |> Seq.takeWhile Char.IsDigit |> Seq.length
+    if digits = 0 then name, Int64.MaxValue, name
+    else
+        let prefix = name.Substring(0, name.Length - digits).TrimEnd()
+        let suffix = name.Substring(name.Length - digits)
+        match Int64.TryParse suffix with
+        | true, number -> prefix, number, name
+        | _ -> name, Int64.MaxValue, name
 
 let rows (snapshot: Snapshot) =
     snapshot.Agents
     |> List.sortBy (fun item ->
-        (if item.PendingNotifications > 0 then -1 else attentionRank item.State), item.Project.ToLowerInvariant(), item.Agent.ToLowerInvariant())
+        item.Project.ToLowerInvariant(), agentSortKey item.Agent, item.Key)
 
 let stateAge (now: DateTimeOffset) (agent: AgentRow) =
     agent.StateEnteredAt

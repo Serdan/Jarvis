@@ -92,3 +92,11 @@ let largeMouseWheelBurstCollapsesToOneEvent () =
     let burst = List.replicate 512 (Mouse(Scroll(-1, 1, 1)))
     Assert.That(coalesceWheelEvents burst,
                 Is.EqualTo([ Mouse(Scroll(-512, 1, 1)) ] :> obj))
+
+
+[<Test>]
+let terminalAppearanceSetsAndRestoresDefaultBackground () =
+    Assert.That(Tracking.startSequence, Does.Contain("\u001b]11;#101010\u001b\\"))
+    Assert.That(Tracking.startSequence, Does.Contain("\u001b[49m"))
+    Assert.That(Tracking.stopSequence, Does.Contain("\u001b]111\u001b\\"))
+    Assert.That(Tracking.stopSequence, Does.Contain("\u001b[?25h"))

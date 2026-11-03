@@ -119,18 +119,24 @@ let coalesceWheelEvents (events: InputEvent list) =
 /// Request normal-button + wheel reports with SGR coordinates and hide the
 /// cursor while the TUI runs. Restore both modes on cancellation/exception.
 module Tracking =
+    // OSC 11 changes the terminal's *default* background, including its
+    // margins and unpainted cells. OSC 111 restores the user's color scheme.
+    // Selection highlights still use per-cell RGB backgrounds.
+    let startSequence = "\u001b]11;#101010\u001b\\\u001b[49m\u001b[?25l\u001b[?1000h\u001b[?1006h"
+    let stopSequence = "\u001b[?1006l\u001b[?1000l\u001b[?25h\u001b[49m\u001b]111\u001b\\"
+
     let enable () : IDisposable =
         if Console.IsInputRedirected || Console.IsOutputRedirected
            || Environment.GetEnvironmentVariable("TERM") = "dumb" then
             { new IDisposable with member _.Dispose() = () }
         else
             try
-                Console.Write("\u001b[?25l\u001b[?1000h\u001b[?1006h")
+                Console.Write(startSequence)
                 Console.Out.Flush()
                 { new IDisposable with
                     member _.Dispose() =
                         try
-                            Console.Write("\u001b[?1006l\u001b[?1000l\u001b[?25h")
+                            Console.Write(stopSequence)
                             Console.Out.Flush()
                         with _ -> () }
             with _ ->

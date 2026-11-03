@@ -106,7 +106,10 @@ type Frame(width: int, height: int) =
             let mutable initialBackground = ConsoleColor.Black
             let mutable activeRgb = None
             try
-                if full then Console.Clear()
+                // Clear using the terminal's default background (OSC 11), not
+                // Console.Clear's palette black. This also covers untouched cells
+                // and the rightmost column reserved against terminal wrapping.
+                if full then Console.Write("\u001b[49m\u001b[2J")
                 initialColor <- Console.ForegroundColor
                 initialBackground <- Console.BackgroundColor
                 for row in 0 .. height - 1 do

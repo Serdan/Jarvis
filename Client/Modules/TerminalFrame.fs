@@ -134,11 +134,13 @@ type Frame(width: int, height: int) =
                                     raise (InvalidOperationException("Terminal resized during presentation."))
                                 Console.SetCursorPosition(runStart, row)
                                 if Console.ForegroundColor <> runColor then Console.ForegroundColor <- runColor
+                                // Console.ForegroundColor may reset terminal attributes,
+                                // including a true-color background. Reapply RGB for every
+                                // changed run rather than trusting a stale cached setting.
                                 match runRgb with
-                                | Some(r, g, b) when activeRgb <> runRgb ->
+                                | Some(r, g, b) ->
                                     Console.Write($"\u001b[48;2;{r};{g};{b}m")
                                     activeRgb <- runRgb
-                                | Some _ -> ()
                                 | None ->
                                     if activeRgb.IsSome then
                                         Console.Write("\u001b[49m")

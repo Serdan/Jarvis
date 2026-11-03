@@ -8,7 +8,7 @@ Jarvis uses Auth0 for OAuth authentication.
 
 The hosted server validates bearer tokens and uses the token's stable subject (`sub`) to associate an MCP request with the same user's connected JarvisClient. The model does not receive or supply a Jarvis session key.
 
-JarvisClient uses native Authorization Code + PKCE. OAuth access and refresh tokens are held in client memory while the process runs. Jarvis does not intentionally persist OAuth tokens to disk. The local client persists a randomly generated device identifier so reconnects can identify the same installation; this identifier is not an authentication secret.
+JarvisClient uses native Authorization Code + PKCE. OAuth access tokens are held only in memory. The native client persists its OAuth refresh token separately from general settings in `oauth-refresh.json` under the user configuration directory, with owner-only file permissions on Linux/macOS, to enable silent reauthentication after restart. Rotated refresh tokens replace the cached token atomically. This is a local credential and must not be shared or backed up into source control. The local client persists a randomly generated device identifier so reconnects can identify the same installation; this identifier is not an authentication secret.
 
 Auth0 and the infrastructure hosting Auth0 may process account and authentication information according to their own service terms and privacy practices.
 
@@ -82,7 +82,7 @@ JarvisClient stores:
 
 - the chosen workspace for the running process;
 - a non-secret device identifier in the user's application-data directory;
-- OAuth tokens in process memory;
+- OAuth access tokens in process memory and refresh credentials in the local owner-only credential cache;
 - an in-memory audit log for sensitive command categories;
 - local activity history in append-only JSONL files under `Jarvis/activity` in the user's local application-data directory.
 

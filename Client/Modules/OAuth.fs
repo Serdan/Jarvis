@@ -3,6 +3,7 @@ namespace Client
 open System
 open System.Collections.Generic
 open System.Diagnostics
+open System.IO
 open System.Net
 open System.Net.Http
 open System.Security.Cryptography
@@ -250,10 +251,84 @@ module OAuth =
               "refresh_token", refreshToken ]
             (Some refreshToken)
 
+    let private cachePath () =
+        Path.Combine(Path.GetDirectoryName(ClientConfig.configPath()), "oauth-refresh.json")
+
+    // Only a refresh token is retained, never the access token. Credentials
+    // are separate from config.json so config exports cannot include secrets.
+    let loadRefreshTokenAt (path: string) (config: OAuthConfig) =
+        try
+            if not (File.Exists path) then None
+            elif File.GetAttributes(path).HasFlag(FileAttributes.ReparsePoint) then None
+            elif (OperatingSystem.IsLinux() || OperatingSystem.IsMacOS())
+                 && (File.GetUnixFileMode(path) &&& (UnixFileMode.GroupRead ||| UnixFileMode.GroupWrite ||| UnixFileMode.OtherRead ||| UnixFileMode.OtherWrite ||| UnixFileMode.GroupExecute ||| UnixFileMode.OtherExecute)) <> enum<UnixFileMode> 0 then None
+            else
+                use doc = JsonDocument.Parse(File.ReadAllText path)
+                let root = doc.RootElement
+                let prop (name: string) = root.GetProperty(name).GetString()
+                if prop "issuer" = issuer config
+                   && prop "audience" = config.Audience
+                   && prop "clientId" = config.ClientId then
+                    match prop "refreshToken" with
+                    | null | "" -> None
+                    | token -> Some token
+                else None
+        with _ -> None
+
+    let saveRefreshTokenAt (path: string) (config: OAuthConfig) (token: string) =
+        if String.IsNullOrWhiteSpace token then invalidArg (nameof token) "Missing refresh token."
+        let directory = Path.GetDirectoryName(path)
+        Directory.CreateDirectory(directory) |> ignore
+        let temporary = path + "." + Guid.NewGuid().ToString("N") + ".tmp"
+        try
+            let payload =
+                JsonSerializer.Serialize(
+                    {| issuer = issuer config
+                       audience = config.Audience
+                       clientId = config.ClientId
+                       refreshToken = token |})
+            let options = FileStreamOptions()
+            options.Mode <- FileMode.CreateNew
+            options.Access <- FileAccess.Write
+            options.Share <- FileShare.None
+            if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
+                options.UnixCreateMode <- UnixFileMode.UserRead ||| UnixFileMode.UserWrite
+            do
+                use stream = new FileStream(temporary, options)
+                use writer = new StreamWriter(stream, new UTF8Encoding(false))
+                writer.Write(payload)
+                writer.Flush()
+                stream.Flush(true)
+            if File.Exists(path) && File.GetAttributes(path).HasFlag(FileAttributes.ReparsePoint) then
+                invalidOp "OAuth credential path must not be a symbolic link."
+            File.Move(temporary, path, true)
+        finally
+            if File.Exists temporary then File.Delete temporary
+
     let login (log: string -> unit) =
         task {
             let config = configuration ()
-            let! initial = interactiveLogin config log
+            let path = cachePath ()
+            let remember (tokens: OAuthTokenSet) =
+                match tokens.RefreshToken with
+                | Some token ->
+                    try saveRefreshTokenAt path config token
+                    with _ -> log "Could not persist OAuth refresh credentials; a later restart may require sign-in."
+                | None -> ()
+            let! initial =
+                task {
+                    match loadRefreshTokenAt path config with
+                    | Some token ->
+                        try
+                            let! result = refresh config token
+                            log "Jarvis OAuth session restored without browser sign-in."
+                            return result
+                        with _ ->
+                            log "Stored OAuth session could not be restored; interactive sign-in required."
+                            return! interactiveLogin config log
+                    | None -> return! interactiveLogin config log
+                }
+            remember initial
             let gate = new SemaphoreSlim(1, 1)
             let mutable current = initial
 
@@ -271,13 +346,16 @@ module OAuth =
                                     try
                                         let! refreshed = refresh config refreshToken
                                         current <- refreshed
+                                        remember refreshed
                                     with ex ->
                                         log $"OAuth refresh failed; signing in again: {ex.Message}"
                                         let! authenticated = interactiveLogin config log
                                         current <- authenticated
+                                        remember authenticated
                                 | None ->
                                     let! authenticated = interactiveLogin config log
                                     current <- authenticated
+                                    remember authenticated
 
                             return current.AccessToken
                         finally

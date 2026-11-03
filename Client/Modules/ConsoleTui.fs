@@ -982,7 +982,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                 draw.WriteLine "-------------"
                 writeDetailField width "Agent" row.Agent
                 writeDetailField width "Project" (ActivityFilter.projectToken row.Project)
-                writeDetailField width "State" row.State
+                writeDetailField width "State" (AgentView.displayState row.State)
                 if row.PendingNotifications > 0 then
                     writeDetailField width "Unread notifications" (string row.PendingNotifications)
                     row.LatestNotification |> Option.iter (writeDetailField width "Latest message")
@@ -1050,11 +1050,11 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         if draw.Height >= 22 then
             draw.WriteLine "------"
             draw.WriteLine
-                (sprintf "Tracked: %d | Review: %d | Unread: %d | Working: %d | Ready: %d | Needs work: %d | Parked: %d"
+                (sprintf "Tracked: %d | Review: %d | Unread: %d | Working: %d | Ready: %d | Waiting: %d | Parked: %d"
                     all.Length reviewCount unreadCount (stateCount "Working") (stateCount "Ready")
                     (stateCount "NeedsWork") (stateCount "Parked"))
         else
-            draw.WriteLine (sprintf "Unread %d · Ready %d · Needs work %d · Working %d · Parked %d" unreadCount (stateCount "Ready") (stateCount "NeedsWork") (stateCount "Working") (stateCount "Parked"))
+            draw.WriteLine (sprintf "Unread %d · Ready %d · Waiting %d · Working %d · Parked %d" unreadCount (stateCount "Ready") (stateCount "NeedsWork") (stateCount "Working") (stateCount "Parked"))
         let refreshed =
             agentSnapshot
             |> Option.map (fun snap -> snap.RefreshedAt.ToLocalTime().ToString("HH:mm:ss"))

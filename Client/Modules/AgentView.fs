@@ -90,7 +90,7 @@ let visibleRows filter snapshot =
     rows snapshot
     |> List.filter (fun row -> row.State <> "Parked" && matches filter row)
 
-let displayState state = if state = "NeedsWork" then "Needs work" else state
+let displayState state = if state = "NeedsWork" then "Waiting" else state
 
 /// Consistent colors for the canonical ledger states. Labels remain visible
 /// so the Agents screen is readable without color.

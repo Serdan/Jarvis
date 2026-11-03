@@ -123,7 +123,7 @@ let agentStatesHaveDistinctReadableColors () =
           "Unexpected", ConsoleColor.Gray ]
     for state, expected in states do
         stateColor state |> shouldEqual expected
-    displayState "NeedsWork" |> shouldEqual "Needs work"
+    displayState "NeedsWork" |> shouldEqual "Waiting"
 
 
 [<Test>]

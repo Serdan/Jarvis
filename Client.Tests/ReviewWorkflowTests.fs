@@ -1259,6 +1259,62 @@ type ReviewWorkflowTests() =
             | Error(InvalidBinding _) -> () // Remote drift blocks authority; it never frees the slot.
             | other -> Assert.Fail(sprintf "Unapproved ledger endpoint must be rejected: %A" other))
     [<Test>]
+    member _.AgentNotificationIsDurableAndAcknowledgedByRecipientOnly() =
+        withFixture (fun _ _ first second _ _ _ _ ->
+            ReviewWorkflow.createTask first (Guid.NewGuid()) "notify-task" "Coordination"
+            |> success |> ignore
+            let before = ReviewWorkflow.getAgentInbox first "Reviewer" |> success
+            Assert.That(before.PendingNotifications, Is.Empty)
+            let ownerBefore = (ReviewWorkflow.getAgentInbox first "Owner" |> success).Agent
+            let recipientBefore = before.Agent
+            let id = Guid.NewGuid()
+            let send () =
+                ReviewWorkflow.notifyAgent first id "Owner" "Reviewer" "notify-task"
+                    "Please confirm the navigation interface"
+            let initial = send () |> success
+            Assert.That(initial.AlreadyApplied, Is.False)
+            let again = send () |> success
+            Assert.That(again.AlreadyApplied, Is.True)
+            let inbox = ReviewWorkflow.getAgentInbox second "Reviewer" |> success
+            Assert.That(inbox.PendingNotifications.Length, Is.EqualTo(1))
+            let notice = inbox.PendingNotifications.Head
+            Assert.That(notice.NotificationId, Is.EqualTo(id.ToString("N")))
+            Assert.That(notice.FromAgentId, Is.EqualTo("Owner"))
+            Assert.That(notice.TaskId, Is.EqualTo("notify-task"))
+            Assert.That(notice.Message, Is.EqualTo("Please confirm the navigation interface"))
+            Assert.That(notice.CreatedAtUtc, Is.Not.Empty)
+            Assert.That(notice.AcknowledgedAtUtc, Is.Null)
+            Assert.That((ReviewWorkflow.getAgentInbox second "Owner" |> success).PendingNotifications, Is.Empty)
+            Assert.That((ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent.Version,
+                        Is.EqualTo(ownerBefore.Version))
+            Assert.That(inbox.Agent.Version, Is.EqualTo(recipientBefore.Version))
+            match ReviewWorkflow.acknowledgeNotification first (Guid.NewGuid()) "Owner" id with
+            | Error(ReviewAccessDenied _) -> ()
+            | other -> Assert.Fail(sprintf "Sender must not acknowledge recipient message: %A" other)
+            let ackId = Guid.NewGuid()
+            let ack () = ReviewWorkflow.acknowledgeNotification second ackId "Reviewer" id
+            let acknowledged = ack () |> success
+            Assert.That(acknowledged.AlreadyApplied, Is.False)
+            Assert.That((ack () |> success).AlreadyApplied, Is.True)
+            let after = ReviewWorkflow.getAgentInbox first "Reviewer" |> success
+            Assert.That(after.PendingNotifications, Is.Empty)
+            Assert.That(after.Agent.Version, Is.EqualTo(recipientBefore.Version))
+            match ReviewWorkflow.acknowledgeNotification second (Guid.NewGuid()) "Reviewer" id with
+            | Error(StaleEntityVersion _) -> ()
+            | other -> Assert.Fail(sprintf "Already acknowledged notification: %A" other))
+
+    [<Test>]
+    member _.InvalidNotificationDoesNotReachRecipient() =
+        withFixture (fun _ _ first second _ _ _ _ ->
+            match ReviewWorkflow.notifyAgent first (Guid.NewGuid()) "Owner" "Absent" "" "Hello" with
+            | Error(StaleEntityVersion _) -> ()
+            | other -> Assert.Fail(sprintf "Unknown recipient must be rejected: %A" other)
+            match ReviewWorkflow.notifyAgent first (Guid.NewGuid()) "Owner" "Reviewer" "" " " with
+            | Error(InvalidBinding _) -> ()
+            | other -> Assert.Fail(sprintf "Empty notification must be rejected: %A" other)
+            Assert.That((ReviewWorkflow.getAgentInbox second "Reviewer" |> success).PendingNotifications, Is.Empty))
+
+    [<Test>]
     member _.AgentInboxRejectsUnknownAgent() =
         withFixture (fun _ _ first _ _ _ _ _ ->
             match ReviewWorkflow.getAgentInbox first "Not registered" with
@@ -1730,6 +1786,9 @@ type ReviewWorkflowTests() =
             initTask taskId
             ReviewWorkflow.yieldAgent first (Guid.NewGuid()) taskId "Owner" 3 3 1
                 "Slice committed" "Review four commits" |> success |> ignore
+            let notificationId = Guid.NewGuid()
+            ReviewWorkflow.notifyAgent first notificationId "Reviewer" "Owner" taskId
+                "Please agree on the new interface" |> success |> ignore
             let canonical = ReviewWorkflow.getAgentInbox first "Owner" |> success
             Assert.That(canonical.Agent.State, Is.EqualTo("Ready"))
             let context = GitCommandTests.TestContext(Path.GetDirectoryName one)
@@ -1751,6 +1810,8 @@ type ReviewWorkflowTests() =
                 Assert.That(owner.State, Is.EqualTo("Ready"))
                 Assert.That(owner.Focus.Value.TaskId, Is.EqualTo(taskId))
                 Assert.That(owner.Focus.Value.Phase, Is.EqualTo("Started"))
+                Assert.That(owner.PendingNotifications, Is.EqualTo(1))
+                Assert.That(owner.LatestNotification.Value, Does.Contain("Please agree on the new interface"))
                 Assert.That(owner.StateEnteredAt.Value, Is.EqualTo(DateTimeOffset.Parse(canonical.Agent.StateEnteredAtUtc)))
                 Assert.That(Client.AgentView.agentSummary owner, Is.EqualTo("#320 - Ready"))
             finally

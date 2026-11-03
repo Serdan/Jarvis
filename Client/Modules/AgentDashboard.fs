@@ -60,10 +60,21 @@ let private projectSnapshot project rt =
                         let tasks = taskRecords |> List.map (read<ReviewTask> binding snapshot)
                         let agents = agentPaths |> List.map (read<ReviewAgent> binding snapshot)
                         let reviews = reviewRecords |> List.map (read<BranchReview> binding snapshot)
+                        let notifications =
+                            LedgerStore.listAt binding snapshot "notifications"
+                            |> Result.mapError string
+                            |> Result.bind (fun paths ->
+                                let records = paths
+                                              |> List.filter (fun path -> path.EndsWith(".json", StringComparison.Ordinal))
+                                              |> List.map (read<AgentNotification> binding snapshot)
+                                match records |> List.tryPick (function Error error -> Some error | Ok _ -> None) with
+                                | Some error -> Error error
+                                | None -> Ok (records |> List.choose (function Ok item -> Some item | _ -> None)))
                         let firstError values = values |> List.tryPick (function Error message -> Some message | Ok _ -> None)
-                        match firstError tasks, firstError agents, firstError reviews with
-                        | Some error, _, _ | _, Some error, _ | _, _, Some error -> Error error
-                        | None, None, None ->
+                        match firstError tasks, firstError agents, firstError reviews, notifications with
+                        | Some error, _, _, _ | _, Some error, _, _ | _, _, Some error, _ -> Error error
+                        | _, _, _, Error error -> Error error
+                        | None, None, None, Ok notifications ->
                             let tasks = tasks |> List.choose (function Ok item -> Some item | _ -> None)
                             let agents = agents |> List.choose (function Ok item -> Some item | _ -> None)
                             let reviews = reviews |> List.choose (function Ok item -> Some item | _ -> None)
@@ -98,7 +109,18 @@ let private projectSnapshot project rt =
                                         ({ Key = project + "::" + agent.AgentId; Agent = agent.AgentId
                                            Project = project; State = agent.State
                                            StateEnteredAt = stateTime agent; StateReason = stringOption agent.StateReason
-                                           Focus = focus } : AgentView.AgentRow)))
+                                           Focus = focus
+                                           PendingNotifications =
+                                             notifications |> List.filter (fun n ->
+                                                 n.ToAgentId = agent.AgentId && String.IsNullOrWhiteSpace n.AcknowledgedAtUtc) |> List.length
+                                           LatestNotification =
+                                             notifications |> List.filter (fun n ->
+                                                 n.ToAgentId = agent.AgentId && String.IsNullOrWhiteSpace n.AcknowledgedAtUtc)
+                                               |> List.sortByDescending (fun n -> n.CreatedAtUtc, n.NotificationId)
+                                               |> List.tryHead
+                                               |> Option.map (fun n ->
+                                                   n.FromAgentId + (if String.IsNullOrWhiteSpace n.TaskId then "" else " #" + n.TaskId)
+                                                   + ": " + n.Message) } : AgentView.AgentRow)))
                             match firstError rows with
                             | Some error -> Error error
                             | None ->

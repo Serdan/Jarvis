@@ -915,7 +915,8 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
             match row.Focus with
             | Some task -> $"{AgentView.displayState row.State} · #{task.TaskId} {task.Title}"
             | None -> AgentView.displayState row.State
-        let rendered = trim $"{marker}{flag} {timestamp,-4} {token} {row.Agent}: {compact status}" width
+        let unread = if row.PendingNotifications = 0 then "" else $" [{row.PendingNotifications} unread]"
+        let rendered = trim $"{marker}{flag} {timestamp,-4} {token} {row.Agent}{unread}: {compact status}" width
         let index = rendered.IndexOf(token, StringComparison.Ordinal)
         if index < 0 then draw.WriteLine rendered
         else
@@ -939,6 +940,9 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                 writeDetailField width "Agent" row.Agent
                 writeDetailField width "Project" (ActivityFilter.projectToken row.Project)
                 writeDetailField width "State" row.State
+                if row.PendingNotifications > 0 then
+                    writeDetailField width "Unread notifications" (string row.PendingNotifications)
+                    row.LatestNotification |> Option.iter (writeDetailField width "Latest message")
                 row.StateEnteredAt
                 |> Option.iter (fun value ->
                     writeDetailField width "State since" (value.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss")))
@@ -960,6 +964,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         let filtered = agentListUnsafe()
         let all = agentSnapshot |> Option.map AgentView.rows |> Option.defaultValue []
         let reviewCount = agentSnapshot |> Option.map (fun snap -> snap.Projects |> List.sumBy _.PendingReviews) |> Option.defaultValue 0
+        let unreadCount = all |> List.sumBy _.PendingNotifications
         let filterSuffix =
             if String.IsNullOrWhiteSpace agentFilter then ""
             else $" [text=\"{trim (compact agentFilter) (max 20 (width - 22))}\"]"
@@ -1002,11 +1007,11 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         if draw.Height >= 22 then
             draw.WriteLine "------"
             draw.WriteLine
-                (sprintf "Tracked: %d | Review: %d | Working: %d | Ready: %d | Needs work: %d | Parked: %d"
-                    all.Length reviewCount (stateCount "Working") (stateCount "Ready")
+                (sprintf "Tracked: %d | Review: %d | Unread: %d | Working: %d | Ready: %d | Needs work: %d | Parked: %d"
+                    all.Length reviewCount unreadCount (stateCount "Working") (stateCount "Ready")
                     (stateCount "NeedsWork") (stateCount "Parked"))
         else
-            draw.WriteLine (sprintf "Ready %d · Needs work %d · Working %d · Parked %d" (stateCount "Ready") (stateCount "NeedsWork") (stateCount "Working") (stateCount "Parked"))
+            draw.WriteLine (sprintf "Unread %d · Ready %d · Needs work %d · Working %d · Parked %d" unreadCount (stateCount "Ready") (stateCount "NeedsWork") (stateCount "Working") (stateCount "Parked"))
         let refreshed =
             agentSnapshot
             |> Option.map (fun snap -> snap.RefreshedAt.ToLocalTime().ToString("HH:mm:ss"))
@@ -1041,6 +1046,8 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                         [ $"Agent: {row.Agent}"
                           $"Project: {row.Project}"
                           $"Status: {AgentView.displayState row.State} ({AgentView.stateAge DateTimeOffset.UtcNow row})"
+                          $"Unread: {row.PendingNotifications}"
+                          "Latest: " + (row.LatestNotification |> Option.defaultValue "-")
                           "Next: " + (row.StateReason |> Option.defaultValue "-") ]
                         @ (match row.Focus with
                            | None -> ["Assignment: none"]

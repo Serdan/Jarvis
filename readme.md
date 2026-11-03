@@ -240,6 +240,17 @@ Jarvis discovers worktrees using Git metadata. New worktrees use hidden sibling 
 
 **Current task authority:** an explicitly initialized project uses one Git orphan branch, `refs/heads/jarvis-orchestration`, on its configured remote. The unprefixed orchestration MCP tools manage canonical HTML task specs, agents, assignments, reviews and integrations. The former source-branch task handlers are retired. Names such as `CreateTask` and `AssignTask` now refer exclusively to orphan-ledger operations; old commands such as `ListTasks` and `CheckpointTask` are not available. Existing `docs/tasks/` HTML/JSON files remain reference material, not live state; upgrading Jarvis does not automatically migrate them.
 
+**Agent coordination notifications:** `notify_agent` records a durable
+message on the canonical orphan Git ledger, with sender, recipient, optional
+task reference, message and caller-stable `operationId` UUID (also the
+notification ID). Both agents must be registered; the optional task must exist.
+An identical retry cannot duplicate the notification. `agent_inbox` returns
+unacknowledged `pendingNotifications`; the TUI Agents screen shows unread
+counts and previews without altering assignments or execution state. The
+recipient calls `acknowledge_notification` using the notification ID and a new
+caller-stable operation UUID. Acknowledgments survive restarts and are
+idempotent on retry. The message remains in Git history after acknowledgment.
+
 The client **Agents** screen reads only explicitly bound canonical ledgers and shows the persisted agent state and transition time; it never scans source-side task files. Unbound projects do not contribute invented agent state, while bound-ledger read failures are surfaced as errors.
 
 See [Migration to Git-backed orchestration](docs/OrchestrationMigration.md) for initialization, selective task carry-over and recovery. The [orchestration V2 architecture](docs/specs/orchestration-v2-architecture.md) defines the authority rules. The older [Git-backed task files guide](docs/GitBackedTasks.md) describes the retired workflow.

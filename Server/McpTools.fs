@@ -199,7 +199,7 @@ module McpToolHelpers =
 
     let private v2TaskReadMethods = [ "AgentInbox"; "GetAssignment"; "GetCheckpoint";  "InspectAttemptSource"; "TaskLifecycleHistory"; "GetTaskSpecPage"; "DiffTaskSpec" ]
     let private v2TaskWriteMethods =
-        [ "MigrateOrthogonalAgentState"; "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "AcknowledgeAssignment"; "ReissueAssignment"; "BeginAttempt"; "CheckpointAttempt"
+        [ "NotifyAgent"; "AcknowledgeNotification"; "MigrateOrthogonalAgentState"; "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "AcknowledgeAssignment"; "ReissueAssignment"; "BeginAttempt"; "CheckpointAttempt"
           "BindReviewBase"; "BindAttemptSource"; "RebindAttemptSource"; "YieldAgent"; "ResumeAgent"; "CompleteAgentWork"
           "ParkAgent"; "ReissueQueuedAttempt"; "RecoverAgentAssignment"; "AcknowledgeReviewFeedback"
           "ParkAttempt"; "BlockAttempt"; "ResumeAttempt"; "AbandonAttempt"; "CancelTask"; "CancelOpenTask"
@@ -1099,6 +1099,16 @@ type JarvisMcpTools =
     static member RegisterAgent(projectName: string, agentId: string, operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         let cmd = V2TaskCommands.write projectName "RegisterAgent" operationId "" agentId
         McpToolHelpers.send client http (V2TaskWriteCommand cmd)
+
+    [<McpServerTool(Title = "notify agent", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Send a durable coordination notification between two registered agents in the canonical Git ledger. Appears in the recipient's agent_inbox and the TUI until acknowledged; does not change assignments or execution state. operationId is a stable UUID used as the notification ID.")>]
+    static member NotifyAgent(projectName: string, fromAgentId: string, toAgentId: string, message: string, operationId: string, [<Optional; DefaultParameterValue("")>] taskId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        let cmd = V2TaskCommands.write projectName "NotifyAgent" operationId taskId fromAgentId
+        McpToolHelpers.send client http (V2TaskWriteCommand { cmd with OwnerId = toAgentId; Summary = message })
+
+    [<McpServerTool(Title = "acknowledge notification", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Mark an existing agent coordination notification as read by its recipient. Preserves the message in the Git ledger; unrelated tasks, assignments, reviews and execution states are unchanged.")>]
+    static member AcknowledgeNotification(projectName: string, agentId: string, notificationId: string, operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        let cmd = V2TaskCommands.write projectName "AcknowledgeNotification" operationId "" agentId
+        McpToolHelpers.send client http (V2TaskWriteCommand { cmd with AttemptId = notificationId })
 
     [<McpServerTool(Title = "assign task", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Assign a registered unoccupied agent to an Open task. The agent immediately becomes Ready; the queued attempt is separate from execution. Reviews are independent.")>]
     static member AssignTask(projectName: string, taskId: string, attemptId: string, ownerId: string, operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =

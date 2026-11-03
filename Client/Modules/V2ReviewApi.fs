@@ -1052,6 +1052,14 @@ module V2TaskApi =
                         let result =
                             V2PendingIntentJournal.executeLedgerWrite binding operationId "V2TaskWrite" journalCommand (fun () ->
                                 match cmd.Action with
+                                | "NotifyAgent" ->
+                                    ReviewWorkflow.ReviewWorkflow.notifyAgent binding operationId
+                                        cmd.ActorId cmd.OwnerId cmd.TaskId cmd.Summary |> mapError
+                                | "AcknowledgeNotification" ->
+                                    guid "notificationId" cmd.AttemptId
+                                    |> Result.bind (fun notificationId ->
+                                        ReviewWorkflow.ReviewWorkflow.acknowledgeNotification
+                                            binding operationId cmd.ActorId notificationId |> mapError)
                                 | "CreateTask" ->
                                     ReviewWorkflow.ReviewWorkflow.createTaskWithSpec binding operationId cmd.TaskId cmd.Title cmd.Html
                                     |> mapError

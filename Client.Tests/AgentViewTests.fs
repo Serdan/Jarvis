@@ -13,7 +13,9 @@ let private record project agent state task =
       State = state
       StateEnteredAt = Some(DateTimeOffset(2026,10,30,4,36,32,TimeSpan.Zero))
       StateReason = Some "Review commits then resume"
-      Focus = task }
+      Focus = task
+      PendingNotifications = 0
+      LatestNotification = None }
 
 let private focused =
     { TaskId = "320"
@@ -95,3 +97,16 @@ let relativeStateAgeUsesTimestampNotLastRefreshTime () =
     let agent = { record "Jarvis" "Agent" "Ready" None with StateEnteredAt = Some(now.AddMinutes(-14.)) }
     stateAge now agent |> shouldEqual "14m"
     stateAge now { agent with StateEnteredAt = None } |> shouldEqual "—"
+
+[<Test>]
+let unreadNotificationsTakePriorityAndTriggerRefresh () =
+    let quiet = record "Wayfold" "Agent 2" "Ready" None
+    let notified =
+        { record "Wayfold" "Agent 7" "Parked" None with
+            PendingNotifications = 2
+            LatestNotification = Some "Agent 3 #304: Agree on the interface" }
+    let before = snapshot [ quiet; { notified with PendingNotifications = 0; LatestNotification = None } ]
+    let after = snapshot [ quiet; notified ]
+    rows after |> List.head |> fun row -> row.Agent |> shouldEqual "Agent 7"
+    changedAgents before after |> shouldEqual (set ["Wayfold::Agent 7"])
+    changedAgents after after |> shouldEqual Set.empty

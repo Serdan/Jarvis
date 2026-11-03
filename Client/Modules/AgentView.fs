@@ -18,7 +18,9 @@ type AgentRow =
       State: string
       StateEnteredAt: DateTimeOffset option
       StateReason: string option
-      Focus: TaskFocus option }
+      Focus: TaskFocus option
+      PendingNotifications: int
+      LatestNotification: string option }
 
 type ProjectSummary =
     { Project: string
@@ -42,7 +44,7 @@ let attentionRank state =
 let rows (snapshot: Snapshot) =
     snapshot.Agents
     |> List.sortBy (fun item ->
-        attentionRank item.State, item.Project.ToLowerInvariant(), item.Agent.ToLowerInvariant())
+        (if item.PendingNotifications > 0 then -1 else attentionRank item.State), item.Project.ToLowerInvariant(), item.Agent.ToLowerInvariant())
 
 let stateAge (now: DateTimeOffset) (agent: AgentRow) =
     agent.StateEnteredAt
@@ -85,6 +87,8 @@ let changedAgents (before: Snapshot) (after: Snapshot) =
             previousRow.State = row.State
             && previousRow.StateEnteredAt = row.StateEnteredAt
             && previousRow.StateReason = row.StateReason
-            && previousRow.Focus = row.Focus -> None
+            && previousRow.Focus = row.Focus
+            && previousRow.PendingNotifications = row.PendingNotifications
+            && previousRow.LatestNotification = row.LatestNotification -> None
         | _ -> Some row.Key)
     |> Set.ofList

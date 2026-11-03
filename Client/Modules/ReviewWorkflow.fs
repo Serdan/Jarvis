@@ -224,6 +224,16 @@ type ReviewFeedbackNotice =
       Version: int }
 
 [<CLIMutable>]
+type AgentNotification =
+    { NotificationId: string
+      FromAgentId: string
+      ToAgentId: string
+      TaskId: string
+      Message: string
+      CreatedAtUtc: string
+      AcknowledgedAtUtc: string }
+
+[<CLIMutable>]
 type AgentCheckpoint =
     { TaskId: string
       AttemptId: string
@@ -256,6 +266,7 @@ type AgentInbox =
       PendingReviews: BranchReview list
       AvailableReviews: BranchReview list
       UnacknowledgedFeedback: ReviewFeedbackNotice list
+      PendingNotifications: AgentNotification list
       SlotAvailable: bool
       Unassigned: bool }
 
@@ -406,6 +417,9 @@ module ReviewWorkflow =
                              RegexOptions.CultureInvariant))
     let private lifecycleEventPath taskId sequence =
         $"tasks/{taskId}/lifecycle/{sequence}.json"
+
+    let private notificationPath (notificationId: Guid) =
+        "notifications/" + notificationId.ToString("N") + ".json"
 
     let private reviewRef taskId requestId number = $"refs/heads/jarvis-review/{taskId}/{requestId}/r{number}"
     let private agentPath (agentId: string) =
@@ -908,6 +922,69 @@ module ReviewWorkflow =
                         return! Error(StaleEntityVersion "No legacy agent or attempt records to convert.")
                     return List.rev modifications
                 })
+
+    let notifyAgent binding operationId fromAgentId toAgentId taskId message =
+        if not (validAgent fromAgentId) || not (validAgent toAgentId)
+           || not (validText 4096 message)
+           || (not (String.IsNullOrWhiteSpace taskId) && not (validTaskId taskId)) then
+            Error(InvalidBinding "Invalid notification sender, recipient, task or message.")
+        else
+            // Operation ID is also the stable notification ID: retries cannot duplicate messages.
+            LedgerStore.transact binding
+                (intent operationId fromAgentId "NotifyAgent"
+                    {| toAgentId = toAgentId; taskId = taskId; message = message |})
+                (fun snapshot -> result {
+                    let! _ = required<ReviewAgent> binding snapshot (agentPath fromAgentId)
+                    let! _ = required<ReviewAgent> binding snapshot (agentPath toAgentId)
+                    if not (String.IsNullOrWhiteSpace taskId) then
+                        let! _ = required<ReviewTask> binding snapshot (taskPath taskId)
+                        ()
+                    let notification =
+                        { NotificationId = operationId.ToString("N")
+                          FromAgentId = fromAgentId; ToAgentId = toAgentId
+                          TaskId = if isNull taskId then "" else taskId
+                          Message = message
+                          CreatedAtUtc = DateTimeOffset.UtcNow.ToString("O")
+                          AcknowledgedAtUtc = null }
+                    return [ change (notificationPath operationId) None notification ]
+                })
+
+    let acknowledgeNotification binding operationId agentId notificationId =
+        if not (validAgent agentId) || notificationId = Guid.Empty then
+            Error(InvalidBinding "Invalid notification acknowledgement.")
+        else
+            LedgerStore.transact binding
+                (intent operationId agentId "AcknowledgeNotification"
+                    {| notificationId = notificationId; agentId = agentId |})
+                (fun snapshot -> result {
+                    let path = notificationPath notificationId
+                    let! notification, oid = required<AgentNotification> binding snapshot path
+                    if notification.NotificationId <> notificationId.ToString("N") then
+                        return! Error(LedgerIntegrityError "Notification identity mismatch.")
+                    if notification.ToAgentId <> agentId then
+                        return! Error(ReviewAccessDenied "Only the recipient may acknowledge a notification.")
+                    if not (String.IsNullOrWhiteSpace notification.AcknowledgedAtUtc) then
+                        return! Error(StaleEntityVersion "Notification has already been acknowledged.")
+                    return [ change path (Some oid)
+                                { notification with AcknowledgedAtUtc = DateTimeOffset.UtcNow.ToString("O") } ]
+                })
+
+    let pendingNotifications binding snapshot agentId = result {
+        let! paths = LedgerStore.listAt binding snapshot "notifications"
+        let mutable pending = []
+        for path in paths do
+            if path.EndsWith(".json", StringComparison.Ordinal) then
+                let! notification, _ = required<AgentNotification> binding snapshot path
+                match Guid.TryParseExact(notification.NotificationId, "N") with
+                | true, parsed when path = notificationPath parsed
+                                    && validAgent notification.FromAgentId
+                                    && validAgent notification.ToAgentId ->
+                    if notification.ToAgentId = agentId
+                       && String.IsNullOrWhiteSpace notification.AcknowledgedAtUtc then
+                        pending <- notification :: pending
+                | _ -> return! Error(LedgerIntegrityError "Invalid notification identity.")
+        return pending |> List.sortBy (fun n -> n.CreatedAtUtc, n.NotificationId)
+    }
 
     let registerAgent binding operationId agentId =
         if not (validAgent agentId) then Error(InvalidBinding "Invalid agent ID.")
@@ -2060,6 +2137,7 @@ module ReviewWorkflow =
             result {
                 let! snapshot = LedgerStore.fetch binding
                 let! agent, _ = required<ReviewAgent> binding snapshot (agentPath agentId)
+                let! notifications = pendingNotifications binding snapshot agentId
                 let! paths = LedgerStore.listAt binding snapshot "tasks"
                 let taskPaths = paths |> List.filter (fun path -> path.EndsWith("/task.json", StringComparison.Ordinal))
                 let reviewPaths = paths |> List.filter (fun path -> path.EndsWith("/review.json", StringComparison.Ordinal))
@@ -2164,6 +2242,7 @@ module ReviewWorkflow =
                           PendingReviews = pending
                           AvailableReviews = available
                           UnacknowledgedFeedback = feedback |> List.sortBy (fun notice -> notice.DecisionSequence)
+                          PendingNotifications = notifications
                           SlotAvailable = isNull (box agent.CurrentAssignment)
                           Unassigned = isNull (box agent.CurrentAssignment) }
             }

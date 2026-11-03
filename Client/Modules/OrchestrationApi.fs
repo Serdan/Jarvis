@@ -243,15 +243,15 @@ module LedgerBindingConfig =
                 LedgerStore.LedgerStore.inspectRemotePolicy binding
                 |> Result.mapError LedgerErrors.toEffect
                 |> Result.map (fun protection ->
-                    {| projectId = binding.ProjectId.ToString("D")
-                      ledgerId = binding.LedgerId.ToString("D")
-                      epoch = binding.Epoch
-                      remoteName = binding.RemoteName
-                      approvedFetchUrl = binding.ApprovedFetchUrl
-                      approvedPushUrl = binding.ApprovedPushUrl
-                      trustedLedgerHead = snapshot.Commit
-                      ledgerSequence = snapshot.Header.NextSequence
-                      remoteProtection = protection |})))
+                    {| projectId = binding.ProjectId.ToString("D");
+                       ledgerId = binding.LedgerId.ToString("D");
+                       epoch = binding.Epoch;
+                       remoteName = binding.RemoteName;
+                       approvedFetchUrl = binding.ApprovedFetchUrl;
+                       approvedPushUrl = binding.ApprovedPushUrl;
+                       trustedLedgerHead = snapshot.Commit;
+                       ledgerSequence = snapshot.Header.NextSequence;
+                       remoteProtection = protection |})))
 
     // Rebind only to the same logical ledger/epoch. Deliberate recovery with a
     // new epoch is a separate backed-up restore operation.
@@ -800,14 +800,14 @@ module LedgerApi =
             |> Result.map (fun records ->
                 records
                 |> List.map (fun record ->
-                    {| operationId = record.OperationId
-                      projectId = record.ProjectId
-                      ledgerId = record.LedgerId
-                      epoch = record.Epoch
-                      commandType = record.CommandType
-                      commandSha256 = record.CommandSha256
-                      originalCommandJson = record.CommandJson
-                      createdUtc = record.CreatedUtc |})
+                    {| operationId = record.OperationId;
+                       projectId = record.ProjectId;
+                       ledgerId = record.LedgerId;
+                       epoch = record.Epoch;
+                       commandType = record.CommandType;
+                       commandSha256 = record.CommandSha256;
+                       originalCommandJson = record.CommandJson;
+                       createdUtc = record.CreatedUtc |})
                 |> box)
         | "ReconcilePendingOperations" ->
             LedgerBindingConfig.load cmd.ProjectName rt
@@ -880,7 +880,7 @@ module LedgerApi =
                            epoch = binding.Epoch; remoteName = binding.RemoteName
                            trustedLedgerHead = binding.HighestTrustedHead |}))
 
-module OrchestrationApi =
+module ReviewApi =
     let private mapError (result: Result<'a, LedgerStore.LedgerFailure>) : Result<'a, EffectError> =
         result |> Result.mapError LedgerErrors.toEffect
     let private parseId label (raw: string) =

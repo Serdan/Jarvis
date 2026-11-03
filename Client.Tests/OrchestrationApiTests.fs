@@ -20,7 +20,7 @@ let disabledReadAndWriteDoNotTouchV1Tasks () =
               TaskId = ""
               RequestId = ""
               ReviewerId = "Reviewer"; DocumentPath = "" }
-        match Client.OrchestrationApi.OrchestrationApi.read query context with
+        match Client.OrchestrationApi.ReviewApi.read query context with
         | Error(Client.ValidationError message) ->
             Assert.That(message, Does.Contain(" ledger disabled"))
         | other -> Assert.Fail(sprintf "Expected disabled  read, got %A" other)
@@ -40,7 +40,7 @@ let disabledReadAndWriteDoNotTouchV1Tasks () =
               Summary = ""
               Verdict = ""
               DocumentPath = ""; Content = ""; ExpectedBlobOid = "" }
-        match Client.OrchestrationApi.OrchestrationApi.write mutation context with
+        match Client.OrchestrationApi.ReviewApi.write mutation context with
         | Error(Client.ValidationError message) ->
             Assert.That(message, Does.Contain(" ledger disabled"))
         | other -> Assert.Fail(sprintf "Expected disabled  write, got %A" other)

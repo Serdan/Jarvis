@@ -94,8 +94,8 @@ type Frame(width: int, height: int) =
         y <- y + 1
 
     /// Draws only changed rows, retaining unchanged cells and their colors.
-    /// Width reserves one physical terminal column so writing the bottom-right
-    /// cell can never provoke an automatic terminal scroll.
+    /// Width reserves one physical terminal column to avoid bottom-right wrapping.
+    /// Paint that final column with ECH, which does not advance the cursor.
     member this.Present(previous: Frame option) =
         if Console.IsOutputRedirected then false
         elif Console.WindowWidth - 1 <> width || Console.WindowHeight <> height then false
@@ -148,6 +148,27 @@ type Frame(width: int, height: int) =
                                     if Console.BackgroundColor <> runBackground then
                                         Console.BackgroundColor <- runBackground
                                 Console.Write(text.ToString())
+                // The frame reserves the terminal's rightmost column to prevent
+                // a write into the bottom-right corner from scrolling. Still paint
+                // its background, using ECH (erase character) at that position.
+                // ECH fills with the current rendition but does not move the cursor.
+                for row in 0 .. height - 1 do
+                    let edge = cells[row, width - 1]
+                    let oldEdge =
+                        previous |> Option.map (fun frame -> frame.GetCell(row, width - 1))
+                    if full
+                       || (oldEdge |> Option.exists (fun old -> old.BackgroundRgb <> edge.BackgroundRgb || old.Background <> edge.Background)) then
+                        Console.SetCursorPosition(width, row)
+                        match edge.BackgroundRgb with
+                        | Some(r, g, b) ->
+                            Console.Write($"\u001b[48;2;{r};{g};{b}m")
+                            activeRgb <- edge.BackgroundRgb
+                        | None ->
+                            if activeRgb.IsSome then
+                                Console.Write("\u001b[49m")
+                                activeRgb <- None
+                            Console.BackgroundColor <- edge.Background
+                        Console.Write("\u001b[1X")
                 if activeRgb.IsSome then Console.Write("\u001b[49m")
                 Console.ForegroundColor <- initialColor
                 Console.BackgroundColor <- initialBackground

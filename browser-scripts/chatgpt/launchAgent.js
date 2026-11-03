@@ -2,12 +2,12 @@
 // The browser extension evaluates execute(args) in a USER_SCRIPT world.
 async function execute(args) {
   const prompt = args?.prompt;
-  const origin = args?.expectedOrigin || "https://chatgpt.com";
+  const startUrl = "https://chatgpt.com/";
   if (typeof prompt !== "string" || !prompt.trim() || prompt.length > 24000) {
     return { status: "notSubmitted", reason: "InvalidPrompt" };
   }
-  if (location.origin !== origin) {
-    return { status: "notSubmitted", reason: "UnexpectedOrigin" };
+  if (location.href !== startUrl) {
+    return { status: "notSubmitted", reason: "UnexpectedStartUrl" };
   }
   const readyMs = Math.min(Math.max(Number(args.uiReadyTimeoutMs) || 10000, 100), 25000);
   const submitMs = Math.min(Math.max(Number(args.submitTimeoutMs) || 10000, 100), 25000);
@@ -51,7 +51,7 @@ async function execute(args) {
 
   const evidence = await until(() => {
     const newUserTurn = document.querySelectorAll('[data-message-author-role="user"]').length > initialTurns;
-    const routeChanged = location.href !== initialUrl && location.origin === origin;
+    const routeChanged = location.href !== initialUrl && location.origin === new URL(startUrl).origin;
     const composerCleared = readEditor().trim().length === 0;
     // A new user turn is positive evidence. Some ChatGPT builds only expose route
     // transition plus cleared composer and a visible generation control.
@@ -64,7 +64,7 @@ async function execute(args) {
   if (!evidence) return { status: "outcomeUnknown", reason: "SubmissionUnconfirmed" };
 
   const conversationUrl = new URL(location.href);
-  if (conversationUrl.origin !== origin) {
+  if (conversationUrl.origin !== new URL(startUrl).origin) {
     return { status: "outcomeUnknown", reason: "UnexpectedNavigation" };
   }
   conversationUrl.search = "";

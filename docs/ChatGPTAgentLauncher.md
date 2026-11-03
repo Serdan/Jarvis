@@ -103,7 +103,6 @@ Recommended argument contract:
 | --- | --- | --- |
 | `prompt` | Yes | Exact bootstrap text to submit; nonempty, bounded, may contain newlines |
 | `role` / `agentId` / `projectName` | No | Caller-owned metadata for logs/correlation; **not** alternative sources of instructions |
-| `expectedOrigin` | No | Defaults to `https://chatgpt.com`; reject unexpected origins |
 | `uiReadyTimeoutMs` | No | Bounded wait for textbox/controls after hydration |
 | `submitTimeoutMs` | No | Bounded wait for evidence of a submitted turn |
 | `postSubmitWaitMs` | No | Small bounded grace interval before returning, for SPA navigation to settle |
@@ -111,7 +110,7 @@ Recommended argument contract:
 
 Jarvis browser-workflow parameters, **not** ChatGPT script arguments, control `windowRegistration`, `active`, `closeTabAfterExecution`, and device selection. Only **scheduled** calls have delay and repeat interval. An orchestrator normally invokes the immediate workflow, rather than scheduling a zero-delay job.
 
-For ChatGPT **Projects**, a supported, explicitly chosen ChatGPT landing URL should be passed as `url`. It must be a known user-selected entry URL that opens a fresh conversation in the intended project. For other contexts, `https://chatgpt.com/` may suffice. Do not infer project identity from a display name, fabricate project URLs, or assume the selected GPT/Project context follows from a prior conversation. When a project, model, or thinking-effort selection is required, UI automation must verify or explicitly select it using discoverable controls. The launch must fail if the required context cannot be established; do not silently send in the wrong context.
+**Fixed ChatGPT entry point:** `https://chatgpt.com/`. The ChatGPT-specific launcher does not accept alternate origins, Project URLs, GPT URLs, or existing conversation URLs. The generic bridge remains URL-agnostic, but callers of this script always supply the fixed URL. The script rejects an unexpected starting URL before typing. Model selection, project navigation and alternate entry points require a separate explicit feature if desired.
 
 ### Model and thinking effort
 

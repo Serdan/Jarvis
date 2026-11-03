@@ -41,7 +41,7 @@ A reusable DOM-based launcher is included in this repository at:
 browser-scripts/chatgpt/launchAgent.js
 ```
 
-Use it through a normal Jarvis project selector (for example `Jarvis::browser-bridge` when working in this development worktree). Its main argument is `prompt`; optional timeouts and `expectedOrigin` are supported. It selects the contenteditable ProseMirror editor, inserts text through normal editing behavior, waits for the enabled **Send** button (which replaces **Start voice**), clicks once, and checks UI evidence of submission. It does not rely on ChatGPT's private network API.
+Use it through a normal Jarvis project selector (for example `Jarvis::browser-bridge` when working in this development worktree). Its main argument is `prompt`; optional timeouts are supported. The entry URL is fixed to `https://chatgpt.com/`, and the script rejects any different starting URL (including an existing `/c/...` conversation). It selects the contenteditable ProseMirror editor, inserts text through normal editing behavior, waits for the enabled **Send** button (which replaces **Start voice**), clicks once, and checks UI evidence of submission. It does not rely on ChatGPT's private network API.
 
 Example command arguments:
 

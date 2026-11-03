@@ -7,7 +7,7 @@ const path = require("node:path");
 const source = fs.readFileSync(path.resolve(__dirname, "../../browser-scripts/chatgpt/launchAgent.js"), "utf8");
 
 function harness(options = {}) {
-  const site = { origin: "https://chatgpt.com", href: "https://chatgpt.com/" };
+  const site = { origin: "https://chatgpt.com", href: options.startUrl || "https://chatgpt.com/" };
   let content = options.existingDraft || "";
   let userTurns = 0;
   let clicks = 0;
@@ -86,5 +86,13 @@ test("missing composer fails before submission", async () => {
   const result = await h.run();
   assert.equal(result.status, "notSubmitted");
   assert.equal(result.reason, "ComposerUnavailable");
+  assert.equal(h.clicks, 0);
+});
+
+test("rejects an existing conversation rather than appending a bootstrap message", async () => {
+  const h = harness({ startUrl: "https://chatgpt.com/c/existing" });
+  const result = await h.run();
+  assert.equal(result.status, "notSubmitted");
+  assert.equal(result.reason, "UnexpectedStartUrl");
   assert.equal(h.clicks, 0);
 });

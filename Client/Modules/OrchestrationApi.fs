@@ -1096,9 +1096,12 @@ module TaskApi =
                                     ReviewWorkflow.ReviewWorkflow.importTaskSpec binding operationId cmd.TaskId
                                         cmd.ExpectedVersion cmd.BaseOid cmd.TargetRef cmd.Title cmd.SourceRef |> mapError
                                 | "AdoptTaskSpec" ->
-                                    ReviewWorkflow.ReviewWorkflow.adoptTaskSpec binding operationId cmd.TaskId
-                                        cmd.ActorId cmd.ExpectedTaskVersion cmd.ExpectedVersion
-                                        cmd.ExpectedAgentVersion cmd.AssignmentGeneration cmd.BaseOid cmd.Summary |> mapError
+                                    if not (String.IsNullOrWhiteSpace cmd.Html) then
+                                        Error(Client.ValidationError "Provide either newSpecHtml or expectedCurrentSpecBlobOid, not both.")
+                                    else
+                                        ReviewWorkflow.ReviewWorkflow.adoptTaskSpec binding operationId cmd.TaskId
+                                            cmd.ActorId cmd.ExpectedTaskVersion cmd.ExpectedVersion
+                                            cmd.ExpectedAgentVersion cmd.AssignmentGeneration cmd.BaseOid cmd.Summary |> mapError
                                 | "MigrateOrthogonalAgentState" ->
                                     ReviewWorkflow.ReviewWorkflow.migrateOrthogonalAgentState binding operationId cmd.BaseOid
                                     |> mapError

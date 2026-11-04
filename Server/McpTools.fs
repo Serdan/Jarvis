@@ -205,7 +205,7 @@ module McpToolHelpers =
           "BindReviewBase"; "BindAttemptSource"; "RebindAttemptSource"; "YieldAgent"; "ResumeAgent"; "CompleteAgentWork"
           "ParkAgent"; "ReissueQueuedAttempt"; "RecoverAgentAssignment"; "AcknowledgeReviewFeedback"
           "ParkAttempt"; "BlockAttempt"; "ResumeAttempt"; "AbandonAttempt"; "CancelTask"
-          "TransferOwner"; "CloseTask"; "ReopenTask"; "ImportTaskSpec"; "AdoptTaskSpec"; "ExportTaskSpec" ]
+          "TransferOwner"; "CloseTask"; "ReopenTask"; "ImportTaskSpec"; "ExportTaskSpec" ]
 
     let private ledgerReadMethods = [ "LedgerHealth"; "GetOperationStatus"; "PendingOperations"; "ReconcilePendingOperations" ]
     let private ledgerWriteMethods = [ "InitializeLedger"; "BindExistingLedger"; "RebindLedgerRemote"; "AcknowledgePendingOperation" ]
@@ -1206,14 +1206,17 @@ type JarvisMcpTools =
                 { ProjectName = projectName; AgentId = ""; Action = "GetAssignment"
                   TaskId = taskId; AssignmentGeneration = assignmentGeneration; CheckpointSequence = 0L; Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null })
 
-    [<McpServerTool(Title = "reissue assignment", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Explicitly reissue instructions or revise canonical HTML for a queued, unstarted Ready assignment. Preserves immutable issue/acknowledgment history and never interrupts Working execution.")>]
-    static member ReissueAssignment(projectName: string, taskId: string, ownerId: string, expectedAttemptVersion: int, expectedAgentVersion: int, assignmentGeneration: int, instructions: string, newSpecHtml: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
-        let cmd = TaskCommands.write projectName "ReissueAssignment" operationId taskId ownerId
+    [<McpServerTool(Title = "reissue assignment", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Update instructions or canonical HTML for an unstarted Ready assignment. Optionally adopt a separately revised canonical spec by supplying expectedCurrentSpecBlobOid and expectedTaskVersion instead of newSpecHtml. Those inputs are mutually exclusive; Working assignments cannot be updated. Immutable issuance history is preserved.")>]
+    static member ReissueAssignment(projectName: string, taskId: string, ownerId: string, expectedAttemptVersion: int, expectedAgentVersion: int, assignmentGeneration: int, instructions: string, [<Optional; DefaultParameterValue("")>] newSpecHtml: string, [<Optional; DefaultParameterValue("")>] expectedCurrentSpecBlobOid: string, [<Optional; DefaultParameterValue(0)>] expectedTaskVersion: int, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        let adoption = not (String.IsNullOrWhiteSpace expectedCurrentSpecBlobOid)
+        let cmd = TaskCommands.write projectName (if adoption then "AdoptTaskSpec" else "ReissueAssignment") operationId taskId ownerId
         McpToolHelpers.send client http
             (TaskWriteCommand
                 { cmd with ExpectedVersion = expectedAttemptVersion
                            ExpectedAgentVersion = expectedAgentVersion
+                           ExpectedTaskVersion = expectedTaskVersion
                            AssignmentGeneration = assignmentGeneration
+                           BaseOid = expectedCurrentSpecBlobOid
                            Summary = instructions; Html = newSpecHtml })
 
     [<McpServerTool(Title = "checkpoint Working attempt", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Write an immutable progress checkpoint for the exact current Working assignment without releasing the execution slot. Source SHA is verified; evidence remains owner-reported.")>]
@@ -1389,11 +1392,6 @@ type JarvisMcpTools =
     static member ImportTaskSpec(projectName: string, taskId: string, expectedTaskVersion: int, expectedSpecBlobOid: string, expectedSourceBlobOid: string, title: string, sourceRelativePath: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         let cmd = TaskCommands.write projectName "ImportTaskSpec" operationId taskId "Orchestrator"
         McpToolHelpers.send client http (TaskWriteCommand { cmd with ExpectedVersion = expectedTaskVersion; BaseOid = expectedSpecBlobOid; TargetRef = expectedSourceBlobOid; Title = title; SourceRef = sourceRelativePath })
-
-    [<McpServerTool(Title = "Reissue an unstarted assignment to explicitly adopt the current canonical task spec blob", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Reissue an unstarted assignment to explicitly adopt the current canonical task spec blob. Requires an existing bound orphan Git ledger.")>]
-    static member AdoptTaskSpec(projectName: string, taskId: string, ownerId: string, expectedTaskVersion: int, expectedAttemptVersion: int, expectedAgentVersion: int, assignmentGeneration: int, expectedCurrentSpecBlobOid: string, instructions: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
-        let cmd = TaskCommands.write projectName "AdoptTaskSpec" operationId taskId ownerId
-        McpToolHelpers.send client http (TaskWriteCommand { cmd with ExpectedTaskVersion = expectedTaskVersion; ExpectedVersion = expectedAttemptVersion; ExpectedAgentVersion = expectedAgentVersion; AssignmentGeneration = assignmentGeneration; BaseOid = expectedCurrentSpecBlobOid; Summary = instructions })
 
     [<McpServerTool(Title = "task state", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read a task's current lifecycle, assignment, and implementation attempt from the bound Git ledger.")>]
         static member ReviewTask(projectName: string, taskId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =

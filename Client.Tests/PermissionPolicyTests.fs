@@ -461,7 +461,7 @@ let ``full trust allows run command`` () =
 
 [<Test>]
 let ``project task listing is read only`` () =
-    let command = ListProjectTasksCommand { ProjectName = "Project1" }
+    let command = ListConfiguredTasksCommand { ProjectName = "Project1" }
     evaluate command |> shouldEqual (Ok())
 
 [<Test>]

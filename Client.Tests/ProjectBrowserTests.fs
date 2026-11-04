@@ -158,7 +158,7 @@ let ``listCommands returns current protocol capabilities`` () =
         capability "PatchFile" |> _.SupportsDryRun |> shouldEqual true
         capability "WriteFile" |> _.SupportsDryRun |> shouldEqual false
         capability "RunCommand" |> _.SupportsDryRun |> shouldEqual false
-        capability "ListProjectTasks" |> _.Permissions |> shouldEqual [ ReadOnly ]
+        capability "ListConfiguredTasks" |> _.Permissions |> shouldEqual [ ReadOnly ]
         capability "RunProjectTask" |> _.Permissions |> shouldEqual [ ProcessExecution ]
         capability "ListSkills" |> _.Permissions |> shouldEqual [ ReadOnly ]
         capability "GetSkill" |> _.Permissions |> shouldEqual [ ReadOnly ]

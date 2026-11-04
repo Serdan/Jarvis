@@ -218,7 +218,7 @@ module private Core =
             | _ ->
                 Error(Client.ValidationError $".jarvis.json task '{name}' requires a non-empty string 'executable'.")
 
-    let private parseProjectTasks (json: string) : Result<ListProjectTasksResult> =
+    let private parseProjectTasks (json: string) : Result<ListConfiguredTasksResult> =
         try
             use document = JsonDocument.Parse(json)
 
@@ -242,7 +242,7 @@ module private Core =
         | ex ->
             Error(ExceptionError ex)
 
-    let listProjectTasks (cmd: ListProjectTasksCommand) : IO<'rt, ListProjectTasksResult> =
+    let listConfiguredTasks (cmd: ListConfiguredTasksCommand) : IO<'rt, ListConfiguredTasksResult> =
         fun rt ->
             match ProjectPaths.resolveProjectFile cmd.ProjectName ".jarvis.json" rt with
             | Error(NotFoundError _) -> Ok { Tasks = [] }
@@ -255,7 +255,7 @@ module private Core =
 
     let resolveProjectTask (cmd: RunProjectTaskCommand) =
         fun rt ->
-            match listProjectTasks { ProjectName = cmd.ProjectName } rt with
+            match listConfiguredTasks { ProjectName = cmd.ProjectName } rt with
             | Error error -> Error error
             | Ok result ->
                 result.Tasks
@@ -355,7 +355,7 @@ module private Core =
         }
 
 let runCommand cmd = Core.runCommand cmd
-let listProjectTasks cmd = Core.listProjectTasks cmd
+let listConfiguredTasks cmd = Core.listConfiguredTasks cmd
 let resolveProjectTask cmd = Core.resolveProjectTask cmd
 
 let runProjectTask projectName (task: ProjectTaskDefinition) =

@@ -77,7 +77,7 @@ type AgentCommand =
     | WriteFileCommand of WriteFileCommand
     | PatchFileCommand of PatchFileCommand
     | RunCommandCommand of RunCommandCommand
-    | ListProjectTasksCommand of ListProjectTasksCommand
+    | ListConfiguredTasksCommand of ListConfiguredTasksCommand
     | RunProjectTaskCommand of RunProjectTaskCommand
     // Legacy WorkTask wire cases are internal compatibility only; no public MCP endpoints.
     | ListSkillsCommand of ListSkillsCommand
@@ -365,7 +365,7 @@ type ProjectTaskDefinition =
       TimeoutSeconds: int option
       MaxOutputBytes: int option }
 
-type ListProjectTasksCommand =
+type ListConfiguredTasksCommand =
     { ProjectName: string }
 
 type RunProjectTaskCommand =
@@ -373,7 +373,7 @@ type RunProjectTaskCommand =
       TaskName: string }
 ```
 
-`ListProjectTasks` is read-only. `RunProjectTask` resolves the named definition locally, then applies the same executable, working-directory, timeout, shell-deny, output, and process-permission checks as `RunCommand`.
+`ListConfiguredTasks` is read-only. `RunProjectTask` resolves the named definition locally, then applies the same executable, working-directory, timeout, shell-deny, output, and process-permission checks as `RunCommand`.
 
 For authorization, Jarvis resolves the task before prompting and authorizes the resolved executable and arguments. The same resolved definition is then executed, so editing `.jarvis.json` after a session grant was created cannot silently change what an already-approved exact command means.
 
@@ -764,7 +764,7 @@ If `InputSchemaJson` and `OutputSchemaJson` are added later, they should be incl
 | `WriteFile` | `WorkspaceWrite` | `RequireConfirmation` | Creates or overwrites project files. |
 | `PatchFile` | `WorkspaceWrite` | `RequireConfirmation` | Preferred edit path. |
 | `RunCommand` | `ProcessExecution` | `RequireConfirmation` | Use allowlists/presets where possible. |
-| `ListProjectTasks` | `ReadOnly` | `Allow` | Reads project-local task definitions. |
+| `ListConfiguredTasks` | `ReadOnly` | `Allow` | Reads project-local task definitions. |
 | `RunProjectTask` | `ProcessExecution` | `RequireConfirmation` | Authorize the resolved task definition, not only its name. |
 | `ListSkills` | `ReadOnly` | `Allow` | Discovers project-local skills. |
 | `GetSkill` | `ReadOnly` | `Allow` | Reads skill guidance. |

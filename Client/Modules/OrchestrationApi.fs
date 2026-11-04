@@ -506,8 +506,6 @@ module PendingIntentJournal =
                 | "TaskWrite", "AdoptTaskSpec" ->
                     attempt @ [ "ExpectedTaskVersion", "expectedTaskVersion"
                                 "BaseOid", "expectedCurrentSpecOid"; "Summary", "instructions" ]
-                | "TaskWrite", "MigrateOrthogonalAgentState" ->
-                    common @ [ "BaseOid", "expectedLedgerHead" ]
                 | "TaskWrite", "RegisterAgent" -> [ "ActorId", "agentId" ]
                 | "TaskWrite", "AssignTask" ->
                     common @ [ "AttemptId", "attemptId"; "OwnerId", "ownerId" ]
@@ -1108,9 +1106,6 @@ module TaskApi =
                                         ReviewWorkflow.ReviewWorkflow.adoptTaskSpec binding operationId cmd.TaskId
                                             cmd.ActorId cmd.ExpectedTaskVersion cmd.ExpectedVersion
                                             cmd.ExpectedAgentVersion cmd.AssignmentGeneration cmd.BaseOid cmd.Summary |> mapError
-                                | "MigrateOrthogonalAgentState" ->
-                                    ReviewWorkflow.ReviewWorkflow.migrateOrthogonalAgentState binding operationId cmd.BaseOid
-                                    |> mapError
                                 | "RegisterAgent" ->
                                     ReviewWorkflow.ReviewWorkflow.registerAgent binding operationId cmd.ActorId
                                     |> mapError

@@ -61,7 +61,7 @@ The response must contain only the exact token.
 | WriteFile | no | yes | no | Can create, append to, or overwrite a local project file. Local approval and project-root confinement apply. |
 | PatchFile | no | yes | no | Can overwrite portions of a local file through an atomic patch. Local approval, optimistic concurrency, and confinement apply. |
 | RunCommand | no | yes | yes | Starts a model-selected local executable that may mutate state or access arbitrary network resources. Local process approval, timeout, output limits, shell restrictions, and environment filtering apply. |
-| ListProjectTasks | yes | no | no | Reads locally configured task definitions only. |
+| ListConfiguredTasks | yes | no | no | Reads locally configured task definitions only. |
 | RunProjectTask | no | yes | yes | Starts a locally configured executable whose behavior may mutate state or access network resources. The resolved definition is locally approved before execution. |
 | GetGitStatus | yes | no | no | Reads local git status only. |
 | GetGitDiff | yes | no | no | Reads local git diff output only. |

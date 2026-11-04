@@ -89,3 +89,57 @@ let unauthenticated_mcp_requests_get_http_oauth_challenge_but_resource_metadata_
             server.Kill(true)
             server.WaitForExit(3000) |> ignore
         try Directory.Delete(tempDirectory, true) with _ -> ()
+
+
+[<Test>]
+let write_tools_expose_optional_operation_ids () =
+    let methods = typeof<Server.JarvisMcpTools>.GetMethods()
+    let writeMethods =
+        methods
+        |> Array.filter (fun methodInfo -> methodInfo.Name <> "Feedback")
+        |> Array.choose (fun methodInfo ->
+            match methodInfo.GetParameters() |> Array.tryFind (fun p -> p.Name = "operationId") with
+            | Some id when methodInfo.Name <> "GetOperationStatus"
+                           && methodInfo.Name <> "AcknowledgePendingOperation" ->
+                Some (methodInfo.Name, id)
+            | _ -> None)
+    Assert.That(writeMethods.Length, Is.EqualTo(46), String.concat ", " (writeMethods |> Array.map fst))
+    for name, id in writeMethods do
+        Assert.That(id.IsOptional, Is.True, $"operationId is required on {name}")
+        Assert.That(id.DefaultValue, Is.EqualTo(""), $"operationId default differs on {name}")
+
+    for selector in [ "GetOperationStatus"; "AcknowledgePendingOperation" ] do
+        let id = typeof<Server.JarvisMcpTools>.GetMethod(selector).GetParameters()
+                 |> Array.find (fun parameter -> parameter.Name = "operationId")
+        Assert.That(id.IsOptional, Is.False, $"Selector ID must remain required: {selector}")
+
+[<Test>]
+let omitted_operation_id_is_generated_and_explicit_retry_id_is_preserved () =
+    let first, generated = Server.McpToolHelpers.resolveOperationId ""
+    let second, generatedAgain = Server.McpToolHelpers.resolveOperationId " "
+    let valid, parsed = Guid.TryParse first
+    Assert.That(generated && generatedAgain && valid && parsed <> Guid.Empty, Is.True)
+    Assert.That(second, Is.Not.EqualTo(first))
+    let explicitId = Guid.NewGuid().ToString("D")
+    let retained, didGenerate = Server.McpToolHelpers.resolveOperationId explicitId
+    Assert.That(retained, Is.EqualTo(explicitId))
+    Assert.That(didGenerate, Is.False)
+
+
+[<Test>]
+let generated_operation_id_is_in_agent_visible_result_and_metadata () =
+    let id = Guid.NewGuid().ToString("D")
+    let result = ModelContextProtocol.Protocol.CallToolResult()
+    result.Content <- ResizeArray<ModelContextProtocol.Protocol.ContentBlock>()
+    let updated = Server.McpToolHelpers.attachGeneratedOperationId (Some id) result
+    Assert.That(updated.Meta["jarvis/generated_operation_id"].GetValue<string>(), Is.EqualTo(id))
+    let text =
+        updated.Content
+        |> Seq.choose (function
+            | :? ModelContextProtocol.Protocol.TextContentBlock as block -> Some block.Text
+            | _ -> None)
+        |> String.concat "\n"
+    Assert.That(text, Does.Contain(id))
+    Assert.That(text, Does.Contain("retries"))
+    let unchanged = Server.McpToolHelpers.attachGeneratedOperationId None result
+    Assert.That(Object.ReferenceEquals(updated, unchanged), Is.True)

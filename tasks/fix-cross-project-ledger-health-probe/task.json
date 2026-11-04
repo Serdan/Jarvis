@@ -1,1 +1,1 @@
-{"schemaVersion":2,"taskId":"fix-cross-project-ledger-health-probe","title":"Fix mismatched LedgerHealth action in cross-project routing","version":2,"lifecycle":"InProgress","specVersion":1,"attemptId":"7ec64038465849d4bb0a43be8a8ec680"}
+{"schemaVersion":2,"taskId":"fix-cross-project-ledger-health-probe","title":"Fix mismatched LedgerHealth action in cross-project routing","version":3,"lifecycle":"Closed","specVersion":1,"attemptId":"7ec64038465849d4bb0a43be8a8ec680"}

@@ -136,6 +136,24 @@ module RequestDeviceRouting =
         }
 
 module McpToolHelpers =
+    /// Convert an optional explicit checkout selector into the registered-worktree
+    /// project name understood by the existing client path and Git validation.
+    /// The ledger API deliberately does not use this helper.
+    let projectWithWorktreeName (projectName: string) (worktreeName: string) =
+        if String.IsNullOrEmpty worktreeName then projectName
+        elif String.IsNullOrWhiteSpace worktreeName then
+            invalidArg "worktreeName" "Expected a nonblank registered worktree directory name."
+        elif String.IsNullOrWhiteSpace projectName
+             || projectName.Contains("::", StringComparison.Ordinal) then
+            invalidArg "worktreeName" "Pass a plain projectName when worktreeName is provided."
+        elif worktreeName = "." || worktreeName = ".."
+             || worktreeName.Contains("..", StringComparison.Ordinal)
+             || worktreeName.IndexOfAny([| '/'; char 92 |]) >= 0
+             || (worktreeName |> Seq.exists Char.IsControl) then
+            invalidArg "worktreeName" "Expected a registered worktree directory name, not a path."
+        else
+            projectName + "::" + worktreeName
+
     let private formatError error =
         match error with
         | NotFound message -> $"NotFound: {message}"
@@ -1487,15 +1505,18 @@ type JarvisMcpTools =
             McpToolHelpers.send client http (ReviewWriteCommand cmd)
 
     [<McpServerTool(Title = "Get project details", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Get project details, README, notes, TODO, and related special files.")>]
-    static member GetProjectDetails(projectName: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member GetProjectDetails(projectName: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        let projectName = McpToolHelpers.projectWithWorktreeName projectName worktreeName
         McpToolHelpers.send client http (GetProjectDetailsCommand { ProjectName = projectName })
 
     [<McpServerTool(Title = "List directory", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("List files and folders in a project directory.")>]
-    static member ListDirectory(projectName: string, folderPath: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member ListDirectory(projectName: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, folderPath: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        let projectName = McpToolHelpers.projectWithWorktreeName projectName worktreeName
         McpToolHelpers.send client http (ListDirectoryCommand { ProjectName = projectName; FolderPath = folderPath })
 
     [<McpServerTool(Title = "Search files", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Search project file and folder names.")>]
-    static member SearchFiles(projectName: string, query: string, folderPath: string, maxResults: Nullable<int>, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member SearchFiles(projectName: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, query: string, folderPath: string, maxResults: Nullable<int>, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        let projectName = McpToolHelpers.projectWithWorktreeName projectName worktreeName
         McpToolHelpers.send client http (SearchFilesCommand {
             ProjectName = projectName
             Query = query
@@ -1503,7 +1524,8 @@ type JarvisMcpTools =
             MaxResults = McpToolHelpers.optionOfNullable maxResults })
 
     [<McpServerTool(Title = "Search text", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Search text inside project files.")>]
-    static member SearchText(projectName: string, query: string, folderPath: string, includeGlobs: string array, excludeGlobs: string array, maxResults: Nullable<int>, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member SearchText(projectName: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, query: string, folderPath: string, includeGlobs: string array, excludeGlobs: string array, maxResults: Nullable<int>, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        let projectName = McpToolHelpers.projectWithWorktreeName projectName worktreeName
         McpToolHelpers.send client http (SearchTextCommand {
             ProjectName = projectName
             Query = query
@@ -1513,7 +1535,8 @@ type JarvisMcpTools =
             MaxResults = McpToolHelpers.optionOfNullable maxResults })
 
     [<McpServerTool(Title = "Read file", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read one project file.")>]
-    static member ReadFile(projectName: string, filePath: string, startLine: Nullable<int>, endLine: Nullable<int>, includeLineNumbers: Nullable<bool>, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member ReadFile(projectName: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, filePath: string, startLine: Nullable<int>, endLine: Nullable<int>, includeLineNumbers: Nullable<bool>, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        let projectName = McpToolHelpers.projectWithWorktreeName projectName worktreeName
         McpToolHelpers.send client http (ReadFileCommand {
             ProjectName = projectName
             FilePath = filePath
@@ -1522,15 +1545,18 @@ type JarvisMcpTools =
             IncludeLineNumbers = McpToolHelpers.optionOfNullableBool includeLineNumbers })
 
     [<McpServerTool(Title = "Read files", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read multiple project files.")>]
-    static member ReadFiles(projectName: string, filePaths: string array, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member ReadFiles(projectName: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, filePaths: string array, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        let projectName = McpToolHelpers.projectWithWorktreeName projectName worktreeName
         McpToolHelpers.send client http (ReadFilesCommand { ProjectName = projectName; FilePaths = filePaths |> Array.toList })
 
     [<McpServerTool(Title = "Read image", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read a PNG, JPEG, or WebP image from a project and return it as native MCP image content for model vision.")>]
-    static member ReadImage(projectName: string, filePath: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member ReadImage(projectName: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, filePath: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        let projectName = McpToolHelpers.projectWithWorktreeName projectName worktreeName
         McpToolHelpers.send client http (ReadImageCommand { ProjectName = projectName; FilePath = filePath })
 
     [<McpServerTool(Title = "Export file", ReadOnly = true, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Export one bounded project file to a short-lived HTTPS URL that can be opened by the user. The URL is an unguessable bearer capability and expires automatically.")>]
-    static member ExportFile(projectName: string, filePath: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member ExportFile(projectName: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, filePath: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        let projectName = McpToolHelpers.projectWithWorktreeName projectName worktreeName
         McpToolHelpers.send client http (ExportFileCommand { ProjectName = projectName; FilePath = filePath })
 
     [<McpServerTool(Title = "Import file", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = true);
@@ -1538,7 +1564,7 @@ type JarvisMcpTools =
       McpMeta("openai/fileParams", JsonValue = """["file"]""");
       Description("Import a ChatGPT-provided file into a project path. The Jarvis client downloads the temporary file URL directly and enforces its local import-size limit.")>]
     static member ImportFile(
-        projectName: string,
+        projectName: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string,
         filePath: string,
         file: OpenAIFileParam,
         overwrite: bool,
@@ -1547,6 +1573,7 @@ type JarvisMcpTools =
         [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService,
         http: IHttpContextAccessor
     ) =
+        let projectName = McpToolHelpers.projectWithWorktreeName projectName worktreeName
         McpToolHelpers.send client http (ImportFileCommand {
             ProjectName = projectName
             FilePath = filePath
@@ -1563,7 +1590,8 @@ type JarvisMcpTools =
         McpToolHelpers.send client http UpdateClientCommand
 
     [<McpServerTool(Title = "Write file", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:write"]}]"""); Description("Write or append to a project file. Requires approval in the local Jarvis client.")>]
-    static member WriteFile(projectName: string, filePath: string, content: string, [<Description("File write mode. Allowed values: Write, Append.")>] fileWriteMode: string, expectedHash: string, createParents: Nullable<bool>, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member WriteFile(projectName: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, filePath: string, content: string, [<Description("File write mode. Allowed values: Write, Append.")>] fileWriteMode: string, expectedHash: string, createParents: Nullable<bool>, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        let projectName = McpToolHelpers.projectWithWorktreeName projectName worktreeName
         match McpToolHelpers.parseFileWriteMode fileWriteMode with
         | Error message ->
             Task.FromResult(McpToolHelpers.validationErrorResult message)
@@ -1577,7 +1605,8 @@ type JarvisMcpTools =
                 CreateParents = McpToolHelpers.optionOfNullableBool createParents })
 
     [<McpServerTool(Title = "Patch file", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:write"]}]"""); Description("Apply an atomic unified diff patch to one project file. Requires approval in the local Jarvis client.")>]
-    static member PatchFile(projectName: string, filePath: string, patch: string, expectedHash: string, dryRun: Nullable<bool>, fuzzyContextLines: Nullable<int>, returnContent: Nullable<bool>, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member PatchFile(projectName: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, filePath: string, patch: string, expectedHash: string, dryRun: Nullable<bool>, fuzzyContextLines: Nullable<int>, returnContent: Nullable<bool>, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        let projectName = McpToolHelpers.projectWithWorktreeName projectName worktreeName
         McpToolHelpers.send client http (PatchFileCommand {
             ProjectName = projectName
             FilePath = filePath
@@ -1589,7 +1618,8 @@ type JarvisMcpTools =
             ReturnContent = McpToolHelpers.optionOfNullableBool returnContent })
 
     [<McpServerTool(Title = "Run command", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["process:execute"]}]"""); Description("Run a bounded local command in a project. Supply a short human-readable reason for why the command is needed. Requires approval in the local Jarvis client.")>]
-    static member RunCommand(projectName: string, executable: string, args: string array, [<Optional; DefaultParameterValue("")>] reason: string, workingDirectory: string, timeoutSeconds: Nullable<int>, maxOutputBytes: Nullable<int>, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member RunCommand(projectName: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, executable: string, args: string array, [<Optional; DefaultParameterValue("")>] reason: string, workingDirectory: string, timeoutSeconds: Nullable<int>, maxOutputBytes: Nullable<int>, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        let projectName = McpToolHelpers.projectWithWorktreeName projectName worktreeName
         McpToolHelpers.send client http (RunCommandCommand {
             ProjectName = projectName
             Executable = executable
@@ -1600,7 +1630,8 @@ type JarvisMcpTools =
             MaxOutputBytes = McpToolHelpers.optionOfNullable maxOutputBytes })
 
     [<McpServerTool(Title = "List configured tasks", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("List locally configured project tasks from .jarvis.json.")>]
-    static member ListConfiguredTasks(projectName: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member ListConfiguredTasks(projectName: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        let projectName = McpToolHelpers.projectWithWorktreeName projectName worktreeName
         McpToolHelpers.send client http (ListConfiguredTasksCommand { ProjectName = projectName })
 
     [<McpServerTool(Title = "List skills", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("List project skills and shared workspace-global skills (scope identified on each result). Use projectName=@global to list global skills only. Skills do not grant execution privileges.")>]
@@ -1623,22 +1654,26 @@ type JarvisMcpTools =
         McpToolHelpers.send client http (CreateSkillCommand { ProjectName = projectName; SkillName = skillName; Content = content; Overwrite = overwrite })
 
     [<McpServerTool(Title = "Run project task", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["process:execute"]}]"""); Description("Run a named task configured in the project's .jarvis.json. Requires local process approval.")>]
-    static member RunProjectTask(projectName: string, taskName: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member RunProjectTask(projectName: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, taskName: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        let projectName = McpToolHelpers.projectWithWorktreeName projectName worktreeName
         McpToolHelpers.send client http (RunProjectTaskCommand { ProjectName = projectName; TaskName = taskName })
 
     [<McpServerTool(Title = "Get git status", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Get git status for a project.")>]
-    static member GetGitStatus(projectName: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member GetGitStatus(projectName: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        let projectName = McpToolHelpers.projectWithWorktreeName projectName worktreeName
         McpToolHelpers.send client http (GetGitStatusCommand { ProjectName = projectName })
 
     [<McpServerTool(Title = "Get git diff", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Get git diff for a project or project-relative path.")>]
-    static member GetGitDiff(projectName: string, path: string, maxOutputBytes: Nullable<int>, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member GetGitDiff(projectName: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, path: string, maxOutputBytes: Nullable<int>, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        let projectName = McpToolHelpers.projectWithWorktreeName projectName worktreeName
         McpToolHelpers.send client http (GetGitDiffCommand {
             ProjectName = projectName
             Path = McpToolHelpers.optionOfString path
             MaxOutputBytes = McpToolHelpers.optionOfNullable maxOutputBytes })
 
     [<McpServerTool(Title = "Create git commit", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Create a reversible local git commit from selected paths. Requires approval in the local Jarvis client and does not push to a remote.")>]
-    static member GitCommit(projectName: string, message: string, body: string, paths: string array, allowEmpty: bool, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member GitCommit(projectName: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, message: string, body: string, paths: string array, allowEmpty: bool, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        let projectName = McpToolHelpers.projectWithWorktreeName projectName worktreeName
         McpToolHelpers.send client http (GitCommitCommand {
             ProjectName = projectName
             Message = message
@@ -1647,7 +1682,8 @@ type JarvisMcpTools =
             AllowEmpty = allowEmpty })
 
     [<McpServerTool(Title = "Start job", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["process:execute"]}]"""); Description("Start a long-running local job. Requires approval in the local Jarvis client.")>]
-    static member StartJob(projectName: string, executable: string, args: string array, workingDirectory: string, maxOutputBytes: Nullable<int>, [<Optional; DefaultParameterValue("")>] reason: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member StartJob(projectName: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, executable: string, args: string array, workingDirectory: string, maxOutputBytes: Nullable<int>, [<Optional; DefaultParameterValue("")>] reason: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        let projectName = McpToolHelpers.projectWithWorktreeName projectName worktreeName
         McpToolHelpers.send client http (StartJobCommand {
             ProjectName = projectName
             Executable = executable
@@ -1657,7 +1693,8 @@ type JarvisMcpTools =
             MaxOutputBytes = McpToolHelpers.optionOfNullable maxOutputBytes })
 
     [<McpServerTool(Title = "List jobs", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("List running or completed Jarvis jobs.")>]
-    static member ListJobs(projectName: string, includeCompleted: bool, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member ListJobs(projectName: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, includeCompleted: bool, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        let projectName = McpToolHelpers.projectWithWorktreeName projectName worktreeName
         McpToolHelpers.send client http (ListJobsCommand {
             ProjectName = McpToolHelpers.optionOfString projectName
             IncludeCompleted = includeCompleted })

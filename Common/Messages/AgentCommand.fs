@@ -316,10 +316,10 @@ type ProjectTaskDefinition =
       TimeoutSeconds: int option
       MaxOutputBytes: int option }
 
-type ListProjectTasksCommand =
+type ListConfiguredTasksCommand =
     { ProjectName: string }
 
-type ListProjectTasksResult =
+type ListConfiguredTasksResult =
     { Tasks: ProjectTaskDefinition list }
 
 type RunProjectTaskCommand =
@@ -531,7 +531,7 @@ type AgentCommand =
     | WriteFileCommand of WriteFileCommand
     | PatchFileCommand of PatchFileCommand
     | RunCommandCommand of RunCommandCommand
-    | ListProjectTasksCommand of ListProjectTasksCommand
+    | ListConfiguredTasksCommand of ListConfiguredTasksCommand
     | RunProjectTaskCommand of RunProjectTaskCommand
     | ListSkillsCommand of ListSkillsCommand
     | GetSkillCommand of GetSkillCommand
@@ -574,7 +574,7 @@ module AgentCommandInfo =
         | WriteFileCommand _ -> "WriteFileCommand"
         | PatchFileCommand _ -> "PatchFileCommand"
         | RunCommandCommand _ -> "RunCommandCommand"
-        | ListProjectTasksCommand _ -> "ListProjectTasksCommand"
+        | ListConfiguredTasksCommand _ -> "ListConfiguredTasksCommand"
         | RunProjectTaskCommand _ -> "RunProjectTaskCommand"
         | ListSkillsCommand _ -> "ListSkillsCommand"
         | GetSkillCommand _ -> "GetSkillCommand"
@@ -623,7 +623,7 @@ module AgentCommandInfo =
         | WriteFileCommand _ -> "WriteFile"
         | PatchFileCommand _ -> "PatchFile"
         | RunCommandCommand _ -> "RunCommand"
-        | ListProjectTasksCommand _ -> "ListProjectTasks"
+        | ListConfiguredTasksCommand _ -> "ListConfiguredTasks"
         | RunProjectTaskCommand _ -> "RunTask"
         | ListSkillsCommand _ -> "ListSkills"
         | GetSkillCommand _ -> "GetSkill"
@@ -669,7 +669,7 @@ module AgentCommandInfo =
         | WriteFileCommand cmd -> Some cmd.ProjectName
         | PatchFileCommand cmd -> Some cmd.ProjectName
         | RunCommandCommand cmd -> Some cmd.ProjectName
-        | ListProjectTasksCommand cmd -> Some cmd.ProjectName
+        | ListConfiguredTasksCommand cmd -> Some cmd.ProjectName
         | RunProjectTaskCommand cmd -> Some cmd.ProjectName
         | ListSkillsCommand cmd -> Some cmd.ProjectName
         | GetSkillCommand cmd -> Some cmd.ProjectName
@@ -753,7 +753,7 @@ module AgentCommandInfo =
         | ListProjectsCommand
         | ListWorktreesCommand _
         | GetProjectDetailsCommand _
-        | ListProjectTasksCommand _
+        | ListConfiguredTasksCommand _
         | GetGitStatusCommand _
         | ListJobsCommand _ -> None
 
@@ -795,7 +795,7 @@ module AgentCommandInfo =
         | ListProjectsCommand
         | ListWorktreesCommand _
         | GetProjectDetailsCommand _
-        | ListProjectTasksCommand _
+        | ListConfiguredTasksCommand _
         | GetGitStatusCommand _
         | ListJobsCommand _ -> None
 
@@ -838,7 +838,7 @@ module AgentCommandInfo =
         | None -> invocation command
 
 module AgentProtocol =
-    let version = "3.55"
+    let version = "3.56"
     let defaultPatchFuzzyContextLines = 3
     let maxResponseBytes = 900 * 1024
     let maxImageBytes = 8 * 1024 * 1024
@@ -880,7 +880,7 @@ module AgentProtocol =
           definition "WriteFile" "Writes or appends one file." [ WorkspaceWrite ] true true false
           definition "PatchFile" "Applies an atomic unified diff to one file." [ WorkspaceWrite ] true true true
           definition "RunCommand" "Runs a bounded local process." [ ProcessExecution ] true true false
-          definition "ListProjectTasks" "Lists locally configured project tasks." [ ReadOnly ] false false false
+          definition "ListConfiguredTasks" "Lists locally configured project tasks." [ ReadOnly ] false false false
           definition "RunProjectTask" "Runs a locally configured project task." [ ProcessExecution ] true true false
           definition "ListSkills" "Lists project-local Jarvis skills." [ ReadOnly ] false false false
           definition "GetSkill" "Reads a project-local Jarvis skill." [ ReadOnly ] false false false

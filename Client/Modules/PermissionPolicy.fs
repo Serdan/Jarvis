@@ -122,7 +122,7 @@ let private requiresConfirmation command =
     | ReadFilesCommand _
     | ReadImageCommand _
     | ExportFileCommand _
-    | ListProjectTasksCommand _
+    | ListConfiguredTasksCommand _
     | ListSkillsCommand _
     | GetSkillCommand _
     | GetGitStatusCommand _

@@ -25,7 +25,7 @@ let private read<'t> binding snapshot path =
             try
                 use doc = System.Text.Json.JsonDocument.Parse(content)
                 if doc.RootElement.GetProperty("schemaVersion").GetInt32() <> 3 then
-                    Error "Legacy agent/attempt ledger data requires explicit MigrateOrthogonalAgentState before reading dashboard."
+                    Error "Legacy agent/attempt ledger schema is unsupported; this client requires orthogonal agent state."
                 else deserialize<'t> content
             with ex -> Error ("Invalid canonical agent/attempt JSON: " + ex.Message)
         else deserialize<'t> content

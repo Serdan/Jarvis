@@ -164,121 +164,31 @@ type ReviewWorkflowTests() =
             Assert.That(reassigned.Focused.Value.Attempt.AssignmentGeneration, Is.EqualTo(2)))
 
     [<Test>]
-    member _.ExplicitOrthogonalMigrationPreservesHistoryAndRejectsStaleHead() =
+    member _.LegacyAgentSchemaIsRejectedWithoutMutatingLedger() =
         withFixture (fun _ _ first second _ _ _ _ ->
-            let taskId = "legacy-ledger-migration"
-            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Legacy task" |> success |> ignore
+            let taskId = "legacy-schema-rejection"
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Task with old agent schema"
+            |> success |> ignore
             ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner"
             |> success |> ignore
-            ReviewWorkflow.beginAttempt first (Guid.NewGuid()) taskId "Owner" 1 1
-            |> success |> ignore
-            ReviewWorkflow.yieldAgent first (Guid.NewGuid()) taskId "Owner" 2 3 1
-                "Checkpoint before conversion" "Continue" |> success |> ignore
-            let _, _, active = ReviewWorkflow.getTask first taskId |> success
-            let attemptId = active.Value.AttemptId
-            let pendingTask = "legacy-queued-followup"
-            ReviewWorkflow.createTask first (Guid.NewGuid()) pendingTask "Legacy queued follow-up"
-            |> success |> ignore
-            ReviewWorkflow.assignTask first (Guid.NewGuid()) pendingTask (Guid.NewGuid()) "Reviewer"
-            |> success |> ignore
-            let _, _, pending = ReviewWorkflow.getTask first pendingTask |> success
-            let pendingAttemptId = pending.Value.AttemptId
-            ReviewWorkflow.registerAgent first (Guid.NewGuid()) "Observer" |> success |> ignore
             let snapshot = LedgerStore.fetch first |> success
-            let agents = LedgerStore.listAt first snapshot "agents" |> success
-            let changeLegacy path =
-                let raw, oid = LedgerStore.readAt first snapshot path |> success
-                let node = System.Text.Json.Nodes.JsonNode.Parse(raw.Value).AsObject()
-                node["schemaVersion"] <- System.Text.Json.Nodes.JsonValue.Create(2)
-                if path.StartsWith("agents/", StringComparison.Ordinal) then
-                    let id = node["agentId"].GetValue<string>()
-                    node.Remove("currentAssignment") |> ignore
-                    node.Remove("execution") |> ignore
-                    node.Remove("unassignedDisposition") |> ignore
-                    let previousState =
-                        if id = "Owner" then "Ready"
-                        elif id = "Reviewer" then "Completed"
-                        else "Parked"
-                    node["state"] <- System.Text.Json.Nodes.JsonValue.Create(previousState)
-                    node["focusAttemptId"] <-
-                        if id = "Owner" then System.Text.Json.Nodes.JsonValue.Create(attemptId)
-                        elif id = "Reviewer" then System.Text.Json.Nodes.JsonValue.Create(pendingAttemptId)
-                        else null
-                    node["activeAttemptId"] <- null
-                else
-                    node["phase"] <- System.Text.Json.Nodes.JsonValue.Create(
-                        if path.Contains("/" + taskId + "/") then "Paused" else "Queued")
-                { Path = path; ExpectedBlobOid = oid; Content = node.ToJsonString() }
-            let changes =
-                (agents |> List.map changeLegacy)
-                @ [ changeLegacy ("tasks/" + taskId + "/attempts/" + attemptId + ".json")
-                    changeLegacy ("tasks/" + pendingTask + "/attempts/" + pendingAttemptId + ".json") ]
-            let legacyIntent =
-                { OperationId = Guid.NewGuid(); Actor = "Test"; Kind = "LegacyFixture"
-                  RequestJson = "{}" }
-            LedgerStore.transact first legacyIntent (fun _ -> Ok changes) |> success |> ignore
-            let legacyHead = (LedgerStore.fetch first |> success).Commit
-            match ReviewWorkflow.getAgentInbox second "Owner" with
-            | Error(LedgerIntegrityError _) -> ()
-            | other -> Assert.Fail(sprintf "Pre-migration agent was read as v3: %A" other)
-            ReviewWorkflow.migrateOrthogonalAgentState first (Guid.NewGuid()) legacyHead
-            |> success |> ignore
-            let result = ReviewWorkflow.getAgentInbox second "Owner" |> success
-            Assert.That(result.Agent.State, Is.EqualTo("Ready"))
-            Assert.That(result.Agent.Execution, Is.EqualTo("Stopped"))
-            Assert.That(result.Agent.CurrentAssignment.TaskId, Is.EqualTo(taskId))
-            Assert.That(result.Focused.Value.Attempt.Phase, Is.EqualTo("Started"))
-            Assert.That(result.NeedsOrchestratorAssignment, Is.False)
-            let free = ReviewWorkflow.getAgentInbox second "Reviewer" |> success
-            Assert.That(free.Agent.State, Is.EqualTo("NeedsWork"))
-            Assert.That(free.Agent.CurrentAssignment, Is.Null)
-            let observer = ReviewWorkflow.getAgentInbox second "Observer" |> success
-            Assert.That(observer.Agent.State, Is.EqualTo("Parked"))
-            let _, _, queuedBefore = ReviewWorkflow.getTask second pendingTask |> success
-            Assert.That(queuedBefore.Value.Phase, Is.EqualTo("Queued"))
-            ReviewWorkflow.reissueQueuedAttempt first (Guid.NewGuid()) pendingTask "Reviewer"
-                queuedBefore.Value.Version free.Agent.Version 1 "Resume old queued follow-up"
-            |> success |> ignore
-            let restarted = ReviewWorkflow.getAgentInbox second "Reviewer" |> success
-            Assert.That(restarted.Agent.State, Is.EqualTo("Ready"))
-            Assert.That(restarted.Agent.CurrentAssignment.TaskId, Is.EqualTo(pendingTask))
-            let _, _, historical, _, _ = ReviewWorkflow.getAssignment first taskId 1 |> success
-            Assert.That(historical, Is.Not.Null)
-            expectStale (ReviewWorkflow.migrateOrthogonalAgentState first (Guid.NewGuid()) legacyHead)
-            let head = (LedgerStore.fetch first |> success).Commit
-            match ReviewWorkflow.migrateOrthogonalAgentState first (Guid.NewGuid()) head with
-            | Error(LedgerIntegrityError _) | Error(StaleEntityVersion _) -> ()
-            | other -> Assert.Fail(sprintf "Repeated conversion must not rewrite v3: %A" other))
-
-    [<Test>]
-    member _.OrthogonalMigrationRejectsContradictoryLegacyAssignmentWithoutChangingHead() =
-        withFixture (fun _ _ first second _ _ _ _ ->
-            let taskId = "invalid-legacy"
-            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Invalid legacy task"
-            |> success |> ignore
-            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner"
-            |> success |> ignore
-            let head = LedgerStore.fetch first |> success
-            let rawAgentPath = "agents/" + Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes("Owner")).TrimEnd('=').Replace('+', '-').Replace('/', '_') + ".json"
-            let agentData, oid = LedgerStore.readAt first head rawAgentPath |> success
-            let node = System.Text.Json.Nodes.JsonNode.Parse(agentData.Value).AsObject()
+            let agentPath =
+                "agents/"
+                + Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes("Owner")).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+                + ".json"
+            let raw, oid = LedgerStore.readAt first snapshot agentPath |> success
+            let node = System.Text.Json.Nodes.JsonNode.Parse(raw.Value).AsObject()
             node["schemaVersion"] <- System.Text.Json.Nodes.JsonValue.Create(2)
-            node.Remove("currentAssignment") |> ignore
-            node.Remove("execution") |> ignore
-            node.Remove("unassignedDisposition") |> ignore
-            node["state"] <- System.Text.Json.Nodes.JsonValue.Create("Working")
-            node["focusAttemptId"] <- System.Text.Json.Nodes.JsonValue.Create("not-the-current-attempt")
-            node["activeAttemptId"] <- System.Text.Json.Nodes.JsonValue.Create("not-the-current-attempt")
             let legacyIntent =
-                { OperationId = Guid.NewGuid(); Actor = "Test"; Kind = "InvalidLegacyFixture"
+                { OperationId = Guid.NewGuid(); Actor = "Test"; Kind = "LegacySchemaFixture"
                   RequestJson = "{}" }
             LedgerStore.transact first legacyIntent (fun _ ->
-                Ok [ { Path = rawAgentPath; ExpectedBlobOid = oid; Content = node.ToJsonString() } ])
+                Ok [ { Path = agentPath; ExpectedBlobOid = oid; Content = node.ToJsonString() } ])
             |> success |> ignore
             let expectedHead = (LedgerStore.fetch first |> success).Commit
-            match ReviewWorkflow.migrateOrthogonalAgentState second (Guid.NewGuid()) expectedHead with
+            match ReviewWorkflow.getAgentInbox second "Owner" with
             | Error(LedgerIntegrityError _) -> ()
-            | other -> Assert.Fail(sprintf "Invalid legacy assignment should reject migration: %A" other)
+            | other -> Assert.Fail(sprintf "Legacy schema was accepted: %A" other)
             Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(expectedHead)))
 
     [<Test>]

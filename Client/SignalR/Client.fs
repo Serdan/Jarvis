@@ -308,7 +308,7 @@ let private dispatch (rt: Runtime) (command: AgentCommand) =
         |> ProjectBrowser.patchFile cmd
         |> serialize'
     | RunCommandCommand cmd -> rt |> ClientShell.runCommand cmd |> serialize'
-    | ListProjectTasksCommand cmd -> rt |> ClientShell.listProjectTasks cmd |> serialize'
+    | ListConfiguredTasksCommand cmd -> rt |> ClientShell.listConfiguredTasks cmd |> serialize'
     | RunProjectTaskCommand cmd ->
         rt
         |> ClientShell.resolveProjectTask cmd

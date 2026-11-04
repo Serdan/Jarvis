@@ -775,11 +775,6 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
                 | "ListFeedback" | "GetFeedback" | "GetFeedbackSummary" | "GetConnectionDiagnostics" | "ListDevices" | "GetServerUpdateStatus" -> true
                 | name -> failwith $"Unexpected server-local MCP tool: {name}"
 
-        let destructive =
-            match methodInfo.Name with
-            | "ImportFile" | "UpdateClient" | "UpdateServer" | "WriteFile" | "PatchFile" | "RunCommand" | "RunProjectTask" | "StartJob" | "CancelJob" | "RemoveWorktree" | "RetireWorktree" | "DeleteReservedOrphanReviewRef" -> true
-            | _ -> false
-
         let openWorld =
             match methodInfo.Name with
             | "ImportFile" | "UpdateClient" | "UpdateServer" | "RunCommand" | "RunProjectTask" | "StartJob" -> true
@@ -787,7 +782,7 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
             | _ -> false
 
         attribute.ReadOnly |> shouldEqual readOnly
-        attribute.Destructive |> shouldEqual destructive
+        attribute.Destructive |> shouldEqual false
         attribute.OpenWorld |> shouldEqual openWorld
 
         let securityMeta =
@@ -1105,3 +1100,16 @@ let cross_project_routing_error_distinguishes_absent_device_from_protocol_mismat
     Assert.That(empty, Does.Not.Contain("requires protocol"))
     let explicit = ProjectNotificationRouting.failureMessage "Wayfold" "TaskWrite" true true [] []
     Assert.That(explicit, Does.Contain("No selected/explicit device"))
+
+
+[<Test>]
+let ``no Jarvis MCP tool declares destructive metadata`` () =
+    let tools =
+        typeof<JarvisMcpTools>.GetMethods()
+        |> Array.choose (fun methodInfo ->
+            match methodInfo.GetCustomAttributes(typeof<McpServerToolAttribute>, false) with
+            | [| :? McpServerToolAttribute as attribute |] -> Some(methodInfo.Name, attribute)
+            | _ -> None)
+    Assert.That(tools.Length, Is.GreaterThan(0))
+    for name, attribute in tools do
+        Assert.That(attribute.Destructive, Is.False, name)

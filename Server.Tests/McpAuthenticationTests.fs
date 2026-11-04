@@ -103,7 +103,7 @@ let write_tools_expose_optional_operation_ids () =
                            && methodInfo.Name <> "AcknowledgePendingOperation" ->
                 Some (methodInfo.Name, id)
             | _ -> None)
-    Assert.That(writeMethods.Length, Is.EqualTo(45), String.concat ", " (writeMethods |> Array.map fst))
+    Assert.That(writeMethods.Length, Is.EqualTo(43), String.concat ", " (writeMethods |> Array.map fst))
     for name, id in writeMethods do
         Assert.That(id.IsOptional, Is.True, $"operationId is required on {name}")
         Assert.That(id.DefaultValue, Is.EqualTo(""), $"operationId default differs on {name}")
@@ -164,3 +164,14 @@ let resume_agent_is_the_only_public_start_tool () =
     let expectedAgentVersion =
         resume.GetParameters() |> Array.find (fun parameter -> parameter.Name = "expectedAgentVersion")
     Assert.That(expectedAgentVersion.IsOptional, Is.False)
+
+[<Test>]
+let source_context_has_one_public_tool_with_optional_initial_baseline () =
+    let methods = typeof<Server.JarvisMcpTools>
+    for retired in [ "BindReviewBase"; "BindAttemptSource"; "RebindAttemptSource" ] do
+        Assert.That(methods.GetMethod(retired), Is.Null, retired)
+    let setSource = methods.GetMethod("SetAttemptSource")
+    Assert.That(setSource, Is.Not.Null)
+    for name in [ "baseOid"; "targetRef"; "allowDetached"; "allowUncommitted" ] do
+        let parameter = setSource.GetParameters() |> Array.find (fun p -> p.Name = name)
+        Assert.That(parameter.IsOptional, Is.True, name)

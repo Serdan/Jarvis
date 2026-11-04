@@ -147,3 +147,10 @@ Use the unprefixed canonical task/review tools for live writes; do not push hand
 A project is migrated when its canonical ledger is bound, its **relevant active tasks** are recreated, agents use the orphan-ledger tools for all new orchestration writes, and participating clients agree on its state. Other projects can migrate independently. Updating the Jarvis client/server by itself does not complete this per-project step.
 
 See the [architecture spec](specs/orchestration-architecture.md). The older [Git-backed tasks guide](GitBackedTasks.md) describes the retired source-branch workflow.
+
+
+## Attempt source context (protocol 3.54)
+
+Use `SetAttemptSource` with an exact task, owner, version, generation, and `sourceRef`. For the first source binding, supply both `baseOid` and `targetRef` so Jarvis can validate ancestry and record source repository identity; optional `allowDetached` and `allowUncommitted` apply only to this initial binding. For later branch switches, omit both baseline fields to retain the original pinned context. Historical `BindAttemptSource` and `RebindAttemptSource` internal ledger actions remain available.
+
+The old `BindReviewBase` public tool is retired: independent review requests have their own exact commit and comparison context. Historical baseline-only attempt bindings remain readable without rewriting Git history. Existing clients must update before calling this revised public API.

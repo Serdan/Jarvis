@@ -479,6 +479,15 @@ module McpToolHelpers =
         if String.IsNullOrWhiteSpace id then Guid.NewGuid().ToString("D"), true
         else id, false
 
+    // Reuse the operation identity for generated task IDs, so an uncertain
+    // retry with the same operationId targets exactly the same task.
+    let resolveTaskId (taskId: string) (operationId: string) =
+        if not (String.IsNullOrWhiteSpace taskId) then taskId, false
+        else
+            match Guid.TryParse operationId with
+            | true, parsed when parsed <> Guid.Empty -> "task-" + parsed.ToString("N"), true
+            | _ -> taskId, false // Invalid operation IDs are rejected by the client.
+
     let private ensureOperationId command =
         match command with
         | TaskWriteCommand cmd ->
@@ -507,6 +516,18 @@ module McpToolHelpers =
                 textContent ($"Jarvis operationId: {id} (server-generated; use this exact ID for status checks or retries if the outcome is uncertain)."))
             result
 
+    let attachGeneratedTaskId (generated: string option) (result: CallToolResult) =
+        match generated with
+        | None -> result
+        | Some taskId ->
+            let meta = if isNull result.Meta then JsonObject() else result.Meta
+            meta["jarvis/generated_task_id"] <- JsonValue.Create(taskId)
+            result.Meta <- meta
+            if isNull result.Content then
+                result.Content <- ResizeArray<ContentBlock>()
+            result.Content.Add(textContent $"Jarvis taskId: {taskId} (generated; use this ID for subsequent task operations).")
+            result
+
     let send (client: ClientService) (http: IHttpContextAccessor) command =
         task {
             match Option.ofObj http.HttpContext with
@@ -514,6 +535,13 @@ module McpToolHelpers =
                 return errorResult (PermissionDenied "The MCP request is missing its HTTP context.")
             | Some context ->
                 let command, generatedId = ensureOperationId command
+                let command, generatedTaskId =
+                    match command with
+                    | TaskWriteCommand cmd when cmd.Action = "CreateTask" ->
+                        let taskId, generated = resolveTaskId cmd.TaskId cmd.OperationId
+                        TaskWriteCommand { cmd with TaskId = taskId },
+                        (if generated then Some taskId else None)
+                    | _ -> command, None
                 let scope = requiredScope command
 
                 match Auth.tryUserId context.User with
@@ -564,6 +592,7 @@ module McpToolHelpers =
                         |> attachInstructions response.Instructions
                         |> attachOperationId tracking
                         |> attachGeneratedOperationId generatedId
+                        |> attachGeneratedTaskId (if response.Result.IsSome && response.Error.IsNone then generatedTaskId else None)
                 | Some _ ->
                     if not (Auth.hasScope scope context.User) then
                         return authorizationErrorResult context scope
@@ -1150,8 +1179,8 @@ type JarvisMcpTools =
     static member AgentInbox(projectName: string, agentId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (TaskReadCommand { ProjectName = projectName; AgentId = agentId; Action = "AgentInbox"; TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L; Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null })
 
-    [<McpServerTool(Title = "create task", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Atomically create a task with its canonical HTML spec on the remote ledger. Requires an existing bound orphan Git ledger.")>]
-    static member CreateTask(projectName: string, taskId: string, title: string, html: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    [<McpServerTool(Title = "create task", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Atomically create a task and canonical HTML spec on the bound Git ledger. Omit taskId to generate a unique, stable ID derived from operationId; provide taskId explicitly for named tasks and imports. Reusing operationId on retry preserves the generated ID.")>]
+    static member CreateTask(projectName: string, title: string, html: string, [<Optional; DefaultParameterValue("")>] taskId: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         let cmd = TaskCommands.write projectName "CreateTask" operationId taskId "Orchestrator"
         McpToolHelpers.send client http (TaskWriteCommand { cmd with Title = title; Html = html })
 

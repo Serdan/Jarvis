@@ -9,6 +9,11 @@ open Microsoft.AspNetCore.SignalR
 open Microsoft.FSharp.Core
 
 module ProjectNotificationRouting =
+    // The client's LedgerApi accepts "Health", not the public MCP tool name
+    // "LedgerHealth". Keep the internal routing probe explicit and tested.
+    let healthProbe projectName =
+        LedgerReadCommand { ProjectName = projectName; Action = "Health"; OperationId = "" }
+
     let ordered (selected: ClientSessionStatus voption) (sessions: ClientSessionStatus list)
                 (explicitDevice: bool) =
         if explicitDevice then
@@ -188,7 +193,7 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                     | session :: rest ->
                         let! health = this.SendCommandToUser(
                             userId,
-                            LedgerReadCommand { ProjectName = projectName; Action = "LedgerHealth"; OperationId = "" },
+                            ProjectNotificationRouting.healthProbe projectName,
                             ?conversationId = conversationId, deviceId = session.DeviceId)
                         match health.Result, health.Error with
                         | Some _, None ->

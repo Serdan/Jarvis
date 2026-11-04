@@ -1113,3 +1113,13 @@ let ``no Jarvis MCP tool declares destructive metadata`` () =
     Assert.That(tools.Length, Is.GreaterThan(0))
     for name, attribute in tools do
         Assert.That(attribute.Destructive, Is.False, name)
+
+
+[<Test>]
+let cross_project_notification_health_probe_uses_client_supported_action () =
+    match ProjectNotificationRouting.healthProbe "Wayfold" with
+    | LedgerReadCommand command ->
+        Assert.That(command.ProjectName, Is.EqualTo("Wayfold"))
+        Assert.That(command.Action, Is.EqualTo("Health"))
+        Assert.That(command.OperationId, Is.Empty)
+    | other -> Assert.Fail(sprintf "Expected LedgerReadCommand; got %A" other)

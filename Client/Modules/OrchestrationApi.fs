@@ -1037,7 +1037,7 @@ module TaskApi =
                     // Session routing metadata does not change ordinary task-write
                     // identity. Resume (and historical Begin) deliberately associates an execution.
                     let journalCommand =
-                        if cmd.Action = "BeginAttempt" || cmd.Action = "ResumeAgent" then cmd
+                        if List.contains cmd.Action [ "BeginAttempt"; "ResumeAgent"; "YieldAgent"; "CheckpointAttempt"; "CompleteAgentWork" ] then cmd
                         else { cmd with SessionId = "" }
                     // An operation already recorded in Git is a retry, even when
                     // the session is now active. Route it through the normal
@@ -1096,9 +1096,12 @@ module TaskApi =
                                     ReviewWorkflow.ReviewWorkflow.importTaskSpec binding operationId cmd.TaskId
                                         cmd.ExpectedVersion cmd.BaseOid cmd.TargetRef cmd.Title cmd.SourceRef |> mapError
                                 | "AdoptTaskSpec" ->
-                                    ReviewWorkflow.ReviewWorkflow.adoptTaskSpec binding operationId cmd.TaskId
-                                        cmd.ActorId cmd.ExpectedTaskVersion cmd.ExpectedVersion
-                                        cmd.ExpectedAgentVersion cmd.AssignmentGeneration cmd.BaseOid cmd.Summary |> mapError
+                                    if not (String.IsNullOrWhiteSpace cmd.Html) then
+                                        Error(Client.ValidationError "Provide either newSpecHtml or expectedCurrentSpecBlobOid, not both.")
+                                    else
+                                        ReviewWorkflow.ReviewWorkflow.adoptTaskSpec binding operationId cmd.TaskId
+                                            cmd.ActorId cmd.ExpectedTaskVersion cmd.ExpectedVersion
+                                            cmd.ExpectedAgentVersion cmd.AssignmentGeneration cmd.BaseOid cmd.Summary |> mapError
                                 | "MigrateOrthogonalAgentState" ->
                                     ReviewWorkflow.ReviewWorkflow.migrateOrthogonalAgentState binding operationId cmd.BaseOid
                                     |> mapError
@@ -1141,22 +1144,22 @@ module TaskApi =
                                         cmd.SourceRef
                                     |> mapError
                                 | "CheckpointAttempt" ->
-                                    ReviewWorkflow.ReviewWorkflow.checkpointAttempt binding operationId
+                                    ReviewWorkflow.ReviewWorkflow.checkpointAttemptWithSession binding operationId
                                         cmd.TaskId cmd.ActorId cmd.ExpectedVersion cmd.ExpectedAgentVersion
-                                        cmd.AssignmentGeneration cmd.Summary cmd.NextAction cmd.BaseOid cmd.Evidence
+                                        cmd.AssignmentGeneration cmd.Summary cmd.NextAction cmd.BaseOid cmd.Evidence cmd.SessionId
                                     |> mapError
                                 | "YieldAgent" ->
-                                    ReviewWorkflow.ReviewWorkflow.yieldAgent binding operationId
+                                    ReviewWorkflow.ReviewWorkflow.yieldAgentWithSession binding operationId
                                         cmd.TaskId cmd.ActorId cmd.ExpectedVersion cmd.ExpectedAgentVersion
-                                        cmd.AssignmentGeneration cmd.Summary cmd.NextAction |> mapError
+                                        cmd.AssignmentGeneration cmd.Summary cmd.NextAction cmd.SessionId |> mapError
                                 | "ResumeAgent" ->
                                     ReviewWorkflow.ReviewWorkflow.resumeAgentWithSession binding operationId
                                         cmd.TaskId cmd.ActorId cmd.ExpectedVersion cmd.ExpectedAgentVersion
                                         cmd.AssignmentGeneration cmd.SessionId |> mapError
                                 | "CompleteAgentWork" ->
-                                    ReviewWorkflow.ReviewWorkflow.completeAgentWork binding operationId
+                                    ReviewWorkflow.ReviewWorkflow.completeAgentWorkWithSession binding operationId
                                         cmd.TaskId cmd.ActorId cmd.ExpectedVersion cmd.ExpectedAgentVersion
-                                        cmd.AssignmentGeneration cmd.Summary |> mapError
+                                        cmd.AssignmentGeneration cmd.Summary cmd.SessionId |> mapError
                                 | "ParkAttempt" | "BlockAttempt" | "ResumeAttempt"
                                 | "AbandonAttempt" | "CancelTask" ->
                                     ReviewWorkflow.ReviewWorkflow.changeAttemptAdministration binding operationId

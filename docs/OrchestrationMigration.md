@@ -91,7 +91,11 @@ For each task still needing work:
 1. **Create its current specification.** Call `CreateTask(projectName, taskId, title, html, operationId)` using the latest intent, acceptance criteria, and a brief reference to the old task file/branch. Keep a useful stable task ID; do not create duplicates.
 2. **Register the agents.** `RegisterAgent(projectName, agentId, operationId)` creates a project-local agent label. Idle agents start `Parked`. Register intended worker/reviewer labels as needed.
 3. **Assign ownership.** `AssignTask(projectName, taskId, attemptId, ownerId, operationId)` creates one implementation attempt and assigns exactly one owner. Reviewers are chosen independently when they claim an individual review; the attempt does not contain a reviewer. Use fresh UUIDs for `attemptId` and `operationId`.
-4. **Read the authoritative assignment.** Use `AgentInbox(projectName, agentId)` and `GetAssignment(projectName, taskId, assignmentGeneration)` for the current generation, spec, owner and versions. Use `AcknowledgeAssignment` when applicable.
+4. **Read the authoritative assignment.** Use `AgentInbox(projectName, agentId)` and `GetAssignment(projectName, taskId, assignmentGeneration)` for the current generation, spec, owner and versions. Starting a Queued attempt through `ResumeAgent` atomically acknowledges its assignment; no separate public acknowledgement call is needed.
+**Simplified task tools (protocol 3.50).** `ReviseTaskSpec` accepts optional `expectedSpecBlobOid`: omit it for an unassigned Open task, supply it for an assigned task or exact-blob precondition. `CancelTask` accepts a task version and reason; omit attempt/agent/generation versions only for an unassigned Open task. Assigned task cancellation still requires all three versions. Public `AcknowledgeAssignment`, `ReviseTaskSpecPinned`, and `CancelOpenTask` are retired; their historical internal ledger actions remain supported.
+
+**Queued assignment updates (protocol 3.51).** Use `ReissueAssignment` to issue replacement instructions, optionally with `newSpecHtml`. If the canonical task spec was revised separately, use the same tool with `expectedCurrentSpecBlobOid` and `expectedTaskVersion` to adopt it. These two spec-change inputs are mutually exclusive. This replaces the separate public `AdoptTaskSpec` tool; original immutable issue/acknowledgement records and historical ledger actions remain valid.
+
 5. **Begin implementation.** The worker calls `ResumeAgent` with its current expected attempt version, agent version, and assignment generation. The operation starts a Queued attempt and atomically acknowledges its issuance. Existing code stays in its ordinary source branch/worktree. Any recorded source ref is context, not a permission gate: the agent may rebase or change branches and the orchestrator may update that context while the agent is Ready. Do not pin a review baseline for the entire task.
 6. **Persist progress.** `CheckpointAttempt` records summary, evidence and next action, but does **not** end a Working turn. Before a normal agent turn finishes, use `YieldAgent` to stop execution and remain `Ready`, or `CompleteAgentWork` to finish the attempt, release its current assignment and become `NeedsWork`.
 7. **Resume deliberately.** `ResumeAgent` also continues a previously Started Ready agent. It also supports explicitly recovering a stalled Working session, recording its session association and recovery event without reassigning ownership.
@@ -147,3 +151,26 @@ Use the unprefixed canonical task/review tools for live writes; do not push hand
 A project is migrated when its canonical ledger is bound, its **relevant active tasks** are recreated, agents use the orphan-ledger tools for all new orchestration writes, and participating clients agree on its state. Other projects can migrate independently. Updating the Jarvis client/server by itself does not complete this per-project step.
 
 See the [architecture spec](specs/orchestration-architecture.md). The older [Git-backed tasks guide](GitBackedTasks.md) describes the retired source-branch workflow.
+
+
+## Administrative deferral (protocol 3.52)
+
+Use `DeferAttempt` for a Queued or Started attempt that should stop holding its agent's assignment. Default `disposition: Deferred` retains the previous park behavior; `disposition: Blocked` retains the previous explicit block behavior. Both require a reason and exact task/attempt/agent versions and preserve immutable lifecycle history. The old `ParkAttempt` and `BlockAttempt` actions remain valid internally for historical ledger operations.
+
+`ResumeAttempt` and `ReissueQueuedAttempt` deliberately remain separate for now: the former creates a new generation when resuming a deferred or blocked attempt; the latter assigns an unoccupied agent to an existing queued generation. This difference requires design/transition review before consolidating further.
+
+## Attempt source context (protocol 3.54)
+
+Use `SetAttemptSource` with an exact task, owner, version, generation, and `sourceRef`. For the first source binding, supply both `baseOid` and `targetRef` so Jarvis can validate ancestry and record source repository identity; optional `allowDetached` and `allowUncommitted` apply only to this initial binding. For later branch switches, omit both baseline fields to retain the original pinned context. Historical `BindAttemptSource` and `RebindAttemptSource` internal ledger actions remain available.
+
+The old `BindReviewBase` public tool is retired: independent review requests have their own exact commit and comparison context. Historical baseline-only attempt bindings remain readable without rewriting Git history. Existing clients must update before calling this revised public API.
+
+## Review publication (protocol 3.53)
+
+`SubmitReview` publishes a new review when `expectedRequestVersion` is omitted (0). To replace an existing unclaimed review snapshot, use the same tool with the existing `requestId` and a positive `expectedRequestVersion`; this uses the historical Update action internally. Claimed reviews remain immutable and reject replacement. Replacement preserves the original `purpose` and `targetRef`, so omit these on update. The separate public `ReplaceReview` tool is retired; existing ledger operations remain compatible.
+
+## Optional lifecycle preconditions (protocol 3.55)
+
+`ResumeAgent`, `YieldAgent`, `CheckpointAttempt`, and `CompleteAgentWork` continue to require `projectName`, `taskId`, and the owner identity. Their `expectedAttemptVersion`, `expectedAgentVersion` and `assignmentGeneration` fields are now optional (default zero): Jarvis resolves current values under each verified Git ledger transaction while checking the exact task/owner/focused assignment and required execution state. Nonzero values remain strict preconditions for callers with a known snapshot; stale assertions reject instead of acting on a different generation. The operation request retains caller-supplied zeros for stable retry identity; generated checkpoints and receipts record actual assignment generation. Same-session resume advisories also accept omitted generation. Versionless checkpoint, yield and completion commands additionally require the calling session to be the active Working session; the client supplies the session ID from its authenticated connection. An old session cannot write to a new generation after administrative recovery. Recovery retains historical session IDs to reject old-session attempts to start the new queued generation. Explicit positive versions retain their prior behavior; zero-version completion from Ready without an active session must resume first or use an exact version assertion.
+
+Keep `taskId` explicit: allowing an agent-only resume would require additional stable operation identity and replay handling when current assignment changes, which is not safely interchangeable with omission of version preconditions.

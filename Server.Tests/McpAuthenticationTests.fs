@@ -103,7 +103,7 @@ let write_tools_expose_optional_operation_ids () =
                            && methodInfo.Name <> "AcknowledgePendingOperation" ->
                 Some (methodInfo.Name, id)
             | _ -> None)
-    Assert.That(writeMethods.Length, Is.EqualTo(45), String.concat ", " (writeMethods |> Array.map fst))
+    Assert.That(writeMethods.Length, Is.EqualTo(37), String.concat ", " (writeMethods |> Array.map fst))
     for name, id in writeMethods do
         Assert.That(id.IsOptional, Is.True, $"operationId is required on {name}")
         Assert.That(id.DefaultValue, Is.EqualTo(""), $"operationId default differs on {name}")
@@ -163,4 +163,77 @@ let resume_agent_is_the_only_public_start_tool () =
     Assert.That(resume, Is.Not.Null)
     let expectedAgentVersion =
         resume.GetParameters() |> Array.find (fun parameter -> parameter.Name = "expectedAgentVersion")
-    Assert.That(expectedAgentVersion.IsOptional, Is.False)
+    Assert.That(expectedAgentVersion.IsOptional, Is.True)
+    Assert.That(expectedAgentVersion.DefaultValue, Is.EqualTo(0))
+
+[<Test>]
+let core_task_tools_have_one_public_operation_per_intention () =
+    let tool name = typeof<Server.JarvisMcpTools>.GetMethod(name)
+    for retired in [ "AcknowledgeAssignment"; "CancelOpenTask"; "ReviseTaskSpecPinned" ] do
+        Assert.That(tool retired, Is.Null, $"Retired MCP tool {retired} must not be exposed.")
+    let revise = tool "ReviseTaskSpec"
+    Assert.That(revise, Is.Not.Null)
+    let expectedSpec = revise.GetParameters() |> Array.find (fun p -> p.Name = "expectedSpecBlobOid")
+    Assert.That(expectedSpec.IsOptional, Is.True)
+    Assert.That(expectedSpec.DefaultValue, Is.EqualTo(""))
+    let cancel = tool "CancelTask"
+    Assert.That(cancel, Is.Not.Null)
+    for name in [ "expectedAttemptVersion"; "expectedAgentVersion"; "assignmentGeneration" ] do
+        let parameter = cancel.GetParameters() |> Array.find (fun p -> p.Name = name)
+        Assert.That(parameter.IsOptional, Is.True, name)
+        Assert.That(parameter.DefaultValue, Is.EqualTo(0), name)
+
+[<Test>]
+let queued_assignment_update_exposes_both_reissue_and_spec_adoption () =
+    let methods = typeof<Server.JarvisMcpTools>
+    Assert.That(methods.GetMethod("AdoptTaskSpec"), Is.Null)
+    let reissue = methods.GetMethod("ReissueAssignment")
+    Assert.That(reissue, Is.Not.Null)
+    for name in [ "newSpecHtml"; "expectedCurrentSpecBlobOid"; "expectedTaskVersion" ] do
+        let parameter = reissue.GetParameters() |> Array.find (fun p -> p.Name = name)
+        Assert.That(parameter.IsOptional, Is.True, name)
+        Assert.That(parameter.DefaultValue,
+                    Is.EqualTo(if name = "expectedTaskVersion" then box 0 else box ""), name)
+
+[<Test>]
+let attempt_deferral_has_single_public_tool_with_disposition () =
+    let methods = typeof<Server.JarvisMcpTools>
+    Assert.That(methods.GetMethod("ParkAttempt"), Is.Null)
+    Assert.That(methods.GetMethod("BlockAttempt"), Is.Null)
+    let deferAttempt = methods.GetMethod("DeferAttempt")
+    Assert.That(deferAttempt, Is.Not.Null)
+    let disposition =
+        deferAttempt.GetParameters() |> Array.find (fun p -> p.Name = "disposition")
+    Assert.That(disposition.IsOptional, Is.True)
+    Assert.That(disposition.DefaultValue, Is.EqualTo("Deferred"))
+
+[<Test>]
+let source_context_has_one_public_tool_with_optional_initial_baseline () =
+    let methods = typeof<Server.JarvisMcpTools>
+    for retired in [ "BindReviewBase"; "BindAttemptSource"; "RebindAttemptSource" ] do
+        Assert.That(methods.GetMethod(retired), Is.Null, retired)
+    let setSource = methods.GetMethod("SetAttemptSource")
+    Assert.That(setSource, Is.Not.Null)
+    for name in [ "baseOid"; "targetRef"; "allowDetached"; "allowUncommitted" ] do
+        let parameter = setSource.GetParameters() |> Array.find (fun p -> p.Name = name)
+        Assert.That(parameter.IsOptional, Is.True, name)
+
+[<Test>]
+let review_publication_is_one_tool_with_optional_replacement_version () =
+    let methods = typeof<Server.JarvisMcpTools>
+    Assert.That(methods.GetMethod("ReplaceReview"), Is.Null)
+    let publish = methods.GetMethod("SubmitReview")
+    Assert.That(publish, Is.Not.Null)
+    let expected = publish.GetParameters() |> Array.find (fun p -> p.Name = "expectedRequestVersion")
+    Assert.That(expected.IsOptional, Is.True)
+    Assert.That(expected.DefaultValue, Is.EqualTo(0))
+
+[<Test>]
+let routine_agent_lifecycle_versions_are_optional_preconditions () =
+    for toolName in [ "ResumeAgent"; "YieldAgent"; "CheckpointAttempt"; "CompleteAgentWork" ] do
+        let methodInfo = typeof<Server.JarvisMcpTools>.GetMethod(toolName)
+        Assert.That(methodInfo, Is.Not.Null)
+        for name in [ "expectedAttemptVersion"; "expectedAgentVersion"; "assignmentGeneration" ] do
+            let parameter = methodInfo.GetParameters() |> Array.find (fun p -> p.Name = name)
+            Assert.That(parameter.IsOptional, Is.True, $"{toolName}: {name}")
+            Assert.That(parameter.DefaultValue, Is.EqualTo(0), $"{toolName}: {name}")

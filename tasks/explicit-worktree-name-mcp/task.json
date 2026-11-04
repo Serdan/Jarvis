@@ -1,1 +1,1 @@
-{"schemaVersion":2,"taskId":"explicit-worktree-name-mcp","title":"Expose optional worktreeName separately on development MCP tools","version":2,"lifecycle":"InProgress","specVersion":1,"attemptId":"ce0ff2e60c6f4cde9460b0c58612ad9c"}
+{"schemaVersion":2,"taskId":"explicit-worktree-name-mcp","title":"Expose optional worktreeName separately on development MCP tools","version":3,"lifecycle":"Closed","specVersion":1,"attemptId":"ce0ff2e60c6f4cde9460b0c58612ad9c"}

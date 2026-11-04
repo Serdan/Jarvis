@@ -527,10 +527,49 @@ let ``client-backed MCP tools expose an optional per-command deviceId`` () =
             parameter.IsOptional |> shouldEqual true
 
 [<Test>]
+let ``development MCP tools accept an optional registered worktreeName`` () =
+    let scopedTools =
+        [ "GetProjectDetails"; "ListDirectory"; "SearchFiles"; "SearchText"
+          "ReadFile"; "ReadFiles"; "ReadImage"; "ExportFile"; "ImportFile"
+          "WriteFile"; "PatchFile"; "RunCommand"; "ListConfiguredTasks"
+          "RunProjectTask"; "GetGitStatus"; "GetGitDiff"; "GitCommit"
+          "StartJob"; "ListJobs" ]
+    for name in scopedTools do
+        let methodInfo = typeof<JarvisMcpTools>.GetMethod(name)
+        Assert.That(methodInfo, Is.Not.Null, name)
+        let worktreeParam =
+            methodInfo.GetParameters() |> Array.find (fun p -> p.Name = "worktreeName")
+        Assert.That(worktreeParam.ParameterType, Is.EqualTo(typeof<string>), name)
+        Assert.That(worktreeParam.IsOptional, Is.True, name)
+        Assert.That(worktreeParam.DefaultValue, Is.EqualTo(""), name)
+    for logicalProjectTool in [ "AgentInbox"; "TaskOverview"; "SubmitReview"; "NotifyAgent" ] do
+        let names =
+            typeof<JarvisMcpTools>.GetMethod(logicalProjectTool).GetParameters()
+            |> Array.map _.Name
+        Assert.That(names, Does.Not.Contain("worktreeName"), logicalProjectTool)
+
+[<Test>]
+let ``worktreeName must be a registered-worktree selector name rather than path`` () =
+    McpToolHelpers.projectWithWorktreeName "Wayfold" "" |> shouldEqual "Wayfold"
+    McpToolHelpers.projectWithWorktreeName "Wayfold" "agent6-example"
+    |> shouldEqual "Wayfold::agent6-example"
+    // Existing callers using the selector form continue to work when the new field is omitted.
+    McpToolHelpers.projectWithWorktreeName "Wayfold::agent6-example" ""
+    |> shouldEqual "Wayfold::agent6-example"
+    for projectName, worktreeName in
+        [ "Wayfold::already-selected", "another"; "Wayfold", "../escape"
+          "Wayfold", "linked/path"; "Wayfold", ".."; "Wayfold", "invalid" + string (char 92) + "name"; "Wayfold", "with\nnewline"; "Wayfold", " " ] do
+        try
+            McpToolHelpers.projectWithWorktreeName projectName worktreeName |> ignore
+            Assert.Fail("Expected invalid worktreeName to be rejected")
+        with :? ArgumentException -> ()
+
+[<Test>]
 let ``WriteFile rejects invalid file write mode with actionable validation error`` () =
     let result =
         JarvisMcpTools.WriteFile(
             "Project1",
+            "",
             "test.txt",
             "content",
             "Create",

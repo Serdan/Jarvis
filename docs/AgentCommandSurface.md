@@ -169,6 +169,24 @@ type SearchTextMatch =
 
 Results are individual matches rather than filenames. `Line` and `Column` are one-based. Multiple matches in the same file or line are returned independently. `Preview` is a bounded excerpt of the matching line. `MaxResults` is a global match budget and stops further file traversal once satisfied.
 
+## Explicit worktree selection in MCP
+
+The public source, file, search, Git and execution tools accept optional `worktreeName`
+alongside the logical `projectName`. Omit `worktreeName` to use the main checkout,
+or provide the directory name of a Git-registered linked worktree:
+
+```json
+{"projectName":"Wayfold","worktreeName":"agent6-composite-campaign-travel","filePath":"src/example.cs"}
+```
+
+File paths and working directories stay relative to the selected checkout. The MCP
+boundary translates the explicit selector into the established internal
+`Project::Worktree` convention; the client verifies worktree registration and
+enforces path containment and symlink checks. Invalid or ambiguous selectors
+are rejected; non-worktree ledger coordination APIs remain scoped to the logical
+project and intentionally have no `worktreeName` field. Older callers may
+continue using `Project::Worktree` as `projectName` when `worktreeName` is omitted.
+
 ## File Access Commands
 
 ### `ReadFile`

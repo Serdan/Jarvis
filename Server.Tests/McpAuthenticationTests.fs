@@ -103,7 +103,7 @@ let write_tools_expose_optional_operation_ids () =
                            && methodInfo.Name <> "AcknowledgePendingOperation" ->
                 Some (methodInfo.Name, id)
             | _ -> None)
-    Assert.That(writeMethods.Length, Is.EqualTo(46), String.concat ", " (writeMethods |> Array.map fst))
+    Assert.That(writeMethods.Length, Is.EqualTo(45), String.concat ", " (writeMethods |> Array.map fst))
     for name, id in writeMethods do
         Assert.That(id.IsOptional, Is.True, $"operationId is required on {name}")
         Assert.That(id.DefaultValue, Is.EqualTo(""), $"operationId default differs on {name}")
@@ -154,3 +154,13 @@ let cross_project_notification_parameter_is_optional_and_backwards_compatible ()
     for name in [ "projectName"; "fromAgentId"; "toAgentId"; "message" ] do
         let parameter = parameters |> Array.find (fun p -> p.Name = name)
         Assert.That(parameter.IsOptional, Is.False, $"{name} must remain required")
+
+[<Test>]
+let resume_agent_is_the_only_public_start_tool () =
+    let start = typeof<Server.JarvisMcpTools>.GetMethod("BeginAttempt")
+    Assert.That(start, Is.Null, "Retired BeginAttempt must not be exposed as an MCP tool.")
+    let resume = typeof<Server.JarvisMcpTools>.GetMethod("ResumeAgent")
+    Assert.That(resume, Is.Not.Null)
+    let expectedAgentVersion =
+        resume.GetParameters() |> Array.find (fun parameter -> parameter.Name = "expectedAgentVersion")
+    Assert.That(expectedAgentVersion.IsOptional, Is.False)

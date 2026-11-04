@@ -14,7 +14,7 @@
 | --- | --- |
 | Task HTML/JSON files (commonly `docs/tasks/`) in ordinary source branches/worktrees | Current task, agent and review records in `refs/heads/jarvis-orchestration` |
 | Different worktrees may hold different copies of task state | A single canonical Git remote ref is shared by clients/worktrees |
-| `CreateTask`, `ListTasks`, `AssignTask`, `BeginTask`, `CheckpointTask`, etc. | `CreateTask`, `AgentInbox`, `AssignTask`, `BeginAttempt`, `CheckpointAttempt`, etc. |
+| `CreateTask`, `ListTasks`, `AssignTask`, `BeginTask`, `CheckpointTask`, etc. | `CreateTask`, `AgentInbox`, `AssignTask`, `ResumeAgent`, `CheckpointAttempt`, etc. |
 | Source worktree/branch can be confused with task ownership | Agent owner is a project-local label; source worktree/ref is separate |
 
 The old orchestration *implementations* are **removed**, not forwarded. Where public names such as `CreateTask` and `AssignTask` are reused, they invoke the new orphan-ledger workflow rather than a legacy handler. `ListProjectTasks` and `RunProjectTask` are still local command-runner tools; they are **not** replacements for the retired task APIs. Normal file, Git, worktree and job commands still work.
@@ -92,9 +92,9 @@ For each task still needing work:
 2. **Register the agents.** `RegisterAgent(projectName, agentId, operationId)` creates a project-local agent label. Idle agents start `Parked`. Register intended worker/reviewer labels as needed.
 3. **Assign ownership.** `AssignTask(projectName, taskId, attemptId, ownerId, operationId)` creates one implementation attempt and assigns exactly one owner. Reviewers are chosen independently when they claim an individual review; the attempt does not contain a reviewer. Use fresh UUIDs for `attemptId` and `operationId`.
 4. **Read the authoritative assignment.** Use `AgentInbox(projectName, agentId)` and `GetAssignment(projectName, taskId, assignmentGeneration)` for the current generation, spec, owner and versions. Use `AcknowledgeAssignment` when applicable.
-5. **Begin implementation.** The worker calls `BeginAttempt` with its current expected attempt version and assignment generation. Existing code stays in its ordinary source branch/worktree. Any recorded source ref is context, not a permission gate: the agent may rebase or change branches and the orchestrator may update that context while the agent is Ready. Do not pin a review baseline for the entire task.
+5. **Begin implementation.** The worker calls `ResumeAgent` with its current expected attempt version, agent version, and assignment generation. The operation starts a Queued attempt and atomically acknowledges its issuance. Existing code stays in its ordinary source branch/worktree. Any recorded source ref is context, not a permission gate: the agent may rebase or change branches and the orchestrator may update that context while the agent is Ready. Do not pin a review baseline for the entire task.
 6. **Persist progress.** `CheckpointAttempt` records summary, evidence and next action, but does **not** end a Working turn. Before a normal agent turn finishes, use `YieldAgent` to stop execution and remain `Ready`, or `CompleteAgentWork` to finish the attempt, release its current assignment and become `NeedsWork`.
-7. **Resume deliberately.** `ResumeAgent` resumes a Ready agent. It also supports explicitly recovering a stalled Working session, recording its session association and recovery event without reassigning ownership.
+7. **Resume deliberately.** `ResumeAgent` also continues a previously Started Ready agent. It also supports explicitly recovering a stalled Working session, recording its session association and recovery event without reassigning ownership.
 
 Always read expected versions/generations from the latest ledger. Do not guess. Use a **new operation UUID for each new logical mutation**, but reuse the **same UUID and parameters** when retrying the *same* operation after a lost response. Provider session IDs are supplied automatically; agents must not invent them.
 

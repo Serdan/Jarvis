@@ -1577,8 +1577,9 @@ type ReviewWorkflowTests() =
                         .EnumerateArray()
                     |> Seq.find (fun item -> item.GetProperty("entityKind").GetString() = "Task")
                 Assert.That(storedEffect.GetProperty("lifecycle").GetString(), Is.EqualTo("Open"))
-                run { template "BeginAttempt" taskId with
-                          ExpectedVersion = 1; AssignmentGeneration = 1 } |> ignore
+                run { template "ResumeAgent" taskId with
+                          ExpectedVersion = 1; ExpectedAgentVersion = 2
+                          AssignmentGeneration = 1 } |> ignore
                 run { template "BindReviewBase" taskId with
                           ExpectedVersion = 2; AssignmentGeneration = 1
                           BaseOid = baseOid; TargetRef = sourceRef } |> ignore
@@ -2700,6 +2701,42 @@ type ReviewWorkflowTests() =
             | other -> Assert.Fail(sprintf "Working agent must not be preempted: %A" other)
             Assert.That((LedgerStore.fetch second |> success).Commit, Is.EqualTo(before)))
 
+
+    [<Test>]
+    member _.ResumeAgentStartsQueuedAttemptAndAtomicallyAcknowledgesAssignment() =
+        withFixture (fun _ _ first second _ _ _ _ ->
+            let taskId = "unified-resume-start"
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Startup via resume"
+            |> success |> ignore
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner"
+            |> success |> ignore
+            let ready = ReviewWorkflow.getAgentInbox second "Owner" |> success
+            Assert.That(ready.Focused.Value.Attempt.Phase, Is.EqualTo("Queued"))
+            Assert.That(ready.Agent.State, Is.EqualTo("Ready"))
+            let operationId = Guid.NewGuid()
+            let start () =
+                ReviewWorkflow.resumeAgentWithSession first operationId taskId "Owner"
+                    ready.Focused.Value.Attempt.Version ready.Agent.Version 1 "new-session"
+                |> success
+            let started = start ()
+            Assert.That(started.AlreadyApplied, Is.False)
+            let inbox = ReviewWorkflow.getAgentInbox second "Owner" |> success
+            Assert.That(inbox.Agent.State, Is.EqualTo("Working"))
+            Assert.That(inbox.Focused.Value.Attempt.Phase, Is.EqualTo("Started"))
+            Assert.That(inbox.Agent.ActiveSessionId, Is.EqualTo("new-session"))
+            let _, _, _, issuance, receipt =
+                ReviewWorkflow.getAssignment first taskId 1 |> success
+            Assert.That(receipt.IsSome, Is.True)
+            Assert.That(receipt.Value.AcknowledgedSequence, Is.EqualTo(started.Operation.Sequence))
+            Assert.That(receipt.Value.IssueSequence, Is.EqualTo(issuance.IssuedSequence))
+            Assert.That(receipt.Value.SpecBlobOid, Is.EqualTo(issuance.SpecBlobOid))
+            let head = (LedgerStore.fetch first |> success).Commit
+            Assert.That((start ()).AlreadyApplied, Is.True)
+            Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(head))
+            match ReviewWorkflow.resumeAgentWithSession second (Guid.NewGuid()) taskId "Owner"
+                      ready.Focused.Value.Attempt.Version ready.Agent.Version 1 "another-session" with
+            | Error(StaleEntityVersion _) -> ()
+            | other -> Assert.Fail(sprintf "Stale startup must fail: %A" other))
 
     [<Test>]
     member _.BeginAttemptAtomicallyAcknowledgesQueuedGeneration() =

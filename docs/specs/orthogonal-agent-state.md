@@ -105,7 +105,7 @@ All mutations remain explicit, Git-ledger-backed, idempotent by operation ID and
 | `RegisterAgent` | None / Stopped / Parked | None | None |
 | `AssignTask` | Assignment set / Stopped / null → **Ready** | Create Queued attempt/issue | Task InProgress as today |
 | `AcknowledgeAssignment` | Unchanged (Ready) | Write acknowledgment receipt, phase stays Queued | None |
-| `BeginAttempt` | Keep assignment / Working / null | Queued → Started | None |
+| `ResumeAgent` on newly assigned Ready agent | Keep assignment / Working / null | Queued → Started | Atomic assignment acknowledgement |
 | `YieldAgent` | Keep assignment / Stopped / null → **Ready** | Remains Started; add yield checkpoint | None |
 | `ResumeAgent` on stopped agent | Keep assignment / Working / null | Remains Started | None |
 | `ResumeAgent` after reported stall | Remains Working | Remains Started | Explicit recovery event and new timed segment only |
@@ -123,7 +123,7 @@ All mutations remain explicit, Git-ledger-backed, idempotent by operation ID and
 
 Clarifications:
 
-- A newly assigned agent is **Ready immediately**; it need not be started once to acquire that label. The normal distinction between `BeginAttempt` and `ResumeAgent` uses the attempt's Queued versus Started progress, not a separate agent state.
+- A newly assigned agent is **Ready immediately**. Its first `ResumeAgent` starts the Queued attempt and atomically records assignment acknowledgement. Later `ResumeAgent` calls resume a Started Ready attempt or explicitly recover a stalled Working session. `BeginAttempt` is retired from the public MCP surface; its historical internal ledger operation remains readable.
 - Completion is a terminal **attempt event**. The agent becomes Needs work, not a persistent Completed state. The orchestrator can assign a new task or explicitly ParkAgent.
 - `ParkAgent` is only for an unassigned agent. `ParkAttempt` is different: it defers a task attempt and frees its owner to take other work. Their names need not change just because the underlying model is simpler.
 - An explicitly Parked, unassigned agent **can be assigned**. Assignment is an explicit orchestrator decision that supersedes the earlier no-work disposition; no intermediate "unpark" operation is necessary.

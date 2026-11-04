@@ -1035,7 +1035,7 @@ module TaskApi =
                         cmd.SourceRef cmd.BaseOid |> mapError |> Result.map box
                 else
                     // Session routing metadata does not change ordinary task-write
-                    // identity. Begin/Resume deliberately associate an execution.
+                    // identity. Resume (and historical Begin) deliberately associates an execution.
                     let journalCommand =
                         if cmd.Action = "BeginAttempt" || cmd.Action = "ResumeAgent" then cmd
                         else { cmd with SessionId = "" }

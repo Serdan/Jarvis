@@ -1414,8 +1414,41 @@ module ReviewWorkflow =
                            || agent.Version <> expectedAgentVersion
                            || agent.FocusAttemptId <> attempt.AttemptId then
                             return! Error(StaleEntityVersion "Current task/attempt/owner changed; reread assignment.")
-                        let! _ = requiredIssue binding snapshot taskId attempt
-                        if agent.State = "Ready" && attempt.Phase = "Started"
+                        let! issuance = requiredIssue binding snapshot taskId attempt
+                        if agent.State = "Ready" && attempt.Phase = "Queued"
+                           && String.IsNullOrWhiteSpace agent.ActiveAttemptId then
+                            // Starting a newly assigned attempt is now an ordinary
+                            // ResumeAgent transition. Preserve the original BeginAttempt
+                            // behavior: validate and atomically record the assignment receipt.
+                            let! existingAcknowledgment =
+                                read<AssignmentReceipt> binding snapshot
+                                    (receiptPath taskId attempt.AttemptId generation)
+                            match existingAcknowledgment with
+                            | Some (ack, _) when
+                                ack.Generation <> generation
+                                || ack.SpecBlobOid <> issuance.SpecBlobOid
+                                || ack.IssueSequence <> issuance.IssuedSequence
+                                || ack.OwnerAgentId <> ownerId ->
+                                return! Error(LedgerIntegrityError "Acknowledgment is not for the current assignment.")
+                            | _ -> ()
+                            return
+                                [ change (attemptPath taskId attempt.AttemptId) (Some attemptOid)
+                                    { attempt with Version = attempt.Version + 1; Phase = "Started" }
+                                  change (agentPath ownerId) (Some agentOid)
+                                    (enterState "Working" agent |> associateSession sessionId
+                                     |> fun updated ->
+                                         { updated with Version = agent.Version + 1
+                                                        StateReason = $"Started task {taskId}"
+                                                        StateSequence = snapshot.Header.NextSequence }) ]
+                                @ (if existingAcknowledgment.IsNone then
+                                       [ change (receiptPath taskId attempt.AttemptId generation) None
+                                           { TaskId = taskId; AttemptId = attempt.AttemptId
+                                             Generation = generation; OwnerAgentId = ownerId
+                                             AcknowledgedSequence = snapshot.Header.NextSequence
+                                             SpecBlobOid = issuance.SpecBlobOid
+                                             IssueSequence = issuance.IssuedSequence } ]
+                                   else [])
+                        elif agent.State = "Ready" && attempt.Phase = "Started"
                            && String.IsNullOrWhiteSpace agent.ActiveAttemptId then
                             return
                                 [ change (attemptPath taskId attempt.AttemptId) (Some attemptOid)
@@ -1455,7 +1488,7 @@ module ReviewWorkflow =
                                        reason = "Explicit resume of Working agent"
                                        sequence = snapshot.Header.NextSequence |} ]
                         else
-                            return! Error(StaleEntityVersion "Resume requires Ready or Working on the same assignment.")
+                            return! Error(StaleEntityVersion "Resume requires a Ready queued/started attempt or a Working attempt on the same assignment.")
                     })
 
     let resumeAgent binding operationId taskId ownerId expectedAttemptVersion expectedAgentVersion generation =

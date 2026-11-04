@@ -103,7 +103,7 @@ let write_tools_expose_optional_operation_ids () =
                            && methodInfo.Name <> "AcknowledgePendingOperation" ->
                 Some (methodInfo.Name, id)
             | _ -> None)
-    Assert.That(writeMethods.Length, Is.EqualTo(45), String.concat ", " (writeMethods |> Array.map fst))
+    Assert.That(writeMethods.Length, Is.EqualTo(44), String.concat ", " (writeMethods |> Array.map fst))
     for name, id in writeMethods do
         Assert.That(id.IsOptional, Is.True, $"operationId is required on {name}")
         Assert.That(id.DefaultValue, Is.EqualTo(""), $"operationId default differs on {name}")
@@ -164,3 +164,15 @@ let resume_agent_is_the_only_public_start_tool () =
     let expectedAgentVersion =
         resume.GetParameters() |> Array.find (fun parameter -> parameter.Name = "expectedAgentVersion")
     Assert.That(expectedAgentVersion.IsOptional, Is.False)
+
+[<Test>]
+let attempt_deferral_has_single_public_tool_with_disposition () =
+    let methods = typeof<Server.JarvisMcpTools>
+    Assert.That(methods.GetMethod("ParkAttempt"), Is.Null)
+    Assert.That(methods.GetMethod("BlockAttempt"), Is.Null)
+    let deferAttempt = methods.GetMethod("DeferAttempt")
+    Assert.That(deferAttempt, Is.Not.Null)
+    let disposition =
+        deferAttempt.GetParameters() |> Array.find (fun p -> p.Name = "disposition")
+    Assert.That(disposition.IsOptional, Is.True)
+    Assert.That(disposition.DefaultValue, Is.EqualTo("Deferred"))

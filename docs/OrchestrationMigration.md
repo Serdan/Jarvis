@@ -147,3 +147,10 @@ Use the unprefixed canonical task/review tools for live writes; do not push hand
 A project is migrated when its canonical ledger is bound, its **relevant active tasks** are recreated, agents use the orphan-ledger tools for all new orchestration writes, and participating clients agree on its state. Other projects can migrate independently. Updating the Jarvis client/server by itself does not complete this per-project step.
 
 See the [architecture spec](specs/orchestration-architecture.md). The older [Git-backed tasks guide](GitBackedTasks.md) describes the retired source-branch workflow.
+
+
+## Administrative deferral (protocol 3.52)
+
+Use `DeferAttempt` for a Queued or Started attempt that should stop holding its agent's assignment. Default `disposition: Deferred` retains the previous park behavior; `disposition: Blocked` retains the previous explicit block behavior. Both require a reason and exact task/attempt/agent versions and preserve immutable lifecycle history. The old `ParkAttempt` and `BlockAttempt` actions remain valid internally for historical ledger operations.
+
+`ResumeAttempt` and `ReissueQueuedAttempt` deliberately remain separate for now: the former creates a new generation when resuming a deferred or blocked attempt; the latter assigns an unoccupied agent to an existing queued generation. This difference requires design/transition review before consolidating further.

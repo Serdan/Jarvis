@@ -314,7 +314,7 @@ The old commands are easy to misuse because they depend on brittle text matching
 
 ### `RunCommand`
 
-Runs a bounded, synchronous command in a project directory.
+Runs a bounded, synchronous command within a project checkout under the local Jarvis client OS account permissions. The OS permission boundary constrains the process; this is not a separate container or VM sandbox.
 
 May mutate state depending on the command. It should usually require confirmation.
 

@@ -9,24 +9,60 @@ open Microsoft.AspNetCore.SignalR
 open Microsoft.FSharp.Core
 
 module ProjectNotificationRouting =
-    let candidates (selected: ClientSessionStatus voption) (sessions: ClientSessionStatus list)
-                   (explicitDevice: bool) (commandName: string) (requireCurrentProtocol: bool) =
-        let ordered =
-            if explicitDevice then
-                match selected with
-                | ValueSome session -> [ session ]
-                | ValueNone -> []
+    let ordered (selected: ClientSessionStatus voption) (sessions: ClientSessionStatus list)
+                (explicitDevice: bool) =
+        if explicitDevice then
+            match selected with
+            | ValueSome session -> [ session ]
+            | ValueNone -> []
+        else
+            match selected with
+            | ValueSome session ->
+                session :: (sessions |> List.filter (fun item -> item.DeviceId <> session.DeviceId))
+            | ValueNone -> sessions
+
+    let rejectionReason commandName requireCurrentProtocol (session: ClientSessionStatus) =
+        if session.State <> Registered || session.ConnectionId.IsNone then Some "disconnected"
+        elif not (List.contains "LedgerRead" session.SupportedCommands) then Some "missing LedgerRead support"
+        elif not (List.contains commandName session.SupportedCommands) then Some $"missing {commandName} support"
+        elif requireCurrentProtocol && session.ProtocolVersion <> AgentProtocol.version then
+            Some $"protocol {session.ProtocolVersion} (requires {AgentProtocol.version})"
+        else None
+
+    let candidates selected sessions explicitDevice commandName requireCurrentProtocol =
+        ordered selected sessions explicitDevice
+        |> List.filter (fun item -> rejectionReason commandName requireCurrentProtocol item |> Option.isNone)
+
+    // Avoid propagating arbitrary client error strings, which may include local paths.
+    let probeFailure (response: AgentCommandResponse) =
+        match response.Error with
+        | Some(NotFound _) -> "destination project or ledger binding not found"
+        | Some(PermissionDenied _) -> "permission denied"
+        | Some(ValidationFailed _) -> "ledger binding or project validation failed"
+        | Some(Conflict _) -> "ledger health conflict"
+        | Some(ExecutionFailed _) -> "ledger health execution failed or timed out"
+        | Some(OutputTruncated _) -> "ledger health response truncated"
+        | Some(ConfirmationRequired _) -> "unexpected ledger health confirmation"
+        | Some(LedgerFailure failure) -> $"ledger health failed ({failure.Code})"
+        | None -> "ledger health returned no successful result"
+
+    let failureMessage projectName commandName requireCurrentProtocol explicitDevice
+                       (sessions: ClientSessionStatus list) (probes: (string * string) list) =
+        let excluded =
+            sessions |> List.choose (fun session ->
+                rejectionReason commandName requireCurrentProtocol session
+                |> Option.map (fun reason -> $"{session.DeviceName}: {reason}"))
+        let details = excluded @ (probes |> List.map (fun (name, reason) -> $"{name}: {reason}"))
+        let description =
+            if List.isEmpty details then
+                if explicitDevice then "No selected/explicit device is available."
+                else "No registered client is available."
             else
-                match selected with
-                | ValueSome session ->
-                    session :: (sessions |> List.filter (fun candidate -> candidate.DeviceId <> session.DeviceId))
-                | ValueNone -> sessions
-        ordered
-        |> List.filter (fun session ->
-            session.State = Registered && session.ConnectionId.IsSome
-            && List.contains "LedgerRead" session.SupportedCommands
-            && List.contains commandName session.SupportedCommands
-            && (not requireCurrentProtocol || session.ProtocolVersion = AgentProtocol.version))
+                let prefix = details |> List.truncate 8 |> String.concat "; "
+                if details.Length > 8 then $"{prefix}; and {details.Length - 8} more" else prefix
+        $"Cannot route cross-project notification for '{projectName}': {description} " +
+        "Check the destination ledger binding and connected client capabilities."
+
 
 type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserService, tracker: ClientResponseTracker) =
     member this.SendMessageToAll(message) = ctx.Clients.All.ReceiveMessage(message)
@@ -130,20 +166,24 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                                      ?conversationId: string, ?deviceId: string) =
         task {
             let selected = users.GetSelectedSession(userId, conversationId, deviceId)
+            let sessions = users.ListDevices(userId) |> Array.toList
+            let commandName = AgentCommandInfo.protocolName command
+            let requireCurrentProtocol =
+                match command with
+                | TaskWriteCommand write when write.Action = "NotifyAgent"
+                      && not (String.IsNullOrWhiteSpace write.SourceRef) -> true
+                | _ -> false
+            let ordered = ProjectNotificationRouting.ordered selected sessions deviceId.IsSome
             let eligible =
-                ProjectNotificationRouting.candidates selected
-                    (users.ListDevices(userId) |> Array.toList) deviceId.IsSome
-                    (AgentCommandInfo.protocolName command)
-                    (match command with
-                     | TaskWriteCommand write when write.Action = "NotifyAgent"
-                           && not (String.IsNullOrWhiteSpace write.SourceRef) -> true
-                     | _ -> false)
-            let rec dispatch (remaining: ClientSessionStatus list) =
+                ProjectNotificationRouting.candidates selected sessions deviceId.IsSome
+                    commandName requireCurrentProtocol
+            let rec dispatch (remaining: ClientSessionStatus list) (probeFailures: (string * string) list) =
                 task {
                     match remaining with
                     | [] ->
                         return { Result = None
-                                 Error = Some(NotFound $"No compatible connected Jarvis client with a verified ledger binding for project '{projectName}'. Cross-project notification writes require protocol {AgentProtocol.version}.")
+                                 Error = Some(NotFound(ProjectNotificationRouting.failureMessage projectName commandName
+                                      requireCurrentProtocol deviceId.IsSome ordered (List.rev probeFailures)))
                                  Instructions = [] }
                     | session :: rest ->
                         let! health = this.SendCommandToUser(
@@ -156,7 +196,9 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                             // an uncertain result may already have been committed.
                             return! this.SendCommandToUser(userId, command,
                                                             ?conversationId = conversationId, deviceId = session.DeviceId)
-                        | _ -> return! dispatch rest
+                        | _ ->
+                            let reason = ProjectNotificationRouting.probeFailure health
+                            return! dispatch rest ((session.DeviceName, reason) :: probeFailures)
                 }
-            return! dispatch eligible
+            return! dispatch eligible []
         }

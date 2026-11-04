@@ -1054,3 +1054,54 @@ let cross_project_routing_prefers_selected_client_then_eligible_alternatives () 
     let unrelated = ProjectNotificationRouting.candidates ValueNone
                         (users.ListDevices("different-user") |> Array.toList) false "TaskWrite" false
     unrelated |> shouldEqual []
+
+[<Test>]
+let cross_project_failure_reports_real_device_incompatibility () =
+    let users = UserService()
+    let user = "routing-diagnostics"
+    let register name protocol commands =
+        users.TransportConnected(user, name + "-connection")
+        users.Register(user,
+            { DeviceId = name; DeviceName = name; ProtocolVersion = protocol
+              ClientVersion = "1"; SupportedCommands = commands },
+            name + "-connection") |> ignore
+    register "old" "3.48" [ "LedgerRead"; "TaskWrite" ]
+    register "no-write" AgentProtocol.version [ "LedgerRead"; "TaskRead" ]
+    register "no-ledger" AgentProtocol.version [ "TaskWrite" ]
+    register "healthy" AgentProtocol.version [ "LedgerRead"; "TaskWrite" ]
+    let selected = users.GetSessionByDevice(user, "old")
+    let ordered = ProjectNotificationRouting.ordered selected
+                      (users.ListDevices(user) |> Array.toList) false
+    let eligible = ProjectNotificationRouting.candidates selected
+                       (users.ListDevices(user) |> Array.toList) false "TaskWrite" true
+    (eligible |> List.map (fun item -> item.DeviceName)) |> shouldEqual [ "healthy" ]
+    let text = ProjectNotificationRouting.failureMessage "Wayfold" "TaskWrite" true false ordered
+                   [ "healthy", "destination project or ledger binding not found" ]
+    Assert.That(text, Does.Contain("old: protocol 3.48"))
+    Assert.That(text, Does.Contain("no-write: missing TaskWrite support"))
+    Assert.That(text, Does.Contain("no-ledger: missing LedgerRead support"))
+    Assert.That(text, Does.Contain("healthy: destination project or ledger binding not found"))
+    Assert.That(text, Does.Not.Contain("No compatible connected"))
+
+[<Test>]
+let cross_project_probe_errors_are_classified_without_leaking_client_error_text () =
+    let error = "private/absolute/path/with-sensitive-details"
+    let failures : (AgentError * string) list =
+        [ NotFound error, "destination project or ledger binding not found"
+          ValidationFailed error, "ledger binding or project validation failed"
+          PermissionDenied error, "permission denied"
+          ExecutionFailed error, "ledger health execution failed or timed out" ]
+    for issue, expected in failures do
+        let reply : AgentCommandResponse =
+            { Result = None; Error = Some issue; Instructions = [] }
+        let classification = ProjectNotificationRouting.probeFailure reply
+        Assert.That(classification, Is.EqualTo(expected))
+        Assert.That(classification, Does.Not.Contain(error))
+
+[<Test>]
+let cross_project_routing_error_distinguishes_absent_device_from_protocol_mismatch () =
+    let empty = ProjectNotificationRouting.failureMessage "Wayfold" "TaskWrite" true false [] []
+    Assert.That(empty, Does.Contain("No registered client"))
+    Assert.That(empty, Does.Not.Contain("requires protocol"))
+    let explicit = ProjectNotificationRouting.failureMessage "Wayfold" "TaskWrite" true true [] []
+    Assert.That(explicit, Does.Contain("No selected/explicit device"))

@@ -163,4 +163,15 @@ let resume_agent_is_the_only_public_start_tool () =
     Assert.That(resume, Is.Not.Null)
     let expectedAgentVersion =
         resume.GetParameters() |> Array.find (fun parameter -> parameter.Name = "expectedAgentVersion")
-    Assert.That(expectedAgentVersion.IsOptional, Is.False)
+    Assert.That(expectedAgentVersion.IsOptional, Is.True)
+    Assert.That(expectedAgentVersion.DefaultValue, Is.EqualTo(0))
+
+[<Test>]
+let routine_agent_lifecycle_versions_are_optional_preconditions () =
+    for toolName in [ "ResumeAgent"; "YieldAgent"; "CheckpointAttempt"; "CompleteAgentWork" ] do
+        let methodInfo = typeof<Server.JarvisMcpTools>.GetMethod(toolName)
+        Assert.That(methodInfo, Is.Not.Null)
+        for name in [ "expectedAttemptVersion"; "expectedAgentVersion"; "assignmentGeneration" ] do
+            let parameter = methodInfo.GetParameters() |> Array.find (fun p -> p.Name = name)
+            Assert.That(parameter.IsOptional, Is.True, $"{toolName}: {name}")
+            Assert.That(parameter.DefaultValue, Is.EqualTo(0), $"{toolName}: {name}")

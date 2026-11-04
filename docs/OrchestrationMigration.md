@@ -147,3 +147,10 @@ Use the unprefixed canonical task/review tools for live writes; do not push hand
 A project is migrated when its canonical ledger is bound, its **relevant active tasks** are recreated, agents use the orphan-ledger tools for all new orchestration writes, and participating clients agree on its state. Other projects can migrate independently. Updating the Jarvis client/server by itself does not complete this per-project step.
 
 See the [architecture spec](specs/orchestration-architecture.md). The older [Git-backed tasks guide](GitBackedTasks.md) describes the retired source-branch workflow.
+
+
+## Optional lifecycle preconditions (protocol 3.55)
+
+`ResumeAgent`, `YieldAgent`, `CheckpointAttempt`, and `CompleteAgentWork` continue to require `projectName`, `taskId`, and the owner identity. Their `expectedAttemptVersion`, `expectedAgentVersion` and `assignmentGeneration` fields are now optional (default zero): Jarvis resolves current values under each verified Git ledger transaction while checking the exact task/owner/focused assignment and required execution state. Nonzero values remain strict preconditions for callers with a known snapshot; stale assertions reject instead of acting on a different generation. The operation request retains caller-supplied zeros for stable retry identity; generated checkpoints and receipts record actual assignment generation. Same-session resume advisories also accept omitted generation.
+
+Keep `taskId` explicit: allowing an agent-only resume would require additional stable operation identity and replay handling when current assignment changes, which is not safely interchangeable with omission of version preconditions.

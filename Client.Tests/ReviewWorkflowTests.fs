@@ -2729,6 +2729,39 @@ type ReviewWorkflowTests() =
 
 
     [<Test>]
+    member _.CurrentLifecycleVersionsResolveInsideTransactionAndExplicitStaleVersionsFail() =
+        withFixture (fun _ _ first second _ _ _ _ ->
+            let taskId = "versionless-lifecycle"
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Current-state lifecycle"
+            |> success |> ignore
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner"
+            |> success |> ignore
+            let started =
+                ReviewWorkflow.resumeAgentWithSession first (Guid.NewGuid()) taskId "Owner"
+                    0 0 0 "session-current" |> success
+            Assert.That(started.AlreadyApplied, Is.False)
+            let _, _, attempt, _, acknowledgement =
+                ReviewWorkflow.getAssignment second taskId 1 |> success
+            Assert.That(attempt.Phase, Is.EqualTo("Started"))
+            Assert.That(acknowledgement.IsSome, Is.True)
+            expectStale (ReviewWorkflow.resumeAgentWithSession first (Guid.NewGuid()) taskId "Owner"
+                             1 2 1 "session-stale")
+            ReviewWorkflow.checkpointAttempt first (Guid.NewGuid()) taskId "Owner"
+                0 0 0 "Progress" "Continue work" null "" |> success |> ignore
+            ReviewWorkflow.yieldAgent second (Guid.NewGuid()) taskId "Owner"
+                0 0 0 "Checkpoint" "Resume work" |> success |> ignore
+            let ready = ReviewWorkflow.getAgentInbox first "Owner" |> success
+            Assert.That(ready.Agent.State, Is.EqualTo("Ready"))
+            ReviewWorkflow.resumeAgentWithSession second (Guid.NewGuid()) taskId "Owner"
+                0 0 0 "session-resumed" |> success |> ignore
+            ReviewWorkflow.completeAgentWork first (Guid.NewGuid()) taskId "Owner"
+                0 0 0 "Implementation completed" |> success |> ignore
+            let complete = ReviewWorkflow.getAgentInbox second "Owner" |> success
+            Assert.That(complete.Agent.State, Is.EqualTo("NeedsWork"))
+            let _, _, finished = ReviewWorkflow.getTask second taskId |> success
+            Assert.That(finished.Value.Phase, Is.EqualTo("Finished")))
+
+    [<Test>]
     member _.ResumeAgentStartsQueuedAttemptAndAtomicallyAcknowledgesAssignment() =
         withFixture (fun _ _ first second _ _ _ _ ->
             let taskId = "unified-resume-start"

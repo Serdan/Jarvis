@@ -1334,7 +1334,7 @@ module ReviewWorkflow =
     let yieldAgent binding operationId taskId ownerId expectedAttemptVersion expectedAgentVersion
                    generation summary nextAction =
         if not (validTaskId taskId) || not (validAgent ownerId)
-           || expectedAttemptVersion < 1 || expectedAgentVersion < 1 || generation < 1
+           || expectedAttemptVersion < 0 || expectedAgentVersion < 0 || generation < 0
            || not (validText 8192 summary) || not (validText 8192 nextAction) then
             Error(InvalidBinding "Yield requires current versions and a substantive checkpoint/next action.")
         else
@@ -1348,11 +1348,12 @@ module ReviewWorkflow =
                     result {
                         let! task, _, attempt, attemptOid = getAttempt binding snapshot taskId
                         let! agent, agentOid = required<ReviewAgent> binding snapshot (agentPath ownerId)
+                        let generation = if generation = 0 then attempt.AssignmentGeneration else generation
                         if task.Lifecycle <> "InProgress" || attempt.OwnerAgentId <> ownerId
-                           || attempt.Version <> expectedAttemptVersion
+                           || (expectedAttemptVersion <> 0 && attempt.Version <> expectedAttemptVersion)
                            || attempt.AssignmentGeneration <> generation
                            || attempt.Phase <> "Started" || agent.State <> "Working"
-                           || agent.Version <> expectedAgentVersion
+                           || (expectedAgentVersion <> 0 && agent.Version <> expectedAgentVersion)
                            || agent.ActiveAttemptId <> attempt.AttemptId
                            || agent.FocusAttemptId <> attempt.AttemptId then
                             return! Error(StaleEntityVersion "Yield requires the current Working assignment and slot.")
@@ -1381,7 +1382,7 @@ module ReviewWorkflow =
             let! agent, _ = required<ReviewAgent> binding snapshot (agentPath ownerId)
             if task.Lifecycle = "InProgress"
                && attempt.OwnerAgentId = ownerId
-               && attempt.AssignmentGeneration = generation
+               && (generation = 0 || attempt.AssignmentGeneration = generation)
                && agent.State = "Working"
                && attempt.Phase = "Started"
                && agent.FocusAttemptId = attempt.AttemptId
@@ -1400,14 +1401,14 @@ module ReviewWorkflow =
                        agentState = agent.State
                        taskId = taskId
                        attemptId = attempt.AttemptId
-                       assignmentGeneration = generation
+                       assignmentGeneration = attempt.AssignmentGeneration
                        head = snapshot.Commit |}
             else return None
         }
 
     let resumeAgentWithSession binding operationId taskId ownerId expectedAttemptVersion expectedAgentVersion generation sessionId =
         if not (validTaskId taskId) || not (validAgent ownerId)
-           || expectedAttemptVersion < 1 || expectedAgentVersion < 1 || generation < 1 then
+           || expectedAttemptVersion < 0 || expectedAgentVersion < 0 || generation < 0 then
             Error(InvalidBinding "Invalid ResumeAgent version or generation.")
         else
             LedgerStore.transact binding
@@ -1420,10 +1421,11 @@ module ReviewWorkflow =
                     result {
                         let! task, _, attempt, attemptOid = getAttempt binding snapshot taskId
                         let! agent, agentOid = required<ReviewAgent> binding snapshot (agentPath ownerId)
+                        let generation = if generation = 0 then attempt.AssignmentGeneration else generation
                         if task.Lifecycle <> "InProgress" || attempt.OwnerAgentId <> ownerId
-                           || attempt.Version <> expectedAttemptVersion
+                           || (expectedAttemptVersion <> 0 && attempt.Version <> expectedAttemptVersion)
                            || attempt.AssignmentGeneration <> generation
-                           || agent.Version <> expectedAgentVersion
+                           || (expectedAgentVersion <> 0 && agent.Version <> expectedAgentVersion)
                            || agent.FocusAttemptId <> attempt.AttemptId then
                             return! Error(StaleEntityVersion "Current task/attempt/owner changed; reread assignment.")
                         let! issuance = requiredIssue binding snapshot taskId attempt
@@ -1509,7 +1511,7 @@ module ReviewWorkflow =
     let completeAgentWork binding operationId taskId ownerId expectedAttemptVersion expectedAgentVersion
                           generation summary =
         if not (validTaskId taskId) || not (validAgent ownerId)
-           || expectedAttemptVersion < 1 || expectedAgentVersion < 1 || generation < 1
+           || expectedAttemptVersion < 0 || expectedAgentVersion < 0 || generation < 0
            || not (validText 8192 summary) then
             Error(InvalidBinding "Completion requires a summary and exact assignment versions.")
         else
@@ -1522,6 +1524,7 @@ module ReviewWorkflow =
                     result {
                         let! task, _, attempt, attemptOid = getAttempt binding snapshot taskId
                         let! agent, agentOid = required<ReviewAgent> binding snapshot (agentPath ownerId)
+                        let generation = if generation = 0 then attempt.AssignmentGeneration else generation
                         let validPhase =
                             (agent.State = "Working" && attempt.Phase = "Started"
                              && agent.ActiveAttemptId = attempt.AttemptId)
@@ -1529,9 +1532,9 @@ module ReviewWorkflow =
                                 && String.IsNullOrWhiteSpace agent.ActiveAttemptId)
                         if not (List.contains task.Lifecycle [ "InProgress"; "Closed" ])
                            || attempt.OwnerAgentId <> ownerId
-                           || attempt.Version <> expectedAttemptVersion
+                           || (expectedAttemptVersion <> 0 && attempt.Version <> expectedAttemptVersion)
                            || attempt.AssignmentGeneration <> generation
-                           || agent.Version <> expectedAgentVersion
+                           || (expectedAgentVersion <> 0 && agent.Version <> expectedAgentVersion)
                            || agent.FocusAttemptId <> attempt.AttemptId || not validPhase then
                             return! Error(StaleEntityVersion "Only the current Working or Ready agent can complete this assignment.")
                         let checkpoint =
@@ -1558,7 +1561,7 @@ module ReviewWorkflow =
     let checkpointAttempt binding operationId taskId ownerId expectedAttemptVersion
                           expectedAgentVersion generation summary nextAction sourceCommit evidence =
         if not (validTaskId taskId) || not (validAgent ownerId)
-           || expectedAttemptVersion < 1 || expectedAgentVersion < 1 || generation < 1
+           || expectedAttemptVersion < 0 || expectedAgentVersion < 0 || generation < 0
            || not (validText 8192 summary) || not (validText 8192 nextAction)
            || (not (String.IsNullOrEmpty evidence) && Encoding.UTF8.GetByteCount evidence > 8192) then
             Error(InvalidBinding "Invalid Working checkpoint metadata.")
@@ -1573,10 +1576,11 @@ module ReviewWorkflow =
                     result {
                         let! task, _, attempt, attemptOid = getAttempt binding snapshot taskId
                         let! agent, _ = required<ReviewAgent> binding snapshot (agentPath ownerId)
+                        let generation = if generation = 0 then attempt.AssignmentGeneration else generation
                         if task.Lifecycle <> "InProgress" || attempt.OwnerAgentId <> ownerId
-                           || attempt.Phase <> "Started" || attempt.Version <> expectedAttemptVersion
+                           || attempt.Phase <> "Started" || (expectedAttemptVersion <> 0 && attempt.Version <> expectedAttemptVersion)
                            || attempt.AssignmentGeneration <> generation
-                           || agent.Version <> expectedAgentVersion || agent.State <> "Working"
+                           || (expectedAgentVersion <> 0 && agent.Version <> expectedAgentVersion) || agent.State <> "Working"
                            || agent.ActiveAttemptId <> attempt.AttemptId then
                             return! Error(StaleEntityVersion "Checkpoint requires exact current Working versions and generation.")
                         let! _ = requiredIssue binding snapshot taskId attempt

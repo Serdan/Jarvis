@@ -2758,6 +2758,84 @@ type ReviewWorkflowTests() =
 
 
     [<Test>]
+    member _.StaleSessionCannotWriteVersionlessLifecycleAfterSameTaskRecovery() =
+        withFixture (fun _ _ first second _ _ _ _ ->
+            let taskId = "versionless-session-recovery"
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Session-fenced lifecycle"
+            |> success |> ignore
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner"
+            |> success |> ignore
+            ReviewWorkflow.resumeAgentWithSession first (Guid.NewGuid()) taskId "Owner"
+                0 0 0 "session-original" |> success |> ignore
+            ReviewWorkflow.yieldAgentWithSession first (Guid.NewGuid()) taskId "Owner"
+                0 0 0 "Checkpoint before recovery" "Restart needed" "session-original"
+            |> success |> ignore
+            let _, _, previousAttempt = ReviewWorkflow.getTask second taskId |> success
+            let previousAgent = (ReviewWorkflow.getAgentInbox first "Owner" |> success).Agent
+            ReviewWorkflow.recoverAgentAssignment first (Guid.NewGuid()) taskId "Owner"
+                previousAttempt.Value.Version previousAgent.Version 1 "Recover same task with new generation"
+            |> success |> ignore
+            expectStale (ReviewWorkflow.resumeAgentWithSession first (Guid.NewGuid()) taskId "Owner"
+                             0 0 0 "session-original")
+            ReviewWorkflow.resumeAgentWithSession second (Guid.NewGuid()) taskId "Owner"
+                0 0 0 "session-new" |> success |> ignore
+            expectStale (ReviewWorkflow.resumeAgentWithSession first (Guid.NewGuid()) taskId "Owner"
+                             0 0 0 "session-original")
+            let _, _, newAttempt = ReviewWorkflow.getTask first taskId |> success
+            Assert.That(newAttempt.Value.AssignmentGeneration, Is.EqualTo(2))
+            expectStale (ReviewWorkflow.checkpointAttemptWithSession first (Guid.NewGuid()) taskId "Owner"
+                             0 0 0 "Stale progress" "Stale action" null "" "session-original")
+            expectStale (ReviewWorkflow.yieldAgentWithSession first (Guid.NewGuid()) taskId "Owner"
+                             0 0 0 "Stale checkpoint" "Stale yield" "session-original")
+            expectStale (ReviewWorkflow.completeAgentWorkWithSession first (Guid.NewGuid()) taskId "Owner"
+                             0 0 0 "Stale completion" "session-original")
+            expectStale (ReviewWorkflow.completeAgentWork first (Guid.NewGuid()) taskId "Owner"
+                             0 0 0 "Versionless without session")
+            ReviewWorkflow.checkpointAttemptWithSession second (Guid.NewGuid()) taskId "Owner"
+                0 0 0 "New session progress" "Finish" null "" "session-new"
+            |> success |> ignore
+            ReviewWorkflow.completeAgentWorkWithSession second (Guid.NewGuid()) taskId "Owner"
+                0 0 0 "Completed by current session" "session-new"
+            |> success |> ignore
+            let finalAgent = (ReviewWorkflow.getAgentInbox first "Owner" |> success).Agent
+            Assert.That(finalAgent.State, Is.EqualTo("NeedsWork"))
+            let _, _, doneAttempt = ReviewWorkflow.getTask second taskId |> success
+            Assert.That(doneAttempt.Value.Phase, Is.EqualTo("Finished")))
+
+    [<Test>]
+    member _.CurrentLifecycleVersionsResolveInsideTransactionAndExplicitStaleVersionsFail() =
+        withFixture (fun _ _ first second _ _ _ _ ->
+            let taskId = "versionless-lifecycle"
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Current-state lifecycle"
+            |> success |> ignore
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner"
+            |> success |> ignore
+            let started =
+                ReviewWorkflow.resumeAgentWithSession first (Guid.NewGuid()) taskId "Owner"
+                    0 0 0 "session-current" |> success
+            Assert.That(started.AlreadyApplied, Is.False)
+            let _, _, attempt, _, acknowledgement =
+                ReviewWorkflow.getAssignment second taskId 1 |> success
+            Assert.That(attempt.Phase, Is.EqualTo("Started"))
+            Assert.That(acknowledgement.IsSome, Is.True)
+            expectStale (ReviewWorkflow.resumeAgentWithSession first (Guid.NewGuid()) taskId "Owner"
+                             1 2 1 "session-stale")
+            ReviewWorkflow.checkpointAttemptWithSession first (Guid.NewGuid()) taskId "Owner"
+                0 0 0 "Progress" "Continue work" null "" "session-current" |> success |> ignore
+            ReviewWorkflow.yieldAgentWithSession second (Guid.NewGuid()) taskId "Owner"
+                0 0 0 "Checkpoint" "Resume work" "session-current" |> success |> ignore
+            let ready = ReviewWorkflow.getAgentInbox first "Owner" |> success
+            Assert.That(ready.Agent.State, Is.EqualTo("Ready"))
+            ReviewWorkflow.resumeAgentWithSession second (Guid.NewGuid()) taskId "Owner"
+                0 0 0 "session-resumed" |> success |> ignore
+            ReviewWorkflow.completeAgentWorkWithSession first (Guid.NewGuid()) taskId "Owner"
+                0 0 0 "Implementation completed" "session-resumed" |> success |> ignore
+            let complete = ReviewWorkflow.getAgentInbox second "Owner" |> success
+            Assert.That(complete.Agent.State, Is.EqualTo("NeedsWork"))
+            let _, _, finished = ReviewWorkflow.getTask second taskId |> success
+            Assert.That(finished.Value.Phase, Is.EqualTo("Finished")))
+
+    [<Test>]
     member _.ResumeAgentStartsQueuedAttemptAndAtomicallyAcknowledgesAssignment() =
         withFixture (fun _ _ first second _ _ _ _ ->
             let taskId = "unified-resume-start"

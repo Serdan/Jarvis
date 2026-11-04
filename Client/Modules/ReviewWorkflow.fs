@@ -1331,10 +1331,17 @@ module ReviewWorkflow =
 
     // A Ready agent has explicitly yielded at a durable checkpoint. Mere inactivity
     // never changes agent state or frees its Working slot.
-    let yieldAgent binding operationId taskId ownerId expectedAttemptVersion expectedAgentVersion
-                   generation summary nextAction =
+    // Calls omitting any optimistic precondition must prove the active
+    // execution session, not merely that task and owner names still match.
+    let private matchesLifecycleSession expectedAttemptVersion expectedAgentVersion requestedGeneration sessionId (agent: ReviewAgent) =
+        let implicit = expectedAttemptVersion = 0 || expectedAgentVersion = 0 || requestedGeneration = 0
+        not implicit || (not (String.IsNullOrWhiteSpace sessionId)
+                         && agent.State = "Working" && agent.ActiveSessionId = sessionId)
+
+    let yieldAgentWithSession binding operationId taskId ownerId expectedAttemptVersion expectedAgentVersion
+                   generation summary nextAction sessionId =
         if not (validTaskId taskId) || not (validAgent ownerId)
-           || expectedAttemptVersion < 1 || expectedAgentVersion < 1 || generation < 1
+           || expectedAttemptVersion < 0 || expectedAgentVersion < 0 || generation < 0
            || not (validText 8192 summary) || not (validText 8192 nextAction) then
             Error(InvalidBinding "Yield requires current versions and a substantive checkpoint/next action.")
         else
@@ -1348,11 +1355,14 @@ module ReviewWorkflow =
                     result {
                         let! task, _, attempt, attemptOid = getAttempt binding snapshot taskId
                         let! agent, agentOid = required<ReviewAgent> binding snapshot (agentPath ownerId)
+                        if not (matchesLifecycleSession expectedAttemptVersion expectedAgentVersion generation sessionId agent) then
+                            return! Error(StaleEntityVersion "Lifecycle command is not from the active execution session.")
+                        let generation = if generation = 0 then attempt.AssignmentGeneration else generation
                         if task.Lifecycle <> "InProgress" || attempt.OwnerAgentId <> ownerId
-                           || attempt.Version <> expectedAttemptVersion
+                           || (expectedAttemptVersion <> 0 && attempt.Version <> expectedAttemptVersion)
                            || attempt.AssignmentGeneration <> generation
                            || attempt.Phase <> "Started" || agent.State <> "Working"
-                           || agent.Version <> expectedAgentVersion
+                           || (expectedAgentVersion <> 0 && agent.Version <> expectedAgentVersion)
                            || agent.ActiveAttemptId <> attempt.AttemptId
                            || agent.FocusAttemptId <> attempt.AttemptId then
                             return! Error(StaleEntityVersion "Yield requires the current Working assignment and slot.")
@@ -1370,6 +1380,10 @@ module ReviewWorkflow =
                                 (enterState "Ready" agent |> fun updated -> { updated with Version = agent.Version + 1; StateReason = nextAction; StateSequence = snapshot.Header.NextSequence }) ]
                     })
 
+    let yieldAgent binding operationId taskId ownerId expectedAttemptVersion expectedAgentVersion generation summary nextAction =
+        yieldAgentWithSession binding operationId taskId ownerId expectedAttemptVersion expectedAgentVersion
+            generation summary nextAction ""
+
     // Existing sessions asking to resume an already-Working attempt only need
     // the current association context. No ledger mutation or timer reset is needed.
     // This is advisory, not a general-purpose session write fence.
@@ -1381,7 +1395,7 @@ module ReviewWorkflow =
             let! agent, _ = required<ReviewAgent> binding snapshot (agentPath ownerId)
             if task.Lifecycle = "InProgress"
                && attempt.OwnerAgentId = ownerId
-               && attempt.AssignmentGeneration = generation
+               && (generation = 0 || attempt.AssignmentGeneration = generation)
                && agent.State = "Working"
                && attempt.Phase = "Started"
                && agent.FocusAttemptId = attempt.AttemptId
@@ -1400,14 +1414,14 @@ module ReviewWorkflow =
                        agentState = agent.State
                        taskId = taskId
                        attemptId = attempt.AttemptId
-                       assignmentGeneration = generation
+                       assignmentGeneration = attempt.AssignmentGeneration
                        head = snapshot.Commit |}
             else return None
         }
 
     let resumeAgentWithSession binding operationId taskId ownerId expectedAttemptVersion expectedAgentVersion generation sessionId =
         if not (validTaskId taskId) || not (validAgent ownerId)
-           || expectedAttemptVersion < 1 || expectedAgentVersion < 1 || generation < 1 then
+           || expectedAttemptVersion < 0 || expectedAgentVersion < 0 || generation < 0 then
             Error(InvalidBinding "Invalid ResumeAgent version or generation.")
         else
             LedgerStore.transact binding
@@ -1420,15 +1434,24 @@ module ReviewWorkflow =
                     result {
                         let! task, _, attempt, attemptOid = getAttempt binding snapshot taskId
                         let! agent, agentOid = required<ReviewAgent> binding snapshot (agentPath ownerId)
+                        let generation = if generation = 0 then attempt.AssignmentGeneration else generation
                         if task.Lifecycle <> "InProgress" || attempt.OwnerAgentId <> ownerId
-                           || attempt.Version <> expectedAttemptVersion
+                           || (expectedAttemptVersion <> 0 && attempt.Version <> expectedAttemptVersion)
                            || attempt.AssignmentGeneration <> generation
-                           || agent.Version <> expectedAgentVersion
+                           || (expectedAgentVersion <> 0 && agent.Version <> expectedAgentVersion)
                            || agent.FocusAttemptId <> attempt.AttemptId then
                             return! Error(StaleEntityVersion "Current task/attempt/owner changed; reread assignment.")
                         let! issuance = requiredIssue binding snapshot taskId attempt
                         if agent.State = "Ready" && attempt.Phase = "Queued"
                            && String.IsNullOrWhiteSpace agent.ActiveAttemptId then
+                            // A generation-reissued assignment must start in a
+                            // new execution session; a prior session cannot
+                            // reclaim it just because versions were omitted.
+                            if not (String.IsNullOrWhiteSpace sessionId)
+                               && not (isNull (box agent.AssociatedSessionIds))
+                               && List.contains sessionId agent.AssociatedSessionIds then
+                                return! Error(StaleEntityVersion
+                                    "This session belongs to an earlier assignment generation; resume in a new session.")
                             // Starting a newly assigned attempt is now an ordinary
                             // ResumeAgent transition. Preserve the original BeginAttempt
                             // behavior: validate and atomically record the assignment receipt.
@@ -1506,10 +1529,10 @@ module ReviewWorkflow =
     let resumeAgent binding operationId taskId ownerId expectedAttemptVersion expectedAgentVersion generation =
         resumeAgentWithSession binding operationId taskId ownerId expectedAttemptVersion expectedAgentVersion generation ""
 
-    let completeAgentWork binding operationId taskId ownerId expectedAttemptVersion expectedAgentVersion
-                          generation summary =
+    let completeAgentWorkWithSession binding operationId taskId ownerId expectedAttemptVersion expectedAgentVersion
+                          generation summary sessionId =
         if not (validTaskId taskId) || not (validAgent ownerId)
-           || expectedAttemptVersion < 1 || expectedAgentVersion < 1 || generation < 1
+           || expectedAttemptVersion < 0 || expectedAgentVersion < 0 || generation < 0
            || not (validText 8192 summary) then
             Error(InvalidBinding "Completion requires a summary and exact assignment versions.")
         else
@@ -1522,6 +1545,9 @@ module ReviewWorkflow =
                     result {
                         let! task, _, attempt, attemptOid = getAttempt binding snapshot taskId
                         let! agent, agentOid = required<ReviewAgent> binding snapshot (agentPath ownerId)
+                        if not (matchesLifecycleSession expectedAttemptVersion expectedAgentVersion generation sessionId agent) then
+                            return! Error(StaleEntityVersion "Lifecycle command is not from the active execution session.")
+                        let generation = if generation = 0 then attempt.AssignmentGeneration else generation
                         let validPhase =
                             (agent.State = "Working" && attempt.Phase = "Started"
                              && agent.ActiveAttemptId = attempt.AttemptId)
@@ -1529,9 +1555,9 @@ module ReviewWorkflow =
                                 && String.IsNullOrWhiteSpace agent.ActiveAttemptId)
                         if not (List.contains task.Lifecycle [ "InProgress"; "Closed" ])
                            || attempt.OwnerAgentId <> ownerId
-                           || attempt.Version <> expectedAttemptVersion
+                           || (expectedAttemptVersion <> 0 && attempt.Version <> expectedAttemptVersion)
                            || attempt.AssignmentGeneration <> generation
-                           || agent.Version <> expectedAgentVersion
+                           || (expectedAgentVersion <> 0 && agent.Version <> expectedAgentVersion)
                            || agent.FocusAttemptId <> attempt.AttemptId || not validPhase then
                             return! Error(StaleEntityVersion "Only the current Working or Ready agent can complete this assignment.")
                         let checkpoint =
@@ -1553,12 +1579,16 @@ module ReviewWorkflow =
 
                     })
 
+    let completeAgentWork binding operationId taskId ownerId expectedAttemptVersion expectedAgentVersion generation summary =
+        completeAgentWorkWithSession binding operationId taskId ownerId expectedAttemptVersion expectedAgentVersion
+            generation summary ""
+
     // A progress checkpoint never yields the Working execution slot. Its
     // source/test evidence is owner-reported, not independently verified.
-    let checkpointAttempt binding operationId taskId ownerId expectedAttemptVersion
-                          expectedAgentVersion generation summary nextAction sourceCommit evidence =
+    let checkpointAttemptWithSession binding operationId taskId ownerId expectedAttemptVersion
+                          expectedAgentVersion generation summary nextAction sourceCommit evidence sessionId =
         if not (validTaskId taskId) || not (validAgent ownerId)
-           || expectedAttemptVersion < 1 || expectedAgentVersion < 1 || generation < 1
+           || expectedAttemptVersion < 0 || expectedAgentVersion < 0 || generation < 0
            || not (validText 8192 summary) || not (validText 8192 nextAction)
            || (not (String.IsNullOrEmpty evidence) && Encoding.UTF8.GetByteCount evidence > 8192) then
             Error(InvalidBinding "Invalid Working checkpoint metadata.")
@@ -1573,10 +1603,13 @@ module ReviewWorkflow =
                     result {
                         let! task, _, attempt, attemptOid = getAttempt binding snapshot taskId
                         let! agent, _ = required<ReviewAgent> binding snapshot (agentPath ownerId)
+                        if not (matchesLifecycleSession expectedAttemptVersion expectedAgentVersion generation sessionId agent) then
+                            return! Error(StaleEntityVersion "Lifecycle command is not from the active execution session.")
+                        let generation = if generation = 0 then attempt.AssignmentGeneration else generation
                         if task.Lifecycle <> "InProgress" || attempt.OwnerAgentId <> ownerId
-                           || attempt.Phase <> "Started" || attempt.Version <> expectedAttemptVersion
+                           || attempt.Phase <> "Started" || (expectedAttemptVersion <> 0 && attempt.Version <> expectedAttemptVersion)
                            || attempt.AssignmentGeneration <> generation
-                           || agent.Version <> expectedAgentVersion || agent.State <> "Working"
+                           || (expectedAgentVersion <> 0 && agent.Version <> expectedAgentVersion) || agent.State <> "Working"
                            || agent.ActiveAttemptId <> attempt.AttemptId then
                             return! Error(StaleEntityVersion "Checkpoint requires exact current Working versions and generation.")
                         let! _ = requiredIssue binding snapshot taskId attempt
@@ -1594,6 +1627,10 @@ module ReviewWorkflow =
                               change (attemptPath taskId attempt.AttemptId) (Some attemptOid)
                                 { attempt with Version = attempt.Version + 1 } ]
                     })
+
+    let checkpointAttempt binding operationId taskId ownerId expectedAttemptVersion expectedAgentVersion generation summary nextAction sourceCommit evidence =
+        checkpointAttemptWithSession binding operationId taskId ownerId expectedAttemptVersion expectedAgentVersion
+            generation summary nextAction sourceCommit evidence ""
 
     let getCheckpoint binding taskId sequence =
         if not (validTaskId taskId) || sequence < 1L then
@@ -1917,7 +1954,7 @@ module ReviewWorkflow =
                                                AssignmentGeneration = attempt.AssignmentGeneration + 1
                                                Phase = "Queued"; IssuedSequence = snapshot.Header.NextSequence }
                               change (agentPath ownerId) (Some agentOid)
-                                (enterState "Ready" (resetSessions agent) |> fun updated -> { updated with Version = agent.Version + 1; StateReason = reason; StateSequence = snapshot.Header.NextSequence })
+                                (enterState "Ready" { agent with ActiveSessionId = null; WorkingTurnStartedAtUtc = null } |> fun updated -> { updated with Version = agent.Version + 1; StateReason = reason; StateSequence = snapshot.Header.NextSequence })
                               change (issuePath taskId attempt.AttemptId
                                           (attempt.AssignmentGeneration + 1)) None
                                 (issue taskId attempt (attempt.AssignmentGeneration + 1)

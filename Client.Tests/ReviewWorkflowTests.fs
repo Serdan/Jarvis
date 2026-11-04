@@ -1394,6 +1394,32 @@ type ReviewWorkflowTests() =
             | other -> Assert.Fail(sprintf "Already acknowledged notification: %A" other))
 
     [<Test>]
+    member _.LegacyNotificationWithoutSourceProjectRemainsReadableAndAcknowledgable() =
+        withFixture (fun one _ first second _ _ _ _ ->
+            let id = Guid.NewGuid()
+            ReviewWorkflow.notifyAgent first id "Owner" "" "Reviewer" "" "Legacy message"
+            |> success |> ignore
+            // Reproduce an actual pre-3.48 schema-v2 notification on the Git
+            // remote: it had no fromProjectName property at all.
+            let checkout = Path.Combine(Path.GetDirectoryName(one), "legacy-notification")
+            git one [ "worktree"; "add"; "--detach"; checkout; "origin/jarvis-orchestration" ] |> ignore
+            let relative = $"notifications/{id:N}.json"
+            let file = Path.Combine(checkout, "notifications", $"{id:N}.json")
+            let node = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(file)).AsObject()
+            Assert.That(node.Remove("fromProjectName"), Is.True)
+            File.WriteAllText(file, node.ToJsonString())
+            git checkout [ "add"; relative ] |> ignore
+            git checkout [ "commit"; "-m"; "Simulate legacy schema-v2 notification" ] |> ignore
+            git checkout [ "push"; "origin"; "HEAD:refs/heads/jarvis-orchestration" ] |> ignore
+            let inbox = ReviewWorkflow.getAgentInbox second "Reviewer" |> success
+            Assert.That(inbox.PendingNotifications.Length, Is.EqualTo(1))
+            Assert.That(inbox.PendingNotifications.Head.FromProjectName, Is.EqualTo(""))
+            Assert.That(inbox.PendingNotifications.Head.Message, Is.EqualTo("Legacy message"))
+            ReviewWorkflow.acknowledgeNotification second (Guid.NewGuid()) "Reviewer" id
+            |> success |> ignore
+            Assert.That((ReviewWorkflow.getAgentInbox first "Reviewer" |> success).PendingNotifications, Is.Empty))
+
+    [<Test>]
     member _.CrossProjectNotificationPersistsSourceWithoutSourceAgentInDestination() =
         withFixture (fun _ _ first second _ _ _ _ ->
             let id = Guid.NewGuid()

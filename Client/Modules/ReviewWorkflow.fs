@@ -375,7 +375,12 @@ module ReviewWorkflow =
                 let complete =
                     required |> Array.forall (fun property ->
                         let mutable memberValue = Unchecked.defaultof<JsonElement>
-                        root.TryGetProperty(property, &memberValue))
+                        root.TryGetProperty(property, &memberValue)
+                        // FromProjectName was added after schema v2 notifications
+                        // were already stored. Missing means same-project; all
+                        // other notification members remain mandatory.
+                        || (typeof<'t> = typeof<AgentNotification>
+                            && property = "fromProjectName"))
                 let status (name: string) (allowed: string list) =
                     let mutable field = Unchecked.defaultof<JsonElement>
                     root.TryGetProperty(name, &field)
@@ -514,6 +519,13 @@ module ReviewWorkflow =
                         return! Error(LedgerIntegrityError $"Invalid ledger entity {path}: {message}")
                     | Ok () ->
                         let parsed = JsonSerializer.Deserialize<'t>(content, options)
+                        let parsed =
+                            if typeof<'t> = typeof<AgentNotification> && not (isNull (box parsed)) then
+                                let notification = unbox<AgentNotification>(box parsed)
+                                if isNull notification.FromProjectName then
+                                    unbox<'t>(box { notification with FromProjectName = "" })
+                                else parsed
+                            else parsed
                         if isNull (box parsed) then
                             return! Error(LedgerIntegrityError $"Null ledger entity: {path}")
                         else

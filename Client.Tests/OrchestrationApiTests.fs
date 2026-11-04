@@ -211,3 +211,28 @@ let historicalPendingJournalKindsRemainRecognizedAfterRenaming () =
     Assert.That(normalize "V2LedgerWrite", Is.EqualTo("LedgerWrite"))
     Assert.That(normalize "TaskWrite", Is.EqualTo("TaskWrite"))
     Assert.That(normalize "Other", Is.EqualTo("Other"))
+
+[<Test>]
+let integrationSubmissionRoutesReviewIdAndTargetRefInCorrectOrder () =
+    // Real server command encoding: Reason holds the optional review ID,
+    // TargetRef holds the remote integration target branch.
+    let cmd : TaskWriteCommand =
+        { ProjectName = "Project1"; Action = "SubmitIntegration"
+          OperationId = Guid.NewGuid().ToString("D"); TaskId = "boundary"
+          AttemptId = Guid.NewGuid().ToString("D"); ActorId = "Owner"; OwnerId = ""
+          Title = ""; Html = ""; ExpectedVersion = 0; ExpectedAgentVersion = 0
+          ExpectedTaskVersion = 0; AssignmentGeneration = 0; Summary = ""
+          NextAction = ""; Reason = Guid.NewGuid().ToString("N")
+          BaseOid = String.replicate 40 "a"; TargetRef = "refs/heads/main"
+          SourceRef = "refs/heads/feature/review"; AllowDetached = false
+          AllowUncommitted = false; DecisionSequence = 0L; Evidence = ""
+          SessionId = "" }
+    let reviewId, targetRef = Client.OrchestrationApi.TaskApi.integrationSubmissionReferences cmd
+    Assert.That(reviewId, Is.EqualTo(cmd.Reason))
+    Assert.That(targetRef, Is.EqualTo(cmd.TargetRef))
+    Assert.That(targetRef, Does.StartWith("refs/heads/"))
+    Assert.That(reviewId, Is.Not.EqualTo(targetRef))
+    let withoutReview = { cmd with Reason = "" }
+    let noReviewId, sameTarget = Client.OrchestrationApi.TaskApi.integrationSubmissionReferences withoutReview
+    Assert.That(noReviewId, Is.Empty)
+    Assert.That(sameTarget, Is.EqualTo(cmd.TargetRef))

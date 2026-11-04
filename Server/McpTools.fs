@@ -202,7 +202,7 @@ module McpToolHelpers =
     let private ledgerTaskReadMethods = [ "GetIntegrationSubmissions"; "AgentInbox"; "GetAssignment"; "GetCheckpoint";  "InspectAttemptSource"; "TaskLifecycleHistory"; "GetTaskSpecPage"; "DiffTaskSpec" ]
     let private ledgerTaskWriteMethods =
         [ "SubmitIntegration"; "CompleteIntegration"; "NotifyAgent"; "AcknowledgeNotification"; "MigrateOrthogonalAgentState"; "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "ReissueAssignment"; "CheckpointAttempt"
-          "BindReviewBase"; "BindAttemptSource"; "RebindAttemptSource"; "YieldAgent"; "ResumeAgent"; "CompleteAgentWork"
+          "SetAttemptSource"; "YieldAgent"; "ResumeAgent"; "CompleteAgentWork"
           "ParkAgent"; "ReissueQueuedAttempt"; "RecoverAgentAssignment"; "AcknowledgeReviewFeedback"
           "DeferAttempt"; "ResumeAttempt"; "AbandonAttempt"; "CancelTask"
           "TransferOwner"; "CloseTask"; "ReopenTask"; "ImportTaskSpec"; "ExportTaskSpec" ]
@@ -1235,27 +1235,27 @@ type JarvisMcpTools =
             { ProjectName = projectName; AgentId = ""; Action = "GetCheckpoint"
               TaskId = taskId; AssignmentGeneration = 0; CheckpointSequence = checkpointSequence; Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null })
 
-    [<McpServerTool(Title = "bind attempt target", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Record source target context for a Working attempt; independent review requests supply their own optional comparison context.")>]
-    static member BindReviewBase(projectName: string, taskId: string, ownerId: string, expectedAttemptVersion: int, assignmentGeneration: int, baseOid: string, targetRef: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
-        let cmd = TaskCommands.write projectName "BindReviewBase" operationId taskId ownerId
-        McpToolHelpers.send client http (TaskWriteCommand { cmd with ExpectedVersion = expectedAttemptVersion; AssignmentGeneration = assignmentGeneration; BaseOid = baseOid; TargetRef = targetRef })
-
-    [<McpServerTool(Title = "bind attempt source", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Record source repository, initial target and branch context for a Working attempt. Working branches remain normal Git branches; source context is not task ownership.")>]
-    static member BindAttemptSource(projectName: string, taskId: string, ownerId: string, expectedAttemptVersion: int, assignmentGeneration: int, sourceRef: string, baseOid: string, targetRef: string, allowDetached: bool, allowUncommitted: bool, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
-        let cmd = TaskCommands.write projectName "BindAttemptSource" operationId taskId ownerId
+    [<McpServerTool(Title = "set attempt source", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Set the source branch for a current Working or Ready attempt. For initial binding supply both baseOid and targetRef; a later source-branch change omits both. Initial binding verifies Git ancestry and optional allowDetached/allowUncommitted; rebinding preserves pinned baseline and independent review snapshots.")>]
+    static member SetAttemptSource(projectName: string, taskId: string, ownerId: string, expectedAttemptVersion: int, assignmentGeneration: int, sourceRef: string,
+                                   [<Optional; DefaultParameterValue("")>] baseOid: string,
+                                   [<Optional; DefaultParameterValue("")>] targetRef: string,
+                                   [<Optional; DefaultParameterValue(false)>] allowDetached: bool,
+                                   [<Optional; DefaultParameterValue(false)>] allowUncommitted: bool,
+                                   [<Optional; DefaultParameterValue("")>] operationId: string,
+                                   [<Optional; DefaultParameterValue("")>] deviceId: string,
+                                   client: ClientService, http: IHttpContextAccessor) =
+        let hasBase = not (String.IsNullOrWhiteSpace baseOid)
+        let hasTarget = not (String.IsNullOrWhiteSpace targetRef)
+        if hasBase <> hasTarget then
+            raise (ArgumentException("Initial source binding requires both baseOid and targetRef. Omit both to update an already bound branch."))
+        if not hasBase && (allowDetached || allowUncommitted) then
+            raise (ArgumentException("allowDetached and allowUncommitted apply only to initial source binding."))
+        let cmd = TaskCommands.write projectName (if hasBase then "BindAttemptSource" else "RebindAttemptSource") operationId taskId ownerId
         McpToolHelpers.send client http
             (TaskWriteCommand
                 { cmd with ExpectedVersion = expectedAttemptVersion; AssignmentGeneration = assignmentGeneration
                            SourceRef = sourceRef; BaseOid = baseOid; TargetRef = targetRef
                            AllowDetached = allowDetached; AllowUncommitted = allowUncommitted })
-
-    [<McpServerTool(Title = "rebind attempt source", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Update working-branch context while an agent is Working or Ready, without interrupting ownership or claimed review snapshots.")>]
-    static member RebindAttemptSource(projectName: string, taskId: string, ownerId: string, expectedAttemptVersion: int, assignmentGeneration: int, sourceRef: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
-        let cmd = TaskCommands.write projectName "RebindAttemptSource" operationId taskId ownerId
-        McpToolHelpers.send client http
-            (TaskWriteCommand
-                { cmd with ExpectedVersion = expectedAttemptVersion; AssignmentGeneration = assignmentGeneration
-                           SourceRef = sourceRef })
 
     [<McpServerTool(Title = "inspect attempt source", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read the pinned source repository/ref and current registered Git worktree observation without changing task ownership, assignment or agent state. Missing source is SourceUnavailable, not agent Free.")>]
     static member InspectAttemptSource(projectName: string, taskId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =

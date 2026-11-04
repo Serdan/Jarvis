@@ -158,3 +158,9 @@ See the [architecture spec](specs/orchestration-architecture.md). The older [Git
 Use `DeferAttempt` for a Queued or Started attempt that should stop holding its agent's assignment. Default `disposition: Deferred` retains the previous park behavior; `disposition: Blocked` retains the previous explicit block behavior. Both require a reason and exact task/attempt/agent versions and preserve immutable lifecycle history. The old `ParkAttempt` and `BlockAttempt` actions remain valid internally for historical ledger operations.
 
 `ResumeAttempt` and `ReissueQueuedAttempt` deliberately remain separate for now: the former creates a new generation when resuming a deferred or blocked attempt; the latter assigns an unoccupied agent to an existing queued generation. This difference requires design/transition review before consolidating further.
+
+## Attempt source context (protocol 3.54)
+
+Use `SetAttemptSource` with an exact task, owner, version, generation, and `sourceRef`. For the first source binding, supply both `baseOid` and `targetRef` so Jarvis can validate ancestry and record source repository identity; optional `allowDetached` and `allowUncommitted` apply only to this initial binding. For later branch switches, omit both baseline fields to retain the original pinned context. Historical `BindAttemptSource` and `RebindAttemptSource` internal ledger actions remain available.
+
+The old `BindReviewBase` public tool is retired: independent review requests have their own exact commit and comparison context. Historical baseline-only attempt bindings remain readable without rewriting Git history. Existing clients must update before calling this revised public API.

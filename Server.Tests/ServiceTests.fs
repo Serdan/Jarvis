@@ -429,7 +429,7 @@ let ``command catalog matches AgentCommand union and MCP tools`` () =
     let ledgerWire = set [ "TaskRead"; "TaskWrite"; "ReviewRead"; "ReviewWrite"; "LedgerRead"; "LedgerWrite" ]
     let orchestrationTools =
         set [ "GetIntegrationSubmissions"; "SubmitIntegration"; "CompleteIntegration"; "NotifyAgent"; "AcknowledgeNotification"; "MigrateOrthogonalAgentState"; "AgentInbox"; "GetAssignment"; "GetCheckpoint"; "InspectAttemptSource"; "TaskLifecycleHistory"; "GetTaskSpecPage"; "DiffTaskSpec"; "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "ReissueAssignment"; "CheckpointAttempt"
-              "BindReviewBase"; "BindAttemptSource"; "RebindAttemptSource"; "YieldAgent"; "ResumeAgent"; "CompleteAgentWork"
+              "SetAttemptSource"; "YieldAgent"; "ResumeAgent"; "CompleteAgentWork"
               "ParkAgent"; "ReissueQueuedAttempt"; "RecoverAgentAssignment"; "AcknowledgeReviewFeedback"; "DeferAttempt"; "ResumeAttempt"; "AbandonAttempt"; "CancelTask"; "TransferOwner"; "CloseTask"; "ReopenTask"; "ImportTaskSpec"; "ExportTaskSpec"
               "ReviewTask"; "TaskOverview"; "ReviewDetails"; "ReviewerInbox"; "ListReviewDocuments"; "ReadReviewDocument"
               "SubmitReview"; "ReplaceReview"; "ClaimReview"; "DecideReview"
@@ -512,7 +512,7 @@ let ``client-backed MCP tools expose an optional per-command deviceId`` () =
         |> Array.filter (fun methodInfo ->
             methodInfo.GetParameters()
             |> Array.exists (fun parameter -> parameter.ParameterType = typeof<ClientService>))
-    clientMethods.Length |> shouldEqual (AgentProtocol.commandDefinitions.Length - 1 + 53) // public orchestration aliases / 8 wire operations
+    clientMethods.Length |> shouldEqual (AgentProtocol.commandDefinitions.Length - 1 + 51) // public orchestration aliases / 8 wire operations
     for methodInfo in clientMethods do
         let deviceParam = methodInfo.GetParameters() |> Array.tryFind (fun parameter -> parameter.Name = "deviceId")
         match deviceParam with
@@ -742,7 +742,7 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
               for name in [ "InitializeLedger"; "BindExistingLedger"; "RebindLedgerRemote"; "AcknowledgePendingOperation" ] -> name, ledgerWrite
               for name in [ "GetIntegrationSubmissions"; "AgentInbox"; "GetAssignment"; "GetCheckpoint"; "InspectAttemptSource"; "TaskLifecycleHistory"; "GetTaskSpecPage"; "DiffTaskSpec" ] -> name, taskRead
               for name in [ "SubmitIntegration"; "CompleteIntegration"; "NotifyAgent"; "AcknowledgeNotification"; "MigrateOrthogonalAgentState"; "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "ReissueAssignment"; "CheckpointAttempt"
-                            "BindReviewBase"; "BindAttemptSource"; "RebindAttemptSource"; "YieldAgent"; "ResumeAgent"; "CompleteAgentWork";
+                            "SetAttemptSource"; "YieldAgent"; "ResumeAgent"; "CompleteAgentWork";
                             "ParkAgent"; "ReissueQueuedAttempt"; "RecoverAgentAssignment"; "AcknowledgeReviewFeedback"; "DeferAttempt"; "ResumeAttempt"; "AbandonAttempt"; "CancelTask"; "TransferOwner"; "CloseTask"; "ReopenTask"; "ImportTaskSpec"; "ExportTaskSpec" ] -> name, taskWrite
               for name in [ "ReviewTask"; "TaskOverview"; "ReviewDetails"; "ReviewerInbox"; "ListReviewDocuments"; "ReadReviewDocument" ] ->
                   name, ledgerRead

@@ -214,7 +214,7 @@ module McpToolHelpers =
         [ "ReviewTask"; "TaskOverview"; "ReviewDetails"; "ReviewerInbox"; "ListReviewDocuments"; "ReadReviewDocument" ]
 
     let private ledgerReviewWriteMethods =
-        [ "SubmitReview"; "ReplaceReview"; "ClaimReview"; "DecideReview"; "ReleaseReview"; "WithdrawReview"
+        [ "SubmitReview"; "ClaimReview"; "DecideReview"; "ReleaseReview"; "WithdrawReview"
           "PutReviewDocument" ]
 
     let private ledgerAliasCapabilities =
@@ -1444,7 +1444,7 @@ type JarvisMcpTools =
         static member ReviewerInbox(projectName: string, reviewerId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
             McpToolHelpers.send client http (ReviewCommands.query projectName "ReviewerQueue" "" "" reviewerId)
 
-    [<McpServerTool(Title = "submit review", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Publish a review snapshot for any available Git commit. No assignment or review phase required. Optional taskId groups the review; optional branch/target/purpose/summary provide context. For unassociated reviews use taskId=_reviews when reading later.")>]
+    [<McpServerTool(Title = "submit review", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Publish a review snapshot for any available Git commit. No assignment or review phase required. Optionally replace an existing unclaimed request using expectedRequestVersion; claimed reviews cannot be replaced. Replacements retain targetRef and purpose. For independent reviews omit taskId (namespace _reviews).")>]
         static member SubmitReview(projectName: string, requesterId: string, requestId: string, headOid: string, [<Optional; DefaultParameterValue("")>] operationId: string,
                                    [<Optional; DefaultParameterValue("")>] taskId: string,
                                    [<Optional; DefaultParameterValue("")>] sourceRef: string,
@@ -1452,17 +1452,17 @@ type JarvisMcpTools =
                                    [<Optional; DefaultParameterValue("")>] purpose: string,
                                    [<Optional; DefaultParameterValue("")>] summary: string,
                                    [<Optional; DefaultParameterValue("")>] deviceId: string,
+                                   [<Optional; DefaultParameterValue(0)>] expectedRequestVersion: int,
                                    client: ClientService, http: IHttpContextAccessor) =
+            if expectedRequestVersion < 0 then
+                raise (ArgumentOutOfRangeException("expectedRequestVersion", "Expected request version must be zero or positive."))
+            if expectedRequestVersion > 0 && (not (String.IsNullOrWhiteSpace targetRef) || not (String.IsNullOrWhiteSpace purpose)) then
+                raise (ArgumentException("Replacement preserves the original targetRef and purpose; omit both on update."))
             let namespaceId = if String.IsNullOrWhiteSpace taskId then "_reviews" else taskId
-            let cmd = ReviewCommands.write projectName "Submit" operationId namespaceId requestId requesterId 0
+            let cmd = ReviewCommands.write projectName (if expectedRequestVersion > 0 then "Update" else "Submit") operationId namespaceId requestId requesterId expectedRequestVersion
             McpToolHelpers.send client http (ReviewWriteCommand
                 { cmd with Kind = purpose; SourceRef = sourceRef; HeadOid = headOid
                            TargetRef = targetRef; Summary = summary })
-
-    [<McpServerTool(Title = "replace review", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Replace an unclaimed review with a new published Git snapshot and diff base. Claimed reviews cannot be replaced.")>]
-        static member ReplaceReview(projectName: string, taskId: string, requesterId: string, requestId: string, expectedRequestVersion: int, sourceRef: string, headOid: string, summary: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
-            let cmd = ReviewCommands.write projectName "Update" operationId taskId requestId requesterId expectedRequestVersion
-            McpToolHelpers.send client http (ReviewWriteCommand { cmd with SourceRef = sourceRef; HeadOid = headOid; Summary = summary })
 
     [<McpServerTool(Title = "claim review", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Claim an unclaimed review and freeze its submitted Git branch for independent inspection.")>]
         static member ClaimReview(projectName: string, taskId: string, requestId: string, reviewerId: string, expectedRequestVersion: int, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =

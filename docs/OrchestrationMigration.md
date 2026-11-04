@@ -147,3 +147,8 @@ Use the unprefixed canonical task/review tools for live writes; do not push hand
 A project is migrated when its canonical ledger is bound, its **relevant active tasks** are recreated, agents use the orphan-ledger tools for all new orchestration writes, and participating clients agree on its state. Other projects can migrate independently. Updating the Jarvis client/server by itself does not complete this per-project step.
 
 See the [architecture spec](specs/orchestration-architecture.md). The older [Git-backed tasks guide](GitBackedTasks.md) describes the retired source-branch workflow.
+
+
+## Review publication (protocol 3.53)
+
+`SubmitReview` publishes a new review when `expectedRequestVersion` is omitted (0). To replace an existing unclaimed review snapshot, use the same tool with the existing `requestId` and a positive `expectedRequestVersion`; this uses the historical Update action internally. Claimed reviews remain immutable and reject replacement. Replacement preserves the original `purpose` and `targetRef`, so omit these on update. The separate public `ReplaceReview` tool is retired; existing ledger operations remain compatible.

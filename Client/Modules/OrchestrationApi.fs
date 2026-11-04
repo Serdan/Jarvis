@@ -988,6 +988,11 @@ module TaskApi =
     let private mapError (result: Result<'a, LedgerStore.LedgerFailure>) : Result<'a, EffectError> =
         result |> Result.mapError LedgerErrors.toEffect
 
+    // The transport stores reviewId in Reason, not TargetRef.
+    // Keep the positional submitIntegration call aligned with its signature.
+    let integrationSubmissionReferences (cmd: TaskWriteCommand) =
+        cmd.Reason, cmd.TargetRef
+
     let private guid label (text: string) =
         match Guid.TryParse text with
         | true, id when id <> Guid.Empty -> Ok id
@@ -1067,9 +1072,10 @@ module TaskApi =
                                 | "SubmitIntegration" ->
                                     guid "submissionId" cmd.AttemptId
                                     |> Result.bind (fun submissionId ->
+                                        let reviewId, targetRef = integrationSubmissionReferences cmd
                                         ReviewWorkflow.ReviewWorkflow.submitIntegration binding operationId
                                             cmd.TaskId cmd.ActorId submissionId cmd.SourceRef cmd.BaseOid
-                                            cmd.TargetRef cmd.Reason |> mapError)
+                                            reviewId targetRef |> mapError)
                                 | "CompleteIntegration" ->
                                     guid "submissionId" cmd.AttemptId
                                     |> Result.bind (fun submissionId ->

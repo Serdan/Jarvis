@@ -103,7 +103,7 @@ let write_tools_expose_optional_operation_ids () =
                            && methodInfo.Name <> "AcknowledgePendingOperation" ->
                 Some (methodInfo.Name, id)
             | _ -> None)
-    Assert.That(writeMethods.Length, Is.EqualTo(45), String.concat ", " (writeMethods |> Array.map fst))
+    Assert.That(writeMethods.Length, Is.EqualTo(44), String.concat ", " (writeMethods |> Array.map fst))
     for name, id in writeMethods do
         Assert.That(id.IsOptional, Is.True, $"operationId is required on {name}")
         Assert.That(id.DefaultValue, Is.EqualTo(""), $"operationId default differs on {name}")
@@ -164,3 +164,15 @@ let resume_agent_is_the_only_public_start_tool () =
     let expectedAgentVersion =
         resume.GetParameters() |> Array.find (fun parameter -> parameter.Name = "expectedAgentVersion")
     Assert.That(expectedAgentVersion.IsOptional, Is.False)
+
+[<Test>]
+let queued_assignment_update_exposes_both_reissue_and_spec_adoption () =
+    let methods = typeof<Server.JarvisMcpTools>
+    Assert.That(methods.GetMethod("AdoptTaskSpec"), Is.Null)
+    let reissue = methods.GetMethod("ReissueAssignment")
+    Assert.That(reissue, Is.Not.Null)
+    for name in [ "newSpecHtml"; "expectedCurrentSpecBlobOid"; "expectedTaskVersion" ] do
+        let parameter = reissue.GetParameters() |> Array.find (fun p -> p.Name = name)
+        Assert.That(parameter.IsOptional, Is.True, name)
+        Assert.That(parameter.DefaultValue,
+                    Is.EqualTo(if name = "expectedTaskVersion" then box 0 else box ""), name)

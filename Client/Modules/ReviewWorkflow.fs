@@ -2579,7 +2579,7 @@ module ReviewWorkflow =
                             LedgerStore.readAt binding current (reviewDocumentPath taskId id "summary.md")
                         return [ change (branchReviewPath taskId id) (Some reviewOid)
                                    { review with Version = review.Version + 1
-                                                 ReviewRef = refName; BaseCommit = baseOid; TaskRef = sourceRef }
+                                                 ReviewRef = refName; BaseCommit = baseOid; TaskRef = if String.IsNullOrWhiteSpace sourceRef then review.TaskRef else sourceRef }
                                  { Path = reviewDocumentPath taskId id "summary.md"
                                    ExpectedBlobOid = summaryOid; Content = summary } ]
                     })

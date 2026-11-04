@@ -387,6 +387,35 @@ type ReviewWorkflowTests() =
                 (updated.Review.Version + 1) Accept |> success |> ignore)
 
     [<Test>]
+    member _.ReplacingReviewWithoutOptionalSourceRefRetainsBranchAndAllowsExplicitChange() =
+        withFixture (fun _ _ first second _ sourceRef newCommit _ ->
+            let taskId = "review-optional-source"
+            let originalHead = newCommit "Original optional source" "first"
+            let reviewId = Guid.NewGuid()
+            ReviewWorkflow.submitBranchReview first (Guid.NewGuid()) taskId "Owner"
+                reviewId sourceRef originalHead "Initial" "source-preservation" ""
+            |> success |> ignore
+            let replacementHead = newCommit "Replacement optional source" "second"
+            ReviewWorkflow.replaceBranchReview first (Guid.NewGuid()) taskId "Owner"
+                reviewId 1 "" replacementHead "Replace without branch"
+            |> success |> ignore
+            let result = ReviewWorkflow.getBranchReview first taskId reviewId |> success
+            Assert.That(result.Review.TaskRef, Is.EqualTo(sourceRef))
+            Assert.That(result.Review.Kind, Is.EqualTo("source-preservation"))
+            Assert.That(result.HeadCommit, Is.EqualTo(replacementHead))
+            ReviewWorkflow.replaceBranchReview first (Guid.NewGuid()) taskId "Owner"
+                reviewId 2 "refs/heads/main" replacementHead "Replace with explicit branch"
+            |> success |> ignore
+            let updated = ReviewWorkflow.getBranchReview second taskId reviewId |> success
+            Assert.That(updated.Review.TaskRef, Is.EqualTo("refs/heads/main"))
+            ReviewWorkflow.claimBranchReview first (Guid.NewGuid()) taskId reviewId "Reviewer" 3
+            |> success |> ignore
+            match ReviewWorkflow.replaceBranchReview first (Guid.NewGuid()) taskId "Owner"
+                      reviewId 4 "" replacementHead "Claimed review is frozen" with
+            | Error(ReviewAlreadyClaimed _) -> ()
+            | other -> failwithf "Expected claimed-review protection, got %A" other)
+
+    [<Test>]
     member _.OwnerTransferKeepsReviewAndTaskCanCloseWhileWorkerIsActive() =
         withFixture (fun _ _ first second _ sourceRef newCommit initTask ->
             let taskId = "handoff-independent"

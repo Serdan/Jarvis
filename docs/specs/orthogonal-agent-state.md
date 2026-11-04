@@ -104,7 +104,7 @@ All mutations remain explicit, Git-ledger-backed, idempotent by operation ID and
 | --- | --- | --- | --- |
 | `RegisterAgent` | None / Stopped / Parked | None | None |
 | `AssignTask` | Assignment set / Stopped / null → **Ready** | Create Queued attempt/issue | Task InProgress as today |
-| `AcknowledgeAssignment` | Unchanged (Ready) | Write acknowledgment receipt, phase stays Queued | None |
+| Historical `AcknowledgeAssignment` (internal compatibility only) | Unchanged (Ready) | Write acknowledgment receipt, phase stays Queued | None |
 | `ResumeAgent` on newly assigned Ready agent | Keep assignment / Working / null | Queued → Started | Atomic assignment acknowledgement |
 | `YieldAgent` | Keep assignment / Stopped / null → **Ready** | Remains Started; add yield checkpoint | None |
 | `ResumeAgent` on stopped agent | Keep assignment / Working / null | Remains Started | None |

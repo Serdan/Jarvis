@@ -103,7 +103,7 @@ let write_tools_expose_optional_operation_ids () =
                            && methodInfo.Name <> "AcknowledgePendingOperation" ->
                 Some (methodInfo.Name, id)
             | _ -> None)
-    Assert.That(writeMethods.Length, Is.EqualTo(45), String.concat ", " (writeMethods |> Array.map fst))
+    Assert.That(writeMethods.Length, Is.EqualTo(42), String.concat ", " (writeMethods |> Array.map fst))
     for name, id in writeMethods do
         Assert.That(id.IsOptional, Is.True, $"operationId is required on {name}")
         Assert.That(id.DefaultValue, Is.EqualTo(""), $"operationId default differs on {name}")
@@ -164,3 +164,20 @@ let resume_agent_is_the_only_public_start_tool () =
     let expectedAgentVersion =
         resume.GetParameters() |> Array.find (fun parameter -> parameter.Name = "expectedAgentVersion")
     Assert.That(expectedAgentVersion.IsOptional, Is.False)
+
+[<Test>]
+let core_task_tools_have_one_public_operation_per_intention () =
+    let tool name = typeof<Server.JarvisMcpTools>.GetMethod(name)
+    for retired in [ "AcknowledgeAssignment"; "CancelOpenTask"; "ReviseTaskSpecPinned" ] do
+        Assert.That(tool retired, Is.Null, $"Retired MCP tool {retired} must not be exposed.")
+    let revise = tool "ReviseTaskSpec"
+    Assert.That(revise, Is.Not.Null)
+    let expectedSpec = revise.GetParameters() |> Array.find (fun p -> p.Name = "expectedSpecBlobOid")
+    Assert.That(expectedSpec.IsOptional, Is.True)
+    Assert.That(expectedSpec.DefaultValue, Is.EqualTo(""))
+    let cancel = tool "CancelTask"
+    Assert.That(cancel, Is.Not.Null)
+    for name in [ "expectedAttemptVersion"; "expectedAgentVersion"; "assignmentGeneration" ] do
+        let parameter = cancel.GetParameters() |> Array.find (fun p -> p.Name = name)
+        Assert.That(parameter.IsOptional, Is.True, name)
+        Assert.That(parameter.DefaultValue, Is.EqualTo(0), name)

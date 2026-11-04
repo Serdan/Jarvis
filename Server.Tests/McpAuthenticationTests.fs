@@ -143,3 +143,14 @@ let generated_operation_id_is_in_agent_visible_result_and_metadata () =
     Assert.That(text, Does.Contain("retries"))
     let unchanged = Server.McpToolHelpers.attachGeneratedOperationId None result
     Assert.That(Object.ReferenceEquals(updated, unchanged), Is.True)
+
+[<Test>]
+let cross_project_notification_parameter_is_optional_and_backwards_compatible () =
+    let methodInfo = typeof<Server.JarvisMcpTools>.GetMethod("NotifyAgent")
+    let parameters = methodInfo.GetParameters()
+    let destination = parameters |> Array.find (fun p -> p.Name = "toProjectName")
+    Assert.That(destination.IsOptional, Is.True)
+    Assert.That(destination.DefaultValue, Is.EqualTo(""))
+    for name in [ "projectName"; "fromAgentId"; "toAgentId"; "message" ] do
+        let parameter = parameters |> Array.find (fun p -> p.Name = name)
+        Assert.That(parameter.IsOptional, Is.False, $"{name} must remain required")

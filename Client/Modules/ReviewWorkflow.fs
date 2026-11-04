@@ -227,6 +227,7 @@ type ReviewFeedbackNotice =
 type AgentNotification =
     { NotificationId: string
       FromAgentId: string
+      FromProjectName: string
       ToAgentId: string
       TaskId: string
       Message: string
@@ -1061,8 +1062,10 @@ module ReviewWorkflow =
                 })
             }
 
-    let notifyAgent binding operationId fromAgentId toAgentId taskId message =
+    let notifyAgent binding operationId fromAgentId fromProjectName toAgentId taskId message =
+        let crossProject = not (String.IsNullOrWhiteSpace fromProjectName)
         if not (validAgent fromAgentId) || not (validAgent toAgentId)
+           || (crossProject && (fromProjectName.Length > 256 || fromProjectName.Contains('/')))
            || not (validText 4096 message)
            || (not (String.IsNullOrWhiteSpace taskId) && not (validTaskId taskId)) then
             Error(InvalidBinding "Invalid notification sender, recipient, task or message.")
@@ -1070,16 +1073,21 @@ module ReviewWorkflow =
             // Operation ID is also the stable notification ID: retries cannot duplicate messages.
             LedgerStore.transact binding
                 (intent operationId fromAgentId "NotifyAgent"
-                    {| toAgentId = toAgentId; taskId = taskId; message = message |})
+                    {| toAgentId = toAgentId; fromProjectName = fromProjectName; taskId = taskId; message = message |})
                 (fun snapshot -> result {
-                    let! _ = required<ReviewAgent> binding snapshot (agentPath fromAgentId)
+                    // A cross-project sender was verified against its source ledger
+                    // by the server before routing this destination-ledger write.
+                    if not crossProject then
+                        let! _ = required<ReviewAgent> binding snapshot (agentPath fromAgentId)
+                        ()
                     let! _ = required<ReviewAgent> binding snapshot (agentPath toAgentId)
-                    if not (String.IsNullOrWhiteSpace taskId) then
+                    if not crossProject && not (String.IsNullOrWhiteSpace taskId) then
                         let! _ = required<ReviewTask> binding snapshot (taskPath taskId)
                         ()
                     let notification =
                         { NotificationId = operationId.ToString("N")
-                          FromAgentId = fromAgentId; ToAgentId = toAgentId
+                          FromAgentId = fromAgentId; FromProjectName = if crossProject then fromProjectName else ""
+                          ToAgentId = toAgentId
                           TaskId = if isNull taskId then "" else taskId
                           Message = message
                           CreatedAtUtc = DateTimeOffset.UtcNow.ToString("O")

@@ -8,6 +8,26 @@ open Common.SignalR
 open Microsoft.AspNetCore.SignalR
 open Microsoft.FSharp.Core
 
+module ProjectNotificationRouting =
+    let candidates (selected: ClientSessionStatus voption) (sessions: ClientSessionStatus list)
+                   (explicitDevice: bool) (commandName: string) (requireCurrentProtocol: bool) =
+        let ordered =
+            if explicitDevice then
+                match selected with
+                | ValueSome session -> [ session ]
+                | ValueNone -> []
+            else
+                match selected with
+                | ValueSome session ->
+                    session :: (sessions |> List.filter (fun candidate -> candidate.DeviceId <> session.DeviceId))
+                | ValueNone -> sessions
+        ordered
+        |> List.filter (fun session ->
+            session.State = Registered && session.ConnectionId.IsSome
+            && List.contains "LedgerRead" session.SupportedCommands
+            && List.contains commandName session.SupportedCommands
+            && (not requireCurrentProtocol || session.ProtocolVersion = AgentProtocol.version))
+
 type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserService, tracker: ClientResponseTracker) =
     member this.SendMessageToAll(message) = ctx.Clients.All.ReceiveMessage(message)
 
@@ -100,4 +120,43 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                                 { Result = None
                                   Error = Some(ExecutionFailed reason)
                                   Instructions = [] }
+        }
+
+
+    // Only used by cross-project notifications. Probe connected clients for the
+    // destination's verified ledger binding instead of assuming the sender's
+    // selected device has the destination project.
+    member this.SendCommandToProject(userId: string, projectName: string, command: AgentCommand,
+                                     ?conversationId: string, ?deviceId: string) =
+        task {
+            let selected = users.GetSelectedSession(userId, conversationId, deviceId)
+            let eligible =
+                ProjectNotificationRouting.candidates selected
+                    (users.ListDevices(userId) |> Array.toList) deviceId.IsSome
+                    (AgentCommandInfo.protocolName command)
+                    (match command with
+                     | TaskWriteCommand write when write.Action = "NotifyAgent"
+                           && not (String.IsNullOrWhiteSpace write.SourceRef) -> true
+                     | _ -> false)
+            let rec dispatch (remaining: ClientSessionStatus list) =
+                task {
+                    match remaining with
+                    | [] ->
+                        return { Result = None
+                                 Error = Some(NotFound $"No compatible connected Jarvis client with a verified ledger binding for project '{projectName}'. Cross-project notification writes require protocol {AgentProtocol.version}.")
+                                 Instructions = [] }
+                    | session :: rest ->
+                        let! health = this.SendCommandToUser(
+                            userId,
+                            LedgerReadCommand { ProjectName = projectName; Action = "LedgerHealth"; OperationId = "" },
+                            ?conversationId = conversationId, deviceId = session.DeviceId)
+                        match health.Result, health.Error with
+                        | Some _, None ->
+                            // Never automatically repeat a write on another client:
+                            // an uncertain result may already have been committed.
+                            return! this.SendCommandToUser(userId, command,
+                                                            ?conversationId = conversationId, deviceId = session.DeviceId)
+                        | _ -> return! dispatch rest
+                }
+            return! dispatch eligible
         }

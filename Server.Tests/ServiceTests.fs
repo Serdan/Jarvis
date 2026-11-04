@@ -1014,3 +1014,43 @@ let ``typed  ledger failures survive response JSON roundtrip`` () =
         Assert.That(issue.Code, Is.EqualTo("OutcomeUnknown"))
         Assert.That(issue.OperationId, Is.EqualTo(Some operationId))
     | other -> Assert.Fail(sprintf "Lost typed  failure during transport: %A" other)
+
+
+[<Test>]
+let cross_project_routing_prefers_selected_client_then_eligible_alternatives () =
+    let users = UserService()
+    let user = "agent-owner"
+    let registration id commands =
+        { DeviceId = id
+          DeviceName = id
+          ProtocolVersion = AgentProtocol.version
+          ClientVersion = "1.0"
+          SupportedCommands = commands }
+    let all = [ "LedgerRead"; "TaskRead"; "TaskWrite" ]
+    users.TransportConnected(user, "sender-connection")
+    users.Register(user, registration "sender" all, "sender-connection") |> ignore
+    users.TransportConnected(user, "destination-connection")
+    users.Register(user, registration "destination" all, "destination-connection") |> ignore
+    let selected = users.GetSessionByDevice(user, "sender")
+    let candidates = ProjectNotificationRouting.candidates selected
+                         (users.ListDevices(user) |> Array.toList) false "TaskWrite" false
+    (candidates |> List.map (fun device -> device.DeviceId))
+    |> shouldEqual [ "sender"; "destination" ]
+    let pinned = ProjectNotificationRouting.candidates selected
+                     (users.ListDevices(user) |> Array.toList) true "TaskWrite" false
+    (pinned |> List.map (fun device -> device.DeviceId)) |> shouldEqual [ "sender" ]
+    users.Disconnect("sender-connection", Some "Disconnected")
+    let fallback = ProjectNotificationRouting.candidates (users.GetSessionByDevice(user, "sender"))
+                       (users.ListDevices(user) |> Array.toList) false "TaskWrite" false
+    (fallback |> List.map (fun device -> device.DeviceId)) |> shouldEqual [ "destination" ]
+    let oldVersion = { (users.GetSessionByDevice(user, "destination") |> function ValueSome session -> session | _ -> failwith "Missing device")
+                       with ProtocolVersion = "3.47" }
+    let crossEligible = ProjectNotificationRouting.candidates ValueNone
+                            [ oldVersion ] false "TaskWrite" true
+    crossEligible |> shouldEqual []
+    let ordinaryEligible = ProjectNotificationRouting.candidates ValueNone
+                               [ oldVersion ] false "TaskWrite" false
+    ordinaryEligible.Length |> shouldEqual 1
+    let unrelated = ProjectNotificationRouting.candidates ValueNone
+                        (users.ListDevices("different-user") |> Array.toList) false "TaskWrite" false
+    unrelated |> shouldEqual []

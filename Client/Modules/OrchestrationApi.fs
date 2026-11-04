@@ -1077,7 +1077,7 @@ module TaskApi =
                                             cmd.TaskId cmd.ActorId submissionId cmd.BaseOid |> mapError)
                                 | "NotifyAgent" ->
                                     ReviewWorkflow.ReviewWorkflow.notifyAgent binding operationId
-                                        cmd.ActorId cmd.OwnerId cmd.TaskId cmd.Summary |> mapError
+                                        cmd.ActorId cmd.SourceRef cmd.OwnerId cmd.TaskId cmd.Summary |> mapError
                                 | "AcknowledgeNotification" ->
                                     guid "notificationId" cmd.AttemptId
                                     |> Result.bind (fun notificationId ->

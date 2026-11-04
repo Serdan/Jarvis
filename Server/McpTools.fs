@@ -523,7 +523,36 @@ module McpToolHelpers =
                                     Auth.hasScope Auth.WorkspaceRead context.User) ->
                     let tracking = beginOperation context userId command
                     let stopwatch = Stopwatch.StartNew()
-                    let! response = client.SendCommandToUser(userId, command, ?conversationId = RequestDeviceRouting.session(), ?deviceId = RequestDeviceRouting.deviceOverride())
+                    let! response =
+                        match command with
+                        | TaskWriteCommand notification when notification.Action = "NotifyAgent"
+                            && not (String.IsNullOrWhiteSpace notification.SourceRef)
+                            && notification.SourceRef <> notification.ProjectName ->
+                            task {
+                                // Validate sender in its source project's verified ledger.
+                                // The destination project alone owns the notification.
+                                let! sender = client.SendCommandToProject(
+                                    userId, notification.SourceRef,
+                                    TaskReadCommand
+                                        { ProjectName = notification.SourceRef
+                                          Action = "AgentInbox"; AgentId = notification.ActorId
+                                          TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L
+                                          Cursor = ""; PageSize = 0; BeforeOid = null
+                                          AfterOid = null; RelativePath = null },
+                                    ?conversationId = RequestDeviceRouting.session(),
+                                    ?deviceId = RequestDeviceRouting.deviceOverride())
+                                match sender.Result, sender.Error with
+                                | Some _, None ->
+                                    return! client.SendCommandToProject(
+                                        userId, notification.ProjectName, command,
+                                        ?conversationId = RequestDeviceRouting.session(),
+                                        ?deviceId = RequestDeviceRouting.deviceOverride())
+                                | _ -> return sender
+                            }
+                        | _ ->
+                            client.SendCommandToUser(userId, command,
+                                                     ?conversationId = RequestDeviceRouting.session(),
+                                                     ?deviceId = RequestDeviceRouting.deviceOverride())
                     stopwatch.Stop()
                     finishOperation tracking response stopwatch.ElapsedMilliseconds
 
@@ -1150,10 +1179,14 @@ type JarvisMcpTools =
         let cmd = TaskCommands.write projectName "CompleteIntegration" operationId taskId actorId
         McpToolHelpers.send client http (TaskWriteCommand { cmd with AttemptId = submissionId; BaseOid = integratedCommit })
 
-    [<McpServerTool(Title = "notify agent", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Send a durable coordination notification between two registered agents in the canonical Git ledger. Appears in the recipient's agent_inbox and the TUI until acknowledged; does not change assignments or execution state. operationId is a stable UUID used as the notification ID.")>]
-    static member NotifyAgent(projectName: string, fromAgentId: string, toAgentId: string, message: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] taskId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
-        let cmd = TaskCommands.write projectName "NotifyAgent" operationId taskId fromAgentId
-        McpToolHelpers.send client http (TaskWriteCommand { cmd with OwnerId = toAgentId; Summary = message })
+    [<McpServerTool(Title = "notify agent", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Send a durable notification to an agent in the same project or in optional toProjectName. Cross-project sends verify the sender in the source ledger and write only to the destination Git ledger, routing to a connected client that has its binding. The recipient inbox exposes the source project and agent. Omit operationId for a generated ID; reuse the returned ID for an uncertain retry.")>]
+    static member NotifyAgent(projectName: string, fromAgentId: string, toAgentId: string, message: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] taskId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, [<Optional; DefaultParameterValue("")>] toProjectName: string, client: ClientService, http: IHttpContextAccessor) =
+        let crossProject = not (String.IsNullOrWhiteSpace toProjectName) && toProjectName <> projectName
+        let destination = if crossProject then toProjectName else projectName
+        let cmd = TaskCommands.write destination "NotifyAgent" operationId taskId fromAgentId
+        McpToolHelpers.send client http (TaskWriteCommand
+            { cmd with OwnerId = toAgentId; Summary = message
+                       SourceRef = if crossProject then projectName else "" })
 
     [<McpServerTool(Title = "acknowledge notification", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Mark an existing agent coordination notification as read by its recipient. Preserves the message in the Git ledger; unrelated tasks, assignments, reviews and execution states are unchanged.")>]
     static member AcknowledgeNotification(projectName: string, agentId: string, notificationId: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =

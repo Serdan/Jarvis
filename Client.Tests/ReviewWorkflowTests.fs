@@ -1358,7 +1358,7 @@ type ReviewWorkflowTests() =
             let recipientBefore = before.Agent
             let id = Guid.NewGuid()
             let send () =
-                ReviewWorkflow.notifyAgent first id "Owner" "Reviewer" "notify-task"
+                ReviewWorkflow.notifyAgent first id "Owner" "" "Reviewer" "notify-task"
                     "Please confirm the navigation interface"
             let initial = send () |> success
             Assert.That(initial.AlreadyApplied, Is.False)
@@ -1369,6 +1369,7 @@ type ReviewWorkflowTests() =
             let notice = inbox.PendingNotifications.Head
             Assert.That(notice.NotificationId, Is.EqualTo(id.ToString("N")))
             Assert.That(notice.FromAgentId, Is.EqualTo("Owner"))
+            Assert.That(notice.FromProjectName, Is.Empty)
             Assert.That(notice.TaskId, Is.EqualTo("notify-task"))
             Assert.That(notice.Message, Is.EqualTo("Please confirm the navigation interface"))
             Assert.That(notice.CreatedAtUtc, Is.Not.Empty)
@@ -1393,12 +1394,34 @@ type ReviewWorkflowTests() =
             | other -> Assert.Fail(sprintf "Already acknowledged notification: %A" other))
 
     [<Test>]
+    member _.CrossProjectNotificationPersistsSourceWithoutSourceAgentInDestination() =
+        withFixture (fun _ _ first second _ _ _ _ ->
+            let id = Guid.NewGuid()
+            let send () =
+                ReviewWorkflow.notifyAgent first id "Agent 10" "Wayfold" "Reviewer"
+                    "311" "Blocked resume_agent: operationId was UUID-shaped"
+            let initial = send () |> success
+            Assert.That(initial.AlreadyApplied, Is.False)
+            Assert.That((send () |> success).AlreadyApplied, Is.True)
+            let inbox = ReviewWorkflow.getAgentInbox second "Reviewer" |> success
+            Assert.That(inbox.PendingNotifications.Length, Is.EqualTo(1))
+            let notification = inbox.PendingNotifications.Head
+            Assert.That(notification.FromProjectName, Is.EqualTo("Wayfold"))
+            Assert.That(notification.FromAgentId, Is.EqualTo("Agent 10"))
+            Assert.That(notification.TaskId, Is.EqualTo("311"))
+            Assert.That(notification.ToAgentId, Is.EqualTo("Reviewer"))
+            Assert.That(notification.NotificationId, Is.EqualTo(id.ToString("N")))
+            ReviewWorkflow.acknowledgeNotification second (Guid.NewGuid()) "Reviewer" id
+            |> success |> ignore
+            Assert.That((ReviewWorkflow.getAgentInbox first "Reviewer" |> success).PendingNotifications, Is.Empty))
+
+    [<Test>]
     member _.InvalidNotificationDoesNotReachRecipient() =
         withFixture (fun _ _ first second _ _ _ _ ->
-            match ReviewWorkflow.notifyAgent first (Guid.NewGuid()) "Owner" "Absent" "" "Hello" with
+            match ReviewWorkflow.notifyAgent first (Guid.NewGuid()) "Owner" "" "Absent" "" "Hello" with
             | Error(StaleEntityVersion _) -> ()
             | other -> Assert.Fail(sprintf "Unknown recipient must be rejected: %A" other)
-            match ReviewWorkflow.notifyAgent first (Guid.NewGuid()) "Owner" "Reviewer" "" " " with
+            match ReviewWorkflow.notifyAgent first (Guid.NewGuid()) "Owner" "" "Reviewer" "" " " with
             | Error(InvalidBinding _) -> ()
             | other -> Assert.Fail(sprintf "Empty notification must be rejected: %A" other)
             Assert.That((ReviewWorkflow.getAgentInbox second "Reviewer" |> success).PendingNotifications, Is.Empty))
@@ -1876,7 +1899,7 @@ type ReviewWorkflowTests() =
             ReviewWorkflow.yieldAgent first (Guid.NewGuid()) taskId "Owner" 3 3 1
                 "Slice committed" "Review four commits" |> success |> ignore
             let notificationId = Guid.NewGuid()
-            ReviewWorkflow.notifyAgent first notificationId "Reviewer" "Owner" taskId
+            ReviewWorkflow.notifyAgent first notificationId "Reviewer" "" "Owner" taskId
                 "Please agree on the new interface" |> success |> ignore
             let canonical = ReviewWorkflow.getAgentInbox first "Owner" |> success
             Assert.That(canonical.Agent.State, Is.EqualTo("Ready"))

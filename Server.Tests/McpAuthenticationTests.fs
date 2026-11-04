@@ -103,7 +103,7 @@ let write_tools_expose_optional_operation_ids () =
                            && methodInfo.Name <> "AcknowledgePendingOperation" ->
                 Some (methodInfo.Name, id)
             | _ -> None)
-    Assert.That(writeMethods.Length, Is.EqualTo(38), String.concat ", " (writeMethods |> Array.map fst))
+    Assert.That(writeMethods.Length, Is.EqualTo(37), String.concat ", " (writeMethods |> Array.map fst))
     for name, id in writeMethods do
         Assert.That(id.IsOptional, Is.True, $"operationId is required on {name}")
         Assert.That(id.DefaultValue, Is.EqualTo(""), $"operationId default differs on {name}")
@@ -216,3 +216,13 @@ let source_context_has_one_public_tool_with_optional_initial_baseline () =
     for name in [ "baseOid"; "targetRef"; "allowDetached"; "allowUncommitted" ] do
         let parameter = setSource.GetParameters() |> Array.find (fun p -> p.Name = name)
         Assert.That(parameter.IsOptional, Is.True, name)
+
+[<Test>]
+let review_publication_is_one_tool_with_optional_replacement_version () =
+    let methods = typeof<Server.JarvisMcpTools>
+    Assert.That(methods.GetMethod("ReplaceReview"), Is.Null)
+    let publish = methods.GetMethod("SubmitReview")
+    Assert.That(publish, Is.Not.Null)
+    let expected = publish.GetParameters() |> Array.find (fun p -> p.Name = "expectedRequestVersion")
+    Assert.That(expected.IsOptional, Is.True)
+    Assert.That(expected.DefaultValue, Is.EqualTo(0))

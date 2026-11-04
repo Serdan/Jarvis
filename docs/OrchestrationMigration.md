@@ -164,3 +164,7 @@ Use `DeferAttempt` for a Queued or Started attempt that should stop holding its 
 Use `SetAttemptSource` with an exact task, owner, version, generation, and `sourceRef`. For the first source binding, supply both `baseOid` and `targetRef` so Jarvis can validate ancestry and record source repository identity; optional `allowDetached` and `allowUncommitted` apply only to this initial binding. For later branch switches, omit both baseline fields to retain the original pinned context. Historical `BindAttemptSource` and `RebindAttemptSource` internal ledger actions remain available.
 
 The old `BindReviewBase` public tool is retired: independent review requests have their own exact commit and comparison context. Historical baseline-only attempt bindings remain readable without rewriting Git history. Existing clients must update before calling this revised public API.
+
+## Review publication (protocol 3.53)
+
+`SubmitReview` publishes a new review when `expectedRequestVersion` is omitted (0). To replace an existing unclaimed review snapshot, use the same tool with the existing `requestId` and a positive `expectedRequestVersion`; this uses the historical Update action internally. Claimed reviews remain immutable and reject replacement. Replacement preserves the original `purpose` and `targetRef`, so omit these on update. The separate public `ReplaceReview` tool is retired; existing ledger operations remain compatible.

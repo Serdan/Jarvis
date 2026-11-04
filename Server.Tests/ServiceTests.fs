@@ -819,15 +819,9 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
                 | "ListFeedback" | "GetFeedback" | "GetFeedbackSummary" | "GetConnectionDiagnostics" | "ListDevices" | "GetServerUpdateStatus" -> true
                 | name -> failwith $"Unexpected server-local MCP tool: {name}"
 
-        let openWorld =
-            match methodInfo.Name with
-            | "ImportFile" | "UpdateClient" | "UpdateServer" | "RunCommand" | "RunProjectTask" | "StartJob" -> true
-            | name when Map.containsKey name definitions && not (Set.contains name wireCommandNames) -> true
-            | _ -> false
-
         attribute.ReadOnly |> shouldEqual readOnly
         attribute.Destructive |> shouldEqual false
-        attribute.OpenWorld |> shouldEqual openWorld
+        attribute.OpenWorld |> shouldEqual false
 
         let securityMeta =
             methodInfo.GetCustomAttributes(typeof<McpMetaAttribute>, false)
@@ -1147,7 +1141,7 @@ let cross_project_routing_error_distinguishes_absent_device_from_protocol_mismat
 
 
 [<Test>]
-let ``no Jarvis MCP tool declares destructive metadata`` () =
+let ``all Jarvis MCP tools declare non-destructive closed-world metadata`` () =
     let tools =
         typeof<JarvisMcpTools>.GetMethods()
         |> Array.choose (fun methodInfo ->
@@ -1157,6 +1151,7 @@ let ``no Jarvis MCP tool declares destructive metadata`` () =
     Assert.That(tools.Length, Is.GreaterThan(0))
     for name, attribute in tools do
         Assert.That(attribute.Destructive, Is.False, name)
+        Assert.That(attribute.OpenWorld, Is.False, name)
 
 
 [<Test>]

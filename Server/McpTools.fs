@@ -204,7 +204,7 @@ module McpToolHelpers =
         [ "SubmitIntegration"; "CompleteIntegration"; "NotifyAgent"; "AcknowledgeNotification"; "MigrateOrthogonalAgentState"; "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "ReissueAssignment"; "CheckpointAttempt"
           "BindReviewBase"; "BindAttemptSource"; "RebindAttemptSource"; "YieldAgent"; "ResumeAgent"; "CompleteAgentWork"
           "ParkAgent"; "ReissueQueuedAttempt"; "RecoverAgentAssignment"; "AcknowledgeReviewFeedback"
-          "ParkAttempt"; "BlockAttempt"; "ResumeAttempt"; "AbandonAttempt"; "CancelTask"
+          "DeferAttempt"; "ResumeAttempt"; "AbandonAttempt"; "CancelTask"
           "TransferOwner"; "CloseTask"; "ReopenTask"; "ImportTaskSpec"; "ExportTaskSpec" ]
 
     let private ledgerReadMethods = [ "LedgerHealth"; "GetOperationStatus"; "PendingOperations"; "ReconcilePendingOperations" ]
@@ -1299,17 +1299,11 @@ type JarvisMcpTools =
         let cmd = TaskCommands.write projectName "RecoverAgentAssignment" operationId taskId ownerId
         McpToolHelpers.send client http (TaskWriteCommand { cmd with ExpectedVersion = expectedAttemptVersion; ExpectedAgentVersion = expectedAgentVersion; AssignmentGeneration = assignmentGeneration; Reason = reason })
 
-    [<McpServerTool(Title = "ParkAttempt", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Explicitly defer a Queued or Started attempt, release its matching current assignment and make that agent Needs work. The attempt retains its owner/history; task and reviews remain independent.")>]
-    static member ParkAttempt(projectName: string, taskId: string, expectedTaskVersion: int, expectedAttemptVersion: int, expectedAgentVersion: int, assignmentGeneration: int, reason: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
-        let cmd = TaskCommands.write projectName "ParkAttempt" operationId taskId "Orchestrator"
-        McpToolHelpers.send client http (TaskWriteCommand
-            { cmd with ExpectedTaskVersion = expectedTaskVersion; ExpectedVersion = expectedAttemptVersion
-                       ExpectedAgentVersion = expectedAgentVersion; AssignmentGeneration = assignmentGeneration
-                       Reason = reason })
-
-    [<McpServerTool(Title = "BlockAttempt", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Explicitly mark a Queued or Started attempt Blocked and release its matching current assignment. The owner may receive other work; task and reviews remain independent.")>]
-    static member BlockAttempt(projectName: string, taskId: string, expectedTaskVersion: int, expectedAttemptVersion: int, expectedAgentVersion: int, assignmentGeneration: int, reason: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
-        let cmd = TaskCommands.write projectName "BlockAttempt" operationId taskId "Orchestrator"
+    [<McpServerTool(Title = "DeferAttempt", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = true); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Defer a Queued or Started attempt, releasing its matching agent assignment. disposition is Deferred (default; formerly park_attempt) or Blocked. Both preserve task, owner/history, and independent reviews. Requires exact task/attempt/agent versions.")>]
+    static member DeferAttempt(projectName: string, taskId: string, expectedTaskVersion: int, expectedAttemptVersion: int, expectedAgentVersion: int, assignmentGeneration: int, reason: string, [<Optional; DefaultParameterValue("Deferred")>] disposition: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        if disposition <> "Deferred" && disposition <> "Blocked" then
+            raise (ArgumentException("disposition must be Deferred or Blocked.", "disposition"))
+        let cmd = TaskCommands.write projectName (if disposition = "Blocked" then "BlockAttempt" else "ParkAttempt") operationId taskId "Orchestrator"
         McpToolHelpers.send client http (TaskWriteCommand
             { cmd with ExpectedTaskVersion = expectedTaskVersion; ExpectedVersion = expectedAttemptVersion
                        ExpectedAgentVersion = expectedAgentVersion; AssignmentGeneration = assignmentGeneration

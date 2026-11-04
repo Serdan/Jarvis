@@ -1,1 +1,1 @@
-{"schemaVersion":2,"taskId":"simplify-attempt-lifecycle","title":"Consolidate defer, block and requeue attempt operations","version":2,"lifecycle":"InProgress","specVersion":1,"attemptId":"b9a74ec243694908921de3da547adf62"}
+{"schemaVersion":2,"taskId":"simplify-attempt-lifecycle","title":"Consolidate defer, block and requeue attempt operations","version":3,"lifecycle":"Closed","specVersion":1,"attemptId":"b9a74ec243694908921de3da547adf62"}

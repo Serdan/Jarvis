@@ -237,3 +237,46 @@ let routine_agent_lifecycle_versions_are_optional_preconditions () =
             let parameter = methodInfo.GetParameters() |> Array.find (fun p -> p.Name = name)
             Assert.That(parameter.IsOptional, Is.True, $"{toolName}: {name}")
             Assert.That(parameter.DefaultValue, Is.EqualTo(0), $"{toolName}: {name}")
+
+
+[<Test>]
+let create_task_accepts_optional_task_id_and_requires_content () =
+    let parameters = typeof<Server.JarvisMcpTools>.GetMethod("CreateTask").GetParameters()
+    for name in [ "projectName"; "title"; "html" ] do
+        let param = parameters |> Array.find (fun p -> p.Name = name)
+        Assert.That(param.IsOptional, Is.False, name)
+    let id = parameters |> Array.find (fun p -> p.Name = "taskId")
+    Assert.That(id.IsOptional, Is.True)
+    Assert.That(id.DefaultValue, Is.EqualTo(""))
+
+[<Test>]
+let generated_task_id_is_unique_per_operation_and_stable_for_retries () =
+    let op = Guid.NewGuid()
+    let id, generated = Server.McpToolHelpers.resolveTaskId "" (op.ToString("D"))
+    let replay, repeated = Server.McpToolHelpers.resolveTaskId null (op.ToString("N").ToUpperInvariant())
+    let other, created = Server.McpToolHelpers.resolveTaskId " " (Guid.NewGuid().ToString("D"))
+    Assert.That(generated && repeated && created, Is.True)
+    Assert.That(id, Is.EqualTo("task-" + op.ToString("N")))
+    Assert.That(replay, Is.EqualTo(id))
+    Assert.That(other, Is.Not.EqualTo(id))
+    let explicitId, explicitGenerated = Server.McpToolHelpers.resolveTaskId "named-task-42" (op.ToString("D"))
+    Assert.That(explicitId, Is.EqualTo("named-task-42"))
+    Assert.That(explicitGenerated, Is.False)
+    let invalid, wasGenerated = Server.McpToolHelpers.resolveTaskId "" "invalid-operation"
+    Assert.That(invalid, Is.Empty)
+    Assert.That(wasGenerated, Is.False)
+
+[<Test>]
+let generated_task_id_is_visible_in_mcp_response_metadata_and_text () =
+    let taskId = "task-" + Guid.NewGuid().ToString("N")
+    let response = ModelContextProtocol.Protocol.CallToolResult()
+    let updated = Server.McpToolHelpers.attachGeneratedTaskId (Some taskId) response
+    Assert.That(updated.Meta["jarvis/generated_task_id"].GetValue<string>(), Is.EqualTo(taskId))
+    let text =
+        updated.Content
+        |> Seq.choose (function
+            | :? ModelContextProtocol.Protocol.TextContentBlock as block -> Some block.Text
+            | _ -> None)
+        |> String.concat "\n"
+    Assert.That(text, Does.Contain("Jarvis taskId: " + taskId))
+    Assert.That(Object.ReferenceEquals(Server.McpToolHelpers.attachGeneratedTaskId None updated, updated), Is.True)

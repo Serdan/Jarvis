@@ -89,6 +89,102 @@ type ReviewWorkflowTests() =
             Directory.Delete(root, true)
 
     [<Test>]
+    member _.AdministrativeActorIsRecordedInReceiptAssignmentAndClosureEvent() =
+        withFixture (fun _ _ first second _ _ _ _ ->
+            let taskId = "administrative-actor-provenance"
+            let createId = Guid.NewGuid()
+            ReviewWorkflow.createTaskWithSpecAs first "Lead" createId taskId
+                "Audited task" "<h1>Audited task</h1>" |> success |> ignore
+            let _, created = LedgerStore.getOperationStatus first createId |> success
+            Assert.That(created.IsSome, Is.True)
+            Assert.That(created.Value.Actor, Is.EqualTo("Lead"))
+
+            let assignId = Guid.NewGuid()
+            ReviewWorkflow.assignTaskAs first "Lead" assignId taskId (Guid.NewGuid()) "Owner"
+            |> success |> ignore
+            let _, _, _, issued, _ = ReviewWorkflow.getAssignment second taskId 1 |> success
+            Assert.That(issued.IssuerId, Is.EqualTo("Lead"))
+            let _, assigned = LedgerStore.getOperationStatus second assignId |> success
+            Assert.That(assigned.Value.Actor, Is.EqualTo("Lead"))
+
+            let _, task, _ = ReviewWorkflow.getTask first taskId |> success
+            let closeId = Guid.NewGuid()
+            let closed = ReviewWorkflow.closeTaskAs first "Lead" closeId taskId task.Version |> success
+            Assert.That(closed.Operation.Actor, Is.EqualTo("Lead"))
+            let _, history = ReviewWorkflow.getTaskLifecycleHistory second taskId |> success
+            Assert.That(history.Length, Is.EqualTo(1))
+            Assert.That(history.Head.Action, Is.EqualTo("CloseTask"))
+            Assert.That(history.Head.ActorId, Is.EqualTo("Lead"))
+            Assert.That(history.Head.PreviousLifecycle, Is.EqualTo("InProgress"))
+            Assert.That(history.Head.NewLifecycle, Is.EqualTo("Closed")))
+
+    [<Test>]
+    member _.AdministrativeAttemptTransitionsRecordInitiatingActorNotOwner() =
+        withFixture (fun _ _ first second _ _ _ initTask ->
+            let taskId = "admin-transition-actor"
+            initTask taskId
+            let _, task, attempt = ReviewWorkflow.getTask first taskId |> success
+            let inbox = ReviewWorkflow.getAgentInbox first "Owner" |> success
+            let operationId = Guid.NewGuid()
+            let changed =
+                ReviewWorkflow.changeAttemptAdministrationAs first "Lead" operationId
+                    taskId "BlockAttempt" task.Version attempt.Value.Version
+                    inbox.Agent.Version attempt.Value.AssignmentGeneration
+                    "Independent blocker"
+                |> success
+            Assert.That(changed.Operation.Actor, Is.EqualTo("Lead"))
+            let _, history = ReviewWorkflow.getTaskLifecycleHistory second taskId |> success
+            Assert.That(history.Length, Is.EqualTo(1))
+            Assert.That(history.Head.ActorId, Is.EqualTo("Lead"))
+            Assert.That(history.Head.PreviousPhase, Is.EqualTo("Started"))
+            Assert.That(history.Head.NewPhase, Is.EqualTo("Blocked")))
+
+    [<Test>]
+    member _.AdministrativeActorUsesCanonicalSessionAndHistoricalReceipt() =
+        withFixture (fun _ _ first second _ _ _ _ ->
+            let resolve id session =
+                Client.OrchestrationApi.TaskApi.administrativeActor first id session
+                |> success
+            Assert.That(resolve (Guid.NewGuid()) "", Is.EqualTo("AuthenticatedUser"))
+            Assert.That(resolve (Guid.NewGuid()) "unknown-session", Is.EqualTo("AuthenticatedUser"))
+
+            let taskId = "administrative-session-identity"
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Session audit"
+            |> success |> ignore
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner"
+            |> success |> ignore
+            ReviewWorkflow.beginAttemptWithSession first (Guid.NewGuid()) taskId "Owner"
+                1 1 "session-owner-audit" |> success |> ignore
+            Assert.That(resolve (Guid.NewGuid()) "session-owner-audit", Is.EqualTo("Owner"))
+
+            let _, task, _ = ReviewWorkflow.getTask second taskId |> success
+            let oldOperationId = Guid.NewGuid()
+            ReviewWorkflow.closeTask first oldOperationId taskId task.Version
+            |> success |> ignore
+            // Historical retries retain the original immutable actor/hash even
+            // though this conversation now identifies a registered agent.
+            Assert.That(resolve oldOperationId "session-owner-audit", Is.EqualTo("Orchestrator")))
+
+    [<Test>]
+    member _.HistoricalOrchestratorOperationRemainsIdempotentWithoutReattribution() =
+        withFixture (fun _ _ first second _ _ _ _ ->
+            let taskId = "legacy-admin-retry"
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Legacy task"
+            |> success |> ignore
+            let _, task, _ = ReviewWorkflow.getTask first taskId |> success
+            let operationId = Guid.NewGuid()
+            ReviewWorkflow.closeTask first operationId taskId task.Version
+            |> success |> ignore
+            let replay =
+                ReviewWorkflow.closeTaskAs second "Orchestrator" operationId taskId task.Version
+                |> success
+            Assert.That(replay.AlreadyApplied, Is.True)
+            Assert.That(replay.Operation.Actor, Is.EqualTo("Orchestrator"))
+            match ReviewWorkflow.closeTaskAs second "Lead" operationId taskId task.Version with
+            | Error OperationIdReused -> ()
+            | result -> Assert.Fail(sprintf "Expected changed legacy operation hash to be rejected: %A" result))
+
+    [<Test>]
     member _.AbandonDeferredAttemptDoesNotInterruptUnrelatedWorkingAssignment() =
         withFixture (fun _ _ first second _ _ _ initTask ->
             let oldTask = "deferred-old"

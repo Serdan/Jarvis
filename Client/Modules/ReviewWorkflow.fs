@@ -481,6 +481,11 @@ module ReviewWorkflow =
         SHA256.HashData(Encoding.UTF8.GetBytes(if isNull content then "" else content))
         |> Convert.ToHexString |> fun value -> value.ToLowerInvariant()
 
+    // Old direct-library entrypoints retain the historic intent actor for
+    // immutable ledger hash compatibility. All MCP administrative writes call
+    // the explicit *As functions with resolved caller attribution instead.
+    let private legacyAdministrativeActor = "Orchestrator"
+
     let private intent operationId actor kind payload =
         { OperationId = operationId
           Actor = actor
@@ -586,13 +591,13 @@ module ReviewWorkflow =
             return issuance
         }
 
-    let createTaskWithSpec binding operationId taskId title html =
+    let createTaskWithSpecAs binding actor operationId taskId title html =
         if not (validTaskId taskId) || not (validText 512 title)
            || not (validTaskHtml html) then
             Error(InvalidBinding "Invalid task ID, title or canonical HTML specification.")
         else
             LedgerStore.transact binding
-                (intent operationId "Orchestrator" "CreateTask"
+                (intent operationId actor "CreateTask"
                     {| taskId = taskId; title = title; specSha256 = specDigest html |})
                 (fun snapshot ->
                     result {
@@ -609,17 +614,21 @@ module ReviewWorkflow =
                     })
 
     // Core fixture compatibility: new MCP clients must supply the canonical HTML.
+
+    let createTaskWithSpec binding operationId taskId title html =
+        createTaskWithSpecAs binding legacyAdministrativeActor operationId taskId title html
+
     let createTask binding operationId taskId title =
         createTaskWithSpec binding operationId taskId title
             ($"<h1>{System.Net.WebUtility.HtmlEncode(title)}</h1>")
 
-    let reviseTaskSpecPinned binding operationId taskId expectedTaskVersion expectedSpecBlobOid title html =
+    let reviseTaskSpecPinnedAs binding actor operationId taskId expectedTaskVersion expectedSpecBlobOid title html =
         if not (validTaskId taskId) || expectedTaskVersion < 1
            || not (validText 512 title) || not (validTaskHtml html) then
             Error(InvalidBinding "Invalid task spec revision.")
         else
             LedgerStore.transact binding
-                (intent operationId "Orchestrator"
+                (intent operationId actor
                     (if String.IsNullOrWhiteSpace expectedSpecBlobOid then "ReviseTaskSpec" else "ReviseTaskSpecPinned")
                     {| taskId = taskId; expectedTaskVersion = expectedTaskVersion
                        title = title; specSha256 = specDigest html
@@ -644,12 +653,16 @@ module ReviewWorkflow =
 
     // Legacy Open-only revision remains compatible; in-progress revisions
     // must supply explicit expected canonical blob via pinned tool.
+
+    let reviseTaskSpecPinned binding operationId taskId expectedTaskVersion expectedSpecBlobOid title html =
+        reviseTaskSpecPinnedAs binding legacyAdministrativeActor operationId taskId expectedTaskVersion expectedSpecBlobOid title html
+
     let reviseTaskSpec binding operationId taskId expectedTaskVersion title html =
         reviseTaskSpecPinned binding operationId taskId expectedTaskVersion null title html
 
     // Split preflight from publication to exercise the real race boundary
     // deterministically: every CAS retry rechecks the source snapshot.
-    let importTaskSpecPrepared binding operationId taskId expectedTaskVersion
+    let importTaskSpecPreparedAs binding actor operationId taskId expectedTaskVersion
                                expectedSpecBlobOid expectedSourceBlobOid title relativePath
                                (original: SourceSpecFile) =
         if not (validTaskId taskId) || expectedTaskVersion < 1
@@ -660,7 +673,7 @@ module ReviewWorkflow =
             Error(InvalidBinding "Import requires safe pinned HTML, task/spec versions and source identity.")
         else
                 LedgerStore.transact binding
-                    (intent operationId "Orchestrator" "ImportTaskSpec"
+                    (intent operationId actor "ImportTaskSpec"
                         {| taskId = taskId; expectedTaskVersion = expectedTaskVersion
                            expectedSpecBlobOid = expectedSpecBlobOid; expectedSourceBlobOid = original.BlobOid
                            sourceRepositoryId = original.RepositoryId; sourceRef = original.SourceRef
@@ -683,7 +696,7 @@ module ReviewWorkflow =
                             return! Error(StaleEntityVersion "Import targets stale task/spec or a terminal lifecycle.")
                         let provenance =
                             { TaskId = taskId; Sequence = snapshot.Header.NextSequence
-                              OperationId = operationId.ToString("D"); ActorId = "Orchestrator"
+                              OperationId = operationId.ToString("D"); ActorId = actor
                               SourceRepositoryId = original.RepositoryId
                               SourceRef = original.SourceRef; SourceCommitOid = original.CommitOid
                               SourceRelativePath = relativePath; SourceBlobOid = original.BlobOid
@@ -699,17 +712,24 @@ module ReviewWorkflow =
                             change (importPath taskId snapshot.Header.NextSequence) None provenance ]
                     })
 
-    let importTaskSpec binding operationId taskId expectedTaskVersion
+    let importTaskSpecPrepared binding operationId taskId expectedTaskVersion expectedSpecBlobOid expectedSourceBlobOid title relativePath (original: SourceSpecFile) =
+        importTaskSpecPreparedAs binding legacyAdministrativeActor operationId taskId expectedTaskVersion expectedSpecBlobOid expectedSourceBlobOid title relativePath original
+
+    let importTaskSpecAs binding actor operationId taskId expectedTaskVersion
                        expectedSpecBlobOid expectedSourceBlobOid title relativePath =
         result {
             let! original = LedgerStore.readRegisteredSourceSpec binding relativePath
-            return! importTaskSpecPrepared binding operationId taskId expectedTaskVersion
+            return! importTaskSpecPreparedAs binding actor operationId taskId expectedTaskVersion
                         expectedSpecBlobOid expectedSourceBlobOid title relativePath original
         }
 
     // In-progress spec updates never rewrite issued instructions: only an
     // explicit generation reissue can adopt the new canonical version.
-    let adoptTaskSpec binding operationId taskId ownerId expectedTaskVersion
+
+    let importTaskSpec binding operationId taskId expectedTaskVersion expectedSpecBlobOid expectedSourceBlobOid title relativePath =
+        importTaskSpecAs binding legacyAdministrativeActor operationId taskId expectedTaskVersion expectedSpecBlobOid expectedSourceBlobOid title relativePath
+
+    let adoptTaskSpecAs binding actor operationId taskId ownerId expectedTaskVersion
                       expectedAttemptVersion expectedAgentVersion generation
                       expectedCurrentSpecOid instructions =
         if not (validTaskId taskId) || not (validAgent ownerId)
@@ -720,7 +740,7 @@ module ReviewWorkflow =
             Error(InvalidBinding "Spec adoption requires pinned canonical blob, exact versions and instructions.")
         else
             LedgerStore.transact binding
-                (intent operationId "Orchestrator" "AdoptTaskSpec"
+                (intent operationId actor "AdoptTaskSpec"
                     {| taskId = taskId; ownerId = ownerId
                        expectedTaskVersion = expectedTaskVersion
                        expectedAttemptVersion = expectedAttemptVersion
@@ -752,12 +772,15 @@ module ReviewWorkflow =
                     return [
                         change (attemptPath taskId attempt.AttemptId) (Some attemptOid) next
                         change (issuePath taskId attempt.AttemptId (generation + 1)) None
-                            (issue taskId next (generation + 1) "Orchestrator" "SpecAdoption"
+                            (issue taskId next (generation + 1) actor "SpecAdoption"
                                 instructions snapshot.Header.NextSequence)
                         change (agentPath ownerId) (Some agentOid)
                             { agent with Version = agent.Version + 1; StateReason = instructions
                                          StateSequence = snapshot.Header.NextSequence } ]
                 })
+
+    let adoptTaskSpec binding operationId taskId ownerId expectedTaskVersion expectedAttemptVersion expectedAgentVersion generation expectedCurrentSpecOid instructions =
+        adoptTaskSpecAs binding legacyAdministrativeActor operationId taskId ownerId expectedTaskVersion expectedAttemptVersion expectedAgentVersion generation expectedCurrentSpecOid instructions
 
     let getTaskSpecPage binding taskId cursor pageBytes =
         if not (validTaskId taskId) || pageBytes < 1 || pageBytes > 32768
@@ -1038,11 +1061,11 @@ module ReviewWorkflow =
         return pending |> List.sortBy (fun n -> n.CreatedAtUtc, n.NotificationId)
     }
 
-    let registerAgent binding operationId agentId =
+    let registerAgentAs binding actor operationId agentId =
         if not (validAgent agentId) then Error(InvalidBinding "Invalid agent ID.")
         else
             LedgerStore.transact binding
-                (intent operationId "Orchestrator" "RegisterAgent" {| agentId = agentId |})
+                (intent operationId actor "RegisterAgent" {| agentId = agentId |})
                 (fun snapshot ->
                     result {
                         let! existing = read<ReviewAgent> binding snapshot (agentPath agentId)
@@ -1058,14 +1081,17 @@ module ReviewWorkflow =
                         return [ change (agentPath agentId) None agent ]
                     })
 
-    let assignTask binding operationId taskId attemptId ownerId =
+    let registerAgent binding operationId agentId =
+        registerAgentAs binding legacyAdministrativeActor operationId agentId
+
+    let assignTaskAs binding actor operationId taskId attemptId ownerId =
         if not (validTaskId taskId) || attemptId = Guid.Empty
            || not (validAgent ownerId) then
             Error(InvalidBinding "Invalid task assignment.")
         else
             let attemptIdText = attemptId.ToString("N")
             LedgerStore.transact binding
-                (intent operationId "Orchestrator" "AssignTask"
+                (intent operationId actor "AssignTask"
                     {| taskId = taskId; attemptId = attemptId; ownerId = ownerId |})
                 (fun snapshot ->
                     result {
@@ -1094,7 +1120,7 @@ module ReviewWorkflow =
                                 { task with Version = task.Version + 1; Lifecycle = "InProgress"; AttemptId = attemptIdText }
                               change (attemptPath taskId attemptIdText) None attempt
                               change (issuePath taskId attemptIdText 1) None
-                                (issue taskId attempt 1 "Orchestrator" "Assignment"
+                                (issue taskId attempt 1 actor "Assignment"
                                     $"Implement task {taskId} against the pinned task specification."
                                     snapshot.Header.NextSequence)
                               change (agentPath ownerId) (Some agentOid)
@@ -1103,6 +1129,9 @@ module ReviewWorkflow =
                                     StateReason = $"Assigned task {taskId}; awaiting operator start"
                                     StateSequence = snapshot.Header.NextSequence } ]
                     })
+
+    let assignTask binding operationId taskId attemptId ownerId =
+        assignTaskAs binding legacyAdministrativeActor operationId taskId attemptId ownerId
 
     let acknowledgeAssignment binding operationId taskId ownerId expectedAttemptVersion generation =
         if not (validTaskId taskId) || not (validAgent ownerId)
@@ -1538,12 +1567,12 @@ module ReviewWorkflow =
             return snapshot.Commit, checkpoint
         }
 
-    let parkAgent binding operationId agentId expectedAgentVersion reason =
+    let parkAgentAs binding actor operationId agentId expectedAgentVersion reason =
         if not (validAgent agentId) || expectedAgentVersion < 1 || not (validText 2048 reason) then
             Error(InvalidBinding "Parking requires an agent version and reason.")
         else
             LedgerStore.transact binding
-                (intent operationId "Orchestrator" "ParkAgent"
+                (intent operationId actor "ParkAgent"
                     {| agentId = agentId; expectedAgentVersion = expectedAgentVersion
                        reason = reason |})
                 (fun snapshot ->
@@ -1564,6 +1593,10 @@ module ReviewWorkflow =
 
     // Source repository identity is an endpoint fingerprint independent from
     // the ledger UUID. An agent's checkout path never enters the owner key.
+
+    let parkAgent binding operationId agentId expectedAgentVersion reason =
+        parkAgentAs binding legacyAdministrativeActor operationId agentId expectedAgentVersion reason
+
     let private verifySourceRepository binding (attempt: ReviewAttempt) =
         result {
             let! source = LedgerStore.sourceRepositoryIdentity binding
@@ -1699,7 +1732,7 @@ module ReviewWorkflow =
                     return snapshot.Commit, attempt, Some observation
         }
 
-    let reissueQueuedAttempt binding operationId taskId ownerId expectedAttemptVersion
+    let reissueQueuedAttemptAs binding actor operationId taskId ownerId expectedAttemptVersion
                              expectedAgentVersion generation reason =
         if not (validTaskId taskId) || not (validAgent ownerId)
            || expectedAttemptVersion < 1 || expectedAgentVersion < 1 || generation < 1
@@ -1707,7 +1740,7 @@ module ReviewWorkflow =
             Error(InvalidBinding "Reissue requires versions, generation and a reason.")
         else
             LedgerStore.transact binding
-                (intent operationId "Orchestrator" "ReissueQueuedAttempt"
+                (intent operationId actor "ReissueQueuedAttempt"
                     {| taskId = taskId; ownerId = ownerId
                        expectedAttemptVersion = expectedAttemptVersion
                        expectedAgentVersion = expectedAgentVersion
@@ -1739,7 +1772,11 @@ module ReviewWorkflow =
     // Explicitly issue new instructions, optionally adopting a new canonical
     // HTML spec, while the same owner is Assigned but has not started work.
     // Prior issuance and acknowledgments stay immutable in ledger history.
-    let reissueAssignment binding operationId taskId ownerId expectedAttemptVersion
+
+    let reissueQueuedAttempt binding operationId taskId ownerId expectedAttemptVersion expectedAgentVersion generation reason =
+        reissueQueuedAttemptAs binding legacyAdministrativeActor operationId taskId ownerId expectedAttemptVersion expectedAgentVersion generation reason
+
+    let reissueAssignmentAs binding actor operationId taskId ownerId expectedAttemptVersion
                           expectedAgentVersion generation instructions newSpecHtml =
         if not (validTaskId taskId) || not (validAgent ownerId)
            || expectedAttemptVersion < 1 || expectedAgentVersion < 1 || generation < 1
@@ -1748,7 +1785,7 @@ module ReviewWorkflow =
             Error(InvalidBinding "Explicit reissue requires current versions, instructions and safe optional HTML.")
         else
             LedgerStore.transact binding
-                (intent operationId "Orchestrator" "ReissueAssignment"
+                (intent operationId actor "ReissueAssignment"
                     {| taskId = taskId; ownerId = ownerId
                        expectedAttemptVersion = expectedAttemptVersion
                        expectedAgentVersion = expectedAgentVersion
@@ -1787,7 +1824,7 @@ module ReviewWorkflow =
                         return
                             [ change (attemptPath taskId attempt.AttemptId) (Some attemptOid) next
                               change (issuePath taskId attempt.AttemptId (generation + 1)) None
-                                (issue taskId next (generation + 1) "Orchestrator"
+                                (issue taskId next (generation + 1) actor
                                     "ExplicitReissue" instructions snapshot.Header.NextSequence)
                               change (agentPath ownerId) (Some agentOid)
                                 { agent with Version = agent.Version + 1
@@ -1805,7 +1842,11 @@ module ReviewWorkflow =
     // Operator-authorized repair: a stalled or lost session never causes this
     // transition automatically. Rebind the SAME attempt, advance its generation,
     // retain its source/reviews and issue an explicit operator restart.
-    let recoverAgentAssignment binding operationId taskId ownerId expectedAttemptVersion
+
+    let reissueAssignment binding operationId taskId ownerId expectedAttemptVersion expectedAgentVersion generation instructions newSpecHtml =
+        reissueAssignmentAs binding legacyAdministrativeActor operationId taskId ownerId expectedAttemptVersion expectedAgentVersion generation instructions newSpecHtml
+
+    let recoverAgentAssignmentAs binding actor operationId taskId ownerId expectedAttemptVersion
                                expectedAgentVersion generation reason =
         if not (validTaskId taskId) || not (validAgent ownerId)
            || expectedAttemptVersion < 1 || expectedAgentVersion < 1 || generation < 1
@@ -1813,7 +1854,7 @@ module ReviewWorkflow =
             Error(InvalidBinding "Recovery requires exact versions and an explicit reason.")
         else
             LedgerStore.transact binding
-                (intent operationId "Orchestrator" "RecoverAgentAssignment"
+                (intent operationId actor "RecoverAgentAssignment"
                     {| taskId = taskId; ownerId = ownerId
                        expectedAttemptVersion = expectedAttemptVersion
                        expectedAgentVersion = expectedAgentVersion
@@ -1852,8 +1893,11 @@ module ReviewWorkflow =
                               change (issuePath taskId attempt.AttemptId
                                           (attempt.AssignmentGeneration + 1)) None
                                 (issue taskId attempt (attempt.AssignmentGeneration + 1)
-                                    "Orchestrator" "Recovery" reason snapshot.Header.NextSequence) ]
+                                    actor "Recovery" reason snapshot.Header.NextSequence) ]
                     })
+
+    let recoverAgentAssignment binding operationId taskId ownerId expectedAttemptVersion expectedAgentVersion generation reason =
+        recoverAgentAssignmentAs binding legacyAdministrativeActor operationId taskId ownerId expectedAttemptVersion expectedAgentVersion generation reason
 
     let getTaskWithSpec binding taskId =
         if not (validTaskId taskId) then Error(InvalidBinding "Invalid task ID.")
@@ -1876,12 +1920,12 @@ module ReviewWorkflow =
 
     // Administrative task lifecycle is distinct from agent Parked and reviewer
     // state. No inactivity timer or stale frontend may implicitly invoke it.
-    let private adminEvent (task: ReviewTask) (attempt: ReviewAttempt option)
+    let private adminEvent actor (task: ReviewTask) (attempt: ReviewAttempt option)
                            (operationId: Guid) sequence action reason nextLifecycle nextPhase nextOwner reviewId reviewDisposition evidence =
         { TaskId = task.TaskId
           AttemptId = attempt |> Option.map (fun a -> a.AttemptId) |> Option.defaultValue null
           OperationId = operationId.ToString("D")
-          Sequence = sequence; Action = action; ActorId = "Orchestrator"; Reason = reason
+          Sequence = sequence; Action = action; ActorId = actor; Reason = reason
           PreviousLifecycle = task.Lifecycle; NewLifecycle = nextLifecycle
           PreviousPhase = attempt |> Option.map (fun a -> a.Phase) |> Option.defaultValue null
           NewPhase = nextPhase
@@ -1920,7 +1964,7 @@ module ReviewWorkflow =
                              (enterState "Completed" agent |> fun updated -> { updated with Version = agent.Version + 1; StateReason = reason; StateSequence = snapshot.Header.NextSequence }) ]
         }
 
-    let changeAttemptAdministration binding operationId taskId action expectedTaskVersion expectedAttemptVersion
+    let changeAttemptAdministrationAs binding actor operationId taskId action expectedTaskVersion expectedAttemptVersion
                                     expectedAgentVersion generation reason =
         if not (validTaskId taskId) || expectedTaskVersion < 1 || expectedAttemptVersion < 1
            || expectedAgentVersion < 1 || generation < 1 || not (validText 2048 reason)
@@ -1928,7 +1972,7 @@ module ReviewWorkflow =
             Error(InvalidBinding "Invalid administrative task/attempt transition.")
         else
             LedgerStore.transact binding
-                (intent operationId "Orchestrator" action
+                (intent operationId actor action
                     {| taskId = taskId; expectedTaskVersion = expectedTaskVersion
                        expectedAttemptVersion = expectedAttemptVersion
                        expectedAgentVersion = expectedAgentVersion
@@ -1981,7 +2025,7 @@ module ReviewWorkflow =
                                        IssuedSequence = if resume then snapshot.Header.NextSequence else attempt.IssuedSequence
                                        }
                     let audit =
-                        { adminEvent task (Some attempt) operationId snapshot.Header.NextSequence
+                        { adminEvent actor task (Some attempt) operationId snapshot.Header.NextSequence
                               action reason nextLifecycle nextPhase attempt.OwnerAgentId null "Unchanged" null
                           with NewGeneration = nextGen }
                     let taskUpdates =
@@ -1996,7 +2040,7 @@ module ReviewWorkflow =
                            @ focusChanges
                            @ (if resume then
                                   [ change (issuePath taskId attempt.AttemptId nextGen) None
-                                      (issue taskId nextAttempt nextGen "Orchestrator" "AdministrativeResume"
+                                      (issue taskId nextAttempt nextGen actor "AdministrativeResume"
                                           ("Resume administratively parked or blocked attempt: " + reason)
                                           snapshot.Header.NextSequence) ]
                               else [])
@@ -2004,12 +2048,16 @@ module ReviewWorkflow =
 
     // Open tasks have no attempt/agent to revoke. Cancellation remains a
     // distinct, audited no-source outcome, not a fabricated integration.
-    let cancelOpenTask binding operationId taskId expectedTaskVersion reason =
+
+    let changeAttemptAdministration binding operationId taskId action expectedTaskVersion expectedAttemptVersion expectedAgentVersion generation reason =
+        changeAttemptAdministrationAs binding legacyAdministrativeActor operationId taskId action expectedTaskVersion expectedAttemptVersion expectedAgentVersion generation reason
+
+    let cancelOpenTaskAs binding actor operationId taskId expectedTaskVersion reason =
         if not (validTaskId taskId) || expectedTaskVersion < 1 || not (validText 2048 reason) then
             Error(InvalidBinding "Open-task cancellation requires exact task version and reason.")
         else
             LedgerStore.transact binding
-                (intent operationId "Orchestrator" "CancelTask"
+                (intent operationId actor "CancelTask"
                     {| taskId = taskId; expectedTaskVersion = expectedTaskVersion; reason = reason |})
                 (fun snapshot -> result {
                     let! task, oid = required<ReviewTask> binding snapshot (taskPath taskId)
@@ -2019,11 +2067,14 @@ module ReviewWorkflow =
                     return [ change (taskPath taskId) (Some oid)
                                  { task with Version = task.Version + 1; Lifecycle = "Cancelled" }
                              change (lifecycleEventPath taskId snapshot.Header.NextSequence) None
-                                 (adminEvent task None operationId snapshot.Header.NextSequence
+                                 (adminEvent actor task None operationId snapshot.Header.NextSequence
                                      "CancelTask" reason "Cancelled" null null null "None" null) ]
                 })
 
-    let transferAttemptOwner binding operationId taskId newAttemptId newOwner
+    let cancelOpenTask binding operationId taskId expectedTaskVersion reason =
+        cancelOpenTaskAs binding legacyAdministrativeActor operationId taskId expectedTaskVersion reason
+
+    let transferAttemptOwnerAs binding actor operationId taskId newAttemptId newOwner
                              expectedTaskVersion expectedAttemptVersion expectedAgentVersion
                              generation reason =
         if not (validTaskId taskId) || newAttemptId = Guid.Empty
@@ -2034,7 +2085,7 @@ module ReviewWorkflow =
         else
             let newId = newAttemptId.ToString("N")
             LedgerStore.transact binding
-                (intent operationId "Orchestrator" "TransferOwner"
+                (intent operationId actor "TransferOwner"
                     {| taskId = taskId; newAttemptId = newAttemptId; newOwner = newOwner
                        expectedTaskVersion = expectedTaskVersion
                        expectedAttemptVersion = expectedAttemptVersion; expectedAgentVersion = expectedAgentVersion
@@ -2069,7 +2120,7 @@ module ReviewWorkflow =
                                        SourceRef = attempt.SourceRef
                                        }
                     let audit =
-                        { adminEvent task (Some attempt) operationId snapshot.Header.NextSequence
+                        { adminEvent actor task (Some attempt) operationId snapshot.Header.NextSequence
                               "TransferOwner" reason "InProgress" "Queued" newOwner null "Unchanged" null
                           with NewGeneration = 1 }
                     return [ change (taskPath taskId) (Some taskOid)
@@ -2079,7 +2130,7 @@ module ReviewWorkflow =
                                                 }
                              change (attemptPath taskId newId) None next
                              change (issuePath taskId newId 1) None
-                                 (issue taskId next 1 "Orchestrator" "OwnershipTransfer"
+                                 (issue taskId next 1 actor "OwnershipTransfer"
                                      ("Transfer from " + attempt.OwnerAgentId + ": " + reason)
                                      snapshot.Header.NextSequence)
                              change (agentPath newOwner) (Some nextOwnerOid)
@@ -2094,13 +2145,17 @@ module ReviewWorkflow =
 
     // Reopening never resurrects an old generation. The old attempt and
     // review/integration evidence stay addressable by immutable paths.
-    let reopenTask binding operationId taskId expectedTaskVersion reason =
+
+    let transferAttemptOwner binding operationId taskId newAttemptId newOwner expectedTaskVersion expectedAttemptVersion expectedAgentVersion generation reason =
+        transferAttemptOwnerAs binding legacyAdministrativeActor operationId taskId newAttemptId newOwner expectedTaskVersion expectedAttemptVersion expectedAgentVersion generation reason
+
+    let reopenTaskAs binding actor operationId taskId expectedTaskVersion reason =
         if not (validTaskId taskId) || expectedTaskVersion < 1
            || not (validText 2048 reason) then
             Error(InvalidBinding "Reopen requires terminal task version and explanation.")
         else
             LedgerStore.transact binding
-                (intent operationId "Orchestrator" "ReopenTask"
+                (intent operationId actor "ReopenTask"
                     {| taskId = taskId; expectedTaskVersion = expectedTaskVersion; reason = reason |})
                 (fun snapshot -> result {
                     let! task, oid = required<ReviewTask> binding snapshot (taskPath taskId)
@@ -2118,9 +2173,12 @@ module ReviewWorkflow =
                     return [ change (taskPath taskId) (Some oid)
                                  { task with Version = task.Version + 1; Lifecycle = "Open"; AttemptId = null }
                              change (lifecycleEventPath taskId snapshot.Header.NextSequence) None
-                                 (adminEvent task oldAttempt operationId snapshot.Header.NextSequence
+                                 (adminEvent actor task oldAttempt operationId snapshot.Header.NextSequence
                                      "ReopenTask" reason "Open" null null null "None" null) ]
                 })
+
+    let reopenTask binding operationId taskId expectedTaskVersion reason =
+        reopenTaskAs binding legacyAdministrativeActor operationId taskId expectedTaskVersion reason
 
     let getTaskLifecycleHistory binding taskId =
         if not (validTaskId taskId) then Error(InvalidBinding "Invalid lifecycle history task.")
@@ -2637,12 +2695,12 @@ module ReviewWorkflow =
 
     // A task is closed by an explicit caller decision, not by review policy
     // or a Git ancestry calculation.
-    let closeTask binding operationId taskId expectedTaskVersion =
+    let closeTaskAs binding actor operationId taskId expectedTaskVersion =
         if not (validTaskId taskId) || expectedTaskVersion < 1 then
             Error(InvalidBinding "Invalid task closure.")
         else
             LedgerStore.transact binding
-                (intent operationId "Orchestrator" "CloseTask"
+                (intent operationId actor "CloseTask"
                     {| taskId = taskId; expectedTaskVersion = expectedTaskVersion |})
                 (fun snapshot -> result {
                     let! task, taskOid = required<ReviewTask> binding snapshot (taskPath taskId)
@@ -2652,11 +2710,15 @@ module ReviewWorkflow =
                     return [ change (taskPath taskId) (Some taskOid)
                                 { task with Version = task.Version + 1; Lifecycle = "Closed" }
                              change (lifecycleEventPath taskId snapshot.Header.NextSequence) None
-                                 (adminEvent task None operationId snapshot.Header.NextSequence
+                                 (adminEvent actor task None operationId snapshot.Header.NextSequence
                                       "CloseTask" "Explicit closure" "Closed" null null null "None" null) ]
                 })
 
     // Simple project-wide read independent of current agent focus.
+
+    let closeTask binding operationId taskId expectedTaskVersion =
+        closeTaskAs binding legacyAdministrativeActor operationId taskId expectedTaskVersion
+
     let listProjectTasks binding =
         result {
             let! snapshot = LedgerStore.fetch binding

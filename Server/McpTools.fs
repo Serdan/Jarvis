@@ -60,6 +60,12 @@ module private ReviewCommands =
           ExpectedBlobOid = "" }
 
 module private TaskCommands =
+    // Compatibility wire value for administrative calls lacking a caller field.
+    // This is NOT the audit actor. The local TaskApi resolves provenance from
+    // the authenticated request's canonical agent session (or the MCP user).
+    // Retain this value in command journaling for existing pending retries.
+    let legacyAdministrativePlaceholder = "Orchestrator"
+
     let write projectName action operationId taskId actorId =
         { ProjectName = projectName
           Action = action
@@ -1185,7 +1191,7 @@ type JarvisMcpTools =
 
     [<McpServerTool(Title = "close task", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Explicitly record that a task is closed. Does not inspect reviews, worker completion or Git integration.")>]
     static member CloseTask(projectName: string, taskId: string, expectedTaskVersion: int, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
-        let cmd = TaskCommands.write projectName "CloseTask" operationId taskId "Orchestrator"
+        let cmd = TaskCommands.write projectName "CloseTask" operationId taskId TaskCommands.legacyAdministrativePlaceholder
         McpToolHelpers.send client http (TaskWriteCommand { cmd with ExpectedTaskVersion = expectedTaskVersion })
 
     [<McpServerTool(Title = "agent inbox", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read an agent's assignment, slot and associated reviews as independent ledger records.")>]
@@ -1194,13 +1200,13 @@ type JarvisMcpTools =
 
     [<McpServerTool(Title = "create task", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Atomically create a task and canonical HTML spec on the bound Git ledger. Omit taskId to generate a unique, stable ID derived from operationId; provide taskId explicitly for named tasks and imports. Reusing operationId on retry preserves the generated ID.")>]
     static member CreateTask(projectName: string, title: string, html: string, [<Optional; DefaultParameterValue("")>] taskId: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
-        let cmd = TaskCommands.write projectName "CreateTask" operationId taskId "Orchestrator"
+        let cmd = TaskCommands.write projectName "CreateTask" operationId taskId TaskCommands.legacyAdministrativePlaceholder
         McpToolHelpers.send client http (TaskWriteCommand { cmd with Title = title; Html = html })
 
     [<McpServerTool(Title = "revise task spec", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Revise a canonical HTML task spec with an exact task version. Supply expectedSpecBlobOid for assigned tasks or to assert the exact current spec; leave it empty for unassigned Open tasks. Assignment adoption remains explicit.")>]
     static member ReviseTaskSpec(projectName: string, taskId: string, expectedTaskVersion: int, title: string, html: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, [<Optional; DefaultParameterValue("")>] expectedSpecBlobOid: string, client: ClientService, http: IHttpContextAccessor) =
         let pinned = not (String.IsNullOrWhiteSpace expectedSpecBlobOid)
-        let cmd = TaskCommands.write projectName (if pinned then "ReviseTaskSpecPinned" else "ReviseTaskSpec") operationId taskId "Orchestrator"
+        let cmd = TaskCommands.write projectName (if pinned then "ReviseTaskSpecPinned" else "ReviseTaskSpec") operationId taskId TaskCommands.legacyAdministrativePlaceholder
         McpToolHelpers.send client http (TaskWriteCommand { cmd with ExpectedVersion = expectedTaskVersion; BaseOid = expectedSpecBlobOid; Title = title; Html = html })
 
     [<McpServerTool(Title = "register agent", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Register an agent in the canonical ledger with no assignment, Stopped execution and explicit Parked disposition.")>]
@@ -1238,7 +1244,7 @@ type JarvisMcpTools =
 
     [<McpServerTool(Title = "assign task", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Assign a registered unoccupied agent to an Open task. The agent immediately becomes Ready; the queued attempt is separate from execution. Reviews are independent.")>]
     static member AssignTask(projectName: string, taskId: string, attemptId: string, ownerId: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
-        let cmd = TaskCommands.write projectName "AssignTask" operationId taskId "Orchestrator"
+        let cmd = TaskCommands.write projectName "AssignTask" operationId taskId TaskCommands.legacyAdministrativePlaceholder
         McpToolHelpers.send client http (TaskWriteCommand { cmd with AttemptId = attemptId; OwnerId = ownerId })
 
     [<McpServerTool(Title = "get assignment generation", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read an immutable assignment generation with the pinned spec OID, instructions, source baseline and optional acknowledgment receipt. Older generations remain readable after reissue or recovery.")>]
@@ -1345,7 +1351,7 @@ type JarvisMcpTools =
     static member DeferAttempt(projectName: string, taskId: string, expectedTaskVersion: int, expectedAttemptVersion: int, expectedAgentVersion: int, assignmentGeneration: int, reason: string, [<Optional; DefaultParameterValue("Deferred")>] disposition: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         if disposition <> "Deferred" && disposition <> "Blocked" then
             raise (ArgumentException("disposition must be Deferred or Blocked.", "disposition"))
-        let cmd = TaskCommands.write projectName (if disposition = "Blocked" then "BlockAttempt" else "ParkAttempt") operationId taskId "Orchestrator"
+        let cmd = TaskCommands.write projectName (if disposition = "Blocked" then "BlockAttempt" else "ParkAttempt") operationId taskId TaskCommands.legacyAdministrativePlaceholder
         McpToolHelpers.send client http (TaskWriteCommand
             { cmd with ExpectedTaskVersion = expectedTaskVersion; ExpectedVersion = expectedAttemptVersion
                        ExpectedAgentVersion = expectedAgentVersion; AssignmentGeneration = assignmentGeneration
@@ -1353,7 +1359,7 @@ type JarvisMcpTools =
 
     [<McpServerTool(Title = "ResumeAttempt", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Explicitly requeue a deferred or blocked attempt with a new generation and assign its unoccupied owner Ready. Reject if that owner has another current assignment. Reviews are unchanged.")>]
     static member ResumeAttempt(projectName: string, taskId: string, expectedTaskVersion: int, expectedAttemptVersion: int, expectedAgentVersion: int, assignmentGeneration: int, reason: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
-        let cmd = TaskCommands.write projectName "ResumeAttempt" operationId taskId "Orchestrator"
+        let cmd = TaskCommands.write projectName "ResumeAttempt" operationId taskId TaskCommands.legacyAdministrativePlaceholder
         McpToolHelpers.send client http (TaskWriteCommand
             { cmd with ExpectedTaskVersion = expectedTaskVersion; ExpectedVersion = expectedAttemptVersion
                        ExpectedAgentVersion = expectedAgentVersion; AssignmentGeneration = assignmentGeneration
@@ -1361,7 +1367,7 @@ type JarvisMcpTools =
 
     [<McpServerTool(Title = "AbandonAttempt", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("End an implementation attempt and release its assignment if occupied, retaining historical reviews and leaving other agents' work unchanged. An active task returns to Open.")>]
     static member AbandonAttempt(projectName: string, taskId: string, expectedTaskVersion: int, expectedAttemptVersion: int, expectedAgentVersion: int, assignmentGeneration: int, reason: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
-        let cmd = TaskCommands.write projectName "AbandonAttempt" operationId taskId "Orchestrator"
+        let cmd = TaskCommands.write projectName "AbandonAttempt" operationId taskId TaskCommands.legacyAdministrativePlaceholder
         McpToolHelpers.send client http (TaskWriteCommand
             { cmd with ExpectedTaskVersion = expectedTaskVersion; ExpectedVersion = expectedAttemptVersion
                        ExpectedAgentVersion = expectedAgentVersion; AssignmentGeneration = assignmentGeneration
@@ -1370,7 +1376,7 @@ type JarvisMcpTools =
     [<McpServerTool(Title = "CancelTask", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Cancel a project task while retaining its history and independent reviews. Assigned tasks require exact attempt and agent version fields; unrelated assignments are unchanged.")>]
     static member CancelTask(projectName: string, taskId: string, expectedTaskVersion: int, reason: string, [<Optional; DefaultParameterValue(0)>] expectedAttemptVersion: int, [<Optional; DefaultParameterValue(0)>] expectedAgentVersion: int, [<Optional; DefaultParameterValue(0)>] assignmentGeneration: int, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         let openTask = expectedAttemptVersion = 0 && expectedAgentVersion = 0 && assignmentGeneration = 0
-        let cmd = TaskCommands.write projectName (if openTask then "CancelOpenTask" else "CancelTask") operationId taskId "Orchestrator"
+        let cmd = TaskCommands.write projectName (if openTask then "CancelOpenTask" else "CancelTask") operationId taskId TaskCommands.legacyAdministrativePlaceholder
         McpToolHelpers.send client http (TaskWriteCommand
             { cmd with ExpectedTaskVersion = expectedTaskVersion; ExpectedVersion = expectedAttemptVersion
                        ExpectedAgentVersion = expectedAgentVersion; AssignmentGeneration = assignmentGeneration
@@ -1378,7 +1384,7 @@ type JarvisMcpTools =
 
     [<McpServerTool(Title = "transfer attempt owner", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Transfer an implementation attempt to another registered agent while preserving independent reviews.")>]
     static member TransferOwner(projectName: string, taskId: string, newAttemptId: string, newOwnerId: string, expectedTaskVersion: int, expectedAttemptVersion: int, expectedAgentVersion: int, assignmentGeneration: int, reason: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
-        let cmd = TaskCommands.write projectName "TransferOwner" operationId taskId "Orchestrator"
+        let cmd = TaskCommands.write projectName "TransferOwner" operationId taskId TaskCommands.legacyAdministrativePlaceholder
         McpToolHelpers.send client http (TaskWriteCommand
             { cmd with AttemptId = newAttemptId; OwnerId = newOwnerId
                        ExpectedTaskVersion = expectedTaskVersion; ExpectedVersion = expectedAttemptVersion
@@ -1387,7 +1393,7 @@ type JarvisMcpTools =
 
     [<McpServerTool(Title = "Reopen task", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Explicitly reopen Closed or Cancelled task, retaining all historical attempt and approval evidence with a new future assignment.")>]
     static member ReopenTask(projectName: string, taskId: string, expectedTaskVersion: int, reason: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
-        let cmd = TaskCommands.write projectName "ReopenTask" operationId taskId "Orchestrator"
+        let cmd = TaskCommands.write projectName "ReopenTask" operationId taskId TaskCommands.legacyAdministrativePlaceholder
         McpToolHelpers.send client http (TaskWriteCommand { cmd with ExpectedTaskVersion = expectedTaskVersion; Reason = reason })
 
     [<McpServerTool(Title = "Task lifecycle history", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read immutable administrative transitions and their previous/new task, attempt and owner metadata.")>]
@@ -1420,13 +1426,13 @@ type JarvisMcpTools =
 
     [<McpServerTool(Title = "Create a non-authoritative copy of canonical HTML inside a registered worktree, refusing overwrite, traversal and symlinks", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Create a non-authoritative copy of canonical HTML inside a registered worktree, refusing overwrite, traversal and symlinks. Requires an existing bound orphan Git ledger.")>]
     static member ExportTaskSpec(projectName: string, taskId: string, relativeHtmlPath: string, expectedSpecBlobOid: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
-        let cmd = TaskCommands.write projectName "ExportTaskSpec" operationId taskId "Orchestrator"
+        let cmd = TaskCommands.write projectName "ExportTaskSpec" operationId taskId TaskCommands.legacyAdministrativePlaceholder
         McpToolHelpers.send client http (TaskWriteCommand
             { cmd with SourceRef = relativeHtmlPath; BaseOid = expectedSpecBlobOid })
 
     [<McpServerTool(Title = "Import stable UTF-8 source HTML from registered worktree with immutable provenance and expected blob checks", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Import stable UTF-8 source HTML from registered worktree with immutable provenance and expected blob checks. Requires an existing bound orphan Git ledger.")>]
     static member ImportTaskSpec(projectName: string, taskId: string, expectedTaskVersion: int, expectedSpecBlobOid: string, expectedSourceBlobOid: string, title: string, sourceRelativePath: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
-        let cmd = TaskCommands.write projectName "ImportTaskSpec" operationId taskId "Orchestrator"
+        let cmd = TaskCommands.write projectName "ImportTaskSpec" operationId taskId TaskCommands.legacyAdministrativePlaceholder
         McpToolHelpers.send client http (TaskWriteCommand { cmd with ExpectedVersion = expectedTaskVersion; BaseOid = expectedSpecBlobOid; TargetRef = expectedSourceBlobOid; Title = title; SourceRef = sourceRelativePath })
 
     [<McpServerTool(Title = "task state", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read a task's current lifecycle, assignment, and implementation attempt from the bound Git ledger.")>]

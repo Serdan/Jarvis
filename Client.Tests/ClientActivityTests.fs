@@ -201,3 +201,65 @@ let ``live hidden worktree activity remains stored under its original selector``
     let entries = tui.GetActivitySnapshot(Some ".Wayfold-worktrees/silver-ring-trade", Some 20).Entries
     entries.Length |> shouldEqual 1
     entries.Head.ProjectName |> shouldEqual (Some ".Wayfold-worktrees/silver-ring-trade")
+
+
+[<Test>]
+let ``sessionless MCP receive updates Seen for successful and failed agent commands`` () =
+    task {
+        let root = Path.Combine(Path.GetTempPath(), "jarvis-seen-incoming-" + Guid.NewGuid().ToString("N"))
+        Directory.CreateDirectory(Path.Combine(root, "Project1")) |> ignore
+        let logPath = Path.Combine(root, "activity")
+        Directory.CreateDirectory logPath |> ignore
+        let storeSettings : Client.ActivityLog.Settings =
+            { DirectoryPath = logPath
+              RetentionDays = 14
+              MaxFileBytes = 1024L * 1024L }
+        try
+            use store = new Client.ActivityLog.Store(storeSettings)
+            let tui = ConsoleTui.ConsoleTui(activityLog = store)
+            let runtime = Runtime(root, tui, PartialTrust)
+
+            let successful = ListDirectoryCommand { ProjectName = "Project1"; FolderPath = "" }
+            let! _, success, _ =
+                Client.SignalR.Client.processIncomingCommand runtime (JsonSerializer.Serialize<AgentCommand>(successful)) "Gemini Agent"
+            match success with
+            | Ok _ -> ()
+            | Error error -> Assert.Fail(sprintf "Expected list directory success, got %A" error)
+            let initial = store.LoadAgentSeen() |> Map.ofList
+            Assert.That(initial.ContainsKey "Project1::Gemini Agent", Is.True)
+            Assert.That(initial.ContainsKey "Project1::ChatGPT Agent", Is.False)
+
+            let failed =
+                ReadFileCommand
+                    { ProjectName = "Project1"; FilePath = "does-not-exist.txt"
+                      StartLine = None; EndLine = None; IncludeLineNumbers = None }
+            let! _, failure, _ =
+                Client.SignalR.Client.processIncomingCommand runtime (JsonSerializer.Serialize<AgentCommand>(failed)) "Other Agent"
+            match failure with
+            | Error _ -> ()
+            | Ok _ -> Assert.Fail("Missing file should fail")
+            let updated = store.LoadAgentSeen() |> Map.ofList
+            Assert.That(updated.ContainsKey "Project1::Other Agent", Is.True)
+
+            // A failed ResumeAgent also counts as observed agent activity,
+            // despite the absence of provider session metadata or a bound ledger.
+            let resume : TaskWriteCommand =
+                { ProjectName = "Project1"; Action = "ResumeAgent"
+                  OperationId = Guid.NewGuid().ToString("D")
+                  TaskId = "missing-task"; AttemptId = ""; ActorId = "Resume Agent"; OwnerId = ""
+                  Title = ""; Html = ""; ExpectedVersion = 0
+                  ExpectedAgentVersion = 0; ExpectedTaskVersion = 0
+                  AssignmentGeneration = 0; Summary = ""; NextAction = ""; Reason = ""
+                  BaseOid = ""; TargetRef = ""; SourceRef = ""; AllowDetached = false
+                  AllowUncommitted = false; DecisionSequence = 0L; Evidence = ""
+                  SessionId = "" }
+            let! _, resumeResult, _ =
+                Client.SignalR.Client.processIncomingCommand runtime (JsonSerializer.Serialize<AgentCommand>(TaskWriteCommand resume)) "Resume Agent"
+            match resumeResult with
+            | Error _ -> ()
+            | Ok _ -> Assert.Fail("Resume without a bound ledger should fail")
+            let observed = store.LoadAgentSeen() |> Map.ofList
+            Assert.That(observed.ContainsKey "Project1::Resume Agent", Is.True)
+        finally
+            Directory.Delete(root, true)
+    }

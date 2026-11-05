@@ -5,6 +5,7 @@ open System.Diagnostics
 open System.IO
 open System.Net
 open System.Net.Http
+open System.Runtime.CompilerServices
 open System.Security.Cryptography
 open System.Text
 open System.Text.Json
@@ -20,8 +21,10 @@ let receiveMessage (rt: Runtime) message =
     rt.Tui.Log message
     Task.CompletedTask
 
-// Explicit MCP agent labels, not provider conversation metadata, identify
-// the current work slot. Guidance uses the canonical ledger Working clock.
+// Explicit agent labels identify the current work slot. Cache canonical
+// Working state for ordinary calls to avoid one remote git fetch per tool.
+let private workingGuidanceCaches = ConditionalWeakTable<Runtime, WorkingTurnGuidance.AgentCache>()
+
 let private checkWorkingGuidance (rt: Runtime) agentId command =
     if String.IsNullOrWhiteSpace agentId then []
     else
@@ -29,17 +32,24 @@ let private checkWorkingGuidance (rt: Runtime) agentId command =
         | None -> []
         | Some routedProject ->
             let project = AgentView.activityProject routedProject
-            match OrchestrationApi.LedgerBindingConfig.load project rt with
-            | Error _ -> []
-            | Ok binding ->
-                match ReviewWorkflow.ReviewWorkflow.getAgentWorkingTurn binding agentId with
-                | Error _ -> []
-                | Ok agent ->
-                    match WorkingTurnGuidance.instructionAt DateTimeOffset.UtcNow agent with
-                    | Some content ->
-                        [ { Scope = "working-turn"; Path = "jarvis/working-turn"
-                            Sha256 = ""; Content = content } ]
-                    | None -> []
+            let now = DateTimeOffset.UtcNow
+            let cache = workingGuidanceCaches.GetValue(rt, fun _ -> WorkingTurnGuidance.AgentCache(TimeSpan.FromMinutes 2.))
+            match command with
+            | TaskWriteCommand _ -> cache.Invalidate(project, agentId)
+            | _ -> ()
+            let agent =
+                cache.Get(now, project, agentId, fun () ->
+                    match OrchestrationApi.LedgerBindingConfig.load project rt with
+                    | Error _ -> None
+                    | Ok binding ->
+                        match ReviewWorkflow.ReviewWorkflow.getAgentWorkingTurn binding agentId with
+                        | Error _ -> None
+                        | Ok found -> Some found)
+            match agent |> Option.bind (WorkingTurnGuidance.instructionAt now) with
+            | Some content ->
+                [ { Scope = "working-turn"; Path = "jarvis/working-turn"
+                    Sha256 = ""; Content = content } ]
+            | None -> []
 
 let private serialize<'a> (value: 'a) =
     try
@@ -370,7 +380,9 @@ let receiveCommandWithInstructions (rt: Runtime) command =
             return response, instructions @ AgentInstructions.writeWarnings rt command response
     }
 
-let receiveCommandAndReply (connection: HubConnection) (rt: Runtime) (correlationId: string) (commandJson: string) (agentId: string) : Task =
+// Shared by SignalR receive and tests. Identity is supplied by the MCP call,
+// not inferred from provider conversation metadata.
+let processIncomingCommand (rt: Runtime) (commandJson: string) (agentId: string) =
     task {
         let mutable parsedCommand = None
         let mutable instructions: InstructionDocument list = []
@@ -379,20 +391,25 @@ let receiveCommandAndReply (connection: HubConnection) (rt: Runtime) (correlatio
                 try
                     let command = JsonSerializer.Deserialize<AgentCommand>(commandJson)
                     parsedCommand <- Some command
-                    // Seen reflects a received agent-attributed tool invocation, regardless of outcome.
                     AgentCommandInfo.projectName command
-                    |> Option.iter (fun project -> rt.Tui.RecordAgentSeen(AgentView.activityProject project, agentId))
-                    let! response, applicable = receiveCommandWithInstructions rt command
+                    |> Option.iter (fun project ->
+                        rt.Tui.RecordAgentSeen(AgentView.activityProject project, agentId))
+                    let! result, applicable = receiveCommandWithInstructions rt command
                     instructions <- applicable @ checkWorkingGuidance rt agentId command
-                    return response
+                    return result
                 with ex ->
                     return Error(ExceptionError ex)
             }
-
         let agentResponse =
             match parsedCommand with
             | Some command -> toAgentResponse command instructions response
             | None -> toAgentResponse ListCommandsCommand [] response
+        return parsedCommand, response, agentResponse
+    }
+
+let receiveCommandAndReply (connection: HubConnection) (rt: Runtime) (correlationId: string) (commandJson: string) (agentId: string) : Task =
+    task {
+        let! parsedCommand, response, agentResponse = processIncomingCommand rt commandJson agentId
         let! sendResult =
             ResponseDelivery.sendWithReconnectRetry
                 (TimeSpan.FromMinutes 2.0)

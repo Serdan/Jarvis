@@ -68,3 +68,23 @@ let recoveredSessionUsesNewCutoffRatherThanStateEntry () =
     Assert.That(forSession (started.AddMinutes(30)) "recovered-session" worker, Is.EqualTo(None))
     let guidance = forSession (started.AddMinutes(54)) "recovered-session" worker |> Option.get
     Assert.That(snd guidance, Does.Contain("SOFT STOP"))
+
+
+[<Test>]
+let agentStateCacheAvoidsRepeatedFetchAndInvalidatesOnTaskTransition () =
+    let cache = AgentCache(TimeSpan.FromMinutes 2.)
+    let now = DateTimeOffset(2026, 11, 6, 0, 0, 0, TimeSpan.Zero)
+    let mutable loads = 0
+    let load () =
+        loads <- loads + 1
+        None
+    cache.Get(now, "Wayfold", "Agent 3", load) |> ignore
+    cache.Get(now.AddMinutes(1.), "Wayfold", "Agent 3", load) |> ignore
+    Assert.That(loads, Is.EqualTo(1))
+    cache.Get(now.AddMinutes(2.1), "Wayfold", "Agent 3", load) |> ignore
+    Assert.That(loads, Is.EqualTo(2))
+    cache.Get(now.AddMinutes(2.1), "Wayfold", "Agent 4", load) |> ignore
+    Assert.That(loads, Is.EqualTo(3))
+    cache.Invalidate("Wayfold", "Agent 3")
+    cache.Get(now.AddMinutes(2.2), "Wayfold", "Agent 3", load) |> ignore
+    Assert.That(loads, Is.EqualTo(4))

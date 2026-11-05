@@ -219,6 +219,9 @@ module private Core =
         fun _ ->
             match jobs.TryGetValue cmd.JobId with
             | false, _ -> Error(NotFoundError $"Unknown job id: {cmd.JobId}")
+            | true, job when not (String.IsNullOrWhiteSpace cmd.ProjectName)
+                             && not (String.Equals(cmd.ProjectName, job.ProjectName, StringComparison.Ordinal)) ->
+                Error(ValidationError "jobId does not belong to the requested project.")
             | true, job ->
                 lock job.SyncRoot (fun () ->
                     let afterSequence = defaultArg cmd.AfterSequence 0L |> max 0L
@@ -238,6 +241,9 @@ module private Core =
         fun _ ->
             match jobs.TryGetValue cmd.JobId with
             | false, _ -> Error(NotFoundError $"Unknown job id: {cmd.JobId}")
+            | true, job when not (String.IsNullOrWhiteSpace cmd.ProjectName)
+                             && not (String.Equals(cmd.ProjectName, job.ProjectName, StringComparison.Ordinal)) ->
+                Error(ValidationError "jobId does not belong to the requested project.")
             | true, job ->
                 if job.Status = Running then
                     job.CancellationRequested <- true

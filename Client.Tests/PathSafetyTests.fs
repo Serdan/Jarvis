@@ -160,3 +160,69 @@ let ``writeFile creates missing parent directories when requested`` () =
                 Assert.Fail("Expected created file content.")
     finally
         Directory.Delete(root, true)
+
+[<Test>]
+let ``writeFile creates a new file when expectedHash is none`` () =
+    let root = createTempProject ()
+    try
+        let context = TestContext root
+        let relativePath = Path.Combine("nested", "new.txt")
+        let cmd =
+            { ProjectName = "Project1"
+              FilePath = relativePath
+              Content = "created with absent precondition"
+              FileWriteMode = FileWriteMode.Write
+              ExpectedHash = Some "none"
+              CreateParents = Some true }
+
+        match writeFile cmd context with
+        | Ok () ->
+            let path = Path.Combine(root, "Project1", relativePath)
+            Assert.That(File.ReadAllText path, Is.EqualTo("created with absent precondition"))
+        | Error error -> Assert.Fail($"Expected successful new file creation, got {error}")
+    finally
+        Directory.Delete(root, true)
+
+[<Test>]
+let ``writeFile none precondition never overwrites existing file`` () =
+    let root = createTempProject ()
+    try
+        let context = TestContext root
+        let path = Path.Combine(root, "Project1", "existing.txt")
+        File.WriteAllText(path, "original")
+        let cmd =
+            { ProjectName = "Project1"
+              FilePath = "existing.txt"
+              Content = "overwrite"
+              FileWriteMode = FileWriteMode.Write
+              ExpectedHash = Some "none"
+              CreateParents = None }
+
+        match writeFile cmd context with
+        | Error(ValidationError message) ->
+            Assert.That(message, Does.Contain("already exists"))
+            Assert.That(File.ReadAllText path, Is.EqualTo("original"))
+        | result -> Assert.Fail($"Expected absent-file precondition failure, got {result}")
+    finally
+        Directory.Delete(root, true)
+
+[<Test>]
+let ``writeFile sha256 precondition for nonexistent file returns validation error`` () =
+    let root = createTempProject ()
+    try
+        let context = TestContext root
+        let cmd =
+            { ProjectName = "Project1"
+              FilePath = "missing.txt"
+              Content = "not created"
+              FileWriteMode = FileWriteMode.Write
+              ExpectedHash = Some "sha256:1234"
+              CreateParents = None }
+
+        match writeFile cmd context with
+        | Error(ValidationError message) ->
+            Assert.That(message, Does.Contain("file does not exist"))
+            Assert.That(File.Exists(Path.Combine(root, "Project1", "missing.txt")), Is.False)
+        | result -> Assert.Fail($"Expected missing-file hash validation error, got {result}")
+    finally
+        Directory.Delete(root, true)

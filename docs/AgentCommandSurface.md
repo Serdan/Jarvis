@@ -8,13 +8,40 @@ Jarvis should not try to be a complete coding-agent runtime. Its purpose is to e
 
 Project-scoped operations automatically carry applicable AGENTS.md guidance from the local workspace and project ancestry. The client-to-server AgentCommandResponse envelope adds an ordered Instructions array of Scope, Path, Sha256, and Content; existing Result and Error semantics remain intact. The MCP server presents each applicable document as a distinct labeled text block before the ordinary tool result. See [AgentInstructions.md](AgentInstructions.md) and [AgentCommandResponse.schema.json](AgentCommandResponse.schema.json).
 
-## Administrative ledger actor attribution
+## Explicit agent labels
 
-For new administrative task writes, the local client records the initiating registered agent when the authenticated MCP conversation is uniquely associated with an agent in the target project's canonical ledger. Otherwise it records `AuthenticatedUser`, not the target owner or a fictitious Orchestrator. Assignment issuance and administrative lifecycle events use the same resolved actor.
+Agent-related MCP operations use **`agentId`** consistently; this replaces
+public `ownerId`, `actorId`, `reviewerId` and `requesterId` parameters.
+Ordinary project development tools (file reads and writes, commands, Git,
+jobs, skills and review actions) also require `agentId`. Sender/recipient
+notifications retain their intrinsic `fromAgentId` and `toAgentId` names.
+Agent-independent bootstrap, project discovery, connection diagnostics,
+feedback, and administrative status functions do not require a fabricated
+agent. See [ExplicitAgentIdentity.md](ExplicitAgentIdentity.md).
 
-Historical operation receipts are immutable. Retries of previously applied operation UUIDs use the actor recorded in the existing receipt, including the legacy `Orchestrator` value, so the canonical request hash stays stable. The legacy `Orchestrator` value remains a wire/journal compatibility placeholder for tools without an explicit caller field; it is not authoritative attribution for new operations.
+An agent ID identifies an ephemeral named working slot, **not** an
+authentication or authorization principal. The authenticated user and local
+OS permissions remain the security boundary. The local client's Agents
+screen records `Seen` on each received, attributable tool invocation,
+including failed execution, without inspecting the originating model's
+conversation metadata. Registered worktree operations count toward the
+parent project's agent activity.
 
-Agent attribution is based on canonical session association, not an unverified caller-supplied identity. Missing or ambiguous session associations fall back to `AuthenticatedUser`. A session may not be registered in a different project's ledger.
+Session metadata is not used to establish agent identity, permit lifecycle
+operations, or infer a separate initiating actor. The server may still use
+`openai/session` to select an explicitly associated ChatGPT device, which
+is independent from agent activity. The client transport carries the explicit
+agent ID, not a conversation ID; working-turn guidance uses the canonical
+agent state and the Working clock.
+
+Administrative Git-ledger operations record `AuthenticatedUser` where no
+specific agent is the initiator; existing immutable operation receipts retain
+their original recorded actor, including historical `Orchestrator` values.
+No session-based actor inference is performed.
+
+**Protocol 3.57** changes the MCP tool schemas and client/server command
+transport. Update the server and client together and refresh the MCP plugin
+tool list after deployment. No old public parameter-name aliases are provided.
 
 ## Design Goals
 

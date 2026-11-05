@@ -49,13 +49,13 @@ let ``job lifecycle starts lists reads and cancels`` () =
 
         Thread.Sleep 500
 
-        match getJobResult { JobId = jobId; AfterSequence = Some 0L } context with
+        match getJobResult { ProjectName = "Wayfold"; JobId = jobId; AfterSequence = Some 0L } context with
         | Ok result ->
             result.JobId |> shouldEqual jobId
             result.NextSequence >= 0L |> shouldEqual true
         | Error error -> Assert.Fail($"Expected GetJobResult Ok, got {error}")
 
-        cancelJob { JobId = jobId } context |> shouldEqual (Ok())
+        cancelJob { ProjectName = "Wayfold"; JobId = jobId } context |> shouldEqual (Ok())
     finally
         Directory.Delete(root, true)
 
@@ -79,7 +79,7 @@ let ``job output is bounded by max output bytes`` () =
 
         Thread.Sleep 750
 
-        match getJobResult { JobId = jobId; AfterSequence = Some 0L } context with
+        match getJobResult { ProjectName = "Wayfold"; JobId = jobId; AfterSequence = Some 0L } context with
         | Ok result ->
             let retainedBytes =
                 result.Events
@@ -147,7 +147,7 @@ let ``job output polling is ordered and incremental across streams`` () =
         // Keep polling incrementally but use a measured deadline, not a fixed 100 iterations.
         let deadline = Stopwatch.StartNew()
         let rec waitForCompletion () =
-            match getJobResult { JobId = jobId; AfterSequence = Some 0L } context with
+            match getJobResult { ProjectName = "Wayfold"; JobId = jobId; AfterSequence = Some 0L } context with
             | Error error -> failwith $"Expected GetJobResult Ok, got {error}"
             | Ok result when result.Status <> Running -> result
             | Ok _ when deadline.Elapsed >= TimeSpan.FromSeconds 20.0 -> failwith "Job did not complete in 20 seconds."
@@ -166,7 +166,7 @@ let ``job output polling is ordered and incremental across streams`` () =
         |> List.forall (fun (before, after) -> before < after)
         |> shouldEqual true
 
-        match getJobResult { JobId = jobId; AfterSequence = Some first.NextSequence } context with
+        match getJobResult { ProjectName = "Wayfold"; JobId = jobId; AfterSequence = Some first.NextSequence } context with
         | Error error -> Assert.Fail($"Expected second GetJobResult Ok, got {error}")
         | Ok second ->
             second.Events |> shouldEqual []
@@ -206,7 +206,7 @@ printfn "%s" (Environment.GetEnvironmentVariable("JARVIS_TEST_JOB_SECRET_TOKEN")
             | Error error -> failwith $"Expected StartJob Ok, got {error}"
 
         let rec waitForCompletion remaining =
-            match getJobResult { JobId = jobId; AfterSequence = Some 0L } context with
+            match getJobResult { ProjectName = "Wayfold"; JobId = jobId; AfterSequence = Some 0L } context with
             | Error error -> failwith $"Expected GetJobResult Ok, got {error}"
             | Ok result when result.Status <> Running -> result
             | Ok _ when remaining <= 0 -> failwith "Job did not complete in time."

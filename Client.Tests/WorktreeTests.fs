@@ -221,4 +221,4 @@ let ``active job in a selected worktree blocks safe removal`` () =
                     inspection.RunningJobCount |> shouldEqual 1
                 | Error e -> Assert.Fail($"Inspection failed: {e}")
             finally
-                Client.JobManager.cancelJob { JobId = id } context |> ignore)
+                Client.JobManager.cancelJob { ProjectName = "Wayfold"; JobId = id } context |> ignore)

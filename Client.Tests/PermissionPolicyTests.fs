@@ -269,7 +269,7 @@ let ``partial trust confirms start job`` () =
 
 [<Test>]
 let ``partial trust confirms cancel job`` () =
-    let command = CancelJobCommand { JobId = "job-1" }
+    let command = CancelJobCommand { ProjectName = "Wayfold"; JobId = "job-1" }
 
     match evaluateWithTrust PartialTrust command with
     | Error(Client.ConfirmationRequired request) ->

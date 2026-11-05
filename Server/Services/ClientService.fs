@@ -80,7 +80,7 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
             TimeSpan.FromSeconds(float executionSeconds) + permissionMargin
         | _ -> TimeSpan.FromMinutes(10L)
 
-    member this.SendCommandToUser(userId: string, command: AgentCommand, ?conversationId: string, ?deviceId: string) =
+    member this.SendCommandToUser(userId: string, command: AgentCommand, ?conversationId: string, ?deviceId: string, ?agentId: string) =
         task {
             match users.GetSelectedSession(userId, conversationId, deviceId) with
             | ValueNone when deviceId.IsSome ->
@@ -135,7 +135,7 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                         let commandJson = JsonSerializer.Serialize<AgentCommand>(command)
 
                         try
-                            do! client.ReceiveCommand(correlationId, commandJson, defaultArg conversationId "")
+                            do! client.ReceiveCommand(correlationId, commandJson, defaultArg agentId "")
                             users.RecordDispatchSuccess(userId, connectionId)
 
                             try
@@ -168,7 +168,7 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
     // destination's verified ledger binding instead of assuming the sender's
     // selected device has the destination project.
     member this.SendCommandToProject(userId: string, projectName: string, command: AgentCommand,
-                                     ?conversationId: string, ?deviceId: string) =
+                                     ?conversationId: string, ?deviceId: string, ?agentId: string) =
         task {
             let selected = users.GetSelectedSession(userId, conversationId, deviceId)
             let sessions = users.ListDevices(userId) |> Array.toList
@@ -194,13 +194,13 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                         let! health = this.SendCommandToUser(
                             userId,
                             ProjectNotificationRouting.healthProbe projectName,
-                            ?conversationId = conversationId, deviceId = session.DeviceId)
+                            ?conversationId = conversationId, deviceId = session.DeviceId, ?agentId = agentId)
                         match health.Result, health.Error with
                         | Some _, None ->
                             // Never automatically repeat a write on another client:
                             // an uncertain result may already have been committed.
                             return! this.SendCommandToUser(userId, command,
-                                                            ?conversationId = conversationId, deviceId = session.DeviceId)
+                                                            ?conversationId = conversationId, deviceId = session.DeviceId, ?agentId = agentId)
                         | _ ->
                             let reason = ProjectNotificationRouting.probeFailure health
                             return! dispatch rest ((session.DeviceName, reason) :: probeFailures)

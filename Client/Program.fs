@@ -165,10 +165,10 @@ let private runClient args =
             |> Result.map (fun result -> result.Jobs)
             |> formatJobResult)
           Read = (fun jobId afterSequence ->
-            JobManager.getJobResult { JobId = jobId; AfterSequence = Some afterSequence } rt
+            JobManager.getJobResult { ProjectName = ""; JobId = jobId; AfterSequence = Some afterSequence } rt
             |> formatJobResult)
           Cancel = (fun jobId ->
-            JobManager.cancelJob { JobId = jobId } rt
+            JobManager.cancelJob { ProjectName = ""; JobId = jobId } rt
             |> formatJobResult) }
     tui.SetAgentAccess { Load = (fun () -> AgentDashboard.load rt) }
     tui.Log $"Trust: {TrustLevel.toDisplayName trustLevel}"

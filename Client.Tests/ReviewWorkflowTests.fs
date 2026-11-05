@@ -140,7 +140,7 @@ type ReviewWorkflowTests() =
             Assert.That(history.Head.NewPhase, Is.EqualTo("Blocked")))
 
     [<Test>]
-    member _.AdministrativeActorUsesCanonicalSessionAndHistoricalReceipt() =
+    member _.AdministrativeActorUsesAuthenticatedUserAndHistoricalReceipt() =
         withFixture (fun _ _ first second _ _ _ _ ->
             let resolve id session =
                 Client.OrchestrationApi.TaskApi.administrativeActor first id session
@@ -155,7 +155,7 @@ type ReviewWorkflowTests() =
             |> success |> ignore
             ReviewWorkflow.beginAttemptWithSession first (Guid.NewGuid()) taskId "Owner"
                 1 1 "session-owner-audit" |> success |> ignore
-            Assert.That(resolve (Guid.NewGuid()) "session-owner-audit", Is.EqualTo("Owner"))
+            Assert.That(resolve (Guid.NewGuid()) "session-owner-audit", Is.EqualTo("AuthenticatedUser"))
 
             let _, task, _ = ReviewWorkflow.getTask second taskId |> success
             let oldOperationId = Guid.NewGuid()
@@ -663,24 +663,21 @@ type ReviewWorkflowTests() =
             Assert.That(recoveryEvents.Length, Is.EqualTo(1))
             let eventJson, _ = LedgerStore.readAt second snapshot recoveryEvents.Head |> success
             use eventDoc = System.Text.Json.JsonDocument.Parse(eventJson.Value)
-            Assert.That(eventDoc.RootElement.GetProperty("kind").GetString(), Is.EqualTo("AgentStallRecovered"))
+            Assert.That(eventDoc.RootElement.GetProperty("kind").GetString(), Is.EqualTo("AgentTurnResumed"))
             Assert.That(DateTimeOffset.Parse(eventDoc.RootElement.GetProperty("occurredAtUtc").GetString()),
                         Is.LessThanOrEqualTo(DateTimeOffset.UtcNow))
-            // The low-level mutation refuses to write a duplicate recovery.
-            // The MCP API presents it as a read-only AlreadyActive response.
-            match ReviewWorkflow.resumeAgentWithSession first (Guid.NewGuid()) taskId "Owner" 2 4 1 "session-B" with
-            | Error(StaleEntityVersion message) ->
-                Assert.That(message, Does.Contain("already associated"))
-            | outcome -> Assert.Fail(sprintf "Duplicate recovery incorrectly wrote an agent record: %A" outcome)
+            // Repeating ResumeAgent with a fresh operation is an explicit
+            // continuation, not an error based on a provider session ID.
+            ReviewWorkflow.resumeAgentWithSession first (Guid.NewGuid()) taskId "Owner" 2 4 1 "session-B"
+            |> success |> ignore
             let repeated = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
-            Assert.That(repeated.Version, Is.EqualTo(recovered.Version))
-            Assert.That(repeated.WorkingTurnStartedAtUtc, Is.EqualTo(recovered.WorkingTurnStartedAtUtc))
+            Assert.That(repeated.Version, Is.EqualTo(recovered.Version + 1))
             Assert.That(repeated.AssociatedSessionIds = recovered.AssociatedSessionIds, Is.True)
             let snapshot2 = LedgerStore.fetch second |> success
             let events2 = LedgerStore.listAt second snapshot2 "tasks" |> success
                           |> List.filter (fun path -> path.Contains("/events/"))
-            Assert.That(events2.Length, Is.EqualTo(1))
-            ReviewWorkflow.yieldAgent first (Guid.NewGuid()) taskId "Owner" 2 4 1
+            Assert.That(events2.Length, Is.EqualTo(2))
+            ReviewWorkflow.yieldAgent first (Guid.NewGuid()) taskId "Owner" 2 5 1
                 "Stopped correctly" "Continue later" |> success |> ignore
             let ready = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
             Assert.That(ready.State, Is.EqualTo("Ready"))
@@ -690,13 +687,13 @@ type ReviewWorkflowTests() =
             let seenWhileReady = ReviewWorkflow.findAgentBySession second "session-A" |> success |> Option.get
             Assert.That(seenWhileReady.AgentId, Is.EqualTo("Owner"))
             Assert.That(ReviewWorkflow.findWorkingAgentBySession second "session-A" |> success, Is.EqualTo(None))
-            ReviewWorkflow.resumeAgentWithSession first (Guid.NewGuid()) taskId "Owner" 3 5 1 "session-C"
+            ReviewWorkflow.resumeAgentWithSession first (Guid.NewGuid()) taskId "Owner" 3 6 1 "session-C"
             |> success |> ignore
             let resumed = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
             Assert.That(resumed.AssociatedSessionIds = [ "session-A"; "session-B"; "session-C" ], Is.True)
             Assert.That(resumed.ActiveSessionId, Is.EqualTo("session-C"))
             Assert.That(resumed.State, Is.EqualTo("Working"))
-            ReviewWorkflow.completeAgentWork first (Guid.NewGuid()) taskId "Owner" 4 6 1 "Done"
+            ReviewWorkflow.completeAgentWork first (Guid.NewGuid()) taskId "Owner" 4 7 1 "Done"
             |> success |> ignore
             let complete = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
             Assert.That(complete.State, Is.EqualTo("NeedsWork"))
@@ -710,7 +707,7 @@ type ReviewWorkflowTests() =
             Assert.That(parked.ActiveSessionId, Is.Null))
 
     [<Test>]
-    member _.ResumeApiReportsCurrentAndSupersededSessionWithoutExtraCommits() =
+    member _.ResumeApiRecordsContinuationsAndPreservesIdempotentRetries() =
         withFixture (fun one _ first second _ _ _ _ ->
             let taskId = "resume-advisory"
             ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Resume advisory"
@@ -751,17 +748,17 @@ type ReviewWorkflowTests() =
             let before = LedgerStore.fetch second |> success
             let active = api (resume "session-A" 3)
             use activeJson = System.Text.Json.JsonDocument.Parse(System.Text.Json.JsonSerializer.Serialize(active))
-            Assert.That(activeJson.RootElement.GetProperty("status").GetString(), Is.EqualTo("AlreadyActive"))
-            Assert.That((LedgerStore.fetch second |> success).Commit, Is.EqualTo(before.Commit))
+            Assert.That(activeJson.RootElement.GetProperty("alreadyApplied").GetBoolean(), Is.False)
+            Assert.That((LedgerStore.fetch second |> success).Commit, Is.Not.EqualTo(before.Commit))
             let oldAgent = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
-            Assert.That(oldAgent.Version, Is.EqualTo(3))
+            Assert.That(oldAgent.Version, Is.EqualTo(4))
             // Simulate Git accepting a recovery but the client losing the reply
             // before its matching pending journal entry can be retired.
-            let recoveryCommand = resume "session-B" 3
+            let recoveryCommand = resume "session-B" 4
             let recoveryId = Guid.Parse recoveryCommand.OperationId
             Client.OrchestrationApi.PendingIntentJournal.persist first recoveryId "TaskWrite"
                 (System.Text.Json.JsonSerializer.Serialize recoveryCommand) |> success
-            ReviewWorkflow.resumeAgentWithSession first recoveryId taskId "Owner" 2 3 1 "session-B"
+            ReviewWorkflow.resumeAgentWithSession first recoveryId taskId "Owner" 2 4 1 "session-B"
             |> success |> ignore
             let afterRecovery = LedgerStore.fetch second |> success
             Assert.That((Client.OrchestrationApi.PendingIntentJournal.listAtRoot one |> success).Length,
@@ -777,15 +774,13 @@ type ReviewWorkflowTests() =
                         Is.EqualTo(0), "A confirmed replay must retire its matching pending local intent.")
             Assert.That((LedgerStore.fetch second |> success).Commit, Is.EqualTo(afterRecovery.Commit),
                         "Replaying an accepted recovery must not create another Git commit.")
-            let stale = api (resume "session-A" 4)
-            use staleJson = System.Text.Json.JsonDocument.Parse(System.Text.Json.JsonSerializer.Serialize(stale))
-            Assert.That(staleJson.RootElement.GetProperty("status").GetString(), Is.EqualTo("SupersededSession"))
-            Assert.That(staleJson.RootElement.GetProperty("activeSessionId").GetString(),
-                        Is.EqualTo("session-B"))
-            Assert.That((LedgerStore.fetch second |> success).Commit, Is.EqualTo(afterRecovery.Commit))
+            let continued = api (resume "session-A" 5)
+            use continuedJson = System.Text.Json.JsonDocument.Parse(System.Text.Json.JsonSerializer.Serialize(continued))
+            Assert.That(continuedJson.RootElement.GetProperty("alreadyApplied").GetBoolean(), Is.False)
+            Assert.That((LedgerStore.fetch second |> success).Commit, Is.Not.EqualTo(afterRecovery.Commit))
             let current = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
-            Assert.That(current.ActiveSessionId, Is.EqualTo("session-B"))
-            Assert.That(current.Version, Is.EqualTo(4))
+            Assert.That(current.ActiveSessionId, Is.EqualTo("session-A"))
+            Assert.That(current.Version, Is.EqualTo(6))
             Assert.That(current.AssociatedSessionIds = [ "session-A"; "session-B" ], Is.True))
 
     [<Test>]
@@ -2764,47 +2759,47 @@ type ReviewWorkflowTests() =
 
 
     [<Test>]
-    member _.StaleSessionCannotWriteVersionlessLifecycleAfterSameTaskRecovery() =
+    member _.VersionlessLifecycleWorksWithoutProviderSessionAcrossClones() =
         withFixture (fun _ _ first second _ _ _ _ ->
-            let taskId = "versionless-session-recovery"
-            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Session-fenced lifecycle"
+            let taskId = "versionless-agent-lifecycle"
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Explicit agent lifecycle"
             |> success |> ignore
             ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner"
             |> success |> ignore
-            ReviewWorkflow.resumeAgentWithSession first (Guid.NewGuid()) taskId "Owner"
-                0 0 0 "session-original" |> success |> ignore
-            ReviewWorkflow.yieldAgentWithSession first (Guid.NewGuid()) taskId "Owner"
-                0 0 0 "Checkpoint before recovery" "Restart needed" "session-original"
+            ReviewWorkflow.resumeAgent first (Guid.NewGuid()) taskId "Owner" 0 0 0
+            |> success |> ignore
+            let started = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
+            Assert.That(started.State, Is.EqualTo("Working"))
+            Assert.That(started.ActiveSessionId, Is.Null)
+            ReviewWorkflow.yieldAgent first (Guid.NewGuid()) taskId "Owner" 0 0 0
+                "Checkpoint before recovery" "Continue after recovery"
             |> success |> ignore
             let _, _, previousAttempt = ReviewWorkflow.getTask second taskId |> success
             let previousAgent = (ReviewWorkflow.getAgentInbox first "Owner" |> success).Agent
             ReviewWorkflow.recoverAgentAssignment first (Guid.NewGuid()) taskId "Owner"
-                previousAttempt.Value.Version previousAgent.Version 1 "Recover same task with new generation"
+                previousAttempt.Value.Version previousAgent.Version 1 "Recover current task generation"
             |> success |> ignore
-            expectStale (ReviewWorkflow.resumeAgentWithSession first (Guid.NewGuid()) taskId "Owner"
-                             0 0 0 "session-original")
-            ReviewWorkflow.resumeAgentWithSession second (Guid.NewGuid()) taskId "Owner"
-                0 0 0 "session-new" |> success |> ignore
-            expectStale (ReviewWorkflow.resumeAgentWithSession first (Guid.NewGuid()) taskId "Owner"
-                             0 0 0 "session-original")
+            ReviewWorkflow.resumeAgent second (Guid.NewGuid()) taskId "Owner" 0 0 0
+            |> success |> ignore
             let _, _, newAttempt = ReviewWorkflow.getTask first taskId |> success
             Assert.That(newAttempt.Value.AssignmentGeneration, Is.EqualTo(2))
-            expectStale (ReviewWorkflow.checkpointAttemptWithSession first (Guid.NewGuid()) taskId "Owner"
-                             0 0 0 "Stale progress" "Stale action" null "" "session-original")
-            expectStale (ReviewWorkflow.yieldAgentWithSession first (Guid.NewGuid()) taskId "Owner"
-                             0 0 0 "Stale checkpoint" "Stale yield" "session-original")
-            expectStale (ReviewWorkflow.completeAgentWorkWithSession first (Guid.NewGuid()) taskId "Owner"
-                             0 0 0 "Stale completion" "session-original")
-            expectStale (ReviewWorkflow.completeAgentWork first (Guid.NewGuid()) taskId "Owner"
-                             0 0 0 "Versionless without session")
-            ReviewWorkflow.checkpointAttemptWithSession second (Guid.NewGuid()) taskId "Owner"
-                0 0 0 "New session progress" "Finish" null "" "session-new"
+            ReviewWorkflow.checkpointAttempt second (Guid.NewGuid()) taskId "Owner"
+                0 0 0 "Progress without provider session" "Finish" null ""
             |> success |> ignore
-            ReviewWorkflow.completeAgentWorkWithSession second (Guid.NewGuid()) taskId "Owner"
-                0 0 0 "Completed by current session" "session-new"
+            ReviewWorkflow.yieldAgent first (Guid.NewGuid()) taskId "Owner" 0 0 0
+                "Pause without provider session" "Resume later"
+            |> success |> ignore
+            ReviewWorkflow.resumeAgent second (Guid.NewGuid()) taskId "Owner" 0 0 0
+            |> success |> ignore
+            // Repeated resume while Working is a normal explicit continuation.
+            ReviewWorkflow.resumeAgent first (Guid.NewGuid()) taskId "Owner" 0 0 0
+            |> success |> ignore
+            ReviewWorkflow.completeAgentWork second (Guid.NewGuid()) taskId "Owner"
+                0 0 0 "Completed without provider session"
             |> success |> ignore
             let finalAgent = (ReviewWorkflow.getAgentInbox first "Owner" |> success).Agent
             Assert.That(finalAgent.State, Is.EqualTo("NeedsWork"))
+            Assert.That(finalAgent.AssociatedSessionIds, Is.Empty)
             let _, _, doneAttempt = ReviewWorkflow.getTask second taskId |> success
             Assert.That(doneAttempt.Value.Phase, Is.EqualTo("Finished")))
 

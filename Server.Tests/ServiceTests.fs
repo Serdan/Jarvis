@@ -507,7 +507,7 @@ let ``task assignment and owner transfer do not accept reviewer IDs`` () =
         Assert.That(parameterNames, Does.Contain("operationId"), methodName)
         Assert.That(parameterNames, Does.Not.Contain("reviewerId"), methodName)
     let claim = typeof<JarvisMcpTools>.GetMethod("ClaimReview")
-    Assert.That(claim.GetParameters() |> Array.map _.Name, Does.Contain("reviewerId"))
+    Assert.That(claim.GetParameters() |> Array.map _.Name, Does.Contain("agentId"))
 
 [<Test>]
 let ``client-backed MCP tools expose an optional per-command deviceId`` () =
@@ -569,6 +569,7 @@ let ``WriteFile rejects invalid file write mode with actionable validation error
     let result =
         JarvisMcpTools.WriteFile(
             "Project1",
+            "Test Agent",
             "",
             "test.txt",
             "content",
@@ -1162,3 +1163,20 @@ let cross_project_notification_health_probe_uses_client_supported_action () =
         Assert.That(command.Action, Is.EqualTo("Health"))
         Assert.That(command.OperationId, Is.Empty)
     | other -> Assert.Fail(sprintf "Expected LedgerReadCommand; got %A" other)
+
+
+[<Test>]
+let ``project scoped MCP tools standardize explicit agentId arguments`` () =
+    let excluded = set [ "RegisterAgent"; "InitializeLedger"; "BindExistingLedger"; "RebindLedgerRemote" ]
+    let tools = typeof<JarvisMcpTools>.GetMethods(System.Reflection.BindingFlags.Public ||| System.Reflection.BindingFlags.Static)
+    for tool in tools do
+        let parameters = tool.GetParameters() |> Array.map (fun p -> p.Name) |> Set.ofArray
+        for deprecated in [ "ownerId"; "newOwnerId"; "actorId"; "reviewerId"; "requesterId" ] do
+            Assert.That(parameters.Contains(deprecated), Is.False, tool.Name + " exposes " + deprecated)
+        if parameters.Contains("projectName") && not (excluded.Contains tool.Name) then
+            let isGlobalFilter =
+                tool.Name = "Feedback" || tool.Name = "ListFeedback"
+                || tool.Name = "GetFeedbackSummary" || tool.Name = "GetConnectionDiagnostics" || tool.Name = "GetClientActivity"
+            if not isGlobalFilter then
+                Assert.That(parameters.Contains("agentId") || (tool.Name = "NotifyAgent" && parameters.Contains("fromAgentId")),
+                            Is.True, tool.Name + " lacks explicit agent attribution")

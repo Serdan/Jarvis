@@ -2,7 +2,6 @@ module Client.SignalR.Client
 
 open System
 open System.Diagnostics
-open System.Collections.Concurrent
 open System.IO
 open System.Net
 open System.Net.Http
@@ -21,76 +20,26 @@ let receiveMessage (rt: Runtime) message =
     rt.Tui.Log message
     Task.CompletedTask
 
-// A successful worker-owned action can provide a session lookup hint.
-// Never infer ownership from inbox reads; only Git holds authoritative state.
-let private workingSessions =
-    ConcurrentDictionary<string, string * string>()
-
-let private workingActor command =
-    match command with
-    | TaskWriteCommand c when List.contains c.Action
-        [ "BeginAttempt"; "ResumeAgent"; "CheckpointAttempt";
-          "BindReviewBase"; "BindAttemptSource"; "RebindAttemptSource" ] ->
-        Some(c.ProjectName, c.ActorId)
-    | ReviewWriteCommand c when List.contains c.Action [ "Submit"; "Update" ] ->
-        Some(c.ProjectName, c.ActorId)
-    | _ -> None
-
-let private checkWorkingGuidance (rt: Runtime) sessionId command response =
-    if String.IsNullOrWhiteSpace sessionId then []
+// Explicit MCP agent labels, not provider conversation metadata, identify
+// the current work slot. Guidance uses the canonical ledger Working clock.
+let private checkWorkingGuidance (rt: Runtime) agentId command =
+    if String.IsNullOrWhiteSpace agentId then []
     else
-        // The cache is only a shortcut; a cold client can resolve a session
-        // directly from the Git ledger on its first project-scoped response.
-        let commandProject = AgentCommandInfo.projectName command
-        let candidate =
-            match response, workingActor command with
-            | Ok _, Some(project, agentId) when not (String.IsNullOrWhiteSpace agentId) ->
-                Some(project, agentId)
-            | _ -> None
-        let cached =
-            match workingSessions.TryGetValue sessionId with
-            | true, (project, agentId) when commandProject.IsNone || commandProject = Some project ->
-                Some(project, agentId)
-            | _ -> None
-        let known = candidate |> Option.orElse cached
-
-        let lookup project =
-            match OrchestrationApi.LedgerBindingConfig.load project rt with
-            | Error _ -> None
-            | Ok binding ->
-                let found =
-                    match known with
-                    | Some(knownProject, agentId) when knownProject = project ->
-                        ReviewWorkflow.ReviewWorkflow.getAgentWorkingTurn binding agentId
-                        |> Result.map Some
-                    | _ ->
-                        ReviewWorkflow.ReviewWorkflow.findAgentBySession binding sessionId
-                match found with
-                | Ok(Some agent) -> Some(project, agent)
-                | _ -> None
-
-        let resolved =
-            match known, commandProject with
-            | Some(project, _), _ -> lookup project
-            | None, Some project -> lookup project
-            | None, None -> None
-        // A known session remains attributable even when the agent's
-        // canonical state changes away from Working.
-        let identity =
-            match resolved with
-            | Some(project, agent) -> Some(project, agent.AgentId)
-            | None -> known
-        identity |> Option.iter (fun (project, agentId) ->
-            workingSessions[sessionId] <- (project, agentId)
-            rt.Tui.RecordAgentSeen(project, agentId))
-        match resolved with
+        match AgentCommandInfo.projectName command with
         | None -> []
-        | Some(project, agent) ->
-            match WorkingTurnGuidance.forSession DateTimeOffset.UtcNow sessionId agent with
-            | Some(scope, content) ->
-                [ { Scope = scope; Path = $"jarvis/{scope}"
-                    Sha256 = ""; Content = content } ]
-            | None -> []
+        | Some routedProject ->
+            let project = AgentView.activityProject routedProject
+            match OrchestrationApi.LedgerBindingConfig.load project rt with
+            | Error _ -> []
+            | Ok binding ->
+                match ReviewWorkflow.ReviewWorkflow.getAgentWorkingTurn binding agentId with
+                | Error _ -> []
+                | Ok agent ->
+                    match WorkingTurnGuidance.instructionAt DateTimeOffset.UtcNow agent with
+                    | Some content ->
+                        [ { Scope = "working-turn"; Path = "jarvis/working-turn"
+                            Sha256 = ""; Content = content } ]
+                    | None -> []
 
 let private serialize<'a> (value: 'a) =
     try
@@ -421,22 +370,20 @@ let receiveCommandWithInstructions (rt: Runtime) command =
             return response, instructions @ AgentInstructions.writeWarnings rt command response
     }
 
-let receiveCommandAndReply (connection: HubConnection) (rt: Runtime) (correlationId: string) (commandJson: string) (sessionId: string) : Task =
+let receiveCommandAndReply (connection: HubConnection) (rt: Runtime) (correlationId: string) (commandJson: string) (agentId: string) : Task =
     task {
         let mutable parsedCommand = None
         let mutable instructions: InstructionDocument list = []
         let! response =
             task {
                 try
-                    let incoming = JsonSerializer.Deserialize<AgentCommand>(commandJson)
-                    let command =
-                        match incoming with
-                        | TaskWriteCommand cmd ->
-                            TaskWriteCommand { cmd with SessionId = sessionId }
-                        | _ -> incoming
+                    let command = JsonSerializer.Deserialize<AgentCommand>(commandJson)
                     parsedCommand <- Some command
+                    // Seen reflects a received agent-attributed tool invocation, regardless of outcome.
+                    AgentCommandInfo.projectName command
+                    |> Option.iter (fun project -> rt.Tui.RecordAgentSeen(AgentView.activityProject project, agentId))
                     let! response, applicable = receiveCommandWithInstructions rt command
-                    instructions <- applicable @ checkWorkingGuidance rt sessionId command response
+                    instructions <- applicable @ checkWorkingGuidance rt agentId command
                     return response
                 with ex ->
                     return Error(ExceptionError ex)

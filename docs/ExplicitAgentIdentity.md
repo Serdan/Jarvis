@@ -1,6 +1,6 @@
 # Explicit Agent Identity and Activity Attribution
 
-Status: **Approved design; not implemented**  
+Status: **Implemented in source; not deployed**
 Task: `task-cada37e778e54b558e362158f069db22`  
 Scope: Jarvis public MCP tools, server-to-client command transport, TUI activity tracking, documentation and tests.
 

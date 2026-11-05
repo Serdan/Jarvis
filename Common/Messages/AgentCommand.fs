@@ -436,7 +436,8 @@ type JobOutputEvent =
       Text: string }
 
 type GetJobResultCommand =
-    { JobId: string
+    { ProjectName: string
+      JobId: string
       AfterSequence: int64 option }
 
 type JobResult =
@@ -446,7 +447,7 @@ type JobResult =
       NextSequence: int64
       Truncated: bool }
 
-type CancelJobCommand = { JobId: string }
+type CancelJobCommand = { ProjectName: string; JobId: string }
 
 type MessageCommand =
     { ProjectName: string option
@@ -655,9 +656,9 @@ module AgentCommandInfo =
         | ListCommandsCommand
         | ListProjectsCommand
         | CreateProjectCommand _
-        | GetJobResultCommand _
-        | CancelJobCommand _
         | UpdateClientCommand -> None
+        | GetJobResultCommand cmd -> Some cmd.ProjectName
+        | CancelJobCommand cmd -> Some cmd.ProjectName
         | MessageCommand cmd -> cmd.ProjectName
         | GetClientActivityCommand cmd -> cmd.ProjectName
         | ListWorktreesCommand cmd -> Some cmd.ProjectName
@@ -854,7 +855,7 @@ module AgentCommandInfo =
         | None -> invocation command
 
 module AgentProtocol =
-    let version = "3.56"
+    let version = "3.57"
     let defaultPatchFuzzyContextLines = 3
     let maxResponseBytes = 900 * 1024
     let maxImageBytes = 8 * 1024 * 1024

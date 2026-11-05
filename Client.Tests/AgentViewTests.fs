@@ -174,7 +174,7 @@ let narrowAgentTablesKeepColumnsWithinAvailableWidth () =
 
 
 [<Test>]
-let lastSeenUsesSessionAttributedAgentKeyOnly () =
+let lastSeenUsesExplicitAgentKeyOnly () =
     let agent = record "Wayfold" "Agent 8" "Working" None
     let timestamp = DateTimeOffset(2026, 11, 3, 16, 0, 0, TimeSpan.Zero)
     let seen = System.Collections.Generic.Dictionary<string, DateTimeOffset>(StringComparer.OrdinalIgnoreCase)
@@ -190,3 +190,10 @@ let lastSeenDisplaysRelativeAgeWithoutInferringPresence () =
     relativeAge now None |> shouldEqual "—"
     relativeAge now (Some(now.AddMinutes(-9.))) |> shouldEqual "9m"
     relativeAge now (Some(now.AddHours(-2.))) |> shouldEqual "2h"
+
+
+[<Test>]
+let activityProjectNormalizesRegisteredWorktreeNames () =
+    activityProject "Wayfold" |> shouldEqual "Wayfold"
+    activityProject "Wayfold::gui-design" |> shouldEqual "Wayfold"
+    activityProject "Jarvis::agent-id-implementation" |> shouldEqual "Jarvis"

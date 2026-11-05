@@ -108,6 +108,23 @@ module RequestDeviceRouting =
                 with _ -> None
             | _ -> None
 
+    let private currentAgentId = AsyncLocal<string option>()
+    let private currentInvalidAgentId = AsyncLocal<bool>()
+    let agentId () = currentAgentId.Value
+    let invalidAgentId () = currentInvalidAgentId.Value
+
+    let private agentArgument (request: CallToolRequestParams) =
+        if isNull request.Arguments then None
+        else
+            let extract name =
+                match request.Arguments.TryGetValue(name) with
+                | true, value when value.ValueKind = JsonValueKind.String ->
+                    let identifier = value.GetString()
+                    if String.IsNullOrWhiteSpace identifier || identifier.Length > 256 then None
+                    else Some identifier
+                | _ -> None
+            extract "agentId" |> Option.orElseWith (fun () -> extract "fromAgentId")
+
     let session () = currentSession.Value
     let deviceOverride () = currentDeviceOverride.Value
     let private invalidDeviceId = String.replicate 257 "x"
@@ -132,13 +149,21 @@ module RequestDeviceRouting =
 
     let withMetadata (request: CallToolRequestParams) (operation: unit -> Task<'a>) =
         task {
-            let oldSession, oldDevice = currentSession.Value, currentDeviceOverride.Value
+            let oldSession, oldDevice, oldAgent, oldInvalid =
+                currentSession.Value, currentDeviceOverride.Value, currentAgentId.Value, currentInvalidAgentId.Value
             currentSession.Value <- valueFrom request.Meta "openai/session"
+            currentAgentId.Value <- agentArgument request
+            let hasAgentField =
+                not (isNull request.Arguments)
+                && (request.Arguments.ContainsKey("agentId") || request.Arguments.ContainsKey("fromAgentId"))
+            currentInvalidAgentId.Value <- hasAgentField && currentAgentId.Value.IsNone
             currentDeviceOverride.Value <- deviceArgument request |> Option.orElseWith (fun () -> metadataDevice request.Meta)
             try return! operation()
             finally
                 currentSession.Value <- oldSession
                 currentDeviceOverride.Value <- oldDevice
+                currentAgentId.Value <- oldAgent
+                currentInvalidAgentId.Value <- oldInvalid
         }
 
 module McpToolHelpers =
@@ -558,6 +583,8 @@ module McpToolHelpers =
             match Option.ofObj http.HttpContext with
             | None ->
                 return errorResult (PermissionDenied "The MCP request is missing its HTTP context.")
+            | Some _ when RequestDeviceRouting.invalidAgentId() ->
+                return errorResult (ValidationFailed "agentId must be a nonempty string of at most 256 characters.")
             | Some context ->
                 let command, generatedId = ensureOperationId command
                 let command, generatedTaskId =
@@ -593,19 +620,22 @@ module McpToolHelpers =
                                           Cursor = ""; PageSize = 0; BeforeOid = null
                                           AfterOid = null; RelativePath = null },
                                     ?conversationId = RequestDeviceRouting.session(),
-                                    ?deviceId = RequestDeviceRouting.deviceOverride())
+                                    ?deviceId = RequestDeviceRouting.deviceOverride(),
+                                                     ?agentId = RequestDeviceRouting.agentId())
                                 match sender.Result, sender.Error with
                                 | Some _, None ->
                                     return! client.SendCommandToProject(
                                         userId, notification.ProjectName, command,
                                         ?conversationId = RequestDeviceRouting.session(),
-                                        ?deviceId = RequestDeviceRouting.deviceOverride())
+                                        ?deviceId = RequestDeviceRouting.deviceOverride(),
+                                                     ?agentId = RequestDeviceRouting.agentId())
                                 | _ -> return sender
                             }
                         | _ ->
                             client.SendCommandToUser(userId, command,
                                                      ?conversationId = RequestDeviceRouting.session(),
-                                                     ?deviceId = RequestDeviceRouting.deviceOverride())
+                                                     ?deviceId = RequestDeviceRouting.deviceOverride(),
+                                                     ?agentId = RequestDeviceRouting.agentId())
                     stopwatch.Stop()
                     finishOperation tracking response stopwatch.ElapsedMilliseconds
 
@@ -1133,46 +1163,46 @@ type JarvisMcpTools =
                   AcknowledgeRemoteVisibility = acknowledgeRemoteVisibility })
 
     [<McpServerTool(Title = "List worktrees", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Discover all registered Git worktrees for a project, regardless of directory layout.")>]
-    static member ListWorktrees(projectName: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member ListWorktrees(projectName: string, agentId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (ListWorktreesCommand { ProjectName = projectName })
 
     [<McpServerTool(Title = "Get worktree", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Inspect an existing Git-registered project worktree.")>]
-    static member GetWorktree(projectName: string, worktreePath: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member GetWorktree(projectName: string, agentId: string, worktreePath: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (GetWorktreeCommand { ProjectName = projectName; WorktreePath = worktreePath })
 
     [<McpServerTool(Title = "Create worktree", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Create an isolated Git working tree and branch for development. The worktree is registered with Jarvis and requires local approval.")>]
-    static member CreateWorktree(projectName: string, name: string, branch: string, baseRef: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member CreateWorktree(projectName: string, agentId: string, name: string, branch: string, baseRef: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (CreateWorktreeCommand { ProjectName = projectName; Name = name; Branch = branch; BaseRef = baseRef })
 
     [<McpServerTool(Title = "Inspect worktree removal", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Inspect cleanliness, lock state and integration before removing a worktree.")>]
-    static member InspectWorktreeRemoval(projectName: string, worktreePath: string, [<Optional; DefaultParameterValue("")>] targetRef: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member InspectWorktreeRemoval(projectName: string, agentId: string, worktreePath: string, [<Optional; DefaultParameterValue("")>] targetRef: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (InspectWorktreeRemovalCommand { ProjectName = projectName; WorktreePath = worktreePath; TargetRef = McpToolHelpers.optionOfString targetRef })
 
     [<McpServerTool(Title = "Remove worktree", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Clean up a completed Git worktree after verifying it is clean, integrated and unlocked. Requires local approval.")>]
-    static member RemoveWorktree(projectName: string, worktreePath: string, [<Optional; DefaultParameterValue("")>] targetRef: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member RemoveWorktree(projectName: string, agentId: string, worktreePath: string, [<Optional; DefaultParameterValue("")>] targetRef: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (RemoveWorktreeCommand { ProjectName = projectName; WorktreePath = worktreePath; TargetRef = McpToolHelpers.optionOfString targetRef })
 
     [<McpServerTool(Title = "ledger health", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read the verified remote orphan Git ledger identity, trusted head and sequence. Requires an explicit existing binding; never initializes a ledger.")>]
-    static member LedgerHealth(projectName: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member LedgerHealth(projectName: string, agentId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (LedgerReadCommand { ProjectName = projectName; Action = "Health"; OperationId = "" })
 
     [<McpServerTool(Title = "pending operations", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Inspect the local crash-persistent write intent journal, including original command parameters for safe retry with the same UUID. No source or ledger mutations.")>]
-    static member PendingOperations(projectName: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member PendingOperations(projectName: string, agentId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http
             (LedgerReadCommand { ProjectName = projectName; Action = "PendingOperations"; OperationId = "" })
 
     [<McpServerTool(Title = "reconcile pending operations", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Compare each locally pending ledger command against one verified remote ledger snapshot. Report Applied, NotFoundAtVerifiedHead, BindingMismatch or IdentityMismatch; never erase local recovery evidence or perform a write.")>]
-    static member ReconcilePendingOperations(projectName: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member ReconcilePendingOperations(projectName: string, agentId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http
             (LedgerReadCommand { ProjectName = projectName; Action = "ReconcilePendingOperations"; OperationId = "" })
 
     [<McpServerTool(Title = "get operation status", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read a specific caller-stable ledger operation UUID from the verified remote ledger; NotFoundAtVerifiedHead is not proof that a timed-out push will never arrive.")>]
-    static member GetOperationStatus(projectName: string, operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member GetOperationStatus(projectName: string, agentId: string, operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http
             (LedgerReadCommand { ProjectName = projectName; Action = "GetOperationStatus"; OperationId = operationId })
 
     [<McpServerTool(Title = "acknowledge pending operation", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("After inspecting a matching Applied ledger receipt, explicitly remove only the corresponding local pending journal record. Requires the exact verified remote requestHash. Does not push, mutate or initialize the ledger.")>]
-    static member AcknowledgePendingOperation(projectName: string, operationId: string, expectedRequestHash: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member AcknowledgePendingOperation(projectName: string, agentId: string, operationId: string, expectedRequestHash: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http
             (LedgerWriteCommand
                 { ProjectName = projectName; Action = "AcknowledgePendingOperation"; OperationId = operationId
@@ -1209,7 +1239,7 @@ type JarvisMcpTools =
                   ExpectedTrustedHead = expectedTrustedHead; ExpectedRequestHash = ""; AcknowledgeVisibility = acknowledgeVisibility })
 
     [<McpServerTool(Title = "close task", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Explicitly record that a task is closed. Does not inspect reviews, worker completion or Git integration.")>]
-    static member CloseTask(projectName: string, taskId: string, expectedTaskVersion: int, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member CloseTask(projectName: string, agentId: string, taskId: string, expectedTaskVersion: int, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         let cmd = TaskCommands.write projectName "CloseTask" operationId taskId TaskCommands.legacyAdministrativePlaceholder
         McpToolHelpers.send client http (TaskWriteCommand { cmd with ExpectedTaskVersion = expectedTaskVersion })
 
@@ -1218,12 +1248,12 @@ type JarvisMcpTools =
         McpToolHelpers.send client http (TaskReadCommand { ProjectName = projectName; AgentId = agentId; Action = "AgentInbox"; TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L; Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null })
 
     [<McpServerTool(Title = "create task", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Atomically create a task and canonical HTML spec on the bound Git ledger. Omit taskId to generate a unique, stable ID derived from operationId; provide taskId explicitly for named tasks and imports. Reusing operationId on retry preserves the generated ID.")>]
-    static member CreateTask(projectName: string, title: string, html: string, [<Optional; DefaultParameterValue("")>] taskId: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member CreateTask(projectName: string, agentId: string, title: string, html: string, [<Optional; DefaultParameterValue("")>] taskId: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         let cmd = TaskCommands.write projectName "CreateTask" operationId taskId TaskCommands.legacyAdministrativePlaceholder
         McpToolHelpers.send client http (TaskWriteCommand { cmd with Title = title; Html = html })
 
     [<McpServerTool(Title = "revise task spec", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Revise a canonical HTML task spec with an exact task version. Supply expectedSpecBlobOid for assigned tasks or to assert the exact current spec; leave it empty for unassigned Open tasks. Assignment adoption remains explicit.")>]
-    static member ReviseTaskSpec(projectName: string, taskId: string, expectedTaskVersion: int, title: string, html: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, [<Optional; DefaultParameterValue("")>] expectedSpecBlobOid: string, client: ClientService, http: IHttpContextAccessor) =
+    static member ReviseTaskSpec(projectName: string, agentId: string, taskId: string, expectedTaskVersion: int, title: string, html: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, [<Optional; DefaultParameterValue("")>] expectedSpecBlobOid: string, client: ClientService, http: IHttpContextAccessor) =
         let pinned = not (String.IsNullOrWhiteSpace expectedSpecBlobOid)
         let cmd = TaskCommands.write projectName (if pinned then "ReviseTaskSpecPinned" else "ReviseTaskSpec") operationId taskId TaskCommands.legacyAdministrativePlaceholder
         McpToolHelpers.send client http (TaskWriteCommand { cmd with ExpectedVersion = expectedTaskVersion; BaseOid = expectedSpecBlobOid; Title = title; Html = html })
@@ -1234,17 +1264,17 @@ type JarvisMcpTools =
         McpToolHelpers.send client http (TaskWriteCommand cmd)
 
     [<McpServerTool(Title = "integration submissions", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read every recorded exact-commit integration submission and the latest submitted boundary for a task, including pending and integrated evidence. Does not merge or infer that a review verdict implies integration.")>]
-    static member GetIntegrationSubmissions(projectName: string, taskId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member GetIntegrationSubmissions(projectName: string, agentId: string, taskId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (TaskReadCommand { ProjectName = projectName; AgentId = ""; Action = "GetIntegrationSubmissions"; TaskId = taskId; AssignmentGeneration = 0; CheckpointSequence = 0L; Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null })
 
     [<McpServerTool(Title = "submit integration boundary", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Submit an exact source branch commit as a durable integration boundary for Lead. Creates an immutable submission record without merging, pausing the agent or changing a review verdict. Each submission ID must be a caller-stable UUID; operationId can be omitted for new calls or supplied for exact retries; optional reviewId must refer to a frozen review of that exact commit.")>]
-    static member SubmitIntegration(projectName: string, taskId: string, actorId: string, submissionId: string, sourceRef: string, submittedCommit: string, targetRef: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] reviewId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
-        let cmd = TaskCommands.write projectName "SubmitIntegration" operationId taskId actorId
+    static member SubmitIntegration(projectName: string, taskId: string, agentId: string, submissionId: string, sourceRef: string, submittedCommit: string, targetRef: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] reviewId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        let cmd = TaskCommands.write projectName "SubmitIntegration" operationId taskId agentId
         McpToolHelpers.send client http (TaskWriteCommand { cmd with AttemptId = submissionId; SourceRef = sourceRef; BaseOid = submittedCommit; TargetRef = targetRef; Reason = reviewId })
 
     [<McpServerTool(Title = "complete integration boundary", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Record an exact integration commit only after verifying the remote target branch contains it and that it contains the submitted commit; does not merge, push source branches or mutate task/review lifecycle.")>]
-    static member CompleteIntegration(projectName: string, taskId: string, actorId: string, submissionId: string, integratedCommit: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
-        let cmd = TaskCommands.write projectName "CompleteIntegration" operationId taskId actorId
+    static member CompleteIntegration(projectName: string, taskId: string, agentId: string, submissionId: string, integratedCommit: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        let cmd = TaskCommands.write projectName "CompleteIntegration" operationId taskId agentId
         McpToolHelpers.send client http (TaskWriteCommand { cmd with AttemptId = submissionId; BaseOid = integratedCommit })
 
     [<McpServerTool(Title = "notify agent", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Send a durable notification to an agent in the same project or in optional toProjectName. Cross-project sends verify the sender in the source ledger and write only to the destination Git ledger, routing to a connected client that has its binding. The recipient inbox exposes the source project and agent. Omit operationId for a generated ID; reuse the returned ID for an uncertain retry.")>]
@@ -1262,21 +1292,21 @@ type JarvisMcpTools =
         McpToolHelpers.send client http (TaskWriteCommand { cmd with AttemptId = notificationId })
 
     [<McpServerTool(Title = "assign task", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Assign a registered unoccupied agent to an Open task. The agent immediately becomes Ready; the queued attempt is separate from execution. Reviews are independent.")>]
-    static member AssignTask(projectName: string, taskId: string, attemptId: string, ownerId: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member AssignTask(projectName: string, taskId: string, attemptId: string, agentId: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         let cmd = TaskCommands.write projectName "AssignTask" operationId taskId TaskCommands.legacyAdministrativePlaceholder
-        McpToolHelpers.send client http (TaskWriteCommand { cmd with AttemptId = attemptId; OwnerId = ownerId })
+        McpToolHelpers.send client http (TaskWriteCommand { cmd with AttemptId = attemptId; OwnerId = agentId })
 
     [<McpServerTool(Title = "get assignment generation", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read an immutable assignment generation with the pinned spec OID, instructions, source baseline and optional acknowledgment receipt. Older generations remain readable after reissue or recovery.")>]
-    static member GetAssignment(projectName: string, taskId: string, assignmentGeneration: int, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member GetAssignment(projectName: string, agentId: string, taskId: string, assignmentGeneration: int, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http
             (TaskReadCommand
                 { ProjectName = projectName; AgentId = ""; Action = "GetAssignment"
                   TaskId = taskId; AssignmentGeneration = assignmentGeneration; CheckpointSequence = 0L; Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null })
 
     [<McpServerTool(Title = "reissue assignment", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Update instructions or canonical HTML for an unstarted Ready assignment. Optionally adopt a separately revised canonical spec by supplying expectedCurrentSpecBlobOid and expectedTaskVersion instead of newSpecHtml. Those inputs are mutually exclusive; Working assignments cannot be updated. Immutable issuance history is preserved.")>]
-    static member ReissueAssignment(projectName: string, taskId: string, ownerId: string, expectedAttemptVersion: int, expectedAgentVersion: int, assignmentGeneration: int, instructions: string, [<Optional; DefaultParameterValue("")>] newSpecHtml: string, [<Optional; DefaultParameterValue("")>] expectedCurrentSpecBlobOid: string, [<Optional; DefaultParameterValue(0)>] expectedTaskVersion: int, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member ReissueAssignment(projectName: string, taskId: string, agentId: string, expectedAttemptVersion: int, expectedAgentVersion: int, assignmentGeneration: int, instructions: string, [<Optional; DefaultParameterValue("")>] newSpecHtml: string, [<Optional; DefaultParameterValue("")>] expectedCurrentSpecBlobOid: string, [<Optional; DefaultParameterValue(0)>] expectedTaskVersion: int, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         let adoption = not (String.IsNullOrWhiteSpace expectedCurrentSpecBlobOid)
-        let cmd = TaskCommands.write projectName (if adoption then "AdoptTaskSpec" else "ReissueAssignment") operationId taskId ownerId
+        let cmd = TaskCommands.write projectName (if adoption then "AdoptTaskSpec" else "ReissueAssignment") operationId taskId agentId
         McpToolHelpers.send client http
             (TaskWriteCommand
                 { cmd with ExpectedVersion = expectedAttemptVersion
@@ -1287,8 +1317,8 @@ type JarvisMcpTools =
                            Summary = instructions; Html = newSpecHtml })
 
     [<McpServerTool(Title = "checkpoint Working attempt", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Write an immutable progress checkpoint for the specified current Working assignment without releasing the slot. Optional exact version/generation assertions; current values resolve inside the ledger transaction. Source SHA is verified; evidence remains owner-reported.")>]
-    static member CheckpointAttempt(projectName: string, taskId: string, ownerId: string, summary: string, nextAction: string, sourceCommit: string, evidence: string, [<Optional; DefaultParameterValue(0)>] expectedAttemptVersion: int, [<Optional; DefaultParameterValue(0)>] expectedAgentVersion: int, [<Optional; DefaultParameterValue(0)>] assignmentGeneration: int, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
-        let cmd = TaskCommands.write projectName "CheckpointAttempt" operationId taskId ownerId
+    static member CheckpointAttempt(projectName: string, taskId: string, agentId: string, summary: string, nextAction: string, sourceCommit: string, evidence: string, [<Optional; DefaultParameterValue(0)>] expectedAttemptVersion: int, [<Optional; DefaultParameterValue(0)>] expectedAgentVersion: int, [<Optional; DefaultParameterValue(0)>] assignmentGeneration: int, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        let cmd = TaskCommands.write projectName "CheckpointAttempt" operationId taskId agentId
         McpToolHelpers.send client http (TaskWriteCommand
             { cmd with ExpectedVersion = expectedAttemptVersion
                        ExpectedAgentVersion = expectedAgentVersion
@@ -1297,13 +1327,13 @@ type JarvisMcpTools =
                        BaseOid = sourceCommit; Evidence = evidence })
 
     [<McpServerTool(Title = "get checkpoint", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read an immutable attempt checkpoint by its ledger sequence from a verified canonical snapshot.")>]
-    static member GetCheckpoint(projectName: string, taskId: string, checkpointSequence: int64, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member GetCheckpoint(projectName: string, agentId: string, taskId: string, checkpointSequence: int64, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (TaskReadCommand
             { ProjectName = projectName; AgentId = ""; Action = "GetCheckpoint"
               TaskId = taskId; AssignmentGeneration = 0; CheckpointSequence = checkpointSequence; Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null })
 
     [<McpServerTool(Title = "set attempt source", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Set the source branch for a current Working or Ready attempt. For initial binding supply both baseOid and targetRef; a later source-branch change omits both. Initial binding verifies Git ancestry and optional allowDetached/allowUncommitted; rebinding preserves pinned baseline and independent review snapshots.")>]
-    static member SetAttemptSource(projectName: string, taskId: string, ownerId: string, expectedAttemptVersion: int, assignmentGeneration: int, sourceRef: string,
+    static member SetAttemptSource(projectName: string, taskId: string, agentId: string, expectedAttemptVersion: int, assignmentGeneration: int, sourceRef: string,
                                    [<Optional; DefaultParameterValue("")>] baseOid: string,
                                    [<Optional; DefaultParameterValue("")>] targetRef: string,
                                    [<Optional; DefaultParameterValue(false)>] allowDetached: bool,
@@ -1317,7 +1347,7 @@ type JarvisMcpTools =
             raise (ArgumentException("Initial source binding requires both baseOid and targetRef. Omit both to update an already bound branch."))
         if not hasBase && (allowDetached || allowUncommitted) then
             raise (ArgumentException("allowDetached and allowUncommitted apply only to initial source binding."))
-        let cmd = TaskCommands.write projectName (if hasBase then "BindAttemptSource" else "RebindAttemptSource") operationId taskId ownerId
+        let cmd = TaskCommands.write projectName (if hasBase then "BindAttemptSource" else "RebindAttemptSource") operationId taskId agentId
         McpToolHelpers.send client http
             (TaskWriteCommand
                 { cmd with ExpectedVersion = expectedAttemptVersion; AssignmentGeneration = assignmentGeneration
@@ -1325,30 +1355,30 @@ type JarvisMcpTools =
                            AllowDetached = allowDetached; AllowUncommitted = allowUncommitted })
 
     [<McpServerTool(Title = "inspect attempt source", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read the pinned source repository/ref and current registered Git worktree observation without changing task ownership, assignment or agent state. Missing source is SourceUnavailable, not agent Free.")>]
-    static member InspectAttemptSource(projectName: string, taskId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member InspectAttemptSource(projectName: string, agentId: string, taskId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http
             (TaskReadCommand
                 { ProjectName = projectName; AgentId = ""; Action = "InspectAttemptSource"
                   TaskId = taskId; AssignmentGeneration = 0; CheckpointSequence = 0L; Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null })
 
     [<McpServerTool(Title = "acknowledge review decision", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Acknowledge a specific review verdict by its decision sequence without interrupting the agent's implementation slot.")>]
-    static member AcknowledgeReviewFeedback(projectName: string, taskId: string, ownerId: string, decisionSequence: int64, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
-        let cmd = TaskCommands.write projectName "AcknowledgeFeedback" operationId taskId ownerId
+    static member AcknowledgeReviewFeedback(projectName: string, taskId: string, agentId: string, decisionSequence: int64, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        let cmd = TaskCommands.write projectName "AcknowledgeFeedback" operationId taskId agentId
         McpToolHelpers.send client http (TaskWriteCommand { cmd with DecisionSequence = decisionSequence })
 
     [<McpServerTool(Title = "yield agent", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Yield the current Working assignment to Ready with a checkpoint and continuation instruction. Omit version/generation arguments to resolve the current ledger snapshot, or supply them as exact assertions.")>]
-    static member YieldAgent(projectName: string, taskId: string, ownerId: string, summary: string, nextAction: string, [<Optional; DefaultParameterValue(0)>] expectedAttemptVersion: int, [<Optional; DefaultParameterValue(0)>] expectedAgentVersion: int, [<Optional; DefaultParameterValue(0)>] assignmentGeneration: int, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
-        let cmd = TaskCommands.write projectName "YieldAgent" operationId taskId ownerId
+    static member YieldAgent(projectName: string, taskId: string, agentId: string, summary: string, nextAction: string, [<Optional; DefaultParameterValue(0)>] expectedAttemptVersion: int, [<Optional; DefaultParameterValue(0)>] expectedAgentVersion: int, [<Optional; DefaultParameterValue(0)>] assignmentGeneration: int, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        let cmd = TaskCommands.write projectName "YieldAgent" operationId taskId agentId
         McpToolHelpers.send client http (TaskWriteCommand { cmd with ExpectedVersion = expectedAttemptVersion; ExpectedAgentVersion = expectedAgentVersion; AssignmentGeneration = assignmentGeneration; Summary = summary; NextAction = nextAction })
 
     [<McpServerTool(Title = "resume agent", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Continue an agent's assigned development task, starting Ready work or reconnecting an interrupted Working session. Jarvis preserves assignment history and resolves omitted version fields from the current ledger state. Reuse operationId only when retrying an uncertain result.")>]
-    static member ResumeAgent(projectName: string, taskId: string, ownerId: string, [<Optional; DefaultParameterValue(0)>] expectedAttemptVersion: int, [<Optional; DefaultParameterValue(0)>] expectedAgentVersion: int, [<Optional; DefaultParameterValue(0)>] assignmentGeneration: int, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
-        let cmd = TaskCommands.write projectName "ResumeAgent" operationId taskId ownerId
+    static member ResumeAgent(projectName: string, taskId: string, agentId: string, [<Optional; DefaultParameterValue(0)>] expectedAttemptVersion: int, [<Optional; DefaultParameterValue(0)>] expectedAgentVersion: int, [<Optional; DefaultParameterValue(0)>] assignmentGeneration: int, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        let cmd = TaskCommands.write projectName "ResumeAgent" operationId taskId agentId
         McpToolHelpers.send client http (TaskWriteCommand { cmd with ExpectedVersion = expectedAttemptVersion; ExpectedAgentVersion = expectedAgentVersion; AssignmentGeneration = assignmentGeneration })
 
     [<McpServerTool(Title = "complete agent work", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Complete the specified current agent assignment, recording a checkpoint and releasing the slot. Version/generation arguments are optional strict assertions; omitting them resolves current ledger state.")>]
-    static member CompleteAgentWork(projectName: string, taskId: string, ownerId: string, summary: string, [<Optional; DefaultParameterValue(0)>] expectedAttemptVersion: int, [<Optional; DefaultParameterValue(0)>] expectedAgentVersion: int, [<Optional; DefaultParameterValue(0)>] assignmentGeneration: int, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
-        let cmd = TaskCommands.write projectName "CompleteAgentWork" operationId taskId ownerId
+    static member CompleteAgentWork(projectName: string, taskId: string, agentId: string, summary: string, [<Optional; DefaultParameterValue(0)>] expectedAttemptVersion: int, [<Optional; DefaultParameterValue(0)>] expectedAgentVersion: int, [<Optional; DefaultParameterValue(0)>] assignmentGeneration: int, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        let cmd = TaskCommands.write projectName "CompleteAgentWork" operationId taskId agentId
         McpToolHelpers.send client http (TaskWriteCommand { cmd with ExpectedVersion = expectedAttemptVersion; ExpectedAgentVersion = expectedAgentVersion; AssignmentGeneration = assignmentGeneration; Summary = summary })
 
     [<McpServerTool(Title = "park agent", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Mark an unassigned agent as Parked, without interrupting active assignments.")>]
@@ -1357,17 +1387,17 @@ type JarvisMcpTools =
         McpToolHelpers.send client http (TaskWriteCommand { cmd with ExpectedAgentVersion = expectedAgentVersion; Reason = reason })
 
     [<McpServerTool(Title = "reissue queued task", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Explicitly assign a queued attempt to an unoccupied agent. Does not preempt a current Ready or Working assignment.")>]
-    static member ReissueQueuedAttempt(projectName: string, taskId: string, ownerId: string, expectedAttemptVersion: int, expectedAgentVersion: int, assignmentGeneration: int, reason: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
-        let cmd = TaskCommands.write projectName "ReissueQueuedAttempt" operationId taskId ownerId
+    static member ReissueQueuedAttempt(projectName: string, taskId: string, agentId: string, expectedAttemptVersion: int, expectedAgentVersion: int, assignmentGeneration: int, reason: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        let cmd = TaskCommands.write projectName "ReissueQueuedAttempt" operationId taskId agentId
         McpToolHelpers.send client http (TaskWriteCommand { cmd with ExpectedVersion = expectedAttemptVersion; ExpectedAgentVersion = expectedAgentVersion; AssignmentGeneration = assignmentGeneration; Reason = reason })
 
     [<McpServerTool(Title = "recover agent assignment", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Prepare continuation of an interrupted agent assignment by recording its checkpoint and issuing a new assignment generation. Requires an explicit operator action.")>]
-    static member RecoverAgentAssignment(projectName: string, taskId: string, ownerId: string, expectedAttemptVersion: int, expectedAgentVersion: int, assignmentGeneration: int, reason: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
-        let cmd = TaskCommands.write projectName "RecoverAgentAssignment" operationId taskId ownerId
+    static member RecoverAgentAssignment(projectName: string, taskId: string, agentId: string, expectedAttemptVersion: int, expectedAgentVersion: int, assignmentGeneration: int, reason: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        let cmd = TaskCommands.write projectName "RecoverAgentAssignment" operationId taskId agentId
         McpToolHelpers.send client http (TaskWriteCommand { cmd with ExpectedVersion = expectedAttemptVersion; ExpectedAgentVersion = expectedAgentVersion; AssignmentGeneration = assignmentGeneration; Reason = reason })
 
     [<McpServerTool(Title = "DeferAttempt", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Defer a Queued or Started attempt, releasing its matching agent assignment. disposition is Deferred (default; formerly park_attempt) or Blocked. Both preserve task, owner/history, and independent reviews. Requires exact task/attempt/agent versions.")>]
-    static member DeferAttempt(projectName: string, taskId: string, expectedTaskVersion: int, expectedAttemptVersion: int, expectedAgentVersion: int, assignmentGeneration: int, reason: string, [<Optional; DefaultParameterValue("Deferred")>] disposition: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member DeferAttempt(projectName: string, agentId: string, taskId: string, expectedTaskVersion: int, expectedAttemptVersion: int, expectedAgentVersion: int, assignmentGeneration: int, reason: string, [<Optional; DefaultParameterValue("Deferred")>] disposition: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         if disposition <> "Deferred" && disposition <> "Blocked" then
             raise (ArgumentException("disposition must be Deferred or Blocked.", "disposition"))
         let cmd = TaskCommands.write projectName (if disposition = "Blocked" then "BlockAttempt" else "ParkAttempt") operationId taskId TaskCommands.legacyAdministrativePlaceholder
@@ -1377,7 +1407,7 @@ type JarvisMcpTools =
                        Reason = reason })
 
     [<McpServerTool(Title = "ResumeAttempt", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Explicitly requeue a deferred or blocked attempt with a new generation and assign its unoccupied owner Ready. Reject if that owner has another current assignment. Reviews are unchanged.")>]
-    static member ResumeAttempt(projectName: string, taskId: string, expectedTaskVersion: int, expectedAttemptVersion: int, expectedAgentVersion: int, assignmentGeneration: int, reason: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member ResumeAttempt(projectName: string, agentId: string, taskId: string, expectedTaskVersion: int, expectedAttemptVersion: int, expectedAgentVersion: int, assignmentGeneration: int, reason: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         let cmd = TaskCommands.write projectName "ResumeAttempt" operationId taskId TaskCommands.legacyAdministrativePlaceholder
         McpToolHelpers.send client http (TaskWriteCommand
             { cmd with ExpectedTaskVersion = expectedTaskVersion; ExpectedVersion = expectedAttemptVersion
@@ -1385,7 +1415,7 @@ type JarvisMcpTools =
                        Reason = reason })
 
     [<McpServerTool(Title = "AbandonAttempt", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("End an implementation attempt and release its assignment if occupied, retaining historical reviews and leaving other agents' work unchanged. An active task returns to Open.")>]
-    static member AbandonAttempt(projectName: string, taskId: string, expectedTaskVersion: int, expectedAttemptVersion: int, expectedAgentVersion: int, assignmentGeneration: int, reason: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member AbandonAttempt(projectName: string, agentId: string, taskId: string, expectedTaskVersion: int, expectedAttemptVersion: int, expectedAgentVersion: int, assignmentGeneration: int, reason: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         let cmd = TaskCommands.write projectName "AbandonAttempt" operationId taskId TaskCommands.legacyAdministrativePlaceholder
         McpToolHelpers.send client http (TaskWriteCommand
             { cmd with ExpectedTaskVersion = expectedTaskVersion; ExpectedVersion = expectedAttemptVersion
@@ -1393,7 +1423,7 @@ type JarvisMcpTools =
                        Reason = reason })
 
     [<McpServerTool(Title = "CancelTask", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Cancel a project task while retaining its history and independent reviews. Assigned tasks require exact attempt and agent version fields; unrelated assignments are unchanged.")>]
-    static member CancelTask(projectName: string, taskId: string, expectedTaskVersion: int, reason: string, [<Optional; DefaultParameterValue(0)>] expectedAttemptVersion: int, [<Optional; DefaultParameterValue(0)>] expectedAgentVersion: int, [<Optional; DefaultParameterValue(0)>] assignmentGeneration: int, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member CancelTask(projectName: string, agentId: string, taskId: string, expectedTaskVersion: int, reason: string, [<Optional; DefaultParameterValue(0)>] expectedAttemptVersion: int, [<Optional; DefaultParameterValue(0)>] expectedAgentVersion: int, [<Optional; DefaultParameterValue(0)>] assignmentGeneration: int, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         let openTask = expectedAttemptVersion = 0 && expectedAgentVersion = 0 && assignmentGeneration = 0
         let cmd = TaskCommands.write projectName (if openTask then "CancelOpenTask" else "CancelTask") operationId taskId TaskCommands.legacyAdministrativePlaceholder
         McpToolHelpers.send client http (TaskWriteCommand
@@ -1402,27 +1432,27 @@ type JarvisMcpTools =
                        Reason = reason })
 
     [<McpServerTool(Title = "transfer attempt owner", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Transfer an implementation attempt to another registered agent while preserving independent reviews.")>]
-    static member TransferOwner(projectName: string, taskId: string, newAttemptId: string, newOwnerId: string, expectedTaskVersion: int, expectedAttemptVersion: int, expectedAgentVersion: int, assignmentGeneration: int, reason: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member TransferOwner(projectName: string, taskId: string, newAttemptId: string, agentId: string, expectedTaskVersion: int, expectedAttemptVersion: int, expectedAgentVersion: int, assignmentGeneration: int, reason: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         let cmd = TaskCommands.write projectName "TransferOwner" operationId taskId TaskCommands.legacyAdministrativePlaceholder
         McpToolHelpers.send client http (TaskWriteCommand
-            { cmd with AttemptId = newAttemptId; OwnerId = newOwnerId
+            { cmd with AttemptId = newAttemptId; OwnerId = agentId
                        ExpectedTaskVersion = expectedTaskVersion; ExpectedVersion = expectedAttemptVersion
                        ExpectedAgentVersion = expectedAgentVersion; AssignmentGeneration = assignmentGeneration
                        Reason = reason })
 
     [<McpServerTool(Title = "Reopen task", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Explicitly reopen Closed or Cancelled task, retaining all historical attempt and approval evidence with a new future assignment.")>]
-    static member ReopenTask(projectName: string, taskId: string, expectedTaskVersion: int, reason: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member ReopenTask(projectName: string, agentId: string, taskId: string, expectedTaskVersion: int, reason: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         let cmd = TaskCommands.write projectName "ReopenTask" operationId taskId TaskCommands.legacyAdministrativePlaceholder
         McpToolHelpers.send client http (TaskWriteCommand { cmd with ExpectedTaskVersion = expectedTaskVersion; Reason = reason })
 
     [<McpServerTool(Title = "Task lifecycle history", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read immutable administrative transitions and their previous/new task, attempt and owner metadata.")>]
-    static member TaskLifecycleHistory(projectName: string, taskId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member TaskLifecycleHistory(projectName: string, agentId: string, taskId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (TaskReadCommand
             { ProjectName = projectName; AgentId = ""; Action = "LifecycleHistory"; TaskId = taskId
               AssignmentGeneration = 0; CheckpointSequence = 0L; Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null })
 
     [<McpServerTool(Title = "Read a bounded canonical task specification page", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read a bounded canonical task specification page. Requires an existing bound orphan Git ledger.")>]
-    static member GetTaskSpecPage(projectName: string, taskId: string, pageBytes: int, cursor: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member GetTaskSpecPage(projectName: string, agentId: string, taskId: string, pageBytes: int, cursor: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (TaskReadCommand
             { ProjectName = projectName; AgentId = ""; Action = "GetSpecPage"; TaskId = taskId
               AssignmentGeneration = 0; CheckpointSequence = 0L
@@ -1433,7 +1463,7 @@ type JarvisMcpTools =
               RelativePath = null })
 
     [<McpServerTool(Title = "Compare two pinned canonical task specification blob OIDs", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Compare two pinned canonical task specification blob OIDs. Requires an existing bound orphan Git ledger.")>]
-    static member DiffTaskSpec(projectName: string, taskId: string, beforeBlobOid: string, afterBlobOid: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member DiffTaskSpec(projectName: string, agentId: string, taskId: string, beforeBlobOid: string, afterBlobOid: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (TaskReadCommand
             { ProjectName = projectName; AgentId = ""; Action = "DiffTaskSpec"; TaskId = taskId
               AssignmentGeneration = 0; CheckpointSequence = 0L
@@ -1444,53 +1474,53 @@ type JarvisMcpTools =
               RelativePath = null })
 
     [<McpServerTool(Title = "Create a non-authoritative copy of canonical HTML inside a registered worktree, refusing overwrite, traversal and symlinks", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Create a non-authoritative copy of canonical HTML inside a registered worktree, refusing overwrite, traversal and symlinks. Requires an existing bound orphan Git ledger.")>]
-    static member ExportTaskSpec(projectName: string, taskId: string, relativeHtmlPath: string, expectedSpecBlobOid: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member ExportTaskSpec(projectName: string, agentId: string, taskId: string, relativeHtmlPath: string, expectedSpecBlobOid: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         let cmd = TaskCommands.write projectName "ExportTaskSpec" operationId taskId TaskCommands.legacyAdministrativePlaceholder
         McpToolHelpers.send client http (TaskWriteCommand
             { cmd with SourceRef = relativeHtmlPath; BaseOid = expectedSpecBlobOid })
 
     [<McpServerTool(Title = "Import stable UTF-8 source HTML from registered worktree with immutable provenance and expected blob checks", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Import stable UTF-8 source HTML from registered worktree with immutable provenance and expected blob checks. Requires an existing bound orphan Git ledger.")>]
-    static member ImportTaskSpec(projectName: string, taskId: string, expectedTaskVersion: int, expectedSpecBlobOid: string, expectedSourceBlobOid: string, title: string, sourceRelativePath: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member ImportTaskSpec(projectName: string, agentId: string, taskId: string, expectedTaskVersion: int, expectedSpecBlobOid: string, expectedSourceBlobOid: string, title: string, sourceRelativePath: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         let cmd = TaskCommands.write projectName "ImportTaskSpec" operationId taskId TaskCommands.legacyAdministrativePlaceholder
         McpToolHelpers.send client http (TaskWriteCommand { cmd with ExpectedVersion = expectedTaskVersion; BaseOid = expectedSpecBlobOid; TargetRef = expectedSourceBlobOid; Title = title; SourceRef = sourceRelativePath })
 
     [<McpServerTool(Title = "task state", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read a task's current lifecycle, assignment, and implementation attempt from the bound Git ledger.")>]
-        static member GetTask(projectName: string, taskId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        static member GetTask(projectName: string, agentId: string, taskId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
             McpToolHelpers.send client http (ReviewCommands.query projectName "GetTask" taskId "" "")
 
     [<McpServerTool(Title = "task overview", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read all canonical tasks, attempts and independently managed reviews from one ledger snapshot.")>]
-        static member TaskOverview(projectName: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        static member TaskOverview(projectName: string, agentId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
             McpToolHelpers.send client http (ReviewCommands.query projectName "ListProjectTasks" "" "" "")
 
     [<McpServerTool(Title = "review details", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read an independent review request, snapshot ref, optional diff context and recorded feedback.")>]
-        static member ReviewDetails(projectName: string, taskId: string, requestId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        static member ReviewDetails(projectName: string, agentId: string, taskId: string, requestId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
             McpToolHelpers.send client http (ReviewCommands.query projectName "GetReview" taskId requestId "")
 
     [<McpServerTool(Title = "list review documents", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("List a review's summary.md and individual findings/*.md files, including Git blob IDs, without embedding their contents in metadata.")>]
-        static member ListReviewDocuments(projectName: string, taskId: string, requestId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        static member ListReviewDocuments(projectName: string, agentId: string, taskId: string, requestId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
             McpToolHelpers.send client http (ReviewCommands.query projectName "ListDocuments" taskId requestId "")
 
     [<McpServerTool(Title = "read review document", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read a review's summary.md or findings/<slug>.md and obtain the Git blob ID for a subsequent edit.")>]
-        static member ReadReviewDocument(projectName: string, taskId: string, requestId: string, documentPath: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        static member ReadReviewDocument(projectName: string, agentId: string, taskId: string, requestId: string, documentPath: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
             McpToolHelpers.send client http
                 (ReviewReadCommand
                     { ProjectName = projectName; Action = "ReadDocument"; TaskId = taskId
                       RequestId = requestId; ReviewerId = ""; DocumentPath = documentPath })
 
     [<McpServerTool(Title = "write review document", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Create or update one review summary.md or findings/<slug>.md on the Git ledger (up to 512 KiB). Supply the current blob ID when replacing a document; review status is unchanged.")>]
-        static member PutReviewDocument(projectName: string, taskId: string, requestId: string, actorId: string, documentPath: string, content: string, expectedBlobOid: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
-            let cmd = ReviewCommands.write projectName "PutDocument" operationId taskId requestId actorId 0
+        static member PutReviewDocument(projectName: string, taskId: string, requestId: string, agentId: string, documentPath: string, content: string, expectedBlobOid: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+            let cmd = ReviewCommands.write projectName "PutDocument" operationId taskId requestId agentId 0
             McpToolHelpers.send client http
                 (ReviewWriteCommand
                     { cmd with DocumentPath = documentPath; Content = content
                                ExpectedBlobOid = expectedBlobOid })
 
     [<McpServerTool(Title = "reviewer inbox", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("List unclaimed reviews available to this reviewer and reviews currently claimed by this reviewer.")>]
-        static member ReviewerInbox(projectName: string, reviewerId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
-            McpToolHelpers.send client http (ReviewCommands.query projectName "ReviewerQueue" "" "" reviewerId)
+        static member ReviewerInbox(projectName: string, agentId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+            McpToolHelpers.send client http (ReviewCommands.query projectName "ReviewerQueue" "" "" agentId)
 
     [<McpServerTool(Title = "submit review", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Publish a review snapshot for any available Git commit. No assignment or review phase required. Optionally replace an existing unclaimed request using expectedRequestVersion; claimed reviews cannot be replaced. Replacements retain targetRef and purpose. For independent reviews omit taskId (namespace _reviews).")>]
-        static member SubmitReview(projectName: string, requesterId: string, requestId: string, headOid: string, [<Optional; DefaultParameterValue("")>] operationId: string,
+        static member SubmitReview(projectName: string, agentId: string, requestId: string, headOid: string, [<Optional; DefaultParameterValue("")>] operationId: string,
                                    [<Optional; DefaultParameterValue("")>] taskId: string,
                                    [<Optional; DefaultParameterValue("")>] sourceRef: string,
                                    [<Optional; DefaultParameterValue("")>] targetRef: string,
@@ -1504,43 +1534,43 @@ type JarvisMcpTools =
             if expectedRequestVersion > 0 && (not (String.IsNullOrWhiteSpace targetRef) || not (String.IsNullOrWhiteSpace purpose)) then
                 raise (ArgumentException("Replacement preserves the original targetRef and purpose; omit both on update."))
             let namespaceId = if String.IsNullOrWhiteSpace taskId then "_reviews" else taskId
-            let cmd = ReviewCommands.write projectName (if expectedRequestVersion > 0 then "Update" else "Submit") operationId namespaceId requestId requesterId expectedRequestVersion
+            let cmd = ReviewCommands.write projectName (if expectedRequestVersion > 0 then "Update" else "Submit") operationId namespaceId requestId agentId expectedRequestVersion
             McpToolHelpers.send client http (ReviewWriteCommand
                 { cmd with Kind = purpose; SourceRef = sourceRef; HeadOid = headOid
                            TargetRef = targetRef; Summary = summary })
 
     [<McpServerTool(Title = "claim review", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Claim an unclaimed review and freeze its submitted Git branch for independent inspection.")>]
-        static member ClaimReview(projectName: string, taskId: string, requestId: string, reviewerId: string, expectedRequestVersion: int, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
-            let cmd = ReviewCommands.write projectName "Claim" operationId taskId requestId reviewerId expectedRequestVersion
+        static member ClaimReview(projectName: string, taskId: string, requestId: string, agentId: string, expectedRequestVersion: int, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+            let cmd = ReviewCommands.write projectName "Claim" operationId taskId requestId agentId expectedRequestVersion
             McpToolHelpers.send client http (ReviewWriteCommand cmd)
 
     [<McpServerTool(Title = "decide review", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Accept a claimed review or request changes. Write detailed findings in separate Markdown documents using put_review_document.")>]
-        static member DecideReview(projectName: string, taskId: string, requestId: string, reviewerId: string, expectedRequestVersion: int, verdict: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
-            let cmd = ReviewCommands.write projectName "Decide" operationId taskId requestId reviewerId expectedRequestVersion
+        static member DecideReview(projectName: string, taskId: string, requestId: string, agentId: string, expectedRequestVersion: int, verdict: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+            let cmd = ReviewCommands.write projectName "Decide" operationId taskId requestId agentId expectedRequestVersion
             McpToolHelpers.send client http (ReviewWriteCommand { cmd with Verdict = verdict })
 
     [<McpServerTool(Title = "release review claim", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Make a claimed review available to another reviewer, retaining its frozen source snapshot and leaving the task unchanged.")>]
-        static member ReleaseReview(projectName: string, taskId: string, requestId: string, actorId: string, expectedRequestVersion: int, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
-            let cmd = ReviewCommands.write projectName "Release" operationId taskId requestId actorId expectedRequestVersion
+        static member ReleaseReview(projectName: string, taskId: string, requestId: string, agentId: string, expectedRequestVersion: int, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+            let cmd = ReviewCommands.write projectName "Release" operationId taskId requestId agentId expectedRequestVersion
             McpToolHelpers.send client http (ReviewWriteCommand cmd)
 
     [<McpServerTool(Title = "withdraw review", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Withdraw a review request while preserving its findings and leaving task assignments unchanged.")>]
-        static member WithdrawReview(projectName: string, taskId: string, requestId: string, actorId: string, expectedRequestVersion: int, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
-            let cmd = ReviewCommands.write projectName "Withdraw" operationId taskId requestId actorId expectedRequestVersion
+        static member WithdrawReview(projectName: string, taskId: string, requestId: string, agentId: string, expectedRequestVersion: int, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+            let cmd = ReviewCommands.write projectName "Withdraw" operationId taskId requestId agentId expectedRequestVersion
             McpToolHelpers.send client http (ReviewWriteCommand cmd)
 
     [<McpServerTool(Title = "Get project details", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Get project details, README, notes, TODO, and related special files.")>]
-    static member GetProjectDetails(projectName: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member GetProjectDetails(projectName: string, agentId: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         let projectName = McpToolHelpers.projectWithWorktreeName projectName worktreeName
         McpToolHelpers.send client http (GetProjectDetailsCommand { ProjectName = projectName })
 
     [<McpServerTool(Title = "List directory", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("List files and folders in a project directory.")>]
-    static member ListDirectory(projectName: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, folderPath: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member ListDirectory(projectName: string, agentId: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, folderPath: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         let projectName = McpToolHelpers.projectWithWorktreeName projectName worktreeName
         McpToolHelpers.send client http (ListDirectoryCommand { ProjectName = projectName; FolderPath = folderPath })
 
     [<McpServerTool(Title = "Search files", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Search project file and folder names.")>]
-    static member SearchFiles(projectName: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, query: string, folderPath: string, maxResults: Nullable<int>, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member SearchFiles(projectName: string, agentId: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, query: string, folderPath: string, maxResults: Nullable<int>, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         let projectName = McpToolHelpers.projectWithWorktreeName projectName worktreeName
         McpToolHelpers.send client http (SearchFilesCommand {
             ProjectName = projectName
@@ -1549,7 +1579,7 @@ type JarvisMcpTools =
             MaxResults = McpToolHelpers.optionOfNullable maxResults })
 
     [<McpServerTool(Title = "Search text", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Search text inside project files.")>]
-    static member SearchText(projectName: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, query: string, folderPath: string, includeGlobs: string array, excludeGlobs: string array, maxResults: Nullable<int>, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member SearchText(projectName: string, agentId: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, query: string, folderPath: string, includeGlobs: string array, excludeGlobs: string array, maxResults: Nullable<int>, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         let projectName = McpToolHelpers.projectWithWorktreeName projectName worktreeName
         McpToolHelpers.send client http (SearchTextCommand {
             ProjectName = projectName
@@ -1560,7 +1590,7 @@ type JarvisMcpTools =
             MaxResults = McpToolHelpers.optionOfNullable maxResults })
 
     [<McpServerTool(Title = "Read file", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read one project file.")>]
-    static member ReadFile(projectName: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, filePath: string, startLine: Nullable<int>, endLine: Nullable<int>, includeLineNumbers: Nullable<bool>, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member ReadFile(projectName: string, agentId: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, filePath: string, startLine: Nullable<int>, endLine: Nullable<int>, includeLineNumbers: Nullable<bool>, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         let projectName = McpToolHelpers.projectWithWorktreeName projectName worktreeName
         McpToolHelpers.send client http (ReadFileCommand {
             ProjectName = projectName
@@ -1570,17 +1600,17 @@ type JarvisMcpTools =
             IncludeLineNumbers = McpToolHelpers.optionOfNullableBool includeLineNumbers })
 
     [<McpServerTool(Title = "Read files", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read multiple project files.")>]
-    static member ReadFiles(projectName: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, filePaths: string array, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member ReadFiles(projectName: string, agentId: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, filePaths: string array, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         let projectName = McpToolHelpers.projectWithWorktreeName projectName worktreeName
         McpToolHelpers.send client http (ReadFilesCommand { ProjectName = projectName; FilePaths = filePaths |> Array.toList })
 
     [<McpServerTool(Title = "Read image", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read a PNG, JPEG, or WebP image from a project and return it as native MCP image content for model vision.")>]
-    static member ReadImage(projectName: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, filePath: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member ReadImage(projectName: string, agentId: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, filePath: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         let projectName = McpToolHelpers.projectWithWorktreeName projectName worktreeName
         McpToolHelpers.send client http (ReadImageCommand { ProjectName = projectName; FilePath = filePath })
 
     [<McpServerTool(Title = "Export file", ReadOnly = true, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Export one bounded project file to a short-lived HTTPS URL that can be opened by the user. The URL is an unguessable bearer capability and expires automatically.")>]
-    static member ExportFile(projectName: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, filePath: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member ExportFile(projectName: string, agentId: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, filePath: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         let projectName = McpToolHelpers.projectWithWorktreeName projectName worktreeName
         McpToolHelpers.send client http (ExportFileCommand { ProjectName = projectName; FilePath = filePath })
 
@@ -1589,7 +1619,7 @@ type JarvisMcpTools =
       McpMeta("openai/fileParams", JsonValue = """["file"]""");
       Description("Import a ChatGPT-provided file into a project path. The Jarvis client downloads the temporary file URL directly and enforces its local import-size limit.")>]
     static member ImportFile(
-        projectName: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string,
+        projectName: string, agentId: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string,
         filePath: string,
         file: OpenAIFileParam,
         overwrite: bool,
@@ -1615,7 +1645,7 @@ type JarvisMcpTools =
         McpToolHelpers.send client http UpdateClientCommand
 
     [<McpServerTool(Title = "Write file", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:write"]}]"""); Description("Create, update or append to a file in the selected project workspace using configured local permissions. Requires client approval.")>]
-    static member WriteFile(projectName: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, filePath: string, content: string, [<Description("File write mode. Allowed values: Write, Append.")>] fileWriteMode: string, [<Description("Optional precondition: SHA-256 hash to require matching existing content, none to require a new file, or empty string for no precondition.")>] expectedHash: string, createParents: Nullable<bool>, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member WriteFile(projectName: string, agentId: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, filePath: string, content: string, [<Description("File write mode. Allowed values: Write, Append.")>] fileWriteMode: string, [<Description("Optional precondition: SHA-256 hash to require matching existing content, none to require a new file, or empty string for no precondition.")>] expectedHash: string, createParents: Nullable<bool>, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         let projectName = McpToolHelpers.projectWithWorktreeName projectName worktreeName
         match McpToolHelpers.parseFileWriteMode fileWriteMode with
         | Error message ->
@@ -1630,7 +1660,7 @@ type JarvisMcpTools =
                 CreateParents = McpToolHelpers.optionOfNullableBool createParents })
 
     [<McpServerTool(Title = "Patch file", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:write"]}]"""); Description("Edit a project file using an atomic unified diff, with optional expected-hash checking and dry-run validation. Requires client approval.")>]
-    static member PatchFile(projectName: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, filePath: string, patch: string, expectedHash: string, dryRun: Nullable<bool>, fuzzyContextLines: Nullable<int>, returnContent: Nullable<bool>, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member PatchFile(projectName: string, agentId: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, filePath: string, patch: string, expectedHash: string, dryRun: Nullable<bool>, fuzzyContextLines: Nullable<int>, returnContent: Nullable<bool>, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         let projectName = McpToolHelpers.projectWithWorktreeName projectName worktreeName
         McpToolHelpers.send client http (PatchFileCommand {
             ProjectName = projectName
@@ -1643,7 +1673,7 @@ type JarvisMcpTools =
             ReturnContent = McpToolHelpers.optionOfNullableBool returnContent })
 
     [<McpServerTool(Title = "Run command", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["process:execute"]}]"""); Description("Execute a bounded development command within the local Jarvis OS-permission sandbox for the selected project workspace. Commands run with the explicitly configured local account permissions and require client approval. Supply a short reason for the command.")>]
-    static member RunCommand(projectName: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, executable: string, args: string array, [<Optional; DefaultParameterValue("")>] reason: string, workingDirectory: string, timeoutSeconds: Nullable<int>, maxOutputBytes: Nullable<int>, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member RunCommand(projectName: string, agentId: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, executable: string, args: string array, [<Optional; DefaultParameterValue("")>] reason: string, workingDirectory: string, timeoutSeconds: Nullable<int>, maxOutputBytes: Nullable<int>, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         let projectName = McpToolHelpers.projectWithWorktreeName projectName worktreeName
         McpToolHelpers.send client http (RunCommandCommand {
             ProjectName = projectName
@@ -1655,21 +1685,21 @@ type JarvisMcpTools =
             MaxOutputBytes = McpToolHelpers.optionOfNullable maxOutputBytes })
 
     [<McpServerTool(Title = "List configured tasks", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("List locally configured project tasks from .jarvis.json.")>]
-    static member ListConfiguredTasks(projectName: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member ListConfiguredTasks(projectName: string, agentId: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         let projectName = McpToolHelpers.projectWithWorktreeName projectName worktreeName
         McpToolHelpers.send client http (ListConfiguredTasksCommand { ProjectName = projectName })
 
     [<McpServerTool(Title = "List skills", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("List project skills and shared workspace-global skills (scope identified on each result). Use projectName=@global to list global skills only. Skills do not grant execution privileges.")>]
-    static member ListSkills(projectName: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member ListSkills(projectName: string, agentId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (ListSkillsCommand { ProjectName = projectName })
 
     [<McpServerTool(Title = "Get skill", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read a project skill; use projectName=@global for a shared workspace-global skill. Skills contain procedural guidance only.")>]
-    static member GetSkill(projectName: string, skillName: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member GetSkill(projectName: string, agentId: string, skillName: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (GetSkillCommand { ProjectName = projectName; SkillName = skillName })
 
     [<McpServerTool(Title = "Create skill", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:write"]}]"""); Description("Create or update project-local or workspace-global agent guidance using normal workspace permissions. Use projectName=@global for shared skills; overwrite=true updates an existing skill.")>]
     static member CreateSkill(
-        projectName: string,
+        projectName: string, agentId: string,
         skillName: string,
         content: string,
         [<Optional; DefaultParameterValue(false)>] overwrite: bool,
@@ -1679,17 +1709,17 @@ type JarvisMcpTools =
         McpToolHelpers.send client http (CreateSkillCommand { ProjectName = projectName; SkillName = skillName; Content = content; Overwrite = overwrite })
 
     [<McpServerTool(Title = "Run project task", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["process:execute"]}]"""); Description("Run a predefined build, test or other development task from the project's .jarvis.json inside the local Jarvis OS-permission sandbox. Requires client approval.")>]
-    static member RunProjectTask(projectName: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, taskName: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member RunProjectTask(projectName: string, agentId: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, taskName: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         let projectName = McpToolHelpers.projectWithWorktreeName projectName worktreeName
         McpToolHelpers.send client http (RunProjectTaskCommand { ProjectName = projectName; TaskName = taskName })
 
     [<McpServerTool(Title = "Get git status", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Get git status for a project.")>]
-    static member GetGitStatus(projectName: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member GetGitStatus(projectName: string, agentId: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         let projectName = McpToolHelpers.projectWithWorktreeName projectName worktreeName
         McpToolHelpers.send client http (GetGitStatusCommand { ProjectName = projectName })
 
     [<McpServerTool(Title = "Get git diff", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Get git diff for a project or project-relative path.")>]
-    static member GetGitDiff(projectName: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, path: string, maxOutputBytes: Nullable<int>, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member GetGitDiff(projectName: string, agentId: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, path: string, maxOutputBytes: Nullable<int>, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         let projectName = McpToolHelpers.projectWithWorktreeName projectName worktreeName
         McpToolHelpers.send client http (GetGitDiffCommand {
             ProjectName = projectName
@@ -1697,7 +1727,7 @@ type JarvisMcpTools =
             MaxOutputBytes = McpToolHelpers.optionOfNullable maxOutputBytes })
 
     [<McpServerTool(Title = "Create git commit", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Commit selected project files to the local Git branch. Does not push to a remote; requires local approval.")>]
-    static member GitCommit(projectName: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, message: string, body: string, paths: string array, allowEmpty: bool, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member GitCommit(projectName: string, agentId: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, message: string, body: string, paths: string array, allowEmpty: bool, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         let projectName = McpToolHelpers.projectWithWorktreeName projectName worktreeName
         McpToolHelpers.send client http (GitCommitCommand {
             ProjectName = projectName
@@ -1707,7 +1737,7 @@ type JarvisMcpTools =
             AllowEmpty = allowEmpty })
 
     [<McpServerTool(Title = "Start job", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["process:execute"]}]"""); Description("Start a long-running development process inside the local Jarvis OS-permission sandbox. Requires client approval.")>]
-    static member StartJob(projectName: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, executable: string, args: string array, workingDirectory: string, maxOutputBytes: Nullable<int>, [<Optional; DefaultParameterValue("")>] reason: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member StartJob(projectName: string, agentId: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, executable: string, args: string array, workingDirectory: string, maxOutputBytes: Nullable<int>, [<Optional; DefaultParameterValue("")>] reason: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         let projectName = McpToolHelpers.projectWithWorktreeName projectName worktreeName
         McpToolHelpers.send client http (StartJobCommand {
             ProjectName = projectName
@@ -1718,25 +1748,27 @@ type JarvisMcpTools =
             MaxOutputBytes = McpToolHelpers.optionOfNullable maxOutputBytes })
 
     [<McpServerTool(Title = "List jobs", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("List running or completed Jarvis jobs.")>]
-    static member ListJobs(projectName: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, includeCompleted: bool, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member ListJobs(projectName: string, agentId: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, includeCompleted: bool, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         let projectName = McpToolHelpers.projectWithWorktreeName projectName worktreeName
         McpToolHelpers.send client http (ListJobsCommand {
             ProjectName = McpToolHelpers.optionOfString projectName
             IncludeCompleted = includeCompleted })
 
     [<McpServerTool(Title = "Get job result", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Get buffered output and status for a Jarvis job.")>]
-    static member GetJobResult(jobId: string, afterSequence: Nullable<int64>, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+    static member GetJobResult(projectName: string, agentId: string, jobId: string, afterSequence: Nullable<int64>, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (GetJobResultCommand {
+            ProjectName = projectName
             JobId = jobId
             AfterSequence = McpToolHelpers.optionOfNullableInt64 afterSequence })
 
     [<McpServerTool(Title = "Cancel job", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["process:execute"]}]"""); Description("Stop a running Jarvis-managed development job. Requires client approval.")>]
-    static member CancelJob(jobId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
-        McpToolHelpers.send client http (CancelJobCommand { JobId = jobId })
+    static member CancelJob(projectName: string, agentId: string, jobId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http (CancelJobCommand { ProjectName = projectName; JobId = jobId })
 
     [<McpServerTool(Title = "Message", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Send a short informational message to the connected Jarvis client activity log, for example progress or turn-completion messages such as 'Done with this turn'. This does not require local approval.")>]
     static member Message(
         message: string,
+        agentId: string,
         [<Optional; DefaultParameterValue("")>] projectName: string,
         [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService,
         http: IHttpContextAccessor

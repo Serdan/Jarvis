@@ -79,7 +79,13 @@ let relativeAge (now: DateTimeOffset) (timestamp: DateTimeOffset option) =
 let stateAge (now: DateTimeOffset) (agent: AgentRow) =
     relativeAge now agent.StateEnteredAt
 
-/// Seen timestamps come from session-attributed tool calls, not parsed messages.
+/// A registered worktree uses Project::worktree for file routing, but agent
+/// activity belongs to the parent project.
+let activityProject (project: string) =
+    let separator = project.IndexOf("::", StringComparison.Ordinal)
+    if separator < 0 then project else project.Substring(0, separator)
+
+/// Seen timestamps come from explicit agent-attributed tool calls, not sessions.
 let lastSeenAt (agent: AgentRow) (seen: IDictionary<string, DateTimeOffset>) =
     match seen.TryGetValue agent.Key with
     | true, timestamp -> Some timestamp

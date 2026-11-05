@@ -453,3 +453,47 @@ let ``connection diagnostics persist disconnect metadata and isolate users`` () 
         |> Array.length
         |> shouldEqual 0
     )
+
+
+[<Test>]
+let ``explicit agent identity uses tool arguments without provider metadata`` () =
+    let request (name: string) (agent: string) =
+        let args = System.Collections.Generic.Dictionary<string, JsonElement>()
+        args[name] <- JsonSerializer.SerializeToElement(agent)
+        ModelContextProtocol.Protocol.CallToolRequestParams(Name = "RunCommand", Arguments = args)
+    let resolve req =
+        RequestDeviceRouting.withMetadata req (fun () ->
+            task {
+                return RequestDeviceRouting.agentId(), RequestDeviceRouting.session()
+            }) |> Async.AwaitTask |> Async.RunSynchronously
+    resolve (request "agentId" "GUI Agent") |> shouldEqual (Some "GUI Agent", None)
+    resolve (request "fromAgentId" "Lead") |> shouldEqual (Some "Lead", None)
+    resolve (request "agentId" "") |> shouldEqual (None, None)
+    let invalid =
+        RequestDeviceRouting.withMetadata (request "agentId" "") (fun () ->
+            task { return RequestDeviceRouting.invalidAgentId() })
+        |> Async.AwaitTask |> Async.RunSynchronously
+    invalid |> shouldEqual true
+    RequestDeviceRouting.agentId() |> shouldEqual None
+    RequestDeviceRouting.invalidAgentId() |> shouldEqual false
+
+[<Test>]
+let ``explicit agent metadata is isolated between concurrent calls`` () =
+    task {
+        let request id =
+            let args = System.Collections.Generic.Dictionary<string, JsonElement>()
+            args["agentId"] <- JsonSerializer.SerializeToElement(id)
+            ModelContextProtocol.Protocol.CallToolRequestParams(Name = "RunCommand", Arguments = args)
+        let run id (delay: int) =
+            RequestDeviceRouting.withMetadata (request id) (fun () ->
+                task {
+                    do! Task.Delay delay
+                    return RequestDeviceRouting.agentId()
+                })
+        let a = run "Agent A" 30
+        let b = run "Agent B" 10
+        let! values = Task.WhenAll([| a; b |])
+        values[0] |> shouldEqual (Some "Agent A")
+        values[1] |> shouldEqual (Some "Agent B")
+        RequestDeviceRouting.agentId() |> shouldEqual None
+    }

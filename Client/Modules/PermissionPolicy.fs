@@ -162,6 +162,15 @@ let private requiresConfirmation command =
             [ VersionControlWrite; NetworkAccess ] [] (Some "git")
             [ cmd.TaskId; cmd.RequestId; cmd.OperationId ]
             (" canonical ledger review " + cmd.Action) false
+    | CreateProjectCommand cmd ->
+        let permissions =
+            [ WorkspaceWrite ]
+            @ (if cmd.InitializeGit then [ VersionControlWrite ] else [])
+            @ (if cmd.InitializeLedger then [ NetworkAccess ] else [])
+        confirmation "CreateProject" None permissions [ cmd.Name ]
+            (if cmd.InitializeGit then Some "git" else None)
+            [ cmd.Name; cmd.RemoteUrl ]
+            $"Create workspace project {cmd.Name}" true
     | CreateWorktreeCommand cmd ->
         confirmation "CreateWorktree" (Some cmd.ProjectName) [ VersionControlWrite ] [] (Some "git") [ cmd.Branch; cmd.Name ] $"Create worktree {cmd.Name}" true
     | GitCommitCommand cmd ->

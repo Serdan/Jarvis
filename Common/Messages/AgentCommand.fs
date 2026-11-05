@@ -63,6 +63,16 @@ type ListCommandsResult =
 
 type ListProjectsCommand = struct end
 
+type CreateProjectCommand =
+    { Name: string
+      InitializeGit: bool
+      CreateJarvisConfig: bool
+      CreateAgentInstructions: bool
+      InitializeLedger: bool
+      RemoteUrl: string
+      AcknowledgeRemoteVisibility: bool }
+
+
 type ListWorktreesCommand = { ProjectName: string }
 type GetWorktreeCommand = { ProjectName: string; WorktreePath: string }
 type CreateWorktreeCommand =
@@ -507,6 +517,7 @@ type AgentCommandResponse =
 type AgentCommand =
     | ListCommandsCommand
     | ListProjectsCommand
+    | CreateProjectCommand of CreateProjectCommand
     | ListWorktreesCommand of ListWorktreesCommand
     | GetWorktreeCommand of GetWorktreeCommand
     | CreateWorktreeCommand of CreateWorktreeCommand
@@ -550,6 +561,7 @@ module AgentCommandInfo =
     let name = function
         | ListCommandsCommand -> "ListCommandsCommand"
         | ListProjectsCommand -> "ListProjectsCommand"
+        | CreateProjectCommand _ -> "CreateProjectCommand"
         | ListWorktreesCommand _ -> "ListWorktreesCommand"
         | GetWorktreeCommand _ -> "GetWorktreeCommand"
         | CreateWorktreeCommand _ -> "CreateWorktreeCommand"
@@ -599,6 +611,7 @@ module AgentCommandInfo =
     let displayName = function
         | ListCommandsCommand -> "ListCommands"
         | ListProjectsCommand -> "ListProjects"
+        | CreateProjectCommand _ -> "CreateProject"
         | ListWorktreesCommand _ -> "ListWorktrees"
         | GetWorktreeCommand _ -> "GetWorktree"
         | CreateWorktreeCommand _ -> "CreateWorktree"
@@ -641,6 +654,7 @@ module AgentCommandInfo =
     let projectName = function
         | ListCommandsCommand
         | ListProjectsCommand
+        | CreateProjectCommand _
         | GetJobResultCommand _
         | CancelJobCommand _
         | UpdateClientCommand -> None
@@ -733,6 +747,7 @@ module AgentCommandInfo =
         | CreateSkillCommand cmd -> Some(compact cmd.SkillName)
         | ListSkillsCommand _ -> None
         | GetWorktreeCommand cmd -> Some(compact cmd.WorktreePath)
+        | CreateProjectCommand cmd -> Some(compact cmd.Name)
         | CreateWorktreeCommand cmd -> Some(compact cmd.Name)
         | InspectWorktreeRemovalCommand cmd -> Some(compact cmd.WorktreePath)
         | RemoveWorktreeCommand cmd -> Some(compact cmd.WorktreePath)
@@ -775,6 +790,7 @@ module AgentCommandInfo =
         | CreateSkillCommand cmd -> Some(truncate 48 cmd.SkillName)
         | ListSkillsCommand _ -> None
         | GetWorktreeCommand cmd -> Some(truncate 64 cmd.WorktreePath)
+        | CreateProjectCommand cmd -> Some(truncate 64 cmd.Name)
         | CreateWorktreeCommand cmd -> Some(truncate 64 cmd.Name)
         | InspectWorktreeRemovalCommand cmd -> Some(truncate 64 cmd.WorktreePath)
         | RemoveWorktreeCommand cmd -> Some(truncate 64 cmd.WorktreePath)
@@ -856,6 +872,7 @@ module AgentProtocol =
     let commandDefinitions =
         [ definition "ListCommands" "Lists supported Jarvis commands." [ ReadOnly ] false false false
           definition "ListProjects" "Lists configured projects." [ ReadOnly ] false false false
+          definition "CreateProject" "Create a new workspace folder with optional Git, starter files and remote-backed ledger." [ WorkspaceWrite; VersionControlWrite; NetworkAccess ] true true false
           definition "ListWorktrees" "Lists Git worktrees registered for a project." [ ReadOnly ] false false false
           definition "GetWorktree" "Inspects a registered Git worktree." [ ReadOnly ] false false false
           definition "CreateWorktree" "Creates an isolated Git worktree and branch." [ VersionControlWrite ] true true false

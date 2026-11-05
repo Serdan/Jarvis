@@ -102,6 +102,20 @@ type AgentCommand =
     | GetClientActivityCommand of GetClientActivityCommand
 ```
 
+## Creating projects
+
+`create_project` creates a **new direct-child directory** within the configured workspace. A project requires no registration record and becomes visible to `list_projects` immediately. Existing directories are never overwritten. Ordinary folder creation with `mkdir` remains supported.
+
+All setup options default to off:
+
+- `initializeGit`: run `git init --initial-branch=main`.
+- `createJarvisConfig`: write a valid minimal `.jarvis.json` with an empty `tasks` object.
+- `createAgentInstructions`: write a project-local `AGENTS.md` starter.
+- `remoteUrl`: when Git is initialized, configure `origin` with the given URL.
+- `initializeLedger`: initialize and locally bind a **new remote-backed orphan Git ledger**, generating project and ledger UUIDs. This implies Git initialization and requires a usable `remoteUrl` and `acknowledgeRemoteVisibility=true`.
+
+Ledger initialization follows the existing trust model: it must not silently assume remote privacy, overwrite an existing ledger or invent a remote. Successful results return the project path, selected setup flags and, when applicable, the generated ledger identifiers and trusted head. If any setup step fails after the directory is created, Jarvis reports the partial state and retains the directory for inspection or recovery rather than removing potentially published ledger history. The new command requires the `git:write` MCP scope because some options initialize and publish Git state.
+
 ## Project Discovery Commands
 
 ### `ListProjects`

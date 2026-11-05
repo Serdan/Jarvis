@@ -38,6 +38,7 @@ let private applicableTargets (rt: Runtime) command =
                                   && cmd.Action <> "ImportTaskSpec" -> Ok None
     | ListCommandsCommand
     | ListProjectsCommand
+    | CreateProjectCommand _
     | UpdateClientCommand
     | GetJobResultCommand _
     | CancelJobCommand _

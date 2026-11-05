@@ -918,8 +918,28 @@ module private Core =
             let! path = parseProjectName projectName >>= resolveWritableFilePath filePath
 
             match expectedHash with
-            | Some _ ->
-                let! existing = FileIO.readAllText path
+            | Some expected when String.Equals(expected, "none", StringComparison.OrdinalIgnoreCase) ->
+                let! absent =
+                    fun rt ->
+                        match FileIO.getFileInfo path rt with
+                        | Error(NotFoundError _) -> Ok true
+                        | Error(ExceptionError (:? FileNotFoundException)) -> Ok true
+                        | Error error -> Error error
+                        | Ok _ -> Ok false
+
+                if not absent then
+                    return! Client.ValidationError "Expected file to be absent, but it already exists." |> Effect.ofError
+                else
+                    do! ensureParent path
+                    do! write path (Content content)
+            | Some expected ->
+                let! existing =
+                    fun rt ->
+                        match FileIO.readAllText path rt with
+                        | Error(ExceptionError (:? FileNotFoundException)) ->
+                            Error(Client.ValidationError $"Expected hash {expected}, but the file does not exist.")
+                        | result -> result
+
                 let (Content existingContent) = existing
                 let! _ = fun _ -> verifyExpectedHash expectedHash existingContent
                 do! ensureParent path

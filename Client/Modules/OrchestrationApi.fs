@@ -1026,6 +1026,20 @@ module TaskApi =
                 |> mapError |> Result.map box
             | _ -> Error(Client.ValidationError "Unsupported  task read operation."))
 
+    // Canonical session association identifies an agent. An unbound session
+    // represents an authenticated MCP user, never an invented Orchestrator.
+    // Existing operation receipts retain their original actor on replay so
+    // changing attribution cannot invalidate historical idempotency hashes.
+    let internal administrativeActor binding operationId sessionId =
+        match LedgerStore.LedgerStore.getOperationStatus binding operationId with
+        | Error error -> Error(LedgerErrors.toEffect error)
+        | Ok(_, Some applied) -> Ok applied.Actor
+        | Ok(_, None) ->
+            match ReviewWorkflow.ReviewWorkflow.findAgentBySession binding sessionId with
+            | Error error -> Error(LedgerErrors.toEffect error)
+            | Ok(Some agent) -> Ok agent.AgentId
+            | Ok None -> Ok "AuthenticatedUser"
+
     let write (cmd: TaskWriteCommand) rt =
         LedgerBindingConfig.load cmd.ProjectName rt
         |> Result.bind (fun binding ->
@@ -1066,6 +1080,8 @@ module TaskApi =
                     | Ok None ->
                         let result =
                             PendingIntentJournal.executeLedgerWrite binding operationId "TaskWrite" journalCommand (fun () ->
+                                let withAdministrativeActor action =
+                                    administrativeActor binding operationId cmd.SessionId |> Result.bind action
                                 match cmd.Action with
                                 | "SubmitIntegration" ->
                                     guid "submissionId" cmd.AttemptId
@@ -1088,38 +1104,46 @@ module TaskApi =
                                         ReviewWorkflow.ReviewWorkflow.acknowledgeNotification
                                             binding operationId cmd.ActorId notificationId |> mapError)
                                 | "CreateTask" ->
-                                    ReviewWorkflow.ReviewWorkflow.createTaskWithSpec binding operationId cmd.TaskId cmd.Title cmd.Html
-                                    |> mapError
+                                    withAdministrativeActor (fun actor ->
+                                        ReviewWorkflow.ReviewWorkflow.createTaskWithSpecAs binding actor operationId cmd.TaskId cmd.Title cmd.Html
+                                        |> mapError)
                                 | "ReviseTaskSpec" ->
-                                    ReviewWorkflow.ReviewWorkflow.reviseTaskSpec binding operationId cmd.TaskId
-                                        cmd.ExpectedVersion cmd.Title cmd.Html |> mapError
+                                    withAdministrativeActor (fun actor ->
+                                        ReviewWorkflow.ReviewWorkflow.reviseTaskSpecPinnedAs binding actor operationId cmd.TaskId
+                                            cmd.ExpectedVersion null cmd.Title cmd.Html |> mapError)
                                 | "ReviseTaskSpecPinned" ->
-                                    ReviewWorkflow.ReviewWorkflow.reviseTaskSpecPinned binding operationId cmd.TaskId
-                                        cmd.ExpectedVersion cmd.BaseOid cmd.Title cmd.Html |> mapError
+                                    withAdministrativeActor (fun actor ->
+                                        ReviewWorkflow.ReviewWorkflow.reviseTaskSpecPinnedAs binding actor operationId cmd.TaskId
+                                            cmd.ExpectedVersion cmd.BaseOid cmd.Title cmd.Html |> mapError)
                                 | "ImportTaskSpec" ->
-                                    ReviewWorkflow.ReviewWorkflow.importTaskSpec binding operationId cmd.TaskId
-                                        cmd.ExpectedVersion cmd.BaseOid cmd.TargetRef cmd.Title cmd.SourceRef |> mapError
+                                    withAdministrativeActor (fun actor ->
+                                        ReviewWorkflow.ReviewWorkflow.importTaskSpecAs binding actor operationId cmd.TaskId
+                                            cmd.ExpectedVersion cmd.BaseOid cmd.TargetRef cmd.Title cmd.SourceRef |> mapError)
                                 | "AdoptTaskSpec" ->
                                     if not (String.IsNullOrWhiteSpace cmd.Html) then
                                         Error(Client.ValidationError "Provide either newSpecHtml or expectedCurrentSpecBlobOid, not both.")
                                     else
-                                        ReviewWorkflow.ReviewWorkflow.adoptTaskSpec binding operationId cmd.TaskId
-                                            cmd.ActorId cmd.ExpectedTaskVersion cmd.ExpectedVersion
-                                            cmd.ExpectedAgentVersion cmd.AssignmentGeneration cmd.BaseOid cmd.Summary |> mapError
+                                        withAdministrativeActor (fun actor ->
+                                            ReviewWorkflow.ReviewWorkflow.adoptTaskSpecAs binding actor operationId cmd.TaskId
+                                                cmd.ActorId cmd.ExpectedTaskVersion cmd.ExpectedVersion
+                                                cmd.ExpectedAgentVersion cmd.AssignmentGeneration cmd.BaseOid cmd.Summary |> mapError)
                                 | "RegisterAgent" ->
-                                    ReviewWorkflow.ReviewWorkflow.registerAgent binding operationId cmd.ActorId
-                                    |> mapError
+                                    withAdministrativeActor (fun actor ->
+                                        ReviewWorkflow.ReviewWorkflow.registerAgentAs binding actor operationId cmd.ActorId
+                                        |> mapError)
                                 | "AssignTask" ->
                                     guid "attemptId" cmd.AttemptId
                                     |> Result.bind (fun attemptId ->
-                                        ReviewWorkflow.ReviewWorkflow.assignTask binding operationId cmd.TaskId
-                                            attemptId cmd.OwnerId
-                                        |> mapError)
+                                        withAdministrativeActor (fun actor ->
+                                            ReviewWorkflow.ReviewWorkflow.assignTaskAs binding actor operationId cmd.TaskId
+                                                attemptId cmd.OwnerId
+                                            |> mapError))
                                 | "ReissueAssignment" ->
-                                    ReviewWorkflow.ReviewWorkflow.reissueAssignment binding operationId
-                                        cmd.TaskId cmd.ActorId cmd.ExpectedVersion cmd.ExpectedAgentVersion
-                                        cmd.AssignmentGeneration cmd.Summary cmd.Html
-                                    |> mapError
+                                    withAdministrativeActor (fun actor ->
+                                        ReviewWorkflow.ReviewWorkflow.reissueAssignmentAs binding actor operationId
+                                            cmd.TaskId cmd.ActorId cmd.ExpectedVersion cmd.ExpectedAgentVersion
+                                            cmd.AssignmentGeneration cmd.Summary cmd.Html
+                                        |> mapError)
                                 | "AcknowledgeAssignment" ->
                                     ReviewWorkflow.ReviewWorkflow.acknowledgeAssignment binding operationId
                                         cmd.TaskId cmd.ActorId cmd.ExpectedVersion cmd.AssignmentGeneration
@@ -1163,36 +1187,44 @@ module TaskApi =
                                         cmd.AssignmentGeneration cmd.Summary cmd.SessionId |> mapError
                                 | "ParkAttempt" | "BlockAttempt" | "ResumeAttempt"
                                 | "AbandonAttempt" | "CancelTask" ->
-                                    ReviewWorkflow.ReviewWorkflow.changeAttemptAdministration binding operationId
-                                        cmd.TaskId cmd.Action cmd.ExpectedTaskVersion cmd.ExpectedVersion
-                                        cmd.ExpectedAgentVersion cmd.AssignmentGeneration cmd.Reason |> mapError
+                                    withAdministrativeActor (fun actor ->
+                                        ReviewWorkflow.ReviewWorkflow.changeAttemptAdministrationAs binding actor operationId
+                                            cmd.TaskId cmd.Action cmd.ExpectedTaskVersion cmd.ExpectedVersion
+                                            cmd.ExpectedAgentVersion cmd.AssignmentGeneration cmd.Reason |> mapError)
                                 | "CloseTask" ->
-                                    ReviewWorkflow.ReviewWorkflow.closeTask binding operationId
-                                        cmd.TaskId cmd.ExpectedTaskVersion |> mapError
+                                    withAdministrativeActor (fun actor ->
+                                        ReviewWorkflow.ReviewWorkflow.closeTaskAs binding actor operationId
+                                            cmd.TaskId cmd.ExpectedTaskVersion |> mapError)
                                 | "CancelOpenTask" ->
-                                    ReviewWorkflow.ReviewWorkflow.cancelOpenTask binding operationId
-                                        cmd.TaskId cmd.ExpectedTaskVersion cmd.Reason |> mapError
+                                    withAdministrativeActor (fun actor ->
+                                        ReviewWorkflow.ReviewWorkflow.cancelOpenTaskAs binding actor operationId
+                                            cmd.TaskId cmd.ExpectedTaskVersion cmd.Reason |> mapError)
                                 | "TransferOwner" ->
                                     guid "newAttemptId" cmd.AttemptId
                                     |> Result.bind (fun newId ->
-                                        ReviewWorkflow.ReviewWorkflow.transferAttemptOwner binding operationId
-                                            cmd.TaskId newId cmd.OwnerId
-                                            cmd.ExpectedTaskVersion cmd.ExpectedVersion cmd.ExpectedAgentVersion
-                                            cmd.AssignmentGeneration cmd.Reason |> mapError)
+                                        withAdministrativeActor (fun actor ->
+                                            ReviewWorkflow.ReviewWorkflow.transferAttemptOwnerAs binding actor operationId
+                                                cmd.TaskId newId cmd.OwnerId
+                                                cmd.ExpectedTaskVersion cmd.ExpectedVersion cmd.ExpectedAgentVersion
+                                                cmd.AssignmentGeneration cmd.Reason |> mapError))
                                 | "ReopenTask" ->
-                                    ReviewWorkflow.ReviewWorkflow.reopenTask binding operationId
-                                        cmd.TaskId cmd.ExpectedTaskVersion cmd.Reason |> mapError
+                                    withAdministrativeActor (fun actor ->
+                                        ReviewWorkflow.ReviewWorkflow.reopenTaskAs binding actor operationId
+                                            cmd.TaskId cmd.ExpectedTaskVersion cmd.Reason |> mapError)
                                 | "ParkAgent" ->
-                                    ReviewWorkflow.ReviewWorkflow.parkAgent binding operationId
-                                        cmd.ActorId cmd.ExpectedAgentVersion cmd.Reason |> mapError
+                                    withAdministrativeActor (fun actor ->
+                                        ReviewWorkflow.ReviewWorkflow.parkAgentAs binding actor operationId
+                                            cmd.ActorId cmd.ExpectedAgentVersion cmd.Reason |> mapError)
                                 | "ReissueQueuedAttempt" ->
-                                    ReviewWorkflow.ReviewWorkflow.reissueQueuedAttempt binding operationId
-                                        cmd.TaskId cmd.ActorId cmd.ExpectedVersion cmd.ExpectedAgentVersion
-                                        cmd.AssignmentGeneration cmd.Reason |> mapError
+                                    withAdministrativeActor (fun actor ->
+                                        ReviewWorkflow.ReviewWorkflow.reissueQueuedAttemptAs binding actor operationId
+                                            cmd.TaskId cmd.ActorId cmd.ExpectedVersion cmd.ExpectedAgentVersion
+                                            cmd.AssignmentGeneration cmd.Reason |> mapError)
                                 | "RecoverAgentAssignment" ->
-                                    ReviewWorkflow.ReviewWorkflow.recoverAgentAssignment binding operationId
-                                        cmd.TaskId cmd.ActorId cmd.ExpectedVersion cmd.ExpectedAgentVersion
-                                        cmd.AssignmentGeneration cmd.Reason |> mapError
+                                    withAdministrativeActor (fun actor ->
+                                        ReviewWorkflow.ReviewWorkflow.recoverAgentAssignmentAs binding actor operationId
+                                            cmd.TaskId cmd.ActorId cmd.ExpectedVersion cmd.ExpectedAgentVersion
+                                            cmd.AssignmentGeneration cmd.Reason |> mapError)
                                 | "AcknowledgeFeedback" ->
                                     ReviewWorkflow.ReviewWorkflow.acknowledgeBranchReview binding operationId
                                         cmd.TaskId cmd.ActorId cmd.DecisionSequence

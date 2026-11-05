@@ -8,6 +8,14 @@ Jarvis should not try to be a complete coding-agent runtime. Its purpose is to e
 
 Project-scoped operations automatically carry applicable AGENTS.md guidance from the local workspace and project ancestry. The client-to-server AgentCommandResponse envelope adds an ordered Instructions array of Scope, Path, Sha256, and Content; existing Result and Error semantics remain intact. The MCP server presents each applicable document as a distinct labeled text block before the ordinary tool result. See [AgentInstructions.md](AgentInstructions.md) and [AgentCommandResponse.schema.json](AgentCommandResponse.schema.json).
 
+## Administrative ledger actor attribution
+
+For new administrative task writes, the local client records the initiating registered agent when the authenticated MCP conversation is uniquely associated with an agent in the target project's canonical ledger. Otherwise it records `AuthenticatedUser`, not the target owner or a fictitious Orchestrator. Assignment issuance and administrative lifecycle events use the same resolved actor.
+
+Historical operation receipts are immutable. Retries of previously applied operation UUIDs use the actor recorded in the existing receipt, including the legacy `Orchestrator` value, so the canonical request hash stays stable. The legacy `Orchestrator` value remains a wire/journal compatibility placeholder for tools without an explicit caller field; it is not authoritative attribution for new operations.
+
+Agent attribution is based on canonical session association, not an unverified caller-supplied identity. Missing or ambiguous session associations fall back to `AuthenticatedUser`. A session may not be registered in a different project's ledger.
+
 ## Design Goals
 
 - Keep commands structured rather than exposing arbitrary filesystem or shell access by default.

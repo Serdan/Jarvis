@@ -405,6 +405,7 @@ module McpToolHelpers =
         | CancelJobCommand _ -> Auth.ProcessExecute
         | GitCommitCommand _
         | CreateWorktreeCommand _
+        | CreateProjectCommand _
         | RemoveWorktreeCommand _
         | TaskWriteCommand _
         | LedgerWriteCommand _
@@ -1112,6 +1113,24 @@ type JarvisMcpTools =
     [<McpServerTool(Title = "List projects", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("List projects exposed by the connected Jarvis client.")>]
     static member ListProjects([<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http ListProjectsCommand
+
+    [<McpServerTool(Title = "Create project", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Create a new top-level workspace folder. Optionally initialize local Git, create .jarvis.json and AGENTS.md, configure origin, and initialize the remote-backed Jarvis ledger with explicit remote visibility acknowledgment. Never overwrites an existing folder.")>]
+    static member CreateProject(name: string,
+                                [<Optional; DefaultParameterValue(false)>] initializeGit: bool,
+                                [<Optional; DefaultParameterValue(false)>] createJarvisConfig: bool,
+                                [<Optional; DefaultParameterValue(false)>] createAgentInstructions: bool,
+                                [<Optional; DefaultParameterValue(false)>] initializeLedger: bool,
+                                [<Optional; DefaultParameterValue("")>] remoteUrl: string,
+                                [<Optional; DefaultParameterValue(false)>] acknowledgeRemoteVisibility: bool,
+                                [<Optional; DefaultParameterValue("")>] deviceId: string,
+                                client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http
+            (CreateProjectCommand
+                { Name = name; InitializeGit = initializeGit || initializeLedger
+                  CreateJarvisConfig = createJarvisConfig
+                  CreateAgentInstructions = createAgentInstructions
+                  InitializeLedger = initializeLedger; RemoteUrl = remoteUrl
+                  AcknowledgeRemoteVisibility = acknowledgeRemoteVisibility })
 
     [<McpServerTool(Title = "List worktrees", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Discover all registered Git worktrees for a project, regardless of directory layout.")>]
     static member ListWorktrees(projectName: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =

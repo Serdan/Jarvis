@@ -258,3 +258,115 @@ type LedgerStoreTests() =
                 Assert.That(git path [ "rev-parse"; "HEAD" ], Is.EqualTo(originalHead))
                 Assert.That(git path [ "status"; "--porcelain" ], Is.Empty)
         finally Directory.Delete(root, true)
+
+    [<Test>]
+    member _.ConcurrentFetchDoesNotUpdateRemoteTrackingRefsOrFetchHead() =
+        let root = Path.Combine(Path.GetTempPath(), "jarvis-ledger-fetch-" + Guid.NewGuid().ToString("N"))
+        Directory.CreateDirectory(root) |> ignore
+        try
+            let bare = Path.Combine(root, "remote.git")
+            let repo = Path.Combine(root, "client")
+            git root [ "init"; "--bare"; bare ] |> ignore
+            git root [ "clone"; bare; repo ] |> ignore
+            File.WriteAllText(Path.Combine(repo, "source.txt"), "source")
+            git repo [ "add"; "source.txt" ] |> ignore
+            git repo [ "-c"; "user.name=Fixture"; "-c"; "user.email=fixture@example.test"; "commit"; "-m"; "source" ] |> ignore
+            git repo [ "push"; "-u"; "origin"; "HEAD" ] |> ignore
+            let binding =
+                { RepositoryPath = repo
+                  RemoteName = "origin"
+                  ApprovedFetchUrl = bare
+                  ApprovedPushUrl = bare
+                  ProjectId = Guid.NewGuid()
+                  LedgerId = Guid.NewGuid()
+                  Epoch = 1 }
+            let initial = LedgerStore.initialize binding true |> success
+            let tracking = "refs/remotes/origin/jarvis-orchestration"
+            git repo [ "update-ref"; tracking; initial.Commit ] |> ignore
+            let updated =
+                LedgerStore.putRecord binding
+                    { OperationId = Guid.NewGuid()
+                      Actor = "Fetch fixture"
+                      Path = "records/fetch.json"
+                      ExpectedBlobOid = None
+                      Content = """{"updated":true}""" }
+                |> success
+            Assert.That(updated.CurrentHead, Is.Not.EqualTo(initial.Commit))
+            git repo [ "update-ref"; tracking; initial.Commit ] |> ignore
+            let gitDir = git repo [ "rev-parse"; "--absolute-git-dir" ]
+            let fetchHeadPath = Path.Combine(gitDir, "FETCH_HEAD")
+            File.WriteAllText(fetchHeadPath, "sentinel fetch head\n")
+            use gate = new System.Threading.ManualResetEventSlim(false)
+            let reads =
+                [| for _ in 1 .. 16 ->
+                    System.Threading.Tasks.Task.Run(fun () ->
+                        gate.Wait()
+                        LedgerStore.fetch binding) |]
+            gate.Set()
+            System.Threading.Tasks.Task.WaitAll(reads |> Array.map (fun task -> task :> System.Threading.Tasks.Task))
+            for read in reads do
+                Assert.That((read.Result |> success).Commit, Is.EqualTo(updated.CurrentHead))
+            Assert.That(git repo [ "rev-parse"; tracking ], Is.EqualTo(initial.Commit),
+                        "Read-only fetches must not advance configured remote-tracking refs")
+            Assert.That(File.ReadAllText(fetchHeadPath), Is.EqualTo("sentinel fetch head\n"),
+                        "Read-only fetches must not write the shared FETCH_HEAD file")
+        finally
+            Directory.Delete(root, true)
+
+    [<Test>]
+    member _.ConcurrentReadersAcrossRemoteAdvanceKeepTrustedCacheMonotonic() =
+        let root = Path.Combine(Path.GetTempPath(), "jarvis-ledger-advance-" + Guid.NewGuid().ToString("N"))
+        Directory.CreateDirectory(root) |> ignore
+        try
+            let bare = Path.Combine(root, "remote.git")
+            let repo = Path.Combine(root, "reader")
+            git root [ "init"; "--bare"; bare ] |> ignore
+            git root [ "clone"; bare; repo ] |> ignore
+            File.WriteAllText(Path.Combine(repo, "source.txt"), "source")
+            git repo [ "add"; "source.txt" ] |> ignore
+            git repo [ "-c"; "user.name=Fixture"; "-c"; "user.email=fixture@example.test"; "commit"; "-m"; "source" ] |> ignore
+            git repo [ "push"; "-u"; "origin"; "HEAD" ] |> ignore
+            let binding =
+                { RepositoryPath = repo
+                  RemoteName = "origin"
+                  ApprovedFetchUrl = bare
+                  ApprovedPushUrl = bare
+                  ProjectId = Guid.NewGuid()
+                  LedgerId = Guid.NewGuid()
+                  Epoch = 1 }
+            let initial = LedgerStore.initialize binding true |> success
+            let first =
+                LedgerStore.putRecord binding
+                    { OperationId = Guid.NewGuid(); Actor = "Race fixture"
+                      Path = "records/one.json"; ExpectedBlobOid = None; Content = "one" }
+                |> success
+            Assert.That(first.CurrentHead, Is.Not.EqualTo(initial.Commit))
+            let cacheRef = "refs/jarvis/ledger-cache/" + binding.ProjectId.ToString("N")
+            use gate = new System.Threading.ManualResetEventSlim(false)
+            let reads =
+                [| for _ in 1 .. 20 ->
+                    System.Threading.Tasks.Task.Run(fun () ->
+                        gate.Wait()
+                        LedgerStore.fetch binding) |]
+            let advance =
+                System.Threading.Tasks.Task.Run(fun () ->
+                    gate.Wait()
+                    LedgerStore.putRecord binding
+                        { OperationId = Guid.NewGuid(); Actor = "Race fixture"
+                          Path = "records/two.json"; ExpectedBlobOid = None; Content = "two" })
+            gate.Set()
+            System.Threading.Tasks.Task.WaitAll(
+                [| yield advance :> System.Threading.Tasks.Task
+                   yield! reads |> Array.map (fun item -> item :> System.Threading.Tasks.Task) |])
+            let latest = advance.Result |> success
+            for item in reads do
+                let observed = item.Result |> success
+                Assert.That(
+                    observed.Commit = first.CurrentHead || observed.Commit = latest.CurrentHead,
+                    Is.True, "Concurrent readers must return a valid remote head")
+            let final = LedgerStore.fetch binding |> success
+            Assert.That(final.Commit, Is.EqualTo(latest.CurrentHead))
+            Assert.That(git repo [ "rev-parse"; cacheRef ], Is.EqualTo(latest.CurrentHead),
+                        "A stale fetch must not overwrite a newer trusted cache head")
+        finally
+            Directory.Delete(root, true)

@@ -407,14 +407,16 @@ module LedgerStore =
         | Error error -> Error error
 
     // All authoritative reads fetch a fresh remote head; local refs are only GC/trust anchors.
-    let fetch (binding: LedgerBinding) : Result<LedgerSnapshot, LedgerFailure> =
+    // Readers can observe different remote heads concurrently. A failed CAS must
+    // fetch again rather than overwrite a newer trusted cache or return stale data.
+    let rec private fetchWithRetries remaining (binding: LedgerBinding) : Result<LedgerSnapshot, LedgerFailure> =
         match validate binding with
         | Error error -> Error error
         | Ok () ->
             let repo = binding.RepositoryPath
             let stage = $"refs/jarvis/fetch/{Guid.NewGuid():N}"
             try
-                match git repo [ "fetch"; "--no-tags"; binding.RemoteName; $"{ledgerRef}:{stage}" ] with
+                match git repo [ "fetch"; "--no-tags"; "--no-write-fetch-head"; "--refmap="; binding.RemoteName; $"{ledgerRef}:{stage}" ] with
                 | Error error -> Error error
                 | Ok fetched when fetched.ExitCode <> 0 ->
                     match remoteExists binding with
@@ -433,16 +435,33 @@ module LedgerStore =
                                 | Some previous -> isAncestor repo previous head
                             match ancestry with
                             | Error error -> Error error
+                            | Ok false when remaining > 0 ->
+                                // A reader may have advanced the cache after our remote fetch.
+                                // Re-fetch to distinguish the race from a remote rewind.
+                                fetchWithRetries (remaining - 1) binding
                             | Ok false -> Error(LedgerIntegrityError "Canonical ledger ref is not descended from trusted history.")
                             | Ok true ->
                                 match readHeader binding head with
                                 | Error error -> Error error
                                 | Ok header ->
-                                    match run repo [ "update-ref"; (cacheRef binding); head ] with
+                                    let expectedOld = trusted |> Option.defaultValue (String.replicate 40 "0")
+                                    match git repo [ "update-ref"; (cacheRef binding); head; expectedOld ] with
                                     | Error error -> Error error
-                                    | Ok _ -> Ok { Commit = head; Header = header }
+                                    | Ok updated when updated.ExitCode = 0 -> Ok { Commit = head; Header = header }
+                                    | Ok failure ->
+                                        // CAS can lose to another fetch. Retry from the remote
+                                        // only if the cache changed; don't mask unrelated Git failures.
+                                        match getRef repo (cacheRef binding) with
+                                        | Ok now when now <> trusted && remaining > 0 ->
+                                            fetchWithRetries (remaining - 1) binding
+                                        | Ok now when now = Some head -> Ok { Commit = head; Header = header }
+                                        | Error error -> Error error
+                                        | _ -> Error(GitFailure $"Cannot update trusted ledger cache: {failure.Stderr}")
             finally
                 git repo [ "update-ref"; "-d"; stage ] |> ignore
+
+    let fetch (binding: LedgerBinding) : Result<LedgerSnapshot, LedgerFailure> =
+        fetchWithRetries 8 binding
 
     let verifyTrustedHead (binding: LedgerBinding) (expectedHead: string) (observedHead: string) =
         if String.IsNullOrWhiteSpace expectedHead
@@ -1412,7 +1431,7 @@ module LedgerStore =
                 | Ok(Some _) ->
                     let stage = $"refs/jarvis/source-reviews/{Guid.NewGuid():N}"
                     try
-                        match git binding.RepositoryPath [ "fetch"; "--no-tags"; binding.RemoteName; $"{gitRef}:{stage}" ] with
+                        match git binding.RepositoryPath [ "fetch"; "--no-tags"; "--no-write-fetch-head"; "--refmap="; binding.RemoteName; $"{gitRef}:{stage}" ] with
                         | Error error -> Error error
                         | Ok output when output.ExitCode <> 0 -> Error(SourceReviewRefUnavailable output.Stderr)
                         | Ok _ ->
@@ -1463,7 +1482,7 @@ module LedgerStore =
                             let stage = $"refs/jarvis/integration-verify/{Guid.NewGuid():N}"
                             try
                                 match git binding.RepositoryPath
-                                        [ "fetch"; "--no-tags"; binding.RemoteName; $"{targetRef}:{stage}" ] with
+                                        [ "fetch"; "--no-tags"; "--no-write-fetch-head"; "--refmap="; binding.RemoteName; $"{targetRef}:{stage}" ] with
                                 | Error error -> Error error
                                 | Ok fetched when fetched.ExitCode <> 0 ->
                                     Error(RemoteUnavailable $"Cannot fetch remote target: {fetched.Stderr}")

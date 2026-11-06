@@ -911,10 +911,14 @@ module ReviewWorkflow =
            || submissionId = Guid.Empty || not (validBranch sourceRef)
            || not (validBranch targetRef)
            || (not (String.IsNullOrWhiteSpace reviewId)
-               && not (match Guid.TryParseExact(reviewId, "N") with true, _ -> true | _ -> false)) then
+               && not (match Guid.TryParse reviewId with true, id when id <> Guid.Empty -> true | _ -> false)) then
             Error(InvalidBinding "Invalid integration submission.")
         else
-            let reviewId = if isNull reviewId then "" else reviewId
+            // API callers may supply the ordinary hyphenated UUID; ledger paths use N.
+            // Normalize before journaling so D and N spellings are idempotent.
+            let reviewId =
+                if String.IsNullOrWhiteSpace reviewId then ""
+                else (Guid.Parse reviewId).ToString("N")
             let action = intent operationId actorId "SubmitIntegration"
                             {| taskId = taskId; submissionId = submissionId
                                sourceRef = sourceRef; submittedCommit = submittedCommit

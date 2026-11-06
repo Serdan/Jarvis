@@ -1309,11 +1309,15 @@ type ReviewWorkflowTests() =
             |> success |> ignore
             let submission1 = Guid.NewGuid()
             let operation1 = Guid.NewGuid()
-            let submit1 () =
+            let submit1 reviewFormat =
                 ReviewWorkflow.submitIntegration first operation1 "boundary" "Owner"
-                    submission1 source firstCommit (reviewId.ToString("N")) target
-            Assert.That((submit1 () |> success).AlreadyApplied, Is.False)
-            Assert.That((submit1 () |> success).AlreadyApplied, Is.True)
+                    submission1 source firstCommit (reviewId.ToString(reviewFormat)) target
+            // MCP review requests use D UUIDs while ledger paths use N UUIDs.
+            // Both formats must resolve to one canonical submission and journal identity.
+            Assert.That((submit1 "D" |> success).AlreadyApplied, Is.False)
+            Assert.That((submit1 "N" |> success).AlreadyApplied, Is.True)
+            let canonical = ReviewWorkflow.getIntegrationSubmissions first "boundary" |> success
+            Assert.That(canonical.Submissions.Head.ReviewId, Is.EqualTo(reviewId.ToString("N")))
             let secondCommit = newCommit "Further work in progress" "second"
             match ReviewWorkflow.submitIntegration first (Guid.NewGuid()) "boundary" "Owner"
                     (Guid.NewGuid()) source secondCommit (reviewId.ToString("N")) target with

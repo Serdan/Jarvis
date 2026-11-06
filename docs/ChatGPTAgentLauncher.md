@@ -124,7 +124,11 @@ Prefer the account's already configured UI defaults when the caller does not spe
 - Support background tabs by default, but test behavior under Chromium background throttling. Configurable `active=true` exists for diagnostics or an identified site limitation; don't steal focus unconditionally.
 - Reject ChatGPT login, challenge, error, suspended account, wrong project/GPT, permission prompts, or otherwise blocked UI states when detectable. Report actionable categories; do not attempt to bypass a challenge.
 
-### 5.2 Stable element selection
+### 5.2 Chat/Work home-mode selection
+
+The `https://chatgpt.com/` homepage may remember **Work** as its selected mode. Before interacting with the composer, locate the unique `button[type="button"][aria-pressed]` buttons whose visible text is exactly **Chat** and **Work**. If Chat is not pressed, click Chat once and wait within the existing overall UI deadline for Chat `aria-pressed="true"` and Work `aria-pressed="false"`. Do not depend on generated CSS classes or button order. If the controls are missing or the transition does not complete, return `notSubmitted` without entering the prompt. If Chat is already selected, do not click it.
+
+### 5.3 Stable element selection
 
 Prefer accessible/semantic DOM attributes over generated CSS class names.
 

@@ -22,6 +22,30 @@ async function execute(args) {
     }
     return predicate();
   };
+  // ChatGPT can remember Work mode even when opening the new-chat homepage.
+  // Resolve by visible label and aria-pressed, not generated classes or DOM order.
+  const modeButton = name => {
+    const matches = Array.from(document.querySelectorAll('button[type="button"][aria-pressed]'))
+      .filter(button => button.textContent.trim() === name);
+    return matches.length === 1 ? matches[0] : null;
+  };
+  const modes = await until(() => {
+    const chat = modeButton("Chat");
+    const work = modeButton("Work");
+    return chat && work ? { chat, work } : null;
+  });
+  if (!modes) return { status: "notSubmitted", reason: "ModeToggleUnavailable" };
+  if (modes.chat.getAttribute("aria-pressed") !== "true") {
+    modes.chat.click();
+  }
+  const chatReady = await until(() => {
+    const chat = modeButton("Chat");
+    const work = modeButton("Work");
+    return chat?.getAttribute("aria-pressed") === "true" &&
+      work?.getAttribute("aria-pressed") === "false";
+  });
+  if (!chatReady) return { status: "notSubmitted", reason: "ChatModeUnavailable" };
+
   const composerSelector = '[data-composer-input-layout] [contenteditable="true"][role="textbox"]';
   const sendSelector = 'button[type="submit"][aria-label="Send"]:not(:disabled)';
   const initialUrl = location.href;

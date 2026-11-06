@@ -12,6 +12,24 @@ function harness(options = {}) {
   let userTurns = 0;
   let clicks = 0;
   let focused = false;
+  let mode = options.initialMode || "Chat";
+  let chatClicks = 0;
+  const makeMode = name => ({
+    textContent: name,
+    getAttribute(attribute) {
+      return attribute === "aria-pressed" ? String(mode === name) : null;
+    },
+    click() {
+      if (name === "Chat") {
+        chatClicks++;
+        if (!options.modeSwitchFails) {
+          setTimeout(() => { mode = "Chat"; }, options.modeDelayMs || 0);
+        }
+      }
+    }
+  });
+  const chatMode = makeMode("Chat");
+  const workMode = makeMode("Work");
   const editor = {
     get innerText() { return content; },
     focus() { focused = true; }
@@ -36,6 +54,9 @@ function harness(options = {}) {
       return null;
     },
     querySelectorAll(selector) {
+      if (selector === 'button[type="button"][aria-pressed]') {
+        return options.noModeToggle ? [] : [chatMode, workMode];
+      }
       return selector.includes('data-message-author-role="user"') ? Array(userTurns).fill({}) : [];
     }
   };
@@ -44,7 +65,8 @@ function harness(options = {}) {
     await vm.runInContext(source + "\nexecute(" + JSON.stringify({
       prompt, timeoutMs: options.timeoutMs || 350
     }) + ")", ctx);
-  return { run, site, get clicks() { return clicks; }, get content() { return content; } };
+  return { run, site, get clicks() { return clicks; }, get chatClicks() { return chatClicks; },
+    get mode() { return mode; }, get content() { return content; } };
 }
 
 test("inserts multiline prompt through editor and submits once", async () => {
@@ -111,4 +133,37 @@ test("keeps the submission uncertain when route never appears", async () => {
   assert.equal(result.status, "outcomeUnknown");
   assert.equal(result.reason, "ConversationUrlUnavailable");
   assert.equal(h.clicks, 1);
+});
+
+test("leaves Chat selected without toggling and submits normally", async () => {
+  const h = harness({ initialMode: "Chat" });
+  const result = await h.run();
+  assert.equal(result.status, "submitted");
+  assert.equal(h.chatClicks, 0);
+  assert.equal(h.clicks, 1);
+});
+
+test("switches Work to Chat before entering the prompt", async () => {
+  const h = harness({ initialMode: "Work", modeDelayMs: 80 });
+  const result = await h.run();
+  assert.equal(result.status, "submitted");
+  assert.equal(h.chatClicks, 1);
+  assert.equal(h.mode, "Chat");
+  assert.equal(h.clicks, 1);
+});
+
+test("does not submit if Work cannot be switched to Chat", async () => {
+  const h = harness({ initialMode: "Work", modeSwitchFails: true, timeoutMs: 125 });
+  const result = await h.run();
+  assert.equal(result.status, "notSubmitted");
+  assert.equal(result.reason, "ChatModeUnavailable");
+  assert.equal(h.clicks, 0);
+});
+
+test("does not submit when mode selection controls are unavailable", async () => {
+  const h = harness({ noModeToggle: true, timeoutMs: 125 });
+  const result = await h.run();
+  assert.equal(result.status, "notSubmitted");
+  assert.equal(result.reason, "ModeToggleUnavailable");
+  assert.equal(h.clicks, 0);
 });

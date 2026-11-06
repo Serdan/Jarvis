@@ -1,0 +1,13 @@
+<h1>Typed project and checkout identities with authoritative path resolution</h1>
+<p>Replace ad hoc interpretation of string project selectors (notably Project::worktree) throughout Jarvis with explicit domain types and centralized parsing/resolution. A project identity, checkout selector, resolved source root, ledger identity and instruction display key are distinct concepts; never synthesize physical paths from selector strings.</p>
+<h2>Requirements</h2>
+<ul>
+<li>Define validated domain types for project identifiers, checkout selection (main or registered worktree), and resolved project location/context. Parse external strings exactly once at API/command boundary or a single typed resolver, preserving compatibility for existing callers.</li>
+<li>Centralize validation and worktree discovery in ProjectPaths or a dedicated module. Resolve registered worktrees to real validated physical roots, retaining existing symlink, containment and authorization constraints.</li>
+<li>Use typed resolution within AgentInstructions, ProjectBrowser, AgentView, JobManager and any other consumers currently splitting or reconstructing the Project::worktree convention. Separate canonical project/ledger identity, checkout-specific source identity and display-only paths.</li>
+<li>Instruction traversal must use actual resolved filesystem roots, and workspace/project/deeper instructions must produce stable, unambiguous logical mapping keys. Worktree-specific content and cache entries must not collide across checkouts; no regression to hierarchical ordering, file-count/byte limits, validation or warnings.</li>
+<li>Preserve external command protocol and legacy project selector syntax where needed, while preventing stringly-typed selector manipulation within internal modules. Do not add patches that simply special-case :: inside the instruction resolver.</li>
+<li>Add tests for main checkout, registered worktree, multiple registered worktrees with distinct instructions, invalid/ambiguous selectors, nesting, traversal/symlink rejection, cache isolation, and unchanged public command compatibility. Run focused and Release test suites.</li>
+</ul>
+<h2>Integration</h2>
+<p>The already implemented incremental AGENTS.md delivery feature on branch feat/incremental-agent-instructions depends on this design correction. Implement together in that isolated worktree; do not deploy or merge without review and operator permission.</p>

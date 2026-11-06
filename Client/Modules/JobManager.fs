@@ -36,6 +36,13 @@ module private Core =
     let private maxCompletedJobs = 100
     let private jobs = ConcurrentDictionary<string, JobRecord>()
 
+    // A registered worktree selects where a job executes, not which logical
+    // project owns its result. GetJobResult/CancelJob only receive projectName.
+    let private projectIdentity (projectName: string) =
+        let separator = projectName.IndexOf("::", StringComparison.Ordinal)
+        if separator < 0 then projectName
+        else projectName.Substring(0, separator)
+
     let private pruneCompletedJobs () =
         jobs.Values
         |> Seq.filter (fun job -> job.Status <> Running)
@@ -121,7 +128,7 @@ module private Core =
 
                 let job =
                     { JobId = jobId
-                      ProjectName = projectName
+                      ProjectName = projectIdentity projectName
                       Executable = executable
                       Args = args
                       Reason = reason
@@ -207,7 +214,7 @@ module private Core =
             jobs.Values
             |> Seq.filter (fun job ->
                 match cmd.ProjectName with
-                | Some projectName -> job.ProjectName = projectName
+                | Some projectName -> job.ProjectName = projectIdentity projectName
                 | None -> true)
             |> Seq.filter (fun job -> cmd.IncludeCompleted || job.Status = Running)
             |> Seq.sortBy (fun job -> job.StartedAt)
@@ -220,7 +227,7 @@ module private Core =
             match jobs.TryGetValue cmd.JobId with
             | false, _ -> Error(NotFoundError $"Unknown job id: {cmd.JobId}")
             | true, job when not (String.IsNullOrWhiteSpace cmd.ProjectName)
-                             && not (String.Equals(cmd.ProjectName, job.ProjectName, StringComparison.Ordinal)) ->
+                             && not (String.Equals(projectIdentity cmd.ProjectName, job.ProjectName, StringComparison.Ordinal)) ->
                 Error(ValidationError "jobId does not belong to the requested project.")
             | true, job ->
                 lock job.SyncRoot (fun () ->
@@ -242,7 +249,7 @@ module private Core =
             match jobs.TryGetValue cmd.JobId with
             | false, _ -> Error(NotFoundError $"Unknown job id: {cmd.JobId}")
             | true, job when not (String.IsNullOrWhiteSpace cmd.ProjectName)
-                             && not (String.Equals(cmd.ProjectName, job.ProjectName, StringComparison.Ordinal)) ->
+                             && not (String.Equals(projectIdentity cmd.ProjectName, job.ProjectName, StringComparison.Ordinal)) ->
                 Error(ValidationError "jobId does not belong to the requested project.")
             | true, job ->
                 if job.Status = Running then

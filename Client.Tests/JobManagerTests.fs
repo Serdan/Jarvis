@@ -255,3 +255,51 @@ let ``job read and cancellation reject a mismatched project without stopping the
         cancelJob { ProjectName = "JobScope"; JobId = jobId } context |> shouldEqual (Ok())
     finally
         Directory.Delete(root, true)
+
+[<Test>]
+let ``worktree jobs remain accessible through their logical project name`` () =
+    let root = createTempProject ()
+    try
+        let main = Path.Combine(root, "Project1")
+        let worktree = Path.Combine(root, "job-worktree")
+        let git args =
+            use proc = new Process()
+            proc.StartInfo.FileName <- "git"
+            proc.StartInfo.WorkingDirectory <- main
+            proc.StartInfo.RedirectStandardOutput <- true
+            proc.StartInfo.RedirectStandardError <- true
+            args |> List.iter proc.StartInfo.ArgumentList.Add
+            Assert.That(proc.Start(), Is.True)
+            let stdout = proc.StandardOutput.ReadToEnd()
+            let stderr = proc.StandardError.ReadToEnd()
+            proc.WaitForExit()
+            Assert.That(proc.ExitCode, Is.EqualTo(0), stderr)
+            stdout.Trim()
+        git [ "init" ] |> ignore
+        File.WriteAllText(Path.Combine(main, "fixture.txt"), "fixture")
+        git [ "add"; "fixture.txt" ] |> ignore
+        git [ "-c"; "user.name=Fixture"; "-c"; "user.email=fixture@example.test"; "commit"; "-m"; "fixture" ] |> ignore
+        git [ "worktree"; "add"; "-b"; "job-fixture"; worktree ] |> ignore
+        let context = TestContext root
+        let jobId =
+            match startJob
+                    { ProjectName = "Project1::job-worktree"
+                      Executable = "dotnet"
+                      Args = [ "--info" ]
+                      Reason = None
+                      WorkingDirectory = None
+                      MaxOutputBytes = Some 4096 } context with
+            | Ok started -> started.JobId
+            | Error error -> failwithf "StartJob failed: %A" error
+        match listJobs { ProjectName = Some "Project1"; IncludeCompleted = true } context with
+        | Ok listed ->
+            let item = listed.Jobs |> List.find (fun job -> job.JobId = jobId)
+            Assert.That(item.ProjectName, Is.EqualTo("Project1"))
+            Assert.That(item.WorkingDirectory, Is.EqualTo(Some worktree))
+        | Error error -> Assert.Fail(sprintf "ListJobs failed: %A" error)
+        match getJobResult { ProjectName = "Project1"; JobId = jobId; AfterSequence = Some 0L } context with
+        | Ok result -> Assert.That(result.JobId, Is.EqualTo(jobId))
+        | Error error -> Assert.Fail(sprintf "GetJobResult failed: %A" error)
+        cancelJob { ProjectName = "Project1"; JobId = jobId } context |> shouldEqual (Ok())
+    finally
+        Directory.Delete(root, true)

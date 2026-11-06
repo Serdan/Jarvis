@@ -10,8 +10,8 @@ async function execute(args) {
     return { status: "notSubmitted", reason: "UnexpectedStartUrl" };
   }
   // A single budget for hydration, insertion, acknowledgement and route capture.
-  // Fits inside the bridge's default 15-second execution limit.
-  const overallMs = Math.min(Math.max(Number(args.timeoutMs) || 13000, 100), 14000);
+  // Leaves a three-second margin inside the bridge's 30-second execution limit.
+  const overallMs = Math.min(Math.max(Number(args.timeoutMs) || 27000, 100), 27000);
   const deadline = Date.now() + overallMs;
   const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
   const until = async predicate => {

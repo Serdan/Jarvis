@@ -103,7 +103,7 @@ Recommended argument contract:
 | --- | --- | --- |
 | `prompt` | Yes | Exact bootstrap text to submit; nonempty, bounded, may contain newlines |
 | `role` / `agentId` / `projectName` | No | Caller-owned metadata for logs/correlation; **not** alternative sources of instructions |
-| `timeoutMs` | No | One overall UI deadline for hydration, insertion, submission confirmation and conversation URL capture (defaults to 13 s; capped at 14 s) |
+| `timeoutMs` | No | One overall UI deadline for hydration, insertion, submission confirmation and conversation URL capture (defaults to 13 s; capped at 27 s) |
 | `debug` | No | Opt-in diagnostics; do not leak draft text by default |
 
 Jarvis browser-workflow parameters, **not** ChatGPT script arguments, control `windowRegistration`, `active`, `closeTabAfterExecution`, and device selection. Only **scheduled** calls have delay and repeat interval. An orchestrator normally invokes the immediate workflow, rather than scheduling a zero-delay job.
@@ -209,7 +209,7 @@ If success cannot be proven after a possible click, return `outcomeUnknown` with
 
 ### 5.6 Timeouts and result boundary
 
-The ChatGPT UI script uses one deadline across all UI phases (13 s default, capped at 14 s), fitting the generic bridge's default 15 s execution limit. When overriding bridge timeouts, configure the script's `timeoutMs` lower than the bridge timeout. Distinguish:
+The ChatGPT UI script uses one deadline across all UI phases (27 s default, capped at 27 s), fitting the generic bridge's default 30 s execution limit. When overriding bridge timeouts, configure the script's `timeoutMs` lower than the bridge timeout. Distinguish:
 - `notSubmitted`: definitively failed before any possible send.
 - `submitted`: observed accepted turn, regardless of later agent outcome.
 - `outcomeUnknown`: clicked/possibly clicked but acceptance not conclusively observed.

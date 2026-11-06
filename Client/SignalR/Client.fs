@@ -287,7 +287,7 @@ let private dispatch (rt: Runtime) (command: AgentCommand) =
                                 let source = File.ReadAllText(path, UTF8Encoding(false, true))
                                 let args = defaultArg cmd.ArgsJson "{}"
                                 use validatedArgs = JsonDocument.Parse(args)
-                                let! result = BrowserBridge.runInNewTab bridge cmd.WindowRegistration cmd.Url "" (defaultArg cmd.Active false) source args (defaultArg cmd.TimeoutMs 15000) (defaultArg cmd.CloseTabAfterExecution false)
+                                let! result = BrowserBridge.runInNewTab bridge cmd.WindowRegistration cmd.Url "" (defaultArg cmd.Active false) source args (defaultArg cmd.TimeoutMs 30000) (defaultArg cmd.CloseTabAfterExecution false)
                                 return result
                                        |> Result.mapError (fun (registrationId,error) ->
                                            let detail =

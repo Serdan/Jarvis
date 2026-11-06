@@ -203,7 +203,7 @@ let private runClient args =
                     else
                         let! result = BrowserBridge.runInNewTab bridge action.WindowRegistration
                                             action.Url action.Alias action.Active source action.ArgsJson
-                                            15000 action.CloseTabAfterExecution
+                                            30000 action.CloseTabAfterExecution
                         match result with
                         | Error e -> return Error e
                         | Ok json -> return Ok json

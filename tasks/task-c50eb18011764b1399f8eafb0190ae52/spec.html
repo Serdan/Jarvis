@@ -1,0 +1,37 @@
+<h1>Git-backed agent-defined hooks</h1>
+<p>Implement a small event-driven hook facility in Jarvis so agents can attach scripts to well-defined lifecycle and operation events. Hooks run locally without extra LLM tool round trips, and their definitions and scripts are shared across branches through a dedicated orphan Git branch (suggested <code>jarvis/hooks</code>), checked out independently of source worktrees.</p>
+<h2>Core design</h2>
+<ul>
+<li>Git-versioned manifest and scripts in a dedicated orphan branch, independent of source branches; local isolated checkout for execution. Concurrent updates should use safe Git/ledger-style serialization or compare-and-retry without lost updates. No invented task IDs.</li>
+<li>Workspace/project-scoped hooks by default, with optional agent/event filters. Worktree and agent context is passed to handlers; source worktree is the script working directory. Avoid executing untrusted branch-local hook definitions implicitly.</li>
+<li>Manifest defines event, script path, enabled flag, filters, optional priority, timeout, and blocking behavior where supported. Define stable structured JSON event payloads and optional structured diagnostic results.</li>
+<li>Before hooks execute synchronously and may block an operation; after hooks execute synchronously and add diagnostics but never reverse completed operations; lifecycle/event hooks can run asynchronously with durable outcome logging. Preserve operation error semantics and do not let reporting hook failures corrupt state.</li>
+<li>Execution safeguards: timeout, recursion/reentrancy protection, bounded output, deterministic ordering, and clear handling of failed scripts. Log event, handler ID, duration, exit code, stderr/stdout summary, and diagnostics. Keep execution state/logs/caches outside Git.</li>
+<li>Expose <code>list_hooks</code>, <code>register_hook</code>, <code>update_hook</code>, <code>remove_hook</code>, and <code>run_hook</code> (manual testing). APIs should use generated identifiers where needed, not user-invented IDs.</li>
+</ul>
+<h2>Initial events</h2>
+<ul>
+<li><code>agent.started</code>, <code>agent.stopped</code></li>
+<li><code>tool.before</code>, <code>tool.after</code> (include execution outcome), <code>command.after</code></li>
+<li><code>file.after_write</code> (only explicitly instrumented Jarvis file tools; document that arbitrary subprocess changes are not detected)</li>
+<li><code>git.before_commit</code>, <code>git.after_commit</code></li>
+<li><code>task.assigned</code>, <code>review.requested</code>, <code>integration.completed</code>, <code>worktree.created</code></li>
+</ul>
+<p>Design the dispatcher so further events can be added cheaply (agent state, command.before, file delete, Git push/merge, checkpoints, review decisions, notification events, etc.). Do not implement all of these initially.</p>
+<h2>Behavioral details</h2>
+<ul>
+<li>A generic <code>tool.before</code>/<code>tool.after</code> hook includes tool name, project, agent, worktree, operation ID, and outcome as available, with secret/sensitive argument redaction.</li>
+<li>Define whether generic hooks and specialized hooks both fire, and give stable order. Prevent double invocation for internal/nested operations, and disallow recursive self-triggering.</li>
+<li>Blocking hooks return actionable rejection diagnostics; nonblocking hook failures are visible and recorded without failing the completed operation.</li>
+<li>Consider command matching/filtering for build/benchmark collection, and a Roslyn daemon start/diagnostics example, without making Roslyn a special case.</li>
+</ul>
+<h2>Acceptance criteria</h2>
+<ol>
+<li>Agents can register, list, update, remove, and manually run script hooks using Jarvis tools; definitions persist through agent sessions and source branch switches.</li>
+<li>Two agents can update hook configuration without silently losing each other's changes.</li>
+<li>Before commit validation can reject a commit; after-write analysis can return diagnostics to the invoking agent; a failed after-hook cannot undo a successful operation.</li>
+<li>Hook loops, timeouts, and excessive output are bounded; runtime history can be inspected.</li>
+<li>Tests cover event dispatch, filters, ordering, blocking/nonblocking semantics, safe Git storage/concurrency, recursion, and failure handling.</li>
+<li>Documentation includes manifest schema, event/payload catalog, examples for Roslyn and benchmark diagnostics, limitations, and guidance for extending the event set.</li>
+</ol>
+<p>Keep implementation focused: no generalized workflow engine or dependency graph between hooks, and no special-case .NET feature in the core dispatcher. Do not deploy without explicit operator approval.</p>

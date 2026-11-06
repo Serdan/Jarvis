@@ -51,6 +51,66 @@ let private checkWorkingGuidance (rt: Runtime) agentId command =
                     Sha256 = ""; Content = content } ]
             | None -> []
 
+// An agent's first ordinary tool call starts its Ready assignment.
+// No new session identifier or explicit resume tool is needed. Never
+// auto-activate a different agent merely because an administrative operation
+// names that agent as its target.
+let private activatesAgent (agentId: string) command =
+    match command with
+    | TaskWriteCommand cmd ->
+        cmd.ActorId = agentId
+        && List.contains cmd.Action
+            [ "CheckpointAttempt"; "YieldAgent"; "CompleteAgentWork"
+              "AcknowledgeFeedback"; "BindAttemptSource"; "RebindAttemptSource"
+              "BindReviewBase"; "SetAttemptSource"; "SubmitIntegration" ]
+    | TaskReadCommand cmd ->
+        String.IsNullOrWhiteSpace cmd.AgentId || cmd.AgentId = agentId
+    | LedgerWriteCommand _ | ReviewWriteCommand _ -> false
+    | _ -> true
+
+let private activateReadyOnActivity (rt: Runtime) (agentId: string) command =
+    if String.IsNullOrWhiteSpace agentId || not (activatesAgent agentId command) then Ok ()
+    else
+        match AgentCommandInfo.projectName command with
+        | None -> Ok ()
+        | Some routedProject ->
+            let project = AgentView.activityProject routedProject
+            let cache = workingGuidanceCaches.GetValue(rt, fun _ -> WorkingTurnGuidance.AgentCache(TimeSpan.FromMinutes 2.))
+            // Inbox is the normal bootstrap operation; always recheck its
+            // current assignment even if other calls cached an idle agent.
+            match command with
+            | TaskReadCommand cmd when cmd.Action = "AgentInbox" -> cache.Invalidate(project, agentId)
+            | _ -> ()
+            let current =
+                cache.Get(DateTimeOffset.UtcNow, project, agentId, fun () ->
+                    match OrchestrationApi.LedgerBindingConfig.load project rt with
+                    | Error _ -> None
+                    | Ok binding ->
+                        match ReviewWorkflow.ReviewWorkflow.getAgentWorkingTurn binding agentId with
+                        | Ok agent -> Some agent
+                        | Error _ -> None)
+            match current with
+            | Some agent when agent.State = "Ready"
+                              && not (isNull (box agent.CurrentAssignment))
+                              && not (String.IsNullOrWhiteSpace agent.CurrentAssignment.TaskId) ->
+                match OrchestrationApi.LedgerBindingConfig.load project rt with
+                | Error error -> Error(Client.ValidationError($"Cannot activate Ready agent: {error}"))
+                | Ok binding ->
+                    let result =
+                        ReviewWorkflow.ReviewWorkflow.activateReadyAgent binding (Guid.NewGuid())
+                            agent.CurrentAssignment.TaskId agentId
+                    cache.Invalidate(project, agentId)
+                    match result with
+                    | Ok _ -> Ok ()
+                    | Error(Client.LedgerStore.StaleEntityVersion _) ->
+                        // Another concurrent tool may already have started this
+                        // assignment. Do not reset its Working clock.
+                        match ReviewWorkflow.ReviewWorkflow.getAgentWorkingTurn binding agentId with
+                        | Ok latest when latest.State = "Working" -> Ok ()
+                        | _ -> Error(Client.ValidationError "Agent assignment changed before automatic activation.")
+                    | Error error -> Error(Client.ValidationError($"Automatic agent activation failed: {error}"))
+            | _ -> Ok ()
+
 let private serialize<'a> (value: 'a) =
     try
         JsonSerializer.Serialize value |> Ok
@@ -394,9 +454,13 @@ let processIncomingCommand (rt: Runtime) (commandJson: string) (agentId: string)
                     AgentCommandInfo.projectName command
                     |> Option.iter (fun project ->
                         rt.Tui.RecordAgentSeen(AgentView.activityProject project, agentId))
-                    let! result, applicable = receiveCommandWithInstructions rt command
-                    instructions <- applicable @ checkWorkingGuidance rt agentId command
-                    return result
+                    match activateReadyOnActivity rt agentId command with
+                    | Error error ->
+                        return Error error
+                    | Ok () ->
+                        let! result, applicable = receiveCommandWithInstructions rt command
+                        instructions <- applicable @ checkWorkingGuidance rt agentId command
+                        return result
                 with ex ->
                     return Error(ExceptionError ex)
             }

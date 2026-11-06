@@ -1333,7 +1333,7 @@ module ReviewWorkflow =
             else return None
         }
 
-    let resumeAgentWithSession binding operationId taskId ownerId expectedAttemptVersion expectedAgentVersion generation sessionId =
+    let private resumeAgentCore binding operationId taskId ownerId expectedAttemptVersion expectedAgentVersion generation sessionId allowWorkingContinuation =
         if not (validTaskId taskId) || not (validAgent ownerId)
            || expectedAttemptVersion < 0 || expectedAgentVersion < 0 || generation < 0 then
             Error(InvalidBinding "Invalid ResumeAgent version or generation.")
@@ -1403,7 +1403,8 @@ module ReviewWorkflow =
                                             Version = agent.Version + 1
                                             StateReason = $"Resumed task {taskId}"
                                             StateSequence = snapshot.Header.NextSequence }) ]
-                        elif agent.State = "Working" && attempt.Phase = "Started"
+                        elif allowWorkingContinuation
+                             && agent.State = "Working" && attempt.Phase = "Started"
                              && agent.ActiveAttemptId = attempt.AttemptId then
                             // An explicit resume continues the current agent slot,
                             // regardless of the model provider or session metadata.
@@ -1425,6 +1426,14 @@ module ReviewWorkflow =
                         else
                             return! Error(StaleEntityVersion "Resume requires a Ready queued/started attempt or a Working attempt on the same assignment.")
                     })
+
+    let resumeAgentWithSession binding operationId taskId ownerId expectedAttemptVersion expectedAgentVersion generation sessionId =
+        resumeAgentCore binding operationId taskId ownerId expectedAttemptVersion expectedAgentVersion generation sessionId true
+
+    // Automatic activation is only a Ready -> Working transition. Repeated or
+    // concurrent calls must never restart a Working agent's clock.
+    let activateReadyAgent binding operationId taskId agentId =
+        resumeAgentCore binding operationId taskId agentId 0 0 0 "" false
 
     let resumeAgent binding operationId taskId ownerId expectedAttemptVersion expectedAgentVersion generation =
         resumeAgentWithSession binding operationId taskId ownerId expectedAttemptVersion expectedAgentVersion generation ""
@@ -1562,6 +1571,35 @@ module ReviewWorkflow =
                                     StateReason = reason
                                     StateSequence = snapshot.Header.NextSequence
                                 } ]
+                    })
+
+    // Administrative state changes apply only to unassigned agents.
+    // Ready is reserved for assigned attempts and Working is entered by
+    // activity, so neither is a directly writable administrative state.
+    let setAgentAdministrativeStateAs binding actor operationId agentId targetState expectedAgentVersion reason =
+        if targetState = "Parked" then
+            parkAgentAs binding actor operationId agentId expectedAgentVersion reason
+        elif targetState <> "NeedsWork" || not (validAgent agentId)
+             || expectedAgentVersion < 1 || not (validText 2048 reason) then
+            Error(InvalidBinding "Administrative state must be NeedsWork or Parked with an exact agent version and reason.")
+        else
+            LedgerStore.transact binding
+                (intent operationId actor "SetAgentState"
+                    {| agentId = agentId; targetState = targetState
+                       expectedAgentVersion = expectedAgentVersion; reason = reason |})
+                (fun snapshot ->
+                    result {
+                        let! agent, agentOid = required<ReviewAgent> binding snapshot (agentPath agentId)
+                        if agent.Version <> expectedAgentVersion
+                           || not (List.contains agent.State [ "NeedsWork"; "Parked" ])
+                           || not (isNull (box agent.CurrentAssignment)) then
+                            return! Error(StaleEntityVersion "Administrative state change cannot interrupt an assignment.")
+                        return
+                            [ change (agentPath agentId) (Some agentOid)
+                                { (enterState "NeedsWork" agent) with
+                                    Version = agent.Version + 1
+                                    StateReason = reason
+                                    StateSequence = snapshot.Header.NextSequence } ]
                     })
 
     // Source repository identity is an endpoint fingerprint independent from

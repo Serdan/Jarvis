@@ -429,8 +429,8 @@ let ``command catalog matches AgentCommand union and MCP tools`` () =
     let ledgerWire = set [ "TaskRead"; "TaskWrite"; "ReviewRead"; "ReviewWrite"; "LedgerRead"; "LedgerWrite" ]
     let orchestrationTools =
         set [ "GetIntegrationSubmissions"; "SubmitIntegration"; "CompleteIntegration"; "NotifyAgent"; "AcknowledgeNotification"; "AgentInbox"; "GetAssignment"; "GetCheckpoint"; "InspectAttemptSource"; "TaskLifecycleHistory"; "GetTaskSpecPage"; "DiffTaskSpec"; "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "ReissueAssignment"; "CheckpointAttempt"
-              "SetAttemptSource"; "YieldAgent"; "ResumeAgent"; "CompleteAgentWork"
-              "ParkAgent"; "ReissueQueuedAttempt"; "RecoverAgentAssignment"; "AcknowledgeReviewFeedback"; "DeferAttempt"; "ResumeAttempt"; "AbandonAttempt"; "CancelTask"; "TransferOwner"; "CloseTask"; "ReopenTask"; "ImportTaskSpec"; "ExportTaskSpec"
+              "SetAttemptSource"; "YieldAgent"; "CompleteAgentWork"
+              "SetAgentState"; "ReissueQueuedAttempt"; "RecoverAgentAssignment"; "AcknowledgeReviewFeedback"; "DeferAttempt"; "ResumeAttempt"; "AbandonAttempt"; "CancelTask"; "TransferOwner"; "CloseTask"; "ReopenTask"; "ImportTaskSpec"; "ExportTaskSpec"
               "GetTask"; "TaskOverview"; "ReviewDetails"; "ReviewerInbox"; "ListReviewDocuments"; "ReadReviewDocument"
               "SubmitReview"; "ClaimReview"; "DecideReview"
               "ReleaseReview"; "WithdrawReview"; "PutReviewDocument"
@@ -787,8 +787,8 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
               for name in [ "InitializeLedger"; "BindExistingLedger"; "RebindLedgerRemote"; "AcknowledgePendingOperation" ] -> name, ledgerWrite
               for name in [ "GetIntegrationSubmissions"; "AgentInbox"; "GetAssignment"; "GetCheckpoint"; "InspectAttemptSource"; "TaskLifecycleHistory"; "GetTaskSpecPage"; "DiffTaskSpec" ] -> name, taskRead
               for name in [ "SubmitIntegration"; "CompleteIntegration"; "NotifyAgent"; "AcknowledgeNotification"; "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "ReissueAssignment"; "CheckpointAttempt"
-                            "SetAttemptSource"; "YieldAgent"; "ResumeAgent"; "CompleteAgentWork";
-                            "ParkAgent"; "ReissueQueuedAttempt"; "RecoverAgentAssignment"; "AcknowledgeReviewFeedback"; "DeferAttempt"; "ResumeAttempt"; "AbandonAttempt"; "CancelTask"; "TransferOwner"; "CloseTask"; "ReopenTask"; "ImportTaskSpec"; "ExportTaskSpec" ] -> name, taskWrite
+                            "SetAttemptSource"; "YieldAgent"; "CompleteAgentWork";
+                            "SetAgentState"; "ReissueQueuedAttempt"; "RecoverAgentAssignment"; "AcknowledgeReviewFeedback"; "DeferAttempt"; "ResumeAttempt"; "AbandonAttempt"; "CancelTask"; "TransferOwner"; "CloseTask"; "ReopenTask"; "ImportTaskSpec"; "ExportTaskSpec" ] -> name, taskWrite
               for name in [ "GetTask"; "TaskOverview"; "ReviewDetails"; "ReviewerInbox"; "ListReviewDocuments"; "ReadReviewDocument" ] ->
                   name, ledgerRead
               for name in [ "SubmitReview"; "ClaimReview"; "DecideReview"

@@ -156,15 +156,18 @@ let cross_project_notification_parameter_is_optional_and_backwards_compatible ()
         Assert.That(parameter.IsOptional, Is.False, $"{name} must remain required")
 
 [<Test>]
-let resume_agent_is_the_only_public_start_tool () =
-    let start = typeof<Server.JarvisMcpTools>.GetMethod("BeginAttempt")
-    Assert.That(start, Is.Null, "Retired BeginAttempt must not be exposed as an MCP tool.")
-    let resume = typeof<Server.JarvisMcpTools>.GetMethod("ResumeAgent")
-    Assert.That(resume, Is.Not.Null)
-    let expectedAgentVersion =
-        resume.GetParameters() |> Array.find (fun parameter -> parameter.Name = "expectedAgentVersion")
-    Assert.That(expectedAgentVersion.IsOptional, Is.True)
-    Assert.That(expectedAgentVersion.DefaultValue, Is.EqualTo(0))
+let public_agent_lifecycle_has_implicit_start_and_explicit_administrative_state () =
+    let tools = typeof<Server.JarvisMcpTools>
+    Assert.That(tools.GetMethod("BeginAttempt"), Is.Null)
+    Assert.That(tools.GetMethod("ResumeAgent"), Is.Null)
+    Assert.That(tools.GetMethod("ParkAgent"), Is.Null)
+    let admin = tools.GetMethod("SetAgentState")
+    Assert.That(admin, Is.Not.Null)
+    let state = admin.GetParameters() |> Array.find (fun p -> p.Name = "state")
+    Assert.That(state.ParameterType, Is.EqualTo(typeof<Server.AdministrativeAgentState>))
+    Assert.That((Enum.GetNames(state.ParameterType) = [| "NeedsWork"; "Parked" |]), Is.True)
+    for name in [ "agentId"; "targetAgentId"; "reason"; "expectedAgentVersion" ] do
+        Assert.That(admin.GetParameters() |> Array.exists (fun p -> p.Name = name), Is.True)
 
 [<Test>]
 let core_task_tools_have_one_public_operation_per_intention () =
@@ -230,7 +233,7 @@ let review_publication_is_one_tool_with_optional_replacement_version () =
 
 [<Test>]
 let routine_agent_lifecycle_versions_are_optional_preconditions () =
-    for toolName in [ "ResumeAgent"; "YieldAgent"; "CheckpointAttempt"; "CompleteAgentWork" ] do
+    for toolName in [ "YieldAgent"; "CheckpointAttempt"; "CompleteAgentWork" ] do
         let methodInfo = typeof<Server.JarvisMcpTools>.GetMethod(toolName)
         Assert.That(methodInfo, Is.Not.Null)
         for name in [ "expectedAttemptVersion"; "expectedAgentVersion"; "assignmentGeneration" ] do

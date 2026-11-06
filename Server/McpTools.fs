@@ -10,6 +10,11 @@ type OpenAIFileParam =
 [<CLIMutable>]
 type ProfileResult = { id: string }
 
+// Direct administrative writes cannot enter Working or assigned Ready.
+type AdministrativeAgentState =
+    | NeedsWork = 0
+    | Parked = 1
+
 open System
 open System.ComponentModel
 open System.Diagnostics
@@ -251,8 +256,8 @@ module McpToolHelpers =
     let private ledgerTaskReadMethods = [ "GetIntegrationSubmissions"; "AgentInbox"; "GetAssignment"; "GetCheckpoint";  "InspectAttemptSource"; "TaskLifecycleHistory"; "GetTaskSpecPage"; "DiffTaskSpec" ]
     let private ledgerTaskWriteMethods =
         [ "SubmitIntegration"; "CompleteIntegration"; "NotifyAgent"; "AcknowledgeNotification"; "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "ReissueAssignment"; "CheckpointAttempt"
-          "SetAttemptSource"; "YieldAgent"; "ResumeAgent"; "CompleteAgentWork"
-          "ParkAgent"; "ReissueQueuedAttempt"; "RecoverAgentAssignment"; "AcknowledgeReviewFeedback"
+          "SetAttemptSource"; "YieldAgent"; "CompleteAgentWork"
+          "SetAgentState"; "ReissueQueuedAttempt"; "RecoverAgentAssignment"; "AcknowledgeReviewFeedback"
           "DeferAttempt"; "ResumeAttempt"; "AbandonAttempt"; "CancelTask"
           "TransferOwner"; "CloseTask"; "ReopenTask"; "ImportTaskSpec"; "ExportTaskSpec" ]
 
@@ -1371,20 +1376,15 @@ type JarvisMcpTools =
         let cmd = TaskCommands.write projectName "YieldAgent" operationId taskId agentId
         McpToolHelpers.send client http (TaskWriteCommand { cmd with ExpectedVersion = expectedAttemptVersion; ExpectedAgentVersion = expectedAgentVersion; AssignmentGeneration = assignmentGeneration; Summary = summary; NextAction = nextAction })
 
-    [<McpServerTool(Title = "resume agent", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Continue an agent's assigned development task, starting Ready work or reconnecting an interrupted Working session. Jarvis preserves assignment history and resolves omitted version fields from the current ledger state. Reuse operationId only when retrying an uncertain result.")>]
-    static member ResumeAgent(projectName: string, taskId: string, agentId: string, [<Optional; DefaultParameterValue(0)>] expectedAttemptVersion: int, [<Optional; DefaultParameterValue(0)>] expectedAgentVersion: int, [<Optional; DefaultParameterValue(0)>] assignmentGeneration: int, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
-        let cmd = TaskCommands.write projectName "ResumeAgent" operationId taskId agentId
-        McpToolHelpers.send client http (TaskWriteCommand { cmd with ExpectedVersion = expectedAttemptVersion; ExpectedAgentVersion = expectedAgentVersion; AssignmentGeneration = assignmentGeneration })
-
     [<McpServerTool(Title = "complete agent work", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Complete the specified current agent assignment, recording a checkpoint and releasing the slot. Version/generation arguments are optional strict assertions; omitting them resolves current ledger state.")>]
     static member CompleteAgentWork(projectName: string, taskId: string, agentId: string, summary: string, [<Optional; DefaultParameterValue(0)>] expectedAttemptVersion: int, [<Optional; DefaultParameterValue(0)>] expectedAgentVersion: int, [<Optional; DefaultParameterValue(0)>] assignmentGeneration: int, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         let cmd = TaskCommands.write projectName "CompleteAgentWork" operationId taskId agentId
         McpToolHelpers.send client http (TaskWriteCommand { cmd with ExpectedVersion = expectedAttemptVersion; ExpectedAgentVersion = expectedAgentVersion; AssignmentGeneration = assignmentGeneration; Summary = summary })
 
-    [<McpServerTool(Title = "park agent", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Mark an unassigned agent as Parked, without interrupting active assignments.")>]
-    static member ParkAgent(projectName: string, agentId: string, expectedAgentVersion: int, reason: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
-        let cmd = TaskCommands.write projectName "ParkAgent" operationId "" agentId
-        McpToolHelpers.send client http (TaskWriteCommand { cmd with ExpectedAgentVersion = expectedAgentVersion; Reason = reason })
+    [<McpServerTool(Title = "set agent state", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Administratively park or unpark an unassigned agent. Only NeedsWork and Parked are valid; assigned Ready is controlled by assignment lifecycle and Working starts automatically on agent activity. Requires current agent version and a reason.")>]
+    static member SetAgentState(projectName: string, agentId: string, targetAgentId: string, state: AdministrativeAgentState, expectedAgentVersion: int, reason: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        let cmd = TaskCommands.write projectName "SetAgentState" operationId "" targetAgentId
+        McpToolHelpers.send client http (TaskWriteCommand { cmd with Summary = state.ToString(); ExpectedAgentVersion = expectedAgentVersion; Reason = reason })
 
     [<McpServerTool(Title = "reissue queued task", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Explicitly assign a queued attempt to an unoccupied agent. Does not preempt a current Ready or Working assignment.")>]
     static member ReissueQueuedAttempt(projectName: string, taskId: string, agentId: string, expectedAttemptVersion: int, expectedAgentVersion: int, assignmentGeneration: int, reason: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =

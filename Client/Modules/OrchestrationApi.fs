@@ -541,9 +541,9 @@ module PendingIntentJournal =
                 | "TaskWrite", "ResumeAgent" -> attempt
                 | "TaskWrite", "CompleteAgentWork" ->
                     attempt @ [ "Summary", "summary" ]
-                | "TaskWrite", "ParkAgent" ->
-                    [ "ActorId", "agentId"; "ExpectedAgentVersion", "expectedAgentVersion"
-                      "Reason", "reason" ]
+                | "TaskWrite", "SetAgentState" ->
+                    [ "ActorId", "targetAgentId"; "Summary", "state"
+                      "ExpectedAgentVersion", "expectedAgentVersion"; "Reason", "reason" ]
                 | "TaskWrite", "ReissueQueuedAttempt"
                 | "TaskWrite", "RecoverAgentAssignment" ->
                     attempt @ [ "Reason", "reason" ]
@@ -1049,7 +1049,7 @@ module TaskApi =
                     // Preserve historical session metadata only in lifecycle
                     // journals; it is not used to establish agent identity.
                     let journalCommand =
-                        if List.contains cmd.Action [ "BeginAttempt"; "ResumeAgent"; "YieldAgent"; "CheckpointAttempt"; "CompleteAgentWork" ] then cmd
+                        if List.contains cmd.Action [ "BeginAttempt"; "YieldAgent"; "CheckpointAttempt"; "CompleteAgentWork" ] then cmd
                         else { cmd with SessionId = "" }
                     let result =
                         PendingIntentJournal.executeLedgerWrite binding operationId "TaskWrite" journalCommand (fun () ->
@@ -1150,10 +1150,6 @@ module TaskApi =
                                 ReviewWorkflow.ReviewWorkflow.yieldAgentWithSession binding operationId
                                     cmd.TaskId cmd.ActorId cmd.ExpectedVersion cmd.ExpectedAgentVersion
                                     cmd.AssignmentGeneration cmd.Summary cmd.NextAction cmd.SessionId |> mapError
-                            | "ResumeAgent" ->
-                                ReviewWorkflow.ReviewWorkflow.resumeAgentWithSession binding operationId
-                                    cmd.TaskId cmd.ActorId cmd.ExpectedVersion cmd.ExpectedAgentVersion
-                                    cmd.AssignmentGeneration cmd.SessionId |> mapError
                             | "CompleteAgentWork" ->
                                 ReviewWorkflow.ReviewWorkflow.completeAgentWorkWithSession binding operationId
                                     cmd.TaskId cmd.ActorId cmd.ExpectedVersion cmd.ExpectedAgentVersion
@@ -1184,10 +1180,10 @@ module TaskApi =
                                 withAdministrativeActor (fun actor ->
                                     ReviewWorkflow.ReviewWorkflow.reopenTaskAs binding actor operationId
                                         cmd.TaskId cmd.ExpectedTaskVersion cmd.Reason |> mapError)
-                            | "ParkAgent" ->
+                            | "SetAgentState" ->
                                 withAdministrativeActor (fun actor ->
-                                    ReviewWorkflow.ReviewWorkflow.parkAgentAs binding actor operationId
-                                        cmd.ActorId cmd.ExpectedAgentVersion cmd.Reason |> mapError)
+                                    ReviewWorkflow.ReviewWorkflow.setAgentAdministrativeStateAs binding actor operationId
+                                        cmd.ActorId cmd.Summary cmd.ExpectedAgentVersion cmd.Reason |> mapError)
                             | "ReissueQueuedAttempt" ->
                                 withAdministrativeActor (fun actor ->
                                     ReviewWorkflow.ReviewWorkflow.reissueQueuedAttemptAs binding actor operationId

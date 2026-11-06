@@ -1,0 +1,30 @@
+<h1>Durable agent challenges</h1>
+<p>Implement first-class challenges for structured inter-agent coordination. This task has no dependency on hooks, browser control, or automatic agent scheduling.</p>
+<h2>Behavior</h2>
+<ul>
+<li>An agent issues a challenge containing a title, optional task context, and one or more conditions, each assigned to a specific agentId with a description.</li>
+<li>Jarvis generates stable challenge and condition IDs, persisting everything in the existing Git ledger, independently of source branches.</li>
+<li>Initial completion policy is ALL: every condition must be satisfied.</li>
+<li>Initial onSatisfied policy is notify: when every condition is satisfied, create exactly one existing-format durable notification in the issuing agent's inbox, including condition results and evidence. Do NOT automatically start or resume an agent.</li>
+<li>Assigned agents can discover outstanding conditions and explicitly resolve their own conditions with evidence. Support Satisfied and Blocked outcomes. A Blocked outcome should notify the issuer, without marking the challenge satisfied.</li>
+<li>The issuer can cancel an outstanding challenge. Maintain an auditable immutable history of outcomes and cancellation, including timestamps.</li>
+<li>Enforce authorization, concurrency safety, idempotent retries, and exactly-once notification behavior using existing ledger and notification conventions.</li>
+</ul>
+<h2>Tools</h2>
+<ul>
+<li>create_challenge: define conditions and owners; return generated challenge and condition IDs.</li>
+<li>list_challenges: show issued and assigned challenges with statuses.</li>
+<li>get_challenge: inspect conditions, evidence, and history.</li>
+<li>resolve_challenge_condition: satisfy or block an owned condition with evidence/reason.</li>
+<li>cancel_challenge: cancel an issued challenge with a reason.</li>
+</ul>
+<h2>Acceptance tests</h2>
+<ol>
+<li>Agent 3 issues a challenge requiring an integration update from Lead and native benchmark results from Agent 8.</li>
+<li>Lead and Agent 8 can independently satisfy their conditions with evidence; unauthorized actors cannot.</li>
+<li>Satisfying one condition does not finish the challenge. Resolving the final condition creates one notification for Agent 3.</li>
+<li>Concurrent updates, duplicate operation retries, and process restarts cannot lose updates or duplicate completion notifications.</li>
+<li>Blocked and cancelled states are inspectable and do not cause false completion.</li>
+<li>Documentation specifies payloads, ownership, ledger semantics, and the deliberate lack of hook or browser dependencies.</li>
+</ol>
+<p>Do not introduce a generic workflow engine, condition expression language, or agent scheduler. Do not deploy without explicit operator approval.</p>

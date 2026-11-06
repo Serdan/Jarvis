@@ -307,7 +307,7 @@ let working_turn_delivery_cache_deduplicates_and_refreshes_hierarchy () =
             ProjectPaths.ProjectTarget.parse "Demo"
             |> function Ok target -> target | Error error -> failwithf "%A" error
         let initial = docs rt (command "source.fs")
-        let filter agent turn documents = cache.Filter(mainTarget, agent, turn, documents, fun () -> Ok [])
+        let filter agent turn documents = cache.Filter(mainTarget, agent, turn, HierarchyLoaded, documents, fun () -> Ok [])
         Assert.That(filter "Owner" "turn-1" initial |> List.map (fun d -> d.Path),
                     Is.EqualTo([ "AGENTS.md"; "Demo/AGENTS.md" ] :> obj))
         Assert.That(filter "Owner" "turn-1" initial, Is.Empty)
@@ -324,7 +324,7 @@ let working_turn_delivery_cache_deduplicates_and_refreshes_hierarchy () =
         let otherTarget =
             ProjectPaths.ProjectTarget.parse "Other"
             |> function Ok target -> target | Error error -> failwithf "%A" error
-        Assert.That(cache.Filter(otherTarget, "Owner", "turn-2", initial, fun () -> Ok []) |> List.length, Is.EqualTo(2)))
+        Assert.That(cache.Filter(otherTarget, "Owner", "turn-2", HierarchyLoaded, initial, fun () -> Ok []) |> List.length, Is.EqualTo(2)))
 
 
 let private gitAt directory arguments =
@@ -417,9 +417,9 @@ let registered_worktrees_resolve_distinct_instructions_from_actual_checkout_root
         | Ok(Content value) -> Assert.That(value, Is.EqualTo("module EngineA"))
         | Error error -> Assert.Fail(sprintf "Prepared checkout source read failed: %A" error)
         let cache = DeliveryCache()
-        Assert.That(cache.Filter(checkoutA, "Owner", "turn-1", check "Demo::tree-a", fun () -> Ok []).Length, Is.EqualTo(3))
-        Assert.That(cache.Filter(checkoutA, "Owner", "turn-1", check "Demo::tree-a", fun () -> Ok []), Is.Empty)
-        Assert.That(cache.Filter(checkoutB, "Owner", "turn-1", check "Demo::tree-b", fun () -> Ok []).Length, Is.EqualTo(3))
+        Assert.That(cache.Filter(checkoutA, "Owner", "turn-1", HierarchyLoaded, check "Demo::tree-a", fun () -> Ok []).Length, Is.EqualTo(3))
+        Assert.That(cache.Filter(checkoutA, "Owner", "turn-1", HierarchyLoaded, check "Demo::tree-a", fun () -> Ok []), Is.Empty)
+        Assert.That(cache.Filter(checkoutB, "Owner", "turn-1", HierarchyLoaded, check "Demo::tree-b", fun () -> Ok []).Length, Is.EqualTo(3))
         match ProjectPaths.ProjectTarget.parse "Demo::tree-a::unexpected" with
         | Error _ -> ()
         | Ok _ -> Assert.Fail("Nested selectors must be rejected")
@@ -457,7 +457,7 @@ let bootstrap_is_once_per_working_turn_even_for_empty_ledger_responses () =
     let roots () =
         rootReads <- rootReads + 1
         Ok [ { Scope = "workspace"; Path = "AGENTS.md"; Sha256 = "sha256:first"; Content = "root" } ]
-    let deliver turn documents = cache.Filter(target, "Owner", turn, documents, roots)
+    let deliver turn documents = cache.Filter(target, "Owner", turn, RootBootstrapRequired, documents, roots)
     Assert.That(deliver "first" [] |> List.map (fun d -> d.Content),
                 Is.EqualTo([ "root" ] :> obj))
     Assert.That(deliver "first" [], Is.Empty)
@@ -465,9 +465,31 @@ let bootstrap_is_once_per_working_turn_even_for_empty_ledger_responses () =
     Assert.That(rootReads, Is.EqualTo(1))
     Assert.That(deliver "second" [] |> List.length, Is.EqualTo(1))
     Assert.That(rootReads, Is.EqualTo(2))
-    let other = cache.Filter(target, "Reviewer", "first", [], roots)
+    let other = cache.Filter(target, "Reviewer", "first", RootBootstrapRequired, [], roots)
     Assert.That(other.Length, Is.EqualTo(1))
     Assert.That(rootReads, Is.EqualTo(3))
+
+[<Test>]
+let empty_completed_source_lookup_suppresses_redundant_checkout_bootstrap () =
+    let target =
+        ProjectPaths.ProjectTarget.parse "Demo::tree-a"
+        |> function Ok selected -> selected | Error error -> failwithf "%A" error
+    let cache = DeliveryCache()
+    let mutable rootLoads = 0
+    let load () =
+        rootLoads <- rootLoads + 1
+        Ok [ { Scope = "workspace"; Path = "AGENTS.md"; Sha256 = "sha256:root"
+               Content = "different checkout" } ]
+    // Source lookup completed successfully but found no instruction files.
+    Assert.That(cache.Filter(target, "Owner", "turn-1", HierarchyLoaded, [], load), Is.Empty)
+    Assert.That(rootLoads, Is.Zero)
+    // Later ledger-only calls must not rediscover a checkout.
+    Assert.That(cache.Filter(target, "Owner", "turn-1", RootBootstrapRequired, [], load), Is.Empty)
+    Assert.That(rootLoads, Is.Zero)
+    // A new working turn resets the cache and ledger bootstrap works normally.
+    let fresh = cache.Filter(target, "Owner", "turn-2", RootBootstrapRequired, [], load)
+    Assert.That(fresh |> List.map (fun d -> d.Content), Is.EqualTo([ "different checkout" ] :> obj))
+    Assert.That(rootLoads, Is.EqualTo(1))
 
 [<Test>]
 let failed_bootstrap_does_not_block_operations_and_retries_until_success () =
@@ -481,7 +503,7 @@ let failed_bootstrap_does_not_block_operations_and_retries_until_success () =
         if attempts = 1 then Error(Client.ValidationError "Invalid AGENTS.md")
         else Ok [ { Scope = "project"; Path = "Demo/AGENTS.md"
                     Sha256 = "sha256:valid"; Content = "valid guidance" } ]
-    let call documents = cache.Filter(target, "Owner", "turn-1", documents, load)
+    let call documents = cache.Filter(target, "Owner", "turn-1", RootBootstrapRequired, documents, load)
     let warning = call []
     Assert.That(warning |> List.exists (fun doc -> doc.Scope = "instruction-warning"), Is.True)
     Assert.That(attempts, Is.EqualTo(1))
@@ -499,7 +521,7 @@ let write_notice_does_not_suppress_initial_instructions () =
     let cache = DeliveryCache()
     let note = { Scope = "write-warning"; Path = "Demo/AGENTS.md"; Sha256 = ""; Content = "Notice" }
     let roots () = Ok [ { Scope = "workspace"; Path = "AGENTS.md"; Sha256 = "sha256:root"; Content = "Root" } ]
-    let delivered = cache.Filter(target, "Owner", "turn-1", [note], roots)
+    let delivered = cache.Filter(target, "Owner", "turn-1", RootBootstrapRequired, [note], roots)
     Assert.That(delivered |> List.map (fun d -> d.Scope),
                 Is.EqualTo([ "workspace"; "write-warning" ] :> obj))
 
@@ -618,6 +640,34 @@ let worktree_git_discovery_drains_both_pipes_and_bounds_a_hung_process () =
         | Error(Client.ValidationError message) -> Assert.That(message, Does.Contain("timed out"))
         | other -> Assert.Fail(sprintf "Expected bounded timeout: %A" other)
         Assert.That(clock.Elapsed, Is.LessThan(TimeSpan.FromSeconds 5.))
+        if OperatingSystem.IsLinux() then
+            // Parent exits promptly while its child retains the inherited
+            // stdout/stderr handles. Kill(true) on the exited parent cannot
+            // reach the orphan; only its original process group can.
+            let pidFile = Path.Combine(root, "orphan.pid")
+            let orphan =
+                script "orphan-git.sh" ("sleep 30 & echo $! > '" + pidFile + "'; exit 0")
+            let result = Client.ProjectPaths.WorktreeGit.list orphan root (TimeSpan.FromMilliseconds 350.)
+            match result with
+            | Error(Client.ValidationError msg) -> Assert.That(msg, Does.Contain("timed out"))
+            | other -> Assert.Fail(sprintf "Inherited orphan pipe must time out: %A" other)
+            Assert.That(File.Exists pidFile, Is.True)
+            let childPid = Int32.Parse(File.ReadAllText(pidFile).Trim())
+            let childAlive () =
+                let stat = "/proc/" + string childPid + "/stat"
+                if not (File.Exists stat) then false
+                else
+                    let record = File.ReadAllText(stat)
+                    let state = record[record.LastIndexOf(") ", StringComparison.Ordinal) + 2]
+                    state <> 'Z' && state <> 'X'
+            // Allow the kernel to finish propagating SIGKILL and reaping.
+            let clock = Stopwatch.StartNew()
+            while childAlive() && clock.Elapsed < TimeSpan.FromSeconds 2. do
+                System.Threading.Thread.Sleep(25)
+            let stillAlive = childAlive()
+            if stillAlive then
+                try Process.GetProcessById(childPid).Kill(true) with _ -> ()
+            Assert.That(stillAlive, Is.False, "The timed-out process group left an orphan running.")
     )
 
 [<Test>]

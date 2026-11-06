@@ -317,11 +317,18 @@ type private DeliveryEntry =
       mutable Bootstrapped: bool
       mutable Hashes: Map<string, string> }
 
+// A completed source hierarchy lookup is authoritative even when no AGENTS.md
+// was found. Ledger-only commands need a separate one-time root bootstrap.
+type BootstrapProvenance =
+    | HierarchyLoaded
+    | RootBootstrapRequired
+
 type DeliveryCache() =
     let entries = ConcurrentDictionary<ProjectPaths.ProjectTarget * string, DeliveryEntry>()
 
     member _.Filter(checkout: ProjectPaths.ProjectTarget, agentId: string, turn: string,
-                    documents: InstructionDocument list, loadRoots: unit -> Client.Result<InstructionDocument list>) =
+                    provenance: BootstrapProvenance, documents: InstructionDocument list,
+                    loadRoots: unit -> Client.Result<InstructionDocument list>) =
         let key = checkout, agentId
         let entry =
             entries.GetOrAdd(key, fun _ ->
@@ -331,16 +338,13 @@ type DeliveryCache() =
                 entry.Turn <- turn
                 entry.Bootstrapped <- false
                 entry.Hashes <- Map.empty
-            // Explicit bootstrap state, not inference from empty tool responses.
-            // Source operations already checked every ancestor; ledger operations
-            // need a one-time root lookup if no source guidance accompanied them.
-            let containsRepositoryGuidance =
-                documents
-                |> List.exists (fun document ->
-                    document.Scope = "workspace" || document.Scope = "project")
+            // A completed source lookup already checked all ancestors. Its
+            // empty result is as conclusive as a non-empty one.
             let initial =
-                if entry.Bootstrapped || containsRepositoryGuidance then
+                if provenance = HierarchyLoaded then
                     entry.Bootstrapped <- true
+                    []
+                elif entry.Bootstrapped then
                     []
                 else
                     match loadRoots() with

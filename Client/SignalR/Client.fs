@@ -144,7 +144,8 @@ let private activateReadyOnActivity (rt: Runtime) (agentId: string)
 // Only the Working turn identifies a stable delivery scope. Ledger calls bootstrap
 // root guidance, while normal source operations discover deeper instructions.
 let private incrementalInstructions (rt: Runtime) (agentId: string)
-                                    (target: ProjectPaths.ProjectTarget option) documents =
+                                    (target: ProjectPaths.ProjectTarget option)
+                                    provenance documents =
     if String.IsNullOrWhiteSpace agentId then documents
     else
         match target with
@@ -167,7 +168,7 @@ let private incrementalInstructions (rt: Runtime) (agentId: string)
             | Some active when active.State = "Working" ->
                 let turn = string active.StateSequence + ":" + active.WorkingTurnStartedAtUtc
                 let delivery = instructionDeliveryCaches.GetValue(rt, fun _ -> AgentInstructions.DeliveryCache())
-                delivery.Filter(target, agentId, turn, documents, fun () ->
+                delivery.Filter(target, agentId, turn, provenance, documents, fun () ->
                     // Ledger status reads remain usable; failed instruction
                     // resolution is surfaced as a retryable warning.
                     AgentInstructions.rootsForTarget rt target)
@@ -539,19 +540,28 @@ let private receiveCommandWithTypedInstructions (rt: Runtime)
                                                 (target: ProjectPaths.ProjectTarget option) command =
     task {
         match AgentInstructions.prepareOperationWithTarget rt target command with
-        | Error error -> return Error error, []
+        | Error error ->
+            return Error error, [], AgentInstructions.RootBootstrapRequired
         | Ok prepared ->
             let! response =
                 receiveCommandForTarget rt target prepared.Source prepared.ProjectTask command
-            return response, prepared.Instructions
-                             @ AgentInstructions.writeWarningsForContext rt prepared.Source command response
+            let provenance =
+                if prepared.Source.IsSome then AgentInstructions.HierarchyLoaded
+                else AgentInstructions.RootBootstrapRequired
+            return response,
+                   prepared.Instructions
+                   @ AgentInstructions.writeWarningsForContext rt prepared.Source command response,
+                   provenance
     }
 
 let receiveCommandWithInstructions (rt: Runtime) command =
     task {
         match classifyProject command with
         | Error error -> return Error error, []
-        | Ok scope -> return! receiveCommandWithTypedInstructions rt (projectTarget scope) command
+        | Ok scope ->
+            let! response, instructions, _ =
+                receiveCommandWithTypedInstructions rt (projectTarget scope) command
+            return response, instructions
     }
 
 // Shared by SignalR receive and tests. Identity is supplied by the MCP call,
@@ -575,8 +585,9 @@ let processIncomingCommand (rt: Runtime) (commandJson: string) (agentId: string)
                         match activateReadyOnActivity rt agentId target command with
                         | Error error -> return Error error
                         | Ok () ->
-                            let! result, applicable = receiveCommandWithTypedInstructions rt target command
-                            instructions <- incrementalInstructions rt agentId target applicable
+                            let! result, applicable, provenance =
+                                receiveCommandWithTypedInstructions rt target command
+                            instructions <- incrementalInstructions rt agentId target provenance applicable
                                             @ checkWorkingGuidance rt agentId target command
                             return result
                 with ex ->

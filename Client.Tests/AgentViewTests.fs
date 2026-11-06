@@ -197,3 +197,9 @@ let activityProjectNormalizesRegisteredWorktreeNames () =
     activityProject "Wayfold" |> shouldEqual "Wayfold"
     activityProject "Wayfold::gui-design" |> shouldEqual "Wayfold"
     activityProject "Jarvis::agent-id-implementation" |> shouldEqual "Jarvis"
+
+
+[<Test>]
+let activityProjectRejectsInvalidCheckoutSelector () =
+    Assert.Throws<ArgumentException>(fun () ->
+        activityProject "Wayfold::bad::selector" |> ignore) |> ignore

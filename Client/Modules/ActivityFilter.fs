@@ -39,7 +39,7 @@ let parseTerms (query: string) =
 let private worktreeParts (projectName: string) =
     match Client.ProjectPaths.ProjectTarget.parse projectName with
     | Ok target ->
-        match Client.ProjectPaths.ProjectTarget.worktreeName target.Checkout with
+        match Client.ProjectPaths.ProjectTarget.worktreeName (Client.ProjectPaths.ProjectTarget.checkout target) with
         | Some worktree -> Some(Client.ProjectPaths.ProjectTarget.projectName target, worktree)
         | None -> None
     | Error _ ->

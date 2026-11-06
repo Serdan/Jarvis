@@ -40,7 +40,14 @@ module private Core =
     // project owns its result. GetJobResult/CancelJob only receive projectName.
     let private projectIdentity (projectName: string) =
         ProjectPaths.ProjectTarget.identity projectName
-        |> Result.defaultValue projectName
+
+    let private validateJobProject projectName (job: JobRecord) =
+        if String.IsNullOrWhiteSpace projectName then Ok()
+        else
+            match projectIdentity projectName with
+            | Error error -> Error error
+            | Ok canonical when canonical = job.ProjectName -> Ok()
+            | Ok _ -> Error(ValidationError "jobId does not belong to the requested project.")
 
     let private pruneCompletedJobs () =
         jobs.Values
@@ -127,7 +134,7 @@ module private Core =
 
                 let job =
                     { JobId = jobId
-                      ProjectName = projectIdentity projectName
+                      ProjectName = projectName
                       Executable = executable
                       Args = args
                       Reason = reason
@@ -191,8 +198,9 @@ module private Core =
             if maxOutputBytes <= 0 then
                 return! Client.ValidationError "MaxOutputBytes must be greater than zero." |> Effect.ofError
             else
+                let! canonical = projectIdentity cmd.ProjectName |> Effect.ofResult
                 let! (FolderPath workingDirectory) = resolveWorkingDirectory cmd.ProjectName cmd.WorkingDirectory
-                let! result = fun _ -> startProcess cmd.ProjectName workingDirectory cmd.Executable cmd.Args cmd.Reason maxOutputBytes
+                let! result = fun _ -> startProcess canonical workingDirectory cmd.Executable cmd.Args cmd.Reason maxOutputBytes
                 return result
         }
 
@@ -210,26 +218,29 @@ module private Core =
 
     let listJobs (cmd: ListJobsCommand) =
         fun _ ->
-            jobs.Values
-            |> Seq.filter (fun job ->
+            let filter =
                 match cmd.ProjectName with
-                | Some projectName -> job.ProjectName = projectIdentity projectName
-                | None -> true)
-            |> Seq.filter (fun job -> cmd.IncludeCompleted || job.Status = Running)
-            |> Seq.sortBy (fun job -> job.StartedAt)
-            |> Seq.map toSummary
-            |> Seq.toList
-            |> fun items -> Ok { Jobs = items }
+                | None -> Ok None
+                | Some projectName -> projectIdentity projectName |> Result.map Some
+            match filter with
+            | Error error -> Error error
+            | Ok canonical ->
+                jobs.Values
+                |> Seq.filter (fun job -> canonical |> Option.forall ((=) job.ProjectName))
+                |> Seq.filter (fun job -> cmd.IncludeCompleted || job.Status = Running)
+                |> Seq.sortBy (fun job -> job.StartedAt)
+                |> Seq.map toSummary
+                |> Seq.toList
+                |> fun items -> Ok { Jobs = items }
 
     let getJobResult (cmd: GetJobResultCommand) =
         fun _ ->
             match jobs.TryGetValue cmd.JobId with
             | false, _ -> Error(NotFoundError $"Unknown job id: {cmd.JobId}")
-            | true, job when not (String.IsNullOrWhiteSpace cmd.ProjectName)
-                             && not (String.Equals(projectIdentity cmd.ProjectName, job.ProjectName, StringComparison.Ordinal)) ->
-                Error(ValidationError "jobId does not belong to the requested project.")
             | true, job ->
-                lock job.SyncRoot (fun () ->
+                match validateJobProject cmd.ProjectName job with
+                | Error error -> Error error
+                | Ok () -> lock job.SyncRoot (fun () ->
                     let afterSequence = defaultArg cmd.AfterSequence 0L |> max 0L
                     let events =
                         job.Events
@@ -247,22 +258,22 @@ module private Core =
         fun _ ->
             match jobs.TryGetValue cmd.JobId with
             | false, _ -> Error(NotFoundError $"Unknown job id: {cmd.JobId}")
-            | true, job when not (String.IsNullOrWhiteSpace cmd.ProjectName)
-                             && not (String.Equals(projectIdentity cmd.ProjectName, job.ProjectName, StringComparison.Ordinal)) ->
-                Error(ValidationError "jobId does not belong to the requested project.")
             | true, job ->
-                if job.Status = Running then
-                    job.CancellationRequested <- true
-                    try
-                        if not job.Process.HasExited then job.Process.Kill(entireProcessTree = true)
-                        job.Status <- Canceled
-                        job.CompletedAt <- Some DateTimeOffset.UtcNow
+                match validateJobProject cmd.ProjectName job with
+                | Error error -> Error error
+                | Ok () ->
+                    if job.Status = Running then
+                        job.CancellationRequested <- true
+                        try
+                            if not job.Process.HasExited then job.Process.Kill(entireProcessTree = true)
+                            job.Status <- Canceled
+                            job.CompletedAt <- Some DateTimeOffset.UtcNow
+                            Ok()
+                        with ex ->
+                            job.CancellationRequested <- false
+                            Error(ExceptionError ex)
+                    else
                         Ok()
-                    with ex ->
-                        job.CancellationRequested <- false
-                        Error(ExceptionError ex)
-                else
-                    Ok()
 
 let startJob cmd = Core.startJob cmd
 let listJobs cmd = Core.listJobs cmd

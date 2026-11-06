@@ -16,12 +16,8 @@ type ProjectId = private ProjectId of string
 [<StructuralEquality; StructuralComparison>]
 type WorktreeId = private WorktreeId of string
 type Checkout = Main | Registered of WorktreeId
-type ProjectTarget = { Project: ProjectId; Checkout: Checkout }
-type ResolvedProject =
-    { Target: ProjectTarget
-      WorkspaceRoot: FolderPath
-      MainRoot: FolderPath
-      SourceRoot: FolderPath }
+type ProjectTarget = private { Project: ProjectId; Checkout: Checkout }
+type ResolvedProject = private { Target: ProjectTarget; WorkspaceRoot: FolderPath; MainRoot: FolderPath; SourceRoot: FolderPath }
 
 module ProjectTarget =
     let parse (input: string) : Client.Result<ProjectTarget> =
@@ -43,8 +39,15 @@ module ProjectTarget =
             | _ -> Error(ValidationError "Invalid project or worktree selector.")
 
     let projectName target = let (ProjectId name) = target.Project in name
+    let checkout target = target.Checkout
     let worktreeName = function Registered (WorktreeId name) -> Some name | Main -> None
     let identity input = parse input |> Result.map projectName
+
+module ResolvedProject =
+    let target (project: ResolvedProject) = project.Target
+    let sourceRoot (project: ResolvedProject) = project.SourceRoot
+    let workspaceRoot (project: ResolvedProject) = project.WorkspaceRoot
+    let mainRoot (project: ResolvedProject) = project.MainRoot
 
 let isPathInRoot (root: string) (fullPath: string) =
     let normalize (path: string) =

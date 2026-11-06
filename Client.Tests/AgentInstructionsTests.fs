@@ -307,7 +307,7 @@ let working_turn_delivery_cache_deduplicates_and_refreshes_hierarchy () =
             ProjectPaths.ProjectTarget.parse "Demo"
             |> function Ok target -> target | Error error -> failwithf "%A" error
         let initial = docs rt (command "source.fs")
-        let filter agent turn documents = cache.Filter(mainTarget, agent, turn, documents)
+        let filter agent turn documents = cache.Filter(mainTarget, agent, turn, documents, fun () -> [])
         Assert.That(filter "Owner" "turn-1" initial |> List.map (fun d -> d.Path),
                     Is.EqualTo([ "AGENTS.md"; "Demo/AGENTS.md" ] :> obj))
         Assert.That(filter "Owner" "turn-1" initial, Is.Empty)
@@ -324,7 +324,7 @@ let working_turn_delivery_cache_deduplicates_and_refreshes_hierarchy () =
         let otherTarget =
             ProjectPaths.ProjectTarget.parse "Other"
             |> function Ok target -> target | Error error -> failwithf "%A" error
-        Assert.That(cache.Filter(otherTarget, "Owner", "turn-2", initial) |> List.length, Is.EqualTo(2)))
+        Assert.That(cache.Filter(otherTarget, "Owner", "turn-2", initial, fun () -> []) |> List.length, Is.EqualTo(2)))
 
 
 let private gitAt directory arguments =
@@ -381,18 +381,18 @@ let registered_worktrees_resolve_distinct_instructions_from_actual_checkout_root
         Assert.That(rootA |> List.map (fun d -> d.Content),
                     Is.EqualTo([ "workspace guidance"; "checkout A" ] :> obj))
         let checkoutA =
-            checkoutIdentity rt "Demo::tree-a"
+            ProjectPaths.ProjectTarget.parse "Demo::tree-a"
             |> function Ok value -> value | Error error -> failwithf "%A" error
         let checkoutB =
-            checkoutIdentity rt "Demo::tree-b"
+            ProjectPaths.ProjectTarget.parse "Demo::tree-b"
             |> function Ok value -> value | Error error -> failwithf "%A" error
         Assert.That(ProjectPaths.ProjectTarget.projectName checkoutA, Is.EqualTo("Demo"))
         Assert.That(ProjectPaths.ProjectTarget.projectName checkoutB, Is.EqualTo("Demo"))
         Assert.That(checkoutA, Is.Not.EqualTo(checkoutB))
         let cache = DeliveryCache()
-        Assert.That(cache.Filter(checkoutA, "Owner", "turn-1", check "Demo::tree-a").Length, Is.EqualTo(3))
-        Assert.That(cache.Filter(checkoutA, "Owner", "turn-1", check "Demo::tree-a"), Is.Empty)
-        Assert.That(cache.Filter(checkoutB, "Owner", "turn-1", check "Demo::tree-b").Length, Is.EqualTo(3))
+        Assert.That(cache.Filter(checkoutA, "Owner", "turn-1", check "Demo::tree-a", fun () -> []).Length, Is.EqualTo(3))
+        Assert.That(cache.Filter(checkoutA, "Owner", "turn-1", check "Demo::tree-a", fun () -> []), Is.Empty)
+        Assert.That(cache.Filter(checkoutB, "Owner", "turn-1", check "Demo::tree-b", fun () -> []).Length, Is.EqualTo(3))
         match ProjectPaths.ProjectTarget.parse "Demo::tree-a::unexpected" with
         | Error _ -> ()
         | Ok _ -> Assert.Fail("Nested selectors must be rejected")
@@ -419,3 +419,25 @@ let registered_worktrees_resolve_distinct_instructions_from_actual_checkout_root
         | :? UnauthorizedAccessException -> ()
         | :? PlatformNotSupportedException -> ()
     )
+
+[<Test>]
+let bootstrap_is_once_per_working_turn_even_for_empty_ledger_responses () =
+    let target =
+        ProjectPaths.ProjectTarget.parse "Demo"
+        |> function Ok value -> value | Error error -> failwithf "%A" error
+    let cache = DeliveryCache()
+    let mutable rootReads = 0
+    let roots () =
+        rootReads <- rootReads + 1
+        [ { Scope = "workspace"; Path = "AGENTS.md"; Sha256 = "sha256:first"; Content = "root" } ]
+    let deliver turn documents = cache.Filter(target, "Owner", turn, documents, roots)
+    Assert.That(deliver "first" [] |> List.map (fun d -> d.Content),
+                Is.EqualTo([ "root" ] :> obj))
+    Assert.That(deliver "first" [], Is.Empty)
+    Assert.That(deliver "first" [], Is.Empty)
+    Assert.That(rootReads, Is.EqualTo(1))
+    Assert.That(deliver "second" [] |> List.length, Is.EqualTo(1))
+    Assert.That(rootReads, Is.EqualTo(2))
+    let other = cache.Filter(target, "Reviewer", "first", [], roots)
+    Assert.That(other.Length, Is.EqualTo(1))
+    Assert.That(rootReads, Is.EqualTo(3))

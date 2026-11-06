@@ -82,8 +82,9 @@ let stateAge (now: DateTimeOffset) (agent: AgentRow) =
 /// A registered worktree uses Project::worktree for file routing, but agent
 /// activity belongs to the parent project.
 let activityProject (project: string) =
-    ProjectPaths.ProjectTarget.identity project
-    |> Result.defaultValue project
+    match ProjectPaths.ProjectTarget.identity project with
+    | Ok name -> name
+    | Error error -> invalidArg "project" (sprintf "Invalid project selector: %A" error)
 
 /// Seen timestamps come from explicit agent-attributed tool calls, not sessions.
 let lastSeenAt (agent: AgentRow) (seen: IDictionary<string, DateTimeOffset>) =

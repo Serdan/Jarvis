@@ -195,8 +195,8 @@ let private resolveTargets (rt: Runtime) projectName targets =
     match ProjectPaths.resolveProjectContext projectName rt with
     | Error error -> Error error
     | Ok project ->
-        let (FolderPath sourceRoot) = project.SourceRoot
-        let logicalProject = ProjectPaths.ProjectTarget.projectName project.Target
+        let (FolderPath sourceRoot) = ProjectPaths.ResolvedProject.sourceRoot project
+        let logicalProject = ProjectPaths.ProjectTarget.projectName (ProjectPaths.ResolvedProject.target project)
         let directories =
             targets
             |> List.fold (fun accumulated target ->
@@ -258,31 +258,36 @@ let resolve (rt: Runtime) command =
 let roots (rt: Runtime) projectName =
     resolveTargets rt projectName [ FolderTarget "" ]
 
-// Distinct registered checkouts must not share delivered-instruction cache keys,
-// even when their logical display hierarchy is identical.
-let checkoutIdentity (_: Runtime) projectName =
-    ProjectPaths.ProjectTarget.parse projectName
-
 // This is a best-effort per-process delivery cache, never authoritative state.
 // A new working turn resets the set; another client may harmlessly redeliver.
 type private DeliveryEntry =
     { Gate: obj
       mutable Turn: string
+      mutable Bootstrapped: bool
       mutable Hashes: Map<string, string> }
 
 type DeliveryCache() =
     let entries = ConcurrentDictionary<ProjectPaths.ProjectTarget * string, DeliveryEntry>()
 
-    member _.Filter(checkout: ProjectPaths.ProjectTarget, agentId: string, turn: string, documents: InstructionDocument list) =
+    member _.Filter(checkout: ProjectPaths.ProjectTarget, agentId: string, turn: string,
+                    documents: InstructionDocument list, loadRoots: unit -> InstructionDocument list) =
         let key = checkout, agentId
         let entry =
             entries.GetOrAdd(key, fun _ ->
-                { Gate = obj(); Turn = turn; Hashes = Map.empty })
+                { Gate = obj(); Turn = turn; Bootstrapped = false; Hashes = Map.empty })
         lock entry.Gate (fun () ->
             if entry.Turn <> turn then
                 entry.Turn <- turn
+                entry.Bootstrapped <- false
                 entry.Hashes <- Map.empty
-            documents
+            // Explicit bootstrap state, not inference from empty tool responses.
+            // Source operations already checked every ancestor; ledger operations
+            // need a one-time root lookup if no source guidance accompanied them.
+            let initial =
+                if not entry.Bootstrapped && List.isEmpty documents then loadRoots()
+                else []
+            entry.Bootstrapped <- true
+            initial @ documents
             |> List.filter (fun document ->
                 if document.Scope = "write-warning" || document.Scope = "working-turn" then true
                 else

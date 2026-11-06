@@ -303,3 +303,31 @@ let ``worktree jobs remain accessible through their logical project name`` () =
         cancelJob { ProjectName = "Project1"; JobId = jobId } context |> shouldEqual (Ok())
     finally
         Directory.Delete(root, true)
+
+
+[<Test>]
+let invalidProjectSelectorsCannotPassJobIdentityChecks () =
+    let root = createTempProject()
+    try
+        let context = TestContext root
+        let started =
+            startJob
+                { ProjectName = "Project1"; Executable = "dotnet"
+                  Args = [ "--info" ]; Reason = None; WorkingDirectory = None
+                  MaxOutputBytes = Some 2048 } context
+        let id =
+            match started with
+            | Ok job -> job.JobId
+            | Error error -> failwithf "Could not start test job: %A" error
+        match listJobs { ProjectName = Some "Project1::bad::selector"; IncludeCompleted = true } context with
+        | Error(Client.ValidationError _) -> ()
+        | other -> Assert.Fail(sprintf "Expected invalid list scope, got: %A" other)
+        match getJobResult { ProjectName = "Project1::bad::selector"; JobId = id; AfterSequence = None } context with
+        | Error(Client.ValidationError _) -> ()
+        | other -> Assert.Fail(sprintf "Expected invalid read scope, got: %A" other)
+        match cancelJob { ProjectName = "Project1::bad::selector"; JobId = id } context with
+        | Error(Client.ValidationError _) -> ()
+        | other -> Assert.Fail(sprintf "Expected invalid cancel scope, got: %A" other)
+        cancelJob { ProjectName = "Project1"; JobId = id } context |> shouldEqual (Ok())
+    finally
+        Directory.Delete(root, true)

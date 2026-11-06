@@ -399,6 +399,23 @@ let registered_worktrees_resolve_distinct_instructions_from_actual_checkout_root
         Assert.That(ProjectPaths.ProjectTarget.projectName checkoutA, Is.EqualTo("Demo"))
         Assert.That(ProjectPaths.ProjectTarget.projectName checkoutB, Is.EqualTo("Demo"))
         Assert.That(checkoutA, Is.Not.EqualTo(checkoutB))
+        let sourceCommand : Common.AgentCommand =
+            ReadFileCommand
+                { ProjectName = "Demo::tree-a"; FilePath = "src/engine.fs"
+                  StartLine = None; EndLine = None; IncludeLineNumbers = None }
+        let prepared =
+            match prepareWithTarget rt (Some checkoutA) sourceCommand with
+            | Ok (documents, Some context) -> documents, context
+            | other -> failwithf "Expected prepared checkout context: %A" other
+        let instructions, sourceContext = prepared
+        Assert.That(instructions |> List.map (fun d -> d.Content),
+                    Is.EqualTo([ "workspace guidance"; "checkout A"; "nested A" ] :> obj))
+        let selectedSource : Common.ReadFileCommand =
+            { ProjectName = "Demo::tree-a"; FilePath = "src/engine.fs"
+              StartLine = None; EndLine = None; IncludeLineNumbers = None }
+        match Client.ProjectBrowser.readFileIn sourceContext selectedSource rt with
+        | Ok(Content value) -> Assert.That(value, Is.EqualTo("module EngineA"))
+        | Error error -> Assert.Fail(sprintf "Prepared checkout source read failed: %A" error)
         let cache = DeliveryCache()
         Assert.That(cache.Filter(checkoutA, "Owner", "turn-1", check "Demo::tree-a", fun () -> Ok []).Length, Is.EqualTo(3))
         Assert.That(cache.Filter(checkoutA, "Owner", "turn-1", check "Demo::tree-a", fun () -> Ok []), Is.Empty)

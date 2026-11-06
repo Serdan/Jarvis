@@ -69,15 +69,11 @@ module private Core =
         else
             Ok executable
 
-    let private resolveWorkingDirectory (target: ProjectPaths.ProjectTarget) workingDirectory =
-        effect {
-            let! context = ProjectPaths.resolveProjectContextForTarget target
-            match workingDirectory with
-            | None -> return ProjectPaths.ResolvedProject.sourceRoot context
-            | Some relativePath ->
-                let! path = ProjectPaths.resolveSourcePath context relativePath >>= FileIO.parseFolder
-                return path
-        }
+    let private resolveWorkingDirectory (context: ProjectPaths.ResolvedProject) workingDirectory =
+        match workingDirectory with
+        | None -> fun _ -> Ok(ProjectPaths.ResolvedProject.sourceRoot context)
+        | Some relativePath ->
+            ProjectPaths.resolveSourcePath context relativePath >>= FileIO.parseFolder
 
     let private takeUtf8Prefix maxBytes (value: string) =
         let output = StringBuilder()
@@ -192,16 +188,23 @@ module private Core =
         with ex ->
             Error(ExceptionError ex)
 
-    let startJobForTarget (target: ProjectPaths.ProjectTarget) (cmd: StartJobCommand) =
+    let startJobForContext (context: ProjectPaths.ResolvedProject) (cmd: StartJobCommand) =
         effect {
             let maxOutputBytes = cmd.MaxOutputBytes |> Option.defaultValue defaultMaxOutputBytes
             if maxOutputBytes <= 0 then
                 return! Client.ValidationError "MaxOutputBytes must be greater than zero." |> Effect.ofError
             else
-                let canonical = ProjectPaths.ProjectTarget.projectId target
-                let! (FolderPath workingDirectory) = resolveWorkingDirectory target cmd.WorkingDirectory
+                let canonical =
+                    context |> ProjectPaths.ResolvedProject.target |> ProjectPaths.ProjectTarget.projectId
+                let! (FolderPath workingDirectory) = resolveWorkingDirectory context cmd.WorkingDirectory
                 let! result = fun _ -> startProcess canonical workingDirectory cmd.Executable cmd.Args cmd.Reason maxOutputBytes
                 return result
+        }
+
+    let startJobForTarget (target: ProjectPaths.ProjectTarget) (cmd: StartJobCommand) =
+        effect {
+            let! context = ProjectPaths.resolveProjectContextForTarget target
+            return! startJobForContext context cmd
         }
 
     let private toSummary (job: JobRecord) =
@@ -277,6 +280,7 @@ let private optionalProjectId raw =
     else projectId raw |> Result.map Some
 
 let startJobForTarget (target: ProjectPaths.ProjectTarget) (cmd: StartJobCommand) = Core.startJobForTarget target cmd
+let startJobIn (context: ProjectPaths.ResolvedProject) (cmd: StartJobCommand) = Core.startJobForContext context cmd
 
 let startJob (cmd: StartJobCommand) =
     effect {

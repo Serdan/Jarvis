@@ -69,9 +69,7 @@ let private applicableTargets (rt: Runtime) command =
                 | PatchFileCommand c -> Ok(files [ c.FilePath ])
                 | RunCommandCommand c -> Ok(directories [ defaultArg c.WorkingDirectory "" ])
                 | StartJobCommand c -> Ok(directories [ defaultArg c.WorkingDirectory "" ])
-                | RunProjectTaskCommand c ->
-                    ClientShell.resolveProjectTask c rt
-                    |> Result.map (fun definition -> directories [ defaultArg definition.WorkingDirectory "" ])
+                | RunProjectTaskCommand _ -> Ok roots
                 | GitCommitCommand c -> Ok(c.Paths |> List.map ExistingTarget)
                 | GetGitDiffCommand c -> Ok [ ExistingTarget(defaultArg c.Path "") ]
                 | GetSkillCommand c ->
@@ -165,11 +163,15 @@ let private readDocument scope (relativePath: string) (path: string) (budget: in
 
 // Successful writes to oversized instruction files are allowed, but the agent
 // must see a clear warning immediately rather than discovering it by accident.
-let writeWarnings (rt: Runtime) command response =
+let writeWarningsForContext (rt: Runtime) (project: ProjectPaths.ResolvedProject option) command response =
     // Advisory errors must never replace a successful source mutation.
     let inspect projectName filePath =
         try
-            match ProjectPaths.resolveProjectPath projectName filePath rt with
+            let sourcePath =
+                match project with
+                | Some resolved -> ProjectPaths.resolveSourcePath resolved filePath
+                | None -> ProjectPaths.resolveProjectPath projectName filePath
+            match sourcePath rt with
             | Ok path when File.Exists path ->
                 let length = FileInfo(path).Length
                 if length > int64 writeWarningBytes then
@@ -188,73 +190,90 @@ let writeWarnings (rt: Runtime) command response =
         inspect c.ProjectName c.FilePath
     | _ -> []
 
+let writeWarnings (rt: Runtime) command response =
+    writeWarningsForContext rt None command response
+
 // All physical instruction paths derive from a resolved checkout, never a
 // protocol selector or human-facing display key.  The displayed hierarchy is
 // logical; the cache keeps checkout provenance separately.
-let private resolveTargets (rt: Runtime) (target: ProjectPaths.ProjectTarget) targets =
-    match ProjectPaths.resolveProjectContextForTarget target rt with
+let private resolveTargets (rt: Runtime) (project: ProjectPaths.ResolvedProject) targets =
+    let (FolderPath sourceRoot) = ProjectPaths.ResolvedProject.sourceRoot project
+    let logicalProject = ProjectPaths.ProjectTarget.projectName (ProjectPaths.ResolvedProject.target project)
+    let directories =
+        targets
+        |> List.fold (fun accumulated target ->
+            accumulated |> Result.bind (fun dirs ->
+                targetDirectory rt project sourceRoot target |> Result.map (fun dir -> dir :: dirs))) (Ok [])
+    match directories with
     | Error error -> Error error
-    | Ok project ->
-        let (FolderPath sourceRoot) = ProjectPaths.ResolvedProject.sourceRoot project
-        let logicalProject = ProjectPaths.ProjectTarget.projectName (ProjectPaths.ResolvedProject.target project)
-        let directories =
-            targets
-            |> List.fold (fun accumulated target ->
-                accumulated |> Result.bind (fun dirs ->
-                    targetDirectory rt project sourceRoot target |> Result.map (fun dir -> dir :: dirs))) (Ok [])
-        match directories with
-        | Error error -> Error error
-        | Ok dirs ->
-            let logicalDirectories =
-                dirs
-                |> List.collect ancestors
-                |> List.distinct
-                |> List.sortBy (fun dir -> dir.Split('/', StringSplitOptions.RemoveEmptyEntries).Length, dir)
-            let candidates =
-                logicalDirectories
-                |> List.map (fun dir ->
-                    let suffix = if dir = "" then "AGENTS.md" else dir + "/AGENTS.md"
-                    "project", logicalProject + "/" + suffix, Some suffix)
-            let candidates = ("workspace", "AGENTS.md", None) :: candidates
-            let rec collect pending docs total =
-                match pending with
-                | [] -> Ok(List.rev docs)
-                | (scope, displayPath, physicalSuffix) :: tail ->
-                    if List.length docs >= maxDocuments then
-                        let marker =
-                            $"[INCOMPLETE REPOSITORY INSTRUCTIONS] Document delivery reached the {maxDocuments}-file limit. Additional instruction paths (including {displayPath}) were omitted. Load them manually using read_file. [/INCOMPLETE REPOSITORY INSTRUCTIONS]"
-                        Ok(List.rev docs @ [ { Scope = "instruction-warning"; Path = displayPath; Sha256 = ""; Content = marker } ])
-                    else
-                        let reserve = min (maxTotalContentBytes / 2) (List.length tail * 1024)
-                        let budget = max 0 (maxTotalContentBytes - total - reserve)
-                        let resolved =
-                            match physicalSuffix with
-                            | None -> ProjectPaths.resolveWorkspacePath [ "AGENTS.md" ] rt
-                            | Some suffix -> ProjectPaths.resolveSourcePath project suffix rt
-                        match resolved with
+    | Ok dirs ->
+        let logicalDirectories =
+            dirs
+            |> List.collect ancestors
+            |> List.distinct
+            |> List.sortBy (fun dir -> dir.Split('/', StringSplitOptions.RemoveEmptyEntries).Length, dir)
+        let candidates =
+            logicalDirectories
+            |> List.map (fun dir ->
+                let suffix = if dir = "" then "AGENTS.md" else dir + "/AGENTS.md"
+                "project", logicalProject + "/" + suffix, Some suffix)
+        let candidates = ("workspace", "AGENTS.md", None) :: candidates
+        let rec collect pending docs total =
+            match pending with
+            | [] -> Ok(List.rev docs)
+            | (scope, displayPath, physicalSuffix) :: tail ->
+                if List.length docs >= maxDocuments then
+                    let marker =
+                        $"[INCOMPLETE REPOSITORY INSTRUCTIONS] Document delivery reached the {maxDocuments}-file limit. Additional instruction paths (including {displayPath}) were omitted. Load them manually using read_file. [/INCOMPLETE REPOSITORY INSTRUCTIONS]"
+                    Ok(List.rev docs @ [ { Scope = "instruction-warning"; Path = displayPath; Sha256 = ""; Content = marker } ])
+                else
+                    let reserve = min (maxTotalContentBytes / 2) (List.length tail * 1024)
+                    let budget = max 0 (maxTotalContentBytes - total - reserve)
+                    let resolved =
+                        match physicalSuffix with
+                        | None -> ProjectPaths.resolveWorkspacePath [ "AGENTS.md" ] rt
+                        | Some suffix -> ProjectPaths.resolveSourcePath project suffix rt
+                    match resolved with
+                    | Error error -> Error error
+                    | Ok fullPath ->
+                        match readDocument scope displayPath fullPath budget with
                         | Error error -> Error error
-                        | Ok fullPath ->
-                            match readDocument scope displayPath fullPath budget with
-                            | Error error -> Error error
-                            | Ok None -> collect tail docs total
-                            | Ok(Some doc) ->
-                                let delivered =
-                                    if doc.Content.StartsWith("[INCOMPLETE REPOSITORY INSTRUCTIONS", StringComparison.Ordinal) then
-                                        let index = doc.Content.IndexOf("\n\n", StringComparison.Ordinal)
-                                        if index >= 0 then Encoding.UTF8.GetByteCount(doc.Content.Substring(index + 2))
-                                        else 0
-                                    else Encoding.UTF8.GetByteCount doc.Content
-                                collect tail (doc :: docs) (total + delivered)
-            collect candidates [] 0
+                        | Ok None -> collect tail docs total
+                        | Ok(Some doc) ->
+                            let delivered =
+                                if doc.Content.StartsWith("[INCOMPLETE REPOSITORY INSTRUCTIONS", StringComparison.Ordinal) then
+                                    let index = doc.Content.IndexOf("\n\n", StringComparison.Ordinal)
+                                    if index >= 0 then Encoding.UTF8.GetByteCount(doc.Content.Substring(index + 2))
+                                    else 0
+                                else Encoding.UTF8.GetByteCount doc.Content
+                            collect tail (doc :: docs) (total + delivered)
+        collect candidates [] 0
 
-let resolveWithTarget (rt: Runtime) (target: ProjectPaths.ProjectTarget option) command =
+// Prepare instruction documents and the source execution context in the same
+// resolution operation. A registered worktree is discovered exactly once.
+let prepareWithTarget (rt: Runtime) (target: ProjectPaths.ProjectTarget option) command =
     match applicableTargets rt command with
     | Error error -> Error error
-    | Ok None -> Ok []
+    | Ok None -> Ok([], None)
     | Ok(Some(_, targets)) ->
         match target with
-        | Some typed -> resolveTargets rt typed targets
         | None -> Error(Client.ValidationError "Project target is required for instruction resolution.")
+        | Some typed ->
+            match ProjectPaths.resolveProjectContextForTarget typed rt with
+            | Error error -> Error error
+            | Ok project ->
+                let resolvedTargets =
+                    match command with
+                    | RunProjectTaskCommand cmd ->
+                        ClientShell.resolveProjectTaskIn project cmd rt
+                        |> Result.map (fun definition -> [ FolderTarget(defaultArg definition.WorkingDirectory "") ])
+                    | _ -> Ok targets
+                resolvedTargets
+                |> Result.bind (resolveTargets rt project)
+                |> Result.map (fun documents -> documents, Some project)
+
+let resolveWithTarget (rt: Runtime) (target: ProjectPaths.ProjectTarget option) command =
+    prepareWithTarget rt target command |> Result.map fst
 
 let resolve (rt: Runtime) command =
     let target =
@@ -266,7 +285,8 @@ let resolve (rt: Runtime) command =
 // Ledger inboxes do not resolve arbitrary source directories, but still
 // bootstrap workspace and selected checkout root instructions.
 let rootsForTarget (rt: Runtime) (target: ProjectPaths.ProjectTarget) =
-    resolveTargets rt target [ FolderTarget "" ]
+    ProjectPaths.resolveProjectContextForTarget target rt
+    |> Result.bind (fun project -> resolveTargets rt project [ FolderTarget "" ])
 
 let roots (rt: Runtime) projectName =
     ProjectPaths.ProjectTarget.parse projectName

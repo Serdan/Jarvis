@@ -25,6 +25,31 @@ let receiveMessage (rt: Runtime) message =
 // Working state for ordinary calls to avoid one remote git fetch per tool.
 let private workingGuidanceCaches = ConditionalWeakTable<Runtime, WorkingTurnGuidance.AgentCache>()
 let private instructionDeliveryCaches = ConditionalWeakTable<Runtime, AgentInstructions.DeliveryCache>()
+// Only commands addressing repository source are checkout selectors.
+// Message/activity project fields are literal history labels, not paths.
+type private CommandProject =
+    | Unscoped
+    | ActivityLabel of string option
+    | Checkout of ProjectPaths.ProjectTarget
+
+let private projectTarget = function
+    | Checkout target -> Some target
+    | Unscoped | ActivityLabel _ -> None
+
+let private classifyProject command =
+    match command with
+    | MessageCommand cmd -> Ok(ActivityLabel cmd.ProjectName)
+    | GetClientActivityCommand cmd -> Ok(ActivityLabel cmd.ProjectName)
+    | ListSkillsCommand cmd when cmd.ProjectName = "@global" -> Ok Unscoped
+    | GetSkillCommand cmd when cmd.ProjectName = "@global" -> Ok Unscoped
+    | CreateSkillCommand cmd when cmd.ProjectName = "@global" -> Ok Unscoped
+    | GetJobResultCommand cmd when String.IsNullOrWhiteSpace cmd.ProjectName -> Ok Unscoped
+    | CancelJobCommand cmd when String.IsNullOrWhiteSpace cmd.ProjectName -> Ok Unscoped
+    | _ ->
+        match AgentCommandInfo.projectName command with
+        | None -> Ok Unscoped
+        | Some raw -> ProjectPaths.ProjectTarget.parse raw |> Result.map Checkout
+
 
 let private checkWorkingGuidance (rt: Runtime) agentId (target: ProjectPaths.ProjectTarget option) command =
     if String.IsNullOrWhiteSpace agentId then []
@@ -227,7 +252,7 @@ let private audit command response =
 
         AuditLog.recordCommand commandName projectName permissions paths executable args summary
 
-let private importFile (cmd: ImportFileCommand) (rt: Runtime) =
+let private importFile (resolved: ProjectPaths.ResolvedProject option) (cmd: ImportFileCommand) (rt: Runtime) =
     match cmd.MaxBytes with
     | Some value when value <= 0L ->
         Error(Client.ValidationError "MaxBytes must be greater than zero when supplied.")
@@ -238,7 +263,11 @@ let private importFile (cmd: ImportFileCommand) (rt: Runtime) =
         | true, uri when uri.Scheme <> Uri.UriSchemeHttps ->
             Error(Client.ValidationError "DownloadUrl must use HTTPS.")
         | true, uri ->
-            match ProjectPaths.resolveWritableProjectFile cmd.ProjectName cmd.FilePath rt with
+            let destination =
+                match resolved with
+                | Some project -> fun rt -> ProjectPaths.resolveSourcePath project cmd.FilePath rt |> Result.map FilePath
+                | None -> ProjectPaths.resolveWritableProjectFile cmd.ProjectName cmd.FilePath
+            match destination rt with
             | Error error -> Error error
             | Ok(FilePath destinationPath) ->
                 let localLimit =
@@ -314,7 +343,13 @@ let private importFile (cmd: ImportFileCommand) (rt: Runtime) =
 
                     Error(Client.ExceptionError ex)
 
-let private dispatch (rt: Runtime) (target: ProjectPaths.ProjectTarget option) (command: AgentCommand) =
+let private sourceOperation resolved withContext legacy =
+    match resolved with
+    | Some project -> withContext project
+    | None -> legacy()
+
+let private dispatch (rt: Runtime) (target: ProjectPaths.ProjectTarget option)
+                     (resolved: ProjectPaths.ResolvedProject option) (command: AgentCommand) =
     match command with
     | ListCommandsCommand -> rt |> ProjectBrowser.listCommands |> serialize'
     | ListWorktreesCommand cmd -> rt |> Worktrees.listWorktrees cmd |> serialize'
@@ -336,54 +371,55 @@ let private dispatch (rt: Runtime) (target: ProjectPaths.ProjectTarget option) (
         |> serialize'
     | GetProjectDetailsCommand cmd ->
         rt
-        |> ProjectBrowser.getProjectDetails cmd
+        |> sourceOperation resolved (fun project -> ProjectBrowser.getProjectDetailsIn project cmd) (fun () -> ProjectBrowser.getProjectDetails cmd)
         |> Result.map (List.map (fun (name, content) -> {| fileName = name; content = unwrapContent content |}))
         |> serialize'
-    | ListDirectoryCommand cmd -> rt |> ProjectBrowser.listDirectory cmd |> serialize'
-    | SearchFilesCommand cmd -> rt |> ProjectBrowser.searchFiles cmd |> serialize'
-    | SearchTextCommand cmd -> rt |> ProjectBrowser.searchText cmd |> serialize'
+    | ListDirectoryCommand cmd -> rt |> sourceOperation resolved (fun project -> ProjectBrowser.listDirectoryIn project cmd) (fun () -> ProjectBrowser.listDirectory cmd) |> serialize'
+    | SearchFilesCommand cmd -> rt |> sourceOperation resolved (fun project -> ProjectBrowser.searchFilesIn project cmd) (fun () -> ProjectBrowser.searchFiles cmd) |> serialize'
+    | SearchTextCommand cmd -> rt |> sourceOperation resolved (fun project -> ProjectBrowser.searchTextIn project cmd) (fun () -> ProjectBrowser.searchText cmd) |> serialize'
     | ReadFileCommand cmd ->
         rt
-        |> ProjectBrowser.readFile cmd
+        |> sourceOperation resolved (fun project -> ProjectBrowser.readFileIn project cmd) (fun () -> ProjectBrowser.readFile cmd)
         |> Result.map unwrapContent
         |> serialize'
     | ReadFilesCommand cmd ->
         rt
-        |> ProjectBrowser.readFiles cmd
+        |> sourceOperation resolved (fun project -> ProjectBrowser.readFilesIn project cmd) (fun () -> ProjectBrowser.readFiles cmd)
         |> Result.map (Seq.zip cmd.FilePaths >> Seq.map (fun (path, result) -> readFileResultToDto path result) >> Seq.toList)
         |> serialize'
     | ReadImageCommand cmd ->
         rt
-        |> ProjectBrowser.readImage cmd
+        |> sourceOperation resolved (fun project -> ProjectBrowser.readImageIn project cmd) (fun () -> ProjectBrowser.readImage cmd)
         |> serialize'
     | ExportFileCommand cmd ->
         rt
-        |> ProjectBrowser.exportFile cmd
+        |> sourceOperation resolved (fun project -> ProjectBrowser.exportFileIn project cmd) (fun () -> ProjectBrowser.exportFile cmd)
         |> serialize'
-    | ImportFileCommand cmd -> rt |> importFile cmd |> serialize'
+    | ImportFileCommand cmd -> rt |> importFile resolved cmd |> serialize'
     | UpdateClientCommand -> SelfUpdate.prepare () |> Async.AwaitTask |> Async.RunSynchronously |> serialize'
-    | WriteFileCommand cmd -> rt |> ProjectBrowser.writeFile cmd |> serialize'
+    | WriteFileCommand cmd -> rt |> sourceOperation resolved (fun project -> ProjectBrowser.writeFileIn project cmd) (fun () -> ProjectBrowser.writeFile cmd) |> serialize'
     | PatchFileCommand cmd ->
         rt
-        |> ProjectBrowser.patchFile cmd
+        |> sourceOperation resolved (fun project -> ProjectBrowser.patchFileIn project cmd) (fun () -> ProjectBrowser.patchFile cmd)
         |> serialize'
-    | RunCommandCommand cmd -> rt |> ClientShell.runCommand cmd |> serialize'
-    | ListConfiguredTasksCommand cmd -> rt |> ClientShell.listConfiguredTasks cmd |> serialize'
+    | RunCommandCommand cmd -> rt |> sourceOperation resolved (fun project -> ClientShell.runCommandIn project cmd) (fun () -> ClientShell.runCommand cmd) |> serialize'
+    | ListConfiguredTasksCommand cmd -> rt |> sourceOperation resolved (fun project -> ClientShell.listConfiguredTasksIn project cmd) (fun () -> ClientShell.listConfiguredTasks cmd) |> serialize'
     | RunProjectTaskCommand cmd ->
         rt
-        |> ClientShell.resolveProjectTask cmd
-        |> Result.bind (fun task -> ClientShell.runProjectTask cmd.ProjectName task rt)
+        |> sourceOperation resolved (fun project -> ClientShell.resolveProjectTaskIn project cmd) (fun () -> ClientShell.resolveProjectTask cmd)
+        |> Result.bind (fun task -> (sourceOperation resolved (fun project -> ClientShell.runProjectTaskIn project task) (fun () -> ClientShell.runProjectTask cmd.ProjectName task)) rt)
         |> serialize'
-    | ListSkillsCommand cmd -> rt |> ProjectBrowser.listSkills cmd |> serialize'
-    | GetSkillCommand cmd -> rt |> ProjectBrowser.getSkill cmd |> serialize'
-    | CreateSkillCommand cmd -> rt |> ProjectBrowser.createSkill cmd |> serialize'
-    | GetGitStatusCommand cmd -> rt |> ClientShell.getGitStatus cmd |> serialize'
-    | GetGitDiffCommand cmd -> rt |> ClientShell.getGitDiff cmd |> serialize'
-    | GitCommitCommand cmd -> rt |> ClientShell.gitCommit cmd |> serialize'
+    | ListSkillsCommand cmd -> rt |> sourceOperation resolved (fun project -> ProjectBrowser.listSkillsIn project cmd) (fun () -> ProjectBrowser.listSkills cmd) |> serialize'
+    | GetSkillCommand cmd -> rt |> sourceOperation resolved (fun project -> ProjectBrowser.getSkillIn project cmd) (fun () -> ProjectBrowser.getSkill cmd) |> serialize'
+    | CreateSkillCommand cmd -> rt |> sourceOperation resolved (fun project -> ProjectBrowser.createSkillIn project cmd) (fun () -> ProjectBrowser.createSkill cmd) |> serialize'
+    | GetGitStatusCommand cmd -> rt |> sourceOperation resolved (fun project -> ClientShell.getGitStatusIn project cmd) (fun () -> ClientShell.getGitStatus cmd) |> serialize'
+    | GetGitDiffCommand cmd -> rt |> sourceOperation resolved (fun project -> ClientShell.getGitDiffIn project cmd) (fun () -> ClientShell.getGitDiff cmd) |> serialize'
+    | GitCommitCommand cmd -> rt |> sourceOperation resolved (fun project -> ClientShell.gitCommitIn project cmd) (fun () -> ClientShell.gitCommit cmd) |> serialize'
     | StartJobCommand cmd ->
-        match target with
-        | Some validated -> rt |> JobManager.startJobForTarget validated cmd |> serialize'
-        | None -> rt |> JobManager.startJob cmd |> serialize'
+        match resolved, target with
+        | Some project, _ -> rt |> JobManager.startJobIn project cmd |> serialize'
+        | None, Some validated -> rt |> JobManager.startJobForTarget validated cmd |> serialize'
+        | None, None -> rt |> JobManager.startJob cmd |> serialize'
     | ListJobsCommand cmd ->
         match target with
         | Some validated ->
@@ -413,7 +449,7 @@ let private dispatch (rt: Runtime) (target: ProjectPaths.ProjectTarget option) (
         |> serialize'
 
 let private receiveCommandForTarget (rt: Runtime) (target: ProjectPaths.ProjectTarget option)
-                                    (command: AgentCommand) =
+                                    (resolved: ProjectPaths.ResolvedProject option) (command: AgentCommand) =
     task {
         let activityId =
             match command with
@@ -426,7 +462,9 @@ let private receiveCommandForTarget (rt: Runtime) (target: ProjectPaths.ProjectT
         let resolution =
             match command with
             | RunProjectTaskCommand cmd ->
-                ClientShell.resolveProjectTask cmd rt
+                (sourceOperation resolved
+                    (fun project -> ClientShell.resolveProjectTaskIn project cmd)
+                    (fun () -> ClientShell.resolveProjectTask cmd)) rt
                 |> Result.map (fun task ->
                     let authorizationCommand =
                         ClientShell.projectTaskAsRunCommand cmd.ProjectName task
@@ -459,10 +497,12 @@ let private receiveCommandForTarget (rt: Runtime) (target: ProjectPaths.ProjectT
                     | Error error, _ ->
                         return Error error
                     | Ok(), Some(cmd, task) ->
-                        let! result = ClientShell.runProjectTask cmd.ProjectName task rt |> serialize'
+                        let! result = (sourceOperation resolved
+                            (fun project -> ClientShell.runProjectTaskIn project task)
+                            (fun () -> ClientShell.runProjectTask cmd.ProjectName task)) rt |> serialize'
                         return result
                     | Ok(), None ->
-                        let! result = dispatch rt target command
+                        let! result = dispatch rt target resolved command
                         return result
             }
 
@@ -485,27 +525,23 @@ let private receiveCommandForTarget (rt: Runtime) (target: ProjectPaths.ProjectT
     }
 
 let receiveCommand (rt: Runtime) (command: AgentCommand) =
-    receiveCommandForTarget rt None command
+    receiveCommandForTarget rt None None command
 
 let private receiveCommandWithTypedInstructions (rt: Runtime)
                                                 (target: ProjectPaths.ProjectTarget option) command =
     task {
-        match AgentInstructions.resolveWithTarget rt target command with
+        match AgentInstructions.prepareWithTarget rt target command with
         | Error error -> return Error error, []
-        | Ok instructions ->
-            let! response = receiveCommandForTarget rt target command
-            return response, instructions @ AgentInstructions.writeWarnings rt command response
+        | Ok (instructions, resolved) ->
+            let! response = receiveCommandForTarget rt target resolved command
+            return response, instructions @ AgentInstructions.writeWarningsForContext rt resolved command response
     }
 
 let receiveCommandWithInstructions (rt: Runtime) command =
     task {
-        let project =
-            match AgentCommandInfo.projectName command with
-            | None -> Ok None
-            | Some raw -> ProjectPaths.ProjectTarget.parse raw |> Result.map Some
-        match project with
+        match classifyProject command with
         | Error error -> return Error error, []
-        | Ok target -> return! receiveCommandWithTypedInstructions rt target command
+        | Ok scope -> return! receiveCommandWithTypedInstructions rt (projectTarget scope) command
     }
 
 // Shared by SignalR receive and tests. Identity is supplied by the MCP call,
@@ -519,17 +555,11 @@ let processIncomingCommand (rt: Runtime) (commandJson: string) (agentId: string)
                 try
                     let command = JsonSerializer.Deserialize<AgentCommand>(commandJson)
                     parsedCommand <- Some command
-                    let project =
-                        match AgentCommandInfo.projectName command with
-                        | None -> Ok None
-                        | Some raw when String.IsNullOrWhiteSpace raw
-                                        && (match command with
-                                            | GetJobResultCommand _ | CancelJobCommand _ -> true
-                                            | _ -> false) -> Ok None
-                        | Some raw -> ProjectPaths.ProjectTarget.parse raw |> Result.map Some
+                    let project = classifyProject command
                     match project with
                     | Error error -> return Error error
-                    | Ok target ->
+                    | Ok scope ->
+                        let target = projectTarget scope
                         target |> Option.iter (fun selected ->
                             rt.Tui.RecordAgentSeen(AgentView.activityProject selected, agentId))
                         match activateReadyOnActivity rt agentId target command with

@@ -414,7 +414,7 @@ module LedgerStore =
             let repo = binding.RepositoryPath
             let stage = $"refs/jarvis/fetch/{Guid.NewGuid():N}"
             try
-                match git repo [ "fetch"; "--no-tags"; binding.RemoteName; $"{ledgerRef}:{stage}" ] with
+                match git repo [ "fetch"; "--no-tags"; "--no-write-fetch-head"; "--refmap="; binding.RemoteName; $"{ledgerRef}:{stage}" ] with
                 | Error error -> Error error
                 | Ok fetched when fetched.ExitCode <> 0 ->
                     match remoteExists binding with
@@ -1412,7 +1412,7 @@ module LedgerStore =
                 | Ok(Some _) ->
                     let stage = $"refs/jarvis/source-reviews/{Guid.NewGuid():N}"
                     try
-                        match git binding.RepositoryPath [ "fetch"; "--no-tags"; binding.RemoteName; $"{gitRef}:{stage}" ] with
+                        match git binding.RepositoryPath [ "fetch"; "--no-tags"; "--no-write-fetch-head"; "--refmap="; binding.RemoteName; $"{gitRef}:{stage}" ] with
                         | Error error -> Error error
                         | Ok output when output.ExitCode <> 0 -> Error(SourceReviewRefUnavailable output.Stderr)
                         | Ok _ ->
@@ -1463,7 +1463,7 @@ module LedgerStore =
                             let stage = $"refs/jarvis/integration-verify/{Guid.NewGuid():N}"
                             try
                                 match git binding.RepositoryPath
-                                        [ "fetch"; "--no-tags"; binding.RemoteName; $"{targetRef}:{stage}" ] with
+                                        [ "fetch"; "--no-tags"; "--no-write-fetch-head"; "--refmap="; binding.RemoteName; $"{targetRef}:{stage}" ] with
                                 | Error error -> Error error
                                 | Ok fetched when fetched.ExitCode <> 0 ->
                                     Error(RemoteUnavailable $"Cannot fetch remote target: {fetched.Stderr}")

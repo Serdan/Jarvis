@@ -10,6 +10,42 @@ open FsToolkit.ErrorHandling
 open Kehlet.FSharp.IO
 open Kehlet.FSharp.IO.Effect.Operators
 
+// External protocol project selectors are parsed here, never used as paths.
+[<StructuralEquality; StructuralComparison>]
+type ProjectId = private ProjectId of string
+[<StructuralEquality; StructuralComparison>]
+type WorktreeId = private WorktreeId of string
+type Checkout = Main | Registered of WorktreeId
+type ProjectTarget = { Project: ProjectId; Checkout: Checkout }
+type ResolvedProject =
+    { Target: ProjectTarget
+      WorkspaceRoot: FolderPath
+      MainRoot: FolderPath
+      SourceRoot: FolderPath }
+
+module ProjectTarget =
+    let parse (input: string) : Client.Result<ProjectTarget> =
+        if String.IsNullOrWhiteSpace input then
+            Error(ValidationError "Project identifier cannot be empty.")
+        else
+            let sections = input.Split([| "::" |], StringSplitOptions.None)
+            let validComponent (part: string) =
+                not (String.IsNullOrWhiteSpace part)
+                && part <> "." && part <> ".."
+                && not (part.Contains('/')) && not (part.Contains('\\'))
+                && not (part.Contains("..", StringComparison.Ordinal))
+                && not (part.Contains(':'))
+            match sections with
+            | [| project |] when validComponent project ->
+                Ok { Project = ProjectId project; Checkout = Main }
+            | [| project; checkout |] when validComponent project && validComponent checkout ->
+                Ok { Project = ProjectId project; Checkout = Registered(WorktreeId checkout) }
+            | _ -> Error(ValidationError "Invalid project or worktree selector.")
+
+    let projectName target = let (ProjectId name) = target.Project in name
+    let worktreeName = function Registered (WorktreeId name) -> Some name | Main -> None
+    let identity input = parse input |> Result.map projectName
+
 let isPathInRoot (root: string) (fullPath: string) =
     let normalize (path: string) =
         path.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar).Replace('\\', '/')
@@ -113,33 +149,49 @@ let private resolveRegisteredWorktree (mainRoot: string) (selector: string) : Cl
                     | _ -> Error(Client.ValidationError "Ambiguous worktree selector.")
         with ex -> Error(Client.ExceptionError ex)
 
+let resolveProjectContext (projectName: string) : IO<'rt, ResolvedProject> =
+    effect {
+        let! target = ProjectTarget.parse projectName |> Effect.ofResult
+        let! (ProjectDirectory workspaceRoot) = ProjectIO.root
+        let mainName = ProjectTarget.projectName target
+        let! (FolderPath mainRoot) = resolveWorkspacePath [ mainName ] >>= FileIO.parseFolder
+        let! (FolderPath sourceRoot) =
+            match target.Checkout with
+            | Main -> fun _ -> Ok(FolderPath mainRoot)
+            | Registered worktree ->
+                let (WorktreeId name) = worktree
+                fun _ -> resolveRegisteredWorktree mainRoot name |> Result.map FolderPath
+        return
+            { Target = target
+              WorkspaceRoot = FolderPath workspaceRoot
+              MainRoot = FolderPath mainRoot
+              SourceRoot = FolderPath sourceRoot }
+    }
+
 let resolveProjectRoot (projectName: string) : IO<'rt, FolderPath> =
-    let separator = projectName.IndexOf("::", StringComparison.Ordinal)
-    if separator < 0 then
-        resolveWorkspacePath [ projectName ] >>= FileIO.parseFolder
-    else
-        effect {
-            let mainName = projectName.Substring(0, separator)
-            let selector = projectName.Substring(separator + 2)
-            if String.IsNullOrWhiteSpace mainName || mainName = "." || mainName = ".."
-               || mainName.Contains('/') || mainName.Contains('\\') then
-                return! Client.ValidationError "Invalid project identifier." |> Effect.ofError
+    resolveProjectContext projectName |>> fun resolved -> resolved.SourceRoot
+
+let resolveSourcePath (project: ResolvedProject) (relativePath: string) : IO<'rt, string> =
+    effect {
+        if Path.IsPathRooted relativePath
+           || relativePath.Split([| Path.DirectorySeparatorChar; Path.AltDirectorySeparatorChar |],
+                                 StringSplitOptions.RemoveEmptyEntries)
+               |> Array.exists (fun part -> part = "..") then
+            return! Client.PermissionDenied "Source path must be checkout-relative." |> Effect.ofError
+        else
+            let (FolderPath root) = project.SourceRoot
+            let! fullPath = [ relativePath ] |> Path.combineAll |> Path.combine root |> FileIO.getFullPath
+            if isPathInRoot root fullPath then
+                do! fun _ -> ensureNoLinksInPath root fullPath
+                return fullPath
             else
-                let! (FolderPath mainRoot) = resolveWorkspacePath [ mainName ] >>= FileIO.parseFolder
-                let! path = fun _ -> resolveRegisteredWorktree mainRoot selector
-                return FolderPath path
-        }
+                return! Client.PermissionDenied "Source path is outside checkout root." |> Effect.ofError
+    }
 
 let resolveProjectPath projectName relativePath : IO<'rt, string> =
     effect {
-        let! (FolderPath projectRoot) = resolveProjectRoot projectName
-        let! fullPath = [ relativePath ] |> Path.combineAll |> Path.combine projectRoot |> FileIO.getFullPath
-
-        match fullPath |> isPathInRoot projectRoot with
-        | true ->
-            do! fun _ -> ensureNoLinksInPath projectRoot fullPath
-            return fullPath
-        | false -> return! Client.PermissionDenied "Path is outside project root." |> Effect.ofError
+        let! context = resolveProjectContext projectName
+        return! resolveSourcePath context relativePath
     }
 
 let resolveProjectFolder projectName relativePath : IO<'rt, FolderPath> =

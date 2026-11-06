@@ -290,12 +290,11 @@ module private Core =
         effect {
             let! projects = enumerateProjects
 
+            let! target = ProjectPaths.ProjectTarget.parse projectName |> Effect.ofResult
+            let mainName = ProjectPaths.ProjectTarget.projectName target
             return!
                 projects
-                |> Seq.tryFind (fun (ProjectName name) ->
-                    let separator = projectName.IndexOf("::", StringComparison.Ordinal)
-                    if separator >= 0 then name = projectName.Substring(0, separator)
-                    else name = projectName)
+                |> Seq.tryFind (fun (ProjectName name) -> name = mainName)
                 |> Option.map (fun _ -> ProjectName projectName)
                 |> Effect.ofOption (fun () -> NotFoundError $"Unknown project name: {projectName}")
         }

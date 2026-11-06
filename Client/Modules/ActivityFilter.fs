@@ -37,10 +37,13 @@ let parseTerms (query: string) =
 // Preserve raw command project IDs; normalize only their presentation.
 // Worktrees are addressed as "Project::worktree" or ".Project-worktrees/worktree".
 let private worktreeParts (projectName: string) =
-    let separator = projectName.IndexOf("::", StringComparison.Ordinal)
-    if separator > 0 && separator + 2 < projectName.Length then
-        Some(projectName.Substring(0, separator), projectName.Substring(separator + 2))
-    else
+    match Client.ProjectPaths.ProjectTarget.parse projectName with
+    | Ok target ->
+        match Client.ProjectPaths.ProjectTarget.worktreeName target.Checkout with
+        | Some worktree -> Some(Client.ProjectPaths.ProjectTarget.projectName target, worktree)
+        | None -> None
+    | Error _ ->
+        // Legacy display-only worktree paths are not protocol selectors.
         let marker = "-worktrees/"
         let index = projectName.IndexOf(marker, StringComparison.Ordinal)
         if projectName.StartsWith(".", StringComparison.Ordinal)

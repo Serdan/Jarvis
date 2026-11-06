@@ -82,8 +82,8 @@ let stateAge (now: DateTimeOffset) (agent: AgentRow) =
 /// A registered worktree uses Project::worktree for file routing, but agent
 /// activity belongs to the parent project.
 let activityProject (project: string) =
-    let separator = project.IndexOf("::", StringComparison.Ordinal)
-    if separator < 0 then project else project.Substring(0, separator)
+    ProjectPaths.ProjectTarget.identity project
+    |> Result.defaultValue project
 
 /// Seen timestamps come from explicit agent-attributed tool calls, not sessions.
 let lastSeenAt (agent: AgentRow) (seen: IDictionary<string, DateTimeOffset>) =

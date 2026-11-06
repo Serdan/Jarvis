@@ -39,9 +39,8 @@ module private Core =
     // A registered worktree selects where a job executes, not which logical
     // project owns its result. GetJobResult/CancelJob only receive projectName.
     let private projectIdentity (projectName: string) =
-        let separator = projectName.IndexOf("::", StringComparison.Ordinal)
-        if separator < 0 then projectName
-        else projectName.Substring(0, separator)
+        ProjectPaths.ProjectTarget.identity projectName
+        |> Result.defaultValue projectName
 
     let private pruneCompletedJobs () =
         jobs.Values

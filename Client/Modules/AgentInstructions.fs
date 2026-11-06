@@ -81,7 +81,7 @@ let private applicableTargets (rt: Runtime) command =
                 | _ -> Ok roots
             targets |> Result.map (fun resolved -> Some(projectName, if resolved.IsEmpty then roots else resolved))
 
-let private targetDirectory rt projectName (projectRoot: string) target =
+let private targetDirectory rt (project: ProjectPaths.ResolvedProject) (projectRoot: string) target =
     let relative, isFolder =
         match target with
         | FolderTarget path -> path, true
@@ -93,7 +93,7 @@ let private targetDirectory rt projectName (projectRoot: string) target =
         match ProjectPaths.validateProjectRelativePath relative with
         | Error error -> Error error
         | Ok valid ->
-            match ProjectPaths.resolveProjectPath projectName valid rt with
+            match ProjectPaths.resolveSourcePath project valid rt with
             | Error error -> Error error
             | Ok resolved ->
                 let isFolder =
@@ -117,56 +117,51 @@ let private utf8Prefix (bytes: byte[]) length =
             with :? DecoderFallbackException -> take (count - 1)
     take length
 
-let private readDocument rt scope (relativePath: string) (budget: int) =
-    let parts = relativePath.Split('/', StringSplitOptions.RemoveEmptyEntries)
-    let resolved = ProjectPaths.resolveWorkspacePath parts rt
-    match resolved with
-    | Error error -> Error error
-    | Ok path ->
-        try
-            let exactlyNamed =
-                Directory.EnumerateFileSystemEntries(Path.GetDirectoryName(path))
-                |> Seq.exists (fun candidate -> String.Equals(Path.GetFileName(candidate), "AGENTS.md", StringComparison.Ordinal))
-            if not exactlyNamed then raise (FileNotFoundException())
-            let attributes = File.GetAttributes path
-            if attributes.HasFlag FileAttributes.Directory then
-                Error(Client.ValidationError $"Instruction source {relativePath} is a directory.")
-            elif attributes.HasFlag FileAttributes.ReparsePoint then
-                Error(Client.PermissionDenied $"Instruction source {relativePath} is a link.")
+let private readDocument scope (relativePath: string) (path: string) (budget: int) =
+    try
+        let exactlyNamed =
+            Directory.EnumerateFileSystemEntries(Path.GetDirectoryName(path))
+            |> Seq.exists (fun candidate -> String.Equals(Path.GetFileName(candidate), "AGENTS.md", StringComparison.Ordinal))
+        if not exactlyNamed then raise (FileNotFoundException())
+        let attributes = File.GetAttributes path
+        if attributes.HasFlag FileAttributes.Directory then
+            Error(Client.ValidationError $"Instruction source {relativePath} is a directory.")
+        elif attributes.HasFlag FileAttributes.ReparsePoint then
+            Error(Client.PermissionDenied $"Instruction source {relativePath} is a link.")
+        else
+            use stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read)
+            let originalBytes = stream.Length
+            let digest = SHA256.HashData(stream) |> Convert.ToHexString |> fun value -> value.ToLowerInvariant()
+            // Validate the entire source even when only its prefix is delivered:
+            // malformed bytes in the omitted suffix must not masquerade as good UTF-8.
+            stream.Position <- 0L
+            use reader = new StreamReader(stream, utf8, false, 8192, true)
+            let scanBuffer = Array.zeroCreate<char> 8192
+            while reader.Read(scanBuffer, 0, scanBuffer.Length) > 0 do ()
+            stream.Position <- 0L
+            let limit = min maxFileContentBytes (max 0 budget)
+            let buffer = Array.zeroCreate<byte> (int (min originalBytes (int64 limit)))
+            stream.ReadExactly(buffer)
+            let content = utf8Prefix buffer buffer.Length
+            let delivered = Encoding.UTF8.GetByteCount content
+            // Fully delivered files must be valid UTF-8; invalid un-delivered
+            // bytes are not silently represented as complete instructions.
+            if originalBytes <= int64 limit && delivered <> int originalBytes then
+                Error(Client.ValidationError $"Instruction source {relativePath} is not valid UTF-8.")
+            elif originalBytes = 0L then Ok None
             else
-                use stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read)
-                let originalBytes = stream.Length
-                let digest = SHA256.HashData(stream) |> Convert.ToHexString |> fun value -> value.ToLowerInvariant()
-                // Validate the entire source even when only its prefix is delivered:
-                // malformed bytes in the omitted suffix must not masquerade as good UTF-8.
-                stream.Position <- 0L
-                use reader = new StreamReader(stream, utf8, false, 8192, true)
-                let scanBuffer = Array.zeroCreate<char> 8192
-                while reader.Read(scanBuffer, 0, scanBuffer.Length) > 0 do ()
-                stream.Position <- 0L
-                let limit = min maxFileContentBytes (max 0 budget)
-                let buffer = Array.zeroCreate<byte> (int (min originalBytes (int64 limit)))
-                stream.ReadExactly(buffer)
-                let content = utf8Prefix buffer buffer.Length
-                let delivered = Encoding.UTF8.GetByteCount content
-                // Fully delivered files must be valid UTF-8; invalid un-delivered
-                // bytes are not silently represented as complete instructions.
-                if originalBytes <= int64 limit && delivered <> int originalBytes then
-                    Error(Client.ValidationError $"Instruction source {relativePath} is not valid UTF-8.")
-                elif originalBytes = 0L then Ok None
-                else
-                    let truncated = int64 delivered < originalBytes
-                    let body =
-                        if truncated then
-                            $"[INCOMPLETE REPOSITORY INSTRUCTIONS — TRUNCATED]\nSource: {relativePath}\nDelivered: {delivered} of {originalBytes} UTF-8 bytes. Full SHA-256: sha256:{digest}.\nThe omitted instructions have NOT been loaded. Use read_file on this path to retrieve the complete file before relying on omitted guidance.\n[/INCOMPLETE REPOSITORY INSTRUCTIONS]\n\n" + content
-                        else content
-                    Ok(Some { Scope = scope; Path = relativePath; Sha256 = "sha256:" + digest; Content = body })
-        with
-        | :? FileNotFoundException
-        | :? DirectoryNotFoundException -> Ok None
-        | :? DecoderFallbackException ->
-            Error(Client.ValidationError $"Instruction source {relativePath} is not valid UTF-8.")
-        | ex -> Error(Client.ValidationError $"Cannot read instruction source {relativePath}: {ex.Message}")
+                let truncated = int64 delivered < originalBytes
+                let body =
+                    if truncated then
+                        $"[INCOMPLETE REPOSITORY INSTRUCTIONS — TRUNCATED]\nSource: {relativePath}\nDelivered: {delivered} of {originalBytes} UTF-8 bytes. Full SHA-256: sha256:{digest}.\nThe omitted instructions have NOT been loaded. Use read_file on this path to retrieve the complete file before relying on omitted guidance.\n[/INCOMPLETE REPOSITORY INSTRUCTIONS]\n\n" + content
+                    else content
+                Ok(Some { Scope = scope; Path = relativePath; Sha256 = "sha256:" + digest; Content = body })
+    with
+    | :? FileNotFoundException
+    | :? DirectoryNotFoundException -> Ok None
+    | :? DecoderFallbackException ->
+        Error(Client.ValidationError $"Instruction source {relativePath} is not valid UTF-8.")
+    | ex -> Error(Client.ValidationError $"Cannot read instruction source {relativePath}: {ex.Message}")
 
 // Successful writes to oversized instruction files are allowed, but the agent
 // must see a clear warning immediately rather than discovering it by accident.
@@ -193,63 +188,80 @@ let writeWarnings (rt: Runtime) command response =
         inspect c.ProjectName c.FilePath
     | _ -> []
 
-let resolve (rt: Runtime) command =
-    match applicableTargets rt command with
+// All physical instruction paths derive from a resolved checkout, never a
+// protocol selector or human-facing display key.  The displayed hierarchy is
+// logical; the cache keeps checkout provenance separately.
+let private resolveTargets (rt: Runtime) projectName targets =
+    match ProjectPaths.resolveProjectContext projectName rt with
     | Error error -> Error error
-    | Ok None -> Ok []
-    | Ok(Some(projectName, targets)) ->
-        match ProjectPaths.resolveProjectRoot projectName rt with
+    | Ok project ->
+        let (FolderPath sourceRoot) = project.SourceRoot
+        let logicalProject = ProjectPaths.ProjectTarget.projectName project.Target
+        let directories =
+            targets
+            |> List.fold (fun accumulated target ->
+                accumulated |> Result.bind (fun dirs ->
+                    targetDirectory rt project sourceRoot target |> Result.map (fun dir -> dir :: dirs))) (Ok [])
+        match directories with
         | Error error -> Error error
-        | Ok(FolderPath projectRoot) ->
-            let directories =
-                targets
-                |> List.fold (fun accumulated target ->
-                    accumulated |> Result.bind (fun dirs ->
-                        targetDirectory rt projectName projectRoot target |> Result.map (fun dir -> dir :: dirs))) (Ok [])
-            match directories with
-            | Error error -> Error error
-            | Ok dirs ->
-                let candidates =
-                    dirs
-                    |> List.collect ancestors
-                    |> List.distinct
-                    |> List.sortBy (fun dir -> dir.Split('/', StringSplitOptions.RemoveEmptyEntries).Length, dir)
-                    |> List.map (fun dir ->
-                        "project", projectName + "/" + (if dir = "" then "" else dir + "/") + "AGENTS.md")
-                let candidates = ("workspace", "AGENTS.md") :: candidates
-                let rec collect pending docs total =
-                    match pending with
-                    | [] -> Ok(List.rev docs)
-                    | (scope, path) :: tail ->
-                        if List.length docs >= maxDocuments then
-                            // The remaining paths are reported, never silently lost.
-                            let marker =
-                                $"[INCOMPLETE REPOSITORY INSTRUCTIONS] Document delivery reached the {maxDocuments}-file limit. Additional instruction paths (including {path}) were omitted. Load them manually using read_file. [/INCOMPLETE REPOSITORY INSTRUCTIONS]"
-                            Ok(List.rev docs @ [ { Scope = "instruction-warning"; Path = path; Sha256 = ""; Content = marker } ])
-                        else
-                            // Keep at least 1 KiB available for each later candidate,
-                            // so a long workspace file cannot crowd out specific guidance.
-                            let reserve = min (maxTotalContentBytes / 2) (List.length tail * 1024)
-                            let budget = max 0 (maxTotalContentBytes - total - reserve)
-                            match readDocument rt scope path budget with
+        | Ok dirs ->
+            let logicalDirectories =
+                dirs
+                |> List.collect ancestors
+                |> List.distinct
+                |> List.sortBy (fun dir -> dir.Split('/', StringSplitOptions.RemoveEmptyEntries).Length, dir)
+            let candidates =
+                logicalDirectories
+                |> List.map (fun dir ->
+                    let suffix = if dir = "" then "AGENTS.md" else dir + "/AGENTS.md"
+                    "project", logicalProject + "/" + suffix, Some suffix)
+            let candidates = ("workspace", "AGENTS.md", None) :: candidates
+            let rec collect pending docs total =
+                match pending with
+                | [] -> Ok(List.rev docs)
+                | (scope, displayPath, physicalSuffix) :: tail ->
+                    if List.length docs >= maxDocuments then
+                        let marker =
+                            $"[INCOMPLETE REPOSITORY INSTRUCTIONS] Document delivery reached the {maxDocuments}-file limit. Additional instruction paths (including {displayPath}) were omitted. Load them manually using read_file. [/INCOMPLETE REPOSITORY INSTRUCTIONS]"
+                        Ok(List.rev docs @ [ { Scope = "instruction-warning"; Path = displayPath; Sha256 = ""; Content = marker } ])
+                    else
+                        let reserve = min (maxTotalContentBytes / 2) (List.length tail * 1024)
+                        let budget = max 0 (maxTotalContentBytes - total - reserve)
+                        let resolved =
+                            match physicalSuffix with
+                            | None -> ProjectPaths.resolveWorkspacePath [ "AGENTS.md" ] rt
+                            | Some suffix -> ProjectPaths.resolveSourcePath project suffix rt
+                        match resolved with
+                        | Error error -> Error error
+                        | Ok fullPath ->
+                            match readDocument scope displayPath fullPath budget with
                             | Error error -> Error error
                             | Ok None -> collect tail docs total
                             | Ok(Some doc) ->
                                 let delivered =
                                     if doc.Content.StartsWith("[INCOMPLETE REPOSITORY INSTRUCTIONS", StringComparison.Ordinal) then
-                                        // The header adds metadata but not instruction source bytes.
                                         let index = doc.Content.IndexOf("\n\n", StringComparison.Ordinal)
                                         if index >= 0 then Encoding.UTF8.GetByteCount(doc.Content.Substring(index + 2))
                                         else 0
                                     else Encoding.UTF8.GetByteCount doc.Content
                                 collect tail (doc :: docs) (total + delivered)
-                collect candidates [] 0
+            collect candidates [] 0
 
+let resolve (rt: Runtime) command =
+    match applicableTargets rt command with
+    | Error error -> Error error
+    | Ok None -> Ok []
+    | Ok(Some(projectName, targets)) -> resolveTargets rt projectName targets
 
-// Inbox is a ledger read, so ordinary source instruction resolution intentionally
-// skips it. Resolve just the workspace and project roots for its initial context.
+// Ledger inboxes do not resolve arbitrary source directories, but still
+// bootstrap workspace and selected checkout root instructions.
 let roots (rt: Runtime) projectName =
-    resolve rt (GetProjectDetailsCommand { ProjectName = projectName })
+    resolveTargets rt projectName [ FolderTarget "" ]
+
+// Distinct registered checkouts must not share delivered-instruction cache keys,
+// even when their logical display hierarchy is identical.
+let checkoutIdentity (_: Runtime) projectName =
+    ProjectPaths.ProjectTarget.parse projectName
 
 // This is a best-effort per-process delivery cache, never authoritative state.
 // A new working turn resets the set; another client may harmlessly redeliver.
@@ -259,10 +271,10 @@ type private DeliveryEntry =
       mutable Hashes: Map<string, string> }
 
 type DeliveryCache() =
-    let entries = ConcurrentDictionary<string, DeliveryEntry>(StringComparer.Ordinal)
+    let entries = ConcurrentDictionary<ProjectPaths.ProjectTarget * string, DeliveryEntry>()
 
-    member _.Filter(project: string, agentId: string, turn: string, documents: InstructionDocument list) =
-        let key = project + "::" + agentId
+    member _.Filter(checkout: ProjectPaths.ProjectTarget, agentId: string, turn: string, documents: InstructionDocument list) =
+        let key = checkout, agentId
         let entry =
             entries.GetOrAdd(key, fun _ ->
                 { Gate = obj(); Turn = turn; Hashes = Map.empty })

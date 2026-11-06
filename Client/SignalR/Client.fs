@@ -139,13 +139,16 @@ let private incrementalInstructions (rt: Runtime) (agentId: string) command docu
                     if List.isEmpty documents then
                         // Ledger-only operations may be the first activation call.
                         // They must not fail because a source instruction is invalid.
-                        match AgentInstructions.roots rt project with
+                        match AgentInstructions.roots rt routedProject with
                         | Ok roots -> roots
                         | Error _ -> []
                     else []
-                let delivery = instructionDeliveryCaches.GetValue(rt, fun _ -> AgentInstructions.DeliveryCache())
                 let turn = string active.StateSequence + ":" + active.WorkingTurnStartedAtUtc
-                delivery.Filter(project, agentId, turn, initial @ documents)
+                match AgentInstructions.checkoutIdentity rt routedProject with
+                | Ok checkout ->
+                    let delivery = instructionDeliveryCaches.GetValue(rt, fun _ -> AgentInstructions.DeliveryCache())
+                    delivery.Filter(checkout, agentId, turn, initial @ documents)
+                | Error _ -> initial @ documents
             | _ -> documents
 
 let private serialize<'a> (value: 'a) =

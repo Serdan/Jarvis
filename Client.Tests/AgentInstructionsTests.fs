@@ -2,6 +2,7 @@ module AgentInstructionsTests
 
 open System
 open System.IO
+open System.Diagnostics
 open Client
 open Client.AgentInstructions
 open Common
@@ -302,8 +303,11 @@ let working_turn_delivery_cache_deduplicates_and_refreshes_hierarchy () =
         create root "Demo/AGENTS.md" "project" |> ignore
         let nested = create root "Demo/src/AGENTS.md" "nested"
         let cache = DeliveryCache()
+        let mainTarget =
+            ProjectPaths.ProjectTarget.parse "Demo"
+            |> function Ok target -> target | Error error -> failwithf "%A" error
         let initial = docs rt (command "source.fs")
-        let filter agent turn documents = cache.Filter("Demo", agent, turn, documents)
+        let filter agent turn documents = cache.Filter(mainTarget, agent, turn, documents)
         Assert.That(filter "Owner" "turn-1" initial |> List.map (fun d -> d.Path),
                     Is.EqualTo([ "AGENTS.md"; "Demo/AGENTS.md" ] :> obj))
         Assert.That(filter "Owner" "turn-1" initial, Is.Empty)
@@ -317,4 +321,101 @@ let working_turn_delivery_cache_deduplicates_and_refreshes_hierarchy () =
                     Is.EqualTo([ "Demo/src/AGENTS.md" ] :> obj))
         Assert.That(filter "Reviewer" "turn-1" initial |> List.length, Is.EqualTo(2))
         Assert.That(filter "Owner" "turn-2" initial |> List.length, Is.EqualTo(2))
-        Assert.That(cache.Filter("Other", "Owner", "turn-2", initial) |> List.length, Is.EqualTo(2)))
+        let otherTarget =
+            ProjectPaths.ProjectTarget.parse "Other"
+            |> function Ok target -> target | Error error -> failwithf "%A" error
+        Assert.That(cache.Filter(otherTarget, "Owner", "turn-2", initial) |> List.length, Is.EqualTo(2)))
+
+
+let private gitAt directory arguments =
+    use proc = new Process()
+    proc.StartInfo.FileName <- "git"
+    proc.StartInfo.WorkingDirectory <- directory
+    proc.StartInfo.RedirectStandardOutput <- true
+    proc.StartInfo.RedirectStandardError <- true
+    for argument in arguments do proc.StartInfo.ArgumentList.Add(argument)
+    if not (proc.Start()) then failwith "Unable to start git fixture"
+    let stdout = proc.StandardOutput.ReadToEnd()
+    let stderr = proc.StandardError.ReadToEnd()
+    proc.WaitForExit()
+    if proc.ExitCode <> 0 then failwithf "Git worktree fixture failed: %s" stderr
+    stdout
+
+[<Test>]
+let registered_worktrees_resolve_distinct_instructions_from_actual_checkout_roots () =
+    workspace (fun root rt ->
+        let main = Path.Combine(root, "Demo")
+        create root "AGENTS.md" "workspace guidance" |> ignore
+        create root "Demo/AGENTS.md" "main guidance" |> ignore
+        gitAt main ["init"; "-q"] |> ignore
+        gitAt main ["config"; "user.name"; "Fixture"] |> ignore
+        gitAt main ["config"; "user.email"; "fixture@example.test"] |> ignore
+        create root "Demo/initial.txt" "baseline" |> ignore
+        gitAt main ["add"; "."] |> ignore
+        gitAt main ["commit"; "-qm"; "baseline"] |> ignore
+        let worktreeRoot = Path.Combine(root, ".Demo-worktrees")
+        let a = Path.Combine(worktreeRoot, "tree-a")
+        let b = Path.Combine(worktreeRoot, "tree-b")
+        gitAt main ["worktree"; "add"; "-qb"; "branch-a"; a; "HEAD"] |> ignore
+        gitAt main ["worktree"; "add"; "-qb"; "branch-b"; b; "HEAD"] |> ignore
+        create a "AGENTS.md" "checkout A" |> ignore
+        create a "src/AGENTS.md" "nested A" |> ignore
+        create b "AGENTS.md" "checkout B" |> ignore
+        create b "src/AGENTS.md" "nested B" |> ignore
+        let check selector =
+            let cmd =
+                ReadFileCommand
+                    { ProjectName = selector; FilePath = "src/engine.fs"
+                      StartLine = None; EndLine = None; IncludeLineNumbers = None }
+            docs rt cmd
+        Assert.That(check "Demo::tree-a" |> List.map (fun d -> d.Content),
+                    Is.EqualTo([ "workspace guidance"; "checkout A"; "nested A" ] :> obj))
+        Assert.That(check "Demo::tree-b" |> List.map (fun d -> d.Content),
+                    Is.EqualTo([ "workspace guidance"; "checkout B"; "nested B" ] :> obj))
+        Assert.That(check "Demo::tree-a" |> List.map (fun d -> d.Path),
+                    Is.EqualTo([ "AGENTS.md"; "Demo/AGENTS.md"; "Demo/src/AGENTS.md" ] :> obj))
+        let rootA =
+            match roots rt "Demo::tree-a" with
+            | Ok docs -> docs
+            | Error error -> failwithf "Cannot resolve worktree roots: %A" error
+        Assert.That(rootA |> List.map (fun d -> d.Content),
+                    Is.EqualTo([ "workspace guidance"; "checkout A" ] :> obj))
+        let checkoutA =
+            checkoutIdentity rt "Demo::tree-a"
+            |> function Ok value -> value | Error error -> failwithf "%A" error
+        let checkoutB =
+            checkoutIdentity rt "Demo::tree-b"
+            |> function Ok value -> value | Error error -> failwithf "%A" error
+        Assert.That(ProjectPaths.ProjectTarget.projectName checkoutA, Is.EqualTo("Demo"))
+        Assert.That(ProjectPaths.ProjectTarget.projectName checkoutB, Is.EqualTo("Demo"))
+        Assert.That(checkoutA, Is.Not.EqualTo(checkoutB))
+        let cache = DeliveryCache()
+        Assert.That(cache.Filter(checkoutA, "Owner", "turn-1", check "Demo::tree-a").Length, Is.EqualTo(3))
+        Assert.That(cache.Filter(checkoutA, "Owner", "turn-1", check "Demo::tree-a"), Is.Empty)
+        Assert.That(cache.Filter(checkoutB, "Owner", "turn-1", check "Demo::tree-b").Length, Is.EqualTo(3))
+        match ProjectPaths.ProjectTarget.parse "Demo::tree-a::unexpected" with
+        | Error _ -> ()
+        | Ok _ -> Assert.Fail("Nested selectors must be rejected")
+        match ProjectPaths.ProjectTarget.parse "Demo::../escape" with
+        | Error _ -> ()
+        | Ok _ -> Assert.Fail("Traversal selectors must be rejected")
+        match ProjectPaths.resolveProjectContext "Demo::unknown" rt with
+        | Error _ -> ()
+        | Ok _ -> Assert.Fail("Unknown worktree should not resolve")
+        match ProjectPaths.resolveProjectPath "Demo::tree-a" "../other/AGENTS.md" rt with
+        | Error(Client.PermissionDenied _) -> ()
+        | other -> Assert.Fail(sprintf "Checkout-relative traversal should be rejected: %A" other)
+        let target = create a "unsafe-instructions.md" "wrong source"
+        File.Delete(Path.Combine(a, "src", "AGENTS.md"))
+        let link = Path.Combine(a, "src", "AGENTS.md")
+        try
+            File.CreateSymbolicLink(link, target) |> ignore
+            match resolve rt (ReadFileCommand
+                { ProjectName = "Demo::tree-a"; FilePath = "src/engine.fs"
+                  StartLine = None; EndLine = None; IncludeLineNumbers = None }) with
+            | Error(Client.PermissionDenied _) -> ()
+            | other -> Assert.Fail(sprintf "Worktree instruction symlink must be rejected: %A" other)
+        with
+        | :? UnauthorizedAccessException -> ()
+        | :? PlatformNotSupportedException -> ()
+    )

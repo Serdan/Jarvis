@@ -1,6 +1,7 @@
 module Client.AgentInstructions
 
 open System
+open System.Collections.Concurrent
 open System.IO
 open System.Security.Cryptography
 open System.Text
@@ -243,3 +244,42 @@ let resolve (rt: Runtime) command =
                                     else Encoding.UTF8.GetByteCount doc.Content
                                 collect tail (doc :: docs) (total + delivered)
                 collect candidates [] 0
+
+
+// Inbox is a ledger read, so ordinary source instruction resolution intentionally
+// skips it. Resolve just the workspace and project roots for its initial context.
+let roots (rt: Runtime) projectName =
+    resolve rt (GetProjectDetailsCommand { ProjectName = projectName })
+
+// This is a best-effort per-process delivery cache, never authoritative state.
+// A new working turn resets the set; another client may harmlessly redeliver.
+type private DeliveryEntry =
+    { Gate: obj
+      mutable Turn: string
+      mutable Hashes: Map<string, string> }
+
+type DeliveryCache() =
+    let entries = ConcurrentDictionary<string, DeliveryEntry>(StringComparer.Ordinal)
+
+    member _.Filter(project: string, agentId: string, turn: string, documents: InstructionDocument list) =
+        let key = project + "::" + agentId
+        let entry =
+            entries.GetOrAdd(key, fun _ ->
+                { Gate = obj(); Turn = turn; Hashes = Map.empty })
+        lock entry.Gate (fun () ->
+            if entry.Turn <> turn then
+                entry.Turn <- turn
+                entry.Hashes <- Map.empty
+            documents
+            |> List.filter (fun document ->
+                if document.Scope = "write-warning" || document.Scope = "working-turn" then true
+                else
+                    let key = document.Scope + ":" + document.Path
+                    let fingerprint =
+                        if document.Scope = "instruction-warning" then document.Content
+                        else document.Sha256
+                    match Map.tryFind key entry.Hashes with
+                    | Some previous when previous = fingerprint -> false
+                    | _ ->
+                        entry.Hashes <- Map.add key fingerprint entry.Hashes
+                        true))

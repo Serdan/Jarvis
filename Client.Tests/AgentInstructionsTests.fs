@@ -293,3 +293,28 @@ let first_project_command_receives_instructions_without_prelude () =
                         Is.EqualTo([ "workspace guidance"; "project guidance" ] :> obj))
         finally if Directory.Exists root then Directory.Delete(root, true)
     }
+
+
+[<Test>]
+let working_turn_delivery_cache_deduplicates_and_refreshes_hierarchy () =
+    workspace (fun root rt ->
+        create root "AGENTS.md" "workspace" |> ignore
+        create root "Demo/AGENTS.md" "project" |> ignore
+        let nested = create root "Demo/src/AGENTS.md" "nested"
+        let cache = DeliveryCache()
+        let initial = docs rt (command "source.fs")
+        let filter agent turn documents = cache.Filter("Demo", agent, turn, documents)
+        Assert.That(filter "Owner" "turn-1" initial |> List.map (fun d -> d.Path),
+                    Is.EqualTo([ "AGENTS.md"; "Demo/AGENTS.md" ] :> obj))
+        Assert.That(filter "Owner" "turn-1" initial, Is.Empty)
+        let deep = docs rt (command "src/a.fs")
+        Assert.That(filter "Owner" "turn-1" deep |> List.map (fun d -> d.Path),
+                    Is.EqualTo([ "Demo/src/AGENTS.md" ] :> obj))
+        Assert.That(filter "Owner" "turn-1" deep, Is.Empty)
+        File.WriteAllText(nested, "nested updated")
+        Assert.That(filter "Owner" "turn-1" (docs rt (command "src/a.fs"))
+                    |> List.map (fun d -> d.Path),
+                    Is.EqualTo([ "Demo/src/AGENTS.md" ] :> obj))
+        Assert.That(filter "Reviewer" "turn-1" initial |> List.length, Is.EqualTo(2))
+        Assert.That(filter "Owner" "turn-2" initial |> List.length, Is.EqualTo(2))
+        Assert.That(cache.Filter("Other", "Owner", "turn-2", initial) |> List.length, Is.EqualTo(2)))

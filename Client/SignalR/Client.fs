@@ -24,6 +24,7 @@ let receiveMessage (rt: Runtime) message =
 // Explicit agent labels identify the current work slot. Cache canonical
 // Working state for ordinary calls to avoid one remote git fetch per tool.
 let private workingGuidanceCaches = ConditionalWeakTable<Runtime, WorkingTurnGuidance.AgentCache>()
+let private instructionDeliveryCaches = ConditionalWeakTable<Runtime, AgentInstructions.DeliveryCache>()
 
 let private checkWorkingGuidance (rt: Runtime) agentId command =
     if String.IsNullOrWhiteSpace agentId then []
@@ -111,6 +112,41 @@ let private activateReadyOnActivity (rt: Runtime) (agentId: string) command =
                         | _ -> Error(Client.ValidationError "Agent assignment changed before automatic activation.")
                     | Error error -> Error(Client.ValidationError($"Automatic agent activation failed: {error}"))
             | _ -> Ok ()
+
+// Only the Working turn identifies a stable delivery scope. Ledger calls bootstrap
+// root guidance, while normal source operations discover deeper instructions.
+let private incrementalInstructions (rt: Runtime) (agentId: string) command documents =
+    if String.IsNullOrWhiteSpace agentId then documents
+    else
+        match AgentCommandInfo.projectName command with
+        | None -> documents
+        | Some routedProject ->
+            let project = AgentView.activityProject routedProject
+            let cache = workingGuidanceCaches.GetValue(rt, fun _ ->
+                WorkingTurnGuidance.AgentCache(TimeSpan.FromMinutes 2.))
+            let now = DateTimeOffset.UtcNow
+            let agent =
+                cache.Get(now, project, agentId, fun () ->
+                    match OrchestrationApi.LedgerBindingConfig.load project rt with
+                    | Error _ -> None
+                    | Ok binding ->
+                        match ReviewWorkflow.ReviewWorkflow.getAgentWorkingTurn binding agentId with
+                        | Ok found -> Some found
+                        | Error _ -> None)
+            match agent with
+            | Some active when active.State = "Working" ->
+                let initial =
+                    if List.isEmpty documents then
+                        // Ledger-only operations may be the first activation call.
+                        // They must not fail because a source instruction is invalid.
+                        match AgentInstructions.roots rt project with
+                        | Ok roots -> roots
+                        | Error _ -> []
+                    else []
+                let delivery = instructionDeliveryCaches.GetValue(rt, fun _ -> AgentInstructions.DeliveryCache())
+                let turn = string active.StateSequence + ":" + active.WorkingTurnStartedAtUtc
+                delivery.Filter(project, agentId, turn, initial @ documents)
+            | _ -> documents
 
 let private serialize<'a> (value: 'a) =
     try
@@ -460,7 +496,7 @@ let processIncomingCommand (rt: Runtime) (commandJson: string) (agentId: string)
                         return Error error
                     | Ok () ->
                         let! result, applicable = receiveCommandWithInstructions rt command
-                        instructions <- applicable @ checkWorkingGuidance rt agentId command
+                        instructions <- incrementalInstructions rt agentId command applicable @ checkWorkingGuidance rt agentId command
                         return result
                 with ex ->
                     return Error(ExceptionError ex)

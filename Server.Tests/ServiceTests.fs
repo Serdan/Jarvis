@@ -943,9 +943,11 @@ let run_command_reason_parameter_is_optional_for_mcp_compatibility () =
 [<Test>]
 let mcp_guidance_blocks_precede_result_without_changing_success () =
     let instructions =
-        [ { Scope = "project"
-            Path = "Demo/src/AGENTS.md"
-            Sha256 = "sha256:" + String('a', 64)
+        [ { Scope = "workspace"; Path = "AGENTS.md"; Sha256 = "sha256:" + String('b', 64)
+            Content = "Workspace guidance" }
+          { Scope = "project"; Path = "Demo/AGENTS.md"; Sha256 = "sha256:" + String('c', 64)
+            Content = "Project guidance" }
+          { Scope = "project"; Path = "Demo/src/AGENTS.md"; Sha256 = "sha256:" + String('a', 64)
             Content = "Source guidance" } ]
     let response =
         { Result = Some """{"result":"ok"}"""
@@ -955,8 +957,13 @@ let mcp_guidance_blocks_precede_result_without_changing_success () =
     Assert.That(result.IsError, Is.EqualTo(Nullable false))
     Assert.That(result.Content.Count, Is.EqualTo(2))
     let guidance = result.Content[0] :?> TextContentBlock
-    Assert.That(guidance.Text, Does.Contain("Demo/src/AGENTS.md"))
-    Assert.That(guidance.Text, Does.Contain("Source guidance"))
+    use json = JsonDocument.Parse(guidance.Text)
+    let map = json.RootElement.GetProperty("AGENTS.md")
+    Assert.That(json.RootElement.EnumerateObject() |> Seq.length, Is.EqualTo(1))
+    Assert.That(map.GetProperty(".").GetString(), Is.EqualTo("Workspace guidance"))
+    Assert.That(map.GetProperty("Demo").GetString(), Is.EqualTo("Project guidance"))
+    Assert.That(map.GetProperty("Demo/src").GetString(), Is.EqualTo("Source guidance"))
+    Assert.That(guidance.Text, Does.Not.Contain("This is workspace content"))
     let operation = result.Content[1] :?> TextContentBlock
     Assert.That(operation.Text, Is.EqualTo("""{"result":"ok"}"""))
 

@@ -2032,6 +2032,13 @@ type ReviewWorkflowTests() =
             |> success |> ignore
             ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner"
             |> success |> ignore
+            // The first inbox call should deliver root guidance even though
+            // ordinary ledger reads deliberately skip source instructions.
+            File.WriteAllText(Path.Combine(Path.GetDirectoryName one, "AGENTS.md"), "workspace guidance")
+            File.WriteAllText(Path.Combine(one, "AGENTS.md"), "project guidance")
+            Directory.CreateDirectory(Path.Combine(one, "src")) |> ignore
+            File.WriteAllText(Path.Combine(one, "src", "AGENTS.md"), "source guidance")
+            File.WriteAllText(Path.Combine(one, "src", "example.fs"), "module Example")
             let context = GitCommandTests.TestContext(Path.GetDirectoryName one)
             let configPath = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
             try
@@ -2049,7 +2056,9 @@ type ReviewWorkflowTests() =
                 let invoke () =
                     Client.SignalR.Client.processIncomingCommand rt payload "Owner"
                     |> Async.AwaitTask |> Async.RunSynchronously
-                let _, initialResult, _ = invoke()
+                let _, initialResult, initialResponse = invoke()
+                Assert.That(initialResponse.Instructions |> List.map (fun d -> d.Path),
+                            Is.EqualTo([ "AGENTS.md"; "owner/AGENTS.md" ] :> obj))
                 match initialResult with
                 | Ok _ -> ()
                 | Error error -> Assert.Fail(sprintf "Agent inbox should succeed: %A" error)
@@ -2060,7 +2069,26 @@ type ReviewWorkflowTests() =
                 let _, _, startedAttempt = ReviewWorkflow.getTask second taskId |> success
                 Assert.That(startedAttempt.Value.Phase, Is.EqualTo("Started"))
 
-                let _, repeatResult, _ = invoke()
+                let _, repeatResult, repeatResponse = invoke()
+                Assert.That(repeatResponse.Instructions, Is.Empty)
+                let srcCommand : Common.AgentCommand =
+                    Common.ReadFileCommand
+                        { ProjectName = "owner"; FilePath = "src/example.fs"
+                          StartLine = None; EndLine = None; IncludeLineNumbers = None }
+                let srcPayload = System.Text.Json.JsonSerializer.Serialize<Common.AgentCommand>(srcCommand)
+                let readSource () =
+                    Client.SignalR.Client.processIncomingCommand rt srcPayload "Owner"
+                    |> Async.AwaitTask |> Async.RunSynchronously
+                let _, srcResult, srcResponse = readSource()
+                Assert.That(srcResult.IsOk, Is.True)
+                Assert.That(srcResponse.Instructions |> List.map (fun d -> d.Path),
+                            Is.EqualTo([ "owner/src/AGENTS.md" ] :> obj))
+                let _, _, repeatSource = readSource()
+                Assert.That(repeatSource.Instructions, Is.Empty)
+                File.WriteAllText(Path.Combine(one, "src", "AGENTS.md"), "changed source guidance")
+                let _, _, updatedSource = readSource()
+                Assert.That(updatedSource.Instructions |> List.map (fun d -> d.Path),
+                            Is.EqualTo([ "owner/src/AGENTS.md" ] :> obj))
                 match repeatResult with
                 | Ok _ -> ()
                 | Error error -> Assert.Fail(sprintf "Second inbox should succeed: %A" error)

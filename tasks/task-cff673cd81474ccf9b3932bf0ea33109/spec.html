@@ -1,0 +1,26 @@
+<h1>Support concurrent Jarvis client instances with unique machine and instance identities</h1>
+<h2>Goal</h2>
+<p>Permit two or more JarvisClient processes to run simultaneously on the same machine, including against the same workspace, without evicting one another, misrouting commands, or corrupting shared client state. Ensure machine identifiers are genuinely unique across independently configured machines/installations.</p>
+<h2>Current problem</h2>
+<p>Client/Modules/DeviceIdentity.fs reads a single application-data device-id file. Client/Program.fs uses that same identifier to register every process. Server/Services/UserService.fs stores one connection per (userId, deviceId), replacing its mapping when another process registers with the same ID. Thus two local client instances can appear as a reconnect of one device rather than distinct connections. Copying a configured device-id file to another machine can also create duplicate machine IDs.</p>
+<h2>Required design</h2>
+<ul>
+<li>Separate stable machine/installation identity from unique running client instance identity. Each process must have a distinct instance identifier while retaining it across reconnects during that process lifetime. Machine identity must remain stable across ordinary restarts and distinct across unrelated installations. Clarify which identity is used for transport registration and explicit command routing, and preserve backward compatibility/migration for existing registered clients.</li>
+<li>Make persisted machine-ID creation concurrency-safe (atomic create and validation). Identify and handle duplicated machine IDs arising from copied configuration, cloned installations or concurrent initial startup. Define detection, collision handling and safe remediation so unrelated machines cannot silently impersonate or displace one another. Do not depend solely on hostname, hardware fingerprints or volatile connection IDs.</li>
+<li>Make server session registration, routing, default selection, list-devices/discovery, disconnect and reconnect operate on distinct client instances. One instance disconnecting must never invalidate another instance's active session; commands explicitly addressed to an instance must reach precisely that instance. Surface both human-readable machine name and disambiguating instance identity in device selection.</li>
+<li>Support multiple processes targeting the same workspace: safe shared settings/identity files, OAuth token state, pending-operation journals, local state and caches, log files and TUI settings, and concurrent Git-ledger access. Avoid destructive writes, accidental per-process overwrites, lost updates or unexpected terminal interference. Preserve project/ledger authority, Git CAS and operation-id idempotency; do not introduce a server-side persistent database.</li>
+<li>Clarify process-local vs machine-shared job and agent activity visibility. Do not accidentally expose a job ID for cancellation through another process that has no access to it; make ownership/routing explicit. Preserve correct project and worktree association.</li>
+<li>Keep the server's registry reconstructible after restart from connected clients; registration/discovery and fallback routing must not rely on persistent server state. The global operator Agents roster task can consume the distinct machine/instance metadata, but is a separate feature.</li>
+<li>Document how to launch and select concurrent clients on the same machine, and how duplicated machine IDs are detected/repaired.</li>
+</ul>
+<h2>Acceptance tests</h2>
+<ul>
+<li>Start two clients concurrently with the same OS user, shared application data and workspace: both register, appear separately in discovery, and receive independently targeted commands without routing oscillation.</li>
+<li>Reconnect either client repeatedly and disconnect one: the other's registration and routing remain intact.</li>
+<li>Simulate cloned machine-ID files on two distinct machines/installations: collisions are detected and safely resolved or surfaced explicitly without silent identity takeover.</li>
+<li>Race fresh identity creation from two processes, verifying a single valid durable machine ID and distinct instance IDs.</li>
+<li>Exercise default/fallback selection, explicit target errors, independent TUI state, shared file and token access, and concurrent ledger operations.</li>
+<li>Restart the server while two clients are active: both reconnect and are discoverable; no durable server state is required. Run relevant Release client/server test suites.</li>
+</ul>
+<h2>Constraints</h2>
+<p>Design for long-term correctness. Do not deploy without operator authorization. Do not automatically create persistent server-side authority. Preserve compatibility with the existing stable device identity wherever feasible, while fixing collisions and instance conflation.</p>

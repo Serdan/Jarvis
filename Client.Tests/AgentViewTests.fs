@@ -194,12 +194,16 @@ let lastSeenDisplaysRelativeAgeWithoutInferringPresence () =
 
 [<Test>]
 let activityProjectNormalizesRegisteredWorktreeNames () =
-    activityProject "Wayfold" |> shouldEqual "Wayfold"
-    activityProject "Wayfold::gui-design" |> shouldEqual "Wayfold"
-    activityProject "Jarvis::agent-id-implementation" |> shouldEqual "Jarvis"
+    let selected raw =
+        ProjectPaths.ProjectTarget.parse raw
+        |> function Ok target -> activityProject target | Error error -> failwithf "%A" error
+    selected "Wayfold" |> shouldEqual "Wayfold"
+    selected "Wayfold::gui-design" |> shouldEqual "Wayfold"
+    selected "Jarvis::agent-id-implementation" |> shouldEqual "Jarvis"
 
 
 [<Test>]
 let activityProjectRejectsInvalidCheckoutSelector () =
-    Assert.Throws<ArgumentException>(fun () ->
-        activityProject "Wayfold::bad::selector" |> ignore) |> ignore
+    match ProjectPaths.ProjectTarget.parse "Wayfold::bad::selector" with
+    | Error(Client.ValidationError _) -> ()
+    | other -> Assert.Fail(sprintf "Expected typed validation: %A" other)

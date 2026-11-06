@@ -191,8 +191,8 @@ let writeWarnings (rt: Runtime) command response =
 // All physical instruction paths derive from a resolved checkout, never a
 // protocol selector or human-facing display key.  The displayed hierarchy is
 // logical; the cache keeps checkout provenance separately.
-let private resolveTargets (rt: Runtime) projectName targets =
-    match ProjectPaths.resolveProjectContext projectName rt with
+let private resolveTargets (rt: Runtime) (target: ProjectPaths.ProjectTarget) targets =
+    match ProjectPaths.resolveProjectContextForTarget target rt with
     | Error error -> Error error
     | Ok project ->
         let (FolderPath sourceRoot) = ProjectPaths.ResolvedProject.sourceRoot project
@@ -247,16 +247,30 @@ let private resolveTargets (rt: Runtime) projectName targets =
                                 collect tail (doc :: docs) (total + delivered)
             collect candidates [] 0
 
-let resolve (rt: Runtime) command =
+let resolveWithTarget (rt: Runtime) (target: ProjectPaths.ProjectTarget option) command =
     match applicableTargets rt command with
     | Error error -> Error error
     | Ok None -> Ok []
-    | Ok(Some(projectName, targets)) -> resolveTargets rt projectName targets
+    | Ok(Some(_, targets)) ->
+        match target with
+        | Some typed -> resolveTargets rt typed targets
+        | None -> Error(Client.ValidationError "Project target is required for instruction resolution.")
+
+let resolve (rt: Runtime) command =
+    let target =
+        match AgentCommandInfo.projectName command with
+        | None -> Ok None
+        | Some projectName -> ProjectPaths.ProjectTarget.parse projectName |> Result.map Some
+    target |> Result.bind (fun validated -> resolveWithTarget rt validated command)
 
 // Ledger inboxes do not resolve arbitrary source directories, but still
 // bootstrap workspace and selected checkout root instructions.
+let rootsForTarget (rt: Runtime) (target: ProjectPaths.ProjectTarget) =
+    resolveTargets rt target [ FolderTarget "" ]
+
 let roots (rt: Runtime) projectName =
-    resolveTargets rt projectName [ FolderTarget "" ]
+    ProjectPaths.ProjectTarget.parse projectName
+    |> Result.bind (rootsForTarget rt)
 
 // This is a best-effort per-process delivery cache, never authoritative state.
 // A new working turn resets the set; another client may harmlessly redeliver.
@@ -270,7 +284,7 @@ type DeliveryCache() =
     let entries = ConcurrentDictionary<ProjectPaths.ProjectTarget * string, DeliveryEntry>()
 
     member _.Filter(checkout: ProjectPaths.ProjectTarget, agentId: string, turn: string,
-                    documents: InstructionDocument list, loadRoots: unit -> InstructionDocument list) =
+                    documents: InstructionDocument list, loadRoots: unit -> Client.Result<InstructionDocument list>) =
         let key = checkout, agentId
         let entry =
             entries.GetOrAdd(key, fun _ ->
@@ -283,10 +297,24 @@ type DeliveryCache() =
             // Explicit bootstrap state, not inference from empty tool responses.
             // Source operations already checked every ancestor; ledger operations
             // need a one-time root lookup if no source guidance accompanied them.
+            let containsRepositoryGuidance =
+                documents
+                |> List.exists (fun document ->
+                    document.Scope = "workspace" || document.Scope = "project")
             let initial =
-                if not entry.Bootstrapped && List.isEmpty documents then loadRoots()
-                else []
-            entry.Bootstrapped <- true
+                if entry.Bootstrapped || containsRepositoryGuidance then
+                    entry.Bootstrapped <- true
+                    []
+                else
+                    match loadRoots() with
+                    | Ok roots ->
+                        entry.Bootstrapped <- true
+                        roots
+                    | Error error ->
+                        // A ledger status operation must remain usable, but an
+                        // unsuccessful bootstrap must remain retryable.
+                        [ { Scope = "instruction-warning"; Path = "AGENTS.md"; Sha256 = ""
+                            Content = $"Unable to load initial AGENTS.md instructions: {error}. The operation is unaffected; Jarvis will retry instruction delivery on the next tool call." } ]
             initial @ documents
             |> List.filter (fun document ->
                 if document.Scope = "write-warning" || document.Scope = "working-turn" then true

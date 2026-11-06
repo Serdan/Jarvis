@@ -26,20 +26,21 @@ let receiveMessage (rt: Runtime) message =
 let private workingGuidanceCaches = ConditionalWeakTable<Runtime, WorkingTurnGuidance.AgentCache>()
 let private instructionDeliveryCaches = ConditionalWeakTable<Runtime, AgentInstructions.DeliveryCache>()
 
-let private checkWorkingGuidance (rt: Runtime) agentId command =
+let private checkWorkingGuidance (rt: Runtime) agentId (target: ProjectPaths.ProjectTarget option) command =
     if String.IsNullOrWhiteSpace agentId then []
     else
-        match AgentCommandInfo.projectName command with
+        match target with
         | None -> []
-        | Some routedProject ->
-            let project = AgentView.activityProject routedProject
+        | Some target ->
+            let projectId = ProjectPaths.ProjectTarget.projectId target
+            let project = ProjectPaths.ProjectId.value projectId
             let now = DateTimeOffset.UtcNow
             let cache = workingGuidanceCaches.GetValue(rt, fun _ -> WorkingTurnGuidance.AgentCache(TimeSpan.FromMinutes 2.))
             match command with
-            | TaskWriteCommand _ -> cache.Invalidate(project, agentId)
+            | TaskWriteCommand _ -> cache.Invalidate(projectId, agentId)
             | _ -> ()
             let agent =
-                cache.Get(now, project, agentId, fun () ->
+                cache.Get(now, projectId, agentId, fun () ->
                     match OrchestrationApi.LedgerBindingConfig.load project rt with
                     | Error _ -> None
                     | Ok binding ->
@@ -70,21 +71,23 @@ let private activatesAgent (agentId: string) command =
     | LedgerWriteCommand _ | ReviewWriteCommand _ -> false
     | _ -> true
 
-let private activateReadyOnActivity (rt: Runtime) (agentId: string) command =
+let private activateReadyOnActivity (rt: Runtime) (agentId: string)
+                                (target: ProjectPaths.ProjectTarget option) command =
     if String.IsNullOrWhiteSpace agentId || not (activatesAgent agentId command) then Ok ()
     else
-        match AgentCommandInfo.projectName command with
+        match target with
         | None -> Ok ()
-        | Some routedProject ->
-            let project = AgentView.activityProject routedProject
+        | Some target ->
+            let projectId = ProjectPaths.ProjectTarget.projectId target
+            let project = ProjectPaths.ProjectId.value projectId
             let cache = workingGuidanceCaches.GetValue(rt, fun _ -> WorkingTurnGuidance.AgentCache(TimeSpan.FromMinutes 2.))
             // Inbox is the normal bootstrap operation; always recheck its
             // current assignment even if other calls cached an idle agent.
             match command with
-            | TaskReadCommand cmd when cmd.Action = "AgentInbox" -> cache.Invalidate(project, agentId)
+            | TaskReadCommand cmd when cmd.Action = "AgentInbox" -> cache.Invalidate(projectId, agentId)
             | _ -> ()
             let current =
-                cache.Get(DateTimeOffset.UtcNow, project, agentId, fun () ->
+                cache.Get(DateTimeOffset.UtcNow, projectId, agentId, fun () ->
                     match OrchestrationApi.LedgerBindingConfig.load project rt with
                     | Error _ -> None
                     | Ok binding ->
@@ -101,7 +104,7 @@ let private activateReadyOnActivity (rt: Runtime) (agentId: string) command =
                     let result =
                         ReviewWorkflow.ReviewWorkflow.activateReadyAgent binding (Guid.NewGuid())
                             agent.CurrentAssignment.TaskId agentId
-                    cache.Invalidate(project, agentId)
+                    cache.Invalidate(projectId, agentId)
                     match result with
                     | Ok _ -> Ok ()
                     | Error(Client.LedgerStore.StaleEntityVersion _) ->
@@ -115,18 +118,20 @@ let private activateReadyOnActivity (rt: Runtime) (agentId: string) command =
 
 // Only the Working turn identifies a stable delivery scope. Ledger calls bootstrap
 // root guidance, while normal source operations discover deeper instructions.
-let private incrementalInstructions (rt: Runtime) (agentId: string) command documents =
+let private incrementalInstructions (rt: Runtime) (agentId: string)
+                                    (target: ProjectPaths.ProjectTarget option) documents =
     if String.IsNullOrWhiteSpace agentId then documents
     else
-        match AgentCommandInfo.projectName command with
+        match target with
         | None -> documents
-        | Some routedProject ->
-            let project = AgentView.activityProject routedProject
+        | Some target ->
+            let projectId = ProjectPaths.ProjectTarget.projectId target
+            let project = ProjectPaths.ProjectId.value projectId
             let cache = workingGuidanceCaches.GetValue(rt, fun _ ->
                 WorkingTurnGuidance.AgentCache(TimeSpan.FromMinutes 2.))
             let now = DateTimeOffset.UtcNow
             let agent =
-                cache.Get(now, project, agentId, fun () ->
+                cache.Get(now, projectId, agentId, fun () ->
                     match OrchestrationApi.LedgerBindingConfig.load project rt with
                     | Error _ -> None
                     | Ok binding ->
@@ -136,15 +141,11 @@ let private incrementalInstructions (rt: Runtime) (agentId: string) command docu
             match agent with
             | Some active when active.State = "Working" ->
                 let turn = string active.StateSequence + ":" + active.WorkingTurnStartedAtUtc
-                match ProjectPaths.ProjectTarget.parse routedProject with
-                | Ok checkout ->
-                    let delivery = instructionDeliveryCaches.GetValue(rt, fun _ -> AgentInstructions.DeliveryCache())
-                    delivery.Filter(checkout, agentId, turn, documents, fun () ->
-                        // Ledger status reads must not fail due to invalid source guidance.
-                        match AgentInstructions.roots rt routedProject with
-                        | Ok roots -> roots
-                        | Error _ -> [])
-                | Error _ -> documents
+                let delivery = instructionDeliveryCaches.GetValue(rt, fun _ -> AgentInstructions.DeliveryCache())
+                delivery.Filter(target, agentId, turn, documents, fun () ->
+                    // Ledger status reads remain usable; failed instruction
+                    // resolution is surfaced as a retryable warning.
+                    AgentInstructions.rootsForTarget rt target)
             | _ -> documents
 
 let private serialize<'a> (value: 'a) =
@@ -313,7 +314,7 @@ let private importFile (cmd: ImportFileCommand) (rt: Runtime) =
 
                     Error(Client.ExceptionError ex)
 
-let private dispatch (rt: Runtime) (command: AgentCommand) =
+let private dispatch (rt: Runtime) (target: ProjectPaths.ProjectTarget option) (command: AgentCommand) =
     match command with
     | ListCommandsCommand -> rt |> ProjectBrowser.listCommands |> serialize'
     | ListWorktreesCommand cmd -> rt |> Worktrees.listWorktrees cmd |> serialize'
@@ -379,10 +380,25 @@ let private dispatch (rt: Runtime) (command: AgentCommand) =
     | GetGitStatusCommand cmd -> rt |> ClientShell.getGitStatus cmd |> serialize'
     | GetGitDiffCommand cmd -> rt |> ClientShell.getGitDiff cmd |> serialize'
     | GitCommitCommand cmd -> rt |> ClientShell.gitCommit cmd |> serialize'
-    | StartJobCommand cmd -> rt |> JobManager.startJob cmd |> serialize'
-    | ListJobsCommand cmd -> rt |> JobManager.listJobs cmd |> serialize'
-    | GetJobResultCommand cmd -> rt |> JobManager.getJobResult cmd |> serialize'
-    | CancelJobCommand cmd -> rt |> JobManager.cancelJob cmd |> serialize'
+    | StartJobCommand cmd ->
+        match target with
+        | Some validated -> rt |> JobManager.startJobForTarget validated cmd |> serialize'
+        | None -> rt |> JobManager.startJob cmd |> serialize'
+    | ListJobsCommand cmd ->
+        match target with
+        | Some validated ->
+            rt |> JobManager.listJobsForProject (Some(ProjectPaths.ProjectTarget.projectId validated)) cmd |> serialize'
+        | None -> rt |> JobManager.listJobs cmd |> serialize'
+    | GetJobResultCommand cmd ->
+        match target with
+        | Some validated ->
+            rt |> JobManager.getJobResultForProject (Some(ProjectPaths.ProjectTarget.projectId validated)) cmd |> serialize'
+        | None -> rt |> JobManager.getJobResult cmd |> serialize'
+    | CancelJobCommand cmd ->
+        match target with
+        | Some validated ->
+            rt |> JobManager.cancelJobForProject (Some(ProjectPaths.ProjectTarget.projectId validated)) cmd |> serialize'
+        | None -> rt |> JobManager.cancelJob cmd |> serialize'
     | MessageCommand cmd ->
         if String.IsNullOrWhiteSpace cmd.Message then
             Error(Client.ValidationError "Message cannot be empty.") |> serialize'
@@ -396,7 +412,8 @@ let private dispatch (rt: Runtime) (command: AgentCommand) =
         |> Ok
         |> serialize'
 
-let receiveCommand (rt: Runtime) (command: AgentCommand) =
+let private receiveCommandForTarget (rt: Runtime) (target: ProjectPaths.ProjectTarget option)
+                                    (command: AgentCommand) =
     task {
         let activityId =
             match command with
@@ -445,7 +462,7 @@ let receiveCommand (rt: Runtime) (command: AgentCommand) =
                         let! result = ClientShell.runProjectTask cmd.ProjectName task rt |> serialize'
                         return result
                     | Ok(), None ->
-                        let! result = dispatch rt command
+                        let! result = dispatch rt target command
                         return result
             }
 
@@ -467,13 +484,28 @@ let receiveCommand (rt: Runtime) (command: AgentCommand) =
         return response
     }
 
-let receiveCommandWithInstructions (rt: Runtime) command =
+let receiveCommand (rt: Runtime) (command: AgentCommand) =
+    receiveCommandForTarget rt None command
+
+let private receiveCommandWithTypedInstructions (rt: Runtime)
+                                                (target: ProjectPaths.ProjectTarget option) command =
     task {
-        match AgentInstructions.resolve rt command with
+        match AgentInstructions.resolveWithTarget rt target command with
         | Error error -> return Error error, []
         | Ok instructions ->
-            let! response = receiveCommand rt command
+            let! response = receiveCommandForTarget rt target command
             return response, instructions @ AgentInstructions.writeWarnings rt command response
+    }
+
+let receiveCommandWithInstructions (rt: Runtime) command =
+    task {
+        let project =
+            match AgentCommandInfo.projectName command with
+            | None -> Ok None
+            | Some raw -> ProjectPaths.ProjectTarget.parse raw |> Result.map Some
+        match project with
+        | Error error -> return Error error, []
+        | Ok target -> return! receiveCommandWithTypedInstructions rt target command
     }
 
 // Shared by SignalR receive and tests. Identity is supplied by the MCP call,
@@ -487,16 +519,26 @@ let processIncomingCommand (rt: Runtime) (commandJson: string) (agentId: string)
                 try
                     let command = JsonSerializer.Deserialize<AgentCommand>(commandJson)
                     parsedCommand <- Some command
-                    AgentCommandInfo.projectName command
-                    |> Option.iter (fun project ->
-                        rt.Tui.RecordAgentSeen(AgentView.activityProject project, agentId))
-                    match activateReadyOnActivity rt agentId command with
-                    | Error error ->
-                        return Error error
-                    | Ok () ->
-                        let! result, applicable = receiveCommandWithInstructions rt command
-                        instructions <- incrementalInstructions rt agentId command applicable @ checkWorkingGuidance rt agentId command
-                        return result
+                    let project =
+                        match AgentCommandInfo.projectName command with
+                        | None -> Ok None
+                        | Some raw when String.IsNullOrWhiteSpace raw
+                                        && (match command with
+                                            | GetJobResultCommand _ | CancelJobCommand _ -> true
+                                            | _ -> false) -> Ok None
+                        | Some raw -> ProjectPaths.ProjectTarget.parse raw |> Result.map Some
+                    match project with
+                    | Error error -> return Error error
+                    | Ok target ->
+                        target |> Option.iter (fun selected ->
+                            rt.Tui.RecordAgentSeen(AgentView.activityProject selected, agentId))
+                        match activateReadyOnActivity rt agentId target command with
+                        | Error error -> return Error error
+                        | Ok () ->
+                            let! result, applicable = receiveCommandWithTypedInstructions rt target command
+                            instructions <- incrementalInstructions rt agentId target applicable
+                                            @ checkWorkingGuidance rt agentId target command
+                            return result
                 with ex ->
                     return Error(ExceptionError ex)
             }

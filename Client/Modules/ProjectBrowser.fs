@@ -288,25 +288,27 @@ module private Core =
 
     let private parseProjectName (projectName: string) =
         effect {
-            let! projects = enumerateProjects
-
             let! target = ProjectPaths.ProjectTarget.parse projectName |> Effect.ofResult
+            let! projects = enumerateProjects
             let mainName = ProjectPaths.ProjectTarget.projectName target
-            return!
+            let! _ =
                 projects
                 |> Seq.tryFind (fun (ProjectName name) -> name = mainName)
-                |> Option.map (fun _ -> ProjectName projectName)
+                |> Option.map (fun _ -> ())
                 |> Effect.ofOption (fun () -> NotFoundError $"Unknown project name: {projectName}")
+            return! ProjectPaths.resolveProjectContextForTarget target
         }
 
-    let private parseFolderPath (path: string) (ProjectName projectName) =
-        ProjectPaths.resolveProjectFolder projectName path
+    // The validated checkout context is retained across file traversal,
+    // including multi-file operations, rather than re-parsing its selector.
+    let private parseFolderPath (path: string) project =
+        ProjectPaths.resolveSourcePath project path >>= FileIO.parseFolder
 
-    let private parseFilePath (path: string) (ProjectName projectName) =
-        ProjectPaths.resolveProjectFile projectName path
+    let private parseFilePath (path: string) project =
+        ProjectPaths.resolveSourcePath project path >>= FileIO.parseFile
 
-    let private resolveWritableFilePath (path: string) (ProjectName projectName) =
-        ProjectPaths.resolveWritableProjectFile projectName path
+    let private resolveWritableFilePath (path: string) project =
+        ProjectPaths.resolveSourcePath project path |>> FilePath
 
     let private getFolderNames path projectName =
         effect {

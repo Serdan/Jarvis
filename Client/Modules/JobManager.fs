@@ -14,7 +14,7 @@ open Kehlet.FSharp.IO.Effect.Operators
 
 type private JobRecord =
     { JobId: string
-      ProjectName: string
+      ProjectName: ProjectPaths.ProjectId
       Executable: string
       Args: string list
       Reason: string option
@@ -38,16 +38,11 @@ module private Core =
 
     // A registered worktree selects where a job executes, not which logical
     // project owns its result. GetJobResult/CancelJob only receive projectName.
-    let private projectIdentity (projectName: string) =
-        ProjectPaths.ProjectTarget.identity projectName
-
-    let private validateJobProject projectName (job: JobRecord) =
-        if String.IsNullOrWhiteSpace projectName then Ok()
-        else
-            match projectIdentity projectName with
-            | Error error -> Error error
-            | Ok canonical when canonical = job.ProjectName -> Ok()
-            | Ok _ -> Error(ValidationError "jobId does not belong to the requested project.")
+    let private validateJobProject (requested: ProjectPaths.ProjectId option) (job: JobRecord) =
+        match requested with
+        | None -> Ok ()
+        | Some canonical when canonical = job.ProjectName -> Ok ()
+        | Some _ -> Error(ValidationError "jobId does not belong to the requested project.")
 
     let private pruneCompletedJobs () =
         jobs.Values
@@ -74,10 +69,15 @@ module private Core =
         else
             Ok executable
 
-    let private resolveWorkingDirectory projectName workingDirectory =
-        match workingDirectory with
-        | None -> ProjectPaths.resolveProjectRoot projectName
-        | Some relativePath -> ProjectPaths.resolveProjectFolder projectName relativePath
+    let private resolveWorkingDirectory (target: ProjectPaths.ProjectTarget) workingDirectory =
+        effect {
+            let! context = ProjectPaths.resolveProjectContextForTarget target
+            match workingDirectory with
+            | None -> return ProjectPaths.ResolvedProject.sourceRoot context
+            | Some relativePath ->
+                let! path = ProjectPaths.resolveSourcePath context relativePath >>= FileIO.parseFolder
+                return path
+        }
 
     let private takeUtf8Prefix maxBytes (value: string) =
         let output = StringBuilder()
@@ -192,14 +192,14 @@ module private Core =
         with ex ->
             Error(ExceptionError ex)
 
-    let startJob (cmd: StartJobCommand) =
+    let startJobForTarget (target: ProjectPaths.ProjectTarget) (cmd: StartJobCommand) =
         effect {
             let maxOutputBytes = cmd.MaxOutputBytes |> Option.defaultValue defaultMaxOutputBytes
             if maxOutputBytes <= 0 then
                 return! Client.ValidationError "MaxOutputBytes must be greater than zero." |> Effect.ofError
             else
-                let! canonical = projectIdentity cmd.ProjectName |> Effect.ofResult
-                let! (FolderPath workingDirectory) = resolveWorkingDirectory cmd.ProjectName cmd.WorkingDirectory
+                let canonical = ProjectPaths.ProjectTarget.projectId target
+                let! (FolderPath workingDirectory) = resolveWorkingDirectory target cmd.WorkingDirectory
                 let! result = fun _ -> startProcess canonical workingDirectory cmd.Executable cmd.Args cmd.Reason maxOutputBytes
                 return result
         }
@@ -207,7 +207,7 @@ module private Core =
     let private toSummary (job: JobRecord) =
         lock job.SyncRoot (fun () ->
             { JobId = job.JobId
-              ProjectName = job.ProjectName
+              ProjectName = ProjectPaths.ProjectId.value job.ProjectName
               Executable = job.Executable
               Args = job.Args
               Reason = job.Reason
@@ -216,29 +216,22 @@ module private Core =
               StartedAt = job.StartedAt
               CompletedAt = job.CompletedAt })
 
-    let listJobs (cmd: ListJobsCommand) =
+    let listJobsForProject (canonical: ProjectPaths.ProjectId option) (cmd: ListJobsCommand) =
         fun _ ->
-            let filter =
-                match cmd.ProjectName with
-                | None -> Ok None
-                | Some projectName -> projectIdentity projectName |> Result.map Some
-            match filter with
-            | Error error -> Error error
-            | Ok canonical ->
-                jobs.Values
-                |> Seq.filter (fun job -> canonical |> Option.forall ((=) job.ProjectName))
-                |> Seq.filter (fun job -> cmd.IncludeCompleted || job.Status = Running)
-                |> Seq.sortBy (fun job -> job.StartedAt)
-                |> Seq.map toSummary
-                |> Seq.toList
-                |> fun items -> Ok { Jobs = items }
+            jobs.Values
+            |> Seq.filter (fun job -> canonical |> Option.forall ((=) job.ProjectName))
+            |> Seq.filter (fun job -> cmd.IncludeCompleted || job.Status = Running)
+            |> Seq.sortBy (fun job -> job.StartedAt)
+            |> Seq.map toSummary
+            |> Seq.toList
+            |> fun items -> Ok { Jobs = items }
 
-    let getJobResult (cmd: GetJobResultCommand) =
+    let getJobResultForProject (canonical: ProjectPaths.ProjectId option) (cmd: GetJobResultCommand) =
         fun _ ->
             match jobs.TryGetValue cmd.JobId with
             | false, _ -> Error(NotFoundError $"Unknown job id: {cmd.JobId}")
             | true, job ->
-                match validateJobProject cmd.ProjectName job with
+                match validateJobProject canonical job with
                 | Error error -> Error error
                 | Ok () -> lock job.SyncRoot (fun () ->
                     let afterSequence = defaultArg cmd.AfterSequence 0L |> max 0L
@@ -254,12 +247,12 @@ module private Core =
                           NextSequence = job.NextSequence
                           Truncated = job.OutputTruncated })
 
-    let cancelJob (cmd: CancelJobCommand) =
+    let cancelJobForProject (canonical: ProjectPaths.ProjectId option) (cmd: CancelJobCommand) =
         fun _ ->
             match jobs.TryGetValue cmd.JobId with
             | false, _ -> Error(NotFoundError $"Unknown job id: {cmd.JobId}")
             | true, job ->
-                match validateJobProject cmd.ProjectName job with
+                match validateJobProject canonical job with
                 | Error error -> Error error
                 | Ok () ->
                     if job.Status = Running then
@@ -275,7 +268,46 @@ module private Core =
                     else
                         Ok()
 
-let startJob cmd = Core.startJob cmd
-let listJobs cmd = Core.listJobs cmd
-let getJobResult cmd = Core.getJobResult cmd
-let cancelJob cmd = Core.cancelJob cmd
+let private projectId raw =
+    ProjectPaths.ProjectTarget.parse raw
+    |> Result.map ProjectPaths.ProjectTarget.projectId
+
+let private optionalProjectId raw =
+    if String.IsNullOrWhiteSpace raw then Ok None
+    else projectId raw |> Result.map Some
+
+let startJobForTarget (target: ProjectPaths.ProjectTarget) (cmd: StartJobCommand) = Core.startJobForTarget target cmd
+
+let startJob (cmd: StartJobCommand) =
+    effect {
+        let! target = ProjectPaths.ProjectTarget.parse cmd.ProjectName |> Effect.ofResult
+        return! Core.startJobForTarget target cmd
+    }
+
+let listJobsForProject (canonical: ProjectPaths.ProjectId option) (cmd: ListJobsCommand) = Core.listJobsForProject canonical cmd
+
+let listJobs (cmd: ListJobsCommand) =
+    fun rt ->
+        let project =
+            match cmd.ProjectName with
+            | None -> Ok None
+            | Some name -> projectId name |> Result.map Some
+        match project with
+        | Error error -> Error error
+        | Ok canonical -> Core.listJobsForProject canonical cmd rt
+
+let getJobResultForProject (canonical: ProjectPaths.ProjectId option) (cmd: GetJobResultCommand) = Core.getJobResultForProject canonical cmd
+
+let getJobResult (cmd: GetJobResultCommand) =
+    fun rt ->
+        match optionalProjectId cmd.ProjectName with
+        | Error error -> Error error
+        | Ok canonical -> Core.getJobResultForProject canonical cmd rt
+
+let cancelJobForProject (canonical: ProjectPaths.ProjectId option) (cmd: CancelJobCommand) = Core.cancelJobForProject canonical cmd
+
+let cancelJob (cmd: CancelJobCommand) =
+    fun rt ->
+        match optionalProjectId cmd.ProjectName with
+        | Error error -> Error error
+        | Ok canonical -> Core.cancelJobForProject canonical cmd rt

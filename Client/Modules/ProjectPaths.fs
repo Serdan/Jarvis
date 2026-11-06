@@ -38,10 +38,14 @@ module ProjectTarget =
                 Ok { Project = ProjectId project; Checkout = Registered(WorktreeId checkout) }
             | _ -> Error(ValidationError "Invalid project or worktree selector.")
 
+    let projectId target = target.Project
     let projectName target = let (ProjectId name) = target.Project in name
     let checkout target = target.Checkout
     let worktreeName = function Registered (WorktreeId name) -> Some name | Main -> None
     let identity input = parse input |> Result.map projectName
+
+module ProjectId =
+    let value (ProjectId name) = name
 
 module ResolvedProject =
     let target (project: ResolvedProject) = project.Target
@@ -152,9 +156,8 @@ let private resolveRegisteredWorktree (mainRoot: string) (selector: string) : Cl
                     | _ -> Error(Client.ValidationError "Ambiguous worktree selector.")
         with ex -> Error(Client.ExceptionError ex)
 
-let resolveProjectContext (projectName: string) : IO<'rt, ResolvedProject> =
+let resolveProjectContextForTarget (target: ProjectTarget) : IO<'rt, ResolvedProject> =
     effect {
-        let! target = ProjectTarget.parse projectName |> Effect.ofResult
         let! (ProjectDirectory workspaceRoot) = ProjectIO.root
         let mainName = ProjectTarget.projectName target
         let! (FolderPath mainRoot) = resolveWorkspacePath [ mainName ] >>= FileIO.parseFolder
@@ -169,6 +172,12 @@ let resolveProjectContext (projectName: string) : IO<'rt, ResolvedProject> =
               WorkspaceRoot = FolderPath workspaceRoot
               MainRoot = FolderPath mainRoot
               SourceRoot = FolderPath sourceRoot }
+    }
+
+let resolveProjectContext (projectName: string) : IO<'rt, ResolvedProject> =
+    effect {
+        let! target = ProjectTarget.parse projectName |> Effect.ofResult
+        return! resolveProjectContextForTarget target
     }
 
 let resolveProjectRoot (projectName: string) : IO<'rt, FolderPath> =

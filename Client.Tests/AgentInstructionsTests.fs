@@ -307,7 +307,7 @@ let working_turn_delivery_cache_deduplicates_and_refreshes_hierarchy () =
             ProjectPaths.ProjectTarget.parse "Demo"
             |> function Ok target -> target | Error error -> failwithf "%A" error
         let initial = docs rt (command "source.fs")
-        let filter agent turn documents = cache.Filter(mainTarget, agent, turn, documents, fun () -> [])
+        let filter agent turn documents = cache.Filter(mainTarget, agent, turn, documents, fun () -> Ok [])
         Assert.That(filter "Owner" "turn-1" initial |> List.map (fun d -> d.Path),
                     Is.EqualTo([ "AGENTS.md"; "Demo/AGENTS.md" ] :> obj))
         Assert.That(filter "Owner" "turn-1" initial, Is.Empty)
@@ -324,7 +324,7 @@ let working_turn_delivery_cache_deduplicates_and_refreshes_hierarchy () =
         let otherTarget =
             ProjectPaths.ProjectTarget.parse "Other"
             |> function Ok target -> target | Error error -> failwithf "%A" error
-        Assert.That(cache.Filter(otherTarget, "Owner", "turn-2", initial, fun () -> []) |> List.length, Is.EqualTo(2)))
+        Assert.That(cache.Filter(otherTarget, "Owner", "turn-2", initial, fun () -> Ok []) |> List.length, Is.EqualTo(2)))
 
 
 let private gitAt directory arguments =
@@ -362,6 +362,16 @@ let registered_worktrees_resolve_distinct_instructions_from_actual_checkout_root
         create a "src/AGENTS.md" "nested A" |> ignore
         create b "AGENTS.md" "checkout B" |> ignore
         create b "src/AGENTS.md" "nested B" |> ignore
+        create a "src/engine.fs" "module EngineA" |> ignore
+        create b "src/engine.fs" "module EngineB" |> ignore
+        let source selector =
+            let cmd : Common.ReadFileCommand = { ProjectName = selector; FilePath = "src/engine.fs"
+                                                 StartLine = None; EndLine = None; IncludeLineNumbers = None }
+            match Client.ProjectBrowser.readFile cmd rt with
+            | Ok(Content text) -> text
+            | Error error -> failwithf "Cannot read selected worktree source: %A" error
+        Assert.That(source "Demo::tree-a", Is.EqualTo("module EngineA"))
+        Assert.That(source "Demo::tree-b", Is.EqualTo("module EngineB"))
         let check selector =
             let cmd =
                 ReadFileCommand
@@ -390,9 +400,9 @@ let registered_worktrees_resolve_distinct_instructions_from_actual_checkout_root
         Assert.That(ProjectPaths.ProjectTarget.projectName checkoutB, Is.EqualTo("Demo"))
         Assert.That(checkoutA, Is.Not.EqualTo(checkoutB))
         let cache = DeliveryCache()
-        Assert.That(cache.Filter(checkoutA, "Owner", "turn-1", check "Demo::tree-a", fun () -> []).Length, Is.EqualTo(3))
-        Assert.That(cache.Filter(checkoutA, "Owner", "turn-1", check "Demo::tree-a", fun () -> []), Is.Empty)
-        Assert.That(cache.Filter(checkoutB, "Owner", "turn-1", check "Demo::tree-b", fun () -> []).Length, Is.EqualTo(3))
+        Assert.That(cache.Filter(checkoutA, "Owner", "turn-1", check "Demo::tree-a", fun () -> Ok []).Length, Is.EqualTo(3))
+        Assert.That(cache.Filter(checkoutA, "Owner", "turn-1", check "Demo::tree-a", fun () -> Ok []), Is.Empty)
+        Assert.That(cache.Filter(checkoutB, "Owner", "turn-1", check "Demo::tree-b", fun () -> Ok []).Length, Is.EqualTo(3))
         match ProjectPaths.ProjectTarget.parse "Demo::tree-a::unexpected" with
         | Error _ -> ()
         | Ok _ -> Assert.Fail("Nested selectors must be rejected")
@@ -429,7 +439,7 @@ let bootstrap_is_once_per_working_turn_even_for_empty_ledger_responses () =
     let mutable rootReads = 0
     let roots () =
         rootReads <- rootReads + 1
-        [ { Scope = "workspace"; Path = "AGENTS.md"; Sha256 = "sha256:first"; Content = "root" } ]
+        Ok [ { Scope = "workspace"; Path = "AGENTS.md"; Sha256 = "sha256:first"; Content = "root" } ]
     let deliver turn documents = cache.Filter(target, "Owner", turn, documents, roots)
     Assert.That(deliver "first" [] |> List.map (fun d -> d.Content),
                 Is.EqualTo([ "root" ] :> obj))
@@ -441,3 +451,67 @@ let bootstrap_is_once_per_working_turn_even_for_empty_ledger_responses () =
     let other = cache.Filter(target, "Reviewer", "first", [], roots)
     Assert.That(other.Length, Is.EqualTo(1))
     Assert.That(rootReads, Is.EqualTo(3))
+
+[<Test>]
+let failed_bootstrap_does_not_block_operations_and_retries_until_success () =
+    let target =
+        ProjectPaths.ProjectTarget.parse "Demo"
+        |> function Ok target -> target | Error error -> failwithf "%A" error
+    let cache = DeliveryCache()
+    let mutable attempts = 0
+    let load () =
+        attempts <- attempts + 1
+        if attempts = 1 then Error(Client.ValidationError "Invalid AGENTS.md")
+        else Ok [ { Scope = "project"; Path = "Demo/AGENTS.md"
+                    Sha256 = "sha256:valid"; Content = "valid guidance" } ]
+    let call documents = cache.Filter(target, "Owner", "turn-1", documents, load)
+    let warning = call []
+    Assert.That(warning |> List.exists (fun doc -> doc.Scope = "instruction-warning"), Is.True)
+    Assert.That(attempts, Is.EqualTo(1))
+    Assert.That(call [] |> List.map (fun doc -> doc.Content),
+                Is.EqualTo([ "valid guidance" ] :> obj))
+    Assert.That(attempts, Is.EqualTo(2))
+    Assert.That(call [], Is.Empty)
+    Assert.That(attempts, Is.EqualTo(2))
+
+[<Test>]
+let write_notice_does_not_suppress_initial_instructions () =
+    let target =
+        ProjectPaths.ProjectTarget.parse "Demo"
+        |> function Ok target -> target | Error error -> failwithf "%A" error
+    let cache = DeliveryCache()
+    let note = { Scope = "write-warning"; Path = "Demo/AGENTS.md"; Sha256 = ""; Content = "Notice" }
+    let roots () = Ok [ { Scope = "workspace"; Path = "AGENTS.md"; Sha256 = "sha256:root"; Content = "Root" } ]
+    let delivered = cache.Filter(target, "Owner", "turn-1", [note], roots)
+    Assert.That(delivered |> List.map (fun d -> d.Scope),
+                Is.EqualTo([ "workspace"; "write-warning" ] :> obj))
+
+
+[<Test>]
+let malformed_project_selector_returns_validation_error_at_command_boundary () =
+    task {
+        let root = Path.Combine(Path.GetTempPath(), "jarvis-invalid-project-" + Guid.NewGuid().ToString("N"))
+        Directory.CreateDirectory(Path.Combine(root, "Demo")) |> ignore
+        try
+            let rt = Runtime(root)
+            let command : Common.AgentCommand =
+                ReadFileCommand
+                    { ProjectName = "Demo::bad::selector"; FilePath = "example.fs"
+                      StartLine = None; EndLine = None; IncludeLineNumbers = None }
+            let payload = System.Text.Json.JsonSerializer.Serialize(command)
+            let! _, response, envelope =
+                Client.SignalR.Client.processIncomingCommand rt payload "Owner"
+            match response with
+            | Error(Client.ValidationError _) -> ()
+            | other -> Assert.Fail(sprintf "Malformed project selector must be validation error: %A" other)
+            Assert.That(envelope.Instructions, Is.Empty)
+            let optionalProject : Common.AgentCommand =
+                GetJobResultCommand
+                    { ProjectName = ""; JobId = "nonexistent"; AfterSequence = None }
+            let optionalPayload = System.Text.Json.JsonSerializer.Serialize(optionalProject)
+            let! _, lookup, _ = Client.SignalR.Client.processIncomingCommand rt optionalPayload "Owner"
+            match lookup with
+            | Error(Client.NotFoundError _) -> ()
+            | other -> Assert.Fail(sprintf "Optional empty job project scope must remain supported: %A" other)
+        finally if Directory.Exists root then Directory.Delete(root, true)
+    }

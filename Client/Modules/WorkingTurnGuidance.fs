@@ -54,10 +54,10 @@ type private CacheEntry =
       mutable Value: ReviewAgent option }
 
 type AgentCache(refreshInterval: TimeSpan) =
-    let entries = ConcurrentDictionary<string, CacheEntry>(StringComparer.OrdinalIgnoreCase)
+    let entries = ConcurrentDictionary<ProjectPaths.ProjectId * string, CacheEntry>()
 
-    member _.Get(now: DateTimeOffset, project: string, agentId: string, load: unit -> ReviewAgent option) =
-        let key = project + "::" + agentId
+    member _.Get(now: DateTimeOffset, project: ProjectPaths.ProjectId, agentId: string, load: unit -> ReviewAgent option) =
+        let key = project, agentId.ToUpperInvariant()
         let entry =
             entries.GetOrAdd(key, fun _ ->
                 { Gate = obj()
@@ -69,8 +69,8 @@ type AgentCache(refreshInterval: TimeSpan) =
                 entry.CheckedAt <- now
             entry.Value)
 
-    member _.Invalidate(project: string, agentId: string) =
-        let key = project + "::" + agentId
+    member _.Invalidate(project: ProjectPaths.ProjectId, agentId: string) =
+        let key = project, agentId.ToUpperInvariant()
         match entries.TryRemove key with
         | true, _ -> ()
         | false, _ -> ()

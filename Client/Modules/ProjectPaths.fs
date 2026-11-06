@@ -3,6 +3,7 @@ module Client.ProjectPaths
 open System
 open System.IO
 open System.Diagnostics
+open System.Threading.Tasks
 open Client
 open Client.Effect
 open Client.IO
@@ -115,16 +116,13 @@ let resolveWorkspacePath (parts: string seq) : IO<'rt, string> =
         | false -> return! Client.PermissionDenied "Path is outside workspace root." |> Effect.ofError
     }
 
-let private resolveRegisteredWorktree (mainRoot: string) (selector: string) : Client.Result<string> =
-    if String.IsNullOrWhiteSpace selector
-       || selector = "." || selector = ".."
-       || selector.Contains('/') || selector.Contains('\\')
-       || selector.Contains("..", StringComparison.Ordinal) then
-        Error(Client.ValidationError "Invalid worktree selector.")
-    else
+// Both pipes must be drained while the process is running. Waiting for EOF
+// before applying a timeout can leave a source operation blocked forever.
+module WorktreeGit =
+    let list (executable: string) (mainRoot: string) (timeout: TimeSpan) : Client.Result<string> =
         try
             use proc = new Process()
-            proc.StartInfo.FileName <- "git"
+            proc.StartInfo.FileName <- executable
             proc.StartInfo.WorkingDirectory <- mainRoot
             proc.StartInfo.UseShellExecute <- false
             proc.StartInfo.RedirectStandardOutput <- true
@@ -135,33 +133,58 @@ let private resolveRegisteredWorktree (mainRoot: string) (selector: string) : Cl
             if not (proc.Start()) then
                 Error(Client.ValidationError "Cannot inspect worktree registration.")
             else
-                let output = proc.StandardOutput.ReadToEnd()
-                if not (proc.WaitForExit(10000)) then
-                    proc.Kill(true)
+                let stdout = proc.StandardOutput.ReadToEndAsync()
+                let stderr = proc.StandardError.ReadToEndAsync()
+                let exit = proc.WaitForExitAsync()
+                let all = Task.WhenAll([| stdout :> Task; stderr :> Task; exit |])
+                try
+                    all.WaitAsync(timeout).GetAwaiter().GetResult()
+                    if proc.ExitCode <> 0 then
+                        Error(Client.ValidationError "Cannot inspect worktree registration.")
+                    else Ok stdout.Result
+                with
+                | :? TimeoutException ->
+                    try
+                        if not proc.HasExited then proc.Kill(true)
+                        // Reap the process without an unbounded second wait.
+                        proc.WaitForExit(2000) |> ignore
+                    with
+                    | :? InvalidOperationException -> ()
+                    | :? System.ComponentModel.Win32Exception -> ()
                     Error(Client.ValidationError "Git worktree discovery timed out.")
-                elif proc.ExitCode <> 0 then
-                    Error(Client.ValidationError "Cannot inspect worktree registration.")
-                else
-                    let comparison = if OperatingSystem.IsWindows() then StringComparison.OrdinalIgnoreCase else StringComparison.Ordinal
-                    let matches =
-                        output.Split('\n', StringSplitOptions.RemoveEmptyEntries)
-                        |> Array.choose (fun line ->
-                            if line.StartsWith("worktree ", StringComparison.Ordinal) then
-                                let path = Path.GetFullPath(line.Substring("worktree ".Length).TrimEnd('\r'))
-                                if String.Equals(Path.GetFileName(Path.TrimEndingDirectorySeparator(path)), selector, comparison) then Some path else None
-                            else None)
-                    match matches with
-                    | [| path |] when Directory.Exists(path) ->
-                        let rec containsLink (dir: DirectoryInfo) =
-                            if dir = null then false
-                            elif dir.Attributes.HasFlag(FileAttributes.ReparsePoint) then true
-                            else containsLink dir.Parent
-                        if containsLink (DirectoryInfo(path)) then
-                            Error(Client.PermissionDenied "Worktree path contains a symbolic link.")
-                        else Ok path
-                    | [||] -> Error(Client.NotFoundError "Unknown Git-registered worktree selector.")
-                    | _ -> Error(Client.ValidationError "Ambiguous worktree selector.")
         with ex -> Error(Client.ExceptionError ex)
+
+let private resolveRegisteredWorktree (mainRoot: string) (selector: string) : Client.Result<string> =
+    if String.IsNullOrWhiteSpace selector
+       || selector = "." || selector = ".."
+       || selector.Contains('/') || selector.Contains('\\')
+       || selector.Contains("..", StringComparison.Ordinal) then
+        Error(Client.ValidationError "Invalid worktree selector.")
+    else
+        match WorktreeGit.list "git" mainRoot (TimeSpan.FromSeconds 10.) with
+        | Error error -> Error error
+        | Ok output ->
+            try
+                let comparison = if OperatingSystem.IsWindows() then StringComparison.OrdinalIgnoreCase else StringComparison.Ordinal
+                let matches =
+                    output.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                    |> Array.choose (fun line ->
+                        if line.StartsWith("worktree ", StringComparison.Ordinal) then
+                            let path = Path.GetFullPath(line.Substring("worktree ".Length).TrimEnd('\r'))
+                            if String.Equals(Path.GetFileName(Path.TrimEndingDirectorySeparator(path)), selector, comparison) then Some path else None
+                        else None)
+                match matches with
+                | [| path |] when Directory.Exists(path) ->
+                    let rec containsLink (dir: DirectoryInfo) =
+                        if dir = null then false
+                        elif dir.Attributes.HasFlag(FileAttributes.ReparsePoint) then true
+                        else containsLink dir.Parent
+                    if containsLink (DirectoryInfo(path)) then
+                        Error(Client.PermissionDenied "Worktree path contains a symbolic link.")
+                    else Ok path
+                | [||] -> Error(Client.NotFoundError "Unknown Git-registered worktree selector.")
+                | _ -> Error(Client.ValidationError "Ambiguous worktree selector.")
+            with ex -> Error(Client.ExceptionError ex)
 
 let resolveProjectContextForTarget (target: ProjectTarget) : IO<'rt, ResolvedProject> =
     effect {

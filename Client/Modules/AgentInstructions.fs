@@ -251,12 +251,18 @@ let private resolveTargets (rt: Runtime) (project: ProjectPaths.ResolvedProject)
                             collect tail (doc :: docs) (total + delivered)
         collect candidates [] 0
 
-// Prepare instruction documents and the source execution context in the same
-// resolution operation. A registered worktree is discovered exactly once.
-let prepareWithTarget (rt: Runtime) (target: ProjectPaths.ProjectTarget option) command =
+// This snapshot must travel from instruction selection to authorization and
+// execution: a mutable .jarvis.json must not be parsed twice for one call.
+type PreparedOperation =
+    { Instructions: InstructionDocument list
+      Source: ProjectPaths.ResolvedProject option
+      ProjectTask: ProjectTaskDefinition option }
+
+// A registered worktree and configured task are each resolved exactly once.
+let prepareOperationWithTarget (rt: Runtime) (target: ProjectPaths.ProjectTarget option) command =
     match applicableTargets rt command with
     | Error error -> Error error
-    | Ok None -> Ok([], None)
+    | Ok None -> Ok { Instructions = []; Source = None; ProjectTask = None }
     | Ok(Some(_, targets)) ->
         match target with
         | None -> Error(Client.ValidationError "Project target is required for instruction resolution.")
@@ -264,15 +270,24 @@ let prepareWithTarget (rt: Runtime) (target: ProjectPaths.ProjectTarget option) 
             match ProjectPaths.resolveProjectContextForTarget typed rt with
             | Error error -> Error error
             | Ok project ->
-                let resolvedTargets =
+                let definition =
                     match command with
                     | RunProjectTaskCommand cmd ->
-                        ClientShell.resolveProjectTaskIn project cmd rt
-                        |> Result.map (fun definition -> [ FolderTarget(defaultArg definition.WorkingDirectory "") ])
-                    | _ -> Ok targets
-                resolvedTargets
-                |> Result.bind (resolveTargets rt project)
-                |> Result.map (fun documents -> documents, Some project)
+                        ClientShell.resolveProjectTaskIn project cmd rt |> Result.map Some
+                    | _ -> Ok None
+                definition
+                |> Result.bind (fun task ->
+                    let targetPaths =
+                        match task with
+                        | Some configured -> [ FolderTarget(defaultArg configured.WorkingDirectory "") ]
+                        | None -> targets
+                    resolveTargets rt project targetPaths
+                    |> Result.map (fun instructions ->
+                        { Instructions = instructions; Source = Some project; ProjectTask = task }))
+
+let prepareWithTarget (rt: Runtime) (target: ProjectPaths.ProjectTarget option) command =
+    prepareOperationWithTarget rt target command
+    |> Result.map (fun prepared -> prepared.Instructions, prepared.Source)
 
 let resolveWithTarget (rt: Runtime) (target: ProjectPaths.ProjectTarget option) command =
     prepareWithTarget rt target command |> Result.map fst

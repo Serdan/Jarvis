@@ -591,3 +591,75 @@ let task_spec_import_export_load_instructions_from_source_html_parent () =
         match resolve rt (taskWrite "ImportTaskSpec" "../escape.html") with
         | Error(Client.PermissionDenied _) -> ()
         | other -> Assert.Fail(sprintf "Source-spec traversal must fail before ledger mutation: %A" other))
+
+[<Test>]
+let worktree_git_discovery_drains_both_pipes_and_bounds_a_hung_process () =
+    if OperatingSystem.IsWindows() then
+        Assert.Ignore("Shell fixture requires Unix executables.")
+    workspace (fun root _ ->
+        let script name body =
+            let path = create root name ("#!/bin/sh\n" + body + "\n")
+            File.SetUnixFileMode(path,
+                UnixFileMode.UserRead ||| UnixFileMode.UserWrite ||| UnixFileMode.UserExecute)
+            path
+        // If stderr is not drained, the process blocks before printing stdout.
+        let verbose =
+            script "verbose-git.sh"
+                "head -c 262144 /dev/zero >&2; printf 'worktree /tmp/fixture\n'"
+        match Client.ProjectPaths.WorktreeGit.list verbose root (TimeSpan.FromSeconds 3.) with
+        | Ok output -> Assert.That(output, Does.Contain("worktree /tmp/fixture"))
+        | other -> Assert.Fail(sprintf "Both pipes must drain concurrently: %A" other)
+        // A producer that never closes stdout must still be terminated.
+        let hung = script "hung-git.sh" "printf 'worktree /tmp/fixture\n'; sleep 30"
+        let clock = Stopwatch.StartNew()
+        let outcome = Client.ProjectPaths.WorktreeGit.list hung root (TimeSpan.FromMilliseconds 350.)
+        clock.Stop()
+        match outcome with
+        | Error(Client.ValidationError message) -> Assert.That(message, Does.Contain("timed out"))
+        | other -> Assert.Fail(sprintf "Expected bounded timeout: %A" other)
+        Assert.That(clock.Elapsed, Is.LessThan(TimeSpan.FromSeconds 5.))
+    )
+
+[<Test>]
+let prepared_project_task_snapshot_keeps_instructions_and_execution_in_sync () =
+    workspace (fun root rt ->
+        Directory.CreateDirectory(Path.Combine(root, "Demo", "src")) |> ignore
+        Directory.CreateDirectory(Path.Combine(root, "Demo", "other")) |> ignore
+        create root "Demo/src/AGENTS.md" "original task instructions" |> ignore
+        create root "Demo/other/AGENTS.md" "replacement task instructions" |> ignore
+        let config = Path.Combine(root, "Demo", ".jarvis.json")
+        let writeConfig dir arg =
+            File.WriteAllText(config,
+                sprintf """{"tasks":{"probe":{"executable":"dotnet","args":["%s"],"workingDirectory":"%s","timeoutSeconds":10}}}"""
+                    arg dir)
+        writeConfig "src" "--version"
+        let cmd : Common.AgentCommand = RunProjectTaskCommand { ProjectName = "Demo"; TaskName = "probe" }
+        let target =
+            Client.ProjectPaths.ProjectTarget.parse "Demo"
+            |> function Ok value -> value | Error error -> failwithf "%A" error
+        let snapshot =
+            match Client.AgentInstructions.prepareOperationWithTarget rt (Some target) cmd with
+            | Ok value -> value
+            | Error error -> failwithf "Project task preparation failed: %A" error
+        Assert.That(snapshot.Instructions |> List.map (fun d -> d.Path),
+                    Is.EqualTo([ "Demo/src/AGENTS.md" ] :> obj))
+        let prepared = snapshot.ProjectTask |> Option.defaultWith (fun () -> failwith "Missing configured task")
+        Assert.That(prepared.WorkingDirectory, Is.EqualTo(Some "src"))
+        Assert.That(prepared.Args, Is.EqualTo([ "--version" ] :> obj))
+        // A concurrent configuration update must not change the command
+        // whose instructions were selected and whose permissions were checked.
+        writeConfig "other" "--info"
+        let source = snapshot.Source |> Option.defaultWith (fun () -> failwith "Missing checkout")
+        let current = Client.ClientShell.resolveProjectTaskIn source
+                          { ProjectName = "Demo"; TaskName = "probe" } rt
+        match current with
+        | Ok latest -> Assert.That(latest.WorkingDirectory, Is.EqualTo(Some "other"))
+        | Error error -> Assert.Fail(sprintf "Updated configuration not read: %A" error)
+        let authorization = Client.ClientShell.projectTaskAsRunCommand "Demo" prepared
+        Assert.That(authorization.Args, Is.EqualTo([ "--version" ] :> obj))
+        match Client.ClientShell.runProjectTaskIn source prepared rt with
+        | Ok output ->
+            Assert.That(output.ExitCode, Is.EqualTo(0))
+            Assert.That(output.StdOut.Trim(), Is.Not.Empty)
+        | Error error -> Assert.Fail(sprintf "Prepared task could not run: %A" error)
+    )

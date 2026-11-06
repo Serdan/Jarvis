@@ -453,7 +453,8 @@ let private dispatch (rt: Runtime) (target: ProjectPaths.ProjectTarget option)
         |> serialize'
 
 let private receiveCommandForTarget (rt: Runtime) (target: ProjectPaths.ProjectTarget option)
-                                    (resolved: ProjectPaths.ResolvedProject option) (command: AgentCommand) =
+                                    (resolved: ProjectPaths.ResolvedProject option)
+                                    (preparedTask: ProjectTaskDefinition option) (command: AgentCommand) =
     task {
         let activityId =
             match command with
@@ -466,9 +467,12 @@ let private receiveCommandForTarget (rt: Runtime) (target: ProjectPaths.ProjectT
         let resolution =
             match command with
             | RunProjectTaskCommand cmd ->
-                (sourceOperation resolved
-                    (fun project -> ClientShell.resolveProjectTaskIn project cmd)
-                    (fun () -> ClientShell.resolveProjectTask cmd)) rt
+                (match preparedTask with
+                 | Some task -> Ok task
+                 | None ->
+                     (sourceOperation resolved
+                         (fun project -> ClientShell.resolveProjectTaskIn project cmd)
+                         (fun () -> ClientShell.resolveProjectTask cmd)) rt)
                 |> Result.map (fun task ->
                     let authorizationCommand =
                         ClientShell.projectTaskAsRunCommand cmd.ProjectName task
@@ -529,16 +533,18 @@ let private receiveCommandForTarget (rt: Runtime) (target: ProjectPaths.ProjectT
     }
 
 let receiveCommand (rt: Runtime) (command: AgentCommand) =
-    receiveCommandForTarget rt None None command
+    receiveCommandForTarget rt None None None command
 
 let private receiveCommandWithTypedInstructions (rt: Runtime)
                                                 (target: ProjectPaths.ProjectTarget option) command =
     task {
-        match AgentInstructions.prepareWithTarget rt target command with
+        match AgentInstructions.prepareOperationWithTarget rt target command with
         | Error error -> return Error error, []
-        | Ok (instructions, resolved) ->
-            let! response = receiveCommandForTarget rt target resolved command
-            return response, instructions @ AgentInstructions.writeWarningsForContext rt resolved command response
+        | Ok prepared ->
+            let! response =
+                receiveCommandForTarget rt target prepared.Source prepared.ProjectTask command
+            return response, prepared.Instructions
+                             @ AgentInstructions.writeWarningsForContext rt prepared.Source command response
     }
 
 let receiveCommandWithInstructions (rt: Runtime) command =

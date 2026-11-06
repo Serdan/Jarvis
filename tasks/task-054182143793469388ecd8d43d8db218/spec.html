@@ -1,0 +1,19 @@
+<h1>Expose unread notification counts by kind in Jarvis tool responses</h1>
+<h2>Goal</h2><p>Make pending agent notifications discoverable during ordinary Jarvis tool use, without requiring explicit inbox polling and without repeating notification contents. This must support the forthcoming structured challenges workflow.</p>
+<h2>Requirements</h2>
+<ul>
+<li>Include an optional, compact <code>notifications</code> summary on agent-attributed tool responses, keyed by notification kind with unread counts, e.g. <code>{"notifications":{"message":2,"challenge":1}}</code>. Omit zero-count kinds and omit the summary entirely when there are no unread notifications.</li>
+<li>Scope counts to the actual recipient agent (and the appropriate project/ledger), never all agents or the whole project. Cross-project notification routing must count only where the destination recipient receives the notification.</li>
+<li>Introduce an extensible, well-defined notification-kind model. Separate the kind (broad workflow such as <code>message</code>, <code>challenge</code>) from a more specific event type (e.g. challenge satisfied or blocked). Do not introduce priority semantics. Preserve compatibility with existing agent-to-agent messages.</li>
+<li>Integrate with challenges so that challenge lifecycle events can be surfaced under <code>challenge</code> when that functionality is present, routing each notification to the agent expected to act next. Do not conflate challenge issuer, owner and satisfier.</li>
+<li>Implement summary enrichment in a shared response path rather than per-tool boilerplate, but ensure error handling, identity, permissions, serialization and transport layering are correct. Do not make result payloads ambiguous or accidentally add duplicate envelopes.</li>
+<li>Unacknowledged counts must reflect durable ledger state and existing acknowledgment operations. Avoid redundant payloads or expensive per-response ledger retrieval. Use a sound cache/index or other efficient approach if necessary, with correct invalidation across writes, acknowledgments, devices and restarts.</li>
+<li>Do not change agent state, auto-acknowledge notifications or require immediate inbox processing. Preserve existing notification content retrieval and acknowledgement behavior.</li>
+</ul>
+<h2>Design and acceptance</h2>
+<ul>
+<li>Inspect current MCP response envelope, agent attribution and notification ledger implementation first; document the selected schema and compatibility/migration strategy, including whether client/server coordinated deployment is necessary.</li>
+<li>Cover responses with no unread notifications, mixed kinds, new notification arrival, acknowledgement, agent/project isolation, cross-project messages, challenge events and error paths.</li>
+<li>Test that ordinary responses remain bounded and do not duplicate AGENTS.md or notification contents. Add focused automated tests and update protocol/schema/docs as appropriate.</li>
+<li>Keep the design minimal and extensible; kinds should represent actionable workflow categories, not one enum member per individual event.</li>
+</ul>

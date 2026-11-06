@@ -1049,7 +1049,7 @@ module TaskApi =
                     // Preserve historical session metadata only in lifecycle
                     // journals; it is not used to establish agent identity.
                     let journalCommand =
-                        if List.contains cmd.Action [ "BeginAttempt"; "YieldAgent"; "CheckpointAttempt"; "CompleteAgentWork" ] then cmd
+                        if List.contains cmd.Action [ "BeginAttempt"; "ResumeAgent"; "YieldAgent"; "CheckpointAttempt"; "CompleteAgentWork" ] then cmd
                         else { cmd with SessionId = "" }
                     let result =
                         PendingIntentJournal.executeLedgerWrite binding operationId "TaskWrite" journalCommand (fun () ->
@@ -1150,6 +1150,12 @@ module TaskApi =
                                 ReviewWorkflow.ReviewWorkflow.yieldAgentWithSession binding operationId
                                     cmd.TaskId cmd.ActorId cmd.ExpectedVersion cmd.ExpectedAgentVersion
                                     cmd.AssignmentGeneration cmd.Summary cmd.NextAction cmd.SessionId |> mapError
+                            // Backward compatibility for operations already persisted in
+                            // protocol 3.57 pending journals; no public resume tool exists.
+                            | "ResumeAgent" ->
+                                ReviewWorkflow.ReviewWorkflow.resumeAgentWithSession binding operationId
+                                    cmd.TaskId cmd.ActorId cmd.ExpectedVersion cmd.ExpectedAgentVersion
+                                    cmd.AssignmentGeneration cmd.SessionId |> mapError
                             | "CompleteAgentWork" ->
                                 ReviewWorkflow.ReviewWorkflow.completeAgentWorkWithSession binding operationId
                                     cmd.TaskId cmd.ActorId cmd.ExpectedVersion cmd.ExpectedAgentVersion

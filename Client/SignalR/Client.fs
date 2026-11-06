@@ -61,8 +61,9 @@ let private activatesAgent (agentId: string) command =
         cmd.ActorId = agentId
         && List.contains cmd.Action
             [ "CheckpointAttempt"; "YieldAgent"; "CompleteAgentWork"
-              "AcknowledgeFeedback"; "BindAttemptSource"; "RebindAttemptSource"
-              "BindReviewBase"; "SetAttemptSource"; "SubmitIntegration" ]
+              "AcknowledgeFeedback"; "AcknowledgeNotification"; "NotifyAgent"
+              "BindAttemptSource"; "RebindAttemptSource"; "BindReviewBase"
+              "SetAttemptSource"; "SubmitIntegration"; "CompleteIntegration" ]
     | TaskReadCommand cmd ->
         String.IsNullOrWhiteSpace cmd.AgentId || cmd.AgentId = agentId
     | LedgerWriteCommand _ | ReviewWriteCommand _ -> false

@@ -85,3 +85,12 @@ Agent-independent bootstrap and agent registration remain possible without a pre
 ## Implementation guidance
 
 Favor one shared agent-identity extraction/propagation design with well-defined exceptions over hand-maintained duplication. Avoid adding a second identity system. Complete and review the API inventory before modifying tool signatures. Prioritize optimal maintainability over quick backwards-compatible scaffolding.
+
+## Follow-up: implicit activation in protocol 3.58
+
+The 3.57 API references to `resume_agent` above are historical. Protocol
+3.58 removes its public MCP tool, starts Ready assignments automatically
+on ordinary agent-attributed activity, and introduces an administrative
+`set_agent_state` tool with the enum `NeedsWork | Parked` restricted to
+unassigned agents. The legacy wire action remains for replaying pending
+ledger operations written by older clients. See `AgentCommandSurface.md`.

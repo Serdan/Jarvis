@@ -271,7 +271,17 @@ idempotent on retry. The message remains in Git history after acknowledgment.
 
 The client **Agents** screen reads only explicitly bound canonical ledgers and shows the persisted agent state and transition time; it never scans source-side task files. Unbound projects do not contribute invented agent state, while bound-ledger read failures are surfaced as errors.
 
-**Current protocol (3.57):** Internal transports are `TaskRead`, `TaskWrite`, `LedgerRead`, `LedgerWrite`, `ReviewRead` and `ReviewWrite`. Public MCP tools retain existing unprefixed names. The client module is `OrchestrationApi`; there are no parallel versioned orchestration handlers. This wire rename requires a coordinated client/server deployment after explicit operator approval. Existing checkout trust bindings remain in `ledger-v2/`, and pending journals written by previous clients remain recognizable. Archived review and migration documents retain their historical version terminology.
+**Current protocol (3.58):** Internal transports are `TaskRead`, `TaskWrite`, `LedgerRead`, `LedgerWrite`, `ReviewRead` and `ReviewWrite`. Public MCP tools retain existing unprefixed names. The client module is `OrchestrationApi`; there are no parallel versioned orchestration handlers. This wire rename requires a coordinated client/server deployment after explicit operator approval. Existing checkout trust bindings remain in `ledger-v2/`, and pending journals written by previous clients remain recognizable. Archived review and migration documents retain their historical version terminology.
+
+**Automatic agent activation (3.58):** Assigned Ready agents start
+Working on their first ordinary tool call (typically `agent_inbox`), without
+calling `resume_agent`. The Working clock is not reset on later calls.
+`resume_agent` and `park_agent` are removed from the public MCP catalog;
+`set_agent_state` provides enum-backed administrative transitions between
+NeedsWork and Parked for unassigned agents. Historical pending ResumeAgent
+intents remain replayable internally. See
+[Agent command surface](docs/AgentCommandSurface.md). Coordinated
+client/server deployment and refreshed MCP schemas are required.
 
 **Agent identity migration (3.57):** Agent-associated MCP operations use the
 required `agentId` argument, replacing public `ownerId`, `actorId`,

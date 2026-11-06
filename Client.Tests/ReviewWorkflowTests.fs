@@ -1570,7 +1570,7 @@ type ReviewWorkflowTests() =
                     Client.OrchestrationApi.TaskApi.write cmd ctx
                     |> function
                         | Ok value -> value
-                        | Error error -> failwithf "Task API failed: %A" error
+                        | Error error -> failwithf "Task API %s failed: %A" cmd.Action error
                 let taskId = "751"
                 let html = "<h1>Full task specification</h1><p>Acceptance: one review</p>"
                 let createCommand =
@@ -1727,8 +1727,8 @@ type ReviewWorkflowTests() =
                           AssignmentGeneration = 1; Summary = "Finished the implementation" } |> ignore
                 let finished = ReviewWorkflow.getAgentInbox first "Owner" |> success
                 Assert.That(finished.Agent.State, Is.EqualTo("NeedsWork"))
-                run { template "ParkAgent" taskId with
-                          ExpectedAgentVersion = 6; Reason = "No other work" } |> ignore
+                run { template "SetAgentState" taskId with
+                          Summary = "Parked"; ExpectedAgentVersion = 6; Reason = "No other work" } |> ignore
                 let parked = ReviewWorkflow.getAgentInbox first "Owner" |> success
                 Assert.That(parked.Agent.State, Is.EqualTo("Parked"))
                 Assert.That(parked.Focused.IsNone, Is.True)
@@ -2019,6 +2019,111 @@ type ReviewWorkflowTests() =
             Assert.That(newer.Count, Is.GreaterThan(records.Count))
             Assert.That(newer |> Map.exists (fun key _ -> key.StartsWith("notifications/")), Is.True)
             Assert.That((LedgerStore.readDashboardRecordsAt first initial |> success) = records, Is.True))
+
+    [<Test>]
+    member _.ImplicitActivityStartsReadyAssignmentAndPreservesWorkingClock() =
+        withFixture (fun one _ first second _ _ _ _ ->
+            let taskId = "implicit-inbox-start"
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Implicit inbox"
+            |> success |> ignore
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner"
+            |> success |> ignore
+            let context = GitCommandTests.TestContext(Path.GetDirectoryName one)
+            let configPath = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
+            try
+                let head = (LedgerStore.fetch first |> success).Commit
+                Client.OrchestrationApi.LedgerBindingConfig.bindExisting
+                    "owner" context first.ProjectId first.LedgerId first.Epoch
+                    first.RemoteName first.ApprovedFetchUrl first.ApprovedPushUrl head true
+                |> success |> ignore
+                let rt = Client.Runtime(Path.GetDirectoryName one, Client.ConsoleTui.ConsoleTui(), Client.PartialTrust)
+                let cmdData : Common.TaskReadCommand =
+                    { ProjectName = "owner"; AgentId = "Owner"; Action = "AgentInbox"
+                      TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L
+                      Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null }
+                let payload = System.Text.Json.JsonSerializer.Serialize<Common.AgentCommand>(Common.TaskReadCommand cmdData)
+                let invoke () =
+                    Client.SignalR.Client.processIncomingCommand rt payload "Owner"
+                    |> Async.AwaitTask |> Async.RunSynchronously
+                let _, initialResult, _ = invoke()
+                match initialResult with
+                | Ok _ -> ()
+                | Error error -> Assert.Fail(sprintf "Agent inbox should succeed: %A" error)
+                let agent = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
+                Assert.That(agent.State, Is.EqualTo("Working"))
+                Assert.That(agent.ActiveSessionId, Is.Null)
+                Assert.That(agent.WorkingTurnStartedAtUtc, Is.Not.Null)
+                let _, _, startedAttempt = ReviewWorkflow.getTask second taskId |> success
+                Assert.That(startedAttempt.Value.Phase, Is.EqualTo("Started"))
+
+                let _, repeatResult, _ = invoke()
+                match repeatResult with
+                | Ok _ -> ()
+                | Error error -> Assert.Fail(sprintf "Second inbox should succeed: %A" error)
+                let again = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
+                Assert.That(again.Version, Is.EqualTo(agent.Version))
+                Assert.That(again.WorkingTurnStartedAtUtc, Is.EqualTo(agent.WorkingTurnStartedAtUtc))
+
+                // Reaching the inbox for a registered but unassigned agent
+                // must never fabricate an assignment or Working state.
+                let other = { cmdData with AgentId = "Reviewer" }
+                let otherPayload =
+                    System.Text.Json.JsonSerializer.Serialize<Common.AgentCommand>(Common.TaskReadCommand other)
+                let _, otherResult, _ =
+                    Client.SignalR.Client.processIncomingCommand rt otherPayload "Reviewer"
+                    |> Async.AwaitTask |> Async.RunSynchronously
+                match otherResult with
+                | Ok _ -> ()
+                | Error error -> Assert.Fail(sprintf "Unassigned agent inbox should succeed: %A" error)
+                let reviewer = (ReviewWorkflow.getAgentInbox second "Reviewer" |> success).Agent
+                Assert.That(reviewer.State, Is.Not.EqualTo("Working"))
+            finally
+                if File.Exists configPath then File.Delete configPath)
+
+    [<Test>]
+    member _.ImplicitReadyActivationHasOneWinnerAcrossConcurrentCalls() =
+        withFixture (fun _ _ first second _ _ _ _ ->
+            let taskId = "implicit-concurrent"
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Concurrent activation" |> success |> ignore
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner" |> success |> ignore
+            let results =
+                [| for _ in 1..3 ->
+                    System.Threading.Tasks.Task.Run(fun () ->
+                        ReviewWorkflow.activateReadyAgent first (Guid.NewGuid()) taskId "Owner") |]
+            System.Threading.Tasks.Task.WaitAll(results |> Array.map (fun task -> task :> System.Threading.Tasks.Task))
+            let successes = results |> Array.filter (fun task -> (match task.Result with Ok _ -> true | Error _ -> false))
+            Assert.That(successes.Length, Is.EqualTo(1))
+            let agent = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
+            Assert.That(agent.State, Is.EqualTo("Working"))
+            Assert.That(agent.Version, Is.EqualTo(3)))
+
+    [<Test>]
+    member _.AdministrativeStateCannotInterruptAssignments() =
+        withFixture (fun _ _ first second _ _ _ _ ->
+            let initial = (ReviewWorkflow.getAgentInbox first "Owner" |> success).Agent
+            ReviewWorkflow.setAgentAdministrativeStateAs first "AuthenticatedUser" (Guid.NewGuid())
+                "Owner" "Parked" initial.Version "Maintenance"
+            |> success |> ignore
+            let parked = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
+            Assert.That(parked.State, Is.EqualTo("Parked"))
+            ReviewWorkflow.setAgentAdministrativeStateAs first "AuthenticatedUser" (Guid.NewGuid())
+                "Owner" "NeedsWork" parked.Version "Available again"
+            |> success |> ignore
+            let idle = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
+            Assert.That(idle.State, Is.EqualTo("NeedsWork"))
+            match ReviewWorkflow.setAgentAdministrativeStateAs first "AuthenticatedUser" (Guid.NewGuid())
+                    "Owner" "Working" idle.Version "Invalid administrative jump" with
+            | Error(InvalidBinding _) -> ()
+            | other -> Assert.Fail(sprintf "Administrative Working must be rejected: %A" other)
+            let taskId = "administrative-active"
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Assignment" |> success |> ignore
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner"
+            |> success |> ignore
+            let ready = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
+            match ReviewWorkflow.setAgentAdministrativeStateAs first "AuthenticatedUser" (Guid.NewGuid())
+                    "Owner" "Parked" ready.Version "Cannot interrupt assignment" with
+            | Error(StaleEntityVersion _) -> ()
+            | other -> Assert.Fail(sprintf "Cannot park assigned agent: %A" other))
 
     [<Test>]
     member _.LedgerBindingNeedsExplicitTrustAndPersistsVerifiedHead() =

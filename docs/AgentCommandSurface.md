@@ -8,6 +8,35 @@ Jarvis should not try to be a complete coding-agent runtime. Its purpose is to e
 
 Project-scoped operations automatically carry applicable AGENTS.md guidance from the local workspace and project ancestry. The client-to-server AgentCommandResponse envelope adds an ordered Instructions array of Scope, Path, Sha256, and Content; existing Result and Error semantics remain intact. The MCP server presents each applicable document as a distinct labeled text block before the ordinary tool result. See [AgentInstructions.md](AgentInstructions.md) and [AgentCommandResponse.schema.json](AgentCommandResponse.schema.json).
 
+## Implicit agent activation (protocol 3.58)
+
+An agent with a Ready assignment transitions to Working on its next ordinary
+agent-attributed MCP command. `agent_inbox(projectName, agentId)` is the usual
+first call: it observes the current assignment, atomically starts or resumes
+the matching attempt, then returns the refreshed inbox. Other ordinary
+project/tool activity also activates a Ready assignment when the client's
+agent-state cache recognizes it; inbox always refreshes that cache first.
+Concurrent starts use canonical Git-ledger version checks. An already Working
+agent does not restart its Working clock on subsequent calls. Unassigned agents
+remain unassigned. No provider conversation ID is required.
+
+The public `resume_agent` method is removed. The internal legacy ResumeAgent
+wire action remains readable for idempotent replay of pending protocol-3.57
+operations; it is not exposed as an MCP tool.
+
+Administrative `set_agent_state(projectName, agentId, targetAgentId, state,
+expectedAgentVersion, reason)` uses a typed enum with `NeedsWork` and
+`Parked`. It may change only **unassigned** agents and requires an exact
+current version and a reason. Direct writes to assigned Ready or Working
+states are rejected: assignment issuance owns Ready, and agent activity
+owns Working. Ordinary `yield_agent` and `complete_agent_work` still manage
+assigned-agent transitions.
+
+Because this removes public tools and introduces a new enum parameter,
+**protocol 3.58 requires a coordinated client/server release and a refresh
+of the connected MCP tool catalog**. Do not deploy without explicit operator
+authorization.
+
 ## Explicit agent labels
 
 Agent-related MCP operations use **`agentId`** consistently; this replaces

@@ -241,10 +241,10 @@ let ``sessionless MCP receive updates Seen for successful and failed agent comma
             let updated = store.LoadAgentSeen() |> Map.ofList
             Assert.That(updated.ContainsKey "Project1::Other Agent", Is.True)
 
-            // A failed ResumeAgent also counts as observed agent activity,
+            // A failed agent action also counts as observed agent activity,
             // despite the absence of provider session metadata or a bound ledger.
             let resume : TaskWriteCommand =
-                { ProjectName = "Project1"; Action = "ResumeAgent"
+                { ProjectName = "Project1"; Action = "CheckpointAttempt"
                   OperationId = Guid.NewGuid().ToString("D")
                   TaskId = "missing-task"; AttemptId = ""; ActorId = "Resume Agent"; OwnerId = ""
                   Title = ""; Html = ""; ExpectedVersion = 0
@@ -257,7 +257,7 @@ let ``sessionless MCP receive updates Seen for successful and failed agent comma
                 Client.SignalR.Client.processIncomingCommand runtime (JsonSerializer.Serialize<AgentCommand>(TaskWriteCommand resume)) "Resume Agent"
             match resumeResult with
             | Error _ -> ()
-            | Ok _ -> Assert.Fail("Resume without a bound ledger should fail")
+            | Ok _ -> Assert.Fail("Checkpoint without a bound ledger should fail")
             let observed = store.LoadAgentSeen() |> Map.ofList
             Assert.That(observed.ContainsKey "Project1::Resume Agent", Is.True)
         finally

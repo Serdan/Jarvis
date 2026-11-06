@@ -97,7 +97,12 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
             | Some _ ->
                 setActions (actions |> List.map (fun a ->
                     if a.Id = id && a.Status = "running" then
-                        if a.RepeatEverySeconds > 0 then
+                        if effectiveStatus = "suspended" then
+                            // A provider UI contract failure needs inspection, not another
+                            // scheduled attempt against the same broken selector.
+                            { a with Status = "suspended"; RegistrationId = registrationId
+                                     Error = error; UpdatedAtUtc = clock() }
+                        elif a.RepeatEverySeconds > 0 then
                             let current = clock()
                             let seconds = float a.RepeatEverySeconds
                             let elapsed = max 0.0 (current - a.DueAtUtc).TotalSeconds
@@ -275,7 +280,8 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
                                 | Ok registrationId -> update entry.Id "completed" registrationId ""
                                 | Error (registrationId, reason) ->
                                     let status =
-                                        if reason.Contains("OutcomeUnknown", StringComparison.OrdinalIgnoreCase) then "outcomeUnknown"
+                                        if reason.StartsWith("UiIncompatible:", StringComparison.Ordinal) then "suspended"
+                                        elif reason.Contains("OutcomeUnknown", StringComparison.OrdinalIgnoreCase) then "outcomeUnknown"
                                         else "failed"
                                     update entry.Id status registrationId
                                         (if reason.Length > 250 then reason.Substring(0, 250) else reason)

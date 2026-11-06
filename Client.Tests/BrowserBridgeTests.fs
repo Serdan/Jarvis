@@ -325,6 +325,7 @@ let compositeLaunchRejectsInvalidInputsBeforeOpeningTab () = task {
 
 [<TestCase("notSubmitted", true)>]
 [<TestCase("outcomeUnknown", false)>]
+[<TestCase("uiIncompatible", false)>]
 let compositeLaunchKeepsUncertainTabButClosesDefinitiveFailure (scriptStatus: string, shouldClose: bool) = task {
     let port = findPort()
     use bridge = new BrowserBridge.Service(port, "test-secret")
@@ -346,7 +347,9 @@ let compositeLaunchKeepsUncertainTabButClosesDefinitiveFailure (scriptStatus: st
         version = 2; kind = "result"; requestId = property executeFrame "requestId"
         connectionId = connectionId; registrationId = "created-tab-02"
         registrationGeneration = 1; status = "completed"
-        result = {| status = scriptStatus |}
+        result = {| status = scriptStatus; stage = "modeSelection"; reason = "ModeToggleUnavailable"
+                    diagnostics = {| chatLabels = 0; editableTextboxes = 1;
+                                     documentReadyState = "complete" |} |}
     |}))
     if shouldClose then
         let! closeFrame = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
@@ -363,6 +366,11 @@ let compositeLaunchKeepsUncertainTabButClosesDefinitiveFailure (scriptStatus: st
         Assert.That(response, Does.Contain("closed"))
     | Error (registrationId, reason) when not shouldClose ->
         Assert.That(registrationId, Is.EqualTo("created-tab-02"))
-        Assert.That(reason, Does.Contain("OutcomeUnknown"))
+        if scriptStatus = "uiIncompatible" then
+            Assert.That(reason, Does.Contain("UiIncompatible:modeSelection:ModeToggleUnavailable"))
+            Assert.That(reason, Does.Contain("chatLabels=0"))
+            Assert.That(reason, Does.Contain("editableTextboxes=1"))
+        else
+            Assert.That(reason, Does.Contain("OutcomeUnknown"))
     | _ -> Assert.Fail("Unexpected script failure handling")
 }

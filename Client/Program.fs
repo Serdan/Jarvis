@@ -205,7 +205,10 @@ let private runClient args =
                                             action.Url action.Alias action.Active source action.ArgsJson
                                             30000 action.CloseTabAfterExecution
                         match result with
-                        | Error e -> return Error e
+                        | Error (registrationId, reason) ->
+                            if reason.StartsWith("UiIncompatible:", StringComparison.Ordinal) then
+                                tui.Log $"Browser schedule '{action.Id}' suspended: {reason}; inspect tab {registrationId} and update provider script."
+                            return Error(registrationId, reason)
                         | Ok json -> return Ok json
             }
             let store = BrowserSchedules.Service(BrowserSchedules.defaultPath(), executeAction)

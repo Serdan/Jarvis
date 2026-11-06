@@ -501,6 +501,49 @@ let runInNewTab (bridge: Service) (windowRegistration: string) (url: string)
                                 | _ -> "completed"
                             if status = "outcomeUnknown" then
                                 return Error(registrationId, "OutcomeUnknown: page submission was not confirmed")
+                            elif status = "uiIncompatible" then
+                                // Provider scripts supply a bounded, non-sensitive stage and
+                                // reason. Preserve the created tab for manual DOM inspection.
+                                let safeField (name: string) =
+                                    match payload.TryGetProperty(name) with
+                                    | true, field when field.ValueKind = JsonValueKind.String ->
+                                        field.GetString()
+                                        |> Seq.filter (fun c -> Char.IsLetterOrDigit(c) || c = '-' || c = '_')
+                                        |> Seq.truncate 64
+                                        |> Seq.toArray
+                                        |> String
+                                    | _ -> "unknown"
+                                // Keep generic diagnostics numeric and bounded: no DOM,
+                                // draft text, HTML, or arbitrary provider strings.
+                                let diagnostics =
+                                    match payload.TryGetProperty("diagnostics") with
+                                    | true, data when data.ValueKind = JsonValueKind.Object ->
+                                        data.EnumerateObject()
+                                        |> Seq.truncate 12
+                                        |> Seq.choose (fun pair ->
+                                            let key = pair.Name
+                                            if key.Length > 32 ||
+                                               not (key |> Seq.forall (fun c -> Char.IsLetterOrDigit(c) || c = '_')) then None
+                                            else
+                                                match pair.Value.ValueKind with
+                                                | JsonValueKind.Number ->
+                                                    match pair.Value.TryGetInt32() with
+                                                    | true, n when n >= 0 && n <= 10000 ->
+                                                        Some(key + "=" + string n)
+                                                    | _ -> None
+                                                | JsonValueKind.True -> Some(key + "=true")
+                                                | JsonValueKind.False -> Some(key + "=false")
+                                                | JsonValueKind.String when key = "documentReadyState" ->
+                                                    match pair.Value.GetString() with
+                                                    | "loading" | "interactive" | "complete" as value ->
+                                                        Some(key + "=" + value)
+                                                    | _ -> None
+                                                | _ -> None)
+                                        |> String.concat ","
+                                    | _ -> ""
+                                let summary = "UiIncompatible:" + safeField "stage" + ":" + safeField "reason"
+                                let details = if diagnostics = "" then summary else summary + ";" + diagnostics
+                                return Error(registrationId, details)
                             else
                                 let mutable cleanup = "retained"
                                 if closeAfterExecution then

@@ -22,6 +22,26 @@ async function execute(args) {
     }
     return predicate();
   };
+  // No arbitrary DOM, innerHTML, draft text, or cookies leave the page.
+  // Only bounded, structural selector observations useful for repairing the script.
+  const selectorCounts = () => ({
+    modeButtons: document.querySelectorAll('button[type="button"][aria-pressed]').length,
+    chatLabels: Array.from(document.querySelectorAll('button[type="button"][aria-pressed]'))
+      .filter(button => button.textContent.trim() === "Chat").length,
+    workLabels: Array.from(document.querySelectorAll('button[type="button"][aria-pressed]'))
+      .filter(button => button.textContent.trim() === "Work").length,
+    composers: document.querySelectorAll('[data-composer-input-layout] [contenteditable="true"][role="textbox"]').length,
+    editableTextboxes: document.querySelectorAll('[contenteditable="true"][role="textbox"]').length,
+    sendButtons: document.querySelectorAll('button[type="submit"][aria-label="Send"]').length
+  });
+  const incompatible = (stage, reason) => ({
+    status: "uiIncompatible",
+    stage,
+    reason,
+    diagnostics: { documentReadyState: document.readyState || "unknown", ...selectorCounts() }
+  });
+  let sendAttempted = false;
+  try {
   // ChatGPT can remember Work mode even when opening the new-chat homepage.
   // Resolve by visible label and aria-pressed, not generated classes or DOM order.
   const modeButton = name => {
@@ -34,7 +54,7 @@ async function execute(args) {
     const work = modeButton("Work");
     return chat && work ? { chat, work } : null;
   });
-  if (!modes) return { status: "notSubmitted", reason: "ModeToggleUnavailable" };
+  if (!modes) return incompatible("modeSelection", "ModeToggleUnavailable");
   if (modes.chat.getAttribute("aria-pressed") !== "true") {
     modes.chat.click();
   }
@@ -44,14 +64,14 @@ async function execute(args) {
     return chat?.getAttribute("aria-pressed") === "true" &&
       work?.getAttribute("aria-pressed") === "false";
   });
-  if (!chatReady) return { status: "notSubmitted", reason: "ChatModeUnavailable" };
+  if (!chatReady) return incompatible("modeSelection", "ChatModeUnavailable");
 
   const composerSelector = '[data-composer-input-layout] [contenteditable="true"][role="textbox"]';
   const sendSelector = 'button[type="submit"][aria-label="Send"]:not(:disabled)';
   const initialUrl = location.href;
   const initialTurns = document.querySelectorAll('[data-message-author-role="user"]').length;
   const composer = await until(() => document.querySelector(composerSelector));
-  if (!composer) return { status: "notSubmitted", reason: "ComposerUnavailable" };
+  if (!composer) return incompatible("composer", "ComposerUnavailable");
   const readEditor = () => composer.innerText.replace(/\r\n/g, "\n").replace(/\u00a0/g, " ");
   if (readEditor().trim()) return { status: "notSubmitted", reason: "ExistingDraft" };
   if (document.querySelector(sendSelector)) return { status: "notSubmitted", reason: "UnexpectedSendState" };
@@ -60,15 +80,16 @@ async function execute(args) {
   // ProseMirror must observe the editing operation. Setting textContent bypasses its state.
   const inserted = document.execCommand("insertText", false, prompt);
   if (!inserted || readEditor() !== prompt.replace(/\r\n/g, "\n")) {
-    return { status: "notSubmitted", reason: "TextInsertionFailed" };
+    return incompatible("composer", "TextInsertionFailed");
   }
   const send = await until(() => document.querySelector(sendSelector));
-  if (!send) return { status: "notSubmitted", reason: "SendUnavailable" };
+  if (!send) return incompatible("submitControl", "SendUnavailable");
   if (readEditor() !== prompt.replace(/\r\n/g, "\n")) {
-    return { status: "notSubmitted", reason: "ComposerChanged" };
+    return incompatible("composer", "ComposerChanged");
   }
   // Once this click is attempted the effect is non-idempotent. Never try again.
   try {
+    sendAttempted = true;
     send.click();
   } catch {
     return { status: "outcomeUnknown", reason: "SendClickUncertain" };
@@ -108,4 +129,11 @@ async function execute(args) {
     ],
     submittedAtUtc: new Date().toISOString()
   };
+  } catch {
+    // Unexpected DOM exceptions are still provider compatibility failures if
+    // we have not attempted Send; after Send, the outcome is unknowable.
+    return sendAttempted
+      ? { status: "outcomeUnknown", reason: "UnexpectedUiErrorAfterSend" }
+      : incompatible("unexpected", "UnexpectedUiError");
+  }
 }

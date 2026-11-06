@@ -38,7 +38,7 @@ At due time:
 2. Read the current project script and wait briefly for the extension to reconnect.
 3. Call the same underlying open → ready → execute → optional close service as the immediate command.
 4. Store the latest registration ID, submitted conversation URL if supplied by script, cleanup result, outcome and update time.
-5. For one-shot actions, finish as completed/failed/outcomeUnknown. For recurring actions, advance the next due time to the next **future** interval regardless of that occurrence's outcome.
+5. For one-shot actions, finish as completed/failed/outcomeUnknown or `suspended` (provider UI incompatibility). For recurring actions, advance to the next **future** interval after ordinary outcomes, but enter `suspended` immediately on a `UiIncompatible:` result. No further occurrences launch until the schedule is explicitly replaced.
 
 After a client restart, a running one-shot is marked `outcomeUnknown`, **never replayed**. A running recurring occurrence is marked uncertain and skipped; the next future interval remains pending. Missed intervals are skipped rather than accumulated. There is no watchdog, strict singleton lease, or separate orchestration engine. The next orchestrator should read Jarvis activity and voluntarily exit if another is active.
 
@@ -50,7 +50,7 @@ The user explicitly registers a browser **window** from the Edge/Chromium extens
 
 Window handles are tied to their actual browser session. After a browser restart, window closure or revocation, the user must re-register/rebind the target. Old schedules that lack a `windowRegistration` are flagged for explicit reconfiguration, not silently retargeted to another window. The legacy manually registered same-origin tab anchor is no longer required.
 
-`closeTabAfterExecution` defaults false for generic compatibility. The ChatGPT launcher convention supplies true: after a confirmed submission the client closes **only the new agent-created tab**. If it cannot confirm whether the page submitted its message, no automatic replay occurs and the tab is normally retained for inspection. A cleanup error after successful submission does not convert the submission into a failure.
+`closeTabAfterExecution` defaults false for generic compatibility. The ChatGPT launcher convention supplies true: after a confirmed submission the client closes **only the new agent-created tab**. If it cannot confirm whether the page submitted its message, no automatic replay occurs and the tab is normally retained for inspection. A provider UI mismatch also retains its tab, reports the registration ID and sanitized structural observations, and suspends a recurring schedule until reconfigured. A cleanup error after successful submission does not convert the submission into a failure.
 
 ## Persistence and privacy
 

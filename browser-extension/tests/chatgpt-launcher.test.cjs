@@ -42,7 +42,9 @@ function harness(options = {}) {
     userTurns++;
   }};
   const document = {
+    readyState: "complete",
     execCommand(command, _, value) {
+      if (options.throwOnInsert) throw new Error("ProseMirror changed unexpectedly");
       if (!focused || command !== "insertText") return false;
       content = options.insertWrong ? "wrong" : value;
       return true;
@@ -54,6 +56,15 @@ function harness(options = {}) {
       return null;
     },
     querySelectorAll(selector) {
+      if (selector === '[data-composer-input-layout] [contenteditable="true"][role="textbox"]') {
+        return options.noComposer ? [] : [editor];
+      }
+      if (selector === '[contenteditable="true"][role="textbox"]') {
+        return options.noComposer ? [] : [editor];
+      }
+      if (selector === 'button[type="submit"][aria-label="Send"]') {
+        return options.noSend ? [] : [send];
+      }
       if (selector === 'button[type="button"][aria-pressed]') {
         return options.noModeToggle ? [] : [chatMode, workMode];
       }
@@ -90,7 +101,9 @@ test("does not overwrite a restored draft", async () => {
 test("does not click Send if editor rejects insertion", async () => {
   const h = harness({ insertWrong: true });
   const result = await h.run();
-  assert.equal(result.status, "notSubmitted");
+  assert.equal(result.status, "uiIncompatible");
+  assert.equal(result.stage, "composer");
+  assert.equal(result.diagnostics?.documentReadyState, "complete");
   assert.equal(result.reason, "TextInsertionFailed");
   assert.equal(h.clicks, 0);
 });
@@ -106,7 +119,9 @@ test("after clicking, missing acknowledgement is uncertain and never resent", as
 test("missing composer fails before submission", async () => {
   const h = harness({ noComposer: true });
   const result = await h.run();
-  assert.equal(result.status, "notSubmitted");
+  assert.equal(result.status, "uiIncompatible");
+  assert.equal(result.stage, "composer");
+  assert.equal(result.diagnostics?.documentReadyState, "complete");
   assert.equal(result.reason, "ComposerUnavailable");
   assert.equal(h.clicks, 0);
 });
@@ -155,7 +170,9 @@ test("switches Work to Chat before entering the prompt", async () => {
 test("does not submit if Work cannot be switched to Chat", async () => {
   const h = harness({ initialMode: "Work", modeSwitchFails: true, timeoutMs: 125 });
   const result = await h.run();
-  assert.equal(result.status, "notSubmitted");
+  assert.equal(result.status, "uiIncompatible");
+  assert.equal(result.stage, "modeSelection");
+  assert.equal(result.diagnostics?.documentReadyState, "complete");
   assert.equal(result.reason, "ChatModeUnavailable");
   assert.equal(h.clicks, 0);
 });
@@ -163,7 +180,41 @@ test("does not submit if Work cannot be switched to Chat", async () => {
 test("does not submit when mode selection controls are unavailable", async () => {
   const h = harness({ noModeToggle: true, timeoutMs: 125 });
   const result = await h.run();
-  assert.equal(result.status, "notSubmitted");
+  assert.equal(result.status, "uiIncompatible");
+  assert.equal(result.stage, "modeSelection");
+  assert.equal(result.diagnostics?.documentReadyState, "complete");
   assert.equal(result.reason, "ModeToggleUnavailable");
   assert.equal(h.clicks, 0);
+});
+
+test("DOM diagnostics report selector counts, never prompt or raw HTML", async () => {
+  const h = harness({ noModeToggle: true, timeoutMs: 125 });
+  const result = await h.run("SECRET BOOTSTRAP PROMPT");
+  assert.equal(result.status, "uiIncompatible");
+  assert.equal(result.stage, "modeSelection");
+  assert.equal(result.diagnostics.modeButtons, 0);
+  assert.equal(result.diagnostics.chatLabels, 0);
+  assert.equal(result.diagnostics.workLabels, 0);
+  assert.equal(result.diagnostics.documentReadyState, "complete");
+  assert.equal(JSON.stringify(result).includes("SECRET BOOTSTRAP PROMPT"), false);
+  assert.equal(h.clicks, 0);
+});
+
+test("missing Send control is an explicit incompatibility, never a send attempt", async () => {
+  const h = harness({ noSend: true, timeoutMs: 125 });
+  const result = await h.run();
+  assert.equal(result.status, "uiIncompatible");
+  assert.equal(result.stage, "submitControl");
+  assert.equal(result.reason, "SendUnavailable");
+  assert.equal(h.clicks, 0);
+});
+
+test("unexpected pre-send DOM exception returns incompatibility without leaking text", async () => {
+  const h = harness({ throwOnInsert: true });
+  const result = await h.run("PRIVATE PROMPT");
+  assert.equal(result.status, "uiIncompatible");
+  assert.equal(result.reason, "UnexpectedUiError");
+  assert.equal(result.stage, "unexpected");
+  assert.equal(h.clicks, 0);
+  assert.equal(JSON.stringify(result).includes("PRIVATE PROMPT"), false);
 });

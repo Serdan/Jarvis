@@ -104,7 +104,7 @@ Recommended argument contract:
 | `prompt` | Yes | Exact bootstrap text to submit; nonempty, bounded, may contain newlines |
 | `role` / `agentId` / `projectName` | No | Caller-owned metadata for logs/correlation; **not** alternative sources of instructions |
 | `timeoutMs` | No | One overall UI deadline for hydration, insertion, submission confirmation and conversation URL capture (defaults to 13 s; capped at 27 s) |
-| `debug` | No | Opt-in diagnostics; do not leak draft text by default |
+| `debug` | No | Reserved for future diagnostics; the current script always returns only sanitized structural counts on compatibility errors |
 
 Jarvis browser-workflow parameters, **not** ChatGPT script arguments, control `windowRegistration`, `active`, `closeTabAfterExecution`, and device selection. Only **scheduled** calls have delay and repeat interval. An orchestrator normally invokes the immediate workflow, rather than scheduling a zero-delay job.
 
@@ -210,7 +210,8 @@ If success cannot be proven after a possible click, return `outcomeUnknown` with
 ### 5.6 Timeouts and result boundary
 
 The ChatGPT UI script uses one deadline across all UI phases (27 s default, capped at 27 s), fitting the generic bridge's default 30 s execution limit. When overriding bridge timeouts, configure the script's `timeoutMs` lower than the bridge timeout. Distinguish:
-- `notSubmitted`: definitively failed before any possible send.
+- `notSubmitted`: definitively failed before any possible send, unrelated to a missing UI contract (e.g. an existing unsent draft).
+- `uiIncompatible`: the page failed to provide required controls or their expected state, or raised an unexpected pre-send DOM error. No send occurred. Preserve the created tab, report sanitized stage/reason/selector counts, and do not automatically retry.
 - `submitted`: observed accepted turn, regardless of later agent outcome.
 - `outcomeUnknown`: clicked/possibly clicked but acceptance not conclusively observed.
 
@@ -251,7 +252,7 @@ Contract:
 
 The **immediate** generic `BrowserRunInNewTab` command and the delayed scheduler both expose optional `closeTabAfterExecution` (false when omitted for legacy generic callers; **true for this ChatGPT launching convention**) and a debug option to keep the tab open. JarvisClient manages cleanup using the exact registration returned by its own open; the page script never invokes privileged tab/window APIs. Both call paths share the same implementation, not duplicated open/execute/close logic.
 
-**Default launcher behavior:** after confirmed submission and a short, bounded grace period, perform best-effort tab close. For a definitive pre-submit failure, close the owned tab unless a diagnostic flag requests preservation. For an outcome-unknown post-click, **do not auto-resubmit**; prefer retaining the tab for inspection rather than risking interruption of an in-flight submission, with its registration/URL available for manual cleanup. A later safe retention policy may be added only with explicit semantics.
+**Default launcher behavior:** after confirmed submission and a short, bounded grace period, perform best-effort tab close. For a definitive non-compatibility pre-submit failure, close the owned tab; for `uiIncompatible`, preserve it for inspection. A later human may close the retained tab explicitly. For an outcome-unknown post-click, **do not auto-resubmit**; prefer retaining the tab for inspection rather than risking interruption of an in-flight submission, with its registration/URL available for manual cleanup. A later safe retention policy may be added only with explicit semantics.
 
 If close fails after confirmed submission, report `submitted + cleanupFailed` and retain enough metadata to clean up later. Do not change successful submission into a failed/duplicated launch. Normal successful hourly launches must not accumulate toward the 20-tab cap.
 
@@ -288,7 +289,7 @@ Required semantics:
 - Fixed-interval **launch attempts**, not recurring completion claims. `runAfterSeconds` sets first due time. Repeated schedule remains until explicitly canceled/changed.
 - Persistent schedule definition, next due UTC, last attempt ID/outcome/URL and bounded recent history. No database; JarvisClient user-private state file remains the source of scheduling truth.
 - Once due, persist an attempt as claimed before any browser effect. Each occurrence gets a unique attempt ID; completion records whether submission was confirmed and whether cleanup succeeded.
-- On success, failure or uncertain outcome, continue at the **next scheduled interval**, except an explicitly disabled/canceled schedule. Never retry the same uncertain occurrence.
+- On ordinary success, failure or uncertain outcome, continue at the **next scheduled interval** without replaying the same occurrence. If the provider script returns `uiIncompatible`, mark the recurring schedule `suspended` and stop future launches until a human explicitly reconfigures it. Keep the created tab and its registration ID.
 - After client downtime, **skip missed occurrences** and schedule the next future interval; do not launch a backlog of hourly orchestrators. If a due attempt was interrupted, record it as uncertain and advance past it.
 - No overlapping **local dispatches of the same schedule ID**. If an invocation is still running at its next interval, skip that interval instead of queueing another copy.
 - Repeated attempts must target the explicitly selected, **currently registered window**, use fresh tabs with unique/generated tab aliases, and never reuse a previous conversation. If that window was closed/revoked or the browser restarted, fail/report until the user explicitly re-registers/rebinds; do not choose a substitute window.

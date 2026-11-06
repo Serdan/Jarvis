@@ -153,3 +153,33 @@ let recurrenceSkipsMissedIntervalsOnRestart () = task {
     finally
         Directory.Delete(dir, true)
 }
+
+[<Test>]
+let recurringUiIncompatibilitySuspendsUntilExplicitReconfiguration () = task {
+    let dir,path = temp()
+    let mutable clock = DateTimeOffset.UtcNow
+    let mutable calls = 0
+    let action (_:BrowserSchedules.ScheduledAction) = task {
+        calls <- calls + 1
+        return Error("created-tab-xyz", "UiIncompatible:modeSelection:ModeToggleUnavailable")
+    }
+    try
+        use store = new BrowserSchedules.Service(path, action, now=(fun () -> clock), pollMs=25)
+        Assert.That(store.Schedule("recurring", 600, "https://chatgpt.com/", "Scripts",
+            "launch.js", "", "{}", false, windowRegistration="agents",
+            repeatEverySeconds=3600).IsOk, Is.True)
+        store.Start()
+        clock <- clock.AddSeconds(601.)
+        do! awaitStatus (fun () -> status store "recurring" = "suspended")
+        Assert.That(store.List(), Does.Contain("UiIncompatible:modeSelection"))
+        Assert.That(store.List(), Does.Contain("created-tab-xyz"))
+        clock <- clock.AddDays(3.)
+        do! Task.Delay(120)
+        Assert.That(calls, Is.EqualTo(1), "A broken UI should never trigger repeated launches")
+        Assert.That(store.Schedule("recurring", 600, "https://chatgpt.com/", "Scripts",
+            "launch.js", "", "{}", false, windowRegistration="agents",
+            repeatEverySeconds=3600).IsOk, Is.True, "Explicit reconfiguration re-enables schedule")
+        Assert.That(status store "recurring", Is.EqualTo("pending"))
+    finally
+        Directory.Delete(dir, true)
+}

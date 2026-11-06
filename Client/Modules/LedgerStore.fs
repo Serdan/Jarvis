@@ -2,6 +2,7 @@ module Client.LedgerStore
 
 open System
 open System.Diagnostics
+open System.Collections.Concurrent
 open System.IO
 open System.Security.Cryptography
 open System.Text
@@ -868,6 +869,94 @@ module LedgerStore =
                 value.Split('\n', StringSplitOptions.RemoveEmptyEntries)
                 |> Array.filter (fun path -> ledgerPath.IsMatch path && not (path.Contains("..")))
                 |> Array.toList)
+
+
+    // Dashboard records are immutable Git blobs. Reuse their verified content
+    // across refreshes; only changed OIDs need to be read from Git.
+    let private dashboardBlobCache = ConcurrentDictionary<string, string>(StringComparer.Ordinal)
+
+    let private dashboardRecordPath (path: string) =
+        (path.StartsWith("agents/", StringComparison.Ordinal)
+         && path.EndsWith(".json", StringComparison.Ordinal))
+        || (path.StartsWith("notifications/", StringComparison.Ordinal)
+            && path.EndsWith(".json", StringComparison.Ordinal))
+        || (path.StartsWith("tasks/", StringComparison.Ordinal)
+            && (path.EndsWith("/task.json", StringComparison.Ordinal)
+                || path.EndsWith("/review.json", StringComparison.Ordinal)
+                || (Regex.IsMatch(path, "^tasks/[A-Za-z0-9_-]+/attempts/[a-f0-9]{32}[.]json$"))))
+
+    // One immutable tree listing and one cat-file batch (only for previously
+    // unseen blobs), instead of two Git processes per entity.
+    let readDashboardRecordsAt (binding: LedgerBinding) (snapshot: LedgerSnapshot) =
+        let repo = binding.RepositoryPath
+        let treeArgs = [ "ls-tree"; "-r"; "-z"; snapshot.Commit; "--"; "agents"; "tasks"; "notifications" ]
+        match gitRaw repo treeArgs |> requireSuccess "Dashboard tree listing" with
+        | Error error -> Error error
+        | Ok listing ->
+            let records =
+                listing.Split('\000', StringSplitOptions.RemoveEmptyEntries)
+                |> Array.choose (fun entry ->
+                    let separator = entry.IndexOf('\t')
+                    if separator < 0 then None
+                    else
+                        let header = entry.Substring(0, separator).Split(' ')
+                        let path = entry.Substring(separator + 1)
+                        if header.Length = 3 && header[1] = "blob"
+                           && oidPattern.IsMatch(header[2])
+                           && ledgerPath.IsMatch path && dashboardRecordPath path then
+                            Some(path, header[2])
+                        else None)
+            let missing =
+                records
+                |> Array.map snd
+                |> Array.distinct
+                |> Array.filter (fun oid -> not (dashboardBlobCache.ContainsKey oid))
+            let load () =
+                if missing.Length = 0 then Ok ()
+                else
+                    let input = String.concat "\n" missing + "\n"
+                    match execute repo [ "cat-file"; "--batch" ] (Some input) [] true
+                          |> requireSuccess "Dashboard blob batch" with
+                    | Error error -> Error error
+                    | Ok raw ->
+                        try
+                            let bytes = encoding.GetBytes raw
+                            let mutable offset = 0
+                            let readLine () =
+                                let mutable endAt = offset
+                                while endAt < bytes.Length && bytes[endAt] <> 10uy do
+                                    endAt <- endAt + 1
+                                if endAt = bytes.Length then failwith "Truncated Git batch header."
+                                let line = encoding.GetString(bytes, offset, endAt - offset)
+                                offset <- endAt + 1
+                                line
+                            let fetched = ResizeArray<string * string>()
+                            for expected in missing do
+                                let header = (readLine()).Split(' ')
+                                if header.Length <> 3 || header[0] <> expected || header[1] <> "blob" then
+                                    failwith "Unexpected Git batch blob header."
+                                let length =
+                                    match Int32.TryParse(header[2]) with
+                                    | true, n when n >= 0 && n <= bytes.Length - offset -> n
+                                    | _ -> failwith "Invalid Git batch blob length."
+                                let content = encoding.GetString(bytes, offset, length)
+                                offset <- offset + length
+                                if offset >= bytes.Length || bytes[offset] <> 10uy then
+                                    failwith "Missing Git batch blob delimiter."
+                                offset <- offset + 1
+                                fetched.Add(expected, content)
+                            if offset <> bytes.Length then failwith "Unexpected trailing Git batch bytes."
+                            for (oid, content) in fetched do
+                                dashboardBlobCache.TryAdd(oid, content) |> ignore
+                            Ok ()
+                        with ex -> Error(LedgerIntegrityError("Invalid Git dashboard batch: " + ex.Message))
+            match load () with
+            | Error error -> Error error
+            | Ok () ->
+                records
+                |> Array.map (fun (path, oid) -> path, dashboardBlobCache[oid])
+                |> Map.ofArray
+                |> Ok
 
     let verifySourceCommit (binding: LedgerBinding) (sourceRef: string) (commit: string) =
         if not (sourceRef.StartsWith("refs/heads/", StringComparison.Ordinal))

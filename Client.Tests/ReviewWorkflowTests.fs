@@ -1983,8 +1983,42 @@ type ReviewWorkflowTests() =
                 Assert.That(owner.LatestNotification.Value, Does.Contain("Please agree on the new interface"))
                 Assert.That(owner.StateEnteredAt.Value, Is.EqualTo(DateTimeOffset.Parse(canonical.Agent.StateEnteredAtUtc)))
                 Assert.That(Client.AgentView.agentSummary owner, Is.EqualTo("#320 - Ready"))
+                // Same Git commit must reproduce the same dashboard without
+                // rehydrating all immutable historical notification records.
+                let warm = System.Diagnostics.Stopwatch.StartNew()
+                let repeated = Client.AgentDashboard.load context |> success
+                warm.Stop()
+                Assert.That((repeated.Agents = dashboard.Agents), Is.True)
+                TestContext.Progress.WriteLine($"Cached dashboard refresh: {warm.ElapsedMilliseconds} ms")
+                ReviewWorkflow.notifyAgent first (Guid.NewGuid()) "Reviewer" "" "Owner" taskId
+                    "Another pending notification" |> success |> ignore
+                let changed = Client.AgentDashboard.load context |> success
+                let ownerChanged = changed.Agents |> List.find (fun row -> row.Agent = "Owner")
+                Assert.That(ownerChanged.PendingNotifications, Is.EqualTo(2))
+                Assert.That(ownerChanged.LatestNotification.Value, Does.Contain("Another pending notification"))
             finally
                 if File.Exists configPath then File.Delete configPath)
+
+    [<Test>]
+    member _.DashboardBatchMatchesPinnedLedgerReadsAndTracksNewBlobs() =
+        withFixture (fun _ _ first second _ _ _ initTask ->
+            initTask "320"
+            let initial = LedgerStore.fetch first |> success
+            let records = LedgerStore.readDashboardRecordsAt first initial |> success
+            Assert.That(records.Count, Is.GreaterThanOrEqualTo(3))
+            for KeyValue(path, content) in records do
+                let single, _ = LedgerStore.readAt first initial path |> success
+                Assert.That(single, Is.EqualTo(Some content), "Batch disagrees on " + path)
+            let again = LedgerStore.readDashboardRecordsAt first initial |> success
+            Assert.That((again = records), Is.True)
+            ReviewWorkflow.notifyAgent first (Guid.NewGuid()) "Reviewer" "" "Owner" "320"
+                "Batch changed head" |> success |> ignore
+            let updated = LedgerStore.fetch second |> success
+            Assert.That(updated.Commit, Is.Not.EqualTo(initial.Commit))
+            let newer = LedgerStore.readDashboardRecordsAt second updated |> success
+            Assert.That(newer.Count, Is.GreaterThan(records.Count))
+            Assert.That(newer |> Map.exists (fun key _ -> key.StartsWith("notifications/")), Is.True)
+            Assert.That((LedgerStore.readDashboardRecordsAt first initial |> success) = records, Is.True))
 
     [<Test>]
     member _.LedgerBindingNeedsExplicitTrustAndPersistsVerifiedHead() =

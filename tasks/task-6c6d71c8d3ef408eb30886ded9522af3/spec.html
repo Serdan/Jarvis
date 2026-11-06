@@ -1,0 +1,26 @@
+<h1>Global operator agent roster across connected Jarvis clients</h1>
+<h2>Goal</h2>
+<p>The operator's Agents screen must display every known agent across all connected Jarvis clients and their projects, not only agents from the machine displaying the TUI. The server is a disposable aggregation/cache layer, not an authority or durable store.</p>
+<h2>Required behavior</h2>
+<ul>
+<li>On client connection and project availability changes, announce project/ledger identities to the server. Identify projects using the canonical ledger binding identity (project/ledger IDs), not local directory paths or project display names. Deduplicate the same ledger visible from multiple devices. Keep unrelated same-named projects distinct.</li>
+<li>Use clients to load authoritative agent/project snapshots from their existing Git-backed ledgers. The server coordinates and caches normalized snapshots by ledger identity and commit, requesting refreshes when necessary. Prefer one client per ledger for a refresh and allow fallback to another available client. Never require Git checkouts on the server.</li>
+<li>Expose the server's aggregated roster to every connected operator TUI. Preserve existing state, assignment focus, pending notifications, project review counts, filtering, sorting, and readability. Display all projects' agents by default with optional machine filtering. A machine is runtime provenance, not part of agent identity or permanent ownership.</li>
+<li>Track agent-attributed tool activity centrally while the server is running, including last-seen time and most recent device. Keep authoritative ledger state, observed activity and device connectivity distinct. Display an em dash (—) for unknown last seen; do not infer it from agent state or client connection.</li>
+<li>Disconnection must not silently remove previously observed agents: retain cached data and label its freshness/availability appropriately. Show unavailable, stale and refresh-error situations without silently presenting cached data as current. On restart, reconstruct the roster as clients reconnect and supply fresh snapshots; missing historical last-seen data is simply unknown (—).</li>
+<li>Continue honoring the ledger as the only authority for agent/assignment lifecycle and notifications. No persistent server database, durable snapshot store, or additional authority. All server-side state must be disposable and recoverable from clients/ledgers, except transient last-seen data which need not survive restart.</li>
+<li>Handle concurrent client reconnects, overlapping ledgers, refresh errors, stale/out-of-order responses and device disconnects without duplicate rows or regressing newer cached ledger snapshots. Avoid redundant Git fetches by coordinating refreshes per ledger.</li>
+</ul>
+<h2>Implementation considerations</h2>
+<p>Currently Client/Program.fs binds the TUI agent access directly to AgentDashboard.load rt, which enumerates local ProjectBrowser.listGitProjects; ConsoleTui also stores local last-seen data. Introduce a server-side aggregate snapshot and client discovery/refresh transport, reusing existing dashboard parsing and display components where sensible. Do not make the server authoritative for any agent record.</p>
+<h2>Acceptance criteria</h2>
+<ul>
+<li>With clients A and B each hosting distinct project ledgers, the Agents screen on either client shows both sets of agents, correct project state and no duplicates.</li>
+<li>With A and B exposing the same ledger, agents appear once, identified by canonical ledger identity; same-named unrelated ledgers remain separate.</li>
+<li>When a client disconnects, its last known roster remains visible as stale/unavailable; when it reconnects, authoritative data refreshes.</li>
+<li>After server restart, connected clients repopulate the complete roster without any server persistence; last seen displays — until activity is observed.</li>
+<li>Activity from either machine updates the global last-seen timestamp and device association without changing canonical agent state.</li>
+<li>Tests cover concurrency/out-of-order snapshots, duplicate providers, errors/fallback, reconnection, restart reconstruction, filtering, and legacy single-client behavior. Release test suites pass.</li>
+</ul>
+<h2>Out of scope</h2>
+<p>Changing canonical ledger schema, persisting server caches, remote agent execution, automatic agent launching, and deploying without operator authorization.</p>

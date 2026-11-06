@@ -136,33 +136,39 @@ module LedgerBindingConfig =
     // Local binding is intentionally opt-in, separately from the normal Jarvis config.
     // A successful load never lowers its persisted trust anchor, even if another
     // client process observes a later head during our network operation.
-    let load projectName rt =
-        match ProjectPaths.resolveProjectRoot projectName rt with
-        | Error error -> Error error
-        | Ok(FolderPath root) ->
-            let path = pathForRoot root
-            if not (File.Exists path) then
-                Error(Client.ValidationError $" ledger disabled for this checkout. Approved binding required at {path}. No V1 fallback.")
-            else
-                withConfigLock path (fun () ->
-                    readStored path
-                    |> Result.bind (fun stored ->
-                        validStored root stored
-                        |> Result.bind (fun binding ->
-                            LedgerStore.LedgerStore.fetch binding
+    let private loadAtRoot root =
+        let path = pathForRoot root
+        if not (File.Exists path) then
+            Error(Client.ValidationError $" ledger disabled for this checkout. Approved binding required at {path}. No V1 fallback.")
+        else
+            withConfigLock path (fun () ->
+                readStored path
+                |> Result.bind (fun stored ->
+                    validStored root stored
+                    |> Result.bind (fun binding ->
+                        LedgerStore.LedgerStore.fetch binding
+                        |> Result.mapError LedgerErrors.toEffect
+                        |> Result.bind (fun snapshot ->
+                            LedgerStore.LedgerStore.verifyTrustedHead binding
+                                stored.HighestTrustedHead snapshot.Commit
                             |> Result.mapError LedgerErrors.toEffect
-                            |> Result.bind (fun snapshot ->
-                                LedgerStore.LedgerStore.verifyTrustedHead binding
-                                    stored.HighestTrustedHead snapshot.Commit
-                                |> Result.mapError LedgerErrors.toEffect
-                                |> Result.bind (fun () ->
-                                    if stored.HighestTrustedHead = snapshot.Commit then Ok binding
-                                    else
-                                        writeStored path
-                                            { stored with HighestTrustedHead = snapshot.Commit } true
-                                        |> Result.map (fun () -> binding))))))
+                            |> Result.bind (fun () ->
+                                if stored.HighestTrustedHead = snapshot.Commit then Ok binding
+                                else
+                                    writeStored path
+                                        { stored with HighestTrustedHead = snapshot.Commit } true
+                                    |> Result.map (fun () -> binding))))))
 
+    // A source operation already resolved its checkout when loading AGENTS.md.
+    // Reuse that physical root, but perform exactly the same pinned trust-anchor
+    // verification and ledger fetch as ordinary binding loads.
+    let loadForContext (context: ProjectPaths.ResolvedProject) =
+        let (FolderPath root) = ProjectPaths.ResolvedProject.sourceRoot context
+        loadAtRoot root
 
+    let load projectName rt =
+        ProjectPaths.resolveProjectRoot projectName rt
+        |> Result.bind (fun (FolderPath root) -> loadAtRoot root)
 
     // Setup is always an explicit approved action, never a side effect of a read.
     // The expected head is a separately supplied trust anchor, not inferred
@@ -1035,8 +1041,12 @@ module TaskApi =
         | Ok(_, Some applied) -> Ok applied.Actor
         | Ok(_, None) -> Ok "AuthenticatedUser"
 
-    let write (cmd: TaskWriteCommand) rt =
-        LedgerBindingConfig.load cmd.ProjectName rt
+    let private writeUsingContext (context: ProjectPaths.ResolvedProject option) (cmd: TaskWriteCommand) rt =
+        let binding =
+            match context with
+            | Some resolved -> LedgerBindingConfig.loadForContext resolved
+            | None -> LedgerBindingConfig.load cmd.ProjectName rt
+        binding
         |> Result.bind (fun binding ->
             guid "operationId" cmd.OperationId
             |> Result.bind (fun operationId ->
@@ -1207,3 +1217,10 @@ module TaskApi =
                             | _ -> Error(Client.ValidationError "Unsupported  task operation.")
                         )
                     result |> Result.map OperationResponse.present))
+
+
+    let writeForContext (context: ProjectPaths.ResolvedProject) (cmd: TaskWriteCommand) rt =
+        writeUsingContext (Some context) cmd rt
+
+    let write (cmd: TaskWriteCommand) rt =
+        writeUsingContext None cmd rt

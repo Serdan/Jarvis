@@ -1794,35 +1794,62 @@ type ReviewWorkflowTests() =
                 match Client.OrchestrationApi.TaskApi.read diffCmd ctx with
                 | Ok value -> Assert.That((unbox<TaskSpecDiff> value).Diff, Does.Contain("API revised"))
                 | Error error -> Assert.Fail(sprintf " diff API failed: %A" error)
+                // Source spec operations must use the checkout already
+                // resolved for AGENTS.md, including nested instructions.
+                let sourceDirectory = Path.Combine(one, "specs")
+                Directory.CreateDirectory(sourceDirectory) |> ignore
+                File.WriteAllText(Path.Combine(sourceDirectory, "AGENTS.md"), "Task spec instructions")
+                let sourceContext =
+                    Client.ProjectPaths.resolveProjectContext "owner" ctx
+                    |> function Ok value -> value | Error error -> failwithf "Cannot resolve source checkout: %A" error
+                let target = Client.ProjectPaths.ResolvedProject.target sourceContext
+                let instructionRuntime = Client.Runtime(Path.GetDirectoryName one)
+                let runPrepared cmd =
+                    Client.OrchestrationApi.TaskApi.writeForContext sourceContext cmd ctx
+                    |> function
+                        | Ok value -> value
+                        | Error error -> failwithf "Prepared task spec %s failed: %A" cmd.Action error
                 let exportCmd = { template "ExportTaskSpec" specTask with
-                                    SourceRef = "spec-api-export.html"
+                                    SourceRef = "specs/spec-api-export.html"
                                     BaseOid = pageAfter.SpecBlobOid }
-                let exportReceipt = run exportCmd
+                match Client.AgentInstructions.prepareWithTarget instructionRuntime (Some target) (Common.TaskWriteCommand exportCmd) with
+                | Ok (instructions, Some preparedContext) ->
+                    Assert.That(instructions |> List.map (fun instruction -> instruction.Path),
+                                Does.Contain("owner/specs/AGENTS.md"))
+                    Assert.That(Client.ProjectPaths.ResolvedProject.sourceRoot preparedContext,
+                                Is.EqualTo(Client.ProjectPaths.ResolvedProject.sourceRoot sourceContext))
+                | other -> Assert.Fail(sprintf "Could not prepare task-spec instructions: %A" other)
+                let exportReceipt = runPrepared exportCmd
                 Assert.That((unbox<TaskSpecExport> exportReceipt).AlreadyApplied, Is.False)
                 Assert.That((unbox<TaskSpecExport> exportReceipt).Authority,
                             Is.EqualTo("NonAuthoritativeSourceCopy"))
-                let exportRetry = run exportCmd
+                let exportRetry = runPrepared exportCmd
                 Assert.That((unbox<TaskSpecExport> exportRetry).AlreadyApplied, Is.True)
                 let otherOperation = { exportCmd with OperationId = Guid.NewGuid().ToString("D") }
                 match Client.OrchestrationApi.TaskApi.write otherOperation ctx with
                 | Error _ -> ()
                 | Ok _ -> Assert.Fail("Unrelated operation overwrote existing exported HTML")
-                Assert.That(File.ReadAllText(Path.Combine(one, "spec-api-export.html")),
+                Assert.That(File.ReadAllText(Path.Combine(sourceDirectory, "spec-api-export.html")),
                             Does.Contain("NON-AUTHORITATIVE JARVIS"))
                 match Client.OrchestrationApi.TaskApi.read
                         { pageCmd with Action = "ExportTaskSpec"; RelativePath = "should-not-write.html" } ctx with
                 | Error _ -> ()
                 | Ok _ -> Assert.Fail("Export incorrectly accessible through read-only  API")
                 Assert.That(File.Exists(Path.Combine(one, "should-not-write.html")), Is.False)
-                File.WriteAllText(Path.Combine(one, "spec-api-import.html"),
+                File.WriteAllText(Path.Combine(sourceDirectory, "spec-api-import.html"),
                                   "<h1>API imported safely</h1>\\n")
-                let sourceDraft = LedgerStore.readRegisteredSourceSpec first "spec-api-import.html" |> success
+                let sourceDraft = LedgerStore.readRegisteredSourceSpec first "specs/spec-api-import.html" |> success
                 let importCommand =
                     { template "ImportTaskSpec" specTask with
                         ExpectedVersion = 2; BaseOid = pageAfter.SpecBlobOid
-                        TargetRef = sourceDraft.BlobOid; SourceRef = "spec-api-import.html"
+                        TargetRef = sourceDraft.BlobOid; SourceRef = "specs/spec-api-import.html"
                         Title = "Spec API imported" }
-                run importCommand |> ignore
+                match Client.AgentInstructions.prepareWithTarget instructionRuntime (Some target) (Common.TaskWriteCommand importCommand) with
+                | Ok (instructions, Some _) ->
+                    Assert.That(instructions |> List.map (fun instruction -> instruction.Path),
+                                Does.Contain("owner/specs/AGENTS.md"))
+                | other -> Assert.Fail(sprintf "Could not prepare import instructions: %A" other)
+                runPrepared importCommand |> ignore
                 let latest =
                     Client.OrchestrationApi.TaskApi.read pageCmd ctx
                     |> function

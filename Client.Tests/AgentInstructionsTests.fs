@@ -532,3 +532,62 @@ let malformed_project_selector_returns_validation_error_at_command_boundary () =
             | other -> Assert.Fail(sprintf "Optional empty job project scope must remain supported: %A" other)
         finally if Directory.Exists root then Directory.Delete(root, true)
     }
+
+[<Test>]
+let project_skill_operations_load_actual_skill_ancestor_instructions () =
+    workspace (fun root rt ->
+        create root "AGENTS.md" "workspace guidance" |> ignore
+        create root "Demo/AGENTS.md" "project guidance" |> ignore
+        create root "Demo/.agents/AGENTS.md" "agent configuration guidance" |> ignore
+        create root "Demo/.agents/skills/AGENTS.md" "shared skill guidance" |> ignore
+        create root "Demo/.agents/skills/example/AGENTS.md" "specific skill guidance" |> ignore
+        create root "Demo/.agents/skills/example/SKILL.md" "# Example skill" |> ignore
+        let expected =
+            [ "AGENTS.md"; "Demo/AGENTS.md"; "Demo/.agents/AGENTS.md"
+              "Demo/.agents/skills/AGENTS.md"; "Demo/.agents/skills/example/AGENTS.md" ]
+        let check cmd =
+            Assert.That(docs rt cmd |> List.map (fun document -> document.Path), Is.EqualTo(expected :> obj))
+        check (GetSkillCommand { ProjectName = "Demo"; SkillName = "example" })
+        check (CreateSkillCommand
+                  { ProjectName = "Demo"; SkillName = "example"
+                    Content = "# Revised"; Overwrite = true }))
+
+[<Test>]
+let task_spec_import_export_load_instructions_from_source_html_parent () =
+    workspace (fun root rt ->
+        create root "AGENTS.md" "workspace guidance" |> ignore
+        create root "Demo/AGENTS.md" "project guidance" |> ignore
+        create root "Demo/specs/AGENTS.md" "spec guidance" |> ignore
+        create root "Demo/specs/deep/AGENTS.md" "deep spec guidance" |> ignore
+        let taskWrite action path : Common.AgentCommand =
+            TaskWriteCommand
+                { ProjectName = "Demo"; Action = action
+                  OperationId = Guid.NewGuid().ToString("D"); TaskId = "task-1"
+                  AttemptId = ""; ActorId = "Owner"; OwnerId = ""
+                  Title = ""; Html = ""; ExpectedVersion = 0
+                  ExpectedAgentVersion = 0; ExpectedTaskVersion = 0
+                  AssignmentGeneration = 0; Summary = ""; NextAction = ""
+                  Reason = ""; BaseOid = ""; TargetRef = ""; SourceRef = path
+                  AllowDetached = false; AllowUncommitted = false
+                  DecisionSequence = 0L; Evidence = ""; SessionId = "" }
+        let expected =
+            [ "AGENTS.md"; "Demo/AGENTS.md"; "Demo/specs/AGENTS.md"
+              "Demo/specs/deep/AGENTS.md" ]
+        for action in [ "ExportTaskSpec"; "ImportTaskSpec" ] do
+            let command = taskWrite action "specs/deep/draft.html"
+            Assert.That(docs rt command |> List.map (fun doc -> doc.Path), Is.EqualTo(expected :> obj))
+            let target =
+                Client.ProjectPaths.ProjectTarget.parse "Demo"
+                |> function Ok selected -> selected | Error error -> failwithf "%A" error
+            match prepareWithTarget rt (Some target) command with
+            | Ok (documents, Some source) ->
+                Assert.That(documents |> List.map (fun doc -> doc.Path), Is.EqualTo(expected :> obj))
+                match Client.ProjectPaths.resolveProjectRoot "Demo" rt with
+                | Ok expectedRoot ->
+                    Assert.That(Client.ProjectPaths.ResolvedProject.sourceRoot source,
+                                Is.EqualTo(expectedRoot))
+                | Error error -> Assert.Fail(sprintf "Cannot resolve fixture: %A" error)
+            | other -> Assert.Fail(sprintf "Task spec must have prepared source context: %A" other)
+        match resolve rt (taskWrite "ImportTaskSpec" "../escape.html") with
+        | Error(Client.PermissionDenied _) -> ()
+        | other -> Assert.Fail(sprintf "Source-spec traversal must fail before ledger mutation: %A" other))

@@ -404,8 +404,7 @@ module private Core =
         else
             Ok(skillName.Trim())
 
-    let private skillPath skillName fileName =
-        Path.Combine(".agents", "skills", skillName, fileName)
+    let private skillPath = ProjectPaths.ProjectSkillPaths.file
 
     let private readSkillContent parsedProject skillName =
         fun rt ->

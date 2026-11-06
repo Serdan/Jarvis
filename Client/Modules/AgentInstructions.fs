@@ -70,12 +70,14 @@ let private applicableTargets (rt: Runtime) command =
                 | RunCommandCommand c -> Ok(directories [ defaultArg c.WorkingDirectory "" ])
                 | StartJobCommand c -> Ok(directories [ defaultArg c.WorkingDirectory "" ])
                 | RunProjectTaskCommand _ -> Ok roots
+                | TaskWriteCommand c when c.Action = "ExportTaskSpec" || c.Action = "ImportTaskSpec" ->
+                    Ok(files [ c.SourceRef ])
                 | GitCommitCommand c -> Ok(c.Paths |> List.map ExistingTarget)
                 | GetGitDiffCommand c -> Ok [ ExistingTarget(defaultArg c.Path "") ]
                 | GetSkillCommand c ->
-                    Ok(files [ Path.Combine(".jarvis", "skills", c.SkillName, "SKILL.md") ])
+                    Ok(files [ ProjectPaths.ProjectSkillPaths.primaryFile c.SkillName ])
                 | CreateSkillCommand c ->
-                    Ok(files [ Path.Combine(".jarvis", "skills", c.SkillName, "SKILL.md") ])
+                    Ok(files [ ProjectPaths.ProjectSkillPaths.primaryFile c.SkillName ])
                 | _ -> Ok roots
             targets |> Result.map (fun resolved -> Some(projectName, if resolved.IsEmpty then roots else resolved))
 

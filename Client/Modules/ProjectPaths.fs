@@ -53,6 +53,13 @@ module ResolvedProject =
     let workspaceRoot (project: ResolvedProject) = project.WorkspaceRoot
     let mainRoot (project: ResolvedProject) = project.MainRoot
 
+// One canonical directory layout for project-local skills.
+module ProjectSkillPaths =
+    let file (skillName: string) (fileName: string) =
+        Path.Combine(".agents", "skills", skillName, fileName)
+
+    let primaryFile (skillName: string) = file skillName "SKILL.md"
+
 let isPathInRoot (root: string) (fullPath: string) =
     let normalize (path: string) =
         path.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar).Replace('\\', '/')

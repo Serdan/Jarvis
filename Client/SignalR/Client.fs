@@ -106,11 +106,11 @@ let private activateReadyOnActivity (rt: Runtime) (agentId: string)
             let projectId = ProjectPaths.ProjectTarget.projectId target
             let project = ProjectPaths.ProjectId.value projectId
             let cache = workingGuidanceCaches.GetValue(rt, fun _ -> WorkingTurnGuidance.AgentCache(TimeSpan.FromMinutes 2.))
-            // Inbox is the normal bootstrap operation; always recheck its
-            // current assignment even if other calls cached an idle agent.
-            match command with
-            | TaskReadCommand cmd when cmd.Action = "AgentInbox" -> cache.Invalidate(projectId, agentId)
-            | _ -> ()
+            // Assignment transitions can be written by another client. A cached
+            // Working value cannot prove that this call is still in the same
+            // turn, nor that Ready activation is unnecessary. Recheck before
+            // every activatable operation; reuse the fresh snapshot for guidance.
+            cache.Invalidate(projectId, agentId)
             let current =
                 cache.Get(DateTimeOffset.UtcNow, projectId, agentId, fun () ->
                     match OrchestrationApi.LedgerBindingConfig.load project rt with

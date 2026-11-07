@@ -2123,6 +2123,29 @@ type ReviewWorkflowTests() =
                 Assert.That(again.Version, Is.EqualTo(agent.Version))
                 Assert.That(again.WorkingTurnStartedAtUtc, Is.EqualTo(agent.WorkingTurnStartedAtUtc))
 
+                // A second client changes the assignment while this client's
+                // Working-state and instruction-delivery caches are still warm.
+                // The next ordinary call must refresh the ledger state, activate
+                // Ready, and re-deliver roots for the new Working turn.
+                let _, _, currentAttempt = ReviewWorkflow.getTask second taskId |> success
+                let attempt = currentAttempt.Value
+                ReviewWorkflow.yieldAgent second (Guid.NewGuid()) taskId "Owner"
+                    attempt.Version again.Version attempt.AssignmentGeneration
+                    "Remote client yielded" "Continue"
+                |> success |> ignore
+                let remoteReady = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
+                Assert.That(remoteReady.State, Is.EqualTo("Ready"))
+                let _, resumedResult, resumedResponse = readSource()
+                Assert.That(resumedResult.IsOk, Is.True)
+                Assert.That(resumedResponse.Instructions |> List.map (fun d -> d.Path),
+                            Is.EqualTo([ "AGENTS.md"; "owner/AGENTS.md"; "owner/src/AGENTS.md" ] :> obj))
+                let remoteWorking = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
+                Assert.That(remoteWorking.State, Is.EqualTo("Working"))
+                Assert.That(remoteWorking.WorkingTurnStartedAtUtc,
+                            Is.Not.EqualTo(agent.WorkingTurnStartedAtUtc))
+                let _, _, repeatResumed = readSource()
+                Assert.That(repeatResumed.Instructions, Is.Empty)
+
                 // Reaching the inbox for a registered but unassigned agent
                 // must never fabricate an assignment or Working state.
                 let other = { cmdData with AgentId = "Reviewer" }

@@ -109,14 +109,6 @@ let private ancestors (directory: string) =
       for depth in 1 .. pieces.Length do
           yield pieces |> Seq.take depth |> String.concat "/" ]
 
-let private utf8Prefix (bytes: byte[]) length =
-    let rec take count =
-        if count = 0 then ""
-        else
-            try utf8.GetString(bytes, 0, count)
-            with :? DecoderFallbackException -> take (count - 1)
-    take length
-
 let private readDocument scope (relativePath: string) (path: string) (budget: int) =
     try
         let exactlyNamed =
@@ -132,30 +124,24 @@ let private readDocument scope (relativePath: string) (path: string) (budget: in
             use stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read)
             let originalBytes = stream.Length
             let digest = SHA256.HashData(stream) |> Convert.ToHexString |> fun value -> value.ToLowerInvariant()
-            // Validate the entire source even when only its prefix is delivered:
-            // malformed bytes in the omitted suffix must not masquerade as good UTF-8.
+            // Reject malformed sources regardless of whether they fit this response's budget.
             stream.Position <- 0L
             use reader = new StreamReader(stream, utf8, false, 8192, true)
             let scanBuffer = Array.zeroCreate<char> 8192
             while reader.Read(scanBuffer, 0, scanBuffer.Length) > 0 do ()
-            stream.Position <- 0L
             let limit = min maxFileContentBytes (max 0 budget)
-            let buffer = Array.zeroCreate<byte> (int (min originalBytes (int64 limit)))
-            stream.ReadExactly(buffer)
-            let content = utf8Prefix buffer buffer.Length
-            let delivered = Encoding.UTF8.GetByteCount content
-            // Fully delivered files must be valid UTF-8; invalid un-delivered
-            // bytes are not silently represented as complete instructions.
-            if originalBytes <= int64 limit && delivered <> int originalBytes then
-                Error(Client.ValidationError $"Instruction source {relativePath} is not valid UTF-8.")
-            elif originalBytes = 0L then Ok None
+            if originalBytes = 0L then Ok None
+            elif originalBytes > int64 limit then
+                // No partial instructions: explicit omission can be retried on a
+                // later call with a larger budget, or loaded with read_file.
+                let warning =
+                    $"[INCOMPLETE REPOSITORY INSTRUCTIONS] Source {relativePath} ({originalBytes} UTF-8 bytes; sha256:{digest}) was NOT delivered because it exceeds the {limit}-byte instruction budget for this response. No portion of this file has been loaded. Use read_file to retrieve the complete file before relying on its instructions. [/INCOMPLETE REPOSITORY INSTRUCTIONS]"
+                Ok(Some { Scope = "instruction-warning"; Path = relativePath; Sha256 = "sha256:" + digest; Content = warning })
             else
-                let truncated = int64 delivered < originalBytes
-                let body =
-                    if truncated then
-                        $"[INCOMPLETE REPOSITORY INSTRUCTIONS — TRUNCATED]\nSource: {relativePath}\nDelivered: {delivered} of {originalBytes} UTF-8 bytes. Full SHA-256: sha256:{digest}.\nThe omitted instructions have NOT been loaded. Use read_file on this path to retrieve the complete file before relying on omitted guidance.\n[/INCOMPLETE REPOSITORY INSTRUCTIONS]\n\n" + content
-                    else content
-                Ok(Some { Scope = scope; Path = relativePath; Sha256 = "sha256:" + digest; Content = body })
+                stream.Position <- 0L
+                let buffer = Array.zeroCreate<byte> (int originalBytes)
+                stream.ReadExactly(buffer)
+                Ok(Some { Scope = scope; Path = relativePath; Sha256 = "sha256:" + digest; Content = utf8.GetString(buffer) })
     with
     | :? FileNotFoundException
     | :? DirectoryNotFoundException -> Ok None
@@ -243,10 +229,7 @@ let private resolveTargets (rt: Runtime) (project: ProjectPaths.ResolvedProject)
                         | Ok None -> collect tail docs total
                         | Ok(Some doc) ->
                             let delivered =
-                                if doc.Content.StartsWith("[INCOMPLETE REPOSITORY INSTRUCTIONS", StringComparison.Ordinal) then
-                                    let index = doc.Content.IndexOf("\n\n", StringComparison.Ordinal)
-                                    if index >= 0 then Encoding.UTF8.GetByteCount(doc.Content.Substring(index + 2))
-                                    else 0
+                                if doc.Scope = "instruction-warning" then 0
                                 else Encoding.UTF8.GetByteCount doc.Content
                             collect tail (doc :: docs) (total + delivered)
         collect candidates [] 0

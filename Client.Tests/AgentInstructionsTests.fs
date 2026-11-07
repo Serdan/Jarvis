@@ -70,22 +70,24 @@ let missing_empty_and_changed_files () =
         Assert.That(second.Sha256, Is.Not.EqualTo(first.Sha256)))
 
 [<Test>]
-let invalid_encoding_fails_but_oversized_content_truncates () =
+let invalid_encoding_fails_and_oversized_content_is_omitted () =
     workspace (fun root rt ->
         let path = create root "Demo/AGENTS.md" "valid"
         File.WriteAllBytes(path, [| 0xffuy; 0xfeuy |])
         match resolve rt (command "a.cs") with
         | Error(Client.ValidationError msg) -> Assert.That(msg, Does.Contain("UTF-8"))
         | other -> Assert.Fail(sprintf "Expected invalid UTF-8: %A" other)
-        // Larger files now return a bounded, explicitly incomplete prefix.
+        // Oversized instructions are never injected as incomplete prefixes.
         File.WriteAllText(path, String('a', 256 * 1024 + 1))
         let document = (docs rt (command "a.cs")).Head
+        Assert.That(document.Scope, Is.EqualTo("instruction-warning"))
         Assert.That(document.Content, Does.Contain("INCOMPLETE REPOSITORY INSTRUCTIONS"))
         Assert.That(document.Content, Does.Contain("262145"))
         Assert.That(document.Content, Does.Contain("read_file"))
-        Assert.That(document.Content, Does.Contain("Delivered: 65536"))
+        Assert.That(document.Content, Does.Contain("NOT delivered"))
+        Assert.That(document.Content, Does.Not.Contain(String('a', 1024)))
         Assert.That(document.Sha256.StartsWith("sha256:"), Is.True)
-        Assert.That(document.Content.Length, Is.LessThan(68000)))
+        Assert.That(document.Content.Length, Is.LessThan(1024)))
 
 [<Test>]
 let malformed_utf8_in_omitted_suffix_is_still_rejected () =
@@ -106,10 +108,11 @@ let hierarchy_preserves_descendants_and_bounds_combined_payload () =
         let result = docs rt (command "src/a.cs")
         Assert.That(result |> List.map (fun d -> d.Path),
                     Is.EqualTo([ "AGENTS.md"; "Demo/AGENTS.md"; "Demo/src/AGENTS.md" ] :> obj))
-        Assert.That(result |> List.forall (fun d -> d.Content.Contains("TRUNCATED")), Is.True)
+        Assert.That(result |> List.forall (fun d -> d.Scope = "instruction-warning"), Is.True)
+        Assert.That(result |> List.forall (fun d -> d.Content.Contains("NOT delivered")), Is.True)
         Assert.That(result |> List.sumBy (fun d -> System.Text.Encoding.UTF8.GetByteCount(d.Content)),
-                    Is.LessThan(150000))
-        Assert.That(result[2].Content, Does.Contain("cccc")))
+                    Is.LessThan(4096))
+        Assert.That(result[2].Content, Does.Not.Contain(String('c', 1024))))
 
 [<Test>]
 let excess_instruction_document_count_reports_omissions_without_failing () =
@@ -125,13 +128,14 @@ let excess_instruction_document_count_reports_omissions_without_failing () =
         Assert.That(result[32].Content, Does.Contain("read_file")))
 
 [<Test>]
-let multibyte_instruction_truncation_preserves_valid_utf8 () =
+let multibyte_oversized_instruction_is_omitted_without_prefix () =
     workspace (fun root rt ->
         let source = String.replicate 30000 "⚙"
         create root "Demo/AGENTS.md" source |> ignore
         let result = (docs rt (command "x.fs")).Head
+        Assert.That(result.Scope, Is.EqualTo("instruction-warning"))
         Assert.That(result.Content, Does.Contain("INCOMPLETE REPOSITORY INSTRUCTIONS"))
-        Assert.That(result.Content, Does.Contain("⚙⚙"))
+        Assert.That(result.Content, Does.Not.Contain("⚙"))
         Assert.That(result.Content, Does.Not.Contain("�"))
         Assert.That(result.Sha256, Is.EqualTo("sha256:" + (System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(source)) |> Convert.ToHexString).ToLowerInvariant())))
 
@@ -167,6 +171,7 @@ let oversized_instruction_does_not_prevent_file_write () =
             | Ok _ -> ()
             | other -> Assert.Fail(sprintf "Truncated instruction cannot block write: %A" other)
             Assert.That(File.ReadAllText(target), Is.EqualTo("side effect"))
+            Assert.That(instructions.Head.Scope, Is.EqualTo("instruction-warning"))
             Assert.That(instructions.Head.Content, Does.Contain("INCOMPLETE REPOSITORY INSTRUCTIONS"))
         finally if Directory.Exists root then Directory.Delete(root, true)
     }
@@ -525,6 +530,37 @@ let write_notice_does_not_suppress_initial_instructions () =
     Assert.That(delivered |> List.map (fun d -> d.Scope),
                 Is.EqualTo([ "workspace"; "write-warning" ] :> obj))
 
+
+[<Test>]
+let omitted_instruction_is_delivered_when_later_response_has_room () =
+    workspace (fun root rt ->
+        // The multi-directory request sees another sizeable ancestor first.
+        // A subsequent source-only request must deliver complete source guidance.
+        create root "AGENTS.md" (String('w', 40000)) |> ignore
+        create root "Demo/AGENTS.md" (String('p', 40000)) |> ignore
+        create root "Demo/other/AGENTS.md" (String('o', 40000)) |> ignore
+        create root "Demo/src/AGENTS.md" (String('s', 40000)) |> ignore
+        let target =
+            ProjectPaths.ProjectTarget.parse "Demo"
+            |> function Ok found -> found | Error error -> failwithf "%A" error
+        let cache = DeliveryCache()
+        let multi = ReadFilesCommand
+                        { ProjectName = "Demo"; FilePaths = ["other/data.fs"; "src/data.fs"] }
+        let initial = docs rt multi
+        let omitted = initial |> List.find (fun document -> document.Path = "Demo/src/AGENTS.md")
+        Assert.That(omitted.Scope, Is.EqualTo("instruction-warning"))
+        Assert.That(omitted.Content, Does.Contain("NOT delivered"))
+        Assert.That(omitted.Content, Does.Not.Contain(String('s', 1024)))
+        let first = cache.Filter(target, "Owner", "turn-1", HierarchyLoaded, initial, fun () -> Ok [])
+        Assert.That(first |> List.exists (fun doc -> doc.Path = omitted.Path), Is.True)
+        let following = docs rt (command "src/data.fs")
+        let source = following |> List.find (fun document -> document.Path = "Demo/src/AGENTS.md")
+        Assert.That(source.Scope, Is.EqualTo("project"))
+        Assert.That(source.Content, Is.EqualTo(String('s', 40000)))
+        let delivered = cache.Filter(target, "Owner", "turn-1", HierarchyLoaded, following, fun () -> Ok [])
+        Assert.That(delivered |> List.map (fun document -> document.Path),
+                    Is.EqualTo([ "Demo/src/AGENTS.md" ] :> obj))
+        Assert.That(cache.Filter(target, "Owner", "turn-1", HierarchyLoaded, following, fun () -> Ok []), Is.Empty))
 
 [<Test>]
 let malformed_project_selector_returns_validation_error_at_command_boundary () =

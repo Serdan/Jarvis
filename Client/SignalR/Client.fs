@@ -392,6 +392,10 @@ let private dispatch (rt: Runtime) (target: ProjectPaths.ProjectTarget option)
         |> sourceOperation resolved (fun project -> ProjectBrowser.readFilesIn project cmd) (fun () -> ProjectBrowser.readFiles cmd)
         |> Result.map (Seq.zip cmd.FilePaths >> Seq.map (fun (path, result) -> readFileResultToDto path result) >> Seq.toList)
         |> serialize'
+    | GetAgentInstructionsCommand cmd ->
+        match target with
+        | Some selected -> rt |> AgentInstructions.getExplicit selected cmd |> serialize'
+        | None -> Error(Client.ValidationError "A validated project checkout is required.") |> serialize'
     | ReadImageCommand cmd ->
         rt
         |> sourceOperation resolved (fun project -> ProjectBrowser.readImageIn project cmd) (fun () -> ProjectBrowser.readImage cmd)
@@ -587,8 +591,15 @@ let processIncomingCommand (rt: Runtime) (commandJson: string) (agentId: string)
                         | Ok () ->
                             let! result, applicable, provenance =
                                 receiveCommandWithTypedInstructions rt target command
-                            instructions <- incrementalInstructions rt agentId target provenance applicable
-                                            @ checkWorkingGuidance rt agentId target command
+                            instructions <-
+                                match command with
+                                | GetAgentInstructionsCommand _ ->
+                                    // The explicit result includes the complete hierarchy.
+                                    // Do not double-inject automatic AGENTS.md payloads.
+                                    checkWorkingGuidance rt agentId target command
+                                | _ ->
+                                    incrementalInstructions rt agentId target provenance applicable
+                                    @ checkWorkingGuidance rt agentId target command
                             return result
                 with ex ->
                     return Error(ExceptionError ex)

@@ -120,6 +120,7 @@ let private requiresConfirmation command =
     | SearchTextCommand _
     | ReadFileCommand _
     | ReadFilesCommand _
+    | GetAgentInstructionsCommand _
     | ReadImageCommand _
     | ExportFileCommand _
     | ListConfiguredTasksCommand _

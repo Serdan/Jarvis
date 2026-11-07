@@ -20,7 +20,7 @@ Read and present these in ancestor-to-descendant order. A more specific file can
 
 An instruction file applies to work **in its directory and descendants**, not sibling directories. For a file target, use its parent directory. For a directory target, include that directory. For multiple targets, use the union of their applicable files, deduplicated by normalized path, ordered from shallowest to deepest and then ordinal path order at the same depth. Do not recursively scan a project for unrelated instruction files.
 
-A missing `AGENTS.md` is normal and contributes no document. Empty files are allowed and contribute no instruction content. The existing path confinement and symlink/reparse-point prohibitions apply to both directories and instruction files, including the workspace-level file.
+A missing `AGENTS.md` is normal and contributes no document. Empty files are allowed. Automatic delivery contributes no instruction content for an empty file; explicit hierarchy retrieval includes it. The existing path confinement and symlink/reparse-point prohibitions apply to both directories and instruction files, including the workspace-level file.
 
 ## MCP initialization guidance
 
@@ -73,8 +73,8 @@ This delivery mechanism applies to the existing stateless MCP transport. The ini
 
 - Missing files: continue without that document.
 - Invalid UTF-8 in delivered content, unsafe paths and symlink instruction sources still fail validation.
-- If an applicable instruction file exceeds the automatic delivery budget, **truncate its delivered prefix rather than rejecting the original command**. Mark the response as incomplete prominently; show its original source path, complete-file SHA-256, delivered/original UTF-8 byte counts and explicit instructions to use `read_file` for the complete source. Do not claim the omitted portion was loaded. Trim on valid UTF-8 boundaries.
-- Allocate at most **64 KiB of source content per instruction file** and **128 KiB combined**, reserving capacity for more-specific descendant instruction files. Include a warning if the **32-document delivery limit** is reached rather than aborting the operation. The files on disk are never truncated.
+- If an applicable instruction file exceeds the automatic delivery budget, **omit it entirely instead of delivering a partial prefix or rejecting the original command**. Mark the response as incomplete prominently; show its original source path, complete-file SHA-256, delivered/original UTF-8 byte counts and explicit instructions to use `get_agent_instructions` for the complete applicable hierarchy. Do not claim the omitted portion was loaded. Trim on valid UTF-8 boundaries.
+- Allocate at most **64 KiB of source content per instruction file** and **128 KiB combined**, reserving capacity for more-specific descendant instruction files. Include a warning if the **32-document delivery limit** is reached rather than aborting the operation. The files on disk are never truncated; explicit `get_agent_instructions` bypasses all these instruction-specific limits and paginates only to respect the tool transport.
 - `write_file` and successful non-dry-run `patch_file` operations targeting `AGENTS.md` **warn, without failing**, when the resulting file exceeds **32 KiB**. The warning recommends keeping the entrypoint concise and moving detail into referenced documents; no arbitrary size limit is imposed on the actual file by this mechanism.
 - **Do not load source instructions for canonical Git-ledger-only operations** (agent inbox, assignments, checkpoints, yields, reviews, notifications). These never mutate the source tree. Task-spec import and export still load source instructions.
 - An explicit request to read `AGENTS.md` through ordinary file tools still follows normal file-read behavior; automatic inclusion does not substitute for the regular file API.
@@ -94,7 +94,7 @@ Repo-controlled Markdown is contextual guidance, not an authorization source. In
 2. A first `ReadFile` or `RunCommand` in a project returns its `AGENTS.md` without a prior explicit instruction-read call.
 3. Workspace root, project root, and nested files appear in the required order; sibling nested files do not leak into the result. Multiple targets deduplicate shared ancestors.
 4. Missing or empty files preserve existing command results. Changed `AGENTS.md` content is visible on the next applicable command without reconnecting.
-5. A symlinked, unreadable, invalidly encoded, or oversized applicable instruction file produces a source-specific error and no requested write/process side effect.
+5. Symlinked, unsafe or invalidly encoded instruction files produce source-specific errors; oversized sources emit omission warnings without blocking ordinary tool calls. Explicit hierarchy retrieval supplies all bytes across cursor pages.
 6. Different devices/workspace roots return only their own applicable files, including when device selection or session metadata changes.
 7. The ordinary command payload is preserved, including multi-file results, errors, image blocks, and exports. The presence of instructions never turns a failed operation into success.
 8. A caller without `workspace:read` cannot receive instruction contents through another scope. Existing local confirmation/trust behavior is unchanged.

@@ -83,7 +83,7 @@ let invalid_encoding_fails_and_oversized_content_is_omitted () =
         Assert.That(document.Scope, Is.EqualTo("instruction-warning"))
         Assert.That(document.Content, Does.Contain("INCOMPLETE REPOSITORY INSTRUCTIONS"))
         Assert.That(document.Content, Does.Contain("262145"))
-        Assert.That(document.Content, Does.Contain("read_file"))
+        Assert.That(document.Content, Does.Contain("get_agent_instructions"))
         Assert.That(document.Content, Does.Contain("NOT delivered"))
         Assert.That(document.Content, Does.Not.Contain(String('a', 1024)))
         Assert.That(document.Sha256.StartsWith("sha256:"), Is.True)
@@ -125,7 +125,7 @@ let excess_instruction_document_count_reports_omissions_without_failing () =
         Assert.That(result.Length, Is.EqualTo(33))
         Assert.That(result[32].Scope, Is.EqualTo("instruction-warning"))
         Assert.That(result[32].Content, Does.Contain("omitted"))
-        Assert.That(result[32].Content, Does.Contain("read_file")))
+        Assert.That(result[32].Content, Does.Contain("get_agent_instructions")))
 
 [<Test>]
 let multibyte_oversized_instruction_is_omitted_without_prefix () =
@@ -346,6 +346,13 @@ let private gitAt directory arguments =
     if proc.ExitCode <> 0 then failwithf "Git worktree fixture failed: %s" stderr
     stdout
 
+let private explicitInstructions (rt: Runtime) selector directory cursor =
+    let target =
+        ProjectPaths.ProjectTarget.parse selector
+        |> function Ok found -> found | Error error -> failwithf "Invalid checkout selector: %A" error
+    getExplicit target
+        { ProjectName = selector; Directory = directory; Cursor = cursor } rt
+
 [<Test>]
 let registered_worktrees_resolve_distinct_instructions_from_actual_checkout_roots () =
     workspace (fun root rt ->
@@ -389,6 +396,16 @@ let registered_worktrees_resolve_distinct_instructions_from_actual_checkout_root
                     Is.EqualTo([ "workspace guidance"; "checkout B"; "nested B" ] :> obj))
         Assert.That(check "Demo::tree-a" |> List.map (fun d -> d.Path),
                     Is.EqualTo([ "AGENTS.md"; "Demo/AGENTS.md"; "Demo/src/AGENTS.md" ] :> obj))
+        for selector, expectedRoot, expectedNested in
+            [ "Demo::tree-a", "checkout A", "nested A"
+              "Demo::tree-b", "checkout B", "nested B" ] do
+            let hierarchy =
+                match explicitInstructions rt selector "src" None with
+                | Ok page -> page["AGENTS.md"].AsObject()
+                | Error error -> failwithf "Cannot get worktree instructions: %A" error
+            Assert.That(hierarchy["."].GetValue<string>(), Is.EqualTo("workspace guidance"))
+            Assert.That(hierarchy["Demo"].GetValue<string>(), Is.EqualTo(expectedRoot))
+            Assert.That(hierarchy["Demo/src"].GetValue<string>(), Is.EqualTo(expectedNested))
         let rootA =
             match roots rt "Demo::tree-a" with
             | Ok docs -> docs
@@ -561,6 +578,181 @@ let omitted_instruction_is_delivered_when_later_response_has_room () =
         Assert.That(delivered |> List.map (fun document -> document.Path),
                     Is.EqualTo([ "Demo/src/AGENTS.md" ] :> obj))
         Assert.That(cache.Filter(target, "Owner", "turn-1", HierarchyLoaded, following, fun () -> Ok []), Is.Empty))
+
+[<Test>]
+let explicit_hierarchy_reads_every_ancestor_without_auto_delivery_limits () =
+    workspace (fun root rt ->
+        let workspaceText = String('w', 260000)
+        let projectText = String('p', 260000)
+        let sourceText = String('s', 260000)
+        create root "AGENTS.md" workspaceText |> ignore
+        create root "Demo/AGENTS.md" projectText |> ignore
+        create root "Demo/src/AGENTS.md" sourceText |> ignore
+        create root "Demo/src/core/AGENTS.md" "" |> ignore
+        create root "Demo/unrelated/AGENTS.md" "not applicable" |> ignore
+        let mutable cursor = None
+        let output = System.Collections.Generic.Dictionary<string, System.Text.StringBuilder>()
+        let mutable pages = 0
+        let mutable doneReading = false
+        while not doneReading && pages < 20 do
+            let page =
+                match explicitInstructions rt "Demo" "src/core" cursor with
+                | Ok value -> value
+                | Error error -> failwithf "Unexpected explicit retrieval failure: %A" error
+            Assert.That(System.Text.Encoding.UTF8.GetByteCount(page.ToJsonString()), Is.LessThanOrEqualTo(640 * 1024))
+            for property in page["AGENTS.md"].AsObject() do
+                let existing =
+                    match output.TryGetValue(property.Key) with
+                    | true, builder -> builder
+                    | false, _ ->
+                        let builder = System.Text.StringBuilder()
+                        output.Add(property.Key, builder)
+                        builder
+                match page["chunk"] with
+                | null -> ()
+                | chunk when chunk["path"].GetValue<string>() = property.Key ->
+                    Assert.That(chunk["offsetBytes"].GetValue<int64>(),
+                                Is.EqualTo(int64 (System.Text.Encoding.UTF8.GetByteCount(existing.ToString()))))
+                | _ -> ()
+                existing.Append(property.Value.GetValue<string>()) |> ignore
+            pages <- pages + 1
+            match page["nextCursor"] with
+            | null -> doneReading <- true
+            | value -> cursor <- Some(value.GetValue<string>())
+        Assert.That(doneReading, Is.True, "Every instruction byte must be retrievable using cursors")
+        Assert.That(pages, Is.GreaterThan(1))
+        Assert.That(output.Keys |> Seq.toList |> List.sort,
+                    Is.EqualTo([ "."; "Demo"; "Demo/src"; "Demo/src/core" ] :> obj))
+        Assert.That(output["."].ToString(), Is.EqualTo(workspaceText))
+        Assert.That(output["Demo"].ToString(), Is.EqualTo(projectText))
+        Assert.That(output["Demo/src"].ToString(), Is.EqualTo(sourceText))
+        Assert.That(output["Demo/src/core"].ToString(), Is.EqualTo("")))
+
+[<Test>]
+let explicit_hierarchy_continues_large_multibyte_escaped_document () =
+    workspace (fun root rt ->
+        let huge = String.replicate 180000 "🌍\n\""
+        create root "Demo/src/AGENTS.md" huge |> ignore
+        let collected = System.Text.StringBuilder()
+        let mutable cursor = None
+        let mutable pages = 0
+        let mutable finished = false
+        while not finished && pages < 30 do
+            let page =
+                match explicitInstructions rt "Demo" "src" cursor with
+                | Ok page -> page
+                | Error error -> failwithf "Unexpected continuation error: %A" error
+            let contents = page["AGENTS.md"].AsObject()
+            match contents["Demo/src"] with
+            | null -> ()
+            | node ->
+                Assert.That(page["chunk"], Is.Not.Null)
+                let offsetNode = page["chunk"].AsObject()["offsetBytes"]
+                Assert.That(offsetNode.GetValue<int64>(),
+                            Is.EqualTo(int64 (System.Text.Encoding.UTF8.GetByteCount(collected.ToString()))))
+                collected.Append(node.GetValue<string>()) |> ignore
+            Assert.That(System.Text.Encoding.UTF8.GetByteCount(page.ToJsonString()), Is.LessThanOrEqualTo(640 * 1024))
+            pages <- pages + 1
+            match page["nextCursor"] with
+            | null -> finished <- true
+            | node -> cursor <- Some(node.GetValue<string>())
+        Assert.That(finished, Is.True)
+        Assert.That(pages, Is.GreaterThan(1))
+        Assert.That(collected.ToString(), Is.EqualTo(huge)))
+
+[<Test>]
+let explicit_hierarchy_is_not_limited_to_32_instruction_files () =
+    workspace (fun root rt ->
+        let mutable directory = ""
+        for i in 1 .. 40 do
+            directory <-
+                if directory = "" then "d" + string i
+                else directory + "/d" + string i
+            create root ("Demo/" + directory + "/AGENTS.md") ("instruction " + string i) |> ignore
+        let page =
+            match explicitInstructions rt "Demo" directory None with
+            | Ok page -> page
+            | Error error -> failwithf "Expected complete instruction hierarchy: %A" error
+        Assert.That(page["AGENTS.md"].AsObject().Count, Is.EqualTo(40))
+        Assert.That(page["nextCursor"], Is.Null))
+
+[<Test>]
+let explicit_cursor_rejects_changed_hierarchy_and_unsafe_directories () =
+    workspace (fun root rt ->
+        let sourcePath = create root "Demo/src/AGENTS.md" (String('x', 900000))
+        let first =
+            match explicitInstructions rt "Demo" "src" None with
+            | Ok value -> value
+            | Error error -> failwithf "%A" error
+        Assert.That(first["nextCursor"], Is.Not.Null)
+        let cursor = first["nextCursor"].GetValue<string>()
+        File.WriteAllText(sourcePath, String('y', 900000))
+        match explicitInstructions rt "Demo" "src" (Some cursor) with
+        | Error(Client.ValidationError message) ->
+            Assert.That(message, Does.Contain("changed"))
+        | other -> Assert.Fail(sprintf "Expected stale cursor rejection: %A" other)
+        match explicitInstructions rt "Demo" "../escape" None with
+        | Error _ -> ()
+        | Ok _ -> Assert.Fail("Path traversal must be rejected"))
+
+
+[<Test>]
+let explicit_tool_transport_returns_safe_page_and_continuation () =
+    task {
+        let root = Path.Combine(Path.GetTempPath(), "jarvis-explicit-transport-" + Guid.NewGuid().ToString("N"))
+        Directory.CreateDirectory(Path.Combine(root, "Demo")) |> ignore
+        try
+            create root "Demo/AGENTS.md" (String('x', 1800000)) |> ignore
+            let rt = Runtime(root)
+            let mutable cursor = None
+            let mutable pages = 0
+            let mutable complete = false
+            let rebuilt = System.Text.StringBuilder()
+            while not complete && pages < 10 do
+                let cmd : AgentCommand =
+                    GetAgentInstructionsCommand
+                        { ProjectName = "Demo"; Directory = ""; Cursor = cursor }
+                let input = System.Text.Json.JsonSerializer.Serialize<AgentCommand>(cmd)
+                let! _, result, envelope =
+                    Client.SignalR.Client.processIncomingCommand rt input ""
+                Assert.That(result.IsOk, Is.True)
+                Assert.That(envelope.Error.IsNone, Is.True)
+                Assert.That(envelope.Result.IsSome, Is.True)
+                use json = System.Text.Json.JsonDocument.Parse(envelope.Result.Value)
+                rebuilt.Append(json.RootElement.GetProperty("AGENTS.md").GetProperty("Demo").GetString())
+                |> ignore
+                let mutable next = Unchecked.defaultof<System.Text.Json.JsonElement>
+                pages <- pages + 1
+                if json.RootElement.TryGetProperty("nextCursor", &next) then
+                    cursor <- Some(next.GetString())
+                else complete <- true
+            Assert.That(complete, Is.True)
+            Assert.That(pages, Is.GreaterThan(1))
+            Assert.That(rebuilt.ToString(), Is.EqualTo(String('x', 1800000)))
+        finally if Directory.Exists root then Directory.Delete(root, true)
+    }
+
+[<Test>]
+let explicit_command_routes_through_client_without_auto_hierarchy_injection () =
+    task {
+        let root = Path.Combine(Path.GetTempPath(), "jarvis-explicit-instructions-" + Guid.NewGuid().ToString("N"))
+        Directory.CreateDirectory(Path.Combine(root, "Demo")) |> ignore
+        try
+            create root "AGENTS.md" "workspace guidance" |> ignore
+            create root "Demo/AGENTS.md" "project guidance" |> ignore
+            let cmd = GetAgentInstructionsCommand
+                          { ProjectName = "Demo"; Directory = ""; Cursor = None }
+            let! response, auto = Client.SignalR.Client.receiveCommandWithInstructions (Runtime(root)) cmd
+            Assert.That(auto, Is.Empty)
+            match response with
+            | Error error -> Assert.Fail(sprintf "Explicit command failed: %A" error)
+            | Ok serialized ->
+                use result = System.Text.Json.JsonDocument.Parse(serialized)
+                let mapping = result.RootElement.GetProperty("AGENTS.md")
+                Assert.That(mapping.GetProperty(".").GetString(), Is.EqualTo("workspace guidance"))
+                Assert.That(mapping.GetProperty("Demo").GetString(), Is.EqualTo("project guidance"))
+        finally if Directory.Exists root then Directory.Delete(root, true)
+    }
 
 [<Test>]
 let malformed_project_selector_returns_validation_error_at_command_boundary () =

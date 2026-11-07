@@ -423,6 +423,7 @@ module McpToolHelpers =
         | SearchTextCommand _
         | ReadFileCommand _
         | ReadFilesCommand _
+        | GetAgentInstructionsCommand _
         | ReadImageCommand _
         | ExportFileCommand _
         | ListConfiguredTasksCommand _
@@ -1613,6 +1614,14 @@ type JarvisMcpTools =
     static member ReadFiles(projectName: string, agentId: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, filePaths: string array, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         let projectName = McpToolHelpers.projectWithWorktreeName projectName worktreeName
         McpToolHelpers.send client http (ReadFilesCommand { ProjectName = projectName; FilePaths = filePaths |> Array.toList })
+
+    [<McpServerTool(Title = "Get agent instructions", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read the complete applicable AGENTS.md hierarchy for a directory, including workspace and selected checkout ancestors. No file-size or document-count limit. Large responses return a continuation cursor; call again with the same project, directory and cursor to obtain every byte. A chunk field identifies partial segments of individual oversized files.")>]
+    static member GetAgentInstructions(projectName: string, agentId: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, directory: string, [<Optional; DefaultParameterValue(""); Description("Continuation cursor from a previous response; omit for the first page.")>] cursor: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        let projectName = McpToolHelpers.projectWithWorktreeName projectName worktreeName
+        McpToolHelpers.send client http (GetAgentInstructionsCommand {
+            ProjectName = projectName
+            Directory = directory
+            Cursor = McpToolHelpers.optionOfString cursor })
 
     [<McpServerTool(Title = "Read image", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read a PNG, JPEG, or WebP image from a project and return it as native MCP image content for model vision.")>]
     static member ReadImage(projectName: string, agentId: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, filePath: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =

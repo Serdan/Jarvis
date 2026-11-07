@@ -64,6 +64,7 @@ let private applicableTargets (rt: Runtime) command =
                 | SearchFilesCommand c -> Ok(directories [ defaultArg c.FolderPath "" ])
                 | SearchTextCommand c -> Ok(directories [ defaultArg c.FolderPath "" ])
                 | ReadFileCommand c -> Ok(files [ c.FilePath ])
+                | ReadFilePageCommand c -> Ok(files [ c.FilePath ])
                 | ReadFilesCommand c -> Ok(files c.FilePaths)
                 | ReadImageCommand c -> Ok(files [ c.FilePath ])
                 | ExportFileCommand c -> Ok(files [ c.FilePath ])

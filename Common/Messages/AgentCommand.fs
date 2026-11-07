@@ -208,6 +208,23 @@ type ReadFileCommand =
       EndLine: int option
       IncludeLineNumbers: bool option }
 
+/// Bounded UTF-8 content page with a file-version-aware continuation.
+type ReadFilePageCommand =
+    { ProjectName: string
+      FilePath: string
+      Cursor: string option
+      PageBytes: int option }
+
+type ReadFilePageResult =
+    { FilePath: string
+      Content: string
+      StartByte: int64
+      NextByte: int64
+      TotalBytes: int64
+      FirstLine: int64
+      NextLine: int64
+      NextCursor: string option }
+
 type ReadFilesCommand =
     { ProjectName: string
       FilePaths: string list }
@@ -549,6 +566,7 @@ type AgentCommand =
     | SearchFilesCommand of SearchFilesCommand
     | SearchTextCommand of SearchTextCommand
     | ReadFileCommand of ReadFileCommand
+    | ReadFilePageCommand of ReadFilePageCommand
     | ReadFilesCommand of ReadFilesCommand
     | GetAgentInstructionsCommand of GetAgentInstructionsCommand
     | ReadImageCommand of ReadImageCommand
@@ -594,6 +612,7 @@ module AgentCommandInfo =
         | SearchFilesCommand _ -> "SearchFilesCommand"
         | SearchTextCommand _ -> "SearchTextCommand"
         | ReadFileCommand _ -> "ReadFileCommand"
+        | ReadFilePageCommand _ -> "ReadFilePageCommand"
         | ReadFilesCommand _ -> "ReadFilesCommand"
         | GetAgentInstructionsCommand _ -> "GetAgentInstructionsCommand"
         | ReadImageCommand _ -> "ReadImageCommand"
@@ -645,6 +664,7 @@ module AgentCommandInfo =
         | SearchFilesCommand _ -> "SearchFiles"
         | SearchTextCommand _ -> "SearchText"
         | ReadFileCommand _ -> "ReadFile"
+        | ReadFilePageCommand _ -> "ReadFilePage"
         | ReadFilesCommand _ -> "ReadFiles"
         | GetAgentInstructionsCommand _ -> "GetAgentInstructions"
         | ReadImageCommand _ -> "ReadImage"
@@ -694,6 +714,7 @@ module AgentCommandInfo =
         | SearchFilesCommand cmd -> Some cmd.ProjectName
         | SearchTextCommand cmd -> Some cmd.ProjectName
         | ReadFileCommand cmd -> Some cmd.ProjectName
+        | ReadFilePageCommand cmd -> Some cmd.ProjectName
         | ReadFilesCommand cmd -> Some cmd.ProjectName
         | GetAgentInstructionsCommand cmd -> Some cmd.ProjectName
         | ReadImageCommand cmd -> Some cmd.ProjectName
@@ -753,6 +774,7 @@ module AgentCommandInfo =
         | SearchFilesCommand cmd -> Some(sprintf "\"%s\"" (compact cmd.Query))
         | SearchTextCommand cmd -> Some(sprintf "\"%s\"" (compact cmd.Query))
         | ReadFileCommand cmd -> Some(compact cmd.FilePath)
+        | ReadFilePageCommand cmd -> Some(compact cmd.FilePath)
         | ReadFilesCommand cmd -> Some(String.concat ", " (cmd.FilePaths |> List.map compact))
         | GetAgentInstructionsCommand cmd -> Some(compact cmd.Directory)
         | ReadImageCommand cmd -> Some(compact cmd.FilePath)
@@ -797,6 +819,7 @@ module AgentCommandInfo =
         | SearchFilesCommand cmd -> Some(quoted cmd.Query)
         | SearchTextCommand cmd -> Some(quoted cmd.Query)
         | ReadFileCommand cmd -> Some(truncate 64 cmd.FilePath)
+        | ReadFilePageCommand cmd -> Some(truncate 64 cmd.FilePath)
         | ReadFilesCommand cmd -> Some $"{cmd.FilePaths.Length} files"
         | GetAgentInstructionsCommand cmd -> Some(truncate 64 cmd.Directory)
         | ReadImageCommand cmd -> Some(truncate 64 cmd.FilePath)
@@ -875,11 +898,18 @@ module AgentCommandInfo =
         | None -> invocation command
 
 module AgentProtocol =
-    let version = "3.61"
+    let version = "3.62"
     let defaultPatchFuzzyContextLines = 3
     let maxResponseBytes = 900 * 1024
     let maxImageBytes = 8 * 1024 * 1024
     let maxExportBytes = 8 * 1024 * 1024
+    // Bound source work before allocations and before the transport's final
+    // response serialization guard. Large sources use ReadFilePage instead.
+    let maxLegacyTextReadBytes = 512 * 1024
+    let maxRangeScanBytes = 8 * 1024 * 1024
+    let maxRangeReturnBytes = 256 * 1024
+    let maxRangeLines = 2048
+    let maxSearchFileBytes = 8 * 1024 * 1024
     let defaultMaxImportBytes = 32L * 1024L * 1024L
 
     let private definition name description permissions mutates requiresConfirmation supportsDryRun : CommandDefinition =
@@ -909,7 +939,8 @@ module AgentProtocol =
           definition "ListDirectory" "Lists files and folders in a project directory." [ ReadOnly ] false false false
           definition "SearchFiles" "Searches project file names." [ ReadOnly ] false false false
           definition "SearchText" "Searches project file contents." [ ReadOnly ] false false false
-          definition "ReadFile" "Reads one file." [ ReadOnly ] false false false
+          definition "ReadFile" "Reads one bounded file." [ ReadOnly ] false false false
+          definition "ReadFilePage" "Reads a bounded UTF-8 page from a file, with snapshot-aware continuation." [ ReadOnly ] false false false
           definition "ReadFiles" "Reads multiple files." [ ReadOnly ] false false false
           definition "GetAgentInstructions" "Reads all applicable AGENTS.md files for a checkout directory, with continuation for transport-size limits." [ ReadOnly ] false false false
           definition "ReadImage" "Reads one PNG, JPEG, or WebP image for model vision." [ ReadOnly ] false false false

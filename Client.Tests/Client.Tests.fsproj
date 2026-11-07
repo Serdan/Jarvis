@@ -41,6 +41,7 @@
         <Compile Include="TerminalFrameTests.fs"/>
         <Compile Include="HashAndPatchTests.fs"/>
         <Compile Include="PathSafetyTests.fs"/>
+        <Compile Include="BoundedReadsTests.fs"/>
         <Compile Include="SelfUpdateTests.fs"/>
         <Compile Include="PermissionPolicyTests.fs"/>
         <Compile Include="AgentCommandInfoTests.fs"/>

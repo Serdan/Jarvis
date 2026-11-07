@@ -357,12 +357,14 @@ let ``listDirectory returns files and folders`` () =
     | Error e -> Assert.Fail($"Expected Ok, got Error: {EffectError.toString e}")
 
 [<Test>]
-let ``listDirectory aggregates missing folder errors`` () =
+let ``listDirectory reports one missing folder error`` () =
     let cmd = { ProjectName = "Project1"; FolderPath = "missing" }
 
+    // Directory resolution is now done once rather than independently in
+    // eager file and subdirectory scans. Do not duplicate a missing-path error.
     match listDirectory cmd fakeContext with
-    | Error(AggregatedErrors errors) -> errors.Length |> shouldEqual 2
-    | other -> Assert.Fail($"Expected AggregatedErrors, got {other}")
+    | Error(NotFoundError _) -> ()
+    | other -> Assert.Fail($"Expected NotFoundError, got {other}")
 
 [<Test>]
 let ``readFile returns content`` () =

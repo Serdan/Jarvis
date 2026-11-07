@@ -423,6 +423,7 @@ module McpToolHelpers =
         | SearchFilesCommand _
         | SearchTextCommand _
         | ReadFileCommand _
+        | ReadFilePageCommand _
         | ReadFilesCommand _
         | GetAgentInstructionsCommand _
         | ReadImageCommand _
@@ -1630,6 +1631,15 @@ type JarvisMcpTools =
             StartLine = McpToolHelpers.optionOfNullable startLine
             EndLine = McpToolHelpers.optionOfNullable endLine
             IncludeLineNumbers = McpToolHelpers.optionOfNullableBool includeLineNumbers })
+
+    [<McpServerTool(Title = "Read file page", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read a bounded UTF-8 page of a project source file, including a continuation cursor. Subsequent calls reject changed files instead of silently mixing versions. Use for files too large for ReadFile.")>]
+    static member ReadFilePage(projectName: string, agentId: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, filePath: string, [<Optional; DefaultParameterValue(""); Description("Continuation token returned by the previous page; omit for the first page.")>] cursor: string, pageBytes: Nullable<int>, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        let projectName = McpToolHelpers.projectWithWorktreeName projectName worktreeName
+        McpToolHelpers.send client http (ReadFilePageCommand {
+            ProjectName = projectName
+            FilePath = filePath
+            Cursor = McpToolHelpers.optionOfString cursor
+            PageBytes = McpToolHelpers.optionOfNullable pageBytes })
 
     [<McpServerTool(Title = "Read files", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read multiple project files.")>]
     static member ReadFiles(projectName: string, agentId: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, filePaths: string array, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =

@@ -39,6 +39,7 @@
         <Compile Include="Modules\ClientConfig.fs"/>
         <Compile Include="Modules\OAuth.fs"/>
         <Compile Include="Modules\ProjectPaths.fs"/>
+        <Compile Include="Modules\BoundedTextPages.fs"/>
         <Compile Include="Modules\AuditLog.fs"/>
         <Compile Include="Modules\PermissionPolicy.fs"/>
         <Compile Include="Modules\ActivityPresentation.fs"/>

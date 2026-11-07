@@ -1,0 +1,22 @@
+<article>
+<h1>Make workspace file mutations atomic and race-safe</h1>
+<p><strong>Priority:</strong> P1 (correctness / lost updates). <strong>Source:</strong> <code>docs/reviews/2026-11-07-deep-review.md</code>, JRV-2026-11-01. <strong>Baseline:</strong> main <code>e50c24af</code>.</p>
+<h2>Problem</h2>
+<p><code>Client/Modules/ProjectBrowser.fs:917-1002</code> reads and checks expected hashes separately from <code>FileIO.writeAllText</code>/<code>appendAllText</code>. <code>Client/IO/Impl/FileOperations.fs:88-109</code> writes in place. Two writers can both pass the same expected SHA-256 check and report success after overwriting each other; interrupted writes can truncate a file.</p>
+<h2>Requirements</h2>
+<ol>
+<li>Design one typed file-mutation primitive used by <code>WriteFile</code> (Write and Append) and <code>PatchFile</code>. Preserve the existing public precondition semantics, including <code>expectedHash="none"</code> for creation and current response diagnostics.</li>
+<li>Make expected-state verification and commit one concurrency-controlled operation. The synchronization must work across concurrent Jarvis client processes on the same filesystem, not merely within one F# process. Recheck file identity/content under the lock and reject stale preconditions rather than silently overwrite.</li>
+<li>Stage replacement contents in the same directory/filesystem, flush appropriately and atomically publish or replace without truncating the live file. Define OS-specific behavior for Linux/macOS/Windows and preserve meaningful file permissions and metadata. Append should use the same committed-state semantics.</li>
+<li>Maintain source-root containment and symlink/hardlink protections across the entire operation, including parent creation and the interval between validation and replacement. Clean up temporary files and locks after failures.</li>
+<li>Avoid introducing a project-wide serialization bottleneck; independent file mutations should proceed concurrently. Keep error reporting typed and actionable.</li>
+</ol>
+<h2>Acceptance and verification</h2>
+<ul>
+<li>Two simultaneous updates with the same precondition permit at most one successful mutation; the other receives a stale/conflict result. Exercise independent clients/processes, not just async tasks in a single test process.</li>
+<li>Simulated failures before commit preserve a complete original file; after commit, consumers see the complete new content, never a partially written intermediate.</li>
+<li>Tests cover Write, Append, Patch, absent-file creation, stale hashes, Unicode content, empty content, permissions, worktree selectors, concurrent readers, parent creation, and cleanup.</li>
+<li>Review correctness of filesystem primitives and platform fallbacks; run relevant focused tests and full Client Release tests. Add a short design note explaining the chosen locking and durability guarantees.</li>
+</ul>
+<p><strong>Non-goals:</strong> No redesign of the canonical Git ledger; no change to Git history or the public MCP tool set unless a compelling API need is documented.</p>
+</article>

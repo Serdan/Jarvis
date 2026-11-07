@@ -116,34 +116,45 @@ module private Native =
 
 let internal groupHostFlag = "--jarvis-internal-process-group"
 
-/// macOS does not ship util-linux setsid; this helper creates its own
-/// native POSIX session. On Windows the helper waits for a one-byte handoff
-/// before launching anything: its outer owner first attaches it to a Job
-/// Object, eliminating the Process.Start-to-AssignProcessToJobObject race.
+/// macOS uses a managed helper because the platform does not ship the
+/// util-linux setsid executable. On Windows a named event is used only as
+/// a startup barrier: the requested process cannot launch until its parent
+/// has assigned this helper to a kill-on-close Job Object. The barrier is
+/// independent of standard input, which must retain its configured meaning.
 let runInternalGroupHost (args: string array) =
-    if args.Length < 1 || not (OperatingSystem.IsMacOS() || OperatingSystem.IsWindows()) then
+    let windows = OperatingSystem.IsWindows()
+    let mac = OperatingSystem.IsMacOS()
+    if not (windows || mac) || args.Length < (if windows then 2 else 1) then
         eprintfn "Invalid internal process-group invocation."
         126
-    elif OperatingSystem.IsMacOS() && Native.setsid() < 0 then
+    elif mac && Native.setsid() < 0 then
         eprintfn "Could not establish process session."
-        126
-    elif OperatingSystem.IsWindows() && Console.OpenStandardInput().ReadByte() <> 71 then
-        eprintfn "Process-group handshake not received."
         126
     else
         try
-            use child = new Process()
-            child.StartInfo.FileName <- args[0]
-            child.StartInfo.WorkingDirectory <- Environment.CurrentDirectory
-            child.StartInfo.UseShellExecute <- false
-            child.StartInfo.CreateNoWindow <- true
-            args |> Seq.skip 1 |> Seq.iter child.StartInfo.ArgumentList.Add
-            // Inherit this helper's stdin/stdout/stderr file descriptors so
-            // the outer executor can stream and bound all three pipes.
-            if not (child.Start()) then 127
+            let offset = if windows then 1 else 0
+            let allowed =
+                if windows then
+                    use ready = EventWaitHandle.OpenExisting(args[0])
+                    ready.WaitOne(TimeSpan.FromSeconds 15.)
+                else true
+
+            if not allowed then
+                eprintfn "Process-group assignment was not confirmed."
+                126
             else
-                child.WaitForExit()
-                child.ExitCode
+                use child = new Process()
+                child.StartInfo.FileName <- args[offset]
+                child.StartInfo.WorkingDirectory <- Environment.CurrentDirectory
+                child.StartInfo.UseShellExecute <- false
+                child.StartInfo.CreateNoWindow <- true
+                args |> Seq.skip (offset + 1) |> Seq.iter child.StartInfo.ArgumentList.Add
+                // Child inherits the helper's stdout/stderr AND stdin: no
+                // startup protocol ever consumes the data sent to the child.
+                if not (child.Start()) then 127
+                else
+                    child.WaitForExit()
+                    child.ExitCode
         with ex ->
             eprintfn "Could not launch process: %s" ex.Message
             127
@@ -164,10 +175,13 @@ type private Capture(limit: int option) =
                 buffer.Write(bytes, 0, allowed)
             if allowed < count then truncated <- true)
 
-    member _.Snapshot() =
+    member _.Snapshot(encoding: Encoding) =
         lock gate (fun () ->
             let data = buffer.ToArray()
-            let text = Encoding.UTF8.GetString data
+            // Process.StandardOutput/StandardError historically decoded using
+            // their configured (or console-default) StreamReader encoding.
+            // Preserve that behavior while independently bounding retained bytes.
+            let text = encoding.GetString data
             let text =
                 match limit with
                 | Some maxBytes when Encoding.UTF8.GetByteCount text > maxBytes ->
@@ -208,7 +222,17 @@ let private tryTerminateGroup pid job =
         // immediate child exits while descendants retain inherited pipes.
         Native.kill(-pid, 9) |> ignore
 
-let private prepareCommand (command: Command) =
+// Framework-dependent apphosts already know which managed assembly to run.
+// Only the general dotnet host needs a DLL path prepended to its arguments.
+let internal helperHostInvocation (hostPath: string) (assemblyPath: string) (args: string list) =
+    let isDotnetHost =
+        String.Equals(Path.GetFileNameWithoutExtension(hostPath), "dotnet",
+                      StringComparison.OrdinalIgnoreCase)
+    if isDotnetHost && not (String.IsNullOrWhiteSpace assemblyPath) then
+        hostPath, assemblyPath :: args
+    else hostPath, args
+
+let private prepareCommand (command: Command) (windowsReadyName: string option) =
     if OperatingSystem.IsLinux() then
         let setsid =
             if File.Exists("/usr/bin/setsid") then "/usr/bin/setsid"
@@ -216,11 +240,18 @@ let private prepareCommand (command: Command) =
             else raise (FileNotFoundException "Linux bounded commands require the system setsid utility.")
         setsid, [ "--"; command.Executable ] @ command.Args
     elif OperatingSystem.IsMacOS() || OperatingSystem.IsWindows() then
+        let host = Environment.ProcessPath
+        if String.IsNullOrWhiteSpace host then
+            raise (InvalidOperationException "Cannot locate the current Jarvis executable.")
         let dll = Assembly.GetExecutingAssembly().Location
-        if not (String.IsNullOrEmpty dll) then
-            "dotnet", [ dll; groupHostFlag; command.Executable ] @ command.Args
-        else
-            Environment.ProcessPath, [ groupHostFlag; command.Executable ] @ command.Args
+        let args =
+            [ yield groupHostFlag
+              if OperatingSystem.IsWindows() then
+                  yield windowsReadyName |> Option.defaultWith (fun () ->
+                      invalidOp "Windows process-group startup requires a readiness event.")
+              yield command.Executable
+              yield! command.Args ]
+        helperHostInvocation host dll args
     else
         command.Executable, command.Args
 
@@ -235,6 +266,10 @@ let runWithCancellation (cancellation: CancellationToken) (command: Command) : C
         let deadline = Stopwatch.StartNew()
         let windows = OperatingSystem.IsWindows()
         let mutable job = 0n
+        let mutable readiness: EventWaitHandle option = None
+        let readyName =
+            if windows then Some($"Local\\Jarvis.BoundedProcess.{Guid.NewGuid():N}")
+            else None
         use proc = new Process()
         use canceled = CancellationTokenSource.CreateLinkedTokenSource(cancellation)
         let stdout = Capture(command.MaxOutputBytes)
@@ -243,16 +278,24 @@ let runWithCancellation (cancellation: CancellationToken) (command: Command) : C
 
         try
             try
-                if windows then job <- Native.newWindowsJob()
+                if windows then
+                    job <- Native.newWindowsJob()
+                    let name = Option.get readyName
+                    readiness <- Some(new EventWaitHandle(false, EventResetMode.ManualReset, name))
 
-                let executable, args = prepareCommand command
+                let executable, args = prepareCommand command readyName
                 proc.StartInfo.FileName <- executable
                 proc.StartInfo.WorkingDirectory <- command.WorkingDirectory
                 proc.StartInfo.UseShellExecute <- false
                 proc.StartInfo.RedirectStandardOutput <- true
                 proc.StartInfo.RedirectStandardError <- true
                 proc.StartInfo.RedirectStandardInput <-
-                    windows || (match command.StandardInput with InheritInput -> false | _ -> true)
+                    (match command.StandardInput with InheritInput -> false | _ -> true)
+                // Git's stdin and generic TextInput payloads are UTF-8.
+                // Do not depend on a Windows console's legacy code page.
+                match command.StandardInput with
+                | TextInput _ -> proc.StartInfo.StandardInputEncoding <- new UTF8Encoding(false)
+                | _ -> ()
                 proc.StartInfo.CreateNoWindow <- true
                 command.ConfigureStart |> Option.iter (fun configure -> configure proc.StartInfo)
                 for key, value in command.ExtraEnvironment do
@@ -266,11 +309,13 @@ let runWithCancellation (cancellation: CancellationToken) (command: Command) : C
                     if windows then
                         if not (Native.AssignProcessToJobObject(job, proc.Handle)) then
                             raise (Win32Exception(Marshal.GetLastWin32Error()))
-                        // The helper cannot start the target until it is
-                        // already in the job, so descendants inherit the job.
-                        proc.StandardInput.BaseStream.WriteByte 71uy
-                        proc.StandardInput.BaseStream.Flush()
+                        // The helper waits for this event before launching
+                        // the target, independent of the actual stdin stream.
+                        // Descendants therefore inherit the assigned job.
+                        readiness |> Option.iter (fun ready -> ready.Set() |> ignore)
 
+                    let stdoutEncoding = proc.StandardOutput.CurrentEncoding
+                    let stderrEncoding = proc.StandardError.CurrentEncoding
                     let stdoutTask = pump proc.StandardOutput.BaseStream stdout canceled.Token
                     let stderrTask = pump proc.StandardError.BaseStream stderr canceled.Token
                     let inputTask =
@@ -280,12 +325,7 @@ let runWithCancellation (cancellation: CancellationToken) (command: Command) : C
                                 do! proc.StandardInput.WriteAsync(value.AsMemory(), canceled.Token)
                                 do! proc.StandardInput.FlushAsync(canceled.Token)
                                 proc.StandardInput.Close()
-                            | ClosedInput ->
-                                proc.StandardInput.Close()
-                            | InheritInput when windows ->
-                                // The group-host helper currently uses stdin
-                                // for the assignment handshake on Windows.
-                                proc.StandardInput.Close()
+                            | ClosedInput -> proc.StandardInput.Close()
                             | InheritInput -> ()
                         }
                     let exitTask = proc.WaitForExitAsync(canceled.Token)
@@ -314,8 +354,8 @@ let runWithCancellation (cancellation: CancellationToken) (command: Command) : C
                             all.WaitAsync(TimeSpan.FromMilliseconds 600.).GetAwaiter().GetResult()
                         with _ -> ()
 
-                    let output, outputTruncated = stdout.Snapshot()
-                    let errors, errorTruncated = stderr.Snapshot()
+                    let output, outputTruncated = stdout.Snapshot(stdoutEncoding)
+                    let errors, errorTruncated = stderr.Snapshot(stderrEncoding)
                     if canceledByCaller then
                         Error(ContextError "Process execution canceled.")
                     else
@@ -337,6 +377,7 @@ let runWithCancellation (cancellation: CancellationToken) (command: Command) : C
                     if not proc.HasExited then proc.Kill(entireProcessTree = true)
                 with _ -> ()
                 try proc.WaitForExit(250) |> ignore with _ -> ()
+            readiness |> Option.iter safeDispose
             if job <> 0n then Native.CloseHandle(job) |> ignore
 
 

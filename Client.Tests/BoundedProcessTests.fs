@@ -204,6 +204,129 @@ let timeout_interrupts_blocked_standard_input_write () =
         if Directory.Exists(root) then Directory.Delete(root, true)
 
 [<Test>]
+let successful_command_cleans_up_detached_descendants () =
+    let root = newProject ()
+    let project = Path.Combine(root, "Project1")
+    let markerPath = Path.Combine(project, "detached-pid.txt")
+    let childPath = Path.Combine(project, "detached-child.fsx")
+    let parentPath = Path.Combine(project, "detached-parent.fsx")
+    try
+        let childScript = $"""open System
+open System.IO
+open System.Threading
+File.WriteAllText(@"{markerPath}", string Environment.ProcessId)
+Thread.Sleep 30000"""
+        let parentScript = $"""open System
+open System.Diagnostics
+open System.IO
+open System.Threading
+let info = ProcessStartInfo("dotnet")
+info.ArgumentList.Add("fsi")
+info.ArgumentList.Add("--exec")
+info.ArgumentList.Add(@"{childPath}")
+info.UseShellExecute <- false
+// Capture the child's output separately so the outer command sees EOF
+// when this parent exits, even though the descendant is still alive.
+info.RedirectStandardOutput <- true
+info.RedirectStandardError <- true
+use child = Process.Start(info)
+let deadline = DateTime.UtcNow.AddSeconds(15.)
+while not (File.Exists(@"{markerPath}")) && DateTime.UtcNow < deadline do
+    Thread.Sleep 20
+if not (File.Exists(@"{markerPath}")) then failwith "Child did not start."
+printfn "parent completed"
+"""
+        File.WriteAllText(childPath, childScript)
+        File.WriteAllText(parentPath, parentScript)
+        match runCommand (command "detached-parent.fsx" 20 4096) (Context root) with
+        | Error error -> Assert.Fail($"Expected successful cleanup, got {error}")
+        | Ok output ->
+            Assert.That(output.TimedOut, Is.False)
+            Assert.That(output.ExitCode, Is.EqualTo(0))
+            Assert.That(File.Exists markerPath, Is.True)
+            let pid = int (File.ReadAllText markerPath)
+            try
+                let deadline = DateTime.UtcNow.AddSeconds(2.)
+                while isAlive pid && DateTime.UtcNow < deadline do Thread.Sleep 50
+                Assert.That(isAlive pid, Is.False,
+                            "A bounded command must not leave descendants alive after success.")
+            finally stopChild pid
+    finally
+        if File.Exists markerPath then
+            match Int32.TryParse(File.ReadAllText markerPath) with
+            | true, pid -> stopChild pid
+            | _ -> ()
+        if Directory.Exists root then Directory.Delete(root, true)
+
+[<Test>]
+let managed_dotnet_host_and_apphost_choose_the_correct_helper_arguments () =
+    let payload = [ "--jarvis-internal-process-group"; "test-event"; "git"; "status" ]
+    let dotnetHost, dotnetArgs =
+        BoundedProcess.helperHostInvocation "/opt/dotnet" "/apps/JarvisClient.dll" payload
+    Assert.That(dotnetHost, Is.EqualTo("/opt/dotnet"))
+    Assert.That((dotnetArgs = "/apps/JarvisClient.dll" :: payload), Is.True)
+
+    let apphost, apphostArgs =
+        BoundedProcess.helperHostInvocation "/apps/JarvisClient.exe" "/apps/JarvisClient.dll" payload
+    Assert.That(apphost, Is.EqualTo("/apps/JarvisClient.exe"))
+    Assert.That((apphostArgs = payload), Is.True)
+
+    let singleFile, singleFileArgs =
+        BoundedProcess.helperHostInvocation "/apps/JarvisClient" "" payload
+    Assert.That(singleFile, Is.EqualTo("/apps/JarvisClient"))
+    Assert.That((singleFileArgs = payload), Is.True)
+
+[<Test>]
+let closed_input_provides_eof_to_the_child () =
+    let root = newProject ()
+    try
+        let project = Path.Combine(root, "Project1")
+        File.WriteAllText(Path.Combine(project, "read-stdin.fsx"),
+                          "let input = System.Console.In.ReadToEnd()\nprintfn \"input-length:%d\" input.Length\n")
+        let command: BoundedProcess.Command =
+            { Executable = "dotnet"
+              Args = [ "fsi"; "--exec"; "read-stdin.fsx" ]
+              WorkingDirectory = project
+              Timeout = TimeSpan.FromSeconds 15.
+              MaxOutputBytes = Some 4096
+              StandardInput = BoundedProcess.ClosedInput
+              ExtraEnvironment = []
+              ConfigureStart = None }
+        match BoundedProcess.run command with
+        | Ok result ->
+            Assert.That(result.TimedOut, Is.False)
+            Assert.That(result.ExitCode, Is.EqualTo(0))
+            Assert.That(result.StdOut, Does.Contain("input-length:0"))
+        | Error error -> Assert.Fail($"Expected stdin EOF, got {error}")
+    finally
+        if Directory.Exists(root) then Directory.Delete(root, true)
+
+[<Test>]
+let supplied_text_reaches_child_stdin_unmodified () =
+    let root = newProject ()
+    try
+        let project = Path.Combine(root, "Project1")
+        File.WriteAllText(Path.Combine(project, "echo-stdin.fsx"),
+                          "let input = System.Console.In.ReadToEnd()\nprintfn \"received:%s\" input\n")
+        let command: BoundedProcess.Command =
+            { Executable = "dotnet"
+              Args = [ "fsi"; "--exec"; "echo-stdin.fsx" ]
+              WorkingDirectory = project
+              Timeout = TimeSpan.FromSeconds 15.
+              MaxOutputBytes = Some 4096
+              StandardInput = BoundedProcess.TextInput "hello ø world"
+              ExtraEnvironment = []
+              ConfigureStart = None }
+        match BoundedProcess.run command with
+        | Ok result ->
+            Assert.That(result.TimedOut, Is.False)
+            Assert.That(result.ExitCode, Is.EqualTo(0))
+            Assert.That(result.StdOut, Does.Contain("received:hello ø world"))
+        | Error error -> Assert.Fail($"Expected supplied UTF-8 stdin, got {error}")
+    finally
+        if Directory.Exists(root) then Directory.Delete(root, true)
+
+[<Test>]
 let nonzero_exit_is_distinct_from_timeout () =
     let root = newProject ()
     try

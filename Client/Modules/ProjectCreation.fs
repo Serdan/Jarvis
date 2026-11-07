@@ -21,25 +21,21 @@ let private validName (name: string) =
         || Array.contains ch (Path.GetInvalidFileNameChars())))
 
 let private runGit root (args: string list) =
-    try
-        use proc = new Process()
-        proc.StartInfo.FileName <- "git"
-        proc.StartInfo.WorkingDirectory <- root
-        proc.StartInfo.UseShellExecute <- false
-        proc.StartInfo.RedirectStandardOutput <- true
-        proc.StartInfo.RedirectStandardError <- true
-        for arg in args do proc.StartInfo.ArgumentList.Add arg
-        if not (proc.Start()) then Error(ValidationError "Could not launch git.")
-        else
-            let stdout = proc.StandardOutput.ReadToEnd()
-            let stderr = proc.StandardError.ReadToEnd()
-            if not (proc.WaitForExit(15000)) then
-                proc.Kill(true)
-                Error(ValidationError "Git project initialization timed out.")
-            elif proc.ExitCode <> 0 then
-                Error(ValidationError $"Git project initialization failed: {stderr}")
-            else Ok stdout
-    with ex -> Error(ExceptionError ex)
+    BoundedProcess.run
+        { Executable = "git"
+          Args = args
+          WorkingDirectory = root
+          Timeout = TimeSpan.FromSeconds 15.
+          MaxOutputBytes = Some(128 * 1024)
+          StandardInput = BoundedProcess.InheritInput
+          ExtraEnvironment = [ "GIT_TERMINAL_PROMPT", "0" ]
+          ConfigureStart = None }
+    |> Result.bind (fun output ->
+        if output.TimedOut then
+            Error(ValidationError "Git project initialization timed out.")
+        elif output.ExitCode <> 0 || output.StdOutTruncated || output.StdErrTruncated then
+            Error(ValidationError $"Git project initialization failed: {output.StdErr}")
+        else Ok output.StdOut)
 
 let private writeNew path (content: string) =
     use stream = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None)

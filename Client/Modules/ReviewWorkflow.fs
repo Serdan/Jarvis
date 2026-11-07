@@ -2297,14 +2297,13 @@ module ReviewWorkflow =
 
     // Derive every queue and slot observation from a single verified ledger commit.
     // Queue membership is never duplicated in agent.json.
-    // Fetch just the canonical agent record for duration guidance.
-    let getAgentWorkingTurn binding agentId =
+    let getAgentWorkingTurnAt binding snapshot agentId =
         if not (validAgent agentId) then Error(InvalidBinding "Invalid Working agent ID.")
-        else result {
-            let! snapshot = LedgerStore.fetch binding
-            let! agent, _ = required<ReviewAgent> binding snapshot (agentPath agentId)
-            return agent
-        }
+        else required<ReviewAgent> binding snapshot (agentPath agentId) |> Result.map fst
+
+    let getAgentWorkingTurn binding agentId =
+        LedgerStore.fetch binding
+        |> Result.bind (fun snapshot -> getAgentWorkingTurnAt binding snapshot agentId)
 
     // Resolve agent association from the canonical ledger even after a client
     // restart. This is identity for activity tracking, not evidence of Working.

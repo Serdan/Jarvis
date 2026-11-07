@@ -25,6 +25,21 @@ let receiveMessage (rt: Runtime) message =
 // Working state for ordinary calls to avoid one remote git fetch per tool.
 let private workingGuidanceCaches = ConditionalWeakTable<Runtime, WorkingTurnGuidance.AgentCache>()
 let private instructionDeliveryCaches = ConditionalWeakTable<Runtime, AgentInstructions.DeliveryCache>()
+let invalidateAgentStates (rt: Runtime) (projectName: string) =
+    // Server notifications only carry the logical project identity. Worktree
+    // selectors share the canonical ledger/assignment cache by ProjectId.
+    match ProjectPaths.ProjectTarget.parse projectName with
+    | Ok target ->
+        let cache = workingGuidanceCaches.GetValue(rt, fun _ ->
+            WorkingTurnGuidance.AgentCache(TimeSpan.FromMinutes 2.))
+        cache.InvalidateProject(ProjectPaths.ProjectTarget.projectId target)
+    | Error _ -> ()
+
+let invalidateAllAgentStates (rt: Runtime) =
+    // Reconnection can follow missed updates from other devices.
+    let cache = workingGuidanceCaches.GetValue(rt, fun _ ->
+        WorkingTurnGuidance.AgentCache(TimeSpan.FromMinutes 2.))
+    cache.InvalidateAll()
 // Only commands addressing repository source are checkout selectors.
 // Message/activity project fields are literal history labels, not paths.
 type private CommandProject =
@@ -51,6 +66,14 @@ let private classifyProject command =
         | Some raw -> ProjectPaths.ProjectTarget.parse raw |> Result.map Checkout
 
 
+let private loadAgentState (rt: Runtime) (project: string) (agentId: string) =
+    match OrchestrationApi.LedgerBindingConfig.loadWithSnapshot project rt with
+    | Error _ -> None
+    | Ok (binding, snapshot) ->
+        match ReviewWorkflow.ReviewWorkflow.getAgentWorkingTurnAt binding snapshot agentId with
+        | Ok agent -> Some agent
+        | Error _ -> None
+
 let private checkWorkingGuidance (rt: Runtime) agentId (target: ProjectPaths.ProjectTarget option) command =
     if String.IsNullOrWhiteSpace agentId then []
     else
@@ -66,12 +89,7 @@ let private checkWorkingGuidance (rt: Runtime) agentId (target: ProjectPaths.Pro
             | _ -> ()
             let agent =
                 cache.Get(now, projectId, agentId, fun () ->
-                    match OrchestrationApi.LedgerBindingConfig.load project rt with
-                    | Error _ -> None
-                    | Ok binding ->
-                        match ReviewWorkflow.ReviewWorkflow.getAgentWorkingTurn binding agentId with
-                        | Error _ -> None
-                        | Ok found -> Some found)
+                    loadAgentState rt project agentId)
             match agent |> Option.bind (WorkingTurnGuidance.instructionAt now) with
             | Some content ->
                 [ { Scope = "working-turn"; Path = "jarvis/working-turn"
@@ -106,19 +124,16 @@ let private activateReadyOnActivity (rt: Runtime) (agentId: string)
             let projectId = ProjectPaths.ProjectTarget.projectId target
             let project = ProjectPaths.ProjectId.value projectId
             let cache = workingGuidanceCaches.GetValue(rt, fun _ -> WorkingTurnGuidance.AgentCache(TimeSpan.FromMinutes 2.))
-            // Assignment transitions can be written by another client. A cached
-            // Working value cannot prove that this call is still in the same
-            // turn, nor that Ready activation is unnecessary. Recheck before
-            // every activatable operation; reuse the fresh snapshot for guidance.
-            cache.Invalidate(projectId, agentId)
+            // The server broadcasts invalidation after successful ledger writes
+            // on any connected device; the inbox also forces authoritative refresh.
+            // Keep the 2-minute fallback for changes outside Jarvis and missed
+            // notifications. Do not fetch from GitHub for every ordinary source call.
+            match command with
+            | TaskReadCommand cmd when cmd.Action = "AgentInbox" -> cache.Invalidate(projectId, agentId)
+            | _ -> ()
             let current =
                 cache.Get(DateTimeOffset.UtcNow, projectId, agentId, fun () ->
-                    match OrchestrationApi.LedgerBindingConfig.load project rt with
-                    | Error _ -> None
-                    | Ok binding ->
-                        match ReviewWorkflow.ReviewWorkflow.getAgentWorkingTurn binding agentId with
-                        | Ok agent -> Some agent
-                        | Error _ -> None)
+                    loadAgentState rt project agentId)
             match current with
             | Some agent when agent.State = "Ready"
                               && not (isNull (box agent.CurrentAssignment))
@@ -158,12 +173,7 @@ let private incrementalInstructions (rt: Runtime) (agentId: string)
             let now = DateTimeOffset.UtcNow
             let agent =
                 cache.Get(now, projectId, agentId, fun () ->
-                    match OrchestrationApi.LedgerBindingConfig.load project rt with
-                    | Error _ -> None
-                    | Ok binding ->
-                        match ReviewWorkflow.ReviewWorkflow.getAgentWorkingTurn binding agentId with
-                        | Ok found -> Some found
-                        | Error _ -> None)
+                    loadAgentState rt project agentId)
             match agent with
             | Some active when active.State = "Working" ->
                 let turn = string active.StateSequence + ":" + active.WorkingTurnStartedAtUtc

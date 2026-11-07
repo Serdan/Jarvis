@@ -69,8 +69,34 @@ module ProjectNotificationRouting =
         "Check the destination ledger binding and connected client capabilities."
 
 
+module AgentStateInvalidationRouting =
+    // A state-changing tool completes against one selected client. Invalidate
+    // every connected device for the authenticated user, but never other users.
+    let recipients (sessions: ClientSessionStatus array) =
+        sessions
+        |> Array.choose (fun session ->
+            if session.State = Registered then session.ConnectionId else None)
+        |> Array.distinct
+
+    let afterSuccessfulCommand = function
+        | TaskWriteCommand _ -> true
+        // Inbox can implicitly activate a Ready assignment.
+        | TaskReadCommand command when command.Action = "AgentInbox" -> true
+        | _ -> false
+
+
 type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserService, tracker: ClientResponseTracker) =
     member this.SendMessageToAll(message) = ctx.Clients.All.ReceiveMessage(message)
+
+    // Only authenticated, registered devices belonging to this user receive
+    // invalidations. No agent-state data or authoritative ledger state is stored
+    // on the server; the hint merely expires each client's local cache.
+    member _.InvalidateAgentStatesForUser(userId: string, projectName: string) : Task =
+        users.ListDevices(userId)
+        |> AgentStateInvalidationRouting.recipients
+        |> Array.map (fun connectionId ->
+            ctx.Clients.Client(connectionId).InvalidateAgentStates(projectName))
+        |> Task.WhenAll
 
     member private this.ResponseTimeout(command: AgentCommand) =
         let permissionMargin = TimeSpan.FromMinutes(5L)

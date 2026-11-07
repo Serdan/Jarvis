@@ -22,6 +22,11 @@ An instruction file applies to work **in its directory and descendants**, not si
 
 A missing `AGENTS.md` is normal and contributes no document. Empty files are allowed. Automatic delivery contributes no instruction content for an empty file; explicit hierarchy retrieval includes it. The existing path confinement and symlink/reparse-point prohibitions apply to both directories and instruction files, including the workspace-level file.
 
+The incremental delivery cache records one current observation per logical
+instruction path. A complete delivery and an omission warning replace one another;
+an oversized document changing to a complete document and back therefore re-emits
+the omission notice. Explicit `get_agent_instructions` always bypasses the cache.
+
 ## MCP initialization guidance
 
 Advertise concise, static instructions through MCP `initialize.result.instructions`. The first 512 characters should convey the core contract:

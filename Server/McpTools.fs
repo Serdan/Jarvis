@@ -26,6 +26,7 @@ open System.Threading
 open Common
 open Microsoft.AspNetCore.Http
 open Microsoft.Extensions.DependencyInjection
+open Microsoft.Extensions.Logging
 open Microsoft.Extensions.Options
 open ModelContextProtocol.Protocol
 open ModelContextProtocol.Server
@@ -654,6 +655,24 @@ module McpToolHelpers =
                                                      ?agentId = RequestDeviceRouting.agentId())
                     stopwatch.Stop()
                     finishOperation tracking response stopwatch.ElapsedMilliseconds
+
+                    // The canonical write has already succeeded. Other connected
+                    // clients must discard stale Ready/Working observations
+                    // before their next ordinary source operation. Failed
+                    // delivery cannot retroactively fail a committed ledger write.
+                    if AgentStateInvalidationRouting.afterSuccessfulCommand command
+                       && response.Error.IsNone && response.Result.IsSome then
+                        try
+                            do! client.InvalidateAgentStatesForUser(
+                                userId, AgentCommandInfo.projectName command |> Option.defaultValue "")
+                        with ex ->
+                            // A committed task operation must not appear to fail
+                            // because a cache hint could not reach every client.
+                            // The recipients still have a periodic refresh fallback.
+                            let factory = context.RequestServices.GetService<ILoggerFactory>()
+                            if not (isNull factory) then
+                                let logger = factory.CreateLogger("Jarvis.AgentStateInvalidation")
+                                logger.LogWarning(ex, "Could not deliver agent-state invalidation hints.")
 
                     return
                         (match command with

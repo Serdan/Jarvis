@@ -37,6 +37,23 @@ Because this removes public tools and introduces a new enum parameter,
 of the connected MCP tool catalog**. Do not deploy without explicit operator
 authorization.
 
+## Cross-client Working-state cache invalidation (protocol 3.60)
+
+After a successful canonical task write or agent-inbox operation, the server
+sends a user-scoped SignalR `InvalidateAgentStates(projectName)` hint to connected
+devices. Each client expires cached agent state for that logical project,
+including registered worktrees. The next attributable operation then reads
+the authoritative Git ledger, while normal local source operations use the
+warm Working-state cache rather than fetching from GitHub on every call.
+
+The two-minute refresh remains as a fallback for ledger changes outside
+Jarvis and missed notifications. Reconnecting clears cached agent states.
+A cache refresh reuses its verified ledger snapshot, avoiding a second
+redundant remote fetch. The server stores no persistent agent state.
+
+**Protocol 3.60 requires coordinated client/server deployment.** Do not
+deploy without explicit operator authorization.
+
 ## Explicit agent labels
 
 Agent-related MCP operations use **`agentId`** consistently; this replaces

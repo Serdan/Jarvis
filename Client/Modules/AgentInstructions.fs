@@ -553,11 +553,18 @@ let roots (rt: Runtime) projectName =
 
 // This is a best-effort per-process delivery cache, never authoritative state.
 // A new working turn resets the set; another client may harmlessly redeliver.
+// Track the *current observation* for each logical instruction path.
+// A warning and a successful delivery are alternative states of the same
+// source, not two independent cache entries.
+type private DeliveryFingerprint =
+    | Delivered of scope: string * sha256: string
+    | Omitted of warning: string
+
 type private DeliveryEntry =
     { Gate: obj
       mutable Turn: string
       mutable Bootstrapped: bool
-      mutable Hashes: Map<string, string> }
+      mutable Observed: Map<string, DeliveryFingerprint> }
 
 // A completed source hierarchy lookup is authoritative even when no AGENTS.md
 // was found. Ledger-only commands need a separate one-time root bootstrap.
@@ -574,12 +581,12 @@ type DeliveryCache() =
         let key = checkout, agentId
         let entry =
             entries.GetOrAdd(key, fun _ ->
-                { Gate = obj(); Turn = turn; Bootstrapped = false; Hashes = Map.empty })
+                { Gate = obj(); Turn = turn; Bootstrapped = false; Observed = Map.empty })
         lock entry.Gate (fun () ->
             if entry.Turn <> turn then
                 entry.Turn <- turn
                 entry.Bootstrapped <- false
-                entry.Hashes <- Map.empty
+                entry.Observed <- Map.empty
             // A completed source lookup already checked all ancestors. Its
             // empty result is as conclusive as a non-empty one.
             let initial =
@@ -602,12 +609,13 @@ type DeliveryCache() =
             |> List.filter (fun document ->
                 if document.Scope = "write-warning" || document.Scope = "working-turn" then true
                 else
-                    let key = document.Scope + ":" + document.Path
+                    let key = document.Path
                     let fingerprint =
-                        if document.Scope = "instruction-warning" then document.Content
-                        else document.Sha256
-                    match Map.tryFind key entry.Hashes with
+                        if document.Scope = "instruction-warning" then
+                            Omitted document.Content
+                        else Delivered(document.Scope, document.Sha256)
+                    match Map.tryFind key entry.Observed with
                     | Some previous when previous = fingerprint -> false
                     | _ ->
-                        entry.Hashes <- Map.add key fingerprint entry.Hashes
+                        entry.Observed <- Map.add key fingerprint entry.Observed
                         true))

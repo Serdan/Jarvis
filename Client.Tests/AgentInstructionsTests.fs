@@ -549,6 +549,38 @@ let write_notice_does_not_suppress_initial_instructions () =
 
 
 [<Test>]
+let omission_warning_is_redelivered_after_complete_file_replaces_it_and_reverts () =
+    workspace (fun root rt ->
+        let path = create root "Demo/AGENTS.md" (String('A', 90000))
+        let target =
+            ProjectPaths.ProjectTarget.parse "Demo"
+            |> function Ok value -> value | Error error -> failwithf "%A" error
+        let cache = DeliveryCache()
+        let read () = docs rt (command "some.cs")
+        let filter () =
+            cache.Filter(target, "Owner", "same-turn", HierarchyLoaded, read(), fun () -> Ok [])
+        let first = filter ()
+        Assert.That(first.Length, Is.EqualTo(1))
+        Assert.That(first.Head.Scope, Is.EqualTo("instruction-warning"))
+        Assert.That(filter(), Is.Empty)
+        File.WriteAllText(path, "New complete instructions")
+        let second = filter ()
+        Assert.That(second.Length, Is.EqualTo(1))
+        Assert.That(second.Head.Scope, Is.EqualTo("project"))
+        Assert.That(second.Head.Content, Is.EqualTo("New complete instructions"))
+        File.WriteAllText(path, String('A', 90000))
+        let third = filter ()
+        Assert.That(third.Length, Is.EqualTo(1))
+        Assert.That(third.Head.Scope, Is.EqualTo("instruction-warning"))
+        Assert.That(third.Head.Content, Is.EqualTo(first.Head.Content))
+        Assert.That(filter(), Is.Empty)
+        File.WriteAllText(path, "New complete instructions")
+        let fourth = filter ()
+        Assert.That(fourth.Length, Is.EqualTo(1))
+        Assert.That(fourth.Head.Scope, Is.EqualTo("project"))
+        Assert.That(fourth.Head.Content, Is.EqualTo(second.Head.Content)))
+
+[<Test>]
 let omitted_instruction_is_delivered_when_later_response_has_room () =
     workspace (fun root rt ->
         // The multi-directory request sees another sizeable ancestor first.

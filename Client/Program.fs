@@ -201,6 +201,9 @@ let private runClient args =
     ignoreAll {
         connection.On<string>("ReceiveMessage", Func<string, Task>(Client.receiveMessage rt))
         connection.On<string, string, string>("ReceiveCommand", Func<string, string, string, Task>(Client.receiveCommandAndReply connection rt))
+        connection.On<string>("InvalidateAgentStates", Func<string, Task>(fun project ->
+            Client.invalidateAgentStates rt project
+            Task.CompletedTask))
     }
 
     connection.add_Closed(
@@ -247,12 +250,14 @@ let private runClient args =
                         connectionFailureCount <- 0
                         let! isRegistered = register tui connection deviceId resolveMachineName
                         registered <- isRegistered
+                        if isRegistered then Client.invalidateAllAgentStates rt
                     else
                         connectionFailureCount <- connectionFailureCount + 1
 
             elif connection.State = HubConnectionState.Connected && not registered then
                 let! isRegistered = register tui connection deviceId resolveMachineName
                 registered <- isRegistered
+                if isRegistered then Client.invalidateAllAgentStates rt
 
             if not tui.ShouldQuit then
                 try

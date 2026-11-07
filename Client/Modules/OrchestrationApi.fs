@@ -136,7 +136,7 @@ module LedgerBindingConfig =
     // Local binding is intentionally opt-in, separately from the normal Jarvis config.
     // A successful load never lowers its persisted trust anchor, even if another
     // client process observes a later head during our network operation.
-    let private loadAtRoot root =
+    let private loadAtRootWithSnapshot root =
         let path = pathForRoot root
         if not (File.Exists path) then
             Error(Client.ValidationError $" ledger disabled for this checkout. Approved binding required at {path}. No V1 fallback.")
@@ -153,11 +153,21 @@ module LedgerBindingConfig =
                                 stored.HighestTrustedHead snapshot.Commit
                             |> Result.mapError LedgerErrors.toEffect
                             |> Result.bind (fun () ->
-                                if stored.HighestTrustedHead = snapshot.Commit then Ok binding
-                                else
-                                    writeStored path
-                                        { stored with HighestTrustedHead = snapshot.Commit } true
-                                    |> Result.map (fun () -> binding))))))
+                                let persisted =
+                                    if stored.HighestTrustedHead = snapshot.Commit then Ok ()
+                                    else
+                                        writeStored path
+                                            { stored with HighestTrustedHead = snapshot.Commit } true
+                                persisted |> Result.map (fun () -> binding, snapshot))))))
+
+    let private loadAtRoot root =
+        loadAtRootWithSnapshot root |> Result.map fst
+
+    // Reuse the single verified snapshot from binding resolution for advisory
+    // agent-state reads, rather than fetching the same remote ledger twice.
+    let loadWithSnapshot projectName rt =
+        ProjectPaths.resolveProjectRoot projectName rt
+        |> Result.bind (fun (FolderPath root) -> loadAtRootWithSnapshot root)
 
     // A source operation already resolved its checkout when loading AGENTS.md.
     // Reuse that physical root, but perform exactly the same pinned trust-anchor

@@ -2112,6 +2112,18 @@ type ReviewWorkflowTests() =
                             Is.EqualTo([ "owner/src/AGENTS.md" ] :> obj))
                 let _, _, repeatSource = readSource()
                 Assert.That(repeatSource.Instructions, Is.Empty)
+                // A warm Working-state cache must avoid GitHub for ordinary
+                // local source reads. Disable the bound remote temporarily;
+                // a forced refresh would surface as duplicate AGENTS.md.
+                let originalRemote = git one [ "remote"; "get-url"; "origin" ]
+                let unavailable = Path.Combine(Path.GetTempPath(), "jarvis-missing-" + Guid.NewGuid().ToString("N"))
+                git one [ "remote"; "set-url"; "origin"; unavailable ] |> ignore
+                try
+                    let _, offlineResult, offlineResponse = readSource()
+                    Assert.That(offlineResult.IsOk, Is.True)
+                    Assert.That(offlineResponse.Instructions, Is.Empty)
+                finally
+                    git one [ "remote"; "set-url"; "origin"; originalRemote ] |> ignore
                 File.WriteAllText(Path.Combine(one, "src", "AGENTS.md"), "changed source guidance")
                 let _, _, updatedSource = readSource()
                 Assert.That(updatedSource.Instructions |> List.map (fun d -> d.Path),
@@ -2135,6 +2147,10 @@ type ReviewWorkflowTests() =
                 |> success |> ignore
                 let remoteReady = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
                 Assert.That(remoteReady.State, Is.EqualTo("Ready"))
+                // In production the server broadcasts this hint after the
+                // successful cross-client ledger write. The fixture invokes
+                // ReviewWorkflow directly, so simulate that transport delivery.
+                Client.SignalR.Client.invalidateAgentStates rt "owner::any-worktree"
                 let _, resumedResult, resumedResponse = readSource()
                 Assert.That(resumedResult.IsOk, Is.True)
                 Assert.That(resumedResponse.Instructions |> List.map (fun d -> d.Path),

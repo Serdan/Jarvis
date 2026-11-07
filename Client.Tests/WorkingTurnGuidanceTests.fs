@@ -91,3 +91,30 @@ let agentStateCacheAvoidsRepeatedFetchAndInvalidatesOnTaskTransition () =
     cache.Invalidate(project, "Agent 3")
     cache.Get(now.AddMinutes(2.2), project, "Agent 3", load) |> ignore
     Assert.That(loads, Is.EqualTo(4))
+
+
+[<Test>]
+let project_invalidation_expires_every_agent_of_one_project_only () =
+    let cache = AgentCache(TimeSpan.FromMinutes 2.)
+    let now = started
+    let project name =
+        Client.ProjectPaths.ProjectTarget.parse name
+        |> function Ok target -> Client.ProjectPaths.ProjectTarget.projectId target | Error error -> failwithf "%A" error
+    let first = project "Wayfold"
+    let second = project "Jarvis"
+    let mutable loads = 0
+    let load () =
+        loads <- loads + 1
+        None
+    cache.Get(now, first, "One", load) |> ignore
+    cache.Get(now, first, "Two", load) |> ignore
+    cache.Get(now, second, "One", load) |> ignore
+    Assert.That(loads, Is.EqualTo(3))
+    cache.InvalidateProject first
+    cache.Get(now.AddSeconds(1), first, "One", load) |> ignore
+    cache.Get(now.AddSeconds(1), first, "Two", load) |> ignore
+    cache.Get(now.AddSeconds(1), second, "One", load) |> ignore
+    Assert.That(loads, Is.EqualTo(5), "Unrelated projects retain their cached state")
+    cache.InvalidateAll()
+    cache.Get(now.AddSeconds(2), second, "One", load) |> ignore
+    Assert.That(loads, Is.EqualTo(6))

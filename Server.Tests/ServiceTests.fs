@@ -14,6 +14,39 @@ open Server
 open Server.Services
 
 [<Test>]
+let invalidation_routes_only_to_connected_devices_of_authenticated_user () =
+    let users = UserService()
+    let register userId device connection =
+        let registration =
+            { DeviceId = device; DeviceName = device; ProtocolVersion = AgentProtocol.version
+              ClientVersion = "test"; SupportedCommands = ["TaskWrite"; "TaskRead"] }
+        users.TransportConnected(userId, connection)
+        users.Register(userId, registration, connection) |> ignore
+    register "alice" "desktop" "a-desktop"
+    register "alice" "laptop" "a-laptop"
+    register "bob" "desktop" "b-desktop"
+    let initial = AgentStateInvalidationRouting.recipients (users.ListDevices("alice"))
+    Assert.That(initial |> Set.ofArray,
+                Is.EqualTo(Set.ofList [ "a-desktop"; "a-laptop" ] :> obj))
+    users.Disconnect("a-laptop", Some "offline")
+    let remaining = AgentStateInvalidationRouting.recipients (users.ListDevices("alice"))
+    Assert.That(remaining, Is.EqualTo([| "a-desktop" |] :> obj))
+    Assert.That(AgentStateInvalidationRouting.recipients (users.ListDevices("bob")),
+                Is.EqualTo([| "b-desktop" |] :> obj))
+
+[<Test>]
+let assignment_invalidation_only_follows_success_eligible_commands () =
+    let inbox : AgentCommand =
+        TaskReadCommand
+            { ProjectName = "Wayfold"; AgentId = "Owner"; Action = "AgentInbox"
+              TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L
+              Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null }
+    let other = match inbox with TaskReadCommand cmd -> TaskReadCommand { cmd with Action = "TaskOverview" } | _ -> failwith "Impossible"
+    Assert.That(AgentStateInvalidationRouting.afterSuccessfulCommand inbox, Is.True)
+    Assert.That(AgentStateInvalidationRouting.afterSuccessfulCommand other, Is.False)
+    Assert.That(AgentStateInvalidationRouting.afterSuccessfulCommand ListProjectsCommand, Is.False)
+
+[<Test>]
 let user_service_exposes_authenticated_transport_before_registration () =
     let users = UserService()
     users.TransportConnected("auth0|user", "connection")

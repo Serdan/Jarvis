@@ -1,0 +1,9 @@
+# [P2] Cached Working state can hide a new remote assignment generation
+
+**Locations:** `Client/SignalR/Client.fs:99-142,144-175,575-591`; `Client/Modules/WorkingTurnGuidance.fs:56-76`.
+
+**Reproduction by code path:** Client A has cached agent state `Working`. The agent yields or is reassigned to `Ready` via client B. Within A's two-minute cache lifetime, the agent's next ordinary non-inbox tool call on A (e.g. `read_file`) uses the stale `Working` value: `activateReadyOnActivity` does not run `activateReadyAgent`, and `incrementalInstructions` filters instructions against the old StateSequence/turn ID. Already-delivered roots and source-path instructions are suppressed, even though a new assignment requires them. The explicit invalidation is only on local task writes or `AgentInbox`, so cross-client transitions are not seen on that first ordinary call.
+
+**Why this matters:** Implicit Ready-to-Working activation is part of the feature contract for the *first ordinary tool call*, not only inbox. A stale cache can leave the ledger assignment in Ready while the tool runs, and can suppress instruction redelivery for the new turn.
+
+**Recommended correction:** Make turn/activation classification authoritative or conservatively uncertain across client boundaries rather than relying solely on the previously cached Working state. Design the refresh so every call need not fetch the ledger. Regression test with two Runtime/client instances sharing the ledger: warm A's Working cache, transition via B, then perform A's first non-inbox activity before TTL expiry; assert the new Working generation and root instructions appear.

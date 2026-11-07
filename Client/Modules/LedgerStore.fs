@@ -709,12 +709,98 @@ module LedgerStore =
         finally
             source |> Option.iter (fun doc -> doc.Dispose())
 
-    let private domainReceipt operationId sequence kind (changes: LedgerFileChange list) =
+    // Only assignment and Working-turn fields matter to instruction/guidance
+    // caches. Agent versions, notifications and session associations alone do
+    // not invalidate another agent's cached state.
+    [<CLIMutable>]
+    type AgentAssignmentProjection =
+        { TaskId: string
+          AttemptId: string }
+
+    [<CLIMutable>]
+    type AgentStateProjection =
+        { AgentId: string
+          CurrentAssignment: AgentAssignmentProjection
+          Execution: string
+          UnassignedDisposition: string
+          StateSequence: int64
+          StateEnteredAtUtc: string
+          WorkingTurnStartedAtUtc: string }
+
+    [<CLIMutable>]
+    type AgentMutationReceipt =
+        { AgentStateChanges: string array }
+
+    let private stateProjection (content: string) =
+        try
+            let value = JsonSerializer.Deserialize<AgentStateProjection>(content, options)
+            if isNull (box value) || String.IsNullOrWhiteSpace value.AgentId then None
+            else Some value
+        with _ -> None
+
+    let private sameAgentState (previous: AgentStateProjection option) (current: AgentStateProjection) =
+        match previous with
+        | None -> false
+        | Some before ->
+            let assignmentEquals =
+                if isNull (box before.CurrentAssignment) then
+                    isNull (box current.CurrentAssignment)
+                elif isNull (box current.CurrentAssignment) then false
+                else
+                    before.CurrentAssignment.TaskId = current.CurrentAssignment.TaskId
+                    && before.CurrentAssignment.AttemptId = current.CurrentAssignment.AttemptId
+            assignmentEquals
+            && before.AgentId = current.AgentId
+            && before.Execution = current.Execution
+            && before.UnassignedDisposition = current.UnassignedDisposition
+            && before.StateSequence = current.StateSequence
+            && before.StateEnteredAtUtc = current.StateEnteredAtUtc
+            && before.WorkingTurnStartedAtUtc = current.WorkingTurnStartedAtUtc
+
+    let private changedAgentStates (binding: LedgerBinding) (snapshot: LedgerSnapshot)
+                                   (changes: LedgerFileChange list) =
+        let rec visit (remaining: LedgerFileChange list) (changed: string list) =
+            match remaining with
+            | [] -> Ok(List.rev changed |> List.distinct)
+            | change :: rest when not (change.Path.StartsWith("agents/", StringComparison.Ordinal)
+                                       && change.Path.EndsWith(".json", StringComparison.Ordinal)) ->
+                visit rest changed
+            | change :: rest ->
+                let prior =
+                    match change.ExpectedBlobOid with
+                    | None -> Ok None
+                    | Some _ ->
+                        showBlob binding.RepositoryPath snapshot.Commit change.Path
+                        |> Result.map Some
+                prior
+                |> Result.bind (fun previous ->
+                    let currentState = stateProjection change.Content
+                    let previousState = previous |> Option.bind stateProjection
+                    let affected =
+                        match currentState with
+                        | Some current when not (sameAgentState previousState current) -> Some current.AgentId
+                        | Some _ -> None
+                        | None -> None // Bad source records retain existing mutation semantics.
+                    visit rest (match affected with Some agent -> agent :: changed | None -> changed))
+        visit changes []
+
+    // State changes are recorded in the immutable, idempotently replayable
+    // transaction receipt, not guessed from tool command names.
+    let changedAgentIds (write: LedgerWrite) =
+        try
+            let parsed = JsonSerializer.Deserialize<AgentMutationReceipt>(
+                write.Operation.OriginalResultJson, options)
+            if isNull (box parsed) || isNull parsed.AgentStateChanges then []
+            else parsed.AgentStateChanges |> Array.toList
+        with _ -> []
+
+    let private domainReceipt operationId sequence kind (changes: LedgerFileChange list) changedAgentIds =
         json
             {| schemaVersion = 2
                operationId = operationId
                sequence = sequence
                kind = kind
+               agentStateChanges = changedAgentIds |> List.toArray
                changes =
                    changes |> List.map (fun change ->
                        {| path = change.Path
@@ -1617,60 +1703,63 @@ module LedgerStore =
                                 match validationFailure with
                                 | Some error -> Error error
                                 | None ->
-                                    let originalResult =
-                                        domainReceipt (intent.OperationId.ToString("D"))
-                                            snapshot.Header.NextSequence intent.Kind changes
-                                    let operation =
-                                        { SchemaVersion = 2
-                                          CanonicalRequestJson = intentInput binding intent
-                                          OriginalResultJson = originalResult
-                                          OriginalResultHash = digest originalResult
-                                          OperationId = intent.OperationId.ToString("D")
-                                          RequestHash = requestHash
-                                          Sequence = snapshot.Header.NextSequence
-                                          Type = intent.Kind
-                                          Actor = intent.Actor
-                                          Path = List.head paths
-                                          BlobOid = ""
-                                          Paths = paths |> List.toArray }
-                                    let header = { snapshot.Header with NextSequence = snapshot.Header.NextSequence + 1L }
-                                    let files =
-                                        [ "ledger.json", json header
-                                          opPath intent.OperationId, json operation ]
-                                        @ (changes |> List.map (fun change -> change.Path, change.Content))
-                                    match writeTree repo (Some head) files with
+                                    match changedAgentStates binding snapshot changes with
                                     | Error error -> Error error
-                                    | Ok tree ->
-                                        match commitTree repo tree (Some head)
-                                                $"Jarvis {intent.Kind}\n\nJarvis-Operation-Id: {intent.OperationId:D}\nJarvis-Request-Hash: {requestHash}" with
-                                        | Error error -> Error error
-                                        | Ok proposed ->
-                                            let pushed = git repo [ "push"; "--porcelain"; binding.RemoteName; $"{proposed}:{ledgerRef}" ]
-                                            match fetch binding with
-                                            | Error _ -> Error(OutcomeUnknown $"Cannot confirm operation {intent.OperationId:D}.")
-                                            | Ok observed ->
-                                                match readOperation binding observed.Commit intent.OperationId with
-                                                | Error error -> Error error
-                                                | Ok(Some applied) when applied.RequestHash <> requestHash ->
-                                                    Error OperationIdReused
-                                                | Ok(Some applied) ->
-                                                    match isAncestor repo proposed observed.Commit with
-                                                    | Ok true ->
-                                                        Ok { Operation = applied
-                                                             CurrentHead = observed.Commit
-                                                             AlreadyApplied = false }
-                                                    | Ok false ->
-                                                        Ok { Operation = applied
-                                                             CurrentHead = observed.Commit
-                                                             AlreadyApplied = true }
-                                                    | Error error -> Error error
-                                                | Ok None ->
-                                                    match pushed with
-                                                    | Error _ -> Error(OutcomeUnknown $"Push outcome uncertain: {intent.OperationId:D}.")
-                                                    | Ok output when output.ExitCode <> 0 && observed.Commit = head ->
-                                                        Error(GitFailure $"Ledger push failed: {output.Stderr}")
-                                                    | Ok _ when retry >= 7 -> Error LedgerContended
-                                                    | _ ->
-                                                        System.Threading.Thread.Sleep(contentionDelay retry)
-                                                        attempt (retry + 1)
+                                    | Ok affectedAgents ->
+                                      let originalResult =
+                                          domainReceipt (intent.OperationId.ToString("D"))
+                                              snapshot.Header.NextSequence intent.Kind changes affectedAgents
+                                      let operation =
+                                          { SchemaVersion = 2
+                                            CanonicalRequestJson = intentInput binding intent
+                                            OriginalResultJson = originalResult
+                                            OriginalResultHash = digest originalResult
+                                            OperationId = intent.OperationId.ToString("D")
+                                            RequestHash = requestHash
+                                            Sequence = snapshot.Header.NextSequence
+                                            Type = intent.Kind
+                                            Actor = intent.Actor
+                                            Path = List.head paths
+                                            BlobOid = ""
+                                            Paths = paths |> List.toArray }
+                                      let header = { snapshot.Header with NextSequence = snapshot.Header.NextSequence + 1L }
+                                      let files =
+                                          [ "ledger.json", json header
+                                            opPath intent.OperationId, json operation ]
+                                          @ (changes |> List.map (fun change -> change.Path, change.Content))
+                                      match writeTree repo (Some head) files with
+                                      | Error error -> Error error
+                                      | Ok tree ->
+                                          match commitTree repo tree (Some head)
+                                                  $"Jarvis {intent.Kind}\n\nJarvis-Operation-Id: {intent.OperationId:D}\nJarvis-Request-Hash: {requestHash}" with
+                                          | Error error -> Error error
+                                          | Ok proposed ->
+                                              let pushed = git repo [ "push"; "--porcelain"; binding.RemoteName; $"{proposed}:{ledgerRef}" ]
+                                              match fetch binding with
+                                              | Error _ -> Error(OutcomeUnknown $"Cannot confirm operation {intent.OperationId:D}.")
+                                              | Ok observed ->
+                                                  match readOperation binding observed.Commit intent.OperationId with
+                                                  | Error error -> Error error
+                                                  | Ok(Some applied) when applied.RequestHash <> requestHash ->
+                                                      Error OperationIdReused
+                                                  | Ok(Some applied) ->
+                                                      match isAncestor repo proposed observed.Commit with
+                                                      | Ok true ->
+                                                          Ok { Operation = applied
+                                                               CurrentHead = observed.Commit
+                                                               AlreadyApplied = false }
+                                                      | Ok false ->
+                                                          Ok { Operation = applied
+                                                               CurrentHead = observed.Commit
+                                                               AlreadyApplied = true }
+                                                      | Error error -> Error error
+                                                  | Ok None ->
+                                                      match pushed with
+                                                      | Error _ -> Error(OutcomeUnknown $"Push outcome uncertain: {intent.OperationId:D}.")
+                                                      | Ok output when output.ExitCode <> 0 && observed.Commit = head ->
+                                                          Error(GitFailure $"Ledger push failed: {output.Stderr}")
+                                                      | Ok _ when retry >= 7 -> Error LedgerContended
+                                                      | _ ->
+                                                          System.Threading.Thread.Sleep(contentionDelay retry)
+                                                          attempt (retry + 1)
             attempt 0

@@ -213,6 +213,16 @@ module private Patch =
         |> skipHeaders
         |> applyHunks 0 0 [] [] 0
 
+// External project names and already resolved checkouts are distinct inputs.
+// A single source operation retains the same checkout throughout traversal.
+type private ProjectSource =
+    | Global
+    | Named of string
+    | Selected of ProjectPaths.ResolvedProject
+
+let private projectSource name =
+    if name = "@global" then Global else Named name
+
 module private Core =
     let private isPathInRoot (root: string) (fullPath: string) =
         let normalize (path: string) =
@@ -286,28 +296,45 @@ module private Core =
                 |> Seq.toList
         } <| rt
 
-    let private parseProjectName (projectName: string) =
+    let private parseProjectName source =
         effect {
-            let! projects = enumerateProjects
-
-            return!
-                projects
-                |> Seq.tryFind (fun (ProjectName name) ->
-                    let separator = projectName.IndexOf("::", StringComparison.Ordinal)
-                    if separator >= 0 then name = projectName.Substring(0, separator)
-                    else name = projectName)
-                |> Option.map (fun _ -> ProjectName projectName)
-                |> Effect.ofOption (fun () -> NotFoundError $"Unknown project name: {projectName}")
+            match source with
+            | Selected resolved ->
+                // Retain the same visibility check as the string-based source
+                // API. A resolved directory is not necessarily a listed project.
+                let! projects = enumerateProjects
+                let mainName =
+                    resolved
+                    |> ProjectPaths.ResolvedProject.target
+                    |> ProjectPaths.ProjectTarget.projectName
+                if projects |> Seq.exists (fun (ProjectName name) -> name = mainName) then
+                    return resolved
+                else
+                    return! NotFoundError $"Unknown project name: {mainName}" |> Effect.ofError
+            | Global ->
+                return! Client.ValidationError "Global skills do not select a project checkout." |> Effect.ofError
+            | Named projectName ->
+                let! target = ProjectPaths.ProjectTarget.parse projectName |> Effect.ofResult
+                let! projects = enumerateProjects
+                let mainName = ProjectPaths.ProjectTarget.projectName target
+                let! _ =
+                    projects
+                    |> Seq.tryFind (fun (ProjectName name) -> name = mainName)
+                    |> Option.map (fun _ -> ())
+                    |> Effect.ofOption (fun () -> NotFoundError $"Unknown project name: {projectName}")
+                return! ProjectPaths.resolveProjectContextForTarget target
         }
 
-    let private parseFolderPath (path: string) (ProjectName projectName) =
-        ProjectPaths.resolveProjectFolder projectName path
+    // The validated checkout context is retained across file traversal,
+    // including multi-file operations, rather than re-parsing its selector.
+    let private parseFolderPath (path: string) project =
+        ProjectPaths.resolveSourcePath project path >>= FileIO.parseFolder
 
-    let private parseFilePath (path: string) (ProjectName projectName) =
-        ProjectPaths.resolveProjectFile projectName path
+    let private parseFilePath (path: string) project =
+        ProjectPaths.resolveSourcePath project path >>= FileIO.parseFile
 
-    let private resolveWritableFilePath (path: string) (ProjectName projectName) =
-        ProjectPaths.resolveWritableProjectFile projectName path
+    let private resolveWritableFilePath (path: string) project =
+        ProjectPaths.resolveSourcePath project path |>> FilePath
 
     let private getFolderNames path projectName =
         effect {
@@ -377,8 +404,7 @@ module private Core =
         else
             Ok(skillName.Trim())
 
-    let private skillPath skillName fileName =
-        Path.Combine(".agents", "skills", skillName, fileName)
+    let private skillPath = ProjectPaths.ProjectSkillPaths.file
 
     let private readSkillContent parsedProject skillName =
         fun rt ->
@@ -519,7 +545,7 @@ module private Core =
 
     // Workspace-wide skills are kept outside individual projects but inside the
     // selected workspace, and use the same symlink-safe path resolution.
-    let private globalScope = "@global"
+    let private globalScope = Global
 
     let private globalSkillPath skillName fileName =
         ProjectPaths.resolveWorkspacePath [ ".agents"; "skills"; skillName; fileName ]
@@ -991,40 +1017,70 @@ let listProjects rt = Core.listProjects rt
 let listGitProjects rt = Core.listGitProjects rt
 
 let getProjectDetails (cmd: GetProjectDetailsCommand) : IO<'rt, (string * Content) list> =
-    Core.getProjectDetails cmd.ProjectName
+    Core.getProjectDetails (projectSource cmd.ProjectName)
 
 let listSkills (cmd: ListSkillsCommand) : IO<'rt, ListSkillsResult> =
-    Core.listSkills cmd.ProjectName
+    Core.listSkills (projectSource cmd.ProjectName)
 
 let getSkill (cmd: GetSkillCommand) : IO<'rt, GetSkillResult> =
-    Core.getSkill cmd.ProjectName cmd.SkillName
+    Core.getSkill (projectSource cmd.ProjectName) cmd.SkillName
 
 let createSkill (cmd: CreateSkillCommand) : IO<'rt, CreateSkillResult> =
-    Core.createSkill cmd.ProjectName cmd.SkillName cmd.Content cmd.Overwrite
+    Core.createSkill (projectSource cmd.ProjectName) cmd.SkillName cmd.Content cmd.Overwrite
 
 let listDirectory (cmd: ListDirectoryCommand) : IO<'rt, ProjectItemKind list> =
-    Core.listProjectDirectory cmd.ProjectName cmd.FolderPath
+    Core.listProjectDirectory (projectSource cmd.ProjectName) cmd.FolderPath
 
 let searchFiles (cmd: SearchFilesCommand) : IO<'rt, ProjectItemKind list> =
-    Core.searchFiles cmd.ProjectName cmd.FolderPath cmd.Query cmd.MaxResults
+    Core.searchFiles (projectSource cmd.ProjectName) cmd.FolderPath cmd.Query cmd.MaxResults
 
 let searchText (cmd: SearchTextCommand) : IO<'rt, SearchTextMatch list> =
-    Core.searchText cmd.ProjectName cmd.FolderPath cmd.Query cmd.IncludeGlobs cmd.ExcludeGlobs cmd.MaxResults
+    Core.searchText (projectSource cmd.ProjectName) cmd.FolderPath cmd.Query cmd.IncludeGlobs cmd.ExcludeGlobs cmd.MaxResults
 
 let readFile (cmd: ReadFileCommand) : IO<'rt, Content> =
-    Core.readFileWithOptions cmd.ProjectName cmd.FilePath cmd.StartLine cmd.EndLine cmd.IncludeLineNumbers
+    Core.readFileWithOptions (projectSource cmd.ProjectName) cmd.FilePath cmd.StartLine cmd.EndLine cmd.IncludeLineNumbers
 
 let readFiles (cmd: ReadFilesCommand) : IO<'rt, Content' seq> =
-    Core.readFiles cmd.ProjectName cmd.FilePaths
+    Core.readFiles (projectSource cmd.ProjectName) cmd.FilePaths
 
 let exportFile (cmd: ExportFileCommand) : IO<'rt, ExportFilePayload> =
-    Core.exportFile cmd.ProjectName cmd.FilePath
+    Core.exportFile (projectSource cmd.ProjectName) cmd.FilePath
 
 let readImage (cmd: ReadImageCommand) : IO<'rt, ReadImageResult> =
-    Core.readImage cmd.ProjectName cmd.FilePath
+    Core.readImage (projectSource cmd.ProjectName) cmd.FilePath
 
 let writeFile (cmd: WriteFileCommand) : IO<'rt, unit> =
-    Core.writeFile cmd.ProjectName cmd.FilePath cmd.Content cmd.FileWriteMode cmd.ExpectedHash cmd.CreateParents
+    Core.writeFile (projectSource cmd.ProjectName) cmd.FilePath cmd.Content cmd.FileWriteMode cmd.ExpectedHash cmd.CreateParents
 
 let patchFile (cmd: PatchFileCommand) : IO<'rt, PatchFileResult> =
-    Core.patchFile cmd.ProjectName cmd.FilePath cmd.ExpectedHash cmd.Format cmd.Patch cmd.DryRun cmd.FuzzyContextLines cmd.ReturnContent
+    Core.patchFile (projectSource cmd.ProjectName) cmd.FilePath cmd.ExpectedHash cmd.Format cmd.Patch cmd.DryRun cmd.FuzzyContextLines cmd.ReturnContent
+
+
+// Already resolved checkouts are accepted by source handlers without parsing
+// a selector or rediscovering a registered worktree.
+let getProjectDetailsIn project (cmd: GetProjectDetailsCommand) =
+    Core.getProjectDetails (Selected project)
+let listSkillsIn project (cmd: ListSkillsCommand) =
+    Core.listSkills (Selected project)
+let getSkillIn project (cmd: GetSkillCommand) =
+    Core.getSkill (Selected project) cmd.SkillName
+let createSkillIn project (cmd: CreateSkillCommand) =
+    Core.createSkill (Selected project) cmd.SkillName cmd.Content cmd.Overwrite
+let listDirectoryIn project (cmd: ListDirectoryCommand) =
+    Core.listProjectDirectory (Selected project) cmd.FolderPath
+let searchFilesIn project (cmd: SearchFilesCommand) =
+    Core.searchFiles (Selected project) cmd.FolderPath cmd.Query cmd.MaxResults
+let searchTextIn project (cmd: SearchTextCommand) =
+    Core.searchText (Selected project) cmd.FolderPath cmd.Query cmd.IncludeGlobs cmd.ExcludeGlobs cmd.MaxResults
+let readFileIn project (cmd: ReadFileCommand) =
+    Core.readFileWithOptions (Selected project) cmd.FilePath cmd.StartLine cmd.EndLine cmd.IncludeLineNumbers
+let readFilesIn project (cmd: ReadFilesCommand) =
+    Core.readFiles (Selected project) cmd.FilePaths
+let exportFileIn project (cmd: ExportFileCommand) =
+    Core.exportFile (Selected project) cmd.FilePath
+let readImageIn project (cmd: ReadImageCommand) =
+    Core.readImage (Selected project) cmd.FilePath
+let writeFileIn project (cmd: WriteFileCommand) =
+    Core.writeFile (Selected project) cmd.FilePath cmd.Content cmd.FileWriteMode cmd.ExpectedHash cmd.CreateParents
+let patchFileIn project (cmd: PatchFileCommand) =
+    Core.patchFile (Selected project) cmd.FilePath cmd.ExpectedHash cmd.Format cmd.Patch cmd.DryRun cmd.FuzzyContextLines cmd.ReturnContent

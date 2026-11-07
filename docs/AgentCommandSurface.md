@@ -37,6 +37,33 @@ Because this removes public tools and introduces a new enum parameter,
 of the connected MCP tool catalog**. Do not deploy without explicit operator
 authorization.
 
+## Cross-client Working-state cache invalidation (protocol 3.61)
+
+A canonical Git-ledger transaction records the exact agent IDs whose assignment
+or Working-turn state changed in its immutable, replayable operation receipt.
+The client forwards those typed effects in `AgentCommandResponse.AgentStateChanges`,
+independently of the ordinary command's success. In particular, a `read_file`
+call may commit Ready-to-Working activation before the file read fails.
+
+The server sends user-scoped SignalR
+`InvalidateAgentStates(projectName, agentIds)` only for the affected agents.
+Other agents' cached state remains valid after checkpoints, notifications,
+and unrelated task operations. Cross-project notification sender checks publish
+their source-project effects independently from destination operations.
+A cross-project `notify_agent` writes the durable notification in the
+destination without counting the source sender's ID as destination activity,
+even when both projects happen to use the same agent label. Its destination
+dispatch does not start a Working turn, update last-seen, or inject unrelated
+Working-turn guidance.
+
+The two-minute fallback refresh still covers missed notifications and external
+ledger writes. Reconnecting clears cached states. A refresh reuses its verified
+ledger snapshot rather than fetching it twice. The server stores no persistent
+agent state.
+
+**Protocol 3.61 requires coordinated client/server deployment.** Do not
+deploy without explicit operator authorization.
+
 ## Explicit agent labels
 
 Agent-related MCP operations use **`agentId`** consistently; this replaces
@@ -135,6 +162,7 @@ type AgentCommand =
     | SearchTextCommand of SearchTextCommand
     | ReadFileCommand of ReadFileCommand
     | ReadFilesCommand of ReadFilesCommand
+    | GetAgentInstructionsCommand of GetAgentInstructionsCommand
     | ReadImageCommand of ReadImageCommand
     | ExportFileCommand of ExportFileCommand
     | UpdateClientCommand
@@ -295,6 +323,14 @@ type ReadFilesCommand =
     { ProjectName: string
       FilePaths: string list }
 ```
+
+### `GetAgentInstructions` (protocol 3.59)
+
+Read the complete applicable `AGENTS.md` hierarchy for a checkout-relative directory, including the workspace root, selected main/registered-worktree root, and every ancestor. Unlike automatic delivery, this explicit tool has **no per-file size, aggregate content, or document-count limit** and never uses the instruction delivery cache.
+
+The result contains an `"AGENTS.md"` mapping such as `{".": "workspace rules", "Wayfold": "project rules", "Wayfold/src": "source rules"}`. A response that cannot fit in the standard 900 KiB tool transport provides `nextCursor`. Repeat the same call with this cursor until it is absent. For a file split across pages, `chunk` identifies the path, start/end byte offsets, total size, and SHA-256; concatenate segments by path and byte offset. Continuations are stateless and rejected if the applicable hierarchy changes.
+
+This tool can retrieve an oversized workspace-root `AGENTS.md` that ordinary project-scoped `read_file` cannot address. It applies the same path and symlink protections as ordinary source reads.
 
 ### `ImportFile`
 
@@ -854,6 +890,7 @@ If `InputSchemaJson` and `OutputSchemaJson` are added later, they should be incl
 | `SearchText` | `ReadOnly` | `Allow` | Should respect ignored directories and max output limits. |
 | `ReadFile` | `ReadOnly` | `Allow` | May still be blocked by sensitive-file filters. |
 | `ReadFiles` | `ReadOnly` | `Allow` | May still be blocked by sensitive-file filters. |
+| `GetAgentInstructions` | `ReadOnly` | `Allow` | Complete applicable hierarchy, paginated if necessary. |
 | `ReadImage` | `ReadOnly` | `Allow` | Reads a PNG, JPEG, or WebP image for model vision. |
 | `ExportFile` | `ReadOnly` | `Allow` | Copies one bounded project file to server memory and returns a 10-minute unguessable HTTPS bearer link for the user. |
 | `UpdateClient` | `ProcessExecution`, `NetworkAccess`, `Destructive` | `Allow` at partial/full trust; confirm at no trust | Downloads only from the configured Jarvis server, verifies `SHA256SUMS`, keeps `.prev`, replaces the standalone client, then restarts in the same terminal. |

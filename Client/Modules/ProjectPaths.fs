@@ -3,12 +3,64 @@ module Client.ProjectPaths
 open System
 open System.IO
 open System.Diagnostics
+open System.Runtime.InteropServices
+open System.Threading.Tasks
 open Client
 open Client.Effect
 open Client.IO
 open FsToolkit.ErrorHandling
 open Kehlet.FSharp.IO
 open Kehlet.FSharp.IO.Effect.Operators
+
+// External protocol project selectors are parsed here, never used as paths.
+[<StructuralEquality; StructuralComparison>]
+type ProjectId = private ProjectId of string
+[<StructuralEquality; StructuralComparison>]
+type WorktreeId = private WorktreeId of string
+type Checkout = Main | Registered of WorktreeId
+type ProjectTarget = private { Project: ProjectId; Checkout: Checkout }
+type ResolvedProject = private { Target: ProjectTarget; WorkspaceRoot: FolderPath; MainRoot: FolderPath; SourceRoot: FolderPath }
+
+module ProjectTarget =
+    let parse (input: string) : Client.Result<ProjectTarget> =
+        if String.IsNullOrWhiteSpace input then
+            Error(ValidationError "Project identifier cannot be empty.")
+        else
+            let sections = input.Split([| "::" |], StringSplitOptions.None)
+            let validComponent (part: string) =
+                not (String.IsNullOrWhiteSpace part)
+                && part <> "." && part <> ".."
+                && not (part.Contains('/')) && not (part.Contains('\\'))
+                && not (part.Contains("..", StringComparison.Ordinal))
+                && not (part.Contains(':'))
+            match sections with
+            | [| project |] when validComponent project ->
+                Ok { Project = ProjectId project; Checkout = Main }
+            | [| project; checkout |] when validComponent project && validComponent checkout ->
+                Ok { Project = ProjectId project; Checkout = Registered(WorktreeId checkout) }
+            | _ -> Error(ValidationError "Invalid project or worktree selector.")
+
+    let projectId target = target.Project
+    let projectName target = let (ProjectId name) = target.Project in name
+    let checkout target = target.Checkout
+    let worktreeName = function Registered (WorktreeId name) -> Some name | Main -> None
+    let identity input = parse input |> Result.map projectName
+
+module ProjectId =
+    let value (ProjectId name) = name
+
+module ResolvedProject =
+    let target (project: ResolvedProject) = project.Target
+    let sourceRoot (project: ResolvedProject) = project.SourceRoot
+    let workspaceRoot (project: ResolvedProject) = project.WorkspaceRoot
+    let mainRoot (project: ResolvedProject) = project.MainRoot
+
+// One canonical directory layout for project-local skills.
+module ProjectSkillPaths =
+    let file (skillName: string) (fileName: string) =
+        Path.Combine(".agents", "skills", skillName, fileName)
+
+    let primaryFile (skillName: string) = file skillName "SKILL.md"
 
 let isPathInRoot (root: string) (fullPath: string) =
     let normalize (path: string) =
@@ -65,6 +117,100 @@ let resolveWorkspacePath (parts: string seq) : IO<'rt, string> =
         | false -> return! Client.PermissionDenied "Path is outside workspace root." |> Effect.ofError
     }
 
+// Keep timed-out descendants bound to a process group, including when the
+// immediate Git process has already exited but a child retains a pipe.
+module private ProcessGroup =
+    [<DllImport("libc", SetLastError = true)>]
+    extern int private kill(int pid, int signal)
+
+    [<DllImport("kernel32.dll", SetLastError = true)>]
+    extern nativeint private CreateJobObject(nativeint attributes, string name)
+
+    [<DllImport("kernel32.dll", SetLastError = true)>]
+    extern bool private AssignProcessToJobObject(nativeint job, nativeint processHandle)
+
+    [<DllImport("kernel32.dll", SetLastError = true)>]
+    extern bool private TerminateJobObject(nativeint job, uint32 exitCode)
+
+    [<DllImport("kernel32.dll", SetLastError = true)>]
+    extern bool private CloseHandle(nativeint handle)
+
+    let createWindowsJob () =
+        let job = CreateJobObject(0n, null)
+        if job = 0n then
+            raise (System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error()))
+        job
+
+    let assignWindowsJob job (proc: Process) =
+        if not (AssignProcessToJobObject(job, proc.Handle)) then
+            raise (System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error()))
+
+    let closeWindowsJob job =
+        if job <> 0n then CloseHandle(job) |> ignore
+
+    let terminateWindowsJob job =
+        if job <> 0n then TerminateJobObject(job, 1u) |> ignore
+
+    let terminateUnixGroup (processId: int) =
+        // setsid executes Git as leader of a new session/process group.
+        // Negative PID signals the entire group, even if its leader exited.
+        kill(-processId, 9) |> ignore
+
+// Both pipes must be drained while the process is running. Waiting for EOF
+// before applying a timeout can leave a source operation blocked forever.
+module WorktreeGit =
+    let list (executable: string) (mainRoot: string) (timeout: TimeSpan) : Client.Result<string> =
+        // Linux uses a new process group so descendants remain addressable
+        // after Git exits; Windows uses a Job Object for the same purpose.
+        let unixGroup = OperatingSystem.IsLinux()
+        let windows = OperatingSystem.IsWindows()
+        let mutable job = 0n
+        try
+            try
+                if windows then job <- ProcessGroup.createWindowsJob()
+                use proc = new Process()
+                proc.StartInfo.FileName <- if unixGroup then "setsid" else executable
+                proc.StartInfo.WorkingDirectory <- mainRoot
+                proc.StartInfo.UseShellExecute <- false
+                proc.StartInfo.RedirectStandardOutput <- true
+                proc.StartInfo.RedirectStandardError <- true
+                if unixGroup then
+                    proc.StartInfo.ArgumentList.Add("--")
+                    proc.StartInfo.ArgumentList.Add(executable)
+                proc.StartInfo.ArgumentList.Add("worktree")
+                proc.StartInfo.ArgumentList.Add("list")
+                proc.StartInfo.ArgumentList.Add("--porcelain")
+                if not (proc.Start()) then
+                    Error(Client.ValidationError "Cannot inspect worktree registration.")
+                else
+                    if windows then ProcessGroup.assignWindowsJob job proc
+                    let stdout = proc.StandardOutput.ReadToEndAsync()
+                    let stderr = proc.StandardError.ReadToEndAsync()
+                    let exit = proc.WaitForExitAsync()
+                    let all = Task.WhenAll([| stdout :> Task; stderr :> Task; exit |])
+                    try
+                        all.WaitAsync(timeout).GetAwaiter().GetResult()
+                        if proc.ExitCode <> 0 then
+                            Error(Client.ValidationError "Cannot inspect worktree registration.")
+                        else Ok stdout.Result
+                    with
+                    | :? TimeoutException ->
+                        // Terminate the group/job unconditionally: the leader may
+                        // have exited while a descendant keeps the streams open.
+                        if unixGroup then ProcessGroup.terminateUnixGroup proc.Id
+                        elif windows then ProcessGroup.terminateWindowsJob job
+                        try
+                            if not proc.HasExited then proc.Kill(true)
+                            // Reap the immediate process without another unbounded wait.
+                            proc.WaitForExit(2000) |> ignore
+                        with
+                        | :? InvalidOperationException -> ()
+                        | :? System.ComponentModel.Win32Exception -> ()
+                        Error(Client.ValidationError "Git worktree discovery timed out.")
+            with ex -> Error(Client.ExceptionError ex)
+        finally
+            if windows then ProcessGroup.closeWindowsJob job
+
 let private resolveRegisteredWorktree (mainRoot: string) (selector: string) : Client.Result<string> =
     if String.IsNullOrWhiteSpace selector
        || selector = "." || selector = ".."
@@ -72,74 +218,79 @@ let private resolveRegisteredWorktree (mainRoot: string) (selector: string) : Cl
        || selector.Contains("..", StringComparison.Ordinal) then
         Error(Client.ValidationError "Invalid worktree selector.")
     else
-        try
-            use proc = new Process()
-            proc.StartInfo.FileName <- "git"
-            proc.StartInfo.WorkingDirectory <- mainRoot
-            proc.StartInfo.UseShellExecute <- false
-            proc.StartInfo.RedirectStandardOutput <- true
-            proc.StartInfo.RedirectStandardError <- true
-            proc.StartInfo.ArgumentList.Add("worktree")
-            proc.StartInfo.ArgumentList.Add("list")
-            proc.StartInfo.ArgumentList.Add("--porcelain")
-            if not (proc.Start()) then
-                Error(Client.ValidationError "Cannot inspect worktree registration.")
-            else
-                let output = proc.StandardOutput.ReadToEnd()
-                if not (proc.WaitForExit(10000)) then
-                    proc.Kill(true)
-                    Error(Client.ValidationError "Git worktree discovery timed out.")
-                elif proc.ExitCode <> 0 then
-                    Error(Client.ValidationError "Cannot inspect worktree registration.")
-                else
-                    let comparison = if OperatingSystem.IsWindows() then StringComparison.OrdinalIgnoreCase else StringComparison.Ordinal
-                    let matches =
-                        output.Split('\n', StringSplitOptions.RemoveEmptyEntries)
-                        |> Array.choose (fun line ->
-                            if line.StartsWith("worktree ", StringComparison.Ordinal) then
-                                let path = Path.GetFullPath(line.Substring("worktree ".Length).TrimEnd('\r'))
-                                if String.Equals(Path.GetFileName(Path.TrimEndingDirectorySeparator(path)), selector, comparison) then Some path else None
-                            else None)
-                    match matches with
-                    | [| path |] when Directory.Exists(path) ->
-                        let rec containsLink (dir: DirectoryInfo) =
-                            if dir = null then false
-                            elif dir.Attributes.HasFlag(FileAttributes.ReparsePoint) then true
-                            else containsLink dir.Parent
-                        if containsLink (DirectoryInfo(path)) then
-                            Error(Client.PermissionDenied "Worktree path contains a symbolic link.")
-                        else Ok path
-                    | [||] -> Error(Client.NotFoundError "Unknown Git-registered worktree selector.")
-                    | _ -> Error(Client.ValidationError "Ambiguous worktree selector.")
-        with ex -> Error(Client.ExceptionError ex)
+        match WorktreeGit.list "git" mainRoot (TimeSpan.FromSeconds 10.) with
+        | Error error -> Error error
+        | Ok output ->
+            try
+                let comparison = if OperatingSystem.IsWindows() then StringComparison.OrdinalIgnoreCase else StringComparison.Ordinal
+                let matches =
+                    output.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                    |> Array.choose (fun line ->
+                        if line.StartsWith("worktree ", StringComparison.Ordinal) then
+                            let path = Path.GetFullPath(line.Substring("worktree ".Length).TrimEnd('\r'))
+                            if String.Equals(Path.GetFileName(Path.TrimEndingDirectorySeparator(path)), selector, comparison) then Some path else None
+                        else None)
+                match matches with
+                | [| path |] when Directory.Exists(path) ->
+                    let rec containsLink (dir: DirectoryInfo) =
+                        if dir = null then false
+                        elif dir.Attributes.HasFlag(FileAttributes.ReparsePoint) then true
+                        else containsLink dir.Parent
+                    if containsLink (DirectoryInfo(path)) then
+                        Error(Client.PermissionDenied "Worktree path contains a symbolic link.")
+                    else Ok path
+                | [||] -> Error(Client.NotFoundError "Unknown Git-registered worktree selector.")
+                | _ -> Error(Client.ValidationError "Ambiguous worktree selector.")
+            with ex -> Error(Client.ExceptionError ex)
+
+let resolveProjectContextForTarget (target: ProjectTarget) : IO<'rt, ResolvedProject> =
+    effect {
+        let! (ProjectDirectory workspaceRoot) = ProjectIO.root
+        let mainName = ProjectTarget.projectName target
+        let! (FolderPath mainRoot) = resolveWorkspacePath [ mainName ] >>= FileIO.parseFolder
+        let! (FolderPath sourceRoot) =
+            match target.Checkout with
+            | Main -> fun _ -> Ok(FolderPath mainRoot)
+            | Registered worktree ->
+                let (WorktreeId name) = worktree
+                fun _ -> resolveRegisteredWorktree mainRoot name |> Result.map FolderPath
+        return
+            { Target = target
+              WorkspaceRoot = FolderPath workspaceRoot
+              MainRoot = FolderPath mainRoot
+              SourceRoot = FolderPath sourceRoot }
+    }
+
+let resolveProjectContext (projectName: string) : IO<'rt, ResolvedProject> =
+    effect {
+        let! target = ProjectTarget.parse projectName |> Effect.ofResult
+        return! resolveProjectContextForTarget target
+    }
 
 let resolveProjectRoot (projectName: string) : IO<'rt, FolderPath> =
-    let separator = projectName.IndexOf("::", StringComparison.Ordinal)
-    if separator < 0 then
-        resolveWorkspacePath [ projectName ] >>= FileIO.parseFolder
-    else
-        effect {
-            let mainName = projectName.Substring(0, separator)
-            let selector = projectName.Substring(separator + 2)
-            if String.IsNullOrWhiteSpace mainName || mainName = "." || mainName = ".."
-               || mainName.Contains('/') || mainName.Contains('\\') then
-                return! Client.ValidationError "Invalid project identifier." |> Effect.ofError
+    resolveProjectContext projectName |>> fun resolved -> resolved.SourceRoot
+
+let resolveSourcePath (project: ResolvedProject) (relativePath: string) : IO<'rt, string> =
+    effect {
+        if Path.IsPathRooted relativePath
+           || relativePath.Split([| Path.DirectorySeparatorChar; Path.AltDirectorySeparatorChar |],
+                                 StringSplitOptions.RemoveEmptyEntries)
+               |> Array.exists (fun part -> part = "..") then
+            return! Client.PermissionDenied "Source path must be checkout-relative." |> Effect.ofError
+        else
+            let (FolderPath root) = project.SourceRoot
+            let! fullPath = [ relativePath ] |> Path.combineAll |> Path.combine root |> FileIO.getFullPath
+            if isPathInRoot root fullPath then
+                do! fun _ -> ensureNoLinksInPath root fullPath
+                return fullPath
             else
-                let! (FolderPath mainRoot) = resolveWorkspacePath [ mainName ] >>= FileIO.parseFolder
-                let! path = fun _ -> resolveRegisteredWorktree mainRoot selector
-                return FolderPath path
-        }
+                return! Client.PermissionDenied "Source path is outside checkout root." |> Effect.ofError
+    }
 
 let resolveProjectPath projectName relativePath : IO<'rt, string> =
     effect {
-        let! (FolderPath projectRoot) = resolveProjectRoot projectName
-        let! fullPath = [ relativePath ] |> Path.combineAll |> Path.combine projectRoot |> FileIO.getFullPath
-
-        match fullPath |> isPathInRoot projectRoot with
-        | true ->
-            do! fun _ -> ensureNoLinksInPath projectRoot fullPath
-            return fullPath
-        | false -> return! Client.PermissionDenied "Path is outside project root." |> Effect.ofError
+        let! context = resolveProjectContext projectName
+        return! resolveSourcePath context relativePath
     }
 
 let resolveProjectFolder projectName relativePath : IO<'rt, FolderPath> =

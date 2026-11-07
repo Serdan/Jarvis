@@ -24,32 +24,88 @@ let receiveMessage (rt: Runtime) message =
 // Explicit agent labels identify the current work slot. Cache canonical
 // Working state for ordinary calls to avoid one remote git fetch per tool.
 let private workingGuidanceCaches = ConditionalWeakTable<Runtime, WorkingTurnGuidance.AgentCache>()
+let private instructionDeliveryCaches = ConditionalWeakTable<Runtime, AgentInstructions.DeliveryCache>()
+let invalidateAgentStates (rt: Runtime) (projectName: string) (agentIds: string array) =
+    // Server notifications only carry the logical project identity. Worktree
+    // selectors share the canonical ledger/assignment cache by ProjectId.
+    match ProjectPaths.ProjectTarget.parse projectName with
+    | Ok target ->
+        let cache = workingGuidanceCaches.GetValue(rt, fun _ ->
+            WorkingTurnGuidance.AgentCache(TimeSpan.FromMinutes 2.))
+        if not (isNull agentIds) then
+            let projectId = ProjectPaths.ProjectTarget.projectId target
+            for agentId in agentIds |> Array.filter (String.IsNullOrWhiteSpace >> not) |> Array.distinct do
+                cache.Invalidate(projectId, agentId)
+    | Error _ -> ()
 
-let private checkWorkingGuidance (rt: Runtime) agentId command =
+let invalidateAllAgentStates (rt: Runtime) =
+    // Reconnection can follow missed updates from other devices.
+    let cache = workingGuidanceCaches.GetValue(rt, fun _ ->
+        WorkingTurnGuidance.AgentCache(TimeSpan.FromMinutes 2.))
+    cache.InvalidateAll()
+// Only commands addressing repository source are checkout selectors.
+// Message/activity project fields are literal history labels, not paths.
+type private CommandProject =
+    | Unscoped
+    | ActivityLabel of string option
+    | Checkout of ProjectPaths.ProjectTarget
+
+let private projectTarget = function
+    | Checkout target -> Some target
+    | Unscoped | ActivityLabel _ -> None
+
+let private classifyProject command =
+    match command with
+    | MessageCommand cmd -> Ok(ActivityLabel cmd.ProjectName)
+    | GetClientActivityCommand cmd -> Ok(ActivityLabel cmd.ProjectName)
+    | ListSkillsCommand cmd when cmd.ProjectName = "@global" -> Ok Unscoped
+    | GetSkillCommand cmd when cmd.ProjectName = "@global" -> Ok Unscoped
+    | CreateSkillCommand cmd when cmd.ProjectName = "@global" -> Ok Unscoped
+    | GetJobResultCommand cmd when String.IsNullOrWhiteSpace cmd.ProjectName -> Ok Unscoped
+    | CancelJobCommand cmd when String.IsNullOrWhiteSpace cmd.ProjectName -> Ok Unscoped
+    | _ ->
+        match AgentCommandInfo.projectName command with
+        | None -> Ok Unscoped
+        | Some raw -> ProjectPaths.ProjectTarget.parse raw |> Result.map Checkout
+
+
+let private loadAgentState (rt: Runtime) (project: string) (agentId: string) =
+    match OrchestrationApi.LedgerBindingConfig.loadWithSnapshot project rt with
+    | Error _ -> None
+    | Ok (binding, snapshot) ->
+        match ReviewWorkflow.ReviewWorkflow.getAgentWorkingTurnAt binding snapshot agentId with
+        | Ok agent -> Some agent
+        | Error _ -> None
+
+let private checkWorkingGuidance (rt: Runtime) agentId (target: ProjectPaths.ProjectTarget option) command =
     if String.IsNullOrWhiteSpace agentId then []
     else
-        match AgentCommandInfo.projectName command with
+        match target with
         | None -> []
-        | Some routedProject ->
-            let project = AgentView.activityProject routedProject
+        | Some target ->
+            let projectId = ProjectPaths.ProjectTarget.projectId target
+            let project = ProjectPaths.ProjectId.value projectId
             let now = DateTimeOffset.UtcNow
             let cache = workingGuidanceCaches.GetValue(rt, fun _ -> WorkingTurnGuidance.AgentCache(TimeSpan.FromMinutes 2.))
-            match command with
-            | TaskWriteCommand _ -> cache.Invalidate(project, agentId)
-            | _ -> ()
             let agent =
-                cache.Get(now, project, agentId, fun () ->
-                    match OrchestrationApi.LedgerBindingConfig.load project rt with
-                    | Error _ -> None
-                    | Ok binding ->
-                        match ReviewWorkflow.ReviewWorkflow.getAgentWorkingTurn binding agentId with
-                        | Error _ -> None
-                        | Ok found -> Some found)
+                cache.Get(now, projectId, agentId, fun () ->
+                    loadAgentState rt project agentId)
             match agent |> Option.bind (WorkingTurnGuidance.instructionAt now) with
             | Some content ->
                 [ { Scope = "working-turn"; Path = "jarvis/working-turn"
                     Sha256 = ""; Content = content } ]
             | None -> []
+
+// A cross-project notification is sent using the *source* agent identity,
+// which is not an identity of an agent in the destination project. Routing
+// health probes likewise do not represent agent activity. Keep both out of
+// destination last-seen, turn-guidance and implicit-activation handling.
+let private isLocalAgentActivity = function
+    | TaskWriteCommand cmd when cmd.Action = "NotifyAgent"
+                                && not (String.IsNullOrWhiteSpace cmd.SourceRef)
+                                && cmd.SourceRef <> cmd.ProjectName -> false
+    | LedgerReadCommand cmd when cmd.Action = "Health" -> false
+    | _ -> true
 
 // An agent's first ordinary tool call starts its Ready assignment.
 // No new session identifier or explicit resume tool is needed. Never
@@ -57,6 +113,7 @@ let private checkWorkingGuidance (rt: Runtime) agentId command =
 // names that agent as its target.
 let private activatesAgent (agentId: string) command =
     match command with
+    | _ when not (isLocalAgentActivity command) -> false
     | TaskWriteCommand cmd ->
         cmd.ActorId = agentId
         && List.contains cmd.Action
@@ -69,27 +126,26 @@ let private activatesAgent (agentId: string) command =
     | LedgerWriteCommand _ | ReviewWriteCommand _ -> false
     | _ -> true
 
-let private activateReadyOnActivity (rt: Runtime) (agentId: string) command =
-    if String.IsNullOrWhiteSpace agentId || not (activatesAgent agentId command) then Ok ()
+let private activateReadyOnActivity (rt: Runtime) (agentId: string)
+                                (target: ProjectPaths.ProjectTarget option) command =
+    if String.IsNullOrWhiteSpace agentId || not (activatesAgent agentId command) then Ok []
     else
-        match AgentCommandInfo.projectName command with
-        | None -> Ok ()
-        | Some routedProject ->
-            let project = AgentView.activityProject routedProject
+        match target with
+        | None -> Ok []
+        | Some target ->
+            let projectId = ProjectPaths.ProjectTarget.projectId target
+            let project = ProjectPaths.ProjectId.value projectId
             let cache = workingGuidanceCaches.GetValue(rt, fun _ -> WorkingTurnGuidance.AgentCache(TimeSpan.FromMinutes 2.))
-            // Inbox is the normal bootstrap operation; always recheck its
-            // current assignment even if other calls cached an idle agent.
+            // The server broadcasts invalidation after successful ledger writes
+            // on any connected device; the inbox also forces authoritative refresh.
+            // Keep the 2-minute fallback for changes outside Jarvis and missed
+            // notifications. Do not fetch from GitHub for every ordinary source call.
             match command with
-            | TaskReadCommand cmd when cmd.Action = "AgentInbox" -> cache.Invalidate(project, agentId)
+            | TaskReadCommand cmd when cmd.Action = "AgentInbox" -> cache.Invalidate(projectId, agentId)
             | _ -> ()
             let current =
-                cache.Get(DateTimeOffset.UtcNow, project, agentId, fun () ->
-                    match OrchestrationApi.LedgerBindingConfig.load project rt with
-                    | Error _ -> None
-                    | Ok binding ->
-                        match ReviewWorkflow.ReviewWorkflow.getAgentWorkingTurn binding agentId with
-                        | Ok agent -> Some agent
-                        | Error _ -> None)
+                cache.Get(DateTimeOffset.UtcNow, projectId, agentId, fun () ->
+                    loadAgentState rt project agentId)
             match current with
             | Some agent when agent.State = "Ready"
                               && not (isNull (box agent.CurrentAssignment))
@@ -100,17 +156,45 @@ let private activateReadyOnActivity (rt: Runtime) (agentId: string) command =
                     let result =
                         ReviewWorkflow.ReviewWorkflow.activateReadyAgent binding (Guid.NewGuid())
                             agent.CurrentAssignment.TaskId agentId
-                    cache.Invalidate(project, agentId)
+                    cache.Invalidate(projectId, agentId)
                     match result with
-                    | Ok _ -> Ok ()
+                    | Ok write -> Ok(Client.LedgerStore.LedgerStore.changedAgentIds write)
                     | Error(Client.LedgerStore.StaleEntityVersion _) ->
                         // Another concurrent tool may already have started this
                         // assignment. Do not reset its Working clock.
                         match ReviewWorkflow.ReviewWorkflow.getAgentWorkingTurn binding agentId with
-                        | Ok latest when latest.State = "Working" -> Ok ()
+                        | Ok latest when latest.State = "Working" -> Ok []
                         | _ -> Error(Client.ValidationError "Agent assignment changed before automatic activation.")
                     | Error error -> Error(Client.ValidationError($"Automatic agent activation failed: {error}"))
-            | _ -> Ok ()
+            | _ -> Ok []
+
+// Only the Working turn identifies a stable delivery scope. Ledger calls bootstrap
+// root guidance, while normal source operations discover deeper instructions.
+let private incrementalInstructions (rt: Runtime) (agentId: string)
+                                    (target: ProjectPaths.ProjectTarget option)
+                                    provenance documents =
+    if String.IsNullOrWhiteSpace agentId then documents
+    else
+        match target with
+        | None -> documents
+        | Some target ->
+            let projectId = ProjectPaths.ProjectTarget.projectId target
+            let project = ProjectPaths.ProjectId.value projectId
+            let cache = workingGuidanceCaches.GetValue(rt, fun _ ->
+                WorkingTurnGuidance.AgentCache(TimeSpan.FromMinutes 2.))
+            let now = DateTimeOffset.UtcNow
+            let agent =
+                cache.Get(now, projectId, agentId, fun () ->
+                    loadAgentState rt project agentId)
+            match agent with
+            | Some active when active.State = "Working" ->
+                let turn = string active.StateSequence + ":" + active.WorkingTurnStartedAtUtc
+                let delivery = instructionDeliveryCaches.GetValue(rt, fun _ -> AgentInstructions.DeliveryCache())
+                delivery.Filter(target, agentId, turn, provenance, documents, fun () ->
+                    // Ledger status reads remain usable; failed instruction
+                    // resolution is surfaced as a retryable warning.
+                    AgentInstructions.rootsForTarget rt target)
+            | _ -> documents
 
 let private serialize<'a> (value: 'a) =
     try
@@ -118,17 +202,35 @@ let private serialize<'a> (value: 'a) =
     with e ->
         e |> ExceptionError |> Error
 
-let private serialize'<'a> = Result.bind serialize<'a> >> ValueTask<_>
+type private DispatchedResult =
+    { Payload: string
+      ChangedAgentIds: string list }
 
-let private toAgentResponse command instructions response =
+let private serialize'<'a> (result: Result<'a, Client.EffectError>) =
+    result
+    |> Result.bind (fun value ->
+        let changedAgentIds =
+            match box value with
+            | :? OrchestrationApi.OperationResponse.Presented as operation ->
+                operation.changedAgentIds
+            | _ -> []
+        serialize value
+        |> Result.map (fun payload ->
+            { Payload = payload; ChangedAgentIds = changedAgentIds }))
+    |> ValueTask<_>
+
+let private toAgentResponse command instructions stateChanges response =
     match response with
     | Error error ->
         { Result = None
           Error = Some(EffectError.toAgentError error)
-          Instructions = instructions }
-    | Ok (payload: string) ->
+          Instructions = instructions
+          AgentStateChanges = stateChanges }
+    | Ok (dispatched: DispatchedResult) ->
+        let payload = dispatched.Payload
         let bytes = Encoding.UTF8.GetByteCount payload +
-                    Encoding.UTF8.GetByteCount(JsonSerializer.Serialize instructions)
+                    Encoding.UTF8.GetByteCount(JsonSerializer.Serialize instructions) +
+                    Encoding.UTF8.GetByteCount(JsonSerializer.Serialize stateChanges)
         let maxBytes =
             match command with
             | ReadImageCommand _ -> (AgentProtocol.maxImageBytes * 4 / 3) + (64 * 1024)
@@ -138,11 +240,13 @@ let private toAgentResponse command instructions response =
         if bytes <= maxBytes then
             { Result = Some payload
               Error = None
-              Instructions = instructions }
+              Instructions = instructions
+              AgentStateChanges = stateChanges }
         else
             { Result = None
               Error = Some(OutputTruncated $"Command response was {bytes} bytes and exceeds the safe response size of {maxBytes} bytes.")
-              Instructions = instructions }
+              Instructions = instructions
+              AgentStateChanges = stateChanges }
 
 let private unwrapProjectName (ProjectName name) = name
 let private unwrapContent (Content content) = content
@@ -191,7 +295,7 @@ let private audit command response =
 
         AuditLog.recordCommand commandName projectName permissions paths executable args summary
 
-let private importFile (cmd: ImportFileCommand) (rt: Runtime) =
+let private importFile (resolved: ProjectPaths.ResolvedProject option) (cmd: ImportFileCommand) (rt: Runtime) =
     match cmd.MaxBytes with
     | Some value when value <= 0L ->
         Error(Client.ValidationError "MaxBytes must be greater than zero when supplied.")
@@ -202,7 +306,11 @@ let private importFile (cmd: ImportFileCommand) (rt: Runtime) =
         | true, uri when uri.Scheme <> Uri.UriSchemeHttps ->
             Error(Client.ValidationError "DownloadUrl must use HTTPS.")
         | true, uri ->
-            match ProjectPaths.resolveWritableProjectFile cmd.ProjectName cmd.FilePath rt with
+            let destination =
+                match resolved with
+                | Some project -> fun rt -> ProjectPaths.resolveSourcePath project cmd.FilePath rt |> Result.map FilePath
+                | None -> ProjectPaths.resolveWritableProjectFile cmd.ProjectName cmd.FilePath
+            match destination rt with
             | Error error -> Error error
             | Ok(FilePath destinationPath) ->
                 let localLimit =
@@ -278,7 +386,13 @@ let private importFile (cmd: ImportFileCommand) (rt: Runtime) =
 
                     Error(Client.ExceptionError ex)
 
-let private dispatch (rt: Runtime) (command: AgentCommand) =
+let private sourceOperation resolved withContext legacy =
+    match resolved with
+    | Some project -> withContext project
+    | None -> legacy()
+
+let private dispatch (rt: Runtime) (target: ProjectPaths.ProjectTarget option)
+                     (resolved: ProjectPaths.ResolvedProject option) (command: AgentCommand) =
     match command with
     | ListCommandsCommand -> rt |> ProjectBrowser.listCommands |> serialize'
     | ListWorktreesCommand cmd -> rt |> Worktrees.listWorktrees cmd |> serialize'
@@ -287,6 +401,10 @@ let private dispatch (rt: Runtime) (command: AgentCommand) =
     | InspectWorktreeRemovalCommand cmd -> rt |> Worktrees.inspectRemoval cmd |> serialize'
     | RemoveWorktreeCommand cmd -> rt |> Worktrees.removeWorktree cmd |> serialize'
     | TaskReadCommand cmd -> rt |> OrchestrationApi.TaskApi.read cmd |> serialize'
+    | TaskWriteCommand cmd when cmd.Action = "ExportTaskSpec" || cmd.Action = "ImportTaskSpec" ->
+        match resolved with
+        | Some context -> rt |> OrchestrationApi.TaskApi.writeForContext context cmd |> serialize'
+        | None -> Error(Client.ValidationError "Task-spec source checkout was not resolved.") |> serialize'
     | TaskWriteCommand cmd -> rt |> OrchestrationApi.TaskApi.write cmd |> serialize'
     | LedgerReadCommand cmd -> rt |> OrchestrationApi.LedgerApi.read cmd |> serialize'
     | LedgerWriteCommand cmd -> rt |> OrchestrationApi.LedgerApi.write cmd |> serialize'
@@ -300,54 +418,74 @@ let private dispatch (rt: Runtime) (command: AgentCommand) =
         |> serialize'
     | GetProjectDetailsCommand cmd ->
         rt
-        |> ProjectBrowser.getProjectDetails cmd
+        |> sourceOperation resolved (fun project -> ProjectBrowser.getProjectDetailsIn project cmd) (fun () -> ProjectBrowser.getProjectDetails cmd)
         |> Result.map (List.map (fun (name, content) -> {| fileName = name; content = unwrapContent content |}))
         |> serialize'
-    | ListDirectoryCommand cmd -> rt |> ProjectBrowser.listDirectory cmd |> serialize'
-    | SearchFilesCommand cmd -> rt |> ProjectBrowser.searchFiles cmd |> serialize'
-    | SearchTextCommand cmd -> rt |> ProjectBrowser.searchText cmd |> serialize'
+    | ListDirectoryCommand cmd -> rt |> sourceOperation resolved (fun project -> ProjectBrowser.listDirectoryIn project cmd) (fun () -> ProjectBrowser.listDirectory cmd) |> serialize'
+    | SearchFilesCommand cmd -> rt |> sourceOperation resolved (fun project -> ProjectBrowser.searchFilesIn project cmd) (fun () -> ProjectBrowser.searchFiles cmd) |> serialize'
+    | SearchTextCommand cmd -> rt |> sourceOperation resolved (fun project -> ProjectBrowser.searchTextIn project cmd) (fun () -> ProjectBrowser.searchText cmd) |> serialize'
     | ReadFileCommand cmd ->
         rt
-        |> ProjectBrowser.readFile cmd
+        |> sourceOperation resolved (fun project -> ProjectBrowser.readFileIn project cmd) (fun () -> ProjectBrowser.readFile cmd)
         |> Result.map unwrapContent
         |> serialize'
     | ReadFilesCommand cmd ->
         rt
-        |> ProjectBrowser.readFiles cmd
+        |> sourceOperation resolved (fun project -> ProjectBrowser.readFilesIn project cmd) (fun () -> ProjectBrowser.readFiles cmd)
         |> Result.map (Seq.zip cmd.FilePaths >> Seq.map (fun (path, result) -> readFileResultToDto path result) >> Seq.toList)
         |> serialize'
+    | GetAgentInstructionsCommand cmd ->
+        match target with
+        | Some selected -> rt |> AgentInstructions.getExplicit selected cmd |> serialize'
+        | None -> Error(Client.ValidationError "A validated project checkout is required.") |> serialize'
     | ReadImageCommand cmd ->
         rt
-        |> ProjectBrowser.readImage cmd
+        |> sourceOperation resolved (fun project -> ProjectBrowser.readImageIn project cmd) (fun () -> ProjectBrowser.readImage cmd)
         |> serialize'
     | ExportFileCommand cmd ->
         rt
-        |> ProjectBrowser.exportFile cmd
+        |> sourceOperation resolved (fun project -> ProjectBrowser.exportFileIn project cmd) (fun () -> ProjectBrowser.exportFile cmd)
         |> serialize'
-    | ImportFileCommand cmd -> rt |> importFile cmd |> serialize'
+    | ImportFileCommand cmd -> rt |> importFile resolved cmd |> serialize'
     | UpdateClientCommand -> SelfUpdate.prepare () |> Async.AwaitTask |> Async.RunSynchronously |> serialize'
-    | WriteFileCommand cmd -> rt |> ProjectBrowser.writeFile cmd |> serialize'
+    | WriteFileCommand cmd -> rt |> sourceOperation resolved (fun project -> ProjectBrowser.writeFileIn project cmd) (fun () -> ProjectBrowser.writeFile cmd) |> serialize'
     | PatchFileCommand cmd ->
         rt
-        |> ProjectBrowser.patchFile cmd
+        |> sourceOperation resolved (fun project -> ProjectBrowser.patchFileIn project cmd) (fun () -> ProjectBrowser.patchFile cmd)
         |> serialize'
-    | RunCommandCommand cmd -> rt |> ClientShell.runCommand cmd |> serialize'
-    | ListConfiguredTasksCommand cmd -> rt |> ClientShell.listConfiguredTasks cmd |> serialize'
+    | RunCommandCommand cmd -> rt |> sourceOperation resolved (fun project -> ClientShell.runCommandIn project cmd) (fun () -> ClientShell.runCommand cmd) |> serialize'
+    | ListConfiguredTasksCommand cmd -> rt |> sourceOperation resolved (fun project -> ClientShell.listConfiguredTasksIn project cmd) (fun () -> ClientShell.listConfiguredTasks cmd) |> serialize'
     | RunProjectTaskCommand cmd ->
         rt
-        |> ClientShell.resolveProjectTask cmd
-        |> Result.bind (fun task -> ClientShell.runProjectTask cmd.ProjectName task rt)
+        |> sourceOperation resolved (fun project -> ClientShell.resolveProjectTaskIn project cmd) (fun () -> ClientShell.resolveProjectTask cmd)
+        |> Result.bind (fun task -> (sourceOperation resolved (fun project -> ClientShell.runProjectTaskIn project task) (fun () -> ClientShell.runProjectTask cmd.ProjectName task)) rt)
         |> serialize'
-    | ListSkillsCommand cmd -> rt |> ProjectBrowser.listSkills cmd |> serialize'
-    | GetSkillCommand cmd -> rt |> ProjectBrowser.getSkill cmd |> serialize'
-    | CreateSkillCommand cmd -> rt |> ProjectBrowser.createSkill cmd |> serialize'
-    | GetGitStatusCommand cmd -> rt |> ClientShell.getGitStatus cmd |> serialize'
-    | GetGitDiffCommand cmd -> rt |> ClientShell.getGitDiff cmd |> serialize'
-    | GitCommitCommand cmd -> rt |> ClientShell.gitCommit cmd |> serialize'
-    | StartJobCommand cmd -> rt |> JobManager.startJob cmd |> serialize'
-    | ListJobsCommand cmd -> rt |> JobManager.listJobs cmd |> serialize'
-    | GetJobResultCommand cmd -> rt |> JobManager.getJobResult cmd |> serialize'
-    | CancelJobCommand cmd -> rt |> JobManager.cancelJob cmd |> serialize'
+    | ListSkillsCommand cmd -> rt |> sourceOperation resolved (fun project -> ProjectBrowser.listSkillsIn project cmd) (fun () -> ProjectBrowser.listSkills cmd) |> serialize'
+    | GetSkillCommand cmd -> rt |> sourceOperation resolved (fun project -> ProjectBrowser.getSkillIn project cmd) (fun () -> ProjectBrowser.getSkill cmd) |> serialize'
+    | CreateSkillCommand cmd -> rt |> sourceOperation resolved (fun project -> ProjectBrowser.createSkillIn project cmd) (fun () -> ProjectBrowser.createSkill cmd) |> serialize'
+    | GetGitStatusCommand cmd -> rt |> sourceOperation resolved (fun project -> ClientShell.getGitStatusIn project cmd) (fun () -> ClientShell.getGitStatus cmd) |> serialize'
+    | GetGitDiffCommand cmd -> rt |> sourceOperation resolved (fun project -> ClientShell.getGitDiffIn project cmd) (fun () -> ClientShell.getGitDiff cmd) |> serialize'
+    | GitCommitCommand cmd -> rt |> sourceOperation resolved (fun project -> ClientShell.gitCommitIn project cmd) (fun () -> ClientShell.gitCommit cmd) |> serialize'
+    | StartJobCommand cmd ->
+        match resolved, target with
+        | Some project, _ -> rt |> JobManager.startJobIn project cmd |> serialize'
+        | None, Some validated -> rt |> JobManager.startJobForTarget validated cmd |> serialize'
+        | None, None -> rt |> JobManager.startJob cmd |> serialize'
+    | ListJobsCommand cmd ->
+        match target with
+        | Some validated ->
+            rt |> JobManager.listJobsForProject (Some(ProjectPaths.ProjectTarget.projectId validated)) cmd |> serialize'
+        | None -> rt |> JobManager.listJobs cmd |> serialize'
+    | GetJobResultCommand cmd ->
+        match target with
+        | Some validated ->
+            rt |> JobManager.getJobResultForProject (Some(ProjectPaths.ProjectTarget.projectId validated)) cmd |> serialize'
+        | None -> rt |> JobManager.getJobResult cmd |> serialize'
+    | CancelJobCommand cmd ->
+        match target with
+        | Some validated ->
+            rt |> JobManager.cancelJobForProject (Some(ProjectPaths.ProjectTarget.projectId validated)) cmd |> serialize'
+        | None -> rt |> JobManager.cancelJob cmd |> serialize'
     | MessageCommand cmd ->
         if String.IsNullOrWhiteSpace cmd.Message then
             Error(Client.ValidationError "Message cannot be empty.") |> serialize'
@@ -361,7 +499,9 @@ let private dispatch (rt: Runtime) (command: AgentCommand) =
         |> Ok
         |> serialize'
 
-let receiveCommand (rt: Runtime) (command: AgentCommand) =
+let private receiveCommandForTarget (rt: Runtime) (target: ProjectPaths.ProjectTarget option)
+                                    (resolved: ProjectPaths.ResolvedProject option)
+                                    (preparedTask: ProjectTaskDefinition option) (command: AgentCommand) =
     task {
         let activityId =
             match command with
@@ -374,7 +514,12 @@ let receiveCommand (rt: Runtime) (command: AgentCommand) =
         let resolution =
             match command with
             | RunProjectTaskCommand cmd ->
-                ClientShell.resolveProjectTask cmd rt
+                (match preparedTask with
+                 | Some task -> Ok task
+                 | None ->
+                     (sourceOperation resolved
+                         (fun project -> ClientShell.resolveProjectTaskIn project cmd)
+                         (fun () -> ClientShell.resolveProjectTask cmd)) rt)
                 |> Result.map (fun task ->
                     let authorizationCommand =
                         ClientShell.projectTaskAsRunCommand cmd.ProjectName task
@@ -407,10 +552,12 @@ let receiveCommand (rt: Runtime) (command: AgentCommand) =
                     | Error error, _ ->
                         return Error error
                     | Ok(), Some(cmd, task) ->
-                        let! result = ClientShell.runProjectTask cmd.ProjectName task rt |> serialize'
+                        let! result = (sourceOperation resolved
+                            (fun project -> ClientShell.runProjectTaskIn project task)
+                            (fun () -> ClientShell.runProjectTask cmd.ProjectName task)) rt |> serialize'
                         return result
                     | Ok(), None ->
-                        let! result = dispatch rt command
+                        let! result = dispatch rt target resolved command
                         return result
             }
 
@@ -418,7 +565,7 @@ let receiveCommand (rt: Runtime) (command: AgentCommand) =
 
         match response with
         | Ok payload ->
-            let outcome = ActivityPresentation.tryResultSummary command payload
+            let outcome = ActivityPresentation.tryResultSummary command payload.Payload
             activityId
             |> Option.iter (fun id ->
                 rt.Tui.CompleteActivity(id, stopwatch.ElapsedMilliseconds, outcome))
@@ -427,18 +574,43 @@ let receiveCommand (rt: Runtime) (command: AgentCommand) =
             |> Option.iter (fun id ->
                 rt.Tui.FailActivity(id, stopwatch.ElapsedMilliseconds, ActivityPresentation.shortError err, ActivityPresentation.fullError err))
 
-        audit command response
+        audit command (response |> Result.map (fun outcome -> outcome.Payload))
 
         return response
     }
 
+let receiveCommand (rt: Runtime) (command: AgentCommand) =
+    task {
+        let! result = receiveCommandForTarget rt None None None command
+        return result |> Result.map (fun outcome -> outcome.Payload)
+    }
+
+let private receiveCommandWithTypedInstructions (rt: Runtime)
+                                                (target: ProjectPaths.ProjectTarget option) command =
+    task {
+        match AgentInstructions.prepareOperationWithTarget rt target command with
+        | Error error ->
+            return Error error, [], AgentInstructions.RootBootstrapRequired
+        | Ok prepared ->
+            let! response =
+                receiveCommandForTarget rt target prepared.Source prepared.ProjectTask command
+            let provenance =
+                if prepared.Source.IsSome then AgentInstructions.HierarchyLoaded
+                else AgentInstructions.RootBootstrapRequired
+            return response,
+                   prepared.Instructions
+                   @ AgentInstructions.writeWarningsForContext rt prepared.Source command response,
+                   provenance
+    }
+
 let receiveCommandWithInstructions (rt: Runtime) command =
     task {
-        match AgentInstructions.resolve rt command with
+        match classifyProject command with
         | Error error -> return Error error, []
-        | Ok instructions ->
-            let! response = receiveCommand rt command
-            return response, instructions @ AgentInstructions.writeWarnings rt command response
+        | Ok scope ->
+            let! response, instructions, _ =
+                receiveCommandWithTypedInstructions rt (projectTarget scope) command
+            return response |> Result.map (fun outcome -> outcome.Payload), instructions
     }
 
 // Shared by SignalR receive and tests. Identity is supplied by the MCP call,
@@ -447,29 +619,73 @@ let processIncomingCommand (rt: Runtime) (commandJson: string) (agentId: string)
     task {
         let mutable parsedCommand = None
         let mutable instructions: InstructionDocument list = []
+        let mutable implicitChanges: string list = []
         let! response =
             task {
                 try
                     let command = JsonSerializer.Deserialize<AgentCommand>(commandJson)
                     parsedCommand <- Some command
-                    AgentCommandInfo.projectName command
-                    |> Option.iter (fun project ->
-                        rt.Tui.RecordAgentSeen(AgentView.activityProject project, agentId))
-                    match activateReadyOnActivity rt agentId command with
-                    | Error error ->
-                        return Error error
-                    | Ok () ->
-                        let! result, applicable = receiveCommandWithInstructions rt command
-                        instructions <- applicable @ checkWorkingGuidance rt agentId command
-                        return result
+                    let project = classifyProject command
+                    match project with
+                    | Error error -> return Error error
+                    | Ok scope ->
+                        let target = projectTarget scope
+                        // The caller's agentId belongs to the source project
+                        // of a cross-project notification, not the destination.
+                        let localAgentId =
+                            if isLocalAgentActivity command then agentId else ""
+                        if not (String.IsNullOrWhiteSpace localAgentId) then
+                            target |> Option.iter (fun selected ->
+                                rt.Tui.RecordAgentSeen(AgentView.activityProject selected, localAgentId))
+                        match activateReadyOnActivity rt localAgentId target command with
+                        | Error error -> return Error error
+                        | Ok changes ->
+                            implicitChanges <- changes
+                            let! result, applicable, provenance =
+                                receiveCommandWithTypedInstructions rt target command
+                            // A write may alter another agent's state, or none
+                            // at all. Invalidate precisely the affected local
+                            // cache entries before preparing turn guidance.
+                            match target, result with
+                            | Some selected, Ok outcome when not outcome.ChangedAgentIds.IsEmpty ->
+                                let cache = workingGuidanceCaches.GetValue(rt, fun _ ->
+                                    WorkingTurnGuidance.AgentCache(TimeSpan.FromMinutes 2.))
+                                let projectId = ProjectPaths.ProjectTarget.projectId selected
+                                for changed in outcome.ChangedAgentIds do
+                                    cache.Invalidate(projectId, changed)
+                            | _ -> ()
+                            instructions <-
+                                match command with
+                                | GetAgentInstructionsCommand _ ->
+                                    // The explicit result includes the complete hierarchy.
+                                    // Do not double-inject automatic AGENTS.md payloads.
+                                    checkWorkingGuidance rt localAgentId target command
+                                | _ ->
+                                    incrementalInstructions rt localAgentId target provenance applicable
+                                    @ checkWorkingGuidance rt localAgentId target command
+                            return result
                 with ex ->
                     return Error(ExceptionError ex)
             }
+        // The metadata is independent of the requested command outcome. A
+        // Ready->Working transition stays committed if the following file read
+        // fails, so other devices must still expire that agent's cache.
+        let changes =
+            match parsedCommand |> Option.bind AgentCommandInfo.projectName with
+            | Some project when not (String.IsNullOrWhiteSpace project) ->
+                let executed =
+                    match response with
+                    | Ok outcome -> outcome.ChangedAgentIds
+                    | Error _ -> []
+                implicitChanges @ executed
+                |> List.distinct
+                |> List.map (fun id -> { ProjectName = project; AgentId = id })
+            | _ -> []
         let agentResponse =
             match parsedCommand with
-            | Some command -> toAgentResponse command instructions response
-            | None -> toAgentResponse ListCommandsCommand [] response
-        return parsedCommand, response, agentResponse
+            | Some command -> toAgentResponse command instructions changes response
+            | None -> toAgentResponse ListCommandsCommand [] changes response
+        return parsedCommand, (response |> Result.map (fun outcome -> outcome.Payload)), agentResponse
     }
 
 let receiveCommandAndReply (connection: HubConnection) (rt: Runtime) (correlationId: string) (commandJson: string) (agentId: string) : Task =

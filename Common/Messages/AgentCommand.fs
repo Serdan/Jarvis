@@ -212,6 +212,13 @@ type ReadFilesCommand =
     { ProjectName: string
       FilePaths: string list }
 
+/// Explicit, uncached hierarchy retrieval. The cursor continues large responses
+/// without imposing a file-length or hierarchy-depth limit.
+type GetAgentInstructionsCommand =
+    { ProjectName: string
+      Directory: string
+      Cursor: string option }
+
 type ReadImageCommand =
     { ProjectName: string
       FilePath: string }
@@ -509,10 +516,17 @@ type InstructionDocument =
       Sha256: string
       Content: string }
 
+/// A canonical ledger mutation changed the assignment or Working-turn state
+/// of this agent. Advisory to other clients; never an authorization claim.
+type AgentStateChange =
+    { ProjectName: string
+      AgentId: string }
+
 type AgentCommandResponse =
     { Result: string option
       Error: AgentError option
-      Instructions: InstructionDocument list }
+      Instructions: InstructionDocument list
+      AgentStateChanges: AgentStateChange list }
 
 [<JsonConverter(typeof<UnionConverter<AgentCommand>>)>]
 type AgentCommand =
@@ -536,6 +550,7 @@ type AgentCommand =
     | SearchTextCommand of SearchTextCommand
     | ReadFileCommand of ReadFileCommand
     | ReadFilesCommand of ReadFilesCommand
+    | GetAgentInstructionsCommand of GetAgentInstructionsCommand
     | ReadImageCommand of ReadImageCommand
     | ExportFileCommand of ExportFileCommand
     | ImportFileCommand of ImportFileCommand
@@ -580,6 +595,7 @@ module AgentCommandInfo =
         | SearchTextCommand _ -> "SearchTextCommand"
         | ReadFileCommand _ -> "ReadFileCommand"
         | ReadFilesCommand _ -> "ReadFilesCommand"
+        | GetAgentInstructionsCommand _ -> "GetAgentInstructionsCommand"
         | ReadImageCommand _ -> "ReadImageCommand"
         | ExportFileCommand _ -> "ExportFileCommand"
         | ImportFileCommand _ -> "ImportFileCommand"
@@ -630,6 +646,7 @@ module AgentCommandInfo =
         | SearchTextCommand _ -> "SearchText"
         | ReadFileCommand _ -> "ReadFile"
         | ReadFilesCommand _ -> "ReadFiles"
+        | GetAgentInstructionsCommand _ -> "GetAgentInstructions"
         | ReadImageCommand _ -> "ReadImage"
         | ExportFileCommand _ -> "ExportFile"
         | ImportFileCommand _ -> "ImportFile"
@@ -678,6 +695,7 @@ module AgentCommandInfo =
         | SearchTextCommand cmd -> Some cmd.ProjectName
         | ReadFileCommand cmd -> Some cmd.ProjectName
         | ReadFilesCommand cmd -> Some cmd.ProjectName
+        | GetAgentInstructionsCommand cmd -> Some cmd.ProjectName
         | ReadImageCommand cmd -> Some cmd.ProjectName
         | ExportFileCommand cmd -> Some cmd.ProjectName
         | ImportFileCommand cmd -> Some cmd.ProjectName
@@ -736,6 +754,7 @@ module AgentCommandInfo =
         | SearchTextCommand cmd -> Some(sprintf "\"%s\"" (compact cmd.Query))
         | ReadFileCommand cmd -> Some(compact cmd.FilePath)
         | ReadFilesCommand cmd -> Some(String.concat ", " (cmd.FilePaths |> List.map compact))
+        | GetAgentInstructionsCommand cmd -> Some(compact cmd.Directory)
         | ReadImageCommand cmd -> Some(compact cmd.FilePath)
         | ExportFileCommand cmd -> Some(compact cmd.FilePath)
         | ImportFileCommand cmd -> Some(compact cmd.FilePath)
@@ -779,6 +798,7 @@ module AgentCommandInfo =
         | SearchTextCommand cmd -> Some(quoted cmd.Query)
         | ReadFileCommand cmd -> Some(truncate 64 cmd.FilePath)
         | ReadFilesCommand cmd -> Some $"{cmd.FilePaths.Length} files"
+        | GetAgentInstructionsCommand cmd -> Some(truncate 64 cmd.Directory)
         | ReadImageCommand cmd -> Some(truncate 64 cmd.FilePath)
         | ExportFileCommand cmd -> Some(truncate 64 cmd.FilePath)
         | ImportFileCommand cmd -> Some(truncate 64 cmd.FilePath)
@@ -855,7 +875,7 @@ module AgentCommandInfo =
         | None -> invocation command
 
 module AgentProtocol =
-    let version = "3.58"
+    let version = "3.61"
     let defaultPatchFuzzyContextLines = 3
     let maxResponseBytes = 900 * 1024
     let maxImageBytes = 8 * 1024 * 1024
@@ -891,6 +911,7 @@ module AgentProtocol =
           definition "SearchText" "Searches project file contents." [ ReadOnly ] false false false
           definition "ReadFile" "Reads one file." [ ReadOnly ] false false false
           definition "ReadFiles" "Reads multiple files." [ ReadOnly ] false false false
+          definition "GetAgentInstructions" "Reads all applicable AGENTS.md files for a checkout directory, with continuation for transport-size limits." [ ReadOnly ] false false false
           definition "ReadImage" "Reads one PNG, JPEG, or WebP image for model vision." [ ReadOnly ] false false false
           definition "ExportFile" "Copies one bounded project file to a short-lived user download URL." [ ReadOnly ] false false false
           definition "ImportFile" "Downloads a ChatGPT-provided file into a project path." [ WorkspaceWrite; NetworkAccess ] true true false

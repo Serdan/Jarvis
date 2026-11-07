@@ -74,17 +74,48 @@ let recoveredSessionUsesNewCutoffRatherThanStateEntry () =
 let agentStateCacheAvoidsRepeatedFetchAndInvalidatesOnTaskTransition () =
     let cache = AgentCache(TimeSpan.FromMinutes 2.)
     let now = DateTimeOffset(2026, 11, 6, 0, 0, 0, TimeSpan.Zero)
+    let project =
+        Client.ProjectPaths.ProjectTarget.parse "Wayfold"
+        |> function Ok target -> Client.ProjectPaths.ProjectTarget.projectId target | Error error -> failwithf "%A" error
     let mutable loads = 0
     let load () =
         loads <- loads + 1
         None
-    cache.Get(now, "Wayfold", "Agent 3", load) |> ignore
-    cache.Get(now.AddMinutes(1.), "Wayfold", "Agent 3", load) |> ignore
+    cache.Get(now, project, "Agent 3", load) |> ignore
+    cache.Get(now.AddMinutes(1.), project, "Agent 3", load) |> ignore
     Assert.That(loads, Is.EqualTo(1))
-    cache.Get(now.AddMinutes(2.1), "Wayfold", "Agent 3", load) |> ignore
+    cache.Get(now.AddMinutes(2.1), project, "Agent 3", load) |> ignore
     Assert.That(loads, Is.EqualTo(2))
-    cache.Get(now.AddMinutes(2.1), "Wayfold", "Agent 4", load) |> ignore
+    cache.Get(now.AddMinutes(2.1), project, "Agent 4", load) |> ignore
     Assert.That(loads, Is.EqualTo(3))
-    cache.Invalidate("Wayfold", "Agent 3")
-    cache.Get(now.AddMinutes(2.2), "Wayfold", "Agent 3", load) |> ignore
+    cache.Invalidate(project, "Agent 3")
+    cache.Get(now.AddMinutes(2.2), project, "Agent 3", load) |> ignore
     Assert.That(loads, Is.EqualTo(4))
+
+
+[<Test>]
+let single_agent_invalidation_leaves_unrelated_caches_warm () =
+    let cache = AgentCache(TimeSpan.FromMinutes 2.)
+    let now = started
+    let project name =
+        Client.ProjectPaths.ProjectTarget.parse name
+        |> function Ok target -> Client.ProjectPaths.ProjectTarget.projectId target | Error error -> failwithf "%A" error
+    let first = project "Wayfold"
+    let second = project "Jarvis"
+    let mutable loads = 0
+    let load () =
+        loads <- loads + 1
+        None
+    cache.Get(now, first, "One", load) |> ignore
+    cache.Get(now, first, "Two", load) |> ignore
+    cache.Get(now, second, "One", load) |> ignore
+    Assert.That(loads, Is.EqualTo(3))
+    // A single changed agent must not make any other agent fetch the ledger.
+    cache.Invalidate(first, "One")
+    cache.Get(now.AddSeconds(1), first, "One", load) |> ignore
+    cache.Get(now.AddSeconds(1), first, "Two", load) |> ignore
+    cache.Get(now.AddSeconds(1), second, "One", load) |> ignore
+    Assert.That(loads, Is.EqualTo(4), "Only the changed agent must reload")
+    cache.InvalidateAll()
+    cache.Get(now.AddSeconds(2), second, "One", load) |> ignore
+    Assert.That(loads, Is.EqualTo(5))

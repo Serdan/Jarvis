@@ -11,14 +11,27 @@ open FsToolkit.ErrorHandling
 open Kehlet.FSharp.IO
 open Kehlet.FSharp.IO.Effect.Operators
 
+type private ProjectSource =
+    | Named of string
+    | Selected of ProjectPaths.ResolvedProject
+
+let private resolveSourceWorkingDirectory source relativeDirectory =
+    effect {
+        match source with
+        | Selected project ->
+            match relativeDirectory with
+            | None -> return ProjectPaths.ResolvedProject.sourceRoot project
+            | Some relative ->
+                return! ProjectPaths.resolveSourcePath project relative >>= FileIO.parseFolder
+        | Named projectName ->
+            match relativeDirectory with
+            | None -> return! ProjectPaths.resolveProjectRoot projectName
+            | Some relative -> return! ProjectPaths.resolveProjectFolder projectName relative
+    }
+
 module private Core =
     let private defaultTimeoutSeconds = 60
     let private defaultMaxOutputBytes = 64 * 1024
-
-    let private resolveWorkingDirectory projectName workingDirectory =
-        match workingDirectory with
-        | None -> ProjectPaths.resolveProjectRoot projectName
-        | Some relativePath -> ProjectPaths.resolveProjectFolder projectName relativePath
 
     let private validateRelativePath = ProjectPaths.validateProjectRelativePath
 
@@ -123,7 +136,7 @@ module private Core =
         with ex ->
             Error(ExceptionError ex)
 
-    let private run projectName workingDirectory executable args timeoutSeconds maxOutputBytes =
+    let run projectName workingDirectory executable args timeoutSeconds maxOutputBytes =
         effect {
             let timeoutSeconds = timeoutSeconds |> Option.defaultValue defaultTimeoutSeconds
             let maxOutputBytes = maxOutputBytes |> Option.defaultValue defaultMaxOutputBytes
@@ -133,7 +146,7 @@ module private Core =
             elif maxOutputBytes <= 0 then
                 return! Client.ValidationError "MaxOutputBytes must be greater than zero." |> Effect.ofError
             else
-                let! (FolderPath workingDirectory) = resolveWorkingDirectory projectName workingDirectory
+                let! (FolderPath workingDirectory) = resolveSourceWorkingDirectory projectName workingDirectory
                 let! result = fun _ -> runProcess workingDirectory executable args timeoutSeconds maxOutputBytes
 
                 return
@@ -145,7 +158,7 @@ module private Core =
         }
 
     let runCommand (cmd: RunCommandCommand) =
-        run cmd.ProjectName cmd.WorkingDirectory cmd.Executable cmd.Args cmd.TimeoutSeconds cmd.MaxOutputBytes
+        run (Named cmd.ProjectName) cmd.WorkingDirectory cmd.Executable cmd.Args cmd.TimeoutSeconds cmd.MaxOutputBytes
 
     let private tryProperty (name: string) (element: JsonElement) =
         let mutable value = Unchecked.defaultof<JsonElement>
@@ -242,9 +255,13 @@ module private Core =
         | ex ->
             Error(ExceptionError ex)
 
-    let listConfiguredTasks (cmd: ListConfiguredTasksCommand) : IO<'rt, ListConfiguredTasksResult> =
+    let listConfiguredTasksFor (source: ProjectSource) : IO<'rt, ListConfiguredTasksResult> =
         fun rt ->
-            match ProjectPaths.resolveProjectFile cmd.ProjectName ".jarvis.json" rt with
+            let location =
+                match source with
+                | Selected context -> ProjectPaths.resolveSourcePath context ".jarvis.json" >>= FileIO.parseFile
+                | Named name -> ProjectPaths.resolveProjectFile name ".jarvis.json"
+            match location rt with
             | Error(NotFoundError _) -> Ok { Tasks = [] }
             | Error error -> Error error
             | Ok configPath ->
@@ -253,34 +270,34 @@ module private Core =
                 | Error error -> Error error
                 | Ok(Content json) -> parseProjectTasks json
 
-    let resolveProjectTask (cmd: RunProjectTaskCommand) =
+    let resolveProjectTaskFor (source: ProjectSource) (cmd: RunProjectTaskCommand) =
         fun rt ->
-            match listConfiguredTasks { ProjectName = cmd.ProjectName } rt with
+            match listConfiguredTasksFor source rt with
             | Error error -> Error error
             | Ok result ->
                 result.Tasks
                 |> List.tryFind (fun task -> String.Equals(task.Name, cmd.TaskName, StringComparison.Ordinal))
                 |> Result.requireSome (NotFoundError $"Unknown project task: {cmd.TaskName}")
 
-    let runProjectTask projectName (task: ProjectTaskDefinition) =
-        run projectName task.WorkingDirectory task.Executable task.Args task.TimeoutSeconds task.MaxOutputBytes
+    let runProjectTaskFor source (task: ProjectTaskDefinition) =
+        run source task.WorkingDirectory task.Executable task.Args task.TimeoutSeconds task.MaxOutputBytes
 
-    let private git projectName args maxOutputBytes =
-        run projectName None "git" args (Some defaultTimeoutSeconds) maxOutputBytes
+    let private git source args maxOutputBytes =
+        run source None "git" args (Some defaultTimeoutSeconds) maxOutputBytes
 
-    let getGitStatus (cmd: GitStatusCommand) =
-        git cmd.ProjectName [ "status"; "--short"; "--branch" ] None
+    let getGitStatusFor source =
+        git source [ "status"; "--short"; "--branch" ] None
 
-    let getGitDiff (cmd: GitDiffCommand) =
+    let getGitDiffFor source (cmd: GitDiffCommand) =
         match cmd.Path with
-        | None -> git cmd.ProjectName [ "diff"; "--" ] cmd.MaxOutputBytes
+        | None -> git source [ "diff"; "--" ] cmd.MaxOutputBytes
         | Some path ->
             effect {
                 let! safePath = fun _ -> validateRelativePath path
-                return! git cmd.ProjectName [ "diff"; "--"; safePath ] cmd.MaxOutputBytes
+                return! git source [ "diff"; "--"; safePath ] cmd.MaxOutputBytes
             }
 
-    let gitCommit (cmd: GitCommitCommand) =
+    let gitCommitFor source (cmd: GitCommitCommand) =
         effect {
             if String.IsNullOrWhiteSpace cmd.Message then
                 return! Client.ValidationError "Commit message cannot be empty." |> Effect.ofError
@@ -304,11 +321,11 @@ module private Core =
                     if safePaths.IsEmpty then
                         fun _ -> Ok None
                     else
-                        git cmd.ProjectName ([ "add"; "--" ] @ safePaths) None |>> Some
+                        git source ([ "add"; "--" ] @ safePaths) None |>> Some
 
                 let! stagedResult =
                     if safePaths.IsEmpty then
-                        git cmd.ProjectName [ "diff"; "--cached"; "--quiet"; "--" ] None |>> Some
+                        git source [ "diff"; "--cached"; "--quiet"; "--" ] None |>> Some
                     else
                         fun _ -> Ok None
 
@@ -339,12 +356,12 @@ module private Core =
                               yield "--"
                               yield! safePaths ]
 
-                    let! commitResult = git cmd.ProjectName commitArgs None
+                    let! commitResult = git source commitArgs None
 
                     if commitResult.ExitCode <> 0 then
                         return! Client.GenericError commitResult.StdErr |> Effect.ofError
                     else
-                        let! revParse = git cmd.ProjectName [ "rev-parse"; "HEAD" ] None
+                        let! revParse = git source [ "rev-parse"; "HEAD" ] None
                         let hash = revParse.StdOut.Trim()
 
                         return
@@ -355,11 +372,19 @@ module private Core =
         }
 
 let runCommand cmd = Core.runCommand cmd
-let listConfiguredTasks cmd = Core.listConfiguredTasks cmd
-let resolveProjectTask cmd = Core.resolveProjectTask cmd
+let runCommandIn project (cmd: RunCommandCommand) =
+    Core.run (Selected project) cmd.WorkingDirectory cmd.Executable cmd.Args cmd.TimeoutSeconds cmd.MaxOutputBytes
+
+let listConfiguredTasks (cmd: ListConfiguredTasksCommand) = Core.listConfiguredTasksFor (Named cmd.ProjectName)
+let listConfiguredTasksIn project (_: ListConfiguredTasksCommand) = Core.listConfiguredTasksFor (Selected project)
+
+let resolveProjectTask (cmd: RunProjectTaskCommand) = Core.resolveProjectTaskFor (Named cmd.ProjectName) cmd
+let resolveProjectTaskIn project (cmd: RunProjectTaskCommand) = Core.resolveProjectTaskFor (Selected project) cmd
 
 let runProjectTask projectName (task: ProjectTaskDefinition) =
-    Core.runProjectTask projectName task
+    Core.runProjectTaskFor (Named projectName) task
+let runProjectTaskIn project (task: ProjectTaskDefinition) =
+    Core.runProjectTaskFor (Selected project) task
 
 let projectTaskAsRunCommand projectName (task: ProjectTaskDefinition) =
     { ProjectName = projectName
@@ -370,6 +395,9 @@ let projectTaskAsRunCommand projectName (task: ProjectTaskDefinition) =
       TimeoutSeconds = task.TimeoutSeconds
       MaxOutputBytes = task.MaxOutputBytes }
 
-let getGitStatus cmd = Core.getGitStatus cmd
-let getGitDiff cmd = Core.getGitDiff cmd
-let gitCommit cmd = Core.gitCommit cmd
+let getGitStatus (cmd: GitStatusCommand) = Core.getGitStatusFor (Named cmd.ProjectName)
+let getGitStatusIn project (_: GitStatusCommand) = Core.getGitStatusFor (Selected project)
+let getGitDiff (cmd: GitDiffCommand) = Core.getGitDiffFor (Named cmd.ProjectName) cmd
+let getGitDiffIn project (cmd: GitDiffCommand) = Core.getGitDiffFor (Selected project) cmd
+let gitCommit (cmd: GitCommitCommand) = Core.gitCommitFor (Named cmd.ProjectName) cmd
+let gitCommitIn project (cmd: GitCommitCommand) = Core.gitCommitFor (Selected project) cmd

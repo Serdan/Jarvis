@@ -1476,6 +1476,132 @@ type ReviewWorkflowTests() =
             Assert.That((ReviewWorkflow.getAgentInbox first "Reviewer" |> success).PendingNotifications, Is.Empty))
 
     [<Test>]
+    member _.CrossProjectNotificationDoesNotActivateSameNamedDestinationAgent() =
+        withFixture (fun source _ sourceBinding _ _ _ _ _ ->
+            let root = Path.GetDirectoryName(source)
+            let destination = Path.Combine(root, "destination")
+            let destinationRemote = Path.Combine(root, "destination.git")
+            git root [ "init"; "--bare"; destinationRemote ] |> ignore
+            git root [ "clone"; destinationRemote; destination ] |> ignore
+            git destination [ "config"; "user.name"; "Fixture" ] |> ignore
+            git destination [ "config"; "user.email"; "fixture@example.test" ] |> ignore
+            File.WriteAllText(Path.Combine(destination, "source.txt"), "destination base")
+            git destination [ "add"; "source.txt" ] |> ignore
+            git destination [ "commit"; "-m"; "destination base" ] |> ignore
+            git destination [ "push"; "-u"; "origin"; "HEAD" ] |> ignore
+
+            let destinationBinding : LedgerBinding =
+                { RepositoryPath = destination; RemoteName = "origin"
+                  ApprovedFetchUrl = destinationRemote; ApprovedPushUrl = destinationRemote
+                  ProjectId = Guid.NewGuid(); LedgerId = Guid.NewGuid(); Epoch = 1 }
+            LedgerStore.initialize destinationBinding true |> success |> ignore
+            for agent in [ "Owner"; "Reviewer" ] do
+                ReviewWorkflow.registerAgent destinationBinding (Guid.NewGuid()) agent
+                |> success |> ignore
+            // "Owner" is Ready in both independent project ledgers.
+            let sourceTask = "source-notification-task"
+            let destinationTask = "destination-unrelated-task"
+            ReviewWorkflow.createTask sourceBinding (Guid.NewGuid()) sourceTask "Sender task"
+            |> success |> ignore
+            ReviewWorkflow.assignTask sourceBinding (Guid.NewGuid()) sourceTask (Guid.NewGuid()) "Owner"
+            |> success |> ignore
+            ReviewWorkflow.createTask destinationBinding (Guid.NewGuid()) destinationTask "Unrelated task"
+            |> success |> ignore
+            ReviewWorkflow.assignTask destinationBinding (Guid.NewGuid()) destinationTask (Guid.NewGuid()) "Owner"
+            |> success |> ignore
+
+            let context = GitCommandTests.TestContext(root)
+            let sourceConfig = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot source
+            let destinationConfig = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot destination
+            try
+                let bind name (binding: LedgerBinding) =
+                    let head = (LedgerStore.fetch binding |> success).Commit
+                    Client.OrchestrationApi.LedgerBindingConfig.bindExisting
+                        name context binding.ProjectId binding.LedgerId binding.Epoch
+                        binding.RemoteName binding.ApprovedFetchUrl binding.ApprovedPushUrl head true
+                    |> success |> ignore
+                bind "owner" sourceBinding
+                bind "destination" destinationBinding
+                let logPath = Path.Combine(root, "activity")
+                Directory.CreateDirectory(logPath) |> ignore
+                let logSettings : Client.ActivityLog.Settings =
+                    { DirectoryPath = logPath
+                      RetentionDays = 14
+                      MaxFileBytes = 1024L * 1024L }
+                use log = new Client.ActivityLog.Store(logSettings)
+                let rt = Client.Runtime(root, Client.ConsoleTui.ConsoleTui(activityLog = log), Client.PartialTrust)
+                let run (command: Common.AgentCommand) =
+                    Client.SignalR.Client.processIncomingCommand rt
+                        (System.Text.Json.JsonSerializer.Serialize command) "Owner"
+                    |> Async.AwaitTask |> Async.RunSynchronously
+
+                // The server validates the source sender via its own inbox.
+                let sourceInbox : Common.AgentCommand =
+                    Common.TaskReadCommand
+                        { ProjectName = "owner"; AgentId = "Owner"; Action = "AgentInbox"
+                          TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L
+                          Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null
+                          RelativePath = null }
+                let _, senderResult, senderResponse = run sourceInbox
+                Assert.That(senderResult.IsOk, Is.True)
+                Assert.That(senderResponse.AgentStateChanges |> List.map _.ProjectName,
+                            Is.EqualTo([ "owner" ] :> obj))
+                Assert.That((ReviewWorkflow.getAgentInbox sourceBinding "Owner" |> success).Agent.State,
+                            Is.EqualTo("Working"))
+                Assert.That(log.LoadAgentSeen() |> List.exists (fun (key, _) -> key = "owner::Owner"),
+                            Is.True, "The source sender is active in its own project")
+
+                let before = (ReviewWorkflow.getAgentInbox destinationBinding "Owner" |> success).Agent
+                Assert.That(before.State, Is.EqualTo("Ready"))
+                let notify sourceProject operationId : Common.AgentCommand =
+                    Common.TaskWriteCommand
+                        { ProjectName = "destination"; Action = "NotifyAgent"
+                          OperationId = operationId; TaskId = ""; AttemptId = ""
+                          ActorId = "Owner"; OwnerId = "Reviewer"; Title = ""; Html = ""
+                          ExpectedVersion = 0; ExpectedAgentVersion = 0; ExpectedTaskVersion = 0
+                          AssignmentGeneration = 0; Summary = "Cross-project notification"
+                          NextAction = ""; Reason = ""; BaseOid = ""; TargetRef = ""
+                          SourceRef = sourceProject; AllowDetached = false
+                          AllowUncommitted = false; DecisionSequence = 0L; Evidence = ""
+                          SessionId = "" }
+                let _, delivered, destinationResponse =
+                    run (notify "owner" (Guid.NewGuid().ToString("D")))
+                Assert.That(delivered.IsOk, Is.True)
+                Assert.That(destinationResponse.AgentStateChanges, Is.Empty,
+                            "Foreign sender must not start an agent in the destination project")
+                Assert.That(destinationResponse.Instructions |> List.exists (fun i -> i.Scope = "working-turn"),
+                            Is.False)
+                let after = (ReviewWorkflow.getAgentInbox destinationBinding "Owner" |> success).Agent
+                Assert.That(after.State, Is.EqualTo("Ready"))
+                Assert.That(after.Version, Is.EqualTo(before.Version))
+                Assert.That(after.WorkingTurnStartedAtUtc, Is.EqualTo(before.WorkingTurnStartedAtUtc))
+                Assert.That(log.LoadAgentSeen() |> List.exists (fun (key, _) -> key = "destination::Owner"),
+                            Is.False, "A foreign notification must not update destination agent last-seen")
+                let reviewerInbox = ReviewWorkflow.getAgentInbox destinationBinding "Reviewer" |> success
+                Assert.That(reviewerInbox.PendingNotifications.Length, Is.EqualTo(1))
+                let received = reviewerInbox.PendingNotifications.Head
+                Assert.That(received.FromProjectName, Is.EqualTo("owner"))
+                Assert.That(received.FromAgentId, Is.EqualTo("Owner"))
+                Assert.That(received.ToAgentId, Is.EqualTo("Reviewer"))
+
+                // A real local notification by destination Owner still counts
+                // as activity and starts that project's own Ready assignment.
+                let _, localResult, localResponse =
+                    run (notify "" (Guid.NewGuid().ToString("D")))
+                Assert.That(localResult.IsOk, Is.True)
+                Assert.That(localResponse.AgentStateChanges,
+                            Is.EqualTo([ ({ ProjectName = "destination"; AgentId = "Owner" } : Common.AgentStateChange) ] :> obj))
+                Assert.That((ReviewWorkflow.getAgentInbox destinationBinding "Owner" |> success).Agent.State,
+                            Is.EqualTo("Working"))
+                Assert.That(log.LoadAgentSeen() |> List.exists (fun (key, _) -> key = "destination::Owner"),
+                            Is.True, "Local notification must update destination agent last-seen")
+                Assert.That((ReviewWorkflow.getAgentInbox destinationBinding "Reviewer" |> success).PendingNotifications.Length,
+                            Is.EqualTo(2))
+            finally
+                for config in [ sourceConfig; destinationConfig ] do
+                    if File.Exists config then File.Delete config)
+
+    [<Test>]
     member _.InvalidNotificationDoesNotReachRecipient() =
         withFixture (fun _ _ first second _ _ _ _ ->
             match ReviewWorkflow.notifyAgent first (Guid.NewGuid()) "Owner" "" "Absent" "" "Hello" with
@@ -1794,35 +1920,62 @@ type ReviewWorkflowTests() =
                 match Client.OrchestrationApi.TaskApi.read diffCmd ctx with
                 | Ok value -> Assert.That((unbox<TaskSpecDiff> value).Diff, Does.Contain("API revised"))
                 | Error error -> Assert.Fail(sprintf " diff API failed: %A" error)
+                // Source spec operations must use the checkout already
+                // resolved for AGENTS.md, including nested instructions.
+                let sourceDirectory = Path.Combine(one, "specs")
+                Directory.CreateDirectory(sourceDirectory) |> ignore
+                File.WriteAllText(Path.Combine(sourceDirectory, "AGENTS.md"), "Task spec instructions")
+                let sourceContext =
+                    Client.ProjectPaths.resolveProjectContext "owner" ctx
+                    |> function Ok value -> value | Error error -> failwithf "Cannot resolve source checkout: %A" error
+                let target = Client.ProjectPaths.ResolvedProject.target sourceContext
+                let instructionRuntime = Client.Runtime(Path.GetDirectoryName one)
+                let runPrepared cmd =
+                    Client.OrchestrationApi.TaskApi.writeForContext sourceContext cmd ctx
+                    |> function
+                        | Ok value -> value
+                        | Error error -> failwithf "Prepared task spec %s failed: %A" cmd.Action error
                 let exportCmd = { template "ExportTaskSpec" specTask with
-                                    SourceRef = "spec-api-export.html"
+                                    SourceRef = "specs/spec-api-export.html"
                                     BaseOid = pageAfter.SpecBlobOid }
-                let exportReceipt = run exportCmd
+                match Client.AgentInstructions.prepareWithTarget instructionRuntime (Some target) (Common.TaskWriteCommand exportCmd) with
+                | Ok (instructions, Some preparedContext) ->
+                    Assert.That(instructions |> List.map (fun instruction -> instruction.Path),
+                                Does.Contain("owner/specs/AGENTS.md"))
+                    Assert.That(Client.ProjectPaths.ResolvedProject.sourceRoot preparedContext,
+                                Is.EqualTo(Client.ProjectPaths.ResolvedProject.sourceRoot sourceContext))
+                | other -> Assert.Fail(sprintf "Could not prepare task-spec instructions: %A" other)
+                let exportReceipt = runPrepared exportCmd
                 Assert.That((unbox<TaskSpecExport> exportReceipt).AlreadyApplied, Is.False)
                 Assert.That((unbox<TaskSpecExport> exportReceipt).Authority,
                             Is.EqualTo("NonAuthoritativeSourceCopy"))
-                let exportRetry = run exportCmd
+                let exportRetry = runPrepared exportCmd
                 Assert.That((unbox<TaskSpecExport> exportRetry).AlreadyApplied, Is.True)
                 let otherOperation = { exportCmd with OperationId = Guid.NewGuid().ToString("D") }
                 match Client.OrchestrationApi.TaskApi.write otherOperation ctx with
                 | Error _ -> ()
                 | Ok _ -> Assert.Fail("Unrelated operation overwrote existing exported HTML")
-                Assert.That(File.ReadAllText(Path.Combine(one, "spec-api-export.html")),
+                Assert.That(File.ReadAllText(Path.Combine(sourceDirectory, "spec-api-export.html")),
                             Does.Contain("NON-AUTHORITATIVE JARVIS"))
                 match Client.OrchestrationApi.TaskApi.read
                         { pageCmd with Action = "ExportTaskSpec"; RelativePath = "should-not-write.html" } ctx with
                 | Error _ -> ()
                 | Ok _ -> Assert.Fail("Export incorrectly accessible through read-only  API")
                 Assert.That(File.Exists(Path.Combine(one, "should-not-write.html")), Is.False)
-                File.WriteAllText(Path.Combine(one, "spec-api-import.html"),
+                File.WriteAllText(Path.Combine(sourceDirectory, "spec-api-import.html"),
                                   "<h1>API imported safely</h1>\\n")
-                let sourceDraft = LedgerStore.readRegisteredSourceSpec first "spec-api-import.html" |> success
+                let sourceDraft = LedgerStore.readRegisteredSourceSpec first "specs/spec-api-import.html" |> success
                 let importCommand =
                     { template "ImportTaskSpec" specTask with
                         ExpectedVersion = 2; BaseOid = pageAfter.SpecBlobOid
-                        TargetRef = sourceDraft.BlobOid; SourceRef = "spec-api-import.html"
+                        TargetRef = sourceDraft.BlobOid; SourceRef = "specs/spec-api-import.html"
                         Title = "Spec API imported" }
-                run importCommand |> ignore
+                match Client.AgentInstructions.prepareWithTarget instructionRuntime (Some target) (Common.TaskWriteCommand importCommand) with
+                | Ok (instructions, Some _) ->
+                    Assert.That(instructions |> List.map (fun instruction -> instruction.Path),
+                                Does.Contain("owner/specs/AGENTS.md"))
+                | other -> Assert.Fail(sprintf "Could not prepare import instructions: %A" other)
+                runPrepared importCommand |> ignore
                 let latest =
                     Client.OrchestrationApi.TaskApi.read pageCmd ctx
                     |> function
@@ -2032,6 +2185,13 @@ type ReviewWorkflowTests() =
             |> success |> ignore
             ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner"
             |> success |> ignore
+            // The first inbox call should deliver root guidance even though
+            // ordinary ledger reads deliberately skip source instructions.
+            File.WriteAllText(Path.Combine(Path.GetDirectoryName one, "AGENTS.md"), "workspace guidance")
+            File.WriteAllText(Path.Combine(one, "AGENTS.md"), "project guidance")
+            Directory.CreateDirectory(Path.Combine(one, "src")) |> ignore
+            File.WriteAllText(Path.Combine(one, "src", "AGENTS.md"), "source guidance")
+            File.WriteAllText(Path.Combine(one, "src", "example.fs"), "module Example")
             let context = GitCommandTests.TestContext(Path.GetDirectoryName one)
             let configPath = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
             try
@@ -2049,7 +2209,11 @@ type ReviewWorkflowTests() =
                 let invoke () =
                     Client.SignalR.Client.processIncomingCommand rt payload "Owner"
                     |> Async.AwaitTask |> Async.RunSynchronously
-                let _, initialResult, _ = invoke()
+                let _, initialResult, initialResponse = invoke()
+                Assert.That(initialResponse.Instructions |> List.map (fun d -> d.Path),
+                            Is.EqualTo([ "AGENTS.md"; "owner/AGENTS.md" ] :> obj))
+                Assert.That(initialResponse.AgentStateChanges |> List.map _.AgentId |> String.concat ",",
+                            Is.EqualTo("Owner"), sprintf "%A" initialResponse.AgentStateChanges)
                 match initialResult with
                 | Ok _ -> ()
                 | Error error -> Assert.Fail(sprintf "Agent inbox should succeed: %A" error)
@@ -2060,13 +2224,99 @@ type ReviewWorkflowTests() =
                 let _, _, startedAttempt = ReviewWorkflow.getTask second taskId |> success
                 Assert.That(startedAttempt.Value.Phase, Is.EqualTo("Started"))
 
-                let _, repeatResult, _ = invoke()
+                let _, repeatResult, repeatResponse = invoke()
+                Assert.That(repeatResponse.Instructions, Is.Empty)
+                Assert.That(repeatResponse.AgentStateChanges, Is.Empty)
+                let srcCommand : Common.AgentCommand =
+                    Common.ReadFileCommand
+                        { ProjectName = "owner"; FilePath = "src/example.fs"
+                          StartLine = None; EndLine = None; IncludeLineNumbers = None }
+                let srcPayload = System.Text.Json.JsonSerializer.Serialize<Common.AgentCommand>(srcCommand)
+                let readSource () =
+                    Client.SignalR.Client.processIncomingCommand rt srcPayload "Owner"
+                    |> Async.AwaitTask |> Async.RunSynchronously
+                let _, srcResult, srcResponse = readSource()
+                Assert.That(srcResult.IsOk, Is.True)
+                Assert.That(srcResponse.Instructions |> List.map (fun d -> d.Path),
+                            Is.EqualTo([ "owner/src/AGENTS.md" ] :> obj))
+                let _, _, repeatSource = readSource()
+                Assert.That(repeatSource.Instructions, Is.Empty)
+                // A warm Working-state cache must avoid GitHub for ordinary
+                // local source reads. Disable the bound remote temporarily;
+                // a forced refresh would surface as duplicate AGENTS.md.
+                let originalRemote = git one [ "remote"; "get-url"; "origin" ]
+                let unavailable = Path.Combine(Path.GetTempPath(), "jarvis-missing-" + Guid.NewGuid().ToString("N"))
+                git one [ "remote"; "set-url"; "origin"; unavailable ] |> ignore
+                try
+                    let _, offlineResult, offlineResponse = readSource()
+                    Assert.That(offlineResult.IsOk, Is.True)
+                    Assert.That(offlineResponse.Instructions, Is.Empty)
+                finally
+                    git one [ "remote"; "set-url"; "origin"; originalRemote ] |> ignore
+                File.WriteAllText(Path.Combine(one, "src", "AGENTS.md"), "changed source guidance")
+                let _, _, updatedSource = readSource()
+                Assert.That(updatedSource.Instructions |> List.map (fun d -> d.Path),
+                            Is.EqualTo([ "owner/src/AGENTS.md" ] :> obj))
                 match repeatResult with
                 | Ok _ -> ()
                 | Error error -> Assert.Fail(sprintf "Second inbox should succeed: %A" error)
                 let again = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
                 Assert.That(again.Version, Is.EqualTo(agent.Version))
                 Assert.That(again.WorkingTurnStartedAtUtc, Is.EqualTo(agent.WorkingTurnStartedAtUtc))
+
+                // A second client changes the assignment while this client's
+                // Working-state and instruction-delivery caches are still warm.
+                // The next ordinary call must refresh the ledger state, activate
+                // Ready, and re-deliver roots for the new Working turn.
+                let _, _, currentAttempt = ReviewWorkflow.getTask second taskId |> success
+                let attempt = currentAttempt.Value
+                // This second client goes through the real TaskWrite command
+                // pipeline. The canonical receipt must identify exactly the
+                // changed agent, which the server would send as a SignalR hint.
+                let yieldCommand : Common.TaskWriteCommand =
+                    { ProjectName = "owner"; Action = "YieldAgent"
+                      OperationId = Guid.NewGuid().ToString("D")
+                      TaskId = taskId; AttemptId = ""; ActorId = "Owner"; OwnerId = ""
+                      Title = ""; Html = ""; ExpectedVersion = attempt.Version
+                      ExpectedAgentVersion = again.Version; ExpectedTaskVersion = 0
+                      AssignmentGeneration = attempt.AssignmentGeneration
+                      Summary = "Remote client yielded"; NextAction = "Continue"; Reason = ""
+                      BaseOid = ""; TargetRef = ""; SourceRef = ""; AllowDetached = false
+                      AllowUncommitted = false; DecisionSequence = 0L; Evidence = ""
+                      SessionId = "" }
+                let remoteRuntime =
+                    Client.Runtime(Path.GetDirectoryName one, Client.ConsoleTui.ConsoleTui(), Client.PartialTrust)
+                let _, yieldedResult, yieldedResponse =
+                    Client.SignalR.Client.processIncomingCommand remoteRuntime
+                        (System.Text.Json.JsonSerializer.Serialize<Common.AgentCommand>(Common.TaskWriteCommand yieldCommand))
+                        "Owner"
+                    |> Async.AwaitTask |> Async.RunSynchronously
+                Assert.That(yieldedResult.IsOk, Is.True)
+                match yieldedResult with
+                | Ok payload ->
+                    use serialized = System.Text.Json.JsonDocument.Parse(payload)
+                    let mutable ignored = Unchecked.defaultof<System.Text.Json.JsonElement>
+                    Assert.That(serialized.RootElement.TryGetProperty("changedAgentIds", &ignored), Is.False,
+                                "Mutation routing metadata is not part of the public task operation result")
+                | Error error -> Assert.Fail(sprintf "Yield failed: %A" error)
+                Assert.That(yieldedResponse.AgentStateChanges |> List.map _.AgentId,
+                            Is.EqualTo([ "Owner" ] :> obj))
+                let remoteReady = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
+                Assert.That(remoteReady.State, Is.EqualTo("Ready"))
+                for mutation in yieldedResponse.AgentStateChanges do
+                    Client.SignalR.Client.invalidateAgentStates rt mutation.ProjectName [| mutation.AgentId |]
+                let _, resumedResult, resumedResponse = readSource()
+                Assert.That(resumedResult.IsOk, Is.True)
+                Assert.That(resumedResponse.AgentStateChanges,
+                            Is.EqualTo([ ({ ProjectName = "owner"; AgentId = "Owner" } : Common.AgentStateChange) ] :> obj))
+                Assert.That(resumedResponse.Instructions |> List.map (fun d -> d.Path),
+                            Is.EqualTo([ "AGENTS.md"; "owner/AGENTS.md"; "owner/src/AGENTS.md" ] :> obj))
+                let remoteWorking = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
+                Assert.That(remoteWorking.State, Is.EqualTo("Working"))
+                Assert.That(remoteWorking.WorkingTurnStartedAtUtc,
+                            Is.Not.EqualTo(agent.WorkingTurnStartedAtUtc))
+                let _, _, repeatResumed = readSource()
+                Assert.That(repeatResumed.Instructions, Is.Empty)
 
                 // Reaching the inbox for a registered but unassigned agent
                 // must never fabricate an assignment or Working state.
@@ -2443,6 +2693,55 @@ type ReviewWorkflowTests() =
                 item.operation.Value.RequestHash |> success |> ignore)
 
     [<Test>]
+    member _.ImplicitActivationIsReportedEvenWhenSourceReadFails() =
+        withFixture (fun one _ first second _ _ _ _ ->
+            let taskId = "failed-source-start"
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Start before failed read"
+            |> success |> ignore
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner"
+            |> success |> ignore
+            let context = GitCommandTests.TestContext(Path.GetDirectoryName one)
+            let configPath = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
+            try
+                let head = (LedgerStore.fetch first |> success).Commit
+                Client.OrchestrationApi.LedgerBindingConfig.bindExisting
+                    "owner" context first.ProjectId first.LedgerId first.Epoch
+                    first.RemoteName first.ApprovedFetchUrl first.ApprovedPushUrl head true
+                |> success |> ignore
+                let rt = Client.Runtime(Path.GetDirectoryName one, Client.ConsoleTui.ConsoleTui(), Client.PartialTrust)
+                let health : Common.AgentCommand =
+                    Common.LedgerReadCommand
+                        { ProjectName = "owner"; Action = "Health"; OperationId = "" }
+                let _, healthResult, healthResponse =
+                    Client.SignalR.Client.processIncomingCommand rt
+                        (System.Text.Json.JsonSerializer.Serialize health) "Owner"
+                    |> Async.AwaitTask |> Async.RunSynchronously
+                Assert.That(healthResult.IsOk, Is.True)
+                Assert.That(healthResponse.AgentStateChanges, Is.Empty)
+                Assert.That((ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent.State,
+                            Is.EqualTo("Ready"), "A routing health probe is not agent activity")
+                let command : Common.AgentCommand =
+                    Common.ReadFileCommand
+                        { ProjectName = "owner"; FilePath = "definitely-missing.fs"
+                          StartLine = None; EndLine = None; IncludeLineNumbers = None }
+                let payload = System.Text.Json.JsonSerializer.Serialize command
+                let _, result, response =
+                    Client.SignalR.Client.processIncomingCommand rt payload "Owner"
+                    |> Async.AwaitTask |> Async.RunSynchronously
+                Assert.That(result.IsError, Is.True)
+                Assert.That(response.Error.IsSome, Is.True)
+                Assert.That(response.AgentStateChanges |> List.map _.AgentId |> String.concat ",",
+                            Is.EqualTo("Owner"), sprintf "%A" response.AgentStateChanges)
+                Assert.That((ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent.State,
+                            Is.EqualTo("Working"))
+                let _, _, repeated =
+                    Client.SignalR.Client.processIncomingCommand rt payload "Owner"
+                    |> Async.AwaitTask |> Async.RunSynchronously
+                Assert.That(repeated.AgentStateChanges, Is.Empty)
+            finally
+                if File.Exists configPath then File.Delete configPath)
+
+    [<Test>]
     member _.DomainResultsRetainExactEntityVersionsAndCheckpointAfterReplay() =
         withFixture (fun _ _ first second _ _ _ _ ->
             let taskId = "domainReceipt"
@@ -2469,6 +2768,8 @@ type ReviewWorkflowTests() =
             let attemptId = Guid.NewGuid()
             let assigned = ReviewWorkflow.assignTask first assignmentId taskId
                                attemptId "Owner" |> success
+            Assert.That(String.concat "," (LedgerStore.changedAgentIds assigned), Is.EqualTo("Owner"),
+                        assigned.Operation.OriginalResultJson)
             use assignmentResult =
                 System.Text.Json.JsonDocument.Parse(assigned.Operation.OriginalResultJson)
             let effects = assignmentResult.RootElement.GetProperty("entityResults").EnumerateArray() |> Seq.toList
@@ -2485,11 +2786,16 @@ type ReviewWorkflowTests() =
             Assert.That(owner.GetProperty("state").GetString(), Is.EqualTo("Ready"))
             Assert.That(owner.GetProperty("entityVersion").GetInt32(), Is.EqualTo(2))
 
-            ReviewWorkflow.beginAttempt first (Guid.NewGuid()) taskId "Owner" 1 1 |> success |> ignore
+            let started = ReviewWorkflow.beginAttempt first (Guid.NewGuid()) taskId "Owner" 1 1 |> success
+            Assert.That(LedgerStore.changedAgentIds started, Is.EqualTo([ "Owner" ] :> obj))
+            let notification = ReviewWorkflow.notifyAgent first (Guid.NewGuid())
+                                   "Reviewer" "" "Owner" taskId "No state transition" |> success
+            Assert.That(LedgerStore.changedAgentIds notification, Is.Empty)
             let pauseId = Guid.NewGuid()
             let paused =
                 ReviewWorkflow.yieldAgent first pauseId taskId "Owner" 2 3 1
                     "Measured current work" "Continue the implementation" |> success
+            Assert.That(LedgerStore.changedAgentIds paused, Is.EqualTo([ "Owner" ] :> obj))
             use yieldResult = System.Text.Json.JsonDocument.Parse(paused.Operation.OriginalResultJson)
             let yielded = yieldResult.RootElement.GetProperty("entityResults").EnumerateArray() |> Seq.toList
             let checkpoint =

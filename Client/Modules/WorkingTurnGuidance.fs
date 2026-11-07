@@ -45,19 +45,19 @@ let forSession (now: DateTimeOffset) sessionId (agent: ReviewAgent) =
     else None
 
 
-// Remote ledger reads are authoritative but costly. Resolve agent state at most
-// once per interval for ordinary tool calls; explicitly invalidate after a
-// task operation, which may change the agent's Working clock or state.
+// Remote ledger reads are authoritative but costly. Use a bounded fallback
+// interval and push invalidations for successful Jarvis ledger writes on any
+// connected device. Reconnection discards entries to account for missed pushes.
 type private CacheEntry =
     { Gate: obj
       mutable CheckedAt: DateTimeOffset
       mutable Value: ReviewAgent option }
 
 type AgentCache(refreshInterval: TimeSpan) =
-    let entries = ConcurrentDictionary<string, CacheEntry>(StringComparer.OrdinalIgnoreCase)
+    let entries = ConcurrentDictionary<ProjectPaths.ProjectId * string, CacheEntry>()
 
-    member _.Get(now: DateTimeOffset, project: string, agentId: string, load: unit -> ReviewAgent option) =
-        let key = project + "::" + agentId
+    member _.Get(now: DateTimeOffset, project: ProjectPaths.ProjectId, agentId: string, load: unit -> ReviewAgent option) =
+        let key = project, agentId.ToUpperInvariant()
         let entry =
             entries.GetOrAdd(key, fun _ ->
                 { Gate = obj()
@@ -69,8 +69,10 @@ type AgentCache(refreshInterval: TimeSpan) =
                 entry.CheckedAt <- now
             entry.Value)
 
-    member _.Invalidate(project: string, agentId: string) =
-        let key = project + "::" + agentId
+    member _.Invalidate(project: ProjectPaths.ProjectId, agentId: string) =
+        let key = project, agentId.ToUpperInvariant()
         match entries.TryRemove key with
         | true, _ -> ()
         | false, _ -> ()
+
+    member _.InvalidateAll() = entries.Clear()

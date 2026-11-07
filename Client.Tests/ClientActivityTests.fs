@@ -263,3 +263,31 @@ let ``sessionless MCP receive updates Seen for successful and failed agent comma
         finally
             Directory.Delete(root, true)
     }
+
+[<Test>]
+let incoming_activity_commands_accept_literal_history_labels () =
+    task {
+        let label = ".Wayfold-worktrees/silver-ring-trade"
+        let tui = ConsoleTui.ConsoleTui()
+        let rt = Runtime(".", tui, NoTrust)
+        let run (command: AgentCommand) =
+            let payload = JsonSerializer.Serialize<AgentCommand>(command)
+            Client.SignalR.Client.processIncomingCommand rt payload "Agent 2"
+        let! _, messageResult, _ =
+            run (MessageCommand { ProjectName = Some label; Message = "handoff" })
+        Assert.That(messageResult.IsOk, Is.True)
+        let! _, activityResult, _ =
+            run (GetClientActivityCommand
+                    { ProjectName = Some label; Limit = Some 20; IncludeObservers = None })
+        match activityResult with
+        | Error error -> Assert.Fail(sprintf "Literal label lookup failed: %A" error)
+        | Ok payload ->
+            let snapshot = JsonSerializer.Deserialize<GetClientActivityResult>(payload)
+            Assert.That(snapshot.Entries.Length, Is.EqualTo(1))
+            Assert.That(snapshot.Entries.Head.ProjectName, Is.EqualTo(Some label))
+            Assert.That(snapshot.Entries.Head.Message, Is.EqualTo("handoff"))
+        let arbitrary = "NotARepository::not-a-registered-worktree"
+        let! _, arbitraryResult, _ =
+            run (MessageCommand { ProjectName = Some arbitrary; Message = "literal label" })
+        Assert.That(arbitraryResult.IsOk, Is.True)
+    }

@@ -94,7 +94,7 @@ let agentStateCacheAvoidsRepeatedFetchAndInvalidatesOnTaskTransition () =
 
 
 [<Test>]
-let project_invalidation_expires_every_agent_of_one_project_only () =
+let single_agent_invalidation_leaves_unrelated_caches_warm () =
     let cache = AgentCache(TimeSpan.FromMinutes 2.)
     let now = started
     let project name =
@@ -110,11 +110,12 @@ let project_invalidation_expires_every_agent_of_one_project_only () =
     cache.Get(now, first, "Two", load) |> ignore
     cache.Get(now, second, "One", load) |> ignore
     Assert.That(loads, Is.EqualTo(3))
-    cache.InvalidateProject first
+    // A single changed agent must not make any other agent fetch the ledger.
+    cache.Invalidate(first, "One")
     cache.Get(now.AddSeconds(1), first, "One", load) |> ignore
     cache.Get(now.AddSeconds(1), first, "Two", load) |> ignore
     cache.Get(now.AddSeconds(1), second, "One", load) |> ignore
-    Assert.That(loads, Is.EqualTo(5), "Unrelated projects retain their cached state")
+    Assert.That(loads, Is.EqualTo(4), "Only the changed agent must reload")
     cache.InvalidateAll()
     cache.Get(now.AddSeconds(2), second, "One", load) |> ignore
-    Assert.That(loads, Is.EqualTo(6))
+    Assert.That(loads, Is.EqualTo(5))

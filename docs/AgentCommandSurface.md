@@ -37,21 +37,26 @@ Because this removes public tools and introduces a new enum parameter,
 of the connected MCP tool catalog**. Do not deploy without explicit operator
 authorization.
 
-## Cross-client Working-state cache invalidation (protocol 3.60)
+## Cross-client Working-state cache invalidation (protocol 3.61)
 
-After a successful canonical task write or agent-inbox operation, the server
-sends a user-scoped SignalR `InvalidateAgentStates(projectName)` hint to connected
-devices. Each client expires cached agent state for that logical project,
-including registered worktrees. The next attributable operation then reads
-the authoritative Git ledger, while normal local source operations use the
-warm Working-state cache rather than fetching from GitHub on every call.
+A canonical Git-ledger transaction records the exact agent IDs whose assignment
+or Working-turn state changed in its immutable, replayable operation receipt.
+The client forwards those typed effects in `AgentCommandResponse.AgentStateChanges`,
+independently of the ordinary command's success. In particular, a `read_file`
+call may commit Ready-to-Working activation before the file read fails.
 
-The two-minute refresh remains as a fallback for ledger changes outside
-Jarvis and missed notifications. Reconnecting clears cached agent states.
-A cache refresh reuses its verified ledger snapshot, avoiding a second
-redundant remote fetch. The server stores no persistent agent state.
+The server sends user-scoped SignalR
+`InvalidateAgentStates(projectName, agentIds)` only for the affected agents.
+Other agents' cached state remains valid after checkpoints, notifications,
+and unrelated task operations. Cross-project notification sender checks publish
+their source-project effects independently from destination operations.
 
-**Protocol 3.60 requires coordinated client/server deployment.** Do not
+The two-minute fallback refresh still covers missed notifications and external
+ledger writes. Reconnecting clears cached states. A refresh reuses its verified
+ledger snapshot rather than fetching it twice. The server stores no persistent
+agent state.
+
+**Protocol 3.61 requires coordinated client/server deployment.** Do not
 deploy without explicit operator authorization.
 
 ## Explicit agent labels

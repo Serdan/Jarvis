@@ -201,8 +201,8 @@ let private runClient args =
     ignoreAll {
         connection.On<string>("ReceiveMessage", Func<string, Task>(Client.receiveMessage rt))
         connection.On<string, string, string>("ReceiveCommand", Func<string, string, string, Task>(Client.receiveCommandAndReply connection rt))
-        connection.On<string>("InvalidateAgentStates", Func<string, Task>(fun project ->
-            Client.invalidateAgentStates rt project
+        connection.On<string, string array>("InvalidateAgentStates", Func<string, string array, Task>(fun project agentIds ->
+            Client.invalidateAgentStates rt project agentIds
             Task.CompletedTask))
     }
 

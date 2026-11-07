@@ -75,9 +75,4 @@ type AgentCache(refreshInterval: TimeSpan) =
         | true, _ -> ()
         | false, _ -> ()
 
-    member _.InvalidateProject(project: ProjectPaths.ProjectId) =
-        for KeyValue(key, _) in entries do
-            if fst key = project then
-                entries.TryRemove key |> ignore
-
     member _.InvalidateAll() = entries.Clear()

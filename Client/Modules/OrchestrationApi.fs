@@ -793,12 +793,24 @@ module PendingIntentJournal =
             | other -> other)
 
 module OperationResponse =
+    // Keep canonical agent state effects available in the client transport
+    // without extracting them from presentation JSON or exposing extra MCP fields.
+    type Presented =
+        { operation: LedgerStore.LedgerOperation
+          head: string
+          alreadyApplied: bool
+          originalResult: JsonElement
+          [<System.Text.Json.Serialization.JsonIgnore>]
+          changedAgentIds: string list }
+
     let present (write: LedgerStore.LedgerWrite) =
         use document = JsonDocument.Parse(write.Operation.OriginalResultJson)
-        box {| operation = write.Operation
-               head = write.CurrentHead
-               alreadyApplied = write.AlreadyApplied
-               originalResult = document.RootElement.Clone() |}
+        box
+            { operation = write.Operation
+              head = write.CurrentHead
+              alreadyApplied = write.AlreadyApplied
+              originalResult = document.RootElement.Clone()
+              changedAgentIds = LedgerStore.LedgerStore.changedAgentIds write }
 
 module LedgerApi =
     let private id label (raw: string) =

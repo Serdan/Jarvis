@@ -620,6 +620,23 @@ module McpToolHelpers =
                                     Auth.hasScope Auth.WorkspaceRead context.User) ->
                     let tracking = beginOperation context userId command
                     let stopwatch = Stopwatch.StartNew()
+                    // A tool can commit a Ready->Working transition before
+                    // failing its requested operation. Publish typed mutation
+                    // evidence, independently of command kind or success.
+                    let publishChanges (response: AgentCommandResponse) =
+                        task {
+                            for project, agentIds in
+                                AgentStateInvalidationRouting.affectedByProject response.AgentStateChanges do
+                                try
+                                    do! client.InvalidateAgentStatesForUser(userId, project, agentIds)
+                                with ex ->
+                                    // This best-effort signal cannot retroactively
+                                    // fail a committed canonical ledger operation.
+                                    let factory = context.RequestServices.GetService<ILoggerFactory>()
+                                    if not (isNull factory) then
+                                        let logger = factory.CreateLogger("Jarvis.AgentStateInvalidation")
+                                        logger.LogWarning(ex, "Could not deliver agent-state invalidation hints.")
+                        }
                     let! response =
                         match command with
                         | TaskWriteCommand notification when notification.Action = "NotifyAgent"
@@ -639,6 +656,7 @@ module McpToolHelpers =
                                     ?conversationId = RequestDeviceRouting.session(),
                                     ?deviceId = RequestDeviceRouting.deviceOverride(),
                                                      ?agentId = RequestDeviceRouting.agentId())
+                                do! publishChanges sender
                                 match sender.Result, sender.Error with
                                 | Some _, None ->
                                     return! client.SendCommandToProject(
@@ -656,23 +674,7 @@ module McpToolHelpers =
                     stopwatch.Stop()
                     finishOperation tracking response stopwatch.ElapsedMilliseconds
 
-                    // The canonical write has already succeeded. Other connected
-                    // clients must discard stale Ready/Working observations
-                    // before their next ordinary source operation. Failed
-                    // delivery cannot retroactively fail a committed ledger write.
-                    if AgentStateInvalidationRouting.afterSuccessfulCommand command
-                       && response.Error.IsNone && response.Result.IsSome then
-                        try
-                            do! client.InvalidateAgentStatesForUser(
-                                userId, AgentCommandInfo.projectName command |> Option.defaultValue "")
-                        with ex ->
-                            // A committed task operation must not appear to fail
-                            // because a cache hint could not reach every client.
-                            // The recipients still have a periodic refresh fallback.
-                            let factory = context.RequestServices.GetService<ILoggerFactory>()
-                            if not (isNull factory) then
-                                let logger = factory.CreateLogger("Jarvis.AgentStateInvalidation")
-                                logger.LogWarning(ex, "Could not deliver agent-state invalidation hints.")
+                    do! publishChanges response
 
                     return
                         (match command with

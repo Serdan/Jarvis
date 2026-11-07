@@ -25,14 +25,17 @@ let receiveMessage (rt: Runtime) message =
 // Working state for ordinary calls to avoid one remote git fetch per tool.
 let private workingGuidanceCaches = ConditionalWeakTable<Runtime, WorkingTurnGuidance.AgentCache>()
 let private instructionDeliveryCaches = ConditionalWeakTable<Runtime, AgentInstructions.DeliveryCache>()
-let invalidateAgentStates (rt: Runtime) (projectName: string) =
+let invalidateAgentStates (rt: Runtime) (projectName: string) (agentIds: string array) =
     // Server notifications only carry the logical project identity. Worktree
     // selectors share the canonical ledger/assignment cache by ProjectId.
     match ProjectPaths.ProjectTarget.parse projectName with
     | Ok target ->
         let cache = workingGuidanceCaches.GetValue(rt, fun _ ->
             WorkingTurnGuidance.AgentCache(TimeSpan.FromMinutes 2.))
-        cache.InvalidateProject(ProjectPaths.ProjectTarget.projectId target)
+        if not (isNull agentIds) then
+            let projectId = ProjectPaths.ProjectTarget.projectId target
+            for agentId in agentIds |> Array.filter (String.IsNullOrWhiteSpace >> not) |> Array.distinct do
+                cache.Invalidate(projectId, agentId)
     | Error _ -> ()
 
 let invalidateAllAgentStates (rt: Runtime) =
@@ -84,9 +87,6 @@ let private checkWorkingGuidance (rt: Runtime) agentId (target: ProjectPaths.Pro
             let project = ProjectPaths.ProjectId.value projectId
             let now = DateTimeOffset.UtcNow
             let cache = workingGuidanceCaches.GetValue(rt, fun _ -> WorkingTurnGuidance.AgentCache(TimeSpan.FromMinutes 2.))
-            match command with
-            | TaskWriteCommand _ -> cache.Invalidate(projectId, agentId)
-            | _ -> ()
             let agent =
                 cache.Get(now, projectId, agentId, fun () ->
                     loadAgentState rt project agentId)
@@ -111,15 +111,19 @@ let private activatesAgent (agentId: string) command =
               "SetAttemptSource"; "SubmitIntegration"; "CompleteIntegration" ]
     | TaskReadCommand cmd ->
         String.IsNullOrWhiteSpace cmd.AgentId || cmd.AgentId = agentId
+    // Cross-project notification routing probes candidate clients using a
+    // ledger Health read. A probe is not agent activity and must never start
+    // an unrelated Ready assignment.
+    | LedgerReadCommand cmd when cmd.Action = "Health" -> false
     | LedgerWriteCommand _ | ReviewWriteCommand _ -> false
     | _ -> true
 
 let private activateReadyOnActivity (rt: Runtime) (agentId: string)
                                 (target: ProjectPaths.ProjectTarget option) command =
-    if String.IsNullOrWhiteSpace agentId || not (activatesAgent agentId command) then Ok ()
+    if String.IsNullOrWhiteSpace agentId || not (activatesAgent agentId command) then Ok []
     else
         match target with
-        | None -> Ok ()
+        | None -> Ok []
         | Some target ->
             let projectId = ProjectPaths.ProjectTarget.projectId target
             let project = ProjectPaths.ProjectId.value projectId
@@ -146,15 +150,15 @@ let private activateReadyOnActivity (rt: Runtime) (agentId: string)
                             agent.CurrentAssignment.TaskId agentId
                     cache.Invalidate(projectId, agentId)
                     match result with
-                    | Ok _ -> Ok ()
+                    | Ok write -> Ok(Client.LedgerStore.LedgerStore.changedAgentIds write)
                     | Error(Client.LedgerStore.StaleEntityVersion _) ->
                         // Another concurrent tool may already have started this
                         // assignment. Do not reset its Working clock.
                         match ReviewWorkflow.ReviewWorkflow.getAgentWorkingTurn binding agentId with
-                        | Ok latest when latest.State = "Working" -> Ok ()
+                        | Ok latest when latest.State = "Working" -> Ok []
                         | _ -> Error(Client.ValidationError "Agent assignment changed before automatic activation.")
                     | Error error -> Error(Client.ValidationError($"Automatic agent activation failed: {error}"))
-            | _ -> Ok ()
+            | _ -> Ok []
 
 // Only the Working turn identifies a stable delivery scope. Ledger calls bootstrap
 // root guidance, while normal source operations discover deeper instructions.
@@ -190,17 +194,35 @@ let private serialize<'a> (value: 'a) =
     with e ->
         e |> ExceptionError |> Error
 
-let private serialize'<'a> = Result.bind serialize<'a> >> ValueTask<_>
+type private DispatchedResult =
+    { Payload: string
+      ChangedAgentIds: string list }
 
-let private toAgentResponse command instructions response =
+let private serialize'<'a> (result: Result<'a, Client.EffectError>) =
+    result
+    |> Result.bind (fun value ->
+        let changedAgentIds =
+            match box value with
+            | :? OrchestrationApi.OperationResponse.Presented as operation ->
+                operation.changedAgentIds
+            | _ -> []
+        serialize value
+        |> Result.map (fun payload ->
+            { Payload = payload; ChangedAgentIds = changedAgentIds }))
+    |> ValueTask<_>
+
+let private toAgentResponse command instructions stateChanges response =
     match response with
     | Error error ->
         { Result = None
           Error = Some(EffectError.toAgentError error)
-          Instructions = instructions }
-    | Ok (payload: string) ->
+          Instructions = instructions
+          AgentStateChanges = stateChanges }
+    | Ok (dispatched: DispatchedResult) ->
+        let payload = dispatched.Payload
         let bytes = Encoding.UTF8.GetByteCount payload +
-                    Encoding.UTF8.GetByteCount(JsonSerializer.Serialize instructions)
+                    Encoding.UTF8.GetByteCount(JsonSerializer.Serialize instructions) +
+                    Encoding.UTF8.GetByteCount(JsonSerializer.Serialize stateChanges)
         let maxBytes =
             match command with
             | ReadImageCommand _ -> (AgentProtocol.maxImageBytes * 4 / 3) + (64 * 1024)
@@ -210,11 +232,13 @@ let private toAgentResponse command instructions response =
         if bytes <= maxBytes then
             { Result = Some payload
               Error = None
-              Instructions = instructions }
+              Instructions = instructions
+              AgentStateChanges = stateChanges }
         else
             { Result = None
               Error = Some(OutputTruncated $"Command response was {bytes} bytes and exceeds the safe response size of {maxBytes} bytes.")
-              Instructions = instructions }
+              Instructions = instructions
+              AgentStateChanges = stateChanges }
 
 let private unwrapProjectName (ProjectName name) = name
 let private unwrapContent (Content content) = content
@@ -533,7 +557,7 @@ let private receiveCommandForTarget (rt: Runtime) (target: ProjectPaths.ProjectT
 
         match response with
         | Ok payload ->
-            let outcome = ActivityPresentation.tryResultSummary command payload
+            let outcome = ActivityPresentation.tryResultSummary command payload.Payload
             activityId
             |> Option.iter (fun id ->
                 rt.Tui.CompleteActivity(id, stopwatch.ElapsedMilliseconds, outcome))
@@ -542,13 +566,16 @@ let private receiveCommandForTarget (rt: Runtime) (target: ProjectPaths.ProjectT
             |> Option.iter (fun id ->
                 rt.Tui.FailActivity(id, stopwatch.ElapsedMilliseconds, ActivityPresentation.shortError err, ActivityPresentation.fullError err))
 
-        audit command response
+        audit command (response |> Result.map (fun outcome -> outcome.Payload))
 
         return response
     }
 
 let receiveCommand (rt: Runtime) (command: AgentCommand) =
-    receiveCommandForTarget rt None None None command
+    task {
+        let! result = receiveCommandForTarget rt None None None command
+        return result |> Result.map (fun outcome -> outcome.Payload)
+    }
 
 let private receiveCommandWithTypedInstructions (rt: Runtime)
                                                 (target: ProjectPaths.ProjectTarget option) command =
@@ -575,7 +602,7 @@ let receiveCommandWithInstructions (rt: Runtime) command =
         | Ok scope ->
             let! response, instructions, _ =
                 receiveCommandWithTypedInstructions rt (projectTarget scope) command
-            return response, instructions
+            return response |> Result.map (fun outcome -> outcome.Payload), instructions
     }
 
 // Shared by SignalR receive and tests. Identity is supplied by the MCP call,
@@ -584,6 +611,7 @@ let processIncomingCommand (rt: Runtime) (commandJson: string) (agentId: string)
     task {
         let mutable parsedCommand = None
         let mutable instructions: InstructionDocument list = []
+        let mutable implicitChanges: string list = []
         let! response =
             task {
                 try
@@ -598,9 +626,21 @@ let processIncomingCommand (rt: Runtime) (commandJson: string) (agentId: string)
                             rt.Tui.RecordAgentSeen(AgentView.activityProject selected, agentId))
                         match activateReadyOnActivity rt agentId target command with
                         | Error error -> return Error error
-                        | Ok () ->
+                        | Ok changes ->
+                            implicitChanges <- changes
                             let! result, applicable, provenance =
                                 receiveCommandWithTypedInstructions rt target command
+                            // A write may alter another agent's state, or none
+                            // at all. Invalidate precisely the affected local
+                            // cache entries before preparing turn guidance.
+                            match target, result with
+                            | Some selected, Ok outcome when not outcome.ChangedAgentIds.IsEmpty ->
+                                let cache = workingGuidanceCaches.GetValue(rt, fun _ ->
+                                    WorkingTurnGuidance.AgentCache(TimeSpan.FromMinutes 2.))
+                                let projectId = ProjectPaths.ProjectTarget.projectId selected
+                                for changed in outcome.ChangedAgentIds do
+                                    cache.Invalidate(projectId, changed)
+                            | _ -> ()
                             instructions <-
                                 match command with
                                 | GetAgentInstructionsCommand _ ->
@@ -614,11 +654,25 @@ let processIncomingCommand (rt: Runtime) (commandJson: string) (agentId: string)
                 with ex ->
                     return Error(ExceptionError ex)
             }
+        // The metadata is independent of the requested command outcome. A
+        // Ready->Working transition stays committed if the following file read
+        // fails, so other devices must still expire that agent's cache.
+        let changes =
+            match parsedCommand |> Option.bind AgentCommandInfo.projectName with
+            | Some project when not (String.IsNullOrWhiteSpace project) ->
+                let executed =
+                    match response with
+                    | Ok outcome -> outcome.ChangedAgentIds
+                    | Error _ -> []
+                implicitChanges @ executed
+                |> List.distinct
+                |> List.map (fun id -> { ProjectName = project; AgentId = id })
+            | _ -> []
         let agentResponse =
             match parsedCommand with
-            | Some command -> toAgentResponse command instructions response
-            | None -> toAgentResponse ListCommandsCommand [] response
-        return parsedCommand, response, agentResponse
+            | Some command -> toAgentResponse command instructions changes response
+            | None -> toAgentResponse ListCommandsCommand [] changes response
+        return parsedCommand, (response |> Result.map (fun outcome -> outcome.Payload)), agentResponse
     }
 
 let receiveCommandAndReply (connection: HubConnection) (rt: Runtime) (correlationId: string) (commandJson: string) (agentId: string) : Task =

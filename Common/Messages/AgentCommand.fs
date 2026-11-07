@@ -516,10 +516,17 @@ type InstructionDocument =
       Sha256: string
       Content: string }
 
+/// A canonical ledger mutation changed the assignment or Working-turn state
+/// of this agent. Advisory to other clients; never an authorization claim.
+type AgentStateChange =
+    { ProjectName: string
+      AgentId: string }
+
 type AgentCommandResponse =
     { Result: string option
       Error: AgentError option
-      Instructions: InstructionDocument list }
+      Instructions: InstructionDocument list
+      AgentStateChanges: AgentStateChange list }
 
 [<JsonConverter(typeof<UnionConverter<AgentCommand>>)>]
 type AgentCommand =
@@ -868,7 +875,7 @@ module AgentCommandInfo =
         | None -> invocation command
 
 module AgentProtocol =
-    let version = "3.60"
+    let version = "3.61"
     let defaultPatchFuzzyContextLines = 3
     let maxResponseBytes = 900 * 1024
     let maxImageBytes = 8 * 1024 * 1024

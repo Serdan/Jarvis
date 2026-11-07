@@ -78,25 +78,32 @@ module AgentStateInvalidationRouting =
             if session.State = Registered then session.ConnectionId else None)
         |> Array.distinct
 
-    let afterSuccessfulCommand = function
-        | TaskWriteCommand _ -> true
-        // Inbox can implicitly activate a Ready assignment.
-        | TaskReadCommand command when command.Action = "AgentInbox" -> true
-        | _ -> false
+    let affectedByProject (mutations: AgentStateChange list) =
+        if isNull (box mutations) then []
+        else
+            mutations
+            |> List.filter (fun change ->
+                not (String.IsNullOrWhiteSpace change.ProjectName)
+                && not (String.IsNullOrWhiteSpace change.AgentId))
+            |> List.groupBy (fun change -> change.ProjectName)
+            |> List.map (fun (project, changes) ->
+                project, (changes |> List.map _.AgentId |> List.distinct |> List.toArray))
 
 
 type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserService, tracker: ClientResponseTracker) =
     member this.SendMessageToAll(message) = ctx.Clients.All.ReceiveMessage(message)
 
-    // Only authenticated, registered devices belonging to this user receive
-    // invalidations. No agent-state data or authoritative ledger state is stored
-    // on the server; the hint merely expires each client's local cache.
-    member _.InvalidateAgentStatesForUser(userId: string, projectName: string) : Task =
-        users.ListDevices(userId)
-        |> AgentStateInvalidationRouting.recipients
-        |> Array.map (fun connectionId ->
-            ctx.Clients.Client(connectionId).InvalidateAgentStates(projectName))
-        |> Task.WhenAll
+    // Typed, per-agent invalidation only reaches authenticated registered
+    // devices for this user; no canonical agent state lives on the server.
+    member _.InvalidateAgentStatesForUser(userId: string, projectName: string, agentIds: string array) : Task =
+        if isNull agentIds || agentIds.Length = 0 then Task.CompletedTask
+        else
+            let unique = agentIds |> Array.filter (String.IsNullOrWhiteSpace >> not) |> Array.distinct
+            users.ListDevices(userId)
+            |> AgentStateInvalidationRouting.recipients
+            |> Array.map (fun connectionId ->
+                ctx.Clients.Client(connectionId).InvalidateAgentStates(projectName, unique))
+            |> Task.WhenAll
 
     member private this.ResponseTimeout(command: AgentCommand) =
         let permissionMargin = TimeSpan.FromMinutes(5L)
@@ -116,12 +123,12 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                         ValidationFailed "deviceId must be a nonempty device ID of at most 256 characters."
                     else
                         NotFound $"Jarvis device '{requested}' is not registered for the authenticated user. Use ListDevices to find available devices."
-                return { Result = None; Error = Some error; Instructions = [] }
+                return { Result = None; Error = Some error; Instructions = []; AgentStateChanges = [] }
             | ValueNone ->
                 return
                     { Result = None
                       Error = Some(NotFound "No Jarvis client has registered for the authenticated user.")
-                      Instructions = [] }
+                      Instructions = []; AgentStateChanges = [] }
             | ValueSome session ->
                 match session.State, session.ConnectionId with
                 | Disconnected, _ ->
@@ -133,7 +140,7 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                                 ExecutionFailed
                                     $"Jarvis device {session.DeviceName} is disconnected (generation {session.Generation}, protocol {session.ProtocolVersion}, last seen {session.LastSeenAt:O}). Reason: {reason}"
                             )
-                          Instructions = [] }
+                          Instructions = []; AgentStateChanges = [] }
                 | Registered, None ->
                     return
                         { Result = None
@@ -142,7 +149,7 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                                 ExecutionFailed
                                     $"Jarvis device {session.DeviceName} generation {session.Generation} is registered without an active connection."
                             )
-                          Instructions = [] }
+                          Instructions = []; AgentStateChanges = [] }
                 | Registered, Some connectionId ->
                     let commandName = AgentCommandInfo.protocolName command
 
@@ -154,7 +161,7 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                                     ExecutionFailed
                                         $"Jarvis device {session.DeviceName} does not advertise support for {commandName}. Client {session.ClientVersion} uses protocol {session.ProtocolVersion}; the server uses protocol {AgentProtocol.version}. Update Jarvis to a compatible version and reconnect."
                                 )
-                              Instructions = [] }
+                              Instructions = []; AgentStateChanges = [] }
                     else
                         let correlationId, trackingTask = tracker.Register(userId, connectionId, session.Generation, this.ResponseTimeout command)
                         let client = ctx.Clients.Client(connectionId)
@@ -177,7 +184,7 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                                             ExecutionFailed
                                                 $"{reason} Protocol {session.ProtocolVersion}, client {session.ClientVersion}, last seen {session.LastSeenAt:O}."
                                         )
-                                      Instructions = [] }
+                                      Instructions = []; AgentStateChanges = [] }
                         with ex ->
                             tracker.Cancel(correlationId)
                             let reason =
@@ -186,7 +193,7 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                             return
                                 { Result = None
                                   Error = Some(ExecutionFailed reason)
-                                  Instructions = [] }
+                                  Instructions = []; AgentStateChanges = [] }
         }
 
 
@@ -215,7 +222,7 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                         return { Result = None
                                  Error = Some(NotFound(ProjectNotificationRouting.failureMessage projectName commandName
                                       requireCurrentProtocol deviceId.IsSome ordered (List.rev probeFailures)))
-                                 Instructions = [] }
+                                 Instructions = []; AgentStateChanges = [] }
                     | session :: rest ->
                         let! health = this.SendCommandToUser(
                             userId,

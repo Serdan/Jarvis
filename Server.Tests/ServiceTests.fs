@@ -35,16 +35,25 @@ let invalidation_routes_only_to_connected_devices_of_authenticated_user () =
                 Is.EqualTo([| "b-desktop" |] :> obj))
 
 [<Test>]
-let assignment_invalidation_only_follows_success_eligible_commands () =
-    let inbox : AgentCommand =
-        TaskReadCommand
-            { ProjectName = "Wayfold"; AgentId = "Owner"; Action = "AgentInbox"
-              TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L
-              Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null }
-    let other = match inbox with TaskReadCommand cmd -> TaskReadCommand { cmd with Action = "TaskOverview" } | _ -> failwith "Impossible"
-    Assert.That(AgentStateInvalidationRouting.afterSuccessfulCommand inbox, Is.True)
-    Assert.That(AgentStateInvalidationRouting.afterSuccessfulCommand other, Is.False)
-    Assert.That(AgentStateInvalidationRouting.afterSuccessfulCommand ListProjectsCommand, Is.False)
+let invalidation_routes_only_exact_changed_agents_even_on_command_failure () =
+    // The server never guesses state changes from the command type or success.
+    let failedRead : AgentCommandResponse =
+        { Result = None
+          Error = Some(NotFound "A source file was missing after activation")
+          Instructions = []
+          AgentStateChanges =
+              [ { ProjectName = "Wayfold"; AgentId = "Owner" }
+                { ProjectName = "Wayfold"; AgentId = "Owner" }
+                { ProjectName = "Jarvis"; AgentId = "Reviewer" } ] }
+    let groups = AgentStateInvalidationRouting.affectedByProject failedRead.AgentStateChanges
+    Assert.That(groups.Length, Is.EqualTo(2))
+    Assert.That(groups |> List.find (fun (project, _) -> project = "Wayfold") |> snd,
+                Is.EqualTo([| "Owner" |] :> obj))
+    Assert.That(groups |> List.find (fun (project, _) -> project = "Jarvis") |> snd,
+                Is.EqualTo([| "Reviewer" |] :> obj))
+    let checkpoint : AgentCommandResponse =
+        { failedRead with Result = Some "{}"; Error = None; AgentStateChanges = [] }
+    Assert.That(AgentStateInvalidationRouting.affectedByProject checkpoint.AgentStateChanges, Is.Empty)
 
 [<Test>]
 let user_service_exposes_authenticated_transport_before_registration () =
@@ -347,7 +356,7 @@ let ``response tracker completes registered response`` () =
         let expected =
             { Result = Some "ok"
               Error = None
-              Instructions = [] }
+              Instructions = []; AgentStateChanges = [] }
 
         tracker.Complete(correlationId, "alice", "conn-1", 1L, expected) |> shouldEqual true
         let! actual = pending
@@ -360,7 +369,7 @@ let ``response tracker rejects other users connections and generations`` () =
     task {
         let tracker = ClientResponseTracker()
         let correlationId, pending = tracker.Register("alice", "connection-a", 3L, TimeSpan.FromSeconds 5L)
-        let response = { Result = Some "accepted"; Error = None; Instructions = [] }
+        let response = { Result = Some "accepted"; Error = None; Instructions = []; AgentStateChanges = [] }
 
         tracker.Complete(correlationId, "bob", "connection-a", 3L, response) |> shouldEqual false
         tracker.Complete(correlationId, "alice", "connection-b", 3L, response) |> shouldEqual false
@@ -665,7 +674,7 @@ let ``MCP bridge returns successful JSON as text without a mismatched output sch
     let response =
         { Result = Some """{"value":42,"items":[1,2]}"""
           Error = None
-          Instructions = [] }
+          Instructions = []; AgentStateChanges = [] }
 
     let result = McpToolHelpers.toCallToolResult response
 
@@ -691,7 +700,7 @@ let ``MCP bridge preserves typed confirmation error details`` () =
     let response =
         { Result = None
           Error = Some(ConfirmationRequired confirmation)
-          Instructions = [] }
+          Instructions = []; AgentStateChanges = [] }
 
     let result = McpToolHelpers.toCallToolResult response
 
@@ -715,7 +724,7 @@ let ``MCP bridge preserves stable AgentError kinds`` () =
         let result =
             { Result = None
               Error = Some error
-              Instructions = [] }
+              Instructions = []; AgentStateChanges = [] }
             |> McpToolHelpers.toCallToolResult
 
         result.IsError |> shouldEqual (Nullable true)
@@ -985,7 +994,7 @@ let mcp_guidance_blocks_precede_result_without_changing_success () =
     let response =
         { Result = Some """{"result":"ok"}"""
           Error = None
-          Instructions = instructions }
+          Instructions = instructions; AgentStateChanges = [] }
     let result = response |> McpToolHelpers.toCallToolResult |> McpToolHelpers.attachInstructions instructions
     Assert.That(result.IsError, Is.EqualTo(Nullable false))
     Assert.That(result.Content.Count, Is.EqualTo(2))
@@ -1005,7 +1014,7 @@ let mcp_agency_write_warning_precedes_success_without_marking_error () =
     let notes =
         [ { Scope = "write-warning"; Path = "Demo/AGENTS.md"; Sha256 = ""
             Content = "WARNING: Demo/AGENTS.md is unusually large. The write succeeded." } ]
-    let response = { Result = Some """{"ok":true}"""; Error = None; Instructions = notes }
+    let response = { Result = Some """{"ok":true}"""; Error = None; Instructions = notes; AgentStateChanges = [] }
     let shown = response |> McpToolHelpers.toCallToolResult |> McpToolHelpers.attachInstructions notes
     Assert.That(shown.IsError, Is.EqualTo(Nullable false))
     Assert.That(shown.Content.Count, Is.EqualTo(2))
@@ -1022,7 +1031,7 @@ let mcp_guidance_preserves_errors_and_non_text_blocks () =
     let failure =
         { Result = None
           Error = Some(ValidationFailed "Unrelated error")
-          Instructions = instructions }
+          Instructions = instructions; AgentStateChanges = [] }
     let error = failure |> McpToolHelpers.toCallToolResult |> McpToolHelpers.attachInstructions instructions
     Assert.That(error.IsError, Is.EqualTo(Nullable true))
     Assert.That((error.Content[1] :?> TextContentBlock).Text, Is.EqualTo("ValidationFailed: Unrelated error"))
@@ -1043,7 +1052,8 @@ let response_json_carries_typed_hierarchical_instructions () =
     let response =
         { Result = Some """{"ok":true}"""
           Error = None
-          Instructions = [ { Scope = "project"; Path = "Demo/AGENTS.md"; Sha256 = "sha256:" + String('f', 64); Content = "# Guidance" } ] }
+          Instructions = [ { Scope = "project"; Path = "Demo/AGENTS.md"; Sha256 = "sha256:" + String('f', 64); Content = "# Guidance" } ]
+          AgentStateChanges = [ { ProjectName = "Demo"; AgentId = "Owner" } ] }
     let json = JsonSerializer.Serialize(response)
     use document = JsonDocument.Parse(json)
     let root = document.RootElement
@@ -1052,6 +1062,11 @@ let response_json_carries_typed_hierarchical_instructions () =
     Assert.That(instruction.GetProperty("Path").GetString(), Is.EqualTo("Demo/AGENTS.md"))
     Assert.That(instruction.GetProperty("Scope").GetString(), Is.EqualTo("project"))
     Assert.That(instruction.GetProperty("Content").GetString(), Is.EqualTo("# Guidance"))
+    let mutation = root.GetProperty("AgentStateChanges").EnumerateArray() |> Seq.exactlyOne
+    Assert.That(mutation.GetProperty("ProjectName").GetString(), Is.EqualTo("Demo"))
+    Assert.That(mutation.GetProperty("AgentId").GetString(), Is.EqualTo("Owner"))
+    let restored = JsonSerializer.Deserialize<AgentCommandResponse>(json)
+    Assert.That(restored.AgentStateChanges, Is.EqualTo(response.AgentStateChanges :> obj))
 
 
 [<Test>]
@@ -1064,7 +1079,7 @@ let ``MCP bridge preserves structured  ledger failure category`` () =
     let response =
         { Result = None
           Error = Some(Common.AgentError.LedgerFailure problem)
-          Instructions = [] }
+          Instructions = []; AgentStateChanges = [] }
     let tool = McpToolHelpers.toCallToolResult response
     tool.IsError |> shouldEqual (Nullable true)
     let content = tool.Content[0] :?> TextContentBlock
@@ -1080,7 +1095,7 @@ let ``typed  ledger failures survive response JSON roundtrip`` () =
               Some(Common.AgentError.LedgerFailure
                   { Code = "OutcomeUnknown"; Message = "Unconfirmed push"
                     OperationId = Some operationId; VerifiedLedgerHead = None })
-          Instructions = [] }
+          Instructions = []; AgentStateChanges = [] }
     let payload = JsonSerializer.Serialize(source)
     let destination = JsonSerializer.Deserialize<Common.AgentCommandResponse>(payload)
     match destination.Error with
@@ -1167,7 +1182,7 @@ let cross_project_probe_errors_are_classified_without_leaking_client_error_text 
           ExecutionFailed error, "ledger health execution failed or timed out" ]
     for issue, expected in failures do
         let reply : AgentCommandResponse =
-            { Result = None; Error = Some issue; Instructions = [] }
+            { Result = None; Error = Some issue; Instructions = []; AgentStateChanges = [] }
         let classification = ProjectNotificationRouting.probeFailure reply
         Assert.That(classification, Is.EqualTo(expected))
         Assert.That(classification, Does.Not.Contain(error))

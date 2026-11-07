@@ -2,12 +2,13 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "urn:jarvis:agent-command-response",
   "title": "AgentCommandResponse",
-  "description": "Client-to-server Jarvis command response. The MCP server renders Instructions as ordered labeled content blocks before ordinary tool content.",
+  "description": "Client-to-server Jarvis command response. Instructions are repository guidance; AgentStateChanges are verified ledger mutation hints for cache invalidation.",
   "type": "object",
   "required": [
     "Result",
     "Error",
-    "Instructions"
+    "Instructions",
+    "AgentStateChanges"
   ],
   "properties": {
     "Result": {
@@ -30,6 +31,13 @@
       "description": "Applicable instructions ordered from workspace to project root to deeper directories; empty for no applicable guidance.",
       "items": {
         "$ref": "#/$defs/InstructionDocument"
+      }
+    },
+    "AgentStateChanges": {
+      "type": "array",
+      "description": "Affected project and agent identities after confirmed canonical Working-turn/assignment transitions. This metadata is retained even when the following tool operation fails; unrelated writes produce an empty array.",
+      "items": {
+        "$ref": "#/$defs/AgentStateChange"
       }
     }
   },
@@ -65,7 +73,25 @@
         },
         "Content": {
           "type": "string",
-          "description": "UTF-8 Markdown or a labeled incomplete prefix with original byte counts and full hash. Bounded delivery is enforced by the client, not JSON Schema."
+          "description": "UTF-8 Markdown or a complete-file omission notice. Automatic delivery is bounded by the client; explicit hierarchy retrieval is paginated."
+        }
+      },
+      "additionalProperties": false
+    },
+    "AgentStateChange": {
+      "type": "object",
+      "required": [
+        "ProjectName",
+        "AgentId"
+      ],
+      "properties": {
+        "ProjectName": {
+          "type": "string",
+          "minLength": 1
+        },
+        "AgentId": {
+          "type": "string",
+          "minLength": 1
         }
       },
       "additionalProperties": false

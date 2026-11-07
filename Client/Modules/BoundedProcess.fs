@@ -74,11 +74,21 @@ module private Native =
     [<Literal>]
     let private JobObjectLimitKillOnClose = 0x2000u
 
-    [<DllImport("libc", SetLastError = true)>]
-    extern int kill(int pid, int signal)
+    [<DllImport("libc", EntryPoint = "kill", SetLastError = true)>]
+    extern int private killLinux(int pid, int signal)
 
-    [<DllImport("libc", SetLastError = true)>]
-    extern int setsid()
+    [<DllImport("libSystem.B.dylib", EntryPoint = "kill", SetLastError = true)>]
+    extern int private killMac(int pid, int signal)
+
+    [<DllImport("libSystem.B.dylib", EntryPoint = "setsid", SetLastError = true)>]
+    extern int private setsidMac()
+
+    let newMacSession () = setsidMac()
+
+    let killUnixGroup pid =
+        // libSystem is the guaranteed macOS system library; libc is Linux.
+        if OperatingSystem.IsMacOS() then killMac(-pid, 9)
+        else killLinux(-pid, 9)
 
     [<DllImport("kernel32.dll", SetLastError = true)>]
     extern nativeint CreateJobObject(nativeint attributes, string name)
@@ -127,7 +137,7 @@ let runInternalGroupHost (args: string array) =
     if not (windows || mac) || args.Length < (if windows then 2 else 1) then
         eprintfn "Invalid internal process-group invocation."
         126
-    elif mac && Native.setsid() < 0 then
+    elif mac && Native.newMacSession() < 0 then
         eprintfn "Could not establish process session."
         126
     else
@@ -220,7 +230,7 @@ let private tryTerminateGroup pid job =
     elif OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
         // Unlike Process.Kill(entireProcessTree), this still works after the
         // immediate child exits while descendants retain inherited pipes.
-        Native.kill(-pid, 9) |> ignore
+        Native.killUnixGroup pid |> ignore
 
 // Framework-dependent apphosts already know which managed assembly to run.
 // Only the general dotnet host needs a DLL path prepended to its arguments.

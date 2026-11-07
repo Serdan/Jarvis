@@ -62,8 +62,24 @@ type ProjectData =
 type WebBrowser =
     { LoadPage: Url -> TaskResult<Content, EffectError> }
 
+// A single filesystem transaction owns the read, precondition check, edit
+// and atomic publication. The edit callback returns the typed command result.
+type TextEditOptions =
+    { SourceRoot: FolderPath
+      CreateParents: bool
+      DryRun: bool }
+
+// Append preserves the existing file's raw bytes (including BOMs and legacy
+// encodings) instead of decoding and re-encoding the original contents.
+type TextFileChange =
+    | ReplaceText of string
+    | AppendUtf8Text of string
+
 type FileIO =
     abstract File: FileOperations
+    abstract EditText<'T>:
+        path: FilePath * options: TextEditOptions *
+        edit: (string option -> Result<TextFileChange * 'T>) -> Result<'T>
 
 type ProjectIO =
     abstract Project: ProjectData

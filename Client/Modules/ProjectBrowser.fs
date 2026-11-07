@@ -914,12 +914,19 @@ module private Core =
                       Data = data }
         }
 
-    let private verifyExpectedHash expectedHash content =
-        let actual = Hash.sha256 content
-        match expectedHash with
-        | None -> Ok actual
-        | Some expected when expected = actual -> Ok actual
-        | Some expected -> Error(Client.ValidationError $"Expected hash {expected}, actual hash {actual}.")
+    let private verifyExpectedHash expectedHash current =
+        match expectedHash, current with
+        | None, _ -> Ok(current |> Option.map Hash.sha256)
+        | Some absent, None when String.Equals(absent, "none", StringComparison.OrdinalIgnoreCase) ->
+            Ok None
+        | Some absent, Some _ when String.Equals(absent, "none", StringComparison.OrdinalIgnoreCase) ->
+            Error(Client.ValidationError "Expected file to be absent, but it already exists.")
+        | Some expected, None ->
+            Error(Client.ValidationError $"Expected hash {expected}, but the file does not exist.")
+        | Some expected, Some text ->
+            let actual = Hash.sha256 text
+            if expected = actual then Ok(Some actual)
+            else Error(Client.ValidationError $"Expected hash {expected}, actual hash {actual}.")
 
     let private rejectBinaryContent (content: string) =
         if content.Contains('\u0000') then
@@ -928,51 +935,22 @@ module private Core =
             Ok()
 
     let writeFile projectName filePath content mode expectedHash createParents =
-        let write =
-            match mode with
-            | Append -> FileIO.appendAllText
-            | Write -> FileIO.writeAllText
-
-        let ensureParent (FilePath fullPath) =
-            effect {
-                if defaultArg createParents false then
-                    let parent = Path.GetDirectoryName(fullPath)
-                    do! FileIO.createDirectory (FolderPath parent)
-            }
-
         effect {
-            let! path = parseProjectName projectName >>= resolveWritableFilePath filePath
-
-            match expectedHash with
-            | Some expected when String.Equals(expected, "none", StringComparison.OrdinalIgnoreCase) ->
-                let! absent =
-                    fun rt ->
-                        match FileIO.getFileInfo path rt with
-                        | Error(NotFoundError _) -> Ok true
-                        | Error(ExceptionError (:? FileNotFoundException)) -> Ok true
-                        | Error error -> Error error
-                        | Ok _ -> Ok false
-
-                if not absent then
-                    return! Client.ValidationError "Expected file to be absent, but it already exists." |> Effect.ofError
-                else
-                    do! ensureParent path
-                    do! write path (Content content)
-            | Some expected ->
-                let! existing =
-                    fun rt ->
-                        match FileIO.readAllText path rt with
-                        | Error(ExceptionError (:? FileNotFoundException)) ->
-                            Error(Client.ValidationError $"Expected hash {expected}, but the file does not exist.")
-                        | result -> result
-
-                let (Content existingContent) = existing
-                let! _ = fun _ -> verifyExpectedHash expectedHash existingContent
-                do! ensureParent path
-                do! write path (Content content)
-            | None ->
-                do! ensureParent path
-                do! write path (Content content)
+            let! project = parseProjectName projectName
+            let! path = resolveWritableFilePath filePath project
+            let options =
+                { SourceRoot = ProjectPaths.ResolvedProject.sourceRoot project
+                  CreateParents = defaultArg createParents false
+                  DryRun = false }
+            return! FileIO.editText path options (fun existing ->
+                result {
+                    let! _ = verifyExpectedHash expectedHash existing
+                    let change =
+                        match mode with
+                        | Write -> ReplaceText content
+                        | Append -> AppendUtf8Text content
+                    return change, ()
+                })
         }
 
     let patchFile projectName filePath expectedHash format patch dryRun fuzzyContextLines returnContent =
@@ -986,30 +964,34 @@ module private Core =
                 if fuzzyContextLines < 0 || fuzzyContextLines > 50 then
                     return! Client.ValidationError "FuzzyContextLines must be between 0 and 50." |> Effect.ofError
                 else
-                    let! path = parseProjectName projectName >>= parseFilePath filePath
-                    let! current = FileIO.readAllText path
-                    let (Content content) = current
-                    let! beforeHash = fun _ -> verifyExpectedHash expectedHash content
-                    do! fun _ -> rejectBinaryContent content
-                    let! applied = fun _ -> Patch.applyUnifiedDiff fuzzyContextLines patch content
-                    let afterHash = Hash.sha256 applied.Content
-
-                    do!
-                        if dryRun then
-                            fun _ -> Ok()
-                        else
-                            FileIO.writeAllText path (Content applied.Content)
-
-                    return
-                        { Applied = true
-                          DryRun = dryRun
-                          FilePath = filePath
-                          HunksApplied = applied.HunksApplied
-                          ChangedLines = applied.ChangedLines
-                          BeforeHash = beforeHash
-                          AfterHash = Some afterHash
-                          Content = if returnContent then Some applied.Content else None
-                          Diagnostics = applied.Diagnostics }
+                    let! project = parseProjectName projectName
+                    let! path = parseFilePath filePath project
+                    let options =
+                        { SourceRoot = ProjectPaths.ResolvedProject.sourceRoot project
+                          CreateParents = false
+                          DryRun = dryRun }
+                    return! FileIO.editText path options (fun existing ->
+                        result {
+                            let! content =
+                                match existing with
+                                | Some value -> Ok value
+                                | None -> Error(Client.NotFoundError "File no longer exists.")
+                            let! beforeHash = verifyExpectedHash expectedHash existing
+                            let! _ = rejectBinaryContent content
+                            let! applied = Patch.applyUnifiedDiff fuzzyContextLines patch content
+                            let afterHash = Hash.sha256 applied.Content
+                            return
+                                ReplaceText applied.Content,
+                                { Applied = true
+                                  DryRun = dryRun
+                                  FilePath = filePath
+                                  HunksApplied = applied.HunksApplied
+                                  ChangedLines = applied.ChangedLines
+                                  BeforeHash = beforeHash |> Option.defaultValue (Hash.sha256 content)
+                                  AfterHash = Some afterHash
+                                  Content = if returnContent then Some applied.Content else None
+                                  Diagnostics = applied.Diagnostics }
+                        })
             }
 
 let listCommands rt = Core.listCommands rt

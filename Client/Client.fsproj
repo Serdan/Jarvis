@@ -33,6 +33,7 @@
         <Compile Include="IO\WebIO.fs"/>
         <Compile Include="IO\Impl\ProjectOperations.fs"/>
         <Compile Include="IO\Impl\FileOperations.fs"/>
+        <Compile Include="IO\Impl\AtomicTextFiles.fs"/>
         <Compile Include="IO\Impl\WebOperations.fs"/>
         <Compile Include="Modules\WorkspaceDefaults.fs"/>
         <Compile Include="Modules\DeviceIdentity.fs"/>

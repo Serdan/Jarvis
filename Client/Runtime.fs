@@ -21,6 +21,8 @@ type Runtime(root: string, tui: ConsoleTui, trustLevel: TrustLevel, maxImportByt
 
     interface FileIO with
         member _.File = FileOperations.impl
+        member _.EditText(path, options, edit) =
+            AtomicTextFiles.edit path options edit
 
     interface WebIO with
         member _.Browser = WebOperations.impl

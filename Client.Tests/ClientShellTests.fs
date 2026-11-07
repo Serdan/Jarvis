@@ -19,6 +19,8 @@ type TestContext(root: string) =
         member _.Project = { Root = ProjectDirectory root; SpecialFiles = []; FolderFilters = [] }
     interface FileIO with
         member _.File = FileOperations.impl
+        member _.EditText(path, options, edit) =
+            AtomicTextFiles.edit path options edit
 
 [<Test>]
 let ``runCommand executes structured command`` () =

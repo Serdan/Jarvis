@@ -117,99 +117,25 @@ let resolveWorkspacePath (parts: string seq) : IO<'rt, string> =
         | false -> return! Client.PermissionDenied "Path is outside workspace root." |> Effect.ofError
     }
 
-// Keep timed-out descendants bound to a process group, including when the
-// immediate Git process has already exited but a child retains a pipe.
-module private ProcessGroup =
-    [<DllImport("libc", SetLastError = true)>]
-    extern int private kill(int pid, int signal)
-
-    [<DllImport("kernel32.dll", SetLastError = true)>]
-    extern nativeint private CreateJobObject(nativeint attributes, string name)
-
-    [<DllImport("kernel32.dll", SetLastError = true)>]
-    extern bool private AssignProcessToJobObject(nativeint job, nativeint processHandle)
-
-    [<DllImport("kernel32.dll", SetLastError = true)>]
-    extern bool private TerminateJobObject(nativeint job, uint32 exitCode)
-
-    [<DllImport("kernel32.dll", SetLastError = true)>]
-    extern bool private CloseHandle(nativeint handle)
-
-    let createWindowsJob () =
-        let job = CreateJobObject(0n, null)
-        if job = 0n then
-            raise (System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error()))
-        job
-
-    let assignWindowsJob job (proc: Process) =
-        if not (AssignProcessToJobObject(job, proc.Handle)) then
-            raise (System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error()))
-
-    let closeWindowsJob job =
-        if job <> 0n then CloseHandle(job) |> ignore
-
-    let terminateWindowsJob job =
-        if job <> 0n then TerminateJobObject(job, 1u) |> ignore
-
-    let terminateUnixGroup (processId: int) =
-        // setsid executes Git as leader of a new session/process group.
-        // Negative PID signals the entire group, even if its leader exited.
-        kill(-processId, 9) |> ignore
-
-// Both pipes must be drained while the process is running. Waiting for EOF
-// before applying a timeout can leave a source operation blocked forever.
+// Reuse the bounded subprocess executor; this must finish even if Git exits
+// but a descendant retains its stdout/stderr file descriptors.
 module WorktreeGit =
     let list (executable: string) (mainRoot: string) (timeout: TimeSpan) : Client.Result<string> =
-        // Linux uses a new process group so descendants remain addressable
-        // after Git exits; Windows uses a Job Object for the same purpose.
-        let unixGroup = OperatingSystem.IsLinux()
-        let windows = OperatingSystem.IsWindows()
-        let mutable job = 0n
-        try
-            try
-                if windows then job <- ProcessGroup.createWindowsJob()
-                use proc = new Process()
-                proc.StartInfo.FileName <- if unixGroup then "setsid" else executable
-                proc.StartInfo.WorkingDirectory <- mainRoot
-                proc.StartInfo.UseShellExecute <- false
-                proc.StartInfo.RedirectStandardOutput <- true
-                proc.StartInfo.RedirectStandardError <- true
-                if unixGroup then
-                    proc.StartInfo.ArgumentList.Add("--")
-                    proc.StartInfo.ArgumentList.Add(executable)
-                proc.StartInfo.ArgumentList.Add("worktree")
-                proc.StartInfo.ArgumentList.Add("list")
-                proc.StartInfo.ArgumentList.Add("--porcelain")
-                if not (proc.Start()) then
-                    Error(Client.ValidationError "Cannot inspect worktree registration.")
-                else
-                    if windows then ProcessGroup.assignWindowsJob job proc
-                    let stdout = proc.StandardOutput.ReadToEndAsync()
-                    let stderr = proc.StandardError.ReadToEndAsync()
-                    let exit = proc.WaitForExitAsync()
-                    let all = Task.WhenAll([| stdout :> Task; stderr :> Task; exit |])
-                    try
-                        all.WaitAsync(timeout).GetAwaiter().GetResult()
-                        if proc.ExitCode <> 0 then
-                            Error(Client.ValidationError "Cannot inspect worktree registration.")
-                        else Ok stdout.Result
-                    with
-                    | :? TimeoutException ->
-                        // Terminate the group/job unconditionally: the leader may
-                        // have exited while a descendant keeps the streams open.
-                        if unixGroup then ProcessGroup.terminateUnixGroup proc.Id
-                        elif windows then ProcessGroup.terminateWindowsJob job
-                        try
-                            if not proc.HasExited then proc.Kill(true)
-                            // Reap the immediate process without another unbounded wait.
-                            proc.WaitForExit(2000) |> ignore
-                        with
-                        | :? InvalidOperationException -> ()
-                        | :? System.ComponentModel.Win32Exception -> ()
-                        Error(Client.ValidationError "Git worktree discovery timed out.")
-            with ex -> Error(Client.ExceptionError ex)
-        finally
-            if windows then ProcessGroup.closeWindowsJob job
+        BoundedProcess.run
+            { Executable = executable
+              Args = [ "worktree"; "list"; "--porcelain" ]
+              WorkingDirectory = mainRoot
+              Timeout = timeout
+              MaxOutputBytes = Some(1024 * 1024)
+              StandardInput = BoundedProcess.InheritInput
+              ExtraEnvironment = []
+              ConfigureStart = None }
+        |> Result.bind (fun result ->
+            if result.TimedOut then
+                Error(ValidationError "Git worktree discovery timed out.")
+            elif result.ExitCode <> 0 || result.StdOutTruncated || result.StdErrTruncated then
+                Error(ValidationError "Cannot inspect worktree registration.")
+            else Ok result.StdOut)
 
 let private resolveRegisteredWorktree (mainRoot: string) (selector: string) : Client.Result<string> =
     if String.IsNullOrWhiteSpace selector

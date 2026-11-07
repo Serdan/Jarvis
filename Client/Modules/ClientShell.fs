@@ -46,95 +46,25 @@ module private Core =
         else
             Ok executable
 
-    let private takeUtf8Prefix maxBytes (value: string) =
-        let output = Text.StringBuilder()
-        let mutable bytes = 0
-        let mutable accepting = true
-
-        for rune in value.EnumerateRunes() do
-            if accepting then
-                let runeBytes = rune.Utf8SequenceLength
-
-                if bytes + runeBytes <= maxBytes then
-                    output.Append(rune.ToString()) |> ignore
-                    bytes <- bytes + runeBytes
-                else
-                    accepting <- false
-
-        output.ToString()
-
-    let private readBounded maxBytes (reader: StreamReader) =
-        task {
-            let buffer = Array.zeroCreate<char> 4096
-            let output = Text.StringBuilder()
-            let mutable bytes = 0
-            let mutable truncated = false
-            let mutable reading = true
-
-            while reading do
-                let! count = reader.ReadAsync(buffer, 0, buffer.Length)
-
-                if count = 0 then
-                    reading <- false
-                else
-                    let chunk = String(buffer, 0, count)
-                    let chunkBytes = Text.Encoding.UTF8.GetByteCount chunk
-                    let remaining = max 0 (maxBytes - bytes)
-
-                    if remaining > 0 then
-                        let fragment = takeUtf8Prefix remaining chunk
-                        let addedBytes = Text.Encoding.UTF8.GetByteCount fragment
-                        output.Append(fragment) |> ignore
-                        bytes <- bytes + addedBytes
-                        truncated <- truncated || addedBytes < chunkBytes
-                    else
-                        truncated <- true
-
-            return output.ToString(), truncated
-        }
-
     let private runProcess workingDirectory executable args timeoutSeconds maxOutputBytes : Client.Result<RunCommandResult> =
-        try
-            match validateExecutable executable with
-            | Error error -> Error error
-            | Ok executable ->
-                use proc = new Process()
-
-                proc.StartInfo.FileName <- executable
-                proc.StartInfo.WorkingDirectory <- workingDirectory
-                proc.StartInfo.RedirectStandardOutput <- true
-                proc.StartInfo.RedirectStandardError <- true
-                proc.StartInfo.UseShellExecute <- false
-                proc.StartInfo.CreateNoWindow <- true
-
-                ProcessEnvironment.apply proc.StartInfo
-                args |> List.iter proc.StartInfo.ArgumentList.Add
-
-                if not (proc.Start()) then
-                    Error(Client.ContextError "Failed to start process.")
-                else
-                    let stdoutTask = readBounded maxOutputBytes proc.StandardOutput
-                    let stderrTask = readBounded maxOutputBytes proc.StandardError
-                    let timeoutMs = timeoutSeconds * 1000
-                    let exited = proc.WaitForExit timeoutMs
-
-                    if not exited then
-                        try
-                            proc.Kill(entireProcessTree = true)
-                            proc.WaitForExit()
-                        with _ -> ()
-
-                    let stdout, stdoutTruncated = stdoutTask.Result
-                    let stderr, stderrTruncated = stderrTask.Result
-
-                    Ok
-                        { ExitCode = if exited then proc.ExitCode else -1
-                          TimedOut = not exited
-                          StdOut = stdout
-                          StdErr = stderr
-                          Truncated = stdoutTruncated || stderrTruncated }
-        with ex ->
-            Error(ExceptionError ex)
+        match validateExecutable executable with
+        | Error failure -> Error failure
+        | Ok executable ->
+            BoundedProcess.run
+                { Executable = executable
+                  Args = args
+                  WorkingDirectory = workingDirectory
+                  Timeout = TimeSpan.FromSeconds(float timeoutSeconds)
+                  MaxOutputBytes = Some maxOutputBytes
+                  StandardInput = BoundedProcess.InheritInput
+                  ExtraEnvironment = []
+                  ConfigureStart = Some ProcessEnvironment.apply }
+            |> Result.map (fun result ->
+                { ExitCode = result.ExitCode
+                  TimedOut = result.TimedOut
+                  StdOut = result.StdOut
+                  StdErr = result.StdErr
+                  Truncated = result.StdOutTruncated || result.StdErrTruncated })
 
     let run projectName workingDirectory executable args timeoutSeconds maxOutputBytes =
         effect {

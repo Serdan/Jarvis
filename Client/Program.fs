@@ -283,7 +283,9 @@ let private runClient args =
 
 [<EntryPoint>]
 let main args =
-    if args.Length = 2 && args[0] = "config" && args[1] = "path" then
+    if args.Length > 0 && args[0] = BoundedProcess.groupHostFlag then
+        BoundedProcess.runInternalGroupHost (args |> Array.skip 1)
+    elif args.Length = 2 && args[0] = "config" && args[1] = "path" then
         printfn "%s" (ClientConfig.configPath())
         0
     elif args.Length > 0 && args[0] = "config" then runConfigCommand args

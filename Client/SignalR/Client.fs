@@ -96,12 +96,24 @@ let private checkWorkingGuidance (rt: Runtime) agentId (target: ProjectPaths.Pro
                     Sha256 = ""; Content = content } ]
             | None -> []
 
+// A cross-project notification is sent using the *source* agent identity,
+// which is not an identity of an agent in the destination project. Routing
+// health probes likewise do not represent agent activity. Keep both out of
+// destination last-seen, turn-guidance and implicit-activation handling.
+let private isLocalAgentActivity = function
+    | TaskWriteCommand cmd when cmd.Action = "NotifyAgent"
+                                && not (String.IsNullOrWhiteSpace cmd.SourceRef)
+                                && cmd.SourceRef <> cmd.ProjectName -> false
+    | LedgerReadCommand cmd when cmd.Action = "Health" -> false
+    | _ -> true
+
 // An agent's first ordinary tool call starts its Ready assignment.
 // No new session identifier or explicit resume tool is needed. Never
 // auto-activate a different agent merely because an administrative operation
 // names that agent as its target.
 let private activatesAgent (agentId: string) command =
     match command with
+    | _ when not (isLocalAgentActivity command) -> false
     | TaskWriteCommand cmd ->
         cmd.ActorId = agentId
         && List.contains cmd.Action
@@ -111,10 +123,6 @@ let private activatesAgent (agentId: string) command =
               "SetAttemptSource"; "SubmitIntegration"; "CompleteIntegration" ]
     | TaskReadCommand cmd ->
         String.IsNullOrWhiteSpace cmd.AgentId || cmd.AgentId = agentId
-    // Cross-project notification routing probes candidate clients using a
-    // ledger Health read. A probe is not agent activity and must never start
-    // an unrelated Ready assignment.
-    | LedgerReadCommand cmd when cmd.Action = "Health" -> false
     | LedgerWriteCommand _ | ReviewWriteCommand _ -> false
     | _ -> true
 
@@ -622,9 +630,14 @@ let processIncomingCommand (rt: Runtime) (commandJson: string) (agentId: string)
                     | Error error -> return Error error
                     | Ok scope ->
                         let target = projectTarget scope
-                        target |> Option.iter (fun selected ->
-                            rt.Tui.RecordAgentSeen(AgentView.activityProject selected, agentId))
-                        match activateReadyOnActivity rt agentId target command with
+                        // The caller's agentId belongs to the source project
+                        // of a cross-project notification, not the destination.
+                        let localAgentId =
+                            if isLocalAgentActivity command then agentId else ""
+                        if not (String.IsNullOrWhiteSpace localAgentId) then
+                            target |> Option.iter (fun selected ->
+                                rt.Tui.RecordAgentSeen(AgentView.activityProject selected, localAgentId))
+                        match activateReadyOnActivity rt localAgentId target command with
                         | Error error -> return Error error
                         | Ok changes ->
                             implicitChanges <- changes
@@ -646,10 +659,10 @@ let processIncomingCommand (rt: Runtime) (commandJson: string) (agentId: string)
                                 | GetAgentInstructionsCommand _ ->
                                     // The explicit result includes the complete hierarchy.
                                     // Do not double-inject automatic AGENTS.md payloads.
-                                    checkWorkingGuidance rt agentId target command
+                                    checkWorkingGuidance rt localAgentId target command
                                 | _ ->
-                                    incrementalInstructions rt agentId target provenance applicable
-                                    @ checkWorkingGuidance rt agentId target command
+                                    incrementalInstructions rt localAgentId target provenance applicable
+                                    @ checkWorkingGuidance rt localAgentId target command
                             return result
                 with ex ->
                     return Error(ExceptionError ex)

@@ -1476,6 +1476,132 @@ type ReviewWorkflowTests() =
             Assert.That((ReviewWorkflow.getAgentInbox first "Reviewer" |> success).PendingNotifications, Is.Empty))
 
     [<Test>]
+    member _.CrossProjectNotificationDoesNotActivateSameNamedDestinationAgent() =
+        withFixture (fun source _ sourceBinding _ _ _ _ _ ->
+            let root = Path.GetDirectoryName(source)
+            let destination = Path.Combine(root, "destination")
+            let destinationRemote = Path.Combine(root, "destination.git")
+            git root [ "init"; "--bare"; destinationRemote ] |> ignore
+            git root [ "clone"; destinationRemote; destination ] |> ignore
+            git destination [ "config"; "user.name"; "Fixture" ] |> ignore
+            git destination [ "config"; "user.email"; "fixture@example.test" ] |> ignore
+            File.WriteAllText(Path.Combine(destination, "source.txt"), "destination base")
+            git destination [ "add"; "source.txt" ] |> ignore
+            git destination [ "commit"; "-m"; "destination base" ] |> ignore
+            git destination [ "push"; "-u"; "origin"; "HEAD" ] |> ignore
+
+            let destinationBinding : LedgerBinding =
+                { RepositoryPath = destination; RemoteName = "origin"
+                  ApprovedFetchUrl = destinationRemote; ApprovedPushUrl = destinationRemote
+                  ProjectId = Guid.NewGuid(); LedgerId = Guid.NewGuid(); Epoch = 1 }
+            LedgerStore.initialize destinationBinding true |> success |> ignore
+            for agent in [ "Owner"; "Reviewer" ] do
+                ReviewWorkflow.registerAgent destinationBinding (Guid.NewGuid()) agent
+                |> success |> ignore
+            // "Owner" is Ready in both independent project ledgers.
+            let sourceTask = "source-notification-task"
+            let destinationTask = "destination-unrelated-task"
+            ReviewWorkflow.createTask sourceBinding (Guid.NewGuid()) sourceTask "Sender task"
+            |> success |> ignore
+            ReviewWorkflow.assignTask sourceBinding (Guid.NewGuid()) sourceTask (Guid.NewGuid()) "Owner"
+            |> success |> ignore
+            ReviewWorkflow.createTask destinationBinding (Guid.NewGuid()) destinationTask "Unrelated task"
+            |> success |> ignore
+            ReviewWorkflow.assignTask destinationBinding (Guid.NewGuid()) destinationTask (Guid.NewGuid()) "Owner"
+            |> success |> ignore
+
+            let context = GitCommandTests.TestContext(root)
+            let sourceConfig = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot source
+            let destinationConfig = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot destination
+            try
+                let bind name (binding: LedgerBinding) =
+                    let head = (LedgerStore.fetch binding |> success).Commit
+                    Client.OrchestrationApi.LedgerBindingConfig.bindExisting
+                        name context binding.ProjectId binding.LedgerId binding.Epoch
+                        binding.RemoteName binding.ApprovedFetchUrl binding.ApprovedPushUrl head true
+                    |> success |> ignore
+                bind "owner" sourceBinding
+                bind "destination" destinationBinding
+                let logPath = Path.Combine(root, "activity")
+                Directory.CreateDirectory(logPath) |> ignore
+                let logSettings : Client.ActivityLog.Settings =
+                    { DirectoryPath = logPath
+                      RetentionDays = 14
+                      MaxFileBytes = 1024L * 1024L }
+                use log = new Client.ActivityLog.Store(logSettings)
+                let rt = Client.Runtime(root, Client.ConsoleTui.ConsoleTui(activityLog = log), Client.PartialTrust)
+                let run (command: Common.AgentCommand) =
+                    Client.SignalR.Client.processIncomingCommand rt
+                        (System.Text.Json.JsonSerializer.Serialize command) "Owner"
+                    |> Async.AwaitTask |> Async.RunSynchronously
+
+                // The server validates the source sender via its own inbox.
+                let sourceInbox : Common.AgentCommand =
+                    Common.TaskReadCommand
+                        { ProjectName = "owner"; AgentId = "Owner"; Action = "AgentInbox"
+                          TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L
+                          Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null
+                          RelativePath = null }
+                let _, senderResult, senderResponse = run sourceInbox
+                Assert.That(senderResult.IsOk, Is.True)
+                Assert.That(senderResponse.AgentStateChanges |> List.map _.ProjectName,
+                            Is.EqualTo([ "owner" ] :> obj))
+                Assert.That((ReviewWorkflow.getAgentInbox sourceBinding "Owner" |> success).Agent.State,
+                            Is.EqualTo("Working"))
+                Assert.That(log.LoadAgentSeen() |> List.exists (fun (key, _) -> key = "owner::Owner"),
+                            Is.True, "The source sender is active in its own project")
+
+                let before = (ReviewWorkflow.getAgentInbox destinationBinding "Owner" |> success).Agent
+                Assert.That(before.State, Is.EqualTo("Ready"))
+                let notify sourceProject operationId : Common.AgentCommand =
+                    Common.TaskWriteCommand
+                        { ProjectName = "destination"; Action = "NotifyAgent"
+                          OperationId = operationId; TaskId = ""; AttemptId = ""
+                          ActorId = "Owner"; OwnerId = "Reviewer"; Title = ""; Html = ""
+                          ExpectedVersion = 0; ExpectedAgentVersion = 0; ExpectedTaskVersion = 0
+                          AssignmentGeneration = 0; Summary = "Cross-project notification"
+                          NextAction = ""; Reason = ""; BaseOid = ""; TargetRef = ""
+                          SourceRef = sourceProject; AllowDetached = false
+                          AllowUncommitted = false; DecisionSequence = 0L; Evidence = ""
+                          SessionId = "" }
+                let _, delivered, destinationResponse =
+                    run (notify "owner" (Guid.NewGuid().ToString("D")))
+                Assert.That(delivered.IsOk, Is.True)
+                Assert.That(destinationResponse.AgentStateChanges, Is.Empty,
+                            "Foreign sender must not start an agent in the destination project")
+                Assert.That(destinationResponse.Instructions |> List.exists (fun i -> i.Scope = "working-turn"),
+                            Is.False)
+                let after = (ReviewWorkflow.getAgentInbox destinationBinding "Owner" |> success).Agent
+                Assert.That(after.State, Is.EqualTo("Ready"))
+                Assert.That(after.Version, Is.EqualTo(before.Version))
+                Assert.That(after.WorkingTurnStartedAtUtc, Is.EqualTo(before.WorkingTurnStartedAtUtc))
+                Assert.That(log.LoadAgentSeen() |> List.exists (fun (key, _) -> key = "destination::Owner"),
+                            Is.False, "A foreign notification must not update destination agent last-seen")
+                let reviewerInbox = ReviewWorkflow.getAgentInbox destinationBinding "Reviewer" |> success
+                Assert.That(reviewerInbox.PendingNotifications.Length, Is.EqualTo(1))
+                let received = reviewerInbox.PendingNotifications.Head
+                Assert.That(received.FromProjectName, Is.EqualTo("owner"))
+                Assert.That(received.FromAgentId, Is.EqualTo("Owner"))
+                Assert.That(received.ToAgentId, Is.EqualTo("Reviewer"))
+
+                // A real local notification by destination Owner still counts
+                // as activity and starts that project's own Ready assignment.
+                let _, localResult, localResponse =
+                    run (notify "" (Guid.NewGuid().ToString("D")))
+                Assert.That(localResult.IsOk, Is.True)
+                Assert.That(localResponse.AgentStateChanges,
+                            Is.EqualTo([ ({ ProjectName = "destination"; AgentId = "Owner" } : Common.AgentStateChange) ] :> obj))
+                Assert.That((ReviewWorkflow.getAgentInbox destinationBinding "Owner" |> success).Agent.State,
+                            Is.EqualTo("Working"))
+                Assert.That(log.LoadAgentSeen() |> List.exists (fun (key, _) -> key = "destination::Owner"),
+                            Is.True, "Local notification must update destination agent last-seen")
+                Assert.That((ReviewWorkflow.getAgentInbox destinationBinding "Reviewer" |> success).PendingNotifications.Length,
+                            Is.EqualTo(2))
+            finally
+                for config in [ sourceConfig; destinationConfig ] do
+                    if File.Exists config then File.Delete config)
+
+    [<Test>]
     member _.InvalidNotificationDoesNotReachRecipient() =
         withFixture (fun _ _ first second _ _ _ _ ->
             match ReviewWorkflow.notifyAgent first (Guid.NewGuid()) "Owner" "" "Absent" "" "Hello" with

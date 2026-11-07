@@ -50,6 +50,11 @@ The server sends user-scoped SignalR
 Other agents' cached state remains valid after checkpoints, notifications,
 and unrelated task operations. Cross-project notification sender checks publish
 their source-project effects independently from destination operations.
+A cross-project `notify_agent` writes the durable notification in the
+destination without counting the source sender's ID as destination activity,
+even when both projects happen to use the same agent label. Its destination
+dispatch does not start a Working turn, update last-seen, or inject unrelated
+Working-turn guidance.
 
 The two-minute fallback refresh still covers missed notifications and external
 ledger writes. Reconnecting clears cached states. A refresh reuses its verified

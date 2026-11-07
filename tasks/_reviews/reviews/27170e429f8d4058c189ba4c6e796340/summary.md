@@ -1,0 +1,1 @@
+Previously reported truncation, workspace retrieval, stale warning A->B->A and unconditional per-call network fetch issues are corrected. Release: Client 390/390 and Server 95/95. New concern: command-type-based notifications miss implicit Ready->Working transitions on source commands and invalidate all agent caches for unrelated task writes.

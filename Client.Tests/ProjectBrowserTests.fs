@@ -141,6 +141,18 @@ type FakeContext() =
 
     interface FileIO with
         member this.File = fakeFileOperations
+        member _.EditText(path, _, edit) =
+            // This legacy project-browser fake has no persistent write store,
+            // just as its old WriteAllText/AppendAllText methods returned Ok.
+            // Still execute the actual typed edit/patch plan against its
+            // current read fixture so diagnostics and preconditions are real.
+            let existing =
+                match fakeFileOperations.ReadAllText(path) with
+                | Ok(Content text) -> Ok(Some text)
+                | Error(NotFoundError _) -> Ok None
+                | Error failure -> Error failure
+            existing |> Result.bind (fun original ->
+                edit original |> Result.map snd)
 
 let fakeContext = FakeContext()
 

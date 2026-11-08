@@ -2915,6 +2915,257 @@ type ReviewWorkflowTests() =
             Assert.That(original.Operation.OperationId, Is.EqualTo(originalId.ToString("D")))
             Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(head)))
 
+
+    [<Test>]
+    member _.OperatorRetryUsesExactSavedTaskCommandAndCurrentLedgerWriter() =
+        withFixture (fun one _ first _ _ _ _ _ ->
+            let before = (LedgerStore.fetch first |> success).Commit
+            let context = GitCommandTests.TestContext(Path.GetDirectoryName one)
+            let configPath = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
+            Client.OrchestrationApi.LedgerBindingConfig.bindExisting
+                "owner" context first.ProjectId first.LedgerId first.Epoch
+                first.RemoteName first.ApprovedFetchUrl first.ApprovedPushUrl before true
+            |> success |> ignore
+            try
+                let operationId = Guid.NewGuid()
+                let taskId = "operator-retry-task"
+                let html = "<h1>Saved original task spec</h1>"
+                let command : Common.TaskWriteCommand =
+                    { ProjectName = "owner"; Action = "CreateTask"
+                      OperationId = operationId.ToString("D")
+                      TaskId = taskId; AttemptId = ""; ActorId = "Owner"; OwnerId = ""
+                      Title = "Saved original title"; Html = html
+                      ExpectedVersion = 0; ExpectedAgentVersion = 0
+                      ExpectedTaskVersion = 0; AssignmentGeneration = 0
+                      Summary = ""; NextAction = ""; Reason = ""
+                      BaseOid = ""; TargetRef = ""; SourceRef = ""
+                      AllowDetached = false; AllowUncommitted = false
+                      DecisionSequence = 0L; Evidence = ""; SessionId = "" }
+                let savedJson = System.Text.Json.JsonSerializer.Serialize(command)
+                Client.OrchestrationApi.PendingIntentJournal.persist
+                    first operationId "TaskWrite" savedJson |> success
+                let saved = Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId
+                            |> success |> Option.get
+                let authorization : Common.RetryPendingIntentCommand =
+                    { ProjectName = "owner"; OperationId = operationId.ToString("D")
+                      OperatorId = "Jarvis Lead"; ExpectedCommandSha256 = saved.CommandSha256
+                      ExpectedVerifiedHead = before }
+                match Client.OrchestrationApi.PendingRecoveryApi.retry
+                        { authorization with ExpectedCommandSha256 = String.replicate 64 "f" } context with
+                | Error(Client.ValidationError _) -> ()
+                | other -> Assert.Fail(sprintf "Wrong command hash cannot retry: %A" other)
+                match Client.OrchestrationApi.PendingRecoveryApi.retry
+                        { authorization with ExpectedVerifiedHead = String.replicate 40 "0" } context with
+                | Error(Client.ValidationError _) -> ()
+                | other -> Assert.Fail(sprintf "Stale verified head cannot retry: %A" other)
+                let outcome = Client.OrchestrationApi.PendingRecoveryApi.retry authorization context |> success
+                let json = System.Text.Json.JsonSerializer.Serialize(outcome)
+                Assert.That(json, Does.Contain(operationId.ToString("D")))
+                let _, remote = LedgerStore.getOperationStatus first operationId |> success
+                Assert.That(remote.IsSome, Is.True)
+                Assert.That(remote.Value.Type, Is.EqualTo("CreateTask"))
+                Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId |> success).IsNone,
+                            Is.True)
+                let newHead = (LedgerStore.fetch first |> success).Commit
+                Assert.That(newHead, Is.Not.EqualTo(before))
+                match Client.OrchestrationApi.PendingRecoveryApi.retry
+                        { authorization with ExpectedVerifiedHead = newHead } context with
+                | Error(Client.ValidationError _) -> ()
+                | other -> Assert.Fail(sprintf "No saved original journal must refuse retry: %A" other)
+                Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(newHead))
+                // Simulate lost response after original remote acceptance.
+                // The read-only retry reports Applied, preserves journal for
+                // explicit verified-hash acknowledgment, and makes no Git write.
+                Client.OrchestrationApi.PendingIntentJournal.persist
+                    first operationId "TaskWrite" savedJson |> success
+                let verified =
+                    Client.OrchestrationApi.PendingRecoveryApi.retry { authorization with ExpectedVerifiedHead = newHead } context |> success
+                let response = System.Text.Json.JsonSerializer.Serialize(verified)
+                Assert.That(response, Does.Contain("Applied"))
+                Assert.That(response, Does.Contain(remote.Value.RequestHash))
+                Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId |> success).IsSome,
+                            Is.True)
+                Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(newHead))
+            finally
+                if File.Exists configPath then File.Delete configPath)
+
+    [<Test>]
+    member _.OperatorRetryNeverResurrectsLegacyResumeOrStaleEntity() =
+        withFixture (fun one _ first _ _ _ _ _ ->
+            let before = (LedgerStore.fetch first |> success).Commit
+            let context = GitCommandTests.TestContext(Path.GetDirectoryName one)
+            let configPath = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
+            Client.OrchestrationApi.LedgerBindingConfig.bindExisting
+                "owner" context first.ProjectId first.LedgerId first.Epoch
+                first.RemoteName first.ApprovedFetchUrl first.ApprovedPushUrl before true
+            |> success |> ignore
+            try
+                let template (operationId: Guid) taskId action : Common.TaskWriteCommand =
+                    { ProjectName = "owner"; Action = action
+                      OperationId = operationId.ToString("D"); TaskId = taskId
+                      AttemptId = ""; ActorId = "Owner"; OwnerId = ""
+                      Title = taskId; Html = "<h1>Historical command</h1>"
+                      ExpectedVersion = 2; ExpectedAgentVersion = 5
+                      ExpectedTaskVersion = 0; AssignmentGeneration = 2
+                      Summary = ""; NextAction = ""; Reason = ""
+                      BaseOid = ""; TargetRef = ""; SourceRef = ""
+                      AllowDetached = false; AllowUncommitted = false
+                      DecisionSequence = 0L; Evidence = ""; SessionId = "historical-private-session-token" }
+                let legacyId = Guid.NewGuid()
+                let legacy = template legacyId "legacy-task" "ResumeAgent"
+                Client.OrchestrationApi.PendingIntentJournal.persist
+                    first legacyId "V2TaskWrite" (System.Text.Json.JsonSerializer.Serialize legacy)
+                |> success
+                let saved = Client.OrchestrationApi.PendingIntentJournal.findAtRoot one legacyId
+                            |> success |> Option.get
+                let authorization : Common.RetryPendingIntentCommand =
+                    { ProjectName = "owner"; OperationId = legacyId.ToString("D")
+                      OperatorId = "Jarvis Lead"; ExpectedCommandSha256 = saved.CommandSha256
+                      ExpectedVerifiedHead = before }
+                match Client.OrchestrationApi.PendingRecoveryApi.retry authorization context with
+                | Error(Client.ValidationError message) ->
+                    Assert.That(message, Does.Contain("ReplayRejectedStale"))
+                | other -> Assert.Fail(sprintf "Retired resume must never retry: %A" other)
+                Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one legacyId |> success).IsSome,
+                            Is.True)
+                Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(before))
+                let staleId = Guid.NewGuid()
+                let staleTaskId = "stale-recovery-task"
+                // Saved CreateTask is now obsolete because a different UUID
+                // already created the same task.
+                let staleCommand =
+                    { template staleId staleTaskId "CreateTask" with
+                        ExpectedVersion = 0; ExpectedAgentVersion = 0
+                        AssignmentGeneration = 0; SessionId = "" }
+                Client.OrchestrationApi.PendingIntentJournal.persist
+                    first staleId "TaskWrite" (System.Text.Json.JsonSerializer.Serialize staleCommand)
+                |> success
+                ReviewWorkflow.createTaskWithSpec first (Guid.NewGuid()) staleTaskId staleTaskId
+                    "<h1>Historical command</h1>" |> success |> ignore
+                let head = (LedgerStore.fetch first |> success).Commit
+                let pending = Client.OrchestrationApi.PendingIntentJournal.findAtRoot one staleId
+                              |> success |> Option.get
+                match Client.OrchestrationApi.PendingRecoveryApi.retry
+                    { authorization with OperationId = staleId.ToString("D")
+                                         ExpectedCommandSha256 = pending.CommandSha256
+                                         ExpectedVerifiedHead = head } context with
+                | Error _ -> ()
+                | other -> Assert.Fail(sprintf "Current writer must reject stale CreateTask: %A" other)
+                Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one staleId |> success).IsSome,
+                            Is.True)
+                Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(head))
+            finally
+                if File.Exists configPath then File.Delete configPath)
+
+    [<Test>]
+    member _.OperatorRetryRejectsRemoteIdentityMismatchWithoutMutation() =
+        withFixture (fun one _ first _ _ _ _ _ ->
+            let before = (LedgerStore.fetch first |> success).Commit
+            let context = GitCommandTests.TestContext(Path.GetDirectoryName one)
+            let configPath = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
+            Client.OrchestrationApi.LedgerBindingConfig.bindExisting
+                "owner" context first.ProjectId first.LedgerId first.Epoch
+                first.RemoteName first.ApprovedFetchUrl first.ApprovedPushUrl before true
+            |> success |> ignore
+            try
+                let operationId = Guid.NewGuid()
+                let command = System.Text.Json.JsonSerializer.Serialize(
+                    {| Action = "CreateTask"; TaskId = "not-actual-task"; Title = "Wrong task" |})
+                Client.OrchestrationApi.PendingIntentJournal.persist
+                    first operationId "TaskWrite" command |> success
+                ReviewWorkflow.createTaskWithSpec first operationId "actual-task"
+                    "Actual task" "<h1>Different actual operation</h1>" |> success |> ignore
+                let head = (LedgerStore.fetch first |> success).Commit
+                let saved = Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId
+                            |> success |> Option.get
+                let request : Common.RetryPendingIntentCommand =
+                    { ProjectName = "owner"; OperationId = operationId.ToString("D")
+                      OperatorId = "Jarvis Lead"; ExpectedCommandSha256 = saved.CommandSha256
+                      ExpectedVerifiedHead = head }
+                match Client.OrchestrationApi.PendingRecoveryApi.retry request context with
+                | Error(Client.ValidationError message) ->
+                    Assert.That(message, Does.Contain("IdentityMismatch"))
+                | other -> Assert.Fail(sprintf "Conflicting remote UUID must not replay: %A" other)
+                Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId |> success).IsSome,
+                            Is.True)
+                Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(head))
+            finally
+                if File.Exists configPath then File.Delete configPath)
+
+
+    [<Test>]
+    member _.PendingIntentLocksAreEnforcedAcrossProcesses() =
+        withFixture (fun one _ first _ _ _ _ _ ->
+            let operationId = Guid.NewGuid()
+            let bindingPath = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
+            let lockDirectory =
+                Path.Combine(Path.GetDirectoryName bindingPath, "pending",
+                             Path.GetFileNameWithoutExtension bindingPath, ".locks")
+            Directory.CreateDirectory(lockDirectory) |> ignore
+            let lockPath = Path.Combine(lockDirectory, operationId.ToString("N").Substring(0, 2) + ".lock")
+            let script = Path.Combine(Path.GetDirectoryName one, "hold-exclusive-lock.fsx")
+            let ready = Path.Combine(Path.GetDirectoryName one, "holder-ready")
+            File.WriteAllText(script,
+                String.concat "\n"
+                    [ "open System"; "open System.IO"
+                      "let lockPath = fsi.CommandLineArgs[1]"
+                      "let readyPath = fsi.CommandLineArgs[2]"
+                      "use held = new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None)"
+                      "File.WriteAllText(readyPath, \"held\")"
+                      "System.Threading.Thread.Sleep(2200)" ])
+            use holder = new Process()
+            holder.StartInfo.FileName <- "dotnet"
+            holder.StartInfo.UseShellExecute <- false
+            holder.StartInfo.RedirectStandardOutput <- true
+            holder.StartInfo.RedirectStandardError <- true
+            for arg in [ "fsi"; "--exec"; script; lockPath; ready ] do
+                holder.StartInfo.ArgumentList.Add(arg)
+            Assert.That(holder.Start(), Is.True)
+            try
+                let wait = Stopwatch.StartNew()
+                while not (File.Exists ready) && not holder.HasExited
+                      && wait.Elapsed < TimeSpan.FromSeconds(15.) do
+                    System.Threading.Thread.Sleep(25)
+                Assert.That(File.Exists ready, Is.True,
+                            "Independent .NET process must acquire the OS lock before pending write.")
+                let elapsed = Stopwatch.StartNew()
+                Client.OrchestrationApi.PendingIntentJournal.persist first operationId "TaskWrite"
+                    (System.Text.Json.JsonSerializer.Serialize(
+                        {| Action = "CreateTask"; TaskId = "cross-process"; Title = "Cross process" |}))
+                |> success
+                elapsed.Stop()
+                Assert.That(elapsed.Elapsed.TotalMilliseconds, Is.GreaterThan(800.0),
+                            "Pending write must wait for the other process to release its FileShare.None lock.")
+                Assert.That(holder.WaitForExit(10000), Is.True)
+                Assert.That(holder.ExitCode, Is.Zero)
+                Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId |> success).IsSome,
+                            Is.True)
+            finally
+                if not holder.HasExited then
+                    holder.Kill(true)
+                    holder.WaitForExit())
+
+    [<Test>]
+    member _.PendingLockNeverRetriesAnAmbiguousIOExceptionCallback() =
+        withFixture (fun one _ first _ _ _ _ _ ->
+            let operationId = Guid.NewGuid()
+            let mutable callbackCalls = 0
+            let before = (LedgerStore.fetch first |> success).Commit
+            let command = {| Action = "CreateTask"; TaskId = "IOException-after-write" |}
+            let outcome : Result<int, Client.EffectError> =
+                Client.OrchestrationApi.PendingIntentJournal.execute first operationId
+                    "TaskWrite" command (fun () ->
+                        callbackCalls <- callbackCalls + 1
+                        raise (IOException("Simulated uncertain outcome after a write attempt")))
+            match outcome with
+            | Error(Client.ValidationError _) -> ()
+            | other -> Assert.Fail(sprintf "Unexpected callback exception result: %A" other)
+            Assert.That(callbackCalls, Is.EqualTo(1),
+                        "An IOException during remote apply must not re-execute its callback.")
+            Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId |> success).IsSome,
+                        Is.True)
+            Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(before)))
+
     [<Test>]
     member _.LostResponseRecoversAcceptedRemoteOperationButNeverGuessesFailure() =
         withFixture (fun one _ first _ _ _ _ _ ->

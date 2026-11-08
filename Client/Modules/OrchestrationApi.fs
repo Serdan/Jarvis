@@ -1072,6 +1072,47 @@ module PendingIntentJournal =
                                                         | _ ->
                                                             Error(Client.ValidationError "Related operation is not a matching verified Applied receipt for the same task and lifecycle action."))))))))
 
+    // Read-only preflight for exact persisted-command retry. A successful
+    // receipt returns its canonical operation; absence stays uncertain.
+    // The caller subsequently re-enters the CURRENT typed Task/Review
+    // writer, whose CAS/version rules and per-intent lock remain decisive.
+    let prepareRetry (binding: LedgerStore.LedgerBinding) operationId
+                     expectedCommandHash expectedHead =
+        if String.IsNullOrWhiteSpace expectedHead
+           || String.IsNullOrWhiteSpace expectedCommandHash
+           || expectedCommandHash.Length <> 64 then
+            Error(Client.ValidationError "Exact command SHA256 and previously inspected verified ledger head required.")
+        else
+            findArchive binding operationId
+            |> Result.bind (function
+                | Some _ -> Error(Client.ValidationError "Intent was superseded: archived UUID may never be retried.")
+                | None ->
+                    findAtRoot binding.RepositoryPath operationId
+                    |> Result.bind (function
+                        | None -> Error(Client.ValidationError "No saved pending intent exists for retry.")
+                        | Some record ->
+                            if not (checkBinding binding record) then
+                                Error(Client.ValidationError "Saved pending intent belongs to a different ledger binding.")
+                            elif not (String.Equals(record.CommandSha256, expectedCommandHash,
+                                                   StringComparison.OrdinalIgnoreCase)) then
+                                Error(Client.ValidationError "Original saved command hash changed; inspect again.")
+                            else
+                                LedgerStore.LedgerStore.fetch binding
+                                |> Result.mapError LedgerErrors.toEffect
+                                |> Result.bind (fun snapshot ->
+                                    if snapshot.Commit <> expectedHead then
+                                        Error(Client.ValidationError "Verified ledger head changed; inspect and authorize against the new head.")
+                                    else
+                                        LedgerStore.LedgerStore.getOperationAt binding snapshot operationId
+                                        |> Result.mapError LedgerErrors.toEffect
+                                        |> Result.bind (function
+                                            | Some remote when identityMatches record remote ->
+                                                Ok (record, Some remote)
+                                            | Some _ ->
+                                                Error(Client.ValidationError "IdentityMismatch: verified UUID belongs to a different command.")
+                                            | None ->
+                                                Ok (record, None)))))
+
     let private archivedDisposition binding snapshot (knownIds: Set<string>)
                                     (archived: SupersededPendingIntent) =
         let original = archived.Original
@@ -1863,3 +1904,99 @@ module TaskApi =
 
     let write (cmd: TaskWriteCommand) rt =
         writeUsingContext None cmd rt
+
+// Operator-only recovery re-enters the current typed writers. Archived or
+// retired lifecycle commands cannot be made executable by choosing a new
+// session or constructing a new request with the original UUID.
+module PendingRecoveryApi =
+    let private requiredId label (value: string) =
+        match Guid.TryParse value with
+        | true, parsed when parsed <> Guid.Empty -> Ok parsed
+        | _ -> Error(Client.ValidationError $"Valid {label} UUID required.")
+
+    let private rehydrate<'a> (record: PendingIntent) =
+        try
+            let command = JsonSerializer.Deserialize<'a>(record.CommandJson)
+            if isNull (box command)
+               || not (String.Equals(JsonSerializer.Serialize(command), record.CommandJson, StringComparison.Ordinal)) then
+                Error(Client.ValidationError "Saved command does not roundtrip byte-for-byte through the CURRENT typed writer; do not retry.")
+            else Ok command
+        with ex ->
+            Error(Client.ValidationError $"Saved command cannot be safely decoded by the current protocol: {ex.Message}")
+
+    let retry (cmd: RetryPendingIntentCommand) rt =
+        if String.IsNullOrWhiteSpace cmd.OperatorId then
+            Error(Client.ValidationError "An operator identity is required for explicit retry.")
+        else
+            requiredId "pending operation" cmd.OperationId
+            |> Result.bind (fun operationId ->
+                LedgerBindingConfig.load cmd.ProjectName rt
+                |> Result.bind (fun binding ->
+                    PendingIntentJournal.prepareRetry binding operationId
+                        cmd.ExpectedCommandSha256 cmd.ExpectedVerifiedHead
+                    |> Result.bind (fun (stored, remote) ->
+                        match remote with
+                        | Some receipt ->
+                            // Do NOT auto-delete a saved intent; exact canonical
+                            // Applied proof is returned for explicit acknowledgment.
+                            Ok (box {| operationId = stored.OperationId
+                                       disposition = "Applied"
+                                       alreadyApplied = true
+                                       verifiedLedgerHead = cmd.ExpectedVerifiedHead
+                                       requestHash = receipt.RequestHash |})
+                        | None ->
+                            match PendingIntentJournal.normalizeCommandType stored.CommandType with
+                            | "TaskWrite" ->
+                                rehydrate<TaskWriteCommand> stored
+                                |> Result.bind (fun saved ->
+                                    if saved.ProjectName <> cmd.ProjectName
+                                       || not (match Guid.TryParse saved.OperationId with
+                                               | true, id -> id = operationId | _ -> false) then
+                                        Error(Client.ValidationError "Original project/operation identity changed during retry decode.")
+                                    elif not (List.contains saved.Action
+                                            [ "CreateTask"; "ReviseTaskSpec"; "CloseTask"; "ReopenTask";
+                                              "CancelOpenTask" ]) then
+                                        Error(Client.ValidationError
+                                            "ReplayRejectedStale: this saved TaskWrite action is not safe to retry through the current protocol; use inspected supersession.")
+                                    else
+                                        TaskApi.write saved rt)
+                            | "ReviewWrite" ->
+                                rehydrate<ReviewWriteCommand> stored
+                                |> Result.bind (fun saved ->
+                                    if saved.ProjectName <> cmd.ProjectName
+                                       || not (match Guid.TryParse saved.OperationId with
+                                               | true, id -> id = operationId | _ -> false) then
+                                        Error(Client.ValidationError "Original project/operation identity changed during retry decode.")
+                                    elif not (List.contains saved.Action
+                                            [ "PutDocument"; "Submit"; "Update"; "Claim"; "Decide";
+                                              "Release"; "Withdraw" ]) then
+                                        Error(Client.ValidationError
+                                            "ReplayRejectedStale: saved review action cannot be retried by this operator tool.")
+                                    else ReviewApi.write saved rt)
+                            | _ ->
+                                Error(Client.ValidationError "Saved ledger setup/lifecycle command is not on the operator retry allowlist."))))
+
+    let supersede (cmd: SupersedePendingIntentCommand) rt =
+        requiredId "pending operation" cmd.OperationId
+        |> Result.bind (fun operationId ->
+            requiredId "related applied operation" cmd.RelatedOperationId
+            |> Result.bind (fun relatedId ->
+                LedgerBindingConfig.load cmd.ProjectName rt
+                |> Result.bind (fun binding ->
+                    PendingIntentJournal.supersede binding operationId
+                        cmd.ExpectedCommandSha256 cmd.ExpectedVerifiedHead
+                        cmd.OperatorId cmd.Reason relatedId cmd.RelatedRequestHash
+                    |> Result.map (fun recorded ->
+                        // No historical session or original command JSON
+                        // in the write response; targeted read-only inspection
+                        // is the explicit mechanism to retrieve those.
+                        box {| operationId = recorded.operationId
+                               disposition = "Superseded"
+                               alreadySuperseded = recorded.alreadySuperseded
+                               verifiedLedgerHead = recorded.verifiedLedgerHead
+                               originalCommandSha256 = recorded.archive.Original.CommandSha256
+                               operatorId = recorded.archive.OperatorId
+                               reason = recorded.archive.Reason
+                               relatedOperationId = recorded.archive.RelatedOperationId
+                               relatedRequestHash = recorded.archive.RelatedRequestHash
+                               relatedOriginCommit = recorded.archive.RelatedOriginCommit |}))))

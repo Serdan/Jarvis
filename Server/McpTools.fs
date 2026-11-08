@@ -453,7 +453,9 @@ module McpToolHelpers =
         | RemoveWorktreeCommand _
         | TaskWriteCommand _
         | LedgerWriteCommand _
-        | ReviewWriteCommand _ -> Auth.GitWrite
+        | ReviewWriteCommand _
+        | RetryPendingIntentCommand _
+        | SupersedePendingIntentCommand _ -> Auth.GitWrite
 
     let private oauthErrorResult (context: HttpContext) errorCode description scope =
         let response = errorResult (PermissionDenied description)
@@ -1264,6 +1266,25 @@ type JarvisMcpTools =
                   RemoteName = ""; ApprovedFetchUrl = ""; ApprovedPushUrl = ""
                   ExpectedTrustedHead = ""; ExpectedRequestHash = expectedRequestHash
                   AcknowledgeVisibility = false })
+
+
+    [<McpServerTool(Title = "retry a saved pending intent", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("EXPLICIT OPERATOR RECOVERY: after targeted inspection, retry the exact stored pending Task/Review command under its original UUID and current ledger CAS/state guards. Requires original SHA256 and verified ledger head. Retired ResumeAgent and agent lifecycle writes are not retryable. No new session/UUID, no automatic retry, no archive cleanup.")>]
+    static member RetryPendingIntent(projectName: string, agentId: string, operationId: string, expectedCommandSha256: string, expectedVerifiedHead: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http
+            (RetryPendingIntentCommand
+                { ProjectName = projectName; OperationId = operationId
+                  OperatorId = agentId; ExpectedCommandSha256 = expectedCommandSha256
+                  ExpectedVerifiedHead = expectedVerifiedHead })
+
+    [<McpServerTool(Title = "supersede a saved pending intent", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("EXPLICIT OPERATOR RECOVERY: archive, never silently discard, a locally uncertain intent only with matching saved SHA256, a pinned verified head, an operator reason and a distinct matching Applied receipt for the same task. Archive is durable, prevents UUID reuse, and remains observable if an original push arrives later. Never pushes or mutates the canonical ledger.")>]
+    static member SupersedePendingIntent(projectName: string, agentId: string, operationId: string, expectedCommandSha256: string, expectedVerifiedHead: string, relatedOperationId: string, relatedRequestHash: string, reason: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http
+            (SupersedePendingIntentCommand
+                { ProjectName = projectName; OperationId = operationId
+                  OperatorId = agentId; ExpectedCommandSha256 = expectedCommandSha256
+                  ExpectedVerifiedHead = expectedVerifiedHead
+                  RelatedOperationId = relatedOperationId
+                  RelatedRequestHash = relatedRequestHash; Reason = reason })
 
     [<McpServerTool(Title = "initialize ledger", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Initialize a NEW orphan Git ledger and bind it locally only after explicit public/unknown visibility acknowledgment and Git write approval. Refuses existing ledger refs.")>]
     static member InitializeLedger(projectName: string, projectId: string, ledgerId: string, epoch: int, remoteName: string, approvedFetchUrl: string, approvedPushUrl: string, acknowledgeVisibility: bool, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =

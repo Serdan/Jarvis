@@ -120,7 +120,8 @@ let private activatesAgent (agentId: string) command =
               "SetAttemptSource"; "SubmitIntegration"; "CompleteIntegration" ]
     | TaskReadCommand cmd ->
         String.IsNullOrWhiteSpace cmd.AgentId || cmd.AgentId = agentId
-    | LedgerWriteCommand _ | ReviewWriteCommand _ -> false
+    | LedgerWriteCommand _ | ReviewWriteCommand _
+    | RetryPendingIntentCommand _ | SupersedePendingIntentCommand _ -> false
     | _ -> true
 
 let private activateReadyOnActivity (rt: Runtime) (agentId: string)
@@ -271,6 +272,13 @@ let private auditDetails command =
     | RemoveWorktreeCommand cmd -> Some("RemoveWorktree", Some cmd.ProjectName, [ VersionControlWrite; Destructive ], [], Some "git", [ cmd.WorktreePath ])
     | TaskWriteCommand cmd -> Some("Task" + cmd.Action, Some cmd.ProjectName, [ VersionControlWrite; NetworkAccess ], [], Some "git", [ cmd.TaskId; cmd.AttemptId; cmd.OperationId ])
     | LedgerWriteCommand cmd -> Some("Ledger" + cmd.Action, Some cmd.ProjectName, [ VersionControlWrite; NetworkAccess ], [], Some "git", [ cmd.RemoteName; cmd.ExpectedTrustedHead; cmd.OperationId ])
+    | RetryPendingIntentCommand cmd ->
+        Some("RetryPendingIntent", Some cmd.ProjectName, [ VersionControlWrite; NetworkAccess ],
+             [], Some "git", [ cmd.OperationId; cmd.ExpectedCommandSha256; cmd.ExpectedVerifiedHead ])
+    | SupersedePendingIntentCommand cmd ->
+        Some("SupersedePendingIntent", Some cmd.ProjectName,
+             [ WorkspaceWrite; VersionControlWrite; NetworkAccess ],
+             [], Some "git", [ cmd.OperationId; cmd.RelatedOperationId; cmd.Reason ])
     | ReviewWriteCommand cmd -> Some("Review" + cmd.Action, Some cmd.ProjectName, [ WorkspaceWrite; VersionControlWrite; NetworkAccess ], [], Some "git", [ cmd.TaskId; cmd.RequestId; cmd.OperationId ])
     | CreateProjectCommand cmd ->
         Some("CreateProject", None, [ WorkspaceWrite ] @ (if cmd.InitializeGit then [ VersionControlWrite ] else []) @ (if cmd.InitializeLedger then [ NetworkAccess ] else []),
@@ -397,6 +405,8 @@ let private dispatch (rt: Runtime) (target: ProjectPaths.ProjectTarget option)
     | LedgerWriteCommand cmd -> rt |> OrchestrationApi.LedgerApi.write cmd |> serialize'
     | ReviewReadCommand cmd -> rt |> OrchestrationApi.ReviewApi.read cmd |> serialize'
     | ReviewWriteCommand cmd -> rt |> OrchestrationApi.ReviewApi.write cmd |> serialize'
+    | RetryPendingIntentCommand cmd -> rt |> OrchestrationApi.PendingRecoveryApi.retry cmd |> serialize'
+    | SupersedePendingIntentCommand cmd -> rt |> OrchestrationApi.PendingRecoveryApi.supersede cmd |> serialize'
     | CreateProjectCommand cmd -> rt |> ProjectCreation.create cmd |> serialize'
     | ListProjectsCommand ->
         rt

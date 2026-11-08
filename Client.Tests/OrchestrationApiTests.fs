@@ -157,6 +157,37 @@ let ledgerTaskMutationsRequireGitWritePermission () =
     | other -> Assert.Fail(sprintf "Expected explicit Git-write confirmation: %A" other)
 
 
+
+[<Test>]
+let pendingRecoveryCommandsAreDistinctExplicitWriteActions () =
+    Client.PermissionPolicy.clearGrants()
+    let operationId = Guid.NewGuid().ToString("D")
+    let retry : AgentCommand =
+        RetryPendingIntentCommand
+            { ProjectName = "Project1"; OperationId = operationId
+              OperatorId = "Operator"; ExpectedCommandSha256 = String.replicate 64 "a"
+              ExpectedVerifiedHead = String.replicate 40 "b" }
+    let supersede : AgentCommand =
+        SupersedePendingIntentCommand
+            { ProjectName = "Project1"; OperationId = operationId
+              OperatorId = "Operator"; ExpectedCommandSha256 = String.replicate 64 "a"
+              ExpectedVerifiedHead = String.replicate 40 "b"
+              RelatedOperationId = Guid.NewGuid().ToString("D")
+              RelatedRequestHash = String.replicate 64 "c"
+              Reason = "Equivalent canonical operation has been verified." }
+    for command in [ retry; supersede ] do
+        match Client.PermissionPolicy.evaluate command with
+        | Error(Client.ConfirmationRequired approval) ->
+            Assert.That(approval.Permissions, Does.Contain(VersionControlWrite))
+            Assert.That(approval.Permissions, Does.Contain(NetworkAccess))
+        | other -> Assert.Fail(sprintf "Recovery must require explicit local approval: %A" other)
+        let json = System.Text.Json.JsonSerializer.Serialize(command)
+        let roundtrip = System.Text.Json.JsonSerializer.Deserialize<AgentCommand>(json)
+        Assert.That(roundtrip, Is.EqualTo(command))
+        Assert.That(AgentCommandInfo.projectName command, Is.EqualTo(Some "Project1"))
+    Assert.That(AgentCommandInfo.displayName retry, Is.EqualTo("RetryPendingIntent"))
+    Assert.That(AgentCommandInfo.displayName supersede, Is.EqualTo("SupersedePendingIntent"))
+
 [<Test>]
 let ledgerOperationStatusUsesReadOnlyTypedLedgerCommand () =
     Client.PermissionPolicy.clearGrants ()

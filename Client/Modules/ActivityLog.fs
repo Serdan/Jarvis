@@ -154,7 +154,9 @@ type Store(settings: Settings) =
         let diagnostic = $"Jarvis activity persistence: {issue} ({ex.GetType().Name}). Check storage permissions and disk space."
         if lastIssue <> Some diagnostic then
             lastIssue <- Some diagnostic
-            eprintfn "%s" diagnostic
+            // The diagnostic channel itself may be closed or unwritable.
+            // Logging a persistence failure must not abort agent execution.
+            try eprintfn "%s" diagnostic with _ -> ()
 
     let closeWriter () =
         try currentWriter |> Option.iter (fun writer -> writer.Dispose())
@@ -246,7 +248,12 @@ type Store(settings: Settings) =
                 let raw = reversed.ToArray()
                 Array.Reverse raw
                 try
-                    let line = UTF8Encoding(false, true).GetString raw
+                    let decoded = UTF8Encoding(false, true).GetString raw
+                    // StreamReader stripped the UTF-8 BOM in the old forward
+                    // reader. Preserve that behavior for existing log files.
+                    let line =
+                        if decoded.Length > 0 && decoded[0] = '\uFEFF' then decoded.Substring(1)
+                        else decoded
                     onLine line
                 with
                 | :? DecoderFallbackException
@@ -306,7 +313,10 @@ type Store(settings: Settings) =
                 secureFile seenPath
                 if not (File.Exists seenPath) then []
                 else
-                    use input = new FileStream(seenPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite)
+                    // Readers must not block another client's atomic rename
+                    // while it publishes a newer complete snapshot on Windows.
+                    use input = new FileStream(seenPath, FileMode.Open, FileAccess.Read,
+                                               FileShare.ReadWrite ||| FileShare.Delete)
                     use content = new MemoryStream()
                     let buffer = Array.zeroCreate<byte> 8192
                     let mutable doneReading = false
@@ -350,10 +360,12 @@ type Store(settings: Settings) =
                     report "agent-seen save failed" ex
                     raise (IOException("Unable to save the Jarvis agent-seen snapshot.", ex))
             finally
-                // The unique staging file is never followed, even on failure.
-                if FileInfo(temporary).LinkTarget <> null then
-                    raise (UnauthorizedAccessException "Activity snapshot staging was replaced with a symbolic link.")
-                if File.Exists temporary then File.Delete temporary)
+                // File.Delete unlinks a symlink itself, never its target.
+                // Cleanup must not mask the original persistence failure.
+                try
+                    if FileInfo(temporary).LinkTarget <> null || File.Exists temporary then
+                        File.Delete temporary
+                with ex -> report "agent-seen staging cleanup failed" ex)
 
     member _.LoadRecent(maxEntries: int) =
         lock syncRoot (fun () ->

@@ -438,3 +438,55 @@ let directory_replaced_with_symlink_after_store_creation_is_rejected_on_load () 
         finally
             if DirectoryInfo(path).LinkTarget <> null then Directory.Delete(path)
             Directory.Delete(root, true)
+
+
+[<Test>]
+let legacy_utf8_bom_and_crlf_activity_file_is_replayed () =
+    let path = tempDirectory()
+    try
+        let filename = todayLog path
+        let json = System.Text.Json.JsonSerializer.Serialize(snapshot "legacy-bom" "Completed")
+        File.WriteAllBytes(filename,
+            Array.concat [
+                System.Text.UTF8Encoding(true).GetPreamble()
+                System.Text.Encoding.UTF8.GetBytes(json + "\r\n")
+            ])
+        use store = new Store(settings path (1024L * 1024L))
+        let entries = store.LoadRecent(20)
+        Assert.That(entries |> List.map _.ActivityId, Is.EqualTo(box [ "legacy-bom" ]))
+        Assert.That(entries.Head.Status, Is.EqualTo("Completed"))
+    finally Directory.Delete(path, true)
+
+[<Test>]
+let reverse_reader_handles_multibyte_text_across_block_boundaries () =
+    let path = tempDirectory()
+    try
+        let detail = String('ø', 10_000) + " 🐈"
+        let record = { snapshot "unicode-block" "Completed" with Detail = detail }
+        File.WriteAllText(todayLog path,
+            System.Text.Json.JsonSerializer.Serialize(record) + "\n",
+            System.Text.UTF8Encoding(false))
+        use store = new Store(settings path (1024L * 1024L))
+        let entries = store.LoadRecent(1)
+        Assert.That(entries.Length, Is.EqualTo(1))
+        Assert.That(entries.Head.Detail, Is.EqualTo(detail))
+    finally Directory.Delete(path, true)
+
+
+[<Test>]
+let recent_selection_includes_newly_finished_long_running_activity () =
+    let path = tempDirectory()
+    try
+        let started = DateTimeOffset.UtcNow.AddHours(-2.)
+        use store = new Store(settings path 1L)
+        store.Append({ snapshot "long-running" "Running" with StartedAt = started })
+        store.Append({ snapshot "middle" "Completed" with StartedAt = started.AddMinutes(30.) })
+        store.Append({ snapshot "new" "Completed" with StartedAt = started.AddMinutes(60.) })
+        store.Append({ snapshot "long-running" "Completed" with StartedAt = started; Result = "finished now" })
+        let entries = store.LoadRecent(2)
+        // Recently completed work remains visible after restart, even if
+        // another activity started more recently. Visible rows remain in
+        // original start-time order rather than completion order.
+        Assert.That(entries |> List.map _.ActivityId, Is.EqualTo(box [ "long-running"; "new" ]))
+        Assert.That(entries.Head.Result, Is.EqualTo("finished now"))
+    finally Directory.Delete(path, true)

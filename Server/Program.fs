@@ -247,6 +247,11 @@ configureServices builder.Services builder.Configuration
 
 let app = builder.Build()
 
+// Resolve the persistent SQLite dependency before accepting readiness traffic.
+// Without this, the public discovery and auth routes can appear healthy while
+// the feedback/operation store cannot even initialize.
+app.Services.GetRequiredService<FeedbackStore>() |> ignore
+
 if app.Environment.IsDevelopment() then
     app.UseDeveloperExceptionPage() |> ignore
 else

@@ -1,0 +1,16 @@
+<h1>Read-only cross-agent observation</h1>
+<p><strong>Feedback:</strong> bb82fc5d8c184a2daedf8d5759a3dc15; 7fb0f3d49e484dbf89b2b8ad2b139bfb.</p>
+<h2>Problem</h2><p><code>agent_inbox</code> is described as a read but the supplied <code>agentId</code> is treated as the actor. Lead observing another agent accidentally starts Ready assignments and falsifies Working / last-seen signals. This is an API authority and semantics boundary, not a cosmetic dashboard bug.</p>
+<h2>Required behavior</h2><ul>
+<li>Expose an explicitly observational operation (prefer <code>observe_agent</code> or equivalent) that has distinct acting <code>agentId</code> and <code>targetAgentId</code>; do not perform target-attributed activity as a side effect of observation. Preserve self-<code>agent_inbox</code> activation behavior.</li>
+<li>Return target assignment, attempt phase, execution/disposition, last-seen provenance, notification/review counts, pending blockers and relevant administrative metadata as available, with explicit unknown/unavailable markers. Distinguish canonical ledger state from transient activity observations.</li>
+<li>Enforce same-project authorized operator/agent access as appropriate; never accept target identity as proof of actor authority. Observation must not mutate target version, state sequence, active session, assigned slot, checkpoint, or notifications.</li>
+<li>Make <code>agent_inbox</code> documentation prominent about Ready-to-Working activation, indicate the observation tool, and show any activation before/after state clearly. Maintain API/schema and client/provider compatibility.</li>
+<li>Coordinate with global operator Agents dashboard task <code>task-6c6d71c8d3ef408eb30886ded9522af3</code>, sharing a canonical read model where possible without creating duplicate lifecycle authority.</li>
+</ul>
+<h2>Acceptance</h2><ol>
+<li>Lead observes eight Ready agents: all retain exact state/version/sequence and no synthetic last seen. Repeating from separate sessions is idempotent and read-only.</li>
+<li>Self-inbox still starts a genuinely Ready assignment once; second read cannot restart Working clock.</li>
+<li>Cross-project/missing/unauthorized targets fail explicitly and without target mutation; stale/cached observation is labeled, never presented as authoritative current state.</li>
+<li>Unit and integration tests cover observer-vs-actor identity, concurrent actual activity, and command documentation; Release suites pass.</li>
+</ol><p>Do not deploy without explicit operator authorization.</p>

@@ -84,12 +84,56 @@ let unauthenticated_mcp_requests_get_http_oauth_challenge_but_resource_metadata_
             Assert.That(challenge, Does.Contain("Bearer"))
             Assert.That(challenge, Does.Contain("resource_metadata=\"https://jarvis2.kehlet.dev/.well-known/oauth-protected-resource\""))
             Assert.That(challenge, Does.Not.Contain("scope=\"client:connect\""))
+        // Verify the updater's SignalR readiness contract against the real router.
+        use negotiate = new HttpRequestMessage(HttpMethod.Post, endpoint + "/client/negotiate?negotiateVersion=1")
+        use negotiateResponse = http.SendAsync(negotiate).GetAwaiter().GetResult()
+        Assert.That(negotiateResponse.StatusCode, Is.EqualTo(HttpStatusCode.Unauthorized))
+        let negotiateChallenge =
+            negotiateResponse.Headers.WwwAuthenticate
+            |> Seq.map string
+            |> String.concat ","
+        Assert.That(negotiateChallenge, Does.Contain("Bearer"))
+        Assert.That(negotiateChallenge, Does.Contain("client:connect"))
     finally
         if not server.HasExited then
             server.Kill(true)
             server.WaitForExit(3000) |> ignore
         try Directory.Delete(tempDirectory, true) with _ -> ()
 
+
+[<Test>]
+let server_does_not_serve_readiness_routes_when_feedback_database_cannot_initialize () =
+    let configuration = DirectoryInfo(AppContext.BaseDirectory).Parent.Name
+    let serverDll =
+        Path.Combine(repositoryRoot (), "Server", "bin", configuration, "net10.0", "JarvisServer.dll")
+    Assert.That(File.Exists(serverDll), Is.True)
+    let tempDirectory = Path.Combine(Path.GetTempPath(), "jarvis-server-readiness-" + Guid.NewGuid().ToString("N"))
+    Directory.CreateDirectory(tempDirectory) |> ignore
+    // Passing a directory as the database filename must fail SQLite startup.
+    let invalidDatabasePath = Path.Combine(tempDirectory, "is-a-directory")
+    Directory.CreateDirectory(invalidDatabasePath) |> ignore
+    let start = ProcessStartInfo("dotnet")
+    start.ArgumentList.Add(serverDll)
+    start.UseShellExecute <- false
+    start.CreateNoWindow <- true
+    start.RedirectStandardError <- true
+    start.Environment["ASPNETCORE_URLS"] <- $"http://127.0.0.1:{unusedLoopbackPort ()}"
+    start.Environment["ASPNETCORE_ENVIRONMENT"] <- "Development"
+    start.Environment["JarvisAuth0Domain"] <- "dev-kn4j3jz3qv2cvw05.eu.auth0.com"
+    start.Environment["JarvisAudience"] <- "https://jarvis2.kehlet.dev"
+    start.Environment["JarvisDatabasePath"] <- invalidDatabasePath
+    use server = Process.Start(start)
+    try
+        let exited = server.WaitForExit(10000)
+        Assert.That(exited, Is.True, "Server must not begin accepting traffic with an unusable database.")
+        Assert.That(server.ExitCode, Is.Not.EqualTo(0))
+        let diagnostic = server.StandardError.ReadToEnd()
+        Assert.That(diagnostic, Does.Contain("SQLite"))
+    finally
+        if not server.HasExited then
+            server.Kill(true)
+            server.WaitForExit(3000) |> ignore
+        try Directory.Delete(tempDirectory, true) with _ -> ()
 
 [<Test>]
 let write_tools_expose_optional_operation_ids () =

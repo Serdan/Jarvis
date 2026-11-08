@@ -1,1 +1,1 @@
-{"schemaVersion":2,"taskId":"task-0eebda7cc2f642a2ad2a707800d75684","title":"[P2] Constrain HTTPS import origins and redirects with explicit trust policy (JRV-2026-11-03)","version":1,"lifecycle":"Open","specVersion":1,"attemptId":null}
+{"schemaVersion":2,"taskId":"task-0eebda7cc2f642a2ad2a707800d75684","title":"[P2] Constrain HTTPS import origins and redirects with explicit trust policy (JRV-2026-11-03)","version":2,"lifecycle":"Closed","specVersion":1,"attemptId":null}

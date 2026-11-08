@@ -355,6 +355,21 @@ type SupersededPendingIntent =
       VerifiedLedgerHead: string
       RecordedUtc: string }
 
+[<RequireQualifiedAccess>]
+type PendingDisposition =
+    | Applied
+    | IdentityMismatch
+    | NotFoundAtVerifiedHead
+    | BindingMismatch
+    | MalformedLocalRecord
+    | MalformedCommand
+    | Superseded
+    | AppliedAfterSupersession
+    | IdentityMismatchAfterSupersession
+    | ArchiveBindingMismatch
+    | ArchivedMalformed
+    | ReplayRejectedStale
+
 type PendingIntentCount =
     { Name: string
       Count: int }
@@ -881,19 +896,19 @@ module PendingIntentJournal =
     // Remote absence remains uncertain. A matching operation receipt is
     // authoritative only if the exact action and required identities match.
     let private classifyAt binding snapshot (knownIds: Set<string>) (record: PendingIntent) =
-        if not (checkBinding binding record) then Ok "BindingMismatch"
+        if not (checkBinding binding record) then Ok PendingDisposition.BindingMismatch
         else
             match Guid.TryParse record.OperationId with
             | false, _ -> Error(Client.ValidationError "Invalid pending operation UUID.")
             | true, id when not (knownIds.Contains(id.ToString("N"))) ->
-                Ok "NotFoundAtVerifiedHead"
+                Ok PendingDisposition.NotFoundAtVerifiedHead
             | true, id ->
                 LedgerStore.LedgerStore.getOperationAt binding snapshot id
                 |> Result.mapError LedgerErrors.toEffect
                 |> Result.map (function
-                    | Some op when identityMatches record op -> "Applied"
-                    | Some _ -> "IdentityMismatch"
-                    | None -> "NotFoundAtVerifiedHead")
+                    | Some op when identityMatches record op -> PendingDisposition.Applied
+                    | Some _ -> PendingDisposition.IdentityMismatch
+                    | None -> PendingDisposition.NotFoundAtVerifiedHead)
 
     // Parse only the bounded metadata needed for triage; old SessionId values
     // remain in the exact command JSON, exposed only via targeted inspection.
@@ -955,6 +970,12 @@ module PendingIntentJournal =
                            && String.Equals(taskId, remoteField "taskId", StringComparison.Ordinal)
             let sameActor = not (String.IsNullOrWhiteSpace actor)
                             && String.Equals(actor, related.Actor, StringComparison.Ordinal)
+                            && String.Equals(actor, remoteField "ownerId", StringComparison.Ordinal)
+            let sameAssignmentGeneration =
+                match Int32.TryParse(ownField "AssignmentGeneration"),
+                      Int32.TryParse(remoteField "generation") with
+                | (true, original), (true, successor) -> original > 0 && original = successor
+                | _ -> false
             let equivalentCreate =
                 normalizeCommandType original.CommandType = "TaskWrite"
                 && action = "CreateTask" && related.Type = "CreateTask"
@@ -963,7 +984,7 @@ module PendingIntentJournal =
                                  StringComparison.OrdinalIgnoreCase)
             let supersededLifecycle =
                 normalizeCommandType original.CommandType = "TaskWrite"
-                && action = "ResumeAgent" && sameActor
+                && action = "ResumeAgent" && sameActor && sameAssignmentGeneration
                 && List.contains related.Type
                     [ "BeginAttempt"; "CheckpointAttempt"; "YieldAgent"; "CompleteAgentWork" ]
             sameTask && (equivalentCreate || supersededLifecycle)
@@ -1116,19 +1137,19 @@ module PendingIntentJournal =
     let private archivedDisposition binding snapshot (knownIds: Set<string>)
                                     (archived: SupersededPendingIntent) =
         let original = archived.Original
-        if not (checkBinding binding original) then Ok "ArchiveBindingMismatch"
+        if not (checkBinding binding original) then Ok PendingDisposition.ArchiveBindingMismatch
         else
             match Guid.TryParse original.OperationId with
-            | false, _ -> Ok "ArchivedMalformed"
+            | false, _ -> Ok PendingDisposition.ArchivedMalformed
             | true, id when not (knownIds.Contains(id.ToString("N"))) ->
-                Ok "Superseded"
+                Ok PendingDisposition.Superseded
             | true, id ->
                 LedgerStore.LedgerStore.getOperationAt binding snapshot id
                 |> Result.mapError LedgerErrors.toEffect
                 |> Result.map (function
-                    | Some op when identityMatches original op -> "AppliedAfterSupersession"
-                    | Some _ -> "IdentityMismatchAfterSupersession"
-                    | None -> "Superseded")
+                    | Some op when identityMatches original op -> PendingDisposition.AppliedAfterSupersession
+                    | Some _ -> PendingDisposition.IdentityMismatchAfterSupersession
+                    | None -> PendingDisposition.Superseded)
 
     // One verified Git tree index and remote operation reads only for UUIDs
     // present at that head. Streaming local scan retains aggregates, not the
@@ -1154,20 +1175,20 @@ module PendingIntentJournal =
                                 match readCheckedFile path with
                                 | Error _ ->
                                     malformed <- malformed + 1
-                                    increment dispositions "MalformedLocalRecord"
+                                    increment dispositions (string PendingDisposition.MalformedLocalRecord)
                                     Ok ()
                                 | Ok record ->
                                     let disposition =
                                         match metadata record with
                                         | None ->
                                             malformed <- malformed + 1
-                                            Ok "MalformedCommand"
+                                            Ok PendingDisposition.MalformedCommand
                                         | Some (action, actor, _) ->
                                             increment actions action
                                             increment actors actor
                                             classifyAt binding snapshot knownIds record
                                     disposition |> Result.map (fun status ->
-                                        increment dispositions status
+                                        increment dispositions (string status)
                                         increment ages (ageBucket record.CreatedUtc now))))
                             (Ok ())
                     scan
@@ -1183,15 +1204,15 @@ module PendingIntentJournal =
                                         match readArchiveFile path with
                                         | Error _ ->
                                             archivedMalformed <- archivedMalformed + 1
-                                            increment dispositions "ArchivedMalformed"
+                                            increment dispositions (string PendingDisposition.ArchivedMalformed)
                                             Ok ()
                                         | Ok archived ->
                                             archivedDisposition binding snapshot knownIds archived
                                             |> Result.map (fun status ->
-                                                increment dispositions status
-                                                if status = "AppliedAfterSupersession" then
+                                                increment dispositions (string status)
+                                                if status = PendingDisposition.AppliedAfterSupersession then
                                                     lateApplied <- lateApplied + 1
-                                                elif status = "IdentityMismatchAfterSupersession" then
+                                                elif status = PendingDisposition.IdentityMismatchAfterSupersession then
                                                     archivedConflict <- archivedConflict + 1)))
                                     (Ok ())
                             archiveScan |> Result.map (fun () ->
@@ -1227,7 +1248,7 @@ module PendingIntentJournal =
                                 { OperationId = operationId.ToString("D")
                                   PresentLocally = stored.IsSome
                                   VerifiedLedgerHead = snapshot.Commit
-                                  Disposition = Some status
+                                  Disposition = Some(string status)
                                   Record = Some audit.Original
                                   Archive = Some audit })
                         | None, None ->
@@ -1238,7 +1259,7 @@ module PendingIntentJournal =
                             classifyAt binding snapshot knownIds record
                             |> Result.map (fun disposition ->
                                 { OperationId = record.OperationId; PresentLocally = true
-                                  VerifiedLedgerHead = snapshot.Commit; Disposition = Some disposition
+                                  VerifiedLedgerHead = snapshot.Commit; Disposition = Some(string disposition)
                                   Record = Some record; Archive = None })))))
 
     let page (binding: LedgerStore.LedgerBinding) cursor pageSize =
@@ -1257,7 +1278,7 @@ module PendingIntentJournal =
                                 Ok ({ LocalFileKey = fileKey; OperationId = ""
                                       Action = "(quarantined)"; Actor = "(unknown)"
                                       TaskId = None; CreatedUtc = ""; CommandSha256 = ""
-                                      Disposition = "MalformedLocalRecord" } :: items)
+                                      Disposition = string PendingDisposition.MalformedLocalRecord } :: items)
                             | Ok record ->
                                 classifyAt binding snapshot knownIds record
                                 |> Result.map (fun status ->
@@ -1269,8 +1290,8 @@ module PendingIntentJournal =
                                       CreatedUtc = record.CreatedUtc
                                       CommandSha256 = record.CommandSha256
                                       Disposition =
-                                        if metadata record |> Option.isNone then "MalformedCommand"
-                                        else status } :: items)))
+                                        if metadata record |> Option.isNone then string PendingDisposition.MalformedCommand
+                                        else string status } :: items)))
                         (Ok [])
                     |> Result.map (fun reversed ->
                         { VerifiedLedgerHead = snapshot.Commit

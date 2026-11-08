@@ -2916,6 +2916,57 @@ type ReviewWorkflowTests() =
             Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(head)))
 
 
+
+    [<Test>]
+    member _.LegacyResumeSupersessionRequiresExactOwnerAndAssignmentGeneration() =
+        withFixture (fun one _ first _ _ _ _ _ ->
+            let taskId = "legacy-generation-proof"
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId taskId |> success |> ignore
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner"
+            |> success |> ignore
+            let oldResume actionId generation actor =
+                let original =
+                    System.Text.Json.JsonSerializer.Serialize(
+                        {| Action = "ResumeAgent"; TaskId = taskId
+                           ActorId = actor; AssignmentGeneration = generation
+                           ExpectedVersion = 1; ExpectedAgentVersion = 0
+                           SessionId = "old-protocol-private-session" |})
+                Client.OrchestrationApi.PendingIntentJournal.persist first actionId "V2TaskWrite" original
+                |> success
+                Client.OrchestrationApi.PendingIntentJournal.findAtRoot one actionId
+                |> success |> Option.get
+            let originalId = Guid.NewGuid()
+            let original = oldResume originalId 1 "Owner"
+            let wrongGenerationId = Guid.NewGuid()
+            let wrongGeneration = oldResume wrongGenerationId 2 "Owner"
+            let unknownGenerationId = Guid.NewGuid()
+            let unknownGeneration = oldResume unknownGenerationId 0 "Owner"
+            let wrongActorId = Guid.NewGuid()
+            let wrongActor = oldResume wrongActorId 1 "Reviewer"
+            let relatedId = Guid.NewGuid()
+            let begun = ReviewWorkflow.beginAttempt first relatedId taskId "Owner" 1 1 |> success
+            let head = (LedgerStore.fetch first |> success).Commit
+            let reason = "Legacy session resume is superseded by the exact accepted BeginAttempt for this assignment."
+            let trySupersede (id: Guid) (stored: Client.OrchestrationApi.PendingIntent) =
+                Client.OrchestrationApi.PendingIntentJournal.supersede first id
+                    stored.CommandSha256 head "Jarvis Lead" reason
+                    relatedId begun.Operation.RequestHash
+            for id, saved in [ wrongGenerationId, wrongGeneration
+                               unknownGenerationId, unknownGeneration
+                               wrongActorId, wrongActor ] do
+                match trySupersede id saved with
+                | Error(Client.ValidationError _) -> ()
+                | other -> Assert.Fail(sprintf "Unrelated generation/actor cannot retire old resume: %A" other)
+                Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one id |> success).IsSome,
+                            Is.True)
+            let archived = trySupersede originalId original |> success
+            Assert.That(archived.alreadySuperseded, Is.False)
+            Assert.That(archived.archive.RelatedOperationKind, Is.EqualTo("BeginAttempt"))
+            Assert.That(archived.archive.Original.CommandJson, Does.Contain("old-protocol-private-session"))
+            let inspected = Client.OrchestrationApi.PendingIntentJournal.inspect first originalId |> success
+            Assert.That(inspected.Disposition, Is.EqualTo(Some "Superseded"))
+            Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(head)))
+
     [<Test>]
     member _.OperatorRetryUsesExactSavedTaskCommandAndCurrentLedgerWriter() =
         withFixture (fun one _ first _ _ _ _ _ ->

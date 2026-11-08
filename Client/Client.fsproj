@@ -63,6 +63,7 @@
         <Compile Include="Modules\ClientShell.fs"/>
         <Compile Include="Modules\JobManager.fs"/>
         <Compile Include="Modules\\Worktrees.fs"/>
+        <Compile Include="Modules\BoundedFifoCache.fs"/>
         <Compile Include="Modules\\LedgerStore.fs"/>
         <Compile Include="Modules\\ReviewWorkflow.fs"/>
         <Compile Include="Modules\\OrchestrationApi.fs"/>

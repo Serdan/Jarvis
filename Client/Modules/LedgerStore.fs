@@ -1007,9 +1007,17 @@ module LedgerStore =
                 |> Array.toList)
 
 
-    // Dashboard records are immutable Git blobs. Reuse their verified content
-    // across refreshes; only changed OIDs need to be read from Git.
-    let private dashboardBlobCache = ConcurrentDictionary<string, string>(StringComparer.Ordinal)
+    // Git blob content is immutable, but historical OIDs accumulate forever.
+    // Keep a bounded FIFO of recent verified blobs, never a process-global
+    // unbounded copy of every notification or task version ever visited.
+    let private dashboardBlobCache = BoundedFifoCache<string>(16384, 32L * 1024L * 1024L)
+
+    // Two UTF-16 strings (OID and JSON), plus a conservative object allowance.
+    // Both the entry count and byte budget are enforced on every insertion.
+    let private estimatedBlobBytes (oid: string) (content: string) =
+        2L * int64 (oid.Length + content.Length) + 128L
+
+    let internal dashboardBlobCacheStats () = dashboardBlobCache.Counts
 
     let private dashboardRecordPath includeIntegrations (path: string) =
         (path.StartsWith("agents/", StringComparison.Ordinal)
@@ -1048,11 +1056,19 @@ module LedgerStore =
                                 malformedRecordPath <- Some path
                                 None
                         else None)
-            let missing =
+            // Hold the current snapshot's resolved strings locally: another
+            // project can evict global cache entries while this view is built.
+            let cached = System.Collections.Generic.Dictionary<string, string>(StringComparer.Ordinal)
+            let distinctOids =
                 records
                 |> Array.map snd
                 |> Array.distinct
-                |> Array.filter (fun oid -> not (dashboardBlobCache.ContainsKey oid))
+            for oid in distinctOids do
+                match dashboardBlobCache.TryGet oid with
+                | ValueSome content -> cached.Add(oid, content)
+                | ValueNone -> ()
+            let missing = distinctOids |> Array.filter (fun oid -> not (cached.ContainsKey oid))
+            let fetched = System.Collections.Generic.Dictionary<string, string>(StringComparer.Ordinal)
             let load () =
                 match malformedRecordPath with
                 | Some path -> Error(LedgerIntegrityError $"Unexpected ledger object type: {path}.")
@@ -1074,7 +1090,6 @@ module LedgerStore =
                                 let line = encoding.GetString(bytes, offset, endAt - offset)
                                 offset <- endAt + 1
                                 line
-                            let fetched = ResizeArray<string * string>()
                             for expected in missing do
                                 let header = (readLine()).Split(' ')
                                 if header.Length <> 3 || header[0] <> expected || header[1] <> "blob" then
@@ -1090,26 +1105,36 @@ module LedgerStore =
                                 offset <- offset + 1
                                 fetched.Add(expected, content)
                             if offset <> bytes.Length then failwith "Unexpected trailing Git batch bytes."
-                            for (oid, content) in fetched do
-                                dashboardBlobCache.TryAdd(oid, content) |> ignore
+                            for KeyValue(oid, content) in fetched do
+                                dashboardBlobCache.Add(oid, content, estimatedBlobBytes oid content)
                             Ok ()
                         with ex -> Error(LedgerIntegrityError("Invalid Git dashboard batch: " + ex.Message))
             match load () with
             | Error error -> Error error
             | Ok () ->
+                let content oid =
+                    match cached.TryGetValue oid with
+                    | true, value -> value
+                    | false, _ -> fetched[oid]
                 records
-                |> Array.map (fun (path, oid) -> path, dashboardBlobCache[oid])
+                |> Array.map (fun (path, oid) -> path, struct (oid, content oid))
                 |> Map.ofArray
                 |> Ok
 
     // These are derived read models only. Both entrypoints require a freshly
     // fetched/verified snapshot and only read blobs reachable from its OID.
     // The OID-keyed immutable blob cache never decides which paths exist.
-    let readDashboardRecordsAt binding snapshot =
+    let internal readDashboardRecordsWithOidsAt binding snapshot =
         readViewRecordsAt false binding snapshot
 
+    let private stripOids records =
+        records |> Map.map (fun _ (struct (_, content)) -> content)
+
+    let readDashboardRecordsAt binding snapshot =
+        readViewRecordsAt false binding snapshot |> Result.map stripOids
+
     let readAgentInboxRecordsAt binding snapshot =
-        readViewRecordsAt true binding snapshot
+        readViewRecordsAt true binding snapshot |> Result.map stripOids
 
     let verifySourceCommit (binding: LedgerBinding) (sourceRef: string) (commit: string) =
         if not (sourceRef.StartsWith("refs/heads/", StringComparison.Ordinal))

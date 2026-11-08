@@ -1,1 +1,1 @@
-{"schemaVersion":2,"taskId":"task-a957f947c5304efea52ce2988ee02bac","title":"[P2] Make AgentInbox scale with actionable state rather than total history (JRV-2026-11-05)","version":1,"lifecycle":"Open","specVersion":1,"attemptId":null}
+{"schemaVersion":2,"taskId":"task-a957f947c5304efea52ce2988ee02bac","title":"[P2] Make AgentInbox scale with actionable state rather than total history (JRV-2026-11-05)","version":2,"lifecycle":"Closed","specVersion":1,"attemptId":null}

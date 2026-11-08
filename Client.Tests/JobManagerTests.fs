@@ -205,16 +205,19 @@ printfn "%s" (Environment.GetEnvironmentVariable("JARVIS_TEST_JOB_SECRET_TOKEN")
             | Ok result -> result.JobId
             | Error error -> failwith $"Expected StartJob Ok, got {error}"
 
-        let rec waitForCompletion remaining =
+        // dotnet fsi startup varies across hosts; use the same measured deadline
+        // as the neighboring cross-stream job test, not five seconds of polling.
+        let deadline = Stopwatch.StartNew()
+        let rec waitForCompletion () =
             match getJobResult { ProjectName = "Project1"; JobId = jobId; AfterSequence = Some 0L } context with
             | Error error -> failwith $"Expected GetJobResult Ok, got {error}"
             | Ok result when result.Status <> Running -> result
-            | Ok _ when remaining <= 0 -> failwith "Job did not complete in time."
+            | Ok _ when deadline.Elapsed >= TimeSpan.FromSeconds 20.0 -> failwith "Job did not complete in 20 seconds."
             | Ok _ ->
                 Thread.Sleep 50
-                waitForCompletion (remaining - 1)
+                waitForCompletion ()
 
-        let result = waitForCompletion 100
+        let result = waitForCompletion ()
         let output = result.Events |> List.map (fun event -> event.Text) |> String.concat ""
 
         output.Contains("missing") |> shouldEqual true

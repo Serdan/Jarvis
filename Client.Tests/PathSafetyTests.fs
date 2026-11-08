@@ -128,8 +128,8 @@ let ``searchText reports multiple matches with line and column from real files``
                     Column = 19
                     Preview = "prefix needle and NEEDLE" } ]
 
-            if matches <> expected then
-                Assert.Fail($"Expected {expected}, got {matches}")
+            if matches.Matches <> expected then
+                Assert.Fail($"Expected {expected}, got {matches.Matches}")
     finally
         Directory.Delete(root, true)
 

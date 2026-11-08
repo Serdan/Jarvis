@@ -18,33 +18,53 @@ type Cursor =
     { PathDigest: string
       TotalBytes: int64
       WriteTicks: int64
+      CreationTicks: int64
       Offset: int64
       Line: int64
       PreviousCarriageReturn: bool }
 
 let private pathDigest (path: string) =
     let canonical = Path.GetFullPath path
-    let normalized =
-        if OperatingSystem.IsWindows() || OperatingSystem.IsMacOS() then canonical.ToUpperInvariant()
-        else canonical
-    SHA256.HashData(Encoding.UTF8.GetBytes normalized)
+    // Do not case-fold: case-sensitive worktrees are possible on both
+    // macOS APFS and Windows directory trees. Rejecting an alias is safer
+    // than accepting a cursor for a distinct, case-sensitive file.
+    SHA256.HashData(Encoding.UTF8.GetBytes canonical)
     |> Convert.ToHexString
 
+// A cursor contains a line number as well as an offset. Without integrity
+// it could be edited to skip bytes and report fabricated line positions.
+let private cursorKey = lazy (RandomNumberGenerator.GetBytes 32)
+
+let private encodeUrlBytes (bytes: byte[]) =
+    Convert.ToBase64String(bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+
+let private decodeUrlBytes (value: string) =
+    let normalized = value.Replace('-', '+').Replace('_', '/')
+    Convert.FromBase64String(normalized.PadRight((normalized.Length + 3) / 4 * 4, '='))
+
 let private encodeCursor cursor =
-    let text = JsonSerializer.Serialize(cursor)
-    Convert.ToBase64String(Encoding.UTF8.GetBytes(text))
-        .TrimEnd('=').Replace('+', '-').Replace('/', '_')
+    let body = JsonSerializer.SerializeToUtf8Bytes(cursor)
+    let mac = HMACSHA256.HashData(cursorKey.Value, body)
+    encodeUrlBytes body + "." + encodeUrlBytes mac
 
 let private decodeCursor (token: string) =
     try
         if String.IsNullOrWhiteSpace token || token.Length > 1024 then
             Error(ValidationError "Invalid read-page cursor.")
         else
-            let data = token.Replace('-', '+').Replace('_', '/')
-            let padded = data.PadRight((data.Length + 3) / 4 * 4, '=')
-            let result = JsonSerializer.Deserialize<Cursor>(Encoding.UTF8.GetString(Convert.FromBase64String padded))
-            if isNull (box result) then Error(ValidationError "Invalid read-page cursor.")
-            else Ok result
+            match token.Split('.') with
+            | [| encoded; signature |] ->
+                let body = decodeUrlBytes encoded
+                let supplied = decodeUrlBytes signature
+                let expected = HMACSHA256.HashData(cursorKey.Value, body)
+                if supplied.Length <> expected.Length ||
+                   not (CryptographicOperations.FixedTimeEquals(supplied, expected)) then
+                    Error(ValidationError "Invalid read-page cursor.")
+                else
+                    let result = JsonSerializer.Deserialize<Cursor>(body)
+                    if isNull (box result) then Error(ValidationError "Invalid read-page cursor.")
+                    else Ok result
+            | _ -> Error(ValidationError "Invalid read-page cursor.")
     with _ -> Error(ValidationError "Invalid read-page cursor.")
 
 let private decodePage (buffer: byte[]) count : Result<string * int> =
@@ -85,12 +105,14 @@ let readFilePage (FilePath path) relativePath cursorToken pageBytes : Client.Res
                                         FileShare.ReadWrite ||| FileShare.Delete)
             let firstLength = source.Length
             let firstTicks = File.GetLastWriteTimeUtc(path).Ticks
+            let firstCreation = File.GetCreationTimeUtc(path).Ticks
             let thisDigest = pathDigest path
             let cursorResult =
                 match cursorToken with
                 | None -> Ok { PathDigest = thisDigest
                                TotalBytes = firstLength
                                WriteTicks = firstTicks
+                               CreationTicks = firstCreation
                                Offset = 0L
                                Line = 1L
                                PreviousCarriageReturn = false }
@@ -99,7 +121,9 @@ let readFilePage (FilePath path) relativePath cursorToken pageBytes : Client.Res
             | Error failure -> Error failure
             | Ok cursor when cursor.PathDigest <> thisDigest ->
                 Error(ValidationError "Read-page cursor belongs to a different file.")
-            | Ok cursor when cursor.TotalBytes <> firstLength || cursor.WriteTicks <> firstTicks ->
+            | Ok cursor when cursor.TotalBytes <> firstLength ||
+                             cursor.WriteTicks <> firstTicks ||
+                             cursor.CreationTicks <> firstCreation ->
                 Error(ValidationError "File changed since the previous read page; restart at the first page.")
             | Ok cursor when cursor.Offset < 0L || cursor.Offset > firstLength || cursor.Line < 1L ->
                 Error(ValidationError "Invalid read-page cursor.")
@@ -118,8 +142,12 @@ let readFilePage (FilePath path) relativePath cursorToken pageBytes : Client.Res
                         advanceLines content cursor.Line cursor.PreviousCarriageReturn
                     let nextOffset = cursor.Offset + int64 usedBytes
                     let currentTicks = File.GetLastWriteTimeUtc(path).Ticks
+                    let currentCreation = File.GetCreationTimeUtc(path).Ticks
                     let currentLength = FileInfo(path).Length
-                    if source.Length <> firstLength || currentLength <> firstLength || currentTicks <> firstTicks then
+                    if source.Length <> firstLength ||
+                       currentLength <> firstLength ||
+                       currentTicks <> firstTicks ||
+                       currentCreation <> firstCreation then
                         Error(ValidationError "File changed while reading the page; restart at the first page.")
                     else
                         let continuation =

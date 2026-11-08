@@ -1,33 +1,38 @@
-# Bounded read and search checkpoint (JRV-2026-11-04)
+# Bounded source reads and searches — JRV-2026-11-04
 
-This is a **work-in-progress design checkpoint**, not release-ready code. It is on fix/bounded-reads-searches and has no deployment.
+## Protocol and resource model
 
-## Backward-compatible source reads
+Jarvis protocol **3.62** adds the ReadFilePage command and changes SearchFiles/SearchText responses from raw arrays into typed SearchResult records. This is an intentional response-shape change: server, client, and consumers must agree on protocol version. No new duplicate search commands were added.
 
-Existing ReadFile continues to return a plain text string, but rejects files above 512 KiB before allocating full content. Line-range ReadFile retains its one-based, inclusive StartLine/EndLine numbering; it rejects scans over 8 MiB, ranges over 2048 lines, and returned text over approximately 256 KiB. FileOperations.ReadAllBytes has an 8 MiB allocation ceiling. Large text files use the separately typed ReadFilePage command; they do not become binary transfers (ExportFile remains separate).
+Each operation enforces independent limits on source bytes, decoded line length, files/directories traversed, wall-clock work, matches, and **actual encoded JSON bytes**. The final transport response-size check remains a backstop, never the primary allocation limit.
 
-ReadFilePage returns FilePath, Content, StartByte, NextByte, TotalBytes, FirstLine, NextLine and NextCursor. Pages are strictly UTF-8, default to 48 KiB and are bounded to 64 KiB. The decoder stops only at valid UTF-8 codepoint boundaries; the next page resumes at precisely the remaining byte offset. CR/LF counts are retained in the typed cursor. A 101 MiB test source is read using only a single bounded buffer.
+## Large-file UTF-8 paging
 
-The cursor binds the absolute path digest, file length, last-write timestamp, byte offset and current line number. File changes detected by the file metadata make subsequent pages fail explicitly instead of silently combining versions. This is **metadata-based snapshot detection**, not immutable snapshot isolation: a malicious or unusual concurrent writer restoring the same size and timestamp could evade it. A source can also change between the final metadata check and the caller receiving its response. Further review should determine whether stronger validation is required.
+ReadFilePage returns FilePath, Content, StartByte, NextByte, TotalBytes, FirstLine, NextLine, and NextCursor. Byte offsets are zero-based, line counts one-based. Pages default to 48 KiB, with a 64 KiB maximum and 16-byte minimum. Strict UTF-8 decoding never splits a Unicode code point; a UTF-8 BOM is removed from only the first page. Carriage-return/newline state carries across pages.
 
-The new command updates the common protocol to 3.62 and adds a matching server MCP tool. The old ReadFile interface and response remain intact.
+Cursors are HMAC-authenticated with a per-client-process key. They bind the absolute checkout path digest, source byte length, creation and last-write timestamps, byte offset and line state. Forged offsets/line numbers are rejected. Tokens become invalid after client restart; modified file metadata triggers an explicit restart requirement. This is metadata-based change detection, not immutable snapshot isolation. Same-size, same-timestamp in-place edits can evade it; an adversarial local process could also replace ancestors concurrently. The separate atomic-file-mutations task addresses related filesystem risks.
 
-## Early-terminating search and directory enumeration
+## Ordinary text and binary read budgets
 
-SearchFiles and SearchText use a common iterative, lazy walker; it processes matching files before recursing into directories. It no longer collects the tree before limiting results. Results are capped at 500 by an explicit MaxResults, with an implicit default cap of 100 (which fails explicitly rather than silently truncating when reached). Independent limits are 12,000 files, 2,000 directories, three seconds between traversal operations and an estimated 480 KiB output. Exceeding work/output limits yields a ValidationError beginning with "Search incomplete", not an empty or seemingly complete match list. Text search additionally scans no more than 8 MiB per file or 48 MiB across the traversal.
+- ReadFile unpaged: 512 KiB actual bytes consumed, 700 KiB encoded JSON string.
+- ReadFile line range: 8 MiB scan, at most 256 Ki characters per line, 2,048 returned lines, about 256 KiB selected text and 700 KiB encoded JSON.
+- ReadFiles: at most 32 file paths, 4 KiB encoded JSON per path and 750 KiB aggregate JSON DTO budget; per-file errors remain explicit.
+- GetProjectDetails: at most 16 configured special files and 700 KiB encoded aggregate JSON; paths are checked inside the selected checkout.
+- ListDirectory: 2,000 entries, 480 KiB JSON and a three-second enumeration deadline.
+- Binary read: 8 MiB source bytes, followed by the existing export/image output-size limits.
 
-Existing glob matching, folder filters, worktree routing and source symlink/containment guards are retained; existing tests pass. Directory listing independently caps 2,000 entries and rejects a large directory instead of materializing it. ReadFiles permits at most 32 paths and accounts for an aggregate text response budget of approximately 700 KiB, emitting per-file resource errors when necessary.
+A shared limited-read stream enforces source bytes while reading, not by checking metadata and then doing an unbounded read. It also bounds individual decoded lines before building them, so files that grow during an operation cannot allocate arbitrary-sized strings. Early line ranges in huge sources remain usable, and large text is inspectable via ReadFilePage.
 
-## Verification and remaining work
+## Search partial results
 
-Focused Release checks have **44/44 passed**, including existing ProjectBrowser and PathSafety tests, plus a 101 MiB page read, Unicode pagination, metadata cursor conflicts, symlink rejection, lazy file/text search with MaxResults=1 and hundreds of thousands of generated candidates, explicit work-budget exhaustion, bounded directory lists and ReadFiles aggregate caps.
+The iterative lazy walker processes files before child folders. MaxResults=1 stops enumeration after one match. Default MaxResults is 100; explicit values range from 1 to 500. Folder filters, include/exclude globs, worktree routing and symlink containment checks remain enforced. Glob counts and lengths are bounded; regex execution has a separate 150 ms per-match timeout.
 
-Outstanding before considering integration:
+Every SearchFiles/SearchText success returns Matches, StopReason, FilesVisited, DirectoriesVisited. StopReason is one of: Finished, ResultLimit, FileVisitLimit, DirectoryVisitLimit, EntryVisitLimit, TimeLimit, OutputByteLimit, TextScanLimit. Only Finished asserts complete traversal. All other reasons mean Matches is **partial**, even if empty. This version has no search continuation cursor; narrow the query, folder or globs for follow-up work.
 
-- Full Client and Server Release suites have **not** been run on this checkpoint.
-- Review remaining memory/time edge cases: output-size estimates versus JSON escaping, character count versus byte count, changes during a read, very long single lines, partial tree/search results and exact budget semantics. Current search work-limit behavior is a clear error, not resumable partial search pagination.
-- The current directory walker intentionally prioritizes local file matches before folder matches, whereas the older eager search assembled folders then files. Confirm or adjust ordering expectations.
-- Review source metadata cursor integrity and path-binding across the actual checkout/worktree routing.
-- Conduct the requested implementation review and correction loop. No merge or deployment is authorized by this checkpoint.
+Independent limits: 12,000 files visited; 2,000 directories; 14,000 total entries including filtered candidates; 3 seconds between traversal operations plus a separate per-file text scan work limit; 480 KiB encoded JSON matches; 8 MiB text scan per file; pessimistic 48 MiB aggregate text scan charge; 256 Ki characters per encountered line. Normal filesystem errors remain errors rather than partial successes. OS file reads that block inside the kernel cannot be forcibly interrupted by synchronous managed code; the timers are cooperative between read and traversal operations.
 
-All limits should be treated as distinct constraints: bytes read, returned lines, nodes traversed, elapsed work and serialized response size. The final transport's existing maxResponseBytes check remains a last line of defense, never the primary allocator budget.
+## Evidence boundaries
+
+Focused regressions cover a 101 MiB page-read, UTF-8/CRLF boundaries, cursor tampering and changed sources, invalid UTF-8, symlinks, huge-line budgets, early line ranges and searches in large files, control-character JSON amplification, normal search/glob behavior, hundreds of thousands of lazy candidates, filtered work budgets, partial search serialization, and aggregate multi-file and project-detail reads.
+
+Full Client and Server Release runs and an implementation review are required for integration. The code is not automatically authorized for merging or deployment; rollout must account for the search response-shape change.

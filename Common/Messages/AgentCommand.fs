@@ -201,6 +201,25 @@ type SearchTextMatch =
       Column: int
       Preview: string }
 
+/// Explicit search completion state; results are never silently truncated.
+[<RequireQualifiedAccess>]
+[<JsonConverter(typeof<UnionConverter<SearchStopReason>>)>]
+type SearchStopReason =
+    | Finished
+    | ResultLimit
+    | FileVisitLimit
+    | DirectoryVisitLimit
+    | EntryVisitLimit
+    | TimeLimit
+    | OutputByteLimit
+    | TextScanLimit
+
+type SearchResult<'T> =
+    { Matches: 'T list
+      StopReason: SearchStopReason
+      FilesVisited: int
+      DirectoriesVisited: int }
+
 type ReadFileCommand =
     { ProjectName: string
       FilePath: string
@@ -936,12 +955,12 @@ module AgentProtocol =
           definition "ReviewWrite" "Updates opt-in canonical review ledger with a stable operation UUID." [ VersionControlWrite; NetworkAccess ] true true false
           definition "RemoveWorktree" "Removes a clean integrated Git worktree." [ VersionControlWrite; Destructive ] true true false
           definition "GetProjectDetails" "Reads project summary details and special files." [ ReadOnly ] false false false
-          definition "ListDirectory" "Lists files and folders in a project directory." [ ReadOnly ] false false false
-          definition "SearchFiles" "Searches project file names." [ ReadOnly ] false false false
-          definition "SearchText" "Searches project file contents." [ ReadOnly ] false false false
-          definition "ReadFile" "Reads one bounded file." [ ReadOnly ] false false false
+          definition "ListDirectory" "Lists a bounded project directory; oversized listings fail explicitly." [ ReadOnly ] false false false
+          definition "SearchFiles" "Finds project file/folder names with lazy traversal. Returns Matches, StopReason and visit counts; non-Finished results are partial." [ ReadOnly ] false false false
+          definition "SearchText" "Finds text matches with bounded scans. Returns Matches, StopReason and visit counts; non-Finished results are partial." [ ReadOnly ] false false false
+          definition "ReadFile" "Reads a small project text file or line range; use ReadFilePage for large UTF-8 sources." [ ReadOnly ] false false false
           definition "ReadFilePage" "Reads a bounded UTF-8 page from a file, with snapshot-aware continuation." [ ReadOnly ] false false false
-          definition "ReadFiles" "Reads multiple files." [ ReadOnly ] false false false
+          definition "ReadFiles" "Reads at most 32 files with an aggregate serialized-byte budget and per-file errors." [ ReadOnly ] false false false
           definition "GetAgentInstructions" "Reads all applicable AGENTS.md files for a checkout directory, with continuation for transport-size limits." [ ReadOnly ] false false false
           definition "ReadImage" "Reads one PNG, JPEG, or WebP image for model vision." [ ReadOnly ] false false false
           definition "ExportFile" "Copies one bounded project file to a short-lived user download URL." [ ReadOnly ] false false false

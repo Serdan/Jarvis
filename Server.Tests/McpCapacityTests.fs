@@ -6,10 +6,14 @@ open System.Security.Claims
 open System.Threading
 open System.Threading.RateLimiting
 open System.Threading.Tasks
+open Microsoft.AspNetCore.Builder
+open Microsoft.AspNetCore.Hosting
 open Microsoft.AspNetCore.Http
+open Microsoft.AspNetCore.RateLimiting
 open Microsoft.Extensions.Configuration
+open Microsoft.Extensions.DependencyInjection
 open NUnit.Framework
-open Server
+open global.Server
 
 let private settings active queued waitMs =
     { McpLoadSettings.defaults with
@@ -210,5 +214,124 @@ let forty_simultaneous_agent_tools_fit_default_active_and_fifo_queue_limits () =
         release.SetResult(())
         let! accepted = Task.WhenAll(all)
         Assert.That(accepted |> Array.forall succeeded, Is.True)
+        Assert.That(budget.ActiveSubjectCount, Is.Zero)
+    }
+
+
+[<Test>]
+let http_mcp_subject_rate_returns_429_and_retry_after_without_limiting_unrelated_users_or_metadata () =
+    task {
+        // Real loopback HTTP middleware with test-only synthetic principals:
+        // exercises production partition and rejection handlers, not JWT parsing.
+        use listener = new System.Net.Sockets.TcpListener(IPAddress.Loopback, 0)
+        listener.Start()
+        let port = (listener.LocalEndpoint :?> IPEndPoint).Port
+        listener.Stop()
+        let endpoint = $"http://127.0.0.1:{port}"
+        let builder = Microsoft.AspNetCore.Builder.WebApplication.CreateBuilder()
+        builder.WebHost.UseUrls(endpoint) |> ignore
+        let configured = { McpLoadSettings.defaults with RequestsPerWindow = 4; WindowSeconds = 10 }
+        builder.Services.AddRateLimiter(fun options ->
+            options.OnRejected <- McpSubjectRate.onRejected
+            options.AddPolicy(McpSubjectRate.Policy, McpSubjectRate.partition configured) |> ignore)
+        |> ignore
+        use app = builder.Build()
+        app.UseRouting() |> ignore
+        app.Use(
+            Func<RequestDelegate, RequestDelegate>(fun next ->
+                RequestDelegate(fun context ->
+                    let subject = context.Request.Headers["X-Test-Subject"].ToString()
+                    context.User <- ClaimsPrincipal(ClaimsIdentity([ Claim("sub", subject) ], "test"))
+                    next.Invoke(context)))
+        ) |> ignore
+        app.UseRateLimiter() |> ignore
+        app.MapGet("/mcp", Func<string>(fun () -> "ok"))
+            .RequireRateLimiting(McpSubjectRate.Policy) |> ignore
+        app.MapGet("/metadata", Func<string>(fun () -> "public")) |> ignore
+        do! app.StartAsync()
+        use http = new System.Net.Http.HttpClient()
+        http.Timeout <- TimeSpan.FromSeconds 5L
+        let get (subject: string) (path: string) =
+            task {
+                use request = new System.Net.Http.HttpRequestMessage(
+                    System.Net.Http.HttpMethod.Get, endpoint + path)
+                request.Headers.Add("X-Test-Subject", subject)
+                return! http.SendAsync(request)
+            }
+        for i in 1 .. 4 do
+            use! accepted = get "a" "/mcp"
+            Assert.That(accepted.StatusCode, Is.EqualTo(HttpStatusCode.OK), $"subject A request {i}")
+        use! rejected = get "a" "/mcp"
+        Assert.That(rejected.StatusCode, Is.EqualTo(HttpStatusCode.TooManyRequests))
+        Assert.That(rejected.Headers.RetryAfter, Is.Not.Null)
+        Assert.That(rejected.Headers.RetryAfter.Delta.HasValue, Is.True)
+        Assert.That(rejected.Headers.RetryAfter.Delta.Value.TotalSeconds, Is.GreaterThanOrEqualTo(1.))
+        for i in 1 .. 4 do
+            use! accepted = get "b" "/mcp"
+            Assert.That(accepted.StatusCode, Is.EqualTo(HttpStatusCode.OK), $"subject B request {i}")
+        use! exempt = get "a" "/metadata"
+        Assert.That(exempt.StatusCode, Is.EqualTo(HttpStatusCode.OK))
+        do! app.StopAsync()
+    }
+
+
+[<Test>]
+let queued_tools_start_in_fifo_order () =
+    task {
+        let budget = McpUserCapacity(settings 1 2 2000)
+        let firstGate = hold()
+        let secondGate = hold()
+        let secondStarted = hold()
+        let thirdStarted = hold()
+        let first =
+            budget.Execute("same-subject", CancellationToken.None, fun () ->
+                task {
+                    do! firstGate.Task
+                    return 1
+                })
+        let second =
+            budget.Execute("same-subject", CancellationToken.None, fun () ->
+                task {
+                    secondStarted.TrySetResult(()) |> ignore
+                    do! secondGate.Task
+                    return 2
+                })
+        let third =
+            budget.Execute("same-subject", CancellationToken.None, fun () ->
+                task {
+                    thirdStarted.TrySetResult(()) |> ignore
+                    return 3
+                })
+        // The second admitted tool cannot be overtaken by the third.
+        firstGate.SetResult(())
+        do! secondStarted.Task.WaitAsync(TimeSpan.FromSeconds(2.))
+        Assert.That(thirdStarted.Task.IsCompleted, Is.False)
+        secondGate.SetResult(())
+        do! thirdStarted.Task.WaitAsync(TimeSpan.FromSeconds(2.))
+        let! values = Task.WhenAll([| first; second; third |])
+        Assert.That(values, Is.EqualTo([| Executed 1; Executed 2; Executed 3 |] :> obj))
+        Assert.That(budget.ActiveSubjectCount, Is.Zero)
+    }
+
+
+[<Test>]
+let admitted_tool_is_not_cancelled_by_expired_queue_wait_deadline () =
+    task {
+        let budget = McpUserCapacity(settings 1 0 30)
+        let entered = hold()
+        let release = hold()
+        let running =
+            budget.Execute("subject", CancellationToken.None, fun () ->
+                task {
+                    entered.TrySetResult(()) |> ignore
+                    do! release.Task
+                    return 101
+                })
+        do! entered.Task
+        do! Task.Delay(130)
+        Assert.That(running.IsCompleted, Is.False)
+        release.SetResult(())
+        let! result = running
+        Assert.That(result, Is.EqualTo(Executed 101))
         Assert.That(budget.ActiveSubjectCount, Is.Zero)
     }

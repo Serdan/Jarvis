@@ -7,7 +7,9 @@ open System.Threading
 open System.Threading.RateLimiting
 open System.Threading.Tasks
 open Microsoft.AspNetCore.Http
+open Microsoft.AspNetCore.RateLimiting
 open Microsoft.Extensions.Configuration
+open Microsoft.Extensions.Primitives
 
 /// Budget applies to an authenticated subject, never to an IP address.
 /// Unlike HTTP discovery, tools/call may wait minutes for a connected client.
@@ -67,6 +69,16 @@ module McpSubjectRate =
                 limiter
         )
 
+    let onRejected (context: OnRejectedContext) (_: CancellationToken) =
+        let seconds =
+            match context.Lease.TryGetMetadata(MetadataName.RetryAfter) with
+            | true, retryAfter -> max 1 (int (Math.Ceiling retryAfter.TotalSeconds))
+            | _ -> 1
+        context.HttpContext.Response.Headers.RetryAfter <-
+            StringValues(seconds.ToString(CultureInfo.InvariantCulture))
+        context.HttpContext.Response.StatusCode <- StatusCodes.Status429TooManyRequests
+        ValueTask.CompletedTask
+
 type ToolAdmission<'a> =
     | Executed of 'a
     | Busy of retryAfterSeconds: int
@@ -95,7 +107,7 @@ type McpUserCapacity(settings: McpLoadSettings) =
                     options.PermitLimit <- settings.MaxConcurrentTools
                     options.QueueLimit <- settings.MaxQueuedTools
                     options.QueueProcessingOrder <- QueueProcessingOrder.OldestFirst
-                    let created = SubjectCapacity(new ConcurrencyLimiter(options))
+                    let created = new SubjectCapacity(new ConcurrencyLimiter(options))
                     partitions.Add(key, created)
                     created
             current.References <- current.References + 1
@@ -140,6 +152,9 @@ type McpUserCapacity(settings: McpLoadSettings) =
                     use lease = permit
                     if not lease.IsAcquired then return Busy settings.BusyRetrySeconds
                     else
+                        // Queue deadline does not apply once the tool is
+                        // admitted; only the request's own cancellation does.
+                        queueDeadline.CancelAfter(Timeout.InfiniteTimeSpan)
                         cancellation.ThrowIfCancellationRequested()
                         let! result = operation()
                         return Executed result

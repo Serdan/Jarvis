@@ -1,7 +1,6 @@
 #nowarn "20"
 
 open System
-open System.Globalization
 open System.Threading.RateLimiting
 open System.Threading.Tasks
 open Microsoft.AspNetCore.Authentication.JwtBearer
@@ -117,21 +116,22 @@ let configureServices (services: IServiceCollection) (configuration: IConfigurat
                             let invoke () =
                                 RequestDeviceRouting.withMetadata context.Params (fun () ->
                                     next.Invoke(context, cancellation).AsTask())
-                            match Auth.tryUserId context.User with
-                            | None -> return! invoke()
-                            | Some subject ->
-                                let capacity = context.Services.GetRequiredService<McpUserCapacity>()
-                                let! admitted = capacity.Execute(subject, cancellation, invoke)
-                                match admitted with
-                                | Executed response -> return response
-                                | Busy retrySeconds ->
-                                    let result = CallToolResult()
-                                    result.IsError <- Nullable true
-                                    result.Content <-
-                                        ResizeArray<ContentBlock>(
-                                            [ TextContentBlock(Text =
-                                                $"Jarvis MCP tool capacity is busy. Retry after {retrySeconds} seconds.") :> ContentBlock ])
-                                    return result
+                            // Do not let authenticated tokens without a usable
+                            // subject bypass capacity. The tool's own identity
+                            // check still reports the missing subject normally.
+                            let subject = Auth.tryUserId context.User |> Option.defaultValue "<missing-subject>"
+                            let capacity = context.Services.GetRequiredService<McpUserCapacity>()
+                            let! admitted = capacity.Execute(subject, cancellation, invoke)
+                            match admitted with
+                            | Executed response -> return response
+                            | Busy retrySeconds ->
+                                let result = CallToolResult()
+                                result.IsError <- Nullable true
+                                result.Content <-
+                                    ResizeArray<ContentBlock>(
+                                        [ TextContentBlock(Text =
+                                            $"Jarvis MCP tool capacity is busy. Retry after {retrySeconds} seconds.") :> ContentBlock ])
+                                return result
                         }
                     )))
             )
@@ -158,18 +158,7 @@ let configureServices (services: IServiceCollection) (configuration: IConfigurat
     |> ignore
 
     services.AddRateLimiter(fun options ->
-        options.OnRejected <-
-            (fun context _ ->
-                match context.Lease.TryGetMetadata(MetadataName.RetryAfter) with
-                | true, retryAfter ->
-                    context.HttpContext.Response.Headers.RetryAfter <-
-                        (max 1 (int (Math.Ceiling retryAfter.TotalSeconds))).ToString(NumberFormatInfo.InvariantInfo)
-                        |> StringValues
-                | _ ->
-                    context.HttpContext.Response.Headers.RetryAfter <- StringValues("1")
-
-                context.HttpContext.Response.StatusCode <- StatusCodes.Status429TooManyRequests
-                ValueTask.CompletedTask)
+        options.OnRejected <- McpSubjectRate.onRejected
 
         options.AddPolicy(
             rateLimiterPolicy,

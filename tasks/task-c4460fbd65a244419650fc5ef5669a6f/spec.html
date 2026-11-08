@@ -1,0 +1,15 @@
+<h1>Administrative correction of assigned Working agents</h1><p><strong>Feedback:</strong> 2bbaa4992f17436aa91914d7e006275e.</p>
+<h2>Problem</h2><p>Lead needs to correct an accidental/stale Working state for another agent without impersonating that agent or manufacturing a checkpoint. The existing unassigned <code>set_agent_state</code> cannot do so; <code>recover_agent_assignment</code> changes generations unnecessarily, while <code>yield_agent</code> misattributes an administrator's action.</p>
+<h2>Required behavior</h2><ul>
+<li>Expose a distinct administrative command accepting actor ID, target agent ID, exact task/attempt identity, expected task/attempt/agent versions and generation, and a nonempty reason. Restrict to an existing assigned Working attempt; transition only execution to Ready.</li>
+<li>Preserve task ownership, attempt identity, source/baseline refs, assignment generation, checkpoint/evidence, review claims, pending integrations and notifications. Do not fabricate a worker checkpoint or last-seen activity for the target.</li>
+<li>Write an auditable immutable event with actor, target, reason and before/after state. Distinguish administrative correction from normal agent self-yield in all inspection APIs.</li>
+<li>Use atomic optimistic concurrency so a stale correction cannot override recent genuine activity or an agent's own yield. Ensure authorization follows documented operator/admin semantics without allowing arbitrary target impersonation.</li>
+<li>Integrate conceptually with side-effect-free observer operation <code>task-79b4fe205a86463184e5ff90b743e9d7</code>; no requirement to wait for that feature to land.</li>
+</ul>
+<h2>Acceptance</h2><ol>
+<li>Lead corrects erroneously Working Architect to Ready with exact versions; assignment/generation/checkpoint and target last seen remain unchanged.</li>
+<li>Concurrent genuine work, wrong generation/version, missing task, unauthenticated actor or different current status fail without mutation.</li>
+<li>Self-<code>yield_agent</code> continues to produce its ordinary worker-attributed checkpoint; administrative audit is unambiguously different.</li>
+<li>Replay by operation ID is idempotent. Relevant ledger/API/client Release tests pass.</li>
+</ol><p>Do not deploy without operator approval.</p>

@@ -23,7 +23,7 @@ Measured the existing private local activity JSONL corpus in aggregate: 169,558 
 - Tool limiter tests cover 40 simultaneous calls and immediate 41st rejection, independent per-subject allocations, FIFO completion order, deadline exhaustion without launching work, queue cancellation, exception cleanup, and continuation of admitted execution beyond the queue deadline.
 - Typed SignalR bridge test cancels the HTTP request after receiving the correlation ID, proves tracker cannot subsequently complete that correlation, and verifies the device stays Registered with no spurious failure.
 - Existing real-server `McpAuthenticationTests` check Bearer 401/challenge and public OAuth metadata on actual `/mcp`; existing SignalR scope and generation tests remain.
-- Focused new capacity tests pass in Release. First full source Release pass was **106/106 Server, 498/498 Client** before the last two test additions; a new full suite is running on exact frozen `1738f25` and is required before Accept.
+- Focused source review tests pass in Release. The **final full source Release** on exact frozen `1738f25` completed exit code 0: **108/108 Server and 498/498 Client**, job `ee8ecd0ed2df443e8c1f853b96b0fea0`. The earlier pre-extra-tests run also passed 106/106 Server and 498/498 Client.
 - `git show --check HEAD` passed, source branch is clean/pushed, and `git merge-tree --write-tree main feat/mcp-user-capacity` produced a conflict-free tree. No protocol version or client wire shape changes.
 
 ## Explicit boundaries
@@ -33,4 +33,4 @@ Measured the existing private local activity JSONL corpus in aggregate: 169,558 
 - Per-call cancellation stops the server wait and tracking, not necessarily a local command already delivered. Writes still rely on idempotent operation IDs and status checking.
 - Production Auth0 token authentication was not replaced/test-overridden. The loopback test exercises the shared production middleware callback with **test-only** principal injection, and the separate real-server auth test protects the OAuth challenge.
 
-**Disposition:** Self-review found no unresolved blocking defects in the frozen source. Accept only after the final full Release suite returns exit 0; do not deploy here.
+**Disposition:** ACCEPT for source integration. No unresolved blocking defects; exact frozen Release gate passed. Do not claim production rollout or actual HTTP concurrency benchmark. Do not deploy here.

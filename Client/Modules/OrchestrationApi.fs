@@ -356,7 +356,8 @@ type PendingIntentSummary =
 // Returned by the compact page API; never contains the stored command JSON,
 // and in particular never exposes historic SessionId tokens.
 type PendingIntentBrief =
-    { OperationId: string
+    { LocalFileKey: string
+      OperationId: string
       Action: string
       Actor: string
       TaskId: string option
@@ -400,6 +401,48 @@ module PendingIntentJournal =
     let private filePath (binding: LedgerStore.LedgerBinding) (operationId: Guid) =
         Path.Combine(journalDirectory binding.RepositoryPath, operationId.ToString("N") + ".json")
 
+    // Only 256 persistent lock stripes, regardless of journal history.
+    // FileShare.None serializes cooperating clients across processes.
+    // Lock files are never unlinked (unlinking a held inode is unsafe on Unix).
+    let private withIntentLock (binding: LedgerStore.LedgerBinding) (operationId: Guid)
+                               (operation: unit -> Result<'a, EffectError>) =
+        try
+            if operationId = Guid.Empty then
+                Error(Client.ValidationError "Valid pending operation UUID required.")
+            else
+                let journal = journalDirectory binding.RepositoryPath
+                Directory.CreateDirectory(journal) |> ignore
+                if DirectoryInfo(journal).Attributes.HasFlag(FileAttributes.ReparsePoint) then
+                    Error(Client.ValidationError "Pending journal directory must not be a symbolic link.")
+                else
+                    let folder = Path.Combine(journal, ".locks")
+                    Directory.CreateDirectory(folder) |> ignore
+                    if DirectoryInfo(folder).Attributes.HasFlag(FileAttributes.ReparsePoint) then
+                        Error(Client.ValidationError "Pending lock directory must not be a symbolic link.")
+                    else
+                        if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
+                            File.SetUnixFileMode(folder, UnixFileMode.UserRead ||| UnixFileMode.UserWrite ||| UnixFileMode.UserExecute)
+                        let slot = operationId.ToString("N").Substring(0, 2)
+                        let lockFile = Path.Combine(folder, slot + ".lock")
+                        if File.Exists(lockFile) && File.GetAttributes(lockFile).HasFlag(FileAttributes.ReparsePoint) then
+                            Error(Client.ValidationError "Pending intent lock must not be a symbolic link.")
+                        else
+                            let rec acquire attempt =
+                                try
+                                    new FileStream(lockFile, FileMode.OpenOrCreate, FileAccess.ReadWrite,
+                                                   FileShare.None, 4096, FileOptions.None)
+                                with :? IOException when attempt < 75 ->
+                                    System.Threading.Thread.Sleep(40)
+                                    acquire (attempt + 1)
+                            use held = acquire 0
+                            if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
+                                File.SetUnixFileMode(lockFile, UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
+                            // Never retry operation() itself on IOException:
+                            // an uncertain remote write must not be repeated.
+                            operation ()
+        with ex ->
+            Error(Client.ValidationError $"Unable to exclusively lock pending intent: {ex.Message}")
+
     let private readFile (file: string) =
         try
             if File.GetAttributes(file).HasFlag(FileAttributes.ReparsePoint)
@@ -417,7 +460,15 @@ module PendingIntentJournal =
         with ex ->
             Error(Client.ValidationError $"Cannot read local pending operation: {ex.Message}")
 
-    let persist (binding: LedgerStore.LedgerBinding) operationId commandType commandJson =
+    let private readCheckedFile file =
+        readFile file
+        |> Result.bind (fun record ->
+            match Guid.TryParse record.OperationId with
+            | true, id when Path.GetFileName(file) = id.ToString("N") + ".json" ->
+                Ok record
+            | _ -> Error(Client.ValidationError "Unexpected pending journal filename or operation UUID."))
+
+    let private persistUnsafe (binding: LedgerStore.LedgerBinding) operationId commandType commandJson =
         let file = filePath binding operationId
         let newRecord =
             { SchemaVersion = 1
@@ -466,6 +517,10 @@ module PendingIntentJournal =
         with ex ->
             Error(Client.ValidationError $"Cannot persist local pending  operation: {ex.Message}")
 
+    let persist binding operationId commandType commandJson =
+        withIntentLock binding operationId (fun () ->
+            persistUnsafe binding operationId commandType commandJson)
+
     let private journalFiles root =
         try
             let directory = journalDirectory root
@@ -489,12 +544,7 @@ module PendingIntentJournal =
                     files
                     |> Array.fold (fun state file ->
                         state |> Result.bind (fun items ->
-                            readFile file |> Result.bind (fun record ->
-                                match Guid.TryParse record.OperationId with
-                                | true, id when Path.GetFileName(file) = id.ToString("N") + ".json" ->
-                                    Ok(record :: items)
-                                | _ ->
-                                    Error(Client.ValidationError "Unexpected pending operation journal filename."))))
+                            readCheckedFile file |> Result.map (fun record -> record :: items)))
                         (Ok [])
                     |> Result.map List.rev
             with ex ->
@@ -512,14 +562,15 @@ module PendingIntentJournal =
                 if record.OperationId = operationId.ToString("D") then Ok(Some record)
                 else Error(Client.ValidationError "Local intent filename and operation UUID disagree."))
 
-    // Opaque sorted UUID cursor. A page reads at most 100 full command
+    // Opaque filename cursor. A page reads at most 100 full commands and reports malformed entries.
     // records, and an individual intent remains inspectable by UUID.
     let pageAtRoot root (cursor: string) (pageSize: int) =
         if pageSize < 1 || pageSize > 100 then
             Error(Client.ValidationError "Pending intent pageSize must be between 1 and 100.")
         elif not (String.IsNullOrWhiteSpace cursor)
-             && not (Guid.TryParseExact(cursor, "N") |> fst) then
-            Error(Client.ValidationError "Pending intent cursor must be an operation UUID in N format.")
+             && (cursor.Length > 255 || cursor.Contains('/') || cursor.Contains('\\')
+                 || cursor.Contains(char 0)) then
+            Error(Client.ValidationError "Invalid pending journal filename cursor.")
         else
             journalFiles root
             |> Result.bind (fun files ->
@@ -529,24 +580,15 @@ module PendingIntentJournal =
                         String.IsNullOrWhiteSpace cursor
                         || String.CompareOrdinal(Path.GetFileNameWithoutExtension(path), cursor) > 0)
                     |> Array.truncate (pageSize + 1)
-                selected
-                |> Array.truncate pageSize
-                |> Array.fold (fun acc file ->
-                    acc |> Result.bind (fun items ->
-                        readFile file |> Result.bind (fun record ->
-                            let expected = record.OperationId.Replace("-", "").ToLowerInvariant() + ".json"
-                            if Path.GetFileName(file) <> expected then
-                                Error(Client.ValidationError "Unexpected pending operation journal filename.")
-                            else Ok(record :: items))))
-                    (Ok [])
-                |> Result.map (fun reversed ->
-                    let records = List.rev reversed
-                    let nextCursor =
-                        if selected.Length > pageSize then
-                            records |> List.tryLast |> Option.map (fun record ->
-                                record.OperationId.Replace("-", "").ToLowerInvariant())
-                        else None
-                    records, nextCursor))
+                let entries =
+                    selected
+                    |> Array.truncate pageSize
+                    |> Array.map (fun file -> Path.GetFileNameWithoutExtension(file), readCheckedFile file)
+                    |> Array.toList
+                let nextCursor =
+                    if selected.Length > pageSize then entries |> List.tryLast |> Option.map fst
+                    else None
+                Ok (entries, nextCursor))
 
     let listForProject projectName rt =
         ProjectPaths.resolveProjectRoot projectName rt
@@ -813,7 +855,7 @@ module PendingIntentJournal =
                     let scan =
                         files |> Array.fold (fun state path ->
                             state |> Result.bind (fun () ->
-                                match readFile path with
+                                match readCheckedFile path with
                                 | Error _ ->
                                     malformed <- malformed + 1
                                     increment dispositions "MalformedLocalRecord"
@@ -871,19 +913,27 @@ module PendingIntentJournal =
                 LedgerStore.LedgerStore.getOperationIdsAt binding snapshot
                 |> Result.mapError LedgerErrors.toEffect
                 |> Result.bind (fun knownIds ->
-                    records |> List.fold (fun state record ->
+                    records |> List.fold (fun state (fileKey, record) ->
                         state |> Result.bind (fun items ->
-                            classifyAt binding snapshot knownIds record |> Result.map (fun status ->
-                                let action, actor, task =
-                                    metadata record
-                                    |> Option.defaultValue ("(malformed)", "(unspecified)", None)
-                                { OperationId = record.OperationId
-                                  Action = action
-                                  Actor = actor
-                                  TaskId = task
-                                  CreatedUtc = record.CreatedUtc
-                                  CommandSha256 = record.CommandSha256
-                                  Disposition = status } :: items)))
+                            match record with
+                            | Error _ ->
+                                Ok ({ LocalFileKey = fileKey; OperationId = ""
+                                      Action = "(quarantined)"; Actor = "(unknown)"
+                                      TaskId = None; CreatedUtc = ""; CommandSha256 = ""
+                                      Disposition = "MalformedLocalRecord" } :: items)
+                            | Ok record ->
+                                classifyAt binding snapshot knownIds record
+                                |> Result.map (fun status ->
+                                    let action, actor, task =
+                                        metadata record
+                                        |> Option.defaultValue ("(malformed)", "(unspecified)", None)
+                                    { LocalFileKey = fileKey; OperationId = record.OperationId
+                                      Action = action; Actor = actor; TaskId = task
+                                      CreatedUtc = record.CreatedUtc
+                                      CommandSha256 = record.CommandSha256
+                                      Disposition =
+                                        if metadata record |> Option.isNone then "MalformedCommand"
+                                        else status } :: items)))
                         (Ok [])
                     |> Result.map (fun reversed ->
                         { VerifiedLedgerHead = snapshot.Commit
@@ -929,15 +979,14 @@ module PendingIntentJournal =
     // Explicitly retire a journal record only after the operator has inspected
     // matching remote proof and supplied its exact request hash. This does
     // not mutate the authoritative Git ledger.
-    let acknowledge (binding: LedgerStore.LedgerBinding) (operationId: Guid) (expectedRequestHash: string) =
+    let private acknowledgeUnsafe (binding: LedgerStore.LedgerBinding) (operationId: Guid) (expectedRequestHash: string) =
         if String.IsNullOrWhiteSpace expectedRequestHash
            || expectedRequestHash.Length <> 64 then
             Error(Client.ValidationError "Expected exact 64-character remote request hash.")
         else
-            listAtRoot binding.RepositoryPath
-            |> Result.bind (fun records ->
-                match records |> List.tryFind (fun record ->
-                    record.OperationId = operationId.ToString("D")) with
+            findAtRoot binding.RepositoryPath operationId
+            |> Result.bind (fun current ->
+                match current with
                 | None ->
                     // Explicit acknowledgments may be retried after deletion.
                     // Require the same exact remote operation proof again.
@@ -985,9 +1034,13 @@ module PendingIntentJournal =
                         | None -> Error(Client.ValidationError
                             "Operation is not present at the verified canonical ledger head; preserve pending journal.")))
 
-    let execute binding operationId commandType command (apply: unit -> Result<'t, EffectError>) =
+    let acknowledge binding operationId expectedRequestHash =
+        withIntentLock binding operationId (fun () ->
+            acknowledgeUnsafe binding operationId expectedRequestHash)
+
+    let private executeUnsafe binding operationId commandType command (apply: unit -> Result<'t, EffectError>) =
         let commandJson = JsonSerializer.Serialize(command)
-        persist binding operationId commandType commandJson
+        persistUnsafe binding operationId commandType commandJson
         |> Result.bind (fun () ->
             let outcome = apply ()
             match outcome with
@@ -1003,6 +1056,10 @@ module PendingIntentJournal =
                 with _ -> () // A stale entry is safe: remote UUID remains authoritative.
                 outcome
         )
+
+    let execute binding operationId commandType command apply =
+        withIntentLock binding operationId (fun () ->
+            executeUnsafe binding operationId commandType command apply)
 
     // An uncertain push can have been accepted even when its response was
     // lost. Re-read the authoritative UUID index before reporting ambiguity.

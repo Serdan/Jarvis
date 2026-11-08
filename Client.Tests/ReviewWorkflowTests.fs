@@ -2752,6 +2752,58 @@ type ReviewWorkflowTests() =
                         Is.EqualTo(4)))
 
     [<Test>]
+    member _.PendingQuarantineRowsDoNotBlockOtherIntentsOrCursorProgress() =
+        withFixture (fun one _ first _ _ _ _ _ ->
+            let folder =
+                let config = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
+                Path.Combine(Path.GetDirectoryName config, "pending",
+                             Path.GetFileNameWithoutExtension config)
+            let make action =
+                let id = Guid.NewGuid()
+                Client.OrchestrationApi.PendingIntentJournal.persist first id "TaskWrite"
+                    (System.Text.Json.JsonSerializer.Serialize(
+                        {| Action = action; TaskId = "safe"; ActorId = "Agent 5"; SessionId = "private-token" |}))
+                |> success
+                id
+            let goodA = make "ReviseTaskSpec"
+            let goodB = make "ReopenTask"
+            let corrupted = make "ResumeAgent"
+            let badFile = Path.Combine(folder, corrupted.ToString("N") + ".json")
+            File.WriteAllText(badFile, "{corrupt-pending-record")
+            let stray = Path.Combine(folder, "not-a-valid-uuid.json")
+            File.WriteAllText(stray, "{}")
+            let sum = Client.OrchestrationApi.PendingIntentJournal.summarize first |> success
+            Assert.That(sum.Total, Is.EqualTo(4))
+            Assert.That(sum.MalformedLocalRecords, Is.EqualTo(2))
+            let quarantined = sum.ByDisposition |> List.find (fun row -> row.Name = "MalformedLocalRecord")
+            Assert.That(quarantined.Count, Is.EqualTo(2))
+            let mutable cursor = ""
+            let mutable donePaging = false
+            let rows = ResizeArray<Client.OrchestrationApi.PendingIntentBrief>()
+            while not donePaging do
+                let page = Client.OrchestrationApi.PendingIntentJournal.page first cursor 1 |> success
+                Assert.That(page.Records.Length, Is.EqualTo(1))
+                rows.Add(page.Records.Head)
+                match page.NextCursor with
+                | Some next -> cursor <- next
+                | None -> donePaging <- true
+            Assert.That(rows.Count, Is.EqualTo(4))
+            Assert.That(rows |> Seq.filter (fun row -> row.Disposition = "MalformedLocalRecord") |> Seq.length,
+                        Is.EqualTo(2))
+            Assert.That(rows |> Seq.filter (fun row -> row.Disposition = "NotFoundAtVerifiedHead") |> Seq.length,
+                        Is.EqualTo(2))
+            Assert.That(rows |> Seq.exists (fun row -> row.OperationId = goodA.ToString("D")), Is.True)
+            Assert.That(rows |> Seq.exists (fun row -> row.OperationId = goodB.ToString("D")), Is.True)
+            Assert.That(rows |> Seq.exists (fun row -> row.LocalFileKey = "not-a-valid-uuid"), Is.True)
+            let serialized = System.Text.Json.JsonSerializer.Serialize(rows)
+            Assert.That(serialized, Does.Not.Contain("private-token"))
+            Assert.That(File.Exists badFile, Is.True)
+            Assert.That(File.Exists stray, Is.True)
+            match Client.OrchestrationApi.PendingIntentJournal.inspect first corrupted with
+            | Error(Client.ValidationError _) -> ()
+            | other -> Assert.Fail(sprintf "Corrupt record must not be accepted for inspection: %A" other))
+
+    [<Test>]
     member _.LostResponseRecoversAcceptedRemoteOperationButNeverGuessesFailure() =
         withFixture (fun one _ first _ _ _ _ _ ->
             let command name =

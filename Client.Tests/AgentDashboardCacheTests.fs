@@ -156,6 +156,14 @@ let changing_heads_and_large_notification_history_keep_caches_bounded () =
             if i % 37 = 0 then entry { item with Message = item.Message + string head }
             else entry item)
         |> Map.ofArray
+    let firstHead = makeRecords 0
+    let firstSummary = summarized firstHead
+    let estimatedCompleteHeadBytes =
+        firstHead
+        |> Seq.sumBy (fun (KeyValue(_, struct (oid, content))) ->
+            2L * int64 (oid.Length + content.Length) + 128L)
+    Assert.That(estimatedCompleteHeadBytes, Is.GreaterThan(16L * 1024L * 1024L),
+                "Fixture must exceed parsed-cache byte capacity to actually exercise eviction.")
     for head in 0 .. 9 do
         let grouped = makeRecords head |> summarized
         Assert.That(grouped.Count, Is.EqualTo(32),
@@ -168,6 +176,12 @@ let changing_heads_and_large_notification_history_keep_caches_bounded () =
         let struct (blobCount, blobBytes) = LedgerStore.dashboardBlobCacheStats()
         Assert.That(blobCount, Is.LessThanOrEqualTo(16384))
         Assert.That(blobBytes, Is.LessThanOrEqualTo(32L * 1024L * 1024L))
+    let revisited = summarized firstHead
+    Assert.That((revisited = firstSummary), Is.True,
+                "After older OIDs have been evicted, rereading the historical Git head must reconstruct identical counts and latest messages.")
+    let struct (retained, retainedBytes) = AgentDashboard.parsedNotificationCacheStats()
+    TestContext.Progress.WriteLine(
+        $"AgentDashboardCache 10 heads, old head revisited: retainedEntries={retained}; estimatedRetainedBytes={retainedBytes}; fullHeadBytes={estimatedCompleteHeadBytes}")
 
 [<Test>]
 let measure_dashboard_notification_refresh_latency_and_allocations () =
@@ -179,22 +193,56 @@ let measure_dashboard_notification_refresh_latency_and_allocations () =
                 (sprintf "2026-11-08T%02d:%02d:%02dZ" ((i/3600)%24) ((i/60)%60) (i%60))
                 (if i % 3 = 0 then "2026-11-08T15:00:00Z" else null)
             |> entry ] |> Map.ofList
-    let measure label =
+    // Original production algorithm, reproduced on exactly the same OID
+    // snapshot fixture to compare allocations without changing Git I/O.
+    let legacyCache =
+        System.Collections.Concurrent.ConcurrentDictionary<string, AgentNotification>(StringComparer.Ordinal)
+    let legacy () =
+        let all =
+            records
+            |> Map.toList
+            |> List.map (fun (_, struct (_, content)) ->
+                legacyCache.GetOrAdd(content, fun raw -> JsonSerializer.Deserialize<AgentNotification>(raw, jsonOptions)))
+        [ for i in 0 .. 47 do
+            let id = "Agent " + string i
+            let pending =
+                all |> List.filter (fun item ->
+                    item.ToAgentId = id && String.IsNullOrWhiteSpace item.AcknowledgedAtUtc)
+            if not pending.IsEmpty then
+                let newest =
+                    pending
+                    |> List.sortByDescending (fun item -> item.CreatedAtUtc, item.NotificationId)
+                    |> List.head
+                let latest =
+                    newest.FromAgentId
+                    + (if String.IsNullOrWhiteSpace newest.TaskId then "" else " #" + newest.TaskId)
+                    + ": " + newest.Message
+                yield id, struct (pending.Length, Some latest) ]
+        |> Map.ofList
+    let current () =
+        summarized records |> Map.map (fun _ item -> struct (item.Pending, item.Latest))
+    let measure label (run: unit -> Map<string, struct (int * string option)>) =
         GC.Collect()
         GC.WaitForPendingFinalizers()
         GC.Collect()
         let before = GC.GetTotalAllocatedBytes(true)
         let sw = Stopwatch.StartNew()
-        let result = summarized records
+        let result = run ()
         sw.Stop()
         let allocated = GC.GetTotalAllocatedBytes(true) - before
         TestContext.Progress.WriteLine(
-            $"AgentDashboardNotificationCache {label}: elapsedMs={sw.Elapsed.TotalMilliseconds:F2}; allocatedBytes={allocated}")
+            $"AgentDashboardNotificationCache {label}: elapsedMs={sw.Elapsed.TotalMilliseconds:F2}; allocatedBytes={allocated}; count={result.Count}")
         result
-    let cold = measure "cold-head"
-    let warm = measure "same-head"
-    Assert.That((warm = cold), Is.True)
-    Assert.That(cold.Count, Is.EqualTo(32))
+    let legacyCold = measure "legacy-cold" legacy
+    let newCold = measure "bounded-cold" current
+    let legacyWarm = measure "legacy-warm" legacy
+    let newWarm = measure "bounded-warm" current
+    Assert.That((legacyCold = legacyWarm), Is.True)
+    Assert.That((legacyCold = newCold && newCold = newWarm), Is.True,
+                "The optimized parser must produce byte-for-byte equivalent unread metadata.")
+    Assert.That(newCold.Count, Is.EqualTo(32))
+    TestContext.Progress.WriteLine(
+        $"AgentDashboardNotificationCache legacyFullJsonKeysRetained={legacyCache.Count} whereas bounded parsed cache does not retain JSON keys")
     let struct (count, bytes) = AgentDashboard.parsedNotificationCacheStats()
     Assert.That(count, Is.LessThanOrEqualTo(16384))
     Assert.That(bytes, Is.LessThanOrEqualTo(16L * 1024L * 1024L))

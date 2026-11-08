@@ -35,4 +35,6 @@ Independent limits: 12,000 files visited; 2,000 directories; 14,000 total entrie
 
 Focused regressions cover a 101 MiB page-read, UTF-8/CRLF boundaries, cursor tampering and changed sources, invalid UTF-8, symlinks, huge-line budgets, early line ranges and searches in large files, control-character JSON amplification, normal search/glob behavior, hundreds of thousands of lazy candidates, filtered work budgets, partial search serialization, and aggregate multi-file and project-detail reads.
 
-Full Client and Server Release runs and an implementation review are required for integration. The code is not automatically authorized for merging or deployment; rollout must account for the search response-shape change.
+The accepted self-reviewed source `3940fbfbb3c3ffb9a4d32c931ce855d10b35a635` was merged into `main` at `039325fe303d8158c4f919037453fca5862c6989` after reconciling the compile order with HTTPS imports and the test fixtures with the atomic FileIO.EditText interface. Focused combined Release tests passed 98/98. The complete Linux Release suite passed 478/478 Client.Tests and 95/95 Server.Tests on November 8, 2026; the merged source is verified, not yet deployed.
+
+The new ReadFilePage tool and SearchFiles/SearchText response shapes in protocol 3.62 require a coordinated server/client release and compatible consuming agents. Do not deploy mismatched binaries or assume Linux testing establishes all native-platform runtime guarantees.

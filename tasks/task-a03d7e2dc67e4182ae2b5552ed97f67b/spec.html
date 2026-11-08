@@ -1,0 +1,16 @@
+<h1>Role-based taskless execution lifecycle</h1><p><strong>Feedback:</strong> f099e39dbf1a472fa2d64f8b9c7b4a44. <strong>Dependency:</strong> role records and agent linkage from <code>task-42e64eb74fef43588d8c64f656e12088</code>.</p>
+<h2>Problem</h2><p>Reviewer and coordinator agents need to perform work without holding permanent placeholder implementation tasks. Today an agent becomes Working through an assigned task; role metadata alone must not imply activity.</p>
+<h2>Required behavior</h2><ul>
+<li>Add explicit, agent-attributed start and yield/stop operations for taskless role work. Transitions must have named, typed lifecycle rules and version/generation checks. Role membership, ordinary reads, and arbitrary tool calls must not implicitly start taskless work.</li>
+<li>Preserve independent ownership invariants: an implementation task has one exclusive active assignee, review requests retain exclusive reviewer claims, and taskless role work neither acquires nor releases either resource implicitly.</li>
+<li>Allow a role-bearing agent without an assignment to be Working with role/activity context (and, where applicable, current claimed review), then yield to Parked when idle. Preserve the current client behavior of hiding Parked agents, showing actual Working agents, and clear unknown/stale last seen.</li>
+<li>Define behavior for concurrent start/yield, role removal, a newly assigned implementation task, lost/replaced client sessions, admin inspection, restart and interrupted work. Avoid phantom Working, forged attribution or silent loss of claimed reviews.</li>
+<li>Coordinate with the observer API task <code>task-79b4fe205a86463184e5ff90b743e9d7</code> so observational calls cannot inadvertently start role sessions.</li>
+</ul>
+<h2>Acceptance</h2><ol>
+<li>Reviewer 1 with a Reviewer role and no task explicitly starts work, claims/decides an independent review, and yields; display moves Working to hidden Parked without a placeholder task.</li>
+<li>Registering/assigning a role or reading its inbox leaves Parked unchanged; no automatic taskless activation.</li>
+<li>Task assignment and review claim exclusivity remain enforced; no double assignment or review ownership changes under role transitions.</li>
+<li>Concurrent and stale transitions are rejected safely; server/client restart and disconnected sessions preserve auditable canonical disposition.</li>
+<li>Ledger/API/UI and Release integration tests cover the lifecycle and long-running review flow.</li>
+</ol><p>Do not deploy without operator authorization.</p>

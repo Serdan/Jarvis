@@ -1,0 +1,16 @@
+<h1>Durable role and agent instructions independent of task assignments</h1>
+<p><strong>Feedback:</strong> f099e39dbf1a472fa2d64f8b9c7b4a44; 8af0b0c68b374f1caafaada9be9aa24b.</p>
+<h2>Problem</h2><p>Stable responsibilities are currently embedded in long-lived placeholder tasks, and agents sharing a role cannot reuse one canonical definition. Instructions must outlive an individual task and be recoverable on new sessions without task pseudo-assignments.</p>
+<h2>Model</h2><ul>
+<li>Define versioned, Git-ledger-backed Role records scoped to project/ledger (ID, human-readable purpose, instruction body); allow multiple agents to reference the same role. Define optional versioned per-agent instruction body/overrides independently of assigned task.</li>
+<li>Expose explicit creation/update/read/list/attach operations with optimistic concurrency and durable provenance; use typed records and deterministic authorization. Do not treat role membership as permission escalation or activity.</li>
+<li>Include applicable role and per-agent instruction documents automatically with <code>agent_inbox</code> and <code>get_agent_instructions</code>, separate from the path-keyed <code>AGENTS.md</code> object. Document deterministic precedence across global, workspace, project/directory, role, agent and assignment-specific instructions without allowing subordinate docs to undermine higher-priority restrictions.</li>
+<li>Preserve actual instructions and semantic history across role edits, assignment changes, project checkout changes and restarts. Prevent arbitrary changes from rewriting pinned task specs or historical attempt evidence. Decide and document whether a role instruction update is picked up at the next turn or next instruction fetch.</li>
+<li>Coordinate with incremental AGENTS.md delivery (<code>task-0b8cf504e4ac41129d581fc6629021c4</code>) and account-global AGENTS.md proposal; do not conflate instruction delivery caches with canonical instruction authority.</li>
+</ul>
+<h2>Acceptance</h2><ol>
+<li>Reviewer 1/2/3 share one Reviewer role; role edits appear at documented boundary, per-agent overrides remain distinct, and none requires an assigned task.</li>
+<li>New and resumed sessions retrieve all applicable instructions with unambiguous scope, precedence and hash/version; no duplicate AGENTS.md content.</li>
+<li>Unauthorized changes, conflicting version updates, missing/removed roles and concurrent edits are detected with stable error behavior; historical task and checkpoint references remain valid.</li>
+<li>Tests cover serialization, authorization, versioning, instruction resolution/caching, multi-agent and multiple projects; Release suites pass.</li>
+</ol><p><strong>Out of scope:</strong> taskless Working transitions themselves (separate dependent task), automatic agent launch, replacing repository AGENTS.md. Do not deploy without operator approval.</p>

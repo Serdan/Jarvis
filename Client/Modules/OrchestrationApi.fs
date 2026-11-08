@@ -436,7 +436,7 @@ module PendingIntentJournal =
     let private filePath (binding: LedgerStore.LedgerBinding) (operationId: Guid) =
         Path.Combine(journalDirectory binding.RepositoryPath, operationId.ToString("N") + ".json")
 
-    // Only 256 persistent lock stripes, regardless of journal history.
+    // At most 4096 persistent lock stripes, regardless of journal history.
     // FileShare.None serializes cooperating clients across processes.
     // Lock files are never unlinked (unlinking a held inode is unsafe on Unix).
     let private withIntentLock (binding: LedgerStore.LedgerBinding) (operationId: Guid)
@@ -457,7 +457,7 @@ module PendingIntentJournal =
                     else
                         if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
                             File.SetUnixFileMode(folder, UnixFileMode.UserRead ||| UnixFileMode.UserWrite ||| UnixFileMode.UserExecute)
-                        let slot = operationId.ToString("N").Substring(0, 2)
+                        let slot = operationId.ToString("N").Substring(0, 3)
                         let lockFile = Path.Combine(folder, slot + ".lock")
                         if File.Exists(lockFile) && File.GetAttributes(lockFile).HasFlag(FileAttributes.ReparsePoint) then
                             Error(Client.ValidationError "Pending intent lock must not be a symbolic link.")
@@ -466,7 +466,7 @@ module PendingIntentJournal =
                                 try
                                     new FileStream(lockFile, FileMode.OpenOrCreate, FileAccess.ReadWrite,
                                                    FileShare.None, 4096, FileOptions.None)
-                                with :? IOException when attempt < 75 ->
+                                with :? IOException when attempt < 1500 ->
                                     System.Threading.Thread.Sleep(40)
                                     acquire (attempt + 1)
                             use held = acquire 0

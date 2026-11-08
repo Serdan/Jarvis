@@ -3153,7 +3153,7 @@ type ReviewWorkflowTests() =
                 Path.Combine(Path.GetDirectoryName bindingPath, "pending",
                              Path.GetFileNameWithoutExtension bindingPath, ".locks")
             Directory.CreateDirectory(lockDirectory) |> ignore
-            let lockPath = Path.Combine(lockDirectory, operationId.ToString("N").Substring(0, 2) + ".lock")
+            let lockPath = Path.Combine(lockDirectory, operationId.ToString("N").Substring(0, 3) + ".lock")
             let script = Path.Combine(Path.GetDirectoryName one, "hold-exclusive-lock.fsx")
             let ready = Path.Combine(Path.GetDirectoryName one, "holder-ready")
             File.WriteAllText(script,

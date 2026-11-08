@@ -1,0 +1,13 @@
+<h1>Transient trust-binding contention in Agents dashboard</h1><p><strong>Feedback:</strong> acd4d298ce104c6d8f017c4e72358c9c.</p>
+<h2>Observed issue</h2><p>The Windows Agents view intermittently presents another project's trust-binding file lock as a persistent ValidationError even though the condition clears on its own. This conflates transient local IO contention with corrupted/invalid trust metadata.</p>
+<h2>Required behavior</h2><ul>
+<li>Identify lock acquisition and reading paths for trust-binding files. Separate transient sharing/lock contention from true validation failures and from remote unavailability using typed error categories; never silently ignore invalid trust identity or substitute unsafe metadata.</li>
+<li>Use bounded retry/backoff or safe short-lived deferred refresh for transient contention, without blocking the entire TUI, performing unsafe lock stealing or changing the trusted ledger binding. Keep other project rows and the previous verified snapshot visible with explicit temporarily-unavailable/stale status.</li>
+<li>Automatically recover on the next existing refresh once contention ends; preserve detailed diagnostics outside the normal status display. A temporary read failure must never become a false zero-agent result or trigger a trust reset.</li>
+<li>Coordinate shared-file semantics with concurrent-client task <code>task-cff673cd81474ccf9b3932bf0ea33109</code> and global dashboard task <code>task-6c6d71c8d3ef408eb30886ded9522af3</code>; avoid duplicating a second trust-binding implementation.</li>
+</ul>
+<h2>Acceptance</h2><ol>
+<li>Injected Windows-style sharing violations recover under bounded contention and display recoverable status without clearing other projects.</li>
+<li>Permanent invalid identity, malformed binding, permission denial and lost file remain distinct explicit failures; no trust bypass or unauthorized rewrite occurs.</li>
+<li>Two concurrent refreshes/clients and interleaved file reads do not corrupt trust state; after lock release the Agents screen automatically recovers. Release tests pass.</li>
+</ol><p>Do not deploy without operator authorization.</p>

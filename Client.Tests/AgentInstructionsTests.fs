@@ -915,11 +915,14 @@ let worktree_git_discovery_drains_both_pipes_and_bounds_a_hung_process () =
             let childPid = Int32.Parse(File.ReadAllText(pidFile).Trim())
             let childAlive () =
                 let stat = "/proc/" + string childPid + "/stat"
-                if not (File.Exists stat) then false
-                else
+                try
                     let record = File.ReadAllText(stat)
                     let state = record[record.LastIndexOf(") ", StringComparison.Ordinal) + 2]
                     state <> 'Z' && state <> 'X'
+                with :? IOException ->
+                    // /proc entries can disappear between lookup and read as
+                    // the timed-out child exits. That is the expected outcome.
+                    false
             // Allow the kernel to finish propagating SIGKILL and reaping.
             let clock = Stopwatch.StartNew()
             while childAlive() && clock.Elapsed < TimeSpan.FromSeconds 2. do

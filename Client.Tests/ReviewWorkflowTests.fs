@@ -3589,3 +3589,35 @@ type ReviewWorkflowTests() =
                 Assert.That(inbox.UnacknowledgedFeedback, Is.Empty)
                 Assert.That(inbox.PendingNotifications, Is.Empty)
                 Assert.That(inbox.IntegrationSubmissions, Is.Empty))
+
+    [<Test>]
+    member _.AgentInboxBatchRejectsNonRegularCanonicalGitObjects() =
+        // A verified commit may still contain a malformed tree entry. The old
+        // per-record reader only accepted mode 100644, never executable blobs
+        // or Gitlinks; batching must preserve that integrity boundary.
+        withFixture (fun one _ first second _ _ _ _ ->
+            let taskId = "inbox-object-mode"
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Object mode validation"
+            |> success |> ignore
+            ReviewWorkflow.getAgentInbox second "Owner" |> success |> ignore
+            let canonical = LedgerStore.fetch first |> success
+            let auxiliary = Path.Combine(Path.GetDirectoryName(one), "ledger-mode")
+            git one [ "worktree"; "add"; "--detach"; auxiliary; canonical.Commit ] |> ignore
+            try
+                let path = $"tasks/{taskId}/task.json"
+                let push () =
+                    let commit = git auxiliary [ "rev-parse"; "HEAD" ]
+                    git one [ "push"; "origin"; commit + ":refs/heads/jarvis-orchestration" ] |> ignore
+                let reject label =
+                    match ReviewWorkflow.getAgentInbox second "Owner" with
+                    | Error(LedgerIntegrityError _) -> ()
+                    | other -> Assert.Fail(sprintf "%s must fail closed: %A" label other)
+                git auxiliary [ "update-index"; "--chmod=+x"; "--"; path ] |> ignore
+                git auxiliary [ "commit"; "-m"; "Corrupt canonical task executable mode" ] |> ignore
+                push ()
+                reject "executable task blob"
+                git auxiliary [ "update-index"; "--add"; "--cacheinfo"; "160000"; canonical.Commit; path ] |> ignore
+                git auxiliary [ "commit"; "-m"; "Corrupt canonical task Gitlink mode" ] |> ignore
+                push ()
+                reject "Gitlink task"
+            finally git one [ "worktree"; "remove"; "--force"; auxiliary ] |> ignore)

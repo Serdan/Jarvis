@@ -1044,6 +1044,7 @@ module LedgerStore =
         match gitRaw repo treeArgs |> requireSuccess "Dashboard tree listing" with
         | Error error -> Error error
         | Ok listing ->
+            let mutable malformedRecordPath = None
             let records =
                 listing.Split('\000', StringSplitOptions.RemoveEmptyEntries)
                 |> Array.choose (fun entry ->
@@ -1052,10 +1053,13 @@ module LedgerStore =
                     else
                         let header = entry.Substring(0, separator).Split(' ')
                         let path = entry.Substring(separator + 1)
-                        if header.Length = 3 && header[1] = "blob"
-                           && oidPattern.IsMatch(header[2])
-                           && ledgerPath.IsMatch path && dashboardRecordPath includeIntegrations path then
-                            Some(path, header[2])
+                        if ledgerPath.IsMatch path && dashboardRecordPath includeIntegrations path then
+                            if header.Length = 3 && header[0] = "100644"
+                               && header[1] = "blob" && oidPattern.IsMatch(header[2]) then
+                                Some(path, header[2])
+                            else
+                                malformedRecordPath <- Some path
+                                None
                         else None)
             let missing =
                 records
@@ -1063,8 +1067,10 @@ module LedgerStore =
                 |> Array.distinct
                 |> Array.filter (fun oid -> not (dashboardBlobCache.ContainsKey oid))
             let load () =
-                if missing.Length = 0 then Ok ()
-                else
+                match malformedRecordPath with
+                | Some path -> Error(LedgerIntegrityError $"Unexpected ledger object type: {path}.")
+                | None when missing.Length = 0 -> Ok ()
+                | None ->
                     let input = String.concat "\n" missing + "\n"
                     match execute repo [ "cat-file"; "--batch" ] (Some input) [] true
                           |> requireSuccess "Dashboard blob batch" with

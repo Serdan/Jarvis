@@ -1,0 +1,12 @@
+<h1>Working-agent inactivity indicators</h1><p><strong>Feedback:</strong> a73c4832afe64a428a026cfa12c87a2f.</p>
+<h2>Behavior</h2><ul>
+<li>Only for agents canonically Working, derive idle duration from the most recent genuine agent-attributed last-seen activity, not from an open browser tab, cached roster access, or unrelated observer/administrative calls.</li>
+<li>Under 10 minutes: unchanged normal status. At 10 minutes to under 30: understated amber warning in existing status column. At 30 minutes and above: prominent red stalled indicator; no new status column, animation, flashing, lifecycle state or polling.</li>
+<li>Clear the warning when verified agent activity advances last seen or the agent exits Working. Handle missing last-seen data and server restart explicitly: display unknown rather than fabricating an inactivity duration.</li>
+<li>Consume the current UI refresh cadence and the shared last-seen provenance model in the global operator dashboard (<code>task-6c6d71c8d3ef408eb30886ded9522af3</code>). Keep timezone/time skew and unavailable remote-client data from creating false stalled claims.</li>
+</ul>
+<h2>Acceptance</h2><ol>
+<li>Boundary tests at 9:59, 10:00, 29:59, 30:00; Working vs Ready/Parked/Blocked; status resets on new activity.</li>
+<li>Missing or stale last-seen produces an explicit unknown/no confident warning rather than an invented timer; observation cannot reset the warning.</li>
+<li>UI tests verify readable indicators in both light/dark terminal themes and compact terminal width; no extra network polling or server state mutation.</li>
+</ol><p>Do not deploy without operator approval.</p>

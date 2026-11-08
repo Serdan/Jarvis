@@ -251,49 +251,36 @@ module LedgerStore =
         with _ -> false
 
     let private execute (repo: string) (args: string list) (input: string option) (environment: (string * string) list) (preserveStdout: bool) =
-        try
-            use gitProcess = new Process()
-            gitProcess.StartInfo.FileName <- "git"
-            gitProcess.StartInfo.WorkingDirectory <- repo
-            gitProcess.StartInfo.UseShellExecute <- false
-            gitProcess.StartInfo.RedirectStandardOutput <- true
-            gitProcess.StartInfo.RedirectStandardError <- true
-            gitProcess.StartInfo.RedirectStandardInput <- true
-            gitProcess.StartInfo.CreateNoWindow <- true
-            gitProcess.StartInfo.Environment["GIT_TERMINAL_PROMPT"] <- "0"
-            // A caller's Git credentials/configuration, not the task payload, select authentication.
-            for (key, value) in environment do
-                gitProcess.StartInfo.Environment[key] <- value
-            args |> List.iter gitProcess.StartInfo.ArgumentList.Add
-            let measured = activeGitReadMetrics.Value
-            if not (isNull measured) then
-                measured.ProcessStarts <- measured.ProcessStarts + 1
-                match args with
-                | "fetch" :: _ -> measured.RemoteFetches <- measured.RemoteFetches + 1
-                | "show" :: _ -> measured.IndividualBlobReads <- measured.IndividualBlobReads + 1
-                | "cat-file" :: "--batch" :: _ -> measured.BatchBlobReads <- measured.BatchBlobReads + 1
-                | _ -> ()
-            if not (gitProcess.Start()) then
-                Error(GitFailure "Cannot launch Git.")
-            else
-                let stdout = gitProcess.StandardOutput.ReadToEndAsync()
-                let stderr = gitProcess.StandardError.ReadToEndAsync()
-                match input with
-                | Some value -> gitProcess.StandardInput.Write(value)
-                | None -> ()
-                gitProcess.StandardInput.Close()
-                if not (gitProcess.WaitForExit(30000)) then
-                    gitProcess.Kill(true)
-                    Error(RemoteUnavailable "Git command timed out.")
-                else
-                    let value = stdout.GetAwaiter().GetResult()
-                    if not (isNull measured) then
-                        measured.OutputBytes <- measured.OutputBytes + int64 (encoding.GetByteCount value)
-                    Ok { ExitCode = gitProcess.ExitCode
-                         Stdout = if preserveStdout then value else value.TrimEnd('\n', '\r')
-                         Stderr = stderr.GetAwaiter().GetResult() }
-        with ex ->
-            Error(GitFailure ex.Message)
+        // Preserve the snapshot benchmark counters while using the shared
+        // lifecycle-bounded process runner for every Git invocation.
+        let measured = activeGitReadMetrics.Value
+        if not (isNull measured) then
+            measured.ProcessStarts <- measured.ProcessStarts + 1
+            match args with
+            | "fetch" :: _ -> measured.RemoteFetches <- measured.RemoteFetches + 1
+            | "show" :: _ -> measured.IndividualBlobReads <- measured.IndividualBlobReads + 1
+            | "cat-file" :: "--batch" :: _ -> measured.BatchBlobReads <- measured.BatchBlobReads + 1
+            | _ -> ()
+        BoundedProcess.run
+            { Executable = "git"
+              Args = args
+              WorkingDirectory = repo
+              Timeout = TimeSpan.FromSeconds 30.
+              MaxOutputBytes = None // Git blob reads are intentionally not page-limited here.
+              StandardInput = input |> Option.map BoundedProcess.TextInput |> Option.defaultValue BoundedProcess.ClosedInput
+              ExtraEnvironment = ("GIT_TERMINAL_PROMPT", "0") :: environment
+              ConfigureStart = None }
+        |> function
+            | Error(ExceptionError ex) -> Error(GitFailure ex.Message)
+            | Error failure -> Error(GitFailure(string failure))
+            | Ok output when output.TimedOut -> Error(RemoteUnavailable "Git command timed out.")
+            | Ok output ->
+                if not (isNull measured) then
+                    measured.OutputBytes <- measured.OutputBytes + int64 (encoding.GetByteCount output.StdOut)
+                Ok
+                    { ExitCode = output.ExitCode
+                      Stdout = if preserveStdout then output.StdOut else output.StdOut.TrimEnd('\n', '\r')
+                      Stderr = output.StdErr }
 
     let private git repo args = execute repo args None [] false
     let private gitRaw repo args = execute repo args None [] true

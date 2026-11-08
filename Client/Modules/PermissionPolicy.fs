@@ -133,7 +133,15 @@ let private requiresConfirmation command =
     | MessageCommand _
     | GetClientActivityCommand _ -> readOnly
     | ImportFileCommand cmd ->
-        confirmation "ImportFile" (Some cmd.ProjectName) [ WorkspaceWrite; NetworkAccess ] [ cmd.FilePath ] None [] $"Import file {cmd.FilePath}" false
+        // Never show a temporary signed file URL (query credentials) in
+        // confirmation dialogs, audits or error messages.
+        let host =
+            match ImportNetwork.classifyUrl cmd.DownloadUrl with
+            | Ok ImportNetwork.ProviderAttachment -> "ChatGPT file delivery"
+            | Ok (ImportNetwork.OtherPublicHttps name) -> name
+            | Error _ -> "unrecognized HTTPS source"
+        confirmation "ImportFile" (Some cmd.ProjectName) [ WorkspaceWrite; NetworkAccess ]
+            [ cmd.FilePath ] None [ host ] $"Import from {host} to {cmd.FilePath}" false
     | UpdateClientCommand ->
         confirmation "UpdateClient" None [ ProcessExecution; NetworkAccess; Destructive ] [] None [] "Update and restart Jarvis client" false
     | WriteFileCommand cmd ->
@@ -184,6 +192,10 @@ let private requiresConfirmation command =
 let private trustAllows trustLevel command =
     match trustLevel, command with
     | FullTrust, _ -> true
+    // The public MCP tool uses an OpenAI file param, but neither its file ID
+    // nor its URL should be trusted as authority by themselves. Only URLs
+    // from the known delivery domain are auto-approved under PartialTrust.
+    | PartialTrust, ImportFileCommand cmd -> ImportNetwork.isKnownAttachment cmd.DownloadUrl
     | PartialTrust, RunCommandCommand _
     | PartialTrust, RunProjectTaskCommand _
     | PartialTrust, StartJobCommand _

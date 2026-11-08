@@ -3,10 +3,7 @@ module Client.SignalR.Client
 open System
 open System.Diagnostics
 open System.IO
-open System.Net
-open System.Net.Http
 open System.Runtime.CompilerServices
-open System.Security.Cryptography
 open System.Text
 open System.Text.Json
 open System.Threading.Tasks
@@ -300,12 +297,9 @@ let private importFile (resolved: ProjectPaths.ResolvedProject option) (cmd: Imp
     | Some value when value <= 0L ->
         Error(Client.ValidationError "MaxBytes must be greater than zero when supplied.")
     | requestedLimit ->
-        match Uri.TryCreate(cmd.DownloadUrl, UriKind.Absolute) with
-        | false, _ ->
-            Error(Client.ValidationError "DownloadUrl must be an absolute URL.")
-        | true, uri when uri.Scheme <> Uri.UriSchemeHttps ->
-            Error(Client.ValidationError "DownloadUrl must use HTTPS.")
-        | true, uri ->
+        match ImportNetwork.parseUrl cmd.DownloadUrl with
+        | Error failure -> Error failure
+        | Ok _ ->
             let destination =
                 match resolved with
                 | Some project -> fun rt -> ProjectPaths.resolveSourcePath project cmd.FilePath rt |> Result.map FilePath
@@ -326,65 +320,58 @@ let private importFile (resolved: ProjectPaths.ResolvedProject option) (cmd: Imp
                 let tempPath =
                     Path.Combine(parentPath, $".{Path.GetFileName(destinationPath)}.{Guid.NewGuid():N}.jarvis-import")
 
-                try
-                    if File.Exists destinationPath && not cmd.Overwrite then
-                        Error(Client.ValidationError $"Destination file already exists: {cmd.FilePath}")
-                    else
-                        if cmd.CreateParents then
-                            Directory.CreateDirectory(parentPath) |> ignore
-                        elif not (Directory.Exists parentPath) then
-                            raise (DirectoryNotFoundException $"Parent directory does not exist: {Path.GetDirectoryName(cmd.FilePath)}")
-
-                        use request = new HttpRequestMessage(HttpMethod.Get, uri)
-                        use response = rt.httpClient.Send(request, HttpCompletionOption.ResponseHeadersRead)
-
-                        if response.StatusCode < HttpStatusCode.OK || response.StatusCode >= HttpStatusCode.MultipleChoices then
-                            Error(Client.ValidationError $"Download failed with HTTP status {int response.StatusCode}.")
+                let result =
+                    try
+                        if File.Exists destinationPath && not cmd.Overwrite then
+                            Error(Client.ValidationError $"Destination file already exists: {cmd.FilePath}")
                         else
-                            let contentLength = response.Content.Headers.ContentLength
+                            if cmd.CreateParents then
+                                Directory.CreateDirectory(parentPath) |> ignore
+                            elif not (Directory.Exists parentPath) then
+                                raise (DirectoryNotFoundException $"Parent directory does not exist: {Path.GetDirectoryName(cmd.FilePath)}")
 
-                            if contentLength.HasValue && contentLength.Value > effectiveLimit then
-                                Error(Client.ValidationError $"File is {contentLength.Value} bytes and exceeds the {effectiveLimit} byte import limit.")
-                            else
-                                use source = response.Content.ReadAsStream()
-                                use destination =
-                                    new FileStream(tempPath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 81920, FileOptions.SequentialScan)
-                                use hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256)
-                                let buffer = Array.zeroCreate<byte> 81920
-                                let mutable total = 0L
-                                let mutable finished = false
+                            // Automatic trust under PartialTrust is restricted to
+                            // provider file hosts throughout the redirect chain.
+                            // Generic HTTPS imports require explicit local approval,
+                            // or the operator's existing FullTrust setting.
+                            let permission = rt :> PermissionIO
+                            let redirectTrust =
+                                if permission.TrustLevel = PartialTrust
+                                    && ImportNetwork.isKnownAttachment cmd.DownloadUrl then
+                                    ImportNetwork.ProviderOriginsOnly
+                                else ImportNetwork.AnyPublicHttps
 
-                                while not finished do
-                                    let read = source.Read(buffer, 0, buffer.Length)
-                                    if read = 0 then
-                                        finished <- true
-                                    else
-                                        total <- total + int64 read
-                                        if total > effectiveLimit then
-                                            raise (InvalidDataException $"Downloaded file exceeds the {effectiveLimit} byte import limit.")
+                            let result =
+                                ImportNetwork.downloadTo
+                                    (ImportNetwork.sharedClient())
+                                    redirectTrust cmd.DownloadUrl tempPath effectiveLimit
+                                    Threading.CancellationToken.None
+                                |> fun task -> task.GetAwaiter().GetResult()
 
-                                        destination.Write(buffer, 0, read)
-                                        hash.AppendData(buffer, 0, read)
-
-                                destination.Flush(true)
-                                let digest =
-                                    hash.GetHashAndReset()
-                                    |> Convert.ToHexString
-                                    |> fun value -> $"sha256:{value.ToLowerInvariant()}"
-
-                                File.Move(tempPath, destinationPath, cmd.Overwrite)
-
-                                Ok
-                                    { FilePath = cmd.FilePath
-                                      FileId = cmd.FileId
-                                      BytesWritten = total
-                                      MimeType = cmd.MimeType
-                                      Sha256 = digest }
-                with ex ->
-                    if File.Exists tempPath then
-                        try File.Delete tempPath with _ -> ()
-
-                    Error(Client.ExceptionError ex)
+                            match result with
+                            | Error failure -> Error failure
+                            | Ok receipt ->
+                                // The checkout can change during a remote download.
+                                // Revalidate source containment before publication.
+                                match destination rt with
+                                | Error error -> Error error
+                                | Ok(FilePath revalidated) when revalidated <> destinationPath ->
+                                    Error(Client.ValidationError "Import destination changed during download.")
+                                | Ok _ ->
+                                    File.Move(tempPath, destinationPath, cmd.Overwrite)
+                                    Ok
+                                        { FilePath = cmd.FilePath
+                                          FileId = cmd.FileId
+                                          BytesWritten = receipt.BytesWritten
+                                          MimeType = cmd.MimeType
+                                          Sha256 = receipt.Sha256 }
+                    with
+                    | :? IOException ->
+                        Error(Client.ValidationError "Unable to publish imported file.")
+                    | ex -> Error(Client.ExceptionError ex)
+                if File.Exists tempPath then
+                    try File.Delete tempPath with _ -> ()
+                result
 
 let private sourceOperation resolved withContext legacy =
     match resolved with

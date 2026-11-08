@@ -1,13 +1,11 @@
 namespace Client
 
-open System.Net.Http
 open System.Threading.Tasks
 open Client.IO
 open Client.ConsoleTui
 open Common
 
 type Runtime(root: string, tui: ConsoleTui, trustLevel: TrustLevel, maxImportBytes: int64) =
-    member _.httpClient = new HttpClient()
     member _.Tui = tui
     member _.MaxImportBytes = maxImportBytes
 

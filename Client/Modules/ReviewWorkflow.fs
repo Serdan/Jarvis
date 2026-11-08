@@ -512,31 +512,36 @@ module ReviewWorkflow =
             else content
         { Path = path; ExpectedBlobOid = blob; Content = content }
 
+    // Shared canonical JSON validation for individual entity reads and the
+    // batched inbox. Never bypass schema/lifecycle/identity validation.
+    let private decodeEntity<'t> path (content: string) : Result<'t, LedgerFailure> =
+        try
+            match validEntity<'t> content with
+            | Error message ->
+                Error(LedgerIntegrityError $"Invalid ledger entity {path}: {message}")
+            | Ok () ->
+                let parsed = JsonSerializer.Deserialize<'t>(content, options)
+                let parsed =
+                    if typeof<'t> = typeof<AgentNotification> && not (isNull (box parsed)) then
+                        let notification = unbox<AgentNotification>(box parsed)
+                        if isNull notification.FromProjectName then
+                            unbox<'t>(box { notification with FromProjectName = "" })
+                        else parsed
+                    else parsed
+                if isNull (box parsed) then
+                    Error(LedgerIntegrityError $"Null ledger entity: {path}")
+                else Ok parsed
+        with ex ->
+            Error(LedgerIntegrityError $"Invalid ledger entity {path}: {ex.Message}")
+
     let private read<'t> binding snapshot path : Result<('t * string) option, LedgerFailure> =
         result {
             let! content, blobOid = LedgerStore.readAt binding snapshot path
             match content, blobOid with
             | None, None -> return None
             | Some content, Some blobOid ->
-                try
-                    match validEntity<'t> content with
-                    | Error message ->
-                        return! Error(LedgerIntegrityError $"Invalid ledger entity {path}: {message}")
-                    | Ok () ->
-                        let parsed = JsonSerializer.Deserialize<'t>(content, options)
-                        let parsed =
-                            if typeof<'t> = typeof<AgentNotification> && not (isNull (box parsed)) then
-                                let notification = unbox<AgentNotification>(box parsed)
-                                if isNull notification.FromProjectName then
-                                    unbox<'t>(box { notification with FromProjectName = "" })
-                                else parsed
-                            else parsed
-                        if isNull (box parsed) then
-                            return! Error(LedgerIntegrityError $"Null ledger entity: {path}")
-                        else
-                            return Some(parsed, blobOid)
-                with ex ->
-                    return! Error(LedgerIntegrityError $"Invalid ledger entity {path}: {ex.Message}")
+                let! parsed = decodeEntity<'t> path content
+                return Some(parsed, blobOid)
             | _ -> return! Error(LedgerIntegrityError $"Inconsistent ledger entity: {path}")
         }
 
@@ -547,6 +552,11 @@ module ReviewWorkflow =
             | Some record -> return record
             | None -> return! Error(StaleEntityVersion $"Missing ledger entity: {path}")
         }
+
+    let private requiredFromRecords<'t> (records: Map<string, string>) path =
+        match Map.tryFind path records with
+        | None -> Error(StaleEntityVersion $"Missing ledger entity: {path}")
+        | Some content -> decodeEntity<'t> path content
 
     let private getAttempt binding snapshot taskId =
         result {
@@ -2336,14 +2346,29 @@ module ReviewWorkflow =
         else
             result {
                 let! snapshot = LedgerStore.fetch binding
-                let! agent, _ = required<ReviewAgent> binding snapshot (agentPath agentId)
-                let! notifications = pendingNotifications binding snapshot agentId
-                let! allIntegrationPaths = LedgerStore.listAt binding snapshot "tasks"
+                let! records = LedgerStore.readAgentInboxRecordsAt binding snapshot
+                let! agent = requiredFromRecords<ReviewAgent> records (agentPath agentId)
+                let paths = records |> Map.toList |> List.map fst
+                let mutable notifications = []
+                for path in paths do
+                    if path.StartsWith("notifications/", StringComparison.Ordinal)
+                       && path.EndsWith(".json", StringComparison.Ordinal) then
+                        let! notification = requiredFromRecords<AgentNotification> records path
+                        match Guid.TryParseExact(notification.NotificationId, "N") with
+                        | true, parsed when path = notificationPath parsed
+                                            && validAgent notification.FromAgentId
+                                            && validAgent notification.ToAgentId ->
+                            if notification.ToAgentId = agentId
+                               && String.IsNullOrWhiteSpace notification.AcknowledgedAtUtc then
+                                notifications <- notification :: notifications
+                        | _ -> return! Error(LedgerIntegrityError "Invalid notification identity.")
+                let notifications = notifications |> List.sortBy (fun n -> n.CreatedAtUtc, n.NotificationId)
+                let allIntegrationPaths = paths
                 let mutable integrationRecords = []
                 for path in allIntegrationPaths do
                     if path.Contains("/integrations/", StringComparison.Ordinal)
                        && path.EndsWith(".json", StringComparison.Ordinal) then
-                        let! record, _ = required<IntegrationSubmission> binding snapshot path
+                        let! record = requiredFromRecords<IntegrationSubmission> records path
                         match Guid.TryParseExact(record.SubmissionId, "N") with
                         | true, id when path = integrationPath record.TaskId id ->
                             if record.ActorId = agentId
@@ -2352,7 +2377,6 @@ module ReviewWorkflow =
                                 integrationRecords <- record :: integrationRecords
                         | _ -> return! Error(LedgerIntegrityError "Invalid integration submission identity.")
 
-                let! paths = LedgerStore.listAt binding snapshot "tasks"
                 let taskPaths = paths |> List.filter (fun path -> path.EndsWith("/task.json", StringComparison.Ordinal))
                 let reviewPaths = paths |> List.filter (fun path -> path.EndsWith("/review.json", StringComparison.Ordinal))
                 let mutable failure = None
@@ -2362,17 +2386,17 @@ module ReviewWorkflow =
                 let mutable feedback = []
                 for path in taskPaths do
                     if failure.IsNone then
-                        match required<ReviewTask> binding snapshot path with
+                        match requiredFromRecords<ReviewTask> records path with
                         | Error error -> failure <- Some error
-                        | Ok(task, _) ->
+                        | Ok task ->
                             if not (validTaskId task.TaskId) || path <> taskPath task.TaskId
                                || not (List.contains task.Lifecycle
                                    [ "Open"; "InProgress"; "Implemented"; "Integrated"; "Closed"; "Cancelled" ]) then
                                 failure <- Some(LedgerIntegrityError "Invalid task identity or lifecycle in inbox.")
                             elif not (String.IsNullOrWhiteSpace task.AttemptId) then
-                                match required<ReviewAttempt> binding snapshot (attemptPath task.TaskId task.AttemptId) with
+                                match requiredFromRecords<ReviewAttempt> records (attemptPath task.TaskId task.AttemptId) with
                                 | Error error -> failure <- Some error
-                                | Ok(attempt, _) ->
+                                | Ok attempt ->
                                     if attempt.TaskId <> task.TaskId || attempt.AttemptId <> task.AttemptId
                                        || not (List.contains attempt.Phase
                                            [ "Queued"; "Started"; "Finished"; "Deferred"; "Blocked"; "Superseded"; "Abandoned" ]) then
@@ -2380,7 +2404,7 @@ module ReviewWorkflow =
                                     elif attempt.OwnerAgentId = agentId then
                                         owned <- { Task = task; Attempt = attempt } :: owned
                 for path in reviewPaths do
-                    let! review, _ = required<BranchReview> binding snapshot path
+                    let! review = requiredFromRecords<BranchReview> records path
                     if not (validTaskId review.TaskId)
                        || path <> branchReviewPath review.TaskId review.ReviewId then
                         failure <- Some(LedgerIntegrityError "Invalid canonical review identity.")

@@ -1,0 +1,15 @@
+<h1>Per-project review queue counts</h1>
+<p><strong>Feedback:</strong> 67ba75c5f73b4a6387f9050adfc2862f; 597168cf862c41618c00c2e0401778dd.</p>
+<h2>Goal</h2><p>Show a compact, immediately actionable review count per project, not merely an aggregate. Display <code>unclaimed/total</code>; total means unclaimed plus claimed outstanding review requests, not completed/withdrawn requests.</p>
+<h2>Implementation</h2><ul>
+<li>Derive counts from canonical independent review records. Group by stable project/ledger identity, not display name alone. Deduplicate repeated ledger visibility across clients and do not double count review snapshots or task review history.</li>
+<li>In the existing review queue area, show each project with U/T (e.g. <code>Wayfold 3/8</code>) using appropriate space-saving truncation/scroll behavior; optional aggregate <code>Reviews U/T</code> may supplement but not replace project breakdown.</li>
+<li>Align totals with review-list filters, the existing refresh cycle, and the planned global operator dashboard <code>task-6c6d71c8d3ef408eb30886ded9522af3</code>. Avoid extra polling and distinguish unavailable/stale project counts rather than silently showing zero.</li>
+<li>Use consistent counts when reviewers claim/release/decide/withdraw requests, including independent reviews in the <code>_reviews</code> namespace.</li>
+</ul>
+<h2>Acceptance</h2><ol>
+<li>Fixtures with claimed, unclaimed and completed reviews across multiple projects yield precise per-project U/T and optional aggregate sums.</li>
+<li>Two clients exposing the same ledger produce one group; same-named distinct ledgers remain distinct.</li>
+<li>Claim/release/completion changes update on existing refresh; no additional network polling, count flicker or double counting.</li>
+<li>Empty, filtered, stale, disconnected and long-name cases remain readable on supported terminal sizes; automated tests and Release build pass.</li>
+</ol><p>Coordinate integration with global dashboard work. Do not deploy without operator approval.</p>

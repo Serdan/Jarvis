@@ -1513,9 +1513,17 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                     | true, previous -> now - previous >= TimeSpan.FromSeconds(10.)
                     | _ -> true
                 if persist then
-                    activityLog |> Option.iter (fun store ->
-                        store.SaveAgentSeen(agentSeen |> Seq.map (fun entry -> entry.Key, entry.Value)))
-                    persistedAgentSeen[key] <- now
+                    let saved =
+                        match activityLog with
+                        | None -> true
+                        | Some store ->
+                            try
+                                store.SaveAgentSeen(agentSeen |> Seq.map (fun entry -> entry.Key, entry.Value))
+                                true
+                            with :? System.IO.IOException -> false
+                    // A failed atomic snapshot must be retried on the next
+                    // attributed call, not treated as durably persisted.
+                    if saved then persistedAgentSeen[key] <- now
                 if mode = AgentsMode || mode = AgentFilterMode then renderUnsafe())
 
     member _.SetAgentAccess(access: AgentUiAccess) =

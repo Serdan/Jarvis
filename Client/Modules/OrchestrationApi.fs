@@ -340,6 +340,42 @@ type PendingIntent =
       CommandSha256: string
       CreatedUtc: string }
 
+type PendingIntentCount =
+    { Name: string
+      Count: int }
+
+type PendingIntentSummary =
+    { VerifiedLedgerHead: string
+      Total: int
+      MalformedLocalRecords: int
+      ByDisposition: PendingIntentCount list
+      ByAction: PendingIntentCount list
+      ByActor: PendingIntentCount list
+      ByAge: PendingIntentCount list }
+
+// Returned by the compact page API; never contains the stored command JSON,
+// and in particular never exposes historic SessionId tokens.
+type PendingIntentBrief =
+    { OperationId: string
+      Action: string
+      Actor: string
+      TaskId: string option
+      CreatedUtc: string
+      CommandSha256: string
+      Disposition: string }
+
+type PendingIntentPage =
+    { VerifiedLedgerHead: string
+      Records: PendingIntentBrief list
+      NextCursor: string option }
+
+type PendingIntentInspection =
+    { OperationId: string
+      PresentLocally: bool
+      VerifiedLedgerHead: string
+      Disposition: string option
+      Record: PendingIntent option }
+
 // Local crash recovery is an intent journal, not a second ledger writer.
 // The authoritative operation outcome remains on the remote orphan ref.
 module PendingIntentJournal =
@@ -430,19 +466,27 @@ module PendingIntentJournal =
         with ex ->
             Error(Client.ValidationError $"Cannot persist local pending  operation: {ex.Message}")
 
-    let listAtRoot root =
+    let private journalFiles root =
         try
             let directory = journalDirectory root
-            if not (Directory.Exists directory) then Ok []
+            if not (Directory.Exists directory) then Ok [||]
             elif DirectoryInfo(directory).Attributes.HasFlag(FileAttributes.ReparsePoint) then
                 Error(Client.ValidationError "Pending  journal directory must not be a symbolic link.")
             else
                 let files = Directory.GetFiles(directory, "*.json")
+                Array.sortInPlace files
+                Ok files
+        with ex ->
+            Error(Client.ValidationError $"Cannot enumerate pending  operations: {ex.Message}")
+
+    let listAtRoot root =
+        journalFiles root
+        |> Result.bind (fun files ->
+            try
                 if files.Length > 1000 then
                     Error(Client.ValidationError "Too many pending operations; manual recovery required.")
                 else
                     files
-                    |> Array.sort
                     |> Array.fold (fun state file ->
                         state |> Result.bind (fun items ->
                             readFile file |> Result.bind (fun record ->
@@ -453,8 +497,56 @@ module PendingIntentJournal =
                                     Error(Client.ValidationError "Unexpected pending operation journal filename."))))
                         (Ok [])
                     |> Result.map List.rev
-        with ex ->
-            Error(Client.ValidationError $"Cannot enumerate pending  operations: {ex.Message}")
+            with ex ->
+                Error(Client.ValidationError $"Cannot read pending  operations: {ex.Message}"))
+
+    // Exact UUID lookup stays usable even when the legacy full-list endpoint
+    // encounters more than 1,000 records. No command or session metadata is
+    // inferred from the current caller.
+    let findAtRoot root (operationId: Guid) =
+        let path = Path.Combine(journalDirectory root, operationId.ToString("N") + ".json")
+        if not (File.Exists path) then Ok None
+        else
+            readFile path
+            |> Result.bind (fun record ->
+                if record.OperationId = operationId.ToString("D") then Ok(Some record)
+                else Error(Client.ValidationError "Local intent filename and operation UUID disagree."))
+
+    // Opaque sorted UUID cursor. A page reads at most 100 full command
+    // records, and an individual intent remains inspectable by UUID.
+    let pageAtRoot root (cursor: string) (pageSize: int) =
+        if pageSize < 1 || pageSize > 100 then
+            Error(Client.ValidationError "Pending intent pageSize must be between 1 and 100.")
+        elif not (String.IsNullOrWhiteSpace cursor)
+             && not (Guid.TryParseExact(cursor, "N") |> fst) then
+            Error(Client.ValidationError "Pending intent cursor must be an operation UUID in N format.")
+        else
+            journalFiles root
+            |> Result.bind (fun files ->
+                let selected =
+                    files
+                    |> Array.filter (fun path ->
+                        String.IsNullOrWhiteSpace cursor
+                        || String.CompareOrdinal(Path.GetFileNameWithoutExtension(path), cursor) > 0)
+                    |> Array.truncate (pageSize + 1)
+                selected
+                |> Array.truncate pageSize
+                |> Array.fold (fun acc file ->
+                    acc |> Result.bind (fun items ->
+                        readFile file |> Result.bind (fun record ->
+                            let expected = record.OperationId.Replace("-", "").ToLowerInvariant() + ".json"
+                            if Path.GetFileName(file) <> expected then
+                                Error(Client.ValidationError "Unexpected pending operation journal filename.")
+                            else Ok(record :: items))))
+                    (Ok [])
+                |> Result.map (fun reversed ->
+                    let records = List.rev reversed
+                    let nextCursor =
+                        if selected.Length > pageSize then
+                            records |> List.tryLast |> Option.map (fun record ->
+                                record.OperationId.Replace("-", "").ToLowerInvariant())
+                        else None
+                    records, nextCursor))
 
     let listForProject projectName rt =
         ProjectPaths.resolveProjectRoot projectName rt
@@ -642,6 +734,162 @@ module PendingIntentJournal =
         && record.LedgerId = binding.LedgerId.ToString("D")
         && record.Epoch = binding.Epoch
 
+    // Remote absence remains uncertain. A matching operation receipt is
+    // authoritative only if the exact action and required identities match.
+    let private classifyAt binding snapshot (knownIds: Set<string>) (record: PendingIntent) =
+        if not (checkBinding binding record) then Ok "BindingMismatch"
+        else
+            match Guid.TryParse record.OperationId with
+            | false, _ -> Error(Client.ValidationError "Invalid pending operation UUID.")
+            | true, id when not (knownIds.Contains(id.ToString("N"))) ->
+                Ok "NotFoundAtVerifiedHead"
+            | true, id ->
+                LedgerStore.LedgerStore.getOperationAt binding snapshot id
+                |> Result.mapError LedgerErrors.toEffect
+                |> Result.map (function
+                    | Some op when identityMatches record op -> "Applied"
+                    | Some _ -> "IdentityMismatch"
+                    | None -> "NotFoundAtVerifiedHead")
+
+    // Parse only the bounded metadata needed for triage; old SessionId values
+    // remain in the exact command JSON, exposed only via targeted inspection.
+    let private metadata (record: PendingIntent) =
+        try
+            use doc = JsonDocument.Parse(record.CommandJson)
+            let root = doc.RootElement
+            if root.ValueKind <> JsonValueKind.Object then None
+            else
+                let field key = commandProperty root key |> Option.defaultValue ""
+                let action = field "Action"
+                if String.IsNullOrWhiteSpace action then None
+                else
+                    let actor =
+                        [ "ActorId"; "ReviewerId"; "OwnerId" ]
+                        |> List.map field
+                        |> List.tryFind (String.IsNullOrWhiteSpace >> not)
+                        |> Option.defaultValue "(unspecified)"
+                    let task = field "TaskId"
+                    Some (action, actor, if String.IsNullOrWhiteSpace task then None else Some task)
+        with _ -> None
+
+    let private increment (values: System.Collections.Generic.Dictionary<string, int>) key =
+        match values.TryGetValue key with
+        | true, count -> values[key] <- count + 1
+        | false, _ -> values[key] <- 1
+
+    let private toCounts (values: System.Collections.Generic.Dictionary<string, int>) =
+        values
+        |> Seq.map (fun (KeyValue(name, count)) -> { Name = name; Count = count })
+        |> Seq.sortBy (fun row -> -row.Count, row.Name)
+        |> Seq.toList
+
+    let private ageBucket (created: string) (now: DateTimeOffset) =
+        match DateTimeOffset.TryParse created with
+        | true, time when now < time -> "FutureTimestamp"
+        | true, time when now - time < TimeSpan.FromDays 1. -> "Under24Hours"
+        | true, time when now - time < TimeSpan.FromDays 7. -> "OneToSevenDays"
+        | true, time when now - time < TimeSpan.FromDays 30. -> "SevenToThirtyDays"
+        | true, _ -> "OlderThan30Days"
+        | _ -> "InvalidTimestamp"
+
+    // One verified Git tree index and remote operation reads only for UUIDs
+    // present at that head. Streaming local scan retains aggregates, not the
+    // command JSON for every historical intent.
+    let summarize (binding: LedgerStore.LedgerBinding) =
+        journalFiles binding.RepositoryPath
+        |> Result.bind (fun files ->
+            LedgerStore.LedgerStore.fetch binding
+            |> Result.mapError LedgerErrors.toEffect
+            |> Result.bind (fun snapshot ->
+                LedgerStore.LedgerStore.getOperationIdsAt binding snapshot
+                |> Result.mapError LedgerErrors.toEffect
+                |> Result.bind (fun knownIds ->
+                    let dispositions = System.Collections.Generic.Dictionary<string, int>(StringComparer.Ordinal)
+                    let actions = System.Collections.Generic.Dictionary<string, int>(StringComparer.Ordinal)
+                    let actors = System.Collections.Generic.Dictionary<string, int>(StringComparer.Ordinal)
+                    let ages = System.Collections.Generic.Dictionary<string, int>(StringComparer.Ordinal)
+                    let now = DateTimeOffset.UtcNow
+                    let mutable malformed = 0
+                    let scan =
+                        files |> Array.fold (fun state path ->
+                            state |> Result.bind (fun () ->
+                                match readFile path with
+                                | Error _ ->
+                                    malformed <- malformed + 1
+                                    increment dispositions "MalformedLocalRecord"
+                                    Ok ()
+                                | Ok record ->
+                                    let disposition =
+                                        match metadata record with
+                                        | None ->
+                                            malformed <- malformed + 1
+                                            Ok "MalformedCommand"
+                                        | Some (action, actor, _) ->
+                                            increment actions action
+                                            increment actors actor
+                                            classifyAt binding snapshot knownIds record
+                                    disposition |> Result.map (fun status ->
+                                        increment dispositions status
+                                        increment ages (ageBucket record.CreatedUtc now))))
+                            (Ok ())
+                    scan |> Result.map (fun () ->
+                        { VerifiedLedgerHead = snapshot.Commit
+                          Total = files.Length
+                          MalformedLocalRecords = malformed
+                          ByDisposition = toCounts dispositions
+                          ByAction = toCounts actions
+                          ByActor = toCounts actors
+                          ByAge = toCounts ages }))))
+
+    let inspect (binding: LedgerStore.LedgerBinding) (operationId: Guid) =
+        findAtRoot binding.RepositoryPath operationId
+        |> Result.bind (fun stored ->
+            LedgerStore.LedgerStore.fetch binding
+            |> Result.mapError LedgerErrors.toEffect
+            |> Result.bind (fun snapshot ->
+                LedgerStore.LedgerStore.getOperationIdsAt binding snapshot
+                |> Result.mapError LedgerErrors.toEffect
+                |> Result.bind (fun knownIds ->
+                    match stored with
+                    | None ->
+                        Ok { OperationId = operationId.ToString("D")
+                             PresentLocally = false; VerifiedLedgerHead = snapshot.Commit
+                             Disposition = None; Record = None }
+                    | Some record ->
+                        classifyAt binding snapshot knownIds record
+                        |> Result.map (fun disposition ->
+                            { OperationId = record.OperationId; PresentLocally = true
+                              VerifiedLedgerHead = snapshot.Commit; Disposition = Some disposition
+                              Record = Some record }))))
+
+    let page (binding: LedgerStore.LedgerBinding) cursor pageSize =
+        pageAtRoot binding.RepositoryPath cursor pageSize
+        |> Result.bind (fun (records, nextCursor) ->
+            LedgerStore.LedgerStore.fetch binding
+            |> Result.mapError LedgerErrors.toEffect
+            |> Result.bind (fun snapshot ->
+                LedgerStore.LedgerStore.getOperationIdsAt binding snapshot
+                |> Result.mapError LedgerErrors.toEffect
+                |> Result.bind (fun knownIds ->
+                    records |> List.fold (fun state record ->
+                        state |> Result.bind (fun items ->
+                            classifyAt binding snapshot knownIds record |> Result.map (fun status ->
+                                let action, actor, task =
+                                    metadata record
+                                    |> Option.defaultValue ("(malformed)", "(unspecified)", None)
+                                { OperationId = record.OperationId
+                                  Action = action
+                                  Actor = actor
+                                  TaskId = task
+                                  CreatedUtc = record.CreatedUtc
+                                  CommandSha256 = record.CommandSha256
+                                  Disposition = status } :: items)))
+                        (Ok [])
+                    |> Result.map (fun reversed ->
+                        { VerifiedLedgerHead = snapshot.Commit
+                          Records = List.rev reversed
+                          NextCursor = nextCursor }))))
+
     let reconcile (binding: LedgerStore.LedgerBinding) =
         listAtRoot binding.RepositoryPath
         |> Result.bind (fun records ->
@@ -821,6 +1069,22 @@ module LedgerApi =
     let read (cmd: LedgerReadCommand) rt =
         match cmd.Action with
         | "Health" -> LedgerBindingConfig.health cmd.ProjectName rt |> Result.map box
+        | "PendingOperationSummary" ->
+            LedgerBindingConfig.load cmd.ProjectName rt
+            |> Result.bind PendingIntentJournal.summarize
+            |> Result.map box
+        | "PendingOperationsPage" ->
+            LedgerBindingConfig.load cmd.ProjectName rt
+            |> Result.bind (fun binding ->
+                PendingIntentJournal.page binding cmd.Cursor cmd.PageSize)
+            |> Result.map box
+        | "InspectPendingOperation" ->
+            id "operation" cmd.OperationId
+            |> Result.bind (fun operationId ->
+                LedgerBindingConfig.load cmd.ProjectName rt
+                |> Result.bind (fun binding ->
+                    PendingIntentJournal.inspect binding operationId))
+            |> Result.map box
         | "PendingOperations" ->
             PendingIntentJournal.listForProject cmd.ProjectName rt
             |> Result.map (fun records ->

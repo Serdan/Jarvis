@@ -14,7 +14,7 @@ module ProjectNotificationRouting =
     // The client's LedgerApi accepts "Health", not the public MCP tool name
     // "LedgerHealth". Keep the internal routing probe explicit and tested.
     let healthProbe projectName =
-        LedgerReadCommand { ProjectName = projectName; Action = "Health"; OperationId = "" }
+        LedgerReadCommand { ProjectName = projectName; Action = "Health"; OperationId = ""; Cursor = ""; PageSize = 0 }
 
     let ordered (selected: ClientSessionStatus voption) (sessions: ClientSessionStatus list)
                 (explicitDevice: bool) =

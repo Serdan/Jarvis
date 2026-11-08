@@ -164,7 +164,7 @@ let ledgerOperationStatusUsesReadOnlyTypedLedgerCommand () =
         LedgerReadCommand
             { ProjectName = "Project1"
               Action = "GetOperationStatus"
-              OperationId = Guid.NewGuid().ToString("D") }
+              OperationId = Guid.NewGuid().ToString("D"); Cursor = ""; PageSize = 0 }
     match Client.PermissionPolicy.evaluate read with
     | Ok () -> ()
     | other -> Assert.Fail(sprintf "Status lookup must require no mutation approval: %A" other)
@@ -174,7 +174,7 @@ let ledgerOperationStatusUsesReadOnlyTypedLedgerCommand () =
         GitCommandTests.initRepo context
         match Client.OrchestrationApi.LedgerApi.read
                 { ProjectName = "Project1"; Action = "GetOperationStatus"
-                  OperationId = Guid.NewGuid().ToString("D") } context with
+                  OperationId = Guid.NewGuid().ToString("D"); Cursor = ""; PageSize = 0 } context with
         | Error(Client.ValidationError message) ->
             Assert.That(message, Does.Contain(" ledger disabled"))
         | other -> Assert.Fail(sprintf "Unbound operation lookup must fail closed: %A" other)

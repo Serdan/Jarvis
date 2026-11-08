@@ -1746,7 +1746,7 @@ type ReviewWorkflowTests() =
 
                 let operationStatus : Common.LedgerReadCommand =
                     { ProjectName = "owner"; Action = "GetOperationStatus"
-                      OperationId = createCommand.OperationId }
+                      OperationId = createCommand.OperationId; Cursor = ""; PageSize = 0 }
                 let operationResponse =
                     Client.OrchestrationApi.LedgerApi.read operationStatus ctx
                     |> function
@@ -2523,7 +2523,7 @@ type ReviewWorkflowTests() =
             Assert.That(saved.Head.CommandSha256.Length, Is.EqualTo(64))
             let ctx = GitCommandTests.TestContext(Path.GetDirectoryName one)
             let lookup : Common.LedgerReadCommand =
-                { ProjectName = "owner"; Action = "PendingOperations"; OperationId = "" }
+                { ProjectName = "owner"; Action = "PendingOperations"; OperationId = ""; Cursor = ""; PageSize = 0 }
             let listing = Client.OrchestrationApi.LedgerApi.read lookup ctx |> success
             let json = System.Text.Json.JsonSerializer.Serialize(listing)
             Assert.That(json, Does.Contain(operationId.ToString("D")))
@@ -2630,6 +2630,126 @@ type ReviewWorkflowTests() =
             Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(before))
             Assert.That(git one [ "status"; "--porcelain" ], Is.Empty))
 
+
+
+    [<Test>]
+    member _.PendingSummaryAndPagingStayUsableBeyondThousandHistoricalIntents() =
+        withFixture (fun one _ first _ _ _ _ _ ->
+            let records =
+                [ for index in 0 .. 1000 do
+                    let id = Guid.NewGuid()
+                    let command =
+                        System.Text.Json.JsonSerializer.Serialize(
+                            {| Action = "ResumeAgent"; TaskId = "legacy-task"; ActorId = "Agent 5"
+                               ExpectedVersion = 4; ExpectedAgentVersion = 12
+                               AssignmentGeneration = 2
+                               SessionId = "historical-private-session-token-" + string index |})
+                    Client.OrchestrationApi.PendingIntentJournal.persist first id "TaskWrite" command
+                    |> success
+                    yield id, command ]
+            let before = (LedgerStore.fetch first |> success).Commit
+            match Client.OrchestrationApi.PendingIntentJournal.listAtRoot one with
+            | Error(Client.ValidationError message) ->
+                Assert.That(message, Does.Contain("Too many pending"))
+            | other -> Assert.Fail(sprintf "Legacy bulk read should reach its documented cap: %A" other)
+
+            let summary = Client.OrchestrationApi.PendingIntentJournal.summarize first |> success
+            Assert.That(summary.VerifiedLedgerHead, Is.EqualTo(before))
+            Assert.That(summary.Total, Is.EqualTo(1001))
+            Assert.That(summary.MalformedLocalRecords, Is.Zero)
+            Assert.That(summary.ByDisposition.Length, Is.EqualTo(1))
+            Assert.That(summary.ByDisposition.Head.Name, Is.EqualTo("NotFoundAtVerifiedHead"))
+            Assert.That(summary.ByDisposition.Head.Count, Is.EqualTo(1001))
+            Assert.That(summary.ByAction.Head.Name, Is.EqualTo("ResumeAgent"))
+            Assert.That(summary.ByAction.Head.Count, Is.EqualTo(1001))
+            Assert.That(summary.ByActor.Head.Name, Is.EqualTo("Agent 5"))
+            let serializedSummary = System.Text.Json.JsonSerializer.Serialize(summary)
+            Assert.That(serializedSummary, Does.Not.Contain("SessionId"))
+            Assert.That(serializedSummary, Does.Not.Contain("historical-private-session-token"))
+
+            let mutable cursor = ""
+            let seen = System.Collections.Generic.HashSet<string>(StringComparer.Ordinal)
+            let mutable pages = 0
+            let mutable keepPaging = true
+            while keepPaging do
+                let page = Client.OrchestrationApi.PendingIntentJournal.page first cursor 100 |> success
+                pages <- pages + 1
+                Assert.That(page.VerifiedLedgerHead, Is.EqualTo(before))
+                Assert.That(page.Records.Length, Is.InRange(1,100))
+                for item in page.Records do
+                    Assert.That(seen.Add(item.OperationId), Is.True)
+                    Assert.That(item.Action, Is.EqualTo("ResumeAgent"))
+                    Assert.That(item.Actor, Is.EqualTo("Agent 5"))
+                    Assert.That(item.Disposition, Is.EqualTo("NotFoundAtVerifiedHead"))
+                let json = System.Text.Json.JsonSerializer.Serialize(page)
+                Assert.That(json, Does.Not.Contain("historical-private-session-token"))
+                match page.NextCursor with
+                | Some next -> cursor <- next
+                | None -> keepPaging <- false
+            Assert.That(pages, Is.EqualTo(11))
+            Assert.That(seen.Count, Is.EqualTo(1001))
+            let inspectedId, commandJson = records[0]
+            let inspected = Client.OrchestrationApi.PendingIntentJournal.inspect first inspectedId |> success
+            Assert.That(inspected.PresentLocally, Is.True)
+            Assert.That(inspected.Disposition, Is.EqualTo(Some "NotFoundAtVerifiedHead"))
+            Assert.That(inspected.Record.Value.CommandJson, Is.EqualTo(commandJson))
+            let pageResponse : Common.LedgerReadCommand =
+                { ProjectName = "owner"; Action = "PendingOperationsPage"
+                  OperationId = ""; Cursor = ""; PageSize = 12 }
+            let context = GitCommandTests.TestContext(Path.GetDirectoryName one)
+            let bindingConfig = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
+            try
+                Client.OrchestrationApi.LedgerBindingConfig.bindExisting
+                    "owner" context first.ProjectId first.LedgerId first.Epoch
+                    first.RemoteName first.ApprovedFetchUrl first.ApprovedPushUrl before true
+                |> success |> ignore
+                let result = Client.OrchestrationApi.LedgerApi.read pageResponse context |> success
+                let body = System.Text.Json.JsonSerializer.Serialize(result)
+                Assert.That(body, Does.Not.Contain("SessionId"))
+                Assert.That(body, Does.Contain("NotFoundAtVerifiedHead"))
+            finally
+                if File.Exists bindingConfig then File.Delete bindingConfig
+            Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(before))
+            Assert.That((Client.OrchestrationApi.PendingIntentJournal.page first "" 100 |> success).Records.Length,
+                        Is.EqualTo(100)))
+
+    [<Test>]
+    member _.PendingSummarySeparatesVerifiedAppliedConflictsAndForeignBindings() =
+        withFixture (fun _ _ first _ _ _ _ _ ->
+            let command taskId =
+                System.Text.Json.JsonSerializer.Serialize(
+                    {| Action = "CreateTask"; TaskId = taskId
+                       Title = taskId; Html = "<h1>Task</h1>" |})
+            let matched = Guid.NewGuid()
+            Client.OrchestrationApi.PendingIntentJournal.persist first matched "TaskWrite" (command "matched") |> success
+            ReviewWorkflow.createTaskWithSpec first matched "matched" "matched" "<h1>Task</h1>"
+            |> success |> ignore
+            let conflicting = Guid.NewGuid()
+            Client.OrchestrationApi.PendingIntentJournal.persist first conflicting "TaskWrite" (command "wrong") |> success
+            ReviewWorkflow.createTaskWithSpec first conflicting "actual" "actual" "<h1>Task</h1>"
+            |> success |> ignore
+            let uncertain = Guid.NewGuid()
+            Client.OrchestrationApi.PendingIntentJournal.persist first uncertain "TaskWrite" (command "unseen") |> success
+            let foreign = Guid.NewGuid()
+            Client.OrchestrationApi.PendingIntentJournal.persist
+                { first with LedgerId = Guid.NewGuid() } foreign "TaskWrite" (command "foreign")
+            |> success
+            let result = Client.OrchestrationApi.PendingIntentJournal.summarize first |> success
+            let byStatus name =
+                result.ByDisposition |> List.find (fun row -> row.Name = name) |> fun row -> row.Count
+            Assert.That(result.Total, Is.EqualTo(4))
+            Assert.That(byStatus "Applied", Is.EqualTo(1))
+            Assert.That(byStatus "IdentityMismatch", Is.EqualTo(1))
+            Assert.That(byStatus "NotFoundAtVerifiedHead", Is.EqualTo(1))
+            Assert.That(byStatus "BindingMismatch", Is.EqualTo(1))
+            let page = Client.OrchestrationApi.PendingIntentJournal.page first "" 20 |> success
+            let matchedPageEntry = page.Records |> List.find (fun x ->
+                x.OperationId = matched.ToString("D"))
+            Assert.That(matchedPageEntry.Disposition, Is.EqualTo("Applied"))
+            let inspected = Client.OrchestrationApi.PendingIntentJournal.inspect first conflicting |> success
+            Assert.That(inspected.Disposition, Is.EqualTo(Some "IdentityMismatch"))
+            Assert.That((Client.OrchestrationApi.PendingIntentJournal.listAtRoot first.RepositoryPath |> success).Length,
+                        Is.EqualTo(4)))
 
     [<Test>]
     member _.LostResponseRecoversAcceptedRemoteOperationButNeverGuessesFailure() =
@@ -2742,7 +2862,7 @@ type ReviewWorkflowTests() =
                 let rt = Client.Runtime(Path.GetDirectoryName one, Client.ConsoleTui.ConsoleTui(), Client.PartialTrust)
                 let health : Common.AgentCommand =
                     Common.LedgerReadCommand
-                        { ProjectName = "owner"; Action = "Health"; OperationId = "" }
+                        { ProjectName = "owner"; Action = "Health"; OperationId = ""; Cursor = ""; PageSize = 0 }
                 let _, healthResult, healthResponse =
                     Client.SignalR.Client.processIncomingCommand rt
                         (System.Text.Json.JsonSerializer.Serialize health) "Owner"

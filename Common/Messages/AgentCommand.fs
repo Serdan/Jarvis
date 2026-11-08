@@ -132,7 +132,9 @@ type TaskWriteCommand =
 type LedgerReadCommand =
     { ProjectName: string
       Action: string
-      OperationId: string }
+      OperationId: string
+      Cursor: string
+      PageSize: int }
 
 type LedgerWriteCommand =
     { ProjectName: string

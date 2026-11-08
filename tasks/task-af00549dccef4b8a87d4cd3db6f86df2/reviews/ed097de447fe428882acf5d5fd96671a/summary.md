@@ -14,7 +14,7 @@
 ## Source and test evidence
 
 - 14 new focused routing tests with injected clock verify TTL boundaries, active device preservation, idle refresh, per-user/global caps across 1800 synthetic conversations, disconnected eviction, explicit error behavior, reconnection before and after eviction, deterministic LRU, restarted empty state, policy validation, same-transport re-registration, ownership and stale-generation tracker rejection, and production DI construction.
-- Existing UserService/ClientService/FeedbackStore/SignalR/MCP tests cover independent devices, stale disconnects, cross-user isolation, and metadata routing. Full Server Release on reviewed source passed **122/122** after fixing DI (no server-startup failures). The frozen full Client+Server Release job `fd2217abe78743968e713fa8b34da1b2` is running and must finish before accepting the review.
+- Existing UserService/ClientService/FeedbackStore/SignalR/MCP tests cover independent devices, stale disconnects, cross-user isolation, and metadata routing. The **final full Release on exact frozen source** `8aad05166bce1d1334dcfc7db9b9e94590fff1dc` completed exit code 0: **122/122 Server and 498/498 Client tests**, job `fd2217abe78743968e713fa8b34da1b2`. This includes actual server-startup OAuth/readiness tests after the DI fix.
 - Source branch committed/pushed, `git diff --check` clean, and `git merge-tree --write-tree main fix/routing-retention` yielded conflict-free tree. Documentation `docs/reviews/RoutingRetention.md` explains policy, user-facing fallback and diagnostic/retention tradeoffs.
 
 ## Deliberate limits and cost tradeoffs
@@ -24,4 +24,4 @@
 - The 2-minute lazy sweep means expiry is observed at the next maintenance access and may lag TTL by up to the sweep interval during active use or indefinitely while totally idle; insertion caps still bound churn. No need for another housekeeping daemon.
 - The feature does not preserve preferences on restart, add a database, or change client wire protocol. No deployment is performed with source merge.
 
-**Disposition:** Review checks complete; no unresolved blocking source defects. Accept after the exact frozen full Release job completes successfully; otherwise amend and re-review.
+**Disposition:** ACCEPT. Source-review findings resolved (including concrete ASP.NET Core DI startup failure). Exact frozen full Release passed. No production deployment, no cross-platform or multi-instance claims.

@@ -13,6 +13,13 @@ open Client.Effect
 open Kehlet.FSharp.IO
 open Kehlet.FSharp.IO.Effect.Operators
 
+module private WireSize =
+    // Use the same System.Text.Json defaults/converters as the final command
+    // transport. Raw UTF-8 length substantially undercounts escaped controls,
+    // non-ASCII and JSON object/union framing.
+    let json<'a> (value: 'a) =
+        System.Text.Json.JsonSerializer.SerializeToUtf8Bytes<'a>(value).Length
+
 module private Hash =
     let sha256 (text: string) =
         let bytes = Encoding.UTF8.GetBytes text
@@ -336,63 +343,113 @@ module private Core =
     let private resolveWritableFilePath (path: string) project =
         ProjectPaths.resolveSourcePath project path |>> FilePath
 
-    let private getFolderNames path projectName =
-        effect {
-            let! path = parseFolderPath path projectName
-            let! children = FileIO.getChildFolders path
-            let! names = children |> listMap FileIO.getFolderName
-            let! filtered = fun rt -> names |> Seq.filterAll (ProjectIO.folderFilters rt) |> Ok
-            return filtered |> Seq.map ProjectFolder |> Seq.toList
-        }
-
-    let private getFileNames path projectName =
-        effect {
-            let! path = parseFolderPath path projectName
-            let! files = FileIO.getFiles path
-
-            let toItem file =
-                fun rt ->
-                    let name = FileIO.getFileName file rt
-
-                    match FileIO.getFileInfo file rt with
-                    | Ok info ->
-                        match ProjectItemKind.ofFileInfo info with
-                        | ProjectFileError _ -> Ok(ProjectFile(name, 0L, DateTimeOffset.MinValue, DateTimeOffset.MinValue))
-                        | item -> Ok item
-                    | Error _ -> Ok(ProjectFile(name, 0L, DateTimeOffset.MinValue, DateTimeOffset.MinValue))
-
-            let! items =
-                fun rt ->
-                    files
-                    |> Seq.map (fun file -> toItem file rt)
-                    |> Seq.choose Result.toOption
-                    |> Seq.toList
-                    |> Ok
-
-            return items
-        }
-
     let private getItems path projectName =
-        let folderNames = getFolderNames path projectName
-        let fileNames = getFileNames path projectName
-        Effect.concat folderNames fileNames
+        effect {
+            let! folder = parseFolderPath path projectName
+            return! fun rt ->
+                let cap = 2000
+                let watch = Diagnostics.Stopwatch.StartNew()
+                let results = ResizeArray<ProjectItemKind>()
+                let mutable budgetError: EffectError option = None
+                let mutable responseBytes = 2 // JSON array brackets
+
+                let append (item: ProjectItemKind) =
+                    let size = WireSize.json item + 1 // comma
+                    if size > 480 * 1024 - responseBytes then
+                        budgetError <- Some(ValidationError
+                            "Directory listing exceeds the serialized response byte limit; narrow the directory.")
+                    else
+                        responseBytes <- responseBytes + size
+                        results.Add item
+
+                let checkBudget () =
+                    if results.Count >= cap then
+                        budgetError <- Some(ValidationError
+                            $"Directory listing exceeds {cap} entries; use SearchFiles with a narrowed query.")
+                        false
+                    elif watch.Elapsed > TimeSpan.FromSeconds 3. then
+                        budgetError <- Some(ValidationError "Directory listing timed out; narrow the directory.")
+                        false
+                    else true
+
+                try
+                    match FileIO.getChildFolders folder rt with
+                    | Error failure -> Error failure
+                    | Ok children ->
+                        use enumerator = children.GetEnumerator()
+                        let mutable reading = true
+                        let allowed name =
+                            ProjectIO.folderFilters rt |> List.forall (fun filter -> filter name)
+                        while reading && budgetError.IsNone do
+                            if not (enumerator.MoveNext()) then reading <- false
+                            else
+                                let name = FileIO.getFolderName enumerator.Current rt
+                                if allowed name && checkBudget() then
+                                    append (ProjectFolder name)
+                        match budgetError with
+                        | Some failure -> Error failure
+                        | None ->
+                            match FileIO.getFiles folder rt with
+                            | Error failure -> Error failure
+                            | Ok files ->
+                                use enumerator = files.GetEnumerator()
+                                let mutable reading = true
+                                while reading && budgetError.IsNone do
+                                    if not (enumerator.MoveNext()) then reading <- false
+                                    elif checkBudget() then
+                                        let file = enumerator.Current
+                                        let name = FileIO.getFileName file rt
+                                        let item =
+                                            match FileIO.getFileInfo file rt with
+                                            | Ok info ->
+                                                match ProjectItemKind.ofFileInfo info with
+                                                | ProjectFile(_, size, created, modified) ->
+                                                    ProjectFile(name, size, created, modified)
+                                                | _ -> ProjectFile(name, 0L, DateTimeOffset.MinValue, DateTimeOffset.MinValue)
+                                            | Error _ -> ProjectFile(name, 0L, DateTimeOffset.MinValue, DateTimeOffset.MinValue)
+                                        append item
+                                match budgetError with
+                                | Some failure -> Error failure
+                                | None -> Ok(results |> Seq.toList)
+                with ex -> Error(ExceptionError ex)
+        }
 
     let getProjectDetails projectName =
-        let loadFile (fileInfo: FileInfo) =
-            effect {
-                let! text = FileIO.readAllText (FilePath fileInfo.FullName)
-                return (fileInfo.Name, text)
-            }
-
-        let projectFilesInfo (FolderPath path) =
-            effect {
-                let! specialFiles = ProjectIO.specialFiles |>> (Seq.map (Path.combine path >> FilePath))
-                let! infos = specialFiles |> listMap FileIO.getFileInfo |>> Seq.choose Result.toOption
-                let! data = infos |> listMap loadFile |>> Seq.choose Result.toOption
-                return data |> Seq.toList
-            }
-
-        projectName |> parseProjectName >>= parseFolderPath "" >>= projectFilesInfo
+        effect {
+            let! parsedProject = parseProjectName projectName
+            let! specialFiles = ProjectIO.specialFiles
+            if specialFiles.Length > 16 then
+                return! ValidationError
+                    "Project details contain more than 16 configured special files."
+                    |> Effect.ofError
+            else
+                return! fun rt ->
+                    let results = ResizeArray<string * Content>()
+                    let mutable responseBytes = 2 // array brackets
+                    let mutable failure: EffectError option = None
+                    for relative in specialFiles do
+                        if failure.IsNone then
+                            match parseFilePath relative parsedProject rt with
+                            | Error _ -> () // Preserve skip-missing special-file behavior.
+                            | Ok path ->
+                                match FileIO.readAllText path rt with
+                                | Error _ -> ()
+                                | Ok(Content text) ->
+                                    let name = Path.GetFileName relative
+                                    // Match the actual SignalR DTO envelope:
+                                    // { fileName, content } for each element.
+                                    let size =
+                                        WireSize.json {| fileName = name; content = text |} + 1
+                                    if size > 700 * 1024 - responseBytes then
+                                        failure <- Some(ValidationError
+                                            "Project details exceed the serialized response budget; read individual files.")
+                                    else
+                                        responseBytes <- responseBytes + size
+                                        results.Add(name, Content text)
+                    match failure with
+                    | Some error -> Error error
+                    | None -> Ok(results |> Seq.toList)
+        }
 
     let private validateSkillName (skillName: string) =
         if String.IsNullOrWhiteSpace skillName then
@@ -642,57 +699,185 @@ module private Core =
     let listProjectDirectory projectName folderPath =
         projectName |> parseProjectName >>= getItems folderPath
 
-    let private combineResults results =
-        results
-        |> List.fold
-            (fun state item ->
-                match state, item with
-                | Ok values, Ok value -> Ok(value @ values)
-                | Error error, _ -> Error error
-                | _, Error error -> Error error)
-            (Ok [])
-        |> Result.map List.rev
+    // Search operations have independent work budgets: a small result limit
+    // must not cause a huge traversal just because the query rarely matches.
+    // All limits are checked as work proceeds, before appending results.
+    let private maxSearchResults = 500
+    let private maxVisitedFiles = 12000
+    let private maxVisitedDirectories = 2000
+    let private maxEnumeratedEntries = 14000
+    let private maxSearchElapsed = TimeSpan.FromSeconds 3.
+    let private maxSearchResponseBytes = 480 * 1024
+    let private maxTextScanBytes = 48L * 1024L * 1024L
 
-    let rec private collectItems currentPath projectName =
-        effect {
-            let! items = getItems currentPath projectName
+    // A callback may return matches, a typed resource exhaustion reason,
+    // or an actual IO/permission failure. No parsing of error strings.
+    type private SearchStep<'T> =
+        | Found of 'T list
+        | Exhausted of SearchStopReason
+        | Failed of EffectError
 
-            let combinePath name =
-                if String.IsNullOrWhiteSpace currentPath then name else Path.Combine(currentPath, name)
+    let private boundedResultsLimit maxResults =
+        let value = defaultArg maxResults 100
+        if value < 1 || value > maxSearchResults then
+            Error(ValidationError $"MaxResults must be between 1 and {maxSearchResults}.")
+        else Ok value
 
-            let localItems =
-                items
-                |> List.map (function
-                    | ProjectFile(name, size, created, modified) -> ProjectFile(combinePath name, size, created, modified)
-                    | ProjectFolder name -> ProjectFolder(combinePath name)
-                    | ProjectFileError(name, error) -> ProjectFileError(combinePath name, error))
+    let private walkSearchTree parsedProject startPath limit
+                               (fileMatches: string -> int -> SearchStep<'T>)
+                               (folderMatches: string -> SearchStep<'T>)
+                               (measure: 'T -> int) rt : Result<SearchResult<'T>> =
+        let watch = Diagnostics.Stopwatch.StartNew()
+        let matches = ResizeArray<'T>()
+        let remainingFolders = Collections.Generic.Stack<string>()
+        remainingFolders.Push startPath
+        let mutable visitedFiles = 0
+        let mutable visitedDirectories = 0
+        let mutable enumeratedEntries = 0
+        let mutable outputBytes = 2 // enclosing JSON array
+        let mutable error: EffectError option = None
+        let mutable stopReason: SearchStopReason option = None
 
-            let folders =
-                items
-                |> List.choose (function
-                    | ProjectFolder name -> Some(combinePath name)
-                    | _ -> None)
+        let stop reason =
+            if stopReason.IsNone then stopReason <- Some reason
 
-            let! nested =
-                fun rt ->
-                    folders
-                    |> List.map (fun folder -> collectItems folder projectName rt)
-                    |> combineResults
+        let deadline () =
+            if watch.Elapsed > maxSearchElapsed then
+                stop SearchStopReason.TimeLimit
+                false
+            else true
 
-            return localItems @ nested
-        }
+        let append (found: 'T list) =
+            for item in found do
+                if error.IsNone && stopReason.IsNone then
+                    let size = max 0 (measure item) + 1
+                    if size > maxSearchResponseBytes - outputBytes then
+                        stop SearchStopReason.OutputByteLimit
+                    else
+                        matches.Add item
+                        outputBytes <- outputBytes + size
+                        if matches.Count >= limit then stop SearchStopReason.ResultLimit
+
+        let collect = function
+            | Found values -> append values
+            | Exhausted reason -> stop reason
+            | Failed failure -> error <- Some failure
+
+        try
+            while remainingFolders.Count > 0 && stopReason.IsNone && error.IsNone do
+                let relative = remainingFolders.Pop()
+                if visitedDirectories >= maxVisitedDirectories then
+                    stop SearchStopReason.DirectoryVisitLimit
+                elif deadline() then
+                    match parseFolderPath relative parsedProject rt with
+                    | Error failure -> error <- Some failure
+                    | Ok folder ->
+                        visitedDirectories <- visitedDirectories + 1
+                        match FileIO.getFiles folder rt with
+                        | Error failure -> error <- Some failure
+                        | Ok files ->
+                            use items = files.GetEnumerator()
+                            let mutable reading = true
+                            while reading && error.IsNone && stopReason.IsNone do
+                                if not (deadline()) then reading <- false
+                                elif not (items.MoveNext()) then reading <- false
+                                elif visitedFiles >= maxVisitedFiles then
+                                    stop SearchStopReason.FileVisitLimit
+                                elif enumeratedEntries >= maxEnumeratedEntries then
+                                    stop SearchStopReason.EntryVisitLimit
+                                else
+                                    enumeratedEntries <- enumeratedEntries + 1
+                                    visitedFiles <- visitedFiles + 1
+                                    let name = FileIO.getFileName items.Current rt
+                                    let path =
+                                        if String.IsNullOrWhiteSpace relative then name
+                                        else Path.Combine(relative, name)
+                                    collect (fileMatches path (limit - matches.Count))
+
+                        if error.IsNone && stopReason.IsNone then
+                            match FileIO.getChildFolders folder rt with
+                            | Error failure -> error <- Some failure
+                            | Ok folders ->
+                                use children = folders.GetEnumerator()
+                                let allowed name =
+                                    ProjectIO.folderFilters rt
+                                    |> List.forall (fun predicate -> predicate name)
+                                let childPaths = ResizeArray<string>()
+                                let mutable enumerating = true
+                                while enumerating && error.IsNone && stopReason.IsNone do
+                                    if not (deadline()) then enumerating <- false
+                                    elif not (children.MoveNext()) then enumerating <- false
+                                    elif enumeratedEntries >= maxEnumeratedEntries then
+                                        stop SearchStopReason.EntryVisitLimit
+                                    elif visitedDirectories + childPaths.Count + remainingFolders.Count >= maxVisitedDirectories then
+                                        stop SearchStopReason.DirectoryVisitLimit
+                                    else
+                                        enumeratedEntries <- enumeratedEntries + 1
+                                        let name = FileIO.getFolderName children.Current rt
+                                        if allowed name then
+                                            let path =
+                                                if String.IsNullOrWhiteSpace relative then name
+                                                else Path.Combine(relative, name)
+                                            collect (folderMatches path)
+                                            if stopReason.IsNone then childPaths.Add path
+                                for i in childPaths.Count - 1 .. -1 .. 0 do
+                                    remainingFolders.Push childPaths[i]
+        with ex -> error <- Some(ExceptionError ex)
+
+        match error with
+        | Some failure -> Error failure
+        | None ->
+            Ok { Matches = matches |> Seq.toList
+                 StopReason = stopReason |> Option.defaultValue SearchStopReason.Finished
+                 FilesVisited = visitedFiles
+                 DirectoriesVisited = visitedDirectories }
 
     let searchFiles projectName folderPath (query: string) maxResults =
-        let filter items =
-            let take = defaultArg maxResults Int32.MaxValue
-            items
-            |> List.choose (function
-                | ProjectFile(name, size, created, modified) when name.Contains(query, StringComparison.OrdinalIgnoreCase) -> Some(ProjectFile(name, size, created, modified))
-                | ProjectFolder name when name.Contains(query, StringComparison.OrdinalIgnoreCase) -> Some(ProjectFolder name)
-                | _ -> None)
-            |> List.truncate take
-
-        parseProjectName projectName >>= collectItems (defaultArg folderPath "") |>> filter
+        effect {
+            let! _ =
+                (if isNull query || query.Length > 4096 then
+                    Error(Client.ValidationError "SearchFiles query exceeds the input budget.")
+                 else Ok ())
+                |> Effect.ofResult
+            let! limit = boundedResultsLimit maxResults |> Effect.ofResult
+            let! project = parseProjectName projectName
+            return! fun rt ->
+                let fileMatches (path: string) _ =
+                    if not (path.Contains(query, StringComparison.OrdinalIgnoreCase)) then Found []
+                    else
+                        match parseFilePath path project rt with
+                        | Error(Client.PermissionDenied _) -> Found [] // No symlink/checkout escape.
+                        | Error(NotFoundError _) -> Found []
+                        | Error failure -> Failed failure
+                        | Ok file ->
+                            let name = Path.GetFileName path
+                            let info =
+                                match FileIO.getFileInfo file rt with
+                                | Ok actual ->
+                                    match ProjectItemKind.ofFileInfo actual with
+                                    | ProjectFileError _ -> ProjectFile(name, 0L, DateTimeOffset.MinValue, DateTimeOffset.MinValue)
+                                    | ProjectFile(_, size, created, modified) -> ProjectFile(name, size, created, modified)
+                                    | _ -> ProjectFile(name, 0L, DateTimeOffset.MinValue, DateTimeOffset.MinValue)
+                                | Error _ ->
+                                    ProjectFile(name, 0L, DateTimeOffset.MinValue, DateTimeOffset.MinValue)
+                            match info with
+                            | ProjectFile(_, size, created, modified) ->
+                                Found [ ProjectFile(path, size, created, modified) ]
+                            | _ -> Found []
+                let folderMatches (path: string) =
+                    if not (path.Contains(query, StringComparison.OrdinalIgnoreCase)) then Found []
+                    else
+                        // A matching symbolic-link folder must not be returned
+                        // before the checkout/symlink guard is evaluated.
+                        match parseFolderPath path project rt with
+                        | Ok _ -> Found [ ProjectFolder path ]
+                        | Error(Client.PermissionDenied _) | Error(NotFoundError _) -> Found []
+                        | Error failure -> Failed failure
+                let estimate (item: ProjectItemKind) = WireSize.json item
+                walkSearchTree project (defaultArg folderPath "") limit
+                    (fun path remaining -> fileMatches path remaining)
+                    folderMatches estimate rt
+        }
 
     let readFile projectName filePath =
         parseProjectName projectName >>= parseFilePath filePath >>= FileIO.readAllText
@@ -721,7 +906,12 @@ module private Core =
                             if includeLineNumbers then $"{lineNumber}\t{line}" else line)
                         |> String.concat Environment.NewLine
 
-                    return Content content
+                    if WireSize.json content > 700 * 1024 then
+                        return! ValidationError
+                            "Line-range result exceeds serialized response budget; narrow the range or use ReadFilePage."
+                            |> Effect.ofError
+                    else
+                        return Content content
             }
 
     let private compileGlob (glob: string) =
@@ -755,7 +945,7 @@ module private Core =
             if OperatingSystem.IsWindows() then RegexOptions.IgnoreCase
             else RegexOptions.None
 
-        let regex = Regex(pattern.ToString(), options)
+        let regex = Regex(pattern.ToString(), options, TimeSpan.FromMilliseconds 150.)
 
         fun (path: string) ->
             let normalizedPath = path.Replace('\\', '/')
@@ -764,108 +954,120 @@ module private Core =
                 else normalizedPath
             regex.IsMatch candidate
 
-    let searchText projectName folderPath (query: string) includeGlobs excludeGlobs maxResults =
-        let includeMatchers = includeGlobs |> List.map compileGlob
-        let excludeMatchers = excludeGlobs |> List.map compileGlob
-        let take = defaultArg maxResults Int32.MaxValue
-
-        let shouldSearch path =
-            (includeMatchers.IsEmpty || includeMatchers |> List.exists (fun matches -> matches path))
-            && not (excludeMatchers |> List.exists (fun matches -> matches path))
-
+    let searchText projectName folderPath (query: string) (includeGlobs: string list) (excludeGlobs: string list) maxResults =
         effect {
             if String.IsNullOrEmpty query then
                 return! Client.ValidationError "Search query cannot be empty." |> Effect.ofError
-            elif take <= 0 then
-                return! Client.ValidationError "MaxResults must be greater than zero." |> Effect.ofError
+            elif query.Length > 4096 ||
+                 includeGlobs.Length > 64 || excludeGlobs.Length > 64 ||
+                 (includeGlobs @ excludeGlobs |> List.exists (fun glob -> glob.Length > 512)) then
+                return! Client.ValidationError "Search query or glob budget exceeded." |> Effect.ofError
             else
-                let! parsedProject = parseProjectName projectName
-
-                let searchFile relativePath remaining rt =
-                    match parseFilePath relativePath parsedProject rt with
-                    | Error _ -> Ok []
-                    | Ok filePath ->
-                        match FileIO.searchText filePath query remaining rt with
-                        | Error _ -> Ok []
-                        | Ok matches ->
-                            matches
-                            |> List.map (fun (line, column, preview) ->
-                                { FilePath = relativePath
-                                  Line = line
-                                  Column = column
-                                  Preview = preview })
-                            |> Ok
-
-                let rec searchFolder currentPath remaining rt =
-                    if remaining <= 0 then
-                        Ok []
-                    else
-                        match getItems currentPath parsedProject rt with
-                        | Error error -> Error error
-                        | Ok items ->
-                            let qualify name =
-                                if String.IsNullOrWhiteSpace currentPath then name
-                                else Path.Combine(currentPath, name)
-
-                            let files =
-                                items
-                                |> List.choose (function
-                                    | ProjectFile(name, _, _, _) -> Some(qualify name)
-                                    | _ -> None)
-
-                            let rec searchFiles remaining acc pending =
-                                match pending with
-                                | [] -> Ok acc
-                                | _ when remaining <= 0 -> Ok acc
-                                | path :: rest when not (shouldSearch path) ->
-                                    searchFiles remaining acc rest
-                                | path :: rest ->
-                                    match searchFile path remaining rt with
-                                    | Error _ -> searchFiles remaining acc rest
-                                    | Ok matches ->
-                                        searchFiles (remaining - matches.Length) (acc @ matches) rest
-
-                            match searchFiles remaining [] files with
-                            | Error error -> Error error
-                            | Ok localMatches ->
-                                let remainingAfterLocal = remaining - localMatches.Length
-
-                                if remainingAfterLocal <= 0 then
-                                    Ok localMatches
+                let! limit = boundedResultsLimit maxResults |> Effect.ofResult
+                let! project = parseProjectName projectName
+                // Compile only after validating list lengths and pattern size.
+                // Regex matching has an independent 150ms per-path deadline.
+                let includeMatchers = includeGlobs |> List.map compileGlob
+                let excludeMatchers = excludeGlobs |> List.map compileGlob
+                let shouldSearch (path: string) =
+                    (includeMatchers.IsEmpty || includeMatchers |> List.exists (fun matches -> matches path))
+                    && not (excludeMatchers |> List.exists (fun matches -> matches path))
+                return! fun rt ->
+                    let mutable scannedBytes = 0L
+                    let fileMatches (path: string) remaining =
+                        let globsMatch =
+                            try Some(shouldSearch path)
+                            with :? RegexMatchTimeoutException -> None
+                        match globsMatch with
+                        | None -> Exhausted SearchStopReason.TimeLimit
+                        | Some false -> Found []
+                        | Some true ->
+                            match parseFilePath path project rt with
+                            | Error(Client.PermissionDenied _) | Error(NotFoundError _) -> Found []
+                            | Error failure -> Failed failure
+                            | Ok file ->
+                                let length =
+                                    match FileIO.getFileInfo file rt with
+                                    | Ok info -> try info.Length with _ -> 0L
+                                    | _ -> 0L
+                                // The internal reader reads at most 8 MiB
+                                // per file and may terminate earlier on the
+                                // requested match count. Charge the pessimistic
+                                // per-file maximum without rejecting a huge
+                                // file whose first lines satisfy the query.
+                                let charged = min length (int64 AgentProtocol.maxSearchFileBytes)
+                                if charged > maxTextScanBytes - scannedBytes then
+                                    Exhausted SearchStopReason.TextScanLimit
                                 else
-                                    let folders =
-                                        items
-                                        |> List.choose (function
-                                            | ProjectFolder name -> Some(qualify name)
-                                            | _ -> None)
-
-                                    let rec searchFolders remaining acc pending =
-                                        match pending with
-                                        | [] -> Ok acc
-                                        | _ when remaining <= 0 -> Ok acc
-                                        | folder :: rest ->
-                                            match searchFolder folder remaining rt with
-                                            | Error error -> Error error
-                                            | Ok matches ->
-                                                searchFolders (remaining - matches.Length) (acc @ matches) rest
-
-                                    match searchFolders remainingAfterLocal [] folders with
-                                    | Error error -> Error error
-                                    | Ok nested -> Ok(localMatches @ nested)
-
-                return! fun rt -> searchFolder (defaultArg folderPath "") take rt
+                                    scannedBytes <- scannedBytes + charged
+                                    match FileIO.searchText file query remaining rt with
+                                    | Error(ValidationError _) -> Exhausted SearchStopReason.TextScanLimit
+                                    | Error(ExceptionError (:? TimeoutException)) ->
+                                        Exhausted SearchStopReason.TimeLimit
+                                    | Error _ -> Found [] // Preserve prior skip-unreadable-file behavior.
+                                    | Ok matches ->
+                                        matches
+                                        |> List.map (fun (line, column, preview) ->
+                                            { FilePath = path
+                                              Line = line
+                                              Column = column
+                                              Preview = preview })
+                                        |> Found
+                    let estimate (item: SearchTextMatch) = WireSize.json item
+                    walkSearchTree project (defaultArg folderPath "") limit
+                        fileMatches (fun _ -> Found []) estimate rt
         }
 
-    let readFiles projectName filePaths =
-        let readFile path projectName =
-            parseFilePath path projectName >>= FileIO.readAllText
-            |>> (fun (Content x) -> Content'.Text x)
-            |> Effect.defaultWith Content'.Error
+    let readFilePage projectName filePath cursor pageBytes =
+        effect {
+            let! parsedProject = parseProjectName projectName
+            let! path = parseFilePath filePath parsedProject
+            return! BoundedTextPages.readFilePage path filePath cursor pageBytes |> Effect.ofResult
+        }
 
-        let readFiles filePaths projectName =
-            fun rt -> seq { for path in filePaths -> readFile path projectName rt } |> Ok
-
-        parseProjectName projectName >>= readFiles filePaths
+    let readFiles projectName (filePaths: string list) =
+        effect {
+            if filePaths.Length > 32 then
+                return! ValidationError "ReadFiles accepts at most 32 files per request." |> Effect.ofError
+            elif filePaths |> List.exists (fun path -> WireSize.json path > 4096) then
+                return! ValidationError "ReadFiles path exceeds the serialized filename budget." |> Effect.ofError
+            else
+                let! parsedProject = parseProjectName projectName
+                return! fun rt ->
+                    let mutable remainingBytes = 750 * 1024
+                    let budgetError =
+                        Content'.Error(ValidationError "Aggregate ReadFiles response budget exhausted.")
+                    let dtoBytes path result =
+                        let dto =
+                            match result with
+                            | Content'.Text text ->
+                                {| filePath = path; content = text; error = Unchecked.defaultof<string> |}
+                            | Content'.Error failure ->
+                                {| filePath = path; content = Unchecked.defaultof<string>
+                                   error = EffectError.toString failure |}
+                        WireSize.json dto + 1 // comma
+                    let readOne path =
+                        let result =
+                            match parseFilePath path parsedProject rt with
+                            | Error failure -> Content'.Error failure
+                            | Ok file ->
+                                if remainingBytes <= 4096 then budgetError
+                                else
+                                    match FileIO.readAllText file rt with
+                                    | Error failure -> Content'.Error failure
+                                    | Ok(Content text) -> Content'.Text text
+                        let size = dtoBytes path result
+                        if size > remainingBytes - 4096 then
+                            // Reserve enough space for all remaining small
+                            // per-file budget errors, instead of serializing
+                            // a large partially accepted batch.
+                            remainingBytes <- max 0 (remainingBytes - dtoBytes path budgetError)
+                            budgetError
+                        else
+                            remainingBytes <- remainingBytes - size
+                            result
+                    filePaths |> List.map readOne |> Seq.ofList |> Ok
+        }
 
     let exportFile projectName filePath =
         effect {
@@ -1013,14 +1215,17 @@ let createSkill (cmd: CreateSkillCommand) : IO<'rt, CreateSkillResult> =
 let listDirectory (cmd: ListDirectoryCommand) : IO<'rt, ProjectItemKind list> =
     Core.listProjectDirectory (projectSource cmd.ProjectName) cmd.FolderPath
 
-let searchFiles (cmd: SearchFilesCommand) : IO<'rt, ProjectItemKind list> =
+let searchFiles (cmd: SearchFilesCommand) : IO<'rt, SearchResult<ProjectItemKind>> =
     Core.searchFiles (projectSource cmd.ProjectName) cmd.FolderPath cmd.Query cmd.MaxResults
 
-let searchText (cmd: SearchTextCommand) : IO<'rt, SearchTextMatch list> =
+let searchText (cmd: SearchTextCommand) : IO<'rt, SearchResult<SearchTextMatch>> =
     Core.searchText (projectSource cmd.ProjectName) cmd.FolderPath cmd.Query cmd.IncludeGlobs cmd.ExcludeGlobs cmd.MaxResults
 
 let readFile (cmd: ReadFileCommand) : IO<'rt, Content> =
     Core.readFileWithOptions (projectSource cmd.ProjectName) cmd.FilePath cmd.StartLine cmd.EndLine cmd.IncludeLineNumbers
+
+let readFilePage (cmd: ReadFilePageCommand) : IO<'rt, ReadFilePageResult> =
+    Core.readFilePage (projectSource cmd.ProjectName) cmd.FilePath cmd.Cursor cmd.PageBytes
 
 let readFiles (cmd: ReadFilesCommand) : IO<'rt, Content' seq> =
     Core.readFiles (projectSource cmd.ProjectName) cmd.FilePaths
@@ -1056,6 +1261,8 @@ let searchTextIn project (cmd: SearchTextCommand) =
     Core.searchText (Selected project) cmd.FolderPath cmd.Query cmd.IncludeGlobs cmd.ExcludeGlobs cmd.MaxResults
 let readFileIn project (cmd: ReadFileCommand) =
     Core.readFileWithOptions (Selected project) cmd.FilePath cmd.StartLine cmd.EndLine cmd.IncludeLineNumbers
+let readFilePageIn project (cmd: ReadFilePageCommand) =
+    Core.readFilePage (Selected project) cmd.FilePath cmd.Cursor cmd.PageBytes
 let readFilesIn project (cmd: ReadFilesCommand) =
     Core.readFiles (Selected project) cmd.FilePaths
 let exportFileIn project (cmd: ExportFileCommand) =

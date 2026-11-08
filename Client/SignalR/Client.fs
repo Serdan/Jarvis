@@ -416,6 +416,12 @@ let private dispatch (rt: Runtime) (target: ProjectPaths.ProjectTarget option)
         |> sourceOperation resolved (fun project -> ProjectBrowser.readFileIn project cmd) (fun () -> ProjectBrowser.readFile cmd)
         |> Result.map unwrapContent
         |> serialize'
+    | ReadFilePageCommand cmd ->
+        rt
+        |> sourceOperation resolved
+            (fun project -> ProjectBrowser.readFilePageIn project cmd)
+            (fun () -> ProjectBrowser.readFilePage cmd)
+        |> serialize'
     | ReadFilesCommand cmd ->
         rt
         |> sourceOperation resolved (fun project -> ProjectBrowser.readFilesIn project cmd) (fun () -> ProjectBrowser.readFiles cmd)

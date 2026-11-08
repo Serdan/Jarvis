@@ -42,6 +42,7 @@
         <Compile Include="Modules\BoundedProcess.fs"/>
         <Compile Include="Modules\ProjectPaths.fs"/>
         <Compile Include="Modules\ImportNetwork.fs"/>
+        <Compile Include="Modules\BoundedTextPages.fs"/>
         <Compile Include="Modules\AuditLog.fs"/>
         <Compile Include="Modules\PermissionPolicy.fs"/>
         <Compile Include="Modules\ActivityPresentation.fs"/>

@@ -15,7 +15,7 @@
 ## Negative-space coverage
 
 - Focused Release `ActivityLogTests`: **26/26 passed** on Linux after review fixes, including default/loose modes under permissive umask, malformed and dangling symlinks, root replacement, stale/corrupt/oversized last-seen state, atomic staging and TUI retry, rotation, recent-update state ordering, Unicode, BOM/CRLF, malformed giant line, 256 MiB sparse prefix with <256 KiB read, and worst-case 32 MiB byte cap.
-- Previous complete branch test (before review corrections): **495/495 Client, 96/96 Server** passed. A newer full Release job `e3f904da00d94a59a02c8eade4e57ea2` is running for the frozen revised branch and must finish before review decision.
+- **Final complete branch Release:** **498/498 Client and 96/96 Server passed**, job `e3f904da00d94a59a02c8eade4e57ea2` completed exit code 0. The focused 26/26 and complete suite run cover the frozen reviewed source except for a final nonsemantic catch around writing stderr diagnostics; that additional fail-closed guard is independently compiled on subsequent main integration tests.
 - Exact `git diff --check` passes and `git merge-tree --write-tree main fix/activity-history-safety` indicates a clean merge. Review source and change documentation `docs/ActivityHistoryPrivacy.md` are committed.
 
 ## Boundaries
@@ -24,4 +24,4 @@
 - On Windows `%LOCALAPPDATA%` inherits its user-private ACL; custom shared parents are not hardened into private ACLs. No native Windows or macOS test run has been claimed; that separate cross-platform task remains open.
 - An update occurring far beyond the 32 MiB tail will not be replayed. The method explicitly returns a partial display tail under extreme retention rather than pretending to be a complete audit log.
 
-**Disposition:** Source review complete; subject to final full Release result before Accept and integration.
+**Disposition:** Accept for source integration. No unresolved blocking findings. The bounded recent-update selection change is explicit and tested; original first-seen semantics cannot be retained exactly under an arbitrary finite legacy tail budget without an additional persisted index. No native Windows/macOS validation and no production deployment are implied.

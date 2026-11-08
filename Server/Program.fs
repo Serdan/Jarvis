@@ -15,6 +15,7 @@ open Microsoft.Extensions.DependencyInjection
 open Microsoft.Extensions.Hosting
 open Microsoft.Extensions.Primitives
 open ModelContextProtocol.Server
+open ModelContextProtocol.Protocol
 open Server
 open Server.Services
 
@@ -45,6 +46,7 @@ let private getDatabasePath (configuration: IConfiguration) =
 let configureServices (services: IServiceCollection) (configuration: IConfiguration) =
     let configured = getConfiguredOptions configuration
     let databasePath = getDatabasePath configuration
+    let mcpLimits = McpLoadSettings.fromConfiguration configuration
 
     services.Configure<JarvisOptions>(configuration) |> ignore
 
@@ -101,6 +103,7 @@ let configureServices (services: IServiceCollection) (configuration: IConfigurat
     |> ignore
 
     services.AddHttpContextAccessor() |> ignore
+    services.AddSingleton<McpUserCapacity>(fun _ -> new McpUserCapacity(mcpLimits)) |> ignore
 
     services
         .AddMcpServer(fun options -> options.ServerInstructions <- InstructionGuidance.Text)
@@ -110,8 +113,26 @@ let configureServices (services: IServiceCollection) (configuration: IConfigurat
                 McpRequestFilter<_, _>(fun next ->
                     McpRequestHandler<_, _>(fun context cancellation ->
                     ValueTask<ModelContextProtocol.Protocol.CallToolResult>(
-                        RequestDeviceRouting.withMetadata context.Params (fun () ->
-                            next.Invoke(context, cancellation).AsTask())
+                        task {
+                            let invoke () =
+                                RequestDeviceRouting.withMetadata context.Params (fun () ->
+                                    next.Invoke(context, cancellation).AsTask())
+                            match Auth.tryUserId context.User with
+                            | None -> return! invoke()
+                            | Some subject ->
+                                let capacity = context.Services.GetRequiredService<McpUserCapacity>()
+                                let! admitted = capacity.Execute(subject, cancellation, invoke)
+                                match admitted with
+                                | Executed response -> return response
+                                | Busy retrySeconds ->
+                                    let result = CallToolResult()
+                                    result.IsError <- Nullable true
+                                    result.Content <-
+                                        ResizeArray<ContentBlock>(
+                                            [ TextContentBlock(Text =
+                                                $"Jarvis MCP tool capacity is busy. Retry after {retrySeconds} seconds.") :> ContentBlock ])
+                                    return result
+                        }
                     )))
             )
             |> ignore)
@@ -142,9 +163,10 @@ let configureServices (services: IServiceCollection) (configuration: IConfigurat
                 match context.Lease.TryGetMetadata(MetadataName.RetryAfter) with
                 | true, retryAfter ->
                     context.HttpContext.Response.Headers.RetryAfter <-
-                        (retryAfter.TotalSeconds |> int).ToString(NumberFormatInfo.InvariantInfo)
+                        (max 1 (int (Math.Ceiling retryAfter.TotalSeconds))).ToString(NumberFormatInfo.InvariantInfo)
                         |> StringValues
-                | _ -> ()
+                | _ ->
+                    context.HttpContext.Response.Headers.RetryAfter <- StringValues("1")
 
                 context.HttpContext.Response.StatusCode <- StatusCodes.Status429TooManyRequests
                 ValueTask.CompletedTask)
@@ -169,6 +191,13 @@ let configureServices (services: IServiceCollection) (configuration: IConfigurat
                         limiter
                 )
         )
+        |> ignore
+        // Discovery remains outside the long-lived tools/call concurrency
+        // limiter; the HTTP budget applies across all authenticated MCP
+        // requests, partitioned by token subject rather than proxy IP.
+        options.AddPolicy(
+            McpSubjectRate.Policy,
+            McpSubjectRate.partition mcpLimits)
         |> ignore)
     |> ignore
 
@@ -234,7 +263,7 @@ let configureApp (app: WebApplication) =
     // Authenticate MCP initialization/discovery at the HTTP boundary so clients
     // receive an OAuth Bearer challenge before accessing tools. Tool-specific
     // scope checks continue to run independently inside McpTools.
-    app.MapMcp("/mcp").RequireAuthorization() |> ignore
+    app.MapMcp("/mcp").RequireAuthorization().RequireRateLimiting(McpSubjectRate.Policy) |> ignore
 
     app
 

@@ -1,0 +1,1 @@
+Review root-owned updater, executable/PID and loopback listener route checks, bounded retries, atomic status, durable interrupted-update recovery, real ASP.NET auth/SignalR/DB startup tests, isolated 18-scenario rollback harness. No production rollout.

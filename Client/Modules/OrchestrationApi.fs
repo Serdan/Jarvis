@@ -340,6 +340,21 @@ type PendingIntent =
       CommandSha256: string
       CreatedUtc: string }
 
+// This records an explicit operator disposition of an uncertain local intent.
+// It does not assert that the original remote push failed or create a receipt.
+type SupersededPendingIntent =
+    { SchemaVersion: int
+      Original: PendingIntent
+      OperatorId: string
+      Reason: string
+      RelatedOperationId: string
+      RelatedRequestHash: string
+      RelatedOperationKind: string
+      RelatedSequence: int64
+      RelatedOriginCommit: string
+      VerifiedLedgerHead: string
+      RecordedUtc: string }
+
 type PendingIntentCount =
     { Name: string
       Count: int }
@@ -348,6 +363,10 @@ type PendingIntentSummary =
     { VerifiedLedgerHead: string
       Total: int
       MalformedLocalRecords: int
+      ArchivedTotal: int
+      ArchivedMalformed: int
+      ArchivedLateApplied: int
+      ArchivedIdentityMismatch: int
       ByDisposition: PendingIntentCount list
       ByAction: PendingIntentCount list
       ByActor: PendingIntentCount list
@@ -375,7 +394,8 @@ type PendingIntentInspection =
       PresentLocally: bool
       VerifiedLedgerHead: string
       Disposition: string option
-      Record: PendingIntent option }
+      Record: PendingIntent option
+      Archive: SupersededPendingIntent option }
 
 // Local crash recovery is an intent journal, not a second ledger writer.
 // The authoritative operation outcome remains on the remote orphan ref.
@@ -468,6 +488,86 @@ module PendingIntentJournal =
                 Ok record
             | _ -> Error(Client.ValidationError "Unexpected pending journal filename or operation UUID."))
 
+    let private archiveDirectory root =
+        Path.Combine(journalDirectory root, "archive")
+
+    let private archivePath (binding: LedgerStore.LedgerBinding) (operationId: Guid) =
+        Path.Combine(archiveDirectory binding.RepositoryPath,
+                     operationId.ToString("N") + ".json")
+
+    let private readArchiveFile (path: string) =
+        try
+            if File.GetAttributes(path).HasFlag(FileAttributes.ReparsePoint)
+               || FileInfo(path).Length > 2L * 1024L * 1024L then
+                Error(Client.ValidationError "Unsafe or oversized archived pending intent.")
+            else
+                let record = JsonSerializer.Deserialize<SupersededPendingIntent>(File.ReadAllText(path))
+                if isNull (box record) || record.SchemaVersion <> 1
+                   || isNull (box record.Original)
+                   || record.Original.SchemaVersion <> 1
+                   || String.IsNullOrWhiteSpace record.OperatorId
+                   || String.IsNullOrWhiteSpace record.Reason
+                   || String.IsNullOrWhiteSpace record.RelatedRequestHash
+                   || not (String.Equals(record.Original.CommandSha256,
+                                         sha record.Original.CommandJson, StringComparison.Ordinal)) then
+                    Error(Client.ValidationError "Invalid archived pending intent audit record.")
+                else
+                    match Guid.TryParse record.Original.OperationId with
+                    | true, id when Path.GetFileName(path) = id.ToString("N") + ".json" -> Ok record
+                    | _ -> Error(Client.ValidationError "Invalid archived pending intent operation UUID.")
+        with ex ->
+            Error(Client.ValidationError $"Cannot read archived pending intent: {ex.Message}")
+
+    let private findArchive (binding: LedgerStore.LedgerBinding) operationId =
+        let path = archivePath binding operationId
+        if File.Exists path then readArchiveFile path |> Result.map Some
+        else Ok None
+
+    let private archiveFiles root =
+        try
+            let folder = archiveDirectory root
+            if not (Directory.Exists folder) then Ok [||]
+            elif DirectoryInfo(folder).Attributes.HasFlag(FileAttributes.ReparsePoint) then
+                Error(Client.ValidationError "Pending intent archive directory must not be a symbolic link.")
+            else Ok (Directory.GetFiles(folder, "*.json") |> Array.sort)
+        with ex ->
+            Error(Client.ValidationError $"Cannot list pending intent archives: {ex.Message}")
+
+    // The audit entry is durably created BEFORE removing the mutable pending
+    // record. A crash between those steps leaves both files, which is safe:
+    // the immutable archive is the tombstone; an operator can finish cleanup.
+    let private createArchive (binding: LedgerStore.LedgerBinding) operationId audit =
+        try
+            let folder = archiveDirectory binding.RepositoryPath
+            Directory.CreateDirectory(folder) |> ignore
+            if DirectoryInfo(folder).Attributes.HasFlag(FileAttributes.ReparsePoint) then
+                Error(Client.ValidationError "Pending archive directory must not be a symbolic link.")
+            else
+                if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
+                    File.SetUnixFileMode(folder, UnixFileMode.UserRead ||| UnixFileMode.UserWrite ||| UnixFileMode.UserExecute)
+                let destination = archivePath binding operationId
+                if File.Exists destination then
+                    Error(Client.ValidationError "Pending intent archive already exists.")
+                else
+                    let temporary = destination + "." + Guid.NewGuid().ToString("N") + ".tmp"
+                    try
+                        do
+                            use stream = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write,
+                                                        FileShare.None, 4096, FileOptions.WriteThrough)
+                            let bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(audit))
+                            stream.Write(bytes, 0, bytes.Length)
+                            stream.Flush(true)
+                        if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
+                            File.SetUnixFileMode(temporary, UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
+                        // Close before rename: Windows FileShare.None prevents
+                        // moving an open stream. Destination is never replaced.
+                        File.Move(temporary, destination, false)
+                        Ok ()
+                    finally
+                        if File.Exists temporary then File.Delete temporary
+        with ex ->
+            Error(Client.ValidationError $"Cannot archive pending intent safely: {ex.Message}")
+
     let private persistUnsafe (binding: LedgerStore.LedgerBinding) operationId commandType commandJson =
         let file = filePath binding operationId
         let newRecord =
@@ -489,7 +589,9 @@ module PendingIntentJournal =
             && existing.CommandSha256 = newRecord.CommandSha256
             && existing.CommandJson = newRecord.CommandJson
         try
-            if File.Exists file then
+            if File.Exists(archivePath binding operationId) then
+                Error(Client.ValidationError "Pending intent was explicitly superseded; archived UUID cannot be reused.")
+            elif File.Exists file then
                 readFile file |> Result.bind (fun existing ->
                     if matches existing then Ok ()
                     else Error(Client.ValidationError "Pending  operation UUID reused with changed input."))
@@ -834,6 +936,159 @@ module PendingIntentJournal =
         | true, _ -> "OlderThan30Days"
         | _ -> "InvalidTimestamp"
 
+    let private relatedProofMatches (original: PendingIntent)
+                                    (related: LedgerStore.LedgerOperation) =
+        try
+            use saved = JsonDocument.Parse(original.CommandJson)
+            use accepted = JsonDocument.Parse(related.CanonicalRequestJson)
+            let requestJson = accepted.RootElement.GetProperty("request").GetString()
+            use request = JsonDocument.Parse(requestJson)
+            let own = saved.RootElement
+            let remote = request.RootElement
+            let ownField name = commandProperty own name |> Option.defaultValue ""
+            let remoteField name = commandProperty remote name |> Option.defaultValue ""
+            let taskId = ownField "TaskId"
+            let actor = ownField "ActorId"
+            let action = ownField "Action"
+            // A related operation on a different task is never proof.
+            let sameTask = not (String.IsNullOrWhiteSpace taskId)
+                           && String.Equals(taskId, remoteField "taskId", StringComparison.Ordinal)
+            let sameActor = not (String.IsNullOrWhiteSpace actor)
+                            && String.Equals(actor, related.Actor, StringComparison.Ordinal)
+            let equivalentCreate =
+                normalizeCommandType original.CommandType = "TaskWrite"
+                && action = "CreateTask" && related.Type = "CreateTask"
+                && String.Equals(ownField "Title", remoteField "title", StringComparison.Ordinal)
+                && String.Equals(sha (ownField "Html"), remoteField "specSha256",
+                                 StringComparison.OrdinalIgnoreCase)
+            let supersededLifecycle =
+                normalizeCommandType original.CommandType = "TaskWrite"
+                && action = "ResumeAgent" && sameActor
+                && List.contains related.Type
+                    [ "BeginAttempt"; "CheckpointAttempt"; "YieldAgent"; "CompleteAgentWork" ]
+            sameTask && (equivalentCreate || supersededLifecycle)
+        with _ -> false
+
+    // Operator-controlled, durable local supersession. This does not mutate
+    // the remote ledger. The related UUID is required to be a verified Applied
+    // receipt with an exact supplied hash and subject-specific equivalence.
+    // It is deliberately narrower than a generic 'discard stale item' tool.
+    let supersede (binding: LedgerStore.LedgerBinding) operationId
+                  (expectedCommandHash: string) (expectedHead: string)
+                  (operatorId: string) (reason: string)
+                  (relatedId: Guid) (relatedRequestHash: string) =
+        withIntentLock binding operationId (fun () ->
+            if String.IsNullOrWhiteSpace operatorId || operatorId.Length > 128
+               || String.IsNullOrWhiteSpace reason || reason.Trim().Length < 10
+               || reason.Length > 2048
+               || operationId = relatedId
+               || String.IsNullOrWhiteSpace expectedHead
+               || String.IsNullOrWhiteSpace expectedCommandHash
+               || String.IsNullOrWhiteSpace relatedRequestHash then
+                Error(Client.ValidationError "Provide operator, a 10-2048 character reason, original hash, pinned head, and a distinct related operation with verified hash.")
+            else
+                findArchive binding operationId
+                |> Result.bind (fun prior ->
+                    let verifyOriginal original =
+                        if not (checkBinding binding original)
+                           || not (String.Equals(original.CommandSha256, expectedCommandHash, StringComparison.OrdinalIgnoreCase)) then
+                            Error(Client.ValidationError "Pending supersession identity or original command hash mismatch.")
+                        else Ok ()
+                    match prior with
+                    | Some archived ->
+                        verifyOriginal archived.Original
+                        |> Result.bind (fun () ->
+                            if archived.OperatorId <> operatorId
+                               || archived.Reason <> reason
+                               || archived.VerifiedLedgerHead <> expectedHead
+                               || archived.RelatedOperationId <> relatedId.ToString("D")
+                               || archived.RelatedRequestHash <> relatedRequestHash then
+                                Error(Client.ValidationError "Archived supersession is immutable; retry must use identical evidence.")
+                            else
+                                // An interrupted archive-first transition may
+                                // have left the pending file. Recover atomically.
+                                findAtRoot binding.RepositoryPath operationId
+                                |> Result.bind (function
+                                    | Some current when current <> archived.Original ->
+                                        Error(Client.ValidationError "Pending intent differs from archived audit; refuse cleanup.")
+                                    | active ->
+                                        try
+                                            if active.IsSome then
+                                                File.Delete(filePath binding operationId)
+                                            Ok {| operationId = operationId.ToString("D")
+                                                  alreadySuperseded = true
+                                                  verifiedLedgerHead = archived.VerifiedLedgerHead
+                                                  archive = archived |}
+                                        with ex ->
+                                            Error(Client.ValidationError $"Cannot complete pending supersession cleanup: {ex.Message}")))
+                    | None ->
+                        findAtRoot binding.RepositoryPath operationId
+                        |> Result.bind (function
+                            | None -> Error(Client.ValidationError "No local pending intent exists for this operation.")
+                            | Some original ->
+                                verifyOriginal original
+                                |> Result.bind (fun () ->
+                                    LedgerStore.LedgerStore.fetch binding
+                                    |> Result.mapError LedgerErrors.toEffect
+                                    |> Result.bind (fun snapshot ->
+                                        if snapshot.Commit <> expectedHead then
+                                            Error(Client.ValidationError "Verified ledger head changed since inspection; inspect intent again.")
+                                        else
+                                            LedgerStore.LedgerStore.getOperationAt binding snapshot operationId
+                                            |> Result.mapError LedgerErrors.toEffect
+                                            |> Result.bind (function
+                                                | Some _ ->
+                                                    Error(Client.ValidationError "Original operation UUID is present at verified head; inspect/acknowledge it, do not supersede.")
+                                                | None ->
+                                                    LedgerStore.LedgerStore.getOperationAt binding snapshot relatedId
+                                                    |> Result.mapError LedgerErrors.toEffect
+                                                    |> Result.bind (function
+                                                        | Some related when
+                                                            String.Equals(related.RequestHash, relatedRequestHash, StringComparison.OrdinalIgnoreCase)
+                                                            && relatedProofMatches original related ->
+                                                            LedgerStore.LedgerStore.getOperationOriginAt binding snapshot related
+                                                            |> Result.mapError LedgerErrors.toEffect
+                                                            |> Result.bind (fun origin ->
+                                                                let audit =
+                                                                    { SchemaVersion = 1; Original = original
+                                                                      OperatorId = operatorId; Reason = reason
+                                                                      RelatedOperationId = relatedId.ToString("D")
+                                                                      RelatedRequestHash = related.RequestHash
+                                                                      RelatedOperationKind = related.Type
+                                                                      RelatedSequence = related.Sequence
+                                                                      RelatedOriginCommit = origin
+                                                                      VerifiedLedgerHead = snapshot.Commit
+                                                                      RecordedUtc = DateTimeOffset.UtcNow.ToString("O") }
+                                                                createArchive binding operationId audit
+                                                                |> Result.bind (fun () ->
+                                                                    try
+                                                                        File.Delete(filePath binding operationId)
+                                                                        Ok {| operationId = operationId.ToString("D")
+                                                                              alreadySuperseded = false
+                                                                              verifiedLedgerHead = snapshot.Commit
+                                                                              archive = audit |}
+                                                                    with ex ->
+                                                                        Error(Client.ValidationError $"Archive is durable; pending cleanup incomplete: {ex.Message}")))
+                                                        | _ ->
+                                                            Error(Client.ValidationError "Related operation is not a matching verified Applied receipt for the same task and lifecycle action."))))))))
+
+    let private archivedDisposition binding snapshot (knownIds: Set<string>)
+                                    (archived: SupersededPendingIntent) =
+        let original = archived.Original
+        if not (checkBinding binding original) then Ok "ArchiveBindingMismatch"
+        else
+            match Guid.TryParse original.OperationId with
+            | false, _ -> Ok "ArchivedMalformed"
+            | true, id when not (knownIds.Contains(id.ToString("N"))) ->
+                Ok "Superseded"
+            | true, id ->
+                LedgerStore.LedgerStore.getOperationAt binding snapshot id
+                |> Result.mapError LedgerErrors.toEffect
+                |> Result.map (function
+                    | Some op when identityMatches original op -> "AppliedAfterSupersession"
+                    | Some _ -> "IdentityMismatchAfterSupersession"
+                    | None -> "Superseded")
+
     // One verified Git tree index and remote operation reads only for UUIDs
     // present at that head. Streaming local scan retains aggregates, not the
     // command JSON for every historical intent.
@@ -874,35 +1129,76 @@ module PendingIntentJournal =
                                         increment dispositions status
                                         increment ages (ageBucket record.CreatedUtc now))))
                             (Ok ())
-                    scan |> Result.map (fun () ->
-                        { VerifiedLedgerHead = snapshot.Commit
-                          Total = files.Length
-                          MalformedLocalRecords = malformed
-                          ByDisposition = toCounts dispositions
-                          ByAction = toCounts actions
-                          ByActor = toCounts actors
-                          ByAge = toCounts ages }))))
+                    scan
+                    |> Result.bind (fun () ->
+                        archiveFiles binding.RepositoryPath
+                        |> Result.bind (fun archivedFiles ->
+                            let mutable archivedMalformed = 0
+                            let mutable lateApplied = 0
+                            let mutable archivedConflict = 0
+                            let archiveScan =
+                                archivedFiles |> Array.fold (fun state path ->
+                                    state |> Result.bind (fun () ->
+                                        match readArchiveFile path with
+                                        | Error _ ->
+                                            archivedMalformed <- archivedMalformed + 1
+                                            increment dispositions "ArchivedMalformed"
+                                            Ok ()
+                                        | Ok archived ->
+                                            archivedDisposition binding snapshot knownIds archived
+                                            |> Result.map (fun status ->
+                                                increment dispositions status
+                                                if status = "AppliedAfterSupersession" then
+                                                    lateApplied <- lateApplied + 1
+                                                elif status = "IdentityMismatchAfterSupersession" then
+                                                    archivedConflict <- archivedConflict + 1)))
+                                    (Ok ())
+                            archiveScan |> Result.map (fun () ->
+                                { VerifiedLedgerHead = snapshot.Commit
+                                  Total = files.Length
+                                  MalformedLocalRecords = malformed
+                                  ArchivedTotal = archivedFiles.Length
+                                  ArchivedMalformed = archivedMalformed
+                                  ArchivedLateApplied = lateApplied
+                                  ArchivedIdentityMismatch = archivedConflict
+                                  ByDisposition = toCounts dispositions
+                                  ByAction = toCounts actions
+                                  ByActor = toCounts actors
+                                  ByAge = toCounts ages }))))))
 
     let inspect (binding: LedgerStore.LedgerBinding) (operationId: Guid) =
         findAtRoot binding.RepositoryPath operationId
         |> Result.bind (fun stored ->
-            LedgerStore.LedgerStore.fetch binding
-            |> Result.mapError LedgerErrors.toEffect
-            |> Result.bind (fun snapshot ->
-                LedgerStore.LedgerStore.getOperationIdsAt binding snapshot
+            findArchive binding operationId
+            |> Result.bind (fun archived ->
+                LedgerStore.LedgerStore.fetch binding
                 |> Result.mapError LedgerErrors.toEffect
-                |> Result.bind (fun knownIds ->
-                    match stored with
-                    | None ->
-                        Ok { OperationId = operationId.ToString("D")
-                             PresentLocally = false; VerifiedLedgerHead = snapshot.Commit
-                             Disposition = None; Record = None }
-                    | Some record ->
-                        classifyAt binding snapshot knownIds record
-                        |> Result.map (fun disposition ->
-                            { OperationId = record.OperationId; PresentLocally = true
-                              VerifiedLedgerHead = snapshot.Commit; Disposition = Some disposition
-                              Record = Some record }))))
+                |> Result.bind (fun snapshot ->
+                    LedgerStore.LedgerStore.getOperationIdsAt binding snapshot
+                    |> Result.mapError LedgerErrors.toEffect
+                    |> Result.bind (fun knownIds ->
+                        match stored, archived with
+                        | Some record, Some audit when record <> audit.Original ->
+                            Error(Client.ValidationError "Pending record differs from archived supersession; inspect local journal corruption.")
+                        | _, Some audit ->
+                            archivedDisposition binding snapshot knownIds audit
+                            |> Result.map (fun status ->
+                                { OperationId = operationId.ToString("D")
+                                  PresentLocally = stored.IsSome
+                                  VerifiedLedgerHead = snapshot.Commit
+                                  Disposition = Some status
+                                  Record = Some audit.Original
+                                  Archive = Some audit })
+                        | None, None ->
+                            Ok { OperationId = operationId.ToString("D")
+                                 PresentLocally = false; VerifiedLedgerHead = snapshot.Commit
+                                 Disposition = None; Record = None; Archive = None }
+                        | Some record, None ->
+                            classifyAt binding snapshot knownIds record
+                            |> Result.map (fun disposition ->
+                                { OperationId = record.OperationId; PresentLocally = true
+                                  VerifiedLedgerHead = snapshot.Commit; Disposition = Some disposition
+                                  Record = Some record; Archive = None })))))
 
     let page (binding: LedgerStore.LedgerBinding) cursor pageSize =
         pageAtRoot binding.RepositoryPath cursor pageSize

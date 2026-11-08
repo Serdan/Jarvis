@@ -2804,6 +2804,118 @@ type ReviewWorkflowTests() =
             | other -> Assert.Fail(sprintf "Corrupt record must not be accepted for inspection: %A" other))
 
     [<Test>]
+    member _.PendingSupersessionRequiresProvenEquivalentAppliedReceiptAndPreservesArchive() =
+        withFixture (fun one _ first _ _ _ _ _ ->
+            let operationId = Guid.NewGuid()
+            let taskId = "supersession-proven-task"
+            let spec = "<h1>Equivalent task</h1>"
+            let savedCommand =
+                System.Text.Json.JsonSerializer.Serialize(
+                    {| Action = "CreateTask"; TaskId = taskId; Title = "Equivalent task"
+                       Html = spec; SessionId = "historical-private-session-token" |})
+            Client.OrchestrationApi.PendingIntentJournal.persist first operationId "TaskWrite" savedCommand
+            |> success
+            let stored = Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId
+                         |> success |> Option.get
+            let wrongId = Guid.NewGuid()
+            let wrong = ReviewWorkflow.createTaskWithSpec first wrongId "unrelated"
+                            "Different task" spec |> success
+            let goodId = Guid.NewGuid()
+            let good = ReviewWorkflow.createTaskWithSpec first goodId taskId
+                           "Equivalent task" spec |> success
+            let head = (LedgerStore.fetch first |> success).Commit
+            let reason = "Equivalent CreateTask accepted with a different UUID; supersede original local intent."
+            let supersede pinned relatedId requestHash requestedReason =
+                Client.OrchestrationApi.PendingIntentJournal.supersede first operationId
+                    stored.CommandSha256 pinned "Jarvis Lead" requestedReason relatedId requestHash
+            match supersede head wrongId wrong.Operation.RequestHash reason with
+            | Error(Client.ValidationError _) -> ()
+            | other -> Assert.Fail(sprintf "Unrelated task cannot prove supersession: %A" other)
+            match supersede (String.replicate 40 "f") goodId good.Operation.RequestHash reason with
+            | Error(Client.ValidationError _) -> ()
+            | other -> Assert.Fail(sprintf "Stale snapshot anchor cannot supersede: %A" other)
+            match supersede head goodId (String.replicate 64 "a") reason with
+            | Error(Client.ValidationError _) -> ()
+            | other -> Assert.Fail(sprintf "Wrong related hash cannot supersede: %A" other)
+            Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId |> success).IsSome,
+                        Is.True)
+            let archived = supersede head goodId good.Operation.RequestHash reason |> success
+            Assert.That(archived.alreadySuperseded, Is.False)
+            Assert.That(archived.archive.Original.CommandJson, Is.EqualTo(savedCommand))
+            Assert.That(archived.archive.RelatedRequestHash, Is.EqualTo(good.Operation.RequestHash))
+            Assert.That(archived.archive.RelatedOperationKind, Is.EqualTo("CreateTask"))
+            Assert.That(archived.archive.RelatedOriginCommit.Length, Is.EqualTo(40))
+            Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId |> success).IsNone,
+                        Is.True)
+            let second = supersede head goodId good.Operation.RequestHash reason |> success
+            Assert.That(second.alreadySuperseded, Is.True)
+            match supersede head goodId good.Operation.RequestHash "A changed audit reason is rejected." with
+            | Error(Client.ValidationError _) -> ()
+            | other -> Assert.Fail(sprintf "Immutable disposition cannot be rewritten: %A" other)
+            match Client.OrchestrationApi.PendingIntentJournal.persist first operationId "TaskWrite" savedCommand with
+            | Error(Client.ValidationError _) -> ()
+            | other -> Assert.Fail(sprintf "Archived UUID must reject new persistence: %A" other)
+            let mutable replayCalled = false
+            match Client.OrchestrationApi.PendingIntentJournal.execute first operationId "TaskWrite" savedCommand (fun () ->
+                replayCalled <- true
+                Ok 5) with
+            | Error(Client.ValidationError _) -> ()
+            | other -> Assert.Fail(sprintf "Archived UUID must reject replay: %A" other)
+            Assert.That(replayCalled, Is.False)
+            let inspected = Client.OrchestrationApi.PendingIntentJournal.inspect first operationId |> success
+            Assert.That(inspected.Disposition, Is.EqualTo(Some "Superseded"))
+            Assert.That(inspected.Archive.IsSome, Is.True)
+            Assert.That(inspected.Record.Value.CommandJson, Is.EqualTo(savedCommand))
+            let summary = Client.OrchestrationApi.PendingIntentJournal.summarize first |> success
+            Assert.That(summary.Total, Is.EqualTo(0))
+            Assert.That(summary.ArchivedTotal, Is.EqualTo(1))
+            Assert.That(summary.ArchivedLateApplied, Is.Zero)
+            Assert.That(summary.ByDisposition |> List.exists (fun item ->
+                item.Name = "Superseded" && item.Count = 1), Is.True)
+            Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(head))
+            // Simulate a process interruption after archive creation but before
+            // pending file deletion. Same-argument retry recovers without
+            // re-reading or re-writing the immutable tombstone.
+            let bindingPath = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
+            let pendingPath = Path.Combine(Path.GetDirectoryName bindingPath, "pending",
+                                           Path.GetFileNameWithoutExtension bindingPath,
+                                           operationId.ToString("N") + ".json")
+            File.WriteAllText(pendingPath, System.Text.Json.JsonSerializer.Serialize(stored))
+            let recovered = supersede head goodId good.Operation.RequestHash reason |> success
+            Assert.That(recovered.alreadySuperseded, Is.True)
+            Assert.That(File.Exists pendingPath, Is.False)
+            Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(head)))
+
+    [<Test>]
+    member _.PendingSupersessionNeverArchivesAnOriginalWithVerifiedAppliedReceipt() =
+        withFixture (fun one _ first _ _ _ _ _ ->
+            let action = "must-remain-applied"
+            let html = "<h1>Already accepted</h1>"
+            let originalId = Guid.NewGuid()
+            let original = ReviewWorkflow.createTaskWithSpec first originalId action action html |> success
+            let savedCommand =
+                System.Text.Json.JsonSerializer.Serialize(
+                    {| Action = "CreateTask"; TaskId = action; Title = action; Html = html |})
+            Client.OrchestrationApi.PendingIntentJournal.persist first originalId "TaskWrite" savedCommand
+            |> success
+            let otherId = Guid.NewGuid()
+            let unrelated = ReviewWorkflow.createTaskWithSpec first otherId "elsewhere"
+                                "Elsewhere" html |> success
+            let saved = Client.OrchestrationApi.PendingIntentJournal.findAtRoot one originalId
+                        |> success |> Option.get
+            let head = (LedgerStore.fetch first |> success).Commit
+            match Client.OrchestrationApi.PendingIntentJournal.supersede first originalId
+                    saved.CommandSha256 head "Jarvis Lead"
+                    "Already accepted operation must never be abandoned." otherId
+                    unrelated.Operation.RequestHash with
+            | Error(Client.ValidationError _) -> ()
+            | other -> Assert.Fail(sprintf "Applied original UUID cannot be superseded: %A" other)
+            Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one originalId |> success).IsSome,
+                        Is.True)
+            Assert.That(original.Operation.OperationId, Is.EqualTo(originalId.ToString("D")))
+            Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(head)))
+
+    [<Test>]
     member _.LostResponseRecoversAcceptedRemoteOperationButNeverGuessesFailure() =
         withFixture (fun one _ first _ _ _ _ _ ->
             let command name =

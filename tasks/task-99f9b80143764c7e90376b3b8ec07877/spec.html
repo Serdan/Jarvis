@@ -1,0 +1,13 @@
+<h1>Robust TUI rendering through terminal resize</h1><p><strong>Feedback:</strong> e352bb5ee13040bd836b9d8a3b8cb63c.</p>
+<h2>Failure</h2><p>On Windows Terminal / PowerShell 7.6, resizing Jarvis Client occasionally prints <code>Render warning: Index was outside the bounds of the array.</code> above the header. The connection appears intact, but a render path is consuming inconsistent geometry or indexing outside a valid buffer.</p>
+<h2>Work</h2><ul>
+<li>Reproduce with rapid repeated terminal resizing, including transitions through zero/minimal rows and columns, while updates arrive. Instrument the relevant layout, redraw, buffer/cursor and terminal-size boundary to establish the actual failing operation; avoid exception swallowing as the only fix.</li>
+<li>Use one coherent geometry snapshot for layout/draw phases or an equivalent validated approach; clamp coordinates/indexed ranges at the ownership boundary, atomically rebuild buffers as required, and schedule a clean redraw when a size change interrupts a frame.</li>
+<li>Do not write exception text into normal TUI display; preserve detailed diagnostics in the existing logs, while maintaining responsive interaction and a stable server connection.</li>
+<li>Coordinate with Debugger's broader ToolFailure task <code>task-2fc1384a2cff430db05aa025b12b1004</code>; this is a scoped implementation item, not a competing ownership assignment.</li>
+</ul>
+<h2>Acceptance</h2><ol>
+<li>Automated tests exercise rapid 0/1/2/normal size changes, concurrent content updates and redraw/scroll after recovery; no uncaught index or stale buffer errors.</li>
+<li>Windows Terminal reproduction no longer prints warning or corrupts the header; TUI redraws properly on returning to a normal size without losing connection or input.</li>
+<li>Regression coverage targets the identified root cause, not just an exception handler. Release client tests pass.</li>
+</ol><p>Do not deploy without operator authorization.</p>

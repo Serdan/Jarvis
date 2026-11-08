@@ -10,6 +10,7 @@
         <Content Include="Structure.md"/>
         <Compile Include="JarvisOptions.fs"/>
         <Compile Include="Auth.fs"/>
+        <Compile Include="McpUserCapacity.fs"/>
         <Compile Include="Services\ClientResponseTracker.fs"/>
         <Compile Include="Services\UserService.fs"/>
         <Compile Include="Services\ExportStore.fs"/>

@@ -11,6 +11,7 @@
         <Compile Include="ExportStoreTests.fs"/>
         <Compile Include="FeedbackStoreTests.fs"/>
         <Compile Include="ServiceTests.fs"/>
+        <Compile Include="McpCapacityTests.fs"/>
         <Compile Include="McpAuthenticationTests.fs"/>
         <Compile Include="Program.fs"/>
     </ItemGroup>

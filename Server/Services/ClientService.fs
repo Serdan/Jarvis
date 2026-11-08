@@ -1,11 +1,13 @@
 namespace Server.Services
 
 open System
+open System.Threading
 open System.Threading.Tasks
 open System.Text.Json
 open Common
 open Common.SignalR
 open Microsoft.AspNetCore.SignalR
+open Microsoft.AspNetCore.Http
 open Microsoft.FSharp.Core
 
 module ProjectNotificationRouting =
@@ -90,7 +92,7 @@ module AgentStateInvalidationRouting =
                 project, (changes |> List.map _.AgentId |> List.distinct |> List.toArray))
 
 
-type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserService, tracker: ClientResponseTracker) =
+type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserService, tracker: ClientResponseTracker, http: IHttpContextAccessor) =
     member this.SendMessageToAll(message) = ctx.Clients.All.ReceiveMessage(message)
 
     // Typed, per-agent invalidation only reaches authenticated registered
@@ -115,6 +117,11 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
 
     member this.SendCommandToUser(userId: string, command: AgentCommand, ?conversationId: string, ?deviceId: string, ?agentId: string) =
         task {
+            let requestAborted =
+                match http.HttpContext with
+                | null -> CancellationToken.None
+                | context -> context.RequestAborted
+            requestAborted.ThrowIfCancellationRequested()
             match users.GetSelectedSession(userId, conversationId, deviceId) with
             | ValueNone when deviceId.IsSome ->
                 let requested = deviceId.Value
@@ -168,12 +175,12 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                         let commandJson = JsonSerializer.Serialize<AgentCommand>(command)
 
                         try
-                            do! client.ReceiveCommand(correlationId, commandJson, defaultArg agentId "")
+                            do! client.ReceiveCommand(correlationId, commandJson, defaultArg agentId "").WaitAsync(requestAborted)
                             users.RecordDispatchSuccess(userId, connectionId)
 
                             try
-                                return! trackingTask
-                            with :? TaskCanceledException ->
+                                return! trackingTask.WaitAsync(requestAborted)
+                            with :? TaskCanceledException when not requestAborted.IsCancellationRequested ->
                                 let reason =
                                     $"Client response timeout for {session.DeviceName} generation {session.Generation}."
                                 users.RecordDispatchFailure(userId, connectionId, reason)
@@ -187,13 +194,19 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                                       Instructions = []; AgentStateChanges = [] }
                         with ex ->
                             tracker.Cancel(correlationId)
-                            let reason =
-                                $"Dispatch failed for {session.DeviceName} generation {session.Generation}: {ex.Message}"
-                            users.RecordDispatchFailure(userId, connectionId, reason)
-                            return
-                                { Result = None
-                                  Error = Some(ExecutionFailed reason)
-                                  Instructions = []; AgentStateChanges = [] }
+                            if requestAborted.IsCancellationRequested then
+                                // The caller is gone, not the device. Keep
+                                // the client session healthy and remove the
+                                // now-unobservable correlation promptly.
+                                return raise (OperationCanceledException(requestAborted))
+                            else
+                                let reason =
+                                    $"Dispatch failed for {session.DeviceName} generation {session.Generation}: {ex.Message}"
+                                users.RecordDispatchFailure(userId, connectionId, reason)
+                                return
+                                    { Result = None
+                                      Error = Some(ExecutionFailed reason)
+                                      Instructions = []; AgentStateChanges = [] }
         }
 
 

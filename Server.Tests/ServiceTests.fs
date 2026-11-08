@@ -308,7 +308,8 @@ let ``client service rejects commands not negotiated by the registered client`` 
         )
         |> ignore
 
-        let client = ClientService(Unchecked.defaultof<_>, users, ClientResponseTracker())
+        let client = ClientService(Unchecked.defaultof<_>, users, ClientResponseTracker(),
+                                   Microsoft.AspNetCore.Http.HttpContextAccessor())
         let command =
             WriteFileCommand
                 { ProjectName = "Jarvis"
@@ -1235,3 +1236,69 @@ let ``project scoped MCP tools standardize explicit agentId arguments`` () =
             if not isGlobalFilter then
                 Assert.That(parameters.Contains("agentId") || (tool.Name = "NotifyAgent" && parameters.Contains("fromAgentId")),
                             Is.True, tool.Name + " lacks explicit agent attribution")
+
+
+[<Test>]
+let client_request_abort_cancels_outstanding_device_correlation_without_faulting_device () =
+    task {
+        let users = UserService()
+        let user = "auth0|caller"
+        let connection = "conn-1"
+        users.TransportConnected(user, connection)
+        let registered =
+            users.Register(user,
+                { DeviceId = "device-1"
+                  DeviceName = "Workstation"
+                  ProtocolVersion = AgentProtocol.version
+                  ClientVersion = "test"
+                  SupportedCommands = [ "ListProjects" ] }, connection)
+        let tracker = ClientResponseTracker()
+        let dispatched =
+            TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let recipient =
+            { new Common.SignalR.IClientService with
+                member _.ReceiveMessage(_) = Task.CompletedTask
+                member _.ReceiveCommand(correlationId, _, _) =
+                    dispatched.TrySetResult(correlationId) |> ignore
+                    Task.CompletedTask
+                member _.InvalidateAgentStates(_, _) = Task.CompletedTask }
+        let clients =
+            { new Microsoft.AspNetCore.SignalR.IHubClients<Common.SignalR.IClientService> with
+                member _.All = recipient
+                member _.AllExcept(_) = recipient
+                member _.Client(_) = recipient
+                member _.Clients(_) = recipient
+                member _.Group(_) = recipient
+                member _.GroupExcept(_, _) = recipient
+                member _.Groups(_) = recipient
+                member _.User(_) = recipient
+                member _.Users(_) = recipient }
+        let hub =
+            { new Microsoft.AspNetCore.SignalR.IHubContext<HubService, Common.SignalR.IClientService> with
+                member _.Clients = clients
+                member _.Groups = Unchecked.defaultof<_> }
+        use abort = new System.Threading.CancellationTokenSource()
+        let context = Microsoft.AspNetCore.Http.DefaultHttpContext()
+        context.RequestAborted <- abort.Token
+        let http = Microsoft.AspNetCore.Http.HttpContextAccessor()
+        http.HttpContext <- context
+        let service = ClientService(hub, users, tracker, http)
+        let pending = service.SendCommandToUser(user, ListProjectsCommand)
+        let! correlationId = dispatched.Task.WaitAsync(TimeSpan.FromSeconds(4.))
+        abort.Cancel()
+        let! canceled =
+            task {
+                try
+                    let! _ = pending
+                    return false
+                with :? OperationCanceledException -> return true
+            }
+        Assert.That(canceled, Is.True)
+        let response = { Result = Some "unexpected"; Error = None; Instructions = []; AgentStateChanges = [] }
+        Assert.That(tracker.Complete(correlationId, user, connection, registered.Generation, response), Is.False)
+        match users.GetSession(user) with
+        | ValueSome session ->
+            Assert.That(session.State, Is.EqualTo(Registered))
+            Assert.That(session.LastFailure.IsNone, Is.True)
+        | ValueNone -> Assert.Fail("Original session should remain registered.")
+    }

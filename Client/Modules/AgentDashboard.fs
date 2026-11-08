@@ -2,6 +2,7 @@ module Client.AgentDashboard
 
 open System
 open System.Collections.Concurrent
+open System.Collections.Generic
 open System.IO
 open System.Text.Json
 open Client.LedgerStore
@@ -17,10 +18,10 @@ let private deserialize<'t> (text: string) =
         else Ok value
     with ex -> Error ("Invalid canonical ledger entity: " + ex.Message)
 
-let private read<'t> (records: Map<string, string>) path =
+let private read<'t> (records: Map<string, struct (string * string)>) path =
     match Map.tryFind path records with
     | None -> Error ("Missing canonical ledger entity: " + path)
-    | Some content ->
+    | Some struct (_, content) ->
         if typeof<'t>.Name = "ReviewAgent" || typeof<'t>.Name = "ReviewAttempt" then
             try
                 use doc = System.Text.Json.JsonDocument.Parse(content)
@@ -30,16 +31,64 @@ let private read<'t> (records: Map<string, string>) path =
             with ex -> Error ("Invalid canonical agent/attempt JSON: " + ex.Message)
         else deserialize<'t> content
 
-// Historical notification blobs are immutable. Parsing each old notification
-// again after every unrelated agent/task commit is unnecessary.
+// Reuse parsed immutable OID content when a new head references the same
+// notification. Unlike the old JSON-string-keyed dictionary, this has hard
+// entry/byte bounds and does not retain duplicate full JSON as cache keys.
 let private parsedNotifications =
-    ConcurrentDictionary<string, Result<AgentNotification, string>>(StringComparer.Ordinal)
+    BoundedFifoCache<Result<AgentNotification, string>>(16384, 16L * 1024L * 1024L)
 
-let private readNotification (records: Map<string, string>) path =
-    match Map.tryFind path records with
-    | None -> Error ("Missing canonical ledger entity: " + path)
-    | Some content ->
-        parsedNotifications.GetOrAdd(content, fun value -> deserialize<AgentNotification> value)
+let internal parsedNotificationCacheStats () = parsedNotifications.Counts
+
+let private parseNotification (oid: string) (content: string) =
+    match parsedNotifications.TryGet oid with
+    | ValueSome parsed -> parsed
+    | ValueNone ->
+        let parsed = deserialize<AgentNotification> content
+        // A parsed record holds the string fields, not the input JSON.
+        // Count UTF-16 content bytes as a conservative record estimate.
+        parsedNotifications.Add(oid, parsed, 2L * int64 (oid.Length + content.Length) + 128L)
+        parsed
+
+type internal NotificationSummary =
+    { Pending: int
+      Latest: string option }
+
+/// Parse notifications once per changed snapshot, reduce unread counts and
+/// newest item in a single pass, then discard all intermediate records. This
+/// avoids rescanning/sorting the entire historical list for each agent.
+let internal notificationSummaries (records: Map<string, struct (string * string)>) =
+    let summaries = Dictionary<string, struct (int * AgentNotification)>(StringComparer.Ordinal)
+    let mutable firstError = None
+    for KeyValue(path, struct (oid, content)) in records do
+        if path.StartsWith("notifications/", StringComparison.Ordinal) then
+            match parseNotification oid content with
+            | Error message ->
+                if firstError.IsNone then firstError <- Some message
+            | Ok notification when
+                not (String.IsNullOrWhiteSpace notification.ToAgentId)
+                && String.IsNullOrWhiteSpace notification.AcknowledgedAtUtc ->
+                match summaries.TryGetValue notification.ToAgentId with
+                | true, struct (count, newest) ->
+                    let latest =
+                        if (notification.CreatedAtUtc, notification.NotificationId) >
+                           (newest.CreatedAtUtc, newest.NotificationId)
+                        then notification else newest
+                    summaries[notification.ToAgentId] <- struct (count + 1, latest)
+                | _ -> summaries.Add(notification.ToAgentId, struct (1, notification))
+            | _ -> ()
+    match firstError with
+    | Some message -> Error message
+    | None ->
+        summaries
+        |> Seq.map (fun (KeyValue(agentId, struct (count, newest))) ->
+            agentId,
+            { Pending = count
+              Latest = Some (
+                  newest.FromAgentId
+                  + (if String.IsNullOrWhiteSpace newest.TaskId then "" else " #" + newest.TaskId)
+                  + ": " + newest.Message) })
+        |> Map.ofSeq
+        |> Ok
 
 let private stateTime (agent: ReviewAgent) =
     match DateTimeOffset.TryParse(agent.StateEnteredAtUtc) with
@@ -71,7 +120,7 @@ let private projectSnapshot project rt =
                     match cachedProjects.TryGetValue(cacheKey) with
                     | true, (head, rows) when head = snapshot.Commit -> Ok (Some rows)
                     | _ ->
-                        match LedgerStore.readDashboardRecordsAt binding snapshot with
+                        match LedgerStore.readDashboardRecordsWithOidsAt binding snapshot with
                         | Error error -> Error (string error)
                         | Ok records ->
                             let paths = records |> Map.toSeq |> Seq.map fst |> Seq.toList
@@ -82,19 +131,12 @@ let private projectSnapshot project rt =
                             let tasks = taskRecords |> List.map (read<ReviewTask> records)
                             let agents = agentPaths |> List.map (read<ReviewAgent> records)
                             let reviews = reviewRecords |> List.map (read<BranchReview> records)
-                            let notifications =
-                                let notificationRecords =
-                                    paths
-                                    |> List.filter (fun path -> path.StartsWith("notifications/", StringComparison.Ordinal))
-                                    |> List.map (readNotification records)
-                                match notificationRecords |> List.tryPick (function Error error -> Some error | Ok _ -> None) with
-                                | Some error -> Error error
-                                | None -> Ok (notificationRecords |> List.choose (function Ok item -> Some item | _ -> None))
+                            let notifications = notificationSummaries records
                             let firstError values = values |> List.tryPick (function Error message -> Some message | Ok _ -> None)
                             match firstError tasks, firstError agents, firstError reviews, notifications with
                             | Some error, _, _, _ | _, Some error, _, _ | _, _, Some error, _ -> Error error
                             | _, _, _, Error error -> Error error
-                            | None, None, None, Ok notifications ->
+                            | None, None, None, Ok notificationCounts ->
                                 let tasks = tasks |> List.choose (function Ok item -> Some item | _ -> None)
                                 let agents = agents |> List.choose (function Ok item -> Some item | _ -> None)
                                 let reviews = reviews |> List.choose (function Ok item -> Some item | _ -> None)
@@ -126,21 +168,16 @@ let private projectSnapshot project rt =
                                     agents
                                     |> List.map (fun agent ->
                                         focused agent |> Result.map (fun focus ->
+                                            let notification =
+                                                notificationCounts
+                                                |> Map.tryFind agent.AgentId
+                                                |> Option.defaultValue { Pending = 0; Latest = None }
                                             ({ Key = project + "::" + agent.AgentId; Agent = agent.AgentId
                                                Project = project; State = agent.State
                                                StateEnteredAt = stateTime agent; StateReason = stringOption agent.StateReason
                                                Focus = focus
-                                               PendingNotifications =
-                                                 notifications |> List.filter (fun n ->
-                                                     n.ToAgentId = agent.AgentId && String.IsNullOrWhiteSpace n.AcknowledgedAtUtc) |> List.length
-                                               LatestNotification =
-                                                 notifications |> List.filter (fun n ->
-                                                     n.ToAgentId = agent.AgentId && String.IsNullOrWhiteSpace n.AcknowledgedAtUtc)
-                                                   |> List.sortByDescending (fun n -> n.CreatedAtUtc, n.NotificationId)
-                                                   |> List.tryHead
-                                                   |> Option.map (fun n ->
-                                                       n.FromAgentId + (if String.IsNullOrWhiteSpace n.TaskId then "" else " #" + n.TaskId)
-                                                       + ": " + n.Message) } : AgentView.AgentRow)))
+                                               PendingNotifications = notification.Pending
+                                               LatestNotification = notification.Latest } : AgentView.AgentRow)))
                                 match firstError rows with
                                 | Some error -> Error error
                                 | None ->

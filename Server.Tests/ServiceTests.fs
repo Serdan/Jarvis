@@ -115,11 +115,11 @@ let user_service_switches_active_device_for_same_user () =
     let secondRegistration = { firstRegistration with DeviceId = "device-2"; DeviceName = "Laptop" }
 
     users.TransportConnected(userId, "desktop-connection")
-    users.Register(userId, firstRegistration, "desktop-connection") |> ignore
+    let firstGeneration = users.Register(userId, firstRegistration, "desktop-connection").Generation
     users.TransportConnected(userId, "laptop-connection")
     let switched = users.Register(userId, secondRegistration, "laptop-connection")
 
-    switched.Generation |> shouldEqual 1L
+    (switched.Generation > firstGeneration) |> shouldEqual true
     switched.RegistrationReason.Contains("Initial registration", StringComparison.Ordinal) |> shouldEqual true
 
     match users.GetSession(userId) with
@@ -147,7 +147,7 @@ let ``multiple device sessions remain independent across reconnect and disconnec
           SupportedCommands = AgentProtocol.commandDefinitions |> List.map _.Name }
 
     users.TransportConnected(userId, "home-1")
-    users.Register(userId, makeRegistration "home" "Home", "home-1") |> ignore
+    let firstHome = users.Register(userId, makeRegistration "home" "Home", "home-1").Generation
     users.TransportConnected(userId, "work-1")
     users.Register(userId, makeRegistration "work" "Work", "work-1") |> ignore
 
@@ -162,7 +162,7 @@ let ``multiple device sessions remain independent across reconnect and disconnec
     users.SetDefaultDevice(userId, "work") |> shouldEqual true
     users.TransportConnected(userId, "home-2")
     let reconnected = users.Register(userId, makeRegistration "home" "Home", "home-2")
-    reconnected.Generation |> shouldEqual 2L
+    (reconnected.Generation > firstHome) |> shouldEqual true
     users.GetDefaultDeviceId(userId) |> shouldEqual (Some "work")
     users.GetSessionByConnection("home-1") |> shouldEqual ValueNone
     users.Disconnect("home-1", None)

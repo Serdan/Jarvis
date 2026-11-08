@@ -3396,3 +3396,228 @@ type ReviewWorkflowTests() =
             | Ok _ -> Assert.Fail("Unverified source SHA accepted")
             let _, _, attempt = ReviewWorkflow.getTask first "progressguard" |> success
             Assert.That(attempt.Value.Version, Is.EqualTo(3)))
+
+    [<Test>]
+    member _.AgentInboxBulkLedgerBenchmarkAndSnapshotCorrectness() =
+        // Hundreds of canonical entities in one immutable ledger commit. Seed
+        // via an isolated Git worktree so setup does not dominate measurements
+        // with hundreds of unrelated push transactions.
+        withFixture (fun one _ first second _ _ _ _ ->
+            let snapshot = LedgerStore.fetch first |> success
+            let auxiliary = Path.Combine(Path.GetDirectoryName(one), "ledger-bulk")
+            git one [ "worktree"; "add"; "--detach"; auxiliary; snapshot.Commit ] |> ignore
+            try
+                let options =
+                    System.Text.Json.JsonSerializerOptions(
+                        PropertyNamingPolicy = System.Text.Json.JsonNamingPolicy.CamelCase)
+                let write (path: string) (schema: int) value =
+                    let fullPath = Path.Combine(auxiliary, path.Replace('/', Path.DirectorySeparatorChar))
+                    Directory.CreateDirectory(Path.GetDirectoryName(fullPath)) |> ignore
+                    let original = System.Text.Json.JsonSerializer.Serialize(value, options)
+                    let content = $"{{\"schemaVersion\":{schema}," + original.Substring(1)
+                    File.WriteAllText(fullPath, content)
+                let count = 220
+                for i in 0 .. count - 1 do
+                    let taskId = sprintf "history%04d" i
+                    let attemptId = Guid.NewGuid().ToString("N")
+                    let reviewId = Guid.NewGuid().ToString("N")
+                    let submissionId = Guid.NewGuid().ToString("N")
+                    let notificationId = Guid.NewGuid().ToString("N")
+                    write $"tasks/{taskId}/task.json" 2
+                        ({ TaskId = taskId; Title = taskId; Version = 3
+                           Lifecycle = "Closed"; SpecVersion = 1; AttemptId = attemptId } : ReviewTask)
+                    write $"tasks/{taskId}/attempts/{attemptId}.json" 3
+                        ({ TaskId = taskId; AttemptId = attemptId; Version = 3
+                           OwnerAgentId = "Reviewer"; Phase = "Finished"
+                           AssignmentGeneration = 1; Priority = i % 5
+                           IssuedSequence = int64 i + 10L; SpecBlobOid = null
+                           BaseCommit = null; TargetRef = null; SourceRepositoryId = null
+                           SourceRemote = null; SourcePushRemote = null; SourceRef = null } : ReviewAttempt)
+                    write $"tasks/{taskId}/reviews/{reviewId}/review.json" 3
+                        ({ ReviewId = reviewId; TaskId = taskId; AttemptId = attemptId
+                           OwnerAgentId = (if i % 10 = 0 then "Owner" else "Reviewer")
+                           Kind = "Implementation"; TaskRef = null; ReviewRef = null
+                           BaseCommit = null; TargetRef = null
+                           Status = (if i % 3 = 0 then "Unclaimed" else "Accepted")
+                           ReviewerId = "Owner"; Version = 2
+                           CreatedSequence = int64 i + 10L
+                           DecisionSequence = (if i % 3 = 0 then 0L else int64 i + 10L)
+                           Acknowledged = (i % 10 <> 0) } : BranchReview)
+                    write $"tasks/{taskId}/integrations/{submissionId}.json" 2
+                        ({ SubmissionId = submissionId; TaskId = taskId
+                           ActorId = (if i % 7 = 0 then "Owner" else "Reviewer")
+                           SourceRef = null; SubmittedCommit = null; ReviewId = reviewId
+                           TargetRef = null; Status = "Integrated"
+                           CreatedSequence = int64 i + 10L
+                           IntegratedCommit = null; CompletedAtUtc = "2026-01-01T00:00:00Z" } : IntegrationSubmission)
+                    write $"notifications/{notificationId}.json" 2
+                        ({ NotificationId = notificationId; FromAgentId = "Reviewer"
+                           FromProjectName = ""; ToAgentId = (if i % 11 = 0 then "Owner" else "Reviewer")
+                           TaskId = taskId; Message = "historical"
+                           CreatedAtUtc = "2026-01-01T00:00:00Z"
+                           AcknowledgedAtUtc = (if i % 2 = 0 then null else "2026-01-02T00:00:00Z") }
+                           : AgentNotification)
+                    // Task specifications are intentionally irrelevant to the
+                    // inbox. Include sizeable blobs to catch accidental reads.
+                    File.WriteAllText(Path.Combine(auxiliary, "tasks", taskId, "spec.html"),
+                                      String.replicate (16 * 1024) "X")
+
+                git auxiliary [ "add"; "tasks"; "notifications" ] |> ignore
+                git auxiliary [ "commit"; "-m"; "Bulk history benchmark fixture" ] |> ignore
+                let injected = git auxiliary [ "rev-parse"; "HEAD" ]
+                git one [ "push"; "origin"; injected + ":refs/heads/jarvis-orchestration" ] |> ignore
+                let measure name =
+                    GC.Collect()
+                    GC.WaitForPendingFinalizers()
+                    GC.Collect()
+                    let allocBefore = GC.GetTotalAllocatedBytes(true)
+                    let stopwatch = Stopwatch.StartNew()
+                    let inbox, io =
+                        LedgerStore.measureGitReads(fun () ->
+                            ReviewWorkflow.getAgentInbox second "Owner" |> success)
+                    stopwatch.Stop()
+                    let allocated = GC.GetTotalAllocatedBytes(true) - allocBefore
+                    let payload = System.Text.Json.JsonSerializer.Serialize(inbox)
+                    TestContext.Progress.WriteLine(
+                        $"AgentInboxBulk {name}: {stopwatch.Elapsed.TotalMilliseconds:F1}ms; " +
+                        $"git={io.ProcessStarts}; fetch={io.RemoteFetches}; " +
+                        $"singleBlobs={io.IndividualBlobReads}; batch={io.BatchBlobReads}; " +
+                        $"outputBytes={io.OutputBytes}; allocatedBytes={allocated}; responseBytes={System.Text.Encoding.UTF8.GetByteCount(payload)}")
+                    inbox, payload
+                let cold, coldJson = measure "cold"
+                let warm, warmJson = measure "warm"
+                Assert.That(cold.SnapshotCommit, Is.EqualTo(injected))
+                Assert.That(cold.Agent.AgentId, Is.EqualTo("Owner"))
+                Assert.That(cold.PendingNotifications.Length, Is.EqualTo(10))
+                Assert.That(cold.PendingReviews.Length, Is.EqualTo(8))
+                Assert.That(cold.AvailableReviews.Length, Is.EqualTo(66))
+                Assert.That(cold.UnacknowledgedFeedback.Length, Is.EqualTo(14))
+                Assert.That(cold.IntegrationSubmissions.Length, Is.EqualTo(32))
+                Assert.That(cold.Focused.IsNone, Is.True)
+                Assert.That(cold.Working.IsNone, Is.True)
+                Assert.That(cold.RunnableQueue, Is.Empty)
+                Assert.That(cold.Parked, Is.Empty)
+                Assert.That(cold.Blocked, Is.Empty)
+                let reviewer = ReviewWorkflow.getAgentInbox second "Reviewer" |> success
+                Assert.That(reviewer.PendingNotifications.Length, Is.EqualTo(100))
+                Assert.That(reviewer.PendingReviews.Length, Is.EqualTo(66))
+                Assert.That(reviewer.AvailableReviews.Length, Is.EqualTo(8))
+                Assert.That(reviewer.UnacknowledgedFeedback, Is.Empty)
+                Assert.That(reviewer.IntegrationSubmissions.Length, Is.EqualTo(188))
+                Assert.That(reviewer.SnapshotCommit, Is.EqualTo(cold.SnapshotCommit))
+                Assert.That(coldJson, Is.EqualTo(warmJson),
+                            "Canonical inbox must be byte-for-byte consistent within an immutable snapshot.")
+            finally git one [ "worktree"; "remove"; "--force"; auxiliary ] |> ignore)
+
+    [<Test>]
+    member _.AgentInboxBatchRejectsMalformedCanonicalStateAndUnexpectedOwner() =
+        withFixture (fun _ _ first second _ _ _ _ ->
+            let taskId = "inbox-malformed"
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Malformed inbox"
+            |> success |> ignore
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId
+                (Guid.NewGuid()) "Owner" |> success |> ignore
+            let baseline = ReviewWorkflow.getAgentInbox second "Owner" |> success
+            let attempt = baseline.Focused.Value.Attempt
+            let taskPath = $"tasks/{taskId}/task.json"
+            let attemptPath = $"tasks/{taskId}/attempts/{attempt.AttemptId}.json"
+            let modify path transform =
+                let snapshot = LedgerStore.fetch first |> success
+                let current, oid = LedgerStore.readAt first snapshot path |> success
+                let previous = current.Value
+                let replacement = transform previous
+                let change =
+                    { Path = path; ExpectedBlobOid = oid; Content = replacement }
+                let intent =
+                    { OperationId = Guid.NewGuid(); Actor = "Corruption fixture"
+                      Kind = "CorruptInboxFixture"; RequestJson = "{}" }
+                LedgerStore.transact first intent (fun _ -> Ok [ change ]) |> success |> ignore
+                previous
+            let checkFail label =
+                match ReviewWorkflow.getAgentInbox second "Owner" with
+                | Error(LedgerIntegrityError _) -> ()
+                | other -> Assert.Fail(sprintf "%s should fail closed: %A" label other)
+            let originalTask =
+                modify taskPath (fun raw -> raw.Replace("\"lifecycle\":\"InProgress\"", "\"lifecycle\":\"Unexpected\""))
+            checkFail "bad task lifecycle"
+            modify taskPath (fun _ -> originalTask) |> ignore
+            let originalAttempt =
+                modify attemptPath (fun raw -> raw.Replace("\"phase\":\"Queued\"", "\"phase\":\"Unexpected\""))
+            checkFail "bad attempt phase"
+            modify attemptPath (fun _ -> originalAttempt) |> ignore
+            let oldOwner =
+                modify attemptPath (fun raw -> raw.Replace("\"ownerAgentId\":\"Owner\"", "\"ownerAgentId\":\"Reviewer\""))
+            checkFail "attempt owner inconsistent with agent assignment"
+            modify attemptPath (fun _ -> oldOwner) |> ignore
+            let restored = ReviewWorkflow.getAgentInbox second "Owner" |> success
+            Assert.That(restored.Focused.Value.Attempt.OwnerAgentId, Is.EqualTo("Owner")))
+
+    [<Test>]
+    member _.AgentInboxSnapshotRemainsPinnedWhenRemoteHeadAdvances() =
+        withFixture (fun _ _ first second _ _ _ _ ->
+            let old = ReviewWorkflow.getAgentInbox second "Owner" |> success
+            Assert.That(old.PendingNotifications, Is.Empty)
+            let oldSnapshot = LedgerStore.fetch second |> success
+            let oldRecords = LedgerStore.readAgentInboxRecordsAt second oldSnapshot |> success
+            let notificationId = Guid.NewGuid()
+            ReviewWorkflow.notifyAgent first notificationId "Reviewer" "" "Owner" ""
+                "New canonical notification" |> success |> ignore
+            let updated = ReviewWorkflow.getAgentInbox second "Owner" |> success
+            Assert.That(updated.SnapshotCommit, Is.Not.EqualTo(old.SnapshotCommit))
+            Assert.That(updated.PendingNotifications.Length, Is.EqualTo(1))
+            Assert.That(updated.PendingNotifications.Head.NotificationId,
+                        Is.EqualTo(notificationId.ToString("N")))
+            let exactOld = LedgerStore.readAgentInboxRecordsAt second oldSnapshot |> success
+            Assert.That((exactOld = oldRecords), Is.True)
+            Assert.That(oldRecords |> Map.exists (fun path _ -> path.StartsWith("notifications/")), Is.False)
+            Assert.That(updated.Agent.AgentId, Is.EqualTo(old.Agent.AgentId)))
+
+    [<Test>]
+    member _.AgentInboxEmptyQueueStillReturnsCanonicalAgentState() =
+        withFixture (fun _ _ first second _ _ _ _ ->
+            let owner = ReviewWorkflow.getAgentInbox first "Owner" |> success
+            let reviewer = ReviewWorkflow.getAgentInbox second "Reviewer" |> success
+            for inbox in [owner; reviewer] do
+                Assert.That(inbox.Agent.State, Is.EqualTo("Parked"))
+                Assert.That(inbox.Focused.IsNone, Is.True)
+                Assert.That(inbox.Working.IsNone, Is.True)
+                Assert.That(inbox.RunnableQueue, Is.Empty)
+                Assert.That(inbox.Parked, Is.Empty)
+                Assert.That(inbox.Blocked, Is.Empty)
+                Assert.That(inbox.PendingReviews, Is.Empty)
+                Assert.That(inbox.AvailableReviews, Is.Empty)
+                Assert.That(inbox.UnacknowledgedFeedback, Is.Empty)
+                Assert.That(inbox.PendingNotifications, Is.Empty)
+                Assert.That(inbox.IntegrationSubmissions, Is.Empty))
+
+    [<Test>]
+    member _.AgentInboxBatchRejectsNonRegularCanonicalGitObjects() =
+        // A verified commit may still contain a malformed tree entry. The old
+        // per-record reader only accepted mode 100644, never executable blobs
+        // or Gitlinks; batching must preserve that integrity boundary.
+        withFixture (fun one _ first second _ _ _ _ ->
+            let taskId = "inbox-object-mode"
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Object mode validation"
+            |> success |> ignore
+            ReviewWorkflow.getAgentInbox second "Owner" |> success |> ignore
+            let canonical = LedgerStore.fetch first |> success
+            let auxiliary = Path.Combine(Path.GetDirectoryName(one), "ledger-mode")
+            git one [ "worktree"; "add"; "--detach"; auxiliary; canonical.Commit ] |> ignore
+            try
+                let path = $"tasks/{taskId}/task.json"
+                let push () =
+                    let commit = git auxiliary [ "rev-parse"; "HEAD" ]
+                    git one [ "push"; "origin"; commit + ":refs/heads/jarvis-orchestration" ] |> ignore
+                let reject label =
+                    match ReviewWorkflow.getAgentInbox second "Owner" with
+                    | Error(LedgerIntegrityError _) -> ()
+                    | other -> Assert.Fail(sprintf "%s must fail closed: %A" label other)
+                git auxiliary [ "update-index"; "--chmod=+x"; "--"; path ] |> ignore
+                git auxiliary [ "commit"; "-m"; "Corrupt canonical task executable mode" ] |> ignore
+                push ()
+                reject "executable task blob"
+                git auxiliary [ "update-index"; "--add"; "--cacheinfo"; "160000"; canonical.Commit; path ] |> ignore
+                git auxiliary [ "commit"; "-m"; "Corrupt canonical task Gitlink mode" ] |> ignore
+                push ()
+                reject "Gitlink task"
+            finally git one [ "worktree"; "remove"; "--force"; auxiliary ] |> ignore)

@@ -171,6 +171,40 @@ module LedgerStore =
           Stdout: string
           Stderr: string }
 
+    /// Explicitly scoped diagnostics for reproducible ledger benchmarks.
+    /// Counters are inactive outside the scope; no extra subprocess is
+    /// introduced and no mutable cache becomes authoritative for reads.
+    type GitReadMetrics =
+        { ProcessStarts: int
+          RemoteFetches: int
+          IndividualBlobReads: int
+          BatchBlobReads: int
+          OutputBytes: int64 }
+
+    [<AllowNullLiteral>]
+    type private MutableGitReadMetrics() =
+        member val ProcessStarts = 0 with get, set
+        member val RemoteFetches = 0 with get, set
+        member val IndividualBlobReads = 0 with get, set
+        member val BatchBlobReads = 0 with get, set
+        member val OutputBytes = 0L with get, set
+
+    let private activeGitReadMetrics = System.Threading.AsyncLocal<MutableGitReadMetrics>()
+
+    let measureGitReads operation =
+        let previous = activeGitReadMetrics.Value
+        let scope = MutableGitReadMetrics()
+        activeGitReadMetrics.Value <- scope
+        try
+            let result = operation ()
+            result,
+            { ProcessStarts = scope.ProcessStarts
+              RemoteFetches = scope.RemoteFetches
+              IndividualBlobReads = scope.IndividualBlobReads
+              BatchBlobReads = scope.BatchBlobReads
+              OutputBytes = scope.OutputBytes }
+        finally activeGitReadMetrics.Value <- previous
+
     let private json value = JsonSerializer.Serialize(value, options)
     let private digest (value: string) =
         SHA256.HashData(encoding.GetBytes value)
@@ -231,6 +265,14 @@ module LedgerStore =
             for (key, value) in environment do
                 gitProcess.StartInfo.Environment[key] <- value
             args |> List.iter gitProcess.StartInfo.ArgumentList.Add
+            let measured = activeGitReadMetrics.Value
+            if not (isNull measured) then
+                measured.ProcessStarts <- measured.ProcessStarts + 1
+                match args with
+                | "fetch" :: _ -> measured.RemoteFetches <- measured.RemoteFetches + 1
+                | "show" :: _ -> measured.IndividualBlobReads <- measured.IndividualBlobReads + 1
+                | "cat-file" :: "--batch" :: _ -> measured.BatchBlobReads <- measured.BatchBlobReads + 1
+                | _ -> ()
             if not (gitProcess.Start()) then
                 Error(GitFailure "Cannot launch Git.")
             else
@@ -245,6 +287,8 @@ module LedgerStore =
                     Error(RemoteUnavailable "Git command timed out.")
                 else
                     let value = stdout.GetAwaiter().GetResult()
+                    if not (isNull measured) then
+                        measured.OutputBytes <- measured.OutputBytes + int64 (encoding.GetByteCount value)
                     Ok { ExitCode = gitProcess.ExitCode
                          Stdout = if preserveStdout then value else value.TrimEnd('\n', '\r')
                          Stderr = stderr.GetAwaiter().GetResult() }
@@ -980,7 +1024,7 @@ module LedgerStore =
     // across refreshes; only changed OIDs need to be read from Git.
     let private dashboardBlobCache = ConcurrentDictionary<string, string>(StringComparer.Ordinal)
 
-    let private dashboardRecordPath (path: string) =
+    let private dashboardRecordPath includeIntegrations (path: string) =
         (path.StartsWith("agents/", StringComparison.Ordinal)
          && path.EndsWith(".json", StringComparison.Ordinal))
         || (path.StartsWith("notifications/", StringComparison.Ordinal)
@@ -988,16 +1032,19 @@ module LedgerStore =
         || (path.StartsWith("tasks/", StringComparison.Ordinal)
             && (path.EndsWith("/task.json", StringComparison.Ordinal)
                 || path.EndsWith("/review.json", StringComparison.Ordinal)
-                || (Regex.IsMatch(path, "^tasks/[A-Za-z0-9_-]+/attempts/[a-f0-9]{32}[.]json$"))))
+                || (Regex.IsMatch(path, "^tasks/[A-Za-z0-9_-]+/attempts/[a-f0-9]{32}[.]json$"))
+                || (includeIntegrations &&
+                    Regex.IsMatch(path, "^tasks/[A-Za-z0-9_-]+/integrations/[a-f0-9]{32}[.]json$"))))
 
     // One immutable tree listing and one cat-file batch (only for previously
     // unseen blobs), instead of two Git processes per entity.
-    let readDashboardRecordsAt (binding: LedgerBinding) (snapshot: LedgerSnapshot) =
+    let private readViewRecordsAt includeIntegrations (binding: LedgerBinding) (snapshot: LedgerSnapshot) =
         let repo = binding.RepositoryPath
         let treeArgs = [ "ls-tree"; "-r"; "-z"; snapshot.Commit; "--"; "agents"; "tasks"; "notifications" ]
         match gitRaw repo treeArgs |> requireSuccess "Dashboard tree listing" with
         | Error error -> Error error
         | Ok listing ->
+            let mutable malformedRecordPath = None
             let records =
                 listing.Split('\000', StringSplitOptions.RemoveEmptyEntries)
                 |> Array.choose (fun entry ->
@@ -1006,10 +1053,13 @@ module LedgerStore =
                     else
                         let header = entry.Substring(0, separator).Split(' ')
                         let path = entry.Substring(separator + 1)
-                        if header.Length = 3 && header[1] = "blob"
-                           && oidPattern.IsMatch(header[2])
-                           && ledgerPath.IsMatch path && dashboardRecordPath path then
-                            Some(path, header[2])
+                        if ledgerPath.IsMatch path && dashboardRecordPath includeIntegrations path then
+                            if header.Length = 3 && header[0] = "100644"
+                               && header[1] = "blob" && oidPattern.IsMatch(header[2]) then
+                                Some(path, header[2])
+                            else
+                                malformedRecordPath <- Some path
+                                None
                         else None)
             let missing =
                 records
@@ -1017,8 +1067,10 @@ module LedgerStore =
                 |> Array.distinct
                 |> Array.filter (fun oid -> not (dashboardBlobCache.ContainsKey oid))
             let load () =
-                if missing.Length = 0 then Ok ()
-                else
+                match malformedRecordPath with
+                | Some path -> Error(LedgerIntegrityError $"Unexpected ledger object type: {path}.")
+                | None when missing.Length = 0 -> Ok ()
+                | None ->
                     let input = String.concat "\n" missing + "\n"
                     match execute repo [ "cat-file"; "--batch" ] (Some input) [] true
                           |> requireSuccess "Dashboard blob batch" with
@@ -1062,6 +1114,15 @@ module LedgerStore =
                 |> Array.map (fun (path, oid) -> path, dashboardBlobCache[oid])
                 |> Map.ofArray
                 |> Ok
+
+    // These are derived read models only. Both entrypoints require a freshly
+    // fetched/verified snapshot and only read blobs reachable from its OID.
+    // The OID-keyed immutable blob cache never decides which paths exist.
+    let readDashboardRecordsAt binding snapshot =
+        readViewRecordsAt false binding snapshot
+
+    let readAgentInboxRecordsAt binding snapshot =
+        readViewRecordsAt true binding snapshot
 
     let verifySourceCommit (binding: LedgerBinding) (sourceRef: string) (commit: string) =
         if not (sourceRef.StartsWith("refs/heads/", StringComparison.Ordinal))

@@ -39,4 +39,6 @@ Post-review Release verification on November 8, 2026: `dotnet test Jarvis.slnx -
 
 The full-suite gate also exposed an existing `JobManagerTests` test with a fixed five-second `dotnet fsi` startup polling limit. The sibling test already accounts for slow host startup using a measured 20-second deadline; the environment-sanitization test was aligned to that existing test policy and then passed, without changing production job execution.
 
-Formal review is still required before integration. This branch does not change the MCP tool catalog or public protocol. No production deployment or merger is implied by benchmark success.
+Lead self-review was Accepted, and the exact source commit was integrated to main by merge commit `9f0f8eb372bd00472f153fad4670059fad4108ca`; the ledger task is Closed. No MCP tool catalog or public protocol change was needed.
+
+The later bounded-process merge preserved the same Git-read instrumentation and canonical pinned batch semantics while replacing the Git runner. Its Linux Release benchmark still observed ten Git launches with 220 historical records (approximately 108 ms cold, 74 ms warm on that run); the subsequent combined full Release suite passed 420/420 Client.Tests and 95/95 Server.Tests. Integration and local tests are not evidence that a running client has been updated.

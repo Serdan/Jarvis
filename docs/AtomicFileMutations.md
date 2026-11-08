@@ -29,4 +29,4 @@ The lock file lives in the current user's application-data Jarvis/file-edit-lock
 
 ## Verification
 
-AtomicTextFilesTests covers independent dotnet-process lock exclusion, simultaneous thread edits, BOM-preserving appends, Unicode, empty contents, parent creation, executable mode preservation, failed stage publication, external edits during staging, and link substitution. Existing HashAndPatchTests and PathSafetyTests retain the prior command behaviors. The full Client and Server Release suites are run before proposing integration.
+AtomicTextFilesTests covers independent dotnet-process lock exclusion, simultaneous thread edits, BOM-preserving appends, Unicode, empty contents, parent creation, executable mode preservation, failed stage publication, external edits during staging, and link substitution. Existing HashAndPatchTests and PathSafetyTests retain the prior command behaviors. After merging with the bounded-process remediation, the complete Linux Release suite passed 420/420 Client.Tests and 95/95 Server.Tests on November 8, 2026; no deployment is implied.

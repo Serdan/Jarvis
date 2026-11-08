@@ -1,1 +1,1 @@
-{"schemaVersion":2,"taskId":"task-cbb2167e58f041ffbb59fbce16eac64c","title":"[P2] Verify server application readiness and roll back unhealthy deployments (JRV-2026-11-07)","version":1,"lifecycle":"Open","specVersion":1,"attemptId":null}
+{"schemaVersion":2,"taskId":"task-cbb2167e58f041ffbb59fbce16eac64c","title":"[P2] Verify server application readiness and roll back unhealthy deployments (JRV-2026-11-07)","version":2,"lifecycle":"Closed","specVersion":1,"attemptId":null}

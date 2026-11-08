@@ -1,0 +1,1 @@
+Frozen source includes Unix 0700/0600 creation and repair, symlink checks, atomic private agent-seen replacement, TUI retry, privacy-preserving diagnostics, bounded 32MiB reverse replay with recent-update selection and 512KiB line cap, UTF-8 BOM/CRLF backward compatibility, 26 focused regression tests. Review semantic tradeoff and failure path prior to acceptance; no deployment.

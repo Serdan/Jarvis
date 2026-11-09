@@ -1738,22 +1738,64 @@ module PendingIntentJournal =
                 | None ->
                     acknowledgeUnsafe binding operationId expectedRequestHash))
 
+    // A known domain/CAS refusal before any remote publication is not an
+    // uncertain Git outcome. Transport, integrity and UUID-identity errors
+    // deliberately do NOT qualify, even when they occur before a push.
+    let private definitivelyRejected = function
+        | Client.ValidationError _ -> true
+        | Client.LedgerFailureError failure ->
+            match failure.Code with
+            | "InvalidBinding" | "StaleEntityVersion" | "AgentBusy"
+            | "ReviewAccessDenied" | "ReviewAlreadyClaimed" | "ReviewVersionConflict"
+            | "SourceUnavailable" | "SourceReviewRefUnavailable" -> true
+            | _ -> false
+        | _ -> false
+
+    // Cleanup is best-effort because a remote Applied write remains successful
+    // even if local storage becomes read-only. Never hide cleanup failure:
+    // the remaining file is visible to reconciliation and can be acknowledged
+    // against its exact remote receipt.
+    let private retireAfterOutcome binding operationId reason =
+        try
+            File.Delete(filePath binding operationId)
+        with ex ->
+            // Avoid exposing command JSON, session tokens or local file paths.
+            try
+                eprintfn "Jarvis pending intent cleanup failed after %s for %O (%s); inspect the local journal."
+                    reason operationId (ex.GetType().Name)
+            with _ -> ()
+
+    let private withOperationId (operationId: Guid) = function
+        | Client.LedgerFailureError failure ->
+            Client.LedgerFailureError
+                { failure with OperationId = Some(operationId.ToString("D")) }
+        | error -> error
+
     let private executeUnsafe binding operationId commandType command (apply: unit -> Result<'t, EffectError>) =
         let commandJson = JsonSerializer.Serialize(command)
+        // A previous invocation may have attempted a push whose acceptance
+        // is still delayed. Never let a fresh preflight rejection erase that
+        // earlier evidence, even when today's caller supplies the same UUID.
+        let previouslyPending = File.Exists(filePath binding operationId)
         persistUnsafe binding operationId commandType commandJson
         |> Result.bind (fun () ->
-            let outcome = apply ()
+            let outcome, publication = LedgerStore.LedgerStore.observePublicationAttempts apply
             match outcome with
+            | Error error
+                when not previouslyPending
+                     && publication = LedgerStore.LedgerStore.PublicationExposure.NotAttempted
+                     && definitivelyRejected error ->
+                // No remote publication was attempted during this invocation
+                // and this UUID had no prior local uncertain attempt. The
+                // authoritative domain error must still reach the caller.
+                retireAfterOutcome binding operationId "definitive pre-publication rejection"
+                Error(withOperationId operationId error)
             | Error(Client.LedgerFailureError failure) ->
                 // The caller-owned UUID remains recoverable even after a harness reset.
-                Error(Client.LedgerFailureError
-                    { failure with OperationId = Some(operationId.ToString("D")) })
+                Error(withOperationId operationId (Client.LedgerFailureError failure))
             | Error _ -> outcome // Preserve exact intent for recovery after lost response.
             | Ok _ ->
-                try
-                    let path = filePath binding operationId
-                    if File.Exists path then File.Delete path
-                with _ -> () // A stale entry is safe: remote UUID remains authoritative.
+                retireAfterOutcome binding operationId "confirmed success"
                 outcome
         )
 

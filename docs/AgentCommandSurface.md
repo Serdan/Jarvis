@@ -48,8 +48,9 @@ with the independently delivered command actor label. A target agent ID never
 authorizes activity or impersonation. Labels are not themselves authentication
 principals; OAuth and workspace permissions remain the authorization boundary.
 
-Observation fetches the target's **verified canonical Git-ledger** inbox and
-returns a compact projection: execution/disposition, state/version/sequence,
+Observation validates both registered observer and target from **one verified
+canonical Git-ledger snapshot** (one remote fetch, with no mismatched ledger
+heads). It returns a compact projection: execution/disposition, state/version/sequence,
 entry and Working-turn timestamps, focused assignment/attempt and phase,
 blocker/task IDs, pending notification/review/feedback counts, and operator
 action flags. It does **not** expose notification bodies, review evidence,

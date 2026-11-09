@@ -2400,7 +2400,12 @@ type ReviewWorkflowTests() =
                     target, agent)
                 for target, before in start do
                     for runtime, observer in [ runtime1, "Owner"; runtime2, "Reviewer" ] do
-                        let _, result, response = invoke runtime "owner" observer target observer
+                        let observed, io =
+                            LedgerStore.measureGitReads(fun () ->
+                                invoke runtime "owner" observer target observer)
+                        let _, result, response = observed
+                        Assert.That(io.RemoteFetches, Is.EqualTo(1),
+                                    "Observer and subject must share one verified ledger fetch.")
                         Assert.That(response.AgentStateChanges, Is.Empty)
                         Assert.That(response.Instructions, Is.Empty)
                         match result with

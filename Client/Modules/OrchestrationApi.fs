@@ -2084,14 +2084,12 @@ module AgentObservationApi =
            || String.IsNullOrWhiteSpace cmd.TargetAgentId then
             Error(Client.ValidationError "Observer and target agent identities are required.")
         else
-            LedgerBindingConfig.load cmd.ProjectName rt
-            |> Result.bind (fun binding ->
-                ReviewWorkflow.ReviewWorkflow.getAgentWorkingTurn binding cmd.ObserverAgentId
+            LedgerBindingConfig.loadWithSnapshot cmd.ProjectName rt
+            |> Result.bind (fun (binding, snapshot) ->
+                ReviewWorkflow.ReviewWorkflow.getObservedAgentInboxAt
+                    binding snapshot cmd.ObserverAgentId cmd.TargetAgentId
                 |> Result.mapError LedgerErrors.toEffect
-                |> Result.bind (fun _ ->
-                    ReviewWorkflow.ReviewWorkflow.getBranchAgentInbox binding cmd.TargetAgentId
-                    |> Result.mapError LedgerErrors.toEffect
-                    |> Result.map (fun inbox ->
+                |> Result.map (fun inbox ->
                         let agent = inbox.Agent
                         let focus = inbox.Focused |> Option.map (fun item ->
                             {| taskId = item.Task.TaskId
@@ -2130,7 +2128,7 @@ module AgentObservationApi =
                                blockedTaskIds = inbox.Blocked |> List.map (fun item -> item.Task.TaskId)
                                lastSeenAtUtc = lastSeen |> Option.map (fun seen -> seen.ToString("O"))
                                lastSeenProvenance = if lastSeen.IsSome then "LocalClientActivityCache" else "Unknown"
-                               lastSeenIsCanonical = false |})))
+                               lastSeenIsCanonical = false |}))
 
 module TaskApi =
     let private mapError (result: Result<'a, LedgerStore.LedgerFailure>) : Result<'a, EffectError> =

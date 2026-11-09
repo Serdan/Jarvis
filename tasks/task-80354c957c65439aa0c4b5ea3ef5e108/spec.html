@@ -1,0 +1,17 @@
+<h1>Prevent abandoned pending-intent accumulation for definitively rejected ledger writes</h1>
+<p><strong>Observed on 2026-11-09:</strong> Main at <code>a61f1dac</code> retains a local journal entry on <em>every</em> <code>executeUnsafe</code> error, including ordinary domain/CAS rejections before any Git push. On success, <code>File.Delete</code> errors are silently ignored. Reconciliation found 18 Jarvis, 22 Favn and 145 Wayfold pending entries: 184 absent under their original UUIDs and one identity mismatch. Counts are time-sensitive. This likely accumulates stale attempts even when agents later succeed with other UUIDs. The completed P1 recovery feature enables explicit triage and archives but does not fix this creation path.</p>
+<h2>Required design</h2>
+<ol>
+<li>Distinguish authoritative outcomes by <em>transaction execution phase</em>: Applied with verified matching receipt; DefinitivelyRejectedBeforePush (e.g. canonical state/version validation before any side-effecting publication); and OutcomeUncertainAfterAttempt (push or response ambiguity). Do not infer remote absence or definitive failure merely from an error message. Maintain request hash/UUID identity checks.</li>
+<li>Do not retain a <em>pending</em> intent for definitively rejected commands; record bounded diagnostic evidence separately if appropriate. Continue returning the original useful error. Retain uncertain intents unchanged until explicit, verified resolution. Handle previously saved same-UUID intents carefully rather than assuming a current preflight failure disproves a previous uncertain push.</li>
+<li>Replace swallowed post-success journal deletion errors with appropriate diagnostics, preserving safety, and ensure a verified matching Applied receipt can be retired safely. Preserve atomicity, locking, platform behavior and crash recovery guarantees.</li>
+<li>Do not reclassify or purge the existing journals by age; apply P1 safe recovery against each existing record. No implicit retry and no public resume_agent.</li>
+</ol>
+<h2>Acceptance tests</h2>
+<ol>
+<li>Definitive stale entity/version, invalid task/review state, and pre-push rejection do not create indefinite pending entries. Verify no push was attempted when a definite rejection is reported.</li>
+<li>Lost response after acceptance, ambiguous push failure, and delayed acceptance preserve the original UUID/command and remain recoverable; no false success or deletion.</li>
+<li>Same-UUID original saved uncertain attempt plus later stale verification does not erase possible prior acceptance. Identity mismatch is quarantined.</li>
+<li>Cleanup filesystem failure becomes observable without treating a successful remote write as failure. Concurrent clients and restart remain safe.</li>
+<li>Run Release Client/Server tests and independent review before source integration. Deployment requires explicit operator authorization.</li>
+</ol>

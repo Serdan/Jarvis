@@ -158,12 +158,46 @@ let runInternalGroupHost (args: string array) =
                 child.StartInfo.WorkingDirectory <- Environment.CurrentDirectory
                 child.StartInfo.UseShellExecute <- false
                 child.StartInfo.CreateNoWindow <- true
+                // On Windows, CreateProcess does not reliably inherit the
+                // helper's redirected standard handles when Process.Start is
+                // called without redirection. An otherwise successful Git
+                // command can therefore produce empty stdout/stderr, causing
+                // the canonical ledger's remote URL check to fail spuriously.
+                // Use explicit child pipes and forward bytes, not text lines,
+                // to preserve Git's raw output and encoding.
+                child.StartInfo.RedirectStandardInput <- windows
+                child.StartInfo.RedirectStandardOutput <- windows
+                child.StartInfo.RedirectStandardError <- windows
                 args |> Seq.skip (offset + 1) |> Seq.iter child.StartInfo.ArgumentList.Add
-                // Child inherits the helper's stdout/stderr AND stdin: no
-                // startup protocol ever consumes the data sent to the child.
                 if not (child.Start()) then 127
                 else
-                    child.WaitForExit()
+                    if windows then
+                        let stdout = child.StandardOutput.BaseStream.CopyToAsync(Console.OpenStandardOutput())
+                        let stderr = child.StandardError.BaseStream.CopyToAsync(Console.OpenStandardError())
+                        // Forward stdin without awaiting it after the child
+                        // exits: a console source can remain open indefinitely,
+                        // even for a command that never reads input. EOF from
+                        // a ClosedInput/TextInput parent is forwarded to the
+                        // child. The helper owns the process lifetime.
+                        let _stdin =
+                            task {
+                                try
+                                    do! Console.OpenStandardInput().CopyToAsync(child.StandardInput.BaseStream)
+                                    do! child.StandardInput.BaseStream.FlushAsync()
+                                with
+                                | :? IOException
+                                | :? ObjectDisposedException -> ()
+                                try child.StandardInput.Close() with _ -> ()
+                            }
+                        child.WaitForExit()
+                        // The exit code is not sufficient until both pipes
+                        // reach EOF. Descendants retaining them are bounded
+                        // by the outer job-object deadline.
+                        Task.WhenAll(stdout, stderr).GetAwaiter().GetResult()
+                    else
+                        // macOS already inherits its session helper's streams.
+                        // Keep its existing behavior unchanged.
+                        child.WaitForExit()
                     child.ExitCode
         with ex ->
             eprintfn "Could not launch process: %s" ex.Message

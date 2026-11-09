@@ -264,6 +264,63 @@ printfn "parent completed"
         if Directory.Exists root then Directory.Delete(root, true)
 
 [<Test>]
+let process_group_helper_forwards_child_stdout_and_stderr_without_losing_bytes () =
+    let root = newProject ()
+    try
+        let project = Path.Combine(root, "Project1")
+        File.WriteAllText(Path.Combine(project, "both-streams.fsx"),
+                          String.concat "\n" [
+                              "let stdout = System.Console.OpenStandardOutput()"
+                              "let stderr = System.Console.OpenStandardError()"
+                              "let write (stream: System.IO.Stream) (text: string) ="
+                              "    let bytes = System.Text.Encoding.UTF8.GetBytes text"
+                              "    stream.Write(bytes, 0, bytes.Length)"
+                              "    stream.Flush()"
+                              "write stdout \"bounded-stdout-marker\""
+                              "write stderr \"bounded-stderr-marker\""
+                          ])
+        match runCommand (command "both-streams.fsx" 15 4096) (Context root) with
+        | Error error -> Assert.Fail(sprintf "Expected process output, got %A" error)
+        | Ok output ->
+            Assert.That(output.ExitCode, Is.EqualTo(0))
+            Assert.That(output.TimedOut, Is.False)
+            Assert.That(output.StdOut, Is.EqualTo("bounded-stdout-marker"))
+            Assert.That(output.StdErr, Is.EqualTo("bounded-stderr-marker"))
+            Assert.That(output.Truncated, Is.False)
+    finally
+        if Directory.Exists root then Directory.Delete(root, true)
+
+[<Test>]
+let bounded_git_remote_get_url_matches_pinned_fetch_and_push_endpoints () =
+    let root = newProject ()
+    try
+        let project = Path.Combine(root, "Project1")
+        let directGit args =
+            use proc = new Process()
+            proc.StartInfo.FileName <- "git"
+            proc.StartInfo.WorkingDirectory <- project
+            proc.StartInfo.UseShellExecute <- false
+            for arg in args do proc.StartInfo.ArgumentList.Add arg
+            Assert.That(proc.Start(), Is.True)
+            proc.WaitForExit()
+            Assert.That(proc.ExitCode, Is.EqualTo(0), sprintf "git %A" args)
+        directGit [ "init"; "-q" ]
+        let approved = "https://github.com/example/FinanceFlow.git"
+        directGit [ "remote"; "add"; "origin"; approved ]
+        for args in [ [ "remote"; "get-url"; "origin" ]
+                      [ "remote"; "get-url"; "--push"; "origin" ] ] do
+            let cmd = { command "" 15 4096 with Executable = "git"; Args = args }
+            match runCommand cmd (Context root) with
+            | Error error -> Assert.Fail(sprintf "Expected Git URL output, got %A" error)
+            | Ok output ->
+                Assert.That(output.ExitCode, Is.EqualTo(0))
+                Assert.That(output.TimedOut, Is.False)
+                Assert.That(output.StdOut.TrimEnd('\n', '\r'), Is.EqualTo(approved),
+                            "The process-group helper must not discard stdout and break ledger trust validation.")
+    finally
+        if Directory.Exists root then Directory.Delete(root, true)
+
+[<Test>]
 let managed_dotnet_host_and_apphost_choose_the_correct_helper_arguments () =
     let payload = [ "--jarvis-internal-process-group"; "test-event"; "git"; "status" ]
     let dotnetHost, dotnetArgs =

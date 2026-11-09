@@ -2959,6 +2959,139 @@ type ReviewWorkflowTests() =
                         Is.EqualTo(2))
             Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(verifiedHead)))
 
+
+    [<Test>]
+    member _.OperatorAbandonRequiresVerifiedNewerAssignmentAndArchivesOriginalSession() =
+        withFixture (fun one _ first _ _ _ _ _ ->
+            let taskId = "obsolete-assignment-generation"
+            ReviewWorkflow.createTaskWithSpec first (Guid.NewGuid()) taskId "Obsolete assignment"
+                "<h1>First generation</h1>" |> success |> ignore
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner"
+            |> success |> ignore
+            let originalId = Guid.NewGuid()
+            let oldJson =
+                System.Text.Json.JsonSerializer.Serialize(
+                    {| Action = "ResumeAgent"; TaskId = taskId
+                       ActorId = "Owner"; AssignmentGeneration = 1
+                       ExpectedVersion = 0; ExpectedAgentVersion = 0
+                       SessionId = "legacy-private-session" |})
+            let unpinnedId = Guid.NewGuid()
+            let unpinnedJson =
+                System.Text.Json.JsonSerializer.Serialize(
+                    {| Action = "ResumeAgent"; TaskId = taskId
+                       ActorId = "Owner"; AssignmentGeneration = 0
+                       ExpectedVersion = 0; ExpectedAgentVersion = 0
+                       SessionId = "wildcard-generation-must-fail" |})
+            for id, saved in [ originalId, oldJson; unpinnedId, unpinnedJson ] do
+                Client.OrchestrationApi.PendingIntentJournal.persist first id "V2TaskWrite" saved
+                |> success
+            let earlierHead = (LedgerStore.fetch first |> success).Commit
+            let earlierRecord =
+                Client.OrchestrationApi.PendingIntentJournal.findAtRoot one originalId
+                |> success |> Option.get
+            let reason = "A newer verified assignment generation superseded the old resume session."
+            let abandon id sha head =
+                Client.OrchestrationApi.PendingIntentJournal.abandon first id
+                    sha head "Jarvis Lead" reason
+            match abandon originalId earlierRecord.CommandSha256 earlierHead with
+            | Error(Client.ValidationError _) -> ()
+            | other -> Assert.Fail(sprintf "Same assignment generation must not be abandoned: %A" other)
+            ReviewWorkflow.acknowledgeAssignment first (Guid.NewGuid()) taskId "Owner" 1 1
+            |> success |> ignore
+            ReviewWorkflow.reissueAssignment first (Guid.NewGuid()) taskId "Owner"
+                2 2 1 "Reissued instructions" "<h1>New generation</h1>"
+            |> success |> ignore
+            let head = (LedgerStore.fetch first |> success).Commit
+            match abandon originalId earlierRecord.CommandSha256 earlierHead with
+            | Error(Client.ValidationError _) -> ()
+            | other -> Assert.Fail(sprintf "Stale ledger head cannot authorize abandonment: %A" other)
+            match abandon originalId (String.replicate 64 "f") head with
+            | Error(Client.ValidationError _) -> ()
+            | other -> Assert.Fail(sprintf "Wrong original SHA must fail: %A" other)
+            let unpinnedRecord =
+                Client.OrchestrationApi.PendingIntentJournal.findAtRoot one unpinnedId
+                |> success |> Option.get
+            match abandon unpinnedId unpinnedRecord.CommandSha256 head with
+            | Error(Client.ValidationError _) -> ()
+            | other -> Assert.Fail(sprintf "Original wildcard generation cannot prove obsolescence: %A" other)
+            let archived = abandon originalId earlierRecord.CommandSha256 head |> success
+            Assert.That(archived.alreadyAbandoned, Is.False)
+            Assert.That(archived.archive.SchemaVersion, Is.EqualTo(2))
+            Assert.That(archived.archive.ObsoleteTask.Rule,
+                        Is.EqualTo(Client.OrchestrationApi.PendingTaskObsolescence.AssignmentAdvanced))
+            Assert.That(archived.archive.ObsoleteTask.ObservedAssignmentGeneration, Is.EqualTo(2))
+            Assert.That(archived.archive.Original.CommandJson, Is.EqualTo(oldJson))
+            let repeated = abandon originalId earlierRecord.CommandSha256 head |> success
+            Assert.That(repeated.alreadyAbandoned, Is.True)
+            let inspected = Client.OrchestrationApi.PendingIntentJournal.inspect first originalId |> success
+            Assert.That(inspected.Disposition, Is.EqualTo(Some "Abandoned"))
+            Assert.That(inspected.Archive.Value.Original.CommandJson,
+                        Does.Contain("legacy-private-session"))
+            Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one originalId |> success).IsNone,
+                        Is.True)
+            Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one unpinnedId |> success).IsSome,
+                        Is.True)
+            match Client.OrchestrationApi.PendingIntentJournal.acknowledge first originalId
+                    (String.replicate 64 "a") with
+            | Error(Client.ValidationError _) -> ()
+            | other -> Assert.Fail(sprintf "Archived UUID cannot be acknowledged: %A" other)
+            Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(head)))
+
+    [<Test>]
+    member _.OperatorAbandonUsesWithdrawnReviewStateWithoutInspectingSourceRef() =
+        withFixture (fun one _ first _ _ _ _ _ ->
+            let taskId = "_reviews"
+            let reviewId = Guid.NewGuid()
+            let sourceHead = git one [ "rev-parse"; "HEAD" ]
+            ReviewWorkflow.submitBranchReview first (Guid.NewGuid()) taskId "Owner"
+                reviewId "" sourceHead "Awaiting review" "" ""
+            |> success |> ignore
+            let pendingId = Guid.NewGuid()
+            let command =
+                System.Text.Json.JsonSerializer.Serialize(
+                    {| Action = "Claim"; TaskId = taskId
+                       RequestId = reviewId.ToString("D")
+                       ActorId = "Reviewer"; ExpectedVersion = 1 |})
+            Client.OrchestrationApi.PendingIntentJournal.persist first pendingId "V2ReviewWrite" command
+            |> success
+            let stored =
+                Client.OrchestrationApi.PendingIntentJournal.findAtRoot one pendingId
+                |> success |> Option.get
+            let firstHead = (LedgerStore.fetch first |> success).Commit
+            let reason = "The verified review is withdrawn, so the original claim cannot apply."
+            let abandon head sha =
+                Client.OrchestrationApi.PendingIntentJournal.abandon first pendingId sha
+                    head "Jarvis Lead" reason
+            match abandon firstHead stored.CommandSha256 with
+            | Error(Client.ValidationError _) -> ()
+            | other -> Assert.Fail(sprintf "Unclaimed review must not be abandoned: %A" other)
+            ReviewWorkflow.withdrawBranchReview first (Guid.NewGuid()) taskId
+                reviewId "Owner" 1 |> success |> ignore
+            let verifiedHead = (LedgerStore.fetch first |> success).Commit
+            let archive = abandon verifiedHead stored.CommandSha256 |> success
+            Assert.That(archive.archive.SchemaVersion, Is.EqualTo(2))
+            Assert.That(archive.archive.ObsoleteReview.ObservedStatus, Is.EqualTo("Withdrawn"))
+            Assert.That(archive.archive.ObsoleteReview.OriginalExpectedVersion, Is.EqualTo(1))
+            Assert.That(archive.archive.ObsoleteReview.Rule,
+                        Is.EqualTo(Client.OrchestrationApi.PendingReviewObsolescence.ReviewVersionAdvanced))
+            Assert.That(archive.archive.Original.CommandJson, Is.EqualTo(command))
+            Assert.That((Client.OrchestrationApi.PendingIntentJournal.inspect first pendingId |> success).Disposition,
+                        Is.EqualTo(Some "Abandoned"))
+            let summary = Client.OrchestrationApi.PendingIntentJournal.summarize first |> success
+            Assert.That(summary.Total, Is.Zero)
+            Assert.That(summary.ArchivedTotal, Is.EqualTo(1))
+            Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(verifiedHead))
+            // Delayed remote acceptance under an abandoned UUID with a DIFFERENT
+            // command identity must be surfaced, never mistaken for the saved
+            // review claim or silently acknowledged.
+            ReviewWorkflow.createTask first pendingId "unrelated-remote-uuid" "Unrelated task"
+            |> success |> ignore
+            let afterConflict = Client.OrchestrationApi.PendingIntentJournal.inspect first pendingId |> success
+            Assert.That(afterConflict.Disposition, Is.EqualTo(Some "IdentityMismatchAfterAbandonment"))
+            Assert.That(afterConflict.Archive.Value.Original.CommandJson, Is.EqualTo(command))
+            Assert.That((Client.OrchestrationApi.PendingIntentJournal.summarize first |> success).ArchivedIdentityMismatch,
+                        Is.EqualTo(1)))
+
     [<Test>]
     member _.PendingSupersessionNeverArchivesAnOriginalWithVerifiedAppliedReceipt() =
         withFixture (fun one _ first _ _ _ _ _ ->

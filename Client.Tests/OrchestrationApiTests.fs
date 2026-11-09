@@ -175,7 +175,13 @@ let pendingRecoveryCommandsAreDistinctExplicitWriteActions () =
               RelatedOperationId = Guid.NewGuid().ToString("D")
               RelatedRequestHash = String.replicate 64 "c"
               Reason = "Equivalent canonical operation has been verified." }
-    for command in [ retry; supersede ] do
+    let abandon : AgentCommand =
+        AbandonPendingIntentCommand
+            { ProjectName = "Project1"; OperationId = operationId
+              OperatorId = "Operator"; ExpectedCommandSha256 = String.replicate 64 "a"
+              ExpectedVerifiedHead = String.replicate 40 "b"
+              Reason = "Verified canonical task or review state makes the saved command obsolete." }
+    for command in [ retry; supersede; abandon ] do
         match Client.PermissionPolicy.evaluate command with
         | Error(Client.ConfirmationRequired approval) ->
             Assert.That(approval.Permissions, Does.Contain(VersionControlWrite))
@@ -187,6 +193,7 @@ let pendingRecoveryCommandsAreDistinctExplicitWriteActions () =
         Assert.That(AgentCommandInfo.projectName command, Is.EqualTo(Some "Project1"))
     Assert.That(AgentCommandInfo.displayName retry, Is.EqualTo("RetryPendingIntent"))
     Assert.That(AgentCommandInfo.displayName supersede, Is.EqualTo("SupersedePendingIntent"))
+    Assert.That(AgentCommandInfo.displayName abandon, Is.EqualTo("AbandonPendingIntent"))
 
 [<Test>]
 let ledgerOperationStatusUsesReadOnlyTypedLedgerCommand () =

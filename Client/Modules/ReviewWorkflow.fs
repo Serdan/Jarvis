@@ -2223,18 +2223,24 @@ module ReviewWorkflow =
             return snapshot.Commit, history |> List.sortBy (fun item -> item.Sequence)
         }
 
-    let getTask binding taskId =
+    let getTaskAt binding snapshot taskId =
         if not (validTaskId taskId) then Error(InvalidBinding "Invalid task ID.")
         else
             result {
-                let! snapshot = LedgerStore.fetch binding
                 let! task, _ = required<ReviewTask> binding snapshot (taskPath taskId)
                 if String.IsNullOrWhiteSpace task.AttemptId then
-                    return snapshot, task, None
+                    return task, None
                 else
                     let! attempt, _ =
                         required<ReviewAttempt> binding snapshot (attemptPath taskId task.AttemptId)
-                    return snapshot, task, Some attempt
+                    return task, Some attempt
+            }
+
+    let getTask binding taskId =
+        result {
+            let! snapshot = LedgerStore.fetch binding
+            let! task, attempt = getTaskAt binding snapshot taskId
+            return snapshot, task, attempt
             }
 
     // Markdown files are regular orphan-ledger Git blobs. The review itself
@@ -2505,13 +2511,22 @@ module ReviewWorkflow =
             return found |> List.sortBy (fun entry -> entry.CreatedSequence, entry.ReviewId)
         }
 
-    let getBranchReview binding taskId reviewId =
+    let getBranchReviewAt binding snapshot taskId reviewId =
         if not (validTaskId taskId) || reviewId = Guid.Empty then
             Error(InvalidBinding "Invalid review identifier.")
         else result {
-            let! snapshot = LedgerStore.fetch binding
             let! review, _ = required<BranchReview> binding snapshot
                                 (branchReviewPath taskId (reviewId.ToString("N")))
+            if review.TaskId <> taskId
+               || not (String.Equals(review.ReviewId, reviewId.ToString("N"), StringComparison.OrdinalIgnoreCase)) then
+                return! Error(LedgerIntegrityError "Canonical review does not match its ledger task/review path.")
+            return review
+        }
+
+    let getBranchReview binding taskId reviewId =
+        result {
+            let! snapshot = LedgerStore.fetch binding
+            let! review = getBranchReviewAt binding snapshot taskId reviewId
             let! advertised = LedgerStore.inspectRemoteReviewRef binding review.ReviewRef
             return { SnapshotCommit = snapshot.Commit; Review = review
                      HeadCommit = advertised |> Option.defaultValue null }

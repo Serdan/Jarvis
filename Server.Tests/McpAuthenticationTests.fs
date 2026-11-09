@@ -145,7 +145,7 @@ let write_tools_expose_optional_operation_ids () =
             match methodInfo.GetParameters() |> Array.tryFind (fun p -> p.Name = "operationId") with
             | Some id when not (List.contains methodInfo.Name
                             [ "GetOperationStatus"; "AcknowledgePendingOperation";
-                              "InspectPendingOperation"; "RetryPendingIntent"; "SupersedePendingIntent" ]) ->
+                              "InspectPendingOperation"; "RetryPendingIntent"; "SupersedePendingIntent"; "AbandonPendingIntent" ]) ->
                 Some (methodInfo.Name, id)
             | _ -> None)
     Assert.That(writeMethods.Length, Is.EqualTo(35), String.concat ", " (writeMethods |> Array.map fst))
@@ -154,7 +154,7 @@ let write_tools_expose_optional_operation_ids () =
         Assert.That(id.DefaultValue, Is.EqualTo(""), $"operationId default differs on {name}")
 
     for selector in [ "GetOperationStatus"; "AcknowledgePendingOperation";
-                      "InspectPendingOperation"; "RetryPendingIntent"; "SupersedePendingIntent" ] do
+                      "InspectPendingOperation"; "RetryPendingIntent"; "SupersedePendingIntent"; "AbandonPendingIntent" ] do
         let id = typeof<Server.JarvisMcpTools>.GetMethod(selector).GetParameters()
                  |> Array.find (fun parameter -> parameter.Name = "operationId")
         Assert.That(id.IsOptional, Is.False, $"Selector ID must remain required: {selector}")

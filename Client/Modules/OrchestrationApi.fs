@@ -1214,7 +1214,7 @@ module PendingIntentJournal =
     // inapplicable is a valid abandonment proof. Missing remote UUID is
     // uncertainty, never proof. Parse the narrow historical fields required
     // for each action rather than reconstituting removed public APIs.
-    let private obsoleteStateProof binding expectedHead (original: PendingIntent) =
+    let private obsoleteStateProof binding (snapshot: LedgerStore.LedgerSnapshot) (original: PendingIntent) =
         try
             use doc = JsonDocument.Parse(original.CommandJson)
             let root = doc.RootElement
@@ -1231,10 +1231,10 @@ module PendingIntentJournal =
             else
                 match normalizeCommandType original.CommandType with
                 | "TaskWrite" ->
-                    ReviewWorkflow.ReviewWorkflow.getTask binding taskId
+                    ReviewWorkflow.ReviewWorkflow.getTaskAt binding snapshot taskId
                     |> Result.mapError LedgerErrors.toEffect
-                    |> Result.bind (fun (snapshot, task, attempt) ->
-                        if snapshot.Commit <> expectedHead || task.TaskId <> taskId then
+                    |> Result.bind (fun (task, attempt) ->
+                        if task.TaskId <> taskId then
                             Error(Client.ValidationError "Canonical task snapshot changed or task identity mismatched; inspect again.")
                         else
                             let generation = positive "AssignmentGeneration"
@@ -1286,11 +1286,10 @@ module PendingIntentJournal =
                 | "ReviewWrite" ->
                     match Guid.TryParse(field "RequestId") with
                     | true, reviewId when reviewId <> Guid.Empty ->
-                        ReviewWorkflow.ReviewWorkflow.getBranchReview binding taskId reviewId
+                        ReviewWorkflow.ReviewWorkflow.getBranchReviewAt binding snapshot taskId reviewId
                         |> Result.mapError LedgerErrors.toEffect
-                        |> Result.bind (fun observed ->
-                            let review = observed.Review
-                            if observed.SnapshotCommit <> expectedHead || review.TaskId <> taskId
+                        |> Result.bind (fun review ->
+                            if review.TaskId <> taskId
                                || not (String.Equals(review.ReviewId, reviewId.ToString("N"),
                                                      StringComparison.OrdinalIgnoreCase)) then
                                 Error(Client.ValidationError "Canonical review snapshot or identifier changed; inspect again.")
@@ -1406,7 +1405,7 @@ module PendingIntentJournal =
                                                 | Some _ ->
                                                     Error(Client.ValidationError "Original UUID is present at verified head; do not abandon.")
                                                 | None ->
-                                                    obsoleteStateProof binding snapshot.Commit original
+                                                    obsoleteStateProof binding snapshot original
                                                     |> Result.bind (fun proof ->
                                                         let taskProof, reviewProof =
                                                             match proof with

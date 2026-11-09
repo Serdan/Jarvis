@@ -182,7 +182,7 @@ let expired_device_re_registration_cannot_reuse_stale_generation_even_on_reused_
     Assert.That(users.GetSessionByDevice("alice", "device").IsNone, Is.True)
     let newRegistration = register users "alice" "device" "same-connection"
     Assert.That(newRegistration.Generation, Is.GreaterThan(first.Generation))
-    let result = { Result = Some "stale"; Error = None; Instructions = []; AgentStateChanges = [] }
+    let result = { Result = Some "stale"; Error = None; Instructions = []; AgentStateChanges = []; InboxActivation = None }
     Assert.That(tracker.Complete(correlationId, "alice", "same-connection",
                                  newRegistration.Generation, result), Is.False)
     tracker.Cancel(correlationId)
@@ -292,7 +292,7 @@ let repeated_registration_on_one_live_transport_invalidates_old_reply_generation
               ProtocolVersion = AgentProtocol.version; ClientVersion = "test"
               SupportedCommands = [ "ListProjects" ] }, "connection")
     Assert.That(second.Generation, Is.GreaterThan(first.Generation))
-    let stale = { Result = Some "stale"; Error = None; Instructions = []; AgentStateChanges = [] }
+    let stale = { Result = Some "stale"; Error = None; Instructions = []; AgentStateChanges = []; InboxActivation = None }
     Assert.That(tracker.Complete(correlationId, "alice", "connection", second.Generation, stale), Is.False)
     tracker.Cancel(correlationId)
     Assert.That(users.RetentionCounts.DeviceSessions, Is.EqualTo(1))

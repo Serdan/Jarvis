@@ -2461,6 +2461,20 @@ type ReviewWorkflowTests() =
                 Assert.That(activated.IsOk, Is.True)
                 Assert.That(activation.AgentStateChanges |> List.map _.AgentId,
                             Is.EqualTo([ firstTarget ] :> obj))
+                Assert.That(activation.InboxActivation.IsSome, Is.True)
+                let committed = activation.InboxActivation.Value
+                Assert.That(committed.ActivatedByThisCall, Is.True)
+                Assert.That(committed.BeforeState, Is.EqualTo(Some "Ready"))
+                Assert.That(committed.AfterState, Is.EqualTo(Some "Working"))
+                Assert.That(committed.OperationId.IsSome, Is.True)
+                Assert.That(committed.CommittedHead.IsSome, Is.True)
+                let _, repeatedInbox, repeatedEnvelope =
+                    Client.SignalR.Client.processIncomingCommand runtime1
+                        (System.Text.Json.JsonSerializer.Serialize(selfInbox)) firstTarget
+                    |> Async.AwaitTask |> Async.RunSynchronously
+                Assert.That(repeatedInbox.IsOk, Is.True)
+                Assert.That(repeatedEnvelope.InboxActivation.Value.ActivatedByThisCall, Is.False)
+                Assert.That(repeatedEnvelope.InboxActivation.Value.CommittedHead.IsNone, Is.True)
                 let working = (ReviewWorkflow.getAgentInbox second firstTarget |> success).Agent
                 Assert.That(working.State, Is.EqualTo("Working"))
                 let seen = runtime1.Tui.GetAgentLastSeen("owner", firstTarget)
@@ -2481,6 +2495,29 @@ type ReviewWorkflowTests() =
                 Assert.That(finalAgent.Version, Is.EqualTo(working.Version))
                 Assert.That(finalAgent.WorkingTurnStartedAtUtc,
                             Is.EqualTo(working.WorkingTurnStartedAtUtc))
+                // A self-inbox read with a missing target ID still counts as
+                // genuine actor activity in the legacy transport. Its later
+                // read fails, but the committed Ready -> Working transition
+                // must be exposed instead of making the call look read-only.
+                let failedTarget = targets.Tail.Head
+                let invalidInbox : Common.AgentCommand =
+                    Common.TaskReadCommand
+                        { ProjectName = "owner"; AgentId = ""; Action = "AgentInbox"
+                          TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L
+                          Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null
+                          RelativePath = null }
+                let _, failed, failedEnvelope =
+                    Client.SignalR.Client.processIncomingCommand runtime1
+                        (System.Text.Json.JsonSerializer.Serialize(invalidInbox)) failedTarget
+                    |> Async.AwaitTask |> Async.RunSynchronously
+                Assert.That(failed.IsError, Is.True)
+                Assert.That(failedEnvelope.Error.IsSome, Is.True)
+                Assert.That(failedEnvelope.InboxActivation.Value.ActivatedByThisCall, Is.True)
+                Assert.That(failedEnvelope.InboxActivation.Value.BeforeState, Is.EqualTo(Some "Ready"))
+                Assert.That(failedEnvelope.InboxActivation.Value.AfterState, Is.EqualTo(Some "Working"))
+                Assert.That(failedEnvelope.AgentStateChanges |> List.map _.AgentId, Is.EqualTo([ failedTarget ] :> obj))
+                let afterFailure = (ReviewWorkflow.getAgentInbox second failedTarget |> success).Agent
+                Assert.That(afterFailure.State, Is.EqualTo("Working"))
             finally
                 if File.Exists configPath then File.Delete configPath)
 

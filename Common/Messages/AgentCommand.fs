@@ -593,11 +593,24 @@ type AgentStateChange =
     { ProjectName: string
       AgentId: string }
 
+/// Caller-visible outcome of a self-AgentInbox's automatic activation.
+/// CommittedHead/OperationId are present only after a confirmed ledger write.
+/// A non-activating read is explicitly reported without inventing a transition.
+type AgentInboxActivation =
+    { ProjectName: string
+      AgentId: string
+      ActivatedByThisCall: bool
+      BeforeState: string option
+      AfterState: string option
+      CommittedHead: string option
+      OperationId: string option }
+
 type AgentCommandResponse =
     { Result: string option
       Error: AgentError option
       Instructions: InstructionDocument list
-      AgentStateChanges: AgentStateChange list }
+      AgentStateChanges: AgentStateChange list
+      InboxActivation: AgentInboxActivation option }
 
 [<JsonConverter(typeof<UnionConverter<AgentCommand>>)>]
 type AgentCommand =

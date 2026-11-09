@@ -349,19 +349,32 @@ module McpToolHelpers =
         | LedgerFailure _ -> "LedgerFailure"
 
     let toCallToolResult (response: AgentCommandResponse) =
-        match response.Result, response.Error with
-        | Some serialized, None ->
-            try
-                use _ = JsonDocument.Parse(serialized)
-                textResult serialized false
-            with ex ->
-                errorResult (ExecutionFailed $"Invalid serialized Jarvis result: {ex.Message}")
-        | None, Some error ->
-            errorResult error
-        | Some _, Some error ->
-            errorResult (ExecutionFailed $"Invalid Jarvis response: both result and error were set. {formatError error}")
-        | None, None ->
-            errorResult (ExecutionFailed "Invalid Jarvis response: neither result nor error was set.")
+        let result =
+            match response.Result, response.Error with
+            | Some serialized, None ->
+                try
+                    use _ = JsonDocument.Parse(serialized)
+                    textResult serialized false
+                with ex ->
+                    errorResult (ExecutionFailed $"Invalid serialized Jarvis result: {ex.Message}")
+            | None, Some error ->
+                errorResult error
+            | Some _, Some error ->
+                errorResult (ExecutionFailed $"Invalid Jarvis response: both result and error were set. {formatError error}")
+            | None, None ->
+                errorResult (ExecutionFailed "Invalid Jarvis response: neither result nor error was set.")
+        // This evidence originates from a confirmed canonical write and must
+        // remain visible even if the subsequent inbox read or result encoding
+        // fails. Preserve the original inbox JSON and typed error unchanged.
+        match response.InboxActivation with
+        | None -> result
+        | Some activation ->
+            let metadata = if isNull result.Meta then JsonObject() else result.Meta
+            metadata["jarvis/inbox_activation"] <- JsonSerializer.SerializeToNode activation
+            result.Meta <- metadata
+            if isNull result.Content then result.Content <- ResizeArray<ContentBlock>()
+            result.Content.Add(textContent (JsonSerializer.Serialize({| agentInboxActivation = activation |})))
+            result
 
     let private imageResult (response: AgentCommandResponse) =
         match response.Result, response.Error with

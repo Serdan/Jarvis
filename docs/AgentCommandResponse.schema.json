@@ -39,6 +39,13 @@
       "items": {
         "$ref": "#/$defs/AgentStateChange"
       }
+    },
+    "InboxActivation": {
+      "oneOf": [
+        { "$ref": "#/$defs/AgentInboxActivation" },
+        { "type": "null" }
+      ],
+      "description": "Explicit caller-visible result of self-AgentInbox activation; absent for other commands. Preserved on a failed inbox read after a confirmed transition."
     }
   },
   "additionalProperties": false,
@@ -94,6 +101,29 @@
           "minLength": 1
         }
       },
+      "additionalProperties": false
+    },
+    "AgentInboxActivation": {
+      "type": "object",
+      "required": [
+        "ProjectName",
+        "AgentId",
+        "ActivatedByThisCall",
+        "BeforeState",
+        "AfterState",
+        "CommittedHead",
+        "OperationId"
+      ],
+      "properties": {
+        "ProjectName": { "type": "string", "minLength": 1 },
+        "AgentId": { "type": "string" },
+        "ActivatedByThisCall": { "type": "boolean" },
+        "BeforeState": { "type": ["string", "null"], "enum": ["Ready", null] },
+        "AfterState": { "type": ["string", "null"], "enum": ["Working", null] },
+        "CommittedHead": { "type": ["string", "null"], "pattern": "^[0-9a-f]{40}$" },
+        "OperationId": { "type": ["string", "null"] }
+      },
+      "description": "A true value must be backed by a confirmed canonical Ready-to-Working operation receipt, not inferred from the returned inbox state. False means this call did not commit an activation.",
       "additionalProperties": false
     }
   }

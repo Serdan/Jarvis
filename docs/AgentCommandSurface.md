@@ -73,6 +73,16 @@ changing the target. The regular self-`agent_inbox` has **different semantics**:
 it may automatically transition the requesting agent from Ready to Working
 **before** returning the refreshed inbox. Its MCP metadata therefore correctly
 reports it as state-mutating. Repeat self-inbox calls do not restart Working.
+Every self-inbox MCP response also appends a public
+`agentInboxActivation` JSON block and `jarvis/inbox_activation` metadata.
+`activatedByThisCall: true` is supported by the *confirmed canonical operation
+receipt* and carries `beforeState: Ready`, `afterState: Working`, the
+committed Git head and operation ID. A repeated read explicitly reports
+`activatedByThisCall: false`, with no invented transition. This evidence
+remains visible even when the later inbox read fails; the failure is still an
+error rather than falsely claiming the entire call had no side effects.
+The internal `AgentStateChanges` list remains a separate cache-invalidation
+signal and is not proof of a caller-visible activation.
 
 The global Agents dashboard can consume the same compact projection instead
 of using `agent_inbox` and accidentally starting another agent's assignment.

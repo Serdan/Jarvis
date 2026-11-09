@@ -128,10 +128,10 @@ let private activatesAgent (agentId: string) command =
 
 let private activateReadyOnActivity (rt: Runtime) (agentId: string)
                                 (target: ProjectPaths.ProjectTarget option) command =
-    if String.IsNullOrWhiteSpace agentId || not (activatesAgent agentId command) then Ok []
+    if String.IsNullOrWhiteSpace agentId || not (activatesAgent agentId command) then Ok ([], None)
     else
         match target with
-        | None -> Ok []
+        | None -> Ok ([], None)
         | Some target ->
             let projectId = ProjectPaths.ProjectTarget.projectId target
             let project = ProjectPaths.ProjectId.value projectId
@@ -158,15 +158,27 @@ let private activateReadyOnActivity (rt: Runtime) (agentId: string)
                             agent.CurrentAssignment.TaskId agentId
                     cache.Invalidate(projectId, agentId)
                     match result with
-                    | Ok write -> Ok(Client.LedgerStore.LedgerStore.changedAgentIds write)
+                    | Ok write when write.AlreadyApplied -> Ok ([], None)
+                    | Ok write ->
+                        // Only a successfully committed Ready-to-Working write
+                        // provides evidence of a transition performed here.
+                        let committed : AgentInboxActivation =
+                            { ProjectName = project
+                              AgentId = agentId
+                              ActivatedByThisCall = true
+                              BeforeState = Some "Ready"
+                              AfterState = Some "Working"
+                              CommittedHead = Some write.CurrentHead
+                              OperationId = Some write.Operation.OperationId }
+                        Ok (Client.LedgerStore.LedgerStore.changedAgentIds write, Some committed)
                     | Error(Client.LedgerStore.StaleEntityVersion _) ->
                         // Another concurrent tool may already have started this
                         // assignment. Do not reset its Working clock.
                         match ReviewWorkflow.ReviewWorkflow.getAgentWorkingTurn binding agentId with
-                        | Ok latest when latest.State = "Working" -> Ok []
+                        | Ok latest when latest.State = "Working" -> Ok ([], None)
                         | _ -> Error(Client.ValidationError "Agent assignment changed before automatic activation.")
                     | Error error -> Error(Client.ValidationError($"Automatic agent activation failed: {error}"))
-            | _ -> Ok []
+            | _ -> Ok ([], None)
 
 // Only the Working turn identifies a stable delivery scope. Ledger calls bootstrap
 // root guidance, while normal source operations discover deeper instructions.
@@ -219,18 +231,20 @@ let private serialize'<'a> (result: Result<'a, Client.EffectError>) =
             { Payload = payload; ChangedAgentIds = changedAgentIds }))
     |> ValueTask<_>
 
-let private toAgentResponse command instructions stateChanges response =
+let private toAgentResponse command instructions stateChanges inboxActivation response =
     match response with
     | Error error ->
         { Result = None
           Error = Some(EffectError.toAgentError error)
           Instructions = instructions
-          AgentStateChanges = stateChanges }
+          AgentStateChanges = stateChanges
+          InboxActivation = inboxActivation }
     | Ok (dispatched: DispatchedResult) ->
         let payload = dispatched.Payload
         let bytes = Encoding.UTF8.GetByteCount payload +
                     Encoding.UTF8.GetByteCount(JsonSerializer.Serialize instructions) +
-                    Encoding.UTF8.GetByteCount(JsonSerializer.Serialize stateChanges)
+                    Encoding.UTF8.GetByteCount(JsonSerializer.Serialize stateChanges) +
+                    Encoding.UTF8.GetByteCount(JsonSerializer.Serialize inboxActivation)
         let maxBytes =
             match command with
             | ReadImageCommand _ -> (AgentProtocol.maxImageBytes * 4 / 3) + (64 * 1024)
@@ -241,12 +255,14 @@ let private toAgentResponse command instructions stateChanges response =
             { Result = Some payload
               Error = None
               Instructions = instructions
-              AgentStateChanges = stateChanges }
+              AgentStateChanges = stateChanges
+              InboxActivation = inboxActivation }
         else
             { Result = None
               Error = Some(OutputTruncated $"Command response was {bytes} bytes and exceeds the safe response size of {maxBytes} bytes.")
               Instructions = instructions
-              AgentStateChanges = stateChanges }
+              AgentStateChanges = stateChanges
+              InboxActivation = inboxActivation }
 
 let private unwrapProjectName (ProjectName name) = name
 let private unwrapContent (Content content) = content
@@ -633,11 +649,23 @@ let processIncomingCommand (rt: Runtime) (commandJson: string) (agentId: string)
         let mutable parsedCommand = None
         let mutable instructions: InstructionDocument list = []
         let mutable implicitChanges: string list = []
+        let mutable inboxActivation: AgentInboxActivation option = None
         let! response =
             task {
                 try
                     let command = JsonSerializer.Deserialize<AgentCommand>(commandJson)
                     parsedCommand <- Some command
+                    // A self-inbox response must explicitly distinguish a
+                    // repeated read from a newly committed activation, even
+                    // when the subsequent inbox read fails.
+                    match command with
+                    | TaskReadCommand inbox when inbox.Action = "AgentInbox" ->
+                        inboxActivation <-
+                            Some { ProjectName = inbox.ProjectName; AgentId = inbox.AgentId
+                                   ActivatedByThisCall = false
+                                   BeforeState = None; AfterState = None
+                                   CommittedHead = None; OperationId = None }
+                    | _ -> ()
                     // A target field is never proof of acting-agent identity.
                     // Reject forged observer identity before source resolution,
                     // any activity attribution, or the canonical read.
@@ -661,8 +689,12 @@ let processIncomingCommand (rt: Runtime) (commandJson: string) (agentId: string)
                                 rt.Tui.RecordAgentSeen(AgentView.activityProject selected, localAgentId))
                         match activateReadyOnActivity rt localAgentId target command with
                         | Error error -> return Error error
-                        | Ok changes ->
+                        | Ok (changes, committedActivation) ->
                             implicitChanges <- changes
+                            match command, committedActivation with
+                            | TaskReadCommand inbox, Some receipt when inbox.Action = "AgentInbox" ->
+                                inboxActivation <- Some receipt
+                            | _ -> ()
                             let! result, applicable, provenance =
                                 receiveCommandWithTypedInstructions rt target command
                             // A write may alter another agent's state, or none
@@ -705,8 +737,8 @@ let processIncomingCommand (rt: Runtime) (commandJson: string) (agentId: string)
             | _ -> []
         let agentResponse =
             match parsedCommand with
-            | Some command -> toAgentResponse command instructions changes response
-            | None -> toAgentResponse ListCommandsCommand [] changes response
+            | Some command -> toAgentResponse command instructions changes inboxActivation response
+            | None -> toAgentResponse ListCommandsCommand [] changes inboxActivation response
         return parsedCommand, (response |> Result.map (fun outcome -> outcome.Payload)), agentResponse
     }
 

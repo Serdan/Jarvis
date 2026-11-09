@@ -15,7 +15,7 @@ A Wayfold audit worker got the generic `Invalid Working checkpoint metadata` eve
 ## Regression evidence
 - `UnboundReadOnlyAuditCanCheckpointEvidenceAndCompleteWithoutInventingSource`: two Git clients, task assigned and Working without source binding; checkpoint evidence persists with `OwnerReported`, null/empty source, immutable sequence, replay by identical UUID `AlreadyApplied`, second checkpoint, stable Working clock and complete-to-NeedsWork.
 - `CheckpointReportsExactInvalidFieldAndUTF8LimitsBeforeLedgerMutation`: required empty/oversized summary and nextAction, oversized multibyte evidence, malformed SHA, negative version/generation, missing 40-hex commit, stale generation all fail without changing the ledger head; **exactly 8192 bytes** of emoji evidence and summary pass.
-- Both targeted Client Release tests **passed (2/2)**. Full Release Client + Server suite in progress at job `db5bf6bd3ba845f7bd6c4b0e011acba0`; update result once complete.
+- Both targeted Client Release tests **passed (2/2)**. Full Release Client + Server suite **completed successfully, exit code 0**, in job `db5bf6bd3ba845f7bd6c4b0e011acba0` on the frozen source. The job's aggregate output was truncated; do not infer individual suite counts from that display.
 - `git diff --check` clean; source branch pushed clean; `git merge-tree --write-tree` into current main succeeds.
 
 ## Review focus

@@ -289,7 +289,12 @@ module McpToolHelpers =
             |> List.find (fun capability -> capability.Name = wireName)
             |> fun capability -> { capability with Name = publicName }
 
-        [ for name in ledgerTaskReadMethods -> fromWire "TaskRead" name
+        [ for name in ledgerTaskReadMethods ->
+              if name = "AgentInbox" then
+                  { fromWire "TaskRead" name with
+                      Description = "Self-inbox: an agent's call may activate its Ready assignment into Working. Use ObserveAgent to inspect another agent without activity."
+                      MutatesState = true }
+              else fromWire "TaskRead" name
           for name in ledgerTaskWriteMethods -> fromWire "TaskWrite" name
           for name in ledgerReadMethods -> fromWire "LedgerRead" name
           for name in ledgerWriteMethods -> fromWire "LedgerWrite" name
@@ -344,19 +349,57 @@ module McpToolHelpers =
         | LedgerFailure _ -> "LedgerFailure"
 
     let toCallToolResult (response: AgentCommandResponse) =
-        match response.Result, response.Error with
-        | Some serialized, None ->
-            try
-                use _ = JsonDocument.Parse(serialized)
-                textResult serialized false
-            with ex ->
-                errorResult (ExecutionFailed $"Invalid serialized Jarvis result: {ex.Message}")
-        | None, Some error ->
-            errorResult error
-        | Some _, Some error ->
-            errorResult (ExecutionFailed $"Invalid Jarvis response: both result and error were set. {formatError error}")
-        | None, None ->
-            errorResult (ExecutionFailed "Invalid Jarvis response: neither result nor error was set.")
+        let result =
+            match response.Result, response.Error with
+            | Some serialized, None ->
+                try
+                    use _ = JsonDocument.Parse(serialized)
+                    textResult serialized false
+                with ex ->
+                    errorResult (ExecutionFailed $"Invalid serialized Jarvis result: {ex.Message}")
+            | None, Some error ->
+                errorResult error
+            | Some _, Some error ->
+                errorResult (ExecutionFailed $"Invalid Jarvis response: both result and error were set. {formatError error}")
+            | None, None ->
+                errorResult (ExecutionFailed "Invalid Jarvis response: neither result nor error was set.")
+        result
+
+    /// Every forwarded project tool result carries its canonical mutation
+    /// evidence. An empty array is explicit, not an omitted field. This stays
+    /// visible even when the requested command fails after a committed write.
+    /// The separate activation receipt is richer only when the ledger has
+    /// actually confirmed the requesting agent's Ready -> Working transition.
+    let attachStateEffects (response: AgentCommandResponse) (result: CallToolResult) =
+        let changes =
+            if isNull (box response.AgentStateChanges) then [] else response.AgentStateChanges
+        let details = JsonObject()
+        details["agentStateChanges"] <- JsonSerializer.SerializeToNode changes
+        let metadata = if isNull result.Meta then JsonObject() else result.Meta
+        metadata["jarvis/agent_state_changes"] <- JsonSerializer.SerializeToNode changes
+        match response.InboxActivation with
+        | None -> ()
+        | Some activation ->
+            details["agentInboxActivation"] <- JsonSerializer.SerializeToNode activation
+            metadata["jarvis/inbox_activation"] <- JsonSerializer.SerializeToNode activation
+        result.Meta <- metadata
+        if isNull result.Content then result.Content <- ResizeArray<ContentBlock>()
+        result.Content.Add(textContent (details.ToJsonString()))
+        result
+
+    /// Preliminary and final dispatches may independently mutate canonical
+    /// state (notably a cross-project notification sender validation). Never
+    /// lose the preliminary mutation from the caller-visible result.
+    let mergeStateEffects (prior: AgentCommandResponse) (final: AgentCommandResponse) =
+        { final with
+            AgentStateChanges =
+                (prior.AgentStateChanges @ final.AgentStateChanges) |> List.distinct
+            InboxActivation =
+                match final.InboxActivation with
+                | Some _ -> final.InboxActivation
+                | None ->
+                    prior.InboxActivation
+                    |> Option.filter (fun receipt -> receipt.ActivatedByThisCall) }
 
     let private imageResult (response: AgentCommandResponse) =
         match response.Result, response.Error with
@@ -417,6 +460,7 @@ module McpToolHelpers =
         | GetWorktreeCommand _
         | InspectWorktreeRemovalCommand _
         | TaskReadCommand _
+        | ObserveAgentCommand _
         | LedgerReadCommand _
         | ReviewReadCommand _
         | GetProjectDetailsCommand _
@@ -664,11 +708,12 @@ module McpToolHelpers =
                                 do! publishChanges sender
                                 match sender.Result, sender.Error with
                                 | Some _, None ->
-                                    return! client.SendCommandToProject(
+                                    let! destination = client.SendCommandToProject(
                                         userId, notification.ProjectName, command,
                                         ?conversationId = RequestDeviceRouting.session(),
                                         ?deviceId = RequestDeviceRouting.deviceOverride(),
                                                      ?agentId = RequestDeviceRouting.agentId())
+                                    return mergeStateEffects sender destination
                                 | _ -> return sender
                             }
                         | _ ->
@@ -686,6 +731,7 @@ module McpToolHelpers =
                          | ReadImageCommand _ -> imageResult response
                          | ExportFileCommand _ -> exportResult context response
                          | _ -> toCallToolResult response)
+                        |> attachStateEffects response
                         |> attachInstructions response.Instructions
                         |> attachOperationId tracking
                         |> attachGeneratedOperationId generatedId
@@ -1327,9 +1373,15 @@ type JarvisMcpTools =
         let cmd = TaskCommands.write projectName "CloseTask" operationId taskId TaskCommands.legacyAdministrativePlaceholder
         McpToolHelpers.send client http (TaskWriteCommand { cmd with ExpectedTaskVersion = expectedTaskVersion })
 
-    [<McpServerTool(Title = "agent inbox", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read an agent's assignment, slot and associated reviews as independent ledger records.")>]
+    [<McpServerTool(Title = "agent inbox", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("SELF-INBOX ONLY: reading your own inbox may automatically activate a Ready assignment into Working and update last-seen. To inspect another agent with no activity/state changes, use ObserveAgent(projectName, agentId, targetAgentId). The response reports the canonical state after any activation.")>]
     static member AgentInbox(projectName: string, agentId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (TaskReadCommand { ProjectName = projectName; AgentId = agentId; Action = "AgentInbox"; TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L; Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null })
+
+    [<McpServerTool(Title = "observe agent without activation", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read-only observation of a registered target agent in the same project. agentId is the initiating tool-call actor label, cross-checked against the client transport; the authenticated OAuth user supplies authority. targetAgentId is the subject, never the actor. Returns verified canonical state plus explicitly labeled client-local last-seen evidence, without activating Ready assignments, updating last-seen or reading private notification bodies. Use agent_inbox for your own turn.")>]
+    static member ObserveAgent(projectName: string, agentId: string, targetAgentId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http
+            (ObserveAgentCommand
+                { ProjectName = projectName; ObserverAgentId = agentId; TargetAgentId = targetAgentId })
 
     [<McpServerTool(Title = "create task", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Atomically create a task and canonical HTML spec on the bound Git ledger. Omit taskId to generate a unique, stable ID derived from operationId; provide taskId explicitly for named tasks and imports. Reusing operationId on retry preserves the generated ID.")>]
     static member CreateTask(projectName: string, agentId: string, title: string, html: string, [<Optional; DefaultParameterValue("")>] taskId: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =

@@ -2347,11 +2347,10 @@ module ReviewWorkflow =
     let findWorkingAgentBySession binding sessionId =
         findAgentBySessionWhere (fun agent -> agent.State = "Working") binding sessionId
 
-    let getAgentInbox binding agentId =
+    let getAgentInboxAt binding snapshot agentId =
         if not (validAgent agentId) then Error(InvalidBinding "Invalid inbox agent ID.")
         else
             result {
-                let! snapshot = LedgerStore.fetch binding
                 let! records = LedgerStore.readAgentInboxRecordsAt binding snapshot
                 let! agent = requiredFromRecords<ReviewAgent> records (agentPath agentId)
                 let paths = records |> Map.toList |> List.map fst
@@ -2491,6 +2490,22 @@ module ReviewWorkflow =
                           SlotAvailable = isNull (box agent.CurrentAssignment)
                           Unassigned = isNull (box agent.CurrentAssignment) }
             }
+
+    let getAgentInbox binding agentId =
+        // Retain pre-fetch validation of malformed agent IDs.
+        if not (validAgent agentId) then Error(InvalidBinding "Invalid inbox agent ID.")
+        else
+            LedgerStore.fetch binding
+            |> Result.bind (fun snapshot -> getAgentInboxAt binding snapshot agentId)
+
+    /// Verify both observer registration and target canonical state against
+    /// ONE immutable ledger snapshot. No agent activity or state mutation.
+    /// The dashboard must not pay two remote fetches per observed agent.
+    let getObservedAgentInboxAt binding snapshot observerAgentId targetAgentId =
+        result {
+            let! _ = getAgentWorkingTurnAt binding snapshot observerAgentId
+            return! getAgentInboxAt binding snapshot targetAgentId
+        }
 
     let getBranchAgentInbox binding agentId = getAgentInbox binding agentId
 

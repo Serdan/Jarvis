@@ -2366,6 +2366,162 @@ type ReviewWorkflowTests() =
                 if File.Exists configPath then File.Delete configPath)
 
     [<Test>]
+    member _.CrossAgentObservationIsReadOnlyAcrossEightReadyAgentsAndSessions() =
+        withFixture (fun one _ first second _ _ _ _ ->
+            let targets = [ for i in 1..8 -> sprintf "Observe-%d" i ]
+            for target in targets do
+                ReviewWorkflow.registerAgent first (Guid.NewGuid()) target |> success |> ignore
+                let taskId = "readonly-" + target.ToLowerInvariant()
+                ReviewWorkflow.createTask first (Guid.NewGuid()) taskId target |> success |> ignore
+                ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) target
+                |> success |> ignore
+            let configPath = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
+            try
+                let head = (LedgerStore.fetch first |> success).Commit
+                let ctx = GitCommandTests.TestContext(Path.GetDirectoryName one)
+                Client.OrchestrationApi.LedgerBindingConfig.bindExisting
+                    "owner" ctx first.ProjectId first.LedgerId first.Epoch
+                    first.RemoteName first.ApprovedFetchUrl first.ApprovedPushUrl head true
+                |> success |> ignore
+                let runtime1 =
+                    Client.Runtime(Path.GetDirectoryName one, Client.ConsoleTui.ConsoleTui(), Client.PartialTrust)
+                let runtime2 =
+                    Client.Runtime(Path.GetDirectoryName one, Client.ConsoleTui.ConsoleTui(), Client.PartialTrust)
+                let invoke runtime projectName observer target actor =
+                    let cmd: Common.AgentCommand =
+                        Common.ObserveAgentCommand
+                            { ProjectName = projectName; ObserverAgentId = observer; TargetAgentId = target }
+                    let serialized = System.Text.Json.JsonSerializer.Serialize(cmd)
+                    Client.SignalR.Client.processIncomingCommand runtime serialized actor
+                    |> Async.AwaitTask |> Async.RunSynchronously
+                let start = targets |> List.map (fun target ->
+                    let agent = (ReviewWorkflow.getAgentInbox second target |> success).Agent
+                    Assert.That(agent.State, Is.EqualTo("Ready"))
+                    target, agent)
+                for target, before in start do
+                    for runtime, observer in [ runtime1, "Owner"; runtime2, "Reviewer" ] do
+                        let observed, io =
+                            LedgerStore.measureGitReads(fun () ->
+                                invoke runtime "owner" observer target observer)
+                        let _, result, response = observed
+                        Assert.That(io.RemoteFetches, Is.EqualTo(1),
+                                    "Observer and subject must share one verified ledger fetch.")
+                        Assert.That(response.AgentStateChanges, Is.Empty)
+                        Assert.That(response.Instructions, Is.Empty)
+                        match result with
+                        | Error error -> Assert.Fail(sprintf "Observe %s failed: %A" target error)
+                        | Ok payload ->
+                            use doc = System.Text.Json.JsonDocument.Parse(payload)
+                            let root = doc.RootElement
+                            Assert.That(root.GetProperty("targetAgentId").GetString(), Is.EqualTo(target))
+                            Assert.That(root.GetProperty("observerAgentId").GetString(), Is.EqualTo(observer))
+                            Assert.That(root.GetProperty("state").GetString(), Is.EqualTo("Ready"))
+                            Assert.That(root.GetProperty("agentVersion").GetInt32(), Is.EqualTo(before.Version))
+                            Assert.That(root.GetProperty("stateSequence").GetInt64(), Is.EqualTo(before.StateSequence))
+                            Assert.That(root.GetProperty("snapshotCommit").GetString(), Is.EqualTo(head))
+                            Assert.That(root.GetProperty("canonicalStateSource").GetString(),
+                                        Is.EqualTo("VerifiedGitLedger"))
+                            Assert.That(root.GetProperty("lastSeenProvenance").GetString(), Is.EqualTo("Unknown"))
+                            Assert.That(root.GetProperty("lastSeenIsCanonical").GetBoolean(), Is.False)
+                    let after = (ReviewWorkflow.getAgentInbox second target |> success).Agent
+                    Assert.That(after, Is.EqualTo(before), "Observation changed canonical state.")
+                    Assert.That(runtime1.Tui.GetAgentLastSeen("owner", target).IsNone, Is.True)
+                    Assert.That(runtime2.Tui.GetAgentLastSeen("owner", target).IsNone, Is.True)
+                Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(head),
+                            "Observing eight agents must not publish a ledger mutation.")
+                Assert.That(runtime1.Tui.GetAgentLastSeen("owner", "Owner").IsNone, Is.True,
+                            "Observing does not synthesize the observer's activity either.")
+
+                let firstTarget = targets.Head
+                for projectName, observer, target, actor in
+                    [ "owner", "Owner", firstTarget, "Reviewer" // forged actor
+                      "owner", "UnknownActor", firstTarget, "UnknownActor"
+                      "owner", "Owner", "MissingAgent", "Owner"
+                      "reviewer", "Owner", firstTarget, "Owner" ] do
+                    let _, result, response = invoke runtime1 projectName observer target actor
+                    Assert.That(result.IsError, Is.True, sprintf "Unauthorized/missing observation %s" target)
+                    Assert.That(response.AgentStateChanges, Is.Empty)
+                let unchanged = (ReviewWorkflow.getAgentInbox second firstTarget |> success).Agent
+                Assert.That(unchanged, Is.EqualTo(snd start.Head))
+                Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(head))
+
+                // Genuine target activity is still allowed and must have a
+                // different provenance from observation. Observation afterward
+                // must neither restart the Working clock nor last-seen.
+                let selfInbox : Common.AgentCommand =
+                    Common.TaskReadCommand
+                        { ProjectName = "owner"; AgentId = firstTarget; Action = "AgentInbox"
+                          TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L
+                          Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null
+                          RelativePath = null }
+                let _, activated, activation =
+                    Client.SignalR.Client.processIncomingCommand runtime1
+                        (System.Text.Json.JsonSerializer.Serialize(selfInbox)) firstTarget
+                    |> Async.AwaitTask |> Async.RunSynchronously
+                Assert.That(activated.IsOk, Is.True)
+                Assert.That(activation.AgentStateChanges |> List.map _.AgentId,
+                            Is.EqualTo([ firstTarget ] :> obj))
+                Assert.That(activation.InboxActivation.IsSome, Is.True)
+                let committed = activation.InboxActivation.Value
+                Assert.That(committed.ActivatedByThisCall, Is.True)
+                Assert.That(committed.BeforeState, Is.EqualTo(Some "Ready"))
+                Assert.That(committed.AfterState, Is.EqualTo(Some "Working"))
+                Assert.That(committed.OperationId.IsSome, Is.True)
+                Assert.That(committed.CommittedHead.IsSome, Is.True)
+                let _, repeatedInbox, repeatedEnvelope =
+                    Client.SignalR.Client.processIncomingCommand runtime1
+                        (System.Text.Json.JsonSerializer.Serialize(selfInbox)) firstTarget
+                    |> Async.AwaitTask |> Async.RunSynchronously
+                Assert.That(repeatedInbox.IsOk, Is.True)
+                Assert.That(repeatedEnvelope.InboxActivation.Value.ActivatedByThisCall, Is.False)
+                Assert.That(repeatedEnvelope.InboxActivation.Value.CommittedHead.IsNone, Is.True)
+                let working = (ReviewWorkflow.getAgentInbox second firstTarget |> success).Agent
+                Assert.That(working.State, Is.EqualTo("Working"))
+                let seen = runtime1.Tui.GetAgentLastSeen("owner", firstTarget)
+                Assert.That(seen.IsSome, Is.True)
+                for i in 1..2 do
+                    let _, observed, response = invoke runtime1 "owner" "Owner" firstTarget "Owner"
+                    Assert.That(observed.IsOk, Is.True)
+                    Assert.That(response.AgentStateChanges, Is.Empty)
+                    match observed with
+                    | Error error -> Assert.Fail(sprintf "Post-activation observation failed: %A" error)
+                    | Ok payload ->
+                        use doc = System.Text.Json.JsonDocument.Parse(payload)
+                        Assert.That(doc.RootElement.GetProperty("state").GetString(), Is.EqualTo("Working"))
+                        Assert.That(doc.RootElement.GetProperty("lastSeenProvenance").GetString(),
+                                    Is.EqualTo("LocalClientActivityCache"))
+                    Assert.That(runtime1.Tui.GetAgentLastSeen("owner", firstTarget), Is.EqualTo(seen))
+                let finalAgent = (ReviewWorkflow.getAgentInbox second firstTarget |> success).Agent
+                Assert.That(finalAgent.Version, Is.EqualTo(working.Version))
+                Assert.That(finalAgent.WorkingTurnStartedAtUtc,
+                            Is.EqualTo(working.WorkingTurnStartedAtUtc))
+                // A self-inbox read with a missing target ID still counts as
+                // genuine actor activity in the legacy transport. Its later
+                // read fails, but the committed Ready -> Working transition
+                // must be exposed instead of making the call look read-only.
+                let failedTarget = targets.Tail.Head
+                let invalidInbox : Common.AgentCommand =
+                    Common.TaskReadCommand
+                        { ProjectName = "owner"; AgentId = ""; Action = "AgentInbox"
+                          TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L
+                          Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null
+                          RelativePath = null }
+                let _, failed, failedEnvelope =
+                    Client.SignalR.Client.processIncomingCommand runtime1
+                        (System.Text.Json.JsonSerializer.Serialize(invalidInbox)) failedTarget
+                    |> Async.AwaitTask |> Async.RunSynchronously
+                Assert.That(failed.IsError, Is.True)
+                Assert.That(failedEnvelope.Error.IsSome, Is.True)
+                Assert.That(failedEnvelope.InboxActivation.Value.ActivatedByThisCall, Is.True)
+                Assert.That(failedEnvelope.InboxActivation.Value.BeforeState, Is.EqualTo(Some "Ready"))
+                Assert.That(failedEnvelope.InboxActivation.Value.AfterState, Is.EqualTo(Some "Working"))
+                Assert.That(failedEnvelope.AgentStateChanges |> List.map _.AgentId, Is.EqualTo([ failedTarget ] :> obj))
+                let afterFailure = (ReviewWorkflow.getAgentInbox second failedTarget |> success).Agent
+                Assert.That(afterFailure.State, Is.EqualTo("Working"))
+            finally
+                if File.Exists configPath then File.Delete configPath)
+
+    [<Test>]
     member _.ImplicitReadyActivationHasOneWinnerAcrossConcurrentCalls() =
         withFixture (fun _ _ first second _ _ _ _ ->
             let taskId = "implicit-concurrent"

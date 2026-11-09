@@ -112,6 +112,7 @@ let private requiresConfirmation command =
     | GetWorktreeCommand _
     | InspectWorktreeRemovalCommand _
     | TaskReadCommand _
+    | ObserveAgentCommand _
     | LedgerReadCommand _
     | ReviewReadCommand _
     | GetProjectDetailsCommand _

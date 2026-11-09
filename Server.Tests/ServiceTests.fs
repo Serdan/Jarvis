@@ -44,7 +44,8 @@ let invalidation_routes_only_exact_changed_agents_even_on_command_failure () =
           AgentStateChanges =
               [ { ProjectName = "Wayfold"; AgentId = "Owner" }
                 { ProjectName = "Wayfold"; AgentId = "Owner" }
-                { ProjectName = "Jarvis"; AgentId = "Reviewer" } ] }
+                { ProjectName = "Jarvis"; AgentId = "Reviewer" } ]
+          InboxActivation = None }
     let groups = AgentStateInvalidationRouting.affectedByProject failedRead.AgentStateChanges
     Assert.That(groups.Length, Is.EqualTo(2))
     Assert.That(groups |> List.find (fun (project, _) -> project = "Wayfold") |> snd,
@@ -357,7 +358,7 @@ let ``response tracker completes registered response`` () =
         let expected =
             { Result = Some "ok"
               Error = None
-              Instructions = []; AgentStateChanges = [] }
+              Instructions = []; AgentStateChanges = []; InboxActivation = None }
 
         tracker.Complete(correlationId, "alice", "conn-1", 1L, expected) |> shouldEqual true
         let! actual = pending
@@ -370,7 +371,7 @@ let ``response tracker rejects other users connections and generations`` () =
     task {
         let tracker = ClientResponseTracker()
         let correlationId, pending = tracker.Register("alice", "connection-a", 3L, TimeSpan.FromSeconds 5L)
-        let response = { Result = Some "accepted"; Error = None; Instructions = []; AgentStateChanges = [] }
+        let response = { Result = Some "accepted"; Error = None; Instructions = []; AgentStateChanges = []; InboxActivation = None }
 
         tracker.Complete(correlationId, "bob", "connection-a", 3L, response) |> shouldEqual false
         tracker.Complete(correlationId, "alice", "connection-b", 3L, response) |> shouldEqual false
@@ -679,7 +680,7 @@ let ``MCP bridge returns successful JSON as text without a mismatched output sch
     let response =
         { Result = Some """{"value":42,"items":[1,2]}"""
           Error = None
-          Instructions = []; AgentStateChanges = [] }
+          Instructions = []; AgentStateChanges = []; InboxActivation = None }
 
     let result = McpToolHelpers.toCallToolResult response
 
@@ -688,6 +689,144 @@ let ``MCP bridge returns successful JSON as text without a mismatched output sch
 
     let text = result.Content[0] :?> TextContentBlock
     text.Text |> shouldEqual """{"value":42,"items":[1,2]}"""
+
+[<Test>]
+let mcp_self_inbox_exposes_committed_activation_on_success_and_read_error () =
+    let receipt : AgentInboxActivation =
+        { ProjectName = "Jarvis"; AgentId = "Owner"
+          ActivatedByThisCall = true
+          BeforeState = Some "Ready"; AfterState = Some "Working"
+          CommittedHead = Some(String('a', 40))
+          OperationId = Some(Guid.NewGuid().ToString("D")) }
+    for readFailed in [ false; true ] do
+        let response : AgentCommandResponse =
+            { Result = if readFailed then None else Some """{"Agent":{"State":"Working"}}"""
+              Error = if readFailed then Some(NotFound "Inbox read failed after activation") else None
+              Instructions = []
+              AgentStateChanges = [ { ProjectName = "Jarvis"; AgentId = "Owner" } ]
+              InboxActivation = Some receipt }
+        let roundtrip =
+            JsonSerializer.Deserialize<AgentCommandResponse>(JsonSerializer.Serialize(response))
+        Assert.That(roundtrip.InboxActivation.IsSome, Is.True)
+        Assert.That(roundtrip.InboxActivation.Value.CommittedHead,
+                    Is.EqualTo(receipt.CommittedHead))
+        let tool =
+            response |> McpToolHelpers.toCallToolResult
+            |> McpToolHelpers.attachStateEffects response
+        Assert.That(tool.IsError, Is.EqualTo(Nullable readFailed))
+        Assert.That(tool.Content.Count, Is.EqualTo(2))
+        let exposed = (tool.Content[1] :?> TextContentBlock).Text
+        use document = JsonDocument.Parse(exposed)
+        let changes = document.RootElement.GetProperty("agentStateChanges").EnumerateArray() |> Seq.toList
+        Assert.That(changes.Length, Is.EqualTo(1))
+        Assert.That(changes.Head.GetProperty("AgentId").GetString(), Is.EqualTo("Owner"))
+        Assert.That(tool.Meta["jarvis/agent_state_changes"].ToJsonString(),
+                    Does.Contain("Owner"))
+        let activation = document.RootElement.GetProperty("agentInboxActivation")
+        Assert.That(activation.GetProperty("ActivatedByThisCall").GetBoolean(), Is.True)
+        Assert.That(activation.GetProperty("BeforeState").GetString(), Is.EqualTo("Ready"))
+        Assert.That(activation.GetProperty("AfterState").GetString(), Is.EqualTo("Working"))
+        Assert.That(activation.GetProperty("CommittedHead").GetString(),
+                    Is.EqualTo(String('a', 40)))
+        Assert.That(tool.Meta["jarvis/inbox_activation"].ToJsonString(),
+                    Does.Contain("ActivatedByThisCall"))
+        if readFailed then
+            Assert.That((tool.Content[0] :?> TextContentBlock).Text,
+                        Does.Contain("Inbox read failed after activation"))
+    let noChange : AgentInboxActivation =
+        { ProjectName = receipt.ProjectName
+          AgentId = receipt.AgentId
+          ActivatedByThisCall = false
+          BeforeState = None; AfterState = None
+          CommittedHead = None; OperationId = None }
+    let repeated =
+        { Result = Some """{"Agent":{"State":"Working"}}"""
+          Error = None; Instructions = []; AgentStateChanges = []
+          InboxActivation = Some noChange }
+    let repeated =
+        repeated |> McpToolHelpers.toCallToolResult
+        |> McpToolHelpers.attachStateEffects repeated
+    use repeatDoc = JsonDocument.Parse((repeated.Content[1] :?> TextContentBlock).Text)
+    let repeatActivation = repeatDoc.RootElement.GetProperty("agentInboxActivation")
+    Assert.That(repeatActivation.GetProperty("ActivatedByThisCall").GetBoolean(), Is.False)
+    Assert.That(repeatActivation.GetProperty("CommittedHead").ValueKind,
+                Is.EqualTo(JsonValueKind.Null))
+    Assert.That(repeatDoc.RootElement.GetProperty("agentStateChanges").GetArrayLength(), Is.EqualTo(0))
+    // Older 3.62 clients omit InboxActivation. A newer server continues to
+    // accept those wire envelopes, without claiming an activation occurred.
+    let legacy = JsonSerializer.Deserialize<AgentCommandResponse>(
+        """{"Result":"{}","Error":null,"Instructions":[],"AgentStateChanges":[]}""")
+    Assert.That(legacy.InboxActivation.IsNone, Is.True)
+
+[<Test>]
+let mcp_project_tool_responses_always_expose_canonical_state_change_evidence () =
+    for failed in [ false; true ] do
+        let response : AgentCommandResponse =
+            { Result = if failed then None else Some """{"result":"ok"}"""
+              Error = if failed then Some(NotFound "Source file absent") else None
+              Instructions = []
+              AgentStateChanges = []
+              InboxActivation = None }
+        let tool =
+            response |> McpToolHelpers.toCallToolResult
+            |> McpToolHelpers.attachStateEffects response
+        Assert.That(tool.IsError, Is.EqualTo(Nullable failed))
+        Assert.That(tool.Content.Count, Is.EqualTo(2))
+        use doc = JsonDocument.Parse((tool.Content[1] :?> TextContentBlock).Text)
+        Assert.That(doc.RootElement.GetProperty("agentStateChanges").GetArrayLength(),
+                    Is.EqualTo(0))
+        let mutable ignored = Unchecked.defaultof<JsonElement>
+        Assert.That(doc.RootElement.TryGetProperty("agentInboxActivation", &ignored), Is.False)
+        Assert.That(tool.Meta["jarvis/agent_state_changes"].ToJsonString(), Is.EqualTo("[]"))
+
+    // A command can affect a different agent, and an earlier committed write
+    // must remain visible even if its subsequent operation fails.
+    let affected : AgentCommandResponse =
+        { Result = None
+          Error = Some(NotFound "Read failed after prior mutation")
+          Instructions = []
+          AgentStateChanges = [ { ProjectName = "Wayfold"; AgentId = "Worker 1" } ]
+          InboxActivation = None }
+    let result =
+        affected |> McpToolHelpers.toCallToolResult
+        |> McpToolHelpers.attachStateEffects affected
+    Assert.That(result.IsError, Is.EqualTo(Nullable true))
+    use effects = JsonDocument.Parse((result.Content[1] :?> TextContentBlock).Text)
+    let changes = effects.RootElement.GetProperty("agentStateChanges")
+    Assert.That(changes.GetArrayLength(), Is.EqualTo(1))
+    Assert.That(changes[0].GetProperty("ProjectName").GetString(), Is.EqualTo("Wayfold"))
+    Assert.That(changes[0].GetProperty("AgentId").GetString(), Is.EqualTo("Worker 1"))
+    let mutable absent = Unchecked.defaultof<JsonElement>
+    Assert.That(effects.RootElement.TryGetProperty("agentInboxActivation", &absent), Is.False)
+
+[<Test>]
+let cross_project_notify_merges_preflight_and_destination_state_changes () =
+    let sourceActivation : AgentInboxActivation =
+        { ProjectName = "Wayfold"; AgentId = "Worker 1"
+          ActivatedByThisCall = true
+          BeforeState = Some "Ready"; AfterState = Some "Working"
+          CommittedHead = Some(String('a', 40)); OperationId = Some(Guid.NewGuid().ToString("D")) }
+    let preflight : AgentCommandResponse =
+        { Result = Some "{}"; Error = None; Instructions = []
+          AgentStateChanges = [ { ProjectName = "Wayfold"; AgentId = "Worker 1" } ]
+          InboxActivation = Some sourceActivation }
+    let destination : AgentCommandResponse =
+        { Result = None; Error = Some(NotFound "Destination write failed")
+          Instructions = []
+          AgentStateChanges =
+            [ { ProjectName = "Jarvis"; AgentId = "Reviewer 1" }
+              { ProjectName = "Wayfold"; AgentId = "Worker 1" } ]
+          InboxActivation = None }
+    let merged = McpToolHelpers.mergeStateEffects preflight destination
+    Assert.That(merged.AgentStateChanges.Length, Is.EqualTo(2))
+    Assert.That(merged.InboxActivation.Value.ActivatedByThisCall, Is.True)
+    Assert.That(merged.Error.IsSome, Is.True)
+    let tool =
+        merged |> McpToolHelpers.toCallToolResult
+        |> McpToolHelpers.attachStateEffects merged
+    use json = JsonDocument.Parse((tool.Content[1] :?> TextContentBlock).Text)
+    Assert.That(json.RootElement.GetProperty("agentStateChanges").GetArrayLength(), Is.EqualTo(2))
+    Assert.That(json.RootElement.GetProperty("agentInboxActivation").GetProperty("ActivatedByThisCall").GetBoolean(), Is.True)
 
 [<Test>]
 let ``MCP bridge preserves typed confirmation error details`` () =
@@ -705,7 +844,7 @@ let ``MCP bridge preserves typed confirmation error details`` () =
     let response =
         { Result = None
           Error = Some(ConfirmationRequired confirmation)
-          Instructions = []; AgentStateChanges = [] }
+          Instructions = []; AgentStateChanges = []; InboxActivation = None }
 
     let result = McpToolHelpers.toCallToolResult response
 
@@ -729,7 +868,7 @@ let ``MCP bridge preserves stable AgentError kinds`` () =
         let result =
             { Result = None
               Error = Some error
-              Instructions = []; AgentStateChanges = [] }
+              Instructions = []; AgentStateChanges = []; InboxActivation = None }
             |> McpToolHelpers.toCallToolResult
 
         result.IsError |> shouldEqual (Nullable true)
@@ -833,7 +972,10 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
             [ for name in [ "LedgerHealth"; "GetOperationStatus"; "PendingOperations"; "ReconcilePendingOperations";
                             "PendingOperationSummary"; "PendingOperationsPage"; "InspectPendingOperation" ] -> name, ledgerRead
               for name in [ "InitializeLedger"; "BindExistingLedger"; "RebindLedgerRemote"; "AcknowledgePendingOperation" ] -> name, ledgerWrite
-              for name in [ "GetIntegrationSubmissions"; "AgentInbox"; "GetAssignment"; "GetCheckpoint"; "InspectAttemptSource"; "TaskLifecycleHistory"; "GetTaskSpecPage"; "DiffTaskSpec" ] -> name, taskRead
+              for name in [ "GetIntegrationSubmissions"; "AgentInbox"; "GetAssignment"; "GetCheckpoint"; "InspectAttemptSource"; "TaskLifecycleHistory"; "GetTaskSpecPage"; "DiffTaskSpec" ] ->
+                  name, (if name = "AgentInbox" then
+                             { taskRead with MutatesState = true }
+                         else taskRead)
               for name in [ "SubmitIntegration"; "CompleteIntegration"; "NotifyAgent"; "AcknowledgeNotification"; "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "ReissueAssignment"; "CheckpointAttempt"
                             "SetAttemptSource"; "YieldAgent"; "CompleteAgentWork";
                             "SetAgentState"; "ReissueQueuedAttempt"; "RecoverAgentAssignment"; "AcknowledgeReviewFeedback"; "DeferAttempt"; "ResumeAttempt"; "AbandonAttempt"; "CancelTask"; "TransferOwner"; "CloseTask"; "ReopenTask"; "ImportTaskSpec"; "ExportTaskSpec" ] -> name, taskWrite
@@ -885,6 +1027,27 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
         let scopes = scheme.GetProperty("scopes")
         scopes[0].GetString() |> shouldEqual scope
 
+
+[<Test>]
+let observe_agent_is_explicitly_read_only_while_self_inbox_is_activity () =
+    let byName name =
+        McpToolHelpers.mcpListCommandsResult.Commands
+        |> List.find (fun item -> item.Name = name)
+    let observation = byName "ObserveAgent"
+    let inbox = byName "AgentInbox"
+    Assert.That(observation.MutatesState, Is.False)
+    Assert.That(inbox.MutatesState, Is.True)
+    Assert.That(observation.Permissions, Does.Contain(ReadOnly))
+    let tool name =
+        let methodInfo = typeof<JarvisMcpTools>.GetMethod(name)
+        let attributes =
+            methodInfo.GetCustomAttributes(typeof<McpServerToolAttribute>, false)
+        attributes[0] :?> McpServerToolAttribute
+    Assert.That((tool "ObserveAgent").ReadOnly, Is.True)
+    Assert.That((tool "AgentInbox").ReadOnly, Is.False)
+    let parameters = typeof<JarvisMcpTools>.GetMethod("ObserveAgent").GetParameters()
+    Assert.That(parameters |> Array.map _.Name |> Array.take 3,
+                Is.EqualTo([| "projectName"; "agentId"; "targetAgentId" |] :> obj))
 
 [<Test>]
 let mcp_profile_tool_uses_authenticated_subject () =
@@ -1000,7 +1163,7 @@ let mcp_guidance_blocks_precede_result_without_changing_success () =
     let response =
         { Result = Some """{"result":"ok"}"""
           Error = None
-          Instructions = instructions; AgentStateChanges = [] }
+          Instructions = instructions; AgentStateChanges = []; InboxActivation = None }
     let result = response |> McpToolHelpers.toCallToolResult |> McpToolHelpers.attachInstructions instructions
     Assert.That(result.IsError, Is.EqualTo(Nullable false))
     Assert.That(result.Content.Count, Is.EqualTo(2))
@@ -1020,7 +1183,7 @@ let mcp_agency_write_warning_precedes_success_without_marking_error () =
     let notes =
         [ { Scope = "write-warning"; Path = "Demo/AGENTS.md"; Sha256 = ""
             Content = "WARNING: Demo/AGENTS.md is unusually large. The write succeeded." } ]
-    let response = { Result = Some """{"ok":true}"""; Error = None; Instructions = notes; AgentStateChanges = [] }
+    let response = { Result = Some """{"ok":true}"""; Error = None; Instructions = notes; AgentStateChanges = []; InboxActivation = None }
     let shown = response |> McpToolHelpers.toCallToolResult |> McpToolHelpers.attachInstructions notes
     Assert.That(shown.IsError, Is.EqualTo(Nullable false))
     Assert.That(shown.Content.Count, Is.EqualTo(2))
@@ -1037,7 +1200,7 @@ let mcp_guidance_preserves_errors_and_non_text_blocks () =
     let failure =
         { Result = None
           Error = Some(ValidationFailed "Unrelated error")
-          Instructions = instructions; AgentStateChanges = [] }
+          Instructions = instructions; AgentStateChanges = []; InboxActivation = None }
     let error = failure |> McpToolHelpers.toCallToolResult |> McpToolHelpers.attachInstructions instructions
     Assert.That(error.IsError, Is.EqualTo(Nullable true))
     Assert.That((error.Content[1] :?> TextContentBlock).Text, Is.EqualTo("ValidationFailed: Unrelated error"))
@@ -1059,7 +1222,8 @@ let response_json_carries_typed_hierarchical_instructions () =
         { Result = Some """{"ok":true}"""
           Error = None
           Instructions = [ { Scope = "project"; Path = "Demo/AGENTS.md"; Sha256 = "sha256:" + String('f', 64); Content = "# Guidance" } ]
-          AgentStateChanges = [ { ProjectName = "Demo"; AgentId = "Owner" } ] }
+          AgentStateChanges = [ { ProjectName = "Demo"; AgentId = "Owner" } ]
+          InboxActivation = None }
     let json = JsonSerializer.Serialize(response)
     use document = JsonDocument.Parse(json)
     let root = document.RootElement
@@ -1085,7 +1249,7 @@ let ``MCP bridge preserves structured  ledger failure category`` () =
     let response =
         { Result = None
           Error = Some(Common.AgentError.LedgerFailure problem)
-          Instructions = []; AgentStateChanges = [] }
+          Instructions = []; AgentStateChanges = []; InboxActivation = None }
     let tool = McpToolHelpers.toCallToolResult response
     tool.IsError |> shouldEqual (Nullable true)
     let content = tool.Content[0] :?> TextContentBlock
@@ -1101,7 +1265,7 @@ let ``typed  ledger failures survive response JSON roundtrip`` () =
               Some(Common.AgentError.LedgerFailure
                   { Code = "OutcomeUnknown"; Message = "Unconfirmed push"
                     OperationId = Some operationId; VerifiedLedgerHead = None })
-          Instructions = []; AgentStateChanges = [] }
+          Instructions = []; AgentStateChanges = []; InboxActivation = None }
     let payload = JsonSerializer.Serialize(source)
     let destination = JsonSerializer.Deserialize<Common.AgentCommandResponse>(payload)
     match destination.Error with
@@ -1188,7 +1352,7 @@ let cross_project_probe_errors_are_classified_without_leaking_client_error_text 
           ExecutionFailed error, "ledger health execution failed or timed out" ]
     for issue, expected in failures do
         let reply : AgentCommandResponse =
-            { Result = None; Error = Some issue; Instructions = []; AgentStateChanges = [] }
+            { Result = None; Error = Some issue; Instructions = []; AgentStateChanges = []; InboxActivation = None }
         let classification = ProjectNotificationRouting.probeFailure reply
         Assert.That(classification, Is.EqualTo(expected))
         Assert.That(classification, Does.Not.Contain(error))
@@ -1299,7 +1463,7 @@ let client_request_abort_cancels_outstanding_device_correlation_without_faulting
                 with :? OperationCanceledException -> return true
             }
         Assert.That(canceled, Is.True)
-        let response = { Result = Some "unexpected"; Error = None; Instructions = []; AgentStateChanges = [] }
+        let response = { Result = Some "unexpected"; Error = None; Instructions = []; AgentStateChanges = []; InboxActivation = None }
         Assert.That(tracker.Complete(correlationId, user, connection, registered.Generation, response), Is.False)
         match users.GetSession(user) with
         | ValueSome session ->

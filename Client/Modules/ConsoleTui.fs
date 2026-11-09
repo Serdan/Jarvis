@@ -1526,6 +1526,15 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                     if saved then persistedAgentSeen[key] <- now
                 if mode = AgentsMode || mode = AgentFilterMode then renderUnsafe())
 
+    // A read-only observation of the local activity cache. This is not a
+    // canonical ledger timestamp: another connected client may have seen
+    // later tool activity that this process has not observed.
+    member _.GetAgentLastSeen(project: string, agentId: string) =
+        lock syncRoot (fun () ->
+            match agentSeen.TryGetValue(project + "::" + agentId) with
+            | true, timestamp -> Some timestamp
+            | _ -> None)
+
     member _.SetAgentAccess(access: AgentUiAccess) =
         lock syncRoot (fun () -> agentAccess <- Some access)
 

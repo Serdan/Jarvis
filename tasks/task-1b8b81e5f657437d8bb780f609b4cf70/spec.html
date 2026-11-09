@@ -1,0 +1,17 @@
+<h1>Per-project agent status lines in the Agents TUI</h1>
+<p><strong>Goal:</strong> The global Agents header currently shows only aggregate <code>Tracked | Review | Unread | Working | Ready | Waiting | Parked</code> counts. Add a compact, visible <strong>status line per project</strong> so the operator can immediately see which project has active, ready, blocked/waiting, parked, and attention-needing agents without manually filtering.</p>
+<h2>Behavior</h2>
+<ul>
+<li>Keep the existing overall summary. Below it, render one concise project-labelled status line using the existing status categories and semantics: <code>Tracked</code>, <code>Review</code>, <code>Unread</code>, <code>Working</code>, <code>Ready</code>, <code>Waiting</code>, <code>Parked</code>. E.g. <code>Wayfold  | Working 4 | Ready 2 | Waiting 1 | Parked 3 | Review 2 | Unread 5</code>. Design the exact compact presentation to remain readable without overwhelming the Agents table.</li>
+<li>Derive project counts from the same canonical dashboard snapshot and agent/review/notification data as the existing global summary, with consistent count definitions and clear totals. Status lines represent projects, not client devices. Stable ledger/project identity distinguishes unrelated same-named projects and deduplicates the same ledger visible from multiple clients.</li>
+<li>Respect the existing project/filter selection and ordering without confusing filtered visible rows with actual project totals. Make the distinction clear where filtering applies. Show stale/unavailable/refresh-error status rather than reporting misleading zero counts for inaccessible projects; unknown activity must not be fabricated.</li>
+<li>Reuse the current refresh cycle and rendering helpers; no additional network polling, no cross-agent <code>agent_inbox</code> calls, and no lifecycle changes from merely viewing status. Work with existing local dashboard data now and keep the model compatible with the planned global operator Agents dashboard (<code>task-6c6d71c8d3ef408eb30886ded9522af3</code>) and per-project U/T review-queue counters (<code>task-ba5639f21acb4d8caea24d8b3d801579</code>) rather than independently implementing those large features.</li>
+<li>Use sensible truncation, wrapping or paging for many projects and normal terminal sizes. Keep alignment/theme semantics consistent with the existing Agents screen.</li>
+</ul>
+<h2>Acceptance</h2>
+<ol>
+<li>Fixtures with multiple projects and agents across each state show correct per-project counts and aggregate totals, including unread/review indicators.</li>
+<li>Duplicated ledgers across clients count once; distinct ledgers with equal display names remain distinct; a project with zero agents is not confused with an unavailable project.</li>
+<li>Project filtering, long names, narrow terminals and stale data are readable; summary lines refresh with existing data and do not perturb agent Working/last-seen state.</li>
+<li>Release build and tests pass; submit a frozen source commit for independent review. No integration or deployment without review and operator approval.</li>
+</ol>

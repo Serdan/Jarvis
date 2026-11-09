@@ -2886,6 +2886,79 @@ type ReviewWorkflowTests() =
             Assert.That(File.Exists pendingPath, Is.False)
             Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(head)))
 
+
+    [<Test>]
+    member _.ArchivedIntentRetainsProvenanceWhenOriginalPushArrivesLateOrConflicts() =
+        withFixture (fun one _ first _ _ _ _ _ ->
+            let taskId = "archived-late-acceptance"
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId taskId |> success |> ignore
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner"
+            |> success |> ignore
+            let originalCommand =
+                System.Text.Json.JsonSerializer.Serialize(
+                    {| Action = "ResumeAgent"; TaskId = taskId; ActorId = "Owner"
+                       ExpectedVersion = 0; ExpectedAgentVersion = 0
+                       AssignmentGeneration = 1
+                       SessionId = "historical-session-secret" |})
+            let lateId = Guid.NewGuid()
+            let conflictingId = Guid.NewGuid()
+            for id in [ lateId; conflictingId ] do
+                Client.OrchestrationApi.PendingIntentJournal.persist first id "V2TaskWrite" originalCommand
+                |> success
+            let successorId = Guid.NewGuid()
+            let successor = ReviewWorkflow.beginAttempt first successorId taskId "Owner" 1 1 |> success
+            let head = (LedgerStore.fetch first |> success).Commit
+            let reason = "Verified successor BeginAttempt makes original session resume unnecessary."
+            for id in [ lateId; conflictingId ] do
+                let stored = Client.OrchestrationApi.PendingIntentJournal.findAtRoot one id
+                             |> success |> Option.get
+                Client.OrchestrationApi.PendingIntentJournal.supersede first id
+                    stored.CommandSha256 head "Jarvis Lead" reason
+                    successorId successor.Operation.RequestHash
+                |> success |> ignore
+                Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one id |> success).IsNone,
+                            Is.True)
+            let initial = Client.OrchestrationApi.PendingIntentJournal.summarize first |> success
+            Assert.That(initial.Total, Is.Zero)
+            Assert.That(initial.ArchivedTotal, Is.EqualTo(2))
+            Assert.That(initial.ArchivedLateApplied, Is.Zero)
+            Assert.That(initial.ArchivedIdentityMismatch, Is.Zero)
+            // A second client had an original ResumeAgent operation in flight,
+            // whose remote acceptance becomes visible AFTER supersession.
+            let late = ReviewWorkflow.resumeAgentWithSession first lateId taskId "Owner"
+                           0 0 1 "historical-session-secret" |> success
+            Assert.That(late.Operation.Type, Is.EqualTo("ResumeAgent"))
+            // The conflicting UUID is a different canonical mutation, and
+            // must never be silently treated as matching the archived command.
+            ReviewWorkflow.createTaskWithSpec first conflictingId "different-task-after-archive"
+                "Different task" "<h1>Not the archived ResumeAgent</h1>" |> success |> ignore
+            let verifiedHead = (LedgerStore.fetch first |> success).Commit
+            let lateInspect = Client.OrchestrationApi.PendingIntentJournal.inspect first lateId |> success
+            let conflictInspect = Client.OrchestrationApi.PendingIntentJournal.inspect first conflictingId |> success
+            Assert.That(lateInspect.Disposition, Is.EqualTo(Some "AppliedAfterSupersession"))
+            Assert.That(conflictInspect.Disposition, Is.EqualTo(Some "IdentityMismatchAfterSupersession"))
+            Assert.That(lateInspect.Archive.Value.Original.CommandJson, Is.EqualTo(originalCommand))
+            Assert.That(conflictInspect.Archive.Value.Original.CommandJson, Is.EqualTo(originalCommand))
+            Assert.That(lateInspect.PresentLocally, Is.False)
+            Assert.That(conflictInspect.PresentLocally, Is.False)
+            let summary = Client.OrchestrationApi.PendingIntentJournal.summarize first |> success
+            Assert.That(summary.VerifiedLedgerHead, Is.EqualTo(verifiedHead))
+            Assert.That(summary.Total, Is.Zero)
+            Assert.That(summary.ArchivedTotal, Is.EqualTo(2))
+            Assert.That(summary.ArchivedLateApplied, Is.EqualTo(1))
+            Assert.That(summary.ArchivedIdentityMismatch, Is.EqualTo(1))
+            // Acknowledge is exclusively for live pending records with matching
+            // Applied proof. It cannot hide an archived late arrival or conflict.
+            for id, hash in [ lateId, late.Operation.RequestHash
+                              conflictingId, (String.replicate 64 "a") ] do
+                match Client.OrchestrationApi.PendingIntentJournal.acknowledge first id hash with
+                | Error(Client.ValidationError message) ->
+                    Assert.That(message, Does.Contain("superseded"))
+                | other -> Assert.Fail(sprintf "Archived intent must not be acknowledged away: %A" other)
+            Assert.That((Client.OrchestrationApi.PendingIntentJournal.summarize first |> success).ArchivedTotal,
+                        Is.EqualTo(2))
+            Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(verifiedHead)))
+
     [<Test>]
     member _.PendingSupersessionNeverArchivesAnOriginalWithVerifiedAppliedReceipt() =
         withFixture (fun one _ first _ _ _ _ _ ->

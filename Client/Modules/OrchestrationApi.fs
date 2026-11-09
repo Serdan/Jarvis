@@ -428,6 +428,49 @@ module PendingIntentJournal =
         SHA256.HashData(Encoding.UTF8.GetBytes(content))
         |> Convert.ToHexString
 
+    // A flushed file plus an atomic rename is not by itself a durable
+    // archive tombstone after sudden power loss: the directory entry must
+    // also reach stable storage BEFORE deleting the original pending intent.
+    [<System.Runtime.InteropServices.DllImport("libc", EntryPoint = "open", SetLastError = true)>]
+    extern int private openDirectoryForSync(string path, int flags)
+
+    [<System.Runtime.InteropServices.DllImport("libc", EntryPoint = "fsync", SetLastError = true)>]
+    extern int private syncDirectoryFd(int fd)
+
+    [<System.Runtime.InteropServices.DllImport("libc", EntryPoint = "close", SetLastError = true)>]
+    extern int private closeDirectoryFd(int fd)
+
+    [<System.Runtime.InteropServices.DllImport("kernel32.dll", EntryPoint = "MoveFileExW",
+                                                 CharSet = System.Runtime.InteropServices.CharSet.Unicode,
+                                                 SetLastError = true)>]
+    extern bool private moveArchiveWriteThrough(string source, string destination, uint32 flags)
+
+    let private syncArchiveDirectory folder =
+        if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
+            // O_RDONLY = 0 on POSIX. Opening an existing directory with this
+            // flag is supported on Linux and macOS; no write handle needed.
+            let fd = openDirectoryForSync(folder, 0)
+            if fd < 0 then
+                let err = System.Runtime.InteropServices.Marshal.GetLastPInvokeError()
+                raise (IOException($"Cannot open archived-intent directory for durable sync (errno {err})."))
+            try
+                if syncDirectoryFd(fd) <> 0 then
+                    let err = System.Runtime.InteropServices.Marshal.GetLastPInvokeError()
+                    raise (IOException($"Cannot fsync archived-intent directory (errno {err})."))
+            finally
+                closeDirectoryFd(fd) |> ignore
+
+    let private durableArchiveMove temporary destination folder =
+        if OperatingSystem.IsWindows() then
+            // MOVEFILE_WRITE_THROUGH = 0x00000008. No
+            // MOVEFILE_REPLACE_EXISTING: an audit UUID is never overwritten.
+            if not (moveArchiveWriteThrough(temporary, destination, 0x00000008u)) then
+                let err = System.Runtime.InteropServices.Marshal.GetLastPInvokeError()
+                raise (IOException($"Cannot durably publish archive tombstone (Win32 error {err})."))
+        else
+            File.Move(temporary, destination, false)
+            syncArchiveDirectory folder
+
     let private journalDirectory root =
         let bindingPath = LedgerBindingConfig.pathForRoot root
         Path.Combine(Path.GetDirectoryName bindingPath, "pending",
@@ -569,14 +612,15 @@ module PendingIntentJournal =
                         do
                             use stream = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write,
                                                         FileShare.None, 4096, FileOptions.WriteThrough)
+                            if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
+                                File.SetUnixFileMode(temporary, UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
                             let bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(audit))
                             stream.Write(bytes, 0, bytes.Length)
                             stream.Flush(true)
-                        if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
-                            File.SetUnixFileMode(temporary, UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
                         // Close before rename: Windows FileShare.None prevents
-                        // moving an open stream. Destination is never replaced.
-                        File.Move(temporary, destination, false)
+                        // moving an open stream. Never overwrite a prior audit.
+                        // Only return success after directory metadata is durable.
+                        durableArchiveMove temporary destination folder
                         Ok ()
                     finally
                         if File.Exists temporary then File.Delete temporary
@@ -1035,6 +1079,9 @@ module PendingIntentJournal =
                                     | active ->
                                         try
                                             if active.IsSome then
+                                                // An earlier rename may have succeeded but
+                                                // failed its directory fsync before cleanup.
+                                                syncArchiveDirectory (archiveDirectory binding.RepositoryPath)
                                                 File.Delete(filePath binding operationId)
                                             Ok {| operationId = operationId.ToString("D")
                                                   alreadySuperseded = true
@@ -1394,7 +1441,13 @@ module PendingIntentJournal =
 
     let acknowledge binding operationId expectedRequestHash =
         withIntentLock binding operationId (fun () ->
-            acknowledgeUnsafe binding operationId expectedRequestHash)
+            findArchive binding operationId
+            |> Result.bind (function
+                | Some _ ->
+                    Error(Client.ValidationError
+                        "This UUID was explicitly superseded. Inspect its immutable archive and any late Applied receipt; acknowledgment cannot rewrite that disposition.")
+                | None ->
+                    acknowledgeUnsafe binding operationId expectedRequestHash))
 
     let private executeUnsafe binding operationId commandType command (apply: unit -> Result<'t, EffectError>) =
         let commandJson = JsonSerializer.Serialize(command)

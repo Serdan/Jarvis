@@ -205,6 +205,37 @@ module LedgerStore =
               OutputBytes = scope.OutputBytes }
         finally activeGitReadMetrics.Value <- previous
 
+    // Track whether the CURRENT invocation attempted to publish any remote
+    // Git ref. Rejections before a publication can be definitive; once a
+    // push was attempted, its eventual outcome may be unknown. Scoping this
+    // to the async execution context prevents concurrent agents from
+    // contaminating one another's evidence.
+    [<RequireQualifiedAccess>]
+    type PublicationExposure =
+        | NotAttempted
+        | Attempted
+
+    [<AllowNullLiteral>]
+    type private PublicationObservation() =
+        member val Attempted = false with get, set
+
+    let private activePublicationObservation =
+        System.Threading.AsyncLocal<PublicationObservation>()
+
+    let observePublicationAttempts operation =
+        let previous = activePublicationObservation.Value
+        let scope = PublicationObservation()
+        activePublicationObservation.Value <- scope
+        try
+            let outcome = operation ()
+            outcome, (if scope.Attempted then PublicationExposure.Attempted else PublicationExposure.NotAttempted)
+        finally
+            // A nested command must not hide its remote publication from
+            // its outer caller's certainty decision.
+            if scope.Attempted && not (isNull previous) then
+                previous.Attempted <- true
+            activePublicationObservation.Value <- previous
+
     let private json value = JsonSerializer.Serialize(value, options)
     let private digest (value: string) =
         SHA256.HashData(encoding.GetBytes value)
@@ -251,6 +282,14 @@ module LedgerStore =
         with _ -> false
 
     let private execute (repo: string) (args: string list) (input: string option) (environment: (string * string) list) (preserveStdout: bool) =
+        // Record an attempted publication BEFORE starting Git, including when
+        // process creation or transport fails. Review-ref pushes and ledger
+        // pushes share this path; neither can be mistaken for a preflight-only
+        // rejection by a pending-intent caller.
+        match args with
+        | "push" :: _ when not (isNull activePublicationObservation.Value) ->
+            activePublicationObservation.Value.Attempted <- true
+        | _ -> ()
         // Preserve the snapshot benchmark counters while using the shared
         // lifecycle-bounded process runner for every Git invocation.
         let measured = activeGitReadMetrics.Value

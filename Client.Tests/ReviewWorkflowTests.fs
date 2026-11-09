@@ -2556,6 +2556,187 @@ type ReviewWorkflowTests() =
 
 
     [<Test>]
+    member _.NewDefinitePrepublicationRejectionsDoNotAccumulatePendingIntents() =
+        withFixture (fun one _ first _ _ _ _ _ ->
+            let taskId = "definitely-rejected-create"
+            let title = "Already exists"
+            let html = "<h1>Already exists</h1>"
+            ReviewWorkflow.createTaskWithSpec first (Guid.NewGuid()) taskId title html
+            |> success |> ignore
+            let head = (LedgerStore.fetch first |> success).Commit
+            let command = {| Action = "CreateTask"; TaskId = taskId; Title = title; Html = html |}
+            let execute id apply =
+                Client.OrchestrationApi.PendingIntentJournal.executeLedgerWrite
+                    first id "TaskWrite" command apply
+            let stale id =
+                execute id (fun () ->
+                    ReviewWorkflow.createTaskWithSpec first id taskId title html
+                    |> Result.mapError Client.OrchestrationApi.LedgerErrors.toEffect)
+            let freshId = Guid.NewGuid()
+            match stale freshId with
+            | Error(Client.LedgerFailureError failure) ->
+                Assert.That(failure.Code, Is.EqualTo("StaleEntityVersion"))
+                Assert.That(failure.OperationId, Is.EqualTo(Some(freshId.ToString("D"))))
+            | other -> Assert.Fail(sprintf "Expected original stale entity rejection: %A" other)
+            Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one freshId |> success).IsNone,
+                        Is.True, "Fresh prepublication refusal must not linger in recovery.")
+            Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(head))
+
+            let invalidId = Guid.NewGuid()
+            match execute invalidId (fun () -> Error(Client.ValidationError "Invalid requested field.")) with
+            | Error(Client.ValidationError _) -> ()
+            | other -> Assert.Fail(sprintf "Expected original validation error: %A" other)
+            Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one invalidId |> success).IsNone,
+                        Is.True)
+
+            // A previously persisted UUID may have an in-flight push whose
+            // receipt has not yet arrived. A new preflight error is not proof
+            // that the prior attempt failed.
+            let existingId = Guid.NewGuid()
+            Client.OrchestrationApi.PendingIntentJournal.persist first existingId "TaskWrite"
+                (System.Text.Json.JsonSerializer.Serialize(command)) |> success
+            let before =
+                Client.OrchestrationApi.PendingIntentJournal.findAtRoot one existingId
+                |> success |> Option.get
+            match stale existingId with
+            | Error(Client.LedgerFailureError failure) ->
+                Assert.That(failure.Code, Is.EqualTo("StaleEntityVersion"))
+            | other -> Assert.Fail(sprintf "Prior uncertain UUID must still be rejected: %A" other)
+            Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one existingId |> success),
+                        Is.EqualTo(Some before))
+
+            // Identity collisions and uncertain transport remain quarantined.
+            let collisionId = Guid.NewGuid()
+            match execute collisionId (fun () ->
+                    Error(Client.OrchestrationApi.LedgerErrors.toEffect OperationIdReused)) with
+            | Error(Client.LedgerFailureError failure) ->
+                Assert.That(failure.Code, Is.EqualTo("OperationIdReused"))
+            | other -> Assert.Fail(sprintf "Expected operation identity failure: %A" other)
+            Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one collisionId |> success).IsSome,
+                        Is.True)
+            let unknownId = Guid.NewGuid()
+            match execute unknownId (fun () ->
+                    Error(Client.OrchestrationApi.LedgerErrors.toEffect
+                        (OutcomeUnknown "Lost transport response"))) with
+            | Error(Client.LedgerFailureError failure) ->
+                Assert.That(failure.Code, Is.EqualTo("OutcomeUnknown"))
+            | other -> Assert.Fail(sprintf "Expected unknown outcome: %A" other)
+            Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one unknownId |> success).IsSome,
+                        Is.True)
+            Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(head)))
+
+    [<Test>]
+    member _.StaleReviewClaimRejectsBeforePublicationWithoutLeavingIntent() =
+        withFixture (fun one _ first _ _ sourceRef _ _ ->
+            let reviewId = Guid.NewGuid()
+            let taskId = "_reviews"
+            let sourceHead = git one [ "rev-parse"; "HEAD" ]
+            ReviewWorkflow.submitBranchReview first (Guid.NewGuid()) taskId "Owner"
+                reviewId sourceRef sourceHead "Review before claim" "" ""
+            |> success |> ignore
+            ReviewWorkflow.claimBranchReview first (Guid.NewGuid()) taskId reviewId "Reviewer" 1
+            |> success |> ignore
+            let head = (LedgerStore.fetch first |> success).Commit
+            let pendingId = Guid.NewGuid()
+            let command =
+                {| Action = "Claim"; TaskId = taskId; RequestId = reviewId.ToString("D")
+                   ActorId = "Reviewer"; ExpectedVersion = 1 |}
+            let rejected =
+                Client.OrchestrationApi.PendingIntentJournal.executeLedgerWrite
+                    first pendingId "ReviewWrite" command (fun () ->
+                        ReviewWorkflow.claimBranchReview first pendingId taskId reviewId "Reviewer" 1
+                        |> Result.mapError Client.OrchestrationApi.LedgerErrors.toEffect)
+            match rejected with
+            | Error(Client.LedgerFailureError failure) ->
+                Assert.That(failure.Code, Is.EqualTo("ReviewAlreadyClaimed"))
+                Assert.That(failure.OperationId, Is.EqualTo(Some(pendingId.ToString("D"))))
+            | other -> Assert.Fail(sprintf "Expected stale review-claim refusal: %A" other)
+            Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one pendingId |> success).IsNone,
+                        Is.True)
+            Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(head)))
+
+    [<Test>]
+    member _.AttemptedRemoteReviewPublicationPreventsPrematureIntentRetirement() =
+        withFixture (fun one _ first _ _ _ _ _ ->
+            let operationId = Guid.NewGuid()
+            let reviewId = Guid.NewGuid().ToString("N")
+            let sourceRef = $"refs/heads/jarvis-review/_reviews/{reviewId}/r1"
+            let sourceHead = git one [ "rev-parse"; "HEAD" ]
+            let command = {| Action = "Submit"; TaskId = "_reviews"; RequestId = reviewId |}
+            let rejected =
+                Client.OrchestrationApi.PendingIntentJournal.executeLedgerWrite
+                    first operationId "ReviewWrite" command (fun () ->
+                        let published, nestedExposure =
+                            LedgerStore.observePublicationAttempts (fun () ->
+                                LedgerStore.publishReviewRef first sourceRef sourceHead)
+                        published |> success
+                        Assert.That(nestedExposure, Is.EqualTo(LedgerStore.PublicationExposure.Attempted))
+                        // The nested observation must propagate to the outer
+                        // pending-intent scope before its rejection is classified.
+                        Error(Client.OrchestrationApi.LedgerErrors.toEffect
+                            (StaleEntityVersion "Simulated conflict after source publication")))
+            match rejected with
+            | Error(Client.LedgerFailureError failure) ->
+                Assert.That(failure.Code, Is.EqualTo("StaleEntityVersion"))
+            | other -> Assert.Fail(sprintf "Expected simulated post-publication conflict: %A" other)
+            Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId |> success).IsSome,
+                        Is.True, "A remote ref was published, so the command must be recoverable.")
+            Assert.That(LedgerStore.inspectRemoteReviewRef first sourceRef |> success,
+                        Is.EqualTo(Some sourceHead))
+            let inspection = Client.OrchestrationApi.PendingIntentJournal.reconcile first |> success
+            Assert.That(inspection.Head.disposition, Is.EqualTo("NotFoundAtVerifiedHead")))
+
+    [<Test>]
+    member _.ConfirmedWriteReportsJournalCleanupFailureWithoutLosingResultOrEvidence() =
+        withFixture (fun one _ first _ _ _ _ _ ->
+            let operationId = Guid.NewGuid()
+            let taskId = "cleanup-failure-after-applied"
+            let title = "Applied despite cleanup failure"
+            let html = "<h1>Applied despite cleanup failure</h1>"
+            let command = {| Action = "CreateTask"; TaskId = taskId; Title = title; Html = html |}
+            let config = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
+            let journalPath =
+                Path.Combine(Path.GetDirectoryName config, "pending",
+                             Path.GetFileNameWithoutExtension config,
+                             operationId.ToString("N") + ".json")
+            let savedPath = journalPath + ".saved"
+            let standardError = Console.Error
+            use captured = new StringWriter()
+            try
+                Console.SetError captured
+                let result =
+                    Client.OrchestrationApi.PendingIntentJournal.executeLedgerWrite first operationId
+                        "TaskWrite" command (fun () ->
+                            let remote =
+                                ReviewWorkflow.createTaskWithSpec first operationId taskId title html
+                                |> Result.mapError Client.OrchestrationApi.LedgerErrors.toEffect
+                            // Replace only the pending file with an undeletable
+                            // directory AFTER the verified Git write, simulating
+                            // a local filesystem retirement failure.
+                            File.Move(journalPath, savedPath)
+                            Directory.CreateDirectory(journalPath) |> ignore
+                            remote)
+                match result with
+                | Ok applied ->
+                    Assert.That(applied.Operation.OperationId, Is.EqualTo(operationId.ToString("D")))
+                    Assert.That(applied.Operation.Type, Is.EqualTo("CreateTask"))
+                | other -> Assert.Fail(sprintf "Verified remote success must remain successful: %A" other)
+                Assert.That(captured.ToString(), Does.Contain("pending intent cleanup failed"))
+                Assert.That(Directory.Exists journalPath, Is.True)
+            finally
+                Console.SetError standardError
+                if Directory.Exists journalPath then Directory.Delete journalPath
+                if File.Exists savedPath then File.Move(savedPath, journalPath)
+            let _, remote = LedgerStore.getOperationStatus first operationId |> success
+            Assert.That(remote.IsSome, Is.True)
+            let inspected = Client.OrchestrationApi.PendingIntentJournal.reconcile first |> success
+            Assert.That(inspected.Head.disposition, Is.EqualTo("Applied"))
+            Client.OrchestrationApi.PendingIntentJournal.acknowledge first operationId
+                remote.Value.RequestHash |> success |> ignore
+            Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId |> success).IsNone,
+                        Is.True))
+
+    [<Test>]
     member _.ReconciliationNeedsVerifiedRemoteReceiptAndExplicitAcknowledgment() =
         withFixture (fun one _ first _ _ _ _ _ ->
             let command taskId =

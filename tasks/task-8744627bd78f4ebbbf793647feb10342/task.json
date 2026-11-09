@@ -1,1 +1,1 @@
-{"schemaVersion":2,"taskId":"task-8744627bd78f4ebbbf793647feb10342","title":"Fix Windows bounded process group losing stdout/stderr and invalidating ledger bindings","version":1,"lifecycle":"Open","specVersion":1,"attemptId":null}
+{"schemaVersion":2,"taskId":"task-8744627bd78f4ebbbf793647feb10342","title":"Fix Windows bounded process group losing stdout/stderr and invalidating ledger bindings","version":2,"lifecycle":"Closed","specVersion":1,"attemptId":null}

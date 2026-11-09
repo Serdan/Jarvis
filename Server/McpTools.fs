@@ -455,7 +455,8 @@ module McpToolHelpers =
         | LedgerWriteCommand _
         | ReviewWriteCommand _
         | RetryPendingIntentCommand _
-        | SupersedePendingIntentCommand _ -> Auth.GitWrite
+        | SupersedePendingIntentCommand _
+        | AbandonPendingIntentCommand _ -> Auth.GitWrite
 
     let private oauthErrorResult (context: HttpContext) errorCode description scope =
         let response = errorResult (PermissionDenied description)
@@ -1285,6 +1286,14 @@ type JarvisMcpTools =
                   ExpectedVerifiedHead = expectedVerifiedHead
                   RelatedOperationId = relatedOperationId
                   RelatedRequestHash = relatedRequestHash; Reason = reason })
+
+    [<McpServerTool(Title = "abandon obsolete pending intent", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("EXPLICIT OPERATOR RECOVERY: archive an exact saved pending UUID only after verified current canonical task/review state at a pinned head positively proves the original action obsolete. Requires original SHA256 and operator reason. Archive-first crash durable, never mutates remote ledger or assumes a missing receipt means failed push.")>]
+    static member AbandonPendingIntent(projectName: string, agentId: string, operationId: string, expectedCommandSha256: string, expectedVerifiedHead: string, reason: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http
+            (AbandonPendingIntentCommand
+                { ProjectName = projectName; OperationId = operationId; OperatorId = agentId
+                  ExpectedCommandSha256 = expectedCommandSha256
+                  ExpectedVerifiedHead = expectedVerifiedHead; Reason = reason })
 
     [<McpServerTool(Title = "initialize ledger", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Initialize a NEW orphan Git ledger and bind it locally only after explicit public/unknown visibility acknowledgment and Git write approval. Refuses existing ledger refs.")>]
     static member InitializeLedger(projectName: string, projectId: string, ledgerId: string, epoch: int, remoteName: string, approvedFetchUrl: string, approvedPushUrl: string, acknowledgeVisibility: bool, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =

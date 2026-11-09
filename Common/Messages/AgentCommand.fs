@@ -196,6 +196,14 @@ type SupersedePendingIntentCommand =
       RelatedRequestHash: string
       Reason: string }
 
+type AbandonPendingIntentCommand =
+    { ProjectName: string
+      OperationId: string
+      OperatorId: string
+      ExpectedCommandSha256: string
+      ExpectedVerifiedHead: string
+      Reason: string }
+
 type GetProjectDetailsCommand = { ProjectName: string }
 
 type ListDirectoryCommand =
@@ -603,6 +611,7 @@ type AgentCommand =
     | ReviewWriteCommand of ReviewWriteCommand
     | RetryPendingIntentCommand of RetryPendingIntentCommand
     | SupersedePendingIntentCommand of SupersedePendingIntentCommand
+    | AbandonPendingIntentCommand of AbandonPendingIntentCommand
     | GetProjectDetailsCommand of GetProjectDetailsCommand
     | ListDirectoryCommand of ListDirectoryCommand
     | SearchFilesCommand of SearchFilesCommand
@@ -651,6 +660,7 @@ module AgentCommandInfo =
         | ReviewWriteCommand _ -> "ReviewWriteCommand"
         | RetryPendingIntentCommand _ -> "RetryPendingIntentCommand"
         | SupersedePendingIntentCommand _ -> "SupersedePendingIntentCommand"
+        | AbandonPendingIntentCommand _ -> "AbandonPendingIntentCommand"
         | GetProjectDetailsCommand _ -> "GetProjectDetailsCommand"
         | ListDirectoryCommand _ -> "ListDirectoryCommand"
         | SearchFilesCommand _ -> "SearchFilesCommand"
@@ -705,6 +715,7 @@ module AgentCommandInfo =
         | ReviewWriteCommand _ -> "ReviewWrite"
         | RetryPendingIntentCommand _ -> "RetryPendingIntent"
         | SupersedePendingIntentCommand _ -> "SupersedePendingIntent"
+        | AbandonPendingIntentCommand _ -> "AbandonPendingIntent"
         | GetProjectDetailsCommand _ -> "GetProjectDetails"
         | ListDirectoryCommand _ -> "ListDirectory"
         | SearchFilesCommand _ -> "SearchFiles"
@@ -757,6 +768,7 @@ module AgentCommandInfo =
         | ReviewWriteCommand cmd -> Some cmd.ProjectName
         | RetryPendingIntentCommand cmd -> Some cmd.ProjectName
         | SupersedePendingIntentCommand cmd -> Some cmd.ProjectName
+        | AbandonPendingIntentCommand cmd -> Some cmd.ProjectName
         | GetProjectDetailsCommand cmd -> Some cmd.ProjectName
         | ListDirectoryCommand cmd -> Some cmd.ProjectName
         | SearchFilesCommand cmd -> Some cmd.ProjectName
@@ -849,6 +861,7 @@ module AgentCommandInfo =
         | ReviewWriteCommand cmd -> Some(compact cmd.Action)
         | RetryPendingIntentCommand cmd -> Some(compact cmd.OperationId)
         | SupersedePendingIntentCommand cmd -> Some(compact cmd.OperationId)
+        | AbandonPendingIntentCommand cmd -> Some(compact cmd.OperationId)
         | GetGitDiffCommand cmd -> cmd.Path |> Option.map compact
         | GitCommitCommand cmd -> Some(compact cmd.Message)
         | StartJobCommand cmd -> Some(fullCommand cmd.Executable cmd.Args)
@@ -896,6 +909,7 @@ module AgentCommandInfo =
         | ReviewWriteCommand cmd -> Some(truncate 64 cmd.Action)
         | RetryPendingIntentCommand cmd -> Some(truncate 64 cmd.OperationId)
         | SupersedePendingIntentCommand cmd -> Some(truncate 64 cmd.OperationId)
+        | AbandonPendingIntentCommand cmd -> Some(truncate 64 cmd.OperationId)
         | GetGitDiffCommand cmd -> cmd.Path |> Option.map (truncate 64)
         | GitCommitCommand cmd -> Some(quoted cmd.Message)
         | StartJobCommand cmd -> Some(commandPreview cmd.Executable cmd.Args)
@@ -988,6 +1002,7 @@ module AgentProtocol =
           definition "ReviewWrite" "Updates opt-in canonical review ledger with a stable operation UUID." [ VersionControlWrite; NetworkAccess ] true true false
           definition "RetryPendingIntent" "Operator-authorized retry of an exact saved intent through current typed CAS writers, preserving UUID." [ VersionControlWrite; NetworkAccess ] true true false
           definition "SupersedePendingIntent" "Operator-authorized immutable local archive of an uncertain intent with verified related Applied receipt; no remote ledger mutation." [ WorkspaceWrite; VersionControlWrite; NetworkAccess ] true true false
+          definition "AbandonPendingIntent" "Operator-authorized archival of an obsolete saved intent using typed canonical task/review state at a pinned verified head; no remote mutation." [ WorkspaceWrite; VersionControlWrite; NetworkAccess ] true true false
           definition "RemoveWorktree" "Removes a clean integrated Git worktree." [ VersionControlWrite; Destructive ] true true false
           definition "GetProjectDetails" "Reads project summary details and special files." [ ReadOnly ] false false false
           definition "ListDirectory" "Lists a bounded project directory; oversized listings fail explicitly." [ ReadOnly ] false false false

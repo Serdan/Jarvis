@@ -121,7 +121,8 @@ let private activatesAgent (agentId: string) command =
     | TaskReadCommand cmd ->
         String.IsNullOrWhiteSpace cmd.AgentId || cmd.AgentId = agentId
     | LedgerWriteCommand _ | ReviewWriteCommand _
-    | RetryPendingIntentCommand _ | SupersedePendingIntentCommand _ -> false
+    | RetryPendingIntentCommand _ | SupersedePendingIntentCommand _
+    | AbandonPendingIntentCommand _ -> false
     | _ -> true
 
 let private activateReadyOnActivity (rt: Runtime) (agentId: string)
@@ -279,6 +280,10 @@ let private auditDetails command =
         Some("SupersedePendingIntent", Some cmd.ProjectName,
              [ WorkspaceWrite; VersionControlWrite; NetworkAccess ],
              [], Some "git", [ cmd.OperationId; cmd.RelatedOperationId; cmd.Reason ])
+    | AbandonPendingIntentCommand cmd ->
+        Some("AbandonPendingIntent", Some cmd.ProjectName,
+             [ WorkspaceWrite; VersionControlWrite; NetworkAccess ],
+             [], Some "git", [ cmd.OperationId; cmd.ExpectedCommandSha256; cmd.Reason ])
     | ReviewWriteCommand cmd -> Some("Review" + cmd.Action, Some cmd.ProjectName, [ WorkspaceWrite; VersionControlWrite; NetworkAccess ], [], Some "git", [ cmd.TaskId; cmd.RequestId; cmd.OperationId ])
     | CreateProjectCommand cmd ->
         Some("CreateProject", None, [ WorkspaceWrite ] @ (if cmd.InitializeGit then [ VersionControlWrite ] else []) @ (if cmd.InitializeLedger then [ NetworkAccess ] else []),
@@ -407,6 +412,7 @@ let private dispatch (rt: Runtime) (target: ProjectPaths.ProjectTarget option)
     | ReviewWriteCommand cmd -> rt |> OrchestrationApi.ReviewApi.write cmd |> serialize'
     | RetryPendingIntentCommand cmd -> rt |> OrchestrationApi.PendingRecoveryApi.retry cmd |> serialize'
     | SupersedePendingIntentCommand cmd -> rt |> OrchestrationApi.PendingRecoveryApi.supersede cmd |> serialize'
+    | AbandonPendingIntentCommand cmd -> rt |> OrchestrationApi.PendingRecoveryApi.abandon cmd |> serialize'
     | CreateProjectCommand cmd -> rt |> ProjectCreation.create cmd |> serialize'
     | ListProjectsCommand ->
         rt

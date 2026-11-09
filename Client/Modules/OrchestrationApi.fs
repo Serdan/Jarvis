@@ -340,6 +340,42 @@ type PendingIntent =
       CommandSha256: string
       CreatedUtc: string }
 
+// Strictly typed, snapshot-pinned proof that a saved command is obsolete.
+// These fields are stored in the immutable local tombstone, never on Git.
+type PendingTaskObsolescence =
+    | TaskAlreadyExists = 1
+    | TaskVersionAdvanced = 2
+    | AssignmentAdvanced = 3
+    | TaskClosed = 4
+
+type PendingReviewObsolescence =
+    | ReviewAlreadyExists = 1
+    | ReviewVersionAdvanced = 2
+    | ReviewTerminal = 3
+
+type PendingObsoleteTaskProof =
+    { Rule: PendingTaskObsolescence
+      TaskId: string
+      OriginalAction: string
+      OriginalExpectedVersion: int
+      OriginalAssignmentGeneration: int
+      ObservedVersion: int
+      ObservedLifecycle: string
+      ObservedAttemptId: string
+      ObservedOwnerId: string
+      ObservedAssignmentGeneration: int }
+
+type PendingObsoleteReviewProof =
+    { Rule: PendingReviewObsolescence
+      TaskId: string
+      ReviewId: string
+      OriginalAction: string
+      OriginalExpectedVersion: int
+      ObservedVersion: int
+      ObservedStatus: string
+      ObservedOwnerId: string
+      ObservedReviewerId: string }
+
 // This records an explicit operator disposition of an uncertain local intent.
 // It does not assert that the original remote push failed or create a receipt.
 type SupersededPendingIntent =
@@ -352,6 +388,10 @@ type SupersededPendingIntent =
       RelatedOperationKind: string
       RelatedSequence: int64
       RelatedOriginCommit: string
+      // Schema 1 uses a distinct Applied receipt; schema 2 uses exactly one
+      // current canonical entity proof. Null fields are not interchangeable.
+      ObsoleteTask: PendingObsoleteTaskProof
+      ObsoleteReview: PendingObsoleteReviewProof
       VerifiedLedgerHead: string
       RecordedUtc: string }
 
@@ -366,6 +406,9 @@ type PendingDisposition =
     | Superseded
     | AppliedAfterSupersession
     | IdentityMismatchAfterSupersession
+    | Abandoned
+    | AppliedAfterAbandonment
+    | IdentityMismatchAfterAbandonment
     | ArchiveBindingMismatch
     | ArchivedMalformed
     | ReplayRejectedStale
@@ -560,12 +603,36 @@ module PendingIntentJournal =
                 Error(Client.ValidationError "Unsafe or oversized archived pending intent.")
             else
                 let record = JsonSerializer.Deserialize<SupersededPendingIntent>(File.ReadAllText(path))
-                if isNull (box record) || record.SchemaVersion <> 1
+                let validEvidence =
+                    if isNull (box record) then false
+                    elif record.SchemaVersion = 1 then
+                        isNull (box record.ObsoleteTask)
+                        && isNull (box record.ObsoleteReview)
+                        && not (String.IsNullOrWhiteSpace record.RelatedRequestHash)
+                        && not (String.IsNullOrWhiteSpace record.RelatedOperationId)
+                    elif record.SchemaVersion = 2 then
+                        let task = not (isNull (box record.ObsoleteTask))
+                        let review = not (isNull (box record.ObsoleteReview))
+                        task <> review
+                        && String.IsNullOrEmpty record.RelatedOperationId
+                        && String.IsNullOrEmpty record.RelatedRequestHash
+                        && (if task then
+                                let proof = record.ObsoleteTask
+                                not (String.IsNullOrWhiteSpace proof.TaskId)
+                                && proof.ObservedVersion > 0
+                                && Enum.IsDefined(proof.Rule)
+                            else
+                                let proof = record.ObsoleteReview
+                                not (String.IsNullOrWhiteSpace proof.TaskId)
+                                && not (String.IsNullOrWhiteSpace proof.ReviewId)
+                                && proof.ObservedVersion > 0
+                                && Enum.IsDefined(proof.Rule))
+                    else false
+                if not validEvidence
                    || isNull (box record.Original)
                    || record.Original.SchemaVersion <> 1
                    || String.IsNullOrWhiteSpace record.OperatorId
                    || String.IsNullOrWhiteSpace record.Reason
-                   || String.IsNullOrWhiteSpace record.RelatedRequestHash
                    || not (String.Equals(record.Original.CommandSha256,
                                          sha record.Original.CommandJson, StringComparison.Ordinal)) then
                     Error(Client.ValidationError "Invalid archived pending intent audit record.")
@@ -1125,6 +1192,8 @@ module PendingIntentJournal =
                                                                       RelatedOperationKind = related.Type
                                                                       RelatedSequence = related.Sequence
                                                                       RelatedOriginCommit = origin
+                                                                      ObsoleteTask = Unchecked.defaultof<_>
+                                                                      ObsoleteReview = Unchecked.defaultof<_>
                                                                       VerifiedLedgerHead = snapshot.Commit
                                                                       RecordedUtc = DateTimeOffset.UtcNow.ToString("O") }
                                                                 createArchive binding operationId audit
@@ -1139,6 +1208,221 @@ module PendingIntentJournal =
                                                                         Error(Client.ValidationError $"Archive is durable; pending cleanup incomplete: {ex.Message}")))
                                                         | _ ->
                                                             Error(Client.ValidationError "Related operation is not a matching verified Applied receipt for the same task and lifecycle action."))))))))
+
+
+    // Only snapshot-observable state which makes the ORIGINAL saved command
+    // inapplicable is a valid abandonment proof. Missing remote UUID is
+    // uncertainty, never proof. Parse the narrow historical fields required
+    // for each action rather than reconstituting removed public APIs.
+    let private obsoleteStateProof binding expectedHead (original: PendingIntent) =
+        try
+            use doc = JsonDocument.Parse(original.CommandJson)
+            let root = doc.RootElement
+            let field name = commandProperty root name |> Option.defaultValue ""
+            let positive name =
+                match Int32.TryParse(field name) with
+                | true, value when value > 0 -> Some value
+                | _ -> None
+            let taskId = field "TaskId"
+            let action = field "Action"
+            if String.IsNullOrWhiteSpace taskId
+               || String.IsNullOrWhiteSpace action then
+                Error(Client.ValidationError "Saved command does not identify a task and operation; cannot establish obsolescence.")
+            else
+                match normalizeCommandType original.CommandType with
+                | "TaskWrite" ->
+                    ReviewWorkflow.ReviewWorkflow.getTask binding taskId
+                    |> Result.mapError LedgerErrors.toEffect
+                    |> Result.bind (fun (snapshot, task, attempt) ->
+                        if snapshot.Commit <> expectedHead || task.TaskId <> taskId then
+                            Error(Client.ValidationError "Canonical task snapshot changed or task identity mismatched; inspect again.")
+                        else
+                            let generation = positive "AssignmentGeneration"
+                            let originalVersion =
+                                if action = "ReviseTaskSpec" then positive "ExpectedVersion"
+                                else positive "ExpectedTaskVersion"
+                            let advanced =
+                                match originalVersion with
+                                | Some before when task.Version > before && List.contains action
+                                    [ "ReviseTaskSpec"; "CloseTask"; "CancelOpenTask"; "ReopenTask" ] ->
+                                    Some PendingTaskObsolescence.TaskVersionAdvanced
+                                | _ -> None
+                            let assignmentAdvanced =
+                                match generation, attempt with
+                                | Some before, Some current
+                                    when action = "ResumeAgent" && current.AssignmentGeneration > before ->
+                                    Some PendingTaskObsolescence.AssignmentAdvanced
+                                | _ -> None
+                            let taskClosed =
+                                if action = "ResumeAgent" && generation.IsSome
+                                   && List.contains task.Lifecycle [ "Closed"; "Cancelled" ] then
+                                    Some PendingTaskObsolescence.TaskClosed
+                                else None
+                            let rule =
+                                if action = "CreateTask" && task.Version >= 1 then
+                                    Some PendingTaskObsolescence.TaskAlreadyExists
+                                else
+                                    advanced |> Option.orElse assignmentAdvanced |> Option.orElse taskClosed
+                            match rule with
+                            | None -> Error(Client.ValidationError
+                                        "No verified task state makes this exact saved action obsolete; preserve the pending intent.")
+                            | Some rule ->
+                                let observedAttemptId, observedOwner, observedGeneration =
+                                    match attempt with
+                                    | Some current ->
+                                        current.AttemptId, current.OwnerAgentId, current.AssignmentGeneration
+                                    | None -> "", "", 0
+                                let proof: PendingObsoleteTaskProof =
+                                    { Rule = rule
+                                      TaskId = taskId; OriginalAction = action
+                                      OriginalExpectedVersion = originalVersion |> Option.defaultValue 0
+                                      OriginalAssignmentGeneration = generation |> Option.defaultValue 0
+                                      ObservedVersion = task.Version
+                                      ObservedLifecycle = task.Lifecycle
+                                      ObservedAttemptId = observedAttemptId
+                                      ObservedOwnerId = observedOwner
+                                      ObservedAssignmentGeneration = observedGeneration }
+                                Ok (Choice1Of2 proof))
+                | "ReviewWrite" ->
+                    match Guid.TryParse(field "RequestId") with
+                    | true, reviewId when reviewId <> Guid.Empty ->
+                        ReviewWorkflow.ReviewWorkflow.getBranchReview binding taskId reviewId
+                        |> Result.mapError LedgerErrors.toEffect
+                        |> Result.bind (fun observed ->
+                            let review = observed.Review
+                            if observed.SnapshotCommit <> expectedHead || review.TaskId <> taskId
+                               || not (String.Equals(review.ReviewId, reviewId.ToString("N"),
+                                                     StringComparison.OrdinalIgnoreCase)) then
+                                Error(Client.ValidationError "Canonical review snapshot or identifier changed; inspect again.")
+                            else
+                                let originalVersion = positive "ExpectedVersion"
+                                let versionAdvanced =
+                                    match originalVersion with
+                                    | Some before when review.Version > before && List.contains action
+                                        [ "Update"; "Claim"; "Decide"; "Release"; "Withdraw" ] ->
+                                        Some PendingReviewObsolescence.ReviewVersionAdvanced
+                                    | _ -> None
+                                let terminal =
+                                    if originalVersion.IsSome
+                                       && List.contains action [ "Update"; "Claim"; "Decide"; "Release"; "Withdraw" ]
+                                       && List.contains review.Status [ "Withdrawn"; "Accepted"; "ChangesRequested" ] then
+                                        Some PendingReviewObsolescence.ReviewTerminal
+                                    else None
+                                let rule =
+                                    if action = "Submit" && review.Version >= 1 then
+                                        Some PendingReviewObsolescence.ReviewAlreadyExists
+                                    else versionAdvanced |> Option.orElse terminal
+                                match rule with
+                                | None -> Error(Client.ValidationError
+                                            "No verified review state makes this saved action obsolete; preserve the pending intent.")
+                                | Some rule ->
+                                    let proof: PendingObsoleteReviewProof =
+                                        { Rule = rule
+                                          TaskId = taskId
+                                          ReviewId = reviewId.ToString("N")
+                                          OriginalAction = action
+                                          OriginalExpectedVersion = originalVersion |> Option.defaultValue 0
+                                          ObservedVersion = review.Version
+                                          ObservedStatus = review.Status
+                                          ObservedOwnerId = review.OwnerAgentId
+                                          ObservedReviewerId = review.ReviewerId }
+                                    Ok (Choice2Of2 proof))
+                    | _ ->
+                        Error(Client.ValidationError "Saved review command has no valid review UUID.")
+                | _ ->
+                    Error(Client.ValidationError "Only saved TaskWrite and ReviewWrite commands can be abandoned by verified state.")
+        with ex ->
+            Error(Client.ValidationError $"Cannot establish typed saved-command obsolescence: {ex.Message}")
+
+    // Operator-controlled abandonment is DISTINCT from supersession by an
+    // Applied receipt. Exact original UUID is absent from a pinned canonical
+    // head, and a current entity must positively show the old action cannot
+    // run. The archive is not an assertion that the old push failed.
+    let abandon (binding: LedgerStore.LedgerBinding) operationId
+                (expectedCommandHash: string) (expectedHead: string)
+                (operatorId: string) (reason: string) =
+        withIntentLock binding operationId (fun () ->
+            if String.IsNullOrWhiteSpace operatorId || operatorId.Length > 128
+               || String.IsNullOrWhiteSpace reason || reason.Trim().Length < 10
+               || reason.Length > 2048
+               || String.IsNullOrWhiteSpace expectedHead
+               || String.IsNullOrWhiteSpace expectedCommandHash
+               || expectedCommandHash.Length <> 64 then
+                Error(Client.ValidationError "Explicit abandonment requires operator, reason, original 64-character SHA256 and pinned verified head.")
+            else
+                findArchive binding operationId
+                |> Result.bind (fun prior ->
+                    let validate original =
+                        if not (checkBinding binding original)
+                           || not (String.Equals(original.CommandSha256, expectedCommandHash,
+                                                 StringComparison.OrdinalIgnoreCase)) then
+                            Error(Client.ValidationError "Abandonment binding or original command hash does not match.")
+                        else Ok ()
+                    let finish (audit: SupersededPendingIntent) repeat =
+                        try
+                            // The durable archive is the local UUID tombstone:
+                            // retrying an interrupted transition may only
+                            // clean the exact same recorded original.
+                            findAtRoot binding.RepositoryPath operationId
+                            |> Result.bind (fun current ->
+                                if current.IsSome && current.Value <> audit.Original then
+                                    Error(Client.ValidationError "Pending record changed after immutable archive; do not remove.")
+                                else
+                                    if current.IsSome then
+                                        syncArchiveDirectory (archiveDirectory binding.RepositoryPath)
+                                        File.Delete(filePath binding operationId)
+                                    Ok {| operationId = operationId.ToString("D")
+                                          alreadyAbandoned = repeat
+                                          verifiedLedgerHead = audit.VerifiedLedgerHead
+                                          archive = audit |})
+                        with ex ->
+                            Error(Client.ValidationError $"Archive exists but local abandonment cleanup failed: {ex.Message}")
+                    match prior with
+                    | Some audit ->
+                        validate audit.Original
+                        |> Result.bind (fun () ->
+                            if audit.SchemaVersion <> 2
+                               || audit.OperatorId <> operatorId
+                               || audit.Reason <> reason
+                               || audit.VerifiedLedgerHead <> expectedHead then
+                                Error(Client.ValidationError "Archived UUID is immutable and cannot be abandoned with changed proof.")
+                            else finish audit true)
+                    | None ->
+                        findAtRoot binding.RepositoryPath operationId
+                        |> Result.bind (function
+                            | None -> Error(Client.ValidationError "No saved pending intent to abandon.")
+                            | Some original ->
+                                validate original
+                                |> Result.bind (fun () ->
+                                    LedgerStore.LedgerStore.fetch binding
+                                    |> Result.mapError LedgerErrors.toEffect
+                                    |> Result.bind (fun snapshot ->
+                                        if snapshot.Commit <> expectedHead then
+                                            Error(Client.ValidationError "Verified head changed since inspection; inspect again.")
+                                        else
+                                            LedgerStore.LedgerStore.getOperationAt binding snapshot operationId
+                                            |> Result.mapError LedgerErrors.toEffect
+                                            |> Result.bind (function
+                                                | Some _ ->
+                                                    Error(Client.ValidationError "Original UUID is present at verified head; do not abandon.")
+                                                | None ->
+                                                    obsoleteStateProof binding snapshot.Commit original
+                                                    |> Result.bind (fun proof ->
+                                                        let taskProof, reviewProof =
+                                                            match proof with
+                                                            | Choice1Of2 task -> task, Unchecked.defaultof<_>
+                                                            | Choice2Of2 review -> Unchecked.defaultof<_>, review
+                                                        let audit =
+                                                            { SchemaVersion = 2; Original = original
+                                                              OperatorId = operatorId; Reason = reason
+                                                              RelatedOperationId = ""; RelatedRequestHash = ""
+                                                              RelatedOperationKind = ""; RelatedSequence = 0L
+                                                              RelatedOriginCommit = ""
+                                                              ObsoleteTask = taskProof; ObsoleteReview = reviewProof
+                                                              VerifiedLedgerHead = snapshot.Commit
+                                                              RecordedUtc = DateTimeOffset.UtcNow.ToString("O") }
+                                                        createArchive binding operationId audit
+                                                        |> Result.bind (fun () -> finish audit false))))))))
 
     // Read-only preflight for exact persisted-command retry. A successful
     // receipt returns its canonical operation; absence stays uncertain.
@@ -1189,14 +1473,20 @@ module PendingIntentJournal =
             match Guid.TryParse original.OperationId with
             | false, _ -> Ok PendingDisposition.ArchivedMalformed
             | true, id when not (knownIds.Contains(id.ToString("N"))) ->
-                Ok PendingDisposition.Superseded
+                Ok (if archived.SchemaVersion = 2 then PendingDisposition.Abandoned else PendingDisposition.Superseded)
             | true, id ->
                 LedgerStore.LedgerStore.getOperationAt binding snapshot id
                 |> Result.mapError LedgerErrors.toEffect
                 |> Result.map (function
-                    | Some op when identityMatches original op -> PendingDisposition.AppliedAfterSupersession
-                    | Some _ -> PendingDisposition.IdentityMismatchAfterSupersession
-                    | None -> PendingDisposition.Superseded)
+                    | Some op when identityMatches original op ->
+                        if archived.SchemaVersion = 2 then PendingDisposition.AppliedAfterAbandonment
+                        else PendingDisposition.AppliedAfterSupersession
+                    | Some _ ->
+                        if archived.SchemaVersion = 2 then PendingDisposition.IdentityMismatchAfterAbandonment
+                        else PendingDisposition.IdentityMismatchAfterSupersession
+                    | None ->
+                        if archived.SchemaVersion = 2 then PendingDisposition.Abandoned
+                        else PendingDisposition.Superseded)
 
     // One verified Git tree index and remote operation reads only for UUIDs
     // present at that head. Streaming local scan retains aggregates, not the
@@ -1257,9 +1547,9 @@ module PendingIntentJournal =
                                             archivedDisposition binding snapshot knownIds archived
                                             |> Result.map (fun status ->
                                                 increment dispositions (string status)
-                                                if status = PendingDisposition.AppliedAfterSupersession then
+                                                if status = PendingDisposition.AppliedAfterSupersession || status = PendingDisposition.AppliedAfterAbandonment then
                                                     lateApplied <- lateApplied + 1
-                                                elif status = PendingDisposition.IdentityMismatchAfterSupersession then
+                                                elif status = PendingDisposition.IdentityMismatchAfterSupersession || status = PendingDisposition.IdentityMismatchAfterAbandonment then
                                                     archivedConflict <- archivedConflict + 1)))
                                     (Ok ())
                             archiveScan |> Result.map (fun () ->
@@ -2074,3 +2364,23 @@ module PendingRecoveryApi =
                                relatedOperationId = recorded.archive.RelatedOperationId
                                relatedRequestHash = recorded.archive.RelatedRequestHash
                                relatedOriginCommit = recorded.archive.RelatedOriginCommit |}))))
+
+    // The operator explicitly adopts a canonical-state proof: no remote write.
+    let abandon (cmd: AbandonPendingIntentCommand) rt =
+        requiredId "pending operation" cmd.OperationId
+        |> Result.bind (fun operationId ->
+            LedgerBindingConfig.load cmd.ProjectName rt
+            |> Result.bind (fun binding ->
+                PendingIntentJournal.abandon binding operationId
+                    cmd.ExpectedCommandSha256 cmd.ExpectedVerifiedHead
+                    cmd.OperatorId cmd.Reason
+                |> Result.map (fun recorded ->
+                    box {| operationId = recorded.operationId
+                           disposition = "Abandoned"
+                           alreadyAbandoned = recorded.alreadyAbandoned
+                           verifiedLedgerHead = recorded.verifiedLedgerHead
+                           originalCommandSha256 = recorded.archive.Original.CommandSha256
+                           operatorId = recorded.archive.OperatorId
+                           reason = recorded.archive.Reason
+                           taskStateProof = recorded.archive.ObsoleteTask
+                           reviewStateProof = recorded.archive.ObsoleteReview |})))

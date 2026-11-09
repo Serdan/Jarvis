@@ -246,3 +246,39 @@ let measure_dashboard_notification_refresh_latency_and_allocations () =
     let struct (count, bytes) = AgentDashboard.parsedNotificationCacheStats()
     Assert.That(count, Is.LessThanOrEqualTo(16384))
     Assert.That(bytes, Is.LessThanOrEqualTo(16L * 1024L * 1024L))
+
+let private agentRow project name state unread =
+    ({ Key = project + "::" + name
+       Project = project
+       Agent = name
+       State = state
+       StateEnteredAt = None
+       StateReason = None
+       Focus = None
+       PendingNotifications = unread
+       LatestNotification = None } : AgentView.AgentRow)
+
+[<Test>]
+let projectDashboardDeduplicatesSharedLedgersButNotSameNamedDistinctLedgers () =
+    let shared = "project-a:ledger-11111111:1"
+    let different = "project-b:ledger-22222222:1"
+    let results =
+        [ "Wayfold", Ok (Some (shared, [agentRow "Wayfold" "A" "Working" 3], 2))
+          "Wayfold copy", Ok (Some (shared, [agentRow "Wayfold copy" "A" "Working" 3], 2))
+          "Wayfold", Ok (Some (different, [agentRow "Wayfold" "B" "Ready" 1], 1))
+          "Empty", Ok (Some ("project-c:ledger-33333333:1", [], 0))
+          "Offline", Error "Failed to fetch canonical ledger" ]
+    let data = AgentDashboard.snapshotFromResults results
+    Assert.That(data.Agents.Length, Is.EqualTo(2))
+    Assert.That(data.Projects.Length, Is.EqualTo(4))
+    Assert.That(data.Projects |> List.filter (fun p -> p.Project = "Wayfold") |> List.length, Is.EqualTo(2))
+    let empty = data.Projects |> List.find (fun p -> p.Project = "Empty")
+    let offline = data.Projects |> List.find (fun p -> p.Project = "Offline")
+    Assert.That(empty.Counts.Value.Tracked, Is.EqualTo(0))
+    Assert.That(offline.Counts.IsNone, Is.True)
+    let counts = AgentView.totalCounts data
+    Assert.That(counts.Tracked, Is.EqualTo(2))
+    Assert.That(counts.Working, Is.EqualTo(1))
+    Assert.That(counts.Ready, Is.EqualTo(1))
+    Assert.That(counts.Unread, Is.EqualTo(4))
+    Assert.That(counts.PendingReviews, Is.EqualTo(3))

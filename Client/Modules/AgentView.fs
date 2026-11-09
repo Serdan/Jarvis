@@ -23,9 +23,19 @@ type AgentRow =
       PendingNotifications: int
       LatestNotification: string option }
 
+type ProjectCounts =
+    { Tracked: int
+      PendingReviews: int
+      Unread: int
+      Working: int
+      Ready: int
+      Waiting: int
+      Parked: int }
+
 type ProjectSummary =
     { Project: string
-      PendingReviews: int
+      Identity: string
+      Counts: ProjectCounts option
       Error: string option }
 
 type Snapshot =
@@ -49,6 +59,79 @@ let rows (snapshot: Snapshot) =
     snapshot.Agents
     |> List.sortBy (fun item ->
         item.Project.ToLowerInvariant(), agentSortKey item.Agent, item.Key)
+
+let projectCounts (agents: AgentRow list) pendingReviews =
+    let count state = agents |> List.sumBy (fun row -> if row.State = state then 1 else 0)
+    { Tracked = agents.Length
+      PendingReviews = pendingReviews
+      Unread = agents |> List.sumBy _.PendingNotifications
+      Working = count "Working"
+      Ready = count "Ready"
+      Waiting = count "NeedsWork"
+      Parked = count "Parked" }
+
+let private zeroCounts =
+    { Tracked = 0; PendingReviews = 0; Unread = 0
+      Working = 0; Ready = 0; Waiting = 0; Parked = 0 }
+
+let totalCounts (snapshot: Snapshot) =
+    snapshot.Projects
+    |> List.choose _.Counts
+    |> List.fold (fun sum item ->
+        { Tracked = sum.Tracked + item.Tracked
+          PendingReviews = sum.PendingReviews + item.PendingReviews
+          Unread = sum.Unread + item.Unread
+          Working = sum.Working + item.Working
+          Ready = sum.Ready + item.Ready
+          Waiting = sum.Waiting + item.Waiting
+          Parked = sum.Parked + item.Parked }) zeroCounts
+
+/// Text search narrows agent rows, not per-project totals. Only @project
+/// selectors narrow the project summary.
+let visibleProjects filter (snapshot: Snapshot) =
+    let terms = ActivityFilter.parseTerms filter
+    snapshot.Projects
+    |> List.filter (fun project ->
+        ActivityFilter.matchesTerms { terms with Text = [] } (Some project.Project) "")
+    |> List.sortBy (fun project -> project.Project.ToLowerInvariant(), project.Identity)
+
+let projectDisplayName (snapshot: Snapshot) (project: ProjectSummary) =
+    let duplicate =
+        snapshot.Projects
+        |> List.filter (fun item ->
+            String.Equals(item.Project, project.Project, StringComparison.OrdinalIgnoreCase))
+    if duplicate.Length <= 1 then project.Project
+    else
+        let parts = project.Identity.Split(':')
+        let key = if parts.Length > 1 then parts[1] else project.Identity
+        project.Project + " [" + key.Substring(0, min 8 key.Length) + "]"
+
+/// Full labels when possible, unambiguous abbreviations when space is tight.
+let projectStatusLine width displayName (project: ProjectSummary) =
+    let clip length (value: string) =
+        if length <= 0 then ""
+        elif value.Length <= length then value
+        elif length = 1 then "…"
+        else value.Substring(0, length - 1) + "…"
+    let label = ActivityFilter.projectToken displayName
+    let detail =
+        match project.Counts with
+        | None -> "UNAVAILABLE (counts unknown)"
+        | Some c ->
+            sprintf "Tracked %d | Review %d | Unread %d | Working %d | Ready %d | Waiting %d | Parked %d"
+                c.Tracked c.PendingReviews c.Unread c.Working c.Ready c.Waiting c.Parked
+    let full = label + " | " + detail
+    if full.Length <= width then full
+    else
+        let compact =
+            match project.Counts with
+            | None -> "UNAVAILABLE (counts unknown)"
+            | Some c ->
+                sprintf "T%d Rev%d U%d W%d Rd%d Wait%d P%d"
+                    c.Tracked c.PendingReviews c.Unread c.Working c.Ready c.Waiting c.Parked
+        let budget = max 0 (width - compact.Length - 3)
+        if budget > 0 then clip budget label + " | " + compact |> clip width
+        else clip width compact
 
 /// Content-sized roster columns, capped to preserve space for task details.
 /// Use the full filtered list so scrolling never changes column positions.

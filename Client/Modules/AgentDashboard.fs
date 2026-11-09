@@ -114,11 +114,14 @@ let private projectSnapshot project rt =
             match OrchestrationApi.LedgerBindingConfig.load project rt with
             | Error error -> Error (string error)
             | Ok binding ->
+                let identity =
+                    binding.ProjectId.ToString("N") + ":" + binding.LedgerId.ToString("N") + ":" + string binding.Epoch
                 match LedgerStore.fetch binding with
                 | Error error -> Error (string error)
                 | Ok snapshot ->
                     match cachedProjects.TryGetValue(cacheKey) with
-                    | true, (head, rows) when head = snapshot.Commit -> Ok (Some rows)
+                    | true, (head, (agents, reviews)) when head = snapshot.Commit ->
+                        Ok (Some (identity, agents, reviews))
                     | _ ->
                         match LedgerStore.readDashboardRecordsWithOidsAt binding snapshot with
                         | Error error -> Error (string error)
@@ -185,26 +188,42 @@ let private projectSnapshot project rt =
                                         reviews |> List.filter (fun r -> r.Status = "Unclaimed" || r.Status = "Claimed") |> List.length
                                     let data = (rows |> List.choose (function Ok row -> Some row | _ -> None), count)
                                     cachedProjects[cacheKey] <- (snapshot.Commit, data)
-                                    Ok (Some data)
+                                    Ok (Some (identity, fst data, snd data))
+/// Build one view from the same canonical per-project records used for the
+/// agent roster. Identity deduplication matters when multiple local checkouts
+/// or clients point at the same remote ledger.
+let internal snapshotFromResults (results: (string * Result<(string * AgentView.AgentRow list * int) option, string>) list) =
+    let seen = HashSet<string>(StringComparer.Ordinal)
+    let unique =
+        results
+        |> List.choose (fun (project, result) ->
+            match result with
+            | Ok (Some (identity, agents, reviews)) when seen.Add identity ->
+                Some (project, identity, Some (agents, reviews), None)
+            | Ok (Some _) | Ok None -> None
+            | Error error -> Some (project, "unavailable:" + project, None, Some error))
+    let rows =
+        unique
+        |> List.collect (function _, _, Some (agents, _), _ -> agents | _ -> [])
+    let summaries : AgentView.ProjectSummary list =
+        unique
+        |> List.map (fun (project, identity, data, error) ->
+            { Project = project
+              Identity = identity
+              Counts = data |> Option.map (fun (agents, reviews) -> AgentView.projectCounts agents reviews)
+              Error = error })
+    ({ Agents = rows; Projects = summaries; Issues = []
+       RefreshedAt = DateTimeOffset.UtcNow } : AgentView.Snapshot)
+
 let load rt =
     match ProjectBrowser.listGitProjects rt with
     | Error error -> Error (string error)
     | Ok projects ->
-        // Each project owns a separate Git checkout and ledger remote.
-        // Fetch them concurrently without holding the TUI lock.
+        // Fetch each project on the existing refresh cycle, never from an
+        // agent inbox or a separate per-project timer.
         let results =
             projects
             |> Seq.toArray
             |> Array.Parallel.map (fun (ProjectName project) -> project, projectSnapshot project rt)
             |> Array.toList
-        let rows =
-            results |> List.collect (function _, Ok (Some (agents, _)) -> agents | _ -> [])
-        let summaries : AgentView.ProjectSummary list =
-            results |> List.choose (function
-                | project, Ok (Some (_, count)) ->
-                    Some ({ Project = project; PendingReviews = count; Error = None } : AgentView.ProjectSummary)
-                | project, Error error ->
-                    Some ({ Project = project; PendingReviews = 0; Error = Some error } : AgentView.ProjectSummary)
-                | _, Ok None -> None)
-        Ok ({ Agents = rows; Projects = summaries; Issues = []
-              RefreshedAt = DateTimeOffset.UtcNow } : AgentView.Snapshot)
+        Ok (snapshotFromResults results)

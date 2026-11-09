@@ -2139,7 +2139,10 @@ type ReviewWorkflowTests() =
                     | Ok snapshot -> snapshot
                     | Error error -> failwithf "Cannot read canonical dashboard: %s" error
                 let owner = Client.AgentView.rows dashboard
-                            |> List.find (fun item -> item.Project = "owner" && item.Agent = "Owner")
+                            |> List.find (fun item -> item.Agent = "Owner")
+                // One canonical ledger appears once, even through two local aliases.
+                Assert.That(dashboard.Projects.Length, Is.EqualTo(1))
+                Assert.That(dashboard.Agents.Length, Is.EqualTo(2))
                 Assert.That(owner.State, Is.EqualTo("Ready"))
                 Assert.That(owner.Focus.Value.TaskId, Is.EqualTo(taskId))
                 Assert.That(owner.Focus.Value.Phase, Is.EqualTo("Started"))
@@ -2147,11 +2150,8 @@ type ReviewWorkflowTests() =
                 Assert.That(owner.LatestNotification.Value, Does.Contain("Please agree on the new interface"))
                 Assert.That(owner.StateEnteredAt.Value, Is.EqualTo(DateTimeOffset.Parse(canonical.Agent.StateEnteredAtUtc)))
                 Assert.That(Client.AgentView.agentSummary owner, Is.EqualTo("#320 - Ready"))
-                let reviewerOwner = dashboard.Agents |> List.find (fun row ->
-                    row.Project = "reviewer" && row.Agent = "Owner")
-                Assert.That(reviewerOwner.PendingNotifications, Is.EqualTo(1),
+                Assert.That((Client.AgentView.totalCounts dashboard).Unread, Is.EqualTo(1),
                             "Two separately bound views of the same ledger must not double-count notifications.")
-                Assert.That(reviewerOwner.LatestNotification, Is.EqualTo(owner.LatestNotification))
                 // Same Git commit must reproduce the same dashboard without
                 // rehydrating all immutable historical notification records.
                 let warm = System.Diagnostics.Stopwatch.StartNew()
@@ -2165,24 +2165,21 @@ type ReviewWorkflowTests() =
                 let ownerChanged = changed.Agents |> List.find (fun row -> row.Agent = "Owner")
                 Assert.That(ownerChanged.PendingNotifications, Is.EqualTo(2))
                 Assert.That(ownerChanged.LatestNotification.Value, Does.Contain("Another pending notification"))
-                let otherProjectChanged = changed.Agents |> List.find (fun row ->
-                    row.Project = "reviewer" && row.Agent = "Owner")
-                Assert.That(otherProjectChanged.PendingNotifications, Is.EqualTo(2))
+                Assert.That(changed.Agents.Length, Is.EqualTo(2))
+                Assert.That((Client.AgentView.totalCounts changed).Unread, Is.EqualTo(2))
 
-                // The changed JSON acquires a new immutable OID; both project
-                // snapshot caches must update without retaining a stale
-                // parsed unread message from their previous head.
+                // New immutable notification OIDs invalidate cached summaries,
+                // including when multiple project aliases share one ledger.
                 let newest = ReviewWorkflow.getAgentInbox first "Owner" |> success
                 let newestId = newest.PendingNotifications
                                |> List.find (fun notice -> notice.Message = "Another pending notification")
                 ReviewWorkflow.acknowledgeNotification first (Guid.NewGuid()) "Owner"
                     (Guid.Parse newestId.NotificationId) |> success |> ignore
                 let afterAck = Client.AgentDashboard.load context |> success
-                for project in [ "owner"; "reviewer" ] do
-                    let row = afterAck.Agents |> List.find (fun item ->
-                        item.Project = project && item.Agent = "Owner")
-                    Assert.That(row.PendingNotifications, Is.EqualTo(1))
-                    Assert.That(row.LatestNotification.Value, Does.Contain("Please agree on the new interface"))
+                Assert.That(afterAck.Agents.Length, Is.EqualTo(2))
+                let remaining = afterAck.Agents |> List.find (fun row -> row.Agent = "Owner")
+                Assert.That(remaining.PendingNotifications, Is.EqualTo(1))
+                Assert.That(remaining.LatestNotification.Value, Does.Contain("Please agree on the new interface"))
             finally
                 if File.Exists configPath then File.Delete configPath
                 if File.Exists reviewerConfigPath then File.Delete reviewerConfigPath)

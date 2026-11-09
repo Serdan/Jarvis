@@ -15,7 +15,7 @@ Return is a compact projection: state/version/sequence, execution/disposition, W
 ## Validation performed
 - Focused Release regression: eight Ready agents × two observer sessions, each with exactly one Git fetch, no state/version/sequence/last-seen/ledger-head mutation, forged actor/unknown target/cross-project failure, real self-inbox activation and stable repeated Working clock — **passed**.
 - Complete Server Release tests, including MCP metadata and permission tests: **123 passed, zero failed**.
-- Full Client Release suite: **running**, to be updated with final result.
+- Full Client Release suite on frozen single-snapshot source: **527 passed, zero failed** (4m 20s). Combined Client + Server: **650 Release tests passed, zero failed**.
 - `git diff --check`: clean. `git merge-tree --write-tree` into current main: succeeds without conflicts.
 
 ## Independent reviewer focus

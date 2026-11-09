@@ -13,7 +13,7 @@
 - New focused Server Release tests for success/error/no-op state-effect blocks, original error preservation, committed inbox activation after an error, repeated read and cross-project aggregation — **passed**.
 - Client regression: 8 Ready targets × 2 observer sessions, one verified Git fetch per observation, no synthetic state/Seen changes, genuine activation, repeated self-inbox, post-activation failed read — **passed**.
 - Full Server Release suite **126 passed / 0 failed**.
-- Full Client Release suite running on frozen source under Job `2571259e59654ed29413190cef07e007`; previous complete suite passed 527/527.
+- Full Client Release suite on frozen commit `8716439`: **527 passed / 0 failed** (4 minutes). Combined with Server: **653 tests passed, 0 failed**. Job `2571259e59654ed29413190cef07e007` completed exit code 0.
 - Git patch and branch clean; no server/client deployment.
 
 ## Suggested independent review focus

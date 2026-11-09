@@ -1,0 +1,1 @@
+9-commit feature from current main. Full Release solution: 522 Client.Tests and 122 Server.Tests passed, zero failures. Tests include real Git canonical snapshots for stale assignment generation, withdrawn branch review, head/hash refusal, immutable archive, delayed UUID identity mismatch, quarantine, retry, and scale. Merge dry-run clean; no deployment performed.

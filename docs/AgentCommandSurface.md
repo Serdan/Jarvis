@@ -37,6 +37,47 @@ Because this removes public tools and introduces a new enum parameter,
 of the connected MCP tool catalog**. Do not deploy without explicit operator
 authorization.
 
+## Side-effect-free cross-agent observation (protocol 3.63)
+
+`observe_agent(projectName, agentId, targetAgentId)` is the **only cross-agent
+state inspection operation**. `agentId` is the requesting agent label, distinct
+from `targetAgentId`. The OAuth-authenticated user must have
+`workspace:read`; both labels must resolve to registered agents in the
+**same bound project**, and the client verifies that the observer label agrees
+with the independently delivered command actor label. A target agent ID never
+authorizes activity or impersonation. Labels are not themselves authentication
+principals; OAuth and workspace permissions remain the authorization boundary.
+
+Observation fetches the target's **verified canonical Git-ledger** inbox and
+returns a compact projection: execution/disposition, state/version/sequence,
+entry and Working-turn timestamps, focused assignment/attempt and phase,
+blocker/task IDs, pending notification/review/feedback counts, and operator
+action flags. It does **not** expose notification bodies, review evidence,
+source documents, or session identifiers. The result includes
+`snapshotCommit`, `canonicalStateSource`, `canonicalStateFreshness`, and
+`observedAtUtc`; the snapshot is verified when queried, not a continuously
+maintained live subscription.
+
+`lastSeenAtUtc` is a separate, optionally unknown timestamp from the **selected
+client's local attributed-tool-activity cache**, not the canonical ledger. A
+different client's observations or agent activity may not be reflected there.
+`lastSeenProvenance` and `lastSeenIsCanonical = false` prevent treating it as
+evidence that an agent has progressed or as a global heartbeat.
+
+The observation transport is explicitly excluded from implicit Ready-to-Working
+activation, `Seen` updates, per-turn AGENTS.md delivery, and the receiver's
+Working clock; both observer and target remain untouched. Unknown actors,
+missing targets, mismatched actor labels and inaccessible projects fail without
+changing the target. The regular self-`agent_inbox` has **different semantics**:
+it may automatically transition the requesting agent from Ready to Working
+**before** returning the refreshed inbox. Its MCP metadata therefore correctly
+reports it as state-mutating. Repeat self-inbox calls do not restart Working.
+
+The global Agents dashboard can consume the same compact projection instead
+of using `agent_inbox` and accidentally starting another agent's assignment.
+Protocol 3.63 changes client/server transport and MCP tool catalog; deployment
+requires an explicit coordinated release authorization.
+
 ## Cross-client Working-state cache invalidation (protocol 3.61)
 
 A canonical Git-ledger transaction records the exact agent IDs whose assignment

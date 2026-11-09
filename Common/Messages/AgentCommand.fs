@@ -103,6 +103,12 @@ type TaskReadCommand =
       AfterOid: string
       RelativePath: string }
 
+/// Distinct actor and subject: observation never authorizes activity for the target.
+type ObserveAgentRequest =
+    { ProjectName: string
+      ObserverAgentId: string
+      TargetAgentId: string }
+
 type TaskWriteCommand =
     { ProjectName: string
       Action: string
@@ -604,6 +610,7 @@ type AgentCommand =
     | InspectWorktreeRemovalCommand of InspectWorktreeRemovalCommand
     | RemoveWorktreeCommand of RemoveWorktreeCommand
     | TaskReadCommand of TaskReadCommand
+    | ObserveAgentCommand of ObserveAgentRequest
     | TaskWriteCommand of TaskWriteCommand
     | LedgerReadCommand of LedgerReadCommand
     | LedgerWriteCommand of LedgerWriteCommand
@@ -653,6 +660,7 @@ module AgentCommandInfo =
         | InspectWorktreeRemovalCommand _ -> "InspectWorktreeRemovalCommand"
         | RemoveWorktreeCommand _ -> "RemoveWorktreeCommand"
         | TaskReadCommand _ -> "TaskReadCommand"
+        | ObserveAgentCommand _ -> "ObserveAgentCommand"
         | TaskWriteCommand _ -> "TaskWriteCommand"
         | LedgerReadCommand _ -> "LedgerReadCommand"
         | LedgerWriteCommand _ -> "LedgerWriteCommand"
@@ -708,6 +716,7 @@ module AgentCommandInfo =
         | InspectWorktreeRemovalCommand _ -> "InspectWorktreeRemoval"
         | RemoveWorktreeCommand _ -> "RemoveWorktree"
         | TaskReadCommand _ -> "TaskRead"
+        | ObserveAgentCommand _ -> "ObserveAgent"
         | TaskWriteCommand _ -> "TaskWrite"
         | LedgerReadCommand _ -> "LedgerRead"
         | LedgerWriteCommand _ -> "LedgerWrite"
@@ -761,6 +770,7 @@ module AgentCommandInfo =
         | InspectWorktreeRemovalCommand cmd -> Some cmd.ProjectName
         | RemoveWorktreeCommand cmd -> Some cmd.ProjectName
         | TaskReadCommand cmd -> Some cmd.ProjectName
+        | ObserveAgentCommand cmd -> Some cmd.ProjectName
         | TaskWriteCommand cmd -> Some cmd.ProjectName
         | LedgerReadCommand cmd -> Some cmd.ProjectName
         | LedgerWriteCommand cmd -> Some cmd.ProjectName
@@ -854,6 +864,7 @@ module AgentCommandInfo =
         | InspectWorktreeRemovalCommand cmd -> Some(compact cmd.WorktreePath)
         | RemoveWorktreeCommand cmd -> Some(compact cmd.WorktreePath)
         | TaskReadCommand cmd -> Some(compact cmd.AgentId)
+        | ObserveAgentCommand cmd -> Some(compact cmd.TargetAgentId)
         | TaskWriteCommand cmd -> Some(compact cmd.Action)
         | LedgerReadCommand cmd -> Some(compact cmd.ProjectName)
         | LedgerWriteCommand cmd -> Some(compact cmd.Action)
@@ -902,6 +913,7 @@ module AgentCommandInfo =
         | InspectWorktreeRemovalCommand cmd -> Some(truncate 64 cmd.WorktreePath)
         | RemoveWorktreeCommand cmd -> Some(truncate 64 cmd.WorktreePath)
         | TaskReadCommand cmd -> Some(truncate 64 cmd.AgentId)
+        | ObserveAgentCommand cmd -> Some(truncate 64 cmd.TargetAgentId)
         | TaskWriteCommand cmd -> Some(truncate 64 cmd.Action)
         | LedgerReadCommand cmd -> Some(truncate 64 cmd.ProjectName)
         | LedgerWriteCommand cmd -> Some(truncate 64 cmd.Action)
@@ -964,7 +976,7 @@ module AgentCommandInfo =
         | None -> invocation command
 
 module AgentProtocol =
-    let version = "3.62"
+    let version = "3.63"
     let defaultPatchFuzzyContextLines = 3
     let maxResponseBytes = 900 * 1024
     let maxImageBytes = 8 * 1024 * 1024
@@ -995,6 +1007,7 @@ module AgentProtocol =
           definition "CreateWorktree" "Creates an isolated Git worktree and branch." [ VersionControlWrite ] true true false
           definition "InspectWorktreeRemoval" "Checks registered worktree removal safety." [ ReadOnly ] false false false
           definition "TaskRead" "Reads a registered agent inbox from a single ledger snapshot." [ ReadOnly; NetworkAccess ] false false false
+          definition "ObserveAgent" "Read an explicitly named target agent without attributing tool activity or beginning a Ready turn. Observer identity is independently verified." [ ReadOnly; NetworkAccess ] false false false
           definition "TaskWrite" "Creates/assigns/starts tasks and binds immutable review base." [ VersionControlWrite; NetworkAccess ] true true false
           definition "LedgerRead" "Inspect the verified canonical Git ledger identity and trust head." [ ReadOnly; NetworkAccess ] false false false
           definition "LedgerWrite" "Explicitly bind, initialize or rebind the canonical ledger with privacy acknowledgment." [ VersionControlWrite; NetworkAccess ] true true false

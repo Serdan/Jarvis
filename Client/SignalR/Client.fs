@@ -102,6 +102,7 @@ let private isLocalAgentActivity = function
                                 && not (String.IsNullOrWhiteSpace cmd.SourceRef)
                                 && cmd.SourceRef <> cmd.ProjectName -> false
     | LedgerReadCommand cmd when cmd.Action = "Health" -> false
+    | ObserveAgentCommand _ -> false // Neither observer nor target is acting.
     | _ -> true
 
 // An agent's first ordinary tool call starts its Ready assignment.
@@ -401,6 +402,9 @@ let private dispatch (rt: Runtime) (target: ProjectPaths.ProjectTarget option)
     | InspectWorktreeRemovalCommand cmd -> rt |> Worktrees.inspectRemoval cmd |> serialize'
     | RemoveWorktreeCommand cmd -> rt |> Worktrees.removeWorktree cmd |> serialize'
     | TaskReadCommand cmd -> rt |> OrchestrationApi.TaskApi.read cmd |> serialize'
+    | ObserveAgentCommand cmd ->
+        rt |> OrchestrationApi.AgentObservationApi.observe cmd
+            (fun project agent -> rt.Tui.GetAgentLastSeen(project, agent)) |> serialize'
     | TaskWriteCommand cmd when cmd.Action = "ExportTaskSpec" || cmd.Action = "ImportTaskSpec" ->
         match resolved with
         | Some context -> rt |> OrchestrationApi.TaskApi.writeForContext context cmd |> serialize'
@@ -634,7 +638,16 @@ let processIncomingCommand (rt: Runtime) (commandJson: string) (agentId: string)
                 try
                     let command = JsonSerializer.Deserialize<AgentCommand>(commandJson)
                     parsedCommand <- Some command
-                    let project = classifyProject command
+                    // A target field is never proof of acting-agent identity.
+                    // Reject forged observer identity before source resolution,
+                    // any activity attribution, or the canonical read.
+                    let project =
+                        match command with
+                        | ObserveAgentCommand observation
+                            when String.IsNullOrWhiteSpace agentId
+                                 || not (String.Equals(observation.ObserverAgentId, agentId, StringComparison.Ordinal)) ->
+                            Error(Client.ValidationError "Observation actor label does not match the initiating tool-call actor.")
+                        | _ -> classifyProject command
                     match project with
                     | Error error -> return Error error
                     | Ok scope ->

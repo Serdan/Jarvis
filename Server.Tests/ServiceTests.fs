@@ -833,7 +833,10 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
             [ for name in [ "LedgerHealth"; "GetOperationStatus"; "PendingOperations"; "ReconcilePendingOperations";
                             "PendingOperationSummary"; "PendingOperationsPage"; "InspectPendingOperation" ] -> name, ledgerRead
               for name in [ "InitializeLedger"; "BindExistingLedger"; "RebindLedgerRemote"; "AcknowledgePendingOperation" ] -> name, ledgerWrite
-              for name in [ "GetIntegrationSubmissions"; "AgentInbox"; "GetAssignment"; "GetCheckpoint"; "InspectAttemptSource"; "TaskLifecycleHistory"; "GetTaskSpecPage"; "DiffTaskSpec" ] -> name, taskRead
+              for name in [ "GetIntegrationSubmissions"; "AgentInbox"; "GetAssignment"; "GetCheckpoint"; "InspectAttemptSource"; "TaskLifecycleHistory"; "GetTaskSpecPage"; "DiffTaskSpec" ] ->
+                  name, (if name = "AgentInbox" then
+                             { taskRead with MutatesState = true }
+                         else taskRead)
               for name in [ "SubmitIntegration"; "CompleteIntegration"; "NotifyAgent"; "AcknowledgeNotification"; "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "ReissueAssignment"; "CheckpointAttempt"
                             "SetAttemptSource"; "YieldAgent"; "CompleteAgentWork";
                             "SetAgentState"; "ReissueQueuedAttempt"; "RecoverAgentAssignment"; "AcknowledgeReviewFeedback"; "DeferAttempt"; "ResumeAttempt"; "AbandonAttempt"; "CancelTask"; "TransferOwner"; "CloseTask"; "ReopenTask"; "ImportTaskSpec"; "ExportTaskSpec" ] -> name, taskWrite
@@ -885,6 +888,27 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
         let scopes = scheme.GetProperty("scopes")
         scopes[0].GetString() |> shouldEqual scope
 
+
+[<Test>]
+let observe_agent_is_explicitly_read_only_while_self_inbox_is_activity () =
+    let byName name =
+        McpToolHelpers.mcpListCommandsResult.Commands
+        |> List.find (fun item -> item.Name = name)
+    let observation = byName "ObserveAgent"
+    let inbox = byName "AgentInbox"
+    Assert.That(observation.MutatesState, Is.False)
+    Assert.That(inbox.MutatesState, Is.True)
+    Assert.That(observation.Permissions, Does.Contain(ReadOnly))
+    let tool name =
+        let methodInfo = typeof<JarvisMcpTools>.GetMethod(name)
+        let attributes =
+            methodInfo.GetCustomAttributes(typeof<McpServerToolAttribute>, false)
+        attributes[0] :?> McpServerToolAttribute
+    Assert.That((tool "ObserveAgent").ReadOnly, Is.True)
+    Assert.That((tool "AgentInbox").ReadOnly, Is.False)
+    let parameters = typeof<JarvisMcpTools>.GetMethod("ObserveAgent").GetParameters()
+    Assert.That(parameters |> Array.map _.Name |> Array.take 3,
+                Is.EqualTo([| "projectName"; "agentId"; "targetAgentId" |] :> obj))
 
 [<Test>]
 let mcp_profile_tool_uses_authenticated_subject () =

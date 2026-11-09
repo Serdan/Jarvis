@@ -2073,6 +2073,65 @@ module ReviewApi =
 
 // Separate typed setup/assignment contract. The review request API never has
 // to reinterpret a request ID as a task, attempt, or agent identifier.
+module AgentObservationApi =
+    // This explicitly observational operation is not a substitute for the
+    // agent's own inbox. Its observer label must match the separate
+    // SignalR actor label before any dispatch reaches this function.
+    // Only summarized canonical metadata is returned; notification bodies,
+    // evidence, source documents and session IDs are never exposed here.
+    let observe (cmd: ObserveAgentRequest) (getLocalLastSeen: string -> string -> DateTimeOffset option) rt =
+        if String.IsNullOrWhiteSpace cmd.ObserverAgentId
+           || String.IsNullOrWhiteSpace cmd.TargetAgentId then
+            Error(Client.ValidationError "Observer and target agent identities are required.")
+        else
+            LedgerBindingConfig.load cmd.ProjectName rt
+            |> Result.bind (fun binding ->
+                ReviewWorkflow.ReviewWorkflow.getAgentWorkingTurn binding cmd.ObserverAgentId
+                |> Result.mapError LedgerErrors.toEffect
+                |> Result.bind (fun _ ->
+                    ReviewWorkflow.ReviewWorkflow.getBranchAgentInbox binding cmd.TargetAgentId
+                    |> Result.mapError LedgerErrors.toEffect
+                    |> Result.map (fun inbox ->
+                        let agent = inbox.Agent
+                        let focus = inbox.Focused |> Option.map (fun item ->
+                            {| taskId = item.Task.TaskId
+                               title = item.Task.Title
+                               lifecycle = item.Task.Lifecycle
+                               attemptId = item.Attempt.AttemptId
+                               attemptVersion = item.Attempt.Version
+                               attemptPhase = item.Attempt.Phase
+                               assignmentGeneration = item.Attempt.AssignmentGeneration |})
+                        let lastSeen = getLocalLastSeen cmd.ProjectName cmd.TargetAgentId
+                        box
+                            {| projectName = cmd.ProjectName
+                               observerAgentId = cmd.ObserverAgentId
+                               targetAgentId = agent.AgentId
+                               snapshotCommit = inbox.SnapshotCommit
+                               canonicalStateSource = "VerifiedGitLedger"
+                               canonicalStateFreshness = "FetchedForThisObservation"
+                               observedAtUtc = DateTimeOffset.UtcNow.ToString("O")
+                               agentVersion = agent.Version
+                               stateSequence = agent.StateSequence
+                               state = agent.State
+                               execution = agent.Execution
+                               unassignedDisposition = Option.ofObj agent.UnassignedDisposition
+                               stateReason = Option.ofObj agent.StateReason
+                               stateEnteredAtUtc = Option.ofObj agent.StateEnteredAtUtc
+                               workingTurnStartedAtUtc = Option.ofObj agent.WorkingTurnStartedAtUtc
+                               focused = focus
+                               operatorActionRequired = inbox.OperatorActionRequired
+                               needsOrchestratorAssignment = inbox.NeedsOrchestratorAssignment
+                               slotAvailable = inbox.SlotAvailable
+                               pendingNotificationCount = inbox.PendingNotifications.Length
+                               pendingReviewCount = inbox.PendingReviews.Length
+                               availableReviewCount = inbox.AvailableReviews.Length
+                               unacknowledgedFeedbackCount = inbox.UnacknowledgedFeedback.Length
+                               blockedAttemptCount = inbox.Blocked.Length
+                               blockedTaskIds = inbox.Blocked |> List.map (fun item -> item.Task.TaskId)
+                               lastSeenAtUtc = lastSeen |> Option.map (fun seen -> seen.ToString("O"))
+                               lastSeenProvenance = if lastSeen.IsSome then "LocalClientActivityCache" else "Unknown"
+                               lastSeenIsCanonical = false |})))
+
 module TaskApi =
     let private mapError (result: Result<'a, LedgerStore.LedgerFailure>) : Result<'a, EffectError> =
         result |> Result.mapError LedgerErrors.toEffect

@@ -73,16 +73,28 @@ changing the target. The regular self-`agent_inbox` has **different semantics**:
 it may automatically transition the requesting agent from Ready to Working
 **before** returning the refreshed inbox. Its MCP metadata therefore correctly
 reports it as state-mutating. Repeat self-inbox calls do not restart Working.
-Every self-inbox MCP response also appends a public
-`agentInboxActivation` JSON block and `jarvis/inbox_activation` metadata.
+Every project-scoped MCP tool response appends a consistent public JSON block
+with `agentStateChanges` (including `[]` when no canonical state changes are
+confirmed), plus `jarvis/agent_state_changes` metadata. This includes failed
+commands: a requested read/write can fail after an earlier automatic agent
+activation has already committed. The mutation list contains only the affected
+project and agent IDs from canonical ledger receipts; it does not infer
+unrecorded before/after states. Local TUI activity timestamps do not count as
+canonical agent state changes.
+For a multi-step tool (notably cross-project `notify_agent`), the final
+response combines the confirmed state changes from preliminary source
+validation and destination dispatch, even if the latter fails.
+
+Self-inbox responses additionally include `agentInboxActivation` in the same
+JSON block and `jarvis/inbox_activation` metadata.
 `activatedByThisCall: true` is supported by the *confirmed canonical operation
 receipt* and carries `beforeState: Ready`, `afterState: Working`, the
 committed Git head and operation ID. A repeated read explicitly reports
 `activatedByThisCall: false`, with no invented transition. This evidence
 remains visible even when the later inbox read fails; the failure is still an
 error rather than falsely claiming the entire call had no side effects.
-The internal `AgentStateChanges` list remains a separate cache-invalidation
-signal and is not proof of a caller-visible activation.
+The same typed `AgentStateChanges` envelope drives cache invalidation; its
+public projection is advisory, never an authorization claim.
 
 The global Agents dashboard can consume the same compact projection instead
 of using `agent_inbox` and accidentally starting another agent's assignment.

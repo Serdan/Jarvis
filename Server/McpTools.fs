@@ -363,18 +363,43 @@ module McpToolHelpers =
                 errorResult (ExecutionFailed $"Invalid Jarvis response: both result and error were set. {formatError error}")
             | None, None ->
                 errorResult (ExecutionFailed "Invalid Jarvis response: neither result nor error was set.")
-        // This evidence originates from a confirmed canonical write and must
-        // remain visible even if the subsequent inbox read or result encoding
-        // fails. Preserve the original inbox JSON and typed error unchanged.
+        result
+
+    /// Every forwarded project tool result carries its canonical mutation
+    /// evidence. An empty array is explicit, not an omitted field. This stays
+    /// visible even when the requested command fails after a committed write.
+    /// The separate activation receipt is richer only when the ledger has
+    /// actually confirmed the requesting agent's Ready -> Working transition.
+    let attachStateEffects (response: AgentCommandResponse) (result: CallToolResult) =
+        let changes =
+            if isNull (box response.AgentStateChanges) then [] else response.AgentStateChanges
+        let details = JsonObject()
+        details["agentStateChanges"] <- JsonSerializer.SerializeToNode changes
+        let metadata = if isNull result.Meta then JsonObject() else result.Meta
+        metadata["jarvis/agent_state_changes"] <- JsonSerializer.SerializeToNode changes
         match response.InboxActivation with
-        | None -> result
+        | None -> ()
         | Some activation ->
-            let metadata = if isNull result.Meta then JsonObject() else result.Meta
+            details["agentInboxActivation"] <- JsonSerializer.SerializeToNode activation
             metadata["jarvis/inbox_activation"] <- JsonSerializer.SerializeToNode activation
-            result.Meta <- metadata
-            if isNull result.Content then result.Content <- ResizeArray<ContentBlock>()
-            result.Content.Add(textContent (JsonSerializer.Serialize({| agentInboxActivation = activation |})))
-            result
+        result.Meta <- metadata
+        if isNull result.Content then result.Content <- ResizeArray<ContentBlock>()
+        result.Content.Add(textContent (details.ToJsonString()))
+        result
+
+    /// Preliminary and final dispatches may independently mutate canonical
+    /// state (notably a cross-project notification sender validation). Never
+    /// lose the preliminary mutation from the caller-visible result.
+    let mergeStateEffects (prior: AgentCommandResponse) (final: AgentCommandResponse) =
+        { final with
+            AgentStateChanges =
+                (prior.AgentStateChanges @ final.AgentStateChanges) |> List.distinct
+            InboxActivation =
+                match final.InboxActivation with
+                | Some _ -> final.InboxActivation
+                | None ->
+                    prior.InboxActivation
+                    |> Option.filter (fun receipt -> receipt.ActivatedByThisCall) }
 
     let private imageResult (response: AgentCommandResponse) =
         match response.Result, response.Error with
@@ -683,11 +708,12 @@ module McpToolHelpers =
                                 do! publishChanges sender
                                 match sender.Result, sender.Error with
                                 | Some _, None ->
-                                    return! client.SendCommandToProject(
+                                    let! destination = client.SendCommandToProject(
                                         userId, notification.ProjectName, command,
                                         ?conversationId = RequestDeviceRouting.session(),
                                         ?deviceId = RequestDeviceRouting.deviceOverride(),
                                                      ?agentId = RequestDeviceRouting.agentId())
+                                    return mergeStateEffects sender destination
                                 | _ -> return sender
                             }
                         | _ ->
@@ -705,6 +731,7 @@ module McpToolHelpers =
                          | ReadImageCommand _ -> imageResult response
                          | ExportFileCommand _ -> exportResult context response
                          | _ -> toCallToolResult response)
+                        |> attachStateEffects response
                         |> attachInstructions response.Instructions
                         |> attachOperationId tracking
                         |> attachGeneratedOperationId generatedId

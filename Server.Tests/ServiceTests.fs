@@ -702,18 +702,26 @@ let mcp_self_inbox_exposes_committed_activation_on_success_and_read_error () =
         let response : AgentCommandResponse =
             { Result = if readFailed then None else Some """{"Agent":{"State":"Working"}}"""
               Error = if readFailed then Some(NotFound "Inbox read failed after activation") else None
-              Instructions = []; AgentStateChanges = []
+              Instructions = []
+              AgentStateChanges = [ { ProjectName = "Jarvis"; AgentId = "Owner" } ]
               InboxActivation = Some receipt }
         let roundtrip =
             JsonSerializer.Deserialize<AgentCommandResponse>(JsonSerializer.Serialize(response))
         Assert.That(roundtrip.InboxActivation.IsSome, Is.True)
         Assert.That(roundtrip.InboxActivation.Value.CommittedHead,
                     Is.EqualTo(receipt.CommittedHead))
-        let tool = McpToolHelpers.toCallToolResult response
+        let tool =
+            response |> McpToolHelpers.toCallToolResult
+            |> McpToolHelpers.attachStateEffects response
         Assert.That(tool.IsError, Is.EqualTo(Nullable readFailed))
         Assert.That(tool.Content.Count, Is.EqualTo(2))
         let exposed = (tool.Content[1] :?> TextContentBlock).Text
         use document = JsonDocument.Parse(exposed)
+        let changes = document.RootElement.GetProperty("agentStateChanges").EnumerateArray() |> Seq.toList
+        Assert.That(changes.Length, Is.EqualTo(1))
+        Assert.That(changes.Head.GetProperty("AgentId").GetString(), Is.EqualTo("Owner"))
+        Assert.That(tool.Meta["jarvis/agent_state_changes"].ToJsonString(),
+                    Does.Contain("Owner"))
         let activation = document.RootElement.GetProperty("agentInboxActivation")
         Assert.That(activation.GetProperty("ActivatedByThisCall").GetBoolean(), Is.True)
         Assert.That(activation.GetProperty("BeforeState").GetString(), Is.EqualTo("Ready"))
@@ -735,17 +743,90 @@ let mcp_self_inbox_exposes_committed_activation_on_success_and_read_error () =
         { Result = Some """{"Agent":{"State":"Working"}}"""
           Error = None; Instructions = []; AgentStateChanges = []
           InboxActivation = Some noChange }
-        |> McpToolHelpers.toCallToolResult
+    let repeated =
+        repeated |> McpToolHelpers.toCallToolResult
+        |> McpToolHelpers.attachStateEffects repeated
     use repeatDoc = JsonDocument.Parse((repeated.Content[1] :?> TextContentBlock).Text)
     let repeatActivation = repeatDoc.RootElement.GetProperty("agentInboxActivation")
     Assert.That(repeatActivation.GetProperty("ActivatedByThisCall").GetBoolean(), Is.False)
     Assert.That(repeatActivation.GetProperty("CommittedHead").ValueKind,
                 Is.EqualTo(JsonValueKind.Null))
+    Assert.That(repeatDoc.RootElement.GetProperty("agentStateChanges").GetArrayLength(), Is.EqualTo(0))
     // Older 3.62 clients omit InboxActivation. A newer server continues to
     // accept those wire envelopes, without claiming an activation occurred.
     let legacy = JsonSerializer.Deserialize<AgentCommandResponse>(
         """{"Result":"{}","Error":null,"Instructions":[],"AgentStateChanges":[]}""")
     Assert.That(legacy.InboxActivation.IsNone, Is.True)
+
+[<Test>]
+let mcp_project_tool_responses_always_expose_canonical_state_change_evidence () =
+    for failed in [ false; true ] do
+        let response : AgentCommandResponse =
+            { Result = if failed then None else Some """{"result":"ok"}"""
+              Error = if failed then Some(NotFound "Source file absent") else None
+              Instructions = []
+              AgentStateChanges = []
+              InboxActivation = None }
+        let tool =
+            response |> McpToolHelpers.toCallToolResult
+            |> McpToolHelpers.attachStateEffects response
+        Assert.That(tool.IsError, Is.EqualTo(Nullable failed))
+        Assert.That(tool.Content.Count, Is.EqualTo(2))
+        use doc = JsonDocument.Parse((tool.Content[1] :?> TextContentBlock).Text)
+        Assert.That(doc.RootElement.GetProperty("agentStateChanges").GetArrayLength(),
+                    Is.EqualTo(0))
+        let mutable ignored = Unchecked.defaultof<JsonElement>
+        Assert.That(doc.RootElement.TryGetProperty("agentInboxActivation", &ignored), Is.False)
+        Assert.That(tool.Meta["jarvis/agent_state_changes"].ToJsonString(), Is.EqualTo("[]"))
+
+    // A command can affect a different agent, and an earlier committed write
+    // must remain visible even if its subsequent operation fails.
+    let affected : AgentCommandResponse =
+        { Result = None
+          Error = Some(NotFound "Read failed after prior mutation")
+          Instructions = []
+          AgentStateChanges = [ { ProjectName = "Wayfold"; AgentId = "Worker 1" } ]
+          InboxActivation = None }
+    let result =
+        affected |> McpToolHelpers.toCallToolResult
+        |> McpToolHelpers.attachStateEffects affected
+    Assert.That(result.IsError, Is.EqualTo(Nullable true))
+    use effects = JsonDocument.Parse((result.Content[1] :?> TextContentBlock).Text)
+    let changes = effects.RootElement.GetProperty("agentStateChanges")
+    Assert.That(changes.GetArrayLength(), Is.EqualTo(1))
+    Assert.That(changes[0].GetProperty("ProjectName").GetString(), Is.EqualTo("Wayfold"))
+    Assert.That(changes[0].GetProperty("AgentId").GetString(), Is.EqualTo("Worker 1"))
+    let mutable absent = Unchecked.defaultof<JsonElement>
+    Assert.That(effects.RootElement.TryGetProperty("agentInboxActivation", &absent), Is.False)
+
+[<Test>]
+let cross_project_notify_merges_preflight_and_destination_state_changes () =
+    let sourceActivation : AgentInboxActivation =
+        { ProjectName = "Wayfold"; AgentId = "Worker 1"
+          ActivatedByThisCall = true
+          BeforeState = Some "Ready"; AfterState = Some "Working"
+          CommittedHead = Some(String('a', 40)); OperationId = Some(Guid.NewGuid().ToString("D")) }
+    let preflight : AgentCommandResponse =
+        { Result = Some "{}"; Error = None; Instructions = []
+          AgentStateChanges = [ { ProjectName = "Wayfold"; AgentId = "Worker 1" } ]
+          InboxActivation = Some sourceActivation }
+    let destination : AgentCommandResponse =
+        { Result = None; Error = Some(NotFound "Destination write failed")
+          Instructions = []
+          AgentStateChanges =
+            [ { ProjectName = "Jarvis"; AgentId = "Reviewer 1" }
+              { ProjectName = "Wayfold"; AgentId = "Worker 1" } ]
+          InboxActivation = None }
+    let merged = McpToolHelpers.mergeStateEffects preflight destination
+    Assert.That(merged.AgentStateChanges.Length, Is.EqualTo(2))
+    Assert.That(merged.InboxActivation.Value.ActivatedByThisCall, Is.True)
+    Assert.That(merged.Error.IsSome, Is.True)
+    let tool =
+        merged |> McpToolHelpers.toCallToolResult
+        |> McpToolHelpers.attachStateEffects merged
+    use json = JsonDocument.Parse((tool.Content[1] :?> TextContentBlock).Text)
+    Assert.That(json.RootElement.GetProperty("agentStateChanges").GetArrayLength(), Is.EqualTo(2))
+    Assert.That(json.RootElement.GetProperty("agentInboxActivation").GetProperty("ActivatedByThisCall").GetBoolean(), Is.True)
 
 [<Test>]
 let ``MCP bridge preserves typed confirmation error details`` () =

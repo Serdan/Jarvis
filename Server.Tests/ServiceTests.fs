@@ -477,7 +477,9 @@ let ``command catalog matches AgentCommand union and MCP tools`` () =
               "GetTask"; "TaskOverview"; "ReviewDetails"; "ReviewerInbox"; "ListReviewDocuments"; "ReadReviewDocument"
               "SubmitReview"; "ClaimReview"; "DecideReview"
               "ReleaseReview"; "WithdrawReview"; "PutReviewDocument"
-              "LedgerHealth"; "GetOperationStatus"; "PendingOperations"; "ReconcilePendingOperations"; "AcknowledgePendingOperation"; "InitializeLedger"; "BindExistingLedger"; "RebindLedgerRemote"
+              "LedgerHealth"; "GetOperationStatus"; "PendingOperations"; "ReconcilePendingOperations"
+              "PendingOperationSummary"; "PendingOperationsPage"; "InspectPendingOperation"
+              "AcknowledgePendingOperation"; "InitializeLedger"; "BindExistingLedger"; "RebindLedgerRemote"
               ]
     // Retired wire cases are deleted; public CreateTask/AssignTask are canonical ledger tools.
     unionNames |> shouldEqual catalogNames
@@ -560,7 +562,9 @@ let ``client-backed MCP tools expose an optional per-command deviceId`` () =
         |> Array.filter (fun methodInfo ->
             methodInfo.GetParameters()
             |> Array.exists (fun parameter -> parameter.ParameterType = typeof<ClientService>))
-    clientMethods.Length |> shouldEqual (AgentProtocol.commandDefinitions.Length - 1 + 48) // public orchestration aliases / 8 wire operations
+    // Three additional read-only pending recovery views are public aliases
+    // of LedgerRead; retry/supersede have distinct wire definitions.
+    clientMethods.Length |> shouldEqual (AgentProtocol.commandDefinitions.Length - 1 + 51)
     for methodInfo in clientMethods do
         let deviceParam = methodInfo.GetParameters() |> Array.tryFind (fun parameter -> parameter.Name = "deviceId")
         match deviceParam with
@@ -826,7 +830,8 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
         let ledgerRead = original["ReviewRead"]
         let ledgerWrite = original["ReviewWrite"]
         let aliases =
-            [ for name in [ "LedgerHealth"; "GetOperationStatus"; "PendingOperations"; "ReconcilePendingOperations" ] -> name, ledgerRead
+            [ for name in [ "LedgerHealth"; "GetOperationStatus"; "PendingOperations"; "ReconcilePendingOperations";
+                            "PendingOperationSummary"; "PendingOperationsPage"; "InspectPendingOperation" ] -> name, ledgerRead
               for name in [ "InitializeLedger"; "BindExistingLedger"; "RebindLedgerRemote"; "AcknowledgePendingOperation" ] -> name, ledgerWrite
               for name in [ "GetIntegrationSubmissions"; "AgentInbox"; "GetAssignment"; "GetCheckpoint"; "InspectAttemptSource"; "TaskLifecycleHistory"; "GetTaskSpecPage"; "DiffTaskSpec" ] -> name, taskRead
               for name in [ "SubmitIntegration"; "CompleteIntegration"; "NotifyAgent"; "AcknowledgeNotification"; "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "ReissueAssignment"; "CheckpointAttempt"

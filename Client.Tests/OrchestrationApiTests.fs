@@ -157,6 +157,44 @@ let ledgerTaskMutationsRequireGitWritePermission () =
     | other -> Assert.Fail(sprintf "Expected explicit Git-write confirmation: %A" other)
 
 
+
+[<Test>]
+let pendingRecoveryCommandsAreDistinctExplicitWriteActions () =
+    Client.PermissionPolicy.clearGrants()
+    let operationId = Guid.NewGuid().ToString("D")
+    let retry : AgentCommand =
+        RetryPendingIntentCommand
+            { ProjectName = "Project1"; OperationId = operationId
+              OperatorId = "Operator"; ExpectedCommandSha256 = String.replicate 64 "a"
+              ExpectedVerifiedHead = String.replicate 40 "b" }
+    let supersede : AgentCommand =
+        SupersedePendingIntentCommand
+            { ProjectName = "Project1"; OperationId = operationId
+              OperatorId = "Operator"; ExpectedCommandSha256 = String.replicate 64 "a"
+              ExpectedVerifiedHead = String.replicate 40 "b"
+              RelatedOperationId = Guid.NewGuid().ToString("D")
+              RelatedRequestHash = String.replicate 64 "c"
+              Reason = "Equivalent canonical operation has been verified." }
+    let abandon : AgentCommand =
+        AbandonPendingIntentCommand
+            { ProjectName = "Project1"; OperationId = operationId
+              OperatorId = "Operator"; ExpectedCommandSha256 = String.replicate 64 "a"
+              ExpectedVerifiedHead = String.replicate 40 "b"
+              Reason = "Verified canonical task or review state makes the saved command obsolete." }
+    for command in [ retry; supersede; abandon ] do
+        match Client.PermissionPolicy.evaluate command with
+        | Error(Client.ConfirmationRequired approval) ->
+            Assert.That(approval.Permissions, Does.Contain(VersionControlWrite))
+            Assert.That(approval.Permissions, Does.Contain(NetworkAccess))
+        | other -> Assert.Fail(sprintf "Recovery must require explicit local approval: %A" other)
+        let json = System.Text.Json.JsonSerializer.Serialize(command)
+        let roundtrip = System.Text.Json.JsonSerializer.Deserialize<AgentCommand>(json)
+        Assert.That(roundtrip, Is.EqualTo(command))
+        Assert.That(AgentCommandInfo.projectName command, Is.EqualTo(Some "Project1"))
+    Assert.That(AgentCommandInfo.displayName retry, Is.EqualTo("RetryPendingIntent"))
+    Assert.That(AgentCommandInfo.displayName supersede, Is.EqualTo("SupersedePendingIntent"))
+    Assert.That(AgentCommandInfo.displayName abandon, Is.EqualTo("AbandonPendingIntent"))
+
 [<Test>]
 let ledgerOperationStatusUsesReadOnlyTypedLedgerCommand () =
     Client.PermissionPolicy.clearGrants ()
@@ -164,7 +202,7 @@ let ledgerOperationStatusUsesReadOnlyTypedLedgerCommand () =
         LedgerReadCommand
             { ProjectName = "Project1"
               Action = "GetOperationStatus"
-              OperationId = Guid.NewGuid().ToString("D") }
+              OperationId = Guid.NewGuid().ToString("D"); Cursor = ""; PageSize = 0 }
     match Client.PermissionPolicy.evaluate read with
     | Ok () -> ()
     | other -> Assert.Fail(sprintf "Status lookup must require no mutation approval: %A" other)
@@ -174,7 +212,7 @@ let ledgerOperationStatusUsesReadOnlyTypedLedgerCommand () =
         GitCommandTests.initRepo context
         match Client.OrchestrationApi.LedgerApi.read
                 { ProjectName = "Project1"; Action = "GetOperationStatus"
-                  OperationId = Guid.NewGuid().ToString("D") } context with
+                  OperationId = Guid.NewGuid().ToString("D"); Cursor = ""; PageSize = 0 } context with
         | Error(Client.ValidationError message) ->
             Assert.That(message, Does.Contain(" ledger disabled"))
         | other -> Assert.Fail(sprintf "Unbound operation lookup must fail closed: %A" other)

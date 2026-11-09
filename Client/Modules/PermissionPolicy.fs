@@ -167,6 +167,21 @@ let private requiresConfirmation command =
             [ VersionControlWrite; NetworkAccess ] [] (Some "git")
             [ cmd.RemoteName; cmd.ExpectedTrustedHead; cmd.OperationId ]
             (" ledger setup " + cmd.Action) false
+    | RetryPendingIntentCommand cmd ->
+        confirmation "RetryPendingIntent" (Some cmd.ProjectName)
+            [ VersionControlWrite; NetworkAccess ] [] (Some "git")
+            [ cmd.OperationId; cmd.ExpectedCommandSha256; cmd.ExpectedVerifiedHead ]
+            "Retry exactly the saved pending operation through current canonical ledger guards" false
+    | SupersedePendingIntentCommand cmd ->
+        confirmation "SupersedePendingIntent" (Some cmd.ProjectName)
+            [ WorkspaceWrite; VersionControlWrite; NetworkAccess ] [] (Some "git")
+            [ cmd.OperationId; cmd.RelatedOperationId; cmd.ExpectedCommandSha256; cmd.Reason ]
+            "Archive original pending intent after verifying a related Applied receipt" false
+    | AbandonPendingIntentCommand cmd ->
+        confirmation "AbandonPendingIntent" (Some cmd.ProjectName)
+            [ WorkspaceWrite; VersionControlWrite; NetworkAccess ] [] (Some "git")
+            [ cmd.OperationId; cmd.ExpectedCommandSha256; cmd.ExpectedVerifiedHead; cmd.Reason ]
+            "Archive only after current canonical task/review state proves the original saved action obsolete" false
     | ReviewWriteCommand cmd ->
         confirmation ("Review" + cmd.Action) (Some cmd.ProjectName)
             [ VersionControlWrite; NetworkAccess ] [] (Some "git")

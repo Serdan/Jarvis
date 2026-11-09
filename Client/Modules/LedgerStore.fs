@@ -618,6 +618,28 @@ module LedgerStore =
         if operationId = Guid.Empty then Error(InvalidBinding "Valid operation UUID required.")
         else readOperation binding snapshot.Commit operationId
 
+    // A single verified-head tree listing avoids thousands of individual Git
+    // lookups when triaging a backlog of local uncertain write intents.
+    // Presence only means that an operation path exists; every present record
+    // must still be fully parsed and verified by getOperationAt.
+    let getOperationIdsAt (binding: LedgerBinding) (snapshot: LedgerSnapshot) =
+        run binding.RepositoryPath
+            [ "ls-tree"; "-r"; "--name-only"; snapshot.Commit; "--"; "ops" ]
+        |> Result.map (fun output ->
+            output.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+            |> Seq.choose (fun path ->
+                let parts = path.Split('/')
+                if parts.Length = 3 && parts[0] = "ops" && parts[1].Length = 2
+                   && parts[2].Length = 37 && parts[2].EndsWith(".json", StringComparison.Ordinal) then
+                    let key = parts[2].Substring(0, 32)
+                    if key.StartsWith(parts[1], StringComparison.Ordinal)
+                       && key |> Seq.forall (fun ch ->
+                           (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f')) then
+                        Some key
+                    else None
+                else None)
+            |> Set.ofSeq)
+
     // Originating commit cannot be embedded in its own tree. Recover it by
     // tracing the addition of this immutable operation file through the
     // verified ancestry, then require the original blob and commit trailers.

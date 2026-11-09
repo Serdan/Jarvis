@@ -1746,7 +1746,7 @@ type ReviewWorkflowTests() =
 
                 let operationStatus : Common.LedgerReadCommand =
                     { ProjectName = "owner"; Action = "GetOperationStatus"
-                      OperationId = createCommand.OperationId }
+                      OperationId = createCommand.OperationId; Cursor = ""; PageSize = 0 }
                 let operationResponse =
                     Client.OrchestrationApi.LedgerApi.read operationStatus ctx
                     |> function
@@ -2523,7 +2523,7 @@ type ReviewWorkflowTests() =
             Assert.That(saved.Head.CommandSha256.Length, Is.EqualTo(64))
             let ctx = GitCommandTests.TestContext(Path.GetDirectoryName one)
             let lookup : Common.LedgerReadCommand =
-                { ProjectName = "owner"; Action = "PendingOperations"; OperationId = "" }
+                { ProjectName = "owner"; Action = "PendingOperations"; OperationId = ""; Cursor = ""; PageSize = 0 }
             let listing = Client.OrchestrationApi.LedgerApi.read lookup ctx |> success
             let json = System.Text.Json.JsonSerializer.Serialize(listing)
             Assert.That(json, Does.Contain(operationId.ToString("D")))
@@ -2630,6 +2630,798 @@ type ReviewWorkflowTests() =
             Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(before))
             Assert.That(git one [ "status"; "--porcelain" ], Is.Empty))
 
+
+
+    [<Test>]
+    member _.PendingSummaryAndPagingStayUsableBeyondThousandHistoricalIntents() =
+        withFixture (fun one _ first _ _ _ _ _ ->
+            let records =
+                [ for index in 0 .. 1000 do
+                    let id = Guid.NewGuid()
+                    let command =
+                        System.Text.Json.JsonSerializer.Serialize(
+                            {| Action = "ResumeAgent"; TaskId = "legacy-task"; ActorId = "Agent 5"
+                               ExpectedVersion = 4; ExpectedAgentVersion = 12
+                               AssignmentGeneration = 2
+                               SessionId = "historical-private-session-token-" + string index |})
+                    Client.OrchestrationApi.PendingIntentJournal.persist first id "TaskWrite" command
+                    |> success
+                    yield id, command ]
+            let before = (LedgerStore.fetch first |> success).Commit
+            match Client.OrchestrationApi.PendingIntentJournal.listAtRoot one with
+            | Error(Client.ValidationError message) ->
+                Assert.That(message, Does.Contain("Too many pending"))
+            | other -> Assert.Fail(sprintf "Legacy bulk read should reach its documented cap: %A" other)
+
+            let summary = Client.OrchestrationApi.PendingIntentJournal.summarize first |> success
+            Assert.That(summary.VerifiedLedgerHead, Is.EqualTo(before))
+            Assert.That(summary.Total, Is.EqualTo(1001))
+            Assert.That(summary.MalformedLocalRecords, Is.Zero)
+            Assert.That(summary.ByDisposition.Length, Is.EqualTo(1))
+            Assert.That(summary.ByDisposition.Head.Name, Is.EqualTo("NotFoundAtVerifiedHead"))
+            Assert.That(summary.ByDisposition.Head.Count, Is.EqualTo(1001))
+            Assert.That(summary.ByAction.Head.Name, Is.EqualTo("ResumeAgent"))
+            Assert.That(summary.ByAction.Head.Count, Is.EqualTo(1001))
+            Assert.That(summary.ByActor.Head.Name, Is.EqualTo("Agent 5"))
+            let serializedSummary = System.Text.Json.JsonSerializer.Serialize(summary)
+            Assert.That(serializedSummary, Does.Not.Contain("SessionId"))
+            Assert.That(serializedSummary, Does.Not.Contain("historical-private-session-token"))
+
+            let mutable cursor = ""
+            let seen = System.Collections.Generic.HashSet<string>(StringComparer.Ordinal)
+            let mutable pages = 0
+            let mutable keepPaging = true
+            while keepPaging do
+                let page = Client.OrchestrationApi.PendingIntentJournal.page first cursor 100 |> success
+                pages <- pages + 1
+                Assert.That(page.VerifiedLedgerHead, Is.EqualTo(before))
+                Assert.That(page.Records.Length, Is.InRange(1,100))
+                for item in page.Records do
+                    Assert.That(seen.Add(item.OperationId), Is.True)
+                    Assert.That(item.Action, Is.EqualTo("ResumeAgent"))
+                    Assert.That(item.Actor, Is.EqualTo("Agent 5"))
+                    Assert.That(item.Disposition, Is.EqualTo("NotFoundAtVerifiedHead"))
+                let json = System.Text.Json.JsonSerializer.Serialize(page)
+                Assert.That(json, Does.Not.Contain("historical-private-session-token"))
+                match page.NextCursor with
+                | Some next -> cursor <- next
+                | None -> keepPaging <- false
+            Assert.That(pages, Is.EqualTo(11))
+            Assert.That(seen.Count, Is.EqualTo(1001))
+            let inspectedId, commandJson = records[0]
+            let inspected = Client.OrchestrationApi.PendingIntentJournal.inspect first inspectedId |> success
+            Assert.That(inspected.PresentLocally, Is.True)
+            Assert.That(inspected.Disposition, Is.EqualTo(Some "NotFoundAtVerifiedHead"))
+            Assert.That(inspected.Record.Value.CommandJson, Is.EqualTo(commandJson))
+            let pageResponse : Common.LedgerReadCommand =
+                { ProjectName = "owner"; Action = "PendingOperationsPage"
+                  OperationId = ""; Cursor = ""; PageSize = 12 }
+            let context = GitCommandTests.TestContext(Path.GetDirectoryName one)
+            let bindingConfig = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
+            try
+                Client.OrchestrationApi.LedgerBindingConfig.bindExisting
+                    "owner" context first.ProjectId first.LedgerId first.Epoch
+                    first.RemoteName first.ApprovedFetchUrl first.ApprovedPushUrl before true
+                |> success |> ignore
+                let result = Client.OrchestrationApi.LedgerApi.read pageResponse context |> success
+                let body = System.Text.Json.JsonSerializer.Serialize(result)
+                Assert.That(body, Does.Not.Contain("SessionId"))
+                Assert.That(body, Does.Contain("NotFoundAtVerifiedHead"))
+            finally
+                if File.Exists bindingConfig then File.Delete bindingConfig
+            Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(before))
+            Assert.That((Client.OrchestrationApi.PendingIntentJournal.page first "" 100 |> success).Records.Length,
+                        Is.EqualTo(100)))
+
+    [<Test>]
+    member _.PendingSummarySeparatesVerifiedAppliedConflictsAndForeignBindings() =
+        withFixture (fun _ _ first _ _ _ _ _ ->
+            let command taskId =
+                System.Text.Json.JsonSerializer.Serialize(
+                    {| Action = "CreateTask"; TaskId = taskId
+                       Title = taskId; Html = "<h1>Task</h1>" |})
+            let matched = Guid.NewGuid()
+            Client.OrchestrationApi.PendingIntentJournal.persist first matched "TaskWrite" (command "matched") |> success
+            ReviewWorkflow.createTaskWithSpec first matched "matched" "matched" "<h1>Task</h1>"
+            |> success |> ignore
+            let conflicting = Guid.NewGuid()
+            Client.OrchestrationApi.PendingIntentJournal.persist first conflicting "TaskWrite" (command "wrong") |> success
+            ReviewWorkflow.createTaskWithSpec first conflicting "actual" "actual" "<h1>Task</h1>"
+            |> success |> ignore
+            let uncertain = Guid.NewGuid()
+            Client.OrchestrationApi.PendingIntentJournal.persist first uncertain "TaskWrite" (command "unseen") |> success
+            let foreign = Guid.NewGuid()
+            Client.OrchestrationApi.PendingIntentJournal.persist
+                { first with LedgerId = Guid.NewGuid() } foreign "TaskWrite" (command "foreign")
+            |> success
+            let result = Client.OrchestrationApi.PendingIntentJournal.summarize first |> success
+            let byStatus name =
+                result.ByDisposition |> List.find (fun row -> row.Name = name) |> fun row -> row.Count
+            Assert.That(result.Total, Is.EqualTo(4))
+            Assert.That(byStatus "Applied", Is.EqualTo(1))
+            Assert.That(byStatus "IdentityMismatch", Is.EqualTo(1))
+            Assert.That(byStatus "NotFoundAtVerifiedHead", Is.EqualTo(1))
+            Assert.That(byStatus "BindingMismatch", Is.EqualTo(1))
+            let page = Client.OrchestrationApi.PendingIntentJournal.page first "" 20 |> success
+            let matchedPageEntry = page.Records |> List.find (fun x ->
+                x.OperationId = matched.ToString("D"))
+            Assert.That(matchedPageEntry.Disposition, Is.EqualTo("Applied"))
+            let inspected = Client.OrchestrationApi.PendingIntentJournal.inspect first conflicting |> success
+            Assert.That(inspected.Disposition, Is.EqualTo(Some "IdentityMismatch"))
+            Assert.That((Client.OrchestrationApi.PendingIntentJournal.listAtRoot first.RepositoryPath |> success).Length,
+                        Is.EqualTo(4)))
+
+    [<Test>]
+    member _.PendingQuarantineRowsDoNotBlockOtherIntentsOrCursorProgress() =
+        withFixture (fun one _ first _ _ _ _ _ ->
+            let folder =
+                let config = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
+                Path.Combine(Path.GetDirectoryName config, "pending",
+                             Path.GetFileNameWithoutExtension config)
+            let make action =
+                let id = Guid.NewGuid()
+                Client.OrchestrationApi.PendingIntentJournal.persist first id "TaskWrite"
+                    (System.Text.Json.JsonSerializer.Serialize(
+                        {| Action = action; TaskId = "safe"; ActorId = "Agent 5"; SessionId = "private-token" |}))
+                |> success
+                id
+            let goodA = make "ReviseTaskSpec"
+            let goodB = make "ReopenTask"
+            let corrupted = make "ResumeAgent"
+            let badFile = Path.Combine(folder, corrupted.ToString("N") + ".json")
+            File.WriteAllText(badFile, "{corrupt-pending-record")
+            let stray = Path.Combine(folder, "not-a-valid-uuid.json")
+            File.WriteAllText(stray, "{}")
+            let sum = Client.OrchestrationApi.PendingIntentJournal.summarize first |> success
+            Assert.That(sum.Total, Is.EqualTo(4))
+            Assert.That(sum.MalformedLocalRecords, Is.EqualTo(2))
+            let quarantined = sum.ByDisposition |> List.find (fun row -> row.Name = "MalformedLocalRecord")
+            Assert.That(quarantined.Count, Is.EqualTo(2))
+            let mutable cursor = ""
+            let mutable donePaging = false
+            let rows = ResizeArray<Client.OrchestrationApi.PendingIntentBrief>()
+            while not donePaging do
+                let page = Client.OrchestrationApi.PendingIntentJournal.page first cursor 1 |> success
+                Assert.That(page.Records.Length, Is.EqualTo(1))
+                rows.Add(page.Records.Head)
+                match page.NextCursor with
+                | Some next -> cursor <- next
+                | None -> donePaging <- true
+            Assert.That(rows.Count, Is.EqualTo(4))
+            Assert.That(rows |> Seq.filter (fun row -> row.Disposition = "MalformedLocalRecord") |> Seq.length,
+                        Is.EqualTo(2))
+            Assert.That(rows |> Seq.filter (fun row -> row.Disposition = "NotFoundAtVerifiedHead") |> Seq.length,
+                        Is.EqualTo(2))
+            Assert.That(rows |> Seq.exists (fun row -> row.OperationId = goodA.ToString("D")), Is.True)
+            Assert.That(rows |> Seq.exists (fun row -> row.OperationId = goodB.ToString("D")), Is.True)
+            Assert.That(rows |> Seq.exists (fun row -> row.LocalFileKey = "not-a-valid-uuid"), Is.True)
+            let serialized = System.Text.Json.JsonSerializer.Serialize(rows)
+            Assert.That(serialized, Does.Not.Contain("private-token"))
+            Assert.That(File.Exists badFile, Is.True)
+            Assert.That(File.Exists stray, Is.True)
+            match Client.OrchestrationApi.PendingIntentJournal.inspect first corrupted with
+            | Error(Client.ValidationError _) -> ()
+            | other -> Assert.Fail(sprintf "Corrupt record must not be accepted for inspection: %A" other))
+
+    [<Test>]
+    member _.PendingSupersessionRequiresProvenEquivalentAppliedReceiptAndPreservesArchive() =
+        withFixture (fun one _ first _ _ _ _ _ ->
+            let operationId = Guid.NewGuid()
+            let taskId = "supersession-proven-task"
+            let spec = "<h1>Equivalent task</h1>"
+            let savedCommand =
+                System.Text.Json.JsonSerializer.Serialize(
+                    {| Action = "CreateTask"; TaskId = taskId; Title = "Equivalent task"
+                       Html = spec; SessionId = "historical-private-session-token" |})
+            Client.OrchestrationApi.PendingIntentJournal.persist first operationId "TaskWrite" savedCommand
+            |> success
+            let stored = Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId
+                         |> success |> Option.get
+            let wrongId = Guid.NewGuid()
+            let wrong = ReviewWorkflow.createTaskWithSpec first wrongId "unrelated"
+                            "Different task" spec |> success
+            let goodId = Guid.NewGuid()
+            let good = ReviewWorkflow.createTaskWithSpec first goodId taskId
+                           "Equivalent task" spec |> success
+            let head = (LedgerStore.fetch first |> success).Commit
+            let reason = "Equivalent CreateTask accepted with a different UUID; supersede original local intent."
+            let supersede pinned relatedId requestHash requestedReason =
+                Client.OrchestrationApi.PendingIntentJournal.supersede first operationId
+                    stored.CommandSha256 pinned "Jarvis Lead" requestedReason relatedId requestHash
+            match supersede head wrongId wrong.Operation.RequestHash reason with
+            | Error(Client.ValidationError _) -> ()
+            | other -> Assert.Fail(sprintf "Unrelated task cannot prove supersession: %A" other)
+            match supersede (String.replicate 40 "f") goodId good.Operation.RequestHash reason with
+            | Error(Client.ValidationError _) -> ()
+            | other -> Assert.Fail(sprintf "Stale snapshot anchor cannot supersede: %A" other)
+            match supersede head goodId (String.replicate 64 "a") reason with
+            | Error(Client.ValidationError _) -> ()
+            | other -> Assert.Fail(sprintf "Wrong related hash cannot supersede: %A" other)
+            Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId |> success).IsSome,
+                        Is.True)
+            let archived = supersede head goodId good.Operation.RequestHash reason |> success
+            Assert.That(archived.alreadySuperseded, Is.False)
+            Assert.That(archived.archive.Original.CommandJson, Is.EqualTo(savedCommand))
+            Assert.That(archived.archive.RelatedRequestHash, Is.EqualTo(good.Operation.RequestHash))
+            Assert.That(archived.archive.RelatedOperationKind, Is.EqualTo("CreateTask"))
+            Assert.That(archived.archive.RelatedOriginCommit.Length, Is.EqualTo(40))
+            Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId |> success).IsNone,
+                        Is.True)
+            let second = supersede head goodId good.Operation.RequestHash reason |> success
+            Assert.That(second.alreadySuperseded, Is.True)
+            match supersede head goodId good.Operation.RequestHash "A changed audit reason is rejected." with
+            | Error(Client.ValidationError _) -> ()
+            | other -> Assert.Fail(sprintf "Immutable disposition cannot be rewritten: %A" other)
+            match Client.OrchestrationApi.PendingIntentJournal.persist first operationId "TaskWrite" savedCommand with
+            | Error(Client.ValidationError _) -> ()
+            | other -> Assert.Fail(sprintf "Archived UUID must reject new persistence: %A" other)
+            let mutable replayCalled = false
+            match Client.OrchestrationApi.PendingIntentJournal.execute first operationId "TaskWrite" savedCommand (fun () ->
+                replayCalled <- true
+                Ok 5) with
+            | Error(Client.ValidationError _) -> ()
+            | other -> Assert.Fail(sprintf "Archived UUID must reject replay: %A" other)
+            Assert.That(replayCalled, Is.False)
+            let inspected = Client.OrchestrationApi.PendingIntentJournal.inspect first operationId |> success
+            Assert.That(inspected.Disposition, Is.EqualTo(Some "Superseded"))
+            Assert.That(inspected.Archive.IsSome, Is.True)
+            Assert.That(inspected.Record.Value.CommandJson, Is.EqualTo(savedCommand))
+            let summary = Client.OrchestrationApi.PendingIntentJournal.summarize first |> success
+            Assert.That(summary.Total, Is.EqualTo(0))
+            Assert.That(summary.ArchivedTotal, Is.EqualTo(1))
+            Assert.That(summary.ArchivedLateApplied, Is.Zero)
+            Assert.That(summary.ByDisposition |> List.exists (fun item ->
+                item.Name = "Superseded" && item.Count = 1), Is.True)
+            Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(head))
+            // Simulate a process interruption after archive creation but before
+            // pending file deletion. Same-argument retry recovers without
+            // re-reading or re-writing the immutable tombstone.
+            let bindingPath = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
+            let pendingPath = Path.Combine(Path.GetDirectoryName bindingPath, "pending",
+                                           Path.GetFileNameWithoutExtension bindingPath,
+                                           operationId.ToString("N") + ".json")
+            File.WriteAllText(pendingPath, System.Text.Json.JsonSerializer.Serialize(stored))
+            let recovered = supersede head goodId good.Operation.RequestHash reason |> success
+            Assert.That(recovered.alreadySuperseded, Is.True)
+            Assert.That(File.Exists pendingPath, Is.False)
+            Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(head)))
+
+
+    [<Test>]
+    member _.ArchivedIntentRetainsProvenanceWhenOriginalPushArrivesLateOrConflicts() =
+        withFixture (fun one _ first _ _ _ _ _ ->
+            let taskId = "archived-late-acceptance"
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId taskId |> success |> ignore
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner"
+            |> success |> ignore
+            let originalCommand =
+                System.Text.Json.JsonSerializer.Serialize(
+                    {| Action = "ResumeAgent"; TaskId = taskId; ActorId = "Owner"
+                       ExpectedVersion = 0; ExpectedAgentVersion = 0
+                       AssignmentGeneration = 1
+                       SessionId = "historical-session-secret" |})
+            let lateId = Guid.NewGuid()
+            let conflictingId = Guid.NewGuid()
+            for id in [ lateId; conflictingId ] do
+                Client.OrchestrationApi.PendingIntentJournal.persist first id "V2TaskWrite" originalCommand
+                |> success
+            let successorId = Guid.NewGuid()
+            let successor = ReviewWorkflow.beginAttempt first successorId taskId "Owner" 1 1 |> success
+            let head = (LedgerStore.fetch first |> success).Commit
+            let reason = "Verified successor BeginAttempt makes original session resume unnecessary."
+            for id in [ lateId; conflictingId ] do
+                let stored = Client.OrchestrationApi.PendingIntentJournal.findAtRoot one id
+                             |> success |> Option.get
+                Client.OrchestrationApi.PendingIntentJournal.supersede first id
+                    stored.CommandSha256 head "Jarvis Lead" reason
+                    successorId successor.Operation.RequestHash
+                |> success |> ignore
+                Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one id |> success).IsNone,
+                            Is.True)
+            let initial = Client.OrchestrationApi.PendingIntentJournal.summarize first |> success
+            Assert.That(initial.Total, Is.Zero)
+            Assert.That(initial.ArchivedTotal, Is.EqualTo(2))
+            Assert.That(initial.ArchivedLateApplied, Is.Zero)
+            Assert.That(initial.ArchivedIdentityMismatch, Is.Zero)
+            // A second client had an original ResumeAgent operation in flight,
+            // whose remote acceptance becomes visible AFTER supersession.
+            let late = ReviewWorkflow.resumeAgentWithSession first lateId taskId "Owner"
+                           0 0 1 "historical-session-secret" |> success
+            Assert.That(late.Operation.Type, Is.EqualTo("ResumeAgent"))
+            // The conflicting UUID is a different canonical mutation, and
+            // must never be silently treated as matching the archived command.
+            ReviewWorkflow.createTaskWithSpec first conflictingId "different-task-after-archive"
+                "Different task" "<h1>Not the archived ResumeAgent</h1>" |> success |> ignore
+            let verifiedHead = (LedgerStore.fetch first |> success).Commit
+            let lateInspect = Client.OrchestrationApi.PendingIntentJournal.inspect first lateId |> success
+            let conflictInspect = Client.OrchestrationApi.PendingIntentJournal.inspect first conflictingId |> success
+            Assert.That(lateInspect.Disposition, Is.EqualTo(Some "AppliedAfterSupersession"))
+            Assert.That(conflictInspect.Disposition, Is.EqualTo(Some "IdentityMismatchAfterSupersession"))
+            Assert.That(lateInspect.Archive.Value.Original.CommandJson, Is.EqualTo(originalCommand))
+            Assert.That(conflictInspect.Archive.Value.Original.CommandJson, Is.EqualTo(originalCommand))
+            Assert.That(lateInspect.PresentLocally, Is.False)
+            Assert.That(conflictInspect.PresentLocally, Is.False)
+            let summary = Client.OrchestrationApi.PendingIntentJournal.summarize first |> success
+            Assert.That(summary.VerifiedLedgerHead, Is.EqualTo(verifiedHead))
+            Assert.That(summary.Total, Is.Zero)
+            Assert.That(summary.ArchivedTotal, Is.EqualTo(2))
+            Assert.That(summary.ArchivedLateApplied, Is.EqualTo(1))
+            Assert.That(summary.ArchivedIdentityMismatch, Is.EqualTo(1))
+            // Acknowledge is exclusively for live pending records with matching
+            // Applied proof. It cannot hide an archived late arrival or conflict.
+            for id, hash in [ lateId, late.Operation.RequestHash
+                              conflictingId, (String.replicate 64 "a") ] do
+                match Client.OrchestrationApi.PendingIntentJournal.acknowledge first id hash with
+                | Error(Client.ValidationError message) ->
+                    Assert.That(message, Does.Contain("superseded"))
+                | other -> Assert.Fail(sprintf "Archived intent must not be acknowledged away: %A" other)
+            Assert.That((Client.OrchestrationApi.PendingIntentJournal.summarize first |> success).ArchivedTotal,
+                        Is.EqualTo(2))
+            Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(verifiedHead)))
+
+
+    [<Test>]
+    member _.OperatorAbandonRequiresVerifiedNewerAssignmentAndArchivesOriginalSession() =
+        withFixture (fun one _ first _ _ _ _ _ ->
+            let taskId = "obsolete-assignment-generation"
+            ReviewWorkflow.createTaskWithSpec first (Guid.NewGuid()) taskId "Obsolete assignment"
+                "<h1>First generation</h1>" |> success |> ignore
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner"
+            |> success |> ignore
+            let originalId = Guid.NewGuid()
+            let oldJson =
+                System.Text.Json.JsonSerializer.Serialize(
+                    {| Action = "ResumeAgent"; TaskId = taskId
+                       ActorId = "Owner"; AssignmentGeneration = 1
+                       ExpectedVersion = 0; ExpectedAgentVersion = 0
+                       SessionId = "legacy-private-session" |})
+            let unpinnedId = Guid.NewGuid()
+            let unpinnedJson =
+                System.Text.Json.JsonSerializer.Serialize(
+                    {| Action = "ResumeAgent"; TaskId = taskId
+                       ActorId = "Owner"; AssignmentGeneration = 0
+                       ExpectedVersion = 0; ExpectedAgentVersion = 0
+                       SessionId = "wildcard-generation-must-fail" |})
+            for id, saved in [ originalId, oldJson; unpinnedId, unpinnedJson ] do
+                Client.OrchestrationApi.PendingIntentJournal.persist first id "V2TaskWrite" saved
+                |> success
+            let earlierHead = (LedgerStore.fetch first |> success).Commit
+            let earlierRecord =
+                Client.OrchestrationApi.PendingIntentJournal.findAtRoot one originalId
+                |> success |> Option.get
+            let reason = "A newer verified assignment generation superseded the old resume session."
+            let abandon id sha head =
+                Client.OrchestrationApi.PendingIntentJournal.abandon first id
+                    sha head "Jarvis Lead" reason
+            match abandon originalId earlierRecord.CommandSha256 earlierHead with
+            | Error(Client.ValidationError _) -> ()
+            | other -> Assert.Fail(sprintf "Same assignment generation must not be abandoned: %A" other)
+            ReviewWorkflow.acknowledgeAssignment first (Guid.NewGuid()) taskId "Owner" 1 1
+            |> success |> ignore
+            ReviewWorkflow.reissueAssignment first (Guid.NewGuid()) taskId "Owner"
+                2 2 1 "Reissued instructions" "<h1>New generation</h1>"
+            |> success |> ignore
+            let head = (LedgerStore.fetch first |> success).Commit
+            match abandon originalId earlierRecord.CommandSha256 earlierHead with
+            | Error(Client.ValidationError _) -> ()
+            | other -> Assert.Fail(sprintf "Stale ledger head cannot authorize abandonment: %A" other)
+            match abandon originalId (String.replicate 64 "f") head with
+            | Error(Client.ValidationError _) -> ()
+            | other -> Assert.Fail(sprintf "Wrong original SHA must fail: %A" other)
+            let unpinnedRecord =
+                Client.OrchestrationApi.PendingIntentJournal.findAtRoot one unpinnedId
+                |> success |> Option.get
+            match abandon unpinnedId unpinnedRecord.CommandSha256 head with
+            | Error(Client.ValidationError _) -> ()
+            | other -> Assert.Fail(sprintf "Original wildcard generation cannot prove obsolescence: %A" other)
+            let archived = abandon originalId earlierRecord.CommandSha256 head |> success
+            Assert.That(archived.alreadyAbandoned, Is.False)
+            Assert.That(archived.archive.SchemaVersion, Is.EqualTo(2))
+            Assert.That(archived.archive.ObsoleteTask.Rule,
+                        Is.EqualTo(Client.OrchestrationApi.PendingTaskObsolescence.AssignmentAdvanced))
+            Assert.That(archived.archive.ObsoleteTask.ObservedAssignmentGeneration, Is.EqualTo(2))
+            Assert.That(archived.archive.Original.CommandJson, Is.EqualTo(oldJson))
+            let repeated = abandon originalId earlierRecord.CommandSha256 head |> success
+            Assert.That(repeated.alreadyAbandoned, Is.True)
+            let inspected = Client.OrchestrationApi.PendingIntentJournal.inspect first originalId |> success
+            Assert.That(inspected.Disposition, Is.EqualTo(Some "Abandoned"))
+            Assert.That(inspected.Archive.Value.Original.CommandJson,
+                        Does.Contain("legacy-private-session"))
+            Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one originalId |> success).IsNone,
+                        Is.True)
+            Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one unpinnedId |> success).IsSome,
+                        Is.True)
+            match Client.OrchestrationApi.PendingIntentJournal.acknowledge first originalId
+                    (String.replicate 64 "a") with
+            | Error(Client.ValidationError _) -> ()
+            | other -> Assert.Fail(sprintf "Archived UUID cannot be acknowledged: %A" other)
+            Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(head)))
+
+    [<Test>]
+    member _.OperatorAbandonUsesWithdrawnReviewStateWithoutInspectingSourceRef() =
+        withFixture (fun one _ first _ _ _ _ _ ->
+            let taskId = "_reviews"
+            let reviewId = Guid.NewGuid()
+            let sourceHead = git one [ "rev-parse"; "HEAD" ]
+            ReviewWorkflow.submitBranchReview first (Guid.NewGuid()) taskId "Owner"
+                reviewId "" sourceHead "Awaiting review" "" ""
+            |> success |> ignore
+            let pendingId = Guid.NewGuid()
+            let command =
+                System.Text.Json.JsonSerializer.Serialize(
+                    {| Action = "Claim"; TaskId = taskId
+                       RequestId = reviewId.ToString("D")
+                       ActorId = "Reviewer"; ExpectedVersion = 1 |})
+            Client.OrchestrationApi.PendingIntentJournal.persist first pendingId "V2ReviewWrite" command
+            |> success
+            let stored =
+                Client.OrchestrationApi.PendingIntentJournal.findAtRoot one pendingId
+                |> success |> Option.get
+            let firstHead = (LedgerStore.fetch first |> success).Commit
+            let reason = "The verified review is withdrawn, so the original claim cannot apply."
+            let abandon head sha =
+                Client.OrchestrationApi.PendingIntentJournal.abandon first pendingId sha
+                    head "Jarvis Lead" reason
+            match abandon firstHead stored.CommandSha256 with
+            | Error(Client.ValidationError _) -> ()
+            | other -> Assert.Fail(sprintf "Unclaimed review must not be abandoned: %A" other)
+            ReviewWorkflow.withdrawBranchReview first (Guid.NewGuid()) taskId
+                reviewId "Owner" 1 |> success |> ignore
+            let verifiedHead = (LedgerStore.fetch first |> success).Commit
+            let archive = abandon verifiedHead stored.CommandSha256 |> success
+            Assert.That(archive.archive.SchemaVersion, Is.EqualTo(2))
+            Assert.That(archive.archive.ObsoleteReview.ObservedStatus, Is.EqualTo("Withdrawn"))
+            Assert.That(archive.archive.ObsoleteReview.OriginalExpectedVersion, Is.EqualTo(1))
+            Assert.That(archive.archive.ObsoleteReview.Rule,
+                        Is.EqualTo(Client.OrchestrationApi.PendingReviewObsolescence.ReviewVersionAdvanced))
+            Assert.That(archive.archive.Original.CommandJson, Is.EqualTo(command))
+            Assert.That((Client.OrchestrationApi.PendingIntentJournal.inspect first pendingId |> success).Disposition,
+                        Is.EqualTo(Some "Abandoned"))
+            let summary = Client.OrchestrationApi.PendingIntentJournal.summarize first |> success
+            Assert.That(summary.Total, Is.Zero)
+            Assert.That(summary.ArchivedTotal, Is.EqualTo(1))
+            Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(verifiedHead))
+            // Delayed remote acceptance under an abandoned UUID with a DIFFERENT
+            // command identity must be surfaced, never mistaken for the saved
+            // review claim or silently acknowledged.
+            ReviewWorkflow.createTask first pendingId "unrelated-remote-uuid" "Unrelated task"
+            |> success |> ignore
+            let afterConflict = Client.OrchestrationApi.PendingIntentJournal.inspect first pendingId |> success
+            Assert.That(afterConflict.Disposition, Is.EqualTo(Some "IdentityMismatchAfterAbandonment"))
+            Assert.That(afterConflict.Archive.Value.Original.CommandJson, Is.EqualTo(command))
+            Assert.That((Client.OrchestrationApi.PendingIntentJournal.summarize first |> success).ArchivedIdentityMismatch,
+                        Is.EqualTo(1)))
+
+    [<Test>]
+    member _.PendingSupersessionNeverArchivesAnOriginalWithVerifiedAppliedReceipt() =
+        withFixture (fun one _ first _ _ _ _ _ ->
+            let action = "must-remain-applied"
+            let html = "<h1>Already accepted</h1>"
+            let originalId = Guid.NewGuid()
+            let original = ReviewWorkflow.createTaskWithSpec first originalId action action html |> success
+            let savedCommand =
+                System.Text.Json.JsonSerializer.Serialize(
+                    {| Action = "CreateTask"; TaskId = action; Title = action; Html = html |})
+            Client.OrchestrationApi.PendingIntentJournal.persist first originalId "TaskWrite" savedCommand
+            |> success
+            let otherId = Guid.NewGuid()
+            let unrelated = ReviewWorkflow.createTaskWithSpec first otherId "elsewhere"
+                                "Elsewhere" html |> success
+            let saved = Client.OrchestrationApi.PendingIntentJournal.findAtRoot one originalId
+                        |> success |> Option.get
+            let head = (LedgerStore.fetch first |> success).Commit
+            match Client.OrchestrationApi.PendingIntentJournal.supersede first originalId
+                    saved.CommandSha256 head "Jarvis Lead"
+                    "Already accepted operation must never be abandoned." otherId
+                    unrelated.Operation.RequestHash with
+            | Error(Client.ValidationError _) -> ()
+            | other -> Assert.Fail(sprintf "Applied original UUID cannot be superseded: %A" other)
+            Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one originalId |> success).IsSome,
+                        Is.True)
+            Assert.That(original.Operation.OperationId, Is.EqualTo(originalId.ToString("D")))
+            Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(head)))
+
+
+
+    [<Test>]
+    member _.LegacyResumeSupersessionRequiresExactOwnerAndAssignmentGeneration() =
+        withFixture (fun one _ first _ _ _ _ _ ->
+            let taskId = "legacy-generation-proof"
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId taskId |> success |> ignore
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner"
+            |> success |> ignore
+            let oldResume actionId generation actor =
+                let original =
+                    System.Text.Json.JsonSerializer.Serialize(
+                        {| Action = "ResumeAgent"; TaskId = taskId
+                           ActorId = actor; AssignmentGeneration = generation
+                           ExpectedVersion = 1; ExpectedAgentVersion = 0
+                           SessionId = "old-protocol-private-session" |})
+                Client.OrchestrationApi.PendingIntentJournal.persist first actionId "V2TaskWrite" original
+                |> success
+                Client.OrchestrationApi.PendingIntentJournal.findAtRoot one actionId
+                |> success |> Option.get
+            let originalId = Guid.NewGuid()
+            let original = oldResume originalId 1 "Owner"
+            let wrongGenerationId = Guid.NewGuid()
+            let wrongGeneration = oldResume wrongGenerationId 2 "Owner"
+            let unknownGenerationId = Guid.NewGuid()
+            let unknownGeneration = oldResume unknownGenerationId 0 "Owner"
+            let wrongActorId = Guid.NewGuid()
+            let wrongActor = oldResume wrongActorId 1 "Reviewer"
+            let relatedId = Guid.NewGuid()
+            let begun = ReviewWorkflow.beginAttempt first relatedId taskId "Owner" 1 1 |> success
+            let head = (LedgerStore.fetch first |> success).Commit
+            let reason = "Legacy session resume is superseded by the exact accepted BeginAttempt for this assignment."
+            let trySupersede (id: Guid) (stored: Client.OrchestrationApi.PendingIntent) =
+                Client.OrchestrationApi.PendingIntentJournal.supersede first id
+                    stored.CommandSha256 head "Jarvis Lead" reason
+                    relatedId begun.Operation.RequestHash
+            for id, saved in [ wrongGenerationId, wrongGeneration
+                               unknownGenerationId, unknownGeneration
+                               wrongActorId, wrongActor ] do
+                match trySupersede id saved with
+                | Error(Client.ValidationError _) -> ()
+                | other -> Assert.Fail(sprintf "Unrelated generation/actor cannot retire old resume: %A" other)
+                Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one id |> success).IsSome,
+                            Is.True)
+            let archived = trySupersede originalId original |> success
+            Assert.That(archived.alreadySuperseded, Is.False)
+            Assert.That(archived.archive.RelatedOperationKind, Is.EqualTo("BeginAttempt"))
+            Assert.That(archived.archive.Original.CommandJson, Does.Contain("old-protocol-private-session"))
+            let inspected = Client.OrchestrationApi.PendingIntentJournal.inspect first originalId |> success
+            Assert.That(inspected.Disposition, Is.EqualTo(Some "Superseded"))
+            Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(head)))
+
+    [<Test>]
+    member _.OperatorRetryUsesExactSavedTaskCommandAndCurrentLedgerWriter() =
+        withFixture (fun one _ first _ _ _ _ _ ->
+            let before = (LedgerStore.fetch first |> success).Commit
+            let context = GitCommandTests.TestContext(Path.GetDirectoryName one)
+            let configPath = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
+            Client.OrchestrationApi.LedgerBindingConfig.bindExisting
+                "owner" context first.ProjectId first.LedgerId first.Epoch
+                first.RemoteName first.ApprovedFetchUrl first.ApprovedPushUrl before true
+            |> success |> ignore
+            try
+                let operationId = Guid.NewGuid()
+                let taskId = "operator-retry-task"
+                let html = "<h1>Saved original task spec</h1>"
+                let command : Common.TaskWriteCommand =
+                    { ProjectName = "owner"; Action = "CreateTask"
+                      OperationId = operationId.ToString("D")
+                      TaskId = taskId; AttemptId = ""; ActorId = "Owner"; OwnerId = ""
+                      Title = "Saved original title"; Html = html
+                      ExpectedVersion = 0; ExpectedAgentVersion = 0
+                      ExpectedTaskVersion = 0; AssignmentGeneration = 0
+                      Summary = ""; NextAction = ""; Reason = ""
+                      BaseOid = ""; TargetRef = ""; SourceRef = ""
+                      AllowDetached = false; AllowUncommitted = false
+                      DecisionSequence = 0L; Evidence = ""; SessionId = "" }
+                let savedJson = System.Text.Json.JsonSerializer.Serialize(command)
+                Client.OrchestrationApi.PendingIntentJournal.persist
+                    first operationId "TaskWrite" savedJson |> success
+                let saved = Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId
+                            |> success |> Option.get
+                let authorization : Common.RetryPendingIntentCommand =
+                    { ProjectName = "owner"; OperationId = operationId.ToString("D")
+                      OperatorId = "Jarvis Lead"; ExpectedCommandSha256 = saved.CommandSha256
+                      ExpectedVerifiedHead = before }
+                match Client.OrchestrationApi.PendingRecoveryApi.retry
+                        { authorization with ExpectedCommandSha256 = String.replicate 64 "f" } context with
+                | Error(Client.ValidationError _) -> ()
+                | other -> Assert.Fail(sprintf "Wrong command hash cannot retry: %A" other)
+                match Client.OrchestrationApi.PendingRecoveryApi.retry
+                        { authorization with ExpectedVerifiedHead = String.replicate 40 "0" } context with
+                | Error(Client.ValidationError _) -> ()
+                | other -> Assert.Fail(sprintf "Stale verified head cannot retry: %A" other)
+                let outcome = Client.OrchestrationApi.PendingRecoveryApi.retry authorization context |> success
+                let json = System.Text.Json.JsonSerializer.Serialize(outcome)
+                Assert.That(json, Does.Contain(operationId.ToString("D")))
+                let _, remote = LedgerStore.getOperationStatus first operationId |> success
+                Assert.That(remote.IsSome, Is.True)
+                Assert.That(remote.Value.Type, Is.EqualTo("CreateTask"))
+                Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId |> success).IsNone,
+                            Is.True)
+                let newHead = (LedgerStore.fetch first |> success).Commit
+                Assert.That(newHead, Is.Not.EqualTo(before))
+                match Client.OrchestrationApi.PendingRecoveryApi.retry
+                        { authorization with ExpectedVerifiedHead = newHead } context with
+                | Error(Client.ValidationError _) -> ()
+                | other -> Assert.Fail(sprintf "No saved original journal must refuse retry: %A" other)
+                Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(newHead))
+                // Simulate lost response after original remote acceptance.
+                // The read-only retry reports Applied, preserves journal for
+                // explicit verified-hash acknowledgment, and makes no Git write.
+                Client.OrchestrationApi.PendingIntentJournal.persist
+                    first operationId "TaskWrite" savedJson |> success
+                let verified =
+                    Client.OrchestrationApi.PendingRecoveryApi.retry { authorization with ExpectedVerifiedHead = newHead } context |> success
+                let response = System.Text.Json.JsonSerializer.Serialize(verified)
+                Assert.That(response, Does.Contain("Applied"))
+                Assert.That(response, Does.Contain(remote.Value.RequestHash))
+                Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId |> success).IsSome,
+                            Is.True)
+                Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(newHead))
+            finally
+                if File.Exists configPath then File.Delete configPath)
+
+    [<Test>]
+    member _.OperatorRetryNeverResurrectsLegacyResumeOrStaleEntity() =
+        withFixture (fun one _ first _ _ _ _ _ ->
+            let before = (LedgerStore.fetch first |> success).Commit
+            let context = GitCommandTests.TestContext(Path.GetDirectoryName one)
+            let configPath = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
+            Client.OrchestrationApi.LedgerBindingConfig.bindExisting
+                "owner" context first.ProjectId first.LedgerId first.Epoch
+                first.RemoteName first.ApprovedFetchUrl first.ApprovedPushUrl before true
+            |> success |> ignore
+            try
+                let template (operationId: Guid) taskId action : Common.TaskWriteCommand =
+                    { ProjectName = "owner"; Action = action
+                      OperationId = operationId.ToString("D"); TaskId = taskId
+                      AttemptId = ""; ActorId = "Owner"; OwnerId = ""
+                      Title = taskId; Html = "<h1>Historical command</h1>"
+                      ExpectedVersion = 2; ExpectedAgentVersion = 5
+                      ExpectedTaskVersion = 0; AssignmentGeneration = 2
+                      Summary = ""; NextAction = ""; Reason = ""
+                      BaseOid = ""; TargetRef = ""; SourceRef = ""
+                      AllowDetached = false; AllowUncommitted = false
+                      DecisionSequence = 0L; Evidence = ""; SessionId = "historical-private-session-token" }
+                let legacyId = Guid.NewGuid()
+                let legacy = template legacyId "legacy-task" "ResumeAgent"
+                Client.OrchestrationApi.PendingIntentJournal.persist
+                    first legacyId "V2TaskWrite" (System.Text.Json.JsonSerializer.Serialize legacy)
+                |> success
+                let saved = Client.OrchestrationApi.PendingIntentJournal.findAtRoot one legacyId
+                            |> success |> Option.get
+                let authorization : Common.RetryPendingIntentCommand =
+                    { ProjectName = "owner"; OperationId = legacyId.ToString("D")
+                      OperatorId = "Jarvis Lead"; ExpectedCommandSha256 = saved.CommandSha256
+                      ExpectedVerifiedHead = before }
+                match Client.OrchestrationApi.PendingRecoveryApi.retry authorization context with
+                | Error(Client.ValidationError message) ->
+                    Assert.That(message, Does.Contain("ReplayRejectedStale"))
+                | other -> Assert.Fail(sprintf "Retired resume must never retry: %A" other)
+                Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one legacyId |> success).IsSome,
+                            Is.True)
+                Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(before))
+                let staleId = Guid.NewGuid()
+                let staleTaskId = "stale-recovery-task"
+                // Saved CreateTask is now obsolete because a different UUID
+                // already created the same task.
+                let staleCommand =
+                    { template staleId staleTaskId "CreateTask" with
+                        ExpectedVersion = 0; ExpectedAgentVersion = 0
+                        AssignmentGeneration = 0; SessionId = "" }
+                Client.OrchestrationApi.PendingIntentJournal.persist
+                    first staleId "TaskWrite" (System.Text.Json.JsonSerializer.Serialize staleCommand)
+                |> success
+                ReviewWorkflow.createTaskWithSpec first (Guid.NewGuid()) staleTaskId staleTaskId
+                    "<h1>Historical command</h1>" |> success |> ignore
+                let head = (LedgerStore.fetch first |> success).Commit
+                let pending = Client.OrchestrationApi.PendingIntentJournal.findAtRoot one staleId
+                              |> success |> Option.get
+                match Client.OrchestrationApi.PendingRecoveryApi.retry
+                    { authorization with OperationId = staleId.ToString("D")
+                                         ExpectedCommandSha256 = pending.CommandSha256
+                                         ExpectedVerifiedHead = head } context with
+                | Error _ -> ()
+                | other -> Assert.Fail(sprintf "Current writer must reject stale CreateTask: %A" other)
+                Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one staleId |> success).IsSome,
+                            Is.True)
+                Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(head))
+            finally
+                if File.Exists configPath then File.Delete configPath)
+
+    [<Test>]
+    member _.OperatorRetryRejectsRemoteIdentityMismatchWithoutMutation() =
+        withFixture (fun one _ first _ _ _ _ _ ->
+            let before = (LedgerStore.fetch first |> success).Commit
+            let context = GitCommandTests.TestContext(Path.GetDirectoryName one)
+            let configPath = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
+            Client.OrchestrationApi.LedgerBindingConfig.bindExisting
+                "owner" context first.ProjectId first.LedgerId first.Epoch
+                first.RemoteName first.ApprovedFetchUrl first.ApprovedPushUrl before true
+            |> success |> ignore
+            try
+                let operationId = Guid.NewGuid()
+                let command = System.Text.Json.JsonSerializer.Serialize(
+                    {| Action = "CreateTask"; TaskId = "not-actual-task"; Title = "Wrong task" |})
+                Client.OrchestrationApi.PendingIntentJournal.persist
+                    first operationId "TaskWrite" command |> success
+                ReviewWorkflow.createTaskWithSpec first operationId "actual-task"
+                    "Actual task" "<h1>Different actual operation</h1>" |> success |> ignore
+                let head = (LedgerStore.fetch first |> success).Commit
+                let saved = Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId
+                            |> success |> Option.get
+                let request : Common.RetryPendingIntentCommand =
+                    { ProjectName = "owner"; OperationId = operationId.ToString("D")
+                      OperatorId = "Jarvis Lead"; ExpectedCommandSha256 = saved.CommandSha256
+                      ExpectedVerifiedHead = head }
+                match Client.OrchestrationApi.PendingRecoveryApi.retry request context with
+                | Error(Client.ValidationError message) ->
+                    Assert.That(message, Does.Contain("IdentityMismatch"))
+                | other -> Assert.Fail(sprintf "Conflicting remote UUID must not replay: %A" other)
+                Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId |> success).IsSome,
+                            Is.True)
+                Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(head))
+            finally
+                if File.Exists configPath then File.Delete configPath)
+
+
+    [<Test>]
+    member _.PendingIntentLocksAreEnforcedAcrossProcesses() =
+        withFixture (fun one _ first _ _ _ _ _ ->
+            let operationId = Guid.NewGuid()
+            let bindingPath = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
+            let lockDirectory =
+                Path.Combine(Path.GetDirectoryName bindingPath, "pending",
+                             Path.GetFileNameWithoutExtension bindingPath, ".locks")
+            Directory.CreateDirectory(lockDirectory) |> ignore
+            let lockPath = Path.Combine(lockDirectory, operationId.ToString("N").Substring(0, 3) + ".lock")
+            let script = Path.Combine(Path.GetDirectoryName one, "hold-exclusive-lock.fsx")
+            let ready = Path.Combine(Path.GetDirectoryName one, "holder-ready")
+            File.WriteAllText(script,
+                String.concat "\n"
+                    [ "open System"; "open System.IO"
+                      "let lockPath = fsi.CommandLineArgs[1]"
+                      "let readyPath = fsi.CommandLineArgs[2]"
+                      "use held = new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None)"
+                      "File.WriteAllText(readyPath, \"held\")"
+                      "System.Threading.Thread.Sleep(2200)" ])
+            use holder = new Process()
+            holder.StartInfo.FileName <- "dotnet"
+            holder.StartInfo.UseShellExecute <- false
+            holder.StartInfo.RedirectStandardOutput <- true
+            holder.StartInfo.RedirectStandardError <- true
+            for arg in [ "fsi"; "--exec"; script; lockPath; ready ] do
+                holder.StartInfo.ArgumentList.Add(arg)
+            Assert.That(holder.Start(), Is.True)
+            try
+                let wait = Stopwatch.StartNew()
+                while not (File.Exists ready) && not holder.HasExited
+                      && wait.Elapsed < TimeSpan.FromSeconds(15.) do
+                    System.Threading.Thread.Sleep(25)
+                Assert.That(File.Exists ready, Is.True,
+                            "Independent .NET process must acquire the OS lock before pending write.")
+                let elapsed = Stopwatch.StartNew()
+                Client.OrchestrationApi.PendingIntentJournal.persist first operationId "TaskWrite"
+                    (System.Text.Json.JsonSerializer.Serialize(
+                        {| Action = "CreateTask"; TaskId = "cross-process"; Title = "Cross process" |}))
+                |> success
+                elapsed.Stop()
+                Assert.That(elapsed.Elapsed.TotalMilliseconds, Is.GreaterThan(800.0),
+                            "Pending write must wait for the other process to release its FileShare.None lock.")
+                Assert.That(holder.WaitForExit(10000), Is.True)
+                Assert.That(holder.ExitCode, Is.Zero)
+                Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId |> success).IsSome,
+                            Is.True)
+            finally
+                if not holder.HasExited then
+                    holder.Kill(true)
+                    holder.WaitForExit())
+
+    [<Test>]
+    member _.PendingLockNeverRetriesAnAmbiguousIOExceptionCallback() =
+        withFixture (fun one _ first _ _ _ _ _ ->
+            let operationId = Guid.NewGuid()
+            let mutable callbackCalls = 0
+            let before = (LedgerStore.fetch first |> success).Commit
+            let command = {| Action = "CreateTask"; TaskId = "IOException-after-write" |}
+            let outcome : Result<int, Client.EffectError> =
+                Client.OrchestrationApi.PendingIntentJournal.execute first operationId
+                    "TaskWrite" command (fun () ->
+                        callbackCalls <- callbackCalls + 1
+                        raise (IOException("Simulated uncertain outcome after a write attempt")))
+            match outcome with
+            | Error(Client.ValidationError _) -> ()
+            | other -> Assert.Fail(sprintf "Unexpected callback exception result: %A" other)
+            Assert.That(callbackCalls, Is.EqualTo(1),
+                        "An IOException during remote apply must not re-execute its callback.")
+            Assert.That((Client.OrchestrationApi.PendingIntentJournal.findAtRoot one operationId |> success).IsSome,
+                        Is.True)
+            Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(before)))
 
     [<Test>]
     member _.LostResponseRecoversAcceptedRemoteOperationButNeverGuessesFailure() =
@@ -2742,7 +3534,7 @@ type ReviewWorkflowTests() =
                 let rt = Client.Runtime(Path.GetDirectoryName one, Client.ConsoleTui.ConsoleTui(), Client.PartialTrust)
                 let health : Common.AgentCommand =
                     Common.LedgerReadCommand
-                        { ProjectName = "owner"; Action = "Health"; OperationId = "" }
+                        { ProjectName = "owner"; Action = "Health"; OperationId = ""; Cursor = ""; PageSize = 0 }
                 let _, healthResult, healthResponse =
                     Client.SignalR.Client.processIncomingCommand rt
                         (System.Text.Json.JsonSerializer.Serialize health) "Owner"

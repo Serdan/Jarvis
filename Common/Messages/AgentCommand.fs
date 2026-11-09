@@ -132,7 +132,9 @@ type TaskWriteCommand =
 type LedgerReadCommand =
     { ProjectName: string
       Action: string
-      OperationId: string }
+      OperationId: string
+      Cursor: string
+      PageSize: int }
 
 type LedgerWriteCommand =
     { ProjectName: string
@@ -174,6 +176,33 @@ type ReviewWriteCommand =
       DocumentPath: string
       Content: string
       ExpectedBlobOid: string }
+
+// Explicit operator-only recovery. Neither command is a routine agent write
+// and neither creates a new operation UUID.
+type RetryPendingIntentCommand =
+    { ProjectName: string
+      OperationId: string
+      OperatorId: string
+      ExpectedCommandSha256: string
+      ExpectedVerifiedHead: string }
+
+type SupersedePendingIntentCommand =
+    { ProjectName: string
+      OperationId: string
+      OperatorId: string
+      ExpectedCommandSha256: string
+      ExpectedVerifiedHead: string
+      RelatedOperationId: string
+      RelatedRequestHash: string
+      Reason: string }
+
+type AbandonPendingIntentCommand =
+    { ProjectName: string
+      OperationId: string
+      OperatorId: string
+      ExpectedCommandSha256: string
+      ExpectedVerifiedHead: string
+      Reason: string }
 
 type GetProjectDetailsCommand = { ProjectName: string }
 
@@ -580,6 +609,9 @@ type AgentCommand =
     | LedgerWriteCommand of LedgerWriteCommand
     | ReviewReadCommand of ReviewReadCommand
     | ReviewWriteCommand of ReviewWriteCommand
+    | RetryPendingIntentCommand of RetryPendingIntentCommand
+    | SupersedePendingIntentCommand of SupersedePendingIntentCommand
+    | AbandonPendingIntentCommand of AbandonPendingIntentCommand
     | GetProjectDetailsCommand of GetProjectDetailsCommand
     | ListDirectoryCommand of ListDirectoryCommand
     | SearchFilesCommand of SearchFilesCommand
@@ -626,6 +658,9 @@ module AgentCommandInfo =
         | LedgerWriteCommand _ -> "LedgerWriteCommand"
         | ReviewReadCommand _ -> "ReviewReadCommand"
         | ReviewWriteCommand _ -> "ReviewWriteCommand"
+        | RetryPendingIntentCommand _ -> "RetryPendingIntentCommand"
+        | SupersedePendingIntentCommand _ -> "SupersedePendingIntentCommand"
+        | AbandonPendingIntentCommand _ -> "AbandonPendingIntentCommand"
         | GetProjectDetailsCommand _ -> "GetProjectDetailsCommand"
         | ListDirectoryCommand _ -> "ListDirectoryCommand"
         | SearchFilesCommand _ -> "SearchFilesCommand"
@@ -678,6 +713,9 @@ module AgentCommandInfo =
         | LedgerWriteCommand _ -> "LedgerWrite"
         | ReviewReadCommand _ -> "ReviewRead"
         | ReviewWriteCommand _ -> "ReviewWrite"
+        | RetryPendingIntentCommand _ -> "RetryPendingIntent"
+        | SupersedePendingIntentCommand _ -> "SupersedePendingIntent"
+        | AbandonPendingIntentCommand _ -> "AbandonPendingIntent"
         | GetProjectDetailsCommand _ -> "GetProjectDetails"
         | ListDirectoryCommand _ -> "ListDirectory"
         | SearchFilesCommand _ -> "SearchFiles"
@@ -728,6 +766,9 @@ module AgentCommandInfo =
         | LedgerWriteCommand cmd -> Some cmd.ProjectName
         | ReviewReadCommand cmd -> Some cmd.ProjectName
         | ReviewWriteCommand cmd -> Some cmd.ProjectName
+        | RetryPendingIntentCommand cmd -> Some cmd.ProjectName
+        | SupersedePendingIntentCommand cmd -> Some cmd.ProjectName
+        | AbandonPendingIntentCommand cmd -> Some cmd.ProjectName
         | GetProjectDetailsCommand cmd -> Some cmd.ProjectName
         | ListDirectoryCommand cmd -> Some cmd.ProjectName
         | SearchFilesCommand cmd -> Some cmd.ProjectName
@@ -818,6 +859,9 @@ module AgentCommandInfo =
         | LedgerWriteCommand cmd -> Some(compact cmd.Action)
         | ReviewReadCommand cmd -> Some(compact cmd.Action)
         | ReviewWriteCommand cmd -> Some(compact cmd.Action)
+        | RetryPendingIntentCommand cmd -> Some(compact cmd.OperationId)
+        | SupersedePendingIntentCommand cmd -> Some(compact cmd.OperationId)
+        | AbandonPendingIntentCommand cmd -> Some(compact cmd.OperationId)
         | GetGitDiffCommand cmd -> cmd.Path |> Option.map compact
         | GitCommitCommand cmd -> Some(compact cmd.Message)
         | StartJobCommand cmd -> Some(fullCommand cmd.Executable cmd.Args)
@@ -863,6 +907,9 @@ module AgentCommandInfo =
         | LedgerWriteCommand cmd -> Some(truncate 64 cmd.Action)
         | ReviewReadCommand cmd -> Some(truncate 64 cmd.Action)
         | ReviewWriteCommand cmd -> Some(truncate 64 cmd.Action)
+        | RetryPendingIntentCommand cmd -> Some(truncate 64 cmd.OperationId)
+        | SupersedePendingIntentCommand cmd -> Some(truncate 64 cmd.OperationId)
+        | AbandonPendingIntentCommand cmd -> Some(truncate 64 cmd.OperationId)
         | GetGitDiffCommand cmd -> cmd.Path |> Option.map (truncate 64)
         | GitCommitCommand cmd -> Some(quoted cmd.Message)
         | StartJobCommand cmd -> Some(commandPreview cmd.Executable cmd.Args)
@@ -953,6 +1000,9 @@ module AgentProtocol =
           definition "LedgerWrite" "Explicitly bind, initialize or rebind the canonical ledger with privacy acknowledgment." [ VersionControlWrite; NetworkAccess ] true true false
           definition "ReviewRead" "Reads opt-in canonical review ledger requests and reviewer inboxes." [ ReadOnly; NetworkAccess ] false false false
           definition "ReviewWrite" "Updates opt-in canonical review ledger with a stable operation UUID." [ VersionControlWrite; NetworkAccess ] true true false
+          definition "RetryPendingIntent" "Operator-authorized retry of an exact saved intent through current typed CAS writers, preserving UUID." [ VersionControlWrite; NetworkAccess ] true true false
+          definition "SupersedePendingIntent" "Operator-authorized immutable local archive of an uncertain intent with verified related Applied receipt; no remote ledger mutation." [ WorkspaceWrite; VersionControlWrite; NetworkAccess ] true true false
+          definition "AbandonPendingIntent" "Operator-authorized archival of an obsolete saved intent using typed canonical task/review state at a pinned verified head; no remote mutation." [ WorkspaceWrite; VersionControlWrite; NetworkAccess ] true true false
           definition "RemoveWorktree" "Removes a clean integrated Git worktree." [ VersionControlWrite; Destructive ] true true false
           definition "GetProjectDetails" "Reads project summary details and special files." [ ReadOnly ] false false false
           definition "ListDirectory" "Lists a bounded project directory; oversized listings fail explicitly." [ ReadOnly ] false false false

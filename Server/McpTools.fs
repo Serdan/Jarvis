@@ -272,7 +272,8 @@ module McpToolHelpers =
           "DeferAttempt"; "ResumeAttempt"; "AbandonAttempt"; "CancelTask"
           "TransferOwner"; "CloseTask"; "ReopenTask"; "ImportTaskSpec"; "ExportTaskSpec" ]
 
-    let private ledgerReadMethods = [ "LedgerHealth"; "GetOperationStatus"; "PendingOperations"; "ReconcilePendingOperations" ]
+    let private ledgerReadMethods =
+        [ "LedgerHealth"; "GetOperationStatus"; "PendingOperations"; "ReconcilePendingOperations"; "PendingOperationSummary"; "PendingOperationsPage"; "InspectPendingOperation" ]
     let private ledgerWriteMethods = [ "InitializeLedger"; "BindExistingLedger"; "RebindLedgerRemote"; "AcknowledgePendingOperation" ]
 
     let private ledgerReviewMethods =
@@ -452,7 +453,10 @@ module McpToolHelpers =
         | RemoveWorktreeCommand _
         | TaskWriteCommand _
         | LedgerWriteCommand _
-        | ReviewWriteCommand _ -> Auth.GitWrite
+        | ReviewWriteCommand _
+        | RetryPendingIntentCommand _
+        | SupersedePendingIntentCommand _
+        | AbandonPendingIntentCommand _ -> Auth.GitWrite
 
     let private oauthErrorResult (context: HttpContext) errorCode description scope =
         let response = errorResult (PermissionDenied description)
@@ -1222,22 +1226,37 @@ type JarvisMcpTools =
 
     [<McpServerTool(Title = "ledger health", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read the verified remote orphan Git ledger identity, trusted head and sequence. Requires an explicit existing binding; never initializes a ledger.")>]
     static member LedgerHealth(projectName: string, agentId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
-        McpToolHelpers.send client http (LedgerReadCommand { ProjectName = projectName; Action = "Health"; OperationId = "" })
+        McpToolHelpers.send client http (LedgerReadCommand { ProjectName = projectName; Action = "Health"; OperationId = ""; Cursor = ""; PageSize = 0 })
+
+    [<McpServerTool(Title = "pending operation summary", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Aggregate pending intent counts by verified disposition, age, action and actor across the selected project. Never returns saved command JSON or session metadata, never retries or discards uncertain writes.")>]
+    static member PendingOperationSummary(projectName: string, agentId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http
+            (LedgerReadCommand { ProjectName = projectName; Action = "PendingOperationSummary"; OperationId = ""; Cursor = ""; PageSize = 0 })
+
+    [<McpServerTool(Title = "pending operations page", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("List at most 100 pending journal entries after an opaque UUID cursor, with compact verified disposition, actor, task and action metadata. No saved command JSON, mutation, replay, or deletion.")>]
+    static member PendingOperationsPage(projectName: string, agentId: string, cursor: string, pageSize: int, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http
+            (LedgerReadCommand { ProjectName = projectName; Action = "PendingOperationsPage"; OperationId = ""; Cursor = cursor; PageSize = pageSize })
+
+    [<McpServerTool(Title = "inspect one pending operation", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Targeted inspection of one exact saved pending intent and its verified ledger outcome, including original stored JSON. May include historical session metadata. Read only; never retries or discards.")>]
+    static member InspectPendingOperation(projectName: string, agentId: string, operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http
+            (LedgerReadCommand { ProjectName = projectName; Action = "InspectPendingOperation"; OperationId = operationId; Cursor = ""; PageSize = 0 })
 
     [<McpServerTool(Title = "pending operations", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Inspect the local crash-persistent write intent journal, including original command parameters for safe retry with the same UUID. No source or ledger mutations.")>]
     static member PendingOperations(projectName: string, agentId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http
-            (LedgerReadCommand { ProjectName = projectName; Action = "PendingOperations"; OperationId = "" })
+            (LedgerReadCommand { ProjectName = projectName; Action = "PendingOperations"; OperationId = ""; Cursor = ""; PageSize = 0 })
 
     [<McpServerTool(Title = "reconcile pending operations", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Compare each locally pending ledger command against one verified remote ledger snapshot. Report Applied, NotFoundAtVerifiedHead, BindingMismatch or IdentityMismatch; never erase local recovery evidence or perform a write.")>]
     static member ReconcilePendingOperations(projectName: string, agentId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http
-            (LedgerReadCommand { ProjectName = projectName; Action = "ReconcilePendingOperations"; OperationId = "" })
+            (LedgerReadCommand { ProjectName = projectName; Action = "ReconcilePendingOperations"; OperationId = ""; Cursor = ""; PageSize = 0 })
 
     [<McpServerTool(Title = "get operation status", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read a specific caller-stable ledger operation UUID from the verified remote ledger; NotFoundAtVerifiedHead is not proof that a timed-out push will never arrive.")>]
     static member GetOperationStatus(projectName: string, agentId: string, operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http
-            (LedgerReadCommand { ProjectName = projectName; Action = "GetOperationStatus"; OperationId = operationId })
+            (LedgerReadCommand { ProjectName = projectName; Action = "GetOperationStatus"; OperationId = operationId; Cursor = ""; PageSize = 0 })
 
     [<McpServerTool(Title = "acknowledge pending operation", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("After inspecting a matching Applied ledger receipt, explicitly remove only the corresponding local pending journal record. Requires the exact verified remote requestHash. Does not push, mutate or initialize the ledger.")>]
     static member AcknowledgePendingOperation(projectName: string, agentId: string, operationId: string, expectedRequestHash: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
@@ -1248,6 +1267,33 @@ type JarvisMcpTools =
                   RemoteName = ""; ApprovedFetchUrl = ""; ApprovedPushUrl = ""
                   ExpectedTrustedHead = ""; ExpectedRequestHash = expectedRequestHash
                   AcknowledgeVisibility = false })
+
+
+    [<McpServerTool(Title = "retry a saved pending intent", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("EXPLICIT OPERATOR RECOVERY: after targeted inspection, retry the exact stored pending Task/Review command under its original UUID and current ledger CAS/state guards. Requires original SHA256 and verified ledger head. Retired ResumeAgent and agent lifecycle writes are not retryable. No new session/UUID, no automatic retry, no archive cleanup.")>]
+    static member RetryPendingIntent(projectName: string, agentId: string, operationId: string, expectedCommandSha256: string, expectedVerifiedHead: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http
+            (RetryPendingIntentCommand
+                { ProjectName = projectName; OperationId = operationId
+                  OperatorId = agentId; ExpectedCommandSha256 = expectedCommandSha256
+                  ExpectedVerifiedHead = expectedVerifiedHead })
+
+    [<McpServerTool(Title = "supersede a saved pending intent", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("EXPLICIT OPERATOR RECOVERY: archive, never silently discard, a locally uncertain intent only with matching saved SHA256, a pinned verified head, an operator reason and a distinct matching Applied receipt for the same task. Archive is durable, prevents UUID reuse, and remains observable if an original push arrives later. Never pushes or mutates the canonical ledger.")>]
+    static member SupersedePendingIntent(projectName: string, agentId: string, operationId: string, expectedCommandSha256: string, expectedVerifiedHead: string, relatedOperationId: string, relatedRequestHash: string, reason: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http
+            (SupersedePendingIntentCommand
+                { ProjectName = projectName; OperationId = operationId
+                  OperatorId = agentId; ExpectedCommandSha256 = expectedCommandSha256
+                  ExpectedVerifiedHead = expectedVerifiedHead
+                  RelatedOperationId = relatedOperationId
+                  RelatedRequestHash = relatedRequestHash; Reason = reason })
+
+    [<McpServerTool(Title = "abandon obsolete pending intent", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("EXPLICIT OPERATOR RECOVERY: archive an exact saved pending UUID only after verified current canonical task/review state at a pinned head positively proves the original action obsolete. Requires original SHA256 and operator reason. Archive-first crash durable, never mutates remote ledger or assumes a missing receipt means failed push.")>]
+    static member AbandonPendingIntent(projectName: string, agentId: string, operationId: string, expectedCommandSha256: string, expectedVerifiedHead: string, reason: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http
+            (AbandonPendingIntentCommand
+                { ProjectName = projectName; OperationId = operationId; OperatorId = agentId
+                  ExpectedCommandSha256 = expectedCommandSha256
+                  ExpectedVerifiedHead = expectedVerifiedHead; Reason = reason })
 
     [<McpServerTool(Title = "initialize ledger", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Initialize a NEW orphan Git ledger and bind it locally only after explicit public/unknown visibility acknowledgment and Git write approval. Refuses existing ledger refs.")>]
     static member InitializeLedger(projectName: string, projectId: string, ledgerId: string, epoch: int, remoteName: string, approvedFetchUrl: string, approvedPushUrl: string, acknowledgeVisibility: bool, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =

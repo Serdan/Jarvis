@@ -238,7 +238,8 @@ let private toAgentResponse command instructions stateChanges inboxActivation re
           Error = Some(EffectError.toAgentError error)
           Instructions = instructions
           AgentStateChanges = stateChanges
-          InboxActivation = inboxActivation }
+          InboxActivation = inboxActivation
+          PendingJob = None }
     | Ok (dispatched: DispatchedResult) ->
         let payload = dispatched.Payload
         let bytes = Encoding.UTF8.GetByteCount payload +
@@ -256,13 +257,15 @@ let private toAgentResponse command instructions stateChanges inboxActivation re
               Error = None
               Instructions = instructions
               AgentStateChanges = stateChanges
-              InboxActivation = inboxActivation }
+              InboxActivation = inboxActivation
+              PendingJob = None }
         else
             { Result = None
               Error = Some(OutputTruncated $"Command response was {bytes} bytes and exceeds the safe response size of {maxBytes} bytes.")
               Instructions = instructions
               AgentStateChanges = stateChanges
-              InboxActivation = inboxActivation }
+              InboxActivation = inboxActivation
+              PendingJob = None }
 
 let private unwrapProjectName (ProjectName name) = name
 let private unwrapContent (Content content) = content
@@ -409,7 +412,7 @@ let private sourceOperation resolved withContext legacy =
     | None -> legacy()
 
 let private dispatch (rt: Runtime) (target: ProjectPaths.ProjectTarget option)
-                     (resolved: ProjectPaths.ResolvedProject option) (command: AgentCommand) =
+                     (resolved: ProjectPaths.ResolvedProject option) (agentId: string) (command: AgentCommand) =
     match command with
     | ListCommandsCommand -> rt |> ProjectBrowser.listCommands |> serialize'
     | ListWorktreesCommand cmd -> rt |> Worktrees.listWorktrees cmd |> serialize'
@@ -503,18 +506,18 @@ let private dispatch (rt: Runtime) (target: ProjectPaths.ProjectTarget option)
     | ListJobsCommand cmd ->
         match target with
         | Some validated ->
-            rt |> JobManager.listJobsForProject (Some(ProjectPaths.ProjectTarget.projectId validated)) cmd |> serialize'
-        | None -> rt |> JobManager.listJobs cmd |> serialize'
+            rt |> JobManager.listJobsForProjectAsAgent (Some(ProjectPaths.ProjectTarget.projectId validated)) (Some agentId) cmd |> serialize'
+        | None -> rt |> JobManager.listJobsForProjectAsAgent None (Some agentId) cmd |> serialize'
     | GetJobResultCommand cmd ->
         match target with
         | Some validated ->
-            rt |> JobManager.getJobResultForProject (Some(ProjectPaths.ProjectTarget.projectId validated)) cmd |> serialize'
-        | None -> rt |> JobManager.getJobResult cmd |> serialize'
+            rt |> JobManager.getJobResultForProjectAsAgent (Some(ProjectPaths.ProjectTarget.projectId validated)) (Some agentId) cmd |> serialize'
+        | None -> rt |> JobManager.getJobResultForProjectAsAgent None (Some agentId) cmd |> serialize'
     | CancelJobCommand cmd ->
         match target with
         | Some validated ->
-            rt |> JobManager.cancelJobForProject (Some(ProjectPaths.ProjectTarget.projectId validated)) cmd |> serialize'
-        | None -> rt |> JobManager.cancelJob cmd |> serialize'
+            rt |> JobManager.cancelJobForProjectAsAgent (Some(ProjectPaths.ProjectTarget.projectId validated)) (Some agentId) cmd |> serialize'
+        | None -> rt |> JobManager.cancelJobForProjectAsAgent None (Some agentId) cmd |> serialize'
     | MessageCommand cmd ->
         if String.IsNullOrWhiteSpace cmd.Message then
             Error(Client.ValidationError "Message cannot be empty.") |> serialize'
@@ -530,7 +533,7 @@ let private dispatch (rt: Runtime) (target: ProjectPaths.ProjectTarget option)
 
 let private receiveCommandForTarget (rt: Runtime) (target: ProjectPaths.ProjectTarget option)
                                     (resolved: ProjectPaths.ResolvedProject option)
-                                    (preparedTask: ProjectTaskDefinition option) (command: AgentCommand) =
+                                    (preparedTask: ProjectTaskDefinition option) (agentId: string) (command: AgentCommand) =
     task {
         let activityId =
             match command with
@@ -586,7 +589,7 @@ let private receiveCommandForTarget (rt: Runtime) (target: ProjectPaths.ProjectT
                             (fun () -> ClientShell.runProjectTask cmd.ProjectName task)) rt |> serialize'
                         return result
                     | Ok(), None ->
-                        let! result = dispatch rt target resolved command
+                        let! result = dispatch rt target resolved agentId command
                         return result
             }
 
@@ -610,19 +613,19 @@ let private receiveCommandForTarget (rt: Runtime) (target: ProjectPaths.ProjectT
 
 let receiveCommand (rt: Runtime) (command: AgentCommand) =
     task {
-        let! result = receiveCommandForTarget rt None None None command
+        let! result = receiveCommandForTarget rt None None None "" command
         return result |> Result.map (fun outcome -> outcome.Payload)
     }
 
 let private receiveCommandWithTypedInstructions (rt: Runtime)
-                                                (target: ProjectPaths.ProjectTarget option) command =
+                                                (target: ProjectPaths.ProjectTarget option) (agentId: string) command =
     task {
         match AgentInstructions.prepareOperationWithTarget rt target command with
         | Error error ->
             return Error error, [], AgentInstructions.RootBootstrapRequired
         | Ok prepared ->
             let! response =
-                receiveCommandForTarget rt target prepared.Source prepared.ProjectTask command
+                receiveCommandForTarget rt target prepared.Source prepared.ProjectTask agentId command
             let provenance =
                 if prepared.Source.IsSome then AgentInstructions.HierarchyLoaded
                 else AgentInstructions.RootBootstrapRequired
@@ -638,7 +641,7 @@ let receiveCommandWithInstructions (rt: Runtime) command =
         | Error error -> return Error error, []
         | Ok scope ->
             let! response, instructions, _ =
-                receiveCommandWithTypedInstructions rt (projectTarget scope) command
+                receiveCommandWithTypedInstructions rt (projectTarget scope) "" command
             return response |> Result.map (fun outcome -> outcome.Payload), instructions
     }
 
@@ -683,7 +686,11 @@ let processIncomingCommand (rt: Runtime) (commandJson: string) (agentId: string)
                         // The caller's agentId belongs to the source project
                         // of a cross-project notification, not the destination.
                         let localAgentId =
-                            if isLocalAgentActivity command then agentId else ""
+                            if isLocalAgentActivity command &&
+                               (match command with
+                                | GetJobResultCommand job -> not (JobManager.isToolOperationJob job.JobId)
+                                | CancelJobCommand job -> not (JobManager.isToolOperationJob job.JobId)
+                                | _ -> true) then agentId else ""
                         if not (String.IsNullOrWhiteSpace localAgentId) then
                             target |> Option.iter (fun selected ->
                                 rt.Tui.RecordAgentSeen(AgentView.activityProject selected, localAgentId))
@@ -696,7 +703,7 @@ let processIncomingCommand (rt: Runtime) (commandJson: string) (agentId: string)
                                 inboxActivation <- Some receipt
                             | _ -> ()
                             let! result, applicable, provenance =
-                                receiveCommandWithTypedInstructions rt target command
+                                receiveCommandWithTypedInstructions rt target localAgentId command
                             // A write may alter another agent's state, or none
                             // at all. Invalidate precisely the affected local
                             // cache entries before preparing turn guidance.
@@ -742,9 +749,100 @@ let processIncomingCommand (rt: Runtime) (commandJson: string) (agentId: string)
         return parsedCommand, (response |> Result.map (fun outcome -> outcome.Payload)), agentResponse
     }
 
+// Bounded, client-owned execution begins before the deadline. An HTTP
+// request and SignalR delivery may end without cancelling this operation.
+let private promotionThreshold () =
+    match Int32.TryParse(Environment.GetEnvironmentVariable "JARVIS_TOOL_JOB_THRESHOLD_MS") with
+    | true, milliseconds when milliseconds >= 250 && milliseconds <= 60000 ->
+        TimeSpan.FromMilliseconds(float milliseconds)
+    | _ -> TimeSpan.FromSeconds 3.
+
+let private tryOperationId (commandJson: string) =
+    try
+        use document = JsonDocument.Parse commandJson
+        let rec locate (node: JsonElement) =
+            match node.ValueKind with
+            | JsonValueKind.Object ->
+                node.EnumerateObject()
+                |> Seq.tryPick (fun property ->
+                    if String.Equals(property.Name, "operationId", StringComparison.OrdinalIgnoreCase)
+                       && property.Value.ValueKind = JsonValueKind.String then
+                        match property.Value.GetString() with
+                        | value when String.IsNullOrWhiteSpace value -> None
+                        | value -> Some value
+                    else locate property.Value)
+            | JsonValueKind.Array -> node.EnumerateArray() |> Seq.tryPick locate
+            | _ -> None
+        locate document.RootElement
+    with _ -> None
+
+let private shouldAutoPromote = function
+    // Cheap controls must never wait for the command worker slots. They can
+    // poll or inspect a slow task while every worker is occupied.
+    | ListJobsCommand _
+    | GetJobResultCommand _
+    | CancelJobCommand _
+    | UpdateClientCommand
+    | MessageCommand _
+    | GetClientActivityCommand _
+    | ListCommandsCommand -> false
+    | _ -> true
+
+let private executeOrPromote (rt: Runtime) (commandJson: string) (agentId: string) =
+    task {
+        let command =
+            try Some(JsonSerializer.Deserialize<AgentCommand>(commandJson))
+            with _ -> None
+        match command with
+        | Some command when shouldAutoPromote command ->
+            match classifyProject command with
+            | Ok scope ->
+                let project = AgentCommandInfo.projectName command |> Option.filter (String.IsNullOrWhiteSpace >> not)
+                let canonical =
+                    match scope with
+                    | Checkout target -> Some(ProjectPaths.ProjectTarget.projectId target)
+                    | ActivityLabel _ | Unscoped -> None
+                let registered =
+                    JobManager.startToolOperation canonical project agentId
+                        (AgentCommandInfo.protocolName command) (tryOperationId commandJson)
+                        (fun () -> task {
+                            let! _, _, outcome = processIncomingCommand rt commandJson agentId
+                            return outcome
+                        })
+                match registered with
+                | Error error ->
+                    return
+                        { Result = None
+                          Error = Some(EffectError.toAgentError error)
+                          Instructions = []
+                          AgentStateChanges = []
+                          InboxActivation = None
+                          PendingJob = None }
+                | Ok operation ->
+                    let! first = JobManager.awaitToolOperation operation (promotionThreshold ())
+                    match first with
+                    | Choice1Of2 response -> return response
+                    | Choice2Of2 handle ->
+                        // Do not invent state-change evidence: activation and
+                        // canonical writes may still be running at this moment.
+                        return
+                            { Result = Some(JsonSerializer.Serialize handle)
+                              Error = None
+                              Instructions = []
+                              AgentStateChanges = []
+                              InboxActivation = None
+                              PendingJob = Some handle }
+            | Error _ ->
+                let! _, _, outcome = processIncomingCommand rt commandJson agentId
+                return outcome
+        | _ ->
+            let! _, _, outcome = processIncomingCommand rt commandJson agentId
+            return outcome
+    }
+
 let receiveCommandAndReply (connection: HubConnection) (rt: Runtime) (correlationId: string) (commandJson: string) (agentId: string) : Task =
     task {
-        let! parsedCommand, response, agentResponse = processIncomingCommand rt commandJson agentId
+        let! agentResponse = executeOrPromote rt commandJson agentId
         let! sendResult =
             ResponseDelivery.sendWithReconnectRetry
                 (TimeSpan.FromMinutes 2.0)
@@ -757,8 +855,15 @@ let receiveCommandAndReply (connection: HubConnection) (rt: Runtime) (correlatio
         | Error ex ->
             rt.Tui.Log $"Failed to deliver command response after reconnect retries: {ex.Message}"
 
-        match sendResult, parsedCommand, response with
-        | Ok(), Some UpdateClientCommand, Ok _ ->
+        let updatedSuccessfully =
+            match agentResponse.Result, agentResponse.Error with
+            | Some _, None -> true
+            | _ -> false
+        let isUpdate =
+            try JsonSerializer.Deserialize<AgentCommand>(commandJson) = UpdateClientCommand
+            with _ -> false
+        match sendResult, isUpdate, updatedSuccessfully with
+        | Ok(), true, true ->
             rt.Tui.Log "Update verified and installed; restarting Jarvis in this terminal."
             match SelfUpdate.activatePending () with
             | Ok _ -> ()

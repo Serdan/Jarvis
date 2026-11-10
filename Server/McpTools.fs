@@ -371,21 +371,23 @@ module McpToolHelpers =
     /// The separate activation receipt is richer only when the ledger has
     /// actually confirmed the requesting agent's Ready -> Working transition.
     let attachStateEffects (response: AgentCommandResponse) (result: CallToolResult) =
-        let changes =
-            if isNull (box response.AgentStateChanges) then [] else response.AgentStateChanges
-        let details = JsonObject()
-        details["agentStateChanges"] <- JsonSerializer.SerializeToNode changes
-        let metadata = if isNull result.Meta then JsonObject() else result.Meta
-        metadata["jarvis/agent_state_changes"] <- JsonSerializer.SerializeToNode changes
-        match response.InboxActivation with
-        | None -> ()
-        | Some activation ->
-            details["agentInboxActivation"] <- JsonSerializer.SerializeToNode activation
-            metadata["jarvis/inbox_activation"] <- JsonSerializer.SerializeToNode activation
-        result.Meta <- metadata
-        if isNull result.Content then result.Content <- ResizeArray<ContentBlock>()
-        result.Content.Add(textContent (details.ToJsonString()))
-        result
+        if response.PendingJob.IsSome then result
+        else
+            let changes =
+                if isNull (box response.AgentStateChanges) then [] else response.AgentStateChanges
+            let details = JsonObject()
+            details["agentStateChanges"] <- JsonSerializer.SerializeToNode changes
+            let metadata = if isNull result.Meta then JsonObject() else result.Meta
+            metadata["jarvis/agent_state_changes"] <- JsonSerializer.SerializeToNode changes
+            match response.InboxActivation with
+            | None -> ()
+            | Some activation ->
+                details["agentInboxActivation"] <- JsonSerializer.SerializeToNode activation
+                metadata["jarvis/inbox_activation"] <- JsonSerializer.SerializeToNode activation
+            result.Meta <- metadata
+            if isNull result.Content then result.Content <- ResizeArray<ContentBlock>()
+            result.Content.Add(textContent (details.ToJsonString()))
+            result
 
     /// Preliminary and final dispatches may independently mutate canonical
     /// state (notably a cross-project notification sender validation). Never
@@ -725,6 +727,18 @@ module McpToolHelpers =
                     finishOperation tracking response stopwatch.ElapsedMilliseconds
 
                     do! publishChanges response
+                    // Polled tool jobs retain the exact immutable final
+                    // response. Advisory cache invalidation can be retried;
+                    // canonical ledger mutations are never re-executed.
+                    match command, response.Result with
+                    | GetJobResultCommand _, Some payload ->
+                        try
+                            let item = JsonSerializer.Deserialize<JobResult>(payload)
+                            match item.ToolResponse with
+                            | Some finished -> do! publishChanges finished
+                            | None -> ()
+                        with _ -> ()
+                    | _ -> ()
 
                     return
                         (match command with
@@ -735,7 +749,7 @@ module McpToolHelpers =
                         |> attachInstructions response.Instructions
                         |> attachOperationId tracking
                         |> attachGeneratedOperationId generatedId
-                        |> attachGeneratedTaskId (if response.Result.IsSome && response.Error.IsNone then generatedTaskId else None)
+                        |> attachGeneratedTaskId (if response.Result.IsSome && response.Error.IsNone && response.PendingJob.IsNone then generatedTaskId else None)
                 | Some _ ->
                     if not (Auth.hasScope scope context.User) then
                         return authorizationErrorResult context scope

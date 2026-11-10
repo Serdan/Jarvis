@@ -16,6 +16,8 @@ let statusText = function
     | JobStatus.Completed code -> $"Exited {code}"
     | JobStatus.Canceled -> "Canceled"
     | JobStatus.FailedToStart message -> $"Failed: {message}"
+    | JobStatus.ToolCompleted -> "Completed"
+    | JobStatus.ToolFailed message -> $"Failed: {message}"
 
 let safeLine (value: string) =
     if isNull value then ""

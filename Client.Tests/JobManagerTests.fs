@@ -5,6 +5,7 @@ open System.Diagnostics
 open System.IO
 open System.Text
 open System.Threading
+open System.Threading.Tasks
 open Client
 open Client.IO
 open Client.JobManager
@@ -336,3 +337,89 @@ let invalidProjectSelectorsCannotPassJobIdentityChecks () =
         cancelJob { ProjectName = "Project1"; JobId = id } context |> shouldEqual (Ok())
     finally
         Directory.Delete(root, true)
+
+
+let private jobProject =
+    match ProjectPaths.ProjectTarget.parse "Project1" with
+    | Ok target -> Some(ProjectPaths.ProjectTarget.projectId target)
+    | Error error -> failwith $"Cannot parse test project: {error}"
+
+let private completedToolResponse payload : AgentCommandResponse =
+    { Result = Some payload
+      Error = None
+      Instructions = []
+      AgentStateChanges = [ { ProjectName = "Project1"; AgentId = "Worker 1" } ]
+      InboxActivation = None
+      PendingJob = None }
+
+[<Test>]
+let autoPromotedToolRetainsIdenticalTypedOutcomeAndNeverExecutesTwice () =
+    let root = createTempProject ()
+    try
+        let context = TestContext root
+        let blocked = TaskCompletionSource<AgentCommandResponse>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let count = ref 0
+        let registered =
+            match startToolOperation jobProject (Some "Project1") "Worker 1" "ReadFile"
+                    (Some "operation-one") (fun () ->
+                        count.Value <- count.Value + 1
+                        blocked.Task) with
+            | Ok job -> job
+            | Error error -> failwith $"Unable to register blocked tool: {error}"
+        let stopwatch = Stopwatch.StartNew()
+        let first = (awaitToolOperation registered (TimeSpan.FromMilliseconds 30.)).GetAwaiter().GetResult()
+        stopwatch.Stop()
+        let handle =
+            match first with
+            | Choice2Of2 handle -> handle
+            | Choice1Of2 _ -> failwith "Blocked tool must return a running handle."
+        Assert.That(stopwatch.ElapsedMilliseconds, Is.LessThan(500L))
+        Assert.That(handle.Status, Is.EqualTo("Running"))
+        Assert.That(handle.OperationId, Is.EqualTo(Some "operation-one"))
+        let cmd = { ProjectName = "Project1"; JobId = handle.JobId; AfterSequence = None }
+        match getJobResultForProjectAsAgent jobProject (Some "Worker 1") cmd context with
+        | Ok value ->
+            Assert.That(value.Status, Is.EqualTo(JobStatus.Running))
+            Assert.That(value.ToolResponse.IsNone, Is.True)
+        | Error error -> Assert.Fail($"Expected running tool: {error}")
+        let original = completedToolResponse """{"result":"complete"}"""
+        blocked.SetResult original
+        let _, completion = registered
+        let observed = completion.WaitAsync(TimeSpan.FromSeconds 4.).GetAwaiter().GetResult()
+        Assert.That(observed, Is.EqualTo(original))
+        for _ in 1 .. 3 do
+            match getJobResultForProjectAsAgent jobProject (Some "Worker 1") cmd context with
+            | Ok value ->
+                Assert.That(value.Status, Is.EqualTo(JobStatus.ToolCompleted))
+                Assert.That(value.ToolResponse, Is.EqualTo(Some original))
+                Assert.That(value.OperationId, Is.EqualTo(Some "operation-one"))
+            | Error error -> Assert.Fail($"Expected complete tool: {error}")
+        Assert.That(count.Value, Is.EqualTo(1),
+                    "Polling must not reexecute the original operation or its ledger mutations.")
+        match getJobResultForProjectAsAgent jobProject (Some "OtherAgent") cmd context with
+        | Error _ -> ()
+        | Ok _ -> Assert.Fail("Wrong agent must not read a tool operation job.")
+        let otherProject =
+            match ProjectPaths.ProjectTarget.parse "OtherProject" with
+            | Ok target -> Some(ProjectPaths.ProjectTarget.projectId target)
+            | Error _ -> None
+        match getJobResultForProjectAsAgent otherProject (Some "Worker 1") cmd context with
+        | Error _ -> ()
+        | Ok _ -> Assert.Fail("Wrong project must not read a tool operation job.")
+    finally
+        Directory.Delete(root, true)
+
+[<Test>]
+let quickToolOperationReturnsOriginalResponseWithoutJobPromotion () =
+    let response = completedToolResponse """{"quick":true}"""
+    let registered =
+        match startToolOperation jobProject (Some "Project1") "Worker 1" "ReadFile"
+                None (fun () -> Task.FromResult response) with
+        | Ok job -> job
+        | Error error -> failwith $"Unable to register quick tool: {error}"
+    match (awaitToolOperation registered (TimeSpan.FromSeconds 2.)).GetAwaiter().GetResult() with
+    | Choice1Of2 actual -> Assert.That(actual, Is.EqualTo(response))
+    | Choice2Of2 _ -> Assert.Fail("A completed fast operation must not return a job handle.")
+    let handle, _ = registered
+    Assert.That(isToolOperationJob handle.JobId, Is.False,
+                "A quick call is discarded rather than cluttering list_jobs.")

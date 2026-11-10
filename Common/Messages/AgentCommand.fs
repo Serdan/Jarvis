@@ -34,6 +34,8 @@ type JobStatus =
     | Completed of exitCode: int
     | FailedToStart of message: string
     | Canceled
+    | ToolCompleted
+    | ToolFailed of message: string
 
 type CommandCapability =
     { Name: string
@@ -497,6 +499,11 @@ type JobSummary =
       Args: string list
       Reason: string option
       WorkingDirectory: string option
+      /// Process and in-process tool operation jobs are separate kinds.
+      Kind: string
+      CommandName: string option
+      OperationId: string option
+      AgentId: string option
       Status: JobStatus
       StartedAt: DateTimeOffset
       CompletedAt: DateTimeOffset option }
@@ -517,13 +524,6 @@ type GetJobResultCommand =
     { ProjectName: string
       JobId: string
       AfterSequence: int64 option }
-
-type JobResult =
-    { JobId: string
-      Status: JobStatus
-      Events: JobOutputEvent list
-      NextSequence: int64
-      Truncated: bool }
 
 type CancelJobCommand = { ProjectName: string; JobId: string }
 
@@ -605,12 +605,36 @@ type AgentInboxActivation =
       CommittedHead: string option
       OperationId: string option }
 
+/// A pending tool call is still executing in this exact client process.
+/// An agent must poll by ID; neither state changes nor instructions are final yet.
+type ToolJobHandle =
+    { JobId: string
+      Kind: string
+      Status: string
+      ProjectName: string option
+      AgentId: string
+      OperationId: string option
+      CommandName: string
+      StartedAt: DateTimeOffset }
+
 type AgentCommandResponse =
     { Result: string option
       Error: AgentError option
       Instructions: InstructionDocument list
       AgentStateChanges: AgentStateChange list
-      InboxActivation: AgentInboxActivation option }
+      InboxActivation: AgentInboxActivation option
+      PendingJob: ToolJobHandle option }
+
+/// Process output and complete, immutable tool response share a lookup API.
+/// ToolResponse contains the ORIGINAL response, not reconstructed polling metadata.
+type JobResult =
+    { JobId: string
+      Status: JobStatus
+      Events: JobOutputEvent list
+      NextSequence: int64
+      Truncated: bool
+      ToolResponse: AgentCommandResponse option
+      OperationId: string option }
 
 [<JsonConverter(typeof<UnionConverter<AgentCommand>>)>]
 type AgentCommand =
@@ -989,7 +1013,7 @@ module AgentCommandInfo =
         | None -> invocation command
 
 module AgentProtocol =
-    let version = "3.63"
+    let version = "3.64"
     let defaultPatchFuzzyContextLines = 3
     let maxResponseBytes = 900 * 1024
     let maxImageBytes = 8 * 1024 * 1024

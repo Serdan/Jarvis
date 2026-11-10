@@ -1232,8 +1232,13 @@ module LedgerStore =
             | Ok _ -> Error(SourceUnavailable "Source branch does not exist.")
             | Error error -> Error error
 
+    // Shared lexical check for source fields that need field-specific
+    // diagnostics before attempting an expensive Git object read.
+    let validSourceCommitOid (commit: string) =
+        not (isNull commit) && oidPattern.IsMatch commit
+
     let verifySourceObject (binding: LedgerBinding) (commit: string) =
-        if isNull commit || not (oidPattern.IsMatch commit) then
+        if not (validSourceCommitOid commit) then
             Error(InvalidBinding "Invalid source commit OID.")
         else
             match git binding.RepositoryPath [ "cat-file"; "-t"; commit ] with

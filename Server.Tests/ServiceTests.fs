@@ -1141,6 +1141,22 @@ let mcp_profile_tool_returns_chatgpt_compatible_authentication_challenge () =
     challenge.Contains("error_description=\"Authentication required.\"") |> shouldEqual true
 
 [<Test>]
+let checkpoint_attempt_source_and_evidence_are_optional_in_public_mcp_signature () =
+    let methodInfo = typeof<JarvisMcpTools>.GetMethod("CheckpointAttempt")
+    Assert.That(methodInfo, Is.Not.Null)
+    let parameters = methodInfo.GetParameters()
+    for name in [ "sourceCommit"; "evidence" ] do
+        let parameter =
+            parameters |> Array.find (fun parameter -> parameter.Name = name)
+        Assert.That(parameter.IsOptional, Is.True, name)
+        Assert.That(parameter.HasDefaultValue, Is.True, name)
+        Assert.That(parameter.DefaultValue, Is.EqualTo(""), name)
+    for name in [ "projectName"; "taskId"; "agentId"; "summary"; "nextAction" ] do
+        let parameter =
+            parameters |> Array.find (fun parameter -> parameter.Name = name)
+        Assert.That(parameter.IsOptional, Is.False, name)
+
+[<Test>]
 let run_command_reason_parameter_is_optional_for_mcp_compatibility () =
     let methodInfo = typeof<JarvisMcpTools>.GetMethod("RunCommand")
     let reason =

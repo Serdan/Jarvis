@@ -4558,6 +4558,133 @@ type ReviewWorkflowTests() =
             Assert.That(attempt.Value.Version, Is.EqualTo(3)))
 
     [<Test>]
+    member _.UnboundReadOnlyAuditCanCheckpointEvidenceAndCompleteWithoutInventingSource() =
+        withFixture (fun _ _ first second _ _ _ _ ->
+            let taskId = "unbound-audit-checkpoint"
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Read-only audit"
+            |> success |> ignore
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner"
+            |> success |> ignore
+            ReviewWorkflow.resumeAgent first (Guid.NewGuid()) taskId "Owner" 0 0 0
+            |> success |> ignore
+            let before = ReviewWorkflow.getAgentInbox second "Owner" |> success
+            Assert.That(before.Focused.Value.Attempt.SourceRef, Is.Null.Or.Empty)
+            let operationId = Guid.NewGuid()
+            let firstWrite =
+                ReviewWorkflow.checkpointAttempt first operationId taskId "Owner"
+                    0 0 0 "Audit report" "Continue inspection" "" "Evidence: 2 findings"
+                |> success
+            Assert.That(firstWrite.AlreadyApplied, Is.False)
+            let replay =
+                ReviewWorkflow.checkpointAttempt second operationId taskId "Owner"
+                    0 0 0 "Audit report" "Continue inspection" "" "Evidence: 2 findings"
+                |> success
+            Assert.That(replay.AlreadyApplied, Is.True)
+            Assert.That(replay.Operation.Sequence, Is.EqualTo(firstWrite.Operation.Sequence))
+            let _, checkpoint =
+                ReviewWorkflow.getCheckpoint second taskId firstWrite.Operation.Sequence |> success
+            Assert.That(checkpoint.Kind, Is.EqualTo("Progress"))
+            Assert.That(checkpoint.Evidence, Is.EqualTo("Evidence: 2 findings"))
+            Assert.That(checkpoint.EvidenceStatus, Is.EqualTo("OwnerReported"))
+            Assert.That(checkpoint.SourceCommit, Is.Null.Or.Empty)
+            Assert.That(checkpoint.OwnerAgentId, Is.EqualTo("Owner"))
+            Assert.That(checkpoint.AssignmentGeneration, Is.EqualTo(1))
+            let after = ReviewWorkflow.getAgentInbox first "Owner" |> success
+            Assert.That(after.Agent.State, Is.EqualTo("Working"))
+            Assert.That(after.Agent.StateEnteredAtUtc, Is.EqualTo(before.Agent.StateEnteredAtUtc))
+            Assert.That(after.Focused.Value.Attempt.Version,
+                        Is.EqualTo(before.Focused.Value.Attempt.Version + 1))
+            let nextWrite =
+                ReviewWorkflow.checkpointAttempt second (Guid.NewGuid()) taskId "Owner"
+                    0 0 0 "Another finding" "Complete audit" null ""
+                |> success
+            Assert.That(nextWrite.Operation.Sequence, Is.GreaterThan(firstWrite.Operation.Sequence))
+            let _, noEvidence =
+                ReviewWorkflow.getCheckpoint first taskId nextWrite.Operation.Sequence |> success
+            Assert.That(noEvidence.EvidenceStatus, Is.EqualTo("NotProvided"))
+            Assert.That(noEvidence.SourceCommit, Is.Null.Or.Empty)
+            ReviewWorkflow.completeAgentWork first (Guid.NewGuid()) taskId "Owner"
+                0 0 0 "Read-only audit completed" |> success |> ignore
+            let completed = ReviewWorkflow.getAgentInbox second "Owner" |> success
+            Assert.That(completed.Agent.State, Is.EqualTo("NeedsWork")))
+
+    [<Test>]
+    member _.CheckpointReportsExactInvalidFieldAndUTF8LimitsBeforeLedgerMutation() =
+        withFixture (fun _ _ first second _ _ _ _ ->
+            let taskId = "checkpoint-field-diagnostics"
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Audit validation"
+            |> success |> ignore
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner"
+            |> success |> ignore
+            ReviewWorkflow.resumeAgent first (Guid.NewGuid()) taskId "Owner" 0 0 0
+            |> success |> ignore
+            let beforeHead = (LedgerStore.fetch first |> success).Commit
+            let check field summary nextAction source evidence version generation =
+                match ReviewWorkflow.checkpointAttempt first (Guid.NewGuid()) taskId "Owner"
+                        version 0 generation summary nextAction source evidence with
+                | Error(InvalidBinding details) ->
+                    Assert.That(details, Does.Contain(field))
+                | other -> Assert.Fail(sprintf "Expected %s field error, got %A" field other)
+                Assert.That((LedgerStore.fetch second |> success).Commit, Is.EqualTo(beforeHead))
+            check "summary" "" "Next" null "" 0 0
+            check "summary" (String.replicate 8193 "a") "Next" null "" 0 0
+            check "nextAction" "Summary" " " null "" 0 0
+            check "nextAction" "Summary" (String.replicate 8193 "b") null "" 0 0
+            check "evidence" "Summary" "Next" null (String.replicate 2049 "😀") 0 0
+            check "sourceCommit" "Summary" "Next" "wrong-hash" "" 0 0
+            check "sourceCommit" "Summary" "Next" " " "" 0 0
+            check "expectedAttemptVersion" "Summary" "Next" null "" -1 0
+            check "assignmentGeneration" "Summary" "Next" null "" 0 -1
+            match ReviewWorkflow.checkpointAttempt first (Guid.NewGuid()) taskId "Owner"
+                    0 0 0 "Summary" "Next" (String.replicate 40 "e") "" with
+            | Error(SourceUnavailable details) ->
+                Assert.That(details, Does.Contain("Source commit"))
+            | other -> Assert.Fail(sprintf "Unknown source should fail distinctly: %A" other)
+            Assert.That((LedgerStore.fetch second |> success).Commit, Is.EqualTo(beforeHead))
+            let working = ReviewWorkflow.getAgentInbox second "Owner" |> success
+            let assertStale field owner attemptVersion agentVersion generation =
+                match ReviewWorkflow.checkpointAttempt first (Guid.NewGuid()) taskId owner
+                        attemptVersion agentVersion generation "Summary" "Next" "" "" with
+                | Error(StaleEntityVersion details) ->
+                    Assert.That(details, Does.Contain(field))
+                | other ->
+                    Assert.Fail(sprintf "Expected stale %s failure, got %A" field other)
+                Assert.That((LedgerStore.fetch second |> success).Commit, Is.EqualTo(beforeHead))
+            assertStale "agentId" "WrongOwner" 0 0 0
+            assertStale "expectedAttemptVersion" "Owner" (working.Focused.Value.Attempt.Version + 1) 0 0
+            assertStale "assignmentGeneration" "Owner" 0 0 2
+            assertStale "expectedAgentVersion" "Owner" 0 (working.Agent.Version + 1) 0
+            // Exactly 8192 UTF-8 bytes remain valid for both summary and
+            // evidence; the next multi-byte character must be rejected.
+            let validEvidence = String.replicate 2048 "😀"
+            ReviewWorkflow.checkpointAttempt first (Guid.NewGuid()) taskId "Owner"
+                0 0 0 validEvidence "Next" "" validEvidence
+            |> success |> ignore)
+
+    [<Test>]
+    member _.CheckpointDiagnosesQueuedAttemptAndNonWorkingAgentWithoutMutation() =
+        withFixture (fun _ _ first second _ _ _ _ ->
+            let taskId = "checkpoint-state-diagnostics"
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Queued checkpoint checks"
+            |> success |> ignore
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner"
+            |> success |> ignore
+            let assertError field =
+                let beforeHead = (LedgerStore.fetch first |> success).Commit
+                match ReviewWorkflow.checkpointAttempt second (Guid.NewGuid()) taskId "Owner"
+                        0 0 0 "Summary" "Continue" "" "" with
+                | Error(StaleEntityVersion details) -> Assert.That(details, Does.Contain(field))
+                | other -> Assert.Fail(sprintf "Expected %s diagnostic, got %A" field other)
+                Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(beforeHead))
+            assertError "attempt.phase"
+            ReviewWorkflow.resumeAgent first (Guid.NewGuid()) taskId "Owner" 0 0 0
+            |> success |> ignore
+            ReviewWorkflow.yieldAgent first (Guid.NewGuid()) taskId "Owner"
+                0 0 0 "Checkpoint pending" "Continue audit"
+            |> success |> ignore
+            assertError "agent.state")
+
+    [<Test>]
     member _.AgentInboxBulkLedgerBenchmarkAndSnapshotCorrectness() =
         // Hundreds of canonical entities in one immutable ledger commit. Seed
         // via an isolated Git worktree so setup does not dominate measurements

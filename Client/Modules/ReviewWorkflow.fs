@@ -1506,14 +1506,35 @@ module ReviewWorkflow =
 
     // A progress checkpoint never yields the Working execution slot. Its
     // source/test evidence is owner-reported, not independently verified.
+    // Diagnose invalid fields independently so an unbound audit agent does
+    // not mistake oversized evidence for a missing source commit.
+    let private checkpointInputError taskId ownerId expectedAttemptVersion expectedAgentVersion
+                                     generation summary nextAction (sourceCommit: string) (evidence: string) =
+        let textError name (value: string) =
+            if String.IsNullOrWhiteSpace value then
+                Some(InvalidBinding $"CheckpointAttempt {name} must contain non-whitespace text.")
+            elif Encoding.UTF8.GetByteCount value > 8192 then
+                Some(InvalidBinding $"CheckpointAttempt {name} exceeds 8192 UTF-8 bytes.")
+            else None
+        if not (validTaskId taskId) then Some(InvalidBinding "CheckpointAttempt taskId is invalid.")
+        elif not (validAgent ownerId) then Some(InvalidBinding "CheckpointAttempt agentId is invalid.")
+        elif expectedAttemptVersion < 0 then Some(InvalidBinding "CheckpointAttempt expectedAttemptVersion cannot be negative.")
+        elif expectedAgentVersion < 0 then Some(InvalidBinding "CheckpointAttempt expectedAgentVersion cannot be negative.")
+        elif generation < 0 then Some(InvalidBinding "CheckpointAttempt assignmentGeneration cannot be negative.")
+        elif (textError "summary" summary).IsSome then textError "summary" summary
+        elif (textError "nextAction" nextAction).IsSome then textError "nextAction" nextAction
+        elif not (isNull evidence) && Encoding.UTF8.GetByteCount evidence > 8192 then
+            Some(InvalidBinding "CheckpointAttempt evidence exceeds 8192 UTF-8 bytes; store the full report separately and pass a bounded reference.")
+        elif not (String.IsNullOrEmpty sourceCommit) && not (LedgerStore.validSourceCommitOid sourceCommit) then
+            Some(InvalidBinding "CheckpointAttempt sourceCommit must be empty or a 40/64-character lowercase Git commit OID.")
+        else None
+
     let checkpointAttemptWithSession binding operationId taskId ownerId expectedAttemptVersion
                           expectedAgentVersion generation summary nextAction sourceCommit evidence sessionId =
-        if not (validTaskId taskId) || not (validAgent ownerId)
-           || expectedAttemptVersion < 0 || expectedAgentVersion < 0 || generation < 0
-           || not (validText 8192 summary) || not (validText 8192 nextAction)
-           || (not (String.IsNullOrEmpty evidence) && Encoding.UTF8.GetByteCount evidence > 8192) then
-            Error(InvalidBinding "Invalid Working checkpoint metadata.")
-        else
+        match checkpointInputError taskId ownerId expectedAttemptVersion expectedAgentVersion
+                                   generation summary nextAction sourceCommit evidence with
+        | Some error -> Error error
+        | None ->
             LedgerStore.transact binding
                 (intent operationId ownerId "CheckpointAttempt"
                     {| taskId = taskId; ownerId = ownerId; expectedAttemptVersion = expectedAttemptVersion
@@ -1523,14 +1544,24 @@ module ReviewWorkflow =
                 (fun snapshot ->
                     result {
                         let! task, _, attempt, attemptOid = getAttempt binding snapshot taskId
-                        let! agent, _ = required<ReviewAgent> binding snapshot (agentPath ownerId)
                         let generation = if generation = 0 then attempt.AssignmentGeneration else generation
-                        if task.Lifecycle <> "InProgress" || attempt.OwnerAgentId <> ownerId
-                           || attempt.Phase <> "Started" || (expectedAttemptVersion <> 0 && attempt.Version <> expectedAttemptVersion)
-                           || attempt.AssignmentGeneration <> generation
-                           || (expectedAgentVersion <> 0 && agent.Version <> expectedAgentVersion) || agent.State <> "Working"
-                           || agent.ActiveAttemptId <> attempt.AttemptId then
-                            return! Error(StaleEntityVersion "Checkpoint requires exact current Working versions and generation.")
+                        if task.Lifecycle <> "InProgress" then
+                            return! Error(StaleEntityVersion "CheckpointAttempt task.lifecycle must be InProgress.")
+                        if attempt.OwnerAgentId <> ownerId then
+                            return! Error(StaleEntityVersion "CheckpointAttempt agentId is not the current attempt owner.")
+                        if attempt.Phase <> "Started" then
+                            return! Error(StaleEntityVersion "CheckpointAttempt attempt.phase must be Started.")
+                        if expectedAttemptVersion <> 0 && attempt.Version <> expectedAttemptVersion then
+                            return! Error(StaleEntityVersion "CheckpointAttempt expectedAttemptVersion differs from the current attempt version.")
+                        if attempt.AssignmentGeneration <> generation then
+                            return! Error(StaleEntityVersion "CheckpointAttempt assignmentGeneration differs from the current assignment generation.")
+                        let! agent, _ = required<ReviewAgent> binding snapshot (agentPath ownerId)
+                        if expectedAgentVersion <> 0 && agent.Version <> expectedAgentVersion then
+                            return! Error(StaleEntityVersion "CheckpointAttempt expectedAgentVersion differs from the current agent version.")
+                        if agent.State <> "Working" then
+                            return! Error(StaleEntityVersion "CheckpointAttempt agent.state must be Working.")
+                        if agent.ActiveAttemptId <> attempt.AttemptId then
+                            return! Error(StaleEntityVersion "CheckpointAttempt agent.activeAttemptId differs from the task attempt.")
                         let! _ = requiredIssue binding snapshot taskId attempt
                         if not (String.IsNullOrWhiteSpace sourceCommit) then
                             do! LedgerStore.verifySourceObject binding sourceCommit

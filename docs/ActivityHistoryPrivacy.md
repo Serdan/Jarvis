@@ -1,0 +1,30 @@
+# Private activity history and bounded replay
+
+Jarvis locally persists command/activity JSONL snapshots and agent last-seen state. Activity details may contain command arguments, paths, reasons, error text, or project names. These files are not intended to be shared between OS users.
+
+## Private storage and migration
+
+- On Linux and macOS the activity directory is created with mode **0700** using the Unix-mode directory creation overload. Existing directories are checked for symlinks and repaired to 0700. JSONL files, agent-seen.json, and unique staging files are created with mode **0600** and checked/repaired before any read or append. All files matching activity-*.jsonl are protected, including malformed legacy filenames that are ignored by replay.
+- The directory itself, JSONL leaves and agent-seen.json refuse symlinks, including dangling symlinks. A replacement cannot be allowed to follow a symlink. The activity directory must be in a trusted per-user parent directory. Descriptor-relative native openat/O_NOFOLLOW operations would be required for a guarantee against a malicious concurrent process running with the same user identity; this implementation does not claim that guarantee.
+- On Windows the default path is under the current user's %LOCALAPPDATA% and inherits that directory's user-private ACL. The code rejects reparse-point link targets but does not rewrite Windows discretionary ACLs. An explicitly configured custom activity directory should likewise be user-private; broad custom parent ACLs are outside the Windows permission hardening guarantee.
+- Existing loose modes are repaired without deleting valid histories. Rotation and age-based retention remain in place: default 10 MiB segments and 14 days. Old matching files are pruned by modification time, while legitimate failures to secure or enumerate them are surfaced.
+
+## Writes and failure reporting
+
+- JSONL is appended with a FileStreamOptions UnixCreateMode of 0600 and the existing rotation threshold. A failed activity append cannot abort the underlying agent command. The store reports a deduplicated generic diagnostic to stderr and exposes LastPersistenceError. Diagnostics disclose the operation and exception category, not stored commands, signed URLs or serialized messages.
+- Agent last-seen state uses a unique same-directory CreateNew staging file with 0600 on Unix, flushes contents to disk, and publishes via an atomic overwrite rename. Staging files are cleaned up on failure; existing state is never truncated before the new state is durable. The TUI only marks a snapshot as persisted after this operation succeeds; failures are retried on subsequent attributed activity.
+- The agent-seen reader caps input at 4 MiB, and malformed JSON is diagnosed and treated as empty. Permission failures and unsafe symlinks are reported rather than silently hidden. A failed save raises a path-neutral IOException to the caller, while the TUI suppresses that exception after the store has recorded the diagnostic.
+
+## Bounded recent replay
+
+- LoadRecent reads log segments in **reverse chronological order**, parsing dates and numeric segment suffixes rather than relying on alphabetical filename order. It reads backwards in fixed 16 KiB blocks instead of scanning the full retained corpus, and stops as soon as it finds the requested number of distinct activity IDs.
+- The newest persisted snapshot per ActivityId wins, and unfinished Running/Awaiting permission states are normalized to Interrupted exactly as on the previous forward reader. The displayed result is ordered by each activity's original StartedAt (stable update order for equal timestamps) so late completions do not reorder rows in the TUI.
+- Replay limits are: at most 5,000 requested distinct activities, **32 MiB actual bytes read** across all files, and **512 KiB per decoded JSONL record**. Oversized or malformed records are skipped. If a retained history has too few distinct activities within the byte budget, replay returns the available partial tail rather than allocating/scanning without bound. This is a display-history cache, not an audit-grade complete ledger.
+- The bounded reverse selection is intentionally based on the most recently persisted distinct IDs: a long-running activity that just completed is still visible after restart. This differs from the old unbounded first-creation-order tail when updates to old activities are interleaved with newer starts. Original start-time display order and the latest state for each selected ID are retained, with regression coverage for that choice. An exact first-creation-order tail from arbitrarily interleaved legacy logs requires a persisted start index or a full historical scan.
+- LastReplayBytesScanned exposes the byte count for deterministic performance regression tests. The sparse 256 MiB historical-prefix regression requests 20 distinct activities and asserts fewer than 256 KiB of actual file bytes read. A separate 64 MiB sparse worst-case file asserts the total 32 MiB budget even when fewer distinct records exist.
+
+## Verification and remaining limits
+
+Focused tests cover broad process umask, existing mode repair, symbolic and dangling links, malformed filename security, atomic last-seen publication/retry, TUI recovery, rotations, distinct latest-state replay, interrupted normalization, legacy UTF-8 BOM/CRLF, multi-block Unicode decoding, recently completed long-running activity selection, bad/oversized JSONL records and large sparse corpora. Full Linux Release tests are required before integration.
+
+Per-file replay readers and filename enumeration operate only inside the selected private directory, but do not provide arbitrary same-uid adversarial filesystem isolation. A truly adversarial actor capable of replacing parent directories concurrently requires a different native descriptor-relative filesystem abstraction. Reader body limits do not make an ongoing JSONL append a database transaction; each complete line is the unit of recovery.

@@ -8,6 +8,161 @@ Jarvis should not try to be a complete coding-agent runtime. Its purpose is to e
 
 Project-scoped operations automatically carry applicable AGENTS.md guidance from the local workspace and project ancestry. The client-to-server AgentCommandResponse envelope adds an ordered Instructions array of Scope, Path, Sha256, and Content; existing Result and Error semantics remain intact. The MCP server presents each applicable document as a distinct labeled text block before the ordinary tool result. See [AgentInstructions.md](AgentInstructions.md) and [AgentCommandResponse.schema.json](AgentCommandResponse.schema.json).
 
+## Implicit agent activation (protocol 3.58)
+
+An agent with a Ready assignment transitions to Working on its next ordinary
+agent-attributed MCP command. `agent_inbox(projectName, agentId)` is the usual
+first call: it observes the current assignment, atomically starts or resumes
+the matching attempt, then returns the refreshed inbox. Other ordinary
+project/tool activity also activates a Ready assignment when the client's
+agent-state cache recognizes it; inbox always refreshes that cache first.
+Concurrent starts use canonical Git-ledger version checks. An already Working
+agent does not restart its Working clock on subsequent calls. Unassigned agents
+remain unassigned. No provider conversation ID is required.
+
+The public `resume_agent` method is removed. The internal legacy ResumeAgent
+wire action remains readable for idempotent replay of pending protocol-3.57
+operations; it is not exposed as an MCP tool.
+
+Administrative `set_agent_state(projectName, agentId, targetAgentId, state,
+expectedAgentVersion, reason)` uses a typed enum with `NeedsWork` and
+`Parked`. It may change only **unassigned** agents and requires an exact
+current version and a reason. Direct writes to assigned Ready or Working
+states are rejected: assignment issuance owns Ready, and agent activity
+owns Working. Ordinary `yield_agent` and `complete_agent_work` still manage
+assigned-agent transitions.
+
+Because this removes public tools and introduces a new enum parameter,
+**protocol 3.58 requires a coordinated client/server release and a refresh
+of the connected MCP tool catalog**. Do not deploy without explicit operator
+authorization.
+
+## Side-effect-free cross-agent observation (protocol 3.63)
+
+`observe_agent(projectName, agentId, targetAgentId)` is the **only cross-agent
+state inspection operation**. `agentId` is the requesting agent label, distinct
+from `targetAgentId`. The OAuth-authenticated user must have
+`workspace:read`; both labels must resolve to registered agents in the
+**same bound project**, and the client verifies that the observer label agrees
+with the independently delivered command actor label. A target agent ID never
+authorizes activity or impersonation. Labels are not themselves authentication
+principals; OAuth and workspace permissions remain the authorization boundary.
+
+Observation validates both registered observer and target from **one verified
+canonical Git-ledger snapshot** (one remote fetch, with no mismatched ledger
+heads). It returns a compact projection: execution/disposition, state/version/sequence,
+entry and Working-turn timestamps, focused assignment/attempt and phase,
+blocker/task IDs, pending notification/review/feedback counts, and operator
+action flags. It does **not** expose notification bodies, review evidence,
+source documents, or session identifiers. The result includes
+`snapshotCommit`, `canonicalStateSource`, `canonicalStateFreshness`, and
+`observedAtUtc`; the snapshot is verified when queried, not a continuously
+maintained live subscription.
+
+`lastSeenAtUtc` is a separate, optionally unknown timestamp from the **selected
+client's local attributed-tool-activity cache**, not the canonical ledger. A
+different client's observations or agent activity may not be reflected there.
+`lastSeenProvenance` and `lastSeenIsCanonical = false` prevent treating it as
+evidence that an agent has progressed or as a global heartbeat.
+
+The observation transport is explicitly excluded from implicit Ready-to-Working
+activation, `Seen` updates, per-turn AGENTS.md delivery, and the receiver's
+Working clock; both observer and target remain untouched. Unknown actors,
+missing targets, mismatched actor labels and inaccessible projects fail without
+changing the target. The regular self-`agent_inbox` has **different semantics**:
+it may automatically transition the requesting agent from Ready to Working
+**before** returning the refreshed inbox. Its MCP metadata therefore correctly
+reports it as state-mutating. Repeat self-inbox calls do not restart Working.
+Every project-scoped MCP tool response appends a consistent public JSON block
+with `agentStateChanges` (including `[]` when no canonical state changes are
+confirmed), plus `jarvis/agent_state_changes` metadata. This includes failed
+commands: a requested read/write can fail after an earlier automatic agent
+activation has already committed. The mutation list contains only the affected
+project and agent IDs from canonical ledger receipts; it does not infer
+unrecorded before/after states. Local TUI activity timestamps do not count as
+canonical agent state changes.
+For a multi-step tool (notably cross-project `notify_agent`), the final
+response combines the confirmed state changes from preliminary source
+validation and destination dispatch, even if the latter fails.
+
+Self-inbox responses additionally include `agentInboxActivation` in the same
+JSON block and `jarvis/inbox_activation` metadata.
+`activatedByThisCall: true` is supported by the *confirmed canonical operation
+receipt* and carries `beforeState: Ready`, `afterState: Working`, the
+committed Git head and operation ID. A repeated read explicitly reports
+`activatedByThisCall: false`, with no invented transition. This evidence
+remains visible even when the later inbox read fails; the failure is still an
+error rather than falsely claiming the entire call had no side effects.
+The same typed `AgentStateChanges` envelope drives cache invalidation; its
+public projection is advisory, never an authorization claim.
+
+The global Agents dashboard can consume the same compact projection instead
+of using `agent_inbox` and accidentally starting another agent's assignment.
+Protocol 3.63 changes client/server transport and MCP tool catalog; deployment
+requires an explicit coordinated release authorization.
+
+## Cross-client Working-state cache invalidation (protocol 3.61)
+
+A canonical Git-ledger transaction records the exact agent IDs whose assignment
+or Working-turn state changed in its immutable, replayable operation receipt.
+The client forwards those typed effects in `AgentCommandResponse.AgentStateChanges`,
+independently of the ordinary command's success. In particular, a `read_file`
+call may commit Ready-to-Working activation before the file read fails.
+
+The server sends user-scoped SignalR
+`InvalidateAgentStates(projectName, agentIds)` only for the affected agents.
+Other agents' cached state remains valid after checkpoints, notifications,
+and unrelated task operations. Cross-project notification sender checks publish
+their source-project effects independently from destination operations.
+A cross-project `notify_agent` writes the durable notification in the
+destination without counting the source sender's ID as destination activity,
+even when both projects happen to use the same agent label. Its destination
+dispatch does not start a Working turn, update last-seen, or inject unrelated
+Working-turn guidance.
+
+The two-minute fallback refresh still covers missed notifications and external
+ledger writes. Reconnecting clears cached states. A refresh reuses its verified
+ledger snapshot rather than fetching it twice. The server stores no persistent
+agent state.
+
+**Protocol 3.61 requires coordinated client/server deployment.** Do not
+deploy without explicit operator authorization.
+
+## Explicit agent labels
+
+Agent-related MCP operations use **`agentId`** consistently; this replaces
+public `ownerId`, `actorId`, `reviewerId` and `requesterId` parameters.
+Ordinary project development tools (file reads and writes, commands, Git,
+jobs, skills and review actions) also require `agentId`. Sender/recipient
+notifications retain their intrinsic `fromAgentId` and `toAgentId` names.
+Agent-independent bootstrap, project discovery, connection diagnostics,
+feedback, and administrative status functions do not require a fabricated
+agent. See [ExplicitAgentIdentity.md](ExplicitAgentIdentity.md).
+
+An agent ID identifies an ephemeral named working slot, **not** an
+authentication or authorization principal. The authenticated user and local
+OS permissions remain the security boundary. The local client's Agents
+screen records `Seen` on each received, attributable tool invocation,
+including failed execution, without inspecting the originating model's
+conversation metadata. Registered worktree operations count toward the
+parent project's agent activity.
+
+Session metadata is not used to establish agent identity, permit lifecycle
+operations, or infer a separate initiating actor. The server may still use
+`openai/session` to select an explicitly associated ChatGPT device, which
+is independent from agent activity. The client transport carries the explicit
+agent ID, not a conversation ID; working-turn guidance uses the canonical
+agent state and the Working clock.
+
+Administrative Git-ledger operations record `AuthenticatedUser` where no
+specific agent is the initiator; existing immutable operation receipts retain
+their original recorded actor, including historical `Orchestrator` values.
+No session-based actor inference is performed.
+
+**Protocol 3.57** changes the MCP tool schemas and client/server command
+transport. Update the server and client together and refresh the MCP plugin
+tool list after deployment. No old public parameter-name aliases are provided.
+
 ## Design Goals
 
 - Keep commands structured rather than exposing arbitrary filesystem or shell access by default.
@@ -71,13 +226,14 @@ type AgentCommand =
     | SearchTextCommand of SearchTextCommand
     | ReadFileCommand of ReadFileCommand
     | ReadFilesCommand of ReadFilesCommand
+    | GetAgentInstructionsCommand of GetAgentInstructionsCommand
     | ReadImageCommand of ReadImageCommand
     | ExportFileCommand of ExportFileCommand
     | UpdateClientCommand
     | WriteFileCommand of WriteFileCommand
     | PatchFileCommand of PatchFileCommand
     | RunCommandCommand of RunCommandCommand
-    | ListProjectTasksCommand of ListProjectTasksCommand
+    | ListConfiguredTasksCommand of ListConfiguredTasksCommand
     | RunProjectTaskCommand of RunProjectTaskCommand
     // Legacy WorkTask wire cases are internal compatibility only; no public MCP endpoints.
     | ListSkillsCommand of ListSkillsCommand
@@ -93,6 +249,20 @@ type AgentCommand =
     | MessageCommand of MessageCommand
     | GetClientActivityCommand of GetClientActivityCommand
 ```
+
+## Creating projects
+
+`create_project` creates a **new direct-child directory** within the configured workspace. A project requires no registration record and becomes visible to `list_projects` immediately. Existing directories are never overwritten. Ordinary folder creation with `mkdir` remains supported.
+
+All setup options default to off:
+
+- `initializeGit`: run `git init --initial-branch=main`.
+- `createJarvisConfig`: write a valid minimal `.jarvis.json` with an empty `tasks` object.
+- `createAgentInstructions`: write a project-local `AGENTS.md` starter.
+- `remoteUrl`: when Git is initialized, configure `origin` with the given URL.
+- `initializeLedger`: initialize and locally bind a **new remote-backed orphan Git ledger**, generating project and ledger UUIDs. This implies Git initialization and requires a usable `remoteUrl` and `acknowledgeRemoteVisibility=true`.
+
+Ledger initialization follows the existing trust model: it must not silently assume remote privacy, overwrite an existing ledger or invent a remote. Successful results return the project path, selected setup flags and, when applicable, the generated ledger identifiers and trusted head. If any setup step fails after the directory is created, Jarvis reports the partial state and retains the directory for inspection or recovery rather than removing potentially published ledger history. The new command requires the `git:write` MCP scope because some options initialize and publish Git state.
 
 ## Project Discovery Commands
 
@@ -169,6 +339,24 @@ type SearchTextMatch =
 
 Results are individual matches rather than filenames. `Line` and `Column` are one-based. Multiple matches in the same file or line are returned independently. `Preview` is a bounded excerpt of the matching line. `MaxResults` is a global match budget and stops further file traversal once satisfied.
 
+## Explicit worktree selection in MCP
+
+The public source, file, search, Git and execution tools accept optional `worktreeName`
+alongside the logical `projectName`. Omit `worktreeName` to use the main checkout,
+or provide the directory name of a Git-registered linked worktree:
+
+```json
+{"projectName":"Wayfold","worktreeName":"agent6-composite-campaign-travel","filePath":"src/example.cs"}
+```
+
+File paths and working directories stay relative to the selected checkout. The MCP
+boundary translates the explicit selector into the established internal
+`Project::Worktree` convention; the client verifies worktree registration and
+enforces path containment and symlink checks. Invalid or ambiguous selectors
+are rejected; non-worktree ledger coordination APIs remain scoped to the logical
+project and intentionally have no `worktreeName` field. Older callers may
+continue using `Project::Worktree` as `projectName` when `worktreeName` is omitted.
+
 ## File Access Commands
 
 ### `ReadFile`
@@ -199,6 +387,14 @@ type ReadFilesCommand =
     { ProjectName: string
       FilePaths: string list }
 ```
+
+### `GetAgentInstructions` (protocol 3.59)
+
+Read the complete applicable `AGENTS.md` hierarchy for a checkout-relative directory, including the workspace root, selected main/registered-worktree root, and every ancestor. Unlike automatic delivery, this explicit tool has **no per-file size, aggregate content, or document-count limit** and never uses the instruction delivery cache.
+
+The result contains an `"AGENTS.md"` mapping such as `{".": "workspace rules", "Wayfold": "project rules", "Wayfold/src": "source rules"}`. A response that cannot fit in the standard 900 KiB tool transport provides `nextCursor`. Repeat the same call with this cursor until it is absent. For a file split across pages, `chunk` identifies the path, start/end byte offsets, total size, and SHA-256; concatenate segments by path and byte offset. Continuations are stateless and rejected if the applicable hierarchy changes.
+
+This tool can retrieve an oversized workspace-root `AGENTS.md` that ordinary project-scoped `read_file` cannot address. It applies the same path and symlink protections as ordinary source reads.
 
 ### `ImportFile`
 
@@ -296,7 +492,7 @@ The old commands are easy to misuse because they depend on brittle text matching
 
 ### `RunCommand`
 
-Runs a bounded, synchronous command in a project directory.
+Runs a bounded, synchronous development command within the local Jarvis OS-permission sandbox for the selected project checkout. The configured client account permissions constrain process access.
 
 May mutate state depending on the command. It should usually require confirmation.
 
@@ -365,7 +561,7 @@ type ProjectTaskDefinition =
       TimeoutSeconds: int option
       MaxOutputBytes: int option }
 
-type ListProjectTasksCommand =
+type ListConfiguredTasksCommand =
     { ProjectName: string }
 
 type RunProjectTaskCommand =
@@ -373,7 +569,7 @@ type RunProjectTaskCommand =
       TaskName: string }
 ```
 
-`ListProjectTasks` is read-only. `RunProjectTask` resolves the named definition locally, then applies the same executable, working-directory, timeout, shell-deny, output, and process-permission checks as `RunCommand`.
+`ListConfiguredTasks` is read-only. `RunProjectTask` resolves the named definition locally, then applies the same executable, working-directory, timeout, shell-deny, output, and process-permission checks as `RunCommand`.
 
 For authorization, Jarvis resolves the task before prompting and authorizes the resolved executable and arguments. The same resolved definition is then executed, so editing `.jarvis.json` after a session grant was created cannot silently change what an already-approved exact command means.
 
@@ -389,7 +585,7 @@ Public WorkTask MCP endpoints have been retired. Repository-backed tasks and the
 
 `ListSkills(projectName)` discovers project-local skill names and descriptions. `GetSkill(projectName, skillName)` returns the full Markdown. Both are read-only and require `workspace:read`.
 
-`CreateSkill(projectName, skillName, content, overwrite=false)` writes `.jarvis/skills/<skill-name>/SKILL.md`. It requires `workspace:write` and follows the local trust policy; existing skills require explicit overwrite. Skills are procedural guidance, not executable operations or permission grants. See [Jarvis Skills](Skills.md) for the authoritative layout, validation, and result details.
+`CreateSkill(projectName, skillName, content, overwrite=false)` writes `.agents/skills/<skill-name>/SKILL.md`. It requires `workspace:write` and follows the local trust policy; existing skills require explicit overwrite. Skills are procedural guidance, not executable operations or permission grants. See [Jarvis Skills](Skills.md) for the authoritative layout, validation, and result details.
 
 ## Git Commands
 
@@ -758,13 +954,14 @@ If `InputSchemaJson` and `OutputSchemaJson` are added later, they should be incl
 | `SearchText` | `ReadOnly` | `Allow` | Should respect ignored directories and max output limits. |
 | `ReadFile` | `ReadOnly` | `Allow` | May still be blocked by sensitive-file filters. |
 | `ReadFiles` | `ReadOnly` | `Allow` | May still be blocked by sensitive-file filters. |
+| `GetAgentInstructions` | `ReadOnly` | `Allow` | Complete applicable hierarchy, paginated if necessary. |
 | `ReadImage` | `ReadOnly` | `Allow` | Reads a PNG, JPEG, or WebP image for model vision. |
 | `ExportFile` | `ReadOnly` | `Allow` | Copies one bounded project file to server memory and returns a 10-minute unguessable HTTPS bearer link for the user. |
 | `UpdateClient` | `ProcessExecution`, `NetworkAccess`, `Destructive` | `Allow` at partial/full trust; confirm at no trust | Downloads only from the configured Jarvis server, verifies `SHA256SUMS`, keeps `.prev`, replaces the standalone client, then restarts in the same terminal. |
 | `WriteFile` | `WorkspaceWrite` | `RequireConfirmation` | Creates or overwrites project files. |
 | `PatchFile` | `WorkspaceWrite` | `RequireConfirmation` | Preferred edit path. |
 | `RunCommand` | `ProcessExecution` | `RequireConfirmation` | Use allowlists/presets where possible. |
-| `ListProjectTasks` | `ReadOnly` | `Allow` | Reads project-local task definitions. |
+| `ListConfiguredTasks` | `ReadOnly` | `Allow` | Reads project-local task definitions. |
 | `RunProjectTask` | `ProcessExecution` | `RequireConfirmation` | Authorize the resolved task definition, not only its name. |
 | `ListSkills` | `ReadOnly` | `Allow` | Discovers project-local skills. |
 | `GetSkill` | `ReadOnly` | `Allow` | Reads skill guidance. |

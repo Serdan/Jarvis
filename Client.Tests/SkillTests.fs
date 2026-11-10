@@ -19,7 +19,7 @@ let private createProject workspace projectName =
 
 let private writeSkill workspace projectName skillName fileName (content: string) =
     let directory =
-        Path.Combine(workspace, projectName, ".jarvis", "skills", skillName)
+        Path.Combine(workspace, projectName, ".agents", "skills", skillName)
 
     Directory.CreateDirectory(directory) |> ignore
     File.WriteAllText(Path.Combine(directory, fileName), content)
@@ -32,7 +32,7 @@ let listSkills_discovers_skill_files_and_descriptions () =
         createProject workspace "Project1"
         writeSkill workspace "Project1" "deploy" "SKILL.md" "# Deploy\n\nDeploy production safely.\n\nMore detail."
         writeSkill workspace "Project1" "build" "skill.md" "# Build\n\nRun the canonical build workflow."
-        Directory.CreateDirectory(Path.Combine(workspace, "Project1", ".jarvis", "skills", "empty")) |> ignore
+        Directory.CreateDirectory(Path.Combine(workspace, "Project1", ".agents", "skills", "empty")) |> ignore
 
         let runtime = Runtime(workspace)
 
@@ -146,11 +146,11 @@ let createSkill_writes_canonical_file_and_returns_metadata () =
         | Error error -> Assert.Fail($"CreateSkill failed: {EffectError.toString error}")
         | Ok result ->
             result.Name |> shouldEqual "release"
-            result.Path |> shouldEqual ".jarvis/skills/release/SKILL.md"
+            result.Path |> shouldEqual ".agents/skills/release/SKILL.md"
             result.Hash.StartsWith("sha256:", StringComparison.Ordinal) |> shouldEqual true
             result.Overwritten |> shouldEqual false
 
-            let path = Path.Combine(workspace, "Project1", ".jarvis", "skills", "release", "SKILL.md")
+            let path = Path.Combine(workspace, "Project1", ".agents", "skills", "release", "SKILL.md")
             File.ReadAllText(path) |> shouldEqual content
 
             getSkill
@@ -210,7 +210,7 @@ let createSkill_overwrite_replaces_skill_with_canonical_file () =
         | Error error -> Assert.Fail($"CreateSkill overwrite failed: {EffectError.toString error}")
         | Ok result ->
             result.Overwritten |> shouldEqual true
-            let path = Path.Combine(workspace, "Project1", ".jarvis", "skills", "release", "SKILL.md")
+            let path = Path.Combine(workspace, "Project1", ".agents", "skills", "release", "SKILL.md")
             File.ReadAllText(path) |> shouldEqual replacement
     finally
         Directory.Delete(workspace, true)
@@ -276,4 +276,37 @@ let globalSkills_are_visible_from_multiple_projects_and_can_be_updated () =
 
         getSkill { ProjectName = "@global"; SkillName = "engineering-judgment" } runtime
         |> shouldEqual (Ok { Name = "engineering-judgment"; Scope = "global"; Content = "# Changed" })
+    finally Directory.Delete(workspace, true)
+
+[<Test>]
+let listSkills_prefers_yaml_frontmatter_description_and_preserves_scope () =
+    let workspace = tempWorkspace ()
+    try
+        createProject workspace "One"
+        writeSkill workspace "One" "metadata" "SKILL.md"
+            "---\nname: metadata\ndescription: \"Frontmatter discovery description\"\n---\n\n# Heading\n\nFallback text."
+        let globalPath = Path.Combine(workspace, ".agents", "skills", "metadata")
+        Directory.CreateDirectory(globalPath) |> ignore
+        File.WriteAllText(Path.Combine(globalPath, "SKILL.md"),
+            "---\nname: metadata\ndescription: Global guidance\n---\n\n# Heading")
+        let runtime = Runtime(workspace)
+        match listSkills { ProjectName = "One" } runtime with
+        | Error error -> Assert.Fail(EffectError.toString error)
+        | Ok result ->
+            result.Skills |> shouldEqual
+                [ { Name = "metadata"; Scope = "global"; Description = Some "Global guidance" }
+                  { Name = "metadata"; Scope = "project"; Description = Some "Frontmatter discovery description" } ]
+    finally Directory.Delete(workspace, true)
+
+[<Test>]
+let listSkills_ignores_legacy_jarvis_directory () =
+    let workspace = tempWorkspace ()
+    try
+        createProject workspace "One"
+        let legacy = Path.Combine(workspace, "One", ".jarvis", "skills", "old")
+        Directory.CreateDirectory(legacy) |> ignore
+        File.WriteAllText(Path.Combine(legacy, "SKILL.md"), "# Legacy")
+        let runtime = Runtime(workspace)
+        listSkills { ProjectName = "One" } runtime
+        |> shouldEqual (Ok { Skills = [] })
     finally Directory.Delete(workspace, true)

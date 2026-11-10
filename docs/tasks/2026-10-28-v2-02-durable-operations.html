@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Complete idempotent operation results, pending-intent recovery and typed errors</title></head>
+<body><main>
+<h1>Complete idempotent operation results, pending-intent recovery and typed errors</h1>
+<p><strong>Task:</strong> 2026-10-28-v2-02-durable-operations. <strong>Priority:</strong> P0. <strong>Status:</strong> Open.</p>
+<h2>Goal and current gap</h2>
+<p>Operation UUID/hash lookup and retry exist, but operation record stores only paths and no complete original logical result; caller-side intent persistence, GetOperationStatus and explicit OutcomeUnknown recovery UX are absent. Adapter flattens typed failures into ValidationError strings; retry delay lacks specified jitter.</p>
+<h2>Source of authority</h2>
+<p>Normative specification: <code>docs/specs/orchestration-v2-architecture.md</code>, sections §5.1–5.3, §8. Current implementation: <code>Client/Modules/LedgerStore.fs:333-374,698-817</code>; <code>Client/Modules/V2ReviewApi.fs:75-77,173-177</code>. Audit: <code>docs/reviews/2026-10-28-v2-spec-implementation-audit.md</code>.</p>
+<h2>Acceptance criteria</h2>
+<ol>
+<li>Persist schema-versioned canonical operation input and exact original logical result/sequence in the same ledger commit; return original on replay.</li>
+<li>Implement GetOperationStatus and persistent pending operation journal for TUI/local client, with no offline second writer; surface OutcomeUnknown plus original UUID and verified head.</li>
+<li>Preserve typed transport, contention, integrity, permission and domain errors through MCP; implement bounded jittered retry without changing the single authoritative ref.</li>
+<li>Prove lost response, restart, repeated same UUID, reused UUID with changed payload, auth/network errors and concurrent distinct operations across clones.</li>
+</ol>
+<h2>Dependencies</h2>
+<ul><li><code>2026-10-28-v2-01-ledger-trust-onboarding</code></li></ul>
+<h2>Safety and completion</h2>
+<p>Work in an isolated Jarvis worktree; keep server stateless and task authority on the single orphan Git ref. Do not use Codex through Jarvis. Use disposable Git remotes for tests. Source-level task files here are backlog artifacts only; do not treat them as already imported into the V2 ledger. Verify behavior, review the implementation, and record tests and exact commits before closing. No production deployment or V1 cutover without explicit authorization.</p>
+</main></body></html>

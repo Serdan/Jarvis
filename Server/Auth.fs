@@ -40,6 +40,15 @@ module Auth =
         else
             "https://" + domain + "/"
 
+    /// Auth0 treats trailing-slash API identifiers as distinct audiences.
+    /// Some MCP hosts (including LM Studio) request the origin resource URI
+    /// with "/", while existing clients use the historical no-slash identifier.
+    /// Accept only these two explicitly equivalent identifiers, not arbitrary
+    /// paths or origins.
+    let validAudiences (options: JarvisOptions) =
+        let audience = options.Audience.Trim().TrimEnd('/')
+        [| audience; audience + "/" |]
+
     let resourceMetadataUri (options: JarvisOptions) =
         options.Audience.Trim().TrimEnd('/') + "/.well-known/oauth-protected-resource"
 

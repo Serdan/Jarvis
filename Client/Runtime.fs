@@ -1,13 +1,11 @@
 namespace Client
 
-open System.Net.Http
 open System.Threading.Tasks
 open Client.IO
 open Client.ConsoleTui
 open Common
 
 type Runtime(root: string, tui: ConsoleTui, trustLevel: TrustLevel, maxImportBytes: int64) =
-    member _.httpClient = new HttpClient()
     member _.Tui = tui
     member _.MaxImportBytes = maxImportBytes
     member val Browser: BrowserBridge.Service option = None with get, set
@@ -23,6 +21,8 @@ type Runtime(root: string, tui: ConsoleTui, trustLevel: TrustLevel, maxImportByt
 
     interface FileIO with
         member _.File = FileOperations.impl
+        member _.EditText(path, options, edit) =
+            AtomicTextFiles.edit path options edit
 
     interface WebIO with
         member _.Browser = WebOperations.impl

@@ -1,7 +1,6 @@
 #nowarn "20"
 
 open System
-open System.Globalization
 open System.Threading.RateLimiting
 open System.Threading.Tasks
 open Microsoft.AspNetCore.Authentication.JwtBearer
@@ -15,6 +14,7 @@ open Microsoft.Extensions.DependencyInjection
 open Microsoft.Extensions.Hosting
 open Microsoft.Extensions.Primitives
 open ModelContextProtocol.Server
+open ModelContextProtocol.Protocol
 open Server
 open Server.Services
 
@@ -45,6 +45,7 @@ let private getDatabasePath (configuration: IConfiguration) =
 let configureServices (services: IServiceCollection) (configuration: IConfiguration) =
     let configured = getConfiguredOptions configuration
     let databasePath = getDatabasePath configuration
+    let mcpLimits = McpLoadSettings.fromConfiguration configuration
 
     services.Configure<JarvisOptions>(configuration) |> ignore
 
@@ -53,6 +54,7 @@ let configureServices (services: IServiceCollection) (configuration: IConfigurat
         .AddJwtBearer(fun options ->
             options.Authority <- Auth.issuer configured
             options.Audience <- configured.Audience
+            options.TokenValidationParameters.ValidAudiences <- Auth.validAudiences configured
             options.MapInboundClaims <- false
             options.RequireHttpsMetadata <- true
 
@@ -100,6 +102,7 @@ let configureServices (services: IServiceCollection) (configuration: IConfigurat
     |> ignore
 
     services.AddHttpContextAccessor() |> ignore
+    services.AddSingleton<McpUserCapacity>(fun _ -> new McpUserCapacity(mcpLimits)) |> ignore
 
     services
         .AddMcpServer(fun options -> options.ServerInstructions <- InstructionGuidance.Text)
@@ -109,8 +112,27 @@ let configureServices (services: IServiceCollection) (configuration: IConfigurat
                 McpRequestFilter<_, _>(fun next ->
                     McpRequestHandler<_, _>(fun context cancellation ->
                     ValueTask<ModelContextProtocol.Protocol.CallToolResult>(
-                        RequestDeviceRouting.withMetadata context.Params (fun () ->
-                            next.Invoke(context, cancellation).AsTask())
+                        task {
+                            let invoke () =
+                                RequestDeviceRouting.withMetadata context.Params (fun () ->
+                                    next.Invoke(context, cancellation).AsTask())
+                            // Do not let authenticated tokens without a usable
+                            // subject bypass capacity. The tool's own identity
+                            // check still reports the missing subject normally.
+                            let subject = Auth.tryUserId context.User |> Option.defaultValue "<missing-subject>"
+                            let capacity = context.Services.GetRequiredService<McpUserCapacity>()
+                            let! admitted = capacity.Execute(subject, cancellation, invoke)
+                            match admitted with
+                            | Executed response -> return response
+                            | Busy retrySeconds ->
+                                let result = CallToolResult()
+                                result.IsError <- Nullable true
+                                result.Content <-
+                                    ResizeArray<ContentBlock>(
+                                        [ TextContentBlock(Text =
+                                            $"Jarvis MCP tool capacity is busy. Retry after {retrySeconds} seconds.") :> ContentBlock ])
+                                return result
+                        }
                     )))
             )
             |> ignore)
@@ -136,17 +158,7 @@ let configureServices (services: IServiceCollection) (configuration: IConfigurat
     |> ignore
 
     services.AddRateLimiter(fun options ->
-        options.OnRejected <-
-            (fun context _ ->
-                match context.Lease.TryGetMetadata(MetadataName.RetryAfter) with
-                | true, retryAfter ->
-                    context.HttpContext.Response.Headers.RetryAfter <-
-                        (retryAfter.TotalSeconds |> int).ToString(NumberFormatInfo.InvariantInfo)
-                        |> StringValues
-                | _ -> ()
-
-                context.HttpContext.Response.StatusCode <- StatusCodes.Status429TooManyRequests
-                ValueTask.CompletedTask)
+        options.OnRejected <- McpSubjectRate.onRejected
 
         options.AddPolicy(
             rateLimiterPolicy,
@@ -168,6 +180,13 @@ let configureServices (services: IServiceCollection) (configuration: IConfigurat
                         limiter
                 )
         )
+        |> ignore
+        // Discovery remains outside the long-lived tools/call concurrency
+        // limiter; the HTTP budget applies across all authenticated MCP
+        // requests, partitioned by token subject rather than proxy IP.
+        options.AddPolicy(
+            McpSubjectRate.Policy,
+            McpSubjectRate.partition mcpLimits)
         |> ignore)
     |> ignore
 
@@ -230,7 +249,10 @@ let configureApp (app: WebApplication) =
     |> fun endpoint -> endpoint.RequireRateLimiting(rateLimiterPolicy)
     |> ignore
 
-    app.MapMcp("/mcp") |> ignore
+    // Authenticate MCP initialization/discovery at the HTTP boundary so clients
+    // receive an OAuth Bearer challenge before accessing tools. Tool-specific
+    // scope checks continue to run independently inside McpTools.
+    app.MapMcp("/mcp").RequireAuthorization().RequireRateLimiting(McpSubjectRate.Policy) |> ignore
 
     app
 
@@ -242,6 +264,11 @@ builder.Services.Configure<JarvisOptions>(builder.Configuration) |> ignore
 configureServices builder.Services builder.Configuration
 
 let app = builder.Build()
+
+// Resolve the persistent SQLite dependency before accepting readiness traffic.
+// Without this, the public discovery and auth routes can appear healthy while
+// the feedback/operation store cannot even initialize.
+app.Services.GetRequiredService<FeedbackStore>() |> ignore
 
 if app.Environment.IsDevelopment() then
     app.UseDeveloperExceptionPage() |> ignore

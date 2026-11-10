@@ -2,12 +2,13 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "urn:jarvis:agent-command-response",
   "title": "AgentCommandResponse",
-  "description": "Client-to-server Jarvis command response. The MCP server renders Instructions as ordered labeled content blocks before ordinary tool content.",
+  "description": "Client-to-server Jarvis command response. Instructions are repository guidance; AgentStateChanges are verified ledger mutation hints for cache invalidation.",
   "type": "object",
   "required": [
     "Result",
     "Error",
-    "Instructions"
+    "Instructions",
+    "AgentStateChanges"
   ],
   "properties": {
     "Result": {
@@ -26,11 +27,25 @@
     },
     "Instructions": {
       "type": "array",
-      "maxItems": 16,
+      "maxItems": 35,
       "description": "Applicable instructions ordered from workspace to project root to deeper directories; empty for no applicable guidance.",
       "items": {
         "$ref": "#/$defs/InstructionDocument"
       }
+    },
+    "AgentStateChanges": {
+      "type": "array",
+      "description": "Affected project and agent identities after confirmed canonical Working-turn/assignment transitions. This metadata is retained even when the following tool operation fails; unrelated writes produce an empty array.",
+      "items": {
+        "$ref": "#/$defs/AgentStateChange"
+      }
+    },
+    "InboxActivation": {
+      "oneOf": [
+        { "$ref": "#/$defs/AgentInboxActivation" },
+        { "type": "null" }
+      ],
+      "description": "Explicit caller-visible result of self-AgentInbox activation; absent for other commands. Preserved on a failed inbox read after a confirmed transition."
     }
   },
   "additionalProperties": false,
@@ -48,7 +63,10 @@
           "type": "string",
           "enum": [
             "workspace",
-            "project"
+            "project",
+            "working-turn",
+            "write-warning",
+            "instruction-warning"
           ]
         },
         "Path": {
@@ -62,9 +80,50 @@
         },
         "Content": {
           "type": "string",
-          "description": "Original UTF-8 Markdown. The 16 KiB/file and 32 KiB combined UTF-8 byte limits are enforced by the client, not by JSON Schema."
+          "description": "UTF-8 Markdown or a complete-file omission notice. Automatic delivery is bounded by the client; explicit hierarchy retrieval is paginated."
         }
       },
+      "additionalProperties": false
+    },
+    "AgentStateChange": {
+      "type": "object",
+      "required": [
+        "ProjectName",
+        "AgentId"
+      ],
+      "properties": {
+        "ProjectName": {
+          "type": "string",
+          "minLength": 1
+        },
+        "AgentId": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "AgentInboxActivation": {
+      "type": "object",
+      "required": [
+        "ProjectName",
+        "AgentId",
+        "ActivatedByThisCall",
+        "BeforeState",
+        "AfterState",
+        "CommittedHead",
+        "OperationId"
+      ],
+      "properties": {
+        "ProjectName": { "type": "string", "minLength": 1 },
+        "AgentId": { "type": "string" },
+        "ActivatedByThisCall": { "type": "boolean" },
+        "BeforeState": { "type": ["string", "null"], "enum": ["Ready", null] },
+        "AfterState": { "type": ["string", "null"], "enum": ["Working", null] },
+        "CommittedHead": { "type": ["string", "null"], "pattern": "^[0-9a-f]{40}$" },
+        "OperationId": { "type": ["string", "null"] }
+      },
+      "description": "A true value must be backed by a confirmed canonical Ready-to-Working operation receipt, not inferred from the returned inbox state. False means this call did not commit an activation.",
       "additionalProperties": false
     }
   }

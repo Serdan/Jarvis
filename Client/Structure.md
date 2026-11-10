@@ -8,6 +8,7 @@
 - **Modules/ProjectPaths.fs** — Workspace/project containment and path safety.
 - **Modules/ProjectBrowser.fs** — Structured project/file operations.
 - **Modules/PermissionPolicy.fs** — Local authorization and confirmation policy.
+- **Modules/ImportNetwork.fs** — HTTPS file-origin classification, SSRF-resistant pinned connections, bounded redirect and streaming import transport.
 - **Modules/ProcessEnvironment.fs** — Sensitive environment-variable filtering for child processes.
 - **Modules/ClientShell.fs** — Bounded processes, project tasks, and git operations.
 - **Modules/JobManager.fs** — Long-running job lifecycle.

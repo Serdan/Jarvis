@@ -20,6 +20,19 @@ type TestContext(?initialContent: string) =
         member _.Project = { Root = ProjectDirectory "/fake/projects"; SpecialFiles = []; FolderFilters = [] }
 
     interface FileIO with
+        member _.EditText(_, options, edit) =
+            let original = Some currentContent
+            match edit original with
+            | Error failure -> Error failure
+            | Ok (change, response) ->
+                if not options.DryRun then
+                    currentContent <-
+                        match change with
+                        | ReplaceText next -> next
+                        | AppendUtf8Text suffix -> currentContent + suffix
+                    writeCount <- writeCount + 1
+                Ok response
+
         member _.File =
             { getFullPath = _.Replace('\\', '/') >> Ok
               ReadAllText = fun _ -> Ok(Content currentContent)

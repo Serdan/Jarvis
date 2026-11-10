@@ -1,0 +1,47 @@
+{
+  "schemaVersion": 1,
+  "id": "2026-10-28-v2-02-durable-operations",
+  "title": "Complete idempotent operation results, pending-intent recovery and typed errors",
+  "status": "active",
+  "priority": "P0",
+  "dependencies": [
+    "2026-10-28-v2-01-ledger-trust-onboarding"
+  ],
+  "owner": {
+    "agent": null,
+    "worktree": null
+  },
+  "checkpoint": {
+    "summary": "Durable V2-02 operation input, typed entity-specific original result, provenance, pending-intent replay/reconciliation and bounded multi-client Git contention are implemented. Added offline-remote and forced remote rewrite acceptance tests: remote failures fail closed with typed errors, preserve pending evidence, and recover the exact operation after restoring trusted refs.",
+    "nextAction": "Re-review remaining V2-02 authorization/UX acceptance once V2-01 trust and V2-11 permission controls are complete; retain active status until cross-task security gates pass. Core development can advance to V2-01 or V2-04.",
+    "verified": [
+      "Cross-clone idempotency, canonicalized JSON hash, duplicate-field rejection, stable receipt after unrelated writer",
+      "Failed call/lost-response retained in local journal, conflicting UUID refused, replay clears journal",
+      "Opt-in V2 API confirmed writes clear journal; pending intents inspectable without configured remote",
+      "Typed LedgerContended/OperationIdReused/OutcomeUnknown/etc. propagated over wire and MCP metadata verified",
+      "Eight independent clones wrote separate records concurrently; every operation/receipt retained; source working trees unchanged",
+      "Read-only reconciliation distinguishes applied, absent, mismatched payload, mismatched ledger identity; local journal unchanged until explicit hash-matched acknowledgment",
+      "Lost remote response is recovered only when exact canonical operation matches; otherwise OutcomeUnknown retains caller UUID, verified head and pending intent",
+      "Review submission payload reconciled against immutable pinned review source; repeat acknowledgment is idempotent",
+      "Original task and assignment entity results remain unchanged across cross-clone retries after later writes",
+      "Original reviewer revision number, exact head SHA and immutable review ref captured in the committed receipt",
+      "Yield checkpoint original sequence/kind and agent Ready/attempt Paused versions verified",
+      "GetOperationStatus exposes structured originalResult and originatingCommit separate from current ledger head; forged trailer hash rejected",
+      "Remote outage during pending write produces typed RemoteUnavailable; journal retained, then exact same UUID applied after remote restoration",
+      "Rewritten canonical ledger rejected by trust ancestry while pending journal is retained; restored head re-establishes healthy inspection"
+    ],
+    "lastCommit": null
+  },
+  "audit": {
+    "specSections": [
+      "§5.1–5.3",
+      "§8"
+    ],
+    "implementationReferences": [
+      "Client/Modules/LedgerStore.fs:333-374,698-817",
+      "Client/Modules/V2ReviewApi.fs:75-77,173-177"
+    ],
+    "sourceReport": "docs/reviews/2026-10-28-v2-spec-implementation-audit.md"
+  },
+  "updatedAt": "2026-10-28T21:29:00+01:00"
+}

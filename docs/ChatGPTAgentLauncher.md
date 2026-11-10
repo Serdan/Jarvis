@@ -1,8 +1,8 @@
 # ChatGPT Ephemeral Agent Launcher — Design Specification
 
 **Status:** Implemented on `feature/browser-bridge`; **not yet deployed or verified in live Edge/ChatGPT**
-**Worktree:** `Jarvis::browser-bridge` (`feature/browser-bridge`)  
-**Depends on:** [Browser bridge](BrowserBridgeSystem.md), [implemented one-shot scheduler](BrowserOneShotScheduler.md)  
+**Worktree:** `Jarvis::browser-bridge` (`feature/browser-bridge`)
+**Depends on:** [Browser bridge](BrowserBridgeSystem.md), [implemented one-shot scheduler](BrowserOneShotScheduler.md)
 **Scope:** User-registered browser-window targets, a generic immediate open/execute/close operation, project-owned ChatGPT UI automation, and optional scheduled repetition. These additions are specified here but **not yet implemented**.
 
 ## 1. Objective

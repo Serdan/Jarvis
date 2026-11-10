@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 1,
+  "id": "2026-10-28-v2-10-ledger-query-history",
+  "title": "Implement snapshot-pinned list, roster, history, operation and pagination APIs",
+  "status": "cancelled",
+  "priority": "P1",
+  "dependencies": [
+    "2026-10-28-v2-02-durable-operations",
+    "2026-10-28-v2-03-schema-contracts",
+    "2026-10-28-v2-09-task-spec-apis"
+  ],
+  "owner": {
+    "agent": null,
+    "worktree": null
+  },
+  "checkpoint": {
+    "summary": "Superseded by the 2026-10-29 minimal orphan-branch cutover decision; do not implement this roadmap task.",
+    "nextAction": "No action. Use existing disk files for any manually selected migration, and prioritize only the orphan-branch cutover.",
+    "verified": [],
+    "lastCommit": null
+  },
+  "audit": {
+    "specSections": [
+      "§4",
+      "§5.4",
+      "§8",
+      "§10"
+    ],
+    "implementationReferences": [
+      "Client/Modules/ReviewWorkflow.fs:1200-1405",
+      "Client/Modules/LedgerStore.fs:230-291,489-510"
+    ],
+    "sourceReport": "docs/reviews/2026-10-28-v2-spec-implementation-audit.md"
+  },
+  "updatedAt": "2026-10-29T17:00:00Z"
+}

@@ -114,26 +114,21 @@ let private requiresConfirmation command =
     | ListWorktreesCommand _
     | GetWorktreeCommand _
     | InspectWorktreeRemovalCommand _
-    | ListTasksCommand _
-    | GetTaskCommand _
-    | CompareWorktreeTasksCommand _
-    | GetAgentAssignmentCommand _
-    | GetOrchestrationSnapshotCommand _
-    | GetTaskHistoryCommand _
+    | TaskReadCommand _
+    | ObserveAgentCommand _
+    | LedgerReadCommand _
+    | ReviewReadCommand _
     | GetProjectDetailsCommand _
     | ListDirectoryCommand _
     | SearchFilesCommand _
     | SearchTextCommand _
     | ReadFileCommand _
+    | ReadFilePageCommand _
     | ReadFilesCommand _
+    | GetAgentInstructionsCommand _
     | ReadImageCommand _
     | ExportFileCommand _
-    | ListProjectTasksCommand _
-    | AttachWorkTaskCommand _
-    | GetWorkTaskCommand _
-    | ListWorkTasksCommand _
-    | CheckpointWorkTaskCommand _
-    | CompleteWorkTaskCommand _
+    | ListConfiguredTasksCommand _
     | ListSkillsCommand _
     | GetSkillCommand _
     | GetGitStatusCommand _
@@ -170,7 +165,15 @@ let private requiresConfirmation command =
             [ ProcessExecution; NetworkAccess; WorkspaceWrite ] [ cmd.FilePath ] None []
             ("Export rendered DOM from " + cmd.TabRegistration + " into " + cmd.ProjectName + "/" + cmd.FilePath) false
     | ImportFileCommand cmd ->
-        confirmation "ImportFile" (Some cmd.ProjectName) [ WorkspaceWrite; NetworkAccess ] [ cmd.FilePath ] None [] $"Import file {cmd.FilePath}" false
+        // Never show a temporary signed file URL (query credentials) in
+        // confirmation dialogs, audits or error messages.
+        let host =
+            match ImportNetwork.classifyUrl cmd.DownloadUrl with
+            | Ok ImportNetwork.ProviderAttachment -> "ChatGPT file delivery"
+            | Ok (ImportNetwork.OtherPublicHttps name) -> name
+            | Error _ -> "unrecognized HTTPS source"
+        confirmation "ImportFile" (Some cmd.ProjectName) [ WorkspaceWrite; NetworkAccess ]
+            [ cmd.FilePath ] None [ host ] $"Import from {host} to {cmd.FilePath}" false
     | UpdateClientCommand ->
         confirmation "UpdateClient" None [ ProcessExecution; NetworkAccess; Destructive ] [] None [] "Update and restart Jarvis client" false
     | WriteFileCommand cmd ->
@@ -178,31 +181,52 @@ let private requiresConfirmation command =
     | PatchFileCommand cmd ->
         confirmation "PatchFile" (Some cmd.ProjectName) [ WorkspaceWrite ] [ cmd.FilePath ] None [] $"Patch file {cmd.FilePath}" true
     | CreateSkillCommand cmd ->
-        confirmation "CreateSkill" (Some cmd.ProjectName) [ WorkspaceWrite ] [ $".jarvis/skills/{cmd.SkillName}/SKILL.md" ] None [] $"Create skill {cmd.SkillName}" false
+        confirmation "CreateSkill" (Some cmd.ProjectName) [ WorkspaceWrite ] [ $".agents/skills/{cmd.SkillName}/SKILL.md" ] None [] $"Create skill {cmd.SkillName}" false
     | RunCommandCommand cmd ->
         confirmation "RunCommand" (Some cmd.ProjectName) [ ProcessExecution ] [] (Some cmd.Executable) cmd.Args $"Run {cmd.Executable}" true
     | RunProjectTaskCommand cmd ->
         confirmation "RunProjectTask" (Some cmd.ProjectName) [ ProcessExecution ] [] None [ cmd.TaskName ] $"Run project task {cmd.TaskName}" false
     | RemoveWorktreeCommand cmd ->
         confirmation "RemoveWorktree" (Some cmd.ProjectName) [ VersionControlWrite; Destructive ] [] (Some "git") [ cmd.WorktreePath ] $"Remove worktree {cmd.WorktreePath}" false
-    | CreateTaskCommand cmd ->
-        confirmation "CreateTask" (Some cmd.ProjectName) [ WorkspaceWrite; VersionControlWrite ] [] (Some "git") [ cmd.TaskId |> Option.defaultValue "new" ] "CreateTask task" false
-    | UpdateTaskCommand cmd ->
-        confirmation "UpdateTask" (Some cmd.ProjectName) [ WorkspaceWrite; VersionControlWrite ] [] (Some "git") [ cmd.TaskId ] "UpdateTask task" false
-    | AssignTaskCommand cmd ->
-        confirmation "AssignTask" (Some cmd.ProjectName) [ WorkspaceWrite; VersionControlWrite ] [] (Some "git") [ cmd.Agent; cmd.TaskId ] "Assign task" false
-    | RetireWorktreeCommand cmd ->
-        confirmation "RetireWorktree" (Some cmd.ProjectName) [ VersionControlWrite; Destructive ] [] (Some "git") [ cmd.WorktreePath ] "Retire worktree" false
-    | BeginTaskCommand cmd ->
-        confirmation "BeginTask" (Some cmd.ProjectName) [ WorkspaceWrite; VersionControlWrite ] [] (Some "git") [ cmd.TaskId ] "Begin task" false
-    | AcknowledgeTaskCommand cmd ->
-        confirmation "AcknowledgeTask" (Some cmd.ProjectName) [ WorkspaceWrite; VersionControlWrite ] [] (Some "git") [ cmd.TaskId ] "Acknowledge assignment" false
-    | ClaimTaskCommand cmd ->
-        confirmation "ClaimTask" (Some cmd.ProjectName) [ WorkspaceWrite; VersionControlWrite ] [] (Some "git") [ cmd.TaskId ] "ClaimTask task" false
-    | CheckpointTaskCommand cmd ->
-        confirmation "CheckpointTask" (Some cmd.ProjectName) [ WorkspaceWrite; VersionControlWrite ] [] (Some "git") [ cmd.TaskId ] "CheckpointTask task" false
-    | CompleteTaskCommand cmd ->
-        confirmation "CompleteTask" (Some cmd.ProjectName) [ WorkspaceWrite; VersionControlWrite ] [] (Some "git") [ cmd.TaskId ] "CompleteTask task" false
+    | TaskWriteCommand cmd ->
+        confirmation ("Task" + cmd.Action) (Some cmd.ProjectName)
+            [ VersionControlWrite; NetworkAccess ] [] (Some "git")
+            [ cmd.TaskId; cmd.AttemptId; cmd.OperationId ]
+            (" ledger task " + cmd.Action) false
+    | LedgerWriteCommand cmd ->
+        confirmation ("Ledger" + cmd.Action) (Some cmd.ProjectName)
+            [ VersionControlWrite; NetworkAccess ] [] (Some "git")
+            [ cmd.RemoteName; cmd.ExpectedTrustedHead; cmd.OperationId ]
+            (" ledger setup " + cmd.Action) false
+    | RetryPendingIntentCommand cmd ->
+        confirmation "RetryPendingIntent" (Some cmd.ProjectName)
+            [ VersionControlWrite; NetworkAccess ] [] (Some "git")
+            [ cmd.OperationId; cmd.ExpectedCommandSha256; cmd.ExpectedVerifiedHead ]
+            "Retry exactly the saved pending operation through current canonical ledger guards" false
+    | SupersedePendingIntentCommand cmd ->
+        confirmation "SupersedePendingIntent" (Some cmd.ProjectName)
+            [ WorkspaceWrite; VersionControlWrite; NetworkAccess ] [] (Some "git")
+            [ cmd.OperationId; cmd.RelatedOperationId; cmd.ExpectedCommandSha256; cmd.Reason ]
+            "Archive original pending intent after verifying a related Applied receipt" false
+    | AbandonPendingIntentCommand cmd ->
+        confirmation "AbandonPendingIntent" (Some cmd.ProjectName)
+            [ WorkspaceWrite; VersionControlWrite; NetworkAccess ] [] (Some "git")
+            [ cmd.OperationId; cmd.ExpectedCommandSha256; cmd.ExpectedVerifiedHead; cmd.Reason ]
+            "Archive only after current canonical task/review state proves the original saved action obsolete" false
+    | ReviewWriteCommand cmd ->
+        confirmation ("Review" + cmd.Action) (Some cmd.ProjectName)
+            [ VersionControlWrite; NetworkAccess ] [] (Some "git")
+            [ cmd.TaskId; cmd.RequestId; cmd.OperationId ]
+            (" canonical ledger review " + cmd.Action) false
+    | CreateProjectCommand cmd ->
+        let permissions =
+            [ WorkspaceWrite ]
+            @ (if cmd.InitializeGit then [ VersionControlWrite ] else [])
+            @ (if cmd.InitializeLedger then [ NetworkAccess ] else [])
+        confirmation "CreateProject" None permissions [ cmd.Name ]
+            (if cmd.InitializeGit then Some "git" else None)
+            [ cmd.Name; cmd.RemoteUrl ]
+            $"Create workspace project {cmd.Name}" true
     | CreateWorktreeCommand cmd ->
         confirmation "CreateWorktree" (Some cmd.ProjectName) [ VersionControlWrite ] [] (Some "git") [ cmd.Branch; cmd.Name ] $"Create worktree {cmd.Name}" true
     | GitCommitCommand cmd ->
@@ -228,6 +252,8 @@ let private trustAllows trustLevel command =
     | PartialTrust, RunProjectTaskCommand _
     | PartialTrust, StartJobCommand _
     | PartialTrust, CancelJobCommand _ -> false
+    // A trusted attachment URL may be imported in PartialTrust.
+    | PartialTrust, ImportFileCommand cmd -> ImportNetwork.isKnownAttachment cmd.DownloadUrl
     | PartialTrust, _ -> true
     | NoTrust, _ -> false
 

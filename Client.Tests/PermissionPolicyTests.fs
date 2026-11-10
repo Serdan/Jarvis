@@ -269,7 +269,7 @@ let ``partial trust confirms start job`` () =
 
 [<Test>]
 let ``partial trust confirms cancel job`` () =
-    let command = CancelJobCommand { JobId = "job-1" }
+    let command = CancelJobCommand { ProjectName = "Wayfold"; JobId = "job-1" }
 
     match evaluateWithTrust PartialTrust command with
     | Error(Client.ConfirmationRequired request) ->
@@ -461,7 +461,7 @@ let ``full trust allows run command`` () =
 
 [<Test>]
 let ``project task listing is read only`` () =
-    let command = ListProjectTasksCommand { ProjectName = "Project1" }
+    let command = ListConfiguredTasksCommand { ProjectName = "Project1" }
     evaluate command |> shouldEqual (Ok())
 
 [<Test>]
@@ -490,7 +490,7 @@ let create_skill_requires_workspace_write_confirmation () =
     | Error(Client.ConfirmationRequired request) ->
         request.CommandName |> shouldEqual "CreateSkill"
         request.Permissions |> shouldEqual [ WorkspaceWrite ]
-        request.Paths |> shouldEqual [ ".jarvis/skills/release/SKILL.md" ]
+        request.Paths |> shouldEqual [ ".agents/skills/release/SKILL.md" ]
     | other -> Assert.Fail($"Expected ConfirmationRequired, got {other}")
 
 [<Test>]

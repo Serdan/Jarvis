@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Reconcile normative ledger schema, validation and safe content limits</title></head>
+<body><main>
+<h1>Reconcile normative ledger schema, validation and safe content limits</h1>
+<p><strong>Task:</strong> 2026-10-28-v2-03-schema-contracts. <strong>Priority:</strong> P0. <strong>Status:</strong> Open.</p>
+<h2>Goal and current gap</h2>
+<p>Runtime records have no per-entity schemaVersion, lack normative fields; deserialization accepts defaults/unknown enum values in many commands. Contract mismatches include 128-KiB task HTML validation versus 64-KiB transactional blob cap, inconsistent checklist paths, encoded agent IDs, and spec-level review/audit fields.</p>
+<h2>Source of authority</h2>
+<p>Normative specification: <code>docs/specs/orchestration-v2-architecture.md</code>, sections §3, §5.2, §6, §10. Current implementation: <code>Client/Modules/ReviewWorkflow.fs:11-155,163-224</code>; <code>Client/Modules/LedgerStore.fs:97-99,723-757</code>. Audit: <code>docs/reviews/2026-10-28-v2-spec-implementation-audit.md</code>.</p>
+<h2>Acceptance criteria</h2>
+<ol>
+<li>Reconcile one documented canonical schema/path map for task/attempt/agent/review/ops/checkpoint/integration; add versioned strict serializers and migration of prototype fixtures.</li>
+<li>Fail closed on unknown status, missing required fields, invalid IDs/path collisions, malicious HTML or content, incompatible schema and oversized UTF-8 without ledger mutation.</li>
+<li>Align task HTML/blob and response-size limits; resolve the 128 KiB versus 64 KiB contradiction and specify pagination/deferred text instead of silent truncation.</li>
+<li>Test malformed/cross-linked records, Unicode/case/path attacks, limits at boundaries, and schema upgrade/recovery with independent clones.</li>
+</ol>
+<h2>Dependencies</h2>
+<p>None.</p>
+<h2>Safety and completion</h2>
+<p>Work in an isolated Jarvis worktree; keep server stateless and task authority on the single orphan Git ref. Do not use Codex through Jarvis. Use disposable Git remotes for tests. Source-level task files here are backlog artifacts only; do not treat them as already imported into the V2 ledger. Verify behavior, review the implementation, and record tests and exact commits before closing. No production deployment or V1 cutover without explicit authorization.</p>
+</main></body></html>

@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Bind source repositories and worktrees by verified identity, not ownership</title></head>
+<body><main>
+<h1>Bind source repositories and worktrees by verified identity, not ownership</h1>
+<p><strong>Task:</strong> 2026-10-28-v2-08-source-bindings. <strong>Priority:</strong> P1. <strong>Status:</strong> Open.</p>
+<h2>Goal and current gap</h2>
+<p>BindReviewBase pins a local SHA/target ref, but attempt source.remote/sourceRef/repository identity, verified registered worktree selection, branch disappearance status, source rename/rebind and explicit BindAttemptSource are absent.</p>
+<h2>Source of authority</h2>
+<p>Normative specification: <code>docs/specs/orchestration-v2-architecture.md</code>, sections §6, §7. Current implementation: <code>Client/Modules/ReviewWorkflow.fs:30-52,518-625</code>; <code>Client/Modules/LedgerStore.fs:511-540</code>. Audit: <code>docs/reviews/2026-10-28-v2-spec-implementation-audit.md</code>.</p>
+<h2>Acceptance criteria</h2>
+<ol>
+<li>Implement BindAttemptSource with verified repository/remote/ref/base identity and independent local worktree observation, preserving owner across worktree rename/removal.</li>
+<li>Show SourceUnavailable without marking agent free when source branch/worktree disappears; handle detached or uncommitted worktrees explicitly.</li>
+<li>Keep source provenance on assignments, review revisions and integration actions; validate source repository identity before publishing refs.</li>
+<li>Test moving/deleting/recreating worktrees and refs, alternate remotes and devices, stale detached HEAD and source-binding conflicts.</li>
+</ol>
+<h2>Dependencies</h2>
+<ul><li><code>2026-10-28-v2-01-ledger-trust-onboarding</code></li><li><code>2026-10-28-v2-04-assignment-generations</code></li></ul>
+<h2>Safety and completion</h2>
+<p>Work in an isolated Jarvis worktree; keep server stateless and task authority on the single orphan Git ref. Do not use Codex through Jarvis. Use disposable Git remotes for tests. Source-level task files here are backlog artifacts only; do not treat them as already imported into the V2 ledger. Verify behavior, review the implementation, and record tests and exact commits before closing. No production deployment or V1 cutover without explicit authorization.</p>
+</main></body></html>

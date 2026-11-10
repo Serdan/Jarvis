@@ -151,8 +151,17 @@ let ``existing file and Git commands accept registered worktree selector`` () =
         match Client.ClientShell.getGitStatus { ProjectName = "Project1::ghost" } context with
         | Error _ -> ()
         | Ok _ -> Assert.Fail("Unregistered worktree should not resolve.")
+        match Client.ProjectBrowser.writeFile
+                  { ProjectName = "Project1::selector"; FilePath = "created-through-file-tool.txt"
+                    Content = "linked worktree only"; FileWriteMode = Write
+                    ExpectedHash = None; CreateParents = None } context with
+        | Ok () -> ()
+        | Error e -> Assert.Fail($"Registered worktree edit failed: {e}")
+        File.ReadAllText(Path.Combine(created.Path, "created-through-file-tool.txt"))
+        |> shouldEqual "linked worktree only"
         // Main worktree is still isolated from linked edits.
-        File.Exists(Path.Combine(project, "other.txt")) |> shouldEqual false)
+        File.Exists(Path.Combine(project, "other.txt")) |> shouldEqual false
+        File.Exists(Path.Combine(project, "created-through-file-tool.txt")) |> shouldEqual false)
 
 [<Test>]
 let ``list projects hides linked sibling worktrees discovered through Git`` () =
@@ -212,4 +221,4 @@ let ``active job in a selected worktree blocks safe removal`` () =
                     inspection.RunningJobCount |> shouldEqual 1
                 | Error e -> Assert.Fail($"Inspection failed: {e}")
             finally
-                Client.JobManager.cancelJob { JobId = id } context |> ignore)
+                Client.JobManager.cancelJob { ProjectName = "Project1::running-job"; JobId = id } context |> shouldEqual (Ok()))

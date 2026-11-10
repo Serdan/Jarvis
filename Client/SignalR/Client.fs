@@ -3,9 +3,7 @@ module Client.SignalR.Client
 open System
 open System.Diagnostics
 open System.IO
-open System.Net
-open System.Net.Http
-open System.Security.Cryptography
+open System.Runtime.CompilerServices
 open System.Text
 open System.Text.Json
 open System.Threading.Tasks
@@ -20,23 +18,233 @@ let receiveMessage (rt: Runtime) message =
     rt.Tui.Log message
     Task.CompletedTask
 
+// Explicit agent labels identify the current work slot. Cache canonical
+// Working state for ordinary calls to avoid one remote git fetch per tool.
+let private workingGuidanceCaches = ConditionalWeakTable<Runtime, WorkingTurnGuidance.AgentCache>()
+let private instructionDeliveryCaches = ConditionalWeakTable<Runtime, AgentInstructions.DeliveryCache>()
+let invalidateAgentStates (rt: Runtime) (projectName: string) (agentIds: string array) =
+    // Server notifications only carry the logical project identity. Worktree
+    // selectors share the canonical ledger/assignment cache by ProjectId.
+    match ProjectPaths.ProjectTarget.parse projectName with
+    | Ok target ->
+        let cache = workingGuidanceCaches.GetValue(rt, fun _ ->
+            WorkingTurnGuidance.AgentCache(TimeSpan.FromMinutes 2.))
+        if not (isNull agentIds) then
+            let projectId = ProjectPaths.ProjectTarget.projectId target
+            for agentId in agentIds |> Array.filter (String.IsNullOrWhiteSpace >> not) |> Array.distinct do
+                cache.Invalidate(projectId, agentId)
+    | Error _ -> ()
+
+let invalidateAllAgentStates (rt: Runtime) =
+    // Reconnection can follow missed updates from other devices.
+    let cache = workingGuidanceCaches.GetValue(rt, fun _ ->
+        WorkingTurnGuidance.AgentCache(TimeSpan.FromMinutes 2.))
+    cache.InvalidateAll()
+// Only commands addressing repository source are checkout selectors.
+// Message/activity project fields are literal history labels, not paths.
+type private CommandProject =
+    | Unscoped
+    | ActivityLabel of string option
+    | Checkout of ProjectPaths.ProjectTarget
+
+let private projectTarget = function
+    | Checkout target -> Some target
+    | Unscoped | ActivityLabel _ -> None
+
+let private classifyProject command =
+    match command with
+    | MessageCommand cmd -> Ok(ActivityLabel cmd.ProjectName)
+    | GetClientActivityCommand cmd -> Ok(ActivityLabel cmd.ProjectName)
+    | ListSkillsCommand cmd when cmd.ProjectName = "@global" -> Ok Unscoped
+    | GetSkillCommand cmd when cmd.ProjectName = "@global" -> Ok Unscoped
+    | CreateSkillCommand cmd when cmd.ProjectName = "@global" -> Ok Unscoped
+    | GetJobResultCommand cmd when String.IsNullOrWhiteSpace cmd.ProjectName -> Ok Unscoped
+    | CancelJobCommand cmd when String.IsNullOrWhiteSpace cmd.ProjectName -> Ok Unscoped
+    | _ ->
+        match AgentCommandInfo.projectName command with
+        | None -> Ok Unscoped
+        | Some raw -> ProjectPaths.ProjectTarget.parse raw |> Result.map Checkout
+
+
+let private loadAgentState (rt: Runtime) (project: string) (agentId: string) =
+    match OrchestrationApi.LedgerBindingConfig.loadWithSnapshot project rt with
+    | Error _ -> None
+    | Ok (binding, snapshot) ->
+        match ReviewWorkflow.ReviewWorkflow.getAgentWorkingTurnAt binding snapshot agentId with
+        | Ok agent -> Some agent
+        | Error _ -> None
+
+let private checkWorkingGuidance (rt: Runtime) agentId (target: ProjectPaths.ProjectTarget option) command =
+    if String.IsNullOrWhiteSpace agentId then []
+    else
+        match target with
+        | None -> []
+        | Some target ->
+            let projectId = ProjectPaths.ProjectTarget.projectId target
+            let project = ProjectPaths.ProjectId.value projectId
+            let now = DateTimeOffset.UtcNow
+            let cache = workingGuidanceCaches.GetValue(rt, fun _ -> WorkingTurnGuidance.AgentCache(TimeSpan.FromMinutes 2.))
+            let agent =
+                cache.Get(now, projectId, agentId, fun () ->
+                    loadAgentState rt project agentId)
+            match agent |> Option.bind (WorkingTurnGuidance.instructionAt now) with
+            | Some content ->
+                [ { Scope = "working-turn"; Path = "jarvis/working-turn"
+                    Sha256 = ""; Content = content } ]
+            | None -> []
+
+// A cross-project notification is sent using the *source* agent identity,
+// which is not an identity of an agent in the destination project. Routing
+// health probes likewise do not represent agent activity. Keep both out of
+// destination last-seen, turn-guidance and implicit-activation handling.
+let private isLocalAgentActivity = function
+    | TaskWriteCommand cmd when cmd.Action = "NotifyAgent"
+                                && not (String.IsNullOrWhiteSpace cmd.SourceRef)
+                                && cmd.SourceRef <> cmd.ProjectName -> false
+    | LedgerReadCommand cmd when cmd.Action = "Health" -> false
+    | ObserveAgentCommand _ -> false // Neither observer nor target is acting.
+    | _ -> true
+
+// An agent's first ordinary tool call starts its Ready assignment.
+// No new session identifier or explicit resume tool is needed. Never
+// auto-activate a different agent merely because an administrative operation
+// names that agent as its target.
+let private activatesAgent (agentId: string) command =
+    match command with
+    | _ when not (isLocalAgentActivity command) -> false
+    | TaskWriteCommand cmd ->
+        cmd.ActorId = agentId
+        && List.contains cmd.Action
+            [ "CheckpointAttempt"; "YieldAgent"; "CompleteAgentWork"
+              "AcknowledgeFeedback"; "AcknowledgeNotification"; "NotifyAgent"
+              "BindAttemptSource"; "RebindAttemptSource"; "BindReviewBase"
+              "SetAttemptSource"; "SubmitIntegration"; "CompleteIntegration" ]
+    | TaskReadCommand cmd ->
+        String.IsNullOrWhiteSpace cmd.AgentId || cmd.AgentId = agentId
+    | LedgerWriteCommand _ | ReviewWriteCommand _
+    | RetryPendingIntentCommand _ | SupersedePendingIntentCommand _
+    | AbandonPendingIntentCommand _ -> false
+    | _ -> true
+
+let private activateReadyOnActivity (rt: Runtime) (agentId: string)
+                                (target: ProjectPaths.ProjectTarget option) command =
+    if String.IsNullOrWhiteSpace agentId || not (activatesAgent agentId command) then Ok ([], None)
+    else
+        match target with
+        | None -> Ok ([], None)
+        | Some target ->
+            let projectId = ProjectPaths.ProjectTarget.projectId target
+            let project = ProjectPaths.ProjectId.value projectId
+            let cache = workingGuidanceCaches.GetValue(rt, fun _ -> WorkingTurnGuidance.AgentCache(TimeSpan.FromMinutes 2.))
+            // The server broadcasts invalidation after successful ledger writes
+            // on any connected device; the inbox also forces authoritative refresh.
+            // Keep the 2-minute fallback for changes outside Jarvis and missed
+            // notifications. Do not fetch from GitHub for every ordinary source call.
+            match command with
+            | TaskReadCommand cmd when cmd.Action = "AgentInbox" -> cache.Invalidate(projectId, agentId)
+            | _ -> ()
+            let current =
+                cache.Get(DateTimeOffset.UtcNow, projectId, agentId, fun () ->
+                    loadAgentState rt project agentId)
+            match current with
+            | Some agent when agent.State = "Ready"
+                              && not (isNull (box agent.CurrentAssignment))
+                              && not (String.IsNullOrWhiteSpace agent.CurrentAssignment.TaskId) ->
+                match OrchestrationApi.LedgerBindingConfig.load project rt with
+                | Error error -> Error(Client.ValidationError($"Cannot activate Ready agent: {error}"))
+                | Ok binding ->
+                    let result =
+                        ReviewWorkflow.ReviewWorkflow.activateReadyAgent binding (Guid.NewGuid())
+                            agent.CurrentAssignment.TaskId agentId
+                    cache.Invalidate(projectId, agentId)
+                    match result with
+                    | Ok write when write.AlreadyApplied -> Ok ([], None)
+                    | Ok write ->
+                        // Only a successfully committed Ready-to-Working write
+                        // provides evidence of a transition performed here.
+                        let committed : AgentInboxActivation =
+                            { ProjectName = project
+                              AgentId = agentId
+                              ActivatedByThisCall = true
+                              BeforeState = Some "Ready"
+                              AfterState = Some "Working"
+                              CommittedHead = Some write.CurrentHead
+                              OperationId = Some write.Operation.OperationId }
+                        Ok (Client.LedgerStore.LedgerStore.changedAgentIds write, Some committed)
+                    | Error(Client.LedgerStore.StaleEntityVersion _) ->
+                        // Another concurrent tool may already have started this
+                        // assignment. Do not reset its Working clock.
+                        match ReviewWorkflow.ReviewWorkflow.getAgentWorkingTurn binding agentId with
+                        | Ok latest when latest.State = "Working" -> Ok ([], None)
+                        | _ -> Error(Client.ValidationError "Agent assignment changed before automatic activation.")
+                    | Error error -> Error(Client.ValidationError($"Automatic agent activation failed: {error}"))
+            | _ -> Ok ([], None)
+
+// Only the Working turn identifies a stable delivery scope. Ledger calls bootstrap
+// root guidance, while normal source operations discover deeper instructions.
+let private incrementalInstructions (rt: Runtime) (agentId: string)
+                                    (target: ProjectPaths.ProjectTarget option)
+                                    provenance documents =
+    if String.IsNullOrWhiteSpace agentId then documents
+    else
+        match target with
+        | None -> documents
+        | Some target ->
+            let projectId = ProjectPaths.ProjectTarget.projectId target
+            let project = ProjectPaths.ProjectId.value projectId
+            let cache = workingGuidanceCaches.GetValue(rt, fun _ ->
+                WorkingTurnGuidance.AgentCache(TimeSpan.FromMinutes 2.))
+            let now = DateTimeOffset.UtcNow
+            let agent =
+                cache.Get(now, projectId, agentId, fun () ->
+                    loadAgentState rt project agentId)
+            match agent with
+            | Some active when active.State = "Working" ->
+                let turn = string active.StateSequence + ":" + active.WorkingTurnStartedAtUtc
+                let delivery = instructionDeliveryCaches.GetValue(rt, fun _ -> AgentInstructions.DeliveryCache())
+                delivery.Filter(target, agentId, turn, provenance, documents, fun () ->
+                    // Ledger status reads remain usable; failed instruction
+                    // resolution is surfaced as a retryable warning.
+                    AgentInstructions.rootsForTarget rt target)
+            | _ -> documents
+
 let private serialize<'a> (value: 'a) =
     try
         JsonSerializer.Serialize value |> Ok
     with e ->
         e |> ExceptionError |> Error
 
-let private serialize'<'a> = Result.bind serialize<'a> >> ValueTask<_>
+type private DispatchedResult =
+    { Payload: string
+      ChangedAgentIds: string list }
 
-let private toAgentResponse command instructions response =
+let private serialize'<'a> (result: Result<'a, Client.EffectError>) =
+    result
+    |> Result.bind (fun value ->
+        let changedAgentIds =
+            match box value with
+            | :? OrchestrationApi.OperationResponse.Presented as operation ->
+                operation.changedAgentIds
+            | _ -> []
+        serialize value
+        |> Result.map (fun payload ->
+            { Payload = payload; ChangedAgentIds = changedAgentIds }))
+    |> ValueTask<_>
+
+let private toAgentResponse command instructions stateChanges inboxActivation response =
     match response with
     | Error error ->
         { Result = None
           Error = Some(EffectError.toAgentError error)
-          Instructions = instructions }
-    | Ok (payload: string) ->
+          Instructions = instructions
+          AgentStateChanges = stateChanges
+          InboxActivation = inboxActivation }
+    | Ok (dispatched: DispatchedResult) ->
+        let payload = dispatched.Payload
         let bytes = Encoding.UTF8.GetByteCount payload +
-                    Encoding.UTF8.GetByteCount(JsonSerializer.Serialize instructions)
+                    Encoding.UTF8.GetByteCount(JsonSerializer.Serialize instructions) +
+                    Encoding.UTF8.GetByteCount(JsonSerializer.Serialize stateChanges) +
+                    Encoding.UTF8.GetByteCount(JsonSerializer.Serialize inboxActivation)
         let maxBytes =
             match command with
             | ReadImageCommand _ -> (AgentProtocol.maxImageBytes * 4 / 3) + (64 * 1024)
@@ -46,11 +254,15 @@ let private toAgentResponse command instructions response =
         if bytes <= maxBytes then
             { Result = Some payload
               Error = None
-              Instructions = instructions }
+              Instructions = instructions
+              AgentStateChanges = stateChanges
+              InboxActivation = inboxActivation }
         else
             { Result = None
               Error = Some(OutputTruncated $"Command response was {bytes} bytes and exceeds the safe response size of {maxBytes} bytes.")
-              Instructions = instructions }
+              Instructions = instructions
+              AgentStateChanges = stateChanges
+              InboxActivation = inboxActivation }
 
 let private unwrapProjectName (ProjectName name) = name
 let private unwrapContent (Content content) = content
@@ -83,17 +295,25 @@ let private auditDetails command =
     | PatchFileCommand cmd -> Some("PatchFile", Some cmd.ProjectName, [ WorkspaceWrite ], [ cmd.FilePath ], None, [])
     | RunCommandCommand cmd -> Some("RunCommand", Some cmd.ProjectName, [ ProcessExecution ], [], Some cmd.Executable, cmd.Args)
     | RunProjectTaskCommand cmd -> Some("RunProjectTask", Some cmd.ProjectName, [ ProcessExecution ], [], None, [ cmd.TaskName ])
-    | CreateSkillCommand cmd -> Some("CreateSkill", Some cmd.ProjectName, [ WorkspaceWrite ], [ $".jarvis/skills/{cmd.SkillName}/SKILL.md" ], None, [])
+    | CreateSkillCommand cmd -> Some("CreateSkill", Some cmd.ProjectName, [ WorkspaceWrite ], [ $".agents/skills/{cmd.SkillName}/SKILL.md" ], None, [])
     | RemoveWorktreeCommand cmd -> Some("RemoveWorktree", Some cmd.ProjectName, [ VersionControlWrite; Destructive ], [], Some "git", [ cmd.WorktreePath ])
-    | CreateTaskCommand cmd -> Some("CreateTask", Some cmd.ProjectName, [ WorkspaceWrite; VersionControlWrite ], [], Some "git", [ cmd.TaskId |> Option.defaultValue "new" ])
-    | UpdateTaskCommand cmd -> Some("UpdateTask", Some cmd.ProjectName, [ WorkspaceWrite; VersionControlWrite ], [], Some "git", [ cmd.TaskId ])
-    | AssignTaskCommand cmd -> Some("AssignTask", Some cmd.ProjectName, [ WorkspaceWrite; VersionControlWrite ], [], Some "git", [ cmd.TaskId ])
-    | RetireWorktreeCommand cmd -> Some("RetireWorktree", Some cmd.ProjectName, [ VersionControlWrite; Destructive ], [], Some "git", [ cmd.WorktreePath ])
-    | BeginTaskCommand cmd -> Some("BeginTask", Some cmd.ProjectName, [ WorkspaceWrite; VersionControlWrite ], [], Some "git", [ cmd.TaskId ])
-    | AcknowledgeTaskCommand cmd -> Some("AcknowledgeTask", Some cmd.ProjectName, [ WorkspaceWrite; VersionControlWrite ], [], Some "git", [ cmd.TaskId ])
-    | ClaimTaskCommand cmd -> Some("ClaimTask", Some cmd.ProjectName, [ WorkspaceWrite; VersionControlWrite ], [], Some "git", [ cmd.TaskId ])
-    | CheckpointTaskCommand cmd -> Some("CheckpointTask", Some cmd.ProjectName, [ WorkspaceWrite; VersionControlWrite ], [], Some "git", [ cmd.TaskId ])
-    | CompleteTaskCommand cmd -> Some("CompleteTask", Some cmd.ProjectName, [ WorkspaceWrite; VersionControlWrite ], [], Some "git", [ cmd.TaskId ])
+    | TaskWriteCommand cmd -> Some("Task" + cmd.Action, Some cmd.ProjectName, [ VersionControlWrite; NetworkAccess ], [], Some "git", [ cmd.TaskId; cmd.AttemptId; cmd.OperationId ])
+    | LedgerWriteCommand cmd -> Some("Ledger" + cmd.Action, Some cmd.ProjectName, [ VersionControlWrite; NetworkAccess ], [], Some "git", [ cmd.RemoteName; cmd.ExpectedTrustedHead; cmd.OperationId ])
+    | RetryPendingIntentCommand cmd ->
+        Some("RetryPendingIntent", Some cmd.ProjectName, [ VersionControlWrite; NetworkAccess ],
+             [], Some "git", [ cmd.OperationId; cmd.ExpectedCommandSha256; cmd.ExpectedVerifiedHead ])
+    | SupersedePendingIntentCommand cmd ->
+        Some("SupersedePendingIntent", Some cmd.ProjectName,
+             [ WorkspaceWrite; VersionControlWrite; NetworkAccess ],
+             [], Some "git", [ cmd.OperationId; cmd.RelatedOperationId; cmd.Reason ])
+    | AbandonPendingIntentCommand cmd ->
+        Some("AbandonPendingIntent", Some cmd.ProjectName,
+             [ WorkspaceWrite; VersionControlWrite; NetworkAccess ],
+             [], Some "git", [ cmd.OperationId; cmd.ExpectedCommandSha256; cmd.Reason ])
+    | ReviewWriteCommand cmd -> Some("Review" + cmd.Action, Some cmd.ProjectName, [ WorkspaceWrite; VersionControlWrite; NetworkAccess ], [], Some "git", [ cmd.TaskId; cmd.RequestId; cmd.OperationId ])
+    | CreateProjectCommand cmd ->
+        Some("CreateProject", None, [ WorkspaceWrite ] @ (if cmd.InitializeGit then [ VersionControlWrite ] else []) @ (if cmd.InitializeLedger then [ NetworkAccess ] else []),
+             [ cmd.Name ], (if cmd.InitializeGit then Some "git" else None), [ cmd.RemoteUrl ])
     | CreateWorktreeCommand cmd -> Some("CreateWorktree", Some cmd.ProjectName, [ VersionControlWrite ], [], Some "git", [ cmd.Branch; cmd.Name ])
     | GitCommitCommand cmd -> Some("GitCommit", Some cmd.ProjectName, [ VersionControlWrite ], cmd.Paths, Some "git", [ cmd.Message ])
     | StartJobCommand cmd -> Some("StartJob", Some cmd.ProjectName, [ ProcessExecution ], [], Some cmd.Executable, cmd.Args)
@@ -111,18 +331,19 @@ let private audit command response =
 
         AuditLog.recordCommand commandName projectName permissions paths executable args summary
 
-let private importFile (cmd: ImportFileCommand) (rt: Runtime) =
+let private importFile (resolved: ProjectPaths.ResolvedProject option) (cmd: ImportFileCommand) (rt: Runtime) =
     match cmd.MaxBytes with
     | Some value when value <= 0L ->
         Error(Client.ValidationError "MaxBytes must be greater than zero when supplied.")
     | requestedLimit ->
-        match Uri.TryCreate(cmd.DownloadUrl, UriKind.Absolute) with
-        | false, _ ->
-            Error(Client.ValidationError "DownloadUrl must be an absolute URL.")
-        | true, uri when uri.Scheme <> Uri.UriSchemeHttps ->
-            Error(Client.ValidationError "DownloadUrl must use HTTPS.")
-        | true, uri ->
-            match ProjectPaths.resolveWritableProjectFile cmd.ProjectName cmd.FilePath rt with
+        match ImportNetwork.parseUrl cmd.DownloadUrl with
+        | Error failure -> Error failure
+        | Ok _ ->
+            let destination =
+                match resolved with
+                | Some project -> fun rt -> ProjectPaths.resolveSourcePath project cmd.FilePath rt |> Result.map FilePath
+                | None -> ProjectPaths.resolveWritableProjectFile cmd.ProjectName cmd.FilePath
+            match destination rt with
             | Error error -> Error error
             | Ok(FilePath destinationPath) ->
                 let localLimit =
@@ -138,255 +359,289 @@ let private importFile (cmd: ImportFileCommand) (rt: Runtime) =
                 let tempPath =
                     Path.Combine(parentPath, $".{Path.GetFileName(destinationPath)}.{Guid.NewGuid():N}.jarvis-import")
 
-                try
-                    if File.Exists destinationPath && not cmd.Overwrite then
-                        Error(Client.ValidationError $"Destination file already exists: {cmd.FilePath}")
-                    else
-                        if cmd.CreateParents then
-                            Directory.CreateDirectory(parentPath) |> ignore
-                        elif not (Directory.Exists parentPath) then
-                            raise (DirectoryNotFoundException $"Parent directory does not exist: {Path.GetDirectoryName(cmd.FilePath)}")
-
-                        use request = new HttpRequestMessage(HttpMethod.Get, uri)
-                        use response = rt.httpClient.Send(request, HttpCompletionOption.ResponseHeadersRead)
-
-                        if response.StatusCode < HttpStatusCode.OK || response.StatusCode >= HttpStatusCode.MultipleChoices then
-                            Error(Client.ValidationError $"Download failed with HTTP status {int response.StatusCode}.")
+                let result =
+                    try
+                        if File.Exists destinationPath && not cmd.Overwrite then
+                            Error(Client.ValidationError $"Destination file already exists: {cmd.FilePath}")
                         else
-                            let contentLength = response.Content.Headers.ContentLength
+                            if cmd.CreateParents then
+                                Directory.CreateDirectory(parentPath) |> ignore
+                            elif not (Directory.Exists parentPath) then
+                                raise (DirectoryNotFoundException $"Parent directory does not exist: {Path.GetDirectoryName(cmd.FilePath)}")
 
-                            if contentLength.HasValue && contentLength.Value > effectiveLimit then
-                                Error(Client.ValidationError $"File is {contentLength.Value} bytes and exceeds the {effectiveLimit} byte import limit.")
-                            else
-                                use source = response.Content.ReadAsStream()
-                                use destination =
-                                    new FileStream(tempPath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 81920, FileOptions.SequentialScan)
-                                use hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256)
-                                let buffer = Array.zeroCreate<byte> 81920
-                                let mutable total = 0L
-                                let mutable finished = false
+                            // Automatic trust under PartialTrust is restricted to
+                            // provider file hosts throughout the redirect chain.
+                            // Generic HTTPS imports require explicit local approval,
+                            // or the operator's existing FullTrust setting.
+                            let permission = rt :> PermissionIO
+                            let redirectTrust =
+                                if permission.TrustLevel = PartialTrust
+                                    && ImportNetwork.isKnownAttachment cmd.DownloadUrl then
+                                    ImportNetwork.ProviderOriginsOnly
+                                else ImportNetwork.AnyPublicHttps
 
-                                while not finished do
-                                    let read = source.Read(buffer, 0, buffer.Length)
-                                    if read = 0 then
-                                        finished <- true
-                                    else
-                                        total <- total + int64 read
-                                        if total > effectiveLimit then
-                                            raise (InvalidDataException $"Downloaded file exceeds the {effectiveLimit} byte import limit.")
+                            let result =
+                                ImportNetwork.downloadTo
+                                    (ImportNetwork.sharedClient())
+                                    redirectTrust cmd.DownloadUrl tempPath effectiveLimit
+                                    Threading.CancellationToken.None
+                                |> fun task -> task.GetAwaiter().GetResult()
 
-                                        destination.Write(buffer, 0, read)
-                                        hash.AppendData(buffer, 0, read)
+                            match result with
+                            | Error failure -> Error failure
+                            | Ok receipt ->
+                                // The checkout can change during a remote download.
+                                // Revalidate source containment before publication.
+                                match destination rt with
+                                | Error error -> Error error
+                                | Ok(FilePath revalidated) when revalidated <> destinationPath ->
+                                    Error(Client.ValidationError "Import destination changed during download.")
+                                | Ok _ ->
+                                    File.Move(tempPath, destinationPath, cmd.Overwrite)
+                                    Ok
+                                        { FilePath = cmd.FilePath
+                                          FileId = cmd.FileId
+                                          BytesWritten = receipt.BytesWritten
+                                          MimeType = cmd.MimeType
+                                          Sha256 = receipt.Sha256 }
+                    with
+                    | :? IOException ->
+                        Error(Client.ValidationError "Unable to publish imported file.")
+                    | ex -> Error(Client.ExceptionError ex)
+                if File.Exists tempPath then
+                    try File.Delete tempPath with _ -> ()
+                result
 
-                                destination.Flush(true)
-                                let digest =
-                                    hash.GetHashAndReset()
-                                    |> Convert.ToHexString
-                                    |> fun value -> $"sha256:{value.ToLowerInvariant()}"
+let private sourceOperation resolved withContext legacy =
+    match resolved with
+    | Some project -> withContext project
+    | None -> legacy()
 
-                                File.Move(tempPath, destinationPath, cmd.Overwrite)
+// Browser actions return bounded serialized JSON; adapt their transport result
+// to the current command-dispatch contract without inventing agent state changes.
+let private fromBrowser (operation: ValueTask<Result<string, EffectError>>) =
+    ValueTask<Result<DispatchedResult, EffectError>>(task {
+        let! result = operation
+        return result |> Result.map (fun payload ->
+            { Payload = payload; ChangedAgentIds = [] })
+    })
 
-                                Ok
-                                    { FilePath = cmd.FilePath
-                                      FileId = cmd.FileId
-                                      BytesWritten = total
-                                      MimeType = cmd.MimeType
-                                      Sha256 = digest }
-                with ex ->
-                    if File.Exists tempPath then
-                        try File.Delete tempPath with _ -> ()
-
-                    Error(Client.ExceptionError ex)
-
-let private dispatch (rt: Runtime) (command: AgentCommand) =
+let private dispatch (rt: Runtime) (target: ProjectPaths.ProjectTarget option)
+                     (resolved: ProjectPaths.ResolvedProject option) (command: AgentCommand) =
     match command with
     | ListCommandsCommand -> rt |> ProjectBrowser.listCommands |> serialize'
     | BrowserListWindowsCommand ->
-        match rt.Browser with
-        | None -> ValueTask<Result<string,EffectError>>(Error(Client.ValidationError "BridgeDisabled"))
-        | Some bridge ->
-            ValueTask<Result<string,EffectError>>(bridge.ListWindows() |> Result.mapError Client.ValidationError)
+        fromBrowser (
+            match rt.Browser with
+            | None -> ValueTask<Result<string,EffectError>>(Error(Client.ValidationError "BridgeDisabled"))
+            | Some bridge ->
+                ValueTask<Result<string,EffectError>>(bridge.ListWindows() |> Result.mapError Client.ValidationError)
+        )
     | BrowserListTabsCommand ->
-        match rt.Browser with
-        | None -> ValueTask<Result<string,EffectError>>(Error(Client.ValidationError "BridgeDisabled"))
-        | Some bridge ->
-            let result = bridge.ListTabs() |> Result.mapError Client.ValidationError
-            ValueTask<Result<string,EffectError>>(result)
+        fromBrowser (
+            match rt.Browser with
+            | None -> ValueTask<Result<string,EffectError>>(Error(Client.ValidationError "BridgeDisabled"))
+            | Some bridge ->
+                let result = bridge.ListTabs() |> Result.mapError Client.ValidationError
+                ValueTask<Result<string,EffectError>>(result)
+        )
     | ListScheduledBrowserExecutionsCommand ->
-        match rt.BrowserScheduler with
-        | None -> ValueTask<Result<string,EffectError>>(Error(Client.ValidationError "BridgeDisabled"))
-        | Some scheduler -> ValueTask<Result<string,EffectError>>(Ok(scheduler.List()))
-    | CancelScheduledBrowserExecutionCommand cmd ->
-        match rt.BrowserScheduler with
-        | None -> ValueTask<Result<string,EffectError>>(Error(Client.ValidationError "BridgeDisabled"))
-        | Some scheduler ->
-            let result =
-                scheduler.Cancel(cmd.ScheduleId)
-                |> Result.map (fun () -> """{"canceled":true}""")
-                |> Result.mapError Client.ValidationError
-            ValueTask<Result<string,EffectError>>(result)
-    | ScheduleBrowserExecutionCommand cmd ->
-        let result =
+        fromBrowser (
             match rt.BrowserScheduler with
-            | None -> Error(Client.ValidationError "BridgeDisabled")
+            | None -> ValueTask<Result<string,EffectError>>(Error(Client.ValidationError "BridgeDisabled"))
+            | Some scheduler -> ValueTask<Result<string,EffectError>>(Ok(scheduler.List()))
+        )
+    | CancelScheduledBrowserExecutionCommand cmd ->
+        fromBrowser (
+            match rt.BrowserScheduler with
+            | None -> ValueTask<Result<string,EffectError>>(Error(Client.ValidationError "BridgeDisabled"))
             | Some scheduler ->
-                match ProjectPaths.validateProjectRelativePath cmd.ScriptPath with
-                | Error error -> Error error
-                | Ok _ when not (cmd.ScriptPath.EndsWith(".js", StringComparison.OrdinalIgnoreCase)) ->
-                    Error(Client.ValidationError "Browser script must be a .js file.")
-                | Ok _ ->
-                    match ProjectPaths.resolveProjectFile cmd.ProjectName cmd.ScriptPath rt with
+                let result =
+                    scheduler.Cancel(cmd.ScheduleId)
+                    |> Result.map (fun () -> """{"canceled":true}""")
+                    |> Result.mapError Client.ValidationError
+                ValueTask<Result<string,EffectError>>(result)
+        )
+    | ScheduleBrowserExecutionCommand cmd ->
+        fromBrowser (
+            let result =
+                match rt.BrowserScheduler with
+                | None -> Error(Client.ValidationError "BridgeDisabled")
+                | Some scheduler ->
+                    match ProjectPaths.validateProjectRelativePath cmd.ScriptPath with
                     | Error error -> Error error
-                    | Ok(FilePath filename) ->
-                        try
-                            if FileInfo(filename).Length > int64 BrowserBridge.MaxScriptBytes then
-                                Error(Client.ValidationError "InputTooLarge: script exceeds 64 KiB.")
-                            else
-                                let date = scheduler.Schedule(cmd.ScheduleId, cmd.RunAfterSeconds, cmd.Url,
-                                                cmd.ProjectName, cmd.ScriptPath, defaultArg cmd.Alias "",
-                                                defaultArg cmd.ArgsJson "{}", defaultArg cmd.Active false,
-                                                ?windowRegistration = cmd.WindowRegistration,
-                                                ?closeAfter = cmd.CloseTabAfterExecution,
-                                                ?repeatEverySeconds = cmd.RepeatEverySeconds)
-                                date
-                                |> Result.map (fun due -> JsonSerializer.Serialize({| scheduleId = cmd.ScheduleId; dueAtUtc = due; status = "pending" |}))
-                                |> Result.mapError Client.ValidationError
-                        with ex -> Error(Client.ExceptionError ex)
-        ValueTask<Result<string,EffectError>>(result)
+                    | Ok _ when not (cmd.ScriptPath.EndsWith(".js", StringComparison.OrdinalIgnoreCase)) ->
+                        Error(Client.ValidationError "Browser script must be a .js file.")
+                    | Ok _ ->
+                        match ProjectPaths.resolveProjectFile cmd.ProjectName cmd.ScriptPath rt with
+                        | Error error -> Error error
+                        | Ok(FilePath filename) ->
+                            try
+                                if FileInfo(filename).Length > int64 BrowserBridge.MaxScriptBytes then
+                                    Error(Client.ValidationError "InputTooLarge: script exceeds 64 KiB.")
+                                else
+                                    let date = scheduler.Schedule(cmd.ScheduleId, cmd.RunAfterSeconds, cmd.Url,
+                                                    cmd.ProjectName, cmd.ScriptPath, defaultArg cmd.Alias "",
+                                                    defaultArg cmd.ArgsJson "{}", defaultArg cmd.Active false,
+                                                    ?windowRegistration = cmd.WindowRegistration,
+                                                    ?closeAfter = cmd.CloseTabAfterExecution,
+                                                    ?repeatEverySeconds = cmd.RepeatEverySeconds)
+                                    date
+                                    |> Result.map (fun due -> JsonSerializer.Serialize({| scheduleId = cmd.ScheduleId; dueAtUtc = due; status = "pending" |}))
+                                    |> Result.mapError Client.ValidationError
+                            with ex -> Error(Client.ExceptionError ex)
+            ValueTask<Result<string,EffectError>>(result)
+        )
     | BrowserOpenTabCommand cmd ->
-        ValueTask<Result<string,EffectError>>(task {
-            match rt.Browser with
-            | None -> return Error(Client.ValidationError "BridgeDisabled")
-            | Some bridge ->
-                let! result = bridge.OpenTab(cmd.WindowRegistration, cmd.Url, defaultArg cmd.Alias "", defaultArg cmd.Active false)
-                return result |> Result.mapError Client.ValidationError
-        })
+        fromBrowser (
+            ValueTask<Result<string,EffectError>>(task {
+                match rt.Browser with
+                | None -> return Error(Client.ValidationError "BridgeDisabled")
+                | Some bridge ->
+                    let! result = bridge.OpenTab(cmd.WindowRegistration, cmd.Url, defaultArg cmd.Alias "", defaultArg cmd.Active false)
+                    return result |> Result.mapError Client.ValidationError
+            })
+        )
     | BrowserCloseTabCommand cmd ->
-        ValueTask<Result<string,EffectError>>(task {
-            match rt.Browser with
-            | None -> return Error(Client.ValidationError "BridgeDisabled")
-            | Some bridge ->
-                let! result = bridge.CloseTab(cmd.TabRegistration)
-                return result |> Result.mapError Client.ValidationError
-        })
+        fromBrowser (
+            ValueTask<Result<string,EffectError>>(task {
+                match rt.Browser with
+                | None -> return Error(Client.ValidationError "BridgeDisabled")
+                | Some bridge ->
+                    let! result = bridge.CloseTab(cmd.TabRegistration)
+                    return result |> Result.mapError Client.ValidationError
+            })
+        )
     | BrowserRunInNewTabCommand cmd ->
-        ValueTask<Result<string,EffectError>>(task {
-            match rt.Browser with
-            | None -> return Error(Client.ValidationError "BridgeDisabled")
-            | Some bridge ->
-                match ProjectPaths.validateProjectRelativePath cmd.ScriptPath with
-                | Error e -> return Error e
-                | Ok _ when not (cmd.ScriptPath.EndsWith(".js", StringComparison.OrdinalIgnoreCase)) ->
-                    return Error(Client.ValidationError "Browser script must be a .js file.")
-                | Ok _ ->
-                    match ProjectPaths.resolveProjectFile cmd.ProjectName cmd.ScriptPath rt with
+        fromBrowser (
+            ValueTask<Result<string,EffectError>>(task {
+                match rt.Browser with
+                | None -> return Error(Client.ValidationError "BridgeDisabled")
+                | Some bridge ->
+                    match ProjectPaths.validateProjectRelativePath cmd.ScriptPath with
                     | Error e -> return Error e
-                    | Ok(FilePath path) ->
-                        try
-                            if FileInfo(path).Length > int64 BrowserBridge.MaxScriptBytes then
-                                return Error(Client.ValidationError "InputTooLarge: script exceeds 64 KiB.")
-                            else
-                                let source = File.ReadAllText(path, UTF8Encoding(false, true))
-                                let args = defaultArg cmd.ArgsJson "{}"
-                                use validatedArgs = JsonDocument.Parse(args)
-                                let! result = BrowserBridge.runInNewTab bridge cmd.WindowRegistration cmd.Url "" (defaultArg cmd.Active false) source args (defaultArg cmd.TimeoutMs 30000) (defaultArg cmd.CloseTabAfterExecution false)
-                                return result
-                                       |> Result.mapError (fun (registrationId,error) ->
-                                           let detail =
-                                               if String.IsNullOrWhiteSpace(registrationId) then error
-                                               else error + " [tabRegistration=" + registrationId + "]"
-                                           Client.ValidationError detail)
-                        with
-                        | :? DecoderFallbackException -> return Error(Client.ValidationError "InvalidUtf8")
-                        | :? JsonException -> return Error(Client.ValidationError "InvalidArgumentsJson")
-                        | :? FileNotFoundException -> return Error(Client.NotFoundError "ScriptNotFound")
-                        | ex -> return Error(Client.ExceptionError ex)
-        })
+                    | Ok _ when not (cmd.ScriptPath.EndsWith(".js", StringComparison.OrdinalIgnoreCase)) ->
+                        return Error(Client.ValidationError "Browser script must be a .js file.")
+                    | Ok _ ->
+                        match ProjectPaths.resolveProjectFile cmd.ProjectName cmd.ScriptPath rt with
+                        | Error e -> return Error e
+                        | Ok(FilePath path) ->
+                            try
+                                if FileInfo(path).Length > int64 BrowserBridge.MaxScriptBytes then
+                                    return Error(Client.ValidationError "InputTooLarge: script exceeds 64 KiB.")
+                                else
+                                    let source = File.ReadAllText(path, UTF8Encoding(false, true))
+                                    let args = defaultArg cmd.ArgsJson "{}"
+                                    use validatedArgs = JsonDocument.Parse(args)
+                                    let! result = BrowserBridge.runInNewTab bridge cmd.WindowRegistration cmd.Url "" (defaultArg cmd.Active false) source args (defaultArg cmd.TimeoutMs 30000) (defaultArg cmd.CloseTabAfterExecution false)
+                                    return result
+                                           |> Result.mapError (fun (registrationId,error) ->
+                                               let detail =
+                                                   if String.IsNullOrWhiteSpace(registrationId) then error
+                                                   else error + " [tabRegistration=" + registrationId + "]"
+                                               Client.ValidationError detail)
+                            with
+                            | :? DecoderFallbackException -> return Error(Client.ValidationError "InvalidUtf8")
+                            | :? JsonException -> return Error(Client.ValidationError "InvalidArgumentsJson")
+                            | :? FileNotFoundException -> return Error(Client.NotFoundError "ScriptNotFound")
+                            | ex -> return Error(Client.ExceptionError ex)
+            })
+        )
     | BrowserExecuteFileCommand cmd ->
-        ValueTask<Result<string,EffectError>>(task {
-            match rt.Browser with
-            | None -> return Error(Client.ValidationError "BridgeDisabled")
-            | Some bridge ->
-                match ProjectPaths.validateProjectRelativePath cmd.ScriptPath with
-                | Error error -> return Error error
-                | Ok _ when not (cmd.ScriptPath.EndsWith(".js", StringComparison.OrdinalIgnoreCase)) ->
-                    return Error(Client.ValidationError "Browser script must be a .js file.")
-                | Ok _ ->
-                    match ProjectPaths.resolveProjectFile cmd.ProjectName cmd.ScriptPath rt with
+        fromBrowser (
+            ValueTask<Result<string,EffectError>>(task {
+                match rt.Browser with
+                | None -> return Error(Client.ValidationError "BridgeDisabled")
+                | Some bridge ->
+                    match ProjectPaths.validateProjectRelativePath cmd.ScriptPath with
                     | Error error -> return Error error
-                    | Ok(FilePath path) ->
-                        try
-                            let info = FileInfo(path)
-                            if info.Length > int64 BrowserBridge.MaxScriptBytes then
-                                return Error(Client.ValidationError "InputTooLarge: script exceeds 64 KiB.")
-                            else
-                                let source = File.ReadAllText(path, UTF8Encoding(false, true))
-                                let! outcome = bridge.Execute(cmd.TabRegistration, source, defaultArg cmd.ArgsJson "{}", defaultArg cmd.TimeoutMs 15000, false)
-                                return outcome |> Result.mapError Client.ValidationError
-                        with
-                        | :? DecoderFallbackException ->
-                            return Error(Client.ValidationError "InvalidUtf8")
-                        | :? FileNotFoundException ->
-                            return Error(Client.NotFoundError "ScriptNotFound")
-                        | ex -> return Error(Client.ExceptionError ex)
-        })
+                    | Ok _ when not (cmd.ScriptPath.EndsWith(".js", StringComparison.OrdinalIgnoreCase)) ->
+                        return Error(Client.ValidationError "Browser script must be a .js file.")
+                    | Ok _ ->
+                        match ProjectPaths.resolveProjectFile cmd.ProjectName cmd.ScriptPath rt with
+                        | Error error -> return Error error
+                        | Ok(FilePath path) ->
+                            try
+                                let info = FileInfo(path)
+                                if info.Length > int64 BrowserBridge.MaxScriptBytes then
+                                    return Error(Client.ValidationError "InputTooLarge: script exceeds 64 KiB.")
+                                else
+                                    let source = File.ReadAllText(path, UTF8Encoding(false, true))
+                                    let! outcome = bridge.Execute(cmd.TabRegistration, source, defaultArg cmd.ArgsJson "{}", defaultArg cmd.TimeoutMs 15000, false)
+                                    return outcome |> Result.mapError Client.ValidationError
+                            with
+                            | :? DecoderFallbackException ->
+                                return Error(Client.ValidationError "InvalidUtf8")
+                            | :? FileNotFoundException ->
+                                return Error(Client.NotFoundError "ScriptNotFound")
+                            | ex -> return Error(Client.ExceptionError ex)
+            })
+        )
     | BrowserCaptureDomCommand cmd ->
-        ValueTask<Result<string,EffectError>>(task {
-            match rt.Browser with
-            | None -> return Error(Client.ValidationError "BridgeDisabled")
-            | Some bridge ->
-                let! result = bridge.CaptureDom(cmd.TabRegistration,
-                    defaultArg cmd.WaitJson """{"kind":"immediate"}""",
-                    defaultArg cmd.CaptureSelector "", defaultArg cmd.TimeoutMs 30000, None)
-                return result |> Result.mapError Client.ValidationError
-        })
-    | BrowserExportDomCommand cmd ->
-        ValueTask<Result<string,EffectError>>(task {
-            match rt.Browser with
-            | None -> return Error(Client.ValidationError "BridgeDisabled")
-            | Some bridge ->
-                match ProjectPaths.resolveWritableProjectFile cmd.ProjectName cmd.FilePath rt with
-                | Error e -> return Error e
-                | Ok(FilePath destination) ->
+        fromBrowser (
+            ValueTask<Result<string,EffectError>>(task {
+                match rt.Browser with
+                | None -> return Error(Client.ValidationError "BridgeDisabled")
+                | Some bridge ->
                     let! result = bridge.CaptureDom(cmd.TabRegistration,
                         defaultArg cmd.WaitJson """{"kind":"immediate"}""",
-                        defaultArg cmd.CaptureSelector "", defaultArg cmd.TimeoutMs 30000, Some destination)
-                    match result with
-                    | Error reason -> return Error(Client.ValidationError reason)
-                    | Ok json ->
-                        use snapshot = JsonDocument.Parse(json)
-                        return Ok(JsonSerializer.Serialize(
-                            {| projectName = cmd.ProjectName; filePath = cmd.FilePath
-                               snapshot = snapshot.RootElement.Clone() |}))
-        })
+                        defaultArg cmd.CaptureSelector "", defaultArg cmd.TimeoutMs 30000, None)
+                    return result |> Result.mapError Client.ValidationError
+            })
+        )
+    | BrowserExportDomCommand cmd ->
+        fromBrowser (
+            ValueTask<Result<string,EffectError>>(task {
+                match rt.Browser with
+                | None -> return Error(Client.ValidationError "BridgeDisabled")
+                | Some bridge ->
+                    match ProjectPaths.resolveWritableProjectFile cmd.ProjectName cmd.FilePath rt with
+                    | Error e -> return Error e
+                    | Ok(FilePath destination) ->
+                        let! result = bridge.CaptureDom(cmd.TabRegistration,
+                            defaultArg cmd.WaitJson """{"kind":"immediate"}""",
+                            defaultArg cmd.CaptureSelector "", defaultArg cmd.TimeoutMs 30000, Some destination)
+                        match result with
+                        | Error reason -> return Error(Client.ValidationError reason)
+                        | Ok json ->
+                            use snapshot = JsonDocument.Parse(json)
+                            return Ok(JsonSerializer.Serialize(
+                                {| projectName = cmd.ProjectName; filePath = cmd.FilePath
+                                   snapshot = snapshot.RootElement.Clone() |}))
+            })
+        )
     | BrowserExecuteJsCommand cmd ->
-        ValueTask<Result<string,EffectError>>(task {
-            match rt.Browser with
-            | None -> return Error(Client.ValidationError "BridgeDisabled")
-            | Some bridge ->
-                let! outcome = bridge.Execute(cmd.TabRegistration, cmd.Code, defaultArg cmd.ArgsJson "{}", defaultArg cmd.TimeoutMs 15000, true)
-                return outcome |> Result.mapError Client.ValidationError
-        })
+        fromBrowser (
+            ValueTask<Result<string,EffectError>>(task {
+                match rt.Browser with
+                | None -> return Error(Client.ValidationError "BridgeDisabled")
+                | Some bridge ->
+                    let! outcome = bridge.Execute(cmd.TabRegistration, cmd.Code, defaultArg cmd.ArgsJson "{}", defaultArg cmd.TimeoutMs 15000, true)
+                    return outcome |> Result.mapError Client.ValidationError
+            })
+        )
     | ListWorktreesCommand cmd -> rt |> Worktrees.listWorktrees cmd |> serialize'
     | GetWorktreeCommand cmd -> rt |> Worktrees.getWorktree cmd |> serialize'
     | CreateWorktreeCommand cmd -> rt |> Worktrees.createWorktree cmd |> serialize'
     | InspectWorktreeRemovalCommand cmd -> rt |> Worktrees.inspectRemoval cmd |> serialize'
     | RemoveWorktreeCommand cmd -> rt |> Worktrees.removeWorktree cmd |> serialize'
-    | ListTasksCommand cmd -> rt |> TaskStore.listTasks cmd |> serialize'
-    | GetTaskCommand cmd -> rt |> TaskStore.getTask cmd |> serialize'
-    | CompareWorktreeTasksCommand cmd -> rt |> TaskStore.compareWorktreeTasks cmd |> serialize'
-    | GetAgentAssignmentCommand cmd -> rt |> TaskStore.getAgentAssignment cmd |> serialize'
-    | GetOrchestrationSnapshotCommand cmd -> rt |> TaskStore.getOrchestrationSnapshot cmd |> serialize'
-    | AssignTaskCommand cmd -> rt |> TaskStore.assignTask cmd |> serialize'
-    | AcknowledgeTaskCommand cmd -> rt |> TaskStore.acknowledgeTask cmd |> serialize'
-    | BeginTaskCommand cmd -> rt |> TaskStore.beginTask cmd |> serialize'
-    | RetireWorktreeCommand cmd -> rt |> TaskStore.retireWorktree cmd |> serialize'
-    | CreateTaskCommand cmd -> rt |> TaskStore.createTask cmd |> serialize'
-    | UpdateTaskCommand cmd -> rt |> TaskStore.updateTask cmd |> serialize'
-    | ClaimTaskCommand cmd -> rt |> TaskStore.claimTask cmd |> serialize'
-    | CheckpointTaskCommand cmd -> rt |> TaskStore.checkpointTask cmd |> serialize'
-    | CompleteTaskCommand cmd -> rt |> TaskStore.completeTask cmd |> serialize'
-    | GetTaskHistoryCommand cmd -> rt |> TaskStore.getTaskHistory cmd |> serialize'
+    | TaskReadCommand cmd -> rt |> OrchestrationApi.TaskApi.read cmd |> serialize'
+    | ObserveAgentCommand cmd ->
+        rt |> OrchestrationApi.AgentObservationApi.observe cmd
+            (fun project agent -> rt.Tui.GetAgentLastSeen(project, agent)) |> serialize'
+    | TaskWriteCommand cmd when cmd.Action = "ExportTaskSpec" || cmd.Action = "ImportTaskSpec" ->
+        match resolved with
+        | Some context -> rt |> OrchestrationApi.TaskApi.writeForContext context cmd |> serialize'
+        | None -> Error(Client.ValidationError "Task-spec source checkout was not resolved.") |> serialize'
+    | TaskWriteCommand cmd -> rt |> OrchestrationApi.TaskApi.write cmd |> serialize'
+    | LedgerReadCommand cmd -> rt |> OrchestrationApi.LedgerApi.read cmd |> serialize'
+    | LedgerWriteCommand cmd -> rt |> OrchestrationApi.LedgerApi.write cmd |> serialize'
+    | ReviewReadCommand cmd -> rt |> OrchestrationApi.ReviewApi.read cmd |> serialize'
+    | ReviewWriteCommand cmd -> rt |> OrchestrationApi.ReviewApi.write cmd |> serialize'
+    | RetryPendingIntentCommand cmd -> rt |> OrchestrationApi.PendingRecoveryApi.retry cmd |> serialize'
+    | SupersedePendingIntentCommand cmd -> rt |> OrchestrationApi.PendingRecoveryApi.supersede cmd |> serialize'
+    | AbandonPendingIntentCommand cmd -> rt |> OrchestrationApi.PendingRecoveryApi.abandon cmd |> serialize'
+    | CreateProjectCommand cmd -> rt |> ProjectCreation.create cmd |> serialize'
     | ListProjectsCommand ->
         rt
         |> ProjectBrowser.listProjects
@@ -394,59 +649,80 @@ let private dispatch (rt: Runtime) (command: AgentCommand) =
         |> serialize'
     | GetProjectDetailsCommand cmd ->
         rt
-        |> ProjectBrowser.getProjectDetails cmd
+        |> sourceOperation resolved (fun project -> ProjectBrowser.getProjectDetailsIn project cmd) (fun () -> ProjectBrowser.getProjectDetails cmd)
         |> Result.map (List.map (fun (name, content) -> {| fileName = name; content = unwrapContent content |}))
         |> serialize'
-    | ListDirectoryCommand cmd -> rt |> ProjectBrowser.listDirectory cmd |> serialize'
-    | SearchFilesCommand cmd -> rt |> ProjectBrowser.searchFiles cmd |> serialize'
-    | SearchTextCommand cmd -> rt |> ProjectBrowser.searchText cmd |> serialize'
+    | ListDirectoryCommand cmd -> rt |> sourceOperation resolved (fun project -> ProjectBrowser.listDirectoryIn project cmd) (fun () -> ProjectBrowser.listDirectory cmd) |> serialize'
+    | SearchFilesCommand cmd -> rt |> sourceOperation resolved (fun project -> ProjectBrowser.searchFilesIn project cmd) (fun () -> ProjectBrowser.searchFiles cmd) |> serialize'
+    | SearchTextCommand cmd -> rt |> sourceOperation resolved (fun project -> ProjectBrowser.searchTextIn project cmd) (fun () -> ProjectBrowser.searchText cmd) |> serialize'
     | ReadFileCommand cmd ->
         rt
-        |> ProjectBrowser.readFile cmd
+        |> sourceOperation resolved (fun project -> ProjectBrowser.readFileIn project cmd) (fun () -> ProjectBrowser.readFile cmd)
         |> Result.map unwrapContent
+        |> serialize'
+    | ReadFilePageCommand cmd ->
+        rt
+        |> sourceOperation resolved
+            (fun project -> ProjectBrowser.readFilePageIn project cmd)
+            (fun () -> ProjectBrowser.readFilePage cmd)
         |> serialize'
     | ReadFilesCommand cmd ->
         rt
-        |> ProjectBrowser.readFiles cmd
+        |> sourceOperation resolved (fun project -> ProjectBrowser.readFilesIn project cmd) (fun () -> ProjectBrowser.readFiles cmd)
         |> Result.map (Seq.zip cmd.FilePaths >> Seq.map (fun (path, result) -> readFileResultToDto path result) >> Seq.toList)
         |> serialize'
+    | GetAgentInstructionsCommand cmd ->
+        match target with
+        | Some selected -> rt |> AgentInstructions.getExplicit selected cmd |> serialize'
+        | None -> Error(Client.ValidationError "A validated project checkout is required.") |> serialize'
     | ReadImageCommand cmd ->
         rt
-        |> ProjectBrowser.readImage cmd
+        |> sourceOperation resolved (fun project -> ProjectBrowser.readImageIn project cmd) (fun () -> ProjectBrowser.readImage cmd)
         |> serialize'
     | ExportFileCommand cmd ->
         rt
-        |> ProjectBrowser.exportFile cmd
+        |> sourceOperation resolved (fun project -> ProjectBrowser.exportFileIn project cmd) (fun () -> ProjectBrowser.exportFile cmd)
         |> serialize'
-    | ImportFileCommand cmd -> rt |> importFile cmd |> serialize'
+    | ImportFileCommand cmd -> rt |> importFile resolved cmd |> serialize'
     | UpdateClientCommand -> SelfUpdate.prepare () |> Async.AwaitTask |> Async.RunSynchronously |> serialize'
-    | WriteFileCommand cmd -> rt |> ProjectBrowser.writeFile cmd |> serialize'
+    | WriteFileCommand cmd -> rt |> sourceOperation resolved (fun project -> ProjectBrowser.writeFileIn project cmd) (fun () -> ProjectBrowser.writeFile cmd) |> serialize'
     | PatchFileCommand cmd ->
         rt
-        |> ProjectBrowser.patchFile cmd
+        |> sourceOperation resolved (fun project -> ProjectBrowser.patchFileIn project cmd) (fun () -> ProjectBrowser.patchFile cmd)
         |> serialize'
-    | RunCommandCommand cmd -> rt |> ClientShell.runCommand cmd |> serialize'
-    | ListProjectTasksCommand cmd -> rt |> ClientShell.listProjectTasks cmd |> serialize'
-    | AttachWorkTaskCommand cmd -> rt |> WorkTaskCompat.attachWorkTask cmd |> serialize'
-    | GetWorkTaskCommand cmd -> rt |> WorkTaskCompat.getWorkTask cmd |> serialize'
-    | ListWorkTasksCommand cmd -> rt |> WorkTaskCompat.listWorkTasks cmd |> serialize'
-    | CheckpointWorkTaskCommand cmd -> rt |> WorkTaskCompat.checkpointWorkTask cmd |> serialize'
-    | CompleteWorkTaskCommand cmd -> rt |> WorkTaskCompat.completeWorkTask cmd |> serialize'
+    | RunCommandCommand cmd -> rt |> sourceOperation resolved (fun project -> ClientShell.runCommandIn project cmd) (fun () -> ClientShell.runCommand cmd) |> serialize'
+    | ListConfiguredTasksCommand cmd -> rt |> sourceOperation resolved (fun project -> ClientShell.listConfiguredTasksIn project cmd) (fun () -> ClientShell.listConfiguredTasks cmd) |> serialize'
     | RunProjectTaskCommand cmd ->
         rt
-        |> ClientShell.resolveProjectTask cmd
-        |> Result.bind (fun task -> ClientShell.runProjectTask cmd.ProjectName task rt)
+        |> sourceOperation resolved (fun project -> ClientShell.resolveProjectTaskIn project cmd) (fun () -> ClientShell.resolveProjectTask cmd)
+        |> Result.bind (fun task -> (sourceOperation resolved (fun project -> ClientShell.runProjectTaskIn project task) (fun () -> ClientShell.runProjectTask cmd.ProjectName task)) rt)
         |> serialize'
-    | ListSkillsCommand cmd -> rt |> ProjectBrowser.listSkills cmd |> serialize'
-    | GetSkillCommand cmd -> rt |> ProjectBrowser.getSkill cmd |> serialize'
-    | CreateSkillCommand cmd -> rt |> ProjectBrowser.createSkill cmd |> serialize'
-    | GetGitStatusCommand cmd -> rt |> ClientShell.getGitStatus cmd |> serialize'
-    | GetGitDiffCommand cmd -> rt |> ClientShell.getGitDiff cmd |> serialize'
-    | GitCommitCommand cmd -> rt |> ClientShell.gitCommit cmd |> serialize'
-    | StartJobCommand cmd -> rt |> JobManager.startJob cmd |> serialize'
-    | ListJobsCommand cmd -> rt |> JobManager.listJobs cmd |> serialize'
-    | GetJobResultCommand cmd -> rt |> JobManager.getJobResult cmd |> serialize'
-    | CancelJobCommand cmd -> rt |> JobManager.cancelJob cmd |> serialize'
+    | ListSkillsCommand cmd -> rt |> sourceOperation resolved (fun project -> ProjectBrowser.listSkillsIn project cmd) (fun () -> ProjectBrowser.listSkills cmd) |> serialize'
+    | GetSkillCommand cmd -> rt |> sourceOperation resolved (fun project -> ProjectBrowser.getSkillIn project cmd) (fun () -> ProjectBrowser.getSkill cmd) |> serialize'
+    | CreateSkillCommand cmd -> rt |> sourceOperation resolved (fun project -> ProjectBrowser.createSkillIn project cmd) (fun () -> ProjectBrowser.createSkill cmd) |> serialize'
+    | GetGitStatusCommand cmd -> rt |> sourceOperation resolved (fun project -> ClientShell.getGitStatusIn project cmd) (fun () -> ClientShell.getGitStatus cmd) |> serialize'
+    | GetGitDiffCommand cmd -> rt |> sourceOperation resolved (fun project -> ClientShell.getGitDiffIn project cmd) (fun () -> ClientShell.getGitDiff cmd) |> serialize'
+    | GitCommitCommand cmd -> rt |> sourceOperation resolved (fun project -> ClientShell.gitCommitIn project cmd) (fun () -> ClientShell.gitCommit cmd) |> serialize'
+    | StartJobCommand cmd ->
+        match resolved, target with
+        | Some project, _ -> rt |> JobManager.startJobIn project cmd |> serialize'
+        | None, Some validated -> rt |> JobManager.startJobForTarget validated cmd |> serialize'
+        | None, None -> rt |> JobManager.startJob cmd |> serialize'
+    | ListJobsCommand cmd ->
+        match target with
+        | Some validated ->
+            rt |> JobManager.listJobsForProject (Some(ProjectPaths.ProjectTarget.projectId validated)) cmd |> serialize'
+        | None -> rt |> JobManager.listJobs cmd |> serialize'
+    | GetJobResultCommand cmd ->
+        match target with
+        | Some validated ->
+            rt |> JobManager.getJobResultForProject (Some(ProjectPaths.ProjectTarget.projectId validated)) cmd |> serialize'
+        | None -> rt |> JobManager.getJobResult cmd |> serialize'
+    | CancelJobCommand cmd ->
+        match target with
+        | Some validated ->
+            rt |> JobManager.cancelJobForProject (Some(ProjectPaths.ProjectTarget.projectId validated)) cmd |> serialize'
+        | None -> rt |> JobManager.cancelJob cmd |> serialize'
     | MessageCommand cmd ->
         if String.IsNullOrWhiteSpace cmd.Message then
             Error(Client.ValidationError "Message cannot be empty.") |> serialize'
@@ -460,7 +736,9 @@ let private dispatch (rt: Runtime) (command: AgentCommand) =
         |> Ok
         |> serialize'
 
-let receiveCommand (rt: Runtime) (command: AgentCommand) =
+let private receiveCommandForTarget (rt: Runtime) (target: ProjectPaths.ProjectTarget option)
+                                    (resolved: ProjectPaths.ResolvedProject option)
+                                    (preparedTask: ProjectTaskDefinition option) (command: AgentCommand) =
     task {
         let activityId =
             match command with
@@ -473,7 +751,12 @@ let receiveCommand (rt: Runtime) (command: AgentCommand) =
         let resolution =
             match command with
             | RunProjectTaskCommand cmd ->
-                ClientShell.resolveProjectTask cmd rt
+                (match preparedTask with
+                 | Some task -> Ok task
+                 | None ->
+                     (sourceOperation resolved
+                         (fun project -> ClientShell.resolveProjectTaskIn project cmd)
+                         (fun () -> ClientShell.resolveProjectTask cmd)) rt)
                 |> Result.map (fun task ->
                     let authorizationCommand =
                         ClientShell.projectTaskAsRunCommand cmd.ProjectName task
@@ -506,10 +789,12 @@ let receiveCommand (rt: Runtime) (command: AgentCommand) =
                     | Error error, _ ->
                         return Error error
                     | Ok(), Some(cmd, task) ->
-                        let! result = ClientShell.runProjectTask cmd.ProjectName task rt |> serialize'
+                        let! result = (sourceOperation resolved
+                            (fun project -> ClientShell.runProjectTaskIn project task)
+                            (fun () -> ClientShell.runProjectTask cmd.ProjectName task)) rt |> serialize'
                         return result
                     | Ok(), None ->
-                        let! result = dispatch rt command
+                        let! result = dispatch rt target resolved command
                         return result
             }
 
@@ -517,7 +802,7 @@ let receiveCommand (rt: Runtime) (command: AgentCommand) =
 
         match response with
         | Ok payload ->
-            let outcome = ActivityPresentation.tryResultSummary command payload
+            let outcome = ActivityPresentation.tryResultSummary command payload.Payload
             activityId
             |> Option.iter (fun id ->
                 rt.Tui.CompleteActivity(id, stopwatch.ElapsedMilliseconds, outcome))
@@ -526,40 +811,148 @@ let receiveCommand (rt: Runtime) (command: AgentCommand) =
             |> Option.iter (fun id ->
                 rt.Tui.FailActivity(id, stopwatch.ElapsedMilliseconds, ActivityPresentation.shortError err, ActivityPresentation.fullError err))
 
-        audit command response
+        audit command (response |> Result.map (fun outcome -> outcome.Payload))
 
         return response
     }
 
-let receiveCommandWithInstructions (rt: Runtime) command =
+let receiveCommand (rt: Runtime) (command: AgentCommand) =
     task {
-        match AgentInstructions.resolve rt command with
-        | Error error -> return Error error, []
-        | Ok instructions ->
-            let! response = receiveCommand rt command
-            return response, instructions
+        let! result = receiveCommandForTarget rt None None None command
+        return result |> Result.map (fun outcome -> outcome.Payload)
     }
 
-let receiveCommandAndReply (connection: HubConnection) (rt: Runtime) (correlationId: string) (commandJson: string) : Task =
+let private receiveCommandWithTypedInstructions (rt: Runtime)
+                                                (target: ProjectPaths.ProjectTarget option) command =
+    task {
+        match AgentInstructions.prepareOperationWithTarget rt target command with
+        | Error error ->
+            return Error error, [], AgentInstructions.RootBootstrapRequired
+        | Ok prepared ->
+            let! response =
+                receiveCommandForTarget rt target prepared.Source prepared.ProjectTask command
+            let provenance =
+                if prepared.Source.IsSome then AgentInstructions.HierarchyLoaded
+                else AgentInstructions.RootBootstrapRequired
+            return response,
+                   prepared.Instructions
+                   @ AgentInstructions.writeWarningsForContext rt prepared.Source command response,
+                   provenance
+    }
+
+let receiveCommandWithInstructions (rt: Runtime) command =
+    task {
+        match classifyProject command with
+        | Error error -> return Error error, []
+        | Ok scope ->
+            let! response, instructions, _ =
+                receiveCommandWithTypedInstructions rt (projectTarget scope) command
+            return response |> Result.map (fun outcome -> outcome.Payload), instructions
+    }
+
+// Shared by SignalR receive and tests. Identity is supplied by the MCP call,
+// not inferred from provider conversation metadata.
+let processIncomingCommand (rt: Runtime) (commandJson: string) (agentId: string) =
     task {
         let mutable parsedCommand = None
         let mutable instructions: InstructionDocument list = []
+        let mutable implicitChanges: string list = []
+        let mutable inboxActivation: AgentInboxActivation option = None
         let! response =
             task {
                 try
                     let command = JsonSerializer.Deserialize<AgentCommand>(commandJson)
                     parsedCommand <- Some command
-                    let! response, applicable = receiveCommandWithInstructions rt command
-                    instructions <- applicable
-                    return response
+                    // A self-inbox response must explicitly distinguish a
+                    // repeated read from a newly committed activation, even
+                    // when the subsequent inbox read fails.
+                    match command with
+                    | TaskReadCommand inbox when inbox.Action = "AgentInbox" ->
+                        inboxActivation <-
+                            Some { ProjectName = inbox.ProjectName; AgentId = inbox.AgentId
+                                   ActivatedByThisCall = false
+                                   BeforeState = None; AfterState = None
+                                   CommittedHead = None; OperationId = None }
+                    | _ -> ()
+                    // A target field is never proof of acting-agent identity.
+                    // Reject forged observer identity before source resolution,
+                    // any activity attribution, or the canonical read.
+                    let project =
+                        match command with
+                        | ObserveAgentCommand observation
+                            when String.IsNullOrWhiteSpace agentId
+                                 || not (String.Equals(observation.ObserverAgentId, agentId, StringComparison.Ordinal)) ->
+                            Error(Client.ValidationError "Observation actor label does not match the initiating tool-call actor.")
+                        | _ -> classifyProject command
+                    match project with
+                    | Error error -> return Error error
+                    | Ok scope ->
+                        let target = projectTarget scope
+                        // The caller's agentId belongs to the source project
+                        // of a cross-project notification, not the destination.
+                        let localAgentId =
+                            if isLocalAgentActivity command then agentId else ""
+                        if not (String.IsNullOrWhiteSpace localAgentId) then
+                            target |> Option.iter (fun selected ->
+                                rt.Tui.RecordAgentSeen(AgentView.activityProject selected, localAgentId))
+                        match activateReadyOnActivity rt localAgentId target command with
+                        | Error error -> return Error error
+                        | Ok (changes, committedActivation) ->
+                            implicitChanges <- changes
+                            match command, committedActivation with
+                            | TaskReadCommand inbox, Some receipt when inbox.Action = "AgentInbox" ->
+                                inboxActivation <- Some receipt
+                            | _ -> ()
+                            let! result, applicable, provenance =
+                                receiveCommandWithTypedInstructions rt target command
+                            // A write may alter another agent's state, or none
+                            // at all. Invalidate precisely the affected local
+                            // cache entries before preparing turn guidance.
+                            match target, result with
+                            | Some selected, Ok outcome when not outcome.ChangedAgentIds.IsEmpty ->
+                                let cache = workingGuidanceCaches.GetValue(rt, fun _ ->
+                                    WorkingTurnGuidance.AgentCache(TimeSpan.FromMinutes 2.))
+                                let projectId = ProjectPaths.ProjectTarget.projectId selected
+                                for changed in outcome.ChangedAgentIds do
+                                    cache.Invalidate(projectId, changed)
+                            | _ -> ()
+                            instructions <-
+                                match command with
+                                | GetAgentInstructionsCommand _ ->
+                                    // The explicit result includes the complete hierarchy.
+                                    // Do not double-inject automatic AGENTS.md payloads.
+                                    checkWorkingGuidance rt localAgentId target command
+                                | _ ->
+                                    incrementalInstructions rt localAgentId target provenance applicable
+                                    @ checkWorkingGuidance rt localAgentId target command
+                            return result
                 with ex ->
                     return Error(ExceptionError ex)
             }
-
+        // The metadata is independent of the requested command outcome. A
+        // Ready->Working transition stays committed if the following file read
+        // fails, so other devices must still expire that agent's cache.
+        let changes =
+            match parsedCommand |> Option.bind AgentCommandInfo.projectName with
+            | Some project when not (String.IsNullOrWhiteSpace project) ->
+                let executed =
+                    match response with
+                    | Ok outcome -> outcome.ChangedAgentIds
+                    | Error _ -> []
+                implicitChanges @ executed
+                |> List.distinct
+                |> List.map (fun id -> { ProjectName = project; AgentId = id })
+            | _ -> []
         let agentResponse =
             match parsedCommand with
-            | Some command -> toAgentResponse command instructions response
-            | None -> toAgentResponse ListCommandsCommand [] response
+            | Some command -> toAgentResponse command instructions changes inboxActivation response
+            | None -> toAgentResponse ListCommandsCommand [] changes inboxActivation response
+        return parsedCommand, (response |> Result.map (fun outcome -> outcome.Payload)), agentResponse
+    }
+
+let receiveCommandAndReply (connection: HubConnection) (rt: Runtime) (correlationId: string) (commandJson: string) (agentId: string) : Task =
+    task {
+        let! parsedCommand, response, agentResponse = processIncomingCommand rt commandJson agentId
         let! sendResult =
             ResponseDelivery.sendWithReconnectRetry
                 (TimeSpan.FromMinutes 2.0)

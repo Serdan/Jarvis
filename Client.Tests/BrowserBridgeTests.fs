@@ -10,6 +10,7 @@ open System.Text.Json
 open System.Threading
 open System.Threading.Tasks
 open Client
+open Common
 open NUnit.Framework
 
 let private findPort () =
@@ -538,6 +539,102 @@ let failedSnapshotIntegrityLeavesNoPartialFile () = task {
         | Ok _ -> Assert.Fail("Corrupt snapshot must not be written")
         Assert.That(IO.File.Exists(target), Is.False)
         Assert.That(IO.Directory.GetFiles(dir), Is.Empty)
+    finally
+        IO.Directory.Delete(dir, true)
+}
+
+[<Test>]
+let everyBrowserCommandHasSafeActivityDetail () =
+    // TUI.StartActivity evaluates AgentCommandInfo.invocation BEFORE command
+    // dispatch. Any missing union case prevents browser operations entirely.
+    let commands: AgentCommand list =
+        [ BrowserListTabsCommand
+          BrowserListWindowsCommand
+          ScheduleBrowserExecutionCommand {
+              ScheduleId = "test"; RunAfterSeconds = 1; Url = "https://example.test"
+              ProjectName = "Jarvis"; ScriptPath = "test.js"; ArgsJson = None
+              Alias = None; Active = None; WindowRegistration = Some "agents"
+              CloseTabAfterExecution = None; RepeatEverySeconds = None }
+          ListScheduledBrowserExecutionsCommand
+          CancelScheduledBrowserExecutionCommand { ScheduleId = "test" }
+          BrowserOpenTabCommand {
+              WindowRegistration = "agents"; Url = "https://example.test"; Alias = None; Active = None }
+          BrowserCloseTabCommand { TabRegistration = "tab" }
+          BrowserRunInNewTabCommand {
+              WindowRegistration = "agents"; Url = "https://example.test"; ProjectName = "Jarvis"
+              ScriptPath = "test.js"; ArgsJson = None; Active = None
+              CloseTabAfterExecution = None; TimeoutMs = None }
+          BrowserExecuteFileCommand {
+              ProjectName = "Jarvis"; ScriptPath = "test.js"; TabRegistration = "tab"
+              ArgsJson = None; TimeoutMs = None }
+          BrowserExecuteJsCommand {
+              TabRegistration = "tab"; Code = "document.title"; ArgsJson = None; TimeoutMs = None }
+          BrowserCaptureDomCommand {
+              TabRegistration = "tab"; WaitJson = None; CaptureSelector = None; TimeoutMs = None }
+          BrowserExportDomCommand {
+              ProjectName = "Jarvis"; FilePath = "snapshot.html"; TabRegistration = "tab"
+              WaitJson = None; CaptureSelector = None; TimeoutMs = None } ]
+    for command in commands do
+        let text = AgentCommandInfo.invocation command
+        Assert.That(text, Is.Not.Null.And.Not.Empty)
+
+[<Test>]
+let snapshotExportDeadlineStopsSlowChunksWithoutPublishing () = task {
+    let dir = IO.Path.Combine(IO.Path.GetTempPath(), "jarvis-dom-deadline-" + Guid.NewGuid().ToString("N"))
+    IO.Directory.CreateDirectory(dir) |> ignore
+    let target = IO.Path.Combine(dir, "slow.html")
+    try
+        let port = findPort()
+        use bridge = new BrowserBridge.Service(port, "test-secret")
+        bridge.Start()
+        let! client, connectionId = handshake port "test-secret"
+        use socket = client
+        do! send socket """{"version":2,"kind":"capabilities","features":["domSnapshotV1"]}"""
+        do! send socket """{"version":2,"kind":"registrations","tabs":[{"registrationId":"slow-tab-01","alias":"slow-export","availability":"ready","registrationGeneration":1}]}"""
+        do! waitUntil (fun () -> bridge.ListTabs() |> Result.exists (fun x -> x.Contains("slow-tab-01")))
+        let markup = "<html>" + String.replicate 200000 "a" + "</html>"
+        let data = Encoding.UTF8.GetBytes(markup)
+        let sha256 = Convert.ToHexString(SHA256.HashData(data)).ToLowerInvariant()
+        let snapshotId = "0000000000000000000000000000000c"
+        // Individual chunks arrive within 10 seconds, but the entire transfer
+        // exceeds this one overall caller deadline.
+        let pending = bridge.CaptureDom("slow-export","""{"kind":"immediate"}""","",400,Some target)
+        let! request = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
+        do! send socket (JsonSerializer.Serialize({|
+            version = 2; kind = "snapshotReady"; requestId = property request "requestId"
+            connectionId = connectionId; registrationId = "slow-tab-01"; registrationGeneration = 1
+            status = "completed"; bytes = data.Length; title = "Slow"
+            url = "https://example.test/page"; capturedAtUtc = "2026-11-10T09:00:00Z"
+            waitKind = "immediate"; snapshotId = snapshotId; sha256 = sha256
+        |}))
+        let mutable finished = false
+        let mutable responded = 0
+        while not finished do
+            let! frame = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
+            if property frame "kind" = "releaseSnapshot" then
+                finished <- true
+            else
+                Assert.That(property frame "kind", Is.EqualTo("snapshotChunk"))
+                use packet = JsonDocument.Parse(frame)
+                let offset = packet.RootElement.GetProperty("offset").GetInt32()
+                let length = min 32768 (data.Length - offset)
+                do! Task.Delay(120)
+                do! send socket (JsonSerializer.Serialize({|
+                    version = 2; kind = "snapshotChunk"; requestId = property frame "requestId"
+                    connectionId = connectionId; registrationId = "slow-tab-01"; registrationGeneration = 1
+                    snapshotId = snapshotId; offset = offset
+                    data = Convert.ToBase64String(data, offset, length)
+                |}))
+                responded <- responded + 1
+        let! outcome = pending
+        match outcome with
+        | Error reason -> Assert.That(reason, Does.Contain("SnapshotDeadlineExceeded"))
+        | Ok _ -> Assert.Fail("Slow transfer must not publish after caller deadline")
+        Assert.That(responded, Is.GreaterThanOrEqualTo(2))
+        Assert.That(IO.File.Exists(target), Is.False)
+        Assert.That(IO.Directory.GetFiles(dir), Is.Empty)
+        do! Task.Delay(150) // Late replies cannot resurrect a finished export.
+        Assert.That(IO.File.Exists(target), Is.False)
     finally
         IO.Directory.Delete(dir, true)
 }

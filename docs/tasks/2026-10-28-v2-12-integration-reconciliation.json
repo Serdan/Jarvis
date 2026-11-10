@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "id": "2026-10-28-v2-12-integration-reconciliation",
+  "title": "Complete source integration proof, recovery and worktree retirement",
+  "status": "cancelled",
+  "priority": "P1",
+  "dependencies": [
+    "2026-10-28-v2-05-checkpoint-review-evidence",
+    "2026-10-28-v2-06-reviewer-claim-recovery",
+    "2026-10-28-v2-08-source-bindings"
+  ],
+  "owner": {
+    "agent": null,
+    "worktree": null
+  },
+  "checkpoint": {
+    "summary": "Superseded by the 2026-10-29 minimal orphan-branch cutover decision; do not implement this roadmap task.",
+    "nextAction": "No action. Use existing disk files for any manually selected migration, and prioritize only the orphan-branch cutover.",
+    "verified": [],
+    "lastCommit": null
+  },
+  "audit": {
+    "specSections": [
+      "§7",
+      "§8",
+      "RV3-03"
+    ],
+    "implementationReferences": [
+      "Client/Modules/ReviewWorkflow.fs:880-1075",
+      "Client/Modules/LedgerStore.fs:632-695"
+    ],
+    "sourceReport": "docs/reviews/2026-10-28-v2-spec-implementation-audit.md"
+  },
+  "updatedAt": "2026-10-29T17:00:00Z"
+}

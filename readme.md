@@ -37,7 +37,7 @@ There is no copied session key. ChatGPT never receives a Jarvis routing secret.
 - Verified self-update for published Linux/macOS clients: the client reads `SHA256SUMS` from its configured Jarvis server, atomically swaps the standalone executable with a `.prev` rollback copy, and restarts attached to the same terminal.
 - Optimistic-concurrency writes and atomic unified-diff patches.
 - Named project tasks from `.jarvis.json`.
-- Persisted unfinished work tasks in `.jarvis/tasks` that reference committed task descriptions and carry resumable execution checkpoints.
+- Canonical Git-orphan-ledger orchestration for tasks, agents, assignments, checkpoints, reviews and integrations, shared across worktrees.
 - Project-local and workspace-global skill discovery, reading, and creation with `ListSkills`, `GetSkill`, and `CreateSkill`.
 - Bounded process execution and asynchronous jobs, with optional human-readable `reason` metadata on `RunCommand` and `StartJob`.
 - Persisted client activity and fresh-session recovery through `GetClientActivity`, with observer diagnostics excluded by default and retrievable explicitly.
@@ -177,6 +177,41 @@ Imported files default to a 32 MiB local maximum. Override it when launching the
 
 `0` means unlimited. A tool call may request a lower per-import limit, but cannot raise the client-configured maximum.
 
+### MCP OAuth discovery
+
+`POST /mcp` requires a valid OAuth bearer token from the first MCP request, including `initialize` and `tools/list`. Anonymous requests receive **HTTP 401** with a `WWW-Authenticate: Bearer` challenge pointing to the public `/.well-known/oauth-protected-resource` metadata document. MCP clients should use that metadata to start OAuth/PKCE with the configured Auth0 authorization server, and supply the resulting access token in the HTTP `Authorization` header. The MCP route does not accept bearer tokens from query parameters. Individual tools still enforce their existing OAuth scope requirements; endpoint authentication does not replace authorization.
+
+For new third-party MCP clients (such as LM Studio), the Auth0 application configuration must allow the client's real redirect/callback URI and requested scopes. A correct HTTP challenge establishes OAuth discovery; it does not guarantee a client's OAuth registration or login flow is configured correctly.
+
+#### LM Studio: slash-suffixed OAuth resource
+
+LM Studio may issue `resource=https://jarvis2.kehlet.dev/` even when the public
+protected-resource metadata advertises `https://jarvis2.kehlet.dev`. Auth0
+considers these **different API identifiers** and rejects the slash-suffixed
+request with `error=access_denied` / `Service not found` before login.
+
+Preserve the existing API and ChatGPT/native client credentials. In the same
+Auth0 tenant, add a **second API** with identifier
+`https://jarvis2.kehlet.dev/` (trailing slash) and grant it the same
+`workspace:read`, `workspace:write`, `process:execute`, and `git:write`
+permissions. Use RS256 signing (matching the existing API). Under
+Applications, ensure the native application used by LM Studio authorizes this
+new API and lists `http://127.0.0.1:33389/mcp-oauth-callback` among its allowed
+callback URLs. LM Studio may use the existing public native client ID; it
+does not need a client secret for Authorization Code + PKCE.
+
+Jarvis validates access tokens for **both exact API identifiers** from the
+same trusted issuer; it still checks the signature, expiration, authenticated
+subject, and per-tool scopes. Do not change the existing Audience setting or
+delete the original Auth0 API. Resource metadata intentionally continues to
+advertise the original identifier for existing MCP clients.
+
+To diagnose the authorization redirect, use a fresh test request to Auth0
+`/authorize` and inspect the `Location` header: a successful pre-login
+validation redirects to Auth0's login page, rather than the LM Studio callback
+with `error=access_denied`. A successful browser login and subsequent
+authenticated tool call must still be verified separately.
+
 ## Project tasks
 
 Projects can expose named build/test/format/lint tasks in a project-root `.jarvis.json`:
@@ -197,19 +232,74 @@ Projects can expose named build/test/format/lint tasks in a project-root `.jarvi
 
 The executable and arguments come from local project configuration rather than model-supplied task arguments. Jarvis resolves the task before permission approval and executes that same definition afterward.
 
-## Worktrees and repository-backed tasks
+## Worktrees and Git-backed orchestration
 
-Jarvis discovers existing worktrees using Git metadata. New worktrees use hidden sibling directories such as `~/Projects/.Wayfold-worktrees/input-config/`, and `ListProjects` groups Git worktrees under their main projects. A registered worktree can be selected for any project-scoped command using `projectName="Wayfold::input-config"`, without affecting other agents.
+Jarvis discovers worktrees using Git metadata. New worktrees use hidden sibling directories such as `~/Projects/.Wayfold-worktrees/input-config/`, and `ListProjects` groups worktrees under their main projects. A registered worktree can be selected for project-scoped commands using `projectName="Wayfold::input-config"`.
 
-Jarvis manages human-readable HTML task descriptions and adjacent version-controlled JSON state. The default canonical folder is `docs/tasks`, configurable through `"taskDirectory"` in project-root `.jarvis.json`. Commands include `CreateTask`, `ListTasks`, `GetTask`, `CompareWorktreeTasks`, `UpdateTask`, `ClaimTask`, `CheckpointTask`, `CompleteTask` and `GetTaskHistory`. Mutations commit only the affected task files on the selected branch.
+**Use the Jarvis `create_worktree` MCP tool for every new linked checkout**, providing `projectName`, `name`, `branch`, and `baseRef`; do not create new checkouts with raw `git worktree add`. For cleanup, use `inspect_worktree_removal` and then `remove_worktree` only when integration, cleanliness, ownership and running jobs are verified. Jarvis does not delete source branches as a side effect of removing a checkout. Existing registered legacy worktrees remain usable until safely retired.
 
-For task coordination, use repository-backed `ListTasks`, `GetTask`, `ClaimTask`, `UpdateTask`, `CheckpointTask`, and `CompleteTask`. The older WorkTask MCP endpoints have been retired. Historical `.jarvis/tasks/` checkpoint files are non-authoritative and must be reconciled with repository task JSON before archival or removal.
+**Current task authority:** an explicitly initialized project uses one Git orphan branch, `refs/heads/jarvis-orchestration`, on its configured remote. The unprefixed orchestration MCP tools manage canonical HTML task specs, agents, assignments, reviews and integrations. The former source-branch task handlers are retired. Names such as `CreateTask` and `AssignTask` now refer exclusively to orphan-ledger operations; old commands such as `ListTasks` and `CheckpointTask` are not available. Existing `docs/tasks/` HTML/JSON files remain reference material, not live state; upgrading Jarvis does not automatically migrate them.
 
-See [Git worktrees and task files](docs/GitBackedTasks.md) for API details, file conventions and tests.
+**Exact integration boundaries:** `submit_integration` records the exact
+submitted commit SHA, fully qualified source and target branches, optional
+frozen review request ID, and caller-stable submission/operation UUIDs in the
+canonical Git-orphan ledger. It does **not** merge, pause or reassign work.
+Each submission is retained independently; `get_integration_submissions`
+returns the latest boundary and full pending/integrated history for a task,
+while `agent_inbox` exposes the submission records to their owner. A newer
+submission on the same branch must descend from earlier pending submitted
+commits; Jarvis refuses a replacement that rewrites the still-pending slice.
+When associated with a review, the submitted commit must match the review's
+frozen snapshot exactly. The Lead may integrate only the submitted SHA even
+when the task branch has advanced. After publishing integration, use
+`complete_integration` with that submission ID and the resulting integration
+commit. Jarvis verifies that the **remote target branch** contains the claimed
+integration commit and that it descends from the submitted commit before
+recording `Integrated`. Other submissions remain pending. Jarvis does not
+block direct external Git force-pushes, and never automatically merges.
+
+**Agent coordination notifications:** `notify_agent` records a durable
+message on the canonical orphan Git ledger, with sender, recipient, optional
+task reference, message and caller-stable `operationId` UUID (also the
+notification ID). Both agents must be registered; the optional task must exist.
+An identical retry cannot duplicate the notification. `agent_inbox` returns
+unacknowledged `pendingNotifications`; the TUI Agents screen shows unread
+counts and previews without altering assignments or execution state. The
+recipient calls `acknowledge_notification` using the notification ID and a new
+caller-stable operation UUID. Acknowledgments survive restarts and are
+idempotent on retry. The message remains in Git history after acknowledgment.
+
+The client **Agents** screen reads only explicitly bound canonical ledgers and shows the persisted agent state and transition time; it never scans source-side task files. Unbound projects do not contribute invented agent state, while bound-ledger read failures are surfaced as errors.
+
+**Current protocol (3.58):** Internal transports are `TaskRead`, `TaskWrite`, `LedgerRead`, `LedgerWrite`, `ReviewRead` and `ReviewWrite`. Public MCP tools retain existing unprefixed names. The client module is `OrchestrationApi`; there are no parallel versioned orchestration handlers. This wire rename requires a coordinated client/server deployment after explicit operator approval. Existing checkout trust bindings remain in `ledger-v2/`, and pending journals written by previous clients remain recognizable. Archived review and migration documents retain their historical version terminology.
+
+**Automatic agent activation (3.58):** Assigned Ready agents start
+Working on their first ordinary tool call (typically `agent_inbox`), without
+calling `resume_agent`. The Working clock is not reset on later calls.
+`resume_agent` and `park_agent` are removed from the public MCP catalog;
+`set_agent_state` provides enum-backed administrative transitions between
+NeedsWork and Parked for unassigned agents. Historical pending ResumeAgent
+intents remain replayable internally. See
+[Agent command surface](docs/AgentCommandSurface.md). Coordinated
+client/server deployment and refreshed MCP schemas are required.
+
+**Agent identity migration (3.57):** Agent-associated MCP operations use the
+required `agentId` argument, replacing public `ownerId`, `actorId`,
+`reviewerId` and `requesterId`. File, Git, command and job tools also carry
+`agentId`; agent-independent bootstrap and status tools do not. The local
+TUI `Seen` column updates from explicit agent-attributed calls, including
+failed execution, without requiring provider conversation metadata. Client
+working-turn guidance also uses agent state directly. This changes the
+SignalR command transport and requires a coordinated client/server release.
+See [Explicit agent identity](docs/ExplicitAgentIdentity.md).
+
+See [Migration to Git-backed orchestration](docs/OrchestrationMigration.md) for initialization, selective task carry-over and recovery. The [orchestration architecture](docs/specs/orchestration-architecture.md) defines the authority rules. The older [Git-backed task files guide](docs/GitBackedTasks.md) describes the retired workflow.
 
 ## Automatic repository instructions
 
 Jarvis automatically loads applicable AGENTS.md files on project-scoped commands. Guidance is discovered from the local workspace root, the project root, and ancestor folders of the targeted file or working directory. The client includes the ordered source paths, hashes, and original Markdown in an Instructions array on its command response. The MCP server presents these as labeled content blocks before the ordinary result; it also advertises the contract through static MCP initialization instructions.
+
+Jarvis delivers a bounded UTF-8 prefix of oversized instruction files (64 KiB per file, 128 KiB combined, maximum 32 files), with explicit truncation notices, original byte counts, full SHA-256 and a path for manually loading omitted content. A workspace-level file cannot exhaust the budget reserved for descendant instructions. A successful `write_file` or `patch_file` that leaves `AGENTS.md` larger than 32 KiB emits an advisory size warning, not a failure. Canonical Git-ledger-only commands (including inbox, checkpoint and yield) bypass source instruction loading, so instruction errors cannot prevent state recovery.
 
 Instruction sources remain project data and never grant permissions. Missing files are normal; unsafe, unreadable, or oversized applicable files reject a command before side effects. Instructions are currently supplied on every applicable call rather than being session-cached.
 
@@ -217,7 +307,7 @@ See [Automatic Agent Instructions](docs/AgentInstructions.md) and the [response 
 
 ## Project and global skills
 
-Projects store instructions at `<project>/.jarvis/skills/<skill-name>/SKILL.md`. The shared workspace skill scope uses `<workspace>/.jarvis/skills/<skill-name>/SKILL.md`.
+Projects store instructions at `<project>/.agents/skills/<skill-name>/SKILL.md`. The shared workspace skill scope uses `<workspace>/.agents/skills/<skill-name>/SKILL.md`.
 
 `ListSkills(projectName)` returns local and global skills with an explicit scope. Use `projectName="@global"` for `GetSkill` or `CreateSkill` when targeting the global scope. Existing skills require `overwrite=true`.
 
@@ -326,3 +416,4 @@ The MCP operations are `BrowserListTabs`, `BrowserOpenTab`, `ScheduleBrowserExec
 Browser scripts can perform authenticated and irreversible page actions. A timeout or disconnect may leave an action's result uncertain; the bridge does not retry automatically. Until tested against real Chrome/Chromium and explicitly released, this implementation is an experimental feature branch; it is not available in installed production binaries.
 
 A persistent, one-shot client-local browser scheduler can create a new tab and run a project script after a chosen delay, with no automatic replay or recovery. It lets ephemeral orchestrator conversations schedule their successors without teaching Jarvis about ChatGPT. See [one-shot browser scheduler](docs/BrowserOneShotScheduler.md).
+\nLegacy skills can be moved safely with `python3 scripts/migrate-skills.py /path/to/workspace` (preview), followed by `--apply` after reviewing conflicts.\n

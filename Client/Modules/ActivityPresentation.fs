@@ -103,6 +103,7 @@ let shortError (error: EffectError) =
         | Client.PermissionDenied message -> "PermissionDenied", message
         | Client.ConfirmationRequired request -> "ConfirmationRequired", request.Summary
         | AggregatedErrors errors -> "MultipleErrors", $"{errors.Length} errors"
+        | LedgerFailureError failure -> $"LedgerFailure({failure.Code})", failure.Message
 
     let message = compact 72 message
     if String.IsNullOrWhiteSpace message then kind else $"{kind}: {message}"

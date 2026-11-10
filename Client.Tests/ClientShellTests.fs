@@ -19,6 +19,8 @@ type TestContext(root: string) =
         member _.Project = { Root = ProjectDirectory root; SpecialFiles = []; FolderFilters = [] }
     interface FileIO with
         member _.File = FileOperations.impl
+        member _.EditText(path, options, edit) =
+            AtomicTextFiles.edit path options edit
 
 [<Test>]
 let ``runCommand executes structured command`` () =
@@ -89,13 +91,13 @@ let ``runCommand rejects shell executable`` () =
         Directory.Delete(root, true)
 
 [<Test>]
-let ``listProjectTasks returns empty when config is missing`` () =
+let ``listConfiguredTasks returns empty when config is missing`` () =
     let root = createTempProject ()
     try
         let context = TestContext root
-        let cmd: ListProjectTasksCommand = { ProjectName = "Project1" }
+        let cmd: ListConfiguredTasksCommand = { ProjectName = "Project1" }
 
-        match listProjectTasks cmd context with
+        match listConfiguredTasks cmd context with
         | Ok result -> result.Tasks |> shouldEqual []
         | Error error -> Assert.Fail($"Expected Ok, got {error}")
     finally
@@ -122,7 +124,7 @@ let ``project tasks are loaded and executed from jarvis config`` () =
         File.WriteAllText(Path.Combine(project, ".jarvis.json"), config)
         let context = TestContext root
 
-        match listProjectTasks ({ ProjectName = "Project1" }: ListProjectTasksCommand) context with
+        match listConfiguredTasks ({ ProjectName = "Project1" }: ListConfiguredTasksCommand) context with
         | Error error -> Assert.Fail($"Expected task list, got {error}")
         | Ok result ->
             result.Tasks.Length |> shouldEqual 1
@@ -148,7 +150,7 @@ let ``project task config rejects malformed task definitions`` () =
         File.WriteAllText(Path.Combine(project, ".jarvis.json"), """{"tasks":{"broken":{"args":[]}}}""")
         let context = TestContext root
 
-        match listProjectTasks ({ ProjectName = "Project1" }: ListProjectTasksCommand) context with
+        match listConfiguredTasks ({ ProjectName = "Project1" }: ListConfiguredTasksCommand) context with
         | Error(Client.ValidationError message) ->
             message.Contains("executable") |> shouldEqual true
         | other -> Assert.Fail($"Expected ValidationError, got {other}")

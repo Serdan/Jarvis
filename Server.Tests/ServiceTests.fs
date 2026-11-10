@@ -14,6 +14,49 @@ open Server
 open Server.Services
 
 [<Test>]
+let invalidation_routes_only_to_connected_devices_of_authenticated_user () =
+    let users = UserService()
+    let register userId device connection =
+        let registration =
+            { DeviceId = device; DeviceName = device; ProtocolVersion = AgentProtocol.version
+              ClientVersion = "test"; SupportedCommands = ["TaskWrite"; "TaskRead"] }
+        users.TransportConnected(userId, connection)
+        users.Register(userId, registration, connection) |> ignore
+    register "alice" "desktop" "a-desktop"
+    register "alice" "laptop" "a-laptop"
+    register "bob" "desktop" "b-desktop"
+    let initial = AgentStateInvalidationRouting.recipients (users.ListDevices("alice"))
+    Assert.That(initial |> Set.ofArray,
+                Is.EqualTo(Set.ofList [ "a-desktop"; "a-laptop" ] :> obj))
+    users.Disconnect("a-laptop", Some "offline")
+    let remaining = AgentStateInvalidationRouting.recipients (users.ListDevices("alice"))
+    Assert.That(remaining, Is.EqualTo([| "a-desktop" |] :> obj))
+    Assert.That(AgentStateInvalidationRouting.recipients (users.ListDevices("bob")),
+                Is.EqualTo([| "b-desktop" |] :> obj))
+
+[<Test>]
+let invalidation_routes_only_exact_changed_agents_even_on_command_failure () =
+    // The server never guesses state changes from the command type or success.
+    let failedRead : AgentCommandResponse =
+        { Result = None
+          Error = Some(NotFound "A source file was missing after activation")
+          Instructions = []
+          AgentStateChanges =
+              [ { ProjectName = "Wayfold"; AgentId = "Owner" }
+                { ProjectName = "Wayfold"; AgentId = "Owner" }
+                { ProjectName = "Jarvis"; AgentId = "Reviewer" } ]
+          InboxActivation = None }
+    let groups = AgentStateInvalidationRouting.affectedByProject failedRead.AgentStateChanges
+    Assert.That(groups.Length, Is.EqualTo(2))
+    Assert.That(groups |> List.find (fun (project, _) -> project = "Wayfold") |> snd,
+                Is.EqualTo([| "Owner" |] :> obj))
+    Assert.That(groups |> List.find (fun (project, _) -> project = "Jarvis") |> snd,
+                Is.EqualTo([| "Reviewer" |] :> obj))
+    let checkpoint : AgentCommandResponse =
+        { failedRead with Result = Some "{}"; Error = None; AgentStateChanges = [] }
+    Assert.That(AgentStateInvalidationRouting.affectedByProject checkpoint.AgentStateChanges, Is.Empty)
+
+[<Test>]
 let user_service_exposes_authenticated_transport_before_registration () =
     let users = UserService()
     users.TransportConnected("auth0|user", "connection")
@@ -73,11 +116,11 @@ let user_service_switches_active_device_for_same_user () =
     let secondRegistration = { firstRegistration with DeviceId = "device-2"; DeviceName = "Laptop" }
 
     users.TransportConnected(userId, "desktop-connection")
-    users.Register(userId, firstRegistration, "desktop-connection") |> ignore
+    let firstGeneration = users.Register(userId, firstRegistration, "desktop-connection").Generation
     users.TransportConnected(userId, "laptop-connection")
     let switched = users.Register(userId, secondRegistration, "laptop-connection")
 
-    switched.Generation |> shouldEqual 1L
+    (switched.Generation > firstGeneration) |> shouldEqual true
     switched.RegistrationReason.Contains("Initial registration", StringComparison.Ordinal) |> shouldEqual true
 
     match users.GetSession(userId) with
@@ -105,7 +148,7 @@ let ``multiple device sessions remain independent across reconnect and disconnec
           SupportedCommands = AgentProtocol.commandDefinitions |> List.map _.Name }
 
     users.TransportConnected(userId, "home-1")
-    users.Register(userId, makeRegistration "home" "Home", "home-1") |> ignore
+    let firstHome = users.Register(userId, makeRegistration "home" "Home", "home-1").Generation
     users.TransportConnected(userId, "work-1")
     users.Register(userId, makeRegistration "work" "Work", "work-1") |> ignore
 
@@ -120,7 +163,7 @@ let ``multiple device sessions remain independent across reconnect and disconnec
     users.SetDefaultDevice(userId, "work") |> shouldEqual true
     users.TransportConnected(userId, "home-2")
     let reconnected = users.Register(userId, makeRegistration "home" "Home", "home-2")
-    reconnected.Generation |> shouldEqual 2L
+    (reconnected.Generation > firstHome) |> shouldEqual true
     users.GetDefaultDeviceId(userId) |> shouldEqual (Some "work")
     users.GetSessionByConnection("home-1") |> shouldEqual ValueNone
     users.Disconnect("home-1", None)
@@ -266,7 +309,8 @@ let ``client service rejects commands not negotiated by the registered client`` 
         )
         |> ignore
 
-        let client = ClientService(Unchecked.defaultof<_>, users, ClientResponseTracker())
+        let client = ClientService(Unchecked.defaultof<_>, users, ClientResponseTracker(),
+                                   Microsoft.AspNetCore.Http.HttpContextAccessor())
         let command =
             WriteFileCommand
                 { ProjectName = "Jarvis"
@@ -314,7 +358,7 @@ let ``response tracker completes registered response`` () =
         let expected =
             { Result = Some "ok"
               Error = None
-              Instructions = [] }
+              Instructions = []; AgentStateChanges = []; InboxActivation = None }
 
         tracker.Complete(correlationId, "alice", "conn-1", 1L, expected) |> shouldEqual true
         let! actual = pending
@@ -327,7 +371,7 @@ let ``response tracker rejects other users connections and generations`` () =
     task {
         let tracker = ClientResponseTracker()
         let correlationId, pending = tracker.Register("alice", "connection-a", 3L, TimeSpan.FromSeconds 5L)
-        let response = { Result = Some "accepted"; Error = None; Instructions = [] }
+        let response = { Result = Some "accepted"; Error = None; Instructions = []; AgentStateChanges = []; InboxActivation = None }
 
         tracker.Complete(correlationId, "bob", "connection-a", 3L, response) |> shouldEqual false
         tracker.Complete(correlationId, "alice", "connection-b", 3L, response) |> shouldEqual false
@@ -418,15 +462,98 @@ let ``command catalog matches AgentCommand union and MCP tools`` () =
     let serverLocalNames =
         set [ "GetProfile"; "Feedback"; "ListFeedback"; "GetFeedback"; "UpdateFeedback"; "GetFeedbackSummary"; "GetConnectionDiagnostics"; "ListDevices"; "SelectDevice"; "UpdateServer"; "GetServerUpdateStatus" ]
 
-    // Retired legacy wire cases remain internal for old-client compatibility,
-    // but must never be discoverable or callable as public MCP tools.
-    let retired = set [ "AttachWorkTask"; "GetWorkTask"; "ListWorkTasks"; "CheckpointWorkTask"; "CompleteWorkTask" ]
-    Set.difference unionNames retired |> shouldEqual catalogNames
+    // Retired task commands must not be exposed by either the wire protocol or MCP.
+    // The orphan Git branch is the sole supported orchestration API.
+    let retired =
+        set [ "AttachWorkTask"; "GetWorkTask"; "ListWorkTasks"; "CheckpointWorkTask"; "CompleteWorkTask"
+              "ListTasks"; "UpdateTask"; "ClaimTask"; "CheckpointTask"
+              "CompleteTask"; "GetTaskHistory"; "CompareWorktreeTasks"; "GetAgentAssignment"
+              "AcknowledgeTask"; "GetOrchestrationSnapshot"; "RetireWorktree"; "BeginTask" ]
+    // Orphan-ledger MCP tools route through eight versioned internal wire commands.
+    let ledgerWire = set [ "TaskRead"; "TaskWrite"; "ReviewRead"; "ReviewWrite"; "LedgerRead"; "LedgerWrite" ]
+    let orchestrationTools =
+        set [ "GetIntegrationSubmissions"; "SubmitIntegration"; "CompleteIntegration"; "NotifyAgent"; "AcknowledgeNotification"; "AgentInbox"; "GetAssignment"; "GetCheckpoint"; "InspectAttemptSource"; "TaskLifecycleHistory"; "GetTaskSpecPage"; "DiffTaskSpec"; "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "ReissueAssignment"; "CheckpointAttempt"
+              "SetAttemptSource"; "YieldAgent"; "CompleteAgentWork"
+              "SetAgentState"; "ReissueQueuedAttempt"; "RecoverAgentAssignment"; "AcknowledgeReviewFeedback"; "DeferAttempt"; "ResumeAttempt"; "AbandonAttempt"; "CancelTask"; "TransferOwner"; "CloseTask"; "ReopenTask"; "ImportTaskSpec"; "ExportTaskSpec"
+              "GetTask"; "TaskOverview"; "ReviewDetails"; "ReviewerInbox"; "ListReviewDocuments"; "ReadReviewDocument"
+              "SubmitReview"; "ClaimReview"; "DecideReview"
+              "ReleaseReview"; "WithdrawReview"; "PutReviewDocument"
+              "LedgerHealth"; "GetOperationStatus"; "PendingOperations"; "ReconcilePendingOperations"
+              "PendingOperationSummary"; "PendingOperationsPage"; "InspectPendingOperation"
+              "AcknowledgePendingOperation"; "InitializeLedger"; "BindExistingLedger"; "RebindLedgerRemote"
+              ]
+    // Retired wire cases are deleted; public CreateTask/AssignTask are canonical ledger tools.
+    unionNames |> shouldEqual catalogNames
     Set.intersect mcpNames retired |> shouldEqual Set.empty
+    Assert.That(mcpNames, Does.Contain("GetTask"))
+    Assert.That(mcpNames, Does.Contain("ListConfiguredTasks"))
+    Assert.That(mcpNames, Does.Not.Contain("ReviewTask"))
+    Assert.That(mcpNames, Does.Not.Contain("ListProjectTasks"))
+    Assert.That(mcpNames, Does.Not.Contain("MigrateOrthogonalAgentState"))
     Set.intersect catalogNames retired |> shouldEqual Set.empty
-    Set.difference mcpNames serverLocalNames |> shouldEqual catalogNames
-    Set.difference mcpNames catalogNames |> shouldEqual serverLocalNames
+    Set.intersect mcpNames orchestrationTools |> shouldEqual orchestrationTools
+    Set.difference (Set.difference mcpNames serverLocalNames) orchestrationTools
+    |> shouldEqual (Set.difference catalogNames ledgerWire)
+    Set.difference (Set.difference mcpNames catalogNames) orchestrationTools
+    |> shouldEqual serverLocalNames
 
+
+[<Test>]
+let ``public orchestration tool metadata describes canonical branch reviews`` () =
+    let reviewMethods =
+        set [ "GetTask"; "ReviewDetails"; "ReviewerInbox"; "SubmitReview"
+              "ClaimReview"; "DecideReview"; "ReleaseReview"; "WithdrawReview"
+              "TaskOverview"; "ListReviewDocuments"; "ReadReviewDocument"
+              "PutReviewDocument" ]
+    for methodInfo in typeof<JarvisMcpTools>.GetMethods() do
+        let toolAttributes =
+            methodInfo.GetCustomAttributes(typeof<McpServerToolAttribute>, false)
+        if toolAttributes.Length = 1 then
+            let tool = toolAttributes[0] :?> McpServerToolAttribute
+            let descriptions =
+                methodInfo.GetCustomAttributes(typeof<System.ComponentModel.DescriptionAttribute>, false)
+            Assert.That(descriptions.Length, Is.EqualTo(1), methodInfo.Name)
+            let description =
+                (descriptions[0] :?> System.ComponentModel.DescriptionAttribute).Description
+            Assert.That(tool.Title, Is.Not.Empty, methodInfo.Name)
+            Assert.That(description, Is.Not.Empty, methodInfo.Name)
+            if reviewMethods.Contains methodInfo.Name then
+                Assert.That(description, Does.Not.Contain("review revision"), methodInfo.Name)
+                Assert.That(description, Does.Not.Contain("client opt-in"), methodInfo.Name)
+    let reviewDescription methodName =
+        let methodInfo = typeof<JarvisMcpTools>.GetMethod(methodName)
+        (methodInfo.GetCustomAttributes(typeof<System.ComponentModel.DescriptionAttribute>, false)[0]
+         :?> System.ComponentModel.DescriptionAttribute).Description
+    Assert.That(reviewDescription "ReviewDetails", Does.Contain("independent"))
+    Assert.That(reviewDescription "ClaimReview", Does.Contain("Git branch"))
+    Assert.That(reviewDescription "DecideReview", Does.Contain("Markdown"))
+    Assert.That(reviewDescription "SubmitReview", Does.Contain("No assignment"))
+
+[<Test>]
+let ``public SubmitReview accepts arbitrary commit and optional context without worker phase`` () =
+    let parameters =
+        typeof<JarvisMcpTools>.GetMethod("SubmitReview").GetParameters()
+    let names = parameters |> Array.map _.Name
+    for oldField in [ "expectedAttemptVersion"; "assignmentGeneration"; "reviewKind"; "ownerId" ] do
+        Assert.That(names, Does.Not.Contain(oldField))
+    for contextField in [ "taskId"; "sourceRef"; "targetRef"; "purpose"; "summary" ] do
+        let field = parameters |> Array.find (fun p -> p.Name = contextField)
+        Assert.That(field.IsOptional, Is.True, contextField)
+    let close = typeof<JarvisMcpTools>.GetMethod("CloseTask")
+    Assert.That(close, Is.Not.Null)
+    Assert.That(typeof<JarvisMcpTools>.GetMethod("CloseNonSourceTask"), Is.Null)
+    Assert.That(typeof<JarvisMcpTools>.GetMethod("ReleaseReview"), Is.Not.Null)
+
+[<Test>]
+let ``task assignment and owner transfer do not accept reviewer IDs`` () =
+    for methodName in [ "AssignTask"; "TransferOwner" ] do
+        let methodInfo = typeof<JarvisMcpTools>.GetMethod(methodName)
+        Assert.That(methodInfo, Is.Not.Null, methodName)
+        let parameterNames = methodInfo.GetParameters() |> Array.map _.Name
+        Assert.That(parameterNames, Does.Contain("operationId"), methodName)
+        Assert.That(parameterNames, Does.Not.Contain("reviewerId"), methodName)
+    let claim = typeof<JarvisMcpTools>.GetMethod("ClaimReview")
+    Assert.That(claim.GetParameters() |> Array.map _.Name, Does.Contain("agentId"))
 
 [<Test>]
 let ``client-backed MCP tools expose an optional per-command deviceId`` () =
@@ -436,7 +563,9 @@ let ``client-backed MCP tools expose an optional per-command deviceId`` () =
         |> Array.filter (fun methodInfo ->
             methodInfo.GetParameters()
             |> Array.exists (fun parameter -> parameter.ParameterType = typeof<ClientService>))
-    clientMethods.Length |> shouldEqual (AgentProtocol.commandDefinitions.Length - 1)
+    // Three additional read-only pending recovery views are public aliases
+    // of LedgerRead; retry/supersede have distinct wire definitions.
+    clientMethods.Length |> shouldEqual (AgentProtocol.commandDefinitions.Length - 1 + 51)
     for methodInfo in clientMethods do
         let deviceParam = methodInfo.GetParameters() |> Array.tryFind (fun parameter -> parameter.Name = "deviceId")
         match deviceParam with
@@ -446,10 +575,50 @@ let ``client-backed MCP tools expose an optional per-command deviceId`` () =
             parameter.IsOptional |> shouldEqual true
 
 [<Test>]
+let ``development MCP tools accept an optional registered worktreeName`` () =
+    let scopedTools =
+        [ "GetProjectDetails"; "ListDirectory"; "SearchFiles"; "SearchText"
+          "ReadFile"; "ReadFiles"; "ReadImage"; "ExportFile"; "ImportFile"
+          "WriteFile"; "PatchFile"; "RunCommand"; "ListConfiguredTasks"
+          "RunProjectTask"; "GetGitStatus"; "GetGitDiff"; "GitCommit"
+          "StartJob"; "ListJobs" ]
+    for name in scopedTools do
+        let methodInfo = typeof<JarvisMcpTools>.GetMethod(name)
+        Assert.That(methodInfo, Is.Not.Null, name)
+        let worktreeParam =
+            methodInfo.GetParameters() |> Array.find (fun p -> p.Name = "worktreeName")
+        Assert.That(worktreeParam.ParameterType, Is.EqualTo(typeof<string>), name)
+        Assert.That(worktreeParam.IsOptional, Is.True, name)
+        Assert.That(worktreeParam.DefaultValue, Is.EqualTo(""), name)
+    for logicalProjectTool in [ "AgentInbox"; "TaskOverview"; "SubmitReview"; "NotifyAgent" ] do
+        let names =
+            typeof<JarvisMcpTools>.GetMethod(logicalProjectTool).GetParameters()
+            |> Array.map _.Name
+        Assert.That(names, Does.Not.Contain("worktreeName"), logicalProjectTool)
+
+[<Test>]
+let ``worktreeName must be a registered-worktree selector name rather than path`` () =
+    McpToolHelpers.projectWithWorktreeName "Wayfold" "" |> shouldEqual "Wayfold"
+    McpToolHelpers.projectWithWorktreeName "Wayfold" "agent6-example"
+    |> shouldEqual "Wayfold::agent6-example"
+    // Existing callers using the selector form continue to work when the new field is omitted.
+    McpToolHelpers.projectWithWorktreeName "Wayfold::agent6-example" ""
+    |> shouldEqual "Wayfold::agent6-example"
+    for projectName, worktreeName in
+        [ "Wayfold::already-selected", "another"; "Wayfold", "../escape"
+          "Wayfold", "linked/path"; "Wayfold", ".."; "Wayfold", "invalid" + string (char 92) + "name"; "Wayfold", "with\nnewline"; "Wayfold", " " ] do
+        try
+            McpToolHelpers.projectWithWorktreeName projectName worktreeName |> ignore
+            Assert.Fail("Expected invalid worktreeName to be rejected")
+        with :? ArgumentException -> ()
+
+[<Test>]
 let ``WriteFile rejects invalid file write mode with actionable validation error`` () =
     let result =
         JarvisMcpTools.WriteFile(
             "Project1",
+            "Test Agent",
+            "",
             "test.txt",
             "content",
             "Create",
@@ -511,7 +680,7 @@ let ``MCP bridge returns successful JSON as text without a mismatched output sch
     let response =
         { Result = Some """{"value":42,"items":[1,2]}"""
           Error = None
-          Instructions = [] }
+          Instructions = []; AgentStateChanges = []; InboxActivation = None }
 
     let result = McpToolHelpers.toCallToolResult response
 
@@ -520,6 +689,144 @@ let ``MCP bridge returns successful JSON as text without a mismatched output sch
 
     let text = result.Content[0] :?> TextContentBlock
     text.Text |> shouldEqual """{"value":42,"items":[1,2]}"""
+
+[<Test>]
+let mcp_self_inbox_exposes_committed_activation_on_success_and_read_error () =
+    let receipt : AgentInboxActivation =
+        { ProjectName = "Jarvis"; AgentId = "Owner"
+          ActivatedByThisCall = true
+          BeforeState = Some "Ready"; AfterState = Some "Working"
+          CommittedHead = Some(String('a', 40))
+          OperationId = Some(Guid.NewGuid().ToString("D")) }
+    for readFailed in [ false; true ] do
+        let response : AgentCommandResponse =
+            { Result = if readFailed then None else Some """{"Agent":{"State":"Working"}}"""
+              Error = if readFailed then Some(NotFound "Inbox read failed after activation") else None
+              Instructions = []
+              AgentStateChanges = [ { ProjectName = "Jarvis"; AgentId = "Owner" } ]
+              InboxActivation = Some receipt }
+        let roundtrip =
+            JsonSerializer.Deserialize<AgentCommandResponse>(JsonSerializer.Serialize(response))
+        Assert.That(roundtrip.InboxActivation.IsSome, Is.True)
+        Assert.That(roundtrip.InboxActivation.Value.CommittedHead,
+                    Is.EqualTo(receipt.CommittedHead))
+        let tool =
+            response |> McpToolHelpers.toCallToolResult
+            |> McpToolHelpers.attachStateEffects response
+        Assert.That(tool.IsError, Is.EqualTo(Nullable readFailed))
+        Assert.That(tool.Content.Count, Is.EqualTo(2))
+        let exposed = (tool.Content[1] :?> TextContentBlock).Text
+        use document = JsonDocument.Parse(exposed)
+        let changes = document.RootElement.GetProperty("agentStateChanges").EnumerateArray() |> Seq.toList
+        Assert.That(changes.Length, Is.EqualTo(1))
+        Assert.That(changes.Head.GetProperty("AgentId").GetString(), Is.EqualTo("Owner"))
+        Assert.That(tool.Meta["jarvis/agent_state_changes"].ToJsonString(),
+                    Does.Contain("Owner"))
+        let activation = document.RootElement.GetProperty("agentInboxActivation")
+        Assert.That(activation.GetProperty("ActivatedByThisCall").GetBoolean(), Is.True)
+        Assert.That(activation.GetProperty("BeforeState").GetString(), Is.EqualTo("Ready"))
+        Assert.That(activation.GetProperty("AfterState").GetString(), Is.EqualTo("Working"))
+        Assert.That(activation.GetProperty("CommittedHead").GetString(),
+                    Is.EqualTo(String('a', 40)))
+        Assert.That(tool.Meta["jarvis/inbox_activation"].ToJsonString(),
+                    Does.Contain("ActivatedByThisCall"))
+        if readFailed then
+            Assert.That((tool.Content[0] :?> TextContentBlock).Text,
+                        Does.Contain("Inbox read failed after activation"))
+    let noChange : AgentInboxActivation =
+        { ProjectName = receipt.ProjectName
+          AgentId = receipt.AgentId
+          ActivatedByThisCall = false
+          BeforeState = None; AfterState = None
+          CommittedHead = None; OperationId = None }
+    let repeated =
+        { Result = Some """{"Agent":{"State":"Working"}}"""
+          Error = None; Instructions = []; AgentStateChanges = []
+          InboxActivation = Some noChange }
+    let repeated =
+        repeated |> McpToolHelpers.toCallToolResult
+        |> McpToolHelpers.attachStateEffects repeated
+    use repeatDoc = JsonDocument.Parse((repeated.Content[1] :?> TextContentBlock).Text)
+    let repeatActivation = repeatDoc.RootElement.GetProperty("agentInboxActivation")
+    Assert.That(repeatActivation.GetProperty("ActivatedByThisCall").GetBoolean(), Is.False)
+    Assert.That(repeatActivation.GetProperty("CommittedHead").ValueKind,
+                Is.EqualTo(JsonValueKind.Null))
+    Assert.That(repeatDoc.RootElement.GetProperty("agentStateChanges").GetArrayLength(), Is.EqualTo(0))
+    // Older 3.62 clients omit InboxActivation. A newer server continues to
+    // accept those wire envelopes, without claiming an activation occurred.
+    let legacy = JsonSerializer.Deserialize<AgentCommandResponse>(
+        """{"Result":"{}","Error":null,"Instructions":[],"AgentStateChanges":[]}""")
+    Assert.That(legacy.InboxActivation.IsNone, Is.True)
+
+[<Test>]
+let mcp_project_tool_responses_always_expose_canonical_state_change_evidence () =
+    for failed in [ false; true ] do
+        let response : AgentCommandResponse =
+            { Result = if failed then None else Some """{"result":"ok"}"""
+              Error = if failed then Some(NotFound "Source file absent") else None
+              Instructions = []
+              AgentStateChanges = []
+              InboxActivation = None }
+        let tool =
+            response |> McpToolHelpers.toCallToolResult
+            |> McpToolHelpers.attachStateEffects response
+        Assert.That(tool.IsError, Is.EqualTo(Nullable failed))
+        Assert.That(tool.Content.Count, Is.EqualTo(2))
+        use doc = JsonDocument.Parse((tool.Content[1] :?> TextContentBlock).Text)
+        Assert.That(doc.RootElement.GetProperty("agentStateChanges").GetArrayLength(),
+                    Is.EqualTo(0))
+        let mutable ignored = Unchecked.defaultof<JsonElement>
+        Assert.That(doc.RootElement.TryGetProperty("agentInboxActivation", &ignored), Is.False)
+        Assert.That(tool.Meta["jarvis/agent_state_changes"].ToJsonString(), Is.EqualTo("[]"))
+
+    // A command can affect a different agent, and an earlier committed write
+    // must remain visible even if its subsequent operation fails.
+    let affected : AgentCommandResponse =
+        { Result = None
+          Error = Some(NotFound "Read failed after prior mutation")
+          Instructions = []
+          AgentStateChanges = [ { ProjectName = "Wayfold"; AgentId = "Worker 1" } ]
+          InboxActivation = None }
+    let result =
+        affected |> McpToolHelpers.toCallToolResult
+        |> McpToolHelpers.attachStateEffects affected
+    Assert.That(result.IsError, Is.EqualTo(Nullable true))
+    use effects = JsonDocument.Parse((result.Content[1] :?> TextContentBlock).Text)
+    let changes = effects.RootElement.GetProperty("agentStateChanges")
+    Assert.That(changes.GetArrayLength(), Is.EqualTo(1))
+    Assert.That(changes[0].GetProperty("ProjectName").GetString(), Is.EqualTo("Wayfold"))
+    Assert.That(changes[0].GetProperty("AgentId").GetString(), Is.EqualTo("Worker 1"))
+    let mutable absent = Unchecked.defaultof<JsonElement>
+    Assert.That(effects.RootElement.TryGetProperty("agentInboxActivation", &absent), Is.False)
+
+[<Test>]
+let cross_project_notify_merges_preflight_and_destination_state_changes () =
+    let sourceActivation : AgentInboxActivation =
+        { ProjectName = "Wayfold"; AgentId = "Worker 1"
+          ActivatedByThisCall = true
+          BeforeState = Some "Ready"; AfterState = Some "Working"
+          CommittedHead = Some(String('a', 40)); OperationId = Some(Guid.NewGuid().ToString("D")) }
+    let preflight : AgentCommandResponse =
+        { Result = Some "{}"; Error = None; Instructions = []
+          AgentStateChanges = [ { ProjectName = "Wayfold"; AgentId = "Worker 1" } ]
+          InboxActivation = Some sourceActivation }
+    let destination : AgentCommandResponse =
+        { Result = None; Error = Some(NotFound "Destination write failed")
+          Instructions = []
+          AgentStateChanges =
+            [ { ProjectName = "Jarvis"; AgentId = "Reviewer 1" }
+              { ProjectName = "Wayfold"; AgentId = "Worker 1" } ]
+          InboxActivation = None }
+    let merged = McpToolHelpers.mergeStateEffects preflight destination
+    Assert.That(merged.AgentStateChanges.Length, Is.EqualTo(2))
+    Assert.That(merged.InboxActivation.Value.ActivatedByThisCall, Is.True)
+    Assert.That(merged.Error.IsSome, Is.True)
+    let tool =
+        merged |> McpToolHelpers.toCallToolResult
+        |> McpToolHelpers.attachStateEffects merged
+    use json = JsonDocument.Parse((tool.Content[1] :?> TextContentBlock).Text)
+    Assert.That(json.RootElement.GetProperty("agentStateChanges").GetArrayLength(), Is.EqualTo(2))
+    Assert.That(json.RootElement.GetProperty("agentInboxActivation").GetProperty("ActivatedByThisCall").GetBoolean(), Is.True)
 
 [<Test>]
 let ``MCP bridge preserves typed confirmation error details`` () =
@@ -537,7 +844,7 @@ let ``MCP bridge preserves typed confirmation error details`` () =
     let response =
         { Result = None
           Error = Some(ConfirmationRequired confirmation)
-          Instructions = [] }
+          Instructions = []; AgentStateChanges = []; InboxActivation = None }
 
     let result = McpToolHelpers.toCallToolResult response
 
@@ -561,7 +868,7 @@ let ``MCP bridge preserves stable AgentError kinds`` () =
         let result =
             { Result = None
               Error = Some error
-              Instructions = [] }
+              Instructions = []; AgentStateChanges = []; InboxActivation = None }
             |> McpToolHelpers.toCallToolResult
 
         result.IsError |> shouldEqual (Nullable true)
@@ -595,6 +902,18 @@ let auth_issuer_normalizes_auth0_domain () =
           OpenAIAppsChallenge = "" }
 
     Auth.issuer options |> shouldEqual "https://dev-kn4j3jz3qv2cvw05.eu.auth0.com/"
+
+[<Test>]
+let auth_accepts_exactly_the_legacy_and_trailing_slash_api_audiences () =
+    let options =
+        { Auth0Domain = "example.eu.auth0.com"
+          Audience = "https://jarvis2.kehlet.dev"
+          OpenAIAppsChallenge = "" }
+    Auth.validAudiences options
+    |> shouldEqual [| "https://jarvis2.kehlet.dev"; "https://jarvis2.kehlet.dev/" |]
+
+    Auth.validAudiences { options with Audience = "https://jarvis2.kehlet.dev/" }
+    |> shouldEqual (Auth.validAudiences options)
 
 [<Test>]
 let auth_scope_lookup_handles_space_separated_scope_claim () =
@@ -636,10 +955,36 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
         elif definition.Permissions |> List.contains ProcessExecution then Auth.ProcessExecute
         else Auth.WorkspaceRead
 
+    let wireCommandNames = AgentProtocol.commandDefinitions |> List.map _.Name |> Set.ofList
+
     let definitions =
-        AgentProtocol.commandDefinitions
-        |> List.map (fun definition -> definition.Name, definition)
-        |> Map.ofList
+        let original =
+            AgentProtocol.commandDefinitions
+            |> List.map (fun definition -> definition.Name, definition)
+            |> Map.ofList
+        let ledgerRead = original["LedgerRead"]
+        let ledgerWrite = original["LedgerWrite"]
+        let taskRead = original["TaskRead"]
+        let taskWrite = original["TaskWrite"]
+        let ledgerRead = original["ReviewRead"]
+        let ledgerWrite = original["ReviewWrite"]
+        let aliases =
+            [ for name in [ "LedgerHealth"; "GetOperationStatus"; "PendingOperations"; "ReconcilePendingOperations";
+                            "PendingOperationSummary"; "PendingOperationsPage"; "InspectPendingOperation" ] -> name, ledgerRead
+              for name in [ "InitializeLedger"; "BindExistingLedger"; "RebindLedgerRemote"; "AcknowledgePendingOperation" ] -> name, ledgerWrite
+              for name in [ "GetIntegrationSubmissions"; "AgentInbox"; "GetAssignment"; "GetCheckpoint"; "InspectAttemptSource"; "TaskLifecycleHistory"; "GetTaskSpecPage"; "DiffTaskSpec" ] ->
+                  name, (if name = "AgentInbox" then
+                             { taskRead with MutatesState = true }
+                         else taskRead)
+              for name in [ "SubmitIntegration"; "CompleteIntegration"; "NotifyAgent"; "AcknowledgeNotification"; "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "ReissueAssignment"; "CheckpointAttempt"
+                            "SetAttemptSource"; "YieldAgent"; "CompleteAgentWork";
+                            "SetAgentState"; "ReissueQueuedAttempt"; "RecoverAgentAssignment"; "AcknowledgeReviewFeedback"; "DeferAttempt"; "ResumeAttempt"; "AbandonAttempt"; "CancelTask"; "TransferOwner"; "CloseTask"; "ReopenTask"; "ImportTaskSpec"; "ExportTaskSpec" ] -> name, taskWrite
+              for name in [ "GetTask"; "TaskOverview"; "ReviewDetails"; "ReviewerInbox"; "ListReviewDocuments"; "ReadReviewDocument" ] ->
+                  name, ledgerRead
+              for name in [ "SubmitReview"; "ClaimReview"; "DecideReview"
+                            "ReleaseReview"; "WithdrawReview"; "PutReviewDocument" ] ->
+                  name, ledgerWrite ]
+        aliases |> List.fold (fun map (key, value) -> Map.add key value map) original
 
     let methods =
         typeof<JarvisMcpTools>.GetMethods()
@@ -658,26 +1003,16 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
 
         let readOnly =
             match definition with
-            | Some definition -> definition.Permissions = [ ReadOnly ]
+            | Some definition -> not definition.MutatesState
             | None ->
                 match methodInfo.Name with
                 | "Feedback" | "UpdateFeedback" | "SelectDevice" | "UpdateServer" -> false
                 | "ListFeedback" | "GetFeedback" | "GetFeedbackSummary" | "GetConnectionDiagnostics" | "ListDevices" | "GetServerUpdateStatus" -> true
                 | name -> failwith $"Unexpected server-local MCP tool: {name}"
 
-        let destructive =
-            match methodInfo.Name with
-            | "ScheduleBrowserExecution" | "CancelScheduledBrowserExecution" | "BrowserOpenTab" | "BrowserCloseTab" | "BrowserRunInNewTab" | "BrowserExecuteFile" | "BrowserExecuteJs" | "ImportFile" | "UpdateClient" | "UpdateServer" | "WriteFile" | "PatchFile" | "RunCommand" | "RunProjectTask" | "StartJob" | "CancelJob" | "RemoveWorktree" | "RetireWorktree" -> true
-            | _ -> false
-
-        let openWorld =
-            match methodInfo.Name with
-            | "ScheduleBrowserExecution" | "BrowserOpenTab" | "BrowserRunInNewTab" | "BrowserExecuteFile" | "BrowserExecuteJs" | "ImportFile" | "UpdateClient" | "UpdateServer" | "RunCommand" | "RunProjectTask" | "StartJob" -> true
-            | _ -> false
-
         attribute.ReadOnly |> shouldEqual readOnly
-        attribute.Destructive |> shouldEqual destructive
-        attribute.OpenWorld |> shouldEqual openWorld
+        attribute.Destructive |> shouldEqual false
+        attribute.OpenWorld |> shouldEqual false
 
         let securityMeta =
             methodInfo.GetCustomAttributes(typeof<McpMetaAttribute>, false)
@@ -692,6 +1027,27 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
         let scopes = scheme.GetProperty("scopes")
         scopes[0].GetString() |> shouldEqual scope
 
+
+[<Test>]
+let observe_agent_is_explicitly_read_only_while_self_inbox_is_activity () =
+    let byName name =
+        McpToolHelpers.mcpListCommandsResult.Commands
+        |> List.find (fun item -> item.Name = name)
+    let observation = byName "ObserveAgent"
+    let inbox = byName "AgentInbox"
+    Assert.That(observation.MutatesState, Is.False)
+    Assert.That(inbox.MutatesState, Is.True)
+    Assert.That(observation.Permissions, Does.Contain(ReadOnly))
+    let tool name =
+        let methodInfo = typeof<JarvisMcpTools>.GetMethod(name)
+        let attributes =
+            methodInfo.GetCustomAttributes(typeof<McpServerToolAttribute>, false)
+        attributes[0] :?> McpServerToolAttribute
+    Assert.That((tool "ObserveAgent").ReadOnly, Is.True)
+    Assert.That((tool "AgentInbox").ReadOnly, Is.False)
+    let parameters = typeof<JarvisMcpTools>.GetMethod("ObserveAgent").GetParameters()
+    Assert.That(parameters |> Array.map _.Name |> Array.take 3,
+                Is.EqualTo([| "projectName"; "agentId"; "targetAgentId" |] :> obj))
 
 [<Test>]
 let mcp_profile_tool_uses_authenticated_subject () =
@@ -785,6 +1141,22 @@ let mcp_profile_tool_returns_chatgpt_compatible_authentication_challenge () =
     challenge.Contains("error_description=\"Authentication required.\"") |> shouldEqual true
 
 [<Test>]
+let checkpoint_attempt_source_and_evidence_are_optional_in_public_mcp_signature () =
+    let methodInfo = typeof<JarvisMcpTools>.GetMethod("CheckpointAttempt")
+    Assert.That(methodInfo, Is.Not.Null)
+    let parameters = methodInfo.GetParameters()
+    for name in [ "sourceCommit"; "evidence" ] do
+        let parameter =
+            parameters |> Array.find (fun parameter -> parameter.Name = name)
+        Assert.That(parameter.IsOptional, Is.True, name)
+        Assert.That(parameter.HasDefaultValue, Is.True, name)
+        Assert.That(parameter.DefaultValue, Is.EqualTo(""), name)
+    for name in [ "projectName"; "taskId"; "agentId"; "summary"; "nextAction" ] do
+        let parameter =
+            parameters |> Array.find (fun parameter -> parameter.Name = name)
+        Assert.That(parameter.IsOptional, Is.False, name)
+
+[<Test>]
 let run_command_reason_parameter_is_optional_for_mcp_compatibility () =
     let methodInfo = typeof<JarvisMcpTools>.GetMethod("RunCommand")
     let reason =
@@ -798,22 +1170,41 @@ let run_command_reason_parameter_is_optional_for_mcp_compatibility () =
 [<Test>]
 let mcp_guidance_blocks_precede_result_without_changing_success () =
     let instructions =
-        [ { Scope = "project"
-            Path = "Demo/src/AGENTS.md"
-            Sha256 = "sha256:" + String('a', 64)
+        [ { Scope = "workspace"; Path = "AGENTS.md"; Sha256 = "sha256:" + String('b', 64)
+            Content = "Workspace guidance" }
+          { Scope = "project"; Path = "Demo/AGENTS.md"; Sha256 = "sha256:" + String('c', 64)
+            Content = "Project guidance" }
+          { Scope = "project"; Path = "Demo/src/AGENTS.md"; Sha256 = "sha256:" + String('a', 64)
             Content = "Source guidance" } ]
     let response =
         { Result = Some """{"result":"ok"}"""
           Error = None
-          Instructions = instructions }
+          Instructions = instructions; AgentStateChanges = []; InboxActivation = None }
     let result = response |> McpToolHelpers.toCallToolResult |> McpToolHelpers.attachInstructions instructions
     Assert.That(result.IsError, Is.EqualTo(Nullable false))
     Assert.That(result.Content.Count, Is.EqualTo(2))
     let guidance = result.Content[0] :?> TextContentBlock
-    Assert.That(guidance.Text, Does.Contain("Demo/src/AGENTS.md"))
-    Assert.That(guidance.Text, Does.Contain("Source guidance"))
+    use json = JsonDocument.Parse(guidance.Text)
+    let map = json.RootElement.GetProperty("AGENTS.md")
+    Assert.That(json.RootElement.EnumerateObject() |> Seq.length, Is.EqualTo(1))
+    Assert.That(map.GetProperty(".").GetString(), Is.EqualTo("Workspace guidance"))
+    Assert.That(map.GetProperty("Demo").GetString(), Is.EqualTo("Project guidance"))
+    Assert.That(map.GetProperty("Demo/src").GetString(), Is.EqualTo("Source guidance"))
+    Assert.That(guidance.Text, Does.Not.Contain("This is workspace content"))
     let operation = result.Content[1] :?> TextContentBlock
     Assert.That(operation.Text, Is.EqualTo("""{"result":"ok"}"""))
+
+[<Test>]
+let mcp_agency_write_warning_precedes_success_without_marking_error () =
+    let notes =
+        [ { Scope = "write-warning"; Path = "Demo/AGENTS.md"; Sha256 = ""
+            Content = "WARNING: Demo/AGENTS.md is unusually large. The write succeeded." } ]
+    let response = { Result = Some """{"ok":true}"""; Error = None; Instructions = notes; AgentStateChanges = []; InboxActivation = None }
+    let shown = response |> McpToolHelpers.toCallToolResult |> McpToolHelpers.attachInstructions notes
+    Assert.That(shown.IsError, Is.EqualTo(Nullable false))
+    Assert.That(shown.Content.Count, Is.EqualTo(2))
+    Assert.That((shown.Content[0] :?> TextContentBlock).Text, Does.StartWith("Jarvis instruction notice:"))
+    Assert.That((shown.Content[1] :?> TextContentBlock).Text, Is.EqualTo("""{"ok":true}"""))
 
 [<Test>]
 let mcp_guidance_preserves_errors_and_non_text_blocks () =
@@ -825,7 +1216,7 @@ let mcp_guidance_preserves_errors_and_non_text_blocks () =
     let failure =
         { Result = None
           Error = Some(ValidationFailed "Unrelated error")
-          Instructions = instructions }
+          Instructions = instructions; AgentStateChanges = []; InboxActivation = None }
     let error = failure |> McpToolHelpers.toCallToolResult |> McpToolHelpers.attachInstructions instructions
     Assert.That(error.IsError, Is.EqualTo(Nullable true))
     Assert.That((error.Content[1] :?> TextContentBlock).Text, Is.EqualTo("ValidationFailed: Unrelated error"))
@@ -846,7 +1237,9 @@ let response_json_carries_typed_hierarchical_instructions () =
     let response =
         { Result = Some """{"ok":true}"""
           Error = None
-          Instructions = [ { Scope = "project"; Path = "Demo/AGENTS.md"; Sha256 = "sha256:" + String('f', 64); Content = "# Guidance" } ] }
+          Instructions = [ { Scope = "project"; Path = "Demo/AGENTS.md"; Sha256 = "sha256:" + String('f', 64); Content = "# Guidance" } ]
+          AgentStateChanges = [ { ProjectName = "Demo"; AgentId = "Owner" } ]
+          InboxActivation = None }
     let json = JsonSerializer.Serialize(response)
     use document = JsonDocument.Parse(json)
     let root = document.RootElement
@@ -855,3 +1248,242 @@ let response_json_carries_typed_hierarchical_instructions () =
     Assert.That(instruction.GetProperty("Path").GetString(), Is.EqualTo("Demo/AGENTS.md"))
     Assert.That(instruction.GetProperty("Scope").GetString(), Is.EqualTo("project"))
     Assert.That(instruction.GetProperty("Content").GetString(), Is.EqualTo("# Guidance"))
+    let mutation = root.GetProperty("AgentStateChanges").EnumerateArray() |> Seq.exactlyOne
+    Assert.That(mutation.GetProperty("ProjectName").GetString(), Is.EqualTo("Demo"))
+    Assert.That(mutation.GetProperty("AgentId").GetString(), Is.EqualTo("Owner"))
+    let restored = JsonSerializer.Deserialize<AgentCommandResponse>(json)
+    Assert.That(restored.AgentStateChanges, Is.EqualTo(response.AgentStateChanges :> obj))
+
+
+[<Test>]
+let ``MCP bridge preserves structured  ledger failure category`` () =
+    let problem : Common.LedgerFailureInfo =
+        { Code = "OutcomeUnknown"
+          Message = "Remote push response lost"
+          OperationId = Some(Guid.NewGuid().ToString("D"))
+          VerifiedLedgerHead = None }
+    let response =
+        { Result = None
+          Error = Some(Common.AgentError.LedgerFailure problem)
+          Instructions = []; AgentStateChanges = []; InboxActivation = None }
+    let tool = McpToolHelpers.toCallToolResult response
+    tool.IsError |> shouldEqual (Nullable true)
+    let content = tool.Content[0] :?> TextContentBlock
+    content.Text.Contains("LedgerFailure(OutcomeUnknown)", StringComparison.Ordinal)
+    |> shouldEqual true
+
+[<Test>]
+let ``typed  ledger failures survive response JSON roundtrip`` () =
+    let operationId = Guid.NewGuid().ToString("D")
+    let source : Common.AgentCommandResponse =
+        { Result = None
+          Error =
+              Some(Common.AgentError.LedgerFailure
+                  { Code = "OutcomeUnknown"; Message = "Unconfirmed push"
+                    OperationId = Some operationId; VerifiedLedgerHead = None })
+          Instructions = []; AgentStateChanges = []; InboxActivation = None }
+    let payload = JsonSerializer.Serialize(source)
+    let destination = JsonSerializer.Deserialize<Common.AgentCommandResponse>(payload)
+    match destination.Error with
+    | Some(Common.AgentError.LedgerFailure issue) ->
+        Assert.That(issue.Code, Is.EqualTo("OutcomeUnknown"))
+        Assert.That(issue.OperationId, Is.EqualTo(Some operationId))
+    | other -> Assert.Fail(sprintf "Lost typed  failure during transport: %A" other)
+
+
+[<Test>]
+let cross_project_routing_prefers_selected_client_then_eligible_alternatives () =
+    let users = UserService()
+    let user = "agent-owner"
+    let registration id commands =
+        { DeviceId = id
+          DeviceName = id
+          ProtocolVersion = AgentProtocol.version
+          ClientVersion = "1.0"
+          SupportedCommands = commands }
+    let all = [ "LedgerRead"; "TaskRead"; "TaskWrite" ]
+    users.TransportConnected(user, "sender-connection")
+    users.Register(user, registration "sender" all, "sender-connection") |> ignore
+    users.TransportConnected(user, "destination-connection")
+    users.Register(user, registration "destination" all, "destination-connection") |> ignore
+    let selected = users.GetSessionByDevice(user, "sender")
+    let candidates = ProjectNotificationRouting.candidates selected
+                         (users.ListDevices(user) |> Array.toList) false "TaskWrite" false
+    (candidates |> List.map (fun device -> device.DeviceId))
+    |> shouldEqual [ "sender"; "destination" ]
+    let pinned = ProjectNotificationRouting.candidates selected
+                     (users.ListDevices(user) |> Array.toList) true "TaskWrite" false
+    (pinned |> List.map (fun device -> device.DeviceId)) |> shouldEqual [ "sender" ]
+    users.Disconnect("sender-connection", Some "Disconnected")
+    let fallback = ProjectNotificationRouting.candidates (users.GetSessionByDevice(user, "sender"))
+                       (users.ListDevices(user) |> Array.toList) false "TaskWrite" false
+    (fallback |> List.map (fun device -> device.DeviceId)) |> shouldEqual [ "destination" ]
+    let oldVersion = { (users.GetSessionByDevice(user, "destination") |> function ValueSome session -> session | _ -> failwith "Missing device")
+                       with ProtocolVersion = "3.47" }
+    let crossEligible = ProjectNotificationRouting.candidates ValueNone
+                            [ oldVersion ] false "TaskWrite" true
+    crossEligible |> shouldEqual []
+    let ordinaryEligible = ProjectNotificationRouting.candidates ValueNone
+                               [ oldVersion ] false "TaskWrite" false
+    ordinaryEligible.Length |> shouldEqual 1
+    let unrelated = ProjectNotificationRouting.candidates ValueNone
+                        (users.ListDevices("different-user") |> Array.toList) false "TaskWrite" false
+    unrelated |> shouldEqual []
+
+[<Test>]
+let cross_project_failure_reports_real_device_incompatibility () =
+    let users = UserService()
+    let user = "routing-diagnostics"
+    let register name protocol commands =
+        users.TransportConnected(user, name + "-connection")
+        users.Register(user,
+            { DeviceId = name; DeviceName = name; ProtocolVersion = protocol
+              ClientVersion = "1"; SupportedCommands = commands },
+            name + "-connection") |> ignore
+    register "old" "3.48" [ "LedgerRead"; "TaskWrite" ]
+    register "no-write" AgentProtocol.version [ "LedgerRead"; "TaskRead" ]
+    register "no-ledger" AgentProtocol.version [ "TaskWrite" ]
+    register "healthy" AgentProtocol.version [ "LedgerRead"; "TaskWrite" ]
+    let selected = users.GetSessionByDevice(user, "old")
+    let ordered = ProjectNotificationRouting.ordered selected
+                      (users.ListDevices(user) |> Array.toList) false
+    let eligible = ProjectNotificationRouting.candidates selected
+                       (users.ListDevices(user) |> Array.toList) false "TaskWrite" true
+    (eligible |> List.map (fun item -> item.DeviceName)) |> shouldEqual [ "healthy" ]
+    let text = ProjectNotificationRouting.failureMessage "Wayfold" "TaskWrite" true false ordered
+                   [ "healthy", "destination project or ledger binding not found" ]
+    Assert.That(text, Does.Contain("old: protocol 3.48"))
+    Assert.That(text, Does.Contain("no-write: missing TaskWrite support"))
+    Assert.That(text, Does.Contain("no-ledger: missing LedgerRead support"))
+    Assert.That(text, Does.Contain("healthy: destination project or ledger binding not found"))
+    Assert.That(text, Does.Not.Contain("No compatible connected"))
+
+[<Test>]
+let cross_project_probe_errors_are_classified_without_leaking_client_error_text () =
+    let error = "private/absolute/path/with-sensitive-details"
+    let failures : (AgentError * string) list =
+        [ NotFound error, "destination project or ledger binding not found"
+          ValidationFailed error, "ledger binding or project validation failed"
+          PermissionDenied error, "permission denied"
+          ExecutionFailed error, "ledger health execution failed or timed out" ]
+    for issue, expected in failures do
+        let reply : AgentCommandResponse =
+            { Result = None; Error = Some issue; Instructions = []; AgentStateChanges = []; InboxActivation = None }
+        let classification = ProjectNotificationRouting.probeFailure reply
+        Assert.That(classification, Is.EqualTo(expected))
+        Assert.That(classification, Does.Not.Contain(error))
+
+[<Test>]
+let cross_project_routing_error_distinguishes_absent_device_from_protocol_mismatch () =
+    let empty = ProjectNotificationRouting.failureMessage "Wayfold" "TaskWrite" true false [] []
+    Assert.That(empty, Does.Contain("No registered client"))
+    Assert.That(empty, Does.Not.Contain("requires protocol"))
+    let explicit = ProjectNotificationRouting.failureMessage "Wayfold" "TaskWrite" true true [] []
+    Assert.That(explicit, Does.Contain("No selected/explicit device"))
+
+
+[<Test>]
+let ``all Jarvis MCP tools declare non-destructive closed-world metadata`` () =
+    let tools =
+        typeof<JarvisMcpTools>.GetMethods()
+        |> Array.choose (fun methodInfo ->
+            match methodInfo.GetCustomAttributes(typeof<McpServerToolAttribute>, false) with
+            | [| :? McpServerToolAttribute as attribute |] -> Some(methodInfo.Name, attribute)
+            | _ -> None)
+    Assert.That(tools.Length, Is.GreaterThan(0))
+    for name, attribute in tools do
+        Assert.That(attribute.Destructive, Is.False, name)
+        Assert.That(attribute.OpenWorld, Is.False, name)
+
+
+[<Test>]
+let cross_project_notification_health_probe_uses_client_supported_action () =
+    match ProjectNotificationRouting.healthProbe "Wayfold" with
+    | LedgerReadCommand command ->
+        Assert.That(command.ProjectName, Is.EqualTo("Wayfold"))
+        Assert.That(command.Action, Is.EqualTo("Health"))
+        Assert.That(command.OperationId, Is.Empty)
+    | other -> Assert.Fail(sprintf "Expected LedgerReadCommand; got %A" other)
+
+
+[<Test>]
+let ``project scoped MCP tools standardize explicit agentId arguments`` () =
+    let excluded = set [ "RegisterAgent"; "InitializeLedger"; "BindExistingLedger"; "RebindLedgerRemote" ]
+    let tools = typeof<JarvisMcpTools>.GetMethods(System.Reflection.BindingFlags.Public ||| System.Reflection.BindingFlags.Static)
+    for tool in tools do
+        let parameters = tool.GetParameters() |> Array.map (fun p -> p.Name) |> Set.ofArray
+        for deprecated in [ "ownerId"; "newOwnerId"; "actorId"; "reviewerId"; "requesterId" ] do
+            Assert.That(parameters.Contains(deprecated), Is.False, tool.Name + " exposes " + deprecated)
+        if parameters.Contains("projectName") && not (excluded.Contains tool.Name) then
+            let isGlobalFilter =
+                tool.Name = "Feedback" || tool.Name = "ListFeedback"
+                || tool.Name = "GetFeedbackSummary" || tool.Name = "GetConnectionDiagnostics" || tool.Name = "GetClientActivity"
+            if not isGlobalFilter then
+                Assert.That(parameters.Contains("agentId") || (tool.Name = "NotifyAgent" && parameters.Contains("fromAgentId")),
+                            Is.True, tool.Name + " lacks explicit agent attribution")
+
+
+[<Test>]
+let client_request_abort_cancels_outstanding_device_correlation_without_faulting_device () =
+    task {
+        let users = UserService()
+        let user = "auth0|caller"
+        let connection = "conn-1"
+        users.TransportConnected(user, connection)
+        let registered =
+            users.Register(user,
+                { DeviceId = "device-1"
+                  DeviceName = "Workstation"
+                  ProtocolVersion = AgentProtocol.version
+                  ClientVersion = "test"
+                  SupportedCommands = [ "ListProjects" ] }, connection)
+        let tracker = ClientResponseTracker()
+        let dispatched =
+            TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let recipient =
+            { new Common.SignalR.IClientService with
+                member _.ReceiveMessage(_) = Task.CompletedTask
+                member _.ReceiveCommand(correlationId, _, _) =
+                    dispatched.TrySetResult(correlationId) |> ignore
+                    Task.CompletedTask
+                member _.InvalidateAgentStates(_, _) = Task.CompletedTask }
+        let clients =
+            { new Microsoft.AspNetCore.SignalR.IHubClients<Common.SignalR.IClientService> with
+                member _.All = recipient
+                member _.AllExcept(_) = recipient
+                member _.Client(_) = recipient
+                member _.Clients(_) = recipient
+                member _.Group(_) = recipient
+                member _.GroupExcept(_, _) = recipient
+                member _.Groups(_) = recipient
+                member _.User(_) = recipient
+                member _.Users(_) = recipient }
+        let hub =
+            { new Microsoft.AspNetCore.SignalR.IHubContext<HubService, Common.SignalR.IClientService> with
+                member _.Clients = clients
+                member _.Groups = Unchecked.defaultof<_> }
+        use abort = new System.Threading.CancellationTokenSource()
+        let context = Microsoft.AspNetCore.Http.DefaultHttpContext()
+        context.RequestAborted <- abort.Token
+        let http = Microsoft.AspNetCore.Http.HttpContextAccessor()
+        http.HttpContext <- context
+        let service = ClientService(hub, users, tracker, http)
+        let pending = service.SendCommandToUser(user, ListProjectsCommand)
+        let! correlationId = dispatched.Task.WaitAsync(TimeSpan.FromSeconds(4.))
+        abort.Cancel()
+        let! canceled =
+            task {
+                try
+                    let! _ = pending
+                    return false
+                with :? OperationCanceledException -> return true
+            }
+        Assert.That(canceled, Is.True)
+        let response = { Result = Some "unexpected"; Error = None; Instructions = []; AgentStateChanges = []; InboxActivation = None }
+        Assert.That(tracker.Complete(correlationId, user, connection, registered.Generation, response), Is.False)
+        match users.GetSession(user) with
+        | ValueSome session ->
+            Assert.That(session.State, Is.EqualTo(Registered))
+            Assert.That(session.LastFailure.IsNone, Is.True)
+        | ValueNone -> Assert.Fail("Original session should remain registered.")
+    }

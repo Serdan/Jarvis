@@ -14,6 +14,7 @@ module EffectError =
         | NotFoundError resource -> $"NotFoundError: {resource} not found"
         | PermissionDenied resource -> $"PermissionDenied: Access denied to {resource}"
         | ConfirmationRequired request -> $"ConfirmationRequired: {request.Summary}"
+        | LedgerFailureError failure -> $"LedgerFailure({failure.Code}): {failure.Message}"
         | AggregatedErrors errors ->
             let errorList = errors |> List.map toString |> String.concat "\n"
             $"AggregatedErrors:\n{errorList}"
@@ -27,6 +28,7 @@ module EffectError =
         | NotFoundError resource -> Common.AgentError.NotFound resource
         | PermissionDenied resource -> Common.AgentError.PermissionDenied resource
         | ConfirmationRequired request -> Common.AgentError.ConfirmationRequired request
+        | LedgerFailureError failure -> Common.AgentError.LedgerFailure failure
         | AggregatedErrors errors ->
             errors |> List.map toString |> String.concat "\n" |> Common.AgentError.ExecutionFailed
 

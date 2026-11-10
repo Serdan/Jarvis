@@ -171,10 +171,12 @@ let inspectRemoval (cmd: InspectWorktreeRemovalCommand) =
         let! status = git cmd.ProjectName [ "-C"; entry.Path; "status"; "--porcelain" ]
         let! integrated = git cmd.ProjectName [ "merge-base"; "--is-ancestor"; entry.Head; target ]
         let! allJobs = JobManager.listJobs { ProjectName = None; IncludeCompleted = false }
+        let canonical = ProjectPaths.ProjectTarget.identity cmd.ProjectName
         let jobs =
             allJobs.Jobs |> List.filter (fun job ->
-                job.ProjectName = cmd.ProjectName
-                || job.ProjectName.StartsWith(cmd.ProjectName + "::", StringComparison.Ordinal))
+                match canonical, ProjectPaths.ProjectTarget.identity job.ProjectName with
+                | Ok expected, Ok actual -> expected = actual
+                | _ -> false)
         let isClean = status.ExitCode = 0 && not status.TimedOut && not status.Truncated && String.IsNullOrWhiteSpace status.StdOut
         let isIntegrated = not (String.IsNullOrWhiteSpace target) && integrated.ExitCode = 0 && not integrated.TimedOut
         let reasons =

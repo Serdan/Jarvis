@@ -141,6 +141,18 @@ type FakeContext() =
 
     interface FileIO with
         member this.File = fakeFileOperations
+        member _.EditText(path, _, edit) =
+            // This legacy project-browser fake has no persistent write store,
+            // just as its old WriteAllText/AppendAllText methods returned Ok.
+            // Still execute the actual typed edit/patch plan against its
+            // current read fixture so diagnostics and preconditions are real.
+            let existing =
+                match fakeFileOperations.ReadAllText(path) with
+                | Ok(Content text) -> Ok(Some text)
+                | Error(NotFoundError _) -> Ok None
+                | Error failure -> Error failure
+            existing |> Result.bind (fun original ->
+                edit original |> Result.map snd)
 
 let fakeContext = FakeContext()
 
@@ -158,7 +170,7 @@ let ``listCommands returns current protocol capabilities`` () =
         capability "PatchFile" |> _.SupportsDryRun |> shouldEqual true
         capability "WriteFile" |> _.SupportsDryRun |> shouldEqual false
         capability "RunCommand" |> _.SupportsDryRun |> shouldEqual false
-        capability "ListProjectTasks" |> _.Permissions |> shouldEqual [ ReadOnly ]
+        capability "ListConfiguredTasks" |> _.Permissions |> shouldEqual [ ReadOnly ]
         capability "RunProjectTask" |> _.Permissions |> shouldEqual [ ProcessExecution ]
         capability "ListSkills" |> _.Permissions |> shouldEqual [ ReadOnly ]
         capability "GetSkill" |> _.Permissions |> shouldEqual [ ReadOnly ]
@@ -262,7 +274,7 @@ let ``searchFiles returns matching project items`` () =
     let result = searchFiles cmd fakeContext
 
     match result with
-    | Ok items -> items.Length |> shouldEqual 1
+    | Ok items -> items.Matches.Length |> shouldEqual 1
     | Error e -> Assert.Fail($"Expected Ok, but got Error: {EffectError.toString e}")
 
 [<Test>]
@@ -275,7 +287,7 @@ let ``searchText returns structured matches`` () =
           ExcludeGlobs = []
           MaxResults = Some 10 }
 
-    let result = searchText cmd fakeContext
+    let result = searchText cmd fakeContext |> Result.map (fun output -> output.Matches)
     result
     |> shouldEqual
         (Ok
@@ -299,6 +311,7 @@ let ``searchText respects include globs`` () =
           MaxResults = Some 10 }
 
     searchText cmd fakeContext
+    |> Result.map (fun output -> output.Matches)
     |> shouldEqual
         (Ok
             [ { FilePath = Path.Combine("src", "deep.md")
@@ -317,6 +330,7 @@ let ``searchText respects exclude globs`` () =
           MaxResults = Some 10 }
 
     searchText cmd fakeContext
+    |> Result.map (fun output -> output.Matches)
     |> shouldEqual
         (Ok
             [ { FilePath = "readme.md"
@@ -333,7 +347,7 @@ let ``searchFiles recursively returns nested project items`` () =
           MaxResults = Some 10 }
 
     match searchFiles cmd fakeContext with
-    | Ok items -> items |> shouldContain (ProjectFile(Path.Combine("src", "deep.md"), 0L, System.DateTimeOffset.MinValue, System.DateTimeOffset.MinValue))
+    | Ok items -> items.Matches |> shouldContain (ProjectFile(Path.Combine("src", "deep.md"), 0L, System.DateTimeOffset.MinValue, System.DateTimeOffset.MinValue))
     | Error e -> Assert.Fail($"Expected Ok, but got Error: {EffectError.toString e}")
 
 
@@ -357,12 +371,14 @@ let ``listDirectory returns files and folders`` () =
     | Error e -> Assert.Fail($"Expected Ok, got Error: {EffectError.toString e}")
 
 [<Test>]
-let ``listDirectory aggregates missing folder errors`` () =
+let ``listDirectory reports one missing folder error`` () =
     let cmd = { ProjectName = "Project1"; FolderPath = "missing" }
 
+    // Directory resolution is now done once rather than independently in
+    // eager file and subdirectory scans. Do not duplicate a missing-path error.
     match listDirectory cmd fakeContext with
-    | Error(AggregatedErrors errors) -> errors.Length |> shouldEqual 2
-    | other -> Assert.Fail($"Expected AggregatedErrors, got {other}")
+    | Error(NotFoundError _) -> ()
+    | other -> Assert.Fail($"Expected NotFoundError, got {other}")
 
 [<Test>]
 let ``readFile returns content`` () =
@@ -448,7 +464,7 @@ let ``searchFiles respects max results`` () =
           MaxResults = Some 1 }
 
     match searchFiles cmd fakeContext with
-    | Ok items -> items.Length |> shouldEqual 1
+    | Ok items -> items.Matches.Length |> shouldEqual 1
     | Error e -> Assert.Fail($"Expected Ok, got Error: {EffectError.toString e}")
 
 [<Test>]
@@ -460,7 +476,7 @@ let ``searchFiles can scope to folder`` () =
           MaxResults = None }
 
     match searchFiles cmd fakeContext with
-    | Ok items -> items |> shouldEqual [ ProjectFile(Path.Combine("src", "deep.md"), 0L, System.DateTimeOffset.MinValue, System.DateTimeOffset.MinValue) ]
+    | Ok items -> items.Matches |> shouldEqual [ ProjectFile(Path.Combine("src", "deep.md"), 0L, System.DateTimeOffset.MinValue, System.DateTimeOffset.MinValue) ]
     | Error e -> Assert.Fail($"Expected Ok, got Error: {EffectError.toString e}")
 
 [<Test>]
@@ -474,6 +490,7 @@ let ``searchText respects max results`` () =
           MaxResults = Some 1 }
 
     searchText cmd fakeContext
+    |> Result.map (fun output -> output.Matches)
     |> shouldEqual
         (Ok
             [ { FilePath = "readme.md"
@@ -491,4 +508,4 @@ let ``searchText returns empty when no matches`` () =
           ExcludeGlobs = []
           MaxResults = None }
 
-    searchText cmd fakeContext |> shouldEqual (Ok [])
+    searchText cmd fakeContext |> Result.map (fun output -> output.Matches) |> shouldEqual (Ok [])

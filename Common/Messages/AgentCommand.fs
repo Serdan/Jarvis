@@ -120,6 +120,14 @@ type BrowserExportDomCommand =
       WaitJson: string option
       CaptureSelector: string option
       TimeoutMs: int option }
+type CreateProjectCommand =
+    { Name: string
+      InitializeGit: bool
+      CreateJarvisConfig: bool
+      CreateAgentInstructions: bool
+      InitializeLedger: bool
+      RemoteUrl: string
+      AcknowledgeRemoteVisibility: bool }
 
 
 type ListWorktreesCommand = { ProjectName: string }
@@ -139,90 +147,125 @@ type RemoveWorktreeCommand =
       TargetRef: string option }
 
 
-type ListTasksCommand = { ProjectName: string; Status: string option; Owner: string option; DependsOn: string option; NextActor: string option }
-type GetTaskCommand = { ProjectName: string; TaskId: string }
-type CompareWorktreeTasksCommand = { ProjectName: string; NextActor: string option }
-type GetAgentAssignmentCommand = { ProjectName: string; Agent: string }
-type GetOrchestrationSnapshotCommand =
+type TaskReadCommand =
     { ProjectName: string
-      Status: string option
-      Owner: string option
-      NextActor: string option
-      ReviewerOnly: bool
-      Offset: int
-      Limit: int
-      IncludeRetirement: bool }
-type CreateTaskCommand =
+      AgentId: string
+      Action: string
+      TaskId: string
+      AssignmentGeneration: int
+      CheckpointSequence: int64
+      Cursor: string
+      PageSize: int
+      BeforeOid: string
+      AfterOid: string
+      RelativePath: string }
+
+/// Distinct actor and subject: observation never authorizes activity for the target.
+type ObserveAgentRequest =
     { ProjectName: string
-      TaskId: string option
+      ObserverAgentId: string
+      TargetAgentId: string }
+
+type TaskWriteCommand =
+    { ProjectName: string
+      Action: string
+      OperationId: string
+      TaskId: string
+      AttemptId: string
+      ActorId: string
+      OwnerId: string
       Title: string
       Html: string
-      Dependencies: string list }
-type UpdateTaskCommand =
-    { ProjectName: string
-      TaskId: string
-      ExpectedRevision: string option
-      Title: string option
-      Status: string option
-      Dependencies: string list option
-      DescriptionCommit: string option
-      AssignmentInstructions: string option
-      AssignmentBaseCommit: string option
-      ExpectedAssignmentRevision: string option
-      NextActor: string option
-      ActorId: string option }
-type AssignTaskCommand =
-    { ProjectName: string
-      Agent: string
-      TaskId: string
-      WorktreeName: string option
-      Branch: string option
-      Instructions: string
-      BaseCommit: string option
-      ExpectedRevision: string option
-      ExpectedAssignmentRevision: string option
-      ActorId: string }
-type RetireWorktreeCommand = { ProjectName: string; WorktreePath: string; TargetRef: string option; DeleteBranch: bool; DryRun: bool }
-type BeginTaskCommand = { ProjectName: string; TaskId: string; Agent: string; AssignmentRevision: string; ExpectedRevision: string option }
-type AcknowledgeTaskCommand =
-    { ProjectName: string
-      TaskId: string
-      Agent: string
-      AssignmentRevision: string
-      ExpectedRevision: string option }
-type ClaimTaskCommand =
-    { ProjectName: string
-      TaskId: string
-      ExpectedRevision: string option
-      Owner: string
-      AllowReassign: bool }
-type CheckpointTaskCommand =
-    { ProjectName: string
-      TaskId: string
-      ExpectedRevision: string option
-      Status: string
+      ExpectedVersion: int
+      ExpectedAgentVersion: int
+      ExpectedTaskVersion: int
+      AssignmentGeneration: int
       Summary: string
       NextAction: string
-      Verified: string list
-      Blocker: string option
-      LastCommit: string option
-      DescriptionCommit: string option
-      AcknowledgedAssignmentRevision: string option
-      ActorId: string option }
-type CompleteTaskCommand =
-    { ProjectName: string
-      TaskId: string
-      ExpectedRevision: string option
-      Verified: string list
-      FinalCommit: string option
-      AcknowledgedAssignmentRevision: string option
-      ActorId: string option }
-type GetTaskHistoryCommand =
-    { ProjectName: string
-      TaskId: string
-      Limit: int option }
+      Reason: string
+      BaseOid: string
+      TargetRef: string
+      SourceRef: string
+      AllowDetached: bool
+      AllowUncommitted: bool
+      DecisionSequence: int64
+      Evidence: string
+      SessionId: string }
 
+type LedgerReadCommand =
+    { ProjectName: string
+      Action: string
+      OperationId: string
+      Cursor: string
+      PageSize: int }
 
+type LedgerWriteCommand =
+    { ProjectName: string
+      Action: string
+      OperationId: string
+      ProjectId: string
+      LedgerId: string
+      Epoch: int
+      RemoteName: string
+      ApprovedFetchUrl: string
+      ApprovedPushUrl: string
+      ExpectedTrustedHead: string
+      ExpectedRequestHash: string
+      AcknowledgeVisibility: bool }
+
+type ReviewReadCommand =
+    { ProjectName: string
+      Action: string
+      TaskId: string
+      RequestId: string
+      ReviewerId: string
+      DocumentPath: string }
+
+type ReviewWriteCommand =
+    { ProjectName: string
+      Action: string
+      OperationId: string
+      TaskId: string
+      RequestId: string
+      ActorId: string
+      ReviewerId: string
+      ExpectedVersion: int
+      Kind: string
+      SourceRef: string
+      HeadOid: string
+      TargetRef: string
+      Summary: string
+      Verdict: string
+      DocumentPath: string
+      Content: string
+      ExpectedBlobOid: string }
+
+// Explicit operator-only recovery. Neither command is a routine agent write
+// and neither creates a new operation UUID.
+type RetryPendingIntentCommand =
+    { ProjectName: string
+      OperationId: string
+      OperatorId: string
+      ExpectedCommandSha256: string
+      ExpectedVerifiedHead: string }
+
+type SupersedePendingIntentCommand =
+    { ProjectName: string
+      OperationId: string
+      OperatorId: string
+      ExpectedCommandSha256: string
+      ExpectedVerifiedHead: string
+      RelatedOperationId: string
+      RelatedRequestHash: string
+      Reason: string }
+
+type AbandonPendingIntentCommand =
+    { ProjectName: string
+      OperationId: string
+      OperatorId: string
+      ExpectedCommandSha256: string
+      ExpectedVerifiedHead: string
+      Reason: string }
 
 type GetProjectDetailsCommand = { ProjectName: string }
 
@@ -250,6 +293,25 @@ type SearchTextMatch =
       Column: int
       Preview: string }
 
+/// Explicit search completion state; results are never silently truncated.
+[<RequireQualifiedAccess>]
+[<JsonConverter(typeof<UnionConverter<SearchStopReason>>)>]
+type SearchStopReason =
+    | Finished
+    | ResultLimit
+    | FileVisitLimit
+    | DirectoryVisitLimit
+    | EntryVisitLimit
+    | TimeLimit
+    | OutputByteLimit
+    | TextScanLimit
+
+type SearchResult<'T> =
+    { Matches: 'T list
+      StopReason: SearchStopReason
+      FilesVisited: int
+      DirectoriesVisited: int }
+
 type ReadFileCommand =
     { ProjectName: string
       FilePath: string
@@ -257,9 +319,33 @@ type ReadFileCommand =
       EndLine: int option
       IncludeLineNumbers: bool option }
 
+/// Bounded UTF-8 content page with a file-version-aware continuation.
+type ReadFilePageCommand =
+    { ProjectName: string
+      FilePath: string
+      Cursor: string option
+      PageBytes: int option }
+
+type ReadFilePageResult =
+    { FilePath: string
+      Content: string
+      StartByte: int64
+      NextByte: int64
+      TotalBytes: int64
+      FirstLine: int64
+      NextLine: int64
+      NextCursor: string option }
+
 type ReadFilesCommand =
     { ProjectName: string
       FilePaths: string list }
+
+/// Explicit, uncached hierarchy retrieval. The cursor continues large responses
+/// without imposing a file-length or hierarchy-depth limit.
+type GetAgentInstructionsCommand =
+    { ProjectName: string
+      Directory: string
+      Cursor: string option }
 
 type ReadImageCommand =
     { ProjectName: string
@@ -375,67 +461,15 @@ type ProjectTaskDefinition =
       TimeoutSeconds: int option
       MaxOutputBytes: int option }
 
-type ListProjectTasksCommand =
+type ListConfiguredTasksCommand =
     { ProjectName: string }
 
-type ListProjectTasksResult =
+type ListConfiguredTasksResult =
     { Tasks: ProjectTaskDefinition list }
 
 type RunProjectTaskCommand =
     { ProjectName: string
       TaskName: string }
-
-type AttachWorkTaskCommand =
-    { ProjectName: string
-      TaskId: string
-      TaskPath: string }
-
-type GetWorkTaskCommand =
-    { ProjectName: string
-      TaskId: string }
-
-type ListWorkTasksCommand =
-    { ProjectName: string }
-
-type CheckpointWorkTaskCommand =
-    { ProjectName: string
-      TaskId: string
-      Status: string
-      Summary: string
-      NextAction: string
-      Verified: string list
-      Blocker: string option
-      LastCommit: string option }
-
-type CompleteWorkTaskCommand =
-    { ProjectName: string
-      TaskId: string }
-
-type WorkTask =
-    { TaskId: string
-      TaskPath: string
-      TaskCommit: string
-      CurrentTaskCommit: string option
-      TaskChanged: bool
-      TaskDirty: bool
-      Status: string
-      Summary: string option
-      NextAction: string option
-      Verified: string list
-      Blocker: string option
-      CreatedAt: DateTimeOffset
-      UpdatedAt: DateTimeOffset
-      LastCommit: string option
-      TaskContent: string option }
-
-type ListWorkTasksResult = { Tasks: WorkTask list }
-
-type CompleteWorkTaskResult =
-    { TaskId: string
-      TaskPath: string
-      TaskCommit: string
-      FinalCommit: string
-      CompletedAt: DateTimeOffset }
 
 type ListSkillsCommand =
     { ProjectName: string }
@@ -537,7 +571,8 @@ type JobOutputEvent =
       Text: string }
 
 type GetJobResultCommand =
-    { JobId: string
+    { ProjectName: string
+      JobId: string
       AfterSequence: int64 option }
 
 type JobResult =
@@ -547,7 +582,7 @@ type JobResult =
       NextSequence: int64
       Truncated: bool }
 
-type CancelJobCommand = { JobId: string }
+type CancelJobCommand = { ProjectName: string; JobId: string }
 
 type MessageCommand =
     { ProjectName: string option
@@ -586,6 +621,12 @@ type ConfirmationRequest =
       EstimatedImpact: string
       SupportsDryRun: bool }
 
+type LedgerFailureInfo =
+    { Code: string
+      Message: string
+      OperationId: string option
+      VerifiedLedgerHead: string option }
+
 [<JsonConverter(typeof<UnionConverter<AgentError>>)>]
 type AgentError =
     | NotFound of string
@@ -595,6 +636,7 @@ type AgentError =
     | Conflict of string
     | ExecutionFailed of string
     | OutputTruncated of string
+    | LedgerFailure of LedgerFailureInfo
 
 type InstructionDocument =
     { Scope: string
@@ -602,10 +644,30 @@ type InstructionDocument =
       Sha256: string
       Content: string }
 
+/// A canonical ledger mutation changed the assignment or Working-turn state
+/// of this agent. Advisory to other clients; never an authorization claim.
+type AgentStateChange =
+    { ProjectName: string
+      AgentId: string }
+
+/// Caller-visible outcome of a self-AgentInbox's automatic activation.
+/// CommittedHead/OperationId are present only after a confirmed ledger write.
+/// A non-activating read is explicitly reported without inventing a transition.
+type AgentInboxActivation =
+    { ProjectName: string
+      AgentId: string
+      ActivatedByThisCall: bool
+      BeforeState: string option
+      AfterState: string option
+      CommittedHead: string option
+      OperationId: string option }
+
 type AgentCommandResponse =
     { Result: string option
       Error: AgentError option
-      Instructions: InstructionDocument list }
+      Instructions: InstructionDocument list
+      AgentStateChanges: AgentStateChange list
+      InboxActivation: AgentInboxActivation option }
 
 [<JsonConverter(typeof<UnionConverter<AgentCommand>>)>]
 type AgentCommand =
@@ -623,32 +685,30 @@ type AgentCommand =
     | BrowserExecuteJsCommand of BrowserExecuteJsCommand
     | BrowserCaptureDomCommand of BrowserCaptureDomCommand
     | BrowserExportDomCommand of BrowserExportDomCommand
+    | CreateProjectCommand of CreateProjectCommand
     | ListWorktreesCommand of ListWorktreesCommand
     | GetWorktreeCommand of GetWorktreeCommand
     | CreateWorktreeCommand of CreateWorktreeCommand
     | InspectWorktreeRemovalCommand of InspectWorktreeRemovalCommand
     | RemoveWorktreeCommand of RemoveWorktreeCommand
-    | ListTasksCommand of ListTasksCommand
-    | GetTaskCommand of GetTaskCommand
-    | CompareWorktreeTasksCommand of CompareWorktreeTasksCommand
-    | GetAgentAssignmentCommand of GetAgentAssignmentCommand
-    | GetOrchestrationSnapshotCommand of GetOrchestrationSnapshotCommand
-    | AssignTaskCommand of AssignTaskCommand
-    | AcknowledgeTaskCommand of AcknowledgeTaskCommand
-    | BeginTaskCommand of BeginTaskCommand
-    | RetireWorktreeCommand of RetireWorktreeCommand
-    | CreateTaskCommand of CreateTaskCommand
-    | UpdateTaskCommand of UpdateTaskCommand
-    | ClaimTaskCommand of ClaimTaskCommand
-    | CheckpointTaskCommand of CheckpointTaskCommand
-    | CompleteTaskCommand of CompleteTaskCommand
-    | GetTaskHistoryCommand of GetTaskHistoryCommand
+    | TaskReadCommand of TaskReadCommand
+    | ObserveAgentCommand of ObserveAgentRequest
+    | TaskWriteCommand of TaskWriteCommand
+    | LedgerReadCommand of LedgerReadCommand
+    | LedgerWriteCommand of LedgerWriteCommand
+    | ReviewReadCommand of ReviewReadCommand
+    | ReviewWriteCommand of ReviewWriteCommand
+    | RetryPendingIntentCommand of RetryPendingIntentCommand
+    | SupersedePendingIntentCommand of SupersedePendingIntentCommand
+    | AbandonPendingIntentCommand of AbandonPendingIntentCommand
     | GetProjectDetailsCommand of GetProjectDetailsCommand
     | ListDirectoryCommand of ListDirectoryCommand
     | SearchFilesCommand of SearchFilesCommand
     | SearchTextCommand of SearchTextCommand
     | ReadFileCommand of ReadFileCommand
+    | ReadFilePageCommand of ReadFilePageCommand
     | ReadFilesCommand of ReadFilesCommand
+    | GetAgentInstructionsCommand of GetAgentInstructionsCommand
     | ReadImageCommand of ReadImageCommand
     | ExportFileCommand of ExportFileCommand
     | ImportFileCommand of ImportFileCommand
@@ -656,13 +716,8 @@ type AgentCommand =
     | WriteFileCommand of WriteFileCommand
     | PatchFileCommand of PatchFileCommand
     | RunCommandCommand of RunCommandCommand
-    | ListProjectTasksCommand of ListProjectTasksCommand
+    | ListConfiguredTasksCommand of ListConfiguredTasksCommand
     | RunProjectTaskCommand of RunProjectTaskCommand
-    | AttachWorkTaskCommand of AttachWorkTaskCommand
-    | GetWorkTaskCommand of GetWorkTaskCommand
-    | ListWorkTasksCommand of ListWorkTasksCommand
-    | CheckpointWorkTaskCommand of CheckpointWorkTaskCommand
-    | CompleteWorkTaskCommand of CompleteWorkTaskCommand
     | ListSkillsCommand of ListSkillsCommand
     | GetSkillCommand of GetSkillCommand
     | CreateSkillCommand of CreateSkillCommand
@@ -692,32 +747,30 @@ module AgentCommandInfo =
         | BrowserExecuteJsCommand _ -> "BrowserExecuteJsCommand"
         | BrowserCaptureDomCommand _ -> "BrowserCaptureDomCommand"
         | BrowserExportDomCommand _ -> "BrowserExportDomCommand"
+        | CreateProjectCommand _ -> "CreateProjectCommand"
         | ListWorktreesCommand _ -> "ListWorktreesCommand"
         | GetWorktreeCommand _ -> "GetWorktreeCommand"
         | CreateWorktreeCommand _ -> "CreateWorktreeCommand"
         | InspectWorktreeRemovalCommand _ -> "InspectWorktreeRemovalCommand"
         | RemoveWorktreeCommand _ -> "RemoveWorktreeCommand"
-        | ListTasksCommand _ -> "ListTasksCommand"
-        | GetTaskCommand _ -> "GetTaskCommand"
-        | CompareWorktreeTasksCommand _ -> "CompareWorktreeTasksCommand"
-        | GetAgentAssignmentCommand _ -> "GetAgentAssignmentCommand"
-        | GetOrchestrationSnapshotCommand _ -> "GetOrchestrationSnapshotCommand"
-        | AssignTaskCommand _ -> "AssignTaskCommand"
-        | AcknowledgeTaskCommand _ -> "AcknowledgeTaskCommand"
-        | BeginTaskCommand _ -> "BeginTaskCommand"
-        | RetireWorktreeCommand _ -> "RetireWorktreeCommand"
-        | CreateTaskCommand _ -> "CreateTaskCommand"
-        | UpdateTaskCommand _ -> "UpdateTaskCommand"
-        | ClaimTaskCommand _ -> "ClaimTaskCommand"
-        | CheckpointTaskCommand _ -> "CheckpointTaskCommand"
-        | CompleteTaskCommand _ -> "CompleteTaskCommand"
-        | GetTaskHistoryCommand _ -> "GetTaskHistoryCommand"
+        | TaskReadCommand _ -> "TaskReadCommand"
+        | ObserveAgentCommand _ -> "ObserveAgentCommand"
+        | TaskWriteCommand _ -> "TaskWriteCommand"
+        | LedgerReadCommand _ -> "LedgerReadCommand"
+        | LedgerWriteCommand _ -> "LedgerWriteCommand"
+        | ReviewReadCommand _ -> "ReviewReadCommand"
+        | ReviewWriteCommand _ -> "ReviewWriteCommand"
+        | RetryPendingIntentCommand _ -> "RetryPendingIntentCommand"
+        | SupersedePendingIntentCommand _ -> "SupersedePendingIntentCommand"
+        | AbandonPendingIntentCommand _ -> "AbandonPendingIntentCommand"
         | GetProjectDetailsCommand _ -> "GetProjectDetailsCommand"
         | ListDirectoryCommand _ -> "ListDirectoryCommand"
         | SearchFilesCommand _ -> "SearchFilesCommand"
         | SearchTextCommand _ -> "SearchTextCommand"
         | ReadFileCommand _ -> "ReadFileCommand"
+        | ReadFilePageCommand _ -> "ReadFilePageCommand"
         | ReadFilesCommand _ -> "ReadFilesCommand"
+        | GetAgentInstructionsCommand _ -> "GetAgentInstructionsCommand"
         | ReadImageCommand _ -> "ReadImageCommand"
         | ExportFileCommand _ -> "ExportFileCommand"
         | ImportFileCommand _ -> "ImportFileCommand"
@@ -725,13 +778,8 @@ module AgentCommandInfo =
         | WriteFileCommand _ -> "WriteFileCommand"
         | PatchFileCommand _ -> "PatchFileCommand"
         | RunCommandCommand _ -> "RunCommandCommand"
-        | ListProjectTasksCommand _ -> "ListProjectTasksCommand"
+        | ListConfiguredTasksCommand _ -> "ListConfiguredTasksCommand"
         | RunProjectTaskCommand _ -> "RunProjectTaskCommand"
-        | AttachWorkTaskCommand _ -> "AttachWorkTaskCommand"
-        | GetWorkTaskCommand _ -> "GetWorkTaskCommand"
-        | ListWorkTasksCommand _ -> "ListWorkTasksCommand"
-        | CheckpointWorkTaskCommand _ -> "CheckpointWorkTaskCommand"
-        | CompleteWorkTaskCommand _ -> "CompleteWorkTaskCommand"
         | ListSkillsCommand _ -> "ListSkillsCommand"
         | GetSkillCommand _ -> "GetSkillCommand"
         | CreateSkillCommand _ -> "CreateSkillCommand"
@@ -767,32 +815,30 @@ module AgentCommandInfo =
         | BrowserExecuteJsCommand _ -> "BrowserExecuteJs"
         | BrowserCaptureDomCommand _ -> "BrowserCaptureDom"
         | BrowserExportDomCommand _ -> "BrowserExportDom"
+        | CreateProjectCommand _ -> "CreateProject"
         | ListWorktreesCommand _ -> "ListWorktrees"
         | GetWorktreeCommand _ -> "GetWorktree"
         | CreateWorktreeCommand _ -> "CreateWorktree"
         | InspectWorktreeRemovalCommand _ -> "InspectWorktreeRemoval"
         | RemoveWorktreeCommand _ -> "RemoveWorktree"
-        | ListTasksCommand _ -> "ListTasks"
-        | GetTaskCommand _ -> "GetTask"
-        | CompareWorktreeTasksCommand _ -> "CompareWorktreeTasks"
-        | GetAgentAssignmentCommand _ -> "GetAgentAssignment"
-        | GetOrchestrationSnapshotCommand _ -> "GetOrchestrationSnapshot"
-        | AssignTaskCommand _ -> "AssignTask"
-        | AcknowledgeTaskCommand _ -> "AcknowledgeTask"
-        | BeginTaskCommand _ -> "BeginTask"
-        | RetireWorktreeCommand _ -> "RetireWorktree"
-        | CreateTaskCommand _ -> "CreateTask"
-        | UpdateTaskCommand _ -> "UpdateTask"
-        | ClaimTaskCommand _ -> "ClaimTask"
-        | CheckpointTaskCommand _ -> "CheckpointTask"
-        | CompleteTaskCommand _ -> "CompleteTask"
-        | GetTaskHistoryCommand _ -> "GetTaskHistory"
+        | TaskReadCommand _ -> "TaskRead"
+        | ObserveAgentCommand _ -> "ObserveAgent"
+        | TaskWriteCommand _ -> "TaskWrite"
+        | LedgerReadCommand _ -> "LedgerRead"
+        | LedgerWriteCommand _ -> "LedgerWrite"
+        | ReviewReadCommand _ -> "ReviewRead"
+        | ReviewWriteCommand _ -> "ReviewWrite"
+        | RetryPendingIntentCommand _ -> "RetryPendingIntent"
+        | SupersedePendingIntentCommand _ -> "SupersedePendingIntent"
+        | AbandonPendingIntentCommand _ -> "AbandonPendingIntent"
         | GetProjectDetailsCommand _ -> "GetProjectDetails"
         | ListDirectoryCommand _ -> "ListDirectory"
         | SearchFilesCommand _ -> "SearchFiles"
         | SearchTextCommand _ -> "SearchText"
         | ReadFileCommand _ -> "ReadFile"
+        | ReadFilePageCommand _ -> "ReadFilePage"
         | ReadFilesCommand _ -> "ReadFiles"
+        | GetAgentInstructionsCommand _ -> "GetAgentInstructions"
         | ReadImageCommand _ -> "ReadImage"
         | ExportFileCommand _ -> "ExportFile"
         | ImportFileCommand _ -> "ImportFile"
@@ -800,13 +846,8 @@ module AgentCommandInfo =
         | WriteFileCommand _ -> "WriteFile"
         | PatchFileCommand _ -> "PatchFile"
         | RunCommandCommand _ -> "RunCommand"
-        | ListProjectTasksCommand _ -> "ListProjectTasks"
+        | ListConfiguredTasksCommand _ -> "ListConfiguredTasks"
         | RunProjectTaskCommand _ -> "RunTask"
-        | AttachWorkTaskCommand _ -> "AttachWorkTask"
-        | GetWorkTaskCommand _ -> "GetWorkTask"
-        | ListWorkTasksCommand _ -> "ListWorkTasks"
-        | CheckpointWorkTaskCommand _ -> "CheckpointWorkTask"
-        | CompleteWorkTaskCommand _ -> "CompleteWorkTask"
         | ListSkillsCommand _ -> "ListSkills"
         | GetSkillCommand _ -> "GetSkill"
         | CreateSkillCommand _ -> "CreateSkill"
@@ -831,9 +872,10 @@ module AgentCommandInfo =
         | BrowserOpenTabCommand _
         | BrowserExecuteJsCommand _
         | BrowserCaptureDomCommand _
-        | GetJobResultCommand _
-        | CancelJobCommand _
+        | CreateProjectCommand _
         | UpdateClientCommand -> None
+        | GetJobResultCommand cmd -> Some cmd.ProjectName
+        | CancelJobCommand cmd -> Some cmd.ProjectName
         | MessageCommand cmd -> cmd.ProjectName
         | GetClientActivityCommand cmd -> cmd.ProjectName
         | ScheduleBrowserExecutionCommand cmd -> Some cmd.ProjectName
@@ -845,40 +887,32 @@ module AgentCommandInfo =
         | CreateWorktreeCommand cmd -> Some cmd.ProjectName
         | InspectWorktreeRemovalCommand cmd -> Some cmd.ProjectName
         | RemoveWorktreeCommand cmd -> Some cmd.ProjectName
-        | ListTasksCommand cmd -> Some cmd.ProjectName
-        | GetTaskCommand cmd -> Some cmd.ProjectName
-        | CompareWorktreeTasksCommand cmd -> Some cmd.ProjectName
-        | GetAgentAssignmentCommand cmd -> Some cmd.ProjectName
-        | GetOrchestrationSnapshotCommand cmd -> Some cmd.ProjectName
-        | AssignTaskCommand cmd -> Some cmd.ProjectName
-        | AcknowledgeTaskCommand cmd -> Some cmd.ProjectName
-        | BeginTaskCommand cmd -> Some cmd.ProjectName
-        | RetireWorktreeCommand cmd -> Some cmd.ProjectName
-        | CreateTaskCommand cmd -> Some cmd.ProjectName
-        | UpdateTaskCommand cmd -> Some cmd.ProjectName
-        | ClaimTaskCommand cmd -> Some cmd.ProjectName
-        | CheckpointTaskCommand cmd -> Some cmd.ProjectName
-        | CompleteTaskCommand cmd -> Some cmd.ProjectName
-        | GetTaskHistoryCommand cmd -> Some cmd.ProjectName
+        | TaskReadCommand cmd -> Some cmd.ProjectName
+        | ObserveAgentCommand cmd -> Some cmd.ProjectName
+        | TaskWriteCommand cmd -> Some cmd.ProjectName
+        | LedgerReadCommand cmd -> Some cmd.ProjectName
+        | LedgerWriteCommand cmd -> Some cmd.ProjectName
+        | ReviewReadCommand cmd -> Some cmd.ProjectName
+        | ReviewWriteCommand cmd -> Some cmd.ProjectName
+        | RetryPendingIntentCommand cmd -> Some cmd.ProjectName
+        | SupersedePendingIntentCommand cmd -> Some cmd.ProjectName
+        | AbandonPendingIntentCommand cmd -> Some cmd.ProjectName
         | GetProjectDetailsCommand cmd -> Some cmd.ProjectName
         | ListDirectoryCommand cmd -> Some cmd.ProjectName
         | SearchFilesCommand cmd -> Some cmd.ProjectName
         | SearchTextCommand cmd -> Some cmd.ProjectName
         | ReadFileCommand cmd -> Some cmd.ProjectName
+        | ReadFilePageCommand cmd -> Some cmd.ProjectName
         | ReadFilesCommand cmd -> Some cmd.ProjectName
+        | GetAgentInstructionsCommand cmd -> Some cmd.ProjectName
         | ReadImageCommand cmd -> Some cmd.ProjectName
         | ExportFileCommand cmd -> Some cmd.ProjectName
         | ImportFileCommand cmd -> Some cmd.ProjectName
         | WriteFileCommand cmd -> Some cmd.ProjectName
         | PatchFileCommand cmd -> Some cmd.ProjectName
         | RunCommandCommand cmd -> Some cmd.ProjectName
-        | ListProjectTasksCommand cmd -> Some cmd.ProjectName
+        | ListConfiguredTasksCommand cmd -> Some cmd.ProjectName
         | RunProjectTaskCommand cmd -> Some cmd.ProjectName
-        | AttachWorkTaskCommand cmd -> Some cmd.ProjectName
-        | GetWorkTaskCommand cmd -> Some cmd.ProjectName
-        | ListWorkTasksCommand cmd -> Some cmd.ProjectName
-        | CheckpointWorkTaskCommand cmd -> Some cmd.ProjectName
-        | CompleteWorkTaskCommand cmd -> Some cmd.ProjectName
         | ListSkillsCommand cmd -> Some cmd.ProjectName
         | GetSkillCommand cmd -> Some cmd.ProjectName
         | CreateSkillCommand cmd -> Some cmd.ProjectName
@@ -943,7 +977,9 @@ module AgentCommandInfo =
         | SearchFilesCommand cmd -> Some(sprintf "\"%s\"" (compact cmd.Query))
         | SearchTextCommand cmd -> Some(sprintf "\"%s\"" (compact cmd.Query))
         | ReadFileCommand cmd -> Some(compact cmd.FilePath)
+        | ReadFilePageCommand cmd -> Some(compact cmd.FilePath)
         | ReadFilesCommand cmd -> Some(String.concat ", " (cmd.FilePaths |> List.map compact))
+        | GetAgentInstructionsCommand cmd -> Some(compact cmd.Directory)
         | ReadImageCommand cmd -> Some(compact cmd.FilePath)
         | ExportFileCommand cmd -> Some(compact cmd.FilePath)
         | ImportFileCommand cmd -> Some(compact cmd.FilePath)
@@ -952,26 +988,24 @@ module AgentCommandInfo =
         | PatchFileCommand cmd -> Some(compact cmd.FilePath)
         | RunCommandCommand cmd -> Some(fullCommand cmd.Executable cmd.Args)
         | RunProjectTaskCommand cmd -> Some(compact cmd.TaskName)
-        | AttachWorkTaskCommand cmd -> Some(compact cmd.TaskId)
-        | GetWorkTaskCommand cmd -> Some(compact cmd.TaskId)
-        | ListWorkTasksCommand _ -> None
-        | CheckpointWorkTaskCommand cmd -> Some(compact cmd.TaskId)
-        | CompleteWorkTaskCommand cmd -> Some(compact cmd.TaskId)
         | GetSkillCommand cmd -> Some(compact cmd.SkillName)
         | CreateSkillCommand cmd -> Some(compact cmd.SkillName)
         | ListSkillsCommand _ -> None
         | GetWorktreeCommand cmd -> Some(compact cmd.WorktreePath)
+        | CreateProjectCommand cmd -> Some(compact cmd.Name)
         | CreateWorktreeCommand cmd -> Some(compact cmd.Name)
         | InspectWorktreeRemovalCommand cmd -> Some(compact cmd.WorktreePath)
         | RemoveWorktreeCommand cmd -> Some(compact cmd.WorktreePath)
-        | ListTasksCommand _ -> None
-        | GetTaskCommand cmd -> Some(compact cmd.TaskId)
-        | CreateTaskCommand cmd -> Some(compact (cmd.TaskId |> Option.defaultValue "new"))
-        | UpdateTaskCommand cmd -> Some(compact cmd.TaskId)
-        | ClaimTaskCommand cmd -> Some(compact cmd.TaskId)
-        | CheckpointTaskCommand cmd -> Some(compact cmd.TaskId)
-        | CompleteTaskCommand cmd -> Some(compact cmd.TaskId)
-        | GetTaskHistoryCommand cmd -> Some(compact cmd.TaskId)
+        | TaskReadCommand cmd -> Some(compact cmd.AgentId)
+        | ObserveAgentCommand cmd -> Some(compact cmd.TargetAgentId)
+        | TaskWriteCommand cmd -> Some(compact cmd.Action)
+        | LedgerReadCommand cmd -> Some(compact cmd.ProjectName)
+        | LedgerWriteCommand cmd -> Some(compact cmd.Action)
+        | ReviewReadCommand cmd -> Some(compact cmd.Action)
+        | ReviewWriteCommand cmd -> Some(compact cmd.Action)
+        | RetryPendingIntentCommand cmd -> Some(compact cmd.OperationId)
+        | SupersedePendingIntentCommand cmd -> Some(compact cmd.OperationId)
+        | AbandonPendingIntentCommand cmd -> Some(compact cmd.OperationId)
         | GetGitDiffCommand cmd -> cmd.Path |> Option.map compact
         | GitCommitCommand cmd -> Some(compact cmd.Message)
         | StartJobCommand cmd -> Some(fullCommand cmd.Executable cmd.Args)
@@ -982,15 +1016,8 @@ module AgentCommandInfo =
         | ListCommandsCommand
         | ListProjectsCommand
         | ListWorktreesCommand _
-        | CompareWorktreeTasksCommand _
-        | GetAgentAssignmentCommand _
-        | GetOrchestrationSnapshotCommand _
-        | AssignTaskCommand _
-        | AcknowledgeTaskCommand _
-        | BeginTaskCommand _
-        | RetireWorktreeCommand _
         | GetProjectDetailsCommand _
-        | ListProjectTasksCommand _
+        | ListConfiguredTasksCommand _
         | GetGitStatusCommand _
         | ListJobsCommand _ -> None
 
@@ -998,7 +1025,10 @@ module AgentCommandInfo =
         | ScheduleBrowserExecutionCommand cmd -> Some($"schedule {cmd.ScheduleId} in {cmd.RunAfterSeconds}s")
         | ListScheduledBrowserExecutionsCommand -> None
         | CancelScheduledBrowserExecutionCommand cmd -> Some cmd.ScheduleId
-        | BrowserListTabsCommand -> None
+        | BrowserListTabsCommand
+        | BrowserListWindowsCommand -> None
+        | BrowserCloseTabCommand cmd -> Some("agent-created tab " + cmd.TabRegistration)
+        | BrowserRunInNewTabCommand cmd -> Some(cmd.ScriptPath + " -> window " + cmd.WindowRegistration)
         | BrowserOpenTabCommand cmd ->
             match Uri.TryCreate(cmd.Url, UriKind.Absolute) with
             | true, uri when uri.Scheme = "https" || uri.Scheme = "http" -> Some(uri.GetLeftPart(UriPartial.Authority) + " (new tab)")
@@ -1011,7 +1041,9 @@ module AgentCommandInfo =
         | SearchFilesCommand cmd -> Some(quoted cmd.Query)
         | SearchTextCommand cmd -> Some(quoted cmd.Query)
         | ReadFileCommand cmd -> Some(truncate 64 cmd.FilePath)
+        | ReadFilePageCommand cmd -> Some(truncate 64 cmd.FilePath)
         | ReadFilesCommand cmd -> Some $"{cmd.FilePaths.Length} files"
+        | GetAgentInstructionsCommand cmd -> Some(truncate 64 cmd.Directory)
         | ReadImageCommand cmd -> Some(truncate 64 cmd.FilePath)
         | ExportFileCommand cmd -> Some(truncate 64 cmd.FilePath)
         | ImportFileCommand cmd -> Some(truncate 64 cmd.FilePath)
@@ -1020,26 +1052,24 @@ module AgentCommandInfo =
         | PatchFileCommand cmd -> Some(truncate 64 cmd.FilePath)
         | RunCommandCommand cmd -> Some(commandPreview cmd.Executable cmd.Args)
         | RunProjectTaskCommand cmd -> Some(truncate 48 cmd.TaskName)
-        | AttachWorkTaskCommand cmd -> Some(truncate 48 cmd.TaskId)
-        | GetWorkTaskCommand cmd -> Some(truncate 48 cmd.TaskId)
-        | ListWorkTasksCommand _ -> None
-        | CheckpointWorkTaskCommand cmd -> Some(truncate 48 cmd.TaskId)
-        | CompleteWorkTaskCommand cmd -> Some(truncate 48 cmd.TaskId)
         | GetSkillCommand cmd -> Some(truncate 48 cmd.SkillName)
         | CreateSkillCommand cmd -> Some(truncate 48 cmd.SkillName)
         | ListSkillsCommand _ -> None
         | GetWorktreeCommand cmd -> Some(truncate 64 cmd.WorktreePath)
+        | CreateProjectCommand cmd -> Some(truncate 64 cmd.Name)
         | CreateWorktreeCommand cmd -> Some(truncate 64 cmd.Name)
         | InspectWorktreeRemovalCommand cmd -> Some(truncate 64 cmd.WorktreePath)
         | RemoveWorktreeCommand cmd -> Some(truncate 64 cmd.WorktreePath)
-        | ListTasksCommand _ -> None
-        | GetTaskCommand cmd -> Some(truncate 64 cmd.TaskId)
-        | CreateTaskCommand cmd -> Some(truncate 64 (cmd.TaskId |> Option.defaultValue "new"))
-        | UpdateTaskCommand cmd -> Some(truncate 64 cmd.TaskId)
-        | ClaimTaskCommand cmd -> Some(truncate 64 cmd.TaskId)
-        | CheckpointTaskCommand cmd -> Some(truncate 64 cmd.TaskId)
-        | CompleteTaskCommand cmd -> Some(truncate 64 cmd.TaskId)
-        | GetTaskHistoryCommand cmd -> Some(truncate 64 cmd.TaskId)
+        | TaskReadCommand cmd -> Some(truncate 64 cmd.AgentId)
+        | ObserveAgentCommand cmd -> Some(truncate 64 cmd.TargetAgentId)
+        | TaskWriteCommand cmd -> Some(truncate 64 cmd.Action)
+        | LedgerReadCommand cmd -> Some(truncate 64 cmd.ProjectName)
+        | LedgerWriteCommand cmd -> Some(truncate 64 cmd.Action)
+        | ReviewReadCommand cmd -> Some(truncate 64 cmd.Action)
+        | ReviewWriteCommand cmd -> Some(truncate 64 cmd.Action)
+        | RetryPendingIntentCommand cmd -> Some(truncate 64 cmd.OperationId)
+        | SupersedePendingIntentCommand cmd -> Some(truncate 64 cmd.OperationId)
+        | AbandonPendingIntentCommand cmd -> Some(truncate 64 cmd.OperationId)
         | GetGitDiffCommand cmd -> cmd.Path |> Option.map (truncate 64)
         | GitCommitCommand cmd -> Some(quoted cmd.Message)
         | StartJobCommand cmd -> Some(commandPreview cmd.Executable cmd.Args)
@@ -1050,15 +1080,8 @@ module AgentCommandInfo =
         | ListCommandsCommand
         | ListProjectsCommand
         | ListWorktreesCommand _
-        | CompareWorktreeTasksCommand _
-        | GetAgentAssignmentCommand _
-        | GetOrchestrationSnapshotCommand _
-        | AssignTaskCommand _
-        | AcknowledgeTaskCommand _
-        | BeginTaskCommand _
-        | RetireWorktreeCommand _
         | GetProjectDetailsCommand _
-        | ListProjectTasksCommand _
+        | ListConfiguredTasksCommand _
         | GetGitStatusCommand _
         | ListJobsCommand _ -> None
 
@@ -1101,11 +1124,18 @@ module AgentCommandInfo =
         | None -> invocation command
 
 module AgentProtocol =
-    let version = "3.22"
+    let version = "3.63"
     let defaultPatchFuzzyContextLines = 3
     let maxResponseBytes = 900 * 1024
     let maxImageBytes = 8 * 1024 * 1024
     let maxExportBytes = 8 * 1024 * 1024
+    // Bound source work before allocations and before the transport's final
+    // response serialization guard. Large sources use ReadFilePage instead.
+    let maxLegacyTextReadBytes = 512 * 1024
+    let maxRangeScanBytes = 8 * 1024 * 1024
+    let maxRangeReturnBytes = 256 * 1024
+    let maxRangeLines = 2048
+    let maxSearchFileBytes = 8 * 1024 * 1024
     let defaultMaxImportBytes = 32L * 1024L * 1024L
 
     let private definition name description permissions mutates requiresConfirmation supportsDryRun : CommandDefinition =
@@ -1131,32 +1161,30 @@ module AgentProtocol =
           definition "BrowserExecuteJs" "Executes supplied JavaScript in a registered browser tab." [ ProcessExecution; NetworkAccess ] true true false
           definition "BrowserCaptureDom" "Capture live DOM markup after an explicit wait condition." [ ProcessExecution ] false true false
           definition "BrowserExportDom" "Write an explicitly requested live DOM snapshot to a project file." [ ProcessExecution; WorkspaceWrite ] true true false
+          definition "CreateProject" "Create a new workspace folder with optional Git, starter files and remote-backed ledger." [ WorkspaceWrite; VersionControlWrite; NetworkAccess ] true true false
           definition "ListWorktrees" "Lists Git worktrees registered for a project." [ ReadOnly ] false false false
           definition "GetWorktree" "Inspects a registered Git worktree." [ ReadOnly ] false false false
           definition "CreateWorktree" "Creates an isolated Git worktree and branch." [ VersionControlWrite ] true true false
           definition "InspectWorktreeRemoval" "Checks registered worktree removal safety." [ ReadOnly ] false false false
-          definition "ListTasks" "Lists repository-backed HTML and JSON task files." [ ReadOnly ] false false false
-          definition "CompareWorktreeTasks" "Summarizes tasks across registered worktrees with optional nextActor filtering." [ ReadOnly ] false false false
-          definition "GetAgentAssignment" "Finds an agent assignment across all registered worktrees; rejects ambiguous active ownership." [ ReadOnly ] false false false
-          definition "GetOrchestrationSnapshot" "Summarizes agent assignments, handoff phases, ownership conflicts, and worktree states." [ ReadOnly ] false false false
-          definition "AssignTask" "Atomically claims and assigns a task with global ownership checks." [ WorkspaceWrite; VersionControlWrite ] true true false
-          definition "AcknowledgeTask" "Records agent receipt of the current assignment without overwriting a checkpoint." [ WorkspaceWrite; VersionControlWrite ] true true false
-          definition "BeginTask" "Records work started for the exact acknowledged assignment revision." [ WorkspaceWrite; VersionControlWrite ] true true false
-          definition "RetireWorktree" "Dry-run or safely retire accepted worktree while preserving task commits and branch history." [ VersionControlWrite; Destructive ] true true false
-          definition "GetTask" "Reads HTML task definition and adjacent JSON state." [ ReadOnly ] false false false
-          definition "CreateTask" "Creates and commits HTML and JSON task files." [ WorkspaceWrite; VersionControlWrite ] true true false
-          definition "UpdateTask" "Updates task metadata or reviewer assignment without changing owner or progress." [ WorkspaceWrite; VersionControlWrite ] true true false
-          definition "ClaimTask" "Claims or reassigns repository-backed task ownership." [ WorkspaceWrite; VersionControlWrite ] true true false
-          definition "CheckpointTask" "Commits agent progress and acknowledges the current assignment revision." [ WorkspaceWrite; VersionControlWrite ] true true false
-          definition "CompleteTask" "Marks a task complete and commits verification." [ WorkspaceWrite; VersionControlWrite ] true true false
-          definition "GetTaskHistory" "Reads Git change history for one task." [ ReadOnly ] false false false
+          definition "TaskRead" "Reads a registered agent inbox from a single ledger snapshot." [ ReadOnly; NetworkAccess ] false false false
+          definition "ObserveAgent" "Read an explicitly named target agent without attributing tool activity or beginning a Ready turn. Observer identity is independently verified." [ ReadOnly; NetworkAccess ] false false false
+          definition "TaskWrite" "Creates/assigns/starts tasks and binds immutable review base." [ VersionControlWrite; NetworkAccess ] true true false
+          definition "LedgerRead" "Inspect the verified canonical Git ledger identity and trust head." [ ReadOnly; NetworkAccess ] false false false
+          definition "LedgerWrite" "Explicitly bind, initialize or rebind the canonical ledger with privacy acknowledgment." [ VersionControlWrite; NetworkAccess ] true true false
+          definition "ReviewRead" "Reads opt-in canonical review ledger requests and reviewer inboxes." [ ReadOnly; NetworkAccess ] false false false
+          definition "ReviewWrite" "Updates opt-in canonical review ledger with a stable operation UUID." [ VersionControlWrite; NetworkAccess ] true true false
+          definition "RetryPendingIntent" "Operator-authorized retry of an exact saved intent through current typed CAS writers, preserving UUID." [ VersionControlWrite; NetworkAccess ] true true false
+          definition "SupersedePendingIntent" "Operator-authorized immutable local archive of an uncertain intent with verified related Applied receipt; no remote ledger mutation." [ WorkspaceWrite; VersionControlWrite; NetworkAccess ] true true false
+          definition "AbandonPendingIntent" "Operator-authorized archival of an obsolete saved intent using typed canonical task/review state at a pinned verified head; no remote mutation." [ WorkspaceWrite; VersionControlWrite; NetworkAccess ] true true false
           definition "RemoveWorktree" "Removes a clean integrated Git worktree." [ VersionControlWrite; Destructive ] true true false
           definition "GetProjectDetails" "Reads project summary details and special files." [ ReadOnly ] false false false
-          definition "ListDirectory" "Lists files and folders in a project directory." [ ReadOnly ] false false false
-          definition "SearchFiles" "Searches project file names." [ ReadOnly ] false false false
-          definition "SearchText" "Searches project file contents." [ ReadOnly ] false false false
-          definition "ReadFile" "Reads one file." [ ReadOnly ] false false false
-          definition "ReadFiles" "Reads multiple files." [ ReadOnly ] false false false
+          definition "ListDirectory" "Lists a bounded project directory; oversized listings fail explicitly." [ ReadOnly ] false false false
+          definition "SearchFiles" "Finds project file/folder names with lazy traversal. Returns Matches, StopReason and visit counts; non-Finished results are partial." [ ReadOnly ] false false false
+          definition "SearchText" "Finds text matches with bounded scans. Returns Matches, StopReason and visit counts; non-Finished results are partial." [ ReadOnly ] false false false
+          definition "ReadFile" "Reads a small project text file or line range; use ReadFilePage for large UTF-8 sources." [ ReadOnly ] false false false
+          definition "ReadFilePage" "Reads a bounded UTF-8 page from a file, with snapshot-aware continuation." [ ReadOnly ] false false false
+          definition "ReadFiles" "Reads at most 32 files with an aggregate serialized-byte budget and per-file errors." [ ReadOnly ] false false false
+          definition "GetAgentInstructions" "Reads all applicable AGENTS.md files for a checkout directory, with continuation for transport-size limits." [ ReadOnly ] false false false
           definition "ReadImage" "Reads one PNG, JPEG, or WebP image for model vision." [ ReadOnly ] false false false
           definition "ExportFile" "Copies one bounded project file to a short-lived user download URL." [ ReadOnly ] false false false
           definition "ImportFile" "Downloads a ChatGPT-provided file into a project path." [ WorkspaceWrite; NetworkAccess ] true true false
@@ -1164,7 +1192,7 @@ module AgentProtocol =
           definition "WriteFile" "Writes or appends one file." [ WorkspaceWrite ] true true false
           definition "PatchFile" "Applies an atomic unified diff to one file." [ WorkspaceWrite ] true true true
           definition "RunCommand" "Runs a bounded local process." [ ProcessExecution ] true true false
-          definition "ListProjectTasks" "Lists locally configured project tasks." [ ReadOnly ] false false false
+          definition "ListConfiguredTasks" "Lists locally configured project tasks." [ ReadOnly ] false false false
           definition "RunProjectTask" "Runs a locally configured project task." [ ProcessExecution ] true true false
           definition "ListSkills" "Lists project-local Jarvis skills." [ ReadOnly ] false false false
           definition "GetSkill" "Reads a project-local Jarvis skill." [ ReadOnly ] false false false

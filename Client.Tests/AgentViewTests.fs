@@ -1,236 +1,316 @@
 module AgentViewTests
 
 open System
-open System.IO
 open Client
 open Client.AgentView
-open Client.AgentDashboard
 open NUnit.Framework
 open FsUnitTyped
 
-let private assignment agent project task phase =
-    { Agent = agent; Project = project; Selector = project + "::" + task
-      TaskId = task; Title = task + " implementation"; Status = "active"
-      Phase = phase; NextActor = Some "agent"; Worktree = "/tmp/" + task
-      Branch = Some ("feature/" + task); Head = "abc"; Clean = Some true
-      AssignmentRevision = Some "rev"; AcknowledgedRevision = None
-      Instructions = Some ("Implement " + task); BaseCommit = None
-      UpdatedAt = None; LastUpdatedBy = None; CheckpointSummary = None
-      CheckpointNextAction = None; CheckpointLastCommit = None
-      CheckpointBlocker = None; CompletionFinalCommit = None }
+let private record project agent state task =
+    { Key = project + "::" + agent
+      Agent = agent
+      Project = project
+      ProjectLabel = project
+      ProjectAliases = [project]
+      State = state
+      StateEnteredAt = Some(DateTimeOffset(2026,10,30,4,36,32,TimeSpan.Zero))
+      StateReason = Some "Review commits then resume"
+      Focus = task
+      PendingNotifications = 0
+      LatestNotification = None
+      ActivityKeys = [project + "::" + agent] }
 
-let private snapshot entries conflicts =
-    { Assignments = entries; Projects = []; Conflicts = conflicts; Issues = []
+let private focused =
+    { TaskId = "320"
+      Title = "Eliminate audio allocations"
+      Lifecycle = "InProgress"
+      Phase = "Paused"
+      SourceRef = Some "refs/heads/perf/320-audio-commit-alloc"
+      BaseCommit = Some "abcdef"
+      AssignmentGeneration = 1 }
+
+let private snapshot agents =
+    { Agents = agents
+      Projects = []
+      Issues = []
       RefreshedAt = DateTimeOffset.UtcNow }
 
 [<Test>]
-let rosterGroupsAndMarksConflicts () =
-    let data = snapshot
-                   [ assignment "Agent 7" "Wayfold" "304" "Working"
-                     assignment "Agent 2" "Wayfold" "292" "Assigned"
-                     assignment "Agent 7" "Wayfold" "305" "ReadyForReview" ]
-                   [ "Wayfold: Agent Agent 7 has multiple active assignments" ]
-    let result = rows data
-    (result |> List.map _.Agent) |> shouldEqual [ "Agent 7"; "Agent 2" ]
-    result.Head.Conflict |> shouldEqual true
-    result.Head.Assignments.Length |> shouldEqual 2
-    (agentSummary result.Head).Contains("CONFLICT") |> shouldEqual true
+let canonicalReadyStateIsNotInferredFromPausedAttempt () =
+    let agent = record "Wayfold" "Agent 3" "Ready" (Some focused)
+    let output = rows (snapshot [agent])
+    output.Head.State |> shouldEqual "Ready"
+    agentSummary output.Head |> shouldEqual "#320 - Ready"
+    output.Head.Focus.Value.Phase |> shouldEqual "Paused"
+    output.Head.StateEnteredAt |> shouldEqual agent.StateEnteredAt
 
 [<Test>]
-let rosterSearchMatchesAgentProjectTaskWorktreeAndPhase () =
-    let data = snapshot [ assignment "Agent 2" "Wayfold" "292" "Working"
-                          assignment "Agent 3" "Jarvis" "308" "Assigned" ] []
-    let agent query = visibleRows query data |> List.map _.Agent
-    agent "agent 2" |> shouldEqual [ "Agent 2" ]
-    agent "WAYFOLD" |> shouldEqual [ "Agent 2" ]
-    agent "308" |> shouldEqual [ "Agent 3" ]
-    agent "tmp/292" |> shouldEqual [ "Agent 2" ]
-    agent "working" |> shouldEqual [ "Agent 2" ]
-    agent "missing" |> shouldEqual []
-    agent "" |> shouldEqual [ "Agent 3"; "Agent 2" ]
-    phaseLabel "ReadyForReview" |> shouldEqual "Review"
+let allFourDerivedStatesAndUnassignedAgentsAreRepresented () =
+    let agents =
+        ["Ready"; "Working"; "NeedsWork"; "Parked"]
+        |> List.mapi (fun index state ->
+            record "Wayfold" ("Agent " + string index) state
+                (if state = "Parked" || state = "NeedsWork" then None else Some focused))
+    let result = rows (snapshot agents)
+    result |> List.map _.State |> shouldEqual ["Ready"; "Working"; "NeedsWork"; "Parked"]
+    agentSummary result[3] |> shouldEqual "Parked"
 
 [<Test>]
-let snapshotAdapterPreservesAssignmentIdentityAndInspectionFailures () =
-    let tree : Client.Worktrees.WorktreeInfo =
-        { Path = "/workspace/Wayfold-gold"; MainPath = "/workspace/Wayfold"
-          Head = "abcdef"; Branch = Some "feature/gold"; IsMain = false
-          IsDetached = false; IsLocked = false; IsPrunable = false; IsClean = Some true }
-    let task : Client.TaskStore.TaskSummary =
-        { Id = "292"; Title = "Gold pickup"; Status = "active"
-          DescriptionPath = "docs/tasks/292.html"; StatePath = "docs/tasks/292.json"
-          HasState = true; Owner = Some "Agent 2"; Dependencies = []
-          Revision = Some "taskrev"; Diagnostics = []; NextActor = Some "agent"
-          LastUpdatedBy = Some "orchestrator"; AssignmentRevision = Some "revision"
-          UpdatedAt = None; CheckpointSummary = None
-          CheckpointNextAction = None; CheckpointLastCommit = None
-          CheckpointBlocker = None; CompletionFinalCommit = None }
-    let assigned : Client.TaskStore.AgentAssignment =
-        { Agent = "Agent 2"; ProjectName = "Wayfold::gold"; Worktree = tree
-          Task = task; AssignmentInstructions = Some "Fix gold"
-          AssignmentBaseCommit = Some "basecommit"; AssignmentRevision = Some "revision"
-          AcknowledgedAssignmentRevision = None; Phase = "Assigned" }
-    let group : Client.TaskStore.WorktreeTaskGroup =
-        { Worktree = tree; Tasks = [task]; Error = None }
-    let source : Client.TaskStore.OrchestrationSnapshot =
-        { ProjectName = "Wayfold"; Worktrees = [group]; Assignments = [assigned]
-          Conflicts = ["Agent 2 duplicate"]; ReviewerTaskCount = 0
-          UnacknowledgedTaskCount = 1; InspectionErrors = ["one worktree unreadable"]
-          RetirementInspections = []; RetirementCandidates = []; IntegratedTasks = []
-          TotalMatches = 1; Offset = 0; Limit = 60; NextOffset = None
-          TaskDiagnosticCount = 0; TaskDiagnostics = []; RetirementInspected = false }
-    let data = fromSnapshots DateTimeOffset.UtcNow
-                    [ "Wayfold", Ok source; "NonGit", Error "not a Git repository" ]
-    data.Assignments.Head.Selector |> shouldEqual "Wayfold::gold"
-    data.Assignments.Head.Instructions |> shouldEqual (Some "Fix gold")
-    data.Assignments.Head.AssignmentRevision |> shouldEqual (Some "revision")
-    data.Conflicts |> shouldEqual [ "Wayfold: Agent 2 duplicate" ]
-    (data.Projects |> List.find (fun p -> p.Project = "Wayfold")).Unacknowledged |> shouldEqual 1
-    (data.Projects |> List.find (fun p -> p.Project = "NonGit")).Error |> shouldEqual (Some "not a Git repository")
-    data.Issues.Length |> shouldEqual 2
+let canonicalAgentSearchUsesProjectStatusTaskAndSourceRef () =
+    let a = record "Wayfold" "Agent 3" "Ready" (Some focused)
+    let b = record "Jarvis" "Agent 8" "Parked" None
+    let data = snapshot [a;b]
+    let lookup filter = visibleRows filter data |> List.map _.Agent
+    lookup "agent 3" |> shouldEqual ["Agent 3"]
+    lookup "wayfold" |> shouldEqual ["Agent 3"]
+    lookup "320" |> shouldEqual ["Agent 3"]
+    lookup "audio-commit-alloc" |> shouldEqual ["Agent 3"]
+    lookup "Ready" |> shouldEqual ["Agent 3"]
+    lookup "Parked" |> shouldEqual []
 
 [<Test>]
-let identicalAgentLabelsAcrossDifferentProjectsAreNotConflicts () =
-    let data =
-        snapshot
-            [ assignment "Agent 1" "Wayfold" "282" "Working"
-              assignment "Agent 1" "Jarvis" "301" "Assigned" ] []
-    let result = rows data
-    result.Length |> shouldEqual 2
-    (result |> List.map _.Key |> Set.ofList)
-    |> shouldEqual (set [ "Wayfold::Agent 1"; "Jarvis::Agent 1" ])
-    result |> List.forall (fun row -> not row.Conflict) |> shouldEqual true
+let canonicalStateTransitionsAndReasonChangeMarkAgentAsChanged () =
+    let ready = record "Wayfold" "Agent 3" "Ready" (Some focused)
+    let before = snapshot [ready]
+    let working = { ready with State = "Working"; StateReason = Some "Resumed" }
+    let changed = snapshot [working]
+    changedAgents before changed |> shouldEqual (set ["Wayfold::Agent 3"])
+    changedAgents changed changed |> shouldEqual Set.empty
 
 [<Test>]
-let duplicateTaskClaimFlagsBothAgentsWithinProject () =
-    let data =
-        snapshot
-            [ assignment "Agent 1" "Wayfold" "282" "Working"
-              assignment "Agent 7" "Wayfold" "282" "Assigned" ]
-            [ "Wayfold: Task 282 is actively claimed in two worktrees" ]
-    let result = rows data
-    result |> List.forall _.Conflict |> shouldEqual true
-    result.Length |> shouldEqual 2
+let agentNamesAreScopedToTheirCanonicalProjects () =
+    let a = record "Wayfold" "Agent 3" "Ready" None
+    let b = record "Jarvis" "Agent 3" "Parked" None
+    rows (snapshot [a;b]) |> List.map _.Key
+    |> shouldEqual ["Jarvis::Agent 3"; "Wayfold::Agent 3"]
 
 [<Test>]
-let completedWorkRemainsVisibleAfterActiveAssignmentDisappears () =
-    let tree : Client.Worktrees.WorktreeInfo =
-        { Path = "/tmp/Wayfold-finished"; MainPath = "/tmp/Wayfold"
-          Head = "abc"; Branch = Some "feature/292"
-          IsMain = false; IsDetached = false; IsLocked = false
-          IsPrunable = false; IsClean = Some true }
-    let completedTask : Client.TaskStore.TaskSummary =
-        { Id = "292"; Title = "Gold pickup"; Status = "completed"
-          DescriptionPath = "docs/tasks/292.html"; StatePath = "docs/tasks/292.json"
-          HasState = true; Owner = Some "Agent 2"; Dependencies = []
-          Revision = Some "final"; Diagnostics = []; NextActor = None
-          LastUpdatedBy = Some "agent:Agent 2"; AssignmentRevision = Some "rev"
-          UpdatedAt = Some(DateTimeOffset(2026, 10, 26, 16, 0, 0, TimeSpan.Zero))
-          CheckpointSummary = Some "Gold pickup implemented"
-          CheckpointNextAction = Some "Reviewer acceptance"
-          CheckpointLastCommit = Some "code-sha"
-          CheckpointBlocker = None; CompletionFinalCommit = Some "accepted-sha" }
-    let source : Client.TaskStore.OrchestrationSnapshot =
-        { ProjectName = "Wayfold"
-          Worktrees = [ { Worktree = tree; Tasks = [ completedTask ]; Error = None } ]
-          Assignments = []
-          Conflicts = []
-          ReviewerTaskCount = 0
-          UnacknowledgedTaskCount = 0
-          InspectionErrors = []
-          RetirementInspections = []
-          RetirementCandidates = []
-          IntegratedTasks = []
-          TotalMatches = 1; Offset = 0; Limit = 60; NextOffset = None
-          TaskDiagnosticCount = 0; TaskDiagnostics = []; RetirementInspected = false }
-    let inProgress = { completedTask with Status = "active"; Revision = Some "progress"; NextActor = Some "reviewer" }
-    let activeAssignment : Client.TaskStore.AgentAssignment =
-        { Agent = "Agent 2"; ProjectName = "Wayfold::Wayfold-finished"
-          Worktree = tree; Task = inProgress
-          AssignmentInstructions = Some "Implement"; AssignmentBaseCommit = None
-          AssignmentRevision = Some "rev"; AcknowledgedAssignmentRevision = Some "rev"
-          Phase = "ReadyForReview" }
-    let beforeSource = { source with
-                            Assignments = [ activeAssignment ]
-                            Worktrees = [ { Worktree = tree; Tasks = [ inProgress ]; Error = None } ] }
-    let before = fromSnapshots DateTimeOffset.UtcNow [ "Wayfold", Ok beforeSource ]
-    let finished = fromSnapshots DateTimeOffset.UtcNow [ "Wayfold", Ok source ]
-    let roster = rows finished
-    roster.Length |> shouldEqual 1
-    roster.Head.Agent |> shouldEqual "Agent 2"
-    roster.Head.Assignments.Length |> shouldEqual 1
-    roster.Head.Assignments.Head.Phase |> shouldEqual "Completed"
-    roster.Head.Assignments.Head.CheckpointSummary |> shouldEqual (Some "Gold pickup implemented")
-    roster.Head.Assignments.Head.CompletionFinalCommit |> shouldEqual (Some "accepted-sha")
-    (agentSummary roster.Head).Contains("Completed") |> shouldEqual true
-    (changedAgents before finished).Contains("Wayfold::Agent 2") |> shouldEqual true
-    let acceptedSource = { source with
-                               IntegratedTasks = [ { Worktree = tree; Task = completedTask; Phase = "Integrated" } ] }
-    let accepted = fromSnapshots DateTimeOffset.UtcNow [ "Wayfold", Ok acceptedSource ]
-    (rows accepted).Head.Assignments.Head.Phase |> shouldEqual "Integrated"
-    (changedAgents finished accepted).Contains("Wayfold::Agent 2") |> shouldEqual true
-    (changedAgents accepted accepted).IsEmpty |> shouldEqual true
+let agentOrderingUsesProjectThenAgentRatherThanState () =
+    let agents =
+        [ record "AAA" "Idle" "Parked" None
+          record "ZZZ" "Ready" "Ready" (Some focused)
+          record "MMM" "Working" "Working" (Some focused)
+          record "CCC" "Unassigned" "NeedsWork" None ]
+    rows (snapshot agents) |> List.map _.State
+    |> shouldEqual ["Parked"; "NeedsWork"; "Working"; "Ready"]
 
 [<Test>]
-let recentCompletedTasksDoNotCreateFalseActiveConflicts () =
-    let today = DateTimeOffset.UtcNow
-    let completed =
-        { (assignment "Agent 2" "Wayfold" "old" "Completed") with
-            Status = "completed"; NextActor = None
-            UpdatedAt = Some(today.AddDays(-1.)) }
-    let current =
-        { (assignment "Agent 2" "Wayfold" "new" "Working") with UpdatedAt = Some today }
-    let roster = rows (snapshot [ completed; current ] [])
-    roster.Length |> shouldEqual 1
-    roster.Head.Conflict |> shouldEqual false
-    roster.Head.Assignments.Head.TaskId |> shouldEqual "new"
-    (agentSummary roster.Head).Contains("+1 completed") |> shouldEqual true
+let relativeStateAgeUsesTimestampNotLastRefreshTime () =
+    let now = DateTimeOffset(2026, 10, 31, 16, 0, 0, TimeSpan.Zero)
+    let agent = { record "Jarvis" "Agent" "Ready" None with StateEnteredAt = Some(now.AddMinutes(-14.)) }
+    stateAge now agent |> shouldEqual "14m"
+    stateAge now { agent with StateEnteredAt = None } |> shouldEqual "—"
 
 [<Test>]
-let timestampOrCheckpointUpdatesMarkAgentAsChanged () =
-    let started = assignment "Agent 1" "Wayfold" "282" "Working"
-    let before = snapshot [started] []
-    let updated = { started with UpdatedAt = Some DateTimeOffset.UtcNow
-                                 CheckpointSummary = Some "New allocation evidence" }
-    let after = snapshot [ updated ] []
-    (changedAgents before after).Contains("Wayfold::Agent 1") |> shouldEqual true
-    (changedAgents after after).IsEmpty |> shouldEqual true
+let unreadNotificationsDoNotReorderAgentsButTriggerRefresh () =
+    let quiet = record "Wayfold" "Agent 2" "Ready" None
+    let notified =
+        { record "Wayfold" "Agent 7" "Parked" None with
+            PendingNotifications = 2
+            LatestNotification = Some "Agent 3 #304: Agree on the interface" }
+    let before = snapshot [ quiet; { notified with PendingNotifications = 0; LatestNotification = None } ]
+    let after = snapshot [ quiet; notified ]
+    rows after |> List.map _.Agent |> shouldEqual ["Agent 2"; "Agent 7"]
+    changedAgents before after |> shouldEqual (set ["Wayfold::Agent 7"])
+    changedAgents after after |> shouldEqual Set.empty
 
 [<Test>]
-let agentsDashboardSkipsNonGitProjectsWithoutHidingGitFailures () =
-    let root, project = GitCommandTests.createTempProject()
-    try
-        let context = GitCommandTests.TestContext(root)
-        for name in [ "LexicalEffects"; "TEST"; "eyepuzzle" ] do
-            Directory.CreateDirectory(Path.Combine(root, name)) |> ignore
-        GitCommandTests.initRepo context
-        File.WriteAllText(Path.Combine(project, "README.md"), "initial")
-        GitCommandTests.expectGitSuccess context [ "add"; "README.md" ]
-        GitCommandTests.expectGitSuccess context [ "commit"; "-m"; "initial" ]
-        let all =
-            match Client.ProjectBrowser.listProjects context with
-            | Ok projects -> projects |> Seq.map (fun (Client.ProjectName value) -> value) |> Seq.toList
-            | Error error -> failwith $"Listing projects failed: {error}"
-        for name in [ "LexicalEffects"; "TEST"; "eyepuzzle"; "Project1" ] do
-            (List.contains name all) |> shouldEqual true
-        let gitOnly =
-            match Client.ProjectBrowser.listGitProjects context with
-            | Ok projects -> projects |> List.map (fun (Client.ProjectName value) -> value)
-            | Error error -> failwith $"Listing Git projects failed: {error}"
-        gitOnly |> shouldEqual [ "Project1" ]
-        match Client.AgentDashboard.load context with
-        | Ok snapshot ->
-            (snapshot.Projects |> List.map _.Project) |> shouldEqual [ "Project1" ]
-            snapshot.Issues |> shouldEqual []
-        | Error error -> Assert.Fail($"Agents dashboard failed: {error}")
-        // A directory advertising a Git root must still report real Git
-        // validation errors instead of being silently ignored.
-        Directory.CreateDirectory(Path.Combine(root, "TEST", ".git")) |> ignore
-        match Client.AgentDashboard.load context with
-        | Error error -> Assert.Fail($"Dashboard aborted instead of reporting Git failure: {error}")
-        | Ok snapshot ->
-            (snapshot.Projects |> List.map _.Project |> List.sort) |> shouldEqual [ "Project1"; "TEST" ]
-            (snapshot.Issues |> List.exists (fun issue ->
-                issue.Contains("TEST") && issue.Contains("Git"))) |> shouldEqual true
-    finally
-        if Directory.Exists root then Directory.Delete(root, true)
+let agentStatesHaveDistinctReadableColors () =
+    let states =
+        [ "Working", ConsoleColor.Green
+          "Ready", ConsoleColor.Yellow
+          "Assigned", ConsoleColor.Cyan
+          "NeedsWork", ConsoleColor.Magenta
+          "Completed", ConsoleColor.Blue
+          "Parked", ConsoleColor.DarkGray
+          "Unexpected", ConsoleColor.Gray ]
+    for state, expected in states do
+        stateColor state |> shouldEqual expected
+    displayState "NeedsWork" |> shouldEqual "Waiting"
+
+
+[<Test>]
+let numericAgentSortingIsStableAcrossStateAndNotificationChanges () =
+    let names = ["Agent 10"; "Agent 2"; "Lead"; "Agent 1"; "Agent 11"]
+    let agents = names |> List.map (fun name -> record "Wayfold" name "Working" None)
+    let expected = ["Agent 1"; "Agent 2"; "Agent 10"; "Agent 11"; "Lead"]
+    rows (snapshot agents) |> List.map _.Agent |> shouldEqual expected
+    let modified =
+        agents |> List.map (fun agent ->
+            { agent with State = "Ready"; PendingNotifications = 3 })
+    rows (snapshot modified) |> List.map _.Agent |> shouldEqual expected
+
+
+[<Test>]
+let parkedAgentsAreHiddenFromTheTuiButRemainInTheLedgerSnapshot () =
+    let parked = record "Wayfold" "Orchestrator" "Parked" None
+    let active = record "Wayfold" "Lead" "Working" None
+    let data = snapshot [ parked; active ]
+    rows data |> List.map _.Agent |> shouldEqual ["Lead"; "Orchestrator"]
+    visibleRows "" data |> List.map _.Agent |> shouldEqual ["Lead"]
+    visibleRows "orchestrator" data |> shouldEqual []
+    visibleRows "Parked" data |> shouldEqual []
+    let resumed = { parked with State = "Ready" }
+    visibleRows "" (snapshot [ resumed; active ]) |> List.map _.Agent
+    |> shouldEqual ["Lead"; "Orchestrator"]
+
+
+[<Test>]
+let agentTableColumnsFollowVisibleContentInsteadOfTerminalWidth () =
+    let wayfold =
+        [| record "Wayfold" "Agent 1" "Working" None
+           record "Wayfold" "Agent 10" "Ready" None |]
+    columnWidths 120 wayfold |> shouldEqual (8, 8)
+    columnWidths 80 wayfold |> shouldEqual (8, 8)
+    let mixed = Array.append wayfold [| record "Longer Project" "GUI Agent" "Ready" None |]
+    columnWidths 120 mixed |> shouldEqual (15, 9)
+    columnWidths 55 mixed |> shouldEqual (5, 5)
+
+[<Test>]
+let narrowAgentTablesKeepColumnsWithinAvailableWidth () =
+    let agents = [| record "A very long project name" "A very long agent name" "Working" None |]
+    for width in [20; 30; 40; 50; 120] do
+        let project, agent = columnWidths width agents
+        Assert.That(project, Is.GreaterThanOrEqualTo(0))
+        Assert.That(agent, Is.GreaterThanOrEqualTo(0))
+        Assert.That(project + agent, Is.LessThanOrEqualTo(max 0 (width - 27 - 8 - 10)))
+
+
+[<Test>]
+let lastSeenUsesExplicitAgentKeyOnly () =
+    let agent = record "Wayfold" "Agent 8" "Working" None
+    let timestamp = DateTimeOffset(2026, 11, 3, 16, 0, 0, TimeSpan.Zero)
+    let seen = System.Collections.Generic.Dictionary<string, DateTimeOffset>(StringComparer.OrdinalIgnoreCase)
+    seen["Wayfold::Agent 8"] <- timestamp
+    seen["Wayfold::Agent 80"] <- timestamp.AddMinutes(10.)
+    seen["Jarvis::Agent 8"] <- timestamp.AddMinutes(20.)
+    lastSeenAt agent seen |> shouldEqual (Some timestamp)
+    lastSeenAt agent (System.Collections.Generic.Dictionary<string, DateTimeOffset>()) |> shouldEqual None
+
+[<Test>]
+let lastSeenDisplaysRelativeAgeWithoutInferringPresence () =
+    let now = DateTimeOffset(2026, 11, 3, 20, 0, 0, TimeSpan.Zero)
+    relativeAge now None |> shouldEqual "—"
+    relativeAge now (Some(now.AddMinutes(-9.))) |> shouldEqual "9m"
+    relativeAge now (Some(now.AddHours(-2.))) |> shouldEqual "2h"
+
+
+[<Test>]
+let activityProjectNormalizesRegisteredWorktreeNames () =
+    let selected raw =
+        ProjectPaths.ProjectTarget.parse raw
+        |> function Ok target -> activityProject target | Error error -> failwithf "%A" error
+    selected "Wayfold" |> shouldEqual "Wayfold"
+    selected "Wayfold::gui-design" |> shouldEqual "Wayfold"
+    selected "Jarvis::agent-id-implementation" |> shouldEqual "Jarvis"
+
+
+[<Test>]
+let activityProjectRejectsInvalidCheckoutSelector () =
+    match ProjectPaths.ProjectTarget.parse "Wayfold::bad::selector" with
+    | Error(Client.ValidationError _) -> ()
+    | other -> Assert.Fail(sprintf "Expected typed validation: %A" other)
+
+[<Test>]
+let projectCountersUseCanonicalRowsIncludingParkedAndUnread () =
+    let agents =
+        [ { record "Wayfold" "A" "Working" None with PendingNotifications = 2 }
+          { record "Wayfold" "B" "Ready" None with PendingNotifications = 1 }
+          record "Wayfold" "C" "NeedsWork" None
+          record "Wayfold" "D" "Parked" None ]
+    let totals = projectCounts agents 3
+    Assert.That(totals.Tracked, Is.EqualTo(4))
+    Assert.That(totals.PendingReviews, Is.EqualTo(3))
+    Assert.That(totals.Unread, Is.EqualTo(3))
+    Assert.That(totals.Working, Is.EqualTo(1))
+    Assert.That(totals.Ready, Is.EqualTo(1))
+    Assert.That(totals.Waiting, Is.EqualTo(1))
+    Assert.That(totals.Parked, Is.EqualTo(1))
+
+[<Test>]
+let projectStatusTotalsStayWholeWhenOnlyAgentRowsAreTextFiltered () =
+    let a = { Project = "Wayfold"; Aliases = ["Wayfold"]; Identity = "pid:11111111:1"; Counts = Some (projectCounts [ record "Wayfold" "Agent" "Working" None ] 2); Error = None }
+    let b = { Project = "Jarvis"; Aliases = ["Jarvis"]; Identity = "pid:22222222:1"; Counts = Some (projectCounts [ record "Jarvis" "Lead" "Parked" None ] 0); Error = None }
+    let data = { snapshot [] with Projects = [b; a] }
+    visibleProjects "Agent" data |> List.map _.Project |> shouldEqual ["Jarvis"; "Wayfold"]
+    visibleProjects "@way Agent" data |> List.map _.Project |> shouldEqual ["Wayfold"]
+    visibleProjects "@jar" data |> List.map _.Project |> shouldEqual ["Jarvis"]
+    visibleProjects "@missing" data |> shouldEqual []
+    totalCounts data |> fun total ->
+        Assert.That(total.Tracked, Is.EqualTo(2))
+        Assert.That(total.Working, Is.EqualTo(1))
+        Assert.That(total.Parked, Is.EqualTo(1))
+
+[<Test>]
+let distinctLedgersWithSameDisplayNameHaveDistinctProjectLabels () =
+    let one = { Project = "Wayfold"; Aliases = ["Wayfold"]; Identity = "pid:abc0123400000000:1"; Counts = Some (projectCounts [] 0); Error = None }
+    let two = { one with Identity = "pid:def0567800000000:1" }
+    let data = { snapshot [] with Projects = [two; one] }
+    projectDisplayName data one |> shouldEqual "Wayfold [abc01234]"
+    projectDisplayName data two |> shouldEqual "Wayfold [def05678]"
+    visibleProjects "" data |> List.map _.Identity |> shouldEqual [one.Identity; two.Identity]
+
+[<Test>]
+let projectStatusLinesBoundWidthsAndKeepUnavailableSeparateFromZero () =
+    let empty = { Project = "Project With A Very Very Very Long Name"; Aliases = ["Project With A Very Very Very Long Name"]; Identity = "pid:a:1"; Counts = Some (projectCounts [] 0); Error = None }
+    let offline = { empty with Counts = None; Error = Some "Network unavailable" }
+    for width in [1; 15; 25; 40; 65; 120] do
+        let name = projectDisplayName (snapshot []) empty
+        let line = projectStatusLine width name empty
+        Assert.That(line.Length, Is.LessThanOrEqualTo(width))
+        Assert.That((projectStatusLine width name offline).Length, Is.LessThanOrEqualTo(width))
+    Assert.That(projectStatusLine 120 empty.Project empty, Does.Contain("Tracked 0"))
+    Assert.That(projectStatusLine 120 offline.Project offline, Does.Contain("UNAVAILABLE (counts unknown)"))
+    let compactLine = projectStatusLine 60 empty.Project empty
+    for token in ["T0"; "Rev0"; "U0"; "W0"; "Rd0"; "Wait0"; "P0"] do
+        Assert.That(compactLine, Does.Contain(token))
+
+[<Test>]
+let partialProjectTotalsNeverTreatUnavailableAsZero () =
+    let online = { Project = "Wayfold"; Aliases = ["Wayfold"]; Identity = "pid:1:1"; Counts = Some (projectCounts [ record "Wayfold" "Worker" "Ready" None ] 2); Error = None }
+    let missing = { Project = "Jarvis"; Aliases = ["Jarvis"]; Identity = "pid:2:1"; Counts = None; Error = Some "Cannot fetch ledger" }
+    let data = { snapshot [] with Projects = [online; missing] }
+    let totals = totalCounts data
+    Assert.That(totals.Tracked, Is.EqualTo(1))
+    Assert.That(totals.PendingReviews, Is.EqualTo(2))
+    Assert.That(missing.Counts.IsNone, Is.True)
+
+[<Test>]
+let sameNamedLedgersWithCollidingShortIdentifiersGetUniqueLabels () =
+    let a = { Project = "Wayfold"; Aliases = ["Wayfold"]; Identity = "pid:abc01234a:1"; Counts = Some (projectCounts [] 0); Error = None }
+    let b = { a with Identity = "pid:abc01234b:1" }
+    let view = { snapshot [] with Projects = [a; b] }
+    projectDisplayName view a |> shouldEqual "Wayfold [abc01234a]"
+    projectDisplayName view b |> shouldEqual "Wayfold [abc01234b]"
+
+[<Test>]
+let narrowProjectStatusWrapsAllCountersWithoutDroppingTheProjectLabel () =
+    let entry =
+        { Project = "Wayfold"; Aliases = ["Wayfold"]; Identity = "project:ledger:1"
+          Counts = Some (projectCounts [record "Wayfold" "A" "Working" None] 2)
+          Error = None }
+    for width in [12; 24; 40; 54] do
+        let lines = projectStatusLines width entry.Project entry
+        Assert.That(lines.Length, Is.GreaterThan(1))
+        Assert.That(lines.Head, Does.StartWith("@"))
+        for line in lines do Assert.That(line.Length, Is.LessThanOrEqualTo(width))
+        let joined = String.concat " " lines
+        for token in ["T1"; "Rev2"; "U0"; "W1"; "Rd0"; "Wait0"; "P0"] do
+            Assert.That(joined, Does.Contain(token))
+    let unavailable = { entry with Counts = None; Error = Some "Remote unreachable" }
+    let offlineLines = projectStatusLines 24 unavailable.Project unavailable
+    Assert.That(offlineLines.Head, Does.StartWith("@Wayfold"))
+    Assert.That(String.concat " " offlineLines, Does.Contain("UNAVAILABLE"))
+    Assert.That(String.concat " " offlineLines, Does.Contain("counts unknown"))
+
+[<Test>]
+let narrowDistinctProjectLabelsKeepTheirLedgerSuffixes () =
+    let prefix = "A Project With A Much Longer Name Than The Terminal"
+    let a = { Project = prefix; Aliases = [prefix]; Identity = "project:a1234567:1"; Counts = Some (projectCounts [] 0); Error = None }
+    let b = { a with Identity = "project:b1234567:1" }
+    let view = { snapshot [] with Projects = [a; b] }
+    let one = (projectStatusLines 26 (projectDisplayName view a) a).Head
+    let two = (projectStatusLines 26 (projectDisplayName view b) b).Head
+    Assert.That(one, Does.Contain("[a1234567]"))
+    Assert.That(two, Does.Contain("[b1234567]"))
+    Assert.That(one, Is.Not.EqualTo(two))

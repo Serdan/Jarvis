@@ -2,6 +2,7 @@ module Client.BrowserBridge
 
 open System
 open System.Collections.Concurrent
+open System.Diagnostics
 open System.IO
 open System.Net
 open System.Net.WebSockets
@@ -468,6 +469,12 @@ type Service(port: int, pairingSecret: string) =
         elif outputPath |> Option.exists (fun path -> not (Directory.Exists(Path.GetDirectoryName(path)))) then
             return Error "SnapshotOutputDirectoryMissing"
         else
+            // One monotonic deadline covers capture, chunk transfer, validation and
+            // publication. No chain of per-chunk timeouts can outlive the caller.
+            let started = Stopwatch.GetTimestamp()
+            let remainingMs () =
+                let left = float timeoutMs - Stopwatch.GetElapsedTime(started).TotalMilliseconds
+                if left <= 0. then 0 else max 1 (int (Math.Ceiling(left)))
             try
                 use waitDoc = JsonDocument.Parse(waitJson)
                 if waitDoc.RootElement.ValueKind <> JsonValueKind.Object then
@@ -506,9 +513,14 @@ type Service(port: int, pairingSecret: string) =
                                registrationId = registrationId; registrationGeneration = generation;
                                timeoutMs = timeoutMs; mode = mode;
                                wait = waitDoc.RootElement.Clone(); captureSelector = captureSelector |}
-                        let! received = requestSnapshotFrame conn requestId frame (timeoutMs + 3000)
+                        let! received =
+                            let remaining = remainingMs()
+                            if remaining <= 0 then Task.FromResult(Error "SnapshotDeadlineExceeded")
+                            else requestSnapshotFrame conn requestId frame remaining
                         match received with
+                        | Error e when remainingMs() <= 0 -> return Error "SnapshotDeadlineExceeded"
                         | Error e -> return Error e
+                        | Ok raw when remainingMs() <= 0 -> return Error "SnapshotDeadlineExceeded"
                         | Ok raw ->
                             use doc = JsonDocument.Parse(raw)
                             let reply = doc.RootElement
@@ -564,9 +576,14 @@ type Service(port: int, pairingSecret: string) =
                                                     let chunkFrame = serialize {| version = ProtocolVersion; kind = "snapshotChunk";
                                                            requestId = chunkRequestId; connectionId = conn.Id;
                                                            snapshotId = snapshotId; offset = offset |}
-                                                    let! chunkResult = requestSnapshotFrame conn chunkRequestId chunkFrame 10000
+                                                    let! chunkResult =
+                                                        let remaining = remainingMs()
+                                                        if remaining <= 0 then Task.FromResult(Error "SnapshotDeadlineExceeded")
+                                                        else requestSnapshotFrame conn chunkRequestId chunkFrame (min remaining 10000)
                                                     match chunkResult with
+                                                    | Error _ when remainingMs() <= 0 -> error <- Some "SnapshotDeadlineExceeded"
                                                     | Error e -> error <- Some e
+                                                    | Ok _ when remainingMs() <= 0 -> error <- Some "SnapshotDeadlineExceeded"
                                                     | Ok chunkRaw ->
                                                         try
                                                             use chunkDoc = JsonDocument.Parse(chunkRaw)
@@ -591,13 +608,25 @@ type Service(port: int, pairingSecret: string) =
                                                                     offset <- offset + data.Length
                                                         with _ -> error <- Some "SnapshotChunkInvalid"
                                                 if error.IsNone then
-                                                    let receivedHash = Convert.ToHexString(hash.GetHashAndReset()).ToLowerInvariant()
-                                                    if receivedHash <> expectedHash then
-                                                        error <- Some "SnapshotChecksumMismatch"
+                                                    if remainingMs() <= 0 then
+                                                        error <- Some "SnapshotDeadlineExceeded"
                                                     else
-                                                        file.Flush(true)
-                                                        file.Dispose()
-                                                        File.Move(temp, destination)
+                                                        let receivedHash = Convert.ToHexString(hash.GetHashAndReset()).ToLowerInvariant()
+                                                        if receivedHash <> expectedHash then
+                                                            error <- Some "SnapshotChecksumMismatch"
+                                                        elif remainingMs() <= 0 then
+                                                            error <- Some "SnapshotDeadlineExceeded"
+                                                        else
+                                                            file.Flush(true)
+                                                            if remainingMs() <= 0 then
+                                                                error <- Some "SnapshotDeadlineExceeded"
+                                                            else
+                                                                file.Dispose()
+                                                                // Final gate: never publish a snapshot after expiry.
+                                                                if remainingMs() <= 0 then
+                                                                    error <- Some "SnapshotDeadlineExceeded"
+                                                                else
+                                                                    File.Move(temp, destination)
                                             with
                                             | :? IOException -> error <- Some "SnapshotOutputWriteFailed"
                                             | ex -> error <- Some("SnapshotTransferFailure:" + ex.GetType().Name)

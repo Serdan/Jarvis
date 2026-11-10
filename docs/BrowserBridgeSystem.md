@@ -1,8 +1,8 @@
 # Jarvis Browser Bridge — System Specification
 
 **Status:** Browser bridge, registered-window launch, safe tab close, and one-shot/recurring scheduling implemented on this unmerged worktree; **live Edge acceptance and deployment pending**
-**Scope:** Jarvis server, JarvisClient, Chromium extension, and project-owned JavaScript scripts  
-**Initial implementation worktree:** `Jarvis::browser-bridge` (`feature/browser-bridge`)  
+**Scope:** Jarvis server, JarvisClient, Chromium extension, and project-owned JavaScript scripts
+**Initial implementation worktree:** `Jarvis::browser-bridge` (`feature/browser-bridge`)
 **Related task:** [Local browser bridge and MCP command routing](tasks/2026-10-26-browser-bridge-jarvis.html)
 
 ## 1. Purpose

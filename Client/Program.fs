@@ -224,10 +224,10 @@ let private runClient args =
             |> Result.map (fun result -> result.Jobs)
             |> formatJobResult)
           Read = (fun jobId afterSequence ->
-            JobManager.getJobResult { JobId = jobId; AfterSequence = Some afterSequence } rt
+            JobManager.getJobResult { ProjectName = ""; JobId = jobId; AfterSequence = Some afterSequence } rt
             |> formatJobResult)
           Cancel = (fun jobId ->
-            JobManager.cancelJob { JobId = jobId } rt
+            JobManager.cancelJob { ProjectName = ""; JobId = jobId } rt
             |> formatJobResult) }
     tui.SetAgentAccess { Load = (fun () -> AgentDashboard.load rt) }
     tui.Log $"Trust: {TrustLevel.toDisplayName trustLevel}"
@@ -259,7 +259,10 @@ let private runClient args =
 
     ignoreAll {
         connection.On<string>("ReceiveMessage", Func<string, Task>(Client.receiveMessage rt))
-        connection.On<string, string>("ReceiveCommand", Func<string, string, Task>(Client.receiveCommandAndReply connection rt))
+        connection.On<string, string, string>("ReceiveCommand", Func<string, string, string, Task>(Client.receiveCommandAndReply connection rt))
+        connection.On<string, string array>("InvalidateAgentStates", Func<string, string array, Task>(fun project agentIds ->
+            Client.invalidateAgentStates rt project agentIds
+            Task.CompletedTask))
     }
 
     connection.add_Closed(
@@ -306,12 +309,14 @@ let private runClient args =
                         connectionFailureCount <- 0
                         let! isRegistered = register tui connection deviceId resolveMachineName
                         registered <- isRegistered
+                        if isRegistered then Client.invalidateAllAgentStates rt
                     else
                         connectionFailureCount <- connectionFailureCount + 1
 
             elif connection.State = HubConnectionState.Connected && not registered then
                 let! isRegistered = register tui connection deviceId resolveMachineName
                 registered <- isRegistered
+                if isRegistered then Client.invalidateAllAgentStates rt
 
             if not tui.ShouldQuit then
                 try
@@ -339,7 +344,9 @@ let private runClient args =
 
 [<EntryPoint>]
 let main args =
-    if args.Length = 2 && args[0] = "browser" && args[1] = "pair" then
+    if args.Length > 0 && args[0] = BoundedProcess.groupHostFlag then
+        BoundedProcess.runInternalGroupHost (args |> Array.skip 1)
+    elif args.Length = 2 && args[0] = "browser" && args[1] = "pair" then
         printfn "Pairing secret (keep private): %s" (BrowserBridge.getOrCreateSecret())
         0
     elif args.Length = 2 && args[0] = "browser" && args[1] = "revoke" then
@@ -347,6 +354,7 @@ let main args =
         if File.Exists(path) then File.Delete(path)
         printfn "Previous browser extension pairing revoked. Restart JarvisClient to apply."
         0
+
     elif args.Length = 2 && args[0] = "config" && args[1] = "path" then
         printfn "%s" (ClientConfig.configPath())
         0

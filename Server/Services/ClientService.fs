@@ -1,15 +1,111 @@
 namespace Server.Services
 
 open System
+open System.Threading
 open System.Threading.Tasks
 open System.Text.Json
 open Common
 open Common.SignalR
 open Microsoft.AspNetCore.SignalR
+open Microsoft.AspNetCore.Http
 open Microsoft.FSharp.Core
 
-type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserService, tracker: ClientResponseTracker) =
+module ProjectNotificationRouting =
+    // The client's LedgerApi accepts "Health", not the public MCP tool name
+    // "LedgerHealth". Keep the internal routing probe explicit and tested.
+    let healthProbe projectName =
+        LedgerReadCommand { ProjectName = projectName; Action = "Health"; OperationId = ""; Cursor = ""; PageSize = 0 }
+
+    let ordered (selected: ClientSessionStatus voption) (sessions: ClientSessionStatus list)
+                (explicitDevice: bool) =
+        if explicitDevice then
+            match selected with
+            | ValueSome session -> [ session ]
+            | ValueNone -> []
+        else
+            match selected with
+            | ValueSome session ->
+                session :: (sessions |> List.filter (fun item -> item.DeviceId <> session.DeviceId))
+            | ValueNone -> sessions
+
+    let rejectionReason commandName requireCurrentProtocol (session: ClientSessionStatus) =
+        if session.State <> Registered || session.ConnectionId.IsNone then Some "disconnected"
+        elif not (List.contains "LedgerRead" session.SupportedCommands) then Some "missing LedgerRead support"
+        elif not (List.contains commandName session.SupportedCommands) then Some $"missing {commandName} support"
+        elif requireCurrentProtocol && session.ProtocolVersion <> AgentProtocol.version then
+            Some $"protocol {session.ProtocolVersion} (requires {AgentProtocol.version})"
+        else None
+
+    let candidates selected sessions explicitDevice commandName requireCurrentProtocol =
+        ordered selected sessions explicitDevice
+        |> List.filter (fun item -> rejectionReason commandName requireCurrentProtocol item |> Option.isNone)
+
+    // Avoid propagating arbitrary client error strings, which may include local paths.
+    let probeFailure (response: AgentCommandResponse) =
+        match response.Error with
+        | Some(NotFound _) -> "destination project or ledger binding not found"
+        | Some(PermissionDenied _) -> "permission denied"
+        | Some(ValidationFailed _) -> "ledger binding or project validation failed"
+        | Some(Conflict _) -> "ledger health conflict"
+        | Some(ExecutionFailed _) -> "ledger health execution failed or timed out"
+        | Some(OutputTruncated _) -> "ledger health response truncated"
+        | Some(ConfirmationRequired _) -> "unexpected ledger health confirmation"
+        | Some(LedgerFailure failure) -> $"ledger health failed ({failure.Code})"
+        | None -> "ledger health returned no successful result"
+
+    let failureMessage projectName commandName requireCurrentProtocol explicitDevice
+                       (sessions: ClientSessionStatus list) (probes: (string * string) list) =
+        let excluded =
+            sessions |> List.choose (fun session ->
+                rejectionReason commandName requireCurrentProtocol session
+                |> Option.map (fun reason -> $"{session.DeviceName}: {reason}"))
+        let details = excluded @ (probes |> List.map (fun (name, reason) -> $"{name}: {reason}"))
+        let description =
+            if List.isEmpty details then
+                if explicitDevice then "No selected/explicit device is available."
+                else "No registered client is available."
+            else
+                let prefix = details |> List.truncate 8 |> String.concat "; "
+                if details.Length > 8 then $"{prefix}; and {details.Length - 8} more" else prefix
+        $"Cannot route cross-project notification for '{projectName}': {description} " +
+        "Check the destination ledger binding and connected client capabilities."
+
+
+module AgentStateInvalidationRouting =
+    // A state-changing tool completes against one selected client. Invalidate
+    // every connected device for the authenticated user, but never other users.
+    let recipients (sessions: ClientSessionStatus array) =
+        sessions
+        |> Array.choose (fun session ->
+            if session.State = Registered then session.ConnectionId else None)
+        |> Array.distinct
+
+    let affectedByProject (mutations: AgentStateChange list) =
+        if isNull (box mutations) then []
+        else
+            mutations
+            |> List.filter (fun change ->
+                not (String.IsNullOrWhiteSpace change.ProjectName)
+                && not (String.IsNullOrWhiteSpace change.AgentId))
+            |> List.groupBy (fun change -> change.ProjectName)
+            |> List.map (fun (project, changes) ->
+                project, (changes |> List.map _.AgentId |> List.distinct |> List.toArray))
+
+
+type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserService, tracker: ClientResponseTracker, http: IHttpContextAccessor) =
     member this.SendMessageToAll(message) = ctx.Clients.All.ReceiveMessage(message)
+
+    // Typed, per-agent invalidation only reaches authenticated registered
+    // devices for this user; no canonical agent state lives on the server.
+    member _.InvalidateAgentStatesForUser(userId: string, projectName: string, agentIds: string array) : Task =
+        if isNull agentIds || agentIds.Length = 0 then Task.CompletedTask
+        else
+            let unique = agentIds |> Array.filter (String.IsNullOrWhiteSpace >> not) |> Array.distinct
+            users.ListDevices(userId)
+            |> AgentStateInvalidationRouting.recipients
+            |> Array.map (fun connectionId ->
+                ctx.Clients.Client(connectionId).InvalidateAgentStates(projectName, unique))
+            |> Task.WhenAll
 
     member private this.ResponseTimeout(command: AgentCommand) =
         let permissionMargin = TimeSpan.FromMinutes(5L)
@@ -19,8 +115,13 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
             TimeSpan.FromSeconds(float executionSeconds) + permissionMargin
         | _ -> TimeSpan.FromMinutes(10L)
 
-    member this.SendCommandToUser(userId: string, command: AgentCommand, ?conversationId: string, ?deviceId: string) =
+    member this.SendCommandToUser(userId: string, command: AgentCommand, ?conversationId: string, ?deviceId: string, ?agentId: string) =
         task {
+            let requestAborted =
+                match http.HttpContext with
+                | null -> CancellationToken.None
+                | context -> context.RequestAborted
+            requestAborted.ThrowIfCancellationRequested()
             match users.GetSelectedSession(userId, conversationId, deviceId) with
             | ValueNone when deviceId.IsSome ->
                 let requested = deviceId.Value
@@ -29,12 +130,12 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                         ValidationFailed "deviceId must be a nonempty device ID of at most 256 characters."
                     else
                         NotFound $"Jarvis device '{requested}' is not registered for the authenticated user. Use ListDevices to find available devices."
-                return { Result = None; Error = Some error; Instructions = [] }
+                return { Result = None; Error = Some error; Instructions = []; AgentStateChanges = []; InboxActivation = None }
             | ValueNone ->
                 return
                     { Result = None
                       Error = Some(NotFound "No Jarvis client has registered for the authenticated user.")
-                      Instructions = [] }
+                      Instructions = []; AgentStateChanges = []; InboxActivation = None }
             | ValueSome session ->
                 match session.State, session.ConnectionId with
                 | Disconnected, _ ->
@@ -46,7 +147,7 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                                 ExecutionFailed
                                     $"Jarvis device {session.DeviceName} is disconnected (generation {session.Generation}, protocol {session.ProtocolVersion}, last seen {session.LastSeenAt:O}). Reason: {reason}"
                             )
-                          Instructions = [] }
+                          Instructions = []; AgentStateChanges = []; InboxActivation = None }
                 | Registered, None ->
                     return
                         { Result = None
@@ -55,7 +156,7 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                                 ExecutionFailed
                                     $"Jarvis device {session.DeviceName} generation {session.Generation} is registered without an active connection."
                             )
-                          Instructions = [] }
+                          Instructions = []; AgentStateChanges = []; InboxActivation = None }
                 | Registered, Some connectionId ->
                     let commandName = AgentCommandInfo.protocolName command
 
@@ -67,19 +168,19 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                                     ExecutionFailed
                                         $"Jarvis device {session.DeviceName} does not advertise support for {commandName}. Client {session.ClientVersion} uses protocol {session.ProtocolVersion}; the server uses protocol {AgentProtocol.version}. Update Jarvis to a compatible version and reconnect."
                                 )
-                              Instructions = [] }
+                              Instructions = []; AgentStateChanges = []; InboxActivation = None }
                     else
                         let correlationId, trackingTask = tracker.Register(userId, connectionId, session.Generation, this.ResponseTimeout command)
                         let client = ctx.Clients.Client(connectionId)
                         let commandJson = JsonSerializer.Serialize<AgentCommand>(command)
 
                         try
-                            do! client.ReceiveCommand(correlationId, commandJson)
+                            do! client.ReceiveCommand(correlationId, commandJson, defaultArg agentId "").WaitAsync(requestAborted)
                             users.RecordDispatchSuccess(userId, connectionId)
 
                             try
-                                return! trackingTask
-                            with :? TaskCanceledException ->
+                                return! trackingTask.WaitAsync(requestAborted)
+                            with :? TaskCanceledException when not requestAborted.IsCancellationRequested ->
                                 let reason =
                                     $"Client response timeout for {session.DeviceName} generation {session.Generation}."
                                 users.RecordDispatchFailure(userId, connectionId, reason)
@@ -90,14 +191,65 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                                             ExecutionFailed
                                                 $"{reason} Protocol {session.ProtocolVersion}, client {session.ClientVersion}, last seen {session.LastSeenAt:O}."
                                         )
-                                      Instructions = [] }
+                                      Instructions = []; AgentStateChanges = []; InboxActivation = None }
                         with ex ->
                             tracker.Cancel(correlationId)
-                            let reason =
-                                $"Dispatch failed for {session.DeviceName} generation {session.Generation}: {ex.Message}"
-                            users.RecordDispatchFailure(userId, connectionId, reason)
-                            return
-                                { Result = None
-                                  Error = Some(ExecutionFailed reason)
-                                  Instructions = [] }
+                            if requestAborted.IsCancellationRequested then
+                                // The caller is gone, not the device. Keep
+                                // the client session healthy and remove the
+                                // now-unobservable correlation promptly.
+                                return raise (OperationCanceledException(requestAborted))
+                            else
+                                let reason =
+                                    $"Dispatch failed for {session.DeviceName} generation {session.Generation}: {ex.Message}"
+                                users.RecordDispatchFailure(userId, connectionId, reason)
+                                return
+                                    { Result = None
+                                      Error = Some(ExecutionFailed reason)
+                                      Instructions = []; AgentStateChanges = []; InboxActivation = None }
+        }
+
+
+    // Only used by cross-project notifications. Probe connected clients for the
+    // destination's verified ledger binding instead of assuming the sender's
+    // selected device has the destination project.
+    member this.SendCommandToProject(userId: string, projectName: string, command: AgentCommand,
+                                     ?conversationId: string, ?deviceId: string, ?agentId: string) =
+        task {
+            let selected = users.GetSelectedSession(userId, conversationId, deviceId)
+            let sessions = users.ListDevices(userId) |> Array.toList
+            let commandName = AgentCommandInfo.protocolName command
+            let requireCurrentProtocol =
+                match command with
+                | TaskWriteCommand write when write.Action = "NotifyAgent"
+                      && not (String.IsNullOrWhiteSpace write.SourceRef) -> true
+                | _ -> false
+            let ordered = ProjectNotificationRouting.ordered selected sessions deviceId.IsSome
+            let eligible =
+                ProjectNotificationRouting.candidates selected sessions deviceId.IsSome
+                    commandName requireCurrentProtocol
+            let rec dispatch (remaining: ClientSessionStatus list) (probeFailures: (string * string) list) =
+                task {
+                    match remaining with
+                    | [] ->
+                        return { Result = None
+                                 Error = Some(NotFound(ProjectNotificationRouting.failureMessage projectName commandName
+                                      requireCurrentProtocol deviceId.IsSome ordered (List.rev probeFailures)))
+                                 Instructions = []; AgentStateChanges = []; InboxActivation = None }
+                    | session :: rest ->
+                        let! health = this.SendCommandToUser(
+                            userId,
+                            ProjectNotificationRouting.healthProbe projectName,
+                            ?conversationId = conversationId, deviceId = session.DeviceId, ?agentId = agentId)
+                        match health.Result, health.Error with
+                        | Some _, None ->
+                            // Never automatically repeat a write on another client:
+                            // an uncertain result may already have been committed.
+                            return! this.SendCommandToUser(userId, command,
+                                                            ?conversationId = conversationId, deviceId = session.DeviceId, ?agentId = agentId)
+                        | _ ->
+                            let reason = ProjectNotificationRouting.probeFailure health
+                            return! dispatch rest ((session.DeviceName, reason) :: probeFailures)
+                }
+            return! dispatch eligible []
         }

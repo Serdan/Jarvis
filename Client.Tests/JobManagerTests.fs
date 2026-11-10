@@ -22,6 +22,8 @@ type TestContext(root: string) =
         member _.Project = { Root = ProjectDirectory root; SpecialFiles = []; FolderFilters = [] }
     interface FileIO with
         member _.File = FileOperations.impl
+        member _.EditText(path, options, edit) =
+            AtomicTextFiles.edit path options edit
 
 [<Test>]
 let ``job lifecycle starts lists reads and cancels`` () =
@@ -49,13 +51,13 @@ let ``job lifecycle starts lists reads and cancels`` () =
 
         Thread.Sleep 500
 
-        match getJobResult { JobId = jobId; AfterSequence = Some 0L } context with
+        match getJobResult { ProjectName = "Project1"; JobId = jobId; AfterSequence = Some 0L } context with
         | Ok result ->
             result.JobId |> shouldEqual jobId
             result.NextSequence >= 0L |> shouldEqual true
         | Error error -> Assert.Fail($"Expected GetJobResult Ok, got {error}")
 
-        cancelJob { JobId = jobId } context |> shouldEqual (Ok())
+        cancelJob { ProjectName = "Project1"; JobId = jobId } context |> shouldEqual (Ok())
     finally
         Directory.Delete(root, true)
 
@@ -79,7 +81,7 @@ let ``job output is bounded by max output bytes`` () =
 
         Thread.Sleep 750
 
-        match getJobResult { JobId = jobId; AfterSequence = Some 0L } context with
+        match getJobResult { ProjectName = "Project1"; JobId = jobId; AfterSequence = Some 0L } context with
         | Ok result ->
             let retainedBytes =
                 result.Events
@@ -147,7 +149,7 @@ let ``job output polling is ordered and incremental across streams`` () =
         // Keep polling incrementally but use a measured deadline, not a fixed 100 iterations.
         let deadline = Stopwatch.StartNew()
         let rec waitForCompletion () =
-            match getJobResult { JobId = jobId; AfterSequence = Some 0L } context with
+            match getJobResult { ProjectName = "Project1"; JobId = jobId; AfterSequence = Some 0L } context with
             | Error error -> failwith $"Expected GetJobResult Ok, got {error}"
             | Ok result when result.Status <> Running -> result
             | Ok _ when deadline.Elapsed >= TimeSpan.FromSeconds 20.0 -> failwith "Job did not complete in 20 seconds."
@@ -166,7 +168,7 @@ let ``job output polling is ordered and incremental across streams`` () =
         |> List.forall (fun (before, after) -> before < after)
         |> shouldEqual true
 
-        match getJobResult { JobId = jobId; AfterSequence = Some first.NextSequence } context with
+        match getJobResult { ProjectName = "Project1"; JobId = jobId; AfterSequence = Some first.NextSequence } context with
         | Error error -> Assert.Fail($"Expected second GetJobResult Ok, got {error}")
         | Ok second ->
             second.Events |> shouldEqual []
@@ -205,16 +207,19 @@ printfn "%s" (Environment.GetEnvironmentVariable("JARVIS_TEST_JOB_SECRET_TOKEN")
             | Ok result -> result.JobId
             | Error error -> failwith $"Expected StartJob Ok, got {error}"
 
-        let rec waitForCompletion remaining =
-            match getJobResult { JobId = jobId; AfterSequence = Some 0L } context with
+        // dotnet fsi startup varies across hosts; use the same measured deadline
+        // as the neighboring cross-stream job test, not five seconds of polling.
+        let deadline = Stopwatch.StartNew()
+        let rec waitForCompletion () =
+            match getJobResult { ProjectName = "Project1"; JobId = jobId; AfterSequence = Some 0L } context with
             | Error error -> failwith $"Expected GetJobResult Ok, got {error}"
             | Ok result when result.Status <> Running -> result
-            | Ok _ when remaining <= 0 -> failwith "Job did not complete in time."
+            | Ok _ when deadline.Elapsed >= TimeSpan.FromSeconds 20.0 -> failwith "Job did not complete in 20 seconds."
             | Ok _ ->
                 Thread.Sleep 50
-                waitForCompletion (remaining - 1)
+                waitForCompletion ()
 
-        let result = waitForCompletion 100
+        let result = waitForCompletion ()
         let output = result.Events |> List.map (fun event -> event.Text) |> String.concat ""
 
         output.Contains("missing") |> shouldEqual true
@@ -222,4 +227,112 @@ printfn "%s" (Environment.GetEnvironmentVariable("JARVIS_TEST_JOB_SECRET_TOKEN")
     finally
         ProcessEnvironment.configureAllowedEnvironmentVariables []
         Environment.SetEnvironmentVariable(variable, original)
+        Directory.Delete(root, true)
+
+
+[<Test>]
+let ``job read and cancellation reject a mismatched project without stopping the job`` () =
+    let root = createTempProject ()
+    try
+        Directory.CreateDirectory(Path.Combine(root, "JobScope")) |> ignore
+        let context = TestContext root
+        let command =
+            { ProjectName = "JobScope"
+              Executable = "dotnet"
+              Args = [ "--version" ]
+              Reason = None
+              WorkingDirectory = None
+              MaxOutputBytes = Some 1024 }
+        let jobId =
+            match startJob command context with
+            | Ok result -> result.JobId
+            | Error error -> failwithf "Unexpected job start failure: %A" error
+
+        match getJobResult { ProjectName = "OtherProject"; JobId = jobId; AfterSequence = None } context with
+        | Error(Client.ValidationError _) -> ()
+        | other -> Assert.Fail(sprintf "Expected cross-project read rejection, got %A" other)
+        match cancelJob { ProjectName = "OtherProject"; JobId = jobId } context with
+        | Error(Client.ValidationError _) -> ()
+        | other -> Assert.Fail(sprintf "Expected cross-project cancel rejection, got %A" other)
+        match getJobResult { ProjectName = "JobScope"; JobId = jobId; AfterSequence = None } context with
+        | Ok _ -> ()
+        | other -> Assert.Fail(sprintf "Correct project should still read job, got %A" other)
+        cancelJob { ProjectName = "JobScope"; JobId = jobId } context |> shouldEqual (Ok())
+    finally
+        Directory.Delete(root, true)
+
+[<Test>]
+let ``worktree jobs remain accessible through their logical project name`` () =
+    let root = createTempProject ()
+    try
+        let main = Path.Combine(root, "Project1")
+        let worktree = Path.Combine(root, "job-worktree")
+        let git args =
+            use proc = new Process()
+            proc.StartInfo.FileName <- "git"
+            proc.StartInfo.WorkingDirectory <- main
+            proc.StartInfo.RedirectStandardOutput <- true
+            proc.StartInfo.RedirectStandardError <- true
+            args |> List.iter proc.StartInfo.ArgumentList.Add
+            Assert.That(proc.Start(), Is.True)
+            let stdout = proc.StandardOutput.ReadToEnd()
+            let stderr = proc.StandardError.ReadToEnd()
+            proc.WaitForExit()
+            Assert.That(proc.ExitCode, Is.EqualTo(0), stderr)
+            stdout.Trim()
+        git [ "init" ] |> ignore
+        File.WriteAllText(Path.Combine(main, "fixture.txt"), "fixture")
+        git [ "add"; "fixture.txt" ] |> ignore
+        git [ "-c"; "user.name=Fixture"; "-c"; "user.email=fixture@example.test"; "commit"; "-m"; "fixture" ] |> ignore
+        git [ "worktree"; "add"; "-b"; "job-fixture"; worktree ] |> ignore
+        let context = TestContext root
+        let jobId =
+            match startJob
+                    { ProjectName = "Project1::job-worktree"
+                      Executable = "dotnet"
+                      Args = [ "--info" ]
+                      Reason = None
+                      WorkingDirectory = None
+                      MaxOutputBytes = Some 4096 } context with
+            | Ok started -> started.JobId
+            | Error error -> failwithf "StartJob failed: %A" error
+        match listJobs { ProjectName = Some "Project1"; IncludeCompleted = true } context with
+        | Ok listed ->
+            let item = listed.Jobs |> List.find (fun job -> job.JobId = jobId)
+            Assert.That(item.ProjectName, Is.EqualTo("Project1"))
+            Assert.That(item.WorkingDirectory, Is.EqualTo(Some worktree))
+        | Error error -> Assert.Fail(sprintf "ListJobs failed: %A" error)
+        match getJobResult { ProjectName = "Project1"; JobId = jobId; AfterSequence = Some 0L } context with
+        | Ok result -> Assert.That(result.JobId, Is.EqualTo(jobId))
+        | Error error -> Assert.Fail(sprintf "GetJobResult failed: %A" error)
+        cancelJob { ProjectName = "Project1"; JobId = jobId } context |> shouldEqual (Ok())
+    finally
+        Directory.Delete(root, true)
+
+
+[<Test>]
+let invalidProjectSelectorsCannotPassJobIdentityChecks () =
+    let root = createTempProject()
+    try
+        let context = TestContext root
+        let started =
+            startJob
+                { ProjectName = "Project1"; Executable = "dotnet"
+                  Args = [ "--info" ]; Reason = None; WorkingDirectory = None
+                  MaxOutputBytes = Some 2048 } context
+        let id =
+            match started with
+            | Ok job -> job.JobId
+            | Error error -> failwithf "Could not start test job: %A" error
+        match listJobs { ProjectName = Some "Project1::bad::selector"; IncludeCompleted = true } context with
+        | Error(Client.ValidationError _) -> ()
+        | other -> Assert.Fail(sprintf "Expected invalid list scope, got: %A" other)
+        match getJobResult { ProjectName = "Project1::bad::selector"; JobId = id; AfterSequence = None } context with
+        | Error(Client.ValidationError _) -> ()
+        | other -> Assert.Fail(sprintf "Expected invalid read scope, got: %A" other)
+        match cancelJob { ProjectName = "Project1::bad::selector"; JobId = id } context with
+        | Error(Client.ValidationError _) -> ()
+        | other -> Assert.Fail(sprintf "Expected invalid cancel scope, got: %A" other)
+        cancelJob { ProjectName = "Project1"; JobId = id } context |> shouldEqual (Ok())
+    finally
         Directory.Delete(root, true)

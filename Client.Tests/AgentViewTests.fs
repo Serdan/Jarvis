@@ -10,12 +10,14 @@ let private record project agent state task =
     { Key = project + "::" + agent
       Agent = agent
       Project = project
+      ProjectLabel = project
       State = state
       StateEnteredAt = Some(DateTimeOffset(2026,10,30,4,36,32,TimeSpan.Zero))
       StateReason = Some "Review commits then resume"
       Focus = task
       PendingNotifications = 0
-      LatestNotification = None }
+      LatestNotification = None
+      ActivityKeys = [project + "::" + agent] }
 
 let private focused =
     { TaskId = "320"
@@ -271,3 +273,43 @@ let partialProjectTotalsNeverTreatUnavailableAsZero () =
     Assert.That(totals.Tracked, Is.EqualTo(1))
     Assert.That(totals.PendingReviews, Is.EqualTo(2))
     Assert.That(missing.Counts.IsNone, Is.True)
+
+[<Test>]
+let sameNamedLedgersWithCollidingShortIdentifiersGetUniqueLabels () =
+    let a = { Project = "Wayfold"; Identity = "pid:abc01234a:1"; Counts = Some (projectCounts [] 0); Error = None }
+    let b = { a with Identity = "pid:abc01234b:1" }
+    let view = { snapshot [] with Projects = [a; b] }
+    projectDisplayName view a |> shouldEqual "Wayfold [abc01234a]"
+    projectDisplayName view b |> shouldEqual "Wayfold [abc01234b]"
+
+[<Test>]
+let narrowProjectStatusWrapsAllCountersWithoutDroppingTheProjectLabel () =
+    let entry =
+        { Project = "Wayfold"; Identity = "project:ledger:1"
+          Counts = Some (projectCounts [record "Wayfold" "A" "Working" None] 2)
+          Error = None }
+    for width in [12; 24; 40; 54] do
+        let lines = projectStatusLines width entry.Project entry
+        Assert.That(lines.Length, Is.GreaterThan(1))
+        Assert.That(lines.Head, Does.StartWith("@"))
+        for line in lines do Assert.That(line.Length, Is.LessThanOrEqualTo(width))
+        let joined = String.concat " " lines
+        for token in ["T1"; "Rev2"; "U0"; "W1"; "Rd0"; "Wait0"; "P0"] do
+            Assert.That(joined, Does.Contain(token))
+    let unavailable = { entry with Counts = None; Error = Some "Remote unreachable" }
+    let offlineLines = projectStatusLines 24 unavailable.Project unavailable
+    Assert.That(offlineLines.Head, Does.StartWith("@Wayfold"))
+    Assert.That(String.concat " " offlineLines, Does.Contain("UNAVAILABLE"))
+    Assert.That(String.concat " " offlineLines, Does.Contain("counts unknown"))
+
+[<Test>]
+let narrowDistinctProjectLabelsKeepTheirLedgerSuffixes () =
+    let prefix = "A Project With A Much Longer Name Than The Terminal"
+    let a = { Project = prefix; Identity = "project:a1234567:1"; Counts = Some (projectCounts [] 0); Error = None }
+    let b = { a with Identity = "project:b1234567:1" }
+    let view = { snapshot [] with Projects = [a; b] }
+    let one = (projectStatusLines 26 (projectDisplayName view a) a).Head
+    let two = (projectStatusLines 26 (projectDisplayName view b) b).Head
+    Assert.That(one, Does.Contain("[a1234567]"))
+    Assert.That(two, Does.Contain("[b1234567]"))
+    Assert.That(one, Is.Not.EqualTo(two))

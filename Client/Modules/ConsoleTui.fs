@@ -962,7 +962,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
             | ConsoleColor.DarkGreen, true -> ConsoleColor.Green
             | ConsoleColor.DarkMagenta, true -> ConsoleColor.Magenta
             | color, _ -> color
-        writeCell (ActivityFilter.projectToken row.Project) projectWidth projectForeground
+        writeCell (AgentView.projectColumnLabel projectWidth row) projectWidth projectForeground
         draw.ForegroundColor <- normalForeground
         draw.Write(" ")
         writeCell row.Agent agentWidth normalForeground
@@ -989,12 +989,18 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         if showAgentDetails then
             match selectedAgentUnsafe () with
             | None -> ()
+            | Some row when draw.Height < 32 ->
+                // Preserve a useful selected-agent context without letting the
+                // details pane consume the table on an ordinary 24-row terminal.
+                let task = row.Focus |> Option.map (fun t -> "#" + t.TaskId + " " + t.Title) |> Option.defaultValue ""
+                draw.WriteLine ""
+                draw.WriteLine (trim (sprintf "Details: %s | %s | %s" row.Agent (AgentView.displayState row.State) task) width)
             | Some row ->
                 draw.WriteLine ""
                 draw.WriteLine "Agent details"
                 draw.WriteLine "-------------"
                 writeDetailField width "Agent" row.Agent
-                writeDetailField width "Project" (ActivityFilter.projectToken row.Project)
+                writeDetailField width "Project" (ActivityFilter.projectToken row.ProjectLabel)
                 writeDetailField width "State" (AgentView.displayState row.State)
                 seenAt row
                 |> Option.iter (fun seen -> writeDetailField width "Last seen" (seen.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss")))
@@ -1033,12 +1039,27 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
             |> Option.map (AgentView.visibleProjects agentFilter)
             |> Option.defaultValue []
             |> List.toArray
-        let projectPageSize = if draw.Height < 22 then 1 else max 1 (min 5 (draw.Height / 12))
+        let projectItems =
+            projects |> Array.map (fun project ->
+                let name =
+                    agentSnapshot
+                    |> Option.map (fun snap -> AgentView.projectDisplayName snap project)
+                    |> Option.defaultValue project.Project
+                project, AgentView.projectStatusLines width name project)
+        let projectPageSize =
+            if draw.Height < 32 || width < 55 then 1
+            else max 1 (min 5 (draw.Height / 14))
         let projectPageCount = max 1 ((projects.Length + projectPageSize - 1) / projectPageSize)
         agentProjectPage <- max 0 (min agentProjectPage (projectPageCount - 1))
         let projectFirst = agentProjectPage * projectPageSize
         let projectLast = min projects.Length (projectFirst + projectPageSize)
-        let projectHeaderRows = if projects.Length = 0 then 0 else 1 + projectLast - projectFirst
+        let projectHeaderRows =
+            if projects.Length = 0 then 0
+            else
+                1 + (projectItems
+                     |> Array.skip projectFirst
+                     |> Array.take (projectLast - projectFirst)
+                     |> Array.sumBy (fun (_, lines) -> lines.Length))
         let filterSuffix =
             if String.IsNullOrWhiteSpace agentFilter then ""
             else $" [text=\"{trim (compact agentFilter) (max 20 (width - 22))}\"]"
@@ -1086,21 +1107,27 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                 totals.Tracked totals.PendingReviews totals.Unread totals.Working totals.Ready totals.Waiting totals.Parked
         if draw.Height >= 22 then draw.WriteLine "------"
         let summary = if (full + partial).Length <= width && draw.Height >= 22 then full else concise
-        draw.WriteLine (trim (summary + partial) width)
+        let summaryLine =
+            if unavailable > 0 && (summary + partial).Length > width then
+                sprintf "PARTIAL(%d) %s" unavailable summary
+            else summary + partial
+        draw.WriteLine (trim summaryLine width)
         if projects.Length > 0 then
-            let pagination =
-                if projectPageCount = 1 then ""
-                else sprintf "  [%d/%d, [ ] pages]" (agentProjectPage + 1) projectPageCount
-            draw.WriteLine (trim ("Projects (whole-project totals)" + pagination) width)
+            let heading =
+                if width < 55 then
+                    if projectPageCount = 1 then "Projects (totals)"
+                    else sprintf "Projects [%d/%d] ([/])" (agentProjectPage + 1) projectPageCount
+                else
+                    let pagination =
+                        if projectPageCount = 1 then ""
+                        else sprintf "  [%d/%d, [ ] pages]" (agentProjectPage + 1) projectPageCount
+                    "Projects (whole-project totals)" + pagination
+            draw.WriteLine (trim heading width)
             for index = projectFirst to projectLast - 1 do
-                let project = projects[index]
-                let name =
-                    agentSnapshot
-                    |> Option.map (fun snap -> AgentView.projectDisplayName snap project)
-                    |> Option.defaultValue project.Project
+                let project, lines = projectItems[index]
                 let previous = draw.ForegroundColor
                 draw.ForegroundColor <- if project.Error.IsSome then ConsoleColor.Red else projectColor project.Project
-                draw.WriteLine (AgentView.projectStatusLine width name project)
+                for line in lines do draw.WriteLine line
                 draw.ForegroundColor <- previous
         let refreshed =
             agentSnapshot

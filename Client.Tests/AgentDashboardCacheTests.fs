@@ -250,13 +250,15 @@ let measure_dashboard_notification_refresh_latency_and_allocations () =
 let private agentRow project name state unread =
     ({ Key = project + "::" + name
        Project = project
+       ProjectLabel = project
        Agent = name
        State = state
        StateEnteredAt = None
        StateReason = None
        Focus = None
        PendingNotifications = unread
-       LatestNotification = None } : AgentView.AgentRow)
+       LatestNotification = None
+       ActivityKeys = [project + "::" + name] } : AgentView.AgentRow)
 
 [<Test>]
 let projectDashboardDeduplicatesSharedLedgersButNotSameNamedDistinctLedgers () =
@@ -282,3 +284,56 @@ let projectDashboardDeduplicatesSharedLedgersButNotSameNamedDistinctLedgers () =
     Assert.That(counts.Ready, Is.EqualTo(1))
     Assert.That(counts.Unread, Is.EqualTo(4))
     Assert.That(counts.PendingReviews, Is.EqualTo(3))
+
+[<Test>]
+let canonicalAgentKeysAndActivityAttributionDistinguishSameNamedLedgers () =
+    let first = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:11111111111111111111111111111111:1"
+    let second = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:22222222222222222222222222222222:1"
+    let data =
+        AgentDashboard.snapshotFromResults
+            [ "Wayfold", Ok (Some (first, [agentRow "Wayfold" "Lead" "Working" 1], 0))
+              "Wayfold", Ok (Some (second, [agentRow "Wayfold" "Lead" "Parked" 0], 0)) ]
+    let keys = data.Agents |> List.map _.Key
+    Assert.That(keys.Length, Is.EqualTo(2))
+    Assert.That(keys |> List.distinct |> List.length, Is.EqualTo(2))
+    Assert.That(keys, Does.Contain(first + "::Lead"))
+    Assert.That(keys, Does.Contain(second + "::Lead"))
+    let seen = System.Collections.Generic.Dictionary<string, DateTimeOffset>()
+    seen["Wayfold::Lead"] <- DateTimeOffset.UtcNow
+    for row in data.Agents do
+        Assert.That(row.ActivityKeys, Is.Empty)
+        Assert.That(AgentView.lastSeenAt row seen, Is.EqualTo(None),
+                    "A local project label cannot attribute presence across distinct ledgers.")
+    Assert.That(AgentView.changedAgents data data, Is.Empty)
+
+[<Test>]
+let aliasesOfOneLedgerPreserveUnambiguousLocalActivityAttribution () =
+    let identity = "project:shared-ledger:1"
+    let data =
+        AgentDashboard.snapshotFromResults
+            [ "owner", Ok (Some (identity, [agentRow "owner" "Lead" "Ready" 0], 0))
+              "reviewer", Ok (Some (identity, [agentRow "reviewer" "Lead" "Ready" 0], 0)) ]
+    Assert.That(data.Agents.Length, Is.EqualTo(1))
+    let row = data.Agents.Head
+    Assert.That(row.Key, Is.EqualTo(identity + "::Lead"))
+    Assert.That(row.ActivityKeys, Is.EquivalentTo(["owner::Lead"; "reviewer::Lead"]))
+    let now = DateTimeOffset.UtcNow
+    let seen = System.Collections.Generic.Dictionary<string, DateTimeOffset>()
+    seen["owner::Lead"] <- now.AddMinutes(-5.0)
+    seen["reviewer::Lead"] <- now
+    Assert.That(AgentView.lastSeenAt row seen, Is.EqualTo(Some now))
+
+[<Test>]
+let agentRosterDisambiguatesLongSameNamedProjectsInNarrowColumns () =
+    let name = "A Very Long Project Name That Cannot Fit"
+    let first = "project:aaaa1111:1"
+    let second = "project:bbbb2222:1"
+    let data =
+        AgentDashboard.snapshotFromResults
+            [ name, Ok (Some (first, [agentRow name "Agent 1" "Ready" 0], 0))
+              name, Ok (Some (second, [agentRow name "Agent 1" "Working" 0], 0)) ]
+    Assert.That(data.Agents.Length, Is.EqualTo(2))
+    let labels = data.Agents |> List.map (AgentView.projectColumnLabel 24)
+    Assert.That(labels |> List.distinct |> List.length, Is.EqualTo(2))
+    Assert.That(labels.Head, Does.Contain("[aaaa1111]"))
+    Assert.That(labels.Tail.Head, Does.Contain("[bbbb2222]"))

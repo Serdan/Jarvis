@@ -175,12 +175,13 @@ let private projectSnapshot project rt =
                                                 notificationCounts
                                                 |> Map.tryFind agent.AgentId
                                                 |> Option.defaultValue { Pending = 0; Latest = None }
-                                            ({ Key = project + "::" + agent.AgentId; Agent = agent.AgentId
-                                               Project = project; State = agent.State
+                                            ({ Key = identity + "::" + agent.AgentId; Agent = agent.AgentId
+                                               Project = project; ProjectLabel = project; State = agent.State
                                                StateEnteredAt = stateTime agent; StateReason = stringOption agent.StateReason
                                                Focus = focus
                                                PendingNotifications = notification.Pending
-                                               LatestNotification = notification.Latest } : AgentView.AgentRow)))
+                                               LatestNotification = notification.Latest
+                                               ActivityKeys = [] } : AgentView.AgentRow)))
                                 match firstError rows with
                                 | Some error -> Error error
                                 | None ->
@@ -193,6 +194,26 @@ let private projectSnapshot project rt =
 /// agent roster. Identity deduplication matters when multiple local checkouts
 /// or clients point at the same remote ledger.
 let internal snapshotFromResults (results: (string * Result<(string * AgentView.AgentRow list * int) option, string>) list) =
+    // Project aliases can share a ledger. A same-named different ledger cannot
+    // safely reuse local activity timestamps keyed only by display name.
+    let labels =
+        results
+        |> List.choose (fun (project, result) ->
+            match result with
+            | Ok (Some (identity, _, _)) -> Some (project, identity)
+            | Error _ -> Some (project, "unavailable:" + project)
+            | Ok None -> None)
+    let identitiesByLabel =
+        labels
+        |> List.groupBy (fun (project, _) -> project.ToUpperInvariant())
+        |> List.map (fun (label, items) -> label, items |> List.map snd |> Set.ofList)
+        |> Map.ofList
+    let activityAliases identity =
+        labels
+        |> List.choose (fun (project, id) ->
+            let owners = Map.find (project.ToUpperInvariant()) identitiesByLabel
+            if id = identity && owners.Count = 1 then Some project else None)
+        |> List.distinct
     let seen = HashSet<string>(StringComparer.Ordinal)
     let unique =
         results
@@ -202,9 +223,6 @@ let internal snapshotFromResults (results: (string * Result<(string * AgentView.
                 Some (project, identity, Some (agents, reviews), None)
             | Ok (Some _) | Ok None -> None
             | Error error -> Some (project, "unavailable:" + project, None, Some error))
-    let rows =
-        unique
-        |> List.collect (function _, _, Some (agents, _), _ -> agents | _ -> [])
     let summaries : AgentView.ProjectSummary list =
         unique
         |> List.map (fun (project, identity, data, error) ->
@@ -212,6 +230,24 @@ let internal snapshotFromResults (results: (string * Result<(string * AgentView.
               Identity = identity
               Counts = data |> Option.map (fun (agents, reviews) -> AgentView.projectCounts agents reviews)
               Error = error })
+    let labelsSnapshot : AgentView.Snapshot =
+        { Agents = []; Projects = summaries; Issues = []; RefreshedAt = DateTimeOffset.UtcNow }
+    let projectLabels =
+        summaries
+        |> List.map (fun project -> project.Identity, AgentView.projectDisplayName labelsSnapshot project)
+        |> Map.ofList
+    let rows =
+        unique
+        |> List.collect (fun (_, identity, data, _) ->
+            match data with
+            | None -> []
+            | Some (agents, _) ->
+                let aliases = activityAliases identity
+                let label = Map.find identity projectLabels
+                agents |> List.map (fun row ->
+                    { row with Key = identity + "::" + row.Agent
+                               ProjectLabel = label
+                               ActivityKeys = aliases |> List.map (fun name -> name + "::" + row.Agent) }))
     ({ Agents = rows; Projects = summaries; Issues = []
        RefreshedAt = DateTimeOffset.UtcNow } : AgentView.Snapshot)
 

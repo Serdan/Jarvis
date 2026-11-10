@@ -1,0 +1,24 @@
+<h1>Investigate and eliminate intermittent MCP client dispatch head-of-line stalls</h1>
+<p><strong>Priority P2.</strong> Occasional user-visible "tool connection failure" / timeout on inexpensive Jarvis calls (BN-047/Favn `agent_inbox`, `get_job_result`) that succeed when retried. This is a correctness and latency issue, not evidence of ledger corruption. <strong>No production modification, endpoint restart, automatic retry of arbitrary mutations or deployment is authorized by this task.</strong></p>
+<h2>Observed evidence (2026-11-10 UTC)</h2>
+<ul>
+<li>Production server journal: 3,870 completed MCP handlers; 217 took over 30s, 59 over 60s, maximum 117s. Independent commands show clustered completions. At 01:39:32-01:39:40, `run_command`, `write_file`, `read_file`, `patch_file`, `get_task`, and <strong>three `get_job_result` calls</strong> all completed around 90-105s after request start, mostly `IsError=False`.</li>
+<li>BN-047 on home client `Favn`: `GetJobResult(4c21a1e6)` recorded <strong>0ms local command duration</strong> at 08:19:17 Europe/Copenhagen while a server `get_job_result` completed at 07:19:17 UTC after ~9.3s. Most delay was outside the actual job-status operation.</li>
+<li>Nginx access log for same day: 3,412 legitimate `/mcp` HTTP 200 responses, two irrelevant 404 probes, no MCP 499/502/504 failures; error log empty, `proxy_read_timeout` and `proxy_send_timeout` both 3600s. Neither connected client has a matching SignalR disconnection event in the incident window; both protocol 3.62.</li>
+<li>`Client/Program.fs` registers `ReceiveCommand` using a task-returning `Client.receiveCommandAndReply` callback. `Client/SignalR/Client.fs` runs `processIncomingCommand` inside that callback, including synchronous `activateReadyOnActivity` ledger Git operations, and uses `HubConnection.InvokeAsync("SendClientResponse")` to reply. Investigate receive-loop / callback head-of-line blocking under long synchronous commands, plus SignalR send/receive dependencies and thread-pool contention. This is a <em>strong hypothesis, not yet an instrumented proof</em>.</li>
+<li>`Server/Services/ClientService.fs` tracks client responses with a 10-minute default deadline, while upstream ChatGPT/tool connection can fail sooner; HTTP request aborts do not produce usable stage-specific logs. `ClientResponseTracker` and activity telemetry do not currently expose dispatch-to-receipt queue latency.</li>
+</ul>
+<h2>Diagnostic implementation</h2>
+<ul>
+<li>Add bounded, privacy-safe, correlated timings for <em>server request accepted → SignalR dispatch attempted/sent → client handler entered → command execution started/completed → reply sent → server reply received</em>, plus upstream HTTP abort vs tracker timeout vs SignalR disconnect. Use correlation IDs with no command argument/body/secret logging. Distinguish local command execution time, queued time and network time.</li>
+<li>Produce a deterministic local SignalR integration stress test with a deliberately stalled/blocking source/ledger action and concurrent cheap `get_job_result`/read commands. Determine whether handler backpressure/serialization or a different shared resource causes the delay. Test one and several projects under simultaneous agents.</li>
+<li>Correct the proven choke point at the appropriate abstraction, likely bounded asynchronous ingress/dispatch decoupled from the SignalR receive loop with explicit lifecycle and backpressure. Do <strong>not</strong> spawn unlimited fire-and-forget commands. Preserve per-command correlation, ordered reply delivery and exact ledger CAS/idempotency semantics. Avoid treating a lost response as proof a write was not committed.</li>
+<li>Review whether invoking `SendClientResponse` by `InvokeAsync` from inside a task-returning client `On` handler introduces same-connection completion waits; avoid blocking the reader. Track tasks across shutdown/reconnect and dispose/cancel safely. Never lose or silently discard a command; reject bounded-queue overflow explicitly and promptly.</li>
+</ul>
+<h2>Acceptance</h2>
+<ol>
+<li>A slow command cannot delay an unrelated cheap command by the slow command's duration; demonstrate with controlled pre-fix failure and post-fix passing integration test, including parallel `get_job_result`.</li>
+<li>Stage timing identifies where a slow request spends its time; report at least p50/p95/p99 with a comparable load test, and verify diagnostics contain no sensitive arguments.</li>
+<li>Forced reconnect, timeout, cancellation, bounded queue saturation, concurrent writes and idempotent retry keep original outcomes and operation IDs correct. No client state regression or lost responses.</li>
+<li>Full Release Client/Server tests pass, independent review accepts the frozen commit, and publishing is separate operator-approved work.</li>
+</ol>

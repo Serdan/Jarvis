@@ -1,22 +1,33 @@
-# Independent review — checkpoint validation and evidence-only audit support
+# Independent review — checkpoint evidence validation for unbound audits
 
-**Frozen source:** `1c1be4ecc2eb1c85081328297a02c0795b7c45f1` on `refs/heads/fix/checkpoint-evidence-validation`, targeting `main`. Task `task-9677a1ef10f046f983cbdabf39d30efd`. No merge or deployment.
+**Verdict: RequestChanges.** One P2 acceptance gap and one P3 public API/docs mismatch.
 
-## Root cause
-A Wayfold audit worker got the generic `Invalid Working checkpoint metadata` even though its attempt was unbound. The source commit has always been optional: `checkpointAttemptWithSession` verifies a source object **only when sourceCommit is nonempty**, but summary, nextAction and evidence have independent **8192-byte UTF-8 limits**. A large audit report in `evidence` can thus fail before the ledger transaction, misleading the worker into blaming missing source binding. This change does not weaken binding or ownership rules.
+Frozen source: `1c1be4ecc2eb1c85081328297a02c0795b7c45f1` on `refs/heads/fix/checkpoint-evidence-validation`, base `2a52211ba2cc2c3fa3204fe8ea2d1c6f9ca27965`, target `main`. No reviewer source edits, integration, or deployment.
 
-## Source changes
-- Validate `taskId`, `agentId`, nonnegative version/generation assertions, required `summary` / `nextAction`, optional `evidence`, and optional `sourceCommit` with **field-specific InvalidBinding errors**.
-- Required strings must contain non-whitespace text and fit 8192 UTF-8 bytes. Evidence can be absent/empty or up to 8192 bytes. Oversized audit reports are rejected with an explicit suggestion to store the full report separately and pass a bounded reference; no silent truncation or unlimited ledger record.
-- Empty or null source SHA means no source commit claimed, appropriate for read-only/unbound audits; a supplied SHA must match the ledger's shared lowercase 40/64-hex Git OID validation and refer to an actually available Git commit. Unknown objects remain `SourceUnavailable`, lexically malformed IDs are `InvalidBinding`.
-- No changes to the atomic ledger transaction, expected versions, immutable checkpoint path, UUID replay rules, source verification or owner-reported evidence status.
-- Tool description now declares each field and bound.
+## What works
 
-## Regression evidence
-- `UnboundReadOnlyAuditCanCheckpointEvidenceAndCompleteWithoutInventingSource`: two Git clients, task assigned and Working without source binding; checkpoint evidence persists with `OwnerReported`, null/empty source, immutable sequence, replay by identical UUID `AlreadyApplied`, second checkpoint, stable Working clock and complete-to-NeedsWork.
-- `CheckpointReportsExactInvalidFieldAndUTF8LimitsBeforeLedgerMutation`: required empty/oversized summary and nextAction, oversized multibyte evidence, malformed SHA, negative version/generation, missing 40-hex commit, stale generation all fail without changing the ledger head; **exactly 8192 bytes** of emoji evidence and summary pass.
-- Both targeted Client Release tests **passed (2/2)**. Full Release Client + Server suite **completed successfully, exit code 0**, in job `db5bf6bd3ba845f7bd6c4b0e011acba0` on the frozen source. The job's aggregate output was truncated; do not infer individual suite counts from that display.
-- `git diff --check` clean; source branch pushed clean; `git merge-tree --write-tree` into current main succeeds.
+- The preflight validator now distinguishes invalid/negative *input* versions, malformed task/agent identity, required summary and nextAction, oversized evidence, and malformed source SHA; the unchanged Git lookup reports a missing 40/64-character OID as `SourceUnavailable`.
+- All text bounds are UTF-8 byte counts. Evidence, including emoji, is accepted at **exactly 8192 bytes** and rejected over the bound without truncation.
+- An unbound read-only Working agent can store a progress checkpoint with sourceCommit empty, preserving owner-reported evidence without fabricating a source commit. Generation, immutable checkpoint sequence, attempt version increment, Working clock, repeated UUID replay and eventual completion behave as intended.
+- No unbounded ledger field or new source-binding abstraction was introduced.
 
-## Review focus
-Check the shared 40/64-digit OID validity against Git source-object lookup, UTF-8 byte boundaries, unchanged owner/phase checks, transaction/error ordering, idempotent replay and that missing source doesn't accidentally become verified evidence. A separate large-report storage protocol is **not** implemented: this task only supplies explicit rejection and reference guidance, consistent with conditional requirement.
+## Findings
+
+**P2 — semantic checkpoint validation is still generic** (`findings/semantic-checkpoint-errors.md`).
+
+`ReviewWorkflow.fs:1548–1554` still combines lifecycle, owner, phase, expectedAttemptVersion, assignmentGeneration, expectedAgentVersion, agent Working state and active attempt checks into one `StaleEntityVersion "Checkpoint requires exact current Working versions and generation."` error. The task expressly requires **field-specific errors for invalid versions and ownership/phase**. New tests assert a generic stale failure rather than differentiating these conditions. Return precise diagnostics within the existing atomic transaction and test stale version/generation and ownership/phase separately.
+
+**P3 — optional source/evidence descriptions contradict public tool schema** (`findings/optional-tool-args.md`).
+
+`Server/McpTools.fs:1403` says caller may omit `sourceCommit`, and that `evidence` is optional, but `CheckpointAttempt` declares both as required `string` arguments at line 1404. The published MCP shape lists them as required. Either give both empty-string defaults with Optional attributes and verify the schema or correct the description to require explicit empty strings. Current unbound audit tests always supply both.
+
+## Independent validation
+
+- Full Client Release suite: **530 passed, 0 failed, 0 skipped** — job `c9c509afe5df45ab9d64045be0f556e8`.
+- Full Server Release suite: **122 passed, 0 failed, 0 skipped** — job `7136df99fc5b449dbb147f3b1081900d`.
+- Both new focused Client checkpoint tests independently rerun: **2 passed, 0 failed** — job `f801538a1d254de79ada4e2287daee2f`. (Included in 530; not additive.)
+- **652 full-suite tests passed** in total.
+- `git diff --check`: clean; exact frozen checkout HEAD and clean worktree verified.
+- `git merge-tree --write-tree main 1c1be4e`: succeeded without conflicts.
+
+The implementation fixes the reported evidence-only root cause; the requested semantic error resolution is still incomplete. No deployment authorized or attempted.

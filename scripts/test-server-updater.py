@@ -26,6 +26,7 @@ def running():
 """
 
 SYSTEMCTL = """
+import time
 args=sys.argv[1:]
 cmd=args[0]
 if cmd=='is-active':
@@ -39,6 +40,8 @@ if cmd=='show':
     print('4242')
     sys.exit(0)
 if cmd=='stop':
+    delay=state.get('stop_delay',0)
+    if delay: time.sleep(delay)
     state['stops']=state.get('stops',0)+1
     state['active']=False
     save()
@@ -94,8 +97,11 @@ auth=''
 if '/.well-known/oauth-protected-resource' in url:
     body='{"resource":"https://jarvis2.kehlet.dev","authorization_servers":["https://issuer.example"]}'
 elif '/mcp' in url:
-    status=401
-    auth='WWW-Authenticate: Bearer resource_metadata="https://jarvis2.kehlet.dev/.well-known/oauth-protected-resource"\\r\\n'
+    if 'Content-Type: application/json' not in args:
+        status=415
+    else:
+        status=401
+        auth='WWW-Authenticate: Bearer resource_metadata="https://jarvis2.kehlet.dev/.well-known/oauth-protected-resource"\\r\\n'
 elif '/client/negotiate' in url:
     status=401
     auth='WWW-Authenticate: Bearer resource_metadata="https://jarvis2.kehlet.dev/.well-known/oauth-protected-resource", scope="client:connect"\\r\\n'
@@ -134,8 +140,10 @@ os.execv('/usr/bin/mv',['mv']+args)
 
 
 SS = """
+if 'sport = :5095' not in sys.argv[1:]:
+    sys.exit(9)
 active_pid='777' if (running()==b'jarvis-new-binary-fixture\\n' and state.get('wrong_listener_owner')) else '4242'
-local_address='192.168.1.10:5000' if (running()==b'jarvis-new-binary-fixture\\n' and state.get('wrong_listener_address')) else '127.0.0.1:5000'
+local_address='192.168.1.10:5095' if (running()==b'jarvis-new-binary-fixture\\n' and state.get('wrong_listener_address')) else '127.0.0.1:5095'
 print(f'LISTEN 0 512 {local_address} 0.0.0.0:* users:(("JarvisServer",pid={active_pid},fd=12))')
 """
 
@@ -214,6 +222,46 @@ class Fixture(unittest.TestCase):
     def assert_no_transaction(self):
         self.assertFalse(self.pending.exists())
         self.assertFalse(list((self.root / "server").glob("*.staging.*")))
+
+    def test_wrong_probe_port_fails_closed_before_stopping_service(self):
+        script = self.runner.read_text()
+        expected = "PROBE_BASE=http://127.0.0.1:5095"
+        self.assertEqual(script.count(expected), 1)
+        self.runner.write_text(script.replace(expected, "PROBE_BASE=http://127.0.0.1:5000"))
+        result = self.run_update()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("stage=preflight-unhealthy-listener-owner rollback=not-needed", self.status.read_text())
+        self.assertEqual(self.live.read_bytes(), OLD)
+        self.assertEqual(self.read_state()["stops"], 0)
+        self.assert_no_transaction()
+
+    def test_mcp_probe_without_json_media_type_fails_closed(self):
+        script = self.runner.read_text()
+        expected = "-H 'Content-Type: application/json'"
+        self.assertEqual(script.count(expected), 1)
+        self.runner.write_text(script.replace(expected, ""))
+        result = self.run_update()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("stage=preflight-unhealthy-mcp-auth rollback=not-needed", self.status.read_text())
+        self.assertEqual(self.live.read_bytes(), OLD)
+        self.assertEqual(self.read_state()["stops"], 0)
+        self.assert_no_transaction()
+
+    def test_stop_budget_allows_graceful_shutdown_and_covers_rollback(self):
+        script = self.runner.read_text()
+        # Source default covers production systemd's 90-second stop policy.
+        self.assertEqual(script.count("STOP_TIMEOUT_SECONDS=100"), 1)
+        self.assertEqual(
+            script.count('timeout -k 2 "$STOP_TIMEOUT_SECONDS" systemctl stop'), 2
+        )
+        # Scale the timeout and simulated graceful stop for fast fixture testing.
+        self.runner.write_text(script.replace("STOP_TIMEOUT_SECONDS=100", "STOP_TIMEOUT_SECONDS=3"))
+        self.update_state(stop_delay=1)
+        result = self.run_update()
+        self.assertEqual(result.returncode, 0, self.status.read_text() + result.stderr)
+        self.assertEqual(self.live.read_bytes(), NEW)
+        self.assertEqual(self.read_state()["stops"], 1)
+        self.assert_no_transaction()
 
     def test_success_confirms_live_binary_and_protocol_then_keeps_previous(self):
         result = self.run_update()

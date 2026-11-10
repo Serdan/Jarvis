@@ -1,0 +1,22 @@
+<h1>Reconcile the tested Jarvis server updater with production configuration</h1>
+<p><strong>Priority P2.</strong> Protocol 3.63 server deployed successfully only after manual operational corrections to the reviewed server updater. Keep the repository authoritative so the next deploy or updater reinstall does not overwrite the working helper with a broken version. This is deployment safety and test fidelity work; <strong>no production restart or deployment</strong> is part of this task.</p>
+<h2>Observed production failures (2026-11-10)</h2>
+<ul>
+<li>Real Jarvis service listens on <code>127.0.0.1:5095</code> (systemd <code>ASPNETCORE_URLS</code>; nginx forwards to 5095), but repository updater <code>PROBE_BASE</code> still points to port <code>5000</code>. The listener-ownership preflight correctly failed before mutation.</li>
+<li>The <code>/mcp</code> readiness POST lacks <code>Content-Type: application/json</code>. Production returns <code>415</code> instead of the expected unauthorized <code>401</code>; the updater stopped before touching the service.</li>
+<li>A normal server shutdown took approximately 32 seconds. The updater's two <code>timeout -k 2 30 systemctl stop</code> guards report a failure although the systemd service's stop timeout is 90 seconds; this triggered an unnecessary verified rollback. Production helper was adjusted to 100 seconds for bounded stop in both deploy and rollback paths.</li>
+<li>Production also lacked the root-owned <code>/var/lib/jarvis-update-state</code> journal directory. The <code>install-server-updater.sh</code> setup already creates it, but manual binary-only helper installation bypassed this prerequisite. Retain and document installing via the canonical installer.</li>
+</ul>
+<h2>Required source changes</h2>
+<ol>
+<li>Make repository updater probes exactly match the configured real production endpoint and JSON media type, with fixed Host and loopback verification, preserving existing strict PID/hash/socket ownership checks and fail-closed behavior.</li>
+<li>Use an explicit bounded stop timeout compatible with systemd's configured 90-second policy for both deployment and rollback; retain restart/readiness deadlines and atomic rollback safeguards.</li>
+<li>Update black-box test fixture to model the real 5095 socket and enforce the MCP JSON Content-Type requirement; add negative-space regressions for mismatched listener port and invalid request media type. Keep all existing stop/rollback/recovery tests intact. If adding a slow-stop test, use scaled fixture limits, not long wall-clock waits.</li>
+<li>Document that the canonical installer creates the root-owned journal directory and privileged updater entrypoint. Make manual production-only patches unnecessary on future upgrades.</li>
+</ol>
+<h2>Acceptance</h2>
+<ul>
+<li><code>sh -n</code> on updater and installer scripts; the entire <code>scripts/test-server-updater.py</code> fixture suite passes, including old failure scenarios and new probes; no unexpected rebuild/deployment or service restart.</li>
+<li>Independent review of frozen source (including test fidelity and unchanged rollback security properties), then integrate into clean <code>main</code>.</li>
+<li>Existing live 3.63 production server stays healthy, clients remain manual-install only; future publication/restart requires operator approval.</li>
+</ul>

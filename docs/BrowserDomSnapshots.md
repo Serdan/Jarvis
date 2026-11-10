@@ -68,3 +68,17 @@ The user's extension registration and explicit site host permission still apply.
 The export buffer is ephemeral in the extension and limited to two snapshots, each up to 8 MiB, with a rolling two-minute idle expiration. Export uses **32 KiB chunks** and SHA-256 integrity checks. A disconnected extension, expired buffer, navigation or lost authorization aborts transfer and preserves no partial output file. The destination is never silently overwritten.
 
 The fixture `browser-extension/tests/fixtures/dynamic-dom.html` demonstrates delayed data and a custom DOM event for live testing. Automated DOM simulation and loopback protocol regressions also cover these scenarios. Live extension acceptance is still required before integration.
+
+## Disposable real-browser smoke test
+
+For a disposable **Chrome for Testing** integration probe, run:
+
+```sh
+node browser-extension/tests/live-chromium-smoke.cjs /absolute/path/to/chrome-for-testing
+```
+
+The harness uses a fresh temporary Chromium profile, a loopback HTTP fixture and a test WebSocket bridge; it does not touch the personal Edge profile or the deployed JarvisClient. It loads the real Manifest V3 extension, enables the per-extension **Allow User Scripts** toggle in the disposable Chrome settings UI, and performs **test-only synthetic** window registration and agent-tab opt-in inside the extension background.
+
+It exercises authenticated HMAC pairing, agent-created tabs, real `chrome.userScripts.execute`, post-hydration selector/timer/custom-event DOM snapshots, frozen SHA-256 chunk transfer, refusal to close a manually registered tab and safe agent-tab cleanup. It prints only stage labels, byte counts and checksum, and deletes its temporary profile.
+
+**Evidence boundary:** This is real extension/Chromium execution, but the loopback transport is a test stand-in for JarvisClient and registration is synthetic. It does **not** replace the separately required human-authorized real browser extension + JarvisClient acceptance test or authorize integration/deployment.

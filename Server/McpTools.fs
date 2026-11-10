@@ -403,6 +403,19 @@ module McpToolHelpers =
                     prior.InboxActivation
                     |> Option.filter (fun receipt -> receipt.ActivatedByThisCall) }
 
+    /// A polled tool job carries the exact original response as typed data.
+    /// Present its instructions and canonical side effects with the polling
+    /// envelope, rather than substituting invented empty metadata.
+    let completedToolEvidence command (response: AgentCommandResponse) =
+        match command, response.Result with
+        | GetJobResultCommand _, Some payload ->
+            try
+                let job = JsonSerializer.Deserialize<JobResult>(payload)
+                if isNull (box job) then response
+                else job.ToolResponse |> Option.defaultValue response
+            with _ -> response
+        | _ -> response
+
     let private imageResult (response: AgentCommandResponse) =
         match response.Result, response.Error with
         | Some serialized, None ->
@@ -688,6 +701,55 @@ module McpToolHelpers =
                                         let logger = factory.CreateLogger("Jarvis.AgentStateInvalidation")
                                         logger.LogWarning(ex, "Could not deliver agent-state invalidation hints.")
                         }
+                    // Cross-project notifications validate the sender before
+                    // dispatching to the destination. A promoted source read
+                    // is NOT proof of successful validation: resolve the
+                    // original result via its client-owned job first.
+                    let rec resolveSenderValidation (project: string) (source: AgentCommandResponse) deadline =
+                        task {
+                            match source.PendingJob with
+                            | None -> return source
+                            | Some handle when DateTimeOffset.UtcNow >= deadline ->
+                                return
+                                    { source with
+                                        Result = None
+                                        Error = Some(ExecutionFailed
+                                            ("Source agent validation remains in client job " + handle.JobId
+                                             + ". Do not retry the notification blindly."))
+                                        PendingJob = None
+                                        AgentStateChanges = [] }
+                            | Some handle ->
+                                do! Task.Delay(500, context.RequestAborted)
+                                let! poll = client.SendCommandToProject(
+                                    userId, project,
+                                    GetJobResultCommand { ProjectName = project
+                                                          JobId = handle.JobId
+                                                          AfterSequence = None },
+                                    ?conversationId = RequestDeviceRouting.session(),
+                                    ?deviceId = RequestDeviceRouting.deviceOverride(),
+                                    ?agentId = RequestDeviceRouting.agentId())
+                                match poll.Result, poll.Error with
+                                | Some payload, None ->
+                                    try
+                                        let outcome = JsonSerializer.Deserialize<JobResult>(payload)
+                                        match outcome.ToolResponse with
+                                        | Some completed -> return completed
+                                        | None when outcome.Status = Running ->
+                                            return! resolveSenderValidation project source deadline
+                                        | None ->
+                                            return
+                                                { poll with
+                                                    Result = None
+                                                    Error = Some(ExecutionFailed
+                                                        "Source agent validation job ended without its terminal response.") }
+                                    with ex ->
+                                        return
+                                            { poll with
+                                                Result = None
+                                                Error = Some(ExecutionFailed
+                                                    ("Unable to read source validation job: " + ex.Message)) }
+                                | _ -> return poll
+                        }
                     let! response =
                         match command with
                         | TaskWriteCommand notification when notification.Action = "NotifyAgent"
@@ -707,9 +769,12 @@ module McpToolHelpers =
                                     ?conversationId = RequestDeviceRouting.session(),
                                     ?deviceId = RequestDeviceRouting.deviceOverride(),
                                                      ?agentId = RequestDeviceRouting.agentId())
+                                let! sender =
+                                    resolveSenderValidation notification.SourceRef sender
+                                        (DateTimeOffset.UtcNow.AddMinutes(5.))
                                 do! publishChanges sender
                                 match sender.Result, sender.Error with
-                                | Some _, None ->
+                                | Some _, None when sender.PendingJob.IsNone ->
                                     let! destination = client.SendCommandToProject(
                                         userId, notification.ProjectName, command,
                                         ?conversationId = RequestDeviceRouting.session(),
@@ -727,26 +792,19 @@ module McpToolHelpers =
                     finishOperation tracking response stopwatch.ElapsedMilliseconds
 
                     do! publishChanges response
-                    // Polled tool jobs retain the exact immutable final
-                    // response. Advisory cache invalidation can be retried;
-                    // canonical ledger mutations are never re-executed.
-                    match command, response.Result with
-                    | GetJobResultCommand _, Some payload ->
-                        try
-                            let item = JsonSerializer.Deserialize<JobResult>(payload)
-                            match item.ToolResponse with
-                            | Some finished -> do! publishChanges finished
-                            | None -> ()
-                        with _ -> ()
-                    | _ -> ()
+                    let evidence = completedToolEvidence command response
+                    // Re-publishing an advisory cache invalidation is safe.
+                    // This does not execute or reapply the original ledger write.
+                    if not (Object.ReferenceEquals(evidence, response)) then
+                        do! publishChanges evidence
 
                     return
                         (match command with
                          | ReadImageCommand _ -> imageResult response
                          | ExportFileCommand _ -> exportResult context response
                          | _ -> toCallToolResult response)
-                        |> attachStateEffects response
-                        |> attachInstructions response.Instructions
+                        |> attachStateEffects evidence
+                        |> attachInstructions evidence.Instructions
                         |> attachOperationId tracking
                         |> attachGeneratedOperationId generatedId
                         |> attachGeneratedTaskId (if response.Result.IsSome && response.Error.IsNone && response.PendingJob.IsNone then generatedTaskId else None)

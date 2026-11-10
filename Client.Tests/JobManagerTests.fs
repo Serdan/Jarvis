@@ -9,6 +9,7 @@ open System.Threading.Tasks
 open Client
 open Client.IO
 open Client.JobManager
+open Client.SignalR
 open Common
 open NUnit.Framework
 open FsUnitTyped
@@ -361,7 +362,7 @@ let autoPromotedToolRetainsIdenticalTypedOutcomeAndNeverExecutesTwice () =
         let count = ref 0
         let registered =
             match startToolOperation jobProject (Some "Project1") "Worker 1" "ReadFile"
-                    (Some "operation-one") (fun () ->
+                    (Some "operation-one") "read-file-blocked-payload" (fun () ->
                         count.Value <- count.Value + 1
                         blocked.Task) with
             | Ok job -> job
@@ -414,7 +415,7 @@ let quickToolOperationReturnsOriginalResponseWithoutJobPromotion () =
     let response = completedToolResponse """{"quick":true}"""
     let registered =
         match startToolOperation jobProject (Some "Project1") "Worker 1" "ReadFile"
-                None (fun () -> Task.FromResult response) with
+                None "read-file-quick-payload" (fun () -> Task.FromResult response) with
         | Ok job -> job
         | Error error -> failwith $"Unable to register quick tool: {error}"
     match (awaitToolOperation registered (TimeSpan.FromSeconds 2.)).GetAwaiter().GetResult() with
@@ -423,3 +424,163 @@ let quickToolOperationReturnsOriginalResponseWithoutJobPromotion () =
     let handle, _ = registered
     Assert.That(isToolOperationJob handle.JobId, Is.False,
                 "A quick call is discarded rather than cluttering list_jobs.")
+
+[<Test>]
+let boundedSignalRIngressDoesNotHeadOfLineBlockCheapRequests () =
+    let errors = System.Collections.Concurrent.ConcurrentQueue<exn>()
+    let ingress = BoundedResponseIngress(2, fun ex -> errors.Enqueue ex)
+    let slow = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+    let first =
+        match ingress.TryDispatch("slow", fun () -> slow.Task :> Task) with
+        | Ok completion -> completion
+        | Error error -> failwith error
+    let quick = System.Diagnostics.Stopwatch.StartNew()
+    let second =
+        match ingress.TryDispatch("poll", fun () -> Task.CompletedTask) with
+        | Ok completion -> completion
+        | Error error -> failwith error
+    second.WaitAsync(TimeSpan.FromSeconds(2.)).GetAwaiter().GetResult()
+    quick.Stop()
+    Assert.That(quick.ElapsedMilliseconds, Is.LessThan(500L),
+                "Cheap polling must complete while the slow dispatch remains unresolved.")
+    Assert.That(first.IsCompleted, Is.False)
+    Assert.That(errors.IsEmpty, Is.True)
+    slow.SetResult(())
+    first.WaitAsync(TimeSpan.FromSeconds(2.)).GetAwaiter().GetResult()
+    Assert.That(ingress.ActiveCount, Is.EqualTo(0))
+
+[<Test>]
+let boundedSignalRIngressRejectsSaturationAndDuplicateCorrelations () =
+    let ingress = BoundedResponseIngress(2, fun _ -> ())
+    let slowA = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+    let slowB = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+    let a =
+        match ingress.TryDispatch("A", fun () -> slowA.Task :> Task) with
+        | Ok completion -> completion
+        | Error error -> failwith error
+    let b =
+        match ingress.TryDispatch("B", fun () -> slowB.Task :> Task) with
+        | Ok completion -> completion
+        | Error error -> failwith error
+    Assert.That(ingress.ActiveCount, Is.EqualTo(2))
+    match ingress.TryDispatch("A", fun () -> Task.CompletedTask) with
+    | Error error -> Assert.That(error, Does.Contain("Duplicate"))
+    | Ok _ -> Assert.Fail("A correlation cannot be executed twice.")
+    match ingress.TryDispatch("C", fun () -> Task.CompletedTask) with
+    | Error error -> Assert.That(error, Does.Contain("capacity"))
+    | Ok _ -> Assert.Fail("Bounded ingress must reject saturation.")
+    slowA.SetResult(())
+    slowB.SetResult(())
+    Task.WhenAll([|a; b|]).WaitAsync(TimeSpan.FromSeconds(2.)).GetAwaiter().GetResult()
+    Assert.That(ingress.ActiveCount, Is.EqualTo(0))
+    match ingress.TryDispatch("C", fun () -> Task.CompletedTask) with
+    | Ok task -> task.WaitAsync(TimeSpan.FromSeconds(2.)).GetAwaiter().GetResult()
+    | Error error -> Assert.Fail("Capacity was not returned after completion: " + error)
+
+
+[<Test>]
+let toolOperationRegistryBoundsRunningAndQueuedJobs () =
+    let root = createTempProject ()
+    let context = TestContext root
+    let waiting = TaskCompletionSource<AgentCommandResponse>(TaskCreationOptions.RunContinuationsAsynchronously)
+    let entered = System.Collections.Concurrent.ConcurrentQueue<int>()
+    let entries = ResizeArray<int * ToolJobHandle * Task<AgentCommandResponse>>()
+    let actor = Some "Worker 1"
+    let invoke index =
+        startToolOperation jobProject (Some "Project1") "Worker 1" "BlockedRead"
+            (Some $"test-operation-{index}") $"blocked-payload-{index}" (fun () ->
+                entered.Enqueue index
+                waiting.Task)
+    try
+        for index in 1 .. 32 do
+            match invoke index with
+            | Ok (handle, completion) -> entries.Add(index, handle, completion)
+            | Error error -> Assert.Fail($"Rejected admitted job {index}: {error}")
+        Assert.That(
+            SpinWait.SpinUntil((fun () -> entered.Count >= 8), TimeSpan.FromSeconds(8.)),
+            Is.True, "Eight bounded worker slots should become occupied.")
+        match invoke 33 with
+        | Error _ -> ()
+        | Ok _ -> Assert.Fail("33rd running/queued operation bypassed capacity limit.")
+        let queued =
+            entries
+            |> Seq.find (fun (index, _, _) -> not (entered.ToArray() |> Array.contains index))
+        let canceledIndex, canceledHandle, canceledCompletion = queued
+        let cmd = { ProjectName = "Project1"; JobId = canceledHandle.JobId }
+        match cancelJobForProjectAsAgent jobProject actor cmd context with
+        | Ok() -> ()
+        | Error error -> Assert.Fail($"Unable to cancel a not-yet-started job: {error}")
+        Assert.That(canceledCompletion.IsCompletedSuccessfully, Is.True)
+        Assert.That(canceledCompletion.Result.Error.IsSome, Is.True)
+        match invoke 34 with
+        | Ok (handle, completion) -> entries.Add(34, handle, completion)
+        | Error error -> Assert.Fail($"Canceled queued entry did not free capacity: {error}")
+        // Mark a job exposed and verify listing/lookup is cheap while all
+        // worker slots remain blocked by the original operations.
+        let _, exposed, _ = entries[0]
+        promoteToolOperation exposed.JobId
+        let lookup = Stopwatch.StartNew()
+        let result =
+            getJobResultForProjectAsAgent jobProject actor
+                { ProjectName = "Project1"; JobId = exposed.JobId; AfterSequence = None } context
+        let visible =
+            listJobsForProjectAsAgent jobProject actor
+                { ProjectName = Some "Project1"; IncludeCompleted = true } context
+        lookup.Stop()
+        Assert.That(lookup.ElapsedMilliseconds, Is.LessThan(300L),
+                    "Job polling/listing must not queue behind full worker slots.")
+        match result with
+        | Ok value -> Assert.That(value.Status, Is.EqualTo(JobStatus.Running))
+        | Error error -> Assert.Fail($"Polling blocked job unexpectedly failed: {error}")
+        match visible with
+        | Ok list -> Assert.That(list.Jobs |> List.exists (fun j -> j.JobId = exposed.JobId), Is.True)
+        | Error error -> Assert.Fail($"Job listing failed: {error}")
+        Assert.That(entered.ToArray() |> Array.contains canceledIndex, Is.False)
+        match cancelJobForProjectAsAgent jobProject actor
+                  { ProjectName = "Project1"; JobId = exposed.JobId } context with
+        | Error _ -> ()
+        | Ok _ -> Assert.Fail("Executing tool operations must not be canceled after side effects may have begun.")
+    finally
+        waiting.TrySetResult(completedToolResponse """{"ok":true}""") |> ignore
+        for _, _, completion in entries do
+            completion.WaitAsync(TimeSpan.FromSeconds(10.)).GetAwaiter().GetResult()
+        Directory.Delete(root, true)
+
+
+[<Test>]
+let stableOperationIdDoesNotDispatchOriginalCommandTwice () =
+    let operationId = "dedup-" + Guid.NewGuid().ToString("N")
+    let original = completedToolResponse """{"finished":true}"""
+    let executed = ref 0
+    let work () =
+        executed.Value <- executed.Value + 1
+        Task.FromResult original
+    let first =
+        match startToolOperation jobProject (Some "Project1") "Worker 1" "LedgerWrite"
+                  (Some operationId) "identical-request-hash" work with
+        | Ok job -> job
+        | Error error -> failwith $"Unable to start original: {error}"
+    let second =
+        match startToolOperation jobProject (Some "Project1") "Worker 1" "LedgerWrite"
+                  (Some operationId) "identical-request-hash" work with
+        | Ok job -> job
+        | Error error -> failwith $"Unable to recover original: {error}"
+    Assert.That(fst first, Is.EqualTo(fst second))
+    let originalResponse =
+        (snd first).WaitAsync(TimeSpan.FromSeconds(3.)).GetAwaiter().GetResult()
+    Assert.That(originalResponse, Is.EqualTo(original))
+    Assert.That((snd second).Result, Is.EqualTo(original))
+    Assert.That(executed.Value, Is.EqualTo(1))
+    match startToolOperation jobProject (Some "Project1") "Worker 1" "LedgerWrite"
+              (Some operationId) "different-request-hash" work with
+    | Error _ -> ()
+    | Ok _ -> Assert.Fail("Reusing an operation ID with changed arguments must be rejected.")
+    let replay =
+        match startToolOperation jobProject (Some "Project1") "Worker 1" "LedgerWrite"
+                  (Some operationId) "identical-request-hash" work with
+        | Ok job -> job
+        | Error error -> failwith $"Unable to replay completed original: {error}"
+    match (awaitToolOperation replay (TimeSpan.FromSeconds(1.))).GetAwaiter().GetResult() with
+    | Choice1Of2 response -> Assert.That(response, Is.EqualTo(original))
+    | Choice2Of2 _ -> Assert.Fail("Completed idempotent retry must replay the original result.")
+    Assert.That(executed.Value, Is.EqualTo(1))

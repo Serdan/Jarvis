@@ -7,6 +7,48 @@ open System.Threading
 open System.Threading.Tasks
 open Microsoft.AspNetCore.SignalR.Client
 
+/// SignalR callback dispatch is non-blocking even while a command awaits
+/// approval, a remote ledger fetch or eventual response delivery. The bounded
+/// registry observes all worker failures and prevents unbounded Task.Run use.
+type BoundedResponseIngress(maxConcurrent: int, onError: exn -> unit) =
+    let gate = obj()
+    let active = System.Collections.Generic.Dictionary<string, TaskCompletionSource<unit>>(StringComparer.Ordinal)
+
+    do
+        if maxConcurrent <= 0 then invalidArg (nameof maxConcurrent) "At least one callback slot is required."
+
+    member _.ActiveCount =
+        lock gate (fun () -> active.Count)
+
+    member _.TryDispatch(correlationId: string, work: unit -> Task) : Result<Task, string> =
+        lock gate (fun () ->
+            if String.IsNullOrWhiteSpace correlationId then
+                Error "Missing SignalR correlation ID."
+            elif active.ContainsKey correlationId then
+                Error "Duplicate SignalR correlation ID: command was not dispatched again."
+            elif active.Count >= maxConcurrent then
+                Error $"Client command-ingress capacity reached ({maxConcurrent} callbacks); retry the original request."
+            else
+                let completion = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+                active.Add(correlationId, completion)
+                try
+                    Task.Run(Func<Task>(fun () ->
+                        task {
+                            try
+                                try
+                                    do! work()
+                                with ex ->
+                                    try onError ex with _ -> ()
+                            finally
+                                lock gate (fun () -> active.Remove(correlationId) |> ignore)
+                                completion.TrySetResult(()) |> ignore
+                        } :> Task))
+                    |> ignore
+                    Ok(completion.Task :> Task)
+                with ex ->
+                    active.Remove(correlationId) |> ignore
+                    Error("Client command-ingress scheduling failed: " + ex.Message))
+
 module ResponseDelivery =
     let private inactiveConnectionMessage = "connection is not active"
 

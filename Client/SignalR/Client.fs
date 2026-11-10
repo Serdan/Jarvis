@@ -250,6 +250,10 @@ let private toAgentResponse command instructions stateChanges inboxActivation re
             match command with
             | ReadImageCommand _ -> (AgentProtocol.maxImageBytes * 4 / 3) + (64 * 1024)
             | ExportFileCommand _ -> (AgentProtocol.maxExportBytes * 4 / 3) + (64 * 1024)
+            // Tool responses are embedded as serialized strings inside
+            // JobResult. Keep the original media/export allowance plus safe
+            // JSON escaping overhead for this one typed polling envelope.
+            | GetJobResultCommand _ -> (AgentProtocol.maxImageBytes * 4 / 3 * 2) + (128 * 1024)
             | _ -> AgentProtocol.maxResponseBytes
 
         if bytes <= maxBytes then
@@ -620,19 +624,26 @@ let receiveCommand (rt: Runtime) (command: AgentCommand) =
 let private receiveCommandWithTypedInstructions (rt: Runtime)
                                                 (target: ProjectPaths.ProjectTarget option) (agentId: string) command =
     task {
-        match AgentInstructions.prepareOperationWithTarget rt target command with
-        | Error error ->
-            return Error error, [], AgentInstructions.RootBootstrapRequired
-        | Ok prepared ->
-            let! response =
-                receiveCommandForTarget rt target prepared.Source prepared.ProjectTask agentId command
-            let provenance =
-                if prepared.Source.IsSome then AgentInstructions.HierarchyLoaded
-                else AgentInstructions.RootBootstrapRequired
-            return response,
-                   prepared.Instructions
-                   @ AgentInstructions.writeWarningsForContext rt prepared.Source command response,
-                   provenance
+        match command with
+        | GetJobResultCommand _ | ListJobsCommand _ | CancelJobCommand _ ->
+            // Cheap controls must bypass source instruction preparation and
+            // remain responsive even while source/ledger commands are blocked.
+            let! response = receiveCommandForTarget rt target None None agentId command
+            return response, [], AgentInstructions.RootBootstrapRequired
+        | _ ->
+            match AgentInstructions.prepareOperationWithTarget rt target command with
+            | Error error ->
+                return Error error, [], AgentInstructions.RootBootstrapRequired
+            | Ok prepared ->
+                let! response =
+                    receiveCommandForTarget rt target prepared.Source prepared.ProjectTask agentId command
+                let provenance =
+                    if prepared.Source.IsSome then AgentInstructions.HierarchyLoaded
+                    else AgentInstructions.RootBootstrapRequired
+                return response,
+                       prepared.Instructions
+                       @ AgentInstructions.writeWarningsForContext rt prepared.Source command response,
+                       provenance
     }
 
 let receiveCommandWithInstructions (rt: Runtime) command =
@@ -703,7 +714,10 @@ let processIncomingCommand (rt: Runtime) (commandJson: string) (agentId: string)
                                 inboxActivation <- Some receipt
                             | _ -> ()
                             let! result, applicable, provenance =
-                                receiveCommandWithTypedInstructions rt target localAgentId command
+                                // Polling does not activate or record local
+                                // agent activity, but access checks still need
+                                // the initiating actor label from the transport.
+                                receiveCommandWithTypedInstructions rt target agentId command
                             // A write may alter another agent's state, or none
                             // at all. Invalidate precisely the affected local
                             // cache entries before preparing turn guidance.
@@ -805,6 +819,7 @@ let private executeOrPromote (rt: Runtime) (commandJson: string) (agentId: strin
                 let registered =
                     JobManager.startToolOperation canonical project agentId
                         (AgentCommandInfo.protocolName command) (tryOperationId commandJson)
+                        (Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(commandJson))))
                         (fun () -> task {
                             let! _, _, outcome = processIncomingCommand rt commandJson agentId
                             return outcome
@@ -829,7 +844,10 @@ let private executeOrPromote (rt: Runtime) (commandJson: string) (agentId: strin
                             { Result = Some(JsonSerializer.Serialize handle)
                               Error = None
                               Instructions = []
-                              AgentStateChanges = []
+                              // Unknown until the original command finishes.
+                              // Null on this one pending wire envelope means
+                              // "not yet known", never "there were no writes".
+                              AgentStateChanges = Unchecked.defaultof<_>
                               InboxActivation = None
                               PendingJob = Some handle }
             | Error _ ->
@@ -840,7 +858,7 @@ let private executeOrPromote (rt: Runtime) (commandJson: string) (agentId: strin
             return outcome
     }
 
-let receiveCommandAndReply (connection: HubConnection) (rt: Runtime) (correlationId: string) (commandJson: string) (agentId: string) : Task =
+let private receiveCommandAndReplyCore (connection: HubConnection) (rt: Runtime) (correlationId: string) (commandJson: string) (agentId: string) : Task =
     task {
         let! agentResponse = executeOrPromote rt commandJson agentId
         let! sendResult =
@@ -870,3 +888,18 @@ let receiveCommandAndReply (connection: HubConnection) (rt: Runtime) (correlatio
             | Error error -> rt.Tui.Log $"Self-update activation failed: {EffectError.toString error}"
         | _ -> ()
     }
+
+let private commandIngress = ConditionalWeakTable<Runtime, BoundedResponseIngress>()
+
+/// Return to SignalR ingress immediately after bounded admission. The
+/// response task remains tracked until it is sent (or delivery fails), so
+/// concurrent cheap polling is not serialized behind a 3-second deadline.
+let receiveCommandAndReply (connection: HubConnection) (rt: Runtime) (correlationId: string) (commandJson: string) (agentId: string) : Task =
+    let ingress =
+        commandIngress.GetValue(rt, fun _ ->
+            BoundedResponseIngress(96, fun ex ->
+                rt.Tui.Log $"Client command response failed: {ex.Message}"))
+    match ingress.TryDispatch(correlationId, fun () ->
+        receiveCommandAndReplyCore connection rt correlationId commandJson agentId) with
+    | Ok _ -> Task.CompletedTask
+    | Error reason -> Task.FromException(InvalidOperationException reason) :> Task

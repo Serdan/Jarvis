@@ -1487,3 +1487,69 @@ let client_request_abort_cancels_outstanding_device_correlation_without_faulting
             Assert.That(session.LastFailure.IsNone, Is.True)
         | ValueNone -> Assert.Fail("Original session should remain registered.")
     }
+
+
+[<Test>]
+let polledToolJobsRestoreExactInstructionsAndMutationEvidence () =
+    let guidance =
+        [ { Scope = "project"; Path = "Jarvis/AGENTS.md"
+            Sha256 = "sha256:" + String('c', 64)
+            Content = "Canonical instructions from the original command." } ]
+    let receipt : AgentInboxActivation =
+        { ProjectName = "Jarvis"; AgentId = "Worker 1"
+          ActivatedByThisCall = true; BeforeState = Some "Ready"
+          AfterState = Some "Working"; CommittedHead = Some(String('a', 40))
+          OperationId = Some "activation-id" }
+    for failed in [false; true] do
+        let original : AgentCommandResponse =
+            { Result = if failed then None else Some """{"value":"terminal"}"""
+              Error = if failed then Some(ValidationFailed "Original validation failure.") else None
+              Instructions = guidance
+              AgentStateChanges = [{ ProjectName = "Jarvis"; AgentId = "Worker 1" }]
+              InboxActivation = Some receipt; PendingJob = None }
+        let job : JobResult =
+            { JobId = "tool-job-1"; Status = if failed then ToolFailed "failed" else ToolCompleted
+              Events = []; NextSequence = 0L; Truncated = false
+              ToolResponse = Some original; OperationId = Some "stable-operation-id" }
+        let poll : AgentCommandResponse =
+            { Result = Some(JsonSerializer.Serialize job)
+              Error = None; Instructions = []
+              AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+        let command = GetJobResultCommand { ProjectName = "Jarvis"; JobId = job.JobId; AfterSequence = None }
+        let effective = McpToolHelpers.completedToolEvidence command poll
+        Assert.That(effective, Is.EqualTo(original))
+        let displayed =
+            poll |> McpToolHelpers.toCallToolResult
+            |> McpToolHelpers.attachStateEffects effective
+            |> McpToolHelpers.attachInstructions effective.Instructions
+        Assert.That(displayed.IsError, Is.EqualTo(Nullable false))
+        Assert.That(displayed.Meta["jarvis/agent_state_changes"].ToJsonString(), Does.Contain("Worker 1"))
+        Assert.That(displayed.Meta["jarvis/inbox_activation"].ToJsonString(), Does.Contain("activation-id"))
+        Assert.That((displayed.Content[0] :?> TextContentBlock).Text,
+                    Does.Contain("Canonical instructions from the original command"))
+        use terminalJson = JsonDocument.Parse((displayed.Content[1] :?> TextContentBlock).Text)
+        let terminal = terminalJson.RootElement.GetProperty("ToolResponse")
+        Assert.That(terminal.GetProperty("AgentStateChanges").GetArrayLength(), Is.EqualTo(1))
+        Assert.That(terminal.GetProperty("Instructions").GetArrayLength(), Is.EqualTo(1))
+        Assert.That(terminal.GetProperty("InboxActivation").GetProperty("ActivatedByThisCall").GetBoolean(), Is.True)
+
+[<Test>]
+let pendingToolJobNeverAdvertisesAFalseEmptyMutationList () =
+    let handle : ToolJobHandle =
+        { JobId = "pending-job"; Kind = "ToolOperation"; Status = "Running"
+          ProjectName = Some "Jarvis"; AgentId = "Worker 1"
+          OperationId = Some "original-id"; CommandName = "ReadFile"
+          StartedAt = DateTimeOffset.UtcNow }
+    let pending : AgentCommandResponse =
+        { Result = Some(JsonSerializer.Serialize handle); Error = None
+          Instructions = []; AgentStateChanges = Unchecked.defaultof<_>
+          InboxActivation = None; PendingJob = Some handle }
+    use wire = JsonDocument.Parse(JsonSerializer.Serialize pending)
+    Assert.That(wire.RootElement.GetProperty("AgentStateChanges").ValueKind,
+                Is.EqualTo(JsonValueKind.Null))
+    let shown =
+        pending |> McpToolHelpers.toCallToolResult
+        |> McpToolHelpers.attachStateEffects pending
+    Assert.That(shown.Meta, Is.Null)
+    Assert.That(shown.Content.Count, Is.EqualTo(1),
+                "A pending response must not add an authoritative agentStateChanges: [] annotation.")

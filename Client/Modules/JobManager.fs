@@ -284,9 +284,12 @@ module private Core =
 type private ToolOperationRecord =
     { Handle: ToolJobHandle
       CanonicalProject: ProjectPaths.ProjectId option
+      CommandHash: string
+      OperationKey: string option
       Completion: TaskCompletionSource<AgentCommandResponse>
       mutable Status: JobStatus
       mutable StartedExecution: bool
+      mutable Counted: bool
       mutable Exposed: bool
       mutable CompletedAt: DateTimeOffset option }
 
@@ -294,6 +297,10 @@ module private ToolOperations =
     let private gate = obj()
     let private records = ConcurrentDictionary<string, ToolOperationRecord>(StringComparer.Ordinal)
     let private expired = ConcurrentDictionary<string, DateTimeOffset>(StringComparer.Ordinal)
+    // Stable original operation IDs prevent duplicate execution on retry or
+    // after losing the first response. Keep a bounded tombstone after eviction.
+    let private byOperation =
+        System.Collections.Generic.Dictionary<string, struct (string * string * DateTimeOffset)>(StringComparer.Ordinal)
     let private workerSlots = new SemaphoreSlim(8, 8)
     let private maxInFlight = 32
     let private maxRetained = 100
@@ -318,6 +325,12 @@ module private ToolOperations =
             if now - whenExpired > terminalAge then
                 let mutable value = Unchecked.defaultof<DateTimeOffset>
                 expired.TryRemove(id, &value) |> ignore
+        // Preserve deduplication for retained jobs and a short bounded
+        // reconciliation window after result eviction.
+        for KeyValue(key, struct (jobId, _, admitted)) in byOperation |> Seq.toArray do
+            if not (records.ContainsKey jobId)
+               && (now - admitted >= terminalAge || byOperation.Count > 512) then
+                byOperation.Remove(key) |> ignore
         // Expiry markers are diagnostic, never a second unbounded registry.
         if expired.Count > 200 then
             expired |> Seq.sortBy (fun entry -> entry.Value)
@@ -344,7 +357,10 @@ module private ToolOperations =
                     | None -> ToolCompleted
                 entry.CompletedAt <- Some DateTimeOffset.UtcNow
                 entry.Completion.TrySetResult(response) |> ignore
-            inFlight <- inFlight - 1
+            // Cancellation of a queued job may already have released its slot.
+            if entry.Counted then
+                entry.Counted <- false
+                inFlight <- inFlight - 1
             prune DateTimeOffset.UtcNow)
 
     let private schedule (entry: ToolOperationRecord) (execute: unit -> Task<AgentCommandResponse>) =
@@ -370,9 +386,8 @@ module private ToolOperations =
                                 }
                             complete entry response
                         else
-                            lock gate (fun () ->
-                                inFlight <- inFlight - 1
-                                prune DateTimeOffset.UtcNow)
+                            // Queue cancellation released admission immediately.
+                            lock gate (fun () -> prune DateTimeOffset.UtcNow)
                     finally
                         workerSlots.Release() |> ignore
                 with ex ->
@@ -380,13 +395,35 @@ module private ToolOperations =
             } :> Task))
         |> ignore
 
-    let start canonical projectName actor commandName operationId execute =
+    let start canonical projectName actor commandName operationId commandHash execute =
         lock gate (fun () ->
             prune DateTimeOffset.UtcNow
-            if inFlight >= maxInFlight then
+            let identity = canonical |> Option.map ProjectPaths.ProjectId.value |> Option.defaultValue "@unscoped"
+            let key =
+                operationId |> Option.filter (String.IsNullOrWhiteSpace >> not)
+                |> Option.map (fun op -> identity + "\u001f" + actor + "\u001f" + op)
+            let duplicate =
+                match key with
+                | None -> None
+                | Some value ->
+                    match byOperation.TryGetValue value with
+                    | false, _ -> None
+                    | true, struct (jobId, priorHash, _) when priorHash <> commandHash ->
+                        Some(Error(Client.ValidationError
+                            "An existing operationId was reused for different tool arguments."))
+                    | true, struct (jobId, _, _) ->
+                        match records.TryGetValue jobId with
+                        | true, existing ->
+                            Some(Ok(existing.Handle, existing.Completion.Task))
+                        | false, _ ->
+                            Some(Error(Client.NotFoundError
+                                "The original tool job has expired. Reconcile its persisted operationId rather than rerunning it."))
+            match duplicate with
+            | Some result -> result
+            | None when inFlight >= maxInFlight ->
                 Error(Client.ContextError
                     "The client has reached its bounded tool-operation capacity (32 running/queued). Retry after an existing job finishes.")
-            else
+            | None ->
                 let id = Guid.NewGuid().ToString("N")
                 let handle =
                     { JobId = id
@@ -400,15 +437,20 @@ module private ToolOperations =
                 let entry =
                     { Handle = handle
                       CanonicalProject = canonical
+                      CommandHash = commandHash
+                      OperationKey = key
                       Completion = TaskCompletionSource<AgentCommandResponse>(TaskCreationOptions.RunContinuationsAsynchronously)
                       Status = Running
                       StartedExecution = false
+                      Counted = true
                       Exposed = false
                       CompletedAt = None }
                 if not (records.TryAdd(id, entry)) then
                     Error(Client.ContextError "Unable to register client-owned tool operation.")
                 else
                     inFlight <- inFlight + 1
+                    key |> Option.iter (fun value ->
+                        byOperation[value] <- struct (id, commandHash, handle.StartedAt))
                     schedule entry execute
                     Ok(handle, entry.Completion.Task))
 
@@ -421,7 +463,8 @@ module private ToolOperations =
     let forgetQuick jobId =
         lock gate (fun () ->
             match records.TryGetValue jobId with
-            | true, entry when not entry.Exposed && entry.Status <> Running ->
+            | true, entry when not entry.Exposed && entry.Status <> Running
+                                && entry.OperationKey.IsNone ->
                 let mutable ignored = Unchecked.defaultof<ToolOperationRecord>
                 records.TryRemove(jobId, &ignored) |> ignore
             | _ -> ())
@@ -507,12 +550,16 @@ module private ToolOperations =
                     | Ok () ->
                         entry.Status <- Canceled
                         entry.CompletedAt <- Some DateTimeOffset.UtcNow
+                        if entry.Counted then
+                            entry.Counted <- false
+                            inFlight <- inFlight - 1
                         entry.Completion.TrySetResult(failedResponse "Tool operation canceled before execution.") |> ignore
+                        prune DateTimeOffset.UtcNow
                         Ok ()
                 Some response)
 
-let startToolOperation canonical projectName actor commandName operationId execute =
-    ToolOperations.start canonical projectName actor commandName operationId execute
+let startToolOperation canonical projectName actor commandName operationId commandHash execute =
+    ToolOperations.start canonical projectName actor commandName operationId commandHash execute
 
 let promoteToolOperation jobId = ToolOperations.promote jobId
 let forgetQuickToolOperation jobId = ToolOperations.forgetQuick jobId

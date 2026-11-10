@@ -10,12 +10,15 @@ let private record project agent state task =
     { Key = project + "::" + agent
       Agent = agent
       Project = project
+      ProjectLabel = project
+      ProjectAliases = [project]
       State = state
       StateEnteredAt = Some(DateTimeOffset(2026,10,30,4,36,32,TimeSpan.Zero))
       StateReason = Some "Review commits then resume"
       Focus = task
       PendingNotifications = 0
-      LatestNotification = None }
+      LatestNotification = None
+      ActivityKeys = [project + "::" + agent] }
 
 let private focused =
     { TaskId = "320"
@@ -207,3 +210,107 @@ let activityProjectRejectsInvalidCheckoutSelector () =
     match ProjectPaths.ProjectTarget.parse "Wayfold::bad::selector" with
     | Error(Client.ValidationError _) -> ()
     | other -> Assert.Fail(sprintf "Expected typed validation: %A" other)
+
+[<Test>]
+let projectCountersUseCanonicalRowsIncludingParkedAndUnread () =
+    let agents =
+        [ { record "Wayfold" "A" "Working" None with PendingNotifications = 2 }
+          { record "Wayfold" "B" "Ready" None with PendingNotifications = 1 }
+          record "Wayfold" "C" "NeedsWork" None
+          record "Wayfold" "D" "Parked" None ]
+    let totals = projectCounts agents 3
+    Assert.That(totals.Tracked, Is.EqualTo(4))
+    Assert.That(totals.PendingReviews, Is.EqualTo(3))
+    Assert.That(totals.Unread, Is.EqualTo(3))
+    Assert.That(totals.Working, Is.EqualTo(1))
+    Assert.That(totals.Ready, Is.EqualTo(1))
+    Assert.That(totals.Waiting, Is.EqualTo(1))
+    Assert.That(totals.Parked, Is.EqualTo(1))
+
+[<Test>]
+let projectStatusTotalsStayWholeWhenOnlyAgentRowsAreTextFiltered () =
+    let a = { Project = "Wayfold"; Aliases = ["Wayfold"]; Identity = "pid:11111111:1"; Counts = Some (projectCounts [ record "Wayfold" "Agent" "Working" None ] 2); Error = None }
+    let b = { Project = "Jarvis"; Aliases = ["Jarvis"]; Identity = "pid:22222222:1"; Counts = Some (projectCounts [ record "Jarvis" "Lead" "Parked" None ] 0); Error = None }
+    let data = { snapshot [] with Projects = [b; a] }
+    visibleProjects "Agent" data |> List.map _.Project |> shouldEqual ["Jarvis"; "Wayfold"]
+    visibleProjects "@way Agent" data |> List.map _.Project |> shouldEqual ["Wayfold"]
+    visibleProjects "@jar" data |> List.map _.Project |> shouldEqual ["Jarvis"]
+    visibleProjects "@missing" data |> shouldEqual []
+    totalCounts data |> fun total ->
+        Assert.That(total.Tracked, Is.EqualTo(2))
+        Assert.That(total.Working, Is.EqualTo(1))
+        Assert.That(total.Parked, Is.EqualTo(1))
+
+[<Test>]
+let distinctLedgersWithSameDisplayNameHaveDistinctProjectLabels () =
+    let one = { Project = "Wayfold"; Aliases = ["Wayfold"]; Identity = "pid:abc0123400000000:1"; Counts = Some (projectCounts [] 0); Error = None }
+    let two = { one with Identity = "pid:def0567800000000:1" }
+    let data = { snapshot [] with Projects = [two; one] }
+    projectDisplayName data one |> shouldEqual "Wayfold [abc01234]"
+    projectDisplayName data two |> shouldEqual "Wayfold [def05678]"
+    visibleProjects "" data |> List.map _.Identity |> shouldEqual [one.Identity; two.Identity]
+
+[<Test>]
+let projectStatusLinesBoundWidthsAndKeepUnavailableSeparateFromZero () =
+    let empty = { Project = "Project With A Very Very Very Long Name"; Aliases = ["Project With A Very Very Very Long Name"]; Identity = "pid:a:1"; Counts = Some (projectCounts [] 0); Error = None }
+    let offline = { empty with Counts = None; Error = Some "Network unavailable" }
+    for width in [1; 15; 25; 40; 65; 120] do
+        let name = projectDisplayName (snapshot []) empty
+        let line = projectStatusLine width name empty
+        Assert.That(line.Length, Is.LessThanOrEqualTo(width))
+        Assert.That((projectStatusLine width name offline).Length, Is.LessThanOrEqualTo(width))
+    Assert.That(projectStatusLine 120 empty.Project empty, Does.Contain("Tracked 0"))
+    Assert.That(projectStatusLine 120 offline.Project offline, Does.Contain("UNAVAILABLE (counts unknown)"))
+    let compactLine = projectStatusLine 60 empty.Project empty
+    for token in ["T0"; "Rev0"; "U0"; "W0"; "Rd0"; "Wait0"; "P0"] do
+        Assert.That(compactLine, Does.Contain(token))
+
+[<Test>]
+let partialProjectTotalsNeverTreatUnavailableAsZero () =
+    let online = { Project = "Wayfold"; Aliases = ["Wayfold"]; Identity = "pid:1:1"; Counts = Some (projectCounts [ record "Wayfold" "Worker" "Ready" None ] 2); Error = None }
+    let missing = { Project = "Jarvis"; Aliases = ["Jarvis"]; Identity = "pid:2:1"; Counts = None; Error = Some "Cannot fetch ledger" }
+    let data = { snapshot [] with Projects = [online; missing] }
+    let totals = totalCounts data
+    Assert.That(totals.Tracked, Is.EqualTo(1))
+    Assert.That(totals.PendingReviews, Is.EqualTo(2))
+    Assert.That(missing.Counts.IsNone, Is.True)
+
+[<Test>]
+let sameNamedLedgersWithCollidingShortIdentifiersGetUniqueLabels () =
+    let a = { Project = "Wayfold"; Aliases = ["Wayfold"]; Identity = "pid:abc01234a:1"; Counts = Some (projectCounts [] 0); Error = None }
+    let b = { a with Identity = "pid:abc01234b:1" }
+    let view = { snapshot [] with Projects = [a; b] }
+    projectDisplayName view a |> shouldEqual "Wayfold [abc01234a]"
+    projectDisplayName view b |> shouldEqual "Wayfold [abc01234b]"
+
+[<Test>]
+let narrowProjectStatusWrapsAllCountersWithoutDroppingTheProjectLabel () =
+    let entry =
+        { Project = "Wayfold"; Aliases = ["Wayfold"]; Identity = "project:ledger:1"
+          Counts = Some (projectCounts [record "Wayfold" "A" "Working" None] 2)
+          Error = None }
+    for width in [12; 24; 40; 54] do
+        let lines = projectStatusLines width entry.Project entry
+        Assert.That(lines.Length, Is.GreaterThan(1))
+        Assert.That(lines.Head, Does.StartWith("@"))
+        for line in lines do Assert.That(line.Length, Is.LessThanOrEqualTo(width))
+        let joined = String.concat " " lines
+        for token in ["T1"; "Rev2"; "U0"; "W1"; "Rd0"; "Wait0"; "P0"] do
+            Assert.That(joined, Does.Contain(token))
+    let unavailable = { entry with Counts = None; Error = Some "Remote unreachable" }
+    let offlineLines = projectStatusLines 24 unavailable.Project unavailable
+    Assert.That(offlineLines.Head, Does.StartWith("@Wayfold"))
+    Assert.That(String.concat " " offlineLines, Does.Contain("UNAVAILABLE"))
+    Assert.That(String.concat " " offlineLines, Does.Contain("counts unknown"))
+
+[<Test>]
+let narrowDistinctProjectLabelsKeepTheirLedgerSuffixes () =
+    let prefix = "A Project With A Much Longer Name Than The Terminal"
+    let a = { Project = prefix; Aliases = [prefix]; Identity = "project:a1234567:1"; Counts = Some (projectCounts [] 0); Error = None }
+    let b = { a with Identity = "project:b1234567:1" }
+    let view = { snapshot [] with Projects = [a; b] }
+    let one = (projectStatusLines 26 (projectDisplayName view a) a).Head
+    let two = (projectStatusLines 26 (projectDisplayName view b) b).Head
+    Assert.That(one, Does.Contain("[a1234567]"))
+    Assert.That(two, Does.Contain("[b1234567]"))
+    Assert.That(one, Is.Not.EqualTo(two))

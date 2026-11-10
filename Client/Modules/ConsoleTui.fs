@@ -120,6 +120,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
     let mutable agentFilter = ""
     let mutable agentOriginalFilter = ""
     let mutable agentScroll = 0
+    let mutable agentProjectPage = 0
     let mutable showAgentDetails = true
     let mouseHits = ResizeArray<MouseHit>()
     let mutable lastMouseClick: (MouseTarget * DateTimeOffset) option = None
@@ -961,7 +962,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
             | ConsoleColor.DarkGreen, true -> ConsoleColor.Green
             | ConsoleColor.DarkMagenta, true -> ConsoleColor.Magenta
             | color, _ -> color
-        writeCell (ActivityFilter.projectToken row.Project) projectWidth projectForeground
+        writeCell (AgentView.projectColumnLabel projectWidth row) projectWidth projectForeground
         draw.ForegroundColor <- normalForeground
         draw.Write(" ")
         writeCell row.Agent agentWidth normalForeground
@@ -988,12 +989,18 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         if showAgentDetails then
             match selectedAgentUnsafe () with
             | None -> ()
+            | Some row when draw.Height < 32 ->
+                // Preserve a useful selected-agent context without letting the
+                // details pane consume the table on an ordinary 24-row terminal.
+                let task = row.Focus |> Option.map (fun t -> "#" + t.TaskId + " " + t.Title) |> Option.defaultValue ""
+                draw.WriteLine ""
+                draw.WriteLine (trim (sprintf "Details: %s | %s | %s" row.Agent (AgentView.displayState row.State) task) width)
             | Some row ->
                 draw.WriteLine ""
                 draw.WriteLine "Agent details"
                 draw.WriteLine "-------------"
                 writeDetailField width "Agent" row.Agent
-                writeDetailField width "Project" (ActivityFilter.projectToken row.Project)
+                writeDetailField width "Project" (ActivityFilter.projectToken row.ProjectLabel)
                 writeDetailField width "State" (AgentView.displayState row.State)
                 seenAt row
                 |> Option.iter (fun seen -> writeDetailField width "Last seen" (seen.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss")))
@@ -1020,8 +1027,39 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         normalizeAgentSelectionUnsafe()
         let filtered = agentListUnsafe()
         let all = agentSnapshot |> Option.map AgentView.rows |> Option.defaultValue []
-        let reviewCount = agentSnapshot |> Option.map (fun snap -> snap.Projects |> List.sumBy _.PendingReviews) |> Option.defaultValue 0
-        let unreadCount = all |> List.sumBy _.PendingNotifications
+        let totals =
+            agentSnapshot |> Option.map AgentView.totalCounts
+            |> Option.defaultWith (fun () -> AgentView.projectCounts [] 0)
+        let unavailable =
+            agentSnapshot
+            |> Option.map (fun snap -> snap.Projects |> List.sumBy (fun p -> if p.Counts.IsNone then 1 else 0))
+            |> Option.defaultValue 0
+        let projects =
+            agentSnapshot
+            |> Option.map (AgentView.visibleProjects agentFilter)
+            |> Option.defaultValue []
+            |> List.toArray
+        let projectItems =
+            projects |> Array.map (fun project ->
+                let name =
+                    agentSnapshot
+                    |> Option.map (fun snap -> AgentView.projectDisplayName snap project)
+                    |> Option.defaultValue project.Project
+                project, AgentView.projectStatusLines width name project)
+        let projectPageSize =
+            if draw.Height < 32 || width < 55 then 1
+            else max 1 (min 5 (draw.Height / 14))
+        let projectPageCount = max 1 ((projects.Length + projectPageSize - 1) / projectPageSize)
+        agentProjectPage <- max 0 (min agentProjectPage (projectPageCount - 1))
+        let projectFirst = agentProjectPage * projectPageSize
+        let projectLast = min projects.Length (projectFirst + projectPageSize)
+        let projectHeaderRows =
+            if projects.Length = 0 then 0
+            else
+                1 + (projectItems
+                     |> Array.skip projectFirst
+                     |> Array.take (projectLast - projectFirst)
+                     |> Array.sumBy (fun (_, lines) -> lines.Length))
         let filterSuffix =
             if String.IsNullOrWhiteSpace agentFilter then ""
             else $" [text=\"{trim (compact agentFilter) (max 20 (width - 22))}\"]"
@@ -1036,7 +1074,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         let headerRows =
             if draw.Height >= 22 then 4 + (if agentChanged.IsEmpty then 0 else 1)
             else 2
-        let headerRows = headerRows + 1 + (if agentError.IsSome then 1 else 0)
+        let headerRows = headerRows + projectHeaderRows + 1 + (if agentError.IsSome then 1 else 0)
                                     + (if mode = AgentFilterMode then 1 else 0)
         let inlineDetails =
             if showAgentDetails then
@@ -1060,20 +1098,45 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                 $" [{agentScroll + 1}-{last} of {filtered.Length} / {all.Length} total]"
             else ""
         draw.WriteLine $"Agents{filterSuffix}{historySuffix}"
-        let stateCount state = all |> List.filter (fun row -> row.State = state) |> List.length
-        if draw.Height >= 22 then
-            draw.WriteLine "------"
-            draw.WriteLine
-                (sprintf "Tracked: %d | Review: %d | Unread: %d | Working: %d | Ready: %d | Waiting: %d | Parked: %d"
-                    all.Length reviewCount unreadCount (stateCount "Working") (stateCount "Ready")
-                    (stateCount "NeedsWork") (stateCount "Parked"))
-        else
-            draw.WriteLine (sprintf "Unread %d · Ready %d · Waiting %d · Working %d · Parked %d" unreadCount (stateCount "Ready") (stateCount "NeedsWork") (stateCount "Working") (stateCount "Parked"))
+        let partial = if unavailable = 0 then "" else sprintf " [PARTIAL: %d unavailable]" unavailable
+        let full =
+            sprintf "Tracked: %d | Review: %d | Unread: %d | Working: %d | Ready: %d | Waiting: %d | Parked: %d"
+                totals.Tracked totals.PendingReviews totals.Unread totals.Working totals.Ready totals.Waiting totals.Parked
+        let concise =
+            sprintf "Total T%d Rev%d U%d W%d Rd%d Wait%d P%d"
+                totals.Tracked totals.PendingReviews totals.Unread totals.Working totals.Ready totals.Waiting totals.Parked
+        if draw.Height >= 22 then draw.WriteLine "------"
+        let summary = if (full + partial).Length <= width && draw.Height >= 22 then full else concise
+        let summaryLine =
+            if unavailable > 0 && (summary + partial).Length > width then
+                sprintf "PARTIAL(%d) %s" unavailable summary
+            else summary + partial
+        draw.WriteLine (trim summaryLine width)
+        if projects.Length > 0 then
+            let heading =
+                if width < 55 then
+                    if projectPageCount = 1 then "Projects (totals)"
+                    else sprintf "Projects [%d/%d] ([/])" (agentProjectPage + 1) projectPageCount
+                else
+                    let pagination =
+                        if projectPageCount = 1 then ""
+                        else sprintf "  [%d/%d, [ ] pages]" (agentProjectPage + 1) projectPageCount
+                    "Projects (whole-project totals)" + pagination
+            draw.WriteLine (trim heading width)
+            for index = projectFirst to projectLast - 1 do
+                let project, lines = projectItems[index]
+                let previous = draw.ForegroundColor
+                draw.ForegroundColor <- if project.Error.IsSome then ConsoleColor.Red else projectColor project.Project
+                for line in lines do draw.WriteLine line
+                draw.ForegroundColor <- previous
         let refreshed =
             agentSnapshot
             |> Option.map (fun snap -> snap.RefreshedAt.ToLocalTime().ToString("HH:mm:ss"))
             |> Option.defaultValue "never"
-        let refreshingSuffix = if agentRefreshing then " (refreshing...)" else ""
+        let refreshingSuffix =
+            if agentRefreshing then " (refreshing...)"
+            elif agentError.IsSome && agentSnapshot.IsSome then " (STALE: refresh failed)"
+            else ""
         if draw.Height >= 22 then draw.WriteLine $"Snapshot: {refreshed}{refreshingSuffix}"
         if draw.Height >= 22 && not agentChanged.IsEmpty then
             draw.WriteLine $"Updated agents: {agentChanged.Count} (*)"
@@ -1959,6 +2022,10 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                                         normalizeAgentSelectionUnsafe()
                                         mode <- AgentFilterMode
                                         renderUnsafe())
+                                | '[', _ when mode = AgentsMode ->
+                                    lock syncRoot (fun () -> agentProjectPage <- max 0 (agentProjectPage - 1); renderUnsafe())
+                                | ']', _ when mode = AgentsMode ->
+                                    lock syncRoot (fun () -> agentProjectPage <- agentProjectPage + 1; renderUnsafe())
                                 | _, ConsoleKey.R when mode = AgentsMode ->
                                     lock syncRoot (fun () ->
                                         startAgentRefreshUnsafe()

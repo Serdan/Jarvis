@@ -246,3 +246,164 @@ let measure_dashboard_notification_refresh_latency_and_allocations () =
     let struct (count, bytes) = AgentDashboard.parsedNotificationCacheStats()
     Assert.That(count, Is.LessThanOrEqualTo(16384))
     Assert.That(bytes, Is.LessThanOrEqualTo(16L * 1024L * 1024L))
+
+let private agentRow project name state unread =
+    ({ Key = project + "::" + name
+       Project = project
+       ProjectLabel = project
+       ProjectAliases = [project]
+       Agent = name
+       State = state
+       StateEnteredAt = None
+       StateReason = None
+       Focus = None
+       PendingNotifications = unread
+       LatestNotification = None
+       ActivityKeys = [project + "::" + name] } : AgentView.AgentRow)
+
+let private available project identity head agents reviews : AgentDashboard.ProjectResult =
+    { Project = project
+      Aliases = [project]
+      Result = Ok { Identity = identity; Head = head; Agents = agents; PendingReviews = reviews } }
+
+let private unavailable project reason : AgentDashboard.ProjectResult =
+    { Project = project; Aliases = [project]; Result = Error reason }
+
+[<Test>]
+let projectDashboardDeduplicatesSharedLedgersButNotSameNamedDistinctLedgers () =
+    let shared = "project-a:ledger-11111111:1"
+    let different = "project-b:ledger-22222222:1"
+    let results =
+        [ available "Wayfold" shared "head-shared" [agentRow "Wayfold" "A" "Working" 3] 2
+          available "Wayfold copy" shared "head-shared" [agentRow "Wayfold copy" "A" "Working" 3] 2
+          available "Wayfold" different "head-different" [agentRow "Wayfold" "B" "Ready" 1] 1
+          available "Empty" "project-c:ledger-33333333:1" "head-empty" [] 0
+          unavailable "Offline" "Failed to fetch canonical ledger" ]
+    let data = AgentDashboard.snapshotFromResults results
+    Assert.That(data.Agents.Length, Is.EqualTo(2))
+    Assert.That(data.Projects.Length, Is.EqualTo(4))
+    Assert.That(data.Projects |> List.filter (fun p -> p.Project = "Wayfold") |> List.length, Is.EqualTo(2))
+    let empty = data.Projects |> List.find (fun p -> p.Project = "Empty")
+    let offline = data.Projects |> List.find (fun p -> p.Project = "Offline")
+    Assert.That(empty.Counts.Value.Tracked, Is.EqualTo(0))
+    Assert.That(offline.Counts.IsNone, Is.True)
+    let counts = AgentView.totalCounts data
+    Assert.That(counts.Tracked, Is.EqualTo(2))
+    Assert.That(counts.Working, Is.EqualTo(1))
+    Assert.That(counts.Ready, Is.EqualTo(1))
+    Assert.That(counts.Unread, Is.EqualTo(4))
+    Assert.That(counts.PendingReviews, Is.EqualTo(3))
+
+[<Test>]
+let canonicalAgentKeysAndActivityAttributionDistinguishSameNamedLedgers () =
+    let first = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:11111111111111111111111111111111:1"
+    let second = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:22222222222222222222222222222222:1"
+    let data =
+        AgentDashboard.snapshotFromResults
+            [ available "Wayfold" first "head-first" [agentRow "Wayfold" "Lead" "Working" 1] 0
+              available "Wayfold" second "head-second" [agentRow "Wayfold" "Lead" "Parked" 0] 0 ]
+    let keys = data.Agents |> List.map _.Key
+    Assert.That(keys.Length, Is.EqualTo(2))
+    Assert.That(keys |> List.distinct |> List.length, Is.EqualTo(2))
+    Assert.That(keys, Does.Contain(first + "::Lead"))
+    Assert.That(keys, Does.Contain(second + "::Lead"))
+    let seen = System.Collections.Generic.Dictionary<string, DateTimeOffset>()
+    seen["Wayfold::Lead"] <- DateTimeOffset.UtcNow
+    for row in data.Agents do
+        Assert.That(row.ActivityKeys, Is.Empty)
+        Assert.That(AgentView.lastSeenAt row seen, Is.EqualTo(None),
+                    "A local project label cannot attribute presence across distinct ledgers.")
+    Assert.That(AgentView.changedAgents data data, Is.Empty)
+
+[<Test>]
+let aliasesOfOneLedgerPreserveUnambiguousLocalActivityAttribution () =
+    let identity = "project:shared-ledger:1"
+    let data =
+        AgentDashboard.snapshotFromResults
+            [ available "owner" identity "head-1" [agentRow "owner" "Lead" "Ready" 0] 0
+              available "reviewer" identity "head-1" [agentRow "reviewer" "Lead" "Ready" 0] 0 ]
+    Assert.That(data.Agents.Length, Is.EqualTo(1))
+    let row = data.Agents.Head
+    Assert.That(row.Key, Is.EqualTo(identity + "::Lead"))
+    Assert.That(row.ActivityKeys, Is.EquivalentTo(["owner::Lead"; "reviewer::Lead"]))
+    let now = DateTimeOffset.UtcNow
+    let seen = System.Collections.Generic.Dictionary<string, DateTimeOffset>()
+    seen["owner::Lead"] <- now.AddMinutes(-5.0)
+    seen["reviewer::Lead"] <- now
+    Assert.That(AgentView.lastSeenAt row seen, Is.EqualTo(Some now))
+
+[<Test>]
+let agentRosterDisambiguatesLongSameNamedProjectsInNarrowColumns () =
+    let name = "A Very Long Project Name That Cannot Fit"
+    let first = "project:aaaa1111:1"
+    let second = "project:bbbb2222:1"
+    let data =
+        AgentDashboard.snapshotFromResults
+            [ available name first "head-1" [agentRow name "Agent 1" "Ready" 0] 0
+              available name second "head-2" [agentRow name "Agent 1" "Working" 0] 0 ]
+    Assert.That(data.Agents.Length, Is.EqualTo(2))
+    let labels = data.Agents |> List.map (AgentView.projectColumnLabel 24)
+    Assert.That(labels |> List.distinct |> List.length, Is.EqualTo(2))
+    Assert.That(labels.Head, Does.Contain("[aaaa1111]"))
+    Assert.That(labels.Tail.Head, Does.Contain("[bbbb2222]"))
+
+[<Test>]
+let projectSelectorsMatchAllAliasesWithoutCrossLedgerLeakage () =
+    let shared = "project-owner:shared-ledger:1"
+    let distinct = "project-other:separate-ledger:1"
+    let data =
+        AgentDashboard.snapshotFromResults
+            [ available "owner" shared "head-shared" [agentRow "owner" "Lead" "Ready" 2] 1
+              available "reviewer" shared "head-shared" [agentRow "reviewer" "Lead" "Ready" 2] 1
+              available "reviewer" distinct "head-other" [agentRow "reviewer" "Other" "Working" 3] 2 ]
+    Assert.That(data.Projects.Length, Is.EqualTo(2))
+    let sharedProject = data.Projects |> List.find (fun p -> p.Identity = shared)
+    Assert.That(sharedProject.Aliases, Is.EquivalentTo(["owner"; "reviewer"]))
+    let selectedProjects filter =
+        AgentView.visibleProjects filter data |> List.map _.Identity
+    let selectedRows filter =
+        AgentView.visibleRows filter data |> List.map _.Key
+    Assert.That(selectedProjects "@owner" = [shared], Is.True)
+    Assert.That(selectedProjects "@reviewer", Is.EquivalentTo([shared; distinct]))
+    Assert.That(selectedProjects "@owner @reviewer" = [shared], Is.True)
+    Assert.That(selectedProjects "@other", Is.Empty)
+    Assert.That(selectedRows "@owner" = [shared + "::Lead"], Is.True)
+    Assert.That(selectedRows "@reviewer", Is.EquivalentTo([shared + "::Lead"; distinct + "::Other"]))
+    Assert.That(selectedRows "@owner @reviewer" = [shared + "::Lead"], Is.True)
+    Assert.That(selectedRows "@owner Other", Is.Empty)
+    let sharedAgent = data.Agents |> List.find (fun row -> row.Key = shared + "::Lead")
+    let otherAgent = data.Agents |> List.find (fun row -> row.Key = distinct + "::Other")
+    Assert.That(sharedAgent.ProjectAliases, Is.EquivalentTo(["owner"; "reviewer"]))
+    Assert.That(sharedAgent.ActivityKeys = ["owner::Lead"], Is.True,
+                "An ambiguous alias is a selector, but not a safe local activity identity.")
+    Assert.That(otherAgent.ActivityKeys, Is.Empty)
+
+[<Test>]
+let differingCanonicalHeadsFailClosedRatherThanSelectingAStaleAlias () =
+    let identity = "project:one-ledger:1"
+    let ready = available "owner" identity "H1" [agentRow "owner" "Lead" "Ready" 0] 0
+    let working = available "reviewer" identity "H2" [agentRow "reviewer" "Lead" "Working" 1] 2
+    for pair in [[ready; working]; [working; ready]] do
+        let data = AgentDashboard.snapshotFromResults pair
+        Assert.That(data.Agents, Is.Empty)
+        Assert.That(data.Projects.Length, Is.EqualTo(1))
+        let project = data.Projects.Head
+        Assert.That(project.Identity, Is.EqualTo(identity))
+        Assert.That(project.Aliases, Is.EquivalentTo(["owner"; "reviewer"]))
+        Assert.That(project.Counts.IsNone, Is.True,
+                    "A fresh dashboard must not publish arbitrary stale counts from a different head.")
+        Assert.That(project.Error.Value, Does.Contain("Inconsistent canonical ledger heads"))
+        Assert.That(AgentView.visibleProjects "@owner" data |> List.length, Is.EqualTo(1))
+        Assert.That(AgentView.visibleProjects "@reviewer" data |> List.length, Is.EqualTo(1))
+        Assert.That((AgentView.totalCounts data).Tracked, Is.EqualTo(0))
+
+[<Test>]
+let identicalCanonicalHeadWithDifferingUnreadOrStateCannotChooseArbitraryAlias () =
+    let identity = "project:one-ledger:1"
+    let ready = available "owner" identity "same-head" [agentRow "owner" "Lead" "Ready" 0] 0
+    let working = available "reviewer" identity "same-head" [agentRow "reviewer" "Lead" "Working" 1] 0
+    let data = AgentDashboard.snapshotFromResults [ready; working]
+    Assert.That(data.Agents, Is.Empty)
+    Assert.That(data.Projects.Length, Is.EqualTo(1))
+    Assert.That(data.Projects.Head.Counts.IsNone, Is.True)
+    Assert.That(data.Projects.Head.Error.Value, Does.Contain("Inconsistent canonical ledger contents"))

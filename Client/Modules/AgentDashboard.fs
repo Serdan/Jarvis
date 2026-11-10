@@ -103,108 +103,266 @@ let private stringOption value =
 let private cachedProjects =
     ConcurrentDictionary<string, string * (AgentView.AgentRow list * int)>(StringComparer.Ordinal)
 
-let private projectSnapshot project rt =
+type internal DashboardRead =
+    { Identity: string
+      Head: string
+      Agents: AgentView.AgentRow list
+      PendingReviews: int }
+
+type internal ProjectResult =
+    { Project: string
+      Aliases: string list
+      Result: Result<DashboardRead, string> }
+
+let private bindingIdentity (binding: LedgerBinding) =
+    binding.ProjectId.ToString("N") + ":" + binding.LedgerId.ToString("N") + ":" + string binding.Epoch
+
+let private projectSnapshot project identity binding snapshot =
+    // Derived rows are immutable at the verified Git head and can be reused
+    // across project aliases without retaining the originating checkout.
+    let cacheKey = identity
+    match cachedProjects.TryGetValue(cacheKey) with
+    | true, (head, (agents, reviews)) when head = snapshot.Commit ->
+        Ok { Identity = identity; Head = snapshot.Commit; Agents = agents; PendingReviews = reviews }
+    | _ ->
+        match LedgerStore.readDashboardRecordsWithOidsAt binding snapshot with
+        | Error error -> Error (string error)
+        | Ok records ->
+            let paths = records |> Map.toSeq |> Seq.map fst |> Seq.toList
+            let agentPaths = paths |> List.filter (fun path -> path.StartsWith("agents/", StringComparison.Ordinal))
+            let taskPaths = paths |> List.filter (fun path -> path.StartsWith("tasks/", StringComparison.Ordinal))
+            let taskRecords = taskPaths |> List.filter (fun path -> path.EndsWith("/task.json", StringComparison.Ordinal))
+            let reviewRecords = taskPaths |> List.filter (fun path -> path.EndsWith("/review.json", StringComparison.Ordinal))
+            let tasks = taskRecords |> List.map (read<ReviewTask> records)
+            let agents = agentPaths |> List.map (read<ReviewAgent> records)
+            let reviews = reviewRecords |> List.map (read<BranchReview> records)
+            let notifications = notificationSummaries records
+            let firstError values = values |> List.tryPick (function Error message -> Some message | Ok _ -> None)
+            match firstError tasks, firstError agents, firstError reviews, notifications with
+            | Some error, _, _, _ | _, Some error, _, _ | _, _, Some error, _ -> Error error
+            | _, _, _, Error error -> Error error
+            | None, None, None, Ok notificationCounts ->
+                let tasks = tasks |> List.choose (function Ok item -> Some item | _ -> None)
+                let agents = agents |> List.choose (function Ok item -> Some item | _ -> None)
+                let reviews = reviews |> List.choose (function Ok item -> Some item | _ -> None)
+                // A focus is an attempt ID, not a source worktree or historical task owner.
+                let attemptForTask (task: ReviewTask) =
+                    if String.IsNullOrWhiteSpace task.AttemptId then Ok None
+                    else
+                        let path = sprintf "tasks/%s/attempts/%s.json" task.TaskId (task.AttemptId.Replace("-", "").ToLowerInvariant())
+                        read<ReviewAttempt> records path |> Result.map Some
+                let focused (agent: ReviewAgent) =
+                    if String.IsNullOrWhiteSpace agent.FocusAttemptId then Ok None
+                    else
+                        match tasks |> List.tryFind (fun task ->
+                            task.AttemptId = agent.FocusAttemptId
+                            && task.TaskId = agent.CurrentAssignment.TaskId) with
+                        | None -> Error ("Missing canonical focused task for agent " + agent.AgentId)
+                        | Some task ->
+                            match attemptForTask task with
+                            | Error error -> Error error
+                            | Ok None -> Error ("Missing canonical attempt for task " + task.TaskId)
+                            | Ok (Some attempt) when attempt.OwnerAgentId <> agent.AgentId ->
+                                Error ("Canonical agent/attempt owner mismatch for " + agent.AgentId)
+                            | Ok (Some attempt) ->
+                                Ok (Some ({ TaskId = task.TaskId; Title = task.Title; Lifecycle = task.Lifecycle
+                                            Phase = attempt.Phase; SourceRef = stringOption attempt.SourceRef
+                                            BaseCommit = stringOption attempt.BaseCommit
+                                            AssignmentGeneration = attempt.AssignmentGeneration } : AgentView.TaskFocus))
+                let rows : Result<AgentView.AgentRow, string> list =
+                    agents
+                    |> List.map (fun agent ->
+                        focused agent |> Result.map (fun focus ->
+                            let notification =
+                                notificationCounts
+                                |> Map.tryFind agent.AgentId
+                                |> Option.defaultValue { Pending = 0; Latest = None }
+                            ({ Key = identity + "::" + agent.AgentId; Agent = agent.AgentId
+                               Project = project; ProjectLabel = project
+                               ProjectAliases = [project]; State = agent.State
+                               StateEnteredAt = stateTime agent; StateReason = stringOption agent.StateReason
+                               Focus = focus
+                               PendingNotifications = notification.Pending
+                               LatestNotification = notification.Latest
+                               ActivityKeys = [] } : AgentView.AgentRow)))
+                match firstError rows with
+                | Some error -> Error error
+                | None ->
+                    let count =
+                        reviews |> List.filter (fun r -> r.Status = "Unclaimed" || r.Status = "Claimed") |> List.length
+                    let data = (rows |> List.choose (function Ok row -> Some row | _ -> None), count)
+                    cachedProjects[cacheKey] <- (snapshot.Commit, data)
+                    Ok { Identity = identity; Head = snapshot.Commit; Agents = fst data; PendingReviews = snd data }
+/// Build one view from verified per-project records. Multiple configured
+/// project names may point at one ledger; only one set of counts is exposed.
+/// Mismatched heads for a shared identity are an inconsistency, not a reason
+/// to silently select whichever alias happened to be enumerated first.
+let internal snapshotFromResults (results: ProjectResult list) =
+    let allNames (result: ProjectResult) =
+        result.Project :: result.Aliases
+        |> List.filter (not << String.IsNullOrWhiteSpace)
+        |> List.distinctBy (fun name -> name.ToUpperInvariant())
+
+    let bound =
+        results
+        |> List.choose (fun result ->
+            match result.Result with
+            | Ok read -> Some (result, read)
+            | Error _ -> None)
+        |> List.groupBy (fun (_, read) -> read.Identity)
+        |> List.map (fun (identity, sources) ->
+            let project = (fst sources.Head).Project
+            let aliases =
+                sources |> List.collect (fun (source, _) -> allNames source)
+                |> List.distinctBy (fun name -> name.ToUpperInvariant())
+            let reads = sources |> List.map snd
+            let first = reads.Head
+            // Row presentation varies by alias; compare the canonical fields
+            // only. Equal Git OIDs must yield equal state and unread metadata.
+            let canonicalContents (read: DashboardRead) =
+                let agents =
+                    read.Agents
+                    |> List.map (fun row ->
+                        row.Agent, row.State, row.StateEnteredAt, row.StateReason,
+                        row.Focus, row.PendingNotifications, row.LatestNotification)
+                    |> List.sortBy (fun (agent, _, _, _, _, _, _) -> agent)
+                read.PendingReviews, agents
+            let error =
+                if reads |> List.exists (fun read -> read.Head <> first.Head) then
+                    Some ("Inconsistent canonical ledger heads for aliases of " + project
+                          + "; counts are unavailable until a consistent refresh.")
+                elif reads |> List.exists (fun read ->
+                    canonicalContents read <> canonicalContents first) then
+                    Some ("Inconsistent canonical ledger contents for aliases of " + project)
+                else None
+            // Preserve the unknown-state distinction even when other aliases
+            // returned counts: the same identity cannot report two valid heads.
+            let data = if error.IsSome then None else Some (first.Agents, first.PendingReviews)
+            project, aliases, identity, data, error)
+    let unavailable =
+        results
+        |> List.choose (fun result ->
+            match result.Result with
+            | Ok _ -> None
+            | Error reason ->
+                Some (result.Project, allNames result,
+                      "unavailable:" + result.Project, None, Some reason))
+    let unique = bound @ unavailable
+    let identityByAlias =
+        unique
+        |> List.collect (fun (_, aliases, identity, _, _) ->
+            aliases |> List.map (fun alias -> alias.ToUpperInvariant(), identity))
+        |> List.groupBy fst
+        |> List.map (fun (alias, entries) ->
+            alias, entries |> List.map snd |> Set.ofList)
+        |> Map.ofList
+    let activityAliases identity (aliases: string list) =
+        aliases
+        |> List.filter (fun name ->
+            let identities = Map.find (name.ToUpperInvariant()) identityByAlias
+            identities.Count = 1 && identities.Contains identity)
+    let summaries : AgentView.ProjectSummary list =
+        unique
+        |> List.map (fun (project, aliases, identity, data, error) ->
+            { Project = project
+              Aliases = aliases
+              Identity = identity
+              Counts = data |> Option.map (fun (agents, reviews) -> AgentView.projectCounts agents reviews)
+              Error = error })
+    let labelsSnapshot : AgentView.Snapshot =
+        { Agents = []; Projects = summaries; Issues = []; RefreshedAt = DateTimeOffset.UtcNow }
+    let projectLabels =
+        summaries
+        |> List.map (fun project -> project.Identity, AgentView.projectDisplayName labelsSnapshot project)
+        |> Map.ofList
+    let rows =
+        unique
+        |> List.collect (fun (project, aliases, identity, data, _) ->
+            match data with
+            | None -> []
+            | Some (agents, _) ->
+                let names = activityAliases identity aliases
+                let label = Map.find identity projectLabels
+                agents |> List.map (fun row ->
+                    { row with Key = identity + "::" + row.Agent
+                               Project = project
+                               ProjectLabel = label
+                               ProjectAliases = aliases
+                               ActivityKeys = names |> List.map (fun name -> name + "::" + row.Agent) }))
+    ({ Agents = rows; Projects = summaries; Issues = []
+       RefreshedAt = DateTimeOffset.UtcNow } : AgentView.Snapshot)
+
+/// Reading a local approved binding cannot invent a ledger or cause a remote
+/// refresh. Unbound ordinary Git projects remain absent from the Agents view.
+let private inspectProject project rt =
     match ProjectPaths.resolveProjectRoot project rt with
     | Error error -> Error (string error)
     | Ok (FolderPath root) ->
-        // Unbound projects have no orchestration state. Never consult V1 files.
         if not (File.Exists(OrchestrationApi.LedgerBindingConfig.pathForRoot root)) then Ok None
         else
-            let cacheKey = root + "::" + project
-            match OrchestrationApi.LedgerBindingConfig.load project rt with
+            OrchestrationApi.LedgerBindingConfig.inspectLocal project rt
+            |> Result.map Some
+            |> Result.mapError string
+
+let private refreshGroup identity (members: (string * LedgerBinding * string) array) rt =
+    let project, firstBinding, _ = members[0]
+    let aliases = members |> Array.map (fun (name, _, _) -> name) |> Array.toList
+    let matchingTransport (binding: LedgerBinding) =
+        binding.ApprovedFetchUrl = firstBinding.ApprovedFetchUrl
+        && binding.ApprovedPushUrl = firstBinding.ApprovedPushUrl
+    let result =
+        if members |> Array.exists (fun (_, binding, _) -> not (matchingTransport binding)) then
+            Error ("Aliases of " + project + " have conflicting approved ledger remotes; counts unavailable.")
+        else
+            match OrchestrationApi.LedgerBindingConfig.loadWithSnapshot project rt with
             | Error error -> Error (string error)
-            | Ok binding ->
-                match LedgerStore.fetch binding with
-                | Error error -> Error (string error)
-                | Ok snapshot ->
-                    match cachedProjects.TryGetValue(cacheKey) with
-                    | true, (head, rows) when head = snapshot.Commit -> Ok (Some rows)
-                    | _ ->
-                        match LedgerStore.readDashboardRecordsWithOidsAt binding snapshot with
-                        | Error error -> Error (string error)
-                        | Ok records ->
-                            let paths = records |> Map.toSeq |> Seq.map fst |> Seq.toList
-                            let agentPaths = paths |> List.filter (fun path -> path.StartsWith("agents/", StringComparison.Ordinal))
-                            let taskPaths = paths |> List.filter (fun path -> path.StartsWith("tasks/", StringComparison.Ordinal))
-                            let taskRecords = taskPaths |> List.filter (fun path -> path.EndsWith("/task.json", StringComparison.Ordinal))
-                            let reviewRecords = taskPaths |> List.filter (fun path -> path.EndsWith("/review.json", StringComparison.Ordinal))
-                            let tasks = taskRecords |> List.map (read<ReviewTask> records)
-                            let agents = agentPaths |> List.map (read<ReviewAgent> records)
-                            let reviews = reviewRecords |> List.map (read<BranchReview> records)
-                            let notifications = notificationSummaries records
-                            let firstError values = values |> List.tryPick (function Error message -> Some message | Ok _ -> None)
-                            match firstError tasks, firstError agents, firstError reviews, notifications with
-                            | Some error, _, _, _ | _, Some error, _, _ | _, _, Some error, _ -> Error error
-                            | _, _, _, Error error -> Error error
-                            | None, None, None, Ok notificationCounts ->
-                                let tasks = tasks |> List.choose (function Ok item -> Some item | _ -> None)
-                                let agents = agents |> List.choose (function Ok item -> Some item | _ -> None)
-                                let reviews = reviews |> List.choose (function Ok item -> Some item | _ -> None)
-                                // A focus is an attempt ID, not a source worktree or historical task owner.
-                                let attemptForTask (task: ReviewTask) =
-                                    if String.IsNullOrWhiteSpace task.AttemptId then Ok None
-                                    else
-                                        let path = sprintf "tasks/%s/attempts/%s.json" task.TaskId (task.AttemptId.Replace("-", "").ToLowerInvariant())
-                                        read<ReviewAttempt> records path |> Result.map Some
-                                let focused (agent: ReviewAgent) =
-                                    if String.IsNullOrWhiteSpace agent.FocusAttemptId then Ok None
-                                    else
-                                        match tasks |> List.tryFind (fun task ->
-                                            task.AttemptId = agent.FocusAttemptId
-                                            && task.TaskId = agent.CurrentAssignment.TaskId) with
-                                        | None -> Error ("Missing canonical focused task for agent " + agent.AgentId)
-                                        | Some task ->
-                                            match attemptForTask task with
-                                            | Error error -> Error error
-                                            | Ok None -> Error ("Missing canonical attempt for task " + task.TaskId)
-                                            | Ok (Some attempt) when attempt.OwnerAgentId <> agent.AgentId ->
-                                                Error ("Canonical agent/attempt owner mismatch for " + agent.AgentId)
-                                            | Ok (Some attempt) ->
-                                                Ok (Some ({ TaskId = task.TaskId; Title = task.Title; Lifecycle = task.Lifecycle
-                                                            Phase = attempt.Phase; SourceRef = stringOption attempt.SourceRef
-                                                            BaseCommit = stringOption attempt.BaseCommit
-                                                            AssignmentGeneration = attempt.AssignmentGeneration } : AgentView.TaskFocus))
-                                let rows : Result<AgentView.AgentRow, string> list =
-                                    agents
-                                    |> List.map (fun agent ->
-                                        focused agent |> Result.map (fun focus ->
-                                            let notification =
-                                                notificationCounts
-                                                |> Map.tryFind agent.AgentId
-                                                |> Option.defaultValue { Pending = 0; Latest = None }
-                                            ({ Key = project + "::" + agent.AgentId; Agent = agent.AgentId
-                                               Project = project; State = agent.State
-                                               StateEnteredAt = stateTime agent; StateReason = stringOption agent.StateReason
-                                               Focus = focus
-                                               PendingNotifications = notification.Pending
-                                               LatestNotification = notification.Latest } : AgentView.AgentRow)))
-                                match firstError rows with
-                                | Some error -> Error error
-                                | None ->
-                                    let count =
-                                        reviews |> List.filter (fun r -> r.Status = "Unclaimed" || r.Status = "Claimed") |> List.length
-                                    let data = (rows |> List.choose (function Ok row -> Some row | _ -> None), count)
-                                    cachedProjects[cacheKey] <- (snapshot.Commit, data)
-                                    Ok (Some data)
+            | Ok (verifiedBinding, snapshot) ->
+                if bindingIdentity verifiedBinding <> identity || not (matchingTransport verifiedBinding) then
+                    Error ("Canonical ledger binding changed during refresh of " + project)
+                else
+                    // Re-read each anchor after the network fetch. One alias
+                    // could have a newer trusted head than the representative;
+                    // showing its older state as freshly verified would be wrong.
+                    let inconsistent =
+                        members
+                        |> Array.tryPick (fun (alias, _, _) ->
+                            match OrchestrationApi.LedgerBindingConfig.inspectLocal alias rt with
+                            | Error error -> Some (alias + ": " + string error)
+                            | Ok (currentBinding, trustedHead) ->
+                                if bindingIdentity currentBinding <> identity
+                                   || not (matchingTransport currentBinding) then
+                                    Some (alias + ": local ledger binding changed during refresh.")
+                                else
+                                    match LedgerStore.verifyTrustedHead verifiedBinding trustedHead snapshot.Commit with
+                                    | Ok () -> None
+                                    | Error error -> Some (alias + ": " + string error))
+                    match inconsistent with
+                    | Some reason -> Error ("Cannot verify shared ledger aliases: " + reason)
+                    | None -> projectSnapshot project identity verifiedBinding snapshot
+    { Project = project; Aliases = aliases; Result = result }
+
 let load rt =
     match ProjectBrowser.listGitProjects rt with
     | Error error -> Error (string error)
     | Ok projects ->
-        // Each project owns a separate Git checkout and ledger remote.
-        // Fetch them concurrently without holding the TUI lock.
-        let results =
+        // Resolve and validate local identities first. Parallel fetches happen
+        // only *after* grouping aliases, exactly once per canonical ledger.
+        let inspected =
             projects
             |> Seq.toArray
-            |> Array.Parallel.map (fun (ProjectName project) -> project, projectSnapshot project rt)
-            |> Array.toList
-        let rows =
-            results |> List.collect (function _, Ok (Some (agents, _)) -> agents | _ -> [])
-        let summaries : AgentView.ProjectSummary list =
-            results |> List.choose (function
-                | project, Ok (Some (_, count)) ->
-                    Some ({ Project = project; PendingReviews = count; Error = None } : AgentView.ProjectSummary)
-                | project, Error error ->
-                    Some ({ Project = project; PendingReviews = 0; Error = Some error } : AgentView.ProjectSummary)
-                | _, Ok None -> None)
-        Ok ({ Agents = rows; Projects = summaries; Issues = []
-              RefreshedAt = DateTimeOffset.UtcNow } : AgentView.Snapshot)
+            |> Array.Parallel.map (fun (ProjectName project) -> project, inspectProject project rt)
+        let bound =
+            inspected
+            |> Array.choose (function
+                | project, Ok (Some (binding, trustedHead)) -> Some (project, binding, trustedHead)
+                | _ -> None)
+            |> Array.groupBy (fun (_, binding, _) -> bindingIdentity binding)
+        let fetched =
+            bound |> Array.Parallel.map (fun (identity, members) -> refreshGroup identity members rt)
+        let failures =
+            inspected
+            |> Array.choose (function
+                | project, Error reason ->
+                    Some { Project = project; Aliases = [project]; Result = Error reason }
+                | _ -> None)
+        Ok (snapshotFromResults (Array.append fetched failures |> Array.toList))

@@ -1,0 +1,23 @@
+<h1>Prevent cross-agent state mutation through self-inbox identity confusion</h1>
+<p><strong>Priority P1; follow-up to completed task-79b4fe205a86463184e5ff90b743e9d7.</strong> The reviewed <code>observe_agent</code> command (protocol 3.63, merged at <code>4696197c</code>) is side-effect-free, but the <code>agent_inbox</code> tool still accepts any caller-supplied <code>agentId</code> and automatically activates that agent's Ready assignment. A Lead or reviewer can inadvertently change another agent's canonical state simply by asking for its inbox. The self-inbox documentation alone cannot prevent this.</p>
+<h2>Root cause to address</h2>
+<ul>
+<li><code>Server/McpTools.fs:AgentInbox</code> constructs <code>TaskReadCommand(Action=AgentInbox, AgentId=agentId)</code> from the tool argument. <code>RequestDeviceRouting.agentArgument</code> derives the transport's acting agent from the <em>same untrusted argument</em>; comparing those two strings is therefore not an independent self-identity check.</li>
+<li><code>Client/SignalR/Client.fs:activateReadyOnActivity</code> uses this acting label and may commit Ready-to-Working, reset activity provenance, and claim a Working turn before the inbox read. An out-of-session inspection must not do any of those things.</li>
+<li>Both currently connected production clients use protocol 3.62, so even the new read-only observation surface is not yet deployed. Do not treat rollout alone as proof that misuse is prevented.</li>
+</ul>
+<h2>Required behavior</h2>
+<ol>
+<li>Establish a genuine self-inbox boundary independently from the submitted target/agentId field. Prefer a validated conversation/session-to-agent association backed by the canonical ledger or another explicit bound actor context. Examine initial registration/first-turn semantics and preserve the existing legitimate self-inbox activation workflow without permitting the caller to silently assume another agent's identity merely by changing a parameter.</li>
+<li>If the caller asks to inspect a different agent via <code>agent_inbox</code>, reject it with an actionable <code>SelfInboxOnly</code>-equivalent validation error directing them to <code>observe_agent(projectName, agentId, targetAgentId)</code>. Perform the check <em>before</em> <code>RecordAgentSeen</code>, implicit activation, Git ledger reads that attribute activity, or other effects. If authentic actor/session context is missing or ambiguous, fail closed for activation; do not invent self identity.</li>
+<li>Keep genuine self-inbox behavior: exactly one Ready-to-Working activation on a legitimate self call; repeats must not restart the Working clock; confirmed before/after activation and canonical state-effects remain visible in every response, including an error after a committed transition.</li>
+<li>Keep <code>observe_agent</code> explicitly read-only and usable by authorized other agents and operators with separate observer and target labels. Do not undermine ledger ownership, session association, cross-project authorization or actual agent-attributed activity while tightening self-inbox.</li>
+<li>Maintain the existing operator workflow for roster inspection and administrative changes through the correct, explicit operations; do not force operators to impersonate a target to observe it. Review compatibility/rollout for protocol 3.62 versus 3.63 and ensure there is no silent behavior regression during migration.</li>
+</ol>
+<h2>Acceptance / adversarial regressions</h2>
+<ul>
+<li>Two registered Ready agents A and B. Associated session A invoking <code>agent_inbox(B)</code> cannot change B's state, version, sequence, assignment generation, Working clock, notifications, or last-seen; it returns an explicit error pointing to <code>observe_agent</code>. Agent B's genuine self-inbox starts B once.</li>
+<li>Repeated observation across separate sessions/devices, forged transport agentId, unknown/unassociated session, duplicate display names and cross-project targets never attribute activity to the target or silently bootstrap an unrelated identity.</li>
+<li>Exact first-session association/legitimate activation and concurrent activity/canonical ledger CAS are tested; activity stays attributed to the real actor, not merely the supplied target. Negative tests confirm rejected calls perform zero ledger writes and no local Seen updates.</li>
+<li>Full Client/Server Release suites pass; independent reviewer validates frozen source, particularly the difference between OAuth user authorization and <em>agent-session identity</em>. No merge or deployment before review. Coordinated server/client release requires explicit operator approval.</li>
+</ul>

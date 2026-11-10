@@ -1544,14 +1544,24 @@ module ReviewWorkflow =
                 (fun snapshot ->
                     result {
                         let! task, _, attempt, attemptOid = getAttempt binding snapshot taskId
-                        let! agent, _ = required<ReviewAgent> binding snapshot (agentPath ownerId)
                         let generation = if generation = 0 then attempt.AssignmentGeneration else generation
-                        if task.Lifecycle <> "InProgress" || attempt.OwnerAgentId <> ownerId
-                           || attempt.Phase <> "Started" || (expectedAttemptVersion <> 0 && attempt.Version <> expectedAttemptVersion)
-                           || attempt.AssignmentGeneration <> generation
-                           || (expectedAgentVersion <> 0 && agent.Version <> expectedAgentVersion) || agent.State <> "Working"
-                           || agent.ActiveAttemptId <> attempt.AttemptId then
-                            return! Error(StaleEntityVersion "Checkpoint requires exact current Working versions and generation.")
+                        if task.Lifecycle <> "InProgress" then
+                            return! Error(StaleEntityVersion "CheckpointAttempt task.lifecycle must be InProgress.")
+                        if attempt.OwnerAgentId <> ownerId then
+                            return! Error(StaleEntityVersion "CheckpointAttempt agentId is not the current attempt owner.")
+                        if attempt.Phase <> "Started" then
+                            return! Error(StaleEntityVersion "CheckpointAttempt attempt.phase must be Started.")
+                        if expectedAttemptVersion <> 0 && attempt.Version <> expectedAttemptVersion then
+                            return! Error(StaleEntityVersion "CheckpointAttempt expectedAttemptVersion differs from the current attempt version.")
+                        if attempt.AssignmentGeneration <> generation then
+                            return! Error(StaleEntityVersion "CheckpointAttempt assignmentGeneration differs from the current assignment generation.")
+                        let! agent, _ = required<ReviewAgent> binding snapshot (agentPath ownerId)
+                        if expectedAgentVersion <> 0 && agent.Version <> expectedAgentVersion then
+                            return! Error(StaleEntityVersion "CheckpointAttempt expectedAgentVersion differs from the current agent version.")
+                        if agent.State <> "Working" then
+                            return! Error(StaleEntityVersion "CheckpointAttempt agent.state must be Working.")
+                        if agent.ActiveAttemptId <> attempt.AttemptId then
+                            return! Error(StaleEntityVersion "CheckpointAttempt agent.activeAttemptId differs from the task attempt.")
                         let! _ = requiredIssue binding snapshot taskId attempt
                         if not (String.IsNullOrWhiteSpace sourceCommit) then
                             do! LedgerStore.verifySourceObject binding sourceCommit

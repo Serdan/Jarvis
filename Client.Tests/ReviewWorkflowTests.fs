@@ -4485,14 +4485,48 @@ type ReviewWorkflowTests() =
                 Assert.That(details, Does.Contain("Source commit"))
             | other -> Assert.Fail(sprintf "Unknown source should fail distinctly: %A" other)
             Assert.That((LedgerStore.fetch second |> success).Commit, Is.EqualTo(beforeHead))
-            expectStale (ReviewWorkflow.checkpointAttempt first (Guid.NewGuid()) taskId "Owner"
-                             0 0 2 "Summary" "Next" "" "")
+            let working = ReviewWorkflow.getAgentInbox second "Owner" |> success
+            let assertStale field owner attemptVersion agentVersion generation =
+                match ReviewWorkflow.checkpointAttempt first (Guid.NewGuid()) taskId owner
+                        attemptVersion agentVersion generation "Summary" "Next" "" "" with
+                | Error(StaleEntityVersion details) ->
+                    Assert.That(details, Does.Contain(field))
+                | other ->
+                    Assert.Fail(sprintf "Expected stale %s failure, got %A" field other)
+                Assert.That((LedgerStore.fetch second |> success).Commit, Is.EqualTo(beforeHead))
+            assertStale "agentId" "WrongOwner" 0 0 0
+            assertStale "expectedAttemptVersion" "Owner" (working.Focused.Value.Attempt.Version + 1) 0 0
+            assertStale "assignmentGeneration" "Owner" 0 0 2
+            assertStale "expectedAgentVersion" "Owner" 0 (working.Agent.Version + 1) 0
             // Exactly 8192 UTF-8 bytes remain valid for both summary and
             // evidence; the next multi-byte character must be rejected.
             let validEvidence = String.replicate 2048 "😀"
             ReviewWorkflow.checkpointAttempt first (Guid.NewGuid()) taskId "Owner"
                 0 0 0 validEvidence "Next" "" validEvidence
             |> success |> ignore)
+
+    [<Test>]
+    member _.CheckpointDiagnosesQueuedAttemptAndNonWorkingAgentWithoutMutation() =
+        withFixture (fun _ _ first second _ _ _ _ ->
+            let taskId = "checkpoint-state-diagnostics"
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Queued checkpoint checks"
+            |> success |> ignore
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner"
+            |> success |> ignore
+            let assertError field =
+                let beforeHead = (LedgerStore.fetch first |> success).Commit
+                match ReviewWorkflow.checkpointAttempt second (Guid.NewGuid()) taskId "Owner"
+                        0 0 0 "Summary" "Continue" "" "" with
+                | Error(StaleEntityVersion details) -> Assert.That(details, Does.Contain(field))
+                | other -> Assert.Fail(sprintf "Expected %s diagnostic, got %A" field other)
+                Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(beforeHead))
+            assertError "attempt.phase"
+            ReviewWorkflow.resumeAgent first (Guid.NewGuid()) taskId "Owner" 0 0 0
+            |> success |> ignore
+            ReviewWorkflow.yieldAgent first (Guid.NewGuid()) taskId "Owner"
+                0 0 0 "Checkpoint pending" "Continue audit"
+            |> success |> ignore
+            assertError "agent.state")
 
     [<Test>]
     member _.AgentInboxBulkLedgerBenchmarkAndSnapshotCorrectness() =

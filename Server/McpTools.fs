@@ -452,7 +452,7 @@ module McpToolHelpers =
         | None, None ->
             errorResult (ExecutionFailed "Invalid Jarvis response: neither result nor error was set.")
 
-    let private requiredScope command =
+    let private requiredScopes command =
         match command with
         | ListCommandsCommand
         | ListProjectsCommand
@@ -484,12 +484,12 @@ module McpToolHelpers =
         | ListJobsCommand _
         | GetJobResultCommand _
         | MessageCommand _
-        | GetClientActivityCommand _ -> Auth.WorkspaceRead
+        | GetClientActivityCommand _ -> [ Auth.WorkspaceRead ]
         | ImportFileCommand _
         | WriteFileCommand _
         | CreateSkillCommand _
-        | PatchFileCommand _ -> Auth.WorkspaceWrite
-        | UpdateClientCommand -> Auth.ProcessExecute
+        | PatchFileCommand _ -> [ Auth.WorkspaceWrite ]
+        | UpdateClientCommand -> [ Auth.ProcessExecute ]
         | ScheduleBrowserExecutionCommand _
         | CancelScheduledBrowserExecutionCommand _
         | BrowserOpenTabCommand _
@@ -497,10 +497,11 @@ module McpToolHelpers =
         | BrowserRunInNewTabCommand _
         | BrowserExecuteFileCommand _
         | BrowserExecuteJsCommand _
+        | BrowserCaptureDomCommand _
         | RunCommandCommand _
         | RunProjectTaskCommand _
         | StartJobCommand _
-        | CancelJobCommand _ -> Auth.ProcessExecute
+        | CancelJobCommand _ -> [ Auth.ProcessExecute ]
         | GitCommitCommand _
         | CreateWorktreeCommand _
         | CreateProjectCommand _
@@ -510,7 +511,11 @@ module McpToolHelpers =
         | ReviewWriteCommand _
         | RetryPendingIntentCommand _
         | SupersedePendingIntentCommand _
-        | AbandonPendingIntentCommand _ -> Auth.GitWrite
+        | AbandonPendingIntentCommand _ -> [ Auth.GitWrite ]
+
+        // File export both executes browser code and writes into the workspace.
+        // Check *both* OAuth scopes before any client command is dispatched.
+        | BrowserExportDomCommand _ -> [ Auth.WorkspaceWrite; Auth.ProcessExecute ]
 
     let private oauthErrorResult (context: HttpContext) errorCode description scope =
         let response = errorResult (PermissionDenied description)
@@ -670,10 +675,12 @@ module McpToolHelpers =
                         TaskWriteCommand { cmd with TaskId = taskId },
                         (if generated then Some taskId else None)
                     | _ -> command, None
-                let scope = requiredScope command
+                let scopes = requiredScopes command
+                let missingScope =
+                    scopes |> List.tryFind (fun scope -> not (Auth.hasScope scope context.User))
 
                 match Auth.tryUserId context.User with
-                | Some userId when Auth.hasScope scope context.User &&
+                | Some userId when missingScope.IsNone &&
                                    (AgentCommandInfo.projectName command = None ||
                                     AgentCommandInfo.projectName command = Some "@global" ||
                                     Auth.hasScope Auth.WorkspaceRead context.User) ->
@@ -747,12 +754,11 @@ module McpToolHelpers =
                         |> attachGeneratedOperationId generatedId
                         |> attachGeneratedTaskId (if response.Result.IsSome && response.Error.IsNone then generatedTaskId else None)
                 | Some _ ->
-                    if not (Auth.hasScope scope context.User) then
-                        return authorizationErrorResult context scope
-                    else
-                        return authorizationErrorResult context Auth.WorkspaceRead
+                    match missingScope with
+                    | Some scope -> return authorizationErrorResult context scope
+                    | None -> return authorizationErrorResult context Auth.WorkspaceRead
                 | None ->
-                    return authenticationErrorResult context (Some scope)
+                    return authenticationErrorResult context (Some(String.concat " " scopes))
         }
 
     let getProfile (http: IHttpContextAccessor) =

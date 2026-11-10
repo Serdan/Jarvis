@@ -63,7 +63,7 @@ For large data, use `BrowserExportDom` with `projectName` and a new `filePath` s
 
 ## Safety and limitations
 
-The user's extension registration and explicit site host permission still apply. The bridge injects into a registered tab in the isolated `USER_SCRIPT` world and checks its identity before and after capture. For file export, **workspace write permission** is additionally required. Captures may contain personal data, tokens or other secrets present in the DOM: treat returned HTML and exported files as sensitive. Jarvis does not automatically commit, log or store snapshot HTML in Git.
+The user's extension registration and explicit site host permission still apply. The bridge injects into a registered tab in the isolated `USER_SCRIPT` world and checks its identity before and after capture. For inline capture, the public MCP tool requires the `process:execute` OAuth scope. For file export, the public MCP tool requires **both** `workspace:write` and `process:execute`, as well as `workspace:read` for its project-scoped routing. These are checked by the server before dispatch, independently of the client's local browser permissions. Captures may contain personal data, tokens or other secrets present in the DOM: treat returned HTML and exported files as sensitive. Jarvis does not automatically commit, log or store snapshot HTML in Git.
 
 The export buffer is ephemeral in the extension and limited to two snapshots, each up to 8 MiB, with a rolling two-minute idle expiration. Export uses **32 KiB chunks** and SHA-256 integrity checks. A disconnected extension, expired buffer, navigation or lost authorization aborts transfer and preserves no partial output file. The destination is never silently overwritten.
 

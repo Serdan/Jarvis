@@ -4,6 +4,8 @@
         <TargetFramework>net10.0</TargetFramework>
         <AssemblyName>JarvisServer</AssemblyName>
         <LangVersion>10.0</LangVersion>
+        <!-- Fail compilation when a new AgentCommand is omitted from authorization dispatch. -->
+        <WarningsAsErrors>FS0025</WarningsAsErrors>
     </PropertyGroup>
 
     <ItemGroup>

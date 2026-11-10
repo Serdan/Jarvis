@@ -11,6 +11,7 @@ let private record project agent state task =
       Agent = agent
       Project = project
       ProjectLabel = project
+      ProjectAliases = [project]
       State = state
       StateEnteredAt = Some(DateTimeOffset(2026,10,30,4,36,32,TimeSpan.Zero))
       StateReason = Some "Review commits then resume"
@@ -228,8 +229,8 @@ let projectCountersUseCanonicalRowsIncludingParkedAndUnread () =
 
 [<Test>]
 let projectStatusTotalsStayWholeWhenOnlyAgentRowsAreTextFiltered () =
-    let a = { Project = "Wayfold"; Identity = "pid:11111111:1"; Counts = Some (projectCounts [ record "Wayfold" "Agent" "Working" None ] 2); Error = None }
-    let b = { Project = "Jarvis"; Identity = "pid:22222222:1"; Counts = Some (projectCounts [ record "Jarvis" "Lead" "Parked" None ] 0); Error = None }
+    let a = { Project = "Wayfold"; Aliases = ["Wayfold"]; Identity = "pid:11111111:1"; Counts = Some (projectCounts [ record "Wayfold" "Agent" "Working" None ] 2); Error = None }
+    let b = { Project = "Jarvis"; Aliases = ["Jarvis"]; Identity = "pid:22222222:1"; Counts = Some (projectCounts [ record "Jarvis" "Lead" "Parked" None ] 0); Error = None }
     let data = { snapshot [] with Projects = [b; a] }
     visibleProjects "Agent" data |> List.map _.Project |> shouldEqual ["Jarvis"; "Wayfold"]
     visibleProjects "@way Agent" data |> List.map _.Project |> shouldEqual ["Wayfold"]
@@ -242,7 +243,7 @@ let projectStatusTotalsStayWholeWhenOnlyAgentRowsAreTextFiltered () =
 
 [<Test>]
 let distinctLedgersWithSameDisplayNameHaveDistinctProjectLabels () =
-    let one = { Project = "Wayfold"; Identity = "pid:abc0123400000000:1"; Counts = Some (projectCounts [] 0); Error = None }
+    let one = { Project = "Wayfold"; Aliases = ["Wayfold"]; Identity = "pid:abc0123400000000:1"; Counts = Some (projectCounts [] 0); Error = None }
     let two = { one with Identity = "pid:def0567800000000:1" }
     let data = { snapshot [] with Projects = [two; one] }
     projectDisplayName data one |> shouldEqual "Wayfold [abc01234]"
@@ -251,7 +252,7 @@ let distinctLedgersWithSameDisplayNameHaveDistinctProjectLabels () =
 
 [<Test>]
 let projectStatusLinesBoundWidthsAndKeepUnavailableSeparateFromZero () =
-    let empty = { Project = "Project With A Very Very Very Long Name"; Identity = "pid:a:1"; Counts = Some (projectCounts [] 0); Error = None }
+    let empty = { Project = "Project With A Very Very Very Long Name"; Aliases = ["Project With A Very Very Very Long Name"]; Identity = "pid:a:1"; Counts = Some (projectCounts [] 0); Error = None }
     let offline = { empty with Counts = None; Error = Some "Network unavailable" }
     for width in [1; 15; 25; 40; 65; 120] do
         let name = projectDisplayName (snapshot []) empty
@@ -266,8 +267,8 @@ let projectStatusLinesBoundWidthsAndKeepUnavailableSeparateFromZero () =
 
 [<Test>]
 let partialProjectTotalsNeverTreatUnavailableAsZero () =
-    let online = { Project = "Wayfold"; Identity = "pid:1:1"; Counts = Some (projectCounts [ record "Wayfold" "Worker" "Ready" None ] 2); Error = None }
-    let missing = { Project = "Jarvis"; Identity = "pid:2:1"; Counts = None; Error = Some "Cannot fetch ledger" }
+    let online = { Project = "Wayfold"; Aliases = ["Wayfold"]; Identity = "pid:1:1"; Counts = Some (projectCounts [ record "Wayfold" "Worker" "Ready" None ] 2); Error = None }
+    let missing = { Project = "Jarvis"; Aliases = ["Jarvis"]; Identity = "pid:2:1"; Counts = None; Error = Some "Cannot fetch ledger" }
     let data = { snapshot [] with Projects = [online; missing] }
     let totals = totalCounts data
     Assert.That(totals.Tracked, Is.EqualTo(1))
@@ -276,7 +277,7 @@ let partialProjectTotalsNeverTreatUnavailableAsZero () =
 
 [<Test>]
 let sameNamedLedgersWithCollidingShortIdentifiersGetUniqueLabels () =
-    let a = { Project = "Wayfold"; Identity = "pid:abc01234a:1"; Counts = Some (projectCounts [] 0); Error = None }
+    let a = { Project = "Wayfold"; Aliases = ["Wayfold"]; Identity = "pid:abc01234a:1"; Counts = Some (projectCounts [] 0); Error = None }
     let b = { a with Identity = "pid:abc01234b:1" }
     let view = { snapshot [] with Projects = [a; b] }
     projectDisplayName view a |> shouldEqual "Wayfold [abc01234a]"
@@ -285,7 +286,7 @@ let sameNamedLedgersWithCollidingShortIdentifiersGetUniqueLabels () =
 [<Test>]
 let narrowProjectStatusWrapsAllCountersWithoutDroppingTheProjectLabel () =
     let entry =
-        { Project = "Wayfold"; Identity = "project:ledger:1"
+        { Project = "Wayfold"; Aliases = ["Wayfold"]; Identity = "project:ledger:1"
           Counts = Some (projectCounts [record "Wayfold" "A" "Working" None] 2)
           Error = None }
     for width in [12; 24; 40; 54] do
@@ -305,7 +306,7 @@ let narrowProjectStatusWrapsAllCountersWithoutDroppingTheProjectLabel () =
 [<Test>]
 let narrowDistinctProjectLabelsKeepTheirLedgerSuffixes () =
     let prefix = "A Project With A Much Longer Name Than The Terminal"
-    let a = { Project = prefix; Identity = "project:a1234567:1"; Counts = Some (projectCounts [] 0); Error = None }
+    let a = { Project = prefix; Aliases = [prefix]; Identity = "project:a1234567:1"; Counts = Some (projectCounts [] 0); Error = None }
     let b = { a with Identity = "project:b1234567:1" }
     let view = { snapshot [] with Projects = [a; b] }
     let one = (projectStatusLines 26 (projectDisplayName view a) a).Head

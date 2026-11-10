@@ -180,6 +180,19 @@ module LedgerBindingConfig =
         ProjectPaths.resolveProjectRoot projectName rt
         |> Result.bind (fun (FolderPath root) -> loadAtRoot root)
 
+    // Inspect locally approved, validated binding identity before network I/O.
+    // Dashboard refreshes use it to group aliases of one canonical ledger;
+    // this read neither fetches a head nor updates the trust anchor.
+    let inspectLocal projectName rt =
+        ProjectPaths.resolveProjectRoot projectName rt
+        |> Result.bind (fun (FolderPath root) ->
+            let path = pathForRoot root
+            withConfigLock path (fun () ->
+                readStored path
+                |> Result.bind (fun stored ->
+                    validStored root stored
+                    |> Result.map (fun binding -> binding, stored.HighestTrustedHead))))
+
     // Setup is always an explicit approved action, never a side effect of a read.
     // The expected head is a separately supplied trust anchor, not inferred
     // from matching task IDs or the newest local branch.

@@ -9,7 +9,7 @@ The extension pairs with a **local JarvisClient** over authenticated loopback We
 3. Load the unpacked `browser-extension` folder in `edge://extensions` or `chrome://extensions` (Developer mode). Enable **Allow User Scripts** in the extension details.
 4. Open the extension popup. Enter the local port/key and pair.
 5. In the browser window that should receive agent launches, click **Register / reauthorize window**, optionally naming it `agents`. This grants **placement**, not access to its existing tabs.
-6. Under **Site to authorize for new tabs**, enter `https://chatgpt.com` and click **Grant site permission**. Browser host permission is independent of window registration.
+6. Under **Site to authorize for new tabs**, enter the origin you want agents to automate (for example `https://example.com`) and click **Grant site permission**. Browser host permission is independent of window registration.
 7. Enable **Allow Jarvis to open new tabs**. New tabs open in the chosen window and are automatically registered. Existing tabs in the window remain inaccessible unless explicitly registered separately.
 
 The extension accepts only registered windows; neither Jarvis nor a webpage may register an arbitrary window. A browser restart or closed window invalidates the window registration until you reauthorize it from the popup. Moving a created tab outside its registered window suspends script execution.
@@ -24,6 +24,8 @@ Manually registering a **tab** is still supported for existing-page inspections,
 | `BrowserListTabs(deviceId?)` | Lists only manually registered and Jarvis-created tabs |
 | `BrowserOpenTab(url, windowRegistration, alias?, active?, deviceId?)` | Opens an agent-created tab in the selected window, default background |
 | `BrowserExecuteFile(projectName, scriptPath, tabRegistration, argsJson?, timeoutMs?, deviceId?)` | Runs a regular project-relative UTF-8 `.js` file in a registered tab |
+| `BrowserCaptureDom(tabRegistration, waitJson?, captureSelector?, timeoutMs?, deviceId?)` | Capture current post-JavaScript DOM, optionally after a timer, selector condition or DOM event |
+| `BrowserExportDom(projectName, filePath, tabRegistration, waitJson?, captureSelector?, timeoutMs?, deviceId?)` | Stream a large DOM snapshot into a new project file, with SHA-256 and atomic write |
 | `BrowserCloseTab(tabRegistration, deviceId?)` | Closes **only** a Jarvis-created tab with matching identity |
 | `BrowserRunInNewTab(windowRegistration, url, projectName, scriptPath, argsJson?, active?, closeTabAfterExecution?, timeoutMs?, deviceId?)` | One-call open → ready → execute → optional close, for immediate agent handoffs |
 | `ScheduleBrowserExecution(scheduleId, runAfterSeconds, url, projectName, scriptPath, windowRegistration, argsJson?, closeTabAfterExecution?, repeatEverySeconds?, ...)` | One-shot or recurring future invocation of the same workflow |
@@ -33,7 +35,23 @@ Manually registering a **tab** is still supported for existing-page inspections,
 
 `BrowserRunInNewTab` and scheduling **do not run a ChatGPT backend API**. They execute the project script in the actual UI. Generic scripts use `async function execute(args)`. The composite operation returns structured script result + registration + cleanup status. If a script indicates `outcomeUnknown` or `uiIncompatible`, the created tab is retained for investigation rather than automatically resubmitting. Returned errors include the created tab registration ID where known. A definitive `notSubmitted` result may close its unused tab. A provider script reporting `uiIncompatible` returns an actionable error with stage, reason, sanitized structural diagnostics and the tab registration; recurring schedules enter `suspended` and do not launch again until explicitly replaced/reconfigured. The ChatGPT script waits for an actual conversation URL within one 27-second default deadline before reporting success.
 
-## Start a fresh ChatGPT agent immediately
+## Capture dynamic web pages
+
+An agent can use the browser bridge to obtain **rendered HTML** when `curl` only returns an application shell. Open a permitted tab (or explicitly register an existing one), then call `BrowserCaptureDom`. The capture can wait for an explicit delay, a selector to appear or contain text, or a future DOM event. For example:
+
+```json
+{
+  "tabRegistration": "results-tab",
+  "waitJson": "{\"kind\":\"selector\",\"selector\":\"#results\",\"state\":\"exists\"}",
+  "captureSelector": "#results"
+}
+```
+
+Small captures return inline HTML. For pages exceeding the inline bound, call `BrowserExportDom` with an explicit `projectName` and new `filePath`; it transfers up to 8 MiB in 32 KiB chunks, verifies a checksum and writes the file atomically without overwriting. No HTML is logged or automatically committed.
+
+See [Live DOM snapshots](../docs/BrowserDomSnapshots.md) for all wait forms, timeout behavior, export details and the test fixture. The extension advertises a snapshot capability; an older extension produces an explicit update-required error instead of an unexplained timeout.
+
+## Example provider script: ChatGPT agent launcher
 
 A reusable DOM-based launcher is included in this repository at:
 

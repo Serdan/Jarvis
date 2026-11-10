@@ -108,6 +108,18 @@ type BrowserExecuteJsCommand =
       Code: string
       ArgsJson: string option
       TimeoutMs: int option }
+type BrowserCaptureDomCommand =
+    { TabRegistration: string
+      WaitJson: string option
+      CaptureSelector: string option
+      TimeoutMs: int option }
+type BrowserExportDomCommand =
+    { TabRegistration: string
+      ProjectName: string
+      FilePath: string
+      WaitJson: string option
+      CaptureSelector: string option
+      TimeoutMs: int option }
 
 
 type ListWorktreesCommand = { ProjectName: string }
@@ -609,6 +621,8 @@ type AgentCommand =
     | BrowserOpenTabCommand of BrowserOpenTabCommand
     | BrowserExecuteFileCommand of BrowserExecuteFileCommand
     | BrowserExecuteJsCommand of BrowserExecuteJsCommand
+    | BrowserCaptureDomCommand of BrowserCaptureDomCommand
+    | BrowserExportDomCommand of BrowserExportDomCommand
     | ListWorktreesCommand of ListWorktreesCommand
     | GetWorktreeCommand of GetWorktreeCommand
     | CreateWorktreeCommand of CreateWorktreeCommand
@@ -676,6 +690,8 @@ module AgentCommandInfo =
         | BrowserOpenTabCommand _ -> "BrowserOpenTabCommand"
         | BrowserExecuteFileCommand _ -> "BrowserExecuteFileCommand"
         | BrowserExecuteJsCommand _ -> "BrowserExecuteJsCommand"
+        | BrowserCaptureDomCommand _ -> "BrowserCaptureDomCommand"
+        | BrowserExportDomCommand _ -> "BrowserExportDomCommand"
         | ListWorktreesCommand _ -> "ListWorktreesCommand"
         | GetWorktreeCommand _ -> "GetWorktreeCommand"
         | CreateWorktreeCommand _ -> "CreateWorktreeCommand"
@@ -749,6 +765,8 @@ module AgentCommandInfo =
         | BrowserOpenTabCommand _ -> "BrowserOpenTab"
         | BrowserExecuteFileCommand _ -> "BrowserExecuteFile"
         | BrowserExecuteJsCommand _ -> "BrowserExecuteJs"
+        | BrowserCaptureDomCommand _ -> "BrowserCaptureDom"
+        | BrowserExportDomCommand _ -> "BrowserExportDom"
         | ListWorktreesCommand _ -> "ListWorktrees"
         | GetWorktreeCommand _ -> "GetWorktree"
         | CreateWorktreeCommand _ -> "CreateWorktree"
@@ -812,6 +830,7 @@ module AgentCommandInfo =
         | CancelScheduledBrowserExecutionCommand _
         | BrowserOpenTabCommand _
         | BrowserExecuteJsCommand _
+        | BrowserCaptureDomCommand _
         | GetJobResultCommand _
         | CancelJobCommand _
         | UpdateClientCommand -> None
@@ -820,6 +839,7 @@ module AgentCommandInfo =
         | ScheduleBrowserExecutionCommand cmd -> Some cmd.ProjectName
         | BrowserRunInNewTabCommand cmd -> Some cmd.ProjectName
         | BrowserExecuteFileCommand cmd -> Some cmd.ProjectName
+        | BrowserExportDomCommand cmd -> Some cmd.ProjectName
         | ListWorktreesCommand cmd -> Some cmd.ProjectName
         | GetWorktreeCommand cmd -> Some cmd.ProjectName
         | CreateWorktreeCommand cmd -> Some cmd.ProjectName
@@ -917,6 +937,8 @@ module AgentCommandInfo =
             | _ -> Some "(new browser tab)"
         | BrowserExecuteFileCommand cmd -> Some(cmd.ScriptPath + " -> " + cmd.TabRegistration)
         | BrowserExecuteJsCommand cmd -> Some("registered tab " + cmd.TabRegistration)
+        | BrowserCaptureDomCommand cmd -> Some("DOM snapshot from " + cmd.TabRegistration)
+        | BrowserExportDomCommand cmd -> Some("DOM snapshot to " + cmd.ProjectName + "/" + cmd.FilePath)
         | ListDirectoryCommand cmd -> Some(compact cmd.FolderPath)
         | SearchFilesCommand cmd -> Some(sprintf "\"%s\"" (compact cmd.Query))
         | SearchTextCommand cmd -> Some(sprintf "\"%s\"" (compact cmd.Query))
@@ -983,6 +1005,8 @@ module AgentCommandInfo =
             | _ -> Some "(new browser tab)"
         | BrowserExecuteFileCommand cmd -> Some(cmd.ScriptPath + " -> " + cmd.TabRegistration)
         | BrowserExecuteJsCommand cmd -> Some("registered tab " + cmd.TabRegistration)
+        | BrowserCaptureDomCommand cmd -> Some("DOM snapshot from " + cmd.TabRegistration)
+        | BrowserExportDomCommand cmd -> Some("DOM snapshot to " + cmd.ProjectName + "/" + cmd.FilePath)
         | ListDirectoryCommand cmd -> Some(truncate 64 cmd.FolderPath)
         | SearchFilesCommand cmd -> Some(quoted cmd.Query)
         | SearchTextCommand cmd -> Some(quoted cmd.Query)
@@ -1105,6 +1129,8 @@ module AgentProtocol =
           definition "BrowserOpenTab" "Opens a new background tab in a user-registered window on an explicitly permitted site." [ ProcessExecution; NetworkAccess ] true true false
           definition "BrowserExecuteFile" "Executes JavaScript from a bounded project file in a registered tab." [ ProcessExecution; NetworkAccess ] true true false
           definition "BrowserExecuteJs" "Executes supplied JavaScript in a registered browser tab." [ ProcessExecution; NetworkAccess ] true true false
+          definition "BrowserCaptureDom" "Capture live DOM markup after an explicit wait condition." [ ProcessExecution ] false true false
+          definition "BrowserExportDom" "Write an explicitly requested live DOM snapshot to a project file." [ ProcessExecution; WorkspaceWrite ] true true false
           definition "ListWorktrees" "Lists Git worktrees registered for a project." [ ReadOnly ] false false false
           definition "GetWorktree" "Inspects a registered Git worktree." [ ReadOnly ] false false false
           definition "CreateWorktree" "Creates an isolated Git worktree and branch." [ VersionControlWrite ] true true false

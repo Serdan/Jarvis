@@ -374,3 +374,170 @@ let compositeLaunchKeepsUncertainTabButClosesDefinitiveFailure (scriptStatus: st
             Assert.That(reason, Does.Contain("OutcomeUnknown"))
     | _ -> Assert.Fail("Unexpected script failure handling")
 }
+
+[<Test>]
+let liveDomSnapshotReturnsPostHydrationMarkup () = task {
+    let port = findPort()
+    use bridge = new BrowserBridge.Service(port, "test-secret")
+    bridge.Start()
+    let! client, connectionId = handshake port "test-secret"
+    use socket = client
+    do! send socket """{"version":2,"kind":"capabilities","features":["domSnapshotV1"]}"""
+    do! send socket """{"version":2,"kind":"registrations","tabs":[{"registrationId":"dom-tab-01","alias":"hydration","availability":"ready","registrationGeneration":1}]}"""
+    do! waitUntil (fun () -> bridge.ListTabs() |> Result.exists (fun x -> x.Contains("hydration")))
+    let waitJson = """{"kind":"selector","selector":"#results","state":"textContains","text":"Loaded"}"""
+    let pending = bridge.CaptureDom("hydration",waitJson,"#results",2000,None)
+    let! request = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
+    Assert.That(property request "kind", Is.EqualTo("captureDom"))
+    Assert.That(property request "mode", Is.EqualTo("inline"))
+    Assert.That(property request "captureSelector", Is.EqualTo("#results"))
+    use sent = JsonDocument.Parse(request)
+    Assert.That(sent.RootElement.GetProperty("wait").GetProperty("kind").GetString(), Is.EqualTo("selector"))
+    let html = "<div id='results'>Loaded Ω after JS</div>"
+    do! send socket (JsonSerializer.Serialize({|
+        version = 2; kind = "snapshotReady"; requestId = property request "requestId"
+        connectionId = connectionId; registrationId = "dom-tab-01"; registrationGeneration = 1
+        status = "completed"; bytes = Encoding.UTF8.GetByteCount(html)
+        title = "Dynamic"; url = "https://example.test/page"
+        capturedAtUtc = "2026-11-10T09:00:00Z"; waitKind = "selector"; html = html
+    |}))
+    let! result = pending
+    match result with
+    | Error reason -> Assert.Fail("Expected DOM snapshot: " + reason)
+    | Ok value ->
+        use json = JsonDocument.Parse(value)
+        Assert.That(json.RootElement.GetProperty("html").GetString(), Is.EqualTo(html))
+        Assert.That(json.RootElement.GetProperty("waitKind").GetString(), Is.EqualTo("selector"))
+        Assert.That(json.RootElement.GetProperty("bytes").GetInt32(), Is.EqualTo(Encoding.UTF8.GetByteCount(html)))
+    let timeout = bridge.CaptureDom("hydration", """{"kind":"event","name":"never","target":"document"}""", "",2000,None)
+    let! expiredRequest = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
+    do! send socket (JsonSerializer.Serialize({|
+        version = 2; kind = "error"; requestId = property expiredRequest "requestId"
+        connectionId = connectionId; registrationId = "dom-tab-01"; registrationGeneration = 1
+        error = "SnapshotTimeout"
+    |}))
+    let! expired = timeout
+    match expired with
+    | Error reason -> Assert.That(reason, Does.Contain("SnapshotTimeout"))
+    | Ok _ -> Assert.Fail("Timed-out event must not return a snapshot")
+}
+
+[<Test>]
+let snapshotLargeFileExportTransfersExactUtf8AndNeverOverwrites () = task {
+    let dir = IO.Path.Combine(IO.Path.GetTempPath(), "jarvis-dom-" + Guid.NewGuid().ToString("N"))
+    IO.Directory.CreateDirectory(dir) |> ignore
+    let target = IO.Path.Combine(dir, "snapshot.html")
+    try
+        let port = findPort()
+        use bridge = new BrowserBridge.Service(port, "test-secret")
+        bridge.Start()
+        let! client, connectionId = handshake port "test-secret"
+        use socket = client
+        do! send socket """{"version":2,"kind":"capabilities","features":["domSnapshotV1"]}"""
+        do! send socket """{"version":2,"kind":"registrations","tabs":[{"registrationId":"dom-tab-02","alias":"export","availability":"ready","registrationGeneration":1}]}"""
+        do! waitUntil (fun () -> bridge.ListTabs() |> Result.exists (fun x -> x.Contains("dom-tab-02")))
+        let markup = "<html><body>" + String.replicate 30000 "🦊" + "</body></html>"
+        let data = Encoding.UTF8.GetBytes(markup)
+        let sha256 = Convert.ToHexString(SHA256.HashData(data)).ToLowerInvariant()
+        let capture = bridge.CaptureDom("export","""{"kind":"immediate"}""","",2000,Some target)
+        let! request = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
+        Assert.That(property request "mode", Is.EqualTo("file"))
+        let snapshotId = "0000000000000000000000000000000a"
+        do! send socket (JsonSerializer.Serialize({|
+            version = 2; kind = "snapshotReady"; requestId = property request "requestId"
+            connectionId = connectionId; registrationId = "dom-tab-02"; registrationGeneration = 1
+            status = "completed"; bytes = data.Length
+            title = "Large"; url = "https://example.test/dynamic"
+            capturedAtUtc = "2026-11-10T09:00:00Z"; waitKind = "immediate"
+            snapshotId = snapshotId; sha256 = sha256
+        |}))
+        let mutable offset = 0
+        while offset < data.Length do
+            let! chunk = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
+            Assert.That(property chunk "kind", Is.EqualTo("snapshotChunk"))
+            use packet = JsonDocument.Parse(chunk)
+            let requestedOffset = packet.RootElement.GetProperty("offset").GetInt32()
+            Assert.That(requestedOffset, Is.EqualTo(offset))
+            let count = min 32768 (data.Length-offset)
+            do! send socket (JsonSerializer.Serialize({|
+                version = 2; kind = "snapshotChunk"; requestId = property chunk "requestId"
+                connectionId = connectionId; registrationId = "dom-tab-02"; registrationGeneration = 1
+                snapshotId = snapshotId; offset = offset
+                data = Convert.ToBase64String(data, offset, count)
+            |}))
+            offset <- offset + count
+        let! release = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
+        Assert.That(property release "kind", Is.EqualTo("releaseSnapshot"))
+        let! result = capture
+        match result with
+        | Error reason -> Assert.Fail("Expected exported DOM snapshot: " + reason)
+        | Ok value -> Assert.That(value, Does.Contain(sha256))
+        Assert.That(IO.File.ReadAllBytes(target), Is.EqualTo(data :> obj))
+        let! rejected = bridge.CaptureDom("export","""{"kind":"immediate"}""","",2000,Some target)
+        match rejected with
+        | Error reason -> Assert.That(reason, Is.EqualTo("SnapshotOutputExists"))
+        | Ok _ -> Assert.Fail("Existing output must be preserved")
+        Assert.That(IO.File.ReadAllBytes(target), Is.EqualTo(data :> obj))
+    finally
+        IO.Directory.Delete(dir, true)
+}
+
+[<Test>]
+let olderExtensionFailsSnapshotCapabilityCheckWithoutDispatch () = task {
+    let port = findPort()
+    use bridge = new BrowserBridge.Service(port, "test-secret")
+    bridge.Start()
+    let! client, _ = handshake port "test-secret"
+    use socket = client
+    do! send socket """{"version":2,"kind":"registrations","tabs":[{"registrationId":"old-tab-01","alias":"old-extension","availability":"ready","registrationGeneration":1}]}"""
+    do! waitUntil (fun () -> bridge.ListTabs() |> Result.exists (fun x -> x.Contains("old-extension")))
+    let! outcome = bridge.CaptureDom("old-extension","""{"kind":"immediate"}""","",1000,None)
+    match outcome with
+    | Error reason -> Assert.That(reason, Does.Contain("ExtensionOutdated"))
+    | Ok _ -> Assert.Fail("An older extension must not silently time out")
+}
+
+[<Test>]
+let failedSnapshotIntegrityLeavesNoPartialFile () = task {
+    let dir = IO.Path.Combine(IO.Path.GetTempPath(), "jarvis-dom-integrity-" + Guid.NewGuid().ToString("N"))
+    IO.Directory.CreateDirectory(dir) |> ignore
+    let target = IO.Path.Combine(dir, "snapshot.html")
+    try
+        let port = findPort()
+        use bridge = new BrowserBridge.Service(port, "test-secret")
+        bridge.Start()
+        let! client, connectionId = handshake port "test-secret"
+        use socket = client
+        do! send socket """{"version":2,"kind":"capabilities","features":["domSnapshotV1"]}"""
+        do! send socket """{"version":2,"kind":"registrations","tabs":[{"registrationId":"corrupt-tab-01","alias":"corrupt","availability":"ready","registrationGeneration":1}]}"""
+        do! waitUntil (fun () -> bridge.ListTabs() |> Result.exists (fun x -> x.Contains("corrupt-tab-01")))
+        let capture = bridge.CaptureDom("corrupt","""{"kind":"immediate"}""","",2000,Some target)
+        let! request = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
+        let bytes = Encoding.UTF8.GetBytes("<p>UTF8 Ω</p>")
+        let snapshotId = "0000000000000000000000000000000b"
+        do! send socket (JsonSerializer.Serialize({|
+            version = 2; kind = "snapshotReady"; requestId = property request "requestId"
+            connectionId = connectionId; registrationId = "corrupt-tab-01"; registrationGeneration = 1
+            status = "completed"; bytes = bytes.Length
+            title = "Page"; url = "https://example.test/page"
+            capturedAtUtc = "2026-11-10T09:00:00Z"; waitKind = "immediate"
+            snapshotId = snapshotId; sha256 = String.replicate 64 "0"
+        |}))
+        let! chunk = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
+        Assert.That(property chunk "kind", Is.EqualTo("snapshotChunk"))
+        do! send socket (JsonSerializer.Serialize({|
+            version = 2; kind = "snapshotChunk"; requestId = property chunk "requestId"
+            connectionId = connectionId; registrationId = "corrupt-tab-01"; registrationGeneration = 1
+            snapshotId = snapshotId; offset = 0; data = Convert.ToBase64String(bytes)
+        |}))
+        let! release = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
+        Assert.That(property release "kind", Is.EqualTo("releaseSnapshot"))
+        let! result = capture
+        match result with
+        | Error reason -> Assert.That(reason, Is.EqualTo("SnapshotChecksumMismatch"))
+        | Ok _ -> Assert.Fail("Corrupt snapshot must not be written")
+        Assert.That(IO.File.Exists(target), Is.False)
+        Assert.That(IO.Directory.GetFiles(dir), Is.Empty)
+    finally
+        IO.Directory.Delete(dir, true)
+}

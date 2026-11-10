@@ -171,6 +171,12 @@ The extension popup/options view supports:
 
 Do not rely on unrestricted page-level `eval` or dynamically injecting scripts through `chrome.scripting.executeScript({func})` to handle arbitrary script source. The `userScripts` API is designed for user-provided code.
 
+## Live rendered DOM snapshots
+
+The bridge also supports **read-only DOM capture**, independent of the project script protocol. `BrowserCaptureDom` captures the current document or a CSS-selected subtree in a registered tab after a bounded readiness condition: an immediate read, an explicit delay, a selector-state predicate (exists, visible or contains text), or a future DOM event on window, document or a selected element. A MutationObserver with an immediate recheck handles delayed client-side hydration, while event listeners are cleaned up on completion or timeout.
+
+`BrowserExportDom` is a separate, explicitly workspace-writing command for large rendered pages. The extension freezes the DOM into an ephemeral, memory-bounded snapshot and serves authenticated, registration-bound chunks; JarvisClient checks offsets/identity and SHA-256 before atomically creating an explicit project file. No raw DOM content is persisted in bridge logs or Git. Both commands honor registered-tab/host permissions. See [Browser DOM snapshots](BrowserDomSnapshots.md) for wire and API details.
+
 ## 7. MCP command surface
 
 ### BrowserListWindows (new, read-only)
@@ -253,6 +259,10 @@ The client distinguishes `notSubmitted`, `submitted`, and `outcomeUnknown` **whe
 `closeTabAfterExecution` defaults **false** for compatibility with existing generic operations, but the ChatGPT launcher supplies **true**. A successful submission is **not** a completed Jarvis task.
 
 The delayed scheduler's due-time callback should reuse the same underlying open/execute/close service rather than reimplementing a second browser launcher. `ScheduleBrowserExecution` gains `windowRegistration` and optional `closeTabAfterExecution`; new schedules must name an authorized window. Existing persisted schedules without a window target must surface a clear reconfiguration-needed state, not silently select the active window.
+
+### BrowserCaptureDom and BrowserExportDom
+
+`BrowserCaptureDom(tabRegistration, waitJson?, captureSelector?, timeoutMs?)` returns live HTML inline after an optional timer, DOM selector-state predicate or future DOM event. `BrowserExportDom(projectName, filePath, tabRegistration, waitJson?, captureSelector?, timeoutMs?)` explicitly writes up to 8 MiB into a new project-relative file through checked chunk transfer. The destination is never silently overwritten. Both are generic browser operations and are independent of ChatGPT or other providers. Examples, bounds and wait semantics are in [Browser DOM snapshots](BrowserDomSnapshots.md).
 
 ### BrowserExecuteFile (primary)
 
@@ -347,7 +357,9 @@ Default proposed limits (final values can be tuned with evidence):
 | Script source (UTF-8 bytes) | 64 KiB |
 | Serialized arguments | 64 KiB |
 | Serialized result | 256 KiB |
-| Default execution timeout | 15 s |
+| Default standalone script execution timeout | 15 s |
+| Default composite script execution timeout | 30 s |
+| Default DOM snapshot timeout | 30 s (maximum 60 s) |
 | Maximum execution timeout | 30 s |
 | Concurrent executions per extension | 4 |
 | Bridge listener | Loopback only, disabled by default |

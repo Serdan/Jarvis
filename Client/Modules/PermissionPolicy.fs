@@ -162,6 +162,13 @@ let private requiresConfirmation command =
         confirmation "BrowserExecuteFile" (Some cmd.ProjectName) [ ProcessExecution; NetworkAccess ] [ cmd.ScriptPath ] None [] ("Execute browser script in registered tab " + cmd.TabRegistration) false
     | BrowserExecuteJsCommand cmd ->
         confirmation "BrowserExecuteJs" None [ ProcessExecution; NetworkAccess ] [] None [] ("Execute JavaScript in registered tab " + cmd.TabRegistration) false
+    | BrowserCaptureDomCommand cmd ->
+        confirmation "BrowserCaptureDom" None [ ProcessExecution; NetworkAccess ] [] None []
+            ("Capture rendered DOM in registered tab " + cmd.TabRegistration) false
+    | BrowserExportDomCommand cmd ->
+        confirmation "BrowserExportDom" (Some cmd.ProjectName)
+            [ ProcessExecution; NetworkAccess; WorkspaceWrite ] [ cmd.FilePath ] None []
+            ("Export rendered DOM from " + cmd.TabRegistration + " into " + cmd.ProjectName + "/" + cmd.FilePath) false
     | ImportFileCommand cmd ->
         confirmation "ImportFile" (Some cmd.ProjectName) [ WorkspaceWrite; NetworkAccess ] [ cmd.FilePath ] None [] $"Import file {cmd.FilePath}" false
     | UpdateClientCommand ->
@@ -215,6 +222,8 @@ let private trustAllows trustLevel command =
     | PartialTrust, BrowserRunInNewTabCommand _
     | PartialTrust, BrowserExecuteFileCommand _
     | PartialTrust, BrowserExecuteJsCommand _
+    | PartialTrust, BrowserCaptureDomCommand _
+    | PartialTrust, BrowserExportDomCommand _
     | PartialTrust, RunCommandCommand _
     | PartialTrust, RunProjectTaskCommand _
     | PartialTrust, StartJobCommand _

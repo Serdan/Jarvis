@@ -77,6 +77,8 @@ let private auditDetails command =
     | BrowserCloseTabCommand _ -> Some("BrowserCloseTab", None, [ ProcessExecution ], [], None, [])
     | BrowserExecuteFileCommand cmd -> Some("BrowserExecuteFile", Some cmd.ProjectName, [ ProcessExecution; NetworkAccess ], [cmd.ScriptPath], None, [])
     | BrowserExecuteJsCommand cmd -> Some("BrowserExecuteJs", None, [ ProcessExecution; NetworkAccess ], [], None, [])
+    | BrowserCaptureDomCommand _ -> Some("BrowserCaptureDom", None, [ ProcessExecution; NetworkAccess ], [], None, [])
+    | BrowserExportDomCommand cmd -> Some("BrowserExportDom", Some cmd.ProjectName, [ ProcessExecution; NetworkAccess; WorkspaceWrite ], [cmd.FilePath], None, [])
     | WriteFileCommand cmd -> Some("WriteFile", Some cmd.ProjectName, [ WorkspaceWrite ], [ cmd.FilePath ], None, [])
     | PatchFileCommand cmd -> Some("PatchFile", Some cmd.ProjectName, [ WorkspaceWrite ], [ cmd.FilePath ], None, [])
     | RunCommandCommand cmd -> Some("RunCommand", Some cmd.ProjectName, [ ProcessExecution ], [], Some cmd.Executable, cmd.Args)
@@ -327,6 +329,35 @@ let private dispatch (rt: Runtime) (command: AgentCommand) =
                         | :? FileNotFoundException ->
                             return Error(Client.NotFoundError "ScriptNotFound")
                         | ex -> return Error(Client.ExceptionError ex)
+        })
+    | BrowserCaptureDomCommand cmd ->
+        ValueTask<Result<string,EffectError>>(task {
+            match rt.Browser with
+            | None -> return Error(Client.ValidationError "BridgeDisabled")
+            | Some bridge ->
+                let! result = bridge.CaptureDom(cmd.TabRegistration,
+                    defaultArg cmd.WaitJson """{"kind":"immediate"}""",
+                    defaultArg cmd.CaptureSelector "", defaultArg cmd.TimeoutMs 30000, None)
+                return result |> Result.mapError Client.ValidationError
+        })
+    | BrowserExportDomCommand cmd ->
+        ValueTask<Result<string,EffectError>>(task {
+            match rt.Browser with
+            | None -> return Error(Client.ValidationError "BridgeDisabled")
+            | Some bridge ->
+                match ProjectPaths.resolveWritableProjectFile cmd.ProjectName cmd.FilePath rt with
+                | Error e -> return Error e
+                | Ok(FilePath destination) ->
+                    let! result = bridge.CaptureDom(cmd.TabRegistration,
+                        defaultArg cmd.WaitJson """{"kind":"immediate"}""",
+                        defaultArg cmd.CaptureSelector "", defaultArg cmd.TimeoutMs 30000, Some destination)
+                    match result with
+                    | Error reason -> return Error(Client.ValidationError reason)
+                    | Ok json ->
+                        use snapshot = JsonDocument.Parse(json)
+                        return Ok(JsonSerializer.Serialize(
+                            {| projectName = cmd.ProjectName; filePath = cmd.FilePath
+                               snapshot = snapshot.RootElement.Clone() |}))
         })
     | BrowserExecuteJsCommand cmd ->
         ValueTask<Result<string,EffectError>>(task {

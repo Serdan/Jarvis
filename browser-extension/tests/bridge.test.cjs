@@ -3,7 +3,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
-const { webcrypto, createHmac } = require("node:crypto");
+const { webcrypto, createHmac, createHash } = require("node:crypto");
 
 const source = fs.readFileSync(path.join(__dirname, "..", "background.js"), "utf8");
 const tick = () => new Promise(resolve => setImmediate(resolve));
@@ -93,6 +93,7 @@ function createHarness(initialStorage = {}, initialSession = {}) {
   };
   vm.runInNewContext(source, {
     chrome, crypto: webcrypto, TextEncoder, URL, WebSocket: FakeWebSocket,
+    btoa: input => Buffer.from(input, "binary").toString("base64"),
     setTimeout, clearTimeout, setInterval: () => 1, clearInterval: () => {}
   });
   const message = (kind, extra = {}, sender = { id: chrome.runtime.id }) =>
@@ -136,6 +137,8 @@ test("paired extension executes file script only on registered tab", async () =>
   const auth = ws.sent.find(m => m.kind === "authenticate");
   assert.equal(auth.proof, createHmac("sha256", pairingKey).update(nonce).digest("hex"));
   await h.deliver(ws, { kind: "ready", connectionId: "epoch-1" });
+  const capabilities = ws.sent.find(m => m.kind === "capabilities");
+  assert.deepEqual(JSON.parse(JSON.stringify(capabilities.features)), ["domSnapshotV1"]);
   const advertised = ws.sent.find(m => m.kind === "registrations");
   assert.equal(advertised.tabs.length, 1);
   assert.equal(advertised.tabs[0].alias, "agent-7");
@@ -409,4 +412,197 @@ test("only agent-created tabs can be closed, preserving the window and manual ta
   assert.ok(h.tabs.has(17));
   assert.equal((await h.message("getState")).windows[0].alias, "agents");
   assert.equal((await h.message("getState")).registrations.length, 1);
+});
+
+async function snapshotHarness(dom = {}) {
+  const h = createHarness();
+  await tick(); await tick();
+  await h.message("register", { tabId: 17, alias: "snapshot" });
+  await h.message("pair", { port: 43822, secret: "a".repeat(64) });
+  await tick(); await tick();
+  const socket = h.sockets[0];
+  await h.deliver(socket, { kind: "challenge", nonce: "b".repeat(64) });
+  await h.deliver(socket, { kind: "ready", connectionId: "epoch-1" });
+  const tab = socket.sent.find(m => m.kind === "registrations").tabs[0];
+  const listeners = new Map();
+  const mutations = new Set();
+  const state = { html: dom.html || "<html><body><div id='app'></div></body></html>",
+    node: null, url: "https://example.test/chat/7" };
+  const document = {
+    title: "Client-rendered page",
+    readyState: "complete",
+    get documentElement() { return { outerHTML: state.html }; },
+    querySelector(selector) {
+      if (dom.invalidSelector && selector === dom.invalidSelector) throw new SyntaxError("invalid CSS");
+      return selector === "#results" ? state.node : null;
+    },
+    addEventListener(name, callback) {
+      const entries = listeners.get(name) || new Set();
+      entries.add(callback);
+      listeners.set(name, entries);
+    },
+    removeEventListener(name, callback) { listeners.get(name)?.delete(callback); }
+  };
+  class Observer {
+    constructor(callback) { this.callback = callback; }
+    observe() { mutations.add(this.callback); }
+    disconnect() { mutations.delete(this.callback); }
+  }
+  const update = (text = "Loaded Ω after hydration") => {
+    state.node = { outerHTML: "<p id='results'>" + text + "</p>", textContent: text,
+      getBoundingClientRect: () => ({width: 100,height:20}) };
+    state.html = "<html><body><div id='app'>" + state.node.outerHTML + "</div></body></html>";
+    for (const observe of mutations) observe();
+  };
+  const fire = name => { for(const listener of [...(listeners.get(name) || [])]) listener(); };
+  h.userScripts.execute = async ({target,js,world}) => {
+    assert.equal(target.tabId,17);
+    assert.equal(world,"USER_SCRIPT");
+    const location = { get href() { return state.url; }, get origin() { return new URL(state.url).origin; },
+      get pathname() { return new URL(state.url).pathname; } };
+    const result = await vm.runInNewContext(js[0].code, {
+      document, location, window: document, Date, setTimeout, clearTimeout,
+      setInterval, clearInterval, MutationObserver: Observer,
+      getComputedStyle: () => ({ display:"block",visibility:"visible" })
+    });
+    return [{result}];
+  };
+  const capture = async (requestId, options = {}) => {
+    await h.deliver(socket, {
+      kind:"captureDom", requestId, connectionId:"epoch-1",
+      registrationId: tab.registrationId, registrationGeneration:tab.registrationGeneration,
+      mode: options.mode || "inline", captureSelector: options.captureSelector || "",
+      timeoutMs:options.timeoutMs || 500, wait: options.wait || {kind:"immediate"}
+    });
+    return socket.sent.find(m => m.requestId === requestId);
+  };
+  const response = async (requestId, ms = 900) => {
+    const deadline=Date.now()+ms;
+    while(Date.now()<deadline){
+      const value=socket.sent.find(m=>m.requestId===requestId);
+      if(value) return value;
+      await new Promise(resolve=>setTimeout(resolve,5));
+    }
+    throw new Error("Missing snapshot reply: "+requestId);
+  };
+  return { h, socket, tab, state, document, capture, response, update, fire, listeners, mutations };
+}
+
+test("DOM capture waits for dynamic hydration and returns the final rendered HTML", async () => {
+  const x = await snapshotHarness();
+  await x.capture("hydrated", {wait:{kind:"selector",selector:"#results",state:"textContains",text:"Ω"}});
+  setTimeout(() => x.update(),35);
+  const result = await x.response("hydrated");
+  assert.equal(result.kind,"snapshotReady");
+  assert.equal(result.waitKind,"selector");
+  assert.match(result.html,/Loaded Ω after hydration/);
+  assert.equal(result.bytes,new TextEncoder().encode(result.html).byteLength);
+  assert.equal(x.mutations.size,0,"MutationObserver must be disconnected");
+});
+
+test("DOM capture supports a bounded event trigger and cleans up its listener", async () => {
+  const x = await snapshotHarness();
+  await x.capture("event-capture",{wait:{kind:"event",name:"page:ready",target:"document"}});
+  x.update("results from custom event");
+  x.fire("page:ready");
+  const result = await x.response("event-capture");
+  assert.equal(result.kind,"snapshotReady");
+  assert.match(result.html,/results from custom event/);
+  assert.equal(x.listeners.get("page:ready")?.size,0);
+});
+
+test("DOM capture waits a timer and can snapshot a selected subtree", async () => {
+  const x = await snapshotHarness();
+  await x.capture("timer",{wait:{kind:"delay",milliseconds:40},captureSelector:"#results"});
+  setTimeout(() => x.update("subtree content"),15);
+  const result = await x.response("timer");
+  assert.equal(result.html,"<p id='results'>subtree content</p>");
+  assert.equal(result.waitKind,"delay");
+});
+
+test("DOM capture times out waiting for missing event and discards listener", async () => {
+  const x = await snapshotHarness();
+  await x.capture("timeout",{wait:{kind:"event",name:"never",target:"document"},timeoutMs:110});
+  const result = await x.response("timeout");
+  assert.equal(result.kind,"error");
+  assert.equal(result.error,"SnapshotTimeout");
+  assert.equal(x.listeners.get("never")?.size,0);
+});
+
+test("DOM capture classifies navigation and invalid selector distinctly", async () => {
+  const x = await snapshotHarness({invalidSelector:"###"});
+  await x.capture("bad-selector",{wait:{kind:"selector",selector:"###",state:"exists"}});
+  assert.equal((await x.response("bad-selector")).error,"InvalidSelector");
+  await x.capture("navigation",{wait:{kind:"selector",selector:"#results",state:"exists"},timeoutMs:300});
+  setTimeout(()=>{x.state.url="https://example.test/next";},35);
+  assert.equal((await x.response("navigation")).error,"NavigationDuringCapture");
+});
+
+test("large DOM is captured once, then transferred as exact checksummed chunks", async () => {
+  const x = await snapshotHarness({html:"<html><body>"+"🙂".repeat(20000)+"</body></html>"});
+  await x.capture("inline-large");
+  assert.match((await x.response("inline-large")).error,/SnapshotTooLargeForInline/);
+  await x.capture("export-large",{mode:"file"});
+  const ready = await x.response("export-large");
+  assert.equal(ready.kind,"snapshotReady");
+  assert.equal(ready.html,undefined);
+  assert.ok(ready.bytes>48000);
+  const chunks=[];
+  for(let offset=0;offset<ready.bytes;){
+    const reqId="chunk-"+offset;
+    await x.h.deliver(x.socket,{kind:"snapshotChunk",requestId:reqId,connectionId:"epoch-1",
+      snapshotId:ready.snapshotId,offset});
+    const reply=await x.response(reqId);
+    assert.equal(reply.kind,"snapshotChunk");
+    assert.equal(reply.offset,offset);
+    const part=Buffer.from(reply.data,"base64");
+    chunks.push(part);
+    offset+=part.length;
+  }
+  const assembled=Buffer.concat(chunks);
+  assert.equal(assembled.length,ready.bytes);
+  assert.equal(assembled.toString(),"<html><body>"+"🙂".repeat(20000)+"</body></html>");
+  assert.equal(createHash("sha256").update(assembled).digest("hex"),ready.sha256);
+  await x.h.deliver(x.socket,{kind:"releaseSnapshot",connectionId:"epoch-1",snapshotId:ready.snapshotId});
+  await x.h.deliver(x.socket,{kind:"snapshotChunk",connectionId:"epoch-1",requestId:"released",
+    snapshotId:ready.snapshotId,offset:0});
+  assert.equal((await x.response("released")).error,"SnapshotExpired");
+});
+
+test("DOM snapshot respects tab registration and permission revocation", async () => {
+  const x = await snapshotHarness();
+  await x.h.deliver(x.socket,{kind:"captureDom",requestId:"unregistered",connectionId:"epoch-1",
+    registrationId:"not-a-tab",registrationGeneration:1,timeoutMs:500,mode:"inline",
+    captureSelector:"",wait:{kind:"immediate"}});
+  assert.equal((await x.response("unregistered")).error,"RegistrationStale");
+  await x.capture("authorized",{mode:"file"});
+  const ready=await x.response("authorized");
+  x.h.tabs.get(17).url="https://unapproved.test/";
+  await x.h.deliver(x.socket,{kind:"snapshotChunk",requestId:"revoked",connectionId:"epoch-1",
+    snapshotId:ready.snapshotId,offset:0});
+  assert.equal((await x.response("revoked")).error,"SnapshotRegistrationChanged");
+});
+
+test("DOM event wait reports a same-origin SPA navigation rather than silent timeout", async () => {
+  const x = await snapshotHarness();
+  await x.capture("navigate-event",{wait:{kind:"event",name:"future",target:"document"},timeoutMs:300});
+  setTimeout(()=>{x.state.url="https://example.test/new-route";},30);
+  const result = await x.response("navigate-event");
+  assert.equal(result.error,"NavigationDuringCapture");
+  assert.equal(x.listeners.get("future")?.size,0);
+});
+
+test("snapshot subtree selector errors are reported without exposing DOM content", async () => {
+  const x = await snapshotHarness({invalidSelector:"###"});
+  await x.capture("invalid-subtree",{captureSelector:"###"});
+  const result = await x.response("invalid-subtree");
+  assert.equal(result.error,"InvalidSelector");
+  assert.equal(JSON.stringify(result).includes("<html>"),false);
+});
+
+test("snapshot rejects unbounded conditions before executing page code", async () => {
+  const x = await snapshotHarness();
+  await x.capture("bad-wait",{wait:{kind:"delay",milliseconds:6000000}});
+  const result=await x.response("bad-wait");
+  assert.equal(result.error,"InvalidSnapshotOptions");
 });

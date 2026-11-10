@@ -66,7 +66,8 @@ type private Connection =
       SendLock: SemaphoreSlim
       Pending: ConcurrentDictionary<string, TaskCompletionSource<string>>
       mutable Registrations: JsonElement list
-      mutable Windows: JsonElement list }
+      mutable Windows: JsonElement list
+      mutable Features: Set<string> }
 
 type Service(port: int, pairingSecret: string) =
     let listener = new HttpListener()
@@ -140,7 +141,7 @@ type Service(port: int, pairingSecret: string) =
                 { Socket = socket; Id = Guid.NewGuid().ToString("N")
                   SendLock = new SemaphoreSlim(1, 1)
                   Pending = ConcurrentDictionary()
-                  Registrations = []; Windows = [] }
+                  Registrations = []; Windows = []; Features = Set.empty }
             try
                 try
                     do! authenticated conn
@@ -173,6 +174,16 @@ type Service(port: int, pairingSecret: string) =
                                     |> Seq.toList
                                 lock sync (fun () -> conn.Registrations <- parsed)
                             | _ -> ()
+                        | "capabilities" ->
+                            match doc["features"] with
+                            | :? JsonArray as features when features.Count <= 32 ->
+                                let parsed = features |> Seq.choose (fun value ->
+                                    try
+                                        let feature = value.GetValue<string>()
+                                        if feature.Length <= 64 then Some feature else None
+                                    with _ -> None) |> Set.ofSeq
+                                lock sync (fun () -> conn.Features <- parsed)
+                            | _ -> ()
                         | "windows" ->
                             match doc["windows"] with
                             | :? JsonArray as windows when windows.Count <= 100 ->
@@ -185,7 +196,7 @@ type Service(port: int, pairingSecret: string) =
                                         else Some(JsonSerializer.SerializeToElement(w))) |> Seq.toList
                                 lock sync (fun () -> conn.Windows <- parsed)
                             | _ -> ()
-                        | "result" | "error" | "tabOpened" | "tabClosed" ->
+                        | "result" | "error" | "tabOpened" | "tabClosed" | "snapshotReady" | "snapshotChunk" ->
                             let requestId = asString doc "requestId"
                             let mutable tcs = Unchecked.defaultof<TaskCompletionSource<string>>
                             if conn.Pending.TryRemove(requestId, &tcs) then
@@ -200,6 +211,25 @@ type Service(port: int, pairingSecret: string) =
                     tcs.TrySetException(IOException("Browser bridge disconnected; outcome unknown.")) |> ignore
                 conn.SendLock.Dispose()
                 try socket.Abort() with _ -> ()
+    }
+
+    let requestSnapshotFrame (conn: Connection) (requestId: string) (frame: string) (timeoutMs: int) = task {
+        if conn.Pending.Count >= 4 then return Error "BridgeBusy"
+        else
+            let pending = TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously)
+            if not (conn.Pending.TryAdd(requestId, pending)) then return Error "DuplicateRequest"
+            else
+                try
+                    try
+                        do! send conn frame
+                        let! response = pending.Task.WaitAsync(TimeSpan.FromMilliseconds(float timeoutMs))
+                        return Ok response
+                    with
+                    | :? TimeoutException -> return Error "SnapshotTransportTimeout"
+                    | ex -> return Error("SnapshotTransportFailure:" + ex.GetType().Name)
+                finally
+                    let mutable removed = Unchecked.defaultof<TaskCompletionSource<string>>
+                    conn.Pending.TryRemove(requestId, &removed) |> ignore
     }
 
     member _.Start() =
@@ -423,6 +453,172 @@ type Service(port: int, pairingSecret: string) =
             with
             | :? JsonException -> return Error "InvalidArgumentsJson"
             | ex -> return Error ("BridgeFailure:" + ex.GetType().Name)
+    }
+
+
+    // DOM snapshots are read-only browser operations. The extension captures the
+    // complete DOM once; oversized results are transferred from that frozen copy.
+    member _.CaptureDom(tabRegistration: string, waitJson: string, captureSelector: string,
+                        timeoutMs: int, outputPath: string option) = task {
+        if String.IsNullOrWhiteSpace(tabRegistration) then return Error "TabNotRegistered"
+        elif isNull waitJson || utf8.GetByteCount(waitJson) > 4096 then return Error "InvalidSnapshotOptions"
+        elif isNull captureSelector || captureSelector.Length > 512 then return Error "InvalidSnapshotSelector"
+        elif timeoutMs < 100 || timeoutMs > 60000 then return Error "InvalidSnapshotTimeout"
+        elif outputPath |> Option.exists File.Exists then return Error "SnapshotOutputExists"
+        elif outputPath |> Option.exists (fun path -> not (Directory.Exists(Path.GetDirectoryName(path)))) then
+            return Error "SnapshotOutputDirectoryMissing"
+        else
+            try
+                use waitDoc = JsonDocument.Parse(waitJson)
+                if waitDoc.RootElement.ValueKind <> JsonValueKind.Object then
+                    return Error "InvalidSnapshotOptions"
+                else
+                    let selected = lock sync (fun () ->
+                        match active with
+                        | None -> Error "ExtensionDisconnected"
+                        | Some conn ->
+                            let matches = conn.Registrations |> List.filter (fun tab ->
+                                tab.GetProperty("registrationId").GetString() = tabRegistration ||
+                                (match tab.TryGetProperty("alias") with
+                                 | true, value -> value.GetString() = tabRegistration
+                                 | _ -> false))
+                            match matches with
+                            | [] -> Error "TabNotRegistered"
+                            | [tab] ->
+                                let status =
+                                    match tab.TryGetProperty("availability") with
+                                    | true, value -> value.GetString()
+                                    | _ -> "unknown"
+                                if status <> "ready" then Error("TabUnavailable:" + status)
+                                elif not (conn.Features.Contains("domSnapshotV1")) then
+                                    Error "ExtensionOutdated: DOM snapshots require a newer browser extension"
+                                else Ok(conn, tab)
+                            | _ -> Error "AliasAmbiguous")
+                    match selected with
+                    | Error error -> return Error error
+                    | Ok(conn, tab) ->
+                        let registrationId = tab.GetProperty("registrationId").GetString()
+                        let generation = tab.GetProperty("registrationGeneration").GetInt32()
+                        let requestId = Guid.NewGuid().ToString("N")
+                        let mode = if outputPath.IsSome then "file" else "inline"
+                        let frame = serialize {| version = ProtocolVersion; kind = "captureDom";
+                               connectionId = conn.Id; requestId = requestId;
+                               registrationId = registrationId; registrationGeneration = generation;
+                               timeoutMs = timeoutMs; mode = mode;
+                               wait = waitDoc.RootElement.Clone(); captureSelector = captureSelector |}
+                        let! received = requestSnapshotFrame conn requestId frame (timeoutMs + 3000)
+                        match received with
+                        | Error e -> return Error e
+                        | Ok raw ->
+                            use doc = JsonDocument.Parse(raw)
+                            let reply = doc.RootElement
+                            let getString (node: JsonElement) (name: string) =
+                                match node.TryGetProperty(name) with
+                                | true, value when value.ValueKind = JsonValueKind.String -> value.GetString()
+                                | _ -> ""
+                            if getString reply "connectionId" <> conn.Id ||
+                               getString reply "registrationId" <> registrationId ||
+                               reply.GetProperty("registrationGeneration").GetInt32() <> generation then
+                                return Error "SnapshotResponseIdentityMismatch"
+                            elif getString reply "kind" = "error" then
+                                return Error("BrowserSnapshotError:" + getString reply "error")
+                            elif getString reply "kind" <> "snapshotReady" then
+                                return Error "UnexpectedSnapshotResponse"
+                            else
+                                let bytes = reply.GetProperty("bytes").GetInt32()
+                                if bytes < 0 || bytes > 8 * 1024 * 1024 then
+                                    return Error "SnapshotTooLarge"
+                                else
+                                    let title = getString reply "title"
+                                    let url = getString reply "url"
+                                    let capturedAtUtc = getString reply "capturedAtUtc"
+                                    let waitKind = getString reply "waitKind"
+                                    match outputPath with
+                                    | None ->
+                                        let html = getString reply "html"
+                                        if utf8.GetByteCount(html) <> bytes then
+                                            return Error "SnapshotSizeMismatch"
+                                        else
+                                            return Ok(serialize
+                                                {| status = "completed"; registrationId = registrationId
+                                                   title = title; url = url; capturedAtUtc = capturedAtUtc
+                                                   waitKind = waitKind; bytes = bytes; html = html |})
+                                    | Some destination ->
+                                        let snapshotId = getString reply "snapshotId"
+                                        let expectedHash = getString reply "sha256"
+                                        if snapshotId.Length <> 32 || expectedHash.Length <> 64 then
+                                            return Error "InvalidSnapshotTransfer"
+                                        elif File.Exists(destination) then
+                                            return Error "SnapshotOutputExists"
+                                        elif not (Directory.Exists(Path.GetDirectoryName(destination))) then
+                                            return Error "SnapshotOutputDirectoryMissing"
+                                        else
+                                            let temp = destination + "." + Guid.NewGuid().ToString("N") + ".tmp"
+                                            let mutable error: string option = None
+                                            try
+                                                use file = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None)
+                                                use hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256)
+                                                let mutable offset = 0
+                                                while offset < bytes && error.IsNone do
+                                                    let chunkRequestId = Guid.NewGuid().ToString("N")
+                                                    let chunkFrame = serialize {| version = ProtocolVersion; kind = "snapshotChunk";
+                                                           requestId = chunkRequestId; connectionId = conn.Id;
+                                                           snapshotId = snapshotId; offset = offset |}
+                                                    let! chunkResult = requestSnapshotFrame conn chunkRequestId chunkFrame 10000
+                                                    match chunkResult with
+                                                    | Error e -> error <- Some e
+                                                    | Ok chunkRaw ->
+                                                        try
+                                                            use chunkDoc = JsonDocument.Parse(chunkRaw)
+                                                            let chunk = chunkDoc.RootElement
+                                                            if getString chunk "kind" = "error" then
+                                                                error <- Some("BrowserSnapshotError:" + getString chunk "error")
+                                                            elif getString chunk "connectionId" <> conn.Id ||
+                                                                 getString chunk "kind" <> "snapshotChunk" ||
+                                                                   getString chunk "snapshotId" <> snapshotId ||
+                                                                   getString chunk "registrationId" <> registrationId ||
+                                                                   chunk.GetProperty("registrationGeneration").GetInt32() <> generation ||
+                                                                   chunk.GetProperty("offset").GetInt32() <> offset then
+                                                                error <- Some "SnapshotChunkIdentityMismatch"
+                                                            else
+                                                                let data = Convert.FromBase64String(getString chunk "data")
+                                                                if data.Length = 0 || data.Length > 32768 ||
+                                                                   offset + data.Length > bytes then
+                                                                    error <- Some "SnapshotChunkInvalid"
+                                                                else
+                                                                    file.Write(data)
+                                                                    hash.AppendData(data)
+                                                                    offset <- offset + data.Length
+                                                        with _ -> error <- Some "SnapshotChunkInvalid"
+                                                if error.IsNone then
+                                                    let receivedHash = Convert.ToHexString(hash.GetHashAndReset()).ToLowerInvariant()
+                                                    if receivedHash <> expectedHash then
+                                                        error <- Some "SnapshotChecksumMismatch"
+                                                    else
+                                                        file.Flush(true)
+                                                        file.Dispose()
+                                                        File.Move(temp, destination)
+                                            with
+                                            | :? IOException -> error <- Some "SnapshotOutputWriteFailed"
+                                            | ex -> error <- Some("SnapshotTransferFailure:" + ex.GetType().Name)
+                                            if File.Exists(temp) then
+                                                try File.Delete(temp) with _ -> ()
+                                            try
+                                                do! send conn (serialize
+                                                    {| version = ProtocolVersion; kind = "releaseSnapshot"
+                                                       connectionId = conn.Id; snapshotId = snapshotId |})
+                                            with _ -> ()
+                                            match error with
+                                            | Some e -> return Error e
+                                            | None ->
+                                                return Ok(serialize
+                                                    {| status = "completed"; registrationId = registrationId
+                                                       title = title; url = url; capturedAtUtc = capturedAtUtc
+                                                       waitKind = waitKind; bytes = bytes
+                                                       sha256 = expectedHash; exported = true |})
+            with
+            | :? JsonException -> return Error "InvalidSnapshotOptions"
+            | ex -> return Error("SnapshotFailure:" + ex.GetType().Name)
     }
 
     interface IDisposable with

@@ -103,7 +103,7 @@ Recommended argument contract:
 | --- | --- | --- |
 | `prompt` | Yes | Exact bootstrap text to submit; nonempty, bounded, may contain newlines |
 | `role` / `agentId` / `projectName` | No | Caller-owned metadata for logs/correlation; **not** alternative sources of instructions |
-| `timeoutMs` | No | One overall UI deadline for hydration, insertion, submission confirmation and conversation URL capture (defaults to 13 s; capped at 27 s) |
+| `timeoutMs` | No | One overall UI deadline for hydration, insertion, submission confirmation and conversation URL capture (defaults to 27 s; capped at 27 s) |
 | `debug` | No | Reserved for future diagnostics; the current script always returns only sanitized structural counts on compatibility errors |
 
 Jarvis browser-workflow parameters, **not** ChatGPT script arguments, control `windowRegistration`, `active`, `closeTabAfterExecution`, and device selection. Only **scheduled** calls have delay and repeat interval. An orchestrator normally invokes the immediate workflow, rather than scheduling a zero-delay job.

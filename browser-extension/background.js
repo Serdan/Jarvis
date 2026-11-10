@@ -7,6 +7,10 @@ const WINDOW_KEY = "registeredWindows";
 const SESSION_KEY = "browserSessionEpoch";
 const OPEN_TABS_KEY = "allowAgentCreatedTabs";
 const MAX_AGENT_TABS = 20;
+const MAX_SNAPSHOT_BYTES = 8 * 1024 * 1024;
+const MAX_INLINE_SNAPSHOT_BYTES = 48 * 1024;
+const SNAPSHOT_CHUNK_BYTES = 32 * 1024;
+const snapshots = new Map();
 const encoder = new TextEncoder();
 
 let socket = null;
@@ -158,6 +162,7 @@ async function advertise() {
   if (connected) send({ kind: "registrations", tabs: registrations.map(safeState) });
 }
 function clearConnection() {
+  snapshots.clear();
   connected = false;
   connectionId = null;
   if (heartbeat) clearInterval(heartbeat);
@@ -187,10 +192,17 @@ async function connect() {
         connected = true;
         if (heartbeat) clearInterval(heartbeat);
         heartbeat = setInterval(() => send({ kind: "ping" }), 20000);
+        send({kind:"capabilities", features:["domSnapshotV1"]});
         await advertise();
         await advertiseWindows();
       } else if (message.kind === "executeJs" && connected) {
         void execute(message);
+      } else if (message.kind === "captureDom" && connected) {
+        void captureDom(message);
+      } else if (message.kind === "snapshotChunk" && connected) {
+        void readSnapshotChunk(message);
+      } else if (message.kind === "releaseSnapshot" && connected) {
+        if (message.connectionId === connectionId) snapshots.delete(message.snapshotId);
       } else if (message.kind === "openTab" && connected) {
         // Serialize creations to enforce alias uniqueness and the tab quota.
         openQueue = openQueue.then(() => openNewTab(message)).catch(() => {});
@@ -277,6 +289,252 @@ async function execute(message) {
   } catch (e) {
     error("ScriptError:" + String(e.message || e).slice(0, 300));
   } finally { inflight--; }
+}
+
+// Runs inside the registered page's isolated USER_SCRIPT world. Capture is a single
+// point-in-time DOM serialization after a bounded, explicit readiness condition.
+async function capturePage(options) {
+  const initialUrl = location.href;
+  const deadline = Date.now() + options.timeoutMs;
+  const ensureSameDocument = () => {
+    if (location.href !== initialUrl) throw new Error("NavigationDuringCapture");
+  };
+  const remaining = () => Math.max(0, deadline - Date.now());
+  const fail = reason => { throw new Error(reason); };
+  const checkSelector = (selector, state, text) => {
+    const element = document.querySelector(selector);
+    if (!element) return null;
+    if (state === "textContains" && !element.textContent?.includes(text)) return null;
+    if (state === "visible") {
+      const style = getComputedStyle(element);
+      const bounds = element.getBoundingClientRect();
+      if (style.display === "none" || style.visibility === "hidden" ||
+          bounds.width === 0 || bounds.height === 0) return null;
+    }
+    return element;
+  };
+  const waitForSelector = (selector, state, text) => new Promise((resolve, reject) => {
+    let done = false;
+    let observer;
+    let interval;
+    let timeout;
+    function finish(error, value) {
+      if (done) return;
+      done = true;
+      observer?.disconnect();
+      clearTimeout(timeout);
+      clearInterval(interval);
+      if (error) reject(error);
+      else resolve(value);
+    }
+    function check() {
+      try {
+        ensureSameDocument();
+        const element = checkSelector(selector, state, text);
+        if (element) finish(null, element);
+      } catch (error) {
+        finish(new Error(error.name === "SyntaxError" ? "InvalidSelector" : error.message));
+      }
+    }
+    try {
+      observer = new MutationObserver(check);
+      observer.observe(document.documentElement || document,
+        { subtree: true, childList: true, characterData: true, attributes: true });
+      // Polling supplements mutation notifications for visibility changes driven by CSS.
+      interval = setInterval(check, 150);
+      timeout = setTimeout(() => finish(new Error("SnapshotTimeout")), remaining());
+      check(); // Recheck after subscribing, eliminating the observer-install race.
+    } catch {
+      finish(new Error("SnapshotDomError"));
+    }
+  });
+  const waitForEvent = (target, name) => new Promise((resolve, reject) => {
+    let done = false;
+    let timeout;
+    let navigationCheck;
+    const listener = () => finish(null);
+    function finish(error) {
+      if (done) return;
+      done = true;
+      clearTimeout(timeout);
+      clearInterval(navigationCheck);
+      target.removeEventListener(name, listener);
+      if (error) reject(error);
+      else resolve();
+    }
+    if (!remaining()) return reject(new Error("SnapshotTimeout"));
+    target.addEventListener(name, listener, { once: true });
+    navigationCheck = setInterval(() => {
+      try { ensureSameDocument(); }
+      catch { finish(new Error("NavigationDuringCapture")); }
+    }, 100);
+    timeout = setTimeout(() => finish(new Error("SnapshotTimeout")), remaining());
+  });
+  try {
+    const wait = options.wait;
+    if (wait.kind === "delay") {
+      if (wait.milliseconds > remaining()) fail("SnapshotTimeout");
+      await new Promise(resolve => setTimeout(resolve, wait.milliseconds));
+    } else if (wait.kind === "selector") {
+      await waitForSelector(wait.selector, wait.state, wait.text);
+    } else if (wait.kind === "event") {
+      const target = wait.target === "window" ? window :
+        wait.target === "document" ? document :
+        await waitForSelector(wait.selector, "exists", "");
+      await waitForEvent(target, wait.name);
+    }
+    ensureSameDocument();
+    if (remaining() === 0) fail("SnapshotTimeout");
+    const selected = options.captureSelector
+      ? document.querySelector(options.captureSelector)
+      : document.documentElement;
+    if (!selected) fail("SnapshotTargetNotFound");
+    const html = selected.outerHTML;
+    if (typeof html !== "string") fail("SnapshotDomError");
+    if (html.length > 8 * 1024 * 1024) fail("SnapshotTooLarge");
+    return {
+      html,
+      title: document.title,
+      url: location.origin + location.pathname,
+      capturedAtUtc: new Date().toISOString(),
+      waitKind: wait.kind
+    };
+  } catch (e) {
+    const recognized = new Set(["SnapshotTimeout", "NavigationDuringCapture",
+      "InvalidSelector", "SnapshotTargetNotFound", "SnapshotDomError", "SnapshotTooLarge"]);
+    return { failure: e?.name === "SyntaxError" ? "InvalidSelector" :
+      recognized.has(e?.message) ? e.message : "SnapshotDomError" };
+  }
+}
+
+function validSnapshotOptions(message) {
+  if (!Number.isInteger(message.timeoutMs) || message.timeoutMs < 100 ||
+      message.timeoutMs > 60000) return false;
+  if (message.mode !== "inline" && message.mode !== "file") return false;
+  if (message.captureSelector !== "" &&
+      (typeof message.captureSelector !== "string" || message.captureSelector.length > 512)) return false;
+  const wait = message.wait;
+  if (!wait || typeof wait !== "object" || Array.isArray(wait)) return false;
+  if (wait.kind === "immediate") return true;
+  if (wait.kind === "delay")
+    return Number.isInteger(wait.milliseconds) && wait.milliseconds >= 0 &&
+      wait.milliseconds < message.timeoutMs;
+  if (wait.kind === "selector")
+    return typeof wait.selector === "string" && wait.selector.length > 0 &&
+      wait.selector.length <= 512 && ["exists", "visible", "textContains"].includes(wait.state) &&
+      (wait.state !== "textContains" ||
+        (typeof wait.text === "string" && wait.text.length > 0 && wait.text.length <= 256));
+  if (wait.kind === "event")
+    return typeof wait.name === "string" && /^[A-Za-z][A-Za-z0-9_.:-]{0,127}$/.test(wait.name) &&
+      ["document", "window", "element"].includes(wait.target) &&
+      (wait.target !== "element" ||
+        (typeof wait.selector === "string" && wait.selector.length > 0 && wait.selector.length <= 512));
+  return false;
+}
+function purgeSnapshots() {
+  for (const [id, item] of snapshots)
+    if (Date.now() - item.createdAt > 120000) snapshots.delete(id);
+}
+async function captureDom(message) {
+  const { requestId, registrationId, registrationGeneration } = message;
+  const requestSocket = socket;
+  const requestConnection = connectionId;
+  const respond = payload => {
+    if (socket === requestSocket && connected && connectionId === requestConnection)
+      send({ kind: "snapshotReady", requestId, connectionId: requestConnection,
+        registrationId, registrationGeneration, ...payload });
+  };
+  const reject = code => respond({ kind: "error", error: code });
+  if (message.connectionId !== requestConnection) return reject("ConnectionEpochMismatch");
+  if (!validSnapshotOptions(message)) return reject("InvalidSnapshotOptions");
+  if (inflight >= 4) return reject("BridgeBusy");
+  const reg = registrations.find(r => r.registrationId === registrationId);
+  if (!reg || reg.registrationGeneration !== registrationGeneration)
+    return reject("RegistrationStale");
+  if (await assess(reg) !== "ready") return reject("TabUnavailable");
+  const api = chrome.userScripts;
+  if (typeof api?.execute !== "function") return reject("AllowUserScriptsDisabled");
+  const options = { timeoutMs: message.timeoutMs, wait: message.wait,
+    captureSelector: message.captureSelector };
+  const identityCheck = reg.agentCreated
+    ? "location.origin === " + JSON.stringify(reg.boundOrigin)
+    : "location.href === " + JSON.stringify(reg.boundUrl);
+  const source = "(async () => { if (!(" + identityCheck +
+    ")) return {failure:'NavigationDuringCapture'}; return (" +
+    capturePage.toString() + ")(" + JSON.stringify(options) + "); })()";
+  inflight++;
+  try {
+    const results = await api.execute({ target: { tabId: reg.tabId },
+      js: [{ code: source }], world: "USER_SCRIPT" });
+    const first = results?.[0];
+    if (first?.error) return reject("SnapshotScriptError");
+    if (reg !== registrations.find(r => r.registrationId === registrationId) ||
+        reg.registrationGeneration !== registrationGeneration ||
+        await assess(reg) !== "ready") return reject("SnapshotRegistrationChanged");
+    const result = first?.result;
+    if (!result || typeof result !== "object") return reject("SnapshotResultInvalid");
+    if (typeof result.failure === "string") return reject(result.failure);
+    if (typeof result.html !== "string" ||
+        typeof result.url !== "string" || typeof result.title !== "string")
+      return reject("SnapshotResultInvalid");
+    const data = encoder.encode(result.html);
+    if (data.byteLength > MAX_SNAPSHOT_BYTES) return reject("SnapshotTooLarge");
+    const metadata = { status: "completed", bytes: data.byteLength,
+      title: result.title.slice(0, 512), url: result.url.slice(0, 4096),
+      capturedAtUtc: result.capturedAtUtc, waitKind: result.waitKind };
+    if (message.mode === "inline") {
+      const response = { ...metadata, html: result.html };
+      if (data.byteLength > MAX_INLINE_SNAPSHOT_BYTES ||
+          bytes(JSON.stringify(response)) > 180000)
+        return reject("SnapshotTooLargeForInline: request file output");
+      return respond(response);
+    }
+    purgeSnapshots();
+    if (snapshots.size >= 2) return reject("SnapshotCapacityReached");
+    const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", data));
+    const sha256 = Array.from(digest, x => x.toString(16).padStart(2, "0")).join("");
+    const snapshotId = randomId();
+    snapshots.set(snapshotId, { data, registrationId, registrationGeneration,
+      connectionId: requestConnection, createdAt: Date.now() });
+    respond({ ...metadata, snapshotId, sha256 });
+  } catch {
+    reject("SnapshotScriptError");
+  } finally {
+    inflight--;
+  }
+}
+
+async function readSnapshotChunk(message) {
+  const { requestId, snapshotId } = message;
+  const requestSocket = socket;
+  const requestConnection = connectionId;
+  const respond = payload => {
+    if (socket === requestSocket && connected && connectionId === requestConnection)
+      send({ requestId, connectionId: requestConnection, ...payload });
+  };
+  const reject = error => respond({ kind: "error", error });
+  if (message.connectionId !== requestConnection) return reject("ConnectionEpochMismatch");
+  purgeSnapshots();
+  const entry = snapshots.get(snapshotId);
+  if (!entry || entry.connectionId !== requestConnection) return reject("SnapshotExpired");
+  const reg = registrations.find(r => r.registrationId === entry.registrationId);
+  if (!reg || reg.registrationGeneration !== entry.registrationGeneration ||
+      await assess(reg) !== "ready") {
+    snapshots.delete(snapshotId);
+    return reject("SnapshotRegistrationChanged");
+  }
+  if (!Number.isInteger(message.offset) || message.offset < 0 ||
+      message.offset >= entry.data.byteLength || message.offset > MAX_SNAPSHOT_BYTES)
+    return reject("InvalidSnapshotOffset");
+  const part = entry.data.subarray(message.offset,
+    Math.min(entry.data.byteLength, message.offset + SNAPSHOT_CHUNK_BYTES));
+  // Keep an active transfer alive while retaining a bounded idle expiration.
+  entry.createdAt = Date.now();
+  let binary = "";
+  for (const value of part) binary += String.fromCharCode(value);
+  respond({ kind: "snapshotChunk", snapshotId, registrationId: entry.registrationId,
+    registrationGeneration: entry.registrationGeneration,
+    offset: message.offset, data: btoa(binary) });
 }
 
 async function openNewTab(message) {

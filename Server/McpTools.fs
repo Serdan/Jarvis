@@ -1151,6 +1151,37 @@ type JarvisMcpTools =
             ArgsJson = McpToolHelpers.optionOfString argsJson
             TimeoutMs = McpToolHelpers.optionOfNullable timeoutMs })
 
+
+    [<McpServerTool(Title = "Capture rendered browser DOM", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false);
+      McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["process:execute"]}]""");
+      Description("Capture live post-JavaScript HTML from an authorized tab, optionally waiting for delay, selector state or DOM event. waitJson examples: {\"kind\":\"delay\",\"milliseconds\":1500}, {\"kind\":\"selector\",\"selector\":\"#results\",\"state\":\"exists\"}, {\"kind\":\"event\",\"target\":\"document\",\"name\":\"ready\"}. Inline output is bounded; use BrowserExportDom for large pages.")>]
+    static member BrowserCaptureDom(tabRegistration: string,
+                                    [<Optional; DefaultParameterValue("")>] waitJson: string,
+                                    [<Optional; DefaultParameterValue("")>] captureSelector: string,
+                                    timeoutMs: Nullable<int>,
+                                    [<Optional; DefaultParameterValue("")>] deviceId: string,
+                                    client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http (BrowserCaptureDomCommand {
+            TabRegistration = tabRegistration
+            WaitJson = McpToolHelpers.optionOfString waitJson
+            CaptureSelector = McpToolHelpers.optionOfString captureSelector
+            TimeoutMs = McpToolHelpers.optionOfNullable timeoutMs })
+
+    [<McpServerTool(Title = "Export rendered browser DOM", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false);
+      McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:write","process:execute"]}]""");
+      Description("Capture up to 8 MiB of live rendered HTML into an explicit project-relative new file. Uses bounded, checksummed chunk transfer and atomic write; refuses overwrite. A tab must be authorized.")>]
+    static member BrowserExportDom(projectName: string, filePath: string, tabRegistration: string,
+                                   [<Optional; DefaultParameterValue("")>] waitJson: string,
+                                   [<Optional; DefaultParameterValue("")>] captureSelector: string,
+                                   timeoutMs: Nullable<int>,
+                                   [<Optional; DefaultParameterValue("")>] deviceId: string,
+                                   client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http (BrowserExportDomCommand {
+            ProjectName = projectName; FilePath = filePath; TabRegistration = tabRegistration
+            WaitJson = McpToolHelpers.optionOfString waitJson
+            CaptureSelector = McpToolHelpers.optionOfString captureSelector
+            TimeoutMs = McpToolHelpers.optionOfNullable timeoutMs })
+
     [<McpServerTool(Title = "Read file", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read one project file.")>]
     static member ReadFile(projectName: string, filePath: string, startLine: Nullable<int>, endLine: Nullable<int>, includeLineNumbers: Nullable<bool>, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (ReadFileCommand {

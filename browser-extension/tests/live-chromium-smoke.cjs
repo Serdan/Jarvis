@@ -11,6 +11,7 @@ const os = require("node:os");
 const path = require("node:path");
 const http = require("node:http");
 const { spawn } = require("node:child_process");
+const net = require("node:net");
 const { once } = require("node:events");
 const { setTimeout: sleep } = require("node:timers/promises");
 const chromePath = process.argv[2];
@@ -23,7 +24,9 @@ const fixtureMarkup = '<!doctype html><html lang="en"><head><title>Jarvis E2E fi
   + '<div id="app">Loading</div><script>setTimeout(() => {'
   + 'const p = document.createElement("p"); p.id = "results";'
   + 'p.textContent = "Hydrated Ω after JavaScript";'
-  + 'document.querySelector("#app").replaceChildren(p);'
+  + 'const bulk=document.createElement("pre"); bulk.id="bulk";'
+  + 'bulk.textContent="Ω🙂".repeat(25000);'
+  + 'document.querySelector("#app").replaceChildren(p,bulk);'
   + 'document.dispatchEvent(new Event("fixture:hydrated"));'
   + '}, 1800);</script></body></html>';
 function frame(message) {
@@ -144,6 +147,126 @@ class Bridge {
     await new Promise(r => this.server.close(r));
   }
 }
+// Uses the actual compiled JarvisClient BrowserBridge.Service and its real
+// authenticated loopback listener, rather than the Node fake WebSocket peer.
+class RealClientBridge {
+  constructor() {
+    this.secret = crypto.randomBytes(32).toString("hex");
+    this.fixture = http.createServer((req, res) => {
+      if (req.url?.startsWith("/fixture")) {
+        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+        res.end(fixtureMarkup);
+      } else res.writeHead(404).end();
+    });
+    this.pending = new Map();
+    this.lines = "";
+    this.hostError = "";
+  }
+  async start() {
+    this.fixture.listen(0, "127.0.0.1");
+    await once(this.fixture, "listening");
+    this.port = this.fixture.address().port;
+    const temporary = net.createServer();
+    temporary.listen(0, "127.0.0.1");
+    await once(temporary, "listening");
+    this.bridgePort = temporary.address().port;
+    await new Promise(resolve => temporary.close(resolve));
+    const dll = path.resolve(__dirname,
+      "live-client-host/bin/Release/net10.0/LiveClientHost.dll");
+    if (!fs.existsSync(dll)) throw Error("Build test host first: dotnet build "
+      + "browser-extension/tests/live-client-host/LiveClientHost.csproj -c Release");
+    let resolveReady, rejectReady;
+    const ready = new Promise((resolve, reject) => {
+      resolveReady = resolve; rejectReady = reject;
+    });
+    this.host = spawn("dotnet", [dll, String(this.bridgePort)], {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: { ...process.env, JARVIS_TEST_BRIDGE_SECRET: this.secret }
+    });
+    this.host.stdout.on("data", data => {
+      this.lines += data.toString("utf8");
+      while (this.lines.includes("\n")) {
+        const index = this.lines.indexOf("\n");
+        const line = this.lines.slice(0, index).trim();
+        this.lines = this.lines.slice(index + 1);
+        let result;
+        try { result = JSON.parse(line); } catch { continue; }
+        if (result.kind === "ready") resolveReady();
+        else if (this.pending.has(result.id)) {
+          const pending = this.pending.get(result.id);
+          this.pending.delete(result.id);
+          clearTimeout(pending.timer);
+          if (!result.ok) pending.reject(Error(result.error || "Native bridge failure"));
+          else pending.resolve(result.data);
+        }
+      }
+    });
+    this.host.stderr.on("data", data => {
+      this.hostError += data.toString("utf8");
+      if (this.hostError.length > 4000) this.hostError = this.hostError.slice(-4000);
+    });
+    this.host.on("exit", code => {
+      const error = Error("Real JarvisClient test host exited: " + code);
+      rejectReady(error);
+      for (const request of this.pending.values()) {
+        clearTimeout(request.timer);
+        request.reject(error);
+      }
+      this.pending.clear();
+    });
+    await Promise.race([ready, sleep(30000).then(() => {
+      throw Error("Real JarvisClient test host startup timeout.");
+    })]);
+  }
+  rpc(kind, args = {}, timeout = 7500) {
+    const id = crypto.randomBytes(8).toString("hex");
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(Error("Timed out in native test host: " + kind));
+      }, timeout);
+      this.pending.set(id, { resolve, reject, timer });
+      this.host.stdin.write(JSON.stringify({ id, kind, ...args }) + "\n");
+    });
+  }
+  async request(message, timeout = 10000) {
+    const reg = message.registrationId;
+    let data;
+    switch (message.kind) {
+      case "openTab":
+        data = await this.rpc("openTab", {
+          windowRegistration: message.windowRegistration, url: message.url,
+          alias: message.alias, active: message.active === true
+        }, timeout);
+        return data;
+      case "executeJs":
+        data = await this.rpc("executeJs", {
+          tabRegistration: reg, source: message.source,
+          argsJson: JSON.stringify(message.args || {}),
+          entrypoint: message.entrypoint, timeoutMs: message.timeoutMs || 5000
+        }, timeout);
+        return data;
+      case "captureDom":
+        data = await this.rpc("captureDom", {
+          tabRegistration: reg, captureSelector: message.captureSelector || "",
+          waitJson: JSON.stringify(message.wait || { kind: "immediate" }),
+          timeoutMs: message.timeoutMs || 5000, outputPath: message.outputPath || ""
+        }, timeout);
+        return { kind: "snapshotReady", ...data };
+      case "closeTab":
+        data = await this.rpc("closeTab", { tabRegistration: reg }, timeout);
+        return { kind: "tabClosed", ...data };
+      default: throw Error("Unknown native test request: " + message.kind);
+    }
+  }
+  async stop() {
+    if (this.host) {
+      this.host.stdin.end();
+      this.host.kill("SIGTERM");
+    }
+    await new Promise(resolve => this.fixture.close(resolve));
+  }
+}
 class CDP {
   constructor(url) {
     this.url = url; this.nextId = 0; this.callbacks = new Map();
@@ -189,7 +312,8 @@ async function until(fn, timeout = 10000) {
 }
 async function main() {
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-mv3-smoke-"));
-  const bridge = new Bridge();
+  const realClient = process.argv.includes("--real-client");
+  const bridge = realClient ? new RealClientBridge() : new Bridge();
   const phases = [];
   let chrome, extension, page;
   try {
@@ -294,12 +418,26 @@ async function main() {
       "chrome.permissions.contains({origins:['http://127.0.0.1/*']})");
     assert.equal(localPermission, true);
     phases.push("Disposable window registration and opt-in");
-    await fromExtension({ kind: "pair", port: bridge.port, secret: bridge.secret });
-    await bridge.wait(m => m.kind === "capabilities"
-      && m.features?.includes("domSnapshotV1"));
-    await bridge.wait(m => m.kind === "windows"
-      && m.windows?.some(x => x.alias === "e2e-window" && x.availability === "ready"));
+    await fromExtension({ kind: "pair", port: bridge.bridgePort || bridge.port, secret: bridge.secret });
+    if (realClient) {
+      await until(async () => {
+        try {
+          const state = await bridge.rpc("windows", {}, 1000);
+          return state.windows?.some(x => x.alias === "e2e-window" && x.availability === "ready");
+        } catch { return false; }
+      }, 12000);
+    } else {
+      await bridge.wait(m => m.kind === "capabilities"
+        && m.features?.includes("domSnapshotV1"));
+      await bridge.wait(m => m.kind === "windows"
+        && m.windows?.some(x => x.alias === "e2e-window" && x.availability === "ready"));
+    }
     phases.push("Authenticated loopback pairing");
+    await assert.rejects(
+      () => bridge.request({ kind: "openTab", windowRegistration: "e2e-window",
+        url: "https://example.invalid/no", alias: "not-granted", active: false }),
+      /BrowserPermissionMissing/);
+    phases.push("Unapproved destination denied");
     const opened = await bridge.request({
       kind: "openTab", windowRegistration: "e2e-window",
       url: "http://127.0.0.1:" + bridge.port + "/fixture?agent",
@@ -358,26 +496,46 @@ async function main() {
       kind: "captureDom", registrationId: tab.registrationId,
       registrationGeneration: tab.registrationGeneration,
       timeoutMs: 2500, mode: "file", captureSelector: "",
+      outputPath: realClient ? path.join(profile, "snapshot.html") : undefined,
       wait: { kind: "immediate" }
     });
     assert.equal(ready.kind, "snapshotReady");
-    const chunks = [];
-    for (let offset = 0; offset < ready.bytes;) {
-      const chunk = await bridge.request({
-        kind: "snapshotChunk", snapshotId: ready.snapshotId, offset
-      });
-      assert.equal(chunk.offset, offset);
-      const bytes = Buffer.from(chunk.data, "base64");
-      chunks.push(bytes);
-      offset += bytes.length;
+    let snapshot;
+    if (realClient) {
+      assert.equal(ready.exported, true);
+      snapshot = fs.readFileSync(path.join(profile, "snapshot.html"));
+    } else {
+      const chunks = [];
+      for (let offset = 0; offset < ready.bytes;) {
+        const chunk = await bridge.request({
+          kind: "snapshotChunk", snapshotId: ready.snapshotId, offset
+        });
+        assert.equal(chunk.offset, offset);
+        const bytes = Buffer.from(chunk.data, "base64");
+        chunks.push(bytes);
+        offset += bytes.length;
+      }
+      snapshot = Buffer.concat(chunks);
+      bridge.send({ kind: "releaseSnapshot", connectionId: bridge.connectionId,
+        snapshotId: ready.snapshotId });
     }
-    const snapshot = Buffer.concat(chunks);
     assert.equal(snapshot.length, ready.bytes);
     assert.equal(crypto.createHash("sha256").update(snapshot).digest("hex"), ready.sha256);
     assert.match(snapshot.toString("utf8"), /Hydrated Ω after JavaScript/);
-    bridge.send({ kind: "releaseSnapshot", connectionId: bridge.connectionId,
-      snapshotId: ready.snapshotId });
-    phases.push("Frozen chunked DOM SHA-256 transfer");
+    assert.ok(snapshot.length > 65536, "Export should exercise multiple 32 KiB chunks");
+    assert.ok(snapshot.toString("utf8").includes("Ω🙂Ω🙂"),
+      "Export must contain post-hydration large text, not just original script source");
+    if (realClient) {
+      await assert.rejects(() => bridge.request({
+        kind: "captureDom", registrationId: tab.registrationId,
+        registrationGeneration: tab.registrationGeneration,
+        timeoutMs: 2000, mode: "file", captureSelector: "",
+        outputPath: path.join(profile, "snapshot.html"),
+        wait: { kind: "immediate" }
+      }), /SnapshotOutputExists/);
+      phases.push("Existing snapshot file not overwritten");
+    }
+    phases.push("Frozen multi-chunk DOM SHA-256 transfer");
     const existing = (await extension.eval("chrome.tabs.query({windowId:"
       + windowId + "})")).find(x => x.url.includes("/fixture")
         && !x.url.includes("?agent"));
@@ -386,12 +544,18 @@ async function main() {
     const state = await fromExtension({ kind: "getState" });
     const manual = state.registrations.find(x => x.alias === "manual-fixture");
     assert.ok(manual);
-    const manualId = crypto.randomBytes(8).toString("hex");
-    const denied = bridge.wait(x => x.requestId === manualId);
-    bridge.send({ kind: "closeTab", connectionId: bridge.connectionId,
-      requestId: manualId, registrationId: manual.registrationId,
-      registrationGeneration: manual.registrationGeneration });
-    assert.equal((await denied).error, "TabNotAgentCreated");
+    if (realClient) {
+      await assert.rejects(
+        () => bridge.request({ kind: "closeTab", registrationId: manual.registrationId }),
+        /TabNotAgentCreated/);
+    } else {
+      const manualId = crypto.randomBytes(8).toString("hex");
+      const denied = bridge.wait(x => x.requestId === manualId);
+      bridge.send({ kind: "closeTab", connectionId: bridge.connectionId,
+        requestId: manualId, registrationId: manual.registrationId,
+        registrationGeneration: manual.registrationGeneration });
+      assert.equal((await denied).error, "TabNotAgentCreated");
+    }
     phases.push("Manual tab close refused");
     const closed = await bridge.request({
       kind: "closeTab", registrationId: tab.registrationId,
@@ -400,6 +564,8 @@ async function main() {
     assert.equal(closed.kind, "tabClosed");
     phases.push("Agent tab safely closed");
     console.log(JSON.stringify({ status: "passed", steps: phases,
+      bridge: realClient ? "actual JarvisClient BrowserBridge.Service" : "test WebSocket peer",
+      consentMode: "synthetic registration in disposable profile",
       snapshotBytes: snapshot.length, snapshotSha256: ready.sha256 }, null, 2));
   } finally {
     page?.close();

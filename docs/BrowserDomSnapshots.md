@@ -71,14 +71,21 @@ The fixture `browser-extension/tests/fixtures/dynamic-dom.html` demonstrates del
 
 ## Disposable real-browser smoke test
 
-For a disposable **Chrome for Testing** integration probe, run:
+Use an official Chrome for Testing executable, not the user's existing browser profile. With the repository's .NET 10 SDK installed, run either mode:
 
 ```sh
+# Real Chromium extension against a minimal, test-only WebSocket peer
 node browser-extension/tests/live-chromium-smoke.cjs /absolute/path/to/chrome-for-testing
+
+# Real Chromium extension paired to the actual JarvisClient BrowserBridge.Service
+dotnet build browser-extension/tests/live-client-host/LiveClientHost.csproj -c Release
+node browser-extension/tests/live-chromium-smoke.cjs /absolute/path/to/chrome-for-testing --real-client
 ```
 
-The harness uses a fresh temporary Chromium profile, a loopback HTTP fixture and a test WebSocket bridge; it does not touch the personal Edge profile or the deployed JarvisClient. It loads the real Manifest V3 extension, enables the per-extension **Allow User Scripts** toggle in the disposable Chrome settings UI, and performs **test-only synthetic** window registration and agent-tab opt-in inside the extension background.
+The native mode launches a small, test-only .NET process referencing the **same Client assembly** as JarvisClient. It uses the actual local `BrowserBridge.Service` authentication, registration, execution, read, chunk transfer, checksum and atomic file-export code. The host avoids the normal client's interactive OAuth login and TUI; it does **not** start a second production Jarvis session.
 
-It exercises authenticated HMAC pairing, agent-created tabs, real `chrome.userScripts.execute`, post-hydration selector/timer/custom-event DOM snapshots, frozen SHA-256 chunk transfer, refusal to close a manually registered tab and safe agent-tab cleanup. It prints only stage labels, byte counts and checksum, and deletes its temporary profile.
+Both modes use a disposable Chromium profile, an HTTP fixture served exclusively on loopback, and a per-extension **Allow User Scripts** toggle enabled through Chrome's extension settings page. Window registration, new-tab opt-in and pairing are synthetic test setup inside the **disposable** extension background. No personal browser profile or real website is accessed.
 
-**Evidence boundary:** This is real extension/Chromium execution, but the loopback transport is a test stand-in for JarvisClient and registration is synthetic. It does **not** replace the separately required human-authorized real browser extension + JarvisClient acceptance test or authorize integration/deployment.
+The fixture generates over 150 KiB of rendered DOM after JavaScript hydration. The test verifies live USER_SCRIPT execution, selector/delay/custom-event waits, permission rejection for an unapproved origin, multi-chunk SHA-256 export, no overwrite of an existing exported file (native mode), refusal to close a manually registered tab, and safe cleanup of an agent-owned tab. Output includes test stage names, byte count, and checksum, never secrets or captured HTML. The harness removes its temporary browser profile on exit.
+
+**Evidence boundary:** The native run proves real extension ↔ production JarvisClient browser-bridge code interoperability; its test host is not the full authenticated Jarvis server/MCP pipeline. Its registration is synthetic, **not a real user's consent through the extension popup**. Loading `popup.html` as an ordinary Chrome tab is correctly rejected with `Extension UI required`; the production sender restriction must remain intact. The explicit human-authorized, normally paired JarvisClient/browser acceptance remains separate and is not implied by this test. Nothing here authorizes integrating or deploying.

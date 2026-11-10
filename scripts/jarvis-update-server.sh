@@ -12,10 +12,13 @@ STATUS=/var/lib/jarvis/server-update-status
 PENDING=/var/lib/jarvis-update-state/pending
 LOCK=/run/jarvis-server-update.lock
 SERVICE=jarvis.service
-PROBE_BASE=http://127.0.0.1:5000
+# Matches jarvis.service ASPNETCORE_URLS and nginx's local upstream.
+PROBE_BASE=http://127.0.0.1:5095
 PROBE_HOST=jarvis2.kehlet.dev
 PROC_ROOT=/proc
 PROBE_WINDOW_SECONDS=35
+# Allow systemd's configured 90-second stop timeout, with a bounded margin.
+STOP_TIMEOUT_SECONDS=100
 ARTIFACT=JarvisServer-linux-x64
 
 # Refuse concurrent runs. The lock inode is persistent, unlike atomic status.
@@ -84,6 +87,7 @@ probe_http () {
     if [ "$method" = POST ]; then
         code=$(curl -sS --noproxy '*' --connect-timeout 1 --max-time "$left" --max-filesize 16384 \
             -H "Host: $PROBE_HOST" -H 'Accept: application/json, text/event-stream' \
+            -H 'Content-Type: application/json' \
             -X POST --data-binary '{}' -D "$WORK/headers" -o "$WORK/body" \
             -w '%{http_code}' "$PROBE_BASE$endpoint" 2>/dev/null) || return 1
     else
@@ -108,7 +112,7 @@ probe_once () {
     [ "$observed_sha" = "$expected_sha" ] || return 1
 
     # The service MainPID must own the listener receiving these HTTP probes.
-    # A stale unrelated process on localhost:5000 must not qualify.
+    # A stale unrelated process on the configured listener port must not qualify.
     last_probe=listener-owner
     listener_time=$((probe_deadline - $(date +%s)))
     if [ "$listener_time" -le 0 ]; then last_probe=deadline; return 1; fi
@@ -116,7 +120,7 @@ probe_once () {
     probe_port=$(printf '%s' "$PROBE_BASE" | sed 's/.*://')
     case "$probe_port" in ''|*[!0-9]*) return 1 ;; esac
     timeout -k 1 "$listener_time" ss -H -lntp "sport = :$probe_port" > "$WORK/listener" 2>/dev/null || return 1
-    # The owned socket must accept localhost:5000, not merely share its port
+    # The owned socket must accept the configured loopback port, not merely share its port
     # on a different interface while another process handles the HTTP request.
     awk -v pid="$observed_pid" -v port="$probe_port" '
         ($4 == "127.0.0.1:" port || $4 == "0.0.0.0:" port ||
@@ -184,7 +188,7 @@ restore_previous () {
         status_done=1
         return 1
     fi
-    if ! timeout -k 2 30 systemctl stop "$SERVICE" >/dev/null 2>&1; then
+    if ! timeout -k 2 "$STOP_TIMEOUT_SECONDS" systemctl stop "$SERVICE" >/dev/null 2>&1; then
         record_status "failed: stage=$failure_stage rollback=stop-failed" || :
         status_done=1
         return 1
@@ -298,7 +302,7 @@ atomic_record "$PENDING" 0600 "$previous_sha" || exit 1
 transaction=1
 
 failure_stage=stop
-timeout -k 2 30 systemctl stop "$SERVICE" >/dev/null 2>&1 || exit 1
+timeout -k 2 "$STOP_TIMEOUT_SECONDS" systemctl stop "$SERVICE" >/dev/null 2>&1 || exit 1
 failure_stage=replace
 mv -f "$STAGE" "$LIVE" || exit 1
 failure_stage=restart

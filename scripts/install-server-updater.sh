@@ -1,6 +1,8 @@
 #!/bin/sh
 set -eu
 
+# Install this wrapper, not just the helper binary: deployment requires the
+# root-owned rollback journal directory and the dedicated sudoers entry.
 # Install from the checked-out, reviewed sources as root on the server.
 # The privileged helper has fixed paths and does not accept arguments or
 # environment-provided overrides from the unprivileged MCP caller.

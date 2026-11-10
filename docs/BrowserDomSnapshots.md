@@ -12,11 +12,11 @@ The extension advertises `domSnapshotV1` on pairing. A newer client paired to an
 
 ## Commands
 
-`BrowserCaptureDom(tabRegistration, waitJson?, captureSelector?, timeoutMs?, deviceId?)`
+`BrowserCaptureDom(tabRegistration, agentId, waitJson?, captureSelector?, timeoutMs?, deviceId?)`
 
 Returns JSON with `status`, `registrationId`, `title`, sanitized `url`, `capturedAtUtc`, `waitKind`, `bytes`, and `html`. Inline markup is limited to **48 KiB of UTF-8** (or smaller when JSON expansion reaches the bounded frame limit). Oversized results are an explicit error, **not** silently truncated.
 
-`BrowserExportDom(projectName, filePath, tabRegistration, waitJson?, captureSelector?, timeoutMs?, deviceId?)`
+`BrowserExportDom(projectName, agentId, worktreeName?, filePath, tabRegistration, waitJson?, captureSelector?, timeoutMs?, deviceId?)`
 
 Captures **up to 8 MiB** of UTF-8 markup into a project-relative file. The project/destination must exist and be writable; the destination file must **not already exist**. The extension serializes the DOM once, then serves bounded chunks from that frozen snapshot. JarvisClient validates chunk identities, verifies SHA-256, writes to a temporary file in the destination directory, atomically moves it into place, and releases the extension snapshot. Failed transfers remove temporary files.
 
@@ -39,7 +39,7 @@ Use `BrowserOpenTab` / `BrowserListTabs` to obtain an authorized `tabRegistratio
 
 Selectors use standard CSS `querySelector`. For selector-state waits, the isolated script checks immediately, installs a `MutationObserver`, and supplements it with bounded visibility polling. Listeners and observers are detached at completion/timeout. Events which fire before the listener is registered **cannot** be detected retroactively. When possible, prefer a selector/text predicate that remains true.
 
-The timeout covers all waiting and serialization and defaults to **30 seconds**, with an allowed range of **100 ms to 60 seconds**. An explicit delay must be shorter than the timeout. A navigation during the wait, invalid selector, missing capture target, timeout or revoked tab registration produces an actionable error.
+A single **monotonic operation deadline** covers waiting, serialization, all chunk transfers, checksum verification, disk flush and final publication. The default is **30 seconds**, with an allowed range of **100 ms to 60 seconds**. Every chunk uses only the remaining deadline budget (never a fresh unbounded 10-second window); when time expires, the temporary file is deleted and no destination file is published. An explicit delay must be shorter than the timeout. A navigation during the wait, invalid selector, missing capture target, timeout or revoked tab registration produces an actionable error.
 
 `captureSelector` optionally chooses a subtree, for example `#results`. If omitted, capture `document.documentElement.outerHTML`. This is serialized **live HTML** from the current DOM, *not* the original server response, not a screenshot, and not a network archive. It does not include closed shadow roots, canvas pixels, ephemeral JS state, or content inside cross-origin iframe documents.
 
@@ -51,6 +51,7 @@ The timeout covers all waiting and serialization and defaults to **30 seconds**,
 
 ```json
 {
+  "agentId": "Browser Agent",
   "tabRegistration": "results-tab",
   "waitJson": "{\"kind\":\"selector\",\"selector\":\"#results\",\"state\":\"textContains\",\"text\":\"Ready\"}",
   "captureSelector": "#results",

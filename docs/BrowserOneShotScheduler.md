@@ -6,9 +6,9 @@ JarvisClient persists browser launch schedules in its local, user-private `brows
 
 ## Commands
 
-- `ScheduleBrowserExecution(scheduleId, runAfterSeconds, url, projectName, scriptPath, argsJson?, alias?, active?, deviceId?, windowRegistration, closeTabAfterExecution?, repeatEverySeconds?)`
-- `ListScheduledBrowserExecutions(deviceId?)`
-- `CancelScheduledBrowserExecution(scheduleId, deviceId?)`
+- `ScheduleBrowserExecution(scheduleId, runAfterSeconds, url, projectName, agentId, worktreeName?, scriptPath, argsJson?, alias?, active?, deviceId?, windowRegistration, closeTabAfterExecution?, repeatEverySeconds?)`
+- `ListScheduledBrowserExecutions(agentId, deviceId?)`
+- `CancelScheduledBrowserExecution(scheduleId, agentId, deviceId?)`
 
 A script is a UTF-8 project-relative `.js` file whose entrypoint is `async function execute(args)`. At scheduling time Jarvis validates path and size; at due time the client re-resolves and re-reads the file under normal Jarvis worktree/symlink confinement, so future edits take effect.
 
@@ -20,7 +20,9 @@ Example delayed worker:
   "runAfterSeconds": 300,
   "windowRegistration": "agents",
   "url": "https://chatgpt.com/",
-  "projectName": "Jarvis::browser-bridge",
+  "projectName": "Jarvis",
+  "agentId": "Browser Agent",
+  "worktreeName": "browser-bridge",
   "scriptPath": "browser-scripts/chatgpt/launchAgent.js",
   "argsJson": "{\"prompt\":\"You are Worker 3. Read your current Jarvis assignment and task, spec and checkpoint. Continue in this new session.\"}",
   "closeTabAfterExecution": true,

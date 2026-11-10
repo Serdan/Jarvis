@@ -18,18 +18,20 @@ Manually registering a **tab** is still supported for existing-page inspections,
 
 ## Browser commands
 
+The current Jarvis protocol requires the caller's `agentId`. Commands that read or write project files also accept an optional registered `worktreeName` alongside `projectName`; pass the worktree name separately instead of encoding it into a project alias.
+
 | MCP command | Purpose |
 | --- | --- |
-| `BrowserListWindows(deviceId?)` | Lists only user-registered windows, with alias, ID and availability |
-| `BrowserListTabs(deviceId?)` | Lists only manually registered and Jarvis-created tabs |
-| `BrowserOpenTab(url, windowRegistration, alias?, active?, deviceId?)` | Opens an agent-created tab in the selected window, default background |
-| `BrowserExecuteFile(projectName, scriptPath, tabRegistration, argsJson?, timeoutMs?, deviceId?)` | Runs a regular project-relative UTF-8 `.js` file in a registered tab |
-| `BrowserCaptureDom(tabRegistration, waitJson?, captureSelector?, timeoutMs?, deviceId?)` | Capture current post-JavaScript DOM, optionally after a timer, selector condition or DOM event |
-| `BrowserExportDom(projectName, filePath, tabRegistration, waitJson?, captureSelector?, timeoutMs?, deviceId?)` | Stream a large DOM snapshot into a new project file, with SHA-256 and atomic write |
-| `BrowserCloseTab(tabRegistration, deviceId?)` | Closes **only** a Jarvis-created tab with matching identity |
-| `BrowserRunInNewTab(windowRegistration, url, projectName, scriptPath, argsJson?, active?, closeTabAfterExecution?, timeoutMs?, deviceId?)` | One-call open → ready → execute → optional close, for immediate agent handoffs |
-| `ScheduleBrowserExecution(scheduleId, runAfterSeconds, url, projectName, scriptPath, windowRegistration, argsJson?, closeTabAfterExecution?, repeatEverySeconds?, ...)` | One-shot or recurring future invocation of the same workflow |
-| `ListScheduledBrowserExecutions` / `CancelScheduledBrowserExecution` | Inspect/cancel local future launches |
+| `BrowserListWindows(agentId, deviceId?)` | Lists only user-registered windows, with alias, ID and availability |
+| `BrowserListTabs(agentId, deviceId?)` | Lists only manually registered and Jarvis-created tabs |
+| `BrowserOpenTab(url, agentId, windowRegistration, alias?, active?, deviceId?)` | Opens an agent-created tab in the selected window, default background |
+| `BrowserExecuteFile(projectName, agentId, worktreeName?, scriptPath, tabRegistration, argsJson?, timeoutMs?, deviceId?)` | Runs a regular project-relative UTF-8 `.js` file in a registered tab |
+| `BrowserCaptureDom(tabRegistration, agentId, waitJson?, captureSelector?, timeoutMs?, deviceId?)` | Capture current post-JavaScript DOM, optionally after a timer, selector condition or DOM event |
+| `BrowserExportDom(projectName, agentId, worktreeName?, filePath, tabRegistration, waitJson?, captureSelector?, timeoutMs?, deviceId?)` | Stream a large DOM snapshot into a new project file, with SHA-256 and atomic write |
+| `BrowserCloseTab(tabRegistration, agentId, deviceId?)` | Closes **only** a Jarvis-created tab with matching identity |
+| `BrowserRunInNewTab(windowRegistration, url, projectName, agentId, worktreeName?, scriptPath, argsJson?, active?, closeTabAfterExecution?, timeoutMs?, deviceId?)` | One-call open → ready → execute → optional close, for immediate agent handoffs |
+| `ScheduleBrowserExecution(scheduleId, runAfterSeconds, url, projectName, agentId, worktreeName?, scriptPath, windowRegistration, argsJson?, closeTabAfterExecution?, repeatEverySeconds?, ...)` | One-shot or recurring future invocation of the same workflow |
+| `ListScheduledBrowserExecutions(agentId)` / `CancelScheduledBrowserExecution(scheduleId, agentId)` | Inspect/cancel local future launches |
 
 `BrowserOpenTab` requires the separate new-tab opt-in, registered window, and destination host permission. Extension caps active Jarvis-created registrations at 20. Agent-created tabs remain authorized across same-origin SPA navigation but not cross-origin navigation. Never retry a timed-out open or execution blindly, because the page may already have been modified.
 
@@ -41,6 +43,7 @@ An agent can use the browser bridge to obtain **rendered HTML** when `curl` only
 
 ```json
 {
+  "agentId": "Browser Agent",
   "tabRegistration": "results-tab",
   "waitJson": "{\"kind\":\"selector\",\"selector\":\"#results\",\"state\":\"exists\"}",
   "captureSelector": "#results"
@@ -67,7 +70,9 @@ Example command arguments:
 {
   "windowRegistration": "agents",
   "url": "https://chatgpt.com/",
-  "projectName": "Jarvis::browser-bridge",
+  "projectName": "Jarvis",
+  "agentId": "Browser Agent",
+  "worktreeName": "browser-bridge",
   "scriptPath": "browser-scripts/chatgpt/launchAgent.js",
   "argsJson": "{\"prompt\":\"You are Worker 3. Read your current Jarvis assignment and AGENTS.md, task, spec, and checkpoint. Continue the assigned work in this fresh session.\"}",
   "active": false,

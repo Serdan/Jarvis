@@ -1,0 +1,1 @@
+Baseline implementation plus DOM snapshots commit 66d4e06. Release tests: server 60/60, client 290/290; JS 35/35; Edge headless fixture renders post-hydration DOM. No deployed extension or paired live Edge acceptance yet. Do not merge/deploy until reviewed and operator approved.

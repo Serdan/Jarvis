@@ -787,11 +787,38 @@ let private shouldAutoPromote = function
     | ListCommandsCommand -> false
     | _ -> true
 
+/// Source-side evidence is attached to the ORIGINAL destination client's
+/// terminal response before completion is recorded in its job registry. Lost
+/// pending handles can then be recovered via list_jobs/get_job_result without
+/// reconstructing state evidence in a server-side cache.
+let combineCrossProjectNotification (source: CrossProjectNotificationCommand)
+                                    (destination: AgentCommandResponse) =
+    let knownChanges =
+        if isNull (box destination.AgentStateChanges) then
+            Unchecked.defaultof<AgentStateChange list>
+        else
+            (source.SourceStateChanges @ destination.AgentStateChanges) |> List.distinct
+    { destination with
+        AgentStateChanges = knownChanges
+        InboxActivation =
+            match destination.InboxActivation with
+            | Some receipt -> Some receipt
+            | None ->
+                source.SourceInboxActivation
+                |> Option.filter (fun receipt -> receipt.ActivatedByThisCall) }
+
 let private executeOrPromote (rt: Runtime) (commandJson: string) (agentId: string) =
     task {
         let command =
             try Some(JsonSerializer.Deserialize<AgentCommand>(commandJson))
             with _ -> None
+        let _, normalizedJson, merge =
+            match command with
+            | Some (CrossProjectNotificationCommand envelope) ->
+                let original = TaskWriteCommand envelope.Notification
+                Some original, JsonSerializer.Serialize<AgentCommand>(original),
+                (combineCrossProjectNotification envelope)
+            | _ -> command, commandJson, id
         match command with
         | Some command when shouldAutoPromote command ->
             match classifyProject command with
@@ -806,10 +833,10 @@ let private executeOrPromote (rt: Runtime) (commandJson: string) (agentId: strin
                         (AgentCommandInfo.protocolName command)
                         (AgentCommandInfo.operationId command
                          |> Option.filter (String.IsNullOrWhiteSpace >> not))
-                        (Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(commandJson))))
+                        (Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(normalizedJson))))
                         (fun () -> task {
-                            let! _, _, outcome = processIncomingCommand rt commandJson agentId
-                            return outcome
+                            let! _, _, outcome = processIncomingCommand rt normalizedJson agentId
+                            return merge outcome
                         })
                 match registered with
                 | Error error ->
@@ -838,11 +865,11 @@ let private executeOrPromote (rt: Runtime) (commandJson: string) (agentId: strin
                               InboxActivation = None
                               PendingJob = Some handle }
             | Error _ ->
-                let! _, _, outcome = processIncomingCommand rt commandJson agentId
-                return outcome
+                let! _, _, outcome = processIncomingCommand rt normalizedJson agentId
+                return merge outcome
         | _ ->
-            let! _, _, outcome = processIncomingCommand rt commandJson agentId
-            return outcome
+            let! _, _, outcome = processIncomingCommand rt normalizedJson agentId
+            return merge outcome
     }
 
 let private receiveCommandAndReplyCore (connection: HubConnection) (rt: Runtime) (correlationId: string) (commandJson: string) (agentId: string) : Task =

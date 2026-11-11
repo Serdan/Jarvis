@@ -16,6 +16,53 @@ module ProjectNotificationRouting =
     let healthProbe projectName =
         LedgerReadCommand { ProjectName = projectName; Action = "Health"; OperationId = ""; Cursor = ""; PageSize = 0 }
 
+    /// A promoted health check has not validated this device yet. Resolve the
+    /// EXACT client's original job, never issue a second health probe or accept
+    /// the handle as proof of a verified destination ledger.
+    let resolveHealth (projectName: string) (expectedActor: string)
+                      (deadline: DateTimeOffset) (initial: AgentCommandResponse)
+                      (poll: GetJobResultCommand -> Task<AgentCommandResponse>) =
+        let failure detail : AgentCommandResponse =
+            { Result = None
+              Error = Some(ExecutionFailed("Ledger health not verified: " + detail))
+              Instructions = []
+              AgentStateChanges = []
+              InboxActivation = None
+              PendingJob = None }
+        let rec resolve (current: AgentCommandResponse) =
+            task {
+                match current.PendingJob with
+                | None -> return current
+                | Some handle when handle.Kind <> JobKind.ToolOperation
+                                   || handle.ProjectName <> Some projectName
+                                   || handle.AgentId <> expectedActor ->
+                    return failure "pending handle does not belong to the verified project and initiating actor."
+                | Some handle when DateTimeOffset.UtcNow >= deadline ->
+                    return failure "pending health job did not finish before the bounded routing deadline."
+                | Some handle ->
+                    let! returned =
+                        poll { ProjectName = projectName
+                               JobId = handle.JobId
+                               AfterSequence = None }
+                    match returned.Result, returned.Error, returned.PendingJob with
+                    | Some payload, None, None ->
+                        try
+                            let job = JsonSerializer.Deserialize<JobResult>(payload)
+                            if isNull (box job) || job.JobId <> handle.JobId then
+                                return failure "poll returned a different or malformed job."
+                            else
+                                match job.ToolResponse, job.Status with
+                                | Some terminal, _ when terminal.PendingJob.IsNone ->
+                                    return terminal
+                                | None, Running ->
+                                    return! resolve current
+                                | _ ->
+                                    return failure "health job ended without a terminal verified result."
+                        with _ -> return failure "health job returned an invalid typed response."
+                    | _ -> return failure "health job could not be read from its original device."
+            }
+        resolve initial
+
     let ordered (selected: ClientSessionStatus voption) (sessions: ClientSessionStatus list)
                 (explicitDevice: bool) =
         if explicitDevice then
@@ -223,6 +270,7 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                 match command with
                 | TaskWriteCommand write when write.Action = "NotifyAgent"
                       && not (String.IsNullOrWhiteSpace write.SourceRef) -> true
+                | CrossProjectNotificationCommand _ -> true
                 | _ -> false
             let ordered = ProjectNotificationRouting.ordered selected sessions deviceId.IsSome
             let eligible =
@@ -241,14 +289,36 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                             userId,
                             ProjectNotificationRouting.healthProbe projectName,
                             ?conversationId = conversationId, deviceId = session.DeviceId, ?agentId = agentId)
-                        match health.Result, health.Error with
-                        | Some _, None ->
-                            // Never automatically repeat a write on another client:
-                            // an uncertain result may already have been committed.
+                        let! verified =
+                            ProjectNotificationRouting.resolveHealth projectName (defaultArg agentId "")
+                                (DateTimeOffset.UtcNow.AddMinutes(2.)) health
+                                (fun query ->
+                                    task {
+                                        do! Task.Delay(250)
+                                        return! this.SendCommandToUser(
+                                            userId, GetJobResultCommand query,
+                                            ?conversationId = conversationId,
+                                            deviceId = session.DeviceId, ?agentId = agentId)
+                                    })
+                        let stillSameDevice =
+                            match users.GetSessionByDevice(userId, session.DeviceId) with
+                            | ValueSome current ->
+                                current.State = Registered
+                                && current.ConnectionId = session.ConnectionId
+                                && current.Generation = session.Generation
+                            | ValueNone -> false
+                        match verified.Result, verified.Error, verified.PendingJob, stillSameDevice with
+                        | Some _, None, None, true ->
+                            // A verified ledger binding on the same connected
+                            // device is required before any destination write.
+                            // Once dispatched, NEVER retry a potentially
+                            // committed mutation against another client.
                             return! this.SendCommandToUser(userId, command,
                                                             ?conversationId = conversationId, deviceId = session.DeviceId, ?agentId = agentId)
                         | _ ->
-                            let reason = ProjectNotificationRouting.probeFailure health
+                            let reason =
+                                if not stillSameDevice then "candidate device session changed during ledger verification"
+                                else ProjectNotificationRouting.probeFailure verified
                             return! dispatch rest ((session.DeviceName, reason) :: probeFailures)
                 }
             return! dispatch eligible []

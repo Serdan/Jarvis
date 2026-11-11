@@ -630,6 +630,15 @@ type AgentCommandResponse =
       InboxActivation: AgentInboxActivation option
       PendingJob: ToolJobHandle option }
 
+/// Internal server-to-client envelope for verified source-side mutation
+/// evidence of a cross-project notification. The destination client owns the
+/// full combined terminal response and its resumable job; no server task store.
+/// This command is not exposed through public MCP actions.
+type CrossProjectNotificationCommand =
+    { Notification: TaskWriteCommand
+      SourceStateChanges: AgentStateChange list
+      SourceInboxActivation: AgentInboxActivation option }
+
 /// Process output and complete, immutable tool response share a lookup API.
 /// ToolResponse contains the ORIGINAL response, not reconstructed polling metadata.
 type JobResult =
@@ -654,6 +663,7 @@ type AgentCommand =
     | TaskReadCommand of TaskReadCommand
     | ObserveAgentCommand of ObserveAgentRequest
     | TaskWriteCommand of TaskWriteCommand
+    | CrossProjectNotificationCommand of CrossProjectNotificationCommand
     | LedgerReadCommand of LedgerReadCommand
     | LedgerWriteCommand of LedgerWriteCommand
     | ReviewReadCommand of ReviewReadCommand
@@ -703,7 +713,8 @@ module AgentCommandInfo =
         | RemoveWorktreeCommand _ -> "RemoveWorktreeCommand"
         | TaskReadCommand _ -> "TaskReadCommand"
         | ObserveAgentCommand _ -> "ObserveAgentCommand"
-        | TaskWriteCommand _ -> "TaskWriteCommand"
+        | TaskWriteCommand _
+        | CrossProjectNotificationCommand _ -> "TaskWriteCommand"
         | LedgerReadCommand _ -> "LedgerReadCommand"
         | LedgerWriteCommand _ -> "LedgerWriteCommand"
         | ReviewReadCommand _ -> "ReviewReadCommand"
@@ -759,7 +770,8 @@ module AgentCommandInfo =
         | RemoveWorktreeCommand _ -> "RemoveWorktree"
         | TaskReadCommand _ -> "TaskRead"
         | ObserveAgentCommand _ -> "ObserveAgent"
-        | TaskWriteCommand _ -> "TaskWrite"
+        | TaskWriteCommand _
+        | CrossProjectNotificationCommand _ -> "TaskWrite"
         | LedgerReadCommand _ -> "LedgerRead"
         | LedgerWriteCommand _ -> "LedgerWrite"
         | ReviewReadCommand _ -> "ReviewRead"
@@ -801,6 +813,7 @@ module AgentCommandInfo =
     /// Do not infer it by scanning arbitrary JSON fields in other commands.
     let operationId = function
         | TaskWriteCommand cmd -> Some cmd.OperationId
+        | CrossProjectNotificationCommand envelope -> Some envelope.Notification.OperationId
         | ReviewWriteCommand cmd -> Some cmd.OperationId
         | LedgerWriteCommand cmd when cmd.Action <> "AcknowledgePendingOperation" -> Some cmd.OperationId
         | RetryPendingIntentCommand cmd -> Some cmd.OperationId
@@ -825,6 +838,7 @@ module AgentCommandInfo =
         | TaskReadCommand cmd -> Some cmd.ProjectName
         | ObserveAgentCommand cmd -> Some cmd.ProjectName
         | TaskWriteCommand cmd -> Some cmd.ProjectName
+        | CrossProjectNotificationCommand envelope -> Some envelope.Notification.ProjectName
         | LedgerReadCommand cmd -> Some cmd.ProjectName
         | LedgerWriteCommand cmd -> Some cmd.ProjectName
         | ReviewReadCommand cmd -> Some cmd.ProjectName
@@ -918,7 +932,8 @@ module AgentCommandInfo =
         | RemoveWorktreeCommand cmd -> Some(compact cmd.WorktreePath)
         | TaskReadCommand cmd -> Some(compact cmd.AgentId)
         | ObserveAgentCommand cmd -> Some(compact cmd.TargetAgentId)
-        | TaskWriteCommand cmd -> Some(compact cmd.Action)
+        | TaskWriteCommand cmd
+        | CrossProjectNotificationCommand { Notification = cmd } -> Some(compact cmd.Action)
         | LedgerReadCommand cmd -> Some(compact cmd.ProjectName)
         | LedgerWriteCommand cmd -> Some(compact cmd.Action)
         | ReviewReadCommand cmd -> Some(compact cmd.Action)
@@ -967,7 +982,8 @@ module AgentCommandInfo =
         | RemoveWorktreeCommand cmd -> Some(truncate 64 cmd.WorktreePath)
         | TaskReadCommand cmd -> Some(truncate 64 cmd.AgentId)
         | ObserveAgentCommand cmd -> Some(truncate 64 cmd.TargetAgentId)
-        | TaskWriteCommand cmd -> Some(truncate 64 cmd.Action)
+        | TaskWriteCommand cmd
+        | CrossProjectNotificationCommand { Notification = cmd } -> Some(truncate 64 cmd.Action)
         | LedgerReadCommand cmd -> Some(truncate 64 cmd.ProjectName)
         | LedgerWriteCommand cmd -> Some(truncate 64 cmd.Action)
         | ReviewReadCommand cmd -> Some(truncate 64 cmd.Action)

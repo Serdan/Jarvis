@@ -1553,3 +1553,155 @@ let pendingToolJobNeverAdvertisesAFalseEmptyMutationList () =
     Assert.That(shown.Meta, Is.Null)
     Assert.That(shown.Content.Count, Is.EqualTo(1),
                 "A pending response must not add an authoritative agentStateChanges: [] annotation.")
+
+
+// Exercise real ClientService routing through two registered SignalR clients
+// and its real response tracker, without starting a production transport.
+let private routedNotificationFixture (reply: string -> AgentCommand -> string -> AgentCommandResponse) =
+    task {
+        let users = UserService()
+        let userId = "route-authenticated-user"
+        let actor = "Worker 1"
+        let tracker = ClientResponseTracker()
+        let calls = System.Collections.Concurrent.ConcurrentQueue<string * AgentCommand * string>()
+        let register device =
+            let connection = device + "-connection"
+            users.TransportConnected(userId, connection)
+            users.Register(userId,
+                { DeviceId = device; DeviceName = device
+                  ProtocolVersion = AgentProtocol.version; ClientVersion = "test"
+                  SupportedCommands = [ "LedgerRead"; "GetJobResult"; "TaskWrite" ] },
+                connection) |> ignore
+        register "first"
+        register "second"
+        Assert.That(users.SelectConversationDevice(userId, "route-test", "first"), Is.True)
+        let recipient (connectionId: string) =
+            { new Common.SignalR.IClientService with
+                member _.ReceiveMessage(_) = Task.CompletedTask
+                member _.InvalidateAgentStates(_, _) = Task.CompletedTask
+                member _.ReceiveCommand(correlationId, commandJson, senderActor) =
+                    let device = connectionId.Replace("-connection", "", StringComparison.Ordinal)
+                    let command = JsonSerializer.Deserialize<AgentCommand>(commandJson)
+                    calls.Enqueue((device, command, senderActor))
+                    let outcome = reply device command senderActor
+                    match users.GetSessionByDevice(userId, device) with
+                    | ValueSome session ->
+                        tracker.Complete(correlationId, userId, connectionId, session.Generation, outcome) |> ignore
+                    | ValueNone -> Assert.Fail("Lost routed test session.")
+                    Task.CompletedTask }
+        let clients =
+            { new Microsoft.AspNetCore.SignalR.IHubClients<Common.SignalR.IClientService> with
+                member _.All = recipient "first-connection"
+                member _.AllExcept(_) = recipient "first-connection"
+                member _.Client(connection) = recipient connection
+                member _.Clients(_) = recipient "first-connection"
+                member _.Group(_) = recipient "first-connection"
+                member _.GroupExcept(_, _) = recipient "first-connection"
+                member _.Groups(_) = recipient "first-connection"
+                member _.User(_) = recipient "first-connection"
+                member _.Users(_) = recipient "first-connection" }
+        let hub =
+            { new Microsoft.AspNetCore.SignalR.IHubContext<HubService, Common.SignalR.IClientService> with
+                member _.Clients = clients
+                member _.Groups = Unchecked.defaultof<_> }
+        let http = Microsoft.AspNetCore.Http.HttpContextAccessor()
+        http.HttpContext <- Microsoft.AspNetCore.Http.DefaultHttpContext()
+        let service = ClientService(hub, users, tracker, http)
+        let notification : TaskWriteCommand =
+            { ProjectName = "Wayfold"; Action = "NotifyAgent"; OperationId = Guid.NewGuid().ToString("D")
+              TaskId = "task-1"; AttemptId = ""; ActorId = actor; OwnerId = ""; Title = ""; Html = ""
+              ExpectedVersion = 0; ExpectedAgentVersion = 0; ExpectedTaskVersion = 0
+              AssignmentGeneration = 0; Summary = "test"; NextAction = ""; Reason = ""
+              BaseOid = ""; TargetRef = ""; SourceRef = "Jarvis"; AllowDetached = false
+              AllowUncommitted = false; DecisionSequence = 0L; Evidence = ""; SessionId = "" }
+        let cmd =
+            CrossProjectNotificationCommand
+                { Notification = notification
+                  SourceStateChanges = [ { ProjectName = "Jarvis"; AgentId = actor } ]
+                  SourceInboxActivation = None }
+        let! response =
+            service.SendCommandToProject(userId, "Wayfold", cmd,
+                                         conversationId = "route-test", agentId = actor)
+        return response, calls.ToArray()
+    }
+
+let private routeTerminalHealth : AgentCommandResponse =
+    { Result = Some """{"VerifiedLedger":true}"""; Error = None
+      Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+
+let private routePendingHealth jobId actor : AgentCommandResponse =
+    let handle : ToolJobHandle =
+        { JobId = jobId; Kind = JobKind.ToolOperation; Status = "Running"
+          ProjectName = Some "Wayfold"; AgentId = actor
+          OperationId = None; CommandName = "LedgerRead"
+          StartedAt = DateTimeOffset.UtcNow }
+    { Result = Some(JsonSerializer.Serialize handle); Error = None
+      Instructions = []; AgentStateChanges = Unchecked.defaultof<_>
+      InboxActivation = None; PendingJob = Some handle }
+
+let private routeJobResult jobId status (terminal: AgentCommandResponse option) : AgentCommandResponse =
+    let result : JobResult =
+        { JobId = jobId; Status = status; Events = []; NextSequence = 0L
+          Truncated = false; ToolResponse = terminal; OperationId = None }
+    { Result = Some(JsonSerializer.Serialize result); Error = None
+      Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+
+[<Test>]
+let pendingHealthFailureRejectsFirstDeviceBeforeRoutedCrossProjectMutation () =
+    task {
+        let jobId = Guid.NewGuid().ToString("N")
+        let firstHealth = routePendingHealth jobId "Worker 1"
+        let unhealthy = { routeTerminalHealth with Result = None; Error = Some(ValidationFailed "unverified ledger") }
+        let respond (device: string) (command: AgentCommand) (actor: string) =
+            match device, command with
+            | "first", LedgerReadCommand _ -> firstHealth
+            | "first", GetJobResultCommand request ->
+                Assert.That(request.JobId, Is.EqualTo(jobId))
+                Assert.That(request.ProjectName, Is.EqualTo("Wayfold"))
+                Assert.That(actor, Is.EqualTo("Worker 1"))
+                routeJobResult jobId (ToolFailed "health") (Some unhealthy)
+            | "second", LedgerReadCommand _ -> routeTerminalHealth
+            | "second", CrossProjectNotificationCommand _ ->
+                { routeTerminalHealth with Result = Some """{"notified":true}""" }
+            | _ -> failwith $"Unexpected routing: {device}: {AgentCommandInfo.name command}"
+        let! outcome, calls = routedNotificationFixture respond
+        Assert.That(outcome.Error.IsNone, Is.True)
+        let writes =
+            calls |> Array.choose (fun (device, command, _) ->
+                match command with
+                | CrossProjectNotificationCommand _ -> Some device
+                | _ -> None)
+        Assert.That(writes, Is.EqualTo([|"second"|] :> obj),
+                    "A pending unhealthy preferred ledger must never receive a destination write.")
+        Assert.That(calls |> Array.exists (fun (device, command, _) ->
+            device = "first" && (match command with GetJobResultCommand _ -> true | _ -> false)), Is.True)
+    }
+
+[<Test>]
+let pendingHealthCompletionUsesExactlyTheOriginalCandidateDeviceAndActor () =
+    task {
+        let jobId = Guid.NewGuid().ToString("N")
+        let firstHealth = routePendingHealth jobId "Worker 1"
+        let mutable polls = 0
+        let respond (device: string) (command: AgentCommand) (actor: string) =
+            match device, command with
+            | "first", LedgerReadCommand _ -> firstHealth
+            | "first", GetJobResultCommand request ->
+                polls <- polls + 1
+                Assert.That(request.JobId, Is.EqualTo(jobId))
+                Assert.That(actor, Is.EqualTo("Worker 1"))
+                if polls = 1 then routeJobResult jobId Running None
+                else routeJobResult jobId ToolCompleted (Some routeTerminalHealth)
+            | "first", CrossProjectNotificationCommand envelope ->
+                Assert.That(envelope.SourceStateChanges.Length, Is.EqualTo(1))
+                Assert.That(envelope.SourceStateChanges.Head.ProjectName, Is.EqualTo("Jarvis"))
+                { routeTerminalHealth with Result = Some """{"notified":true}""" }
+            | _ -> failwith $"Incorrect fallback/actor: {device}: {AgentCommandInfo.name command}"
+        let! outcome, calls = routedNotificationFixture respond
+        Assert.That(outcome.Error.IsNone, Is.True)
+        Assert.That(polls, Is.EqualTo(2))
+        Assert.That(calls |> Array.forall (fun (device, _, _) -> device = "first"), Is.True)
+        Assert.That(calls |> Array.filter (fun (_, cmd, _) ->
+            match cmd with CrossProjectNotificationCommand _ -> true | _ -> false) |> Array.length,
+            Is.EqualTo(1))
+    }

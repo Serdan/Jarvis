@@ -393,15 +393,26 @@ module McpToolHelpers =
     /// state (notably a cross-project notification sender validation). Never
     /// lose the preliminary mutation from the caller-visible result.
     let mergeStateEffects (prior: AgentCommandResponse) (final: AgentCommandResponse) =
+        // Unknown final effects are NOT an empty list. A promoted destination
+        // must carry its source evidence into the client-owned job, so that
+        // polling eventually returns both confirmed sets of mutations.
+        let changes =
+            if final.PendingJob.IsSome || isNull (box final.AgentStateChanges) then
+                Unchecked.defaultof<AgentStateChange list>
+            else
+                let source =
+                    if isNull (box prior.AgentStateChanges) then [] else prior.AgentStateChanges
+                (source @ final.AgentStateChanges) |> List.distinct
         { final with
-            AgentStateChanges =
-                (prior.AgentStateChanges @ final.AgentStateChanges) |> List.distinct
+            AgentStateChanges = changes
             InboxActivation =
-                match final.InboxActivation with
-                | Some _ -> final.InboxActivation
-                | None ->
-                    prior.InboxActivation
-                    |> Option.filter (fun receipt -> receipt.ActivatedByThisCall) }
+                if final.PendingJob.IsSome then None
+                else
+                    match final.InboxActivation with
+                    | Some _ -> final.InboxActivation
+                    | None ->
+                        prior.InboxActivation
+                        |> Option.filter (fun receipt -> receipt.ActivatedByThisCall) }
 
     /// A polled tool job carries the exact original response as typed data.
     /// Present its instructions and canonical side effects with the polling
@@ -511,6 +522,7 @@ module McpToolHelpers =
         | CreateProjectCommand _
         | RemoveWorktreeCommand _
         | TaskWriteCommand _
+        | CrossProjectNotificationCommand _
         | LedgerWriteCommand _
         | ReviewWriteCommand _
         | RetryPendingIntentCommand _
@@ -775,12 +787,22 @@ module McpToolHelpers =
                                 do! publishChanges sender
                                 match sender.Result, sender.Error with
                                 | Some _, None when sender.PendingJob.IsNone ->
-                                    let! destination = client.SendCommandToProject(
-                                        userId, notification.ProjectName, command,
+                                    // Carry source activation evidence into
+                                    // the destination client's ORIGINAL task.
+                                    // Its normal pending handle and subsequent
+                                    // get_job_result now recover both projects'
+                                    // terminal effects, even if the first reply
+                                    // is lost. No server-owned task store.
+                                    let forwarded =
+                                        CrossProjectNotificationCommand
+                                            { Notification = notification
+                                              SourceStateChanges = sender.AgentStateChanges
+                                              SourceInboxActivation = sender.InboxActivation }
+                                    return! client.SendCommandToProject(
+                                        userId, notification.ProjectName, forwarded,
                                         ?conversationId = RequestDeviceRouting.session(),
                                         ?deviceId = RequestDeviceRouting.deviceOverride(),
                                                      ?agentId = RequestDeviceRouting.agentId())
-                                    return mergeStateEffects sender destination
                                 | _ -> return sender
                             }
                         | _ ->

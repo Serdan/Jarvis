@@ -175,6 +175,14 @@ The old `BindReviewBase` public tool is retired: independent review requests hav
 
 Keep `taskId` explicit: allowing an agent-only resume would require additional stable operation identity and replay handling when current assignment changes, which is not safely interchangeable with omission of version preconditions.
 
+## Audited Working-to-Ready correction
+
+`CorrectAgentWorkingState` is a distinct operator-authorized command for an assigned agent whose Working state is stale. Supply the requesting `agentId`, `targetAgentId`, exact `taskId` and `attemptId`, positive `expectedTaskVersion`, `expectedAttemptVersion`, `expectedAgentVersion`, `assignmentGeneration`, and a nonempty `reason`. No version inference is allowed: a concurrent worker checkpoint, own yield, implicit activation, or assignment change must win over a stale administrative correction.
+
+The tool requires the authenticated user's `git:write` authorization, and the canonical receipt/audit identifies that user as the authoritative actor (`AuthenticatedUser`). The `agentId` is separately recorded as `requestingAgentId` provenance; it is not treated as proof of agent identity. `TaskLifecycleHistory` records action `CorrectAgentWorkingState`, actor, requester, target, reason, and before/after agent state/version. The command changes only the target agent's execution to Stopped (derived state Ready), clears the active Working timer/session and updates the agent version/state sequence. Assignment, attempt and task versions, generation, source refs, existing checkpoints, reviews, integrations, notifications and target last-seen activity are preserved. No worker-authored checkpoint is invented; ordinary `YieldAgent` remains separate.
+
+`SetAgentState` is still restricted to unassigned agents. `RecoverAgentAssignment` remains the explicit generation-changing recovery mechanism. Neither is interchangeable with this correction.
+
 ## MCP tool catalog cleanup (protocol 3.56)
 
 The former public `ReviewTask` MCP method is now `GetTask`. The configured executable-task listing is now `ListConfiguredTasks` (distinct from the Git-ledger `TaskOverview`). The one-time `MigrateOrthogonalAgentState` public tool and its implementation are removed. Client and server must be upgraded together to use the renamed local configured-task command. This change does not alter existing ledger data.

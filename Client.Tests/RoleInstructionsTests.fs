@@ -239,7 +239,7 @@ type RoleInstructionsTests() =
             | Error error -> Assert.Fail(sprintf "Cannot bind fixture ledger: %A" error)
             | Ok _ -> ()
 
-            let inspect selector cursor =
+            let inspectAs selector cursor agentId =
                 let target =
                     Client.ProjectPaths.ProjectTarget.parse selector
                     |> function
@@ -247,7 +247,7 @@ type RoleInstructionsTests() =
                         | Error error -> failwithf "Invalid fixture selector: %A" error
                 let command : Common.GetAgentInstructionsCommand =
                     { ProjectName = selector
-                      AgentId = "Reviewer 1"
+                      AgentId = agentId
                       Directory = ""
                       Cursor = cursor }
                 let result =
@@ -256,6 +256,14 @@ type RoleInstructionsTests() =
                         | Ok value -> value
                         | Error error -> failwithf "Cannot resolve layered instructions: %A" error
                 JsonDocument.Parse(result.ToJsonString())
+
+            let inspect selector cursor = inspectAs selector cursor "Reviewer 1"
+            // A repository read must remain available before agent registration.
+            use unregistered = inspectAs "owner" None "Unregistered Reader"
+            Assert.That(unregistered.RootElement.GetProperty("AGENTS.md").EnumerateObject() |> Seq.length,
+                        Is.EqualTo(2))
+            let mutable missing = Unchecked.defaultof<JsonElement>
+            Assert.That(unregistered.RootElement.TryGetProperty("instructionLayers", &missing), Is.False)
 
             use main = inspect "owner" None
             let mainRoot = main.RootElement

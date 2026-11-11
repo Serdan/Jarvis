@@ -511,9 +511,8 @@ let getExplicit (target: ProjectPaths.ProjectTarget) (command: GetAgentInstructi
                 else
                     OrchestrationApi.LedgerBindingConfig.loadWithSnapshot projectName rt
                     |> Result.bind (fun (binding, snapshot) ->
-                        RoleInstructions.RoleInstructions.resolveAt binding snapshot command.AgentId
-                        |> Result.mapError OrchestrationApi.LedgerErrors.toEffect
-                        |> Result.map Some)
+                        RoleInstructions.RoleInstructions.tryResolveAt binding snapshot command.AgentId
+                        |> Result.mapError OrchestrationApi.LedgerErrors.toEffect)
             layers
             |> Result.bind (fun layers ->
                 let layerNode =

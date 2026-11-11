@@ -383,6 +383,21 @@ module RoleInstructions =
             return! resolveAtKnownAgent binding snapshot agentId
         }
 
+    // Repository instructions remain readable by callers that have not yet
+    // registered an orchestration agent. Only a registered identity may
+    // contribute role/individual instruction layers; malformed registered
+    // records still fail closed through resolveAt.
+    let tryResolveAt binding snapshot agentId =
+        if not (isAgentId agentId) then Error(InvalidBinding "Invalid agent ID.")
+        else result {
+            let! content, _ = LedgerStore.readAt binding snapshot (agentPath agentId)
+            match content with
+            | None -> return None
+            | Some _ ->
+                let! layers = resolveAt binding snapshot agentId
+                return Some layers
+        }
+
     let resolve binding agentId =
         result {
             let! snapshot = LedgerStore.fetch binding

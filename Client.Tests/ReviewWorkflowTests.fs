@@ -393,6 +393,72 @@ type ReviewWorkflowTests() =
             finally
                 if File.Exists configPath then File.Delete configPath)
 
+    // Optional diagnostic; intentionally excluded from routine CI because it
+    // performs 100 real Git-backed ingress calls and records latency rather
+    // than imposing a machine-dependent performance threshold.
+    [<Test; Explicit("Run manually when assessing reservation hot-path cost")>]
+    member _.BenchmarkHundredMixedWorkingCalls() =
+        withFixture (fun one _ first second _ _ _ _ ->
+            let taskId = "benchmark-inflight-hotpath"
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Benchmark ingress"
+            |> success |> ignore
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner"
+            |> success |> ignore
+            ReviewWorkflow.beginAttempt first (Guid.NewGuid()) taskId "Owner" 1 1
+            |> success |> ignore
+            let configPath = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
+            try
+                Client.OrchestrationApi.LedgerBindingConfig.bindExisting
+                    "owner" (GitCommandTests.TestContext(Path.GetDirectoryName one))
+                    first.ProjectId first.LedgerId first.Epoch first.RemoteName
+                    first.ApprovedFetchUrl first.ApprovedPushUrl
+                    (LedgerStore.fetch first |> success).Commit true
+                |> success |> ignore
+                let runtime =
+                    Client.Runtime(Path.GetDirectoryName one, Client.ConsoleTui.ConsoleTui(), Client.PartialTrust)
+                let read : Common.AgentCommand =
+                    Common.ReadFilesCommand { ProjectName = "owner"; FilePaths = [ "source.txt" ] }
+                let search : Common.AgentCommand =
+                    Common.SearchTextCommand
+                        { ProjectName = "owner"; Query = "base"; FolderPath = None
+                          IncludeGlobs = [ "*.txt" ]; ExcludeGlobs = []; MaxResults = Some 10 }
+                let notify (): Common.AgentCommand =
+                    Common.TaskWriteCommand
+                        { ProjectName = "owner"; Action = "NotifyAgent"
+                          OperationId = Guid.NewGuid().ToString("D")
+                          TaskId = ""; AttemptId = ""; ActorId = "Owner"
+                          OwnerId = "Reviewer"; Title = ""; Html = ""
+                          ExpectedVersion = 0; ExpectedAgentVersion = 0; ExpectedTaskVersion = 0
+                          AssignmentGeneration = 0; Summary = "Benchmark notice"
+                          NextAction = ""; Reason = ""; BaseOid = ""; TargetRef = ""
+                          SourceRef = ""; AllowDetached = false; AllowUncommitted = false
+                          DecisionSequence = 0L; Evidence = ""; SessionId = "" }
+                let invoke command =
+                    Client.SignalR.Client.processIncomingCommand runtime
+                        (System.Text.Json.JsonSerializer.Serialize<Common.AgentCommand>(command)) "Owner"
+                    |> Async.AwaitTask |> Async.RunSynchronously
+                let _, initial, _ = invoke read
+                Assert.That(initial.IsOk, Is.True)
+                let startHead = (LedgerStore.fetch second |> success).Commit
+                let began = DateTimeOffset.UtcNow
+                let timer = Stopwatch.StartNew()
+                for i in 1 .. 100 do
+                    let command =
+                        if i % 3 = 0 then read
+                        elif i % 3 = 1 then search
+                        else notify ()
+                    let _, outcome, _ = invoke command
+                    Assert.That(outcome.IsOk, Is.True, sprintf "Call %d: %A" i outcome)
+                timer.Stop()
+                let ended = DateTimeOffset.UtcNow
+                let endHead = (LedgerStore.fetch second |> success).Commit
+                TestContext.Out.WriteLine(
+                    sprintf "100 mixed Working calls: %.0f ms (%.1f ms/call), ledger head changed=%b, UTC %s to %s"
+                        timer.Elapsed.TotalMilliseconds (timer.Elapsed.TotalMilliseconds / 100.)
+                        (startHead <> endHead) (began.ToString("O")) (ended.ToString("O")))
+            finally
+                if File.Exists configPath then File.Delete configPath)
+
     [<Test>]
     member _.InFlightOwnerTransitionsBlockConcurrentCorrectionWithoutChangingExactVersions() =
         for transition in [ "Checkpoint"; "Yield"; "Complete" ] do

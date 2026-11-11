@@ -62,3 +62,34 @@ However, existing task-ledger reads already incur substantial Git process
 overhead (~33 starts per call in this fixture). That read-path problem is
 separate from the administrative correction, and optimizing it needs its own
 measurement and acceptance criteria.
+
+## Mixed 100-call regression on durable per-operation reservations
+
+The `7021c003` revision added a separate durable in-flight reservation per
+command. The explicit diagnostic `BenchmarkHundredMixedWorkingCalls` runs
+100 genuine ingress operations against a local Git-backed fixture: 34 SearchText,
+33 ReadFiles and 33 same-project self NotifyAgent calls.
+
+| Metric | Result |
+| --- | ---: |
+| Wall time | **44,447 ms (444.5 ms per call)** |
+| Canonical commits/pushes | **233** |
+| Git process starts | **13,350** |
+| Git child starts | **3,199** |
+
+The 233 commits are explained by **two reservation writes per call** (begin +
+end), plus 33 actual notification mutations. Git trace2 was filtered to the
+exact timed UTC interval 2026-11-11T07:04:27.7647389Z to
+2026-11-11T07:05:12.2112889Z, excluding fixture setup.
+
+Compared with 100 cheap-leased GetAssignment calls (159–190 ms/call, no
+ledger writes), the per-call reservation model causes severe write
+amplification. The workloads differ, so a direct latency ratio should not be
+attributed solely to reservations; the **233 canonical writes** are conclusive.
+A production remote ledger would also incur network latency and contention
+absent from this local fixture.
+
+**Acceptance:** amortize durable fencing across bursts of active calls without
+weakening cross-device correction safety; provide explicit authenticated
+orphan recovery backed by evidence that the original operation cannot still
+be executing. Blind expiry would reintroduce the original race.

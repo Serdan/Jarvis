@@ -66,6 +66,22 @@ let private classifyProject command =
         | Some raw -> ProjectPaths.ProjectTarget.parse raw |> Result.map Checkout
 
 
+// A local approved binding means this checkout participates in canonical
+// agent-state correction. Failed Git/agent reads must not be interpreted as
+// "no active assignment" and silently skip a required in-flight fence.
+// Unbound source-only projects continue to work without ledger enrollment.
+let private hasCanonicalLedgerBinding (rt: Runtime) (project: string) =
+    match ProjectPaths.resolveProjectRoot project rt with
+    | Error _ -> true // A failed project lookup cannot prove the absence of a ledger.
+    | Ok (FolderPath root) ->
+        let path = OrchestrationApi.LedgerBindingConfig.pathForRoot root
+        try
+            File.GetAttributes(path) |> ignore
+            true
+        with
+        | :? FileNotFoundException | :? DirectoryNotFoundException -> false
+        | _ -> true
+
 let private loadAgentState (rt: Runtime) (project: string) (agentId: string) =
     match OrchestrationApi.LedgerBindingConfig.loadWithSnapshot project rt with
     | Error _ -> None
@@ -233,6 +249,9 @@ let private activateReadyOnActivity (rt: Runtime) (agentId: string)
                     match renewWorkingLease agent.CurrentAssignment with
                     | Ok () -> Ok ([], None)
                     | Error error -> Error error
+            | None when hasCanonicalLedgerBinding rt project ->
+                Error(Client.ValidationError(
+                    "Cannot resolve the canonical agent state for this bound project; refusing to run unfenced. Reread the agent inbox."))
             | _ -> Ok ([], None)
 
 // Keep a canonical lease valid throughout long-running tools. An admitted
@@ -802,8 +821,26 @@ let processIncomingCommand (rt: Runtime) (commandJson: string) (agentId: string)
                                         Some (project, projectId, active.CurrentAssignment)
                                     | _ -> None
                                 | _ -> None
+                            // A failed cache refresh must not silently
+                            // turn a bound Working-agent call into an
+                            // unreserved operation. Preserve source-only
+                            // behavior for checkouts with no approved ledger.
+                            let expectedFence =
+                                match target with
+                                | Some selected when not (String.IsNullOrWhiteSpace localAgentId)
+                                                     && activatesAgent localAgentId command ->
+                                    let project = selected |> ProjectPaths.ProjectTarget.projectId
+                                                           |> ProjectPaths.ProjectId.value
+                                    hasCanonicalLedgerBinding rt project
+                                | _ -> false
                             let! (execution, renewalFailure) =
                                 match leaseContext with
+                                | None when expectedFence ->
+                                    task {
+                                        return (Error(Client.ValidationError(
+                                            "Canonical Working activity state unavailable; the call was not executed.")),
+                                            [], AgentInstructions.RootBootstrapRequired), None
+                                    }
                                 | None ->
                                     task {
                                         let! outcome = work()

@@ -742,15 +742,27 @@ let processIncomingCommand (rt: Runtime) (commandJson: string) (agentId: string)
         return parsedCommand, (response |> Result.map (fun outcome -> outcome.Payload)), agentResponse
     }
 
-let receiveCommandAndReply (connection: HubConnection) (rt: Runtime) (correlationId: string) (commandJson: string) (agentId: string) : Task =
+let receiveCommandAndReplyWithTiming (connection: HubConnection) (rt: Runtime)
+    (correlationId: string) (commandJson: string) (agentId: string)
+    (report: string -> float -> float -> bool -> unit) : Task =
     task {
+        let commandStarted = Stopwatch.GetTimestamp()
         let! parsedCommand, response, agentResponse = processIncomingCommand rt commandJson agentId
+        let commandMilliseconds = Stopwatch.GetElapsedTime(commandStarted).TotalMilliseconds
+        let replyStarted = Stopwatch.GetTimestamp()
         let! sendResult =
             ResponseDelivery.sendWithReconnectRetry
                 (TimeSpan.FromMinutes 2.0)
                 (TimeSpan.FromMilliseconds 250.0)
                 (fun () -> connection.State)
                 (fun () -> connection.invokeAsync("SendClientResponse", correlationId, agentResponse))
+
+        let replyMilliseconds = Stopwatch.GetElapsedTime(replyStarted).TotalMilliseconds
+        try
+            report correlationId commandMilliseconds replyMilliseconds sendResult.IsOk
+        with _ ->
+            // Timing sinks must not affect command outcome or self-update.
+            ()
 
         match sendResult with
         | Ok() -> ()
@@ -765,3 +777,8 @@ let receiveCommandAndReply (connection: HubConnection) (rt: Runtime) (correlatio
             | Error error -> rt.Tui.Log $"Self-update activation failed: {EffectError.toString error}"
         | _ -> ()
     }
+
+let receiveCommandAndReply (connection: HubConnection) (rt: Runtime)
+    (correlationId: string) (commandJson: string) (agentId: string) : Task =
+    receiveCommandAndReplyWithTiming connection rt correlationId commandJson agentId
+        (fun _ _ _ _ -> ())

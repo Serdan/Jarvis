@@ -209,10 +209,38 @@ let private runClient args =
                     let failure = timing.FailureType |> Option.defaultValue "none"
                     tui.Log $"MCP command {timing.CorrelationId}: queueMs={timing.QueueMilliseconds:F0} executionAndReplyMs={timing.ExecutionMilliseconds:F0} failureType={failure}")
 
+    let replyUnhandled (correlationId: string) (error: exn) : Task =
+        task {
+            // The exception might follow a completed mutation. Never claim
+            // that execution failed atomically or suggest blind replay.
+            let uncertain : AgentCommandResponse =
+                { Result = None
+                  Error =
+                    Some(ExecutionFailed
+                        "Jarvis client command terminated unexpectedly; the outcome may be committed. Verify the original operation ID before retrying a mutation.")
+                  Instructions = []; AgentStateChanges = []; InboxActivation = None }
+            let! send =
+                ResponseDelivery.sendWithReconnectRetry
+                    (TimeSpan.FromMinutes 2.0)
+                    (TimeSpan.FromMilliseconds 250.0)
+                    (fun () -> connection.State)
+                    (fun () -> connection.invokeAsync("SendClientResponse", correlationId, uncertain))
+            match send with
+            | Ok () -> ()
+            | Error deliveryError ->
+                tui.Log $"MCP command {correlationId}: unhandledType={error.GetType().Name} recoveryReplyType={deliveryError.GetType().Name}"
+        }
+
     let receiveQueued correlationId commandJson agentId : Task =
         if dispatch.TrySubmit(
             correlationId,
-            fun () -> Client.receiveCommandAndReply connection rt correlationId commandJson agentId) then
+            (fun () ->
+                Client.receiveCommandAndReplyWithTiming connection rt correlationId commandJson agentId
+                    (fun id commandMs replyMs delivered ->
+                        if commandMs >= 200.0 || replyMs >= 1000.0 || not delivered then
+                            tui.Log
+                                $"MCP stage {id}: commandMs={commandMs:F0} replyMs={replyMs:F0} replyAck={delivered}")),
+            (fun error -> replyUnhandled correlationId error)) then
             Task.CompletedTask
         else
             // No command was executed. Reply with an explicit overload error;
@@ -220,7 +248,7 @@ let private runClient args =
             // SignalR's single receive callback.
             let rejected : AgentCommandResponse =
                 { Result = None
-                  Error = Some(ExecutionFailed "Jarvis client dispatch capacity exhausted; command not executed. Resolve uncertain writes by their operation ID before retrying.")
+                  Error = Some(ExecutionFailed "Jarvis client dispatch capacity exhausted; this command was not executed.")
                   Instructions = []; AgentStateChanges = []; InboxActivation = None }
             task {
                 try

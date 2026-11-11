@@ -16,7 +16,8 @@ type CommandDispatchTiming =
 type private QueuedCommand =
     { CorrelationId: string
       EnqueuedAt: int64
-      Execute: unit -> Task }
+      Execute: unit -> Task
+      OnUnhandled: exn -> Task }
 
 // Dedicated bounded worker pool. The pending channel does not own durable
 // command state: on overload its caller must send an explicit rejection.
@@ -41,16 +42,26 @@ type CommandDispatchQueue(maxParallel: int, maxQueued: int, observe: CommandDisp
         try
             do! command.Execute()
         with error ->
-            // Never let a failed command kill a worker or disappear without
-            // a correlated error observation. The caller's handler is
-            // responsible for encoding an error reply when possible.
             failure <- Some(error.GetType().Name)
+            // An exception in execution must not strand the caller until
+            // the server timeout. The supplied handler reports an uncertain
+            // outcome using the original correlation ID.
+            try
+                do! command.OnUnhandled error
+            with _ ->
+                // Delivery may fail on disconnect; the server retains its
+                // timeout/abort path, and the worker must remain live.
+                ()
         let elapsed = Stopwatch.GetElapsedTime(started)
-        observe
-            { CorrelationId = command.CorrelationId
-              QueueMilliseconds = queueDuration.TotalMilliseconds
-              ExecutionMilliseconds = elapsed.TotalMilliseconds
-              FailureType = failure }
+        try
+            observe
+                { CorrelationId = command.CorrelationId
+                  QueueMilliseconds = queueDuration.TotalMilliseconds
+                  ExecutionMilliseconds = elapsed.TotalMilliseconds
+                  FailureType = failure }
+        with _ ->
+            // Observability is non-authoritative and must never kill a worker.
+            ()
     }
 
     let worker () = task {
@@ -71,11 +82,15 @@ type CommandDispatchQueue(maxParallel: int, maxQueued: int, observe: CommandDisp
         Array.init maxParallel (fun _ ->
             Task.Run(Func<Task>(fun () -> worker() :> Task)))
 
-    member _.TrySubmit(correlationId: string, execute: unit -> Task) =
+    member this.TrySubmit(correlationId: string, execute: unit -> Task) =
+        this.TrySubmit(correlationId, execute, fun _ -> Task.CompletedTask)
+
+    member _.TrySubmit(correlationId: string, execute: unit -> Task, onUnhandled: exn -> Task) =
         channel.Writer.TryWrite
             { CorrelationId = correlationId
               EnqueuedAt = Stopwatch.GetTimestamp()
-              Execute = execute }
+              Execute = execute
+              OnUnhandled = onUnhandled }
 
     // Completion is graceful: stop admitting new work, run every admitted
     // command to completion, then wait until all workers terminate.

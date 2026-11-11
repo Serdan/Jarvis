@@ -172,3 +172,125 @@ module DispatchProbeTests =
         Assert.That(first, Is.SameAs(fastReplied.Task),
             "The fast response must reach the server without waiting for the slow command.")
     }
+
+    [<Test>]
+    let ``unhandled command reports uncertain outcome and subsequent commands still complete`` () = task {
+        let failed = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let succeeded = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let measurements = System.Collections.Concurrent.ConcurrentBag<CommandDispatchTiming>()
+        let queue = CommandDispatchQueue(1, 4, measurements.Add)
+        let thrown () : Task = Task.FromException(InvalidOperationException("secret-command-body"))
+        let onUnhandled (ex: exn) : Task = task {
+            Assert.That(ex, Is.TypeOf<InvalidOperationException>())
+            failed.TrySetResult(()) |> ignore
+        }
+        let success () : Task = task {
+            succeeded.TrySetResult(()) |> ignore
+        }
+        Assert.That(queue.TrySubmit("first", thrown, onUnhandled), Is.True)
+        Assert.That(queue.TrySubmit("second", success), Is.True)
+        do! failed.Task.WaitAsync(TimeSpan.FromSeconds 5.0)
+        do! succeeded.Task.WaitAsync(TimeSpan.FromSeconds 5.0)
+        do! queue.Complete().WaitAsync(TimeSpan.FromSeconds 5.0)
+        let failedTiming = measurements |> Seq.find (fun item -> item.CorrelationId = "first")
+        Assert.That(failedTiming.FailureType, Is.EqualTo(Some "InvalidOperationException"))
+        Assert.That(failedTiming.ToString().Contains("secret-command-body"), Is.False)
+    }
+
+    [<Test>]
+    let ``telemetry exceptions cannot terminate a dispatch worker`` () = task {
+        let completed = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let queue = CommandDispatchQueue(1, 4, (fun _ -> failwith "Telemetry endpoint failed"))
+        let complete () : Task = task {
+            completed.TrySetResult(()) |> ignore
+        }
+        Assert.That(queue.TrySubmit("one", fun () -> Task.CompletedTask), Is.True)
+        Assert.That(queue.TrySubmit("two", complete), Is.True)
+        do! completed.Task.WaitAsync(TimeSpan.FromSeconds 5.0)
+        do! queue.Complete().WaitAsync(TimeSpan.FromSeconds 5.0)
+    }
+
+    [<Test>]
+    let ``concurrent cheap command p50 p95 p99 improves while a source command is stalled`` () = task {
+        let builder = WebApplication.CreateBuilder()
+        builder.WebHost.UseUrls("http://127.0.0.1:0") |> ignore
+        builder.Services.AddSignalR() |> ignore
+        use server = builder.Build()
+        server.MapHub<DispatchProbeHub>("/probe") |> ignore
+        do! server.StartAsync()
+        let endpoint = server.Urls |> Seq.head
+        let sender = server.Services.GetRequiredService<IHubContext<DispatchProbeHub>>()
+        let samples = 64
+
+        let percentile (values: float array) p =
+            let sorted = values |> Array.sort
+            sorted[max 0 (min (sorted.Length - 1) (int (Math.Ceiling(float sorted.Length * p)) - 1))]
+
+        let run useBoundedQueue = task {
+            let slowEntered = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let releaseSlow = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let allCheap = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let started = System.Collections.Concurrent.ConcurrentDictionary<string, int64>()
+            let latencies = System.Collections.Concurrent.ConcurrentBag<float>()
+            let mutable completed = 0
+            let queue = CommandDispatchQueue(4, 128, (fun _ -> ()))
+            let connection = HubConnectionBuilder().WithUrl(endpoint + "/probe").Build()
+
+            let work (command: string) () : Task = task {
+                if command = "slow-ledger-write" then
+                    slowEntered.TrySetResult(()) |> ignore
+                    do! releaseSlow.Task
+                else
+                    let beginAt = started[command]
+                    latencies.Add(System.Diagnostics.Stopwatch.GetElapsedTime(beginAt).TotalMilliseconds)
+                    if Interlocked.Increment(&completed) = samples then
+                        allCheap.TrySetResult(()) |> ignore
+            }
+
+            use registration =
+                connection.On<string>(
+                    "ReceiveCommand",
+                    Func<string, Task>(fun command ->
+                        if useBoundedQueue then
+                            if queue.TrySubmit(command, work command) then Task.CompletedTask
+                            else Task.FromException(InvalidOperationException("Synthetic dispatch queue saturated"))
+                        else
+                            work command ()))
+            do! connection.StartAsync()
+
+            do! sender.Clients.All.SendAsync("ReceiveCommand", "slow-ledger-write")
+            do! slowEntered.Task.WaitAsync(TimeSpan.FromSeconds 5.0)
+
+            for i in 1 .. samples do
+                let label =
+                    if i % 2 = 0 then $"get_job_result:{i}"
+                    else $"read_file:{i}"
+                started.TryAdd(label, System.Diagnostics.Stopwatch.GetTimestamp()) |> ignore
+                do! sender.Clients.All.SendAsync("ReceiveCommand", label)
+
+            let! first = Task.WhenAny(allCheap.Task, Task.Delay(350))
+            let completedBeforeRelease = obj.ReferenceEquals(first, allCheap.Task)
+            releaseSlow.TrySetResult(()) |> ignore
+            do! allCheap.Task.WaitAsync(TimeSpan.FromSeconds 10.0)
+            do! queue.Complete().WaitAsync(TimeSpan.FromSeconds 10.0)
+            do! connection.DisposeAsync().AsTask()
+            let values = latencies.ToArray()
+            Assert.That(values.Length, Is.EqualTo(samples))
+            return completedBeforeRelease,
+                   percentile values 0.5,
+                   percentile values 0.95,
+                   percentile values 0.99
+        }
+
+        let! before = run false
+        let! after = run true
+        let beforeEarly, before50, before95, before99 = before
+        let afterEarly, after50, after95, after99 = after
+        TestContext.Progress.WriteLine(
+            $"Synthetic SignalR cheap-command load (64 reads/job-status, 1 blocked ledger action) latency ms BEFORE p50={before50:F1} p95={before95:F1} p99={before99:F1}; AFTER p50={after50:F1} p95={after95:F1} p99={after99:F1}")
+
+        Assert.That(beforeEarly, Is.False, "The baseline control must exhibit callback head-of-line blocking.")
+        Assert.That(afterEarly, Is.True, "Fast operations should all complete while the slow action is still held.")
+        Assert.That(after50, Is.LessThan(before50))
+        do! server.StopAsync()
+    }

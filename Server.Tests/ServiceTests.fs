@@ -450,6 +450,9 @@ let ``command catalog matches AgentCommand union and MCP tools`` () =
             else
                 unionCase.Name)
         |> Set.ofArray
+        // Internal server-to-client envelope: not a public command, never
+        // advertised through the MCP catalog or client capabilities.
+        |> Set.remove "CrossProjectNotification"
 
     let mcpNames =
         typeof<JarvisMcpTools>.GetMethods()
@@ -484,6 +487,7 @@ let ``command catalog matches AgentCommand union and MCP tools`` () =
               ]
     // Retired wire cases are deleted; public CreateTask/AssignTask are canonical ledger tools.
     unionNames |> shouldEqual catalogNames
+    Assert.That(catalogNames.Contains("CrossProjectNotification"), Is.False)
     Set.intersect mcpNames retired |> shouldEqual Set.empty
     Assert.That(mcpNames, Does.Contain("GetTask"))
     Assert.That(mcpNames, Does.Contain("ListConfiguredTasks"))

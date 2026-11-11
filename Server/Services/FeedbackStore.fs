@@ -63,6 +63,13 @@ type AgentExecutionReadiness =
     | LegacyDrainUnverified
     | LegacyDrainVerified of operatorId: string * evidence: string * approvedAt: DateTimeOffset
 
+/// An explicit proof boundary for releasing a correction permit. A server
+/// timeout or an unreconciled dispatch must never be interpreted as terminal.
+type AgentExecutionResolution =
+    | NeverDispatched
+    | AuthenticatedClientFinished
+    | ExecutionUnresolved
+
 [<CLIMutable>]
 type ConnectionEventEntry =
     { CreatedAt: DateTimeOffset
@@ -740,6 +747,32 @@ INSERT INTO operations (
             if command.ExecuteNonQuery() = 1 then Ok ()
             else Error "Cannot certify non-dispatch for this request."
         with ex -> Error $"Cannot record proven non-dispatch: {ex.Message}"
+
+    // This query is part of the correction release proof. It may be called
+    // only after the client response is known, but does NOT itself certify
+    // that a Git operation committed. Missing/corrupt rows fail closed.
+    member _.GetAgentExecutionResolution(userId: string, requestId: string)
+        : Result<AgentExecutionResolution, string> =
+        if String.IsNullOrWhiteSpace userId || String.IsNullOrWhiteSpace requestId then
+            Error "Authenticated operation identity is required."
+        else
+            try
+                use connection = openConnection()
+                use command = connection.CreateCommand()
+                command.CommandText <-
+                    """SELECT state FROM agent_execution_witness
+                       WHERE user_id = $userId AND request_id = $requestId LIMIT 1;"""
+                addParameter command "$userId" userId
+                addParameter command "$requestId" requestId
+                match command.ExecuteScalar() with
+                | :? string as status ->
+                    match status with
+                    | "Terminal" -> Ok AuthenticatedClientFinished
+                    | "NotDispatched" -> Ok NeverDispatched
+                    | "Admitted" | "Dispatched" -> Ok ExecutionUnresolved
+                    | _ -> Error "Execution witness status is invalid."
+                | _ -> Error "Execution witness was not found for authenticated request."
+            with ex -> Error $"Cannot read exact execution witness: {ex.Message}"
 
     // The transport server must verify the authenticated sender's active
     // device registration before passing its connection/generation here.

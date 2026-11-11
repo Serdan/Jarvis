@@ -325,6 +325,155 @@ let ``telemetry pruning cannot remove unresolved execution witnesses`` () =
         |> shouldEqual true)
 
 [<Test>]
+let ``correction permit lifecycle requires durable terminal or proven non dispatch`` () =
+    withStore (fun store ->
+        approveTestEpoch store
+        let user, actor, target = "alice", "Reviewer 1", "Worker 3"
+        let initial = beginWitness store user actor
+        store.GetAgentExecutionResolution(user, initial.Id)
+        |> shouldEqual (Ok ExecutionUnresolved)
+        store.GetAgentExecutionResolution("bob", initial.Id).IsError
+        |> shouldEqual true
+        store.TryMarkAgentNotDispatched(user, initial.Id)
+        |> shouldEqual (Ok ())
+        store.GetAgentExecutionResolution(user, initial.Id)
+        |> shouldEqual (Ok NeverDispatched)
+        let permit =
+            match store.TryAcquireAgentCorrection(user, target, "operator-correction-1") with
+            | Ok value -> value
+            | Error error -> failwith error
+        store.TryBeginAgentOperation(
+            user, target, "AgentInbox", Some "Jarvis",
+            "server", None, None).IsError
+        |> shouldEqual true
+        store.TryReleaseAgentCorrection(user, target, permit, false).IsError
+        |> shouldEqual true
+        store.TryReleaseAgentCorrection(user, target, permit, true)
+        |> shouldEqual (Ok ())
+        let owned = beginWitness store user target
+        store.GetAgentExecutionResolution(user, owned.Id)
+        |> shouldEqual (Ok ExecutionUnresolved)
+        store.TryAcquireAgentCorrection(user, target, "operator-correction-2").IsError
+        |> shouldEqual true
+        store.TryMarkAgentDispatched(user, owned.Id, "device", "conn",
+                                      2L, "correlation")
+        |> shouldEqual (Ok ())
+        store.GetAgentExecutionResolution(user, owned.Id)
+        |> shouldEqual (Ok ExecutionUnresolved)
+        store.CompleteOperation(owned.Id, false, Some "Timeout", 600000L)
+        store.GetAgentExecutionResolution(user, owned.Id)
+        |> shouldEqual (Ok ExecutionUnresolved)
+        store.TryRecordAgentClientTerminal(user, "conn", 2L, "correlation")
+        |> shouldEqual (Ok(Some owned.Id))
+        store.GetAgentExecutionResolution(user, owned.Id)
+        |> shouldEqual (Ok AuthenticatedClientFinished)
+        let corrected =
+            match store.TryAcquireAgentCorrection(user, target, "operator-correction-2") with
+            | Ok value -> value
+            | Error error -> failwith error
+        store.TryReleaseAgentCorrection(user, target, corrected, true)
+        |> shouldEqual (Ok ())
+        store.GetAgentExecutionResolution(user, "missing-id").IsError
+        |> shouldEqual true)
+
+[<TestFixture>]
+type CorrectionAdmissionConcurrentTests() =
+    [<Test>]
+    member _.TwoDevicesCannotEnterTargetDuringAdministrativePermit() =
+        withStore (fun store ->
+            approveTestEpoch store
+            let user, agent = "alice", "Worker 3"
+            let permit =
+                store.TryAcquireAgentCorrection(user, agent, "operator-id")
+                |> function Ok id -> id | Error error -> failwith error
+            let attempts =
+                [| for device in 1 .. 8 ->
+                    Task.Run(fun () ->
+                        store.TryBeginAgentOperation(
+                            user, agent, "ReadFiles", Some(sprintf "Device-%d" device),
+                            "server", None, None)) |]
+            Task.WaitAll(attempts |> Array.map (fun t -> t :> Task))
+            Assert.That(attempts |> Array.forall (fun t -> t.Result.IsError), Is.True)
+            use restarted = new FeedbackStore(store.DatabasePath)
+            Assert.That(
+                restarted.TryBeginAgentOperation(user, agent, "ReadFiles", None, "server", None, None).IsError,
+                Is.True, "A restart must not erase the correction gate.")
+            restarted.TryReleaseAgentCorrection(user, agent, permit, true)
+            |> shouldEqual (Ok ())
+            Assert.That(store.TryBeginAgentOperation(user, agent, "ReadFiles", None, "server", None, None).IsOk,
+                        Is.True))
+
+[<Test>]
+let ``authenticated MCP correction releases exclusive permit after proven no route`` () =
+    withStore (fun store ->
+        approveTestEpoch store
+        let userId = "alice"
+        let services =
+            Microsoft.Extensions.DependencyInjection.ServiceCollection()
+            :> Microsoft.Extensions.DependencyInjection.IServiceCollection
+        Microsoft.Extensions.DependencyInjection.ServiceCollectionServiceExtensions.AddSingleton<FeedbackStore>(
+            services, store) |> ignore
+        let users = new UserService()
+        Microsoft.Extensions.DependencyInjection.ServiceCollectionServiceExtensions.AddSingleton<UserService>(
+            services, users) |> ignore
+        use provider =
+            Microsoft.Extensions.DependencyInjection.ServiceCollectionContainerBuilderExtensions.BuildServiceProvider(services)
+        let context = DefaultHttpContext()
+        context.User <-
+            ClaimsPrincipal(
+                ClaimsIdentity(
+                    [ Claim("sub", userId)
+                      Claim("scope", Auth.WorkspaceRead + " " + Auth.GitWrite) ],
+                    "test"))
+        context.RequestServices <- provider
+        let http = HttpContextAccessor()
+        http.HttpContext <- context
+        let client =
+            new ClientService(Unchecked.defaultof<_>, users, new ClientResponseTracker(), http, store)
+        let result =
+            JarvisMcpTools.CorrectAgentWorkingState(
+                "Jarvis", "Admin 1", "Worker 3", "task-1", "attempt-1",
+                1, 1, 1, 1, "Operator proved prior session idle",
+                "operator-correction-no-device", "", client, http)
+            |> Async.AwaitTask
+            |> Async.RunSynchronously
+        Assert.That(result.IsError, Is.EqualTo(Nullable true))
+        // No route existed. The initiating Admin witness is provably
+        // NotDispatched and the target's exclusive permit was released.
+        let permit =
+            store.TryAcquireAgentCorrection(userId, "Worker 3", "operator-2")
+        Assert.That(permit.IsOk, Is.True,
+                    sprintf "No-device request leaked exclusive correction permit: %A" permit)
+        Assert.That(store.CountUnresolvedAgentExecutions(userId, "Admin 1"), Is.Zero)
+        match permit with
+        | Ok id ->
+            store.TryReleaseAgentCorrection(userId, "Worker 3", id, true)
+            |> shouldEqual (Ok ())
+        | Error _ -> ()
+        let activeOwner = beginWitness store userId "Worker 3"
+        let blocked =
+            JarvisMcpTools.CorrectAgentWorkingState(
+                "Jarvis", "Admin 1", "Worker 3", "task-1", "attempt-1",
+                1, 1, 1, 1, "Operator correction must not race owner activity",
+                "operator-correction-busy", "", client, http)
+            |> Async.AwaitTask |> Async.RunSynchronously
+        Assert.That(blocked.IsError, Is.EqualTo(Nullable true))
+        Assert.That(store.CountUnresolvedAgentExecutions(userId, "Worker 3"), Is.EqualTo(1),
+                    "The owner's admitted request must veto correction independently of device routing.")
+        Assert.That(store.CountUnresolvedAgentExecutions(userId, "Admin 1"), Is.Zero,
+                    "A correction refused before dispatch must not leak its initiating witness.")
+        store.TryMarkAgentNotDispatched(userId, activeOwner.Id) |> shouldEqual (Ok ())
+        let resumed =
+            store.TryAcquireAgentCorrection(userId, "Worker 3", "operator-after-idle")
+        Assert.That(resumed.IsOk, Is.True,
+                    sprintf "Denied correction left an unexpected exclusive permit: %A" resumed)
+        match resumed with
+        | Ok id ->
+            store.TryReleaseAgentCorrection(userId, "Worker 3", id, true)
+            |> shouldEqual (Ok ())
+        | Error _ -> ())
+
+[<Test>]
 let ``concurrent SQLite correction and admission cannot both pass`` () =
     withStore (fun store ->
         approveTestEpoch store

@@ -118,3 +118,32 @@ reconcile operations dispatched before migration, and require each connected
 device/job to prove termination. An old client reconnecting must never
 silently make `Ready` authoritative. Do not introduce a public "force ready"
 shortcut. This branch is not integration-ready.
+
+## Exclusive administrative correction gate (latest checkpoint)
+
+`McpToolHelpers.send` acquires a persisted, target-agent-specific
+`TryAcquireAgentCorrection` permit **before** forwarding
+`CorrectAgentWorkingState`. This serializes with the same SQLite writer
+transaction used by agent activity admission, across project selectors
+and devices. The target is the command's `OwnerId`, not its initiating
+operator.
+
+A typed `AgentExecutionResolution` query distinguishes never-dispatched,
+authenticated client-terminal and unresolved activity. The exclusive permit
+is released only when the initiating request is proven never dispatched, or
+when its exact client-terminal witness was persisted **and** its canonical
+Git result was successful. Timeout, SQLite failure, dropped response and
+uncertain Git outcomes conservatively retain the permit. Failure to release
+does not mask the original command's result.
+
+Tests cover authenticated MCP correction with no available device,
+correction refused while a target owner has active work, persistent
+exclusion through restart, eight concurrent second-device attempts,
+and all three typed witness-resolution states. **Full Release Server:
+143/143 passed.**
+
+Remaining before independent acceptance: real authenticated legacy-client
+and detached-child-job drain/recovery; cross-project notification's
+preliminary sender-check and destination write need separately correlated
+child witnesses; full SignalR and ambiguous Git-result race tests. The old
+canonical Git reservation path remains in place. No merge/deploy.

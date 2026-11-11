@@ -711,6 +711,25 @@ module McpToolHelpers =
                         match admission with
                         | Ok (record, request) -> record, request, None
                         | Error failure -> None, None, Some failure
+                    // The same durable SQLite writer-transaction domain gates
+                    // initiating commands and administrative correction. The
+                    // permit targets the Working owner, NOT the operator.
+                    // Take it before any client-side Git correction can run.
+                    let correctionPermit, correctionFailure =
+                        match command, admissionFailure with
+                        | TaskWriteCommand correction, None
+                            when correction.Action = "CorrectAgentWorkingState" ->
+                            let store = context.RequestServices.GetService<FeedbackStore>()
+                            if isNull (box store) then
+                                None, Some "Durable correction barrier is unavailable."
+                            else
+                                match store.TryAcquireAgentCorrection(
+                                        userId, correction.OwnerId, correction.OperationId) with
+                                | Ok permitId -> Some(correction.OwnerId, permitId), None
+                                | Error failure -> None, Some failure
+                        | _ -> None, None
+                    let dispatchFailure =
+                        admissionFailure |> Option.orElse correctionFailure
                     let stopwatch = Stopwatch.StartNew()
                     // A tool can commit a Ready->Working transition before
                     // failing its requested operation. Publish typed mutation
@@ -730,7 +749,7 @@ module McpToolHelpers =
                                         logger.LogWarning(ex, "Could not deliver agent-state invalidation hints.")
                         }
                     let! response =
-                        match admissionFailure, command with
+                        match dispatchFailure, command with
                         | Some failure, _ ->
                             Task.FromResult(
                                 { Result = None; Error = Some(ExecutionFailed(
@@ -786,6 +805,36 @@ module McpToolHelpers =
                         let store = context.RequestServices.GetService<FeedbackStore>()
                         if not (isNull (box store)) then
                             store.TryMarkAgentNotDispatched(userId, requestId) |> ignore
+                    | _ -> ()
+                    // A correction permit is a crash-stable exclusion, not a
+                    // timeout lease. Release it only on proven non-dispatch or
+                    // on a durable authenticated client-terminal witness AND
+                    // a confirmed successful canonical Git command result.
+                    // Failed/uncertain Git results require receipt reconciliation
+                    // and deliberately keep the exclusive permit.
+                    match correctionPermit, activityRequestId with
+                    | Some (targetAgent, permitId), Some requestId ->
+                        let store = context.RequestServices.GetService<FeedbackStore>()
+                        if not (isNull (box store)) then
+                            let resolved =
+                                match store.GetAgentExecutionResolution(userId, requestId) with
+                                | Ok NeverDispatched -> true
+                                | Ok AuthenticatedClientFinished
+                                    when response.Result.IsSome && response.Error.IsNone -> true
+                                | _ -> false
+                            if resolved then
+                                match store.TryReleaseAgentCorrection(
+                                        userId, targetAgent, permitId, true) with
+                                | Ok () -> ()
+                                | Error failure ->
+                                    let loggerFactory =
+                                        context.RequestServices.GetService<ILoggerFactory>()
+                                    if not (isNull loggerFactory) then
+                                        loggerFactory.CreateLogger("Jarvis.AgentCorrectionGate")
+                                            .LogWarning(
+                                                "Correction {OperationId} succeeded or was not dispatched, " +
+                                                "but exclusive permit {PermitId} could not be released: {Error}",
+                                                requestId, permitId, failure)
                     | _ -> ()
                     stopwatch.Stop()
                     finishOperation tracking response stopwatch.ElapsedMilliseconds

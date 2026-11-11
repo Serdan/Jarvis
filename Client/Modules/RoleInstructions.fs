@@ -73,10 +73,16 @@ module RoleInstructions =
         not (String.IsNullOrWhiteSpace value)
         && utf8.GetByteCount value <= 120
         && not (value |> Seq.exists Char.IsControl)
+    // A body is serialized once in the ledger and again in inbox/explicit
+    // instruction responses. Bounding the escaped JSON size (not merely UTF-8
+    // source bytes) keeps 16 roles plus one agent override below the 640 KiB
+    // explicit instruction page budget even for control-heavy text.
+    let private maxEscapedBodyBytes = 16 * 1024
     let private validBody allowEmpty (value: string) =
         not (isNull value)
         && (allowEmpty || not (String.IsNullOrWhiteSpace value))
         && utf8.GetByteCount value <= 32768
+        && utf8.GetByteCount(JsonSerializer.Serialize(value, options)) <= maxEscapedBodyBytes
     let private validPurpose (value: string) =
         not (String.IsNullOrWhiteSpace value) && utf8.GetByteCount value <= 4096
     let private validRoles (values: string list) =

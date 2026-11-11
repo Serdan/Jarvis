@@ -63,6 +63,12 @@ type RoleInstructionsTests() =
                 ReviewWorkflow.registerAgent one (Guid.NewGuid()) agent |> success |> ignore
             action one two
         finally
+            for checkout in [ "owner"; "reader" ] do
+                let config =
+                    Client.OrchestrationApi.LedgerBindingConfig.pathForRoot(
+                        Path.Combine(root, checkout))
+                if File.Exists config then File.Delete config
+                if File.Exists(config + ".lock") then File.Delete(config + ".lock")
             Directory.Delete(root, true)
 
     [<Test>]
@@ -207,3 +213,202 @@ type RoleInstructionsTests() =
             match RoleInstructions.getRole two "Reviewer" with
             | Error(LedgerIntegrityError _) -> ()
             | other -> Assert.Fail(sprintf "Tampered role identity must fail: %A" other))
+
+
+    [<Test>]
+    member _.ExplicitInstructionsCombineCheckoutHierarchyAndCanonicalRolesWithoutDuplication() =
+        fixture (fun one _ ->
+            let root = Path.GetDirectoryName(one.RepositoryPath)
+            let workspaceInstructions = Path.Combine(root, "AGENTS.md")
+            File.WriteAllText(workspaceInstructions, "Workspace scope applies.")
+            File.WriteAllText(Path.Combine(one.RepositoryPath, "AGENTS.md"), "Main checkout scope applies.")
+            let roleBody = "Review against the canonical ledger; keep source changes independent."
+            RoleInstructions.createRole one "Lead" (Guid.NewGuid())
+                "Reviewer" "Stable reviewer responsibility" roleBody |> success |> ignore
+            RoleInstructions.attachRole one "Lead" (Guid.NewGuid())
+                "Reviewer 1" "Reviewer" 0 |> success |> ignore
+            RoleInstructions.setAgentInstructions one "Lead" (Guid.NewGuid())
+                "Reviewer 1" 1 "Check serialized boundaries." |> success |> ignore
+
+            let rt = Client.Runtime(root)
+            let trusted = LedgerStore.fetch one |> success
+            match Client.OrchestrationApi.LedgerBindingConfig.bindExisting
+                    "owner" rt one.ProjectId one.LedgerId one.Epoch
+                    one.RemoteName one.ApprovedFetchUrl one.ApprovedPushUrl
+                    trusted.Commit true with
+            | Error error -> Assert.Fail(sprintf "Cannot bind fixture ledger: %A" error)
+            | Ok _ -> ()
+
+            let inspect selector cursor =
+                let target =
+                    Client.ProjectPaths.ProjectTarget.parse selector
+                    |> function
+                        | Ok value -> value
+                        | Error error -> failwithf "Invalid fixture selector: %A" error
+                let command : Common.GetAgentInstructionsCommand =
+                    { ProjectName = selector
+                      AgentId = "Reviewer 1"
+                      Directory = ""
+                      Cursor = cursor }
+                let result =
+                    Client.AgentInstructions.getExplicit target command rt
+                    |> function
+                        | Ok value -> value
+                        | Error error -> failwithf "Cannot resolve layered instructions: %A" error
+                JsonDocument.Parse(result.ToJsonString())
+
+            use main = inspect "owner" None
+            let mainRoot = main.RootElement
+            let mainRepo = mainRoot.GetProperty("AGENTS.md")
+            Assert.That(mainRepo.EnumerateObject() |> Seq.length, Is.EqualTo(2))
+            Assert.That(mainRepo.GetProperty(".").GetString(), Is.EqualTo("Workspace scope applies."))
+            Assert.That(mainRepo.GetProperty("owner").GetString(), Is.EqualTo("Main checkout scope applies."))
+            let roleLayers = mainRoot.GetProperty("instructionLayers")
+            let ids = roleLayers.GetProperty("RoleIds")
+            Assert.That(ids[0].GetString(), Is.EqualTo("Reviewer"))
+            Assert.That(roleLayers.GetProperty("AgentConfigVersion").GetInt32(), Is.EqualTo(2))
+            let docs = roleLayers.GetProperty("Documents")
+            Assert.That(docs.GetArrayLength(), Is.EqualTo(2))
+            Assert.That(docs[0].GetProperty("Scope").GetString(), Is.EqualTo("role"))
+            Assert.That(docs[0].GetProperty("Content").GetString(), Is.EqualTo(roleBody))
+            Assert.That(docs[1].GetProperty("Scope").GetString(), Is.EqualTo("agent"))
+            Assert.That(docs[1].GetProperty("Content").GetString(), Is.EqualTo("Check serialized boundaries."))
+            Assert.That(docs[0].GetProperty("Sha256").GetString(), Does.StartWith("sha256:"))
+
+            // Switch to an actual registered checkout. It contributes its own
+            // path-scoped AGENTS.md while both checkouts share ledger roles.
+            let checkout = Path.Combine(root, "roles-checkout")
+            git one.RepositoryPath [ "worktree"; "add"; "-b"; "test-role-worktree"; checkout ] |> ignore
+            File.WriteAllText(Path.Combine(checkout, "AGENTS.md"), "Worktree scope applies.")
+            use worktree = inspect "owner::roles-checkout" None
+            let worktreeRoot = worktree.RootElement
+            let repository = worktreeRoot.GetProperty("AGENTS.md")
+            Assert.That(repository.EnumerateObject() |> Seq.length, Is.EqualTo(2))
+            Assert.That(repository.GetProperty("owner").GetString(), Is.EqualTo("Worktree scope applies."))
+            Assert.That(repository.GetRawText(), Does.Not.Contain("Main checkout scope applies."))
+            let worktreeDocs =
+                worktreeRoot.GetProperty("instructionLayers").GetProperty("Documents")
+            Assert.That(worktreeDocs[0].GetProperty("Content").GetString(), Is.EqualTo(roleBody))
+
+            // Every explicit page includes full canonical role information,
+            // while each AGENTS.md segment is bounded and continued.
+            File.WriteAllText(workspaceInstructions, String('x', 1100000))
+            use page1 = inspect "owner::roles-checkout" None
+            Assert.That(System.Text.Encoding.UTF8.GetByteCount(page1.RootElement.GetRawText()),
+                        Is.LessThanOrEqualTo(640 * 1024))
+            let nextCursor = page1.RootElement.GetProperty("nextCursor").GetString()
+            Assert.That(nextCursor, Is.Not.Empty)
+            use page2 = inspect "owner::roles-checkout" (Some nextCursor)
+            Assert.That(System.Text.Encoding.UTF8.GetByteCount(page2.RootElement.GetRawText()),
+                        Is.LessThanOrEqualTo(640 * 1024))
+            let firstDocs = page1.RootElement.GetProperty("instructionLayers").GetProperty("Documents")
+            let secondDocs = page2.RootElement.GetProperty("instructionLayers").GetProperty("Documents")
+            Assert.That(
+                secondDocs[0].GetProperty("Sha256").GetString(),
+                Is.EqualTo(firstDocs[0].GetProperty("Sha256").GetString())))
+
+    [<Test>]
+    member _.EscapedBodySizeIsBoundedAndMalformedStoredInstructionsFailClosed() =
+        fixture (fun one two ->
+            let pathological = String(char 1, 3000)
+            match RoleInstructions.createRole one "Lead" (Guid.NewGuid()) "Oversized"
+                    "Escaped control bytes" pathological with
+            | Error(InvalidBinding _) -> ()
+            | other -> Assert.Fail(sprintf "JSON-expanded size must be rejected: %A" other)
+            RoleInstructions.createRole one "Lead" (Guid.NewGuid()) "Reviewer"
+                "Reviewer role" "Canonical review guidance" |> success |> ignore
+            match RoleInstructions.setAgentInstructions one "Lead" (Guid.NewGuid())
+                    "Reviewer 1" 0 pathological with
+            | Error(InvalidBinding _) -> ()
+            | other -> Assert.Fail(sprintf "JSON-expanded agent body must be rejected: %A" other)
+            RoleInstructions.attachRole one "Lead" (Guid.NewGuid())
+                "Reviewer 1" "Reviewer" 0 |> success |> ignore
+            let prior = LedgerStore.fetch one |> success
+            let configPath = "records/agent-instructions/" +
+                             Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes("Reviewer 1"))
+                                .TrimEnd('=').Replace('+', '-').Replace('/', '_') + ".json"
+            let _, oid = LedgerStore.readAt one prior configPath |> success
+            let malicious =
+                """{"schemaVersion":1,"agentId":"Reviewer 1","roleIds":["Nonexistent"],"instructions":"","version":2,"updatedBy":"Lead","updatedSequence":999}"""
+            LedgerStore.transact one
+                { OperationId = Guid.NewGuid(); Actor = "Test"; Kind = "InvalidRoleFixture"
+                  RequestJson = """{"fixture":true}""" }
+                (fun _ ->
+                    Ok [ { Path = configPath; ExpectedBlobOid = oid; Content = malicious } ])
+            |> success |> ignore
+            match RoleInstructions.resolve two "Reviewer 1" with
+            | Error(StaleEntityVersion _) -> ()
+            | other -> Assert.Fail(sprintf "Missing referenced role must fail: %A" other))
+
+
+    [<Test>]
+    member _.SameAgentAndRoleNamesAreIsolatedBetweenProjectLedgers() =
+        fixture (fun first _ ->
+            let root = Path.GetDirectoryName(first.RepositoryPath)
+            RoleInstructions.createRole first "Lead" (Guid.NewGuid()) "Reviewer"
+                "First project review" "Use the first project's requirements." |> success |> ignore
+            RoleInstructions.attachRole first "Lead" (Guid.NewGuid())
+                "Reviewer 1" "Reviewer" 0 |> success |> ignore
+
+            let remote = Path.Combine(root, "second.git")
+            let checkout = Path.Combine(root, "second")
+            git root [ "init"; "--bare"; remote ] |> ignore
+            git root [ "clone"; remote; checkout ] |> ignore
+            git checkout [ "config"; "user.name"; "Role Fixture" ] |> ignore
+            git checkout [ "config"; "user.email"; "fixture@example.test" ] |> ignore
+            File.WriteAllText(Path.Combine(checkout, "source.txt"), "second project")
+            git checkout [ "add"; "source.txt" ] |> ignore
+            git checkout [ "commit"; "-m"; "second project base" ] |> ignore
+            git checkout [ "push"; "-u"; "origin"; "HEAD" ] |> ignore
+            let second : LedgerBinding =
+                { first with RepositoryPath = checkout; ApprovedFetchUrl = remote
+                             ApprovedPushUrl = remote; ProjectId = Guid.NewGuid()
+                             LedgerId = Guid.NewGuid() }
+            LedgerStore.initialize second true |> success |> ignore
+            ReviewWorkflow.registerAgent second (Guid.NewGuid()) "Reviewer 1" |> success |> ignore
+            RoleInstructions.createRole second "Lead" (Guid.NewGuid()) "Reviewer"
+                "Second project review" "Use only the second project's requirements."
+            |> success |> ignore
+            RoleInstructions.attachRole second "Lead" (Guid.NewGuid())
+                "Reviewer 1" "Reviewer" 0 |> success |> ignore
+
+            let firstResolved = RoleInstructions.resolve first "Reviewer 1" |> success
+            let secondResolved = RoleInstructions.resolve second "Reviewer 1" |> success
+            Assert.That(firstResolved.Documents.Length, Is.EqualTo(1))
+            Assert.That(secondResolved.Documents.Length, Is.EqualTo(1))
+            Assert.That(firstResolved.Documents.Head.Content,
+                        Is.EqualTo("Use the first project's requirements."))
+            Assert.That(secondResolved.Documents.Head.Content,
+                        Is.EqualTo("Use only the second project's requirements."))
+            Assert.That(firstResolved.SnapshotCommit, Is.Not.EqualTo(secondResolved.SnapshotCommit))
+            Assert.That(firstResolved.Documents.Head.BlobOid, Is.Not.EqualTo(secondResolved.Documents.Head.BlobOid)))
+
+
+    [<Test>]
+    member _.RoleAttachmentOrderAndIndividualOverrideAreDeterministic() =
+        fixture (fun first _ ->
+            RoleInstructions.createRole first "Lead" (Guid.NewGuid())
+                "Architecture" "Architecture guidance" "Review architectural dependencies."
+            |> success |> ignore
+            RoleInstructions.createRole first "Lead" (Guid.NewGuid())
+                "Reviewer" "Review guidance" "Review test and source evidence."
+            |> success |> ignore
+            RoleInstructions.attachRole first "Lead" (Guid.NewGuid())
+                "Reviewer 1" "Architecture" 0 |> success |> ignore
+            RoleInstructions.attachRole first "Lead" (Guid.NewGuid())
+                "Reviewer 1" "Reviewer" 1 |> success |> ignore
+            RoleInstructions.setAgentInstructions first "Lead" (Guid.NewGuid())
+                "Reviewer 1" 2 "Use careful diff inspection." |> success |> ignore
+            let combined = RoleInstructions.resolve first "Reviewer 1" |> success
+            Assert.That(combined.RoleIds, Is.EqualTo(box [ "Architecture"; "Reviewer" ]))
+            Assert.That(combined.Documents |> List.map (fun layer -> layer.Scope),
+                        Is.EqualTo(box [ "role"; "role"; "agent" ]))
+            Assert.That(combined.Documents[0].Content, Is.EqualTo("Review architectural dependencies."))
+            Assert.That(combined.Documents[1].Content, Is.EqualTo("Review test and source evidence."))
+            Assert.That(combined.Documents[2].Content, Is.EqualTo("Use careful diff inspection."))
+            RoleInstructions.setAgentInstructions first "Lead" (Guid.NewGuid())
+                "Reviewer 1" 3 "" |> success |> ignore
+            let cleared = RoleInstructions.resolve first "Reviewer 1" |> success
+            Assert.That(cleared.AgentConfigVersion, Is.EqualTo(4))
+            Assert.That(cleared.RoleIds, Is.EqualTo(box [ "Architecture"; "Reviewer" ]))
+            Assert.That(cleared.Documents.Length, Is.EqualTo(2)))

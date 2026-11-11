@@ -27,6 +27,60 @@ instruction path. A complete delivery and an omission warning replace one anothe
 an oversized document changing to a complete document and back therefore re-emits
 the omission notice. Explicit `get_agent_instructions` always bypasses the cache.
 
+## Persistent roles and individual agent instructions
+
+Repository `AGENTS.md` is still scoped by filesystem path. Stable responsibilities
+are now separate, canonical **Git-ledger entities**, independent of tasks and
+source branches:
+
+- `records/roles/{roleId}.json` defines one shared role (stable ID, human-readable
+  purpose, Markdown instructions, version, updating actor and ledger sequence).
+- `records/agent-instructions/{base64url(agentId)}.json` defines the agent's
+  ordered role memberships, optional individual Markdown instructions, version
+  and provenance. This record does **not** replace the existing agent lifecycle
+  record and does not require an assignment.
+
+`create_role` and `update_role` create/revise canonical roles; `get_role` and
+`list_roles` read them. `attach_role` and `detach_role` change one registered
+agent's membership; `set_agent_instructions` replaces that agent's individual
+instructions (empty content clears the body but preserves roles). Read with
+`get_agent_instruction_config` or `resolve_agent_instructions`.
+All writes require `git:write`, derive the immutable operation actor from the
+authenticated user, and participate in the same idempotent, optimistic
+multi-record ledger transactions as ordinary orchestration. Role creation
+starts at version 1; updates require the exact current version. An agent with
+no configuration has implicit version **0**, used on its first attach/update.
+Concurrent writes, stale versions, duplicate role attachment, unregistered
+agents and missing role references fail without rewriting historical records.
+
+The effective instruction order is **global (when available), workspace
+`AGENTS.md`, project/directory `AGENTS.md` from root to target, attached
+roles in attachment order, individual agent instructions, and assignment-specific
+instructions**. Earlier layers are authoritative over later layers: a
+lower-priority document can specialize behavior, but cannot negate an earlier
+restriction, a user's instruction, host rules, or Jarvis permissions. Role
+membership never grants permissions or transitions agent activity.
+
+Each **self-agent inbox** includes a distinct `instructionLayers` object alongside
+its existing task, review and notification data. The explicit
+`get_agent_instructions` result still contains only repository documents under
+the path-keyed `AGENTS.md` object; it adds a separate `instructionLayers`
+object for the supplied agent. That object contains the verified ledger snapshot,
+ordered role IDs, agent configuration version, precedence, and each document's
+scope, identifier, source ledger path, role/configuration version, Git blob OID,
+SHA-256 and full instruction content. Repository files are never duplicated
+inside it. New and resumed sessions obtain current role content on their **next
+inbox/instruction read**, including after role edits, checkout switches or
+restarts; no instruction cache is authoritative. Earlier Git snapshots preserve
+the exact prior content, while existing task specs, checkpoints and reviews
+remain untouched.
+
+Role and individual bodies are bounded at 16 KiB of escaped JSON each; agents
+may attach at most 16 distinct roles. This controls worst-case transport size
+without silently truncating instructions. Explicit repository instruction
+pagination continues independently, reserving response capacity for complete
+role/agent layers.
+
 ## MCP initialization guidance
 
 Advertise concise, static instructions through MCP `initialize.result.instructions`. The first 512 characters should convey the core contract:

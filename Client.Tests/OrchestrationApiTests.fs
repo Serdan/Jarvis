@@ -358,3 +358,31 @@ let missingMalformedOrMismatchedBindingIsNotTransientContention () =
         if File.Exists(bindingPath) then File.Delete(bindingPath)
         if File.Exists(bindingPath + ".lock") then File.Delete(bindingPath + ".lock")
         Directory.Delete(root, true)
+
+
+[<Test>]
+let unreadableTrustBindingReportsPermissionDeniedInsteadOfMalformedData () =
+    if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
+        let root, project = GitCommandTests.createTempProject ()
+        let path = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot project
+        try
+            let context = GitCommandTests.TestContext root
+            GitCommandTests.initRepo context
+            Directory.CreateDirectory(Path.GetDirectoryName(path)) |> ignore
+            let binding : Client.OrchestrationApi.LedgerTrustBinding =
+                { SchemaVersion = 1; Enabled = true; ProjectRoot = Path.GetFullPath(project)
+                  ProjectId = Guid.NewGuid().ToString("D")
+                  LedgerId = Guid.NewGuid().ToString("D"); Epoch = 1
+                  RemoteName = "origin"; ApprovedFetchUrl = "local-test"
+                  ApprovedPushUrl = "local-test"; HighestTrustedHead = String.replicate 40 "a" }
+            File.WriteAllText(path, System.Text.Json.JsonSerializer.Serialize(binding))
+            File.SetUnixFileMode(path, UnixFileMode.UserWrite)
+            match Client.OrchestrationApi.LedgerBindingConfig.inspectLocal "Project1" context with
+            | Error(Client.PermissionDenied detail) -> Assert.That(detail, Does.Contain("read"))
+            | other -> Assert.Fail(sprintf "An unreadable trust file is a permission error, not bad trust data: %A" other)
+        finally
+            if File.Exists(path) then
+                File.SetUnixFileMode(path, UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
+                File.Delete(path)
+            if File.Exists(path + ".lock") then File.Delete(path + ".lock")
+            Directory.Delete(root, true)

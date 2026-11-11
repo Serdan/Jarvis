@@ -126,7 +126,10 @@ module LedgerBindingConfig =
                 if isNull (box parsed) then
                     Error(Client.ValidationError "Missing  binding record.")
                 else Ok parsed
-        with ex -> Error(Client.ValidationError $"Cannot read  binding: {ex.Message}")
+        with
+        | :? UnauthorizedAccessException as ex ->
+            Error(Client.PermissionDenied $"Cannot read trust binding: {ex.Message}")
+        | ex -> Error(Client.ValidationError $"Cannot read trust binding: {ex.Message}")
 
     let private writeStored (path: string) (stored: LedgerTrustBinding) overwrite =
         let temp = path + "." + Guid.NewGuid().ToString("N") + ".tmp"
@@ -137,8 +140,11 @@ module LedgerBindingConfig =
                     File.SetUnixFileMode(temp, UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
                 File.Move(temp, path, overwrite)
                 Ok ()
-            with ex ->
-                Error(Client.ValidationError $"Cannot persist  binding: {ex.Message}")
+            with
+            | :? UnauthorizedAccessException as ex ->
+                Error(Client.PermissionDenied $"Cannot persist trust binding: {ex.Message}")
+            | ex ->
+                Error(Client.ValidationError $"Cannot persist trust binding: {ex.Message}")
         finally
             if File.Exists(temp) then File.Delete(temp)
 

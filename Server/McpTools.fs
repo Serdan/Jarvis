@@ -72,6 +72,13 @@ module private TaskCommands =
     // Retain this value in command journaling for existing pending retries.
     let legacyAdministrativePlaceholder = "Orchestrator"
 
+    let read projectName action agentId taskId =
+        TaskReadCommand
+            { ProjectName = projectName; AgentId = agentId; Action = action
+              TaskId = taskId; AssignmentGeneration = 0; CheckpointSequence = 0L
+              Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null
+              RelativePath = null }
+
     let write projectName action operationId taskId actorId =
         { ProjectName = projectName
           Action = action
@@ -264,12 +271,14 @@ module McpToolHelpers =
           InputSchemaJson = None
           OutputSchemaJson = None }
 
-    let private ledgerTaskReadMethods = [ "GetIntegrationSubmissions"; "AgentInbox"; "GetAssignment"; "GetCheckpoint";  "InspectAttemptSource"; "TaskLifecycleHistory"; "GetTaskSpecPage"; "DiffTaskSpec" ]
+    let private ledgerTaskReadMethods = [ "GetIntegrationSubmissions"; "AgentInbox"; "GetAssignment"; "GetCheckpoint";  "InspectAttemptSource"; "TaskLifecycleHistory"; "GetTaskSpecPage"; "DiffTaskSpec";
+                                         "GetRole"; "ListRoles"; "GetAgentInstructionConfig"; "ResolveAgentInstructions" ]
     let private ledgerTaskWriteMethods =
         [ "SubmitIntegration"; "CompleteIntegration"; "NotifyAgent"; "AcknowledgeNotification"; "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "ReissueAssignment"; "CheckpointAttempt"
           "SetAttemptSource"; "YieldAgent"; "CompleteAgentWork"
           "SetAgentState"; "ReissueQueuedAttempt"; "RecoverAgentAssignment"; "AcknowledgeReviewFeedback"
           "DeferAttempt"; "ResumeAttempt"; "AbandonAttempt"; "CancelTask"
+          "CreateRole"; "UpdateRole"; "AttachRole"; "DetachRole"; "SetAgentInstructions"
           "TransferOwner"; "CloseTask"; "ReopenTask"; "ImportTaskSpec"; "ExportTaskSpec" ]
 
     let private ledgerReadMethods =
@@ -1399,6 +1408,47 @@ type JarvisMcpTools =
         let cmd = TaskCommands.write projectName "RegisterAgent" operationId "" agentId
         McpToolHelpers.send client http (TaskWriteCommand cmd)
 
+    [<McpServerTool(Title = "get role", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read a versioned shared role, including content and Git ledger blob provenance.")>]
+    static member GetRole(projectName: string, agentId: string, roleId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http (TaskCommands.read projectName "GetRole" "" roleId)
+
+    [<McpServerTool(Title = "list roles", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("List shared instruction roles defined in this project's canonical ledger.")>]
+    static member ListRoles(projectName: string, agentId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http (TaskCommands.read projectName "ListRoles" "" "")
+
+    [<McpServerTool(Title = "create role", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Create an independent versioned shared agent role with purpose and instructions. Does not assign tasks or grant permissions.")>]
+    static member CreateRole(projectName: string, agentId: string, roleId: string, purpose: string, instructions: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        let cmd = TaskCommands.write projectName "CreateRole" operationId roleId TaskCommands.legacyAdministrativePlaceholder
+        McpToolHelpers.send client http (TaskWriteCommand { cmd with Title = purpose; Html = instructions })
+
+    [<McpServerTool(Title = "update role", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Revise shared role purpose and instructions with an exact version. Edits apply on the next instruction read without changing historical assignments.")>]
+    static member UpdateRole(projectName: string, agentId: string, roleId: string, expectedVersion: int, purpose: string, instructions: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        let cmd = TaskCommands.write projectName "UpdateRole" operationId roleId TaskCommands.legacyAdministrativePlaceholder
+        McpToolHelpers.send client http (TaskWriteCommand { cmd with ExpectedVersion = expectedVersion; Title = purpose; Html = instructions })
+
+    [<McpServerTool(Title = "get agent instruction config", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read a registered agent's versioned role memberships and persistent individual instructions.")>]
+    static member GetAgentInstructionConfig(projectName: string, agentId: string, targetAgentId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http (TaskCommands.read projectName "GetAgentInstructionConfig" targetAgentId "")
+
+    [<McpServerTool(Title = "resolve agent instructions", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read all current role and per-agent instruction layers at one verified Git ledger head, with scope, version, hashes and deterministic precedence.")>]
+    static member ResolveAgentInstructions(projectName: string, agentId: string, targetAgentId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http (TaskCommands.read projectName "ResolveAgentInstructions" targetAgentId "")
+
+    [<McpServerTool(Title = "attach role", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Attach an existing shared role to a registered agent using the current agent-instruction version (zero when absent). No permission or activity effect.")>]
+    static member AttachRole(projectName: string, agentId: string, targetAgentId: string, roleId: string, expectedVersion: int, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        let cmd = TaskCommands.write projectName "AttachRole" operationId roleId TaskCommands.legacyAdministrativePlaceholder
+        McpToolHelpers.send client http (TaskWriteCommand { cmd with OwnerId = targetAgentId; ExpectedVersion = expectedVersion })
+
+    [<McpServerTool(Title = "detach role", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Detach role membership with optimistic versioning; the shared role remains in the ledger for other agents.")>]
+    static member DetachRole(projectName: string, agentId: string, targetAgentId: string, roleId: string, expectedVersion: int, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        let cmd = TaskCommands.write projectName "DetachRole" operationId roleId TaskCommands.legacyAdministrativePlaceholder
+        McpToolHelpers.send client http (TaskWriteCommand { cmd with OwnerId = targetAgentId; ExpectedVersion = expectedVersion })
+
+    [<McpServerTool(Title = "set agent instructions", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Replace an agent's persistent individual instruction body using the exact current config version. Empty body clears the override while retaining memberships.")>]
+    static member SetAgentInstructions(projectName: string, agentId: string, targetAgentId: string, expectedVersion: int, instructions: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        let cmd = TaskCommands.write projectName "SetAgentInstructions" operationId "" TaskCommands.legacyAdministrativePlaceholder
+        McpToolHelpers.send client http (TaskWriteCommand { cmd with OwnerId = targetAgentId; ExpectedVersion = expectedVersion; Html = instructions })
+
     [<McpServerTool(Title = "integration submissions", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read every recorded exact-commit integration submission and the latest submitted boundary for a task, including pending and integrated evidence. Does not merge or infer that a review verdict implies integration.")>]
     static member GetIntegrationSubmissions(projectName: string, agentId: string, taskId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (TaskReadCommand { ProjectName = projectName; AgentId = ""; Action = "GetIntegrationSubmissions"; TaskId = taskId; AssignmentGeneration = 0; CheckpointSequence = 0L; Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null })
@@ -1749,6 +1799,7 @@ type JarvisMcpTools =
         let projectName = McpToolHelpers.projectWithWorktreeName projectName worktreeName
         McpToolHelpers.send client http (GetAgentInstructionsCommand {
             ProjectName = projectName
+            AgentId = agentId
             Directory = directory
             Cursor = McpToolHelpers.optionOfString cursor })
 

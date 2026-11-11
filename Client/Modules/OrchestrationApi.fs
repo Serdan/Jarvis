@@ -2161,6 +2161,18 @@ module TaskApi =
         LedgerBindingConfig.load cmd.ProjectName rt
         |> Result.bind (fun binding ->
             match cmd.Action with
+            | "GetRole" ->
+                RoleInstructions.RoleInstructions.getRole binding cmd.TaskId
+                |> mapError |> Result.map box
+            | "ListRoles" ->
+                RoleInstructions.RoleInstructions.listRoles binding
+                |> mapError |> Result.map box
+            | "GetAgentInstructionConfig" ->
+                RoleInstructions.RoleInstructions.getAgentConfig binding cmd.AgentId
+                |> mapError |> Result.map box
+            | "ResolveAgentInstructions" ->
+                RoleInstructions.RoleInstructions.resolve binding cmd.AgentId
+                |> mapError |> Result.map box
             | "GetSpecPage" ->
                 ReviewWorkflow.ReviewWorkflow.getTaskSpecPage binding cmd.TaskId cmd.Cursor cmd.PageSize
                 |> mapError |> Result.map box
@@ -2269,6 +2281,26 @@ module TaskApi =
                                 withAdministrativeActor (fun actor ->
                                     ReviewWorkflow.ReviewWorkflow.registerAgentAs binding actor operationId cmd.ActorId
                                     |> mapError)
+                            | "CreateRole" ->
+                                withAdministrativeActor (fun actor ->
+                                    RoleInstructions.RoleInstructions.createRole binding actor operationId
+                                        cmd.TaskId cmd.Title cmd.Html |> mapError)
+                            | "UpdateRole" ->
+                                withAdministrativeActor (fun actor ->
+                                    RoleInstructions.RoleInstructions.updateRole binding actor operationId
+                                        cmd.TaskId cmd.ExpectedVersion cmd.Title cmd.Html |> mapError)
+                            | "AttachRole" ->
+                                withAdministrativeActor (fun actor ->
+                                    RoleInstructions.RoleInstructions.attachRole binding actor operationId
+                                        cmd.OwnerId cmd.TaskId cmd.ExpectedVersion |> mapError)
+                            | "DetachRole" ->
+                                withAdministrativeActor (fun actor ->
+                                    RoleInstructions.RoleInstructions.detachRole binding actor operationId
+                                        cmd.OwnerId cmd.TaskId cmd.ExpectedVersion |> mapError)
+                            | "SetAgentInstructions" ->
+                                withAdministrativeActor (fun actor ->
+                                    RoleInstructions.RoleInstructions.setAgentInstructions binding actor operationId
+                                        cmd.OwnerId cmd.ExpectedVersion cmd.Html |> mapError)
                             | "AssignTask" ->
                                 guid "attemptId" cmd.AttemptId
                                 |> Result.bind (fun attemptId ->

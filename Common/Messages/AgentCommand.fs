@@ -287,6 +287,7 @@ type ReadFilesCommand =
 /// without imposing a file-length or hierarchy-depth limit.
 type GetAgentInstructionsCommand =
     { ProjectName: string
+      AgentId: string
       Directory: string
       Cursor: string option }
 

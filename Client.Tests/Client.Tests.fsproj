@@ -33,6 +33,7 @@
         <Compile Include="ProjectCreationTests.fs"/>
         <Compile Include="WorktreeTests.fs"/>
         <Compile Include="LedgerStoreTests.fs"/>
+        <Compile Include="RoleInstructionsTests.fs"/>
         <Compile Include="ReviewWorkflowTests.fs"/>
         <Compile Include="WorkingTurnGuidanceTests.fs"/>
         <Compile Include="OrchestrationApiTests.fs"/>

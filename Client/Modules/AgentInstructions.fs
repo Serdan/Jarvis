@@ -409,7 +409,7 @@ let private explicitPage (documents: (string * string) list) (segment: (Explicit
 let private explicitPageSize (page: JsonObject) =
     page.ToJsonString() |> Encoding.UTF8.GetByteCount
 
-let getExplicit (target: ProjectPaths.ProjectTarget) (command: GetAgentInstructionsCommand) (rt: Runtime) =
+let private getExplicitRepository (target: ProjectPaths.ProjectTarget) (command: GetAgentInstructionsCommand) (rt: Runtime) pageBudget =
     ProjectPaths.resolveProjectContextForTarget target rt
     |> Result.bind (fun project ->
         explicitSources rt project (if isNull command.Directory then "" else command.Directory)
@@ -447,7 +447,7 @@ let getExplicit (target: ProjectPaths.ProjectTarget) (command: GetAgentInstructi
                         Ok(explicitPage documents None None)
                     else
                         let source = items[index]
-                        readExplicitSegment source offset explicitPageBytes
+                        readExplicitSegment source offset pageBudget
                         |> Result.bind (fun text ->
                             let endOffset = offset + int64 (utf8.GetByteCount text)
                             let complete = endOffset = source.Bytes
@@ -458,7 +458,7 @@ let getExplicit (target: ProjectPaths.ProjectTarget) (command: GetAgentInstructi
                                 if offset > 0L || not complete then Some(source, offset, endOffset)
                                 else None
                             let page = explicitPage candidate chunk (cursorAt nextIndex nextOffset)
-                            if complete && explicitPageSize page <= explicitPageBytes then
+                            if complete && explicitPageSize page <= pageBudget then
                                 if offset > 0L then
                                     // Final continuation piece still needs its
                                     // byte-offset metadata; do not discard it
@@ -489,10 +489,49 @@ let getExplicit (target: ProjectPaths.ProjectTarget) (command: GetAgentInstructi
                                             else None
                                         let fitted =
                                             explicitPage [source.Key, prefix] part (cursorAt nextIndex nextOffset)
-                                        if explicitPageSize fitted <= explicitPageBytes then Ok fitted
+                                        if explicitPageSize fitted <= pageBudget then Ok fitted
                                         else fit (chars / 2)
                                 fit text.Length)
                 assemble start offset [])))
+
+// Durable role and agent layers are read from the verified project ledger,
+// never from the source checkout or a cached instruction delivery response.
+// Their next-read refresh boundary is independent of repository paging.
+let getExplicit (target: ProjectPaths.ProjectTarget) (command: GetAgentInstructionsCommand) (rt: Runtime) =
+    ProjectPaths.resolveProjectContextForTarget target rt
+    |> Result.bind (fun project ->
+        let projectName =
+            ProjectPaths.ProjectTarget.projectName (ProjectPaths.ResolvedProject.target project)
+        ProjectPaths.resolveProjectRoot projectName rt
+        |> Result.bind (fun (FolderPath root) ->
+            let ledgerConfigured =
+                File.Exists(OrchestrationApi.LedgerBindingConfig.pathForRoot root)
+            let layers =
+                if String.IsNullOrWhiteSpace command.AgentId || not ledgerConfigured then Ok None
+                else
+                    OrchestrationApi.LedgerBindingConfig.loadWithSnapshot projectName rt
+                    |> Result.bind (fun (binding, snapshot) ->
+                        RoleInstructions.RoleInstructions.resolveAt binding snapshot command.AgentId
+                        |> Result.mapError OrchestrationApi.LedgerErrors.toEffect
+                        |> Result.map Some)
+            layers
+            |> Result.bind (fun layers ->
+                let layerNode =
+                    layers |> Option.map (fun resolved ->
+                        JsonSerializer.SerializeToNode(resolved))
+                // A role body may be large. Reserve its encoded size before
+                // slicing AGENTS.md to keep the entire MCP reply bounded.
+                let layerBytes =
+                    layerNode
+                    |> Option.map (fun node -> Encoding.UTF8.GetByteCount(node.ToJsonString()))
+                    |> Option.defaultValue 0
+                let pageBudget = max 1024 (explicitPageBytes - layerBytes - 1024)
+                getExplicitRepository target command rt pageBudget
+                |> Result.map (fun page ->
+                    match layerNode with
+                    | Some node -> page["instructionLayers"] <- node
+                    | None -> ()
+                    page))))
 
 // This snapshot must travel from instruction selection to authorization and
 // execution: a mutable .jarvis.json must not be parsed twice for one call.

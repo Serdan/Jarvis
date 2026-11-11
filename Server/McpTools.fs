@@ -701,9 +701,17 @@ module McpToolHelpers =
                                             RequestDeviceRouting.deviceOverride()) with
                                         | ValueSome session -> Some session.ClientVersion, Some session.ProtocolVersion
                                         | ValueNone -> None, None
+                                let witnessProject =
+                                    match command with
+                                    | TaskWriteCommand notification when
+                                          notification.Action = "NotifyAgent"
+                                          && not (String.IsNullOrWhiteSpace notification.SourceRef)
+                                          && notification.SourceRef <> notification.ProjectName ->
+                                        Some notification.SourceRef
+                                    | _ -> AgentCommandInfo.projectName command
                                 match store.TryBeginAgentOperation(
                                           userId, agent, toolName command,
-                                          AgentCommandInfo.projectName command,
+                                          witnessProject,
                                           serverVersion, clientVersion, protocolVersion) with
                                 | Ok started -> Ok(Some(store, started), Some started.Id)
                                 | Error failure -> Error failure
@@ -748,19 +756,22 @@ module McpToolHelpers =
                                         let logger = factory.CreateLogger("Jarvis.AgentStateInvalidation")
                                         logger.LogWarning(ex, "Could not deliver agent-state invalidation hints.")
                         }
-                    let! response =
+                    let! response, continuationId =
                         match dispatchFailure, command with
                         | Some failure, _ ->
                             Task.FromResult(
                                 { Result = None; Error = Some(ExecutionFailed(
                                       $"Durable MCP activity admission refused: {failure}"))
-                                  Instructions = []; AgentStateChanges = []; InboxActivation = None })
+                                  Instructions = []; AgentStateChanges = []; InboxActivation = None }, None)
                         | None, TaskWriteCommand notification when notification.Action = "NotifyAgent"
                             && not (String.IsNullOrWhiteSpace notification.SourceRef)
                             && notification.SourceRef <> notification.ProjectName ->
                             task {
-                                // Validate sender in its source project's verified ledger.
-                                // The destination project alone owns the notification.
+                                // The source inbox is a genuine agent activity:
+                                // route the original witness to its exact
+                                // device/correlation. A destination write is
+                                // independently witnessed only after this
+                                // source activity has a persisted terminal.
                                 let! sender = client.SendCommandToProject(
                                     userId, notification.SourceRef,
                                     TaskReadCommand
@@ -771,41 +782,59 @@ module McpToolHelpers =
                                           AfterOid = null; RelativePath = null },
                                     ?conversationId = RequestDeviceRouting.session(),
                                     ?deviceId = RequestDeviceRouting.deviceOverride(),
-                                                     ?agentId = RequestDeviceRouting.agentId())
+                                    ?agentId = sourceAgent,
+                                    ?activityRequestId = activityRequestId)
                                 do! publishChanges sender
-                                match sender.Result, sender.Error with
-                                | Some _, None ->
-                                    let! destination = client.SendCommandToProject(
-                                        userId, notification.ProjectName, command,
-                                        ?conversationId = RequestDeviceRouting.session(),
-                                        ?deviceId = RequestDeviceRouting.deviceOverride(),
-                                                     ?agentId = sourceAgent,
-                                                     ?activityRequestId = activityRequestId)
-                                    return mergeStateEffects sender destination
-                                | _ -> return sender
+                                match sender.Result, sender.Error, activityRequestId with
+                                | Some _, None, Some parentId ->
+                                    let store = context.RequestServices.GetService<FeedbackStore>()
+                                    let continuation =
+                                        if isNull (box store) then
+                                            Error "Durable agent execution storage is unavailable."
+                                        else
+                                            store.TryBeginAgentContinuation(
+                                                userId, parentId, notification.ProjectName)
+                                    match continuation with
+                                    | Ok childId ->
+                                        let! destination = client.SendCommandToProject(
+                                            userId, notification.ProjectName, command,
+                                            ?conversationId = RequestDeviceRouting.session(),
+                                            ?deviceId = RequestDeviceRouting.deviceOverride(),
+                                            ?agentId = sourceAgent,
+                                            ?activityRequestId = Some childId)
+                                        return mergeStateEffects sender destination, Some childId
+                                    | Error failure ->
+                                        let denied =
+                                            { Result = None
+                                              Error = Some(ExecutionFailed(
+                                                  $"Cross-project continuation refused: {failure}"))
+                                              Instructions = []
+                                              AgentStateChanges = []
+                                              InboxActivation = None }
+                                        return mergeStateEffects sender denied, None
+                                | _ -> return sender, None
                             }
                         | None, _ ->
-                            client.SendCommandToUser(userId, command,
-                                                     ?conversationId = RequestDeviceRouting.session(),
-                                                     ?deviceId = RequestDeviceRouting.deviceOverride(),
-                                                     ?agentId = sourceAgent,
-                                                     ?activityRequestId = activityRequestId)
-                    // Only the original SQLite Admitted state proves no
-                    // client dispatch was attempted. Once the route binds a
-                    // correlation, a timeout/cancellation is *indeterminate*.
-                    // Cross-project sender validation can dispatch before the
-                    // final destination route; its pending witness must never
-                    // be cleared merely because destination routing failed.
-                    match activityRequestId, response.Error, command with
-                    | Some requestId, Some _, TaskWriteCommand notification
-                        when notification.Action = "NotifyAgent"
-                             && not (String.IsNullOrWhiteSpace notification.SourceRef)
-                             && notification.SourceRef <> notification.ProjectName -> ()
-                    | Some requestId, Some _, _ ->
+                            task {
+                                let! forwarded = client.SendCommandToUser(
+                                    userId, command,
+                                    ?conversationId = RequestDeviceRouting.session(),
+                                    ?deviceId = RequestDeviceRouting.deviceOverride(),
+                                    ?agentId = sourceAgent,
+                                    ?activityRequestId = activityRequestId)
+                                return forwarded, None
+                            }
+                    // A failed stage can clear only its own *Admitted*
+                    // witness. A bound SignalR route is Dispatched; even a
+                    // timeout or lost response must remain unresolved.
+                    // Infrastructure health probes do not carry an agent ID.
+                    match response.Error with
+                    | Some _ ->
                         let store = context.RequestServices.GetService<FeedbackStore>()
                         if not (isNull (box store)) then
-                            store.TryMarkAgentNotDispatched(userId, requestId) |> ignore
-                    | _ -> ()
+                            for requestId in [ activityRequestId; continuationId ] |> List.choose id do
+                                store.TryMarkAgentNotDispatched(userId, requestId) |> ignore
+                    | None -> ()
                     // A correction permit is a crash-stable exclusion, not a
                     // timeout lease. Release it only on proven non-dispatch or
                     // on a durable authenticated client-terminal witness AND

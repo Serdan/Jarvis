@@ -250,6 +250,7 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
             let sessions = users.ListDevices(userId) |> Array.toList
             let commandName = AgentCommandInfo.protocolName command
             let requireCurrentProtocol =
+                activityRequestId.IsSome ||
                 match command with
                 | TaskWriteCommand write when write.Action = "NotifyAgent"
                       && not (String.IsNullOrWhiteSpace write.SourceRef) -> true
@@ -270,7 +271,7 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                         let! health = this.SendCommandToUser(
                             userId,
                             ProjectNotificationRouting.healthProbe projectName,
-                            ?conversationId = conversationId, deviceId = session.DeviceId, ?agentId = agentId)
+                            ?conversationId = conversationId, deviceId = session.DeviceId)
                         match health.Result, health.Error with
                         | Some _, None ->
                             // Never automatically repeat a write on another client:

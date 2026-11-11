@@ -142,8 +142,35 @@ exclusion through restart, eight concurrent second-device attempts,
 and all three typed witness-resolution states. **Full Release Server:
 143/143 passed.**
 
+## Two-stage cross-project notification execution proof
+
+A cross-project NotifyAgent request now admits its initiating source actor
+and binds that original witness to the exact client/correlation for sender
+AgentInbox validation. An authenticated terminal receipt is mandatory before
+the destination stage. A new SQLite-writer-serialized
+TryBeginAgentContinuation operation atomically creates a linked child witness
+for the destination under the SAME source actor, with a unique parent ID;
+it refuses an unproven terminal, repeated child creation, or a correction
+permit acquired between stages. A persistent parent_request_id field is
+migrated without deleting prior witnesses. Destination routes bind their
+own independent client correlation and terminal receipt; both witnesses
+survive server restart.
+
+Infrastructure project-health probes no longer carry an initiating agent ID
+or activate Ready assignments, and witness-bound source/destination routing
+requires the current protocol. A proven pre-dispatch failure can terminate
+only its own still-Admitted witness. Dispatched timeouts remain unknown;
+untracked or forged receipts cannot advance the continuation.
+
+Added deterministic tests covering source timeout/forged receipt and
+correction in the interstage gap, repeated child admission, restart, and
+authenticated end-to-end MCP notification through a simulated SignalR
+client with two distinct exact receipts and no agent attribution on probes.
+**Full Release Server 146/146 passed.** Previous full Client Release
+557/557 also passed, before this server-only increment.
+
 Remaining before independent acceptance: real authenticated legacy-client
-and detached-child-job drain/recovery; cross-project notification's
-preliminary sender-check and destination write need separately correlated
-child witnesses; full SignalR and ambiguous Git-result race tests. The old
-canonical Git reservation path remains in place. No merge/deploy.
+and detached-child-job drain/recovery, full SignalR disconnect and SQLite
+failure-path integration tests, ambiguous Git result and audited orphan
+permit reconciliation. The old canonical Git reservation path remains
+in place. No merge/deploy.

@@ -325,6 +325,85 @@ let ``telemetry pruning cannot remove unresolved execution witnesses`` () =
         |> shouldEqual true)
 
 [<Test>]
+let ``cross-project notification requires witnessed source completion before separate destination admission`` () =
+    withStore (fun store ->
+        approveTestEpoch store
+        let user, agent = "alice", "Sender"
+        let parent = beginWitness store user agent
+        let beginChild() = store.TryBeginAgentContinuation(user, parent.Id, "Destination")
+        Assert.That(beginChild().IsError, Is.True,
+                    "An admitted source health probe is not source terminal proof.")
+        store.TryMarkAgentDispatched(user, parent.Id, "source-device", "source-conn", 1L, "source-corr")
+        |> shouldEqual (Ok ())
+        Assert.That(beginChild().IsError, Is.True,
+                    "A running source inbox must veto destination dispatch.")
+        store.CompleteOperation(parent.Id, false, Some "Timeout", 700000L)
+        Assert.That(beginChild().IsError, Is.True,
+                    "Server telemetry completion is not a client receipt.")
+        let spoofed =
+            store.TryRecordAgentClientTerminal(user, "other-conn", 1L, "source-corr")
+        spoofed |> shouldEqual (Ok None)
+        Assert.That(beginChild().IsError, Is.True)
+        store.TryRecordAgentClientTerminal(user, "source-conn", 1L, "source-corr")
+        |> shouldEqual (Ok(Some parent.Id))
+        let child =
+            beginChild() |> function Ok id -> id | Error error -> failwith error
+        Assert.That(child, Is.Not.EqualTo(parent.Id))
+        Assert.That(beginChild().IsError, Is.True,
+                    "The same source terminal can have at most one destination write.")
+        store.CountUnresolvedAgentExecutions(user, agent) |> shouldEqual 1
+        Assert.That(
+            store.TryAcquireAgentCorrection(user, agent, "operator-during-destination").IsError,
+            Is.True, "A pending destination child blocks correction even after source terminal.")
+        use restarted = new FeedbackStore(store.DatabasePath)
+        restarted.CountUnresolvedAgentExecutions(user, agent) |> shouldEqual 1
+        restarted.TryMarkAgentDispatched(
+            user, child, "destination-device", "destination-conn", 4L, "destination-corr")
+        |> shouldEqual (Ok ())
+        restarted.GetAgentExecutionResolution(user, child)
+        |> shouldEqual (Ok ExecutionUnresolved)
+        restarted.TryRecordAgentClientTerminal(user, "destination-conn", 4L, "destination-corr")
+        |> shouldEqual (Ok(Some child))
+        restarted.GetAgentExecutionResolution(user, child)
+        |> shouldEqual (Ok AuthenticatedClientFinished)
+        restarted.CountUnresolvedAgentExecutions(user, agent) |> shouldEqual 0
+        let permit = restarted.TryAcquireAgentCorrection(user, agent, "operator-after-two-stage")
+        Assert.That(permit.IsOk, Is.True)
+        match permit with
+        | Ok id ->
+            restarted.TryReleaseAgentCorrection(user, agent, id, true)
+            |> shouldEqual (Ok ())
+        | Error _ -> ())
+
+[<Test>]
+let ``correction excludes notification continuation between source and destination`` () =
+    withStore (fun store ->
+        approveTestEpoch store
+        let user, agent = "alice", "Sender"
+        let parent = beginWitness store user agent
+        store.TryMarkAgentDispatched(user, parent.Id, "source", "conn", 1L, "corr")
+        |> shouldEqual (Ok ())
+        store.TryRecordAgentClientTerminal(user, "conn", 1L, "corr")
+        |> shouldEqual (Ok(Some parent.Id))
+        let permit =
+            store.TryAcquireAgentCorrection(user, agent, "operator-between-steps")
+            |> function Ok id -> id | Error error -> failwith error
+        store.TryBeginAgentContinuation(user, parent.Id, "Destination").IsError
+        |> shouldEqual true
+        use restarted = new FeedbackStore(store.DatabasePath)
+        restarted.TryBeginAgentContinuation(user, parent.Id, "Destination").IsError
+        |> shouldEqual true
+        restarted.TryReleaseAgentCorrection(user, agent, permit, false).IsError
+        |> shouldEqual true
+        restarted.TryReleaseAgentCorrection(user, agent, permit, true)
+        |> shouldEqual (Ok ())
+        let child =
+            restarted.TryBeginAgentContinuation(user, parent.Id, "Destination")
+            |> function Ok id -> id | Error error -> failwith error
+        restarted.TryMarkAgentNotDispatched(user, child) |> shouldEqual (Ok ())
+        restarted.CountUnresolvedAgentExecutions(user, agent) |> shouldEqual 0)
+
+[<Test>]
 let ``correction permit lifecycle requires durable terminal or proven non dispatch`` () =
     withStore (fun store ->
         approveTestEpoch store
@@ -402,6 +481,117 @@ type CorrectionAdmissionConcurrentTests() =
             |> shouldEqual (Ok ())
             Assert.That(store.TryBeginAgentOperation(user, agent, "ReadFiles", None, "server", None, None).IsOk,
                         Is.True))
+
+[<Test>]
+let ``authenticated cross-project MCP notification independently witnesses sender and destination`` () =
+    withStore (fun store ->
+        approveTestEpoch store
+        let userId = "alice"
+        let users = new UserService()
+        let connectionId = "cross-project-conn"
+        users.TransportConnected(userId, connectionId)
+        let registered =
+            users.Register(
+                userId,
+                { DeviceId = "client-1"
+                  DeviceName = "Test workstation"
+                  ProtocolVersion = Common.AgentProtocol.version
+                  ClientVersion = "test"
+                  SupportedCommands = [ "LedgerRead"; "TaskRead"; "TaskWrite" ] },
+                connectionId)
+        let tracker = new ClientResponseTracker()
+        let observedActors = ResizeArray<string>()
+        let recipient =
+            { new Common.SignalR.IClientService with
+                member _.ReceiveMessage(_) = Task.CompletedTask
+                member _.InvalidateAgentStates(_, _) = Task.CompletedTask
+                member _.ReceiveCommand(correlationId, _, invokingAgentId) =
+                    observedActors.Add(invokingAgentId)
+                    let witness =
+                        store.TryRecordAgentClientTerminal(
+                            userId, connectionId, registered.Generation, correlationId)
+                    Assert.That(witness.IsOk, Is.True, sprintf "Client witness persistence failed: %A" witness)
+                    let response: Common.AgentCommandResponse =
+                        { Result = Some "{}"
+                          Error = None
+                          Instructions = []
+                          AgentStateChanges = []
+                          InboxActivation = None }
+                    Assert.That(
+                        tracker.Complete(
+                            correlationId, userId, connectionId, registered.Generation, response),
+                        Is.True)
+                    Task.CompletedTask }
+        let clients =
+            { new Microsoft.AspNetCore.SignalR.IHubClients<Common.SignalR.IClientService> with
+                member _.All = recipient
+                member _.AllExcept(_) = recipient
+                member _.Client(_) = recipient
+                member _.Clients(_) = recipient
+                member _.Group(_) = recipient
+                member _.GroupExcept(_, _) = recipient
+                member _.Groups(_) = recipient
+                member _.User(_) = recipient
+                member _.Users(_) = recipient }
+        let hub =
+            { new Microsoft.AspNetCore.SignalR.IHubContext<HubService, Common.SignalR.IClientService> with
+                member _.Clients = clients
+                member _.Groups = Unchecked.defaultof<_> }
+        let services =
+            Microsoft.Extensions.DependencyInjection.ServiceCollection()
+            :> Microsoft.Extensions.DependencyInjection.IServiceCollection
+        Microsoft.Extensions.DependencyInjection.ServiceCollectionServiceExtensions.AddSingleton<FeedbackStore>(
+            services, store) |> ignore
+        Microsoft.Extensions.DependencyInjection.ServiceCollectionServiceExtensions.AddSingleton<UserService>(
+            services, users) |> ignore
+        use provider =
+            Microsoft.Extensions.DependencyInjection.ServiceCollectionContainerBuilderExtensions.BuildServiceProvider(services)
+        let context = DefaultHttpContext()
+        context.User <-
+            ClaimsPrincipal(
+                ClaimsIdentity(
+                    [ Claim("sub", userId)
+                      Claim("scope", Auth.WorkspaceRead + " " + Auth.GitWrite) ], "test"))
+        context.RequestServices <- provider
+        let http = HttpContextAccessor()
+        http.HttpContext <- context
+        let service = new ClientService(hub, users, tracker, http, store)
+        let result =
+            JarvisMcpTools.NotifyAgent(
+                "Source", "Sender", "Recipient", "Please inspect the destination",
+                "notification-two-stage", "", "", "Destination", service, http)
+            |> Async.AwaitTask
+            |> Async.RunSynchronously
+        Assert.That(result.IsError, Is.EqualTo(Nullable false))
+        observedActors |> Seq.toList
+        |> shouldEqual [ ""; "Sender"; ""; "Sender" ]
+        store.CountUnresolvedAgentExecutions(userId, "Sender") |> shouldEqual 0
+        store.CountUnresolvedAgentExecutions(userId, "Recipient") |> shouldEqual 0
+        use database = new SqliteConnection($"Data Source={store.DatabasePath}")
+        database.Open()
+        use query = database.CreateCommand()
+        query.CommandText <-
+            """SELECT request_id, parent_request_id, project_name, state
+               FROM agent_execution_witness WHERE user_id = $user;"""
+        query.Parameters.AddWithValue("$user", userId) |> ignore
+        use reader = query.ExecuteReader()
+        let mutable rows = []
+        while reader.Read() do
+            rows <-
+                (reader.GetString 0,
+                 (if reader.IsDBNull 1 then None else Some(reader.GetString 1)),
+                 reader.GetString 2,
+                 reader.GetString 3) :: rows
+        Assert.That(rows.Length, Is.EqualTo(2))
+        let root = rows |> List.find (fun (_, parent, _, _) -> parent.IsNone)
+        let child = rows |> List.find (fun (_, parent, _, _) -> parent.IsSome)
+        let rootId, _, rootProject, rootState = root
+        let _, childParent, childProject, childState = child
+        Assert.That(rootProject, Is.EqualTo("Source"))
+        Assert.That(childProject, Is.EqualTo("Destination"))
+        Assert.That(childParent, Is.EqualTo(Some rootId))
+        Assert.That(rootState, Is.EqualTo("Terminal"))
+        Assert.That(childState, Is.EqualTo("Terminal")))
 
 [<Test>]
 let ``authenticated MCP correction releases exclusive permit after proven no route`` () =

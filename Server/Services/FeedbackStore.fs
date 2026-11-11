@@ -236,7 +236,8 @@ CREATE TABLE IF NOT EXISTS agent_execution_witness (
     connection_id TEXT NULL,
     device_generation INTEGER NULL,
     correlation_id TEXT UNIQUE NULL,
-    terminal_at TEXT NULL
+    terminal_at TEXT NULL,
+    parent_request_id TEXT NULL
 );
 CREATE INDEX IF NOT EXISTS ix_agent_execution_witness_pending
     ON agent_execution_witness(user_id, agent_id, state);
@@ -267,6 +268,30 @@ INSERT OR IGNORE INTO agent_execution_epoch
     (epoch_id, state) VALUES (1, 'AwaitingLegacyDrain');
 """
         schema.ExecuteNonQuery() |> ignore
+
+        // Retain compatibility with persisted pre-continuation witness data
+        // without reinitializing the audit epoch or discarding unknown rows.
+        use witnessColumns = connection.CreateCommand()
+        witnessColumns.CommandText <- "PRAGMA table_info(agent_execution_witness);"
+        use witnessReader = witnessColumns.ExecuteReader()
+        let hasParentRequestColumn =
+            let mutable found = false
+            while witnessReader.Read() do
+                if witnessReader.GetString(1) = "parent_request_id" then
+                    found <- true
+            found
+        witnessReader.Close()
+        if not hasParentRequestColumn then
+            use witnessMigration = connection.CreateCommand()
+            witnessMigration.CommandText <-
+                "ALTER TABLE agent_execution_witness ADD COLUMN parent_request_id TEXT NULL;"
+            witnessMigration.ExecuteNonQuery() |> ignore
+        use childIndex = connection.CreateCommand()
+        childIndex.CommandText <-
+            """CREATE UNIQUE INDEX IF NOT EXISTS ix_agent_execution_child_parent
+               ON agent_execution_witness(parent_request_id)
+               WHERE parent_request_id IS NOT NULL;"""
+        childIndex.ExecuteNonQuery() |> ignore
 
         use inspect = connection.CreateCommand()
         inspect.CommandText <- "PRAGMA table_info(feedback);"
@@ -596,6 +621,84 @@ INSERT INTO operations (
                     Ok { Id = requestId; StartedAt = startedAt }
             with ex ->
                 Error $"Cannot record durable agent admission: {ex.Message}"
+
+    // For a two-stage cross-project notification, the source AgentInbox
+    // validation is a genuine agent operation. Its exact client-terminal
+    // receipt must be persisted *before* a separate destination dispatch.
+    // Create one child witness without duplicating parent MCP telemetry.
+    // The same writer transaction excludes a concurrent correction of the
+    // source agent between the two independently correlated dispatches.
+    member _.TryBeginAgentContinuation(
+        userId: string, parentRequestId: string, destinationProject: string
+    ) : Result<string, string> =
+        if String.IsNullOrWhiteSpace userId
+           || String.IsNullOrWhiteSpace parentRequestId
+           || String.IsNullOrWhiteSpace destinationProject then
+            Error "An authenticated terminal parent and destination are required."
+        else
+            try
+                use connection = openConnection()
+                use transaction = connection.BeginTransaction()
+                use parent = connection.CreateCommand()
+                parent.Transaction <- transaction
+                parent.CommandText <-
+                    """SELECT agent_id, state, parent_request_id
+                       FROM agent_execution_witness
+                       WHERE user_id = $userId AND request_id = $parent LIMIT 1;"""
+                addParameter parent "$userId" userId
+                addParameter parent "$parent" parentRequestId
+                use parentReader = parent.ExecuteReader()
+                let root =
+                    if parentReader.Read() then
+                        Some(
+                            parentReader.GetString 0,
+                            parentReader.GetString 1,
+                            parentReader.IsDBNull 2)
+                    else None
+                parentReader.Close()
+                match root with
+                | Some(agent, "Terminal", true) ->
+                    use correction = connection.CreateCommand()
+                    correction.Transaction <- transaction
+                    correction.CommandText <-
+                        """SELECT 1 FROM agent_correction_permit
+                           WHERE user_id = $userId AND agent_id = $agent LIMIT 1;"""
+                    addParameter correction "$userId" userId
+                    addParameter correction "$agent" agent
+                    if not (isNull (correction.ExecuteScalar())) then
+                        Error "Correction permit excludes the source agent's continuation."
+                    else
+                        let childId = Guid.NewGuid().ToString("N")
+                        let now = DateTimeOffset.UtcNow.ToString("O")
+                        use insert = connection.CreateCommand()
+                        insert.Transaction <- transaction
+                        insert.CommandText <-
+                            """INSERT INTO agent_execution_witness (
+                                   request_id, user_id, agent_id, project_name,
+                                   state, created_at, updated_at, parent_request_id
+                               ) VALUES (
+                                   $childId, $userId, $agent, $project,
+                                   'Admitted', $now, $now, $parent
+                               );"""
+                        addParameter insert "$childId" childId
+                        addParameter insert "$userId" userId
+                        addParameter insert "$agent" agent
+                        addParameter insert "$project" destinationProject
+                        addParameter insert "$now" now
+                        addParameter insert "$parent" parentRequestId
+                        insert.ExecuteNonQuery() |> ignore
+                        transaction.Commit()
+                        Ok childId
+                | Some (_, "Admitted", _) | Some (_, "Dispatched", _) ->
+                    Error "Source validation is still running or its terminal receipt is unavailable."
+                | Some (_, "NotDispatched", _) ->
+                    Error "Source validation was not dispatched; continuation is forbidden."
+                | Some (_, "Terminal", false) ->
+                    Error "Cannot create a continuation from an already nested request."
+                | _ ->
+                    Error "Parent client terminal proof was not found."
+            with ex ->
+                Error $"Cannot durably admit cross-project continuation: {ex.Message}"
 
     // Claim the exclusive operator correction barrier in the same SQLite
     // writer-serialization domain as TryBeginAgentOperation. A pending or

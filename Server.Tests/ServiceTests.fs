@@ -310,7 +310,8 @@ let ``client service rejects commands not negotiated by the registered client`` 
         |> ignore
 
         let client = ClientService(Unchecked.defaultof<_>, users, ClientResponseTracker(),
-                                   Microsoft.AspNetCore.Http.HttpContextAccessor())
+                                   Microsoft.AspNetCore.Http.HttpContextAccessor(),
+                                   Microsoft.Extensions.Logging.Abstractions.NullLogger<ClientService>.Instance)
         let command =
             WriteFileCommand
                 { ProjectName = "Jarvis"
@@ -1426,6 +1427,18 @@ let ``project scoped MCP tools standardize explicit agentId arguments`` () =
 [<Test>]
 let client_request_abort_cancels_outstanding_device_correlation_without_faulting_device () =
     task {
+        let measurements = System.Collections.Concurrent.ConcurrentBag<string * float>()
+        use metrics = new System.Diagnostics.Metrics.MeterListener()
+        metrics.InstrumentPublished <-
+            Action<System.Diagnostics.Metrics.Instrument, System.Diagnostics.Metrics.MeterListener>(
+                fun instrument listener ->
+                    if instrument.Meter.Name = "Jarvis.Server.Dispatch" then
+                        listener.EnableMeasurementEvents(instrument))
+        metrics.SetMeasurementEventCallback<float>(
+            System.Diagnostics.Metrics.MeasurementCallback<float>(
+                fun instrument reading _ _ ->
+                    measurements.Add(instrument.Name, reading)))
+        metrics.Start()
         let users = UserService()
         let user = "auth0|caller"
         let connection = "conn-1"
@@ -1438,13 +1451,21 @@ let client_request_abort_cancels_outstanding_device_correlation_without_faulting
                   ClientVersion = "test"
                   SupportedCommands = [ "ListProjects" ] }, connection)
         let tracker = ClientResponseTracker()
+        let expected =
+            { Result = Some "later-success"
+              Error = None
+              Instructions = []; AgentStateChanges = []; InboxActivation = None }
+        let mutable dispatchCount = 0
         let dispatched =
             TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously)
         let recipient =
             { new Common.SignalR.IClientService with
                 member _.ReceiveMessage(_) = Task.CompletedTask
                 member _.ReceiveCommand(correlationId, _, _) =
-                    dispatched.TrySetResult(correlationId) |> ignore
+                    if System.Threading.Interlocked.Increment(&dispatchCount) = 1 then
+                        dispatched.TrySetResult(correlationId) |> ignore
+                    else
+                        tracker.Complete(correlationId, user, connection, registered.Generation, expected) |> ignore
                     Task.CompletedTask
                 member _.InvalidateAgentStates(_, _) = Task.CompletedTask }
         let clients =
@@ -1467,7 +1488,7 @@ let client_request_abort_cancels_outstanding_device_correlation_without_faulting
         context.RequestAborted <- abort.Token
         let http = Microsoft.AspNetCore.Http.HttpContextAccessor()
         http.HttpContext <- context
-        let service = ClientService(hub, users, tracker, http)
+        let service = ClientService(hub, users, tracker, http, Microsoft.Extensions.Logging.Abstractions.NullLogger<ClientService>.Instance)
         let pending = service.SendCommandToUser(user, ListProjectsCommand)
         let! correlationId = dispatched.Task.WaitAsync(TimeSpan.FromSeconds(4.))
         abort.Cancel()
@@ -1486,4 +1507,21 @@ let client_request_abort_cancels_outstanding_device_correlation_without_faulting
             Assert.That(session.State, Is.EqualTo(Registered))
             Assert.That(session.LastFailure.IsNone, Is.True)
         | ValueNone -> Assert.Fail("Original session should remain registered.")
+        Assert.That(
+            measurements
+            |> Seq.exists (fun (name, value) -> name = "jarvis.server.dispatch.total.ms" && value >= 0.0),
+            Is.True,
+            "An upstream abort must emit stage telemetry without retaining a canceled correlation.")
+        // The next request is routable and the original generation remains
+        // healthy even though the previous caller disconnected.
+        context.RequestAborted <- System.Threading.CancellationToken.None
+        let! recovered = service.SendCommandToUser(user, ListProjectsCommand)
+        Assert.That(recovered, Is.EqualTo(expected))
+        Assert.That(
+            measurements
+            |> Seq.exists (fun (name, value) -> name = "jarvis.server.dispatch.reply_wait.ms" && value > 0.0),
+            Is.True, "The canceled request must attribute waiting time to reply delivery.")
+        Assert.That(
+            measurements |> Seq.filter (fun (name, _) -> name = "jarvis.server.dispatch.total.ms") |> Seq.length,
+            Is.GreaterThanOrEqualTo(2))
     }

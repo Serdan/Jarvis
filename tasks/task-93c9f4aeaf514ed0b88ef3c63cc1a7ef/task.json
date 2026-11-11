@@ -1,1 +1,1 @@
-{"schemaVersion":2,"taskId":"task-93c9f4aeaf514ed0b88ef3c63cc1a7ef","title":"[P2] Recover gracefully from transient trust-binding file contention","version":1,"lifecycle":"Open","specVersion":1,"attemptId":null}
+{"schemaVersion":2,"taskId":"task-93c9f4aeaf514ed0b88ef3c63cc1a7ef","title":"[P2] Recover gracefully from cross-platform transient trust-binding contention","version":2,"lifecycle":"Open","specVersion":2,"attemptId":null}

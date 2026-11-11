@@ -1,13 +1,19 @@
-<h1>Transient trust-binding contention in Agents dashboard</h1><p><strong>Feedback:</strong> acd4d298ce104c6d8f017c4e72358c9c.</p>
-<h2>Observed issue</h2><p>The Windows Agents view intermittently presents another project's trust-binding file lock as a persistent ValidationError even though the condition clears on its own. This conflates transient local IO contention with corrupted/invalid trust metadata.</p>
-<h2>Required behavior</h2><ul>
-<li>Identify lock acquisition and reading paths for trust-binding files. Separate transient sharing/lock contention from true validation failures and from remote unavailability using typed error categories; never silently ignore invalid trust identity or substitute unsafe metadata.</li>
-<li>Use bounded retry/backoff or safe short-lived deferred refresh for transient contention, without blocking the entire TUI, performing unsafe lock stealing or changing the trusted ledger binding. Keep other project rows and the previous verified snapshot visible with explicit temporarily-unavailable/stale status.</li>
-<li>Automatically recover on the next existing refresh once contention ends; preserve detailed diagnostics outside the normal status display. A temporary read failure must never become a false zero-agent result or trigger a trust reset.</li>
-<li>Coordinate shared-file semantics with concurrent-client task <code>task-cff673cd81474ccf9b3932bf0ea33109</code> and global dashboard task <code>task-6c6d71c8d3ef408eb30886ded9522af3</code>; avoid duplicating a second trust-binding implementation.</li>
+<h1>Recover gracefully from transient trust-binding contention in Agents dashboard (cross-platform)</h1>
+<p><strong>Priority P2.</strong> Existing feedback acd4d298ce104c6d8f017c4e72358c9c. New reproduction: 2026-11-11 on Linux KDE Konsole, Agents dashboard displayed <code>Wayfold: ValidationError "Cannot lock trust binding: The process ..."</code> and <code>Wayfold UNAVAILABLE (counts unknown)</code>, while other projects remained populated. Manual refresh immediately recovered. This confirms the symptom occurs on Linux, not merely Windows.</p>
+<h2>Root-cause investigation</h2>
+<p>Inspect <code>Client/Modules/OrchestrationApi.fs</code> <code>LedgerBindingConfig.withConfigLock</code>: it opens a per-project <code>.lock</code> with <code>FileShare.None</code>, retries any <code>IOException</code> up to 50 times with synchronous 40 ms sleeps, then an outer broad catch maps failures to <code>ValidationError("Cannot lock trust binding: ...")</code>. Inspect all lock and <code>readStored</code> paths and the Agents dashboard asynchronous refresh/snapshot behavior. Classify transient lock/sharing contention separately from actual invalid trust data, permissions, absent files and remote unavailability; do not claim a validated root cause without reproduction.</p>
+<h2>Required behavior</h2>
+<ul>
+<li>Introduce a typed, recoverable transient contention outcome for relevant Windows/Linux/macOS file-lock conditions, without converting arbitrary I/O errors or malformed bindings into contention.</li>
+<li>Use bounded, nonblocking contention handling or a safe short deferred re-read on the existing refresh cadence. Do not synchronously stall the entire TUI or a SignalR ingress callback for a 2-second spin. Do not steal locks, ignore trust checks, use stale bindings to authorize new mutations, or rewrite/reset the trusted ledger state.</li>
+<li>When a single project cannot be read due to contention, retain its last independently verified dashboard data if available and clearly mark it stale/temporarily unavailable; otherwise show unknown counts. Other project rows must stay available and totals must not treat missing data as zero.</li>
+<li>Automatically reattempt once the lock is free using the existing refresh behavior, without manual <code>g</code>/<code>Enter</code> refresh or additional unbounded polling. Preserve detailed diagnostic information in appropriate telemetry, not a misleading persistent <code>ValidationError</code> banner.</li>
+<li>Coordinate shared-file behavior with concurrent-client task <code>task-cff673cd81474ccf9b3932bf0ea33109</code> and global-dashboard task <code>task-6c6d71c8d3ef408eb30886ded9522af3</code>. Reuse current lock/trust authority rather than introducing a competing trust-binding scheme.</li>
 </ul>
-<h2>Acceptance</h2><ol>
-<li>Injected Windows-style sharing violations recover under bounded contention and display recoverable status without clearing other projects.</li>
-<li>Permanent invalid identity, malformed binding, permission denial and lost file remain distinct explicit failures; no trust bypass or unauthorized rewrite occurs.</li>
-<li>Two concurrent refreshes/clients and interleaved file reads do not corrupt trust state; after lock release the Agents screen automatically recovers. Release tests pass.</li>
-</ol><p>Do not deploy without operator authorization.</p>
+<h2>Acceptance</h2>
+<ol>
+<li>Deterministic injected Windows-style sharing violation and Linux-style lock contention produce typed recoverable outcomes and self-recover after release without manual refresh; verify the behavior at the Agents dashboard UI layer.</li>
+<li>Concurrent clients/refresher threads cannot corrupt the trust file or silently lower/replace the trusted head. Existing validated snapshots remain visually identifiable as stale during an outage and recover correctly.</li>
+<li>Permanent malformed binding, identity mismatch, access denied, lost file, and remote unavailability have distinct explicit error classifications; never bypass trusted binding validation.</li>
+<li>Bound time and number of retries; preserve responsive TUI and unrelated project counts; test the original regression and negative cases. Run Release suites, obtain independent frozen-commit review; integration/deployment requires explicit operator authorization.</li>
+</ol>

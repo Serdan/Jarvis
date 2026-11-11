@@ -1,0 +1,1 @@
+Two commits 2e85140 and ab196144; 7 new role tests pass; server Release suite passes. Verify schema integrity, authorization, correct precedence, response budget, worktree handling and role update history; no deployment.

@@ -1502,7 +1502,11 @@ module ReviewWorkflow =
                 (fun snapshot -> result {
                     let! task, _, attempt, _ = getAttempt binding snapshot taskId
                     let! agent, agentOid = required<ReviewAgent> binding snapshot (agentPath agentId)
-                    if task.Lifecycle <> "InProgress"
+                    // A task may be closed independently while its owner is
+                    // still Working and finishing the attempt. Correction
+                    // remains InProgress-only, but ordinary tool ingress must
+                    // not break after administrative closure.
+                    if not (List.contains task.Lifecycle [ "InProgress"; "Closed" ])
                        || attempt.AttemptId <> attemptId
                        || attempt.OwnerAgentId <> agentId
                        || attempt.Phase <> "Started"

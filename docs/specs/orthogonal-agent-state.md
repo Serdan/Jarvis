@@ -147,6 +147,35 @@ The existing soft-stop guidance at 25 minutes and hard-stop guidance at 30 minut
 - A finished attempt is counted as a completion event, not as days spent in a synthetic "Completed" agent state. All metrics remain wall-clock observations, not productive CPU-time claims.
 - Keep only timestamps necessary for the current interval/segment and reconstruct earlier boundaries from existing event/Git history. Do not add a second stored "display state" or counters.
 
+### Canonical Working activity lease for administrative correction
+
+The operator-only `CorrectAgentWorkingState` command requires exact task,
+attempt, assignment generation and entity versions **and** an expired canonical
+Working activity lease. Ordinary activity from the *initiating* agent, including
+read-only calls, renews a five-minute lease in its own `ReviewAgent` record
+before tool dispatch when fewer than two minutes remain. Cached, sufficiently
+valid canonical leases let repeated calls proceed without Git writes. A
+two-minute heartbeat renews while a long-running tool executes. Lease renewal
+increments the agent version but does not touch assignment, attempt, owner,
+checkpoint, state sequence, turn start, or target last-seen. Target-only
+observation does not renew activity.
+
+The lease field is optional for previously persisted v3 agents; a missing
+field is not evidence of recent activity. A corrupt nonempty lease timestamp
+is *not* treated as expired for correction. When a new call requires renewal
+but the canonical Git transaction cannot be completed, it fails before
+dispatch rather than relying on client-local TUI last-seen. The administrative
+correction itself still only applies to `InProgress` attempts; a Working
+agent may continue the completion workflow after independent task closure.
+
+**Failure boundary:** a heartbeat renewal failure is reported as an error at
+the end of the admitted tool call. The current command execution API does not
+propagate a cancellation token into every underlying source/process operation;
+therefore it cannot yet guarantee that an already-executing operation is
+interrupted immediately on renewal failure. Do not equate a failed response
+with proof that the source operation did not run. That limitation needs
+independent review before this correction is deployed.
+
 ## 6. Migration of existing Git-ledger data
 
 This changes canonical JSON shape; it cannot be deployed by simply changing enum validation. Perform a **one-time, explicit, checked conversion of the bound Git orphan ledger**, preserving its parent history. No old/new dual-write mode, V1 fallback, migration daemon, or permanent legacy tool aliases.

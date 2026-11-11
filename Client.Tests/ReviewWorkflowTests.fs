@@ -372,16 +372,60 @@ type ReviewWorkflowTests() =
                 Assert.That(changes.AgentStateChanges, Is.Empty)
                 Assert.That((ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent.Version,
                             Is.EqualTo(after.Version))
-                // A second ordinary call reuses the canonical lease without a
-                // Git write or version bump.
+                // Repeated ordinary reads reuse the lease without 100
+                // separate canonical Git writes. Benchmark elapsed wall time
+                // but do not assert a hardware/network-dependent time limit.
                 let priorHead = (LedgerStore.fetch second |> success).Commit
-                let _, secondRead, _ = invoke selfRead "Owner"
-                Assert.That(secondRead.IsOk, Is.True)
+                let beganAt = DateTimeOffset.UtcNow
+                let watch = Stopwatch.StartNew()
+                for _ in 1..100 do
+                    let _, read, _ = invoke selfRead "Owner"
+                    Assert.That(read.IsOk, Is.True)
+                watch.Stop()
+                let endedAt = DateTimeOffset.UtcNow
+                TestContext.Out.WriteLine(
+                    sprintf "Canonical Working lease: 100 reads, %.1f ms total (%.2f ms/read), 0 new ledger commits; UTC window %s to %s"
+                        watch.Elapsed.TotalMilliseconds (watch.Elapsed.TotalMilliseconds / 100.)
+                        (beganAt.ToString("O")) (endedAt.ToString("O")))
                 Assert.That((LedgerStore.fetch second |> success).Commit, Is.EqualTo(priorHead))
                 Assert.That((ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent.Version,
                             Is.EqualTo(after.Version))
             finally
                 if File.Exists configPath then File.Delete configPath)
+
+    [<Test>]
+    member _.WorkingLeaseSurvivesIndependentTaskClosureAndPreservesOwnerCompletion() =
+        withFixture (fun _ _ first second _ _ _ _ ->
+            let taskId = "closed-working-lease"
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Closed lease"
+            |> success |> ignore
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner"
+            |> success |> ignore
+            ReviewWorkflow.beginAttempt first (Guid.NewGuid()) taskId "Owner" 1 1
+            |> success |> ignore
+            let _, task, maybeAttempt = ReviewWorkflow.getTask first taskId |> success
+            let attempt = maybeAttempt.Value
+            ReviewWorkflow.closeTaskAs first "Lead" (Guid.NewGuid()) taskId task.Version
+            |> success |> ignore
+            let _, closed, _ = ReviewWorkflow.getTask second taskId |> success
+            Assert.That(closed.Lifecycle, Is.EqualTo("Closed"))
+            let before = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
+            ReviewWorkflow.recordWorkingActivity second (Guid.NewGuid())
+                "Owner" taskId attempt.AttemptId |> success |> ignore
+            let after = (ReviewWorkflow.getAgentInbox first "Owner" |> success).Agent
+            Assert.That(after.State, Is.EqualTo("Working"))
+            Assert.That(after.Version, Is.EqualTo(before.Version + 1))
+            expectStale
+                (ReviewWorkflow.correctAgentWorkingStateAs first "Lead" (Guid.NewGuid())
+                    "Lead" "Owner" taskId attempt.AttemptId closed.Version attempt.Version
+                    after.Version attempt.AssignmentGeneration "Cannot correct closed task")
+            let finished =
+                ReviewWorkflow.completeAgentWork first (Guid.NewGuid()) taskId "Owner"
+                    attempt.Version after.Version attempt.AssignmentGeneration "Finished closed assignment"
+                |> success
+            Assert.That(finished.AlreadyApplied, Is.False)
+            Assert.That((ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent.State,
+                        Is.EqualTo("NeedsWork")))
 
     [<Test>]
     member _.WorkingLeaseHeartbeatRenewsDuringLongToolAndStopsCleanly() =

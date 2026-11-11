@@ -617,6 +617,8 @@ type ToolJobHandle =
       Kind: JobKind
       Status: string
       ProjectName: string option
+      /// Destination routing provenance is attached by the server, never inferred from a default device.
+      DeviceId: string option
       AgentId: string
       OperationId: string option
       CommandName: string

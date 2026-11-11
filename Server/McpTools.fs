@@ -717,50 +717,38 @@ module McpToolHelpers =
                     // dispatching to the destination. A promoted source read
                     // is NOT proof of successful validation: resolve the
                     // original result via its client-owned job first.
-                    let rec resolveSenderValidation (project: string) (source: AgentCommandResponse) deadline =
+                    let resolveSenderValidation (project: string) (source: AgentCommandResponse) deadline =
                         task {
                             match source.PendingJob with
                             | None -> return source
-                            | Some handle when DateTimeOffset.UtcNow >= deadline ->
-                                return
-                                    { source with
-                                        Result = None
-                                        Error = Some(ExecutionFailed
-                                            ("Source agent validation remains in client job " + handle.JobId
-                                             + ". Do not retry the notification blindly."))
-                                        PendingJob = None
-                                        AgentStateChanges = [] }
                             | Some handle ->
-                                do! Task.Delay(500, context.RequestAborted)
-                                let! poll = client.SendCommandToProject(
-                                    userId, project,
-                                    GetJobResultCommand { ProjectName = project
-                                                          JobId = handle.JobId
-                                                          AfterSequence = None },
-                                    ?conversationId = RequestDeviceRouting.session(),
-                                    ?deviceId = RequestDeviceRouting.deviceOverride(),
-                                    ?agentId = RequestDeviceRouting.agentId())
-                                match poll.Result, poll.Error with
-                                | Some payload, None ->
-                                    try
-                                        let outcome = JsonSerializer.Deserialize<JobResult>(payload)
-                                        match outcome.ToolResponse with
-                                        | Some completed -> return completed
-                                        | None when outcome.Status = Running ->
-                                            return! resolveSenderValidation project source deadline
-                                        | None ->
-                                            return
-                                                { poll with
-                                                    Result = None
-                                                    Error = Some(ExecutionFailed
-                                                        "Source agent validation job ended without its terminal response.") }
-                                    with ex ->
-                                        return
-                                            { poll with
-                                                Result = None
-                                                Error = Some(ExecutionFailed
-                                                    ("Unable to read source validation job: " + ex.Message)) }
-                                | _ -> return poll
+                                match handle.DeviceId with
+                                | None ->
+                                    return
+                                        { source with
+                                            Result = None
+                                            Error = Some(ExecutionFailed
+                                                "Source validation job has no bound device; cannot safely poll a different candidate.")
+                                            PendingJob = None
+                                            AgentStateChanges = [] }
+                                | Some originalDevice ->
+                                    // Shared typed resolver checks the job ID, project,
+                                    // actor, terminal status and deadline. The callback
+                                    // always polls the exact verified source device.
+                                    return!
+                                        ProjectNotificationRouting.resolveHealth project
+                                            (defaultArg (RequestDeviceRouting.agentId()) "")
+                                            deadline source
+                                            (fun query ->
+                                                task {
+                                                    do! Task.Delay(500, context.RequestAborted)
+                                                    return!
+                                                        client.SendCommandToUser(
+                                                            userId, GetJobResultCommand query,
+                                                            ?conversationId = RequestDeviceRouting.session(),
+                                                            deviceId = originalDevice,
+                                                            ?agentId = RequestDeviceRouting.agentId())
+                                                })
                         }
                     let! response =
                         match command with

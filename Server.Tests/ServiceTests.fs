@@ -1537,7 +1537,7 @@ let polledToolJobsRestoreExactInstructionsAndMutationEvidence () =
 let pendingToolJobNeverAdvertisesAFalseEmptyMutationList () =
     let handle : ToolJobHandle =
         { JobId = "pending-job"; Kind = JobKind.ToolOperation; Status = "Running"
-          ProjectName = Some "Jarvis"; AgentId = "Worker 1"
+          ProjectName = Some "Jarvis"; DeviceId = None; AgentId = "Worker 1"
           OperationId = Some "original-id"; CommandName = "ReadFile"
           StartedAt = DateTimeOffset.UtcNow }
     let pending : AgentCommandResponse =
@@ -1632,7 +1632,7 @@ let private routeTerminalHealth : AgentCommandResponse =
 let private routePendingHealth jobId actor : AgentCommandResponse =
     let handle : ToolJobHandle =
         { JobId = jobId; Kind = JobKind.ToolOperation; Status = "Running"
-          ProjectName = Some "Wayfold"; AgentId = actor
+          ProjectName = Some "Wayfold"; DeviceId = None; AgentId = actor
           OperationId = None; CommandName = "LedgerRead"
           StartedAt = DateTimeOffset.UtcNow }
     { Result = Some(JsonSerializer.Serialize handle); Error = None
@@ -1705,3 +1705,68 @@ let pendingHealthCompletionUsesExactlyTheOriginalCandidateDeviceAndActor () =
             match cmd with CrossProjectNotificationCommand _ -> true | _ -> false) |> Array.length,
             Is.EqualTo(1))
     }
+
+
+[<Test>]
+let routedPendingDestinationKeepsOriginalDeviceAndSourceEnvelopeWithoutReexecution () =
+    task {
+        let jobId = Guid.NewGuid().ToString("N")
+        let mutable writes = 0
+        let respond (device: string) (command: AgentCommand) (actor: string) =
+            match device, command with
+            | "first", LedgerReadCommand _ -> routeTerminalHealth
+            | "first", CrossProjectNotificationCommand envelope ->
+                writes <- writes + 1
+                Assert.That(actor, Is.EqualTo("Worker 1"))
+                Assert.That(envelope.Notification.Action, Is.EqualTo("NotifyAgent"))
+                Assert.That(envelope.SourceStateChanges.Length, Is.EqualTo(1))
+                Assert.That(envelope.SourceStateChanges[0].ProjectName, Is.EqualTo("Jarvis"))
+                let pending = routePendingHealth jobId actor
+                let routed = { pending.PendingJob.Value with CommandName = "TaskWrite" }
+                { pending with
+                    PendingJob = Some routed
+                    Result = Some(JsonSerializer.Serialize routed) }
+            | _ -> failwith $"Cross-device mutation or repeated execution: {device}/{AgentCommandInfo.name command}"
+        let! reply, calls = routedNotificationFixture respond
+        Assert.That(reply.Error.IsNone, Is.True)
+        Assert.That(reply.PendingJob.IsSome, Is.True)
+        let handle = reply.PendingJob.Value
+        Assert.That(handle.JobId, Is.EqualTo(jobId))
+        Assert.That(handle.DeviceId, Is.EqualTo(Some "first"))
+        Assert.That(handle.ProjectName, Is.EqualTo(Some "Wayfold"))
+        Assert.That(handle.AgentId, Is.EqualTo("Worker 1"))
+        Assert.That(isNull (box reply.AgentStateChanges), Is.True,
+                    "Running destination has unknown effects, not an authoritative empty list.")
+        let fromPayload = JsonSerializer.Deserialize<ToolJobHandle>(reply.Result.Value)
+        Assert.That(fromPayload, Is.EqualTo(handle))
+        Assert.That(writes, Is.EqualTo(1))
+        Assert.That(calls |> Array.filter (fun (_, command, _) ->
+            match command with CrossProjectNotificationCommand _ -> true | _ -> false) |> Array.length,
+            Is.EqualTo(1))
+    }
+
+[<Test>]
+let mergingSourceWithPendingDestinationPreservesUnknownChangesAndOriginalJobHandle () =
+    for sourceChanged in [false; true] do
+        let source : AgentCommandResponse =
+            { Result = Some "{}"; Error = None; Instructions = []
+              AgentStateChanges =
+                if sourceChanged then [ { ProjectName = "Jarvis"; AgentId = "Worker 1" } ] else []
+              InboxActivation =
+                if sourceChanged then
+                    Some { ProjectName = "Jarvis"; AgentId = "Worker 1"
+                           ActivatedByThisCall = true; BeforeState = Some "Ready"
+                           AfterState = Some "Working"; CommittedHead = Some(String('a', 40))
+                           OperationId = Some "source-activation" }
+                else None
+              PendingJob = None }
+        let pending = routePendingHealth (Guid.NewGuid().ToString("N")) "Worker 1"
+        let merged = McpToolHelpers.mergeStateEffects source pending
+        Assert.That(merged.PendingJob, Is.EqualTo(pending.PendingJob))
+        Assert.That(merged.Result, Is.EqualTo(pending.Result))
+        Assert.That(isNull (box merged.AgentStateChanges), Is.True)
+        Assert.That(merged.InboxActivation.IsNone, Is.True)
+        let result =
+            merged |> McpToolHelpers.toCallToolResult
+            |> McpToolHelpers.attachStateEffects merged
+        Assert.That(result.Meta, Is.Null, "Unverified effects must not appear as committed on a pending reply.")

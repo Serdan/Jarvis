@@ -287,6 +287,7 @@ type private ToolOperationRecord =
       CommandHash: string
       OperationKey: string option
       Completion: TaskCompletionSource<AgentCommandResponse>
+      PreserveEvidence: AgentCommandResponse -> AgentCommandResponse
       mutable Status: JobStatus
       mutable StartedExecution: bool
       mutable Counted: bool
@@ -382,7 +383,7 @@ module private ToolOperations =
                             let! response =
                                 task {
                                     try return! execute ()
-                                    with ex -> return failedResponse ("Tool operation failed: " + ex.Message)
+                                    with ex -> return entry.PreserveEvidence (failedResponse ("Tool operation failed: " + ex.Message))
                                 }
                             complete entry response
                         else
@@ -391,11 +392,11 @@ module private ToolOperations =
                     finally
                         workerSlots.Release() |> ignore
                 with ex ->
-                    complete entry (failedResponse ("Tool operation dispatch failed: " + ex.Message))
+                    complete entry (entry.PreserveEvidence (failedResponse ("Tool operation dispatch failed: " + ex.Message)))
             } :> Task))
         |> ignore
 
-    let start canonical projectName actor commandName operationId commandHash execute =
+    let start canonical projectName actor commandName operationId commandHash execute preserveEvidence =
         lock gate (fun () ->
             prune DateTimeOffset.UtcNow
             let identity = canonical |> Option.map ProjectPaths.ProjectId.value |> Option.defaultValue "@unscoped"
@@ -430,6 +431,7 @@ module private ToolOperations =
                       Kind = JobKind.ToolOperation
                       Status = "Running"
                       ProjectName = projectName
+                      DeviceId = None
                       AgentId = actor
                       OperationId = operationId
                       CommandName = commandName
@@ -440,6 +442,7 @@ module private ToolOperations =
                       CommandHash = commandHash
                       OperationKey = key
                       Completion = TaskCompletionSource<AgentCommandResponse>(TaskCreationOptions.RunContinuationsAsynchronously)
+                      PreserveEvidence = preserveEvidence
                       Status = Running
                       StartedExecution = false
                       Counted = true
@@ -553,13 +556,16 @@ module private ToolOperations =
                         if entry.Counted then
                             entry.Counted <- false
                             inFlight <- inFlight - 1
-                        entry.Completion.TrySetResult(failedResponse "Tool operation canceled before execution.") |> ignore
+                        entry.Completion.TrySetResult(entry.PreserveEvidence (failedResponse "Tool operation canceled before execution.")) |> ignore
                         prune DateTimeOffset.UtcNow
                         Ok ()
                 Some response)
 
 let startToolOperation canonical projectName actor commandName operationId commandHash execute =
-    ToolOperations.start canonical projectName actor commandName operationId commandHash execute
+    ToolOperations.start canonical projectName actor commandName operationId commandHash execute id
+
+let startToolOperationWithCancelEvidence canonical projectName actor commandName operationId commandHash execute preserveEvidence =
+    ToolOperations.start canonical projectName actor commandName operationId commandHash execute preserveEvidence
 
 let promoteToolOperation jobId = ToolOperations.promote jobId
 let forgetQuickToolOperation jobId = ToolOperations.forgetQuick jobId

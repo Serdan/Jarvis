@@ -52,7 +52,9 @@ module ProjectNotificationRouting =
                                 return failure "poll returned a different or malformed job."
                             else
                                 match job.ToolResponse, job.Status with
-                                | Some terminal, _ when terminal.PendingJob.IsNone ->
+                                | Some terminal, ToolCompleted when terminal.PendingJob.IsNone ->
+                                    return terminal
+                                | Some terminal, ToolFailed _ when terminal.PendingJob.IsNone && terminal.Error.IsSome ->
                                     return terminal
                                 | None, Running ->
                                     return! resolve current
@@ -313,8 +315,19 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                             // device is required before any destination write.
                             // Once dispatched, NEVER retry a potentially
                             // committed mutation against another client.
-                            return! this.SendCommandToUser(userId, command,
-                                                            ?conversationId = conversationId, deviceId = session.DeviceId, ?agentId = agentId)
+                            let! destination =
+                                this.SendCommandToUser(userId, command,
+                                    ?conversationId = conversationId, deviceId = session.DeviceId, ?agentId = agentId)
+                            // Bind the pending handle to this verified device.
+                            // A later poll MUST NOT fall back to the user's current default device.
+                            return
+                                match destination.PendingJob with
+                                | None -> destination
+                                | Some handle ->
+                                    let routed = { handle with DeviceId = Some session.DeviceId }
+                                    { destination with
+                                        PendingJob = Some routed
+                                        Result = Some(JsonSerializer.Serialize routed) }
                         | _ ->
                             let reason =
                                 if not stillSameDevice then "candidate device session changed during ledger verification"

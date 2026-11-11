@@ -668,3 +668,153 @@ let missingToolJobAfterClientRestartExplainsReconciliation () =
         | other -> Assert.Fail($"Unknown client-owned job must explain restart/expiry: {other}")
     finally
         Directory.Delete(root, true)
+
+
+let private notificationFixture (sourceChanges: AgentStateChange list)
+                                (sourceReceipt: AgentInboxActivation option) =
+    let original : TaskWriteCommand =
+        { ProjectName = "Project1"; Action = "NotifyAgent"
+          OperationId = Guid.NewGuid().ToString("D")
+          TaskId = ""; AttemptId = ""; ActorId = "Worker 1"; OwnerId = ""
+          Title = ""; Html = ""; ExpectedVersion = 0; ExpectedAgentVersion = 0
+          ExpectedTaskVersion = 0; AssignmentGeneration = 0; Summary = ""
+          NextAction = ""; Reason = ""; BaseOid = ""; TargetRef = ""
+          SourceRef = "Jarvis"; AllowDetached = false; AllowUncommitted = false
+          DecisionSequence = 0L; Evidence = ""; SessionId = "" }
+    { Notification = original
+      SourceStateChanges = sourceChanges
+      SourceInboxActivation = sourceReceipt }
+
+let private activationFixture () : AgentInboxActivation =
+    { ProjectName = "Jarvis"; AgentId = "Worker 1"
+      ActivatedByThisCall = true; BeforeState = Some "Ready"
+      AfterState = Some "Working"; CommittedHead = Some(String('a', 40))
+      OperationId = Some(Guid.NewGuid().ToString("D")) }
+
+[<Test>]
+let forwardedNotificationJobKeepsSourceAndDestinationEvidenceThroughTerminalPolling () =
+    let root = createTempProject ()
+    let context = TestContext root
+    try
+        for sourceChanged in [false; true] do
+            for outcomeIsFailure in [false; true] do
+                let source = if sourceChanged then
+                                 [ { ProjectName = "Jarvis"; AgentId = "Worker 1" } ]
+                             else []
+                let receipt = if sourceChanged then Some(activationFixture()) else None
+                let envelope = notificationFixture source receipt
+                let merge = Client.SignalR.Client.combineCrossProjectNotification envelope
+                let deferred =
+                    TaskCompletionSource<AgentCommandResponse>(TaskCreationOptions.RunContinuationsAsynchronously)
+                let calls = ref 0
+                let registered =
+                    match startToolOperationWithCancelEvidence jobProject (Some "Project1") "Worker 1"
+                            "TaskWrite" (Some envelope.Notification.OperationId)
+                            envelope.Notification.OperationId
+                            (fun () ->
+                                task {
+                                    calls.Value <- calls.Value + 1
+                                    let! destination = deferred.Task
+                                    return merge destination
+                                }) merge with
+                    | Ok job -> job
+                    | Error error -> failwith $"Cannot admit forwarded notification: {error}"
+                let pending = (awaitToolOperation registered (TimeSpan.FromMilliseconds 20.)).GetAwaiter().GetResult()
+                let handle =
+                    match pending with
+                    | Choice2Of2 value -> value
+                    | _ -> failwith "Unfinished destination must return pending handle."
+                let cmd = { ProjectName = "Project1"; JobId = handle.JobId; AfterSequence = None }
+                match getJobResultForProjectAsAgent jobProject (Some "Worker 1") cmd context with
+                | Ok value ->
+                    Assert.That(value.Status, Is.EqualTo(JobStatus.Running))
+                    Assert.That(value.ToolResponse.IsNone, Is.True)
+                | Error issue -> Assert.Fail($"Unable to poll pending destination: {issue}")
+                let destination =
+                    { Result = if outcomeIsFailure then None else Some """{"notified":true}"""
+                      Error = if outcomeIsFailure then Some(Conflict "destination failed") else None
+                      Instructions = []
+                      AgentStateChanges = [ { ProjectName = "Project1"; AgentId = "Receiver" } ]
+                      InboxActivation = None; PendingJob = None }
+                deferred.SetResult destination
+                let _, completion = registered
+                let terminal = completion.WaitAsync(TimeSpan.FromSeconds 4.).GetAwaiter().GetResult()
+                Assert.That(terminal.AgentStateChanges.Length, Is.EqualTo(if sourceChanged then 2 else 1))
+                Assert.That(terminal.InboxActivation, Is.EqualTo(receipt))
+                Assert.That(terminal.Error.IsSome, Is.EqualTo(outcomeIsFailure))
+                for _ in 1 .. 3 do
+                    match getJobResultForProjectAsAgent jobProject (Some "Worker 1") cmd context with
+                    | Ok value ->
+                        Assert.That(value.ToolResponse, Is.EqualTo(Some terminal))
+                        Assert.That(value.Status,
+                            Is.EqualTo(if outcomeIsFailure then ToolFailed "Conflict \"destination failed\""
+                                       else ToolCompleted))
+                    | Error issue -> Assert.Fail($"Unable to poll finished destination: {issue}")
+                let replay =
+                    startToolOperationWithCancelEvidence jobProject (Some "Project1") "Worker 1"
+                        "TaskWrite" (Some envelope.Notification.OperationId) envelope.Notification.OperationId
+                        (fun () ->
+                            calls.Value <- calls.Value + 1
+                            Task.FromResult(merge destination)) merge
+                match replay with
+                | Ok (same, _) -> Assert.That(same.JobId, Is.EqualTo(handle.JobId))
+                | Error issue -> Assert.Fail($"Stable operation ID could not recover original: {issue}")
+                Assert.That(calls.Value, Is.EqualTo(1),
+                    "Polling and retrying a forwarded notification must not execute a duplicate destination mutation.")
+    finally
+        Directory.Delete(root, true)
+
+[<Test>]
+let cancelingQueuedForwardedNotificationPreservesCommittedSourceActivation () =
+    let root = createTempProject ()
+    let context = TestContext root
+    let wait = TaskCompletionSource<AgentCommandResponse>(TaskCreationOptions.RunContinuationsAsynchronously)
+    let entered = System.Collections.Concurrent.ConcurrentQueue<int>()
+    let blockers = ResizeArray<ToolJobHandle * Task<AgentCommandResponse>>()
+    try
+        for index in 1 .. 8 do
+            match startToolOperation jobProject (Some "Project1") "Worker 1" "BlockingRead"
+                    (Some ("cancel-evidence-blocker-" + Guid.NewGuid().ToString("N")))
+                    (string index) (fun () ->
+                        entered.Enqueue index
+                        wait.Task) with
+            | Ok item -> blockers.Add(item)
+            | Error issue -> Assert.Fail($"Unable to fill worker slots: {issue}")
+        Assert.That(SpinWait.SpinUntil((fun () -> entered.Count = 8), TimeSpan.FromSeconds(5.)), Is.True)
+        let source = [ { ProjectName = "Jarvis"; AgentId = "Worker 1" } ]
+        let receipt = Some(activationFixture())
+        let envelope = notificationFixture source receipt
+        let merge = Client.SignalR.Client.combineCrossProjectNotification envelope
+        let mutable dispatched = 0
+        let queued =
+            match startToolOperationWithCancelEvidence jobProject (Some "Project1") "Worker 1"
+                    "TaskWrite" (Some envelope.Notification.OperationId)
+                    envelope.Notification.OperationId
+                    (fun () ->
+                        dispatched <- dispatched + 1
+                        Task.FromResult(merge (completedToolResponse "{}"))) merge with
+            | Ok job -> job
+            | Error issue -> failwith $"Cannot queue notification: {issue}"
+        let handle, completion = queued
+        promoteToolOperation handle.JobId
+        match cancelJobForProjectAsAgent jobProject (Some "Worker 1")
+                  { ProjectName = "Project1"; JobId = handle.JobId } context with
+        | Ok () -> ()
+        | Error issue -> Assert.Fail($"Cannot cancel queued notification: {issue}")
+        let canceled = completion.WaitAsync(TimeSpan.FromSeconds(3.)).GetAwaiter().GetResult()
+        Assert.That(canceled.Error.IsSome, Is.True)
+        Assert.That(canceled.AgentStateChanges, Is.EqualTo(source :> obj))
+        Assert.That(canceled.InboxActivation, Is.EqualTo(receipt))
+        Assert.That(dispatched, Is.EqualTo(0))
+        for _ in 1 .. 2 do
+            match getJobResultForProjectAsAgent jobProject (Some "Worker 1")
+                      { ProjectName = "Project1"; JobId = handle.JobId; AfterSequence = None } context with
+            | Ok job ->
+                Assert.That(job.Status, Is.EqualTo(JobStatus.Canceled))
+                Assert.That(job.ToolResponse, Is.EqualTo(Some canceled))
+            | Error issue -> Assert.Fail($"Cannot recover canceled job: {issue}")
+    finally
+        wait.TrySetResult(completedToolResponse "{}") |> ignore
+        for _, completion in blockers do
+            completion.WaitAsync(TimeSpan.FromSeconds(6.)).GetAwaiter().GetResult() |> ignore
+        Directory.Delete(root, true)

@@ -433,6 +433,8 @@ let private dispatch (rt: Runtime) (target: ProjectPaths.ProjectTarget option)
         | Some context -> rt |> OrchestrationApi.TaskApi.writeForContext context cmd |> serialize'
         | None -> Error(Client.ValidationError "Task-spec source checkout was not resolved.") |> serialize'
     | TaskWriteCommand cmd -> rt |> OrchestrationApi.TaskApi.write cmd |> serialize'
+    | CrossProjectNotificationCommand _ ->
+        Error(Client.ValidationError "Forwarded notification must be normalized before client dispatch.") |> serialize'
     | LedgerReadCommand cmd -> rt |> OrchestrationApi.LedgerApi.read cmd |> serialize'
     | LedgerWriteCommand cmd -> rt |> OrchestrationApi.LedgerApi.write cmd |> serialize'
     | ReviewReadCommand cmd -> rt |> OrchestrationApi.ReviewApi.read cmd |> serialize'
@@ -829,7 +831,7 @@ let private executeOrPromote (rt: Runtime) (commandJson: string) (agentId: strin
                     | Checkout target -> Some(ProjectPaths.ProjectTarget.projectId target)
                     | ActivityLabel _ | Unscoped -> None
                 let registered =
-                    JobManager.startToolOperation canonical project agentId
+                    JobManager.startToolOperationWithCancelEvidence canonical project agentId
                         (AgentCommandInfo.protocolName command)
                         (AgentCommandInfo.operationId command
                          |> Option.filter (String.IsNullOrWhiteSpace >> not))
@@ -837,7 +839,7 @@ let private executeOrPromote (rt: Runtime) (commandJson: string) (agentId: strin
                         (fun () -> task {
                             let! _, _, outcome = processIncomingCommand rt normalizedJson agentId
                             return merge outcome
-                        })
+                        }) merge
                 match registered with
                 | Error error ->
                     return

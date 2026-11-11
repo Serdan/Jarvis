@@ -105,12 +105,20 @@ let private isLocalAgentActivity = function
     | ObserveAgentCommand _ -> false // Neither observer nor target is acting.
     | _ -> true
 
-// These owner transitions advance the canonical agent version and complete
-// promptly. Lease renewal before them could invalidate an exact version token.
-let private activityFencedByCommand agentId = function
-    | TaskWriteCommand cmd when cmd.ActorId = agentId ->
-        List.contains cmd.Action
-            [ "CheckpointAttempt"; "YieldAgent"; "CompleteAgentWork" ]
+// Mutating or potentially extended operations need a durable in-flight
+// reservation before execution, not merely a time-bounded lease. Unlike a
+// ReviewAgent version increment, the separate reservation record preserves
+// exact optimistic concurrency tokens on owner task transitions.
+let private requiresDurableActivityReservation agentId = function
+    | TaskWriteCommand cmd -> cmd.ActorId = agentId
+    | WriteFileCommand _ | PatchFileCommand _ | GitCommitCommand _
+    | RunCommandCommand _ | RunProjectTaskCommand _
+    | ImportFileCommand _ | ExportFileCommand _
+    | CreateProjectCommand _ | CreateWorktreeCommand _
+    | RemoveWorktreeCommand _ | CreateSkillCommand _
+    | StartJobCommand _ | CancelJobCommand _
+    | SearchTextCommand _ | SearchFilesCommand _ | ReadFilesCommand _ ->
+        true
     | _ -> false
 
 // An agent's first ordinary tool call starts its Ready assignment.
@@ -190,22 +198,30 @@ let private activateReadyOnActivity (rt: Runtime) (agentId: string)
                               AfterState = Some "Working"
                               CommittedHead = Some write.CurrentHead
                               OperationId = Some write.Operation.OperationId }
-                        match renewWorkingLease agent.CurrentAssignment with
-                        | Ok () -> Ok (Client.LedgerStore.LedgerStore.changedAgentIds write, Some committed)
-                        | Error error -> Error error
+                        if requiresDurableActivityReservation agentId command then
+                            // The following reserved ingress establishes the
+                            // in-flight fence without changing owner CAS tokens.
+                            Ok (Client.LedgerStore.LedgerStore.changedAgentIds write, Some committed)
+                        else
+                            match renewWorkingLease agent.CurrentAssignment with
+                            | Ok () -> Ok (Client.LedgerStore.LedgerStore.changedAgentIds write, Some committed)
+                            | Error error -> Error error
                     | Error(Client.LedgerStore.StaleEntityVersion _) ->
                         // Another concurrent tool may already have started this
                         // assignment. Do not reset its Working clock.
                         match ReviewWorkflow.ReviewWorkflow.getAgentWorkingTurn binding agentId with
                         | Ok latest when latest.State = "Working"
                                          && not (isNull (box latest.CurrentAssignment)) ->
-                            match renewWorkingLease latest.CurrentAssignment with
-                            | Ok () -> Ok ([], None)
-                            | Error error -> Error error
+                            if requiresDurableActivityReservation agentId command then
+                                Ok ([], None)
+                            else
+                                match renewWorkingLease latest.CurrentAssignment with
+                                | Ok () -> Ok ([], None)
+                                | Error error -> Error error
                         | _ -> Error(Client.ValidationError "Agent assignment changed before automatic activation.")
                     | Error error -> Error(Client.ValidationError($"Automatic agent activation failed: {error}"))
             | Some agent when agent.State = "Working"
-                              && not (activityFencedByCommand agentId command) ->
+                              && not (requiresDurableActivityReservation agentId command) ->
                 // A locally cached *canonical* lease guarantees that a
                 // correction cannot win before its expiry. Renew through Git
                 // only near expiry; never silently revive a corrected turn.
@@ -774,8 +790,7 @@ let processIncomingCommand (rt: Runtime) (commandJson: string) (agentId: string)
                             let leaseContext =
                                 match target with
                                 | Some selected when not (String.IsNullOrWhiteSpace localAgentId)
-                                                     && activatesAgent localAgentId command
-                                                     && not (activityFencedByCommand localAgentId command) ->
+                                                     && activatesAgent localAgentId command ->
                                     let projectId = ProjectPaths.ProjectTarget.projectId selected
                                     let project = ProjectPaths.ProjectId.value projectId
                                     let cache = workingGuidanceCaches.GetValue(rt, fun _ ->
@@ -794,6 +809,52 @@ let processIncomingCommand (rt: Runtime) (commandJson: string) (agentId: string)
                                         let! outcome = work()
                                         return outcome, None
                                     }
+                                | Some (project, _, assignment)
+                                    when requiresDurableActivityReservation localAgentId command ->
+                                    // Admission and release are canonical Git transactions.
+                                    // The reservation survives lease expiry, even when a
+                                    // heartbeat could not reach the remote. Unlike a lease
+                                    // renewal, this does not alter the owner's CAS version.
+                                    task {
+                                        match OrchestrationApi.LedgerBindingConfig.load project rt with
+                                        | Error error ->
+                                            return (Error(Client.ValidationError(
+                                                $"Cannot reserve in-flight activity: {error}")), [],
+                                                AgentInstructions.RootBootstrapRequired), None
+                                        | Ok binding ->
+                                            let reservationId = Guid.NewGuid()
+                                            match ReviewWorkflow.ReviewWorkflow.beginInFlightAgentOperation
+                                                      binding (Guid.NewGuid()) localAgentId
+                                                      assignment.TaskId assignment.AttemptId reservationId with
+                                            | Error error ->
+                                                return (Error(Client.ValidationError(
+                                                    $"Cannot reserve in-flight activity: {error}")), [],
+                                                    AgentInstructions.RootBootstrapRequired), None
+                                            | Ok _ ->
+                                                let releaseOperationId = Guid.NewGuid()
+                                                let mutable releaseFailure : string option = None
+                                                let release () =
+                                                    try
+                                                        match ReviewWorkflow.ReviewWorkflow.endInFlightAgentOperation
+                                                                  binding releaseOperationId localAgentId reservationId with
+                                                        | Ok _ -> ()
+                                                        | Error error ->
+                                                            releaseFailure <- Some (
+                                                                $"Reservation {reservationId:N} could not be released: {error}. " +
+                                                                "Correction stays blocked; the returned tool outcome is unchanged.")
+                                                    with ex ->
+                                                        releaseFailure <- Some (
+                                                            $"Reservation {reservationId:N} release threw: {ex.Message}. " +
+                                                            "Correction stays blocked; the returned tool outcome is unchanged.")
+                                                try
+                                                    let! outcome = work()
+                                                    release()
+                                                    return outcome, releaseFailure
+                                                with ex ->
+                                                    release()
+                                                    return (Error(ExceptionError ex), [],
+                                                            AgentInstructions.RootBootstrapRequired), releaseFailure
+                                    }
                                 | Some (project, projectId, assignment) ->
                                     withActivityLeaseHeartbeat (TimeSpan.FromMinutes(2.))
                                         (fun () ->
@@ -811,11 +872,10 @@ let processIncomingCommand (rt: Runtime) (commandJson: string) (agentId: string)
                                                 | Error error -> Error(sprintf "Lease renewal rejected: %A" error))
                                         work
                             let returned, applicable, provenance = execution
-                            let result =
-                                match renewalFailure with
-                                | Some failure -> Error(Client.ValidationError(
-                                    $"Working activity lease expired or could not be renewed: {failure}. Reread the agent inbox."))
-                                | None -> returned
+                            // Never replace a real committed command receipt with a
+                            // fabricated generic error after activity bookkeeping
+                            // fails. Surface liveness uncertainty separately.
+                            let result = returned
                             // A write may alter another agent's state, or none
                             // at all. Invalidate precisely the affected local
                             // cache entries before preparing turn guidance.
@@ -836,6 +896,14 @@ let processIncomingCommand (rt: Runtime) (commandJson: string) (agentId: string)
                                 | _ ->
                                     incrementalInstructions rt localAgentId target provenance applicable
                                     @ checkWorkingGuidance rt localAgentId target command
+                            match renewalFailure with
+                            | Some warning ->
+                                rt.Tui.Log warning
+                                instructions <-
+                                    instructions @
+                                    [ { Scope = "activity-fence"; Path = "jarvis/activity-fence"
+                                        Sha256 = ""; Content = warning } ]
+                            | None -> ()
                             return result
                 with ex ->
                     return Error(ExceptionError ex)

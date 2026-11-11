@@ -244,6 +244,25 @@ type AgentNotification =
       CreatedAtUtc: string
       AcknowledgedAtUtc: string }
 
+// These canonical records are independent of ReviewAgent.Version: a worker
+// with an exact expectedAgentVersion must be able to admit its own operation
+// without invalidating that assertion. A reservation has no expiration: a
+// failed heartbeat cannot silently make an active mutating operation correctable.
+[<CLIMutable>]
+type InFlightAgentOperation =
+    { Id: string
+      TaskId: string
+      AttemptId: string
+      StartedAtUtc: string }
+
+[<CLIMutable>]
+type AgentInFlightReservations =
+    { AgentId: string
+      Operations: InFlightAgentOperation list
+      // Completion remains recent even when no agent-version field changed.
+      // This rejects stale corrections immediately following a real call.
+      RecentlyCompletedUntilUtc: string }
+
 [<CLIMutable>]
 type IntegrationSubmission =
     { SubmissionId: string
@@ -478,6 +497,11 @@ module ReviewWorkflow =
             Convert.ToBase64String(Encoding.UTF8.GetBytes agentId)
                 .TrimEnd('=').Replace('+', '-').Replace('/', '_')
         $"agents/{safe}.json"
+
+    // The separate record is checked in the *same* ledger transaction as an
+    // operator correction; reservation acquisition and correction serialize.
+    let private inFlightPath agentId =
+        "records/working-activity/" + (agentPath agentId).Substring("agents/".Length)
 
     let private validTaskId (taskId: string) = not (isNull taskId) && idPattern.IsMatch taskId
     let private validAgent (agent: string) =
@@ -1524,6 +1548,86 @@ module ReviewWorkflow =
     let recordWorkingActivity binding operationId agentId taskId attemptId =
         recordWorkingActivityAt binding operationId agentId taskId attemptId DateTimeOffset.UtcNow
 
+    // Durable in-flight reservations protect potentially long-running or
+    // mutating commands independently of the expiring cheap-read lease.
+    // They do NOT change ReviewAgent.Version, so owner commands with exact
+    // expected versions remain valid. No TTL: a failed release must block
+    // administrative correction, not silently declare running work stale.
+    let beginInFlightAgentOperation binding operationId agentId taskId attemptId (reservationId: Guid) =
+        if not (validAgent agentId) || not (validTaskId taskId)
+           || String.IsNullOrWhiteSpace attemptId || reservationId = Guid.Empty then
+            Error(InvalidBinding "In-flight activity requires exact agent, task, attempt and reservation ID.")
+        else
+            LedgerStore.transact binding
+                (intent operationId agentId "BeginInFlightAgentOperation"
+                    {| agentId = agentId; taskId = taskId; attemptId = attemptId
+                       reservationId = reservationId.ToString("N") |})
+                (fun snapshot -> result {
+                    let! task, _, attempt, _ = getAttempt binding snapshot taskId
+                    let! agent, _ = required<ReviewAgent> binding snapshot (agentPath agentId)
+                    if not (List.contains task.Lifecycle [ "InProgress"; "Closed" ])
+                       || attempt.AttemptId <> attemptId
+                       || attempt.OwnerAgentId <> agentId
+                       || attempt.Phase <> "Started"
+                       || agent.State <> "Working"
+                       || not (matchesAssignment taskId attempt agent) then
+                        return! Error(StaleEntityVersion "Assignment changed before in-flight activity admission.")
+                    let path = inFlightPath agentId
+                    let! existing = read<AgentInFlightReservations> binding snapshot path
+                    let entries, oid =
+                        match existing with
+                        | None -> [], None
+                        | Some (record, oid) ->
+                            (if record.AgentId = agentId && not (isNull (box record.Operations))
+                             then record.Operations else []), Some oid
+                    match existing with
+                    | Some (record, _) when record.AgentId <> agentId
+                                           || isNull (box record.Operations) ->
+                        return! Error(LedgerIntegrityError "Invalid in-flight reservation record.")
+                    | _ -> ()
+                    if entries.Length >= 128 || entries |> List.exists (fun entry ->
+                           entry.Id = reservationId.ToString("N")) then
+                        return! Error(StaleEntityVersion "In-flight reservation already exists or limit reached.")
+                    let entry =
+                        { Id = reservationId.ToString("N"); TaskId = taskId; AttemptId = attemptId
+                          StartedAtUtc = DateTimeOffset.UtcNow.ToString("O") }
+                    let previousUntil =
+                        existing |> Option.map (fun (value, _) -> value.RecentlyCompletedUntilUtc)
+                                 |> Option.defaultValue null
+                    return [ change path oid
+                                 { AgentId = agentId; Operations = entries @ [ entry ]
+                                   RecentlyCompletedUntilUtc = previousUntil } ]
+                })
+
+    let internal endInFlightAgentOperationAt binding operationId agentId (reservationId: Guid) (now: DateTimeOffset) =
+        if not (validAgent agentId) || reservationId = Guid.Empty then
+            Error(InvalidBinding "Releasing activity requires exact agent and reservation.")
+        else
+            LedgerStore.transact binding
+                (intent operationId agentId "EndInFlightAgentOperation"
+                    {| agentId = agentId; reservationId = reservationId.ToString("N") |})
+                (fun snapshot -> result {
+                    let path = inFlightPath agentId
+                    let! record, oid =
+                        required<AgentInFlightReservations> binding snapshot path
+                    if record.AgentId <> agentId
+                       || isNull (box record.Operations) then
+                        return! Error(LedgerIntegrityError "Invalid in-flight reservation record.")
+                    if not (record.Operations |> List.exists
+                               (fun entry -> entry.Id = reservationId.ToString("N"))) then
+                        return! Error(StaleEntityVersion "In-flight reservation already released.")
+                    let remaining =
+                        record.Operations
+                        |> List.filter (fun entry -> entry.Id <> reservationId.ToString("N"))
+                    return [ change path (Some oid)
+                                 { record with Operations = remaining
+                                               RecentlyCompletedUntilUtc =
+                                                   (now.AddMinutes(5.)).ToString("O") } ]
+                })
+
+    let endInFlightAgentOperation binding operationId agentId reservationId =
+        endInFlightAgentOperationAt binding operationId agentId reservationId DateTimeOffset.UtcNow
+
     let resumeAgent binding operationId taskId ownerId expectedAttemptVersion expectedAgentVersion generation =
         resumeAgentWithSession binding operationId taskId ownerId expectedAttemptVersion expectedAgentVersion generation ""
 
@@ -2095,6 +2199,24 @@ module ReviewWorkflow =
                     let! task, _, attempt, _ = getAttempt binding snapshot taskId
                     let! agent, agentOid =
                         required<ReviewAgent> binding snapshot (agentPath targetAgentId)
+                    // A durable reservation fences an admitted operation even
+                    // if the network is down and its time-bounded lease has
+                    // expired. This read is in the same optimistic Git
+                    // transaction as the correction's agent-state update.
+                    let! reservations =
+                        read<AgentInFlightReservations> binding snapshot (inFlightPath targetAgentId)
+                    match reservations with
+                    | Some (record, _) when record.AgentId <> targetAgentId
+                                           || isNull (box record.Operations) ->
+                        return! Error(LedgerIntegrityError "Corrupt target agent reservation record.")
+                    | Some (record, _) when not (List.isEmpty record.Operations) ->
+                        return! Error(StaleEntityVersion "Cannot correct agent with in-flight operations.")
+                    | Some (record, _) when not (String.IsNullOrWhiteSpace record.RecentlyCompletedUntilUtc) ->
+                        let mutable recentUntil = Unchecked.defaultof<DateTimeOffset>
+                        if not (DateTimeOffset.TryParse(record.RecentlyCompletedUntilUtc, &recentUntil))
+                           || recentUntil > DateTimeOffset.UtcNow then
+                            return! Error(StaleEntityVersion "Agent recently completed a genuine operation.")
+                    | _ -> ()
                     if task.Version <> expectedTaskVersion
                        || task.Lifecycle <> "InProgress"
                        || attempt.AttemptId <> attemptId

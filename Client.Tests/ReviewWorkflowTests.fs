@@ -394,6 +394,90 @@ type ReviewWorkflowTests() =
                 if File.Exists configPath then File.Delete configPath)
 
     [<Test>]
+    member _.InFlightOwnerTransitionsBlockConcurrentCorrectionWithoutChangingExactVersions() =
+        for transition in [ "Checkpoint"; "Yield"; "Complete" ] do
+            for expired in [ false; true ] do
+                withFixture (fun _ _ first second _ _ _ _ ->
+                    let taskId =
+                        sprintf "inflight-%s-%s" (transition.ToLowerInvariant())
+                            (if expired then "expired" else "legacy")
+                    ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "In-flight owner transition"
+                    |> success |> ignore
+                    ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner"
+                    |> success |> ignore
+                    ReviewWorkflow.beginAttempt first (Guid.NewGuid()) taskId "Owner" 1 1
+                    |> success |> ignore
+                    let _, taskInfo, attemptOpt = ReviewWorkflow.getTask first taskId |> success
+                    let attempt = attemptOpt.Value
+                    if expired then
+                        ReviewWorkflow.recordWorkingActivityAt first (Guid.NewGuid())
+                            "Owner" taskId attempt.AttemptId (DateTimeOffset.UtcNow.AddMinutes(-10.))
+                        |> success |> ignore
+                    let owner = (ReviewWorkflow.getAgentInbox first "Owner" |> success).Agent
+                    Assert.That(owner.State, Is.EqualTo("Working"))
+                    Assert.That(String.IsNullOrWhiteSpace owner.ActivityLeaseUntilUtc || expired, Is.True)
+                    let reservation = Guid.NewGuid()
+                    ReviewWorkflow.beginInFlightAgentOperation second (Guid.NewGuid())
+                        "Owner" taskId attempt.AttemptId reservation |> success |> ignore
+                    let observed = (ReviewWorkflow.getAgentInbox first "Owner" |> success).Agent
+                    // A reservation must not invalidate an owner transition's
+                    // supplied expected agent version.
+                    Assert.That(observed.Version, Is.EqualTo(owner.Version))
+                    let gate =
+                        System.Threading.Tasks.TaskCompletionSource<unit>(
+                            System.Threading.Tasks.TaskCreationOptions.RunContinuationsAsynchronously)
+                    let pending = task {
+                        do! gate.Task
+                        let result =
+                            match transition with
+                            | "Checkpoint" ->
+                                ReviewWorkflow.checkpointAttempt second (Guid.NewGuid()) taskId "Owner"
+                                    attempt.Version owner.Version attempt.AssignmentGeneration
+                                    "Worker progress" "Continue" null null
+                            | "Yield" ->
+                                ReviewWorkflow.yieldAgent second (Guid.NewGuid()) taskId "Owner"
+                                    attempt.Version owner.Version attempt.AssignmentGeneration
+                                    "Paused" "Resume later"
+                            | "Complete" ->
+                                ReviewWorkflow.completeAgentWork second (Guid.NewGuid()) taskId "Owner"
+                                    attempt.Version owner.Version attempt.AssignmentGeneration "Completed"
+                            | _ -> failwith "Unknown test transition"
+                        let finish =
+                            ReviewWorkflow.endInFlightAgentOperation first (Guid.NewGuid())
+                                "Owner" reservation
+                        return result, finish
+                    }
+                    // The operator has *current* versions and a Working agent
+                    // with no valid lease, but cannot interrupt genuine
+                    // admitted work, even from another Git clone.
+                    for clone in [ first; second ] do
+                        expectStale
+                            (ReviewWorkflow.correctAgentWorkingStateAs clone "Lead" (Guid.NewGuid())
+                                "Lead" "Owner" taskId attempt.AttemptId taskInfo.Version attempt.Version
+                                observed.Version attempt.AssignmentGeneration "False inactivity")
+                    let _, beforeHistory = ReviewWorkflow.getTaskLifecycleHistory first taskId |> success
+                    Assert.That(beforeHistory, Is.Empty)
+                    gate.SetResult(())
+                    let result, release =
+                        pending |> Async.AwaitTask |> Async.RunSynchronously
+                    result |> success |> ignore
+                    release |> success |> ignore
+                    let after = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
+                    if transition = "Checkpoint" then
+                        Assert.That(after.State, Is.EqualTo("Working"))
+                        let _, currentTask, updatedAttemptOpt =
+                            ReviewWorkflow.getTask first taskId |> success
+                        expectStale
+                            (ReviewWorkflow.correctAgentWorkingStateAs first "Lead" (Guid.NewGuid())
+                                "Lead" "Owner" taskId attempt.AttemptId
+                                currentTask.Version updatedAttemptOpt.Value.Version
+                                after.Version attempt.AssignmentGeneration "Just completed call")
+                    else
+                        Assert.That(after.State, Is.Not.EqualTo("Working"))
+                    let _, history = ReviewWorkflow.getTaskLifecycleHistory second taskId |> success
+                    Assert.That(history, Is.Empty))
+
+    [<Test>]
     member _.WorkingLeaseSurvivesIndependentTaskClosureAndPreservesOwnerCompletion() =
         withFixture (fun _ _ first second _ _ _ _ ->
             let taskId = "closed-working-lease"

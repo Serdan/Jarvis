@@ -377,6 +377,63 @@ let compositeLaunchKeepsUncertainTabButClosesDefinitiveFailure (scriptStatus: st
 }
 
 [<Test>]
+let compositeNotReadyCleanupReportsFailureOrConfirmedClosure () = task {
+    let port = findPort()
+    use bridge = new BrowserBridge.Service(port, "test-secret")
+    bridge.Start()
+    let! client, connectionId = handshake port "test-secret"
+    use socket = client
+
+    // These two workflows wait for distinct created tabs that become discarded.
+    // They exercise the real 30-second bounded readiness path concurrently.
+    let fail = BrowserBridge.runInNewTab bridge "agents" "https://example.test/fail" "fail" false
+                   "async function execute(args) { return args; }" "{}" 5000 true
+    let close = BrowserBridge.runInNewTab bridge "agents" "https://example.test/close" "close" false
+                    "async function execute(args) { return args; }" "{}" 5000 true
+
+    let! openA = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
+    let! openB = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
+    Assert.That(property openA "kind", Is.EqualTo("openTab"))
+    Assert.That(property openB "kind", Is.EqualTo("openTab"))
+    let idFor frame =
+        if property frame "url" = "https://example.test/fail" then "discarded-fail"
+        else "discarded-close"
+    do! send socket """{"version":2,"kind":"registrations","tabs":[{"registrationId":"discarded-fail","alias":"fail","agentCreated":true,"availability":"discarded","registrationGeneration":1},{"registrationId":"discarded-close","alias":"close","agentCreated":true,"availability":"discarded","registrationGeneration":1}]}"""
+    for frame in [openA; openB] do
+        do! send socket (JsonSerializer.Serialize({|
+            version = 2; kind = "tabOpened"; requestId = property frame "requestId"
+            connectionId = connectionId
+            tab = {| registrationId = idFor frame; agentCreated = true
+                     availability = "discarded"; registrationGeneration = 1 |}
+        |}))
+    for _ in 1..2 do
+        let! frame = (receive socket).WaitAsync(TimeSpan.FromSeconds(40.0))
+        Assert.That(property frame "kind", Is.EqualTo("closeTab"))
+        let tabId = property frame "registrationId"
+        let failCleanup = tabId = "discarded-fail"
+        do! send socket (JsonSerializer.Serialize({|
+            version = 2
+            kind = if failCleanup then "error" else "tabClosed"
+            requestId = property frame "requestId"
+            connectionId = connectionId; registrationId = tabId
+            registrationGeneration = 1
+            error = if failCleanup then "RegistrationStale" else ""
+        |}))
+    let! failed = fail
+    let! closed = close
+    match failed with
+    | Error (registrationId, reason) ->
+        Assert.That(registrationId, Is.EqualTo("discarded-fail"))
+        Assert.That(reason, Does.Contain("TabNotReady; cleanupFailed:BrowserCloseTabError:RegistrationStale"))
+    | Ok _ -> Assert.Fail("Failed cleanup must never report success")
+    match closed with
+    | Error (registrationId, reason) ->
+        Assert.That(registrationId, Is.EqualTo("discarded-close"))
+        Assert.That(reason, Is.EqualTo("TabNotReady; cleanup=closed"))
+    | Ok _ -> Assert.Fail("An unready page must not report an executed script")
+}
+
+[<Test>]
 let liveDomSnapshotReturnsPostHydrationMarkup () = task {
     let port = findPort()
     use bridge = new BrowserBridge.Service(port, "test-secret")

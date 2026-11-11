@@ -1,6 +1,6 @@
 # Live DOM snapshots in the Jarvis browser bridge
 
-**Status:** Implemented on `feature/browser-bridge`; not merged, deployed or verified in a live Edge/Chromium extension. The generic tab and script functions predate this addition.
+**Status:** Implemented on `feature/browser-bridge`; not merged or deployed. Automated live Chrome for Testing verification has passed with the real MV3 extension paired to the actual `Client.BrowserBridge.Service` through an isolated test host. Human-operated extension-popup consent and the normal authenticated Jarvis MCP/server-to-client flow have not yet been verified.
 
 ## Why use it?
 
@@ -67,7 +67,9 @@ The user's extension registration and explicit site host permission still apply.
 
 The export buffer is ephemeral in the extension and limited to two snapshots, each up to 8 MiB, with a rolling two-minute idle expiration. Export uses **32 KiB chunks** and SHA-256 integrity checks. A disconnected extension, expired buffer, navigation or lost authorization aborts transfer and preserves no partial output file. The destination is never silently overwritten.
 
-The fixture `browser-extension/tests/fixtures/dynamic-dom.html` demonstrates delayed data and a custom DOM event for live testing. Automated DOM simulation and loopback protocol regressions also cover these scenarios. Live extension acceptance is still required before integration.
+The fixture `browser-extension/tests/fixtures/dynamic-dom.html` demonstrates delayed content and a custom DOM event. Automated DOM simulation, loopback protocol regressions, and a **real Chromium extension ↔ native JarvisClient bridge** smoke test all pass. The latter uses synthetic consent in a disposable profile; the separate human-authorized popup and full Jarvis OAuth/MCP acceptance test remain unverified.
+
+Tab closure is based on valid Jarvis ownership and authorization, **not whether page scripts can execute**. An owned `discarded` or `frozen` tab can be closed without waking or activating it, provided its registration generation, window, origin, and current host permission still match. Manually registered tabs remain non-closable. If a composite open-and-execute operation times out waiting for page readiness, it reports `TabNotReady; cleanup=closed`, `TabNotReady; cleanupFailed:<reason>`, or `TabNotReady; cleanup=retained` rather than hiding a failed cleanup.
 
 ## Disposable real-browser smoke test
 

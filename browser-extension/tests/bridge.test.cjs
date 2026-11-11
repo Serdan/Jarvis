@@ -20,6 +20,7 @@ function createHarness(initialStorage = {}, initialSession = {}) {
   const calls = [];
   const createdTabs = [];
   let nextCreatedId = 19;
+  let hostPermissionGranted = true;
   class FakeWebSocket {
     static OPEN = 1;
     static CONNECTING = 0;
@@ -74,7 +75,7 @@ function createHarness(initialStorage = {}, initialSession = {}) {
       onRemoved: { addListener: cb => { listeners.windowRemoved = cb; } }
     },
     webNavigation: { onHistoryStateUpdated: { addListener: cb => { listeners.history = cb; } } },
-    permissions: { contains: async () => true },
+    permissions: { contains: async () => hostPermissionGranted },
     alarms: {
       create: () => {},
       onAlarm: { addListener: cb => { listeners.alarm = cb; } }
@@ -102,7 +103,9 @@ function createHarness(initialStorage = {}, initialSession = {}) {
     await socket.onmessage({ data: JSON.stringify({ version: 2, ...value }) });
     await tick(); await tick();
   };
-  return { storage, session, tabs, createdTabs, sockets, calls, listeners, message, deliver, userScripts: chrome.userScripts };
+  return { storage, session, tabs, createdTabs, sockets, calls, listeners, message, deliver,
+    userScripts: chrome.userScripts,
+    setHostPermissionGranted: granted => { hostPermissionGranted = granted; } };
 }
 
 test("registration requires a user action and unregistered tabs stay private", async () => {
@@ -412,6 +415,92 @@ test("only agent-created tabs can be closed, preserving the window and manual ta
   assert.ok(h.tabs.has(17));
   assert.equal((await h.message("getState")).windows[0].alias, "agents");
   assert.equal((await h.message("getState")).registrations.length, 1);
+});
+
+async function createdTabForCloseRegression() {
+  const h = createHarness();
+  await tick(); await tick();
+  await h.message("registerWindow", { windowId: 1, alias: "agents" });
+  await h.message("register", { tabId: 17, alias: "manual" });
+  await h.message("setAgentCreatedTabs", { allowed: true });
+  await h.message("pair", { port: 43822, secret: "f".repeat(64) });
+  await tick(); await tick();
+  const ws = h.sockets[0];
+  await h.deliver(ws, { kind: "challenge", nonce: "e".repeat(64) });
+  await h.deliver(ws, { kind: "ready", connectionId: "epoch-1" });
+  await h.deliver(ws, {
+    kind: "openTab", requestId: "owned-open", connectionId: "epoch-1",
+    url: "https://example.test/chat/new", alias: "owned", windowRegistration: "agents", active: false
+  });
+  const registered = ws.sent.find(m => m.requestId === "owned-open" && m.kind === "tabOpened")?.tab;
+  assert.ok(registered);
+  const tab = h.createdTabs[0];
+  tab.url = "https://example.test/chat/new";
+  tab.status = "complete";
+  delete tab.pendingUrl;
+  const close = async (requestId, options = {}) => {
+    await h.deliver(ws, {
+      kind: "closeTab", requestId, connectionId: "epoch-1",
+      registrationId: registered.registrationId,
+      registrationGeneration: registered.registrationGeneration, ...options
+    });
+    return ws.sent.find(m => m.requestId === requestId);
+  };
+  return { h, ws, tab, registered, close };
+}
+
+for (const lifecycleState of ["discarded", "frozen"]) {
+  test("owned " + lifecycleState + " tab can be safely closed without waking it", async () => {
+    const { h, tab, registered, close } = await createdTabForCloseRegression();
+    tab[lifecycleState] = true;
+    const status = await h.message("getState");
+    assert.equal(status.registrations.find(r => r.registrationId === registered.registrationId).availability,
+      lifecycleState);
+    const response = await close("close-" + lifecycleState);
+    assert.equal(response.kind, "tabClosed");
+    assert.equal(h.tabs.has(tab.id), false);
+    assert.equal(h.tabs.has(17), true, "Manually registered tab must survive");
+    assert.equal(h.tabs.has(18), true, "Unregistered tab must survive");
+    assert.equal((await h.message("getState")).windows[0].alias, "agents");
+    assert.equal(h.calls.length, 0, "Closing may not execute a page script");
+    assert.equal(tab[lifecycleState], true, "Closing must not wake/activate the tab");
+  });
+}
+
+test("owned discarded/frozen close fails closed on stale generation, revoked origin or window", async () => {
+  const { h, tab, registered, close } = await createdTabForCloseRegression();
+  tab.discarded = true;
+  assert.equal((await close("wrong-generation", {
+    registrationGeneration: registered.registrationGeneration + 1
+  })).error, "TabNotAgentCreated");
+  assert.equal(h.tabs.has(tab.id), true);
+
+  h.setHostPermissionGranted(false);
+  assert.equal((await close("revoked-permission")).error, "RegistrationStale");
+  assert.equal(h.tabs.has(tab.id), true, "Host permission revocation cannot authorize closure");
+  h.setHostPermissionGranted(true);
+
+  tab.windowId = 99;
+  assert.equal((await close("moved-window")).error, "RegistrationStale");
+  assert.equal(h.tabs.has(tab.id), true, "Moved tab cannot be closed");
+});
+
+test("closing an owned frozen tab refuses cross-origin navigation", async () => {
+  const { h, tab, close } = await createdTabForCloseRegression();
+  tab.frozen = true;
+  tab.url = "https://unrelated.test/other";
+  assert.equal((await close("cross-origin")).error, "RegistrationStale");
+  assert.equal(h.tabs.has(tab.id), true);
+});
+
+test("closing a pending created tab requires its originally granted origin", async () => {
+  const { h, tab, close } = await createdTabForCloseRegression();
+  tab.url = "about:blank";
+  tab.pendingUrl = "https://example.test/chat/new";
+  tab.status = "loading";
+  h.setHostPermissionGranted(false);
+  assert.equal((await close("pending-revoked")).error, "RegistrationStale");
+  assert.equal(h.tabs.has(tab.id), true);
 });
 
 async function snapshotHarness(dom = {}) {

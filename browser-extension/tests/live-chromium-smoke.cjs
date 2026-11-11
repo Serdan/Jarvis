@@ -557,12 +557,25 @@ async function main() {
       assert.equal((await denied).error, "TabNotAgentCreated");
     }
     phases.push("Manual tab close refused");
+    // A real discarded agent-owned tab must remain safely closable without
+    // a page script, a wake-up, or accidentally closing the registered window.
+    // Detach DevTools first because an attached debugger prevents discarding.
+    page?.close();
+    page = null;
+    const owned = state.registrations.find(r => r.registrationId === tab.registrationId);
+    assert.ok(owned?.tabId);
+    const discarded = await extension.eval("chrome.tabs.discard(" + owned.tabId + ")");
+    assert.equal(discarded?.discarded, true, "Chrome must really discard the created tab");
+    const afterDiscard = await fromExtension({ kind: "getState" });
+    assert.equal(afterDiscard.registrations.find(r =>
+      r.registrationId === tab.registrationId)?.availability, "discarded");
+    phases.push("Real agent-created Chrome tab discarded");
     const closed = await bridge.request({
       kind: "closeTab", registrationId: tab.registrationId,
       registrationGeneration: tab.registrationGeneration
     });
     assert.equal(closed.kind, "tabClosed");
-    phases.push("Agent tab safely closed");
+    phases.push("Discarded agent-owned tab safely closed without reactivation");
     console.log(JSON.stringify({ status: "passed", steps: phases,
       bridge: realClient ? "actual JarvisClient BrowserBridge.Service" : "test WebSocket peer",
       consentMode: "synthetic registration in disposable profile",

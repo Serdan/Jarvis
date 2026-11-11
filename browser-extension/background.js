@@ -129,7 +129,12 @@ async function assess(reg) {
     const pendingInitialNavigation = reg.agentCreated && tab.status === "loading" &&
       tab.pendingUrl === reg.boundUrl &&
       (!isAllowedUrl(tab.url) || tab.url === "about:blank");
-    if (pendingInitialNavigation) return "loading";
+    if (pendingInitialNavigation) {
+      // Even an uncommitted new tab must retain its original host permission.
+      if (!(await chrome.permissions.contains({ origins: [reg.boundOrigin + "/*"] })))
+        return "needsReauthorization";
+      return "loading";
+    }
 
     if (!isAllowedUrl(tab.url) ||
         (reg.agentCreated
@@ -145,11 +150,13 @@ async function assess(reg) {
       return "needsReauthorization";
     }
     if (reg.agentCreated) reg.currentUrl = tab.url;
+    // Closing a discarded/frozen tab is safe, but must never bypass the site
+    // permission check that is required for page execution.
+    const origin = new URL(tab.url).origin + "/*";
+    if (!(await chrome.permissions.contains({ origins: [origin] }))) return "needsReauthorization";
     if (tab.discarded) return "discarded";
     if (tab.frozen) return "frozen";
     if (tab.status === "loading") return "loading";
-    const origin = new URL(tab.url).origin + "/*";
-    if (!(await chrome.permissions.contains({ origins: [origin] }))) return "needsReauthorization";
     return "ready";
   } catch { return "missing"; }
 }
@@ -615,7 +622,9 @@ async function closeCreatedTab(message) {
   if (!reg || !reg.agentCreated || reg.registrationGeneration !== registrationGeneration)
     return reject("TabNotAgentCreated");
   const availability = await assess(reg);
-  if (availability !== "ready" && availability !== "loading")
+  // Close is a tab-ownership operation, not page execution. Discarded/frozen
+  // tabs retain their authorization and can be removed without waking them.
+  if (!["ready", "loading", "discarded", "frozen"].includes(availability))
     return reject("RegistrationStale");
   const parent = await validWindow(reg.windowRegistration);
   if (!parent) return reject("WindowNotRegistered");

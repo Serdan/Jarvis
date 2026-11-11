@@ -52,7 +52,7 @@ An agent can use the browser bridge to obtain **rendered HTML** when `curl` only
 
 Small captures return inline HTML. For pages exceeding the inline bound, call `BrowserExportDom` with an explicit `projectName` and new `filePath`; it transfers up to 8 MiB in 32 KiB chunks, verifies a checksum and writes the file atomically without overwriting. No HTML is logged or automatically committed.
 
-See [Live DOM snapshots](../docs/BrowserDomSnapshots.md) for all wait forms, timeout behavior, export details and the test fixture. The extension advertises a snapshot capability; an older extension produces an explicit update-required error instead of an unexplained timeout.
+See [Live DOM snapshots](../docs/BrowserDomSnapshots.md) for all wait forms, timeout behavior, export details and the test fixture. The real Chrome for Testing MV3 extension and `Client.BrowserBridge.Service` have passed the isolated native integration smoke test; manual action-popup consent and the full authenticated MCP pipeline remain separate acceptance work. The extension advertises a snapshot capability; an older extension produces an explicit update-required error instead of an unexplained timeout.
 
 ## Example provider script: ChatGPT agent launcher
 

@@ -707,9 +707,15 @@ let runInNewTab (bridge: Service) (windowRegistration: string) (url: string)
                     if not ready then
                         // No page script was dispatched; cleanup cannot interrupt a submission.
                         if closeAfterExecution then
-                            let! _ = bridge.CloseTab(registrationId)
-                            ()
-                        return Error(registrationId, "TabNotReady")
+                            match! bridge.CloseTab(registrationId) with
+                            | Ok _ -> return Error(registrationId, "TabNotReady; cleanup=closed")
+                            | Error e ->
+                                // Report that an owned tab may remain instead of
+                                // silently discarding a failed cleanup attempt.
+                                let safe = if e.Length > 100 then e.Substring(0, 100) else e
+                                return Error(registrationId, "TabNotReady; cleanupFailed:" + safe)
+                        else
+                            return Error(registrationId, "TabNotReady; cleanup=retained")
                     else
                         let! script = bridge.Execute(registrationId, source, argsJson, timeoutMs, false)
                         match script with

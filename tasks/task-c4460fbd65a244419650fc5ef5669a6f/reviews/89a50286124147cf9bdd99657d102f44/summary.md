@@ -1,0 +1,1 @@
+New CorrectAgentWorkingState command in ledger+TaskWrite/MCP; preserves task/attempt/checkpoints/owner refs and target last seen. Release Server.Tests 128/128 and Client Administrative 9/9 passed. Full Client.Tests running via managed job 4c9a3998571a46e8abc44b2af1e98c98. Commit f68449e.

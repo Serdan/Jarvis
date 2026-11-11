@@ -209,7 +209,14 @@ type TaskLifecycleEvent =
       NewGeneration: int
       ReviewRequestId: string
       ReviewDisposition: string
-      Evidence: string }
+      Evidence: string
+      // Optional for historical schema-v2 lifecycle events.
+      RequestingAgentId: string
+      TargetAgentId: string
+      PreviousAgentState: string
+      NewAgentState: string
+      PreviousAgentVersion: int
+      NewAgentVersion: int }
 
 [<CLIMutable>]
 type ReviewFeedbackNotice =
@@ -380,7 +387,12 @@ module ReviewWorkflow =
                         // were already stored. Missing means same-project; all
                         // other notification members remain mandatory.
                         || (typeof<'t> = typeof<AgentNotification>
-                            && property = "fromProjectName"))
+                            && property = "fromProjectName")
+                        || (typeof<'t> = typeof<TaskLifecycleEvent>
+                            && List.contains property
+                                [ "requestingAgentId"; "targetAgentId"
+                                  "previousAgentState"; "newAgentState"
+                                  "previousAgentVersion"; "newAgentVersion" ]))
                 let status (name: string) (allowed: string list) =
                     let mutable field = Unchecked.defaultof<JsonElement>
                     root.TryGetProperty(name, &field)
@@ -411,7 +423,8 @@ module ReviewWorkflow =
                     | "AgentCheckpoint" -> status "kind" [ "Yield"; "Completion"; "Recovery"; "Progress"; "Submission"; "Revision" ]
                     | "TaskLifecycleEvent" ->
                         status "action" [ "ParkAttempt"; "BlockAttempt"; "ResumeAttempt"; "CancelTask";
-                                          "AbandonAttempt"; "TransferOwner"; "CloseTask"; "ReopenTask" ]
+                                          "AbandonAttempt"; "TransferOwner"; "CloseTask"; "ReopenTask";
+                                          "CorrectAgentWorkingState" ]
                     | "AssignmentIssue" ->
                         status "reason" [ "Assignment"; "ReviewChanges"; "CompletionRequeue"; "Recovery"; "ExplicitReissue"; "AdministrativeResume"; "OwnershipTransfer"; "SpecAdoption" ]
                     | "AssignmentReceipt" -> true
@@ -1989,7 +2002,69 @@ module ReviewWorkflow =
           NewOwnerId = nextOwner
           PreviousGeneration = attempt |> Option.map (fun a -> a.AssignmentGeneration) |> Option.defaultValue 0
           NewGeneration = attempt |> Option.map (fun a -> a.AssignmentGeneration) |> Option.defaultValue 0
-          ReviewRequestId = reviewId; ReviewDisposition = reviewDisposition; Evidence = evidence }
+          ReviewRequestId = reviewId; ReviewDisposition = reviewDisposition; Evidence = evidence
+          RequestingAgentId = null; TargetAgentId = null
+          PreviousAgentState = null; NewAgentState = null
+          PreviousAgentVersion = 0; NewAgentVersion = 0 }
+
+    // Operator-authorized correction of stale Working state. The requesting
+    // agent identity is supplied provenance, while actor is the authenticated
+    // operator identity. This does not create a checkpoint or reissue work.
+    let correctAgentWorkingStateAs binding actor operationId requestingAgentId targetAgentId
+                                   taskId attemptId expectedTaskVersion expectedAttemptVersion
+                                   expectedAgentVersion generation reason =
+        if not (validAgent actor) || not (validAgent requestingAgentId)
+           || not (validAgent targetAgentId) || not (validTaskId taskId)
+           || String.IsNullOrWhiteSpace attemptId
+           || expectedTaskVersion < 1 || expectedAttemptVersion < 1
+           || expectedAgentVersion < 1 || generation < 1
+           || not (validText 2048 reason) then
+            Error(InvalidBinding "Administrative Working-to-Ready correction requires exact identities, versions, generation and reason.")
+        else
+            LedgerStore.transact binding
+                (intent operationId actor "CorrectAgentWorkingState"
+                    {| requestingAgentId = requestingAgentId; targetAgentId = targetAgentId
+                       taskId = taskId; attemptId = attemptId
+                       expectedTaskVersion = expectedTaskVersion
+                       expectedAttemptVersion = expectedAttemptVersion
+                       expectedAgentVersion = expectedAgentVersion
+                       generation = generation; reason = reason |})
+                (fun snapshot -> result {
+                    let! task, _, attempt, _ = getAttempt binding snapshot taskId
+                    let! agent, agentOid =
+                        required<ReviewAgent> binding snapshot (agentPath targetAgentId)
+                    if task.Version <> expectedTaskVersion
+                       || task.Lifecycle <> "InProgress"
+                       || attempt.AttemptId <> attemptId
+                       || attempt.OwnerAgentId <> targetAgentId
+                       || attempt.Version <> expectedAttemptVersion
+                       || attempt.AssignmentGeneration <> generation
+                       || attempt.Phase <> "Started"
+                       || agent.Version <> expectedAgentVersion
+                       || agent.State <> "Working"
+                       || not (matchesAssignment taskId attempt agent)
+                       || agent.ActiveAttemptId <> attempt.AttemptId then
+                        return! Error(StaleEntityVersion "Administrative correction targets a stale or unrelated Working assignment.")
+                    let correction =
+                        enterState "Ready" agent
+                        |> fun updated ->
+                            { updated with Version = agent.Version + 1
+                                           StateReason = reason
+                                           StateSequence = snapshot.Header.NextSequence }
+                    let audit =
+                        { adminEvent actor task (Some attempt) operationId snapshot.Header.NextSequence
+                              "CorrectAgentWorkingState" reason task.Lifecycle attempt.Phase
+                              targetAgentId null "Unchanged" null with
+                            RequestingAgentId = requestingAgentId
+                            TargetAgentId = targetAgentId
+                            PreviousAgentState = agent.State
+                            NewAgentState = correction.State
+                            PreviousAgentVersion = agent.Version
+                            NewAgentVersion = correction.Version }
+                    return
+                        [ change (agentPath targetAgentId) (Some agentOid) correction
+                          change (lifecycleEventPath taskId snapshot.Header.NextSequence) None audit ]
+                })
 
     // Only clear a focus that still belongs to this attempt. Never interrupt
     // an owner's newer assignment, or turn agent Parked into an attempt phase.

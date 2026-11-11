@@ -263,6 +263,110 @@ type ReviewWorkflowTests() =
             Assert.That(history, Is.Empty))
 
     [<Test>]
+    member _.OrdinaryWorkingActivityFencesStaleAdministrativeCorrectionAcrossClones() =
+        withFixture (fun _ _ first second _ _ _ _ ->
+            let taskId = "admin-activity-fence"
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Working activity fence"
+            |> success |> ignore
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner"
+            |> success |> ignore
+            ReviewWorkflow.beginAttempt first (Guid.NewGuid()) taskId "Owner" 1 1
+            |> success |> ignore
+            let _, task, maybeAttempt = ReviewWorkflow.getTask first taskId |> success
+            let attempt = maybeAttempt.Value
+            let before = (ReviewWorkflow.getAgentInbox first "Owner" |> success).Agent
+            let activity =
+                ReviewWorkflow.recordWorkingActivity second (Guid.NewGuid())
+                    "Owner" taskId attempt.AttemptId |> success
+            Assert.That(activity.Operation.Actor, Is.EqualTo("Owner"))
+            let after = (ReviewWorkflow.getAgentInbox first "Owner" |> success).Agent
+            Assert.That(after.State, Is.EqualTo("Working"))
+            Assert.That(after.Version, Is.EqualTo(before.Version + 1))
+            Assert.That(after.StateSequence, Is.EqualTo(before.StateSequence))
+            Assert.That(after.WorkingTurnStartedAtUtc, Is.EqualTo(before.WorkingTurnStartedAtUtc))
+            Assert.That(after.StateEnteredAtUtc, Is.EqualTo(before.StateEnteredAtUtc))
+            Assert.That(after.CurrentAssignment, Is.EqualTo(before.CurrentAssignment :> obj))
+            let _, taskAfter, attemptAfter = ReviewWorkflow.getTask first taskId |> success
+            Assert.That(taskAfter, Is.EqualTo(task :> obj))
+            Assert.That(attemptAfter.Value, Is.EqualTo(attempt :> obj))
+            expectStale
+                (ReviewWorkflow.correctAgentWorkingStateAs first "Lead" (Guid.NewGuid())
+                    "Lead" "Owner" taskId attempt.AttemptId task.Version attempt.Version
+                    before.Version attempt.AssignmentGeneration "Old observation")
+            let _, history = ReviewWorkflow.getTaskLifecycleHistory second taskId |> success
+            Assert.That(history, Is.Empty)
+            Assert.That((ReviewWorkflow.getAgentInbox first "Owner" |> success).Agent.State,
+                        Is.EqualTo("Working"))
+            // Once an administrator has observed the new version, the exact
+            // correction remains available; recent activity cannot be mistaken
+            // for older activity, and the operator can still repair a bad state.
+            ReviewWorkflow.correctAgentWorkingStateAs first "Lead" (Guid.NewGuid())
+                "Lead" "Owner" taskId attempt.AttemptId task.Version attempt.Version
+                after.Version attempt.AssignmentGeneration "Inspected latest working state"
+            |> success |> ignore
+            Assert.That((ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent.State,
+                        Is.EqualTo("Ready")))
+
+    [<Test>]
+    member _.OrdinarySelfReadRecordsCanonicalActivityBeforeReturningAcrossDevices() =
+        withFixture (fun one _ first second _ _ _ _ ->
+            let taskId = "admin-activity-read"
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Activity read"
+            |> success |> ignore
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner"
+            |> success |> ignore
+            ReviewWorkflow.beginAttempt first (Guid.NewGuid()) taskId "Owner" 1 1
+            |> success |> ignore
+            let _, task, maybeAttempt = ReviewWorkflow.getTask first taskId |> success
+            let attempt = maybeAttempt.Value
+            let before = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
+            let configPath = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
+            try
+                Client.OrchestrationApi.LedgerBindingConfig.bindExisting
+                    "owner" (GitCommandTests.TestContext(Path.GetDirectoryName one))
+                    first.ProjectId first.LedgerId first.Epoch first.RemoteName
+                    first.ApprovedFetchUrl first.ApprovedPushUrl
+                    (LedgerStore.fetch first |> success).Commit true
+                |> success |> ignore
+                let runtime =
+                    Client.Runtime(Path.GetDirectoryName one, Client.ConsoleTui.ConsoleTui(), Client.PartialTrust)
+                let selfRead : Common.AgentCommand =
+                    Common.TaskReadCommand
+                        { ProjectName = "owner"; AgentId = "Owner"; Action = "GetAssignment"
+                          TaskId = taskId; AssignmentGeneration = 1
+                          CheckpointSequence = 0L; Cursor = ""; PageSize = 0
+                          BeforeOid = null; AfterOid = null; RelativePath = null }
+                let invoke command actor =
+                    Client.SignalR.Client.processIncomingCommand runtime
+                        (System.Text.Json.JsonSerializer.Serialize<Common.AgentCommand>(command)) actor
+                    |> Async.AwaitTask |> Async.RunSynchronously
+                let _, readResult, _ = invoke selfRead "Owner"
+                Assert.That(readResult.IsOk, Is.True, sprintf "Self-read failed: %A" readResult)
+                let after = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
+                Assert.That(after.Version, Is.EqualTo(before.Version + 1))
+                Assert.That(after.State, Is.EqualTo("Working"))
+                Assert.That(after.WorkingTurnStartedAtUtc, Is.EqualTo(before.WorkingTurnStartedAtUtc))
+                expectStale
+                    (ReviewWorkflow.correctAgentWorkingStateAs second "Lead" (Guid.NewGuid())
+                        "Lead" "Owner" taskId attempt.AttemptId task.Version attempt.Version
+                        before.Version attempt.AssignmentGeneration "Concurrent tool activity")
+                // A target-only observation is explicitly not self activity.
+                let observe : Common.AgentCommand =
+                    Common.ObserveAgentCommand
+                        { ProjectName = "owner"; ObserverAgentId = "Reviewer"; TargetAgentId = "Owner" }
+                let _, observationResult, changes = invoke observe "Reviewer"
+                Assert.That(observationResult.IsOk, Is.True)
+                Assert.That(changes.AgentStateChanges, Is.Empty)
+                Assert.That((ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent.Version,
+                            Is.EqualTo(after.Version))
+                let _, secondRead, _ = invoke selfRead "Owner"
+                Assert.That(secondRead.IsOk, Is.True)
+                Assert.That((ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent.Version,
+                            Is.EqualTo(after.Version + 1))
+            finally
+                if File.Exists configPath then File.Delete configPath)
+
+    [<Test>]
     member _.AdministrativeCorrectionTypedApiUsesAuthenticatedOperatorAndSafeReplay() =
         withFixture (fun one _ first second _ _ _ _ ->
             let taskId = "admin-correction-api"

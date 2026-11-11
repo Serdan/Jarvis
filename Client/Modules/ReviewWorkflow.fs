@@ -1462,6 +1462,37 @@ module ReviewWorkflow =
     let activateReadyAgent binding operationId taskId agentId =
         resumeAgentCore binding operationId taskId agentId 0 0 0 "" false
 
+    // A tool call by an already-Working agent is real activity even when the
+    // requested operation is read-only. Fence that activity in the canonical
+    // ledger before dispatch, so an administrator cannot use an old agent
+    // version to stop work that happened since inspection. This does not
+    // restart the turn clock, manufacture a checkpoint or mutate the attempt.
+    let recordWorkingActivity binding operationId agentId taskId attemptId =
+        if not (validAgent agentId) || not (validTaskId taskId)
+           || String.IsNullOrWhiteSpace attemptId then
+            Error(InvalidBinding "Working activity requires an exact agent assignment.")
+        else
+            LedgerStore.transact binding
+                (intent operationId agentId "RecordWorkingActivity"
+                    {| agentId = agentId; taskId = taskId; attemptId = attemptId |})
+                (fun snapshot -> result {
+                    let! task, _, attempt, _ = getAttempt binding snapshot taskId
+                    let! agent, agentOid = required<ReviewAgent> binding snapshot (agentPath agentId)
+                    if task.Lifecycle <> "InProgress"
+                       || attempt.AttemptId <> attemptId
+                       || attempt.OwnerAgentId <> agentId
+                       || attempt.Phase <> "Started"
+                       || agent.State <> "Working"
+                       || not (matchesAssignment taskId attempt agent)
+                       || agent.ActiveAttemptId <> attemptId then
+                        return! Error(StaleEntityVersion "Working assignment changed before tool activity.")
+                    // Version is the optimistic activity fence. In particular,
+                    // do not change StateSequence or WorkingTurnStartedAtUtc:
+                    // this is not a new Working turn or a guidance invalidation.
+                    return [ change (agentPath agentId) (Some agentOid)
+                                 { agent with Version = agent.Version + 1 } ]
+                })
+
     let resumeAgent binding operationId taskId ownerId expectedAttemptVersion expectedAgentVersion generation =
         resumeAgentWithSession binding operationId taskId ownerId expectedAttemptVersion expectedAgentVersion generation ""
 

@@ -105,6 +105,17 @@ let private isLocalAgentActivity = function
     | ObserveAgentCommand _ -> false // Neither observer nor target is acting.
     | _ -> true
 
+// These owner operations already change canonical task/attempt/agent versions
+// atomically, so a separate pre-dispatch activity write would invalidate the
+// caller's explicit optimistic concurrency token.
+let private activityFencedByCommand agentId = function
+    | TaskWriteCommand cmd when cmd.ActorId = agentId ->
+        List.contains cmd.Action
+            [ "CheckpointAttempt"; "YieldAgent"; "CompleteAgentWork"
+              "BindAttemptSource"; "RebindAttemptSource"; "BindReviewBase"
+              "SetAttemptSource"; "CompleteIntegration" ]
+    | _ -> false
+
 // An agent's first ordinary tool call starts its Ready assignment.
 // No new session identifier or explicit resume tool is needed. Never
 // auto-activate a different agent merely because an administrative operation
@@ -178,6 +189,45 @@ let private activateReadyOnActivity (rt: Runtime) (agentId: string)
                         | Ok latest when latest.State = "Working" -> Ok ([], None)
                         | _ -> Error(Client.ValidationError "Agent assignment changed before automatic activation.")
                     | Error error -> Error(Client.ValidationError($"Automatic agent activation failed: {error}"))
+            | Some agent when agent.State = "Working"
+                              && not (activityFencedByCommand agentId command) ->
+                // Every genuine call is fenced before its body runs. A separate
+                // device cannot race an old operator correction past this write.
+                let assignment = agent.CurrentAssignment
+                if isNull (box assignment) then
+                    Error(Client.ValidationError "Working activity has no assigned attempt.")
+                else
+                    match OrchestrationApi.LedgerBindingConfig.load project rt with
+                    | Error error -> Error(Client.ValidationError($"Cannot fence Working activity: {error}"))
+                    | Ok binding ->
+                        match ReviewWorkflow.ReviewWorkflow.recordWorkingActivity binding
+                                  (Guid.NewGuid()) agentId assignment.TaskId assignment.AttemptId with
+                        | Ok _ -> Ok ([], None)
+                        | Error(Client.LedgerStore.StaleEntityVersion _) ->
+                            // If a correction won the race, require a fresh
+                            // Ready -> Working activation before executing the tool.
+                            cache.Invalidate(projectId, agentId)
+                            match ReviewWorkflow.ReviewWorkflow.getAgentWorkingTurn binding agentId with
+                            | Ok latest when latest.State = "Ready"
+                                             && latest.CurrentAssignment = assignment ->
+                                match ReviewWorkflow.ReviewWorkflow.activateReadyAgent binding
+                                          (Guid.NewGuid()) assignment.TaskId agentId with
+                                | Ok write when write.AlreadyApplied -> Ok ([], None)
+                                | Ok write ->
+                                    let receipt : AgentInboxActivation =
+                                        { ProjectName = project; AgentId = agentId
+                                          ActivatedByThisCall = true
+                                          BeforeState = Some "Ready"
+                                          AfterState = Some "Working"
+                                          CommittedHead = Some write.CurrentHead
+                                          OperationId = Some write.Operation.OperationId }
+                                    Ok (Client.LedgerStore.LedgerStore.changedAgentIds write, Some receipt)
+                                | Error error ->
+                                    Error(Client.ValidationError($"Cannot reactivate corrected agent: {error}"))
+                            | _ ->
+                                Error(Client.ValidationError "Working assignment changed before tool activity; reread inbox.")
+                        | Error error ->
+                            Error(Client.ValidationError($"Cannot fence Working activity: {error}"))
             | _ -> Ok ([], None)
 
 // Only the Working turn identifies a stable delivery scope. Ledger calls bootstrap

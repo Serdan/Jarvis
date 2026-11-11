@@ -667,7 +667,50 @@ module McpToolHelpers =
                                    (AgentCommandInfo.projectName command = None ||
                                     AgentCommandInfo.projectName command = Some "@global" ||
                                     Auth.hasScope Auth.WorkspaceRead context.User) ->
-                    let tracking = beginOperation context userId command
+                    // The authenticated MCP actor, not a notification's
+                    // destination/observed target, owns an execution witness.
+                    // Registration is a target-only operation, not agent
+                    // activity by the freshly registered label.
+                    let sourceAgent =
+                        match command with
+                        | TaskWriteCommand write when write.Action = "RegisterAgent" -> None
+                        | TaskWriteCommand write when
+                            not (String.IsNullOrWhiteSpace write.ActorId)
+                            && write.ActorId <> TaskCommands.legacyAdministrativePlaceholder ->
+                            Some write.ActorId
+                        | TaskReadCommand read when read.Action = "AgentInbox" ->
+                            Some read.AgentId
+                        | ObserveAgentCommand observer -> Some observer.ObserverAgentId
+                        | _ -> RequestDeviceRouting.agentId()
+                    let admission =
+                        match sourceAgent with
+                        | None -> Ok(beginOperation context userId command, None)
+                        | Some agent when String.IsNullOrWhiteSpace agent ->
+                            Error "Initiating agent label is empty; no client operation was dispatched."
+                        | Some agent ->
+                            let store = context.RequestServices.GetService<FeedbackStore>()
+                            if isNull (box store) then
+                                Error "Durable agent execution storage is unavailable; command not dispatched."
+                            else
+                                let users = context.RequestServices.GetService<UserService>()
+                                let clientVersion, protocolVersion =
+                                    if isNull (box users) then None, None
+                                    else
+                                        match users.GetSelectedSession(
+                                            userId, RequestDeviceRouting.session(),
+                                            RequestDeviceRouting.deviceOverride()) with
+                                        | ValueSome session -> Some session.ClientVersion, Some session.ProtocolVersion
+                                        | ValueNone -> None, None
+                                match store.TryBeginAgentOperation(
+                                          userId, agent, toolName command,
+                                          AgentCommandInfo.projectName command,
+                                          serverVersion, clientVersion, protocolVersion) with
+                                | Ok started -> Ok(Some(store, started), Some started.Id)
+                                | Error failure -> Error failure
+                    let tracking, activityRequestId, admissionFailure =
+                        match admission with
+                        | Ok (record, request) -> record, request, None
+                        | Error failure -> None, None, Some failure
                     let stopwatch = Stopwatch.StartNew()
                     // A tool can commit a Ready->Working transition before
                     // failing its requested operation. Publish typed mutation
@@ -687,8 +730,13 @@ module McpToolHelpers =
                                         logger.LogWarning(ex, "Could not deliver agent-state invalidation hints.")
                         }
                     let! response =
-                        match command with
-                        | TaskWriteCommand notification when notification.Action = "NotifyAgent"
+                        match admissionFailure, command with
+                        | Some failure, _ ->
+                            Task.FromResult(
+                                { Result = None; Error = Some(ExecutionFailed(
+                                      $"Durable MCP activity admission refused: {failure}"))
+                                  Instructions = []; AgentStateChanges = []; InboxActivation = None })
+                        | None, TaskWriteCommand notification when notification.Action = "NotifyAgent"
                             && not (String.IsNullOrWhiteSpace notification.SourceRef)
                             && notification.SourceRef <> notification.ProjectName ->
                             task {
@@ -712,15 +760,33 @@ module McpToolHelpers =
                                         userId, notification.ProjectName, command,
                                         ?conversationId = RequestDeviceRouting.session(),
                                         ?deviceId = RequestDeviceRouting.deviceOverride(),
-                                                     ?agentId = RequestDeviceRouting.agentId())
+                                                     ?agentId = sourceAgent,
+                                                     ?activityRequestId = activityRequestId)
                                     return mergeStateEffects sender destination
                                 | _ -> return sender
                             }
-                        | _ ->
+                        | None, _ ->
                             client.SendCommandToUser(userId, command,
                                                      ?conversationId = RequestDeviceRouting.session(),
                                                      ?deviceId = RequestDeviceRouting.deviceOverride(),
-                                                     ?agentId = RequestDeviceRouting.agentId())
+                                                     ?agentId = sourceAgent,
+                                                     ?activityRequestId = activityRequestId)
+                    // Only the original SQLite Admitted state proves no
+                    // client dispatch was attempted. Once the route binds a
+                    // correlation, a timeout/cancellation is *indeterminate*.
+                    // Cross-project sender validation can dispatch before the
+                    // final destination route; its pending witness must never
+                    // be cleared merely because destination routing failed.
+                    match activityRequestId, response.Error, command with
+                    | Some requestId, Some _, TaskWriteCommand notification
+                        when notification.Action = "NotifyAgent"
+                             && not (String.IsNullOrWhiteSpace notification.SourceRef)
+                             && notification.SourceRef <> notification.ProjectName -> ()
+                    | Some requestId, Some _, _ ->
+                        let store = context.RequestServices.GetService<FeedbackStore>()
+                        if not (isNull (box store)) then
+                            store.TryMarkAgentNotDispatched(userId, requestId) |> ignore
+                    | _ -> ()
                     stopwatch.Stop()
                     finishOperation tracking response stopwatch.ElapsedMilliseconds
 

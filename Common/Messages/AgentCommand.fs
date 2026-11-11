@@ -989,7 +989,9 @@ module AgentCommandInfo =
         | None -> invocation command
 
 module AgentProtocol =
-    let version = "3.63"
+    // 3.64 introduces mandatory durable server-side execution witnesses for
+    // attributed MCP calls. Older clients cannot safely satisfy the gate.
+    let version = "3.64"
     let defaultPatchFuzzyContextLines = 3
     let maxResponseBytes = 900 * 1024
     let maxImageBytes = 8 * 1024 * 1024

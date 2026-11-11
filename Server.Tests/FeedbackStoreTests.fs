@@ -286,15 +286,15 @@ let ``late exact client receipt survives telemetry timeout and SQLite restart`` 
               "alice", "conn-old", 3L, "corr-42"
               "alice", "conn-42", 4L, "corr-42"
               "alice", "conn-42", 3L, "corr-forged" ] do
-            restarted.TryRecordAgentClientTerminal(user, conn, gen, correlation).IsError
-            |> shouldEqual true
+            restarted.TryRecordAgentClientTerminal(user, conn, gen, correlation)
+            |> shouldEqual (Ok None)
         restarted.CountUnresolvedAgentExecutions("alice", "Worker 3")
         |> shouldEqual 1
         restarted.TryRecordAgentClientTerminal("alice", "conn-42", 3L, "corr-42")
-        |> shouldEqual (Ok call.Id)
+        |> shouldEqual (Ok(Some call.Id))
         // Duplicate late terminal receipt is idempotent.
         restarted.TryRecordAgentClientTerminal("alice", "conn-42", 3L, "corr-42")
-        |> shouldEqual (Ok call.Id)
+        |> shouldEqual (Ok(Some call.Id))
         restarted.CountUnresolvedAgentExecutions("alice", "Worker 3")
         |> shouldEqual 0
         let correction =
@@ -357,7 +357,7 @@ let ``benchmark hundred durable SQLite admissions and authenticated terminal rec
             store.CompleteOperation(req.Id, true, None, 0L)
             match store.TryRecordAgentClientTerminal(
                 "alice", "connection-1", 1L, correlation) with
-            | Ok receipt -> Assert.That(receipt, Is.EqualTo(req.Id))
+            | Ok receipt -> Assert.That(receipt, Is.EqualTo(Some req.Id))
             | Error error -> Assert.Fail(error)
         stopwatch.Stop()
         Assert.That(store.CountUnresolvedAgentExecutions("alice", "Worker 3"), Is.Zero)

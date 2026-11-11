@@ -125,32 +125,32 @@ type HubService(users: UserService, tracker: ClientResponseTracker, store: Feedb
         users.TouchConnection(this.Context.ConnectionId)
         match users.GetSessionByConnection(this.Context.ConnectionId) with
         | ValueSome session when session.State = Registered && session.ConnectionId = Some this.Context.ConnectionId ->
-            let accepted =
-                tracker.Complete(correlationId, this.UserId, this.Context.ConnectionId,
-                                 session.Generation, response)
-            // A response can arrive after ClientResponseTracker's server-side
-            // timeout evicted the correlation. The separate persistent witness
-            // must still record authenticated client termination. Match the
-            // exact user/connection/generation/correlation; do not accept a
-            // disconnected or replaced device's unverified response.
+            // Persist the exact authenticated client-terminal witness before
+            // completing an ordinary server response. A client result remains
+            // valid even when SQLite later fails: the liveness check will
+            // conservatively refuse correction until receipt recovery.
+            // A late response after tracker timeout still records termination.
             let durable =
                 store.TryRecordAgentClientTerminal(
                     this.UserId, this.Context.ConnectionId, session.Generation, correlationId)
+            let accepted =
+                tracker.Complete(correlationId, this.UserId, this.Context.ConnectionId,
+                                 session.Generation, response)
             match durable with
-            | Error message when message.StartsWith("No matching admitted request", StringComparison.Ordinal) ->
-                if not accepted then
-                    logger.LogWarning(
-                        "Rejected unexpected or stale Jarvis response {CorrelationId} from {ConnectionId}.",
-                        correlationId, this.Context.ConnectionId)
+            | Ok None when not accepted ->
+                logger.LogWarning(
+                    "Rejected unexpected or stale Jarvis response {CorrelationId} from {ConnectionId}.",
+                    correlationId, this.Context.ConnectionId)
+            | Ok(Some _) when not accepted ->
+                logger.LogInformation(
+                    "Authenticated late Jarvis terminal receipt for {CorrelationId} on {ConnectionId}.",
+                    correlationId, this.Context.ConnectionId)
             | Error message ->
                 logger.LogWarning(
-                    "Jarvis client terminal witness for {CorrelationId} on {ConnectionId} was not persisted: {Error}.",
+                    "Cannot persist authenticated client terminal witness {CorrelationId} on {ConnectionId}: {Error}. " +
+                    "The response outcome is unchanged but correction remains blocked.",
                     correlationId, this.Context.ConnectionId, message)
-            | Ok _ when not accepted ->
-                logger.LogInformation(
-                    "Accepted late Jarvis client terminal witness for {CorrelationId} on {ConnectionId}.",
-                    correlationId, this.Context.ConnectionId)
-            | Ok _ -> ()
+            | _ -> ()
         | _ ->
             logger.LogWarning("Rejected Jarvis response {CorrelationId} from inactive connection {ConnectionId}.", correlationId, this.Context.ConnectionId)
         Task.CompletedTask

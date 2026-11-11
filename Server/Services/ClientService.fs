@@ -160,7 +160,16 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                 | Registered, Some connectionId ->
                     let commandName = AgentCommandInfo.protocolName command
 
-                    if not (session.SupportedCommands |> List.contains commandName) then
+                    if activityRequestId.IsSome && session.ProtocolVersion <> AgentProtocol.version then
+                        // Old 3.63 clients may have undiscoverable in-flight
+                        // work from before the durable witness epoch. Never
+                        // route a newly admitted command through one.
+                        return { Result = None
+                                 Error = Some(ExecutionFailed(
+                                     $"Device {session.DeviceName} has protocol {session.ProtocolVersion}; " +
+                                     $"attributed commands require witness-capable protocol {AgentProtocol.version}."))
+                                 Instructions = []; AgentStateChanges = []; InboxActivation = None }
+                    elif not (session.SupportedCommands |> List.contains commandName) then
                         return
                             { Result = None
                               Error =
@@ -234,7 +243,8 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
     // destination's verified ledger binding instead of assuming the sender's
     // selected device has the destination project.
     member this.SendCommandToProject(userId: string, projectName: string, command: AgentCommand,
-                                     ?conversationId: string, ?deviceId: string, ?agentId: string) =
+                                     ?conversationId: string, ?deviceId: string, ?agentId: string,
+                                     ?activityRequestId: string) =
         task {
             let selected = users.GetSelectedSession(userId, conversationId, deviceId)
             let sessions = users.ListDevices(userId) |> Array.toList
@@ -266,7 +276,8 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                             // Never automatically repeat a write on another client:
                             // an uncertain result may already have been committed.
                             return! this.SendCommandToUser(userId, command,
-                                                            ?conversationId = conversationId, deviceId = session.DeviceId, ?agentId = agentId)
+                                                            ?conversationId = conversationId, deviceId = session.DeviceId,
+                                                            ?agentId = agentId, ?activityRequestId = activityRequestId)
                         | _ ->
                             let reason = ProjectNotificationRouting.probeFailure health
                             return! dispatch rest ((session.DeviceName, reason) :: probeFailures)

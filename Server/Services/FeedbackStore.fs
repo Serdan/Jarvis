@@ -460,32 +460,36 @@ INSERT INTO operations (
            || evidence.Trim().Length < 20 then
             Error "Protocol readiness requires an operator, stable operation ID and substantive drain evidence."
         else
-            let verified =
-                try verifyLegacyQuiescence()
-                with ex -> Error ex.Message
-            match verified with
-            | Error reason -> Error $"Legacy activity was not proven quiescent: {reason}"
-            | Ok () ->
-                try
-                    use connection = openConnection()
-                    use transaction = connection.BeginTransaction()
-                    use query = connection.CreateCommand()
-                    query.Transaction <- transaction
-                    query.CommandText <-
-                        """SELECT state, approval_operation_id
-                           FROM agent_execution_epoch WHERE epoch_id = 1;"""
-                    use reader = query.ExecuteReader()
-                    let epoch =
-                        if reader.Read() then
-                            Some(reader.GetString 0, if reader.IsDBNull 1 then "" else reader.GetString 1)
-                        else None
-                    reader.Close()
-                    match epoch with
-                    | Some("Ready", original) when original = operationId ->
-                        Ok () // idempotent replay of the same operator approval
-                    | Some("Ready", _) ->
-                        Error "Protocol epoch was already approved by a different operation."
-                    | Some("AwaitingLegacyDrain", _) ->
+            try
+                use connection = openConnection()
+                use transaction = connection.BeginTransaction()
+                use query = connection.CreateCommand()
+                query.Transaction <- transaction
+                query.CommandText <-
+                    """SELECT state, approval_operation_id
+                       FROM agent_execution_epoch WHERE epoch_id = 1;"""
+                use reader = query.ExecuteReader()
+                let epoch =
+                    if reader.Read() then
+                        Some(reader.GetString 0, if reader.IsDBNull 1 then "" else reader.GetString 1)
+                    else None
+                reader.Close()
+                match epoch with
+                | Some("Ready", original) when original = operationId ->
+                    Ok () // idempotent replay of the same operator approval
+                | Some("Ready", _) ->
+                    Error "Protocol epoch was already approved by a different operation."
+                | Some("AwaitingLegacyDrain", _) ->
+                    // This SQLite writer transaction serializes the *final*
+                    // legacy-process verification with all new admissions.
+                    // No pre-witness client may dispatch on this server.
+                    let verified =
+                        try verifyLegacyQuiescence()
+                        with ex -> Error ex.Message
+                    match verified with
+                    | Error reason ->
+                        Error $"Legacy activity was not proven quiescent: {reason}"
+                    | Ok () ->
                         use unknown = connection.CreateCommand()
                         unknown.Transaction <- transaction
                         unknown.CommandText <-
@@ -511,8 +515,8 @@ INSERT INTO operations (
                             else
                                 transaction.Commit()
                                 Ok ()
-                    | _ -> Error "Execution epoch is missing or corrupt."
-                with ex -> Error $"Cannot audit protocol drain approval: {ex.Message}"
+                | _ -> Error "Execution epoch is missing or corrupt."
+            with ex -> Error $"Cannot audit protocol drain approval: {ex.Message}"
 
     // This is separate from best-effort telemetry BeginOperation: a genuine
     // self-agent tool MUST have a durable witness before it can be dispatched.
@@ -743,7 +747,7 @@ INSERT INTO operations (
     // ClientResponseTracker already timed out and forgot its correlation.
     member _.TryRecordAgentClientTerminal(
         userId: string, connectionId: string, generation: int64, correlationId: string
-    ) : Result<string, string> =
+    ) : Result<string option, string> =
         if [ userId; connectionId; correlationId ] |> List.exists String.IsNullOrWhiteSpace
            || generation < 1L then
             Error "An authenticated routed client receipt is required."
@@ -768,8 +772,8 @@ INSERT INTO operations (
                     else None
                 reader.Close()
                 match found with
-                | None -> Error "No matching admitted request for this client receipt."
-                | Some (requestId, "Terminal") -> Ok requestId // idempotent late duplicate
+                | None -> Ok None // Untracked MCP replies do not carry an execution witness.
+                | Some (requestId, "Terminal") -> Ok(Some requestId) // idempotent late duplicate
                 | Some (requestId, "Dispatched") ->
                     use update = connection.CreateCommand()
                     update.Transaction <- transaction
@@ -783,7 +787,7 @@ INSERT INTO operations (
                         Error "Client terminal receipt raced another update."
                     else
                         transaction.Commit()
-                        Ok requestId
+                        Ok(Some requestId)
                 | Some _ -> Error "Receipt is inconsistent with non-dispatched activity."
             with ex -> Error $"Cannot persist authenticated client terminal receipt: {ex.Message}"
 

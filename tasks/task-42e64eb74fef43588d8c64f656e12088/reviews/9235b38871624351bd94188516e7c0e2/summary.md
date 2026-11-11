@@ -1,1 +1,1 @@
-Two commits 2e85140 and ab196144; 7 new role tests pass; server Release suite passes. Verify schema integrity, authorization, correct precedence, response budget, worktree handling and role update history; no deployment.
+Updated immutable source boundary to 569f20d3: explicit AGENTS.md remains available for unregistered callers with bound ledger; registered identities still load roles. Full Release suites 554 client and 127 server passed before this compatibility patch; targeted tests 7/7 pass after patch. No deployment.

@@ -57,6 +57,12 @@ type OperationStart =
     { Id: string
       StartedAt: DateTimeOffset }
 
+// A typed projection of the schema-checked execution epoch. An empty or
+// freshly migrated witness table never constitutes proof of legacy quiescence.
+type AgentExecutionReadiness =
+    | LegacyDrainUnverified
+    | LegacyDrainVerified of operatorId: string * evidence: string * approvedAt: DateTimeOffset
+
 [<CLIMutable>]
 type ConnectionEventEntry =
     { CreatedAt: DateTimeOffset
@@ -238,6 +244,20 @@ CREATE TABLE IF NOT EXISTS agent_correction_permit (
     created_at TEXT NOT NULL,
     PRIMARY KEY(user_id, agent_id)
 );
+
+-- A migration from pre-witness server protocol 3.63 cannot infer safety from
+-- zero rows: an old MCP request may still be executing on another device.
+-- Explicit authenticated drain proof is required before ANY correction.
+CREATE TABLE IF NOT EXISTS agent_execution_epoch (
+    epoch_id INTEGER PRIMARY KEY CHECK(epoch_id = 1),
+    state TEXT NOT NULL CHECK(state IN ('AwaitingLegacyDrain','Ready')),
+    operator_id TEXT NULL,
+    approval_operation_id TEXT UNIQUE NULL,
+    evidence TEXT NULL,
+    approved_at TEXT NULL
+);
+INSERT OR IGNORE INTO agent_execution_epoch
+    (epoch_id, state) VALUES (1, 'AwaitingLegacyDrain');
 """
         schema.ExecuteNonQuery() |> ignore
 
@@ -403,6 +423,97 @@ INSERT INTO operations (
 
         { Id = operationId; StartedAt = startedAt }
 
+    // A freshly deployed witness schema has no knowledge of MCP calls
+    // dispatched by the previous server. An empty witness table is therefore
+    // never sufficient evidence to permit correction.
+    member _.GetAgentExecutionReadiness() : Result<AgentExecutionReadiness, string> =
+        try
+            use connection = openConnection()
+            use command = connection.CreateCommand()
+            command.CommandText <-
+                """SELECT state, operator_id, evidence, approved_at
+                   FROM agent_execution_epoch WHERE epoch_id = 1;"""
+            use reader = command.ExecuteReader()
+            if not (reader.Read()) then Error "Execution epoch record is missing."
+            else
+                match reader.GetString 0 with
+                | "AwaitingLegacyDrain" -> Ok LegacyDrainUnverified
+                | "Ready" when not (reader.IsDBNull 1 || reader.IsDBNull 2 || reader.IsDBNull 3) ->
+                    match DateTimeOffset.TryParse(reader.GetString 3) with
+                    | true, at ->
+                        Ok (LegacyDrainVerified(reader.GetString 1, reader.GetString 2, at))
+                    | _ -> Error "Execution epoch approval timestamp is corrupt."
+                | _ -> Error "Execution epoch is not a verified protocol state."
+        with ex -> Error $"Cannot read execution protocol readiness: {ex.Message}"
+
+    // Caller must be the authenticated operator path after proving that ALL
+    // pre-witness requests and detached child jobs have exited across devices.
+    // This is intentionally not exposed through MCP until real device/process
+    // reconciliation can supply that proof. Never auto-ready on startup.
+    member _.TryAuthorizeLegacyDrain(
+        operatorId: string, operationId: string, evidence: string,
+        verifyLegacyQuiescence: unit -> Result<unit, string>
+    ) : Result<unit, string> =
+        if String.IsNullOrWhiteSpace operatorId
+           || String.IsNullOrWhiteSpace operationId
+           || String.IsNullOrWhiteSpace evidence
+           || evidence.Trim().Length < 20 then
+            Error "Protocol readiness requires an operator, stable operation ID and substantive drain evidence."
+        else
+            let verified =
+                try verifyLegacyQuiescence()
+                with ex -> Error ex.Message
+            match verified with
+            | Error reason -> Error $"Legacy activity was not proven quiescent: {reason}"
+            | Ok () ->
+                try
+                    use connection = openConnection()
+                    use transaction = connection.BeginTransaction()
+                    use query = connection.CreateCommand()
+                    query.Transaction <- transaction
+                    query.CommandText <-
+                        """SELECT state, approval_operation_id
+                           FROM agent_execution_epoch WHERE epoch_id = 1;"""
+                    use reader = query.ExecuteReader()
+                    let epoch =
+                        if reader.Read() then
+                            Some(reader.GetString 0, if reader.IsDBNull 1 then "" else reader.GetString 1)
+                        else None
+                    reader.Close()
+                    match epoch with
+                    | Some("Ready", original) when original = operationId ->
+                        Ok () // idempotent replay of the same operator approval
+                    | Some("Ready", _) ->
+                        Error "Protocol epoch was already approved by a different operation."
+                    | Some("AwaitingLegacyDrain", _) ->
+                        use unknown = connection.CreateCommand()
+                        unknown.Transaction <- transaction
+                        unknown.CommandText <-
+                            """SELECT 1 FROM agent_execution_witness
+                               WHERE state NOT IN ('Terminal','NotDispatched') LIMIT 1;"""
+                        if not (isNull (unknown.ExecuteScalar())) then
+                            Error "Current tracked activity remains unresolved; epoch cannot become ready."
+                        else
+                            use update = connection.CreateCommand()
+                            update.Transaction <- transaction
+                            update.CommandText <-
+                                """UPDATE agent_execution_epoch SET
+                                       state = 'Ready', operator_id = $operator,
+                                       approval_operation_id = $operation,
+                                       evidence = $evidence, approved_at = $at
+                                   WHERE epoch_id = 1 AND state = 'AwaitingLegacyDrain';"""
+                            addParameter update "$operator" (operatorId.Trim())
+                            addParameter update "$operation" (operationId.Trim())
+                            addParameter update "$evidence" (evidence.Trim())
+                            addParameter update "$at" (DateTimeOffset.UtcNow.ToString("O"))
+                            if update.ExecuteNonQuery() <> 1 then
+                                Error "Protocol readiness changed during verification."
+                            else
+                                transaction.Commit()
+                                Ok ()
+                    | _ -> Error "Execution epoch is missing or corrupt."
+                with ex -> Error $"Cannot audit protocol drain approval: {ex.Message}"
+
     // This is separate from best-effort telemetry BeginOperation: a genuine
     // self-agent tool MUST have a durable witness before it can be dispatched.
     // One SQLite writer transaction contains the telemetry row and activity
@@ -503,7 +614,17 @@ INSERT INTO operations (
                     if existing.Read() then Some(existing.GetString 0, existing.GetString 1)
                     else None
                 existing.Close()
+                use readiness = connection.CreateCommand()
+                readiness.Transaction <- transaction
+                readiness.CommandText <-
+                    """SELECT state FROM agent_execution_epoch WHERE epoch_id = 1;"""
+                let epochReady =
+                    match readiness.ExecuteScalar() with
+                    | :? string as state when state = "Ready" -> true
+                    | _ -> false
                 match prior with
+                | _ when not epochReady ->
+                    Error "Protocol epoch has not proven pre-witness legacy activity quiescent."
                 | Some (permit, previousOperation) when previousOperation = operationId ->
                     Ok permit // idempotent recovery of the same unresolved permit
                 | Some _ -> Error "Another administrative correction is unresolved."

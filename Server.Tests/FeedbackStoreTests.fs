@@ -178,9 +178,63 @@ let private beginWitness (store: FeedbackStore) user agent =
     | Ok operation -> operation
     | Error error -> failwith error
 
+let private approveTestEpoch (store: FeedbackStore) =
+    match store.TryAuthorizeLegacyDrain(
+              "test-operator", Guid.NewGuid().ToString("N"),
+              "Verified old client processes and detached job trees are stopped.",
+              fun () -> Ok ()) with
+    | Ok () -> ()
+    | Error error -> failwith error
+
+[<Test>]
+let ``freshly migrated witness table never proves an old protocol request inactive`` () =
+    withStore (fun store ->
+        // Simulate a 3.63 command dispatched by a pre-witness server. It
+        // contributes to the legacy telemetry table, not the new witness.
+        let prior = store.BeginOperation(
+            "alice", "RunCommand", Some "Jarvis", "server-v3.63",
+            Some "old-client", Some "3.63")
+        store.CountUnresolvedAgentExecutions("alice", "Worker 3") |> shouldEqual 0
+        store.GetAgentExecutionReadiness() |> shouldEqual (Ok LegacyDrainUnverified)
+        store.TryAcquireAgentCorrection("alice", "Worker 3", "operator-pre-drain").IsError
+        |> shouldEqual true
+        // Even a timeout tagged completed in server telemetry cannot prove
+        // the original client process or detached child work has terminated.
+        store.CompleteOperation(prior.Id, false, Some "Timeout", 600000L)
+        use restarted = new FeedbackStore(store.DatabasePath)
+        restarted.GetAgentExecutionReadiness() |> shouldEqual (Ok LegacyDrainUnverified)
+        restarted.TryAcquireAgentCorrection("alice", "Worker 3", "operator-pre-drain").IsError
+        |> shouldEqual true
+        restarted.TryAuthorizeLegacyDrain(
+            "operator", "drain-id", "Confirmed no pre-witness jobs remain.",
+            fun () -> Error "Prior-version command may still be executing").IsError
+        |> shouldEqual true
+        restarted.GetAgentExecutionReadiness() |> shouldEqual (Ok LegacyDrainUnverified)
+        restarted.TryAuthorizeLegacyDrain(
+            "operator", "drain-id", "Confirmed no pre-witness jobs remain.",
+            fun () -> Ok ()) |> shouldEqual (Ok ())
+        restarted.TryAuthorizeLegacyDrain(
+            "operator", "drain-id", "Confirmed no pre-witness jobs remain.",
+            fun () -> Ok ()) |> shouldEqual (Ok ())
+        let ready = restarted.GetAgentExecutionReadiness()
+        match ready with
+        | Ok (LegacyDrainVerified("operator", evidence, _)) ->
+            Assert.That(evidence, Does.Contain("pre-witness jobs"))
+        | other -> Assert.Fail(sprintf "Expected audited drain: %A" other)
+        restarted.TryAuthorizeLegacyDrain(
+            "operator-2", "different-drain-id", "Different evidence for same protocol epoch.",
+            fun () -> Ok ()).IsError |> shouldEqual true
+        use twice = new FeedbackStore(store.DatabasePath)
+        match twice.GetAgentExecutionReadiness() with
+        | Ok (LegacyDrainVerified("operator", _, _)) -> ()
+        | other -> Assert.Fail(sprintf "Readiness not durable: %A" other)
+        let permit = twice.TryAcquireAgentCorrection("alice", "Worker 3", "operator-after-drain")
+        Assert.That(permit.IsOk, Is.True, sprintf "Unexpected correction veto: %A" permit))
+
 [<Test>]
 let ``durable agent admission serializes with operator correction and records no false terminal`` () =
     withStore (fun store ->
+        approveTestEpoch store
         let call = beginWitness store "alice" "Worker 3"
         store.CountUnresolvedAgentExecutions("alice", "WORKER 3")
         |> shouldEqual 1
@@ -214,6 +268,7 @@ let ``durable agent admission serializes with operator correction and records no
 [<Test>]
 let ``late exact client receipt survives telemetry timeout and SQLite restart`` () =
     withStore (fun store ->
+        approveTestEpoch store
         let call = beginWitness store "alice" "Worker 3"
         store.TryMarkAgentDispatched(
             "alice", call.Id, "desktop", "conn-42", 3L, "corr-42").IsOk
@@ -257,6 +312,7 @@ let ``late exact client receipt survives telemetry timeout and SQLite restart`` 
 [<Test>]
 let ``telemetry pruning cannot remove unresolved execution witnesses`` () =
     withStore (fun store ->
+        approveTestEpoch store
         let active = beginWitness store "alice" "Worker 3"
         store.PruneTelemetry(DateTimeOffset.UtcNow.AddDays(31.))
         store.ResolveOperation("alice", Some active.Id, None, None).IsError
@@ -271,6 +327,7 @@ let ``telemetry pruning cannot remove unresolved execution witnesses`` () =
 [<Test>]
 let ``concurrent SQLite correction and admission cannot both pass`` () =
     withStore (fun store ->
+        approveTestEpoch store
         for i in 1 .. 16 do
             let agent = sprintf "Worker-%d" i
             let t1 =

@@ -86,3 +86,35 @@ Next: wire initiating-agent MCP admissions before actual dispatch,
 acquire the exclusive target permit for correction, handle all no-route
 and ambiguous delivery outcomes, test crash/long-job reconciliation,
 then remove the old Git reservation path only after independent review.
+
+## Legacy-protocol migration barrier (next checkpoint)
+
+Lead identified a missing negative case: **the first upgraded server may have
+zero entries in the new witness table even while an old 3.63 request is still
+executing on a client**. Empty tables are not proof of inactivity.
+
+Every new or migrated SQLite database now seeds a singleton
+`agent_execution_epoch` row in `AwaitingLegacyDrain`. The operator correction
+permit transaction refuses every request while this row is unverified,
+**including one with no unresolved witness records**. A typed
+`AgentExecutionReadiness` projects the schema-checked states to F#. The
+trusted (not publicly wired) `TryAuthorizeLegacyDrain` transition demands a
+specific operator, stable operation ID, substantive evidence, and a successful
+external legacy process/job quiescence verifier. It atomically records the
+approval after checking the unresolved witness table, persists across server
+restart, and only accepts idempotent retries with the same approval ID.
+
+Tests model a legacy 3.63 operation in old telemetry with no witness,
+a server timeout, and server restart. Correction remains blocked before the
+explicit verified drain. Tests also cover rejected verifier results,
+idempotent approval replay, conflicting approval rejection and durable ready
+state. Full Server Release passed **140/140** on this checkpoint.
+
+**Not a complete migration protocol yet.** No authenticated real-device
+process/child-job verifier is wired to approve the epoch, so a newly migrated
+instance remains intentionally quarantined for correction. Before enabling
+the new gate in production, reject old pre-witness client protocol sessions,
+reconcile operations dispatched before migration, and require each connected
+device/job to prove termination. An old client reconnecting must never
+silently make `Ready` authoritative. Do not introduce a public "force ready"
+shortcut. This branch is not integration-ready.

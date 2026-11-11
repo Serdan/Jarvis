@@ -348,14 +348,37 @@ let preserveTransientProjects (previous: Snapshot option) (latest: Snapshot) =
                     | _ -> None)
         if retained.IsEmpty then latest
         else
-            let projects =
+            let converted =
                 latest.Projects
                 |> List.map (fun project ->
                     match retained |> List.tryFind (fun (current, _) -> current = project) with
                     | Some (_, verified) ->
-                        { verified with Status = Stale
+                        { verified with Project = project.Project
+                                        Aliases = project.Aliases
+                                        Status = Stale
                                         Error = Some "Temporary trust-binding contention; last verified counts shown as stale." }
                     | None -> project)
+            // A verified ledger may have multiple configured aliases. When
+            // all fail to acquire their respective local locks, each failure
+            // initially has a synthetic unavailable identity. Carry forward
+            // the one canonical verified identity, merging only current
+            // aliases and counting the ledger exactly once.
+            let projects =
+                let _, reversed =
+                    converted
+                    |> List.fold (fun (seen, acc) project ->
+                        if project.Status <> Stale then seen, project :: acc
+                        elif Set.contains project.Identity seen then seen, acc
+                        else
+                            let aliases =
+                                converted
+                                |> List.filter (fun item ->
+                                    item.Status = Stale && item.Identity = project.Identity)
+                                |> List.collect _.Aliases
+                                |> List.distinctBy (fun alias -> alias.ToUpperInvariant())
+                            Set.add project.Identity seen,
+                            { project with Aliases = aliases } :: acc) (Set.empty, [])
+                List.rev reversed
             let identities = retained |> List.map (fun (_, prior) -> prior.Identity) |> Set.ofList
             let rows =
                 before.Agents

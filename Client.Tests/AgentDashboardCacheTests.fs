@@ -481,3 +481,25 @@ let permanentDashboardFailureNeverReusesPreviousTrustedRows () =
         Assert.That(shown.Projects.Head.Counts.IsNone, Is.True)
         Assert.That(shown.Projects.Head.Error.Value, Does.Contain(reason))
         Assert.That(shown.Agents, Is.Empty)
+
+
+[<Test>]
+let transientAliasesOfOneVerifiedLedgerDoNotDuplicateProjectTotals () =
+    let shared = "project:shared-ledger:1"
+    let prior =
+        AgentDashboard.snapshotFromResults
+            [ available "owner" shared "H1" [agentRow "owner" "Lead" "Ready" 2] 3
+              available "reviewer" shared "H1" [agentRow "reviewer" "Lead" "Ready" 2] 3 ]
+    Assert.That(prior.Projects.Length, Is.EqualTo(1))
+    let current = AgentDashboard.snapshotFromResults [temporary "owner"; temporary "reviewer"]
+    let stale = AgentView.preserveTransientProjects (Some prior) current
+    Assert.That(stale.Projects.Length, Is.EqualTo(1),
+                "Multiple aliases of one verified ledger must produce one stale summary.")
+    Assert.That(stale.Agents.Length, Is.EqualTo(1),
+                "Canonical stale agents must not duplicate across aliases.")
+    Assert.That(stale.Projects.Head.Aliases, Is.EquivalentTo(["owner"; "reviewer"]))
+    Assert.That(stale.Projects.Head.Status, Is.EqualTo(AgentView.Stale))
+    let counts = AgentView.totalCounts stale
+    Assert.That(counts.Tracked, Is.EqualTo(1))
+    Assert.That(counts.Unread, Is.EqualTo(2))
+    Assert.That(counts.PendingReviews, Is.EqualTo(3))

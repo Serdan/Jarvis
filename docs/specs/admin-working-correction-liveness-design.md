@@ -50,4 +50,39 @@ On a healthy one-server installation, moving the hot-path in-flight reference co
 4. After independent tests establish the new invariant, remove the client-side per-tool canonical reservation write path. Keep the canonical CAS and auditable operator reason untouched; decide whether bounded leases remain useful as advisory recent activity, not sole proof of quiescence.
 5. Independently review frozen source and full Release suites before merging. No live deploy without authorization.
 
-**Decision needed from Lead:** confirm that server SQLite is acceptable as a conservative execution *witness* (never authoritative task state), and whether correction should refuse while any previously dispatched operation remains indeterminate until explicit device/job reconciliation is implemented. That policy is materially safer than silently clearing an expired record and materially more useful than a permanent unowned Git reservation.
+**Lead decision (2026-11-11): approved.** SQLite may serve as a durable conservative *execution witness*, not Git task-state authority. Uncertain dispatches must veto correction until authenticated device/process/job reconciliation. No blind expiry.
+
+## SQLite implementation checkpoint (not yet active in MCP admission)
+
+`FeedbackStore` now stores `agent_execution_witness` and
+`agent_correction_permit` independently of prunable telemetry. Admission
+inserts the existing telemetry row and a normalized user/agent witness
+atomically with the correction-permit check, using a SQLite writer
+transaction. Operator correction acquires a persistent exclusive permit
+against unresolved witnesses using the same serialization; stable
+operator operation IDs support restart replay. An unresolved Git outcome
+cannot release that permit.
+
+A request can be bound to an exact device, connection, generation and
+correlation before dispatch. A valid client terminal receipt updates the
+witness even after the ordinary response tracker times out. The SignalR
+hub now records such receipts independently. Forged or stale-generation
+receipts fail; only a request proved never sent can be marked NotDispatched.
+The optional `ClientService.SendCommandToUser` binding hook fails
+closed if durable route binding cannot be persisted.
+
+**Important:** `McpToolHelpers.send` does **not yet** invoke this
+admission/correction protocol. This increment is therefore tested storage
+and optional routing support, **not** an operational replacement for the
+client's Git reservation gate. Do not integrate it alone.
+
+Server Release tests pass, including 16 concurrent admission/correction
+races, restart retention, timeout and late-receipt negative tests. A
+manual local SQLite microbenchmark of 100 full admission/route/telemetry/
+terminal cycles took **43.0 ms (0.43 ms/cycle)**, excluding SignalR and
+actual client or Git work. This is not an end-to-end latency measurement.
+
+Next: wire initiating-agent MCP admissions before actual dispatch,
+acquire the exclusive target permit for correction, handle all no-route
+and ambiguous delivery outcomes, test crash/long-job reconciliation,
+then remove the old Git reservation path only after independent review.

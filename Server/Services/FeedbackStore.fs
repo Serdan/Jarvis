@@ -208,6 +208,36 @@ CREATE TABLE IF NOT EXISTS connection_events (
 
 CREATE INDEX IF NOT EXISTS ix_connection_events_user_created
     ON connection_events(user_id, created_at DESC);
+
+-- Independent from 30-day operation telemetry retention: unresolved client
+-- executions are never pruned by age. The Git ledger remains task authority.
+CREATE TABLE IF NOT EXISTS agent_execution_witness (
+    request_id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
+    project_name TEXT NULL,
+    state TEXT NOT NULL CHECK(state IN ('Admitted','Dispatched','Terminal','NotDispatched')),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    device_id TEXT NULL,
+    connection_id TEXT NULL,
+    device_generation INTEGER NULL,
+    correlation_id TEXT UNIQUE NULL,
+    terminal_at TEXT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_agent_execution_witness_pending
+    ON agent_execution_witness(user_id, agent_id, state);
+
+-- The correction barrier must survive a server restart or lost HTTP result.
+-- It serializes with agent admission under a SQLite writer transaction.
+CREATE TABLE IF NOT EXISTS agent_correction_permit (
+    user_id TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
+    permit_id TEXT NOT NULL UNIQUE,
+    operation_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(user_id, agent_id)
+);
 """
         schema.ExecuteNonQuery() |> ignore
 
@@ -372,6 +402,280 @@ INSERT INTO operations (
         command.ExecuteNonQuery() |> ignore
 
         { Id = operationId; StartedAt = startedAt }
+
+    // This is separate from best-effort telemetry BeginOperation: a genuine
+    // self-agent tool MUST have a durable witness before it can be dispatched.
+    // One SQLite writer transaction contains the telemetry row and activity
+    // admission. The rare correction permit checks the same SQLite database.
+    member _.TryBeginAgentOperation(
+        userId: string, agentId: string, toolName: string,
+        projectName: string option, serverVersion: string,
+        clientVersion: string option, protocolVersion: string option
+    ) : Result<OperationStart, string> =
+        if String.IsNullOrWhiteSpace userId || String.IsNullOrWhiteSpace agentId
+           || agentId.Length > 256 then
+            Error "The authenticated user and bounded initiating agent are required."
+        else
+            try
+                let normalized = agentId.ToUpperInvariant()
+                let startedAt = DateTimeOffset.UtcNow
+                let requestId = Guid.NewGuid().ToString("N")
+                use connection = openConnection()
+                // SQLite's default non-deferred transaction takes the writer
+                // reservation before reading the correction gate: no check/
+                // insertion race with an operator acquisition.
+                use transaction = connection.BeginTransaction()
+                use existing = connection.CreateCommand()
+                existing.Transaction <- transaction
+                existing.CommandText <-
+                    """SELECT 1 FROM agent_correction_permit
+                       WHERE user_id = $userId AND agent_id = $agentId LIMIT 1;"""
+                addParameter existing "$userId" userId
+                addParameter existing "$agentId" normalized
+                if not (isNull (existing.ExecuteScalar())) then
+                    Error "Administrative correction is currently excluding this agent's commands."
+                else
+                    use telemetry = connection.CreateCommand()
+                    telemetry.Transaction <- transaction
+                    telemetry.CommandText <-
+                        """INSERT INTO operations (
+                               id, created_at, user_id, project_name, tool_name,
+                               server_version, client_version, protocol_version
+                           ) VALUES (
+                               $id, $createdAt, $userId, $projectName, $toolName,
+                               $serverVersion, $clientVersion, $protocolVersion
+                           );"""
+                    addParameter telemetry "$id" requestId
+                    addParameter telemetry "$createdAt" (startedAt.ToString("O"))
+                    addParameter telemetry "$userId" userId
+                    addParameter telemetry "$projectName" (dbValue projectName)
+                    addParameter telemetry "$toolName" toolName
+                    addParameter telemetry "$serverVersion" serverVersion
+                    addParameter telemetry "$clientVersion" (dbValue clientVersion)
+                    addParameter telemetry "$protocolVersion" (dbValue protocolVersion)
+                    telemetry.ExecuteNonQuery() |> ignore
+                    use witness = connection.CreateCommand()
+                    witness.Transaction <- transaction
+                    witness.CommandText <-
+                        """INSERT INTO agent_execution_witness (
+                               request_id, user_id, agent_id, project_name,
+                               state, created_at, updated_at
+                           ) VALUES (
+                               $id, $userId, $agentId, $projectName,
+                               'Admitted', $createdAt, $createdAt
+                           );"""
+                    addParameter witness "$id" requestId
+                    addParameter witness "$userId" userId
+                    addParameter witness "$agentId" normalized
+                    addParameter witness "$projectName" (dbValue projectName)
+                    addParameter witness "$createdAt" (startedAt.ToString("O"))
+                    witness.ExecuteNonQuery() |> ignore
+                    transaction.Commit()
+                    Ok { Id = requestId; StartedAt = startedAt }
+            with ex ->
+                Error $"Cannot record durable agent admission: {ex.Message}"
+
+    // Claim the exclusive operator correction barrier in the same SQLite
+    // writer-serialization domain as TryBeginAgentOperation. A pending or
+    // dispatched request vetoes it, including after server restart.
+    member _.TryAcquireAgentCorrection(
+        userId: string, targetAgentId: string, operationId: string
+    ) : Result<string, string> =
+        if String.IsNullOrWhiteSpace userId
+           || String.IsNullOrWhiteSpace targetAgentId
+           || targetAgentId.Length > 256
+           || String.IsNullOrWhiteSpace operationId then
+            Error "Correction requires an authenticated user, target agent and stable operation ID."
+        else
+            try
+                let agent = targetAgentId.ToUpperInvariant()
+                use connection = openConnection()
+                use transaction = connection.BeginTransaction()
+                use current = connection.CreateCommand()
+                current.Transaction <- transaction
+                current.CommandText <-
+                    """SELECT permit_id, operation_id FROM agent_correction_permit
+                       WHERE user_id = $userId AND agent_id = $agentId LIMIT 1;"""
+                addParameter current "$userId" userId
+                addParameter current "$agentId" agent
+                use existing = current.ExecuteReader()
+                let prior =
+                    if existing.Read() then Some(existing.GetString 0, existing.GetString 1)
+                    else None
+                existing.Close()
+                match prior with
+                | Some (permit, previousOperation) when previousOperation = operationId ->
+                    Ok permit // idempotent recovery of the same unresolved permit
+                | Some _ -> Error "Another administrative correction is unresolved."
+                | None ->
+                    use busy = connection.CreateCommand()
+                    busy.Transaction <- transaction
+                    busy.CommandText <-
+                        """SELECT 1 FROM agent_execution_witness
+                           WHERE user_id = $userId AND agent_id = $agentId
+                           AND state NOT IN ('Terminal', 'NotDispatched')
+                           LIMIT 1;"""
+                    addParameter busy "$userId" userId
+                    addParameter busy "$agentId" agent
+                    if not (isNull (busy.ExecuteScalar())) then
+                        Error "Cannot prove the agent is inactive: unresolved execution witness exists."
+                    else
+                        let permit = Guid.NewGuid().ToString("N")
+                        use insert = connection.CreateCommand()
+                        insert.Transaction <- transaction
+                        insert.CommandText <-
+                            """INSERT INTO agent_correction_permit
+                               (user_id, agent_id, permit_id, operation_id, created_at)
+                               VALUES ($userId, $agentId, $permit, $operationId, $now);"""
+                        addParameter insert "$userId" userId
+                        addParameter insert "$agentId" agent
+                        addParameter insert "$permit" permit
+                        addParameter insert "$operationId" operationId
+                        addParameter insert "$now" (DateTimeOffset.UtcNow.ToString("O"))
+                        insert.ExecuteNonQuery() |> ignore
+                        transaction.Commit()
+                        Ok permit
+            with ex ->
+                Error $"Cannot acquire durable correction barrier: {ex.Message}"
+
+    // A correction gate does not disappear on timeout, network failure or
+    // server restart. The caller must first establish a definitive canonical
+    // Git operation result (or independently prove the operation did not run).
+    member _.TryReleaseAgentCorrection(
+        userId: string, targetAgentId: string, permitId: string,
+        canonicalOutcomeResolved: bool
+    ) : Result<unit, string> =
+        if not canonicalOutcomeResolved then
+            Error "Ambiguous canonical correction; exclusive gate remains held."
+        else
+            try
+                use connection = openConnection()
+                use command = connection.CreateCommand()
+                command.CommandText <-
+                    """DELETE FROM agent_correction_permit
+                       WHERE user_id = $userId AND agent_id = $agentId
+                       AND permit_id = $permit;"""
+                addParameter command "$userId" userId
+                addParameter command "$agentId" (targetAgentId.ToUpperInvariant())
+                addParameter command "$permit" permitId
+                if command.ExecuteNonQuery() = 1 then Ok ()
+                else Error "Unknown or stale correction permit."
+            with ex -> Error $"Cannot release correction barrier: {ex.Message}"
+
+    // Bind the exact routed connection before SignalR dispatch is attempted.
+    // Once bound, an HTTP cancellation or server timeout leaves the witness
+    // Dispatched until authenticated client-terminal evidence arrives.
+    member _.TryMarkAgentDispatched(
+        userId: string, requestId: string,
+        deviceId: string, connectionId: string, generation: int64,
+        correlationId: string
+    ) : Result<unit, string> =
+        if [ userId; requestId; deviceId; connectionId; correlationId ]
+           |> List.exists String.IsNullOrWhiteSpace
+           || generation < 1L then
+            Error "Dispatch requires authenticated user, request, device, connection, generation and correlation."
+        else
+            try
+                use connection = openConnection()
+                use command = connection.CreateCommand()
+                command.CommandText <-
+                    """UPDATE agent_execution_witness
+                       SET state = 'Dispatched', device_id = $deviceId,
+                           connection_id = $connectionId,
+                           device_generation = $generation, correlation_id = $correlationId,
+                           updated_at = $now
+                       WHERE user_id = $userId AND request_id = $requestId
+                           AND state = 'Admitted';"""
+                addParameter command "$userId" userId
+                addParameter command "$requestId" requestId
+                addParameter command "$deviceId" deviceId
+                addParameter command "$connectionId" connectionId
+                addParameter command "$generation" generation
+                addParameter command "$correlationId" correlationId
+                addParameter command "$now" (DateTimeOffset.UtcNow.ToString("O"))
+                if command.ExecuteNonQuery() = 1 then Ok ()
+                else Error "Dispatch request is missing or already left the admitted state."
+            with ex -> Error $"Cannot persist exact agent dispatch: {ex.Message}"
+
+    // Only call when the request is *provably* not sent to the client.
+    // A SignalR timeout or exception after calling ReceiveCommand cannot
+    // prove this and must leave the witness unresolved.
+    member _.TryMarkAgentNotDispatched(userId: string, requestId: string) : Result<unit, string> =
+        try
+            use connection = openConnection()
+            use command = connection.CreateCommand()
+            command.CommandText <-
+                """UPDATE agent_execution_witness
+                   SET state = 'NotDispatched', updated_at = $now, terminal_at = $now
+                   WHERE user_id = $userId AND request_id = $requestId
+                       AND state = 'Admitted';"""
+            addParameter command "$userId" userId
+            addParameter command "$requestId" requestId
+            addParameter command "$now" (DateTimeOffset.UtcNow.ToString("O"))
+            if command.ExecuteNonQuery() = 1 then Ok ()
+            else Error "Cannot certify non-dispatch for this request."
+        with ex -> Error $"Cannot record proven non-dispatch: {ex.Message}"
+
+    // The transport server must verify the authenticated sender's active
+    // device registration before passing its connection/generation here.
+    // Match the persisted route exactly and accept a late response even if
+    // ClientResponseTracker already timed out and forgot its correlation.
+    member _.TryRecordAgentClientTerminal(
+        userId: string, connectionId: string, generation: int64, correlationId: string
+    ) : Result<string, string> =
+        if [ userId; connectionId; correlationId ] |> List.exists String.IsNullOrWhiteSpace
+           || generation < 1L then
+            Error "An authenticated routed client receipt is required."
+        else
+            try
+                use connection = openConnection()
+                use transaction = connection.BeginTransaction()
+                use command = connection.CreateCommand()
+                command.Transaction <- transaction
+                command.CommandText <-
+                    """SELECT request_id, state FROM agent_execution_witness
+                       WHERE user_id = $userId AND connection_id = $connectionId
+                         AND device_generation = $generation AND correlation_id = $correlationId
+                       LIMIT 1;"""
+                addParameter command "$userId" userId
+                addParameter command "$connectionId" connectionId
+                addParameter command "$generation" generation
+                addParameter command "$correlationId" correlationId
+                use reader = command.ExecuteReader()
+                let found =
+                    if reader.Read() then Some(reader.GetString 0, reader.GetString 1)
+                    else None
+                reader.Close()
+                match found with
+                | None -> Error "No matching admitted request for this client receipt."
+                | Some (requestId, "Terminal") -> Ok requestId // idempotent late duplicate
+                | Some (requestId, "Dispatched") ->
+                    use update = connection.CreateCommand()
+                    update.Transaction <- transaction
+                    update.CommandText <-
+                        """UPDATE agent_execution_witness
+                           SET state = 'Terminal', updated_at = $now, terminal_at = $now
+                           WHERE request_id = $requestId AND state = 'Dispatched';"""
+                    addParameter update "$now" (DateTimeOffset.UtcNow.ToString("O"))
+                    addParameter update "$requestId" requestId
+                    if update.ExecuteNonQuery() <> 1 then
+                        Error "Client terminal receipt raced another update."
+                    else
+                        transaction.Commit()
+                        Ok requestId
+                | Some _ -> Error "Receipt is inconsistent with non-dispatched activity."
+            with ex -> Error $"Cannot persist authenticated client terminal receipt: {ex.Message}"
+
+    member _.CountUnresolvedAgentExecutions(userId: string, agentId: string) =
+        use connection = openConnection()
+        use command = connection.CreateCommand()
+        command.CommandText <-
+            """SELECT COUNT(*) FROM agent_execution_witness
+               WHERE user_id = $userId AND agent_id = $agentId
+               AND state NOT IN ('Terminal', 'NotDispatched');"""
+        addParameter command "$userId" userId
+        addParameter command "$agentId" (agentId.ToUpperInvariant())
+        Convert.ToInt32(command.ExecuteScalar())
 
     member _.CompleteOperation(operationId: string, success: bool, errorCategory: string option, durationMs: int64) =
         use connection = openConnection()

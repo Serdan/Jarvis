@@ -310,7 +310,8 @@ let ``client service rejects commands not negotiated by the registered client`` 
         |> ignore
 
         let client = ClientService(Unchecked.defaultof<_>, users, ClientResponseTracker(),
-                                   Microsoft.AspNetCore.Http.HttpContextAccessor())
+                                   Microsoft.AspNetCore.Http.HttpContextAccessor(),
+                                   Unchecked.defaultof<FeedbackStore>)
         let command =
             WriteFileCommand
                 { ProjectName = "Jarvis"
@@ -1467,7 +1468,7 @@ let client_request_abort_cancels_outstanding_device_correlation_without_faulting
         context.RequestAborted <- abort.Token
         let http = Microsoft.AspNetCore.Http.HttpContextAccessor()
         http.HttpContext <- context
-        let service = ClientService(hub, users, tracker, http)
+        let service = ClientService(hub, users, tracker, http, Unchecked.defaultof<FeedbackStore>)
         let pending = service.SendCommandToUser(user, ListProjectsCommand)
         let! correlationId = dispatched.Task.WaitAsync(TimeSpan.FromSeconds(4.))
         abort.Cancel()

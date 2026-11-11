@@ -171,6 +171,144 @@ let ``device MCP tools preserve user isolation and explicit selection`` () =
                  |> Async.AwaitTask |> Async.RunSynchronously
     listed.IsError |> shouldEqual (Nullable false)
 
+let private beginWitness (store: FeedbackStore) user agent =
+    match store.TryBeginAgentOperation(
+              user, agent, "ReadFiles", Some "Jarvis",
+              "server", Some "client", Some "3.80") with
+    | Ok operation -> operation
+    | Error error -> failwith error
+
+[<Test>]
+let ``durable agent admission serializes with operator correction and records no false terminal`` () =
+    withStore (fun store ->
+        let call = beginWitness store "alice" "Worker 3"
+        store.CountUnresolvedAgentExecutions("alice", "WORKER 3")
+        |> shouldEqual 1
+        // Server request timeout or HTTP cancellation is not a terminal
+        // execution witness even when telemetry marks it completed.
+        store.CompleteOperation(call.Id, false, Some "Timeout", 600000L)
+        store.CountUnresolvedAgentExecutions("alice", "Worker 3")
+        |> shouldEqual 1
+        store.TryAcquireAgentCorrection("alice", "Worker 3", "operator-1").IsError
+        |> shouldEqual true
+        store.TryMarkAgentNotDispatched("alice", call.Id).IsOk
+        |> shouldEqual true
+        let correction =
+            match store.TryAcquireAgentCorrection("alice", "worker 3", "operator-1") with
+            | Ok permit -> permit
+            | Error error -> failwith error
+        store.TryBeginAgentOperation(
+            "alice", "WORKER 3", "ReadFiles", None, "server", None, None).IsError
+        |> shouldEqual true
+        store.TryAcquireAgentCorrection("alice", "Worker 3", "operator-1")
+        |> shouldEqual (Ok correction)
+        store.TryReleaseAgentCorrection("alice", "Worker 3", correction, false).IsError
+        |> shouldEqual true
+        store.TryBeginAgentOperation(
+            "alice", "Worker 3", "ReadFiles", None, "server", None, None).IsError
+        |> shouldEqual true
+        store.TryReleaseAgentCorrection("alice", "Worker 3", correction, true).IsOk
+        |> shouldEqual true
+        beginWitness store "alice" "Worker 3" |> ignore)
+
+[<Test>]
+let ``late exact client receipt survives telemetry timeout and SQLite restart`` () =
+    withStore (fun store ->
+        let call = beginWitness store "alice" "Worker 3"
+        store.TryMarkAgentDispatched(
+            "alice", call.Id, "desktop", "conn-42", 3L, "corr-42").IsOk
+        |> shouldEqual true
+        store.TryMarkAgentNotDispatched("alice", call.Id).IsError
+        |> shouldEqual true
+        store.CompleteOperation(call.Id, false, Some "Timeout", 600000L)
+        use restarted = new FeedbackStore(store.DatabasePath)
+        restarted.CountUnresolvedAgentExecutions("alice", "Worker 3")
+        |> shouldEqual 1
+        restarted.TryAcquireAgentCorrection("alice", "Worker 3", "operator-2").IsError
+        |> shouldEqual true
+        for user, conn, gen, correlation in
+            [ "bob", "conn-42", 3L, "corr-42"
+              "alice", "conn-old", 3L, "corr-42"
+              "alice", "conn-42", 4L, "corr-42"
+              "alice", "conn-42", 3L, "corr-forged" ] do
+            restarted.TryRecordAgentClientTerminal(user, conn, gen, correlation).IsError
+            |> shouldEqual true
+        restarted.CountUnresolvedAgentExecutions("alice", "Worker 3")
+        |> shouldEqual 1
+        restarted.TryRecordAgentClientTerminal("alice", "conn-42", 3L, "corr-42")
+        |> shouldEqual (Ok call.Id)
+        // Duplicate late terminal receipt is idempotent.
+        restarted.TryRecordAgentClientTerminal("alice", "conn-42", 3L, "corr-42")
+        |> shouldEqual (Ok call.Id)
+        restarted.CountUnresolvedAgentExecutions("alice", "Worker 3")
+        |> shouldEqual 0
+        let correction =
+            restarted.TryAcquireAgentCorrection("alice", "Worker 3", "operator-2")
+            |> function Ok permit -> permit | Error error -> failwith error
+        use nextRestart = new FeedbackStore(store.DatabasePath)
+        nextRestart.TryBeginAgentOperation(
+            "alice", "Worker 3", "ReadFiles", None, "server", None, None).IsError
+        |> shouldEqual true
+        nextRestart.TryAcquireAgentCorrection("alice", "Worker 3", "operator-2")
+        |> shouldEqual (Ok correction)
+        nextRestart.TryReleaseAgentCorrection("alice", "Worker 3", correction, true).IsOk
+        |> shouldEqual true)
+
+[<Test>]
+let ``telemetry pruning cannot remove unresolved execution witnesses`` () =
+    withStore (fun store ->
+        let active = beginWitness store "alice" "Worker 3"
+        store.PruneTelemetry(DateTimeOffset.UtcNow.AddDays(31.))
+        store.ResolveOperation("alice", Some active.Id, None, None).IsError
+        |> shouldEqual true
+        store.CountUnresolvedAgentExecutions("alice", "Worker 3")
+        |> shouldEqual 1
+        store.TryAcquireAgentCorrection("alice", "Worker 3", "operator-3").IsError
+        |> shouldEqual true
+        store.TryMarkAgentNotDispatched("alice", active.Id).IsOk
+        |> shouldEqual true)
+
+[<Test>]
+let ``concurrent SQLite correction and admission cannot both pass`` () =
+    withStore (fun store ->
+        for i in 1 .. 16 do
+            let agent = sprintf "Worker-%d" i
+            let t1 =
+                Task.Run(fun () ->
+                    store.TryBeginAgentOperation(
+                        "alice", agent, "SearchFiles", Some "Jarvis", "server", None, None))
+            let t2 =
+                Task.Run(fun () ->
+                    store.TryAcquireAgentCorrection("alice", agent, sprintf "operator-%d" i))
+            Task.WaitAll([| t1 :> Task; t2 :> Task |])
+            Assert.That(t1.Result.IsOk && t2.Result.IsOk, Is.False,
+                        "Admission and correction cannot win the same agent gate.")
+            Assert.That(t1.Result.IsOk || t2.Result.IsOk, Is.True,
+                        "At least one contender must acquire the uncontended SQLite writer gate."))
+
+[<Test; Explicit("Manual 100-call SQLite execution-witness performance measurement")>]
+let ``benchmark hundred durable SQLite admissions and authenticated terminal receipts`` () =
+    withStore (fun store ->
+        let stopwatch = System.Diagnostics.Stopwatch.StartNew()
+        for i in 1 .. 100 do
+            let req = beginWitness store "alice" "Worker 3"
+            let correlation = sprintf "corr-%d" i
+            match store.TryMarkAgentDispatched(
+                "alice", req.Id, "desktop", "connection-1", 1L, correlation) with
+            | Ok () -> ()
+            | Error error -> Assert.Fail(error)
+            store.CompleteOperation(req.Id, true, None, 0L)
+            match store.TryRecordAgentClientTerminal(
+                "alice", "connection-1", 1L, correlation) with
+            | Ok receipt -> Assert.That(receipt, Is.EqualTo(req.Id))
+            | Error error -> Assert.Fail(error)
+        stopwatch.Stop()
+        Assert.That(store.CountUnresolvedAgentExecutions("alice", "Worker 3"), Is.Zero)
+        TestContext.Out.WriteLine(
+            sprintf "100 durable SQLite admissions/routes/terminals: %.1f ms total, %.2f ms/call"
+                stopwatch.Elapsed.TotalMilliseconds
+                (stopwatch.Elapsed.TotalMilliseconds / 100.)))
+
 [<Test>]
 let ``existing feedback database migrates without losing records`` () =
     let directory = Path.Combine(Path.GetTempPath(), "jarvis-feedback-legacy-" + Guid.NewGuid().ToString("N"))

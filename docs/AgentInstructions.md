@@ -65,21 +65,43 @@ Each **self-agent inbox** includes a distinct `instructionLayers` object alongsi
 its existing task, review and notification data. The explicit
 `get_agent_instructions` result still contains only repository documents under
 the path-keyed `AGENTS.md` object; it adds a separate `instructionLayers`
-object for the supplied agent. That object contains the verified ledger snapshot,
+object on the first hierarchy page for a registered agent with a verified
+bound ledger. That object contains the verified ledger snapshot,
 ordered role IDs, agent configuration version, precedence, and each document's
 scope, identifier, source ledger path, role/configuration version, Git blob OID,
 SHA-256 and full instruction content. Repository files are never duplicated
 inside it. New and resumed sessions obtain current role content on their **next
-inbox/instruction read**, including after role edits, checkout switches or
-restarts; no instruction cache is authoritative. Earlier Git snapshots preserve
-the exact prior content, while existing task specs, checkpoints and reviews
-remain untouched.
+inbox or initial explicit instruction read**, including after role edits,
+checkout switches or restarts; no instruction cache is authoritative.
+Earlier Git snapshots preserve the exact prior content, while existing task
+specs, checkpoints and reviews remain untouched.
+
+Local `AGENTS.md` retrieval does not depend on a working remote ledger. When
+the approved ledger is temporarily unavailable or contended, the first
+hierarchy page still includes the local documents, but `instructionLayers`
+becomes a **typed incomplete diagnostic**:
+`{ "status": "unavailable", "complete": false, "code": "RemoteUnavailable",
+"message": "INCOMPLETE INSTRUCTIONS: ... NOT loaded ..." }`.
+This is not an empty role list or evidence of a successful role check. Retry
+the **initial** request once the remote is available. Malformed records,
+broken trust validation, an invalid configuration, missing referenced roles
+or a mismatched registered identity remain errors, never degraded successes.
+
+On `nextCursor` continuations, the local hierarchy is fetched independently
+without another remote ledger roundtrip. Each continuation exposes
+`instructionLayers` with `status: "continuation"`,
+`complete: false`, `code: "RoleLayersNotRepeated"` and a reminder to use
+the initial page's verified role content or restart without a cursor to refresh.
+Role content is **not** repeated or silently treated as empty. Unregistered
+identities with a reachable ledger have no role layers to return; an unknown
+identity cannot be established while the remote ledger is offline, so it
+receives the same incomplete warning as a previously registered agent.
 
 Role and individual bodies are bounded at 16 KiB of escaped JSON each; agents
 may attach at most 16 distinct roles. This controls worst-case transport size
 without silently truncating instructions. Explicit repository instruction
 pagination continues independently, reserving response capacity for complete
-role/agent layers.
+role/agent layers on the first page.
 
 ## MCP initialization guidance
 

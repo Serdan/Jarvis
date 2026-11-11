@@ -397,12 +397,21 @@ The result contains an `"AGENTS.md"` mapping such as `{".": "workspace rules", "
 This tool can retrieve an oversized workspace-root `AGENTS.md` that ordinary project-scoped `read_file` cannot address. It applies the same path and symlink protections as ordinary source reads.
 
 When `agentId` identifies a registered agent in a bound project, the response
-also carries `instructionLayers` separately from `AGENTS.md`. The layered
-object includes current versioned shared roles and per-agent instructions from
-the verified canonical Git ledger, with provenance hashes and deterministic
-priority. These are independent of the selected main checkout or registered
-worktree. A changed role takes effect on the next instruction fetch; cursors
-continue only the repository hierarchy. See [AgentInstructions.md](AgentInstructions.md).
+on the **initial hierarchy page** also carries `instructionLayers` separately
+from `AGENTS.md`. The layered object includes current versioned shared roles
+and per-agent instructions from the verified canonical Git ledger, with
+provenance hashes and deterministic priority. These are independent of the
+selected main checkout or registered worktree. A changed role takes effect on
+the next initial instruction fetch or agent inbox read.
+
+Local `AGENTS.md` remains readable during a transient ledger outage:
+`instructionLayers` then carries `status: "unavailable"`,
+`complete: false` and a typed failure code instead of claiming that absent
+role content is complete. Continuation pages use a distinct
+`status: "continuation"` marker and do not re-fetch or repeat role documents.
+Refer to the initial page or restart without a cursor to refresh roles.
+Malformed canonical role records still fail closed. See
+[AgentInstructions.md](AgentInstructions.md).
 
 ### Shared roles and durable agent instruction APIs
 

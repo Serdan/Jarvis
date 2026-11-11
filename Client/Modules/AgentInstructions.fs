@@ -496,7 +496,23 @@ let private getExplicitRepository (target: ProjectPaths.ProjectTarget) (command:
 
 // Durable role and agent layers are read from the verified project ledger,
 // never from the source checkout or a cached instruction delivery response.
-// Their next-read refresh boundary is independent of repository paging.
+// The first page resolves roles from the live ledger; local AGENTS.md must
+// remain retrievable if that remote ledger is transiently unavailable.
+// Continuation pages refer to the initial role resolution instead of making
+// one new remote request per repository chunk.
+let private unresolvedInstructionLayers (status: string) (code: string) (message: string) =
+    let node = JsonObject()
+    node["status"] <- JsonValue.Create(status)
+    node["complete"] <- JsonValue.Create(false)
+    node["code"] <- JsonValue.Create(code)
+    node["message"] <- JsonValue.Create(message)
+    node :> JsonNode
+
+let private transientLedgerError = function
+    | Client.LedgerFailureError failure
+        when failure.Code = "RemoteUnavailable" || failure.Code = "LedgerContended" -> true
+    | _ -> false
+
 let getExplicit (target: ProjectPaths.ProjectTarget) (command: GetAgentInstructionsCommand) (rt: Runtime) =
     ProjectPaths.resolveProjectContextForTarget target rt
     |> Result.bind (fun project ->
@@ -504,33 +520,50 @@ let getExplicit (target: ProjectPaths.ProjectTarget) (command: GetAgentInstructi
             ProjectPaths.ProjectTarget.projectName (ProjectPaths.ResolvedProject.target project)
         ProjectPaths.resolveProjectRoot projectName rt
         |> Result.bind (fun (FolderPath root) ->
-            let ledgerConfigured =
-                File.Exists(OrchestrationApi.LedgerBindingConfig.pathForRoot root)
-            let layers =
-                if String.IsNullOrWhiteSpace command.AgentId || not ledgerConfigured then Ok None
-                else
-                    OrchestrationApi.LedgerBindingConfig.loadWithSnapshot projectName rt
-                    |> Result.bind (fun (binding, snapshot) ->
-                        RoleInstructions.RoleInstructions.tryResolveAt binding snapshot command.AgentId
-                        |> Result.mapError OrchestrationApi.LedgerErrors.toEffect)
-            layers
-            |> Result.bind (fun layers ->
+            // Resolve the local hierarchy independently, including its
+            // source-validation errors, before any optional remote ledger I/O.
+            getExplicitRepository target command rt (explicitPageBytes - 1024)
+            |> Result.bind (fun localPage ->
+                let ledgerConfigured =
+                    File.Exists(OrchestrationApi.LedgerBindingConfig.pathForRoot root)
                 let layerNode =
-                    layers |> Option.map (fun resolved ->
-                        JsonSerializer.SerializeToNode(resolved))
-                // A role body may be large. Reserve its encoded size before
-                // slicing AGENTS.md to keep the entire MCP reply bounded.
-                let layerBytes =
-                    layerNode
-                    |> Option.map (fun node -> Encoding.UTF8.GetByteCount(node.ToJsonString()))
-                    |> Option.defaultValue 0
-                let pageBudget = max 1024 (explicitPageBytes - layerBytes - 1024)
-                getExplicitRepository target command rt pageBudget
-                |> Result.map (fun page ->
-                    match layerNode with
-                    | Some node -> page["instructionLayers"] <- node
-                    | None -> ()
-                    page))))
+                    if String.IsNullOrWhiteSpace command.AgentId || not ledgerConfigured then Ok None
+                    elif command.Cursor.IsSome then
+                        Ok(Some(unresolvedInstructionLayers "continuation" "RoleLayersNotRepeated"
+                            "Role and individual instructions are checked only on the initial hierarchy page, not repeated here. Use that page's instructionLayers if present; restart without a cursor to refresh."))
+                    else
+                        OrchestrationApi.LedgerBindingConfig.loadWithSnapshot projectName rt
+                        |> Result.bind (fun (binding, snapshot) ->
+                            RoleInstructions.RoleInstructions.tryResolveAt binding snapshot command.AgentId
+                            |> Result.mapError OrchestrationApi.LedgerErrors.toEffect)
+                        |> function
+                            | Ok resolved -> Ok(resolved |> Option.map JsonSerializer.SerializeToNode)
+                            | Error failure when transientLedgerError failure ->
+                                let code =
+                                    match failure with
+                                    | Client.LedgerFailureError detail -> detail.Code
+                                    | _ -> "RoleLayersUnavailable"
+                                Ok(Some(unresolvedInstructionLayers "unavailable" code
+                                    "INCOMPLETE INSTRUCTIONS: the canonical role and agent layers could not be verified and were NOT loaded. Local AGENTS.md is available independently. Retry the initial request when the ledger is reachable."))
+                            | Error failure -> Error failure
+                layerNode
+                |> Result.bind (fun layerNode ->
+                    // A role body may be large. Repage only if the local page
+                    // does not fit alongside the verified role payload.
+                    let layerBytes =
+                        layerNode
+                        |> Option.map (fun node -> Encoding.UTF8.GetByteCount(node.ToJsonString()))
+                        |> Option.defaultValue 0
+                    let pageBudget = max 1024 (explicitPageBytes - layerBytes - 1024)
+                    let fitted =
+                        if explicitPageSize localPage <= pageBudget then Ok localPage
+                        else getExplicitRepository target command rt pageBudget
+                    fitted
+                    |> Result.map (fun page ->
+                        match layerNode with
+                        | Some node -> page["instructionLayers"] <- node
+                        | None -> ()
+                        page)))))
 
 // This snapshot must travel from instruction selection to authorization and
 // execution: a mutable .jarvis.json must not be parsed twice for one call.

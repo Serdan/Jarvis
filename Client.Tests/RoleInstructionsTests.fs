@@ -298,8 +298,8 @@ type RoleInstructionsTests() =
                 worktreeRoot.GetProperty("instructionLayers").GetProperty("Documents")
             Assert.That(worktreeDocs[0].GetProperty("Content").GetString(), Is.EqualTo(roleBody))
 
-            // Every explicit page includes full canonical role information,
-            // while each AGENTS.md segment is bounded and continued.
+            // The first page carries full canonical role information; local
+            // AGENTS.md continuation pages are bounded and do not re-fetch it.
             File.WriteAllText(workspaceInstructions, String('x', 1100000))
             use page1 = inspect "owner::roles-checkout" None
             Assert.That(System.Text.Encoding.UTF8.GetByteCount(page1.RootElement.GetRawText()),
@@ -309,11 +309,10 @@ type RoleInstructionsTests() =
             use page2 = inspect "owner::roles-checkout" (Some nextCursor)
             Assert.That(System.Text.Encoding.UTF8.GetByteCount(page2.RootElement.GetRawText()),
                         Is.LessThanOrEqualTo(640 * 1024))
-            let firstDocs = page1.RootElement.GetProperty("instructionLayers").GetProperty("Documents")
-            let secondDocs = page2.RootElement.GetProperty("instructionLayers").GetProperty("Documents")
-            Assert.That(
-                secondDocs[0].GetProperty("Sha256").GetString(),
-                Is.EqualTo(firstDocs[0].GetProperty("Sha256").GetString())))
+            let later = page2.RootElement.GetProperty("instructionLayers")
+            Assert.That(later.GetProperty("status").GetString(), Is.EqualTo("continuation"))
+            Assert.That(later.GetProperty("complete").GetBoolean(), Is.False)
+            Assert.That(later.GetProperty("code").GetString(), Is.EqualTo("RoleLayersNotRepeated")))
 
     [<Test>]
     member _.EscapedBodySizeIsBoundedAndMalformedStoredInstructionsFailClosed() =
@@ -420,3 +419,139 @@ type RoleInstructionsTests() =
             Assert.That(cleared.AgentConfigVersion, Is.EqualTo(4))
             Assert.That(cleared.RoleIds, Is.EqualTo(box [ "Architecture"; "Reviewer" ]))
             Assert.That(cleared.Documents.Length, Is.EqualTo(2)))
+
+
+    [<Test>]
+    member _.OfflineLedgerPreservesLocalHierarchyWithIncompleteRoleWarningAndPages() =
+        fixture (fun binding _ ->
+            let workspace = Path.GetDirectoryName(binding.RepositoryPath)
+            File.WriteAllText(Path.Combine(workspace, "AGENTS.md"), String('w', 900000))
+            File.WriteAllText(Path.Combine(binding.RepositoryPath, "AGENTS.md"), "Local project guidance.")
+            RoleInstructions.createRole binding "Lead" (Guid.NewGuid())
+                "Reviewer" "Review responsibility" "Canonical reviewer instructions."
+            |> success |> ignore
+            RoleInstructions.attachRole binding "Lead" (Guid.NewGuid())
+                "Reviewer 1" "Reviewer" 0 |> success |> ignore
+            let rt = Client.Runtime(workspace)
+            let trusted = LedgerStore.fetch binding |> success
+            match Client.OrchestrationApi.LedgerBindingConfig.bindExisting
+                    "owner" rt binding.ProjectId binding.LedgerId binding.Epoch
+                    binding.RemoteName binding.ApprovedFetchUrl binding.ApprovedPushUrl
+                    trusted.Commit true with
+            | Error error -> Assert.Fail(sprintf "Cannot bind fixture ledger: %A" error)
+            | Ok _ -> ()
+
+            let target =
+                Client.ProjectPaths.ProjectTarget.parse "owner"
+                |> function
+                    | Ok value -> value
+                    | Error failure -> failwithf "Invalid target: %A" failure
+            let retrieve agentId cursor =
+                let command : Common.GetAgentInstructionsCommand =
+                    { ProjectName = "owner"; AgentId = agentId; Directory = ""; Cursor = cursor }
+                Client.AgentInstructions.getExplicit target command rt
+            let read agentId cursor =
+                match retrieve agentId cursor with
+                | Ok node -> JsonDocument.Parse(node.ToJsonString())
+                | Error failure -> failwithf "Local hierarchy must survive remote outage: %A" failure
+
+            use healthy = read "Reviewer 1" None
+            let healthyDocs = healthy.RootElement.GetProperty("instructionLayers").GetProperty("Documents")
+            Assert.That(healthyDocs[0].GetProperty("Content").GetString(),
+                        Is.EqualTo("Canonical reviewer instructions."))
+
+            // The approved bare Git remote disappears. This must not deny
+            // local source guidance to a registered or unregistered reader.
+            let unavailable = binding.ApprovedFetchUrl + "-offline"
+            Directory.Move(binding.ApprovedFetchUrl, unavailable)
+            use registered = read "Reviewer 1" None
+            let source = registered.RootElement.GetProperty("AGENTS.md")
+            Assert.That(source.GetProperty(".").GetString(), Does.StartWith(String('w', 100)))
+            let roleWarning = registered.RootElement.GetProperty("instructionLayers")
+            Assert.That(roleWarning.GetProperty("status").GetString(), Is.EqualTo("unavailable"))
+            Assert.That(roleWarning.GetProperty("complete").GetBoolean(), Is.False)
+            Assert.That(roleWarning.GetProperty("code").GetString(), Is.EqualTo("RemoteUnavailable"))
+            Assert.That(roleWarning.GetProperty("message").GetString(), Does.Contain("NOT loaded"))
+
+            use unregistered = read "Unregistered Reader" None
+            Assert.That(unregistered.RootElement.GetProperty("AGENTS.md").GetProperty(".").GetString(),
+                        Does.StartWith(String('w', 100)))
+            Assert.That(unregistered.RootElement.GetProperty("instructionLayers")
+                                  .GetProperty("status").GetString(), Is.EqualTo("unavailable"))
+
+            let cursor = registered.RootElement.GetProperty("nextCursor").GetString()
+            Assert.That(cursor, Is.Not.Empty)
+            use continuation = read "Reviewer 1" (Some cursor)
+            Assert.That(continuation.RootElement.GetProperty("AGENTS.md").GetProperty(".").GetString(),
+                        Does.StartWith("wwww"))
+            let continued = continuation.RootElement.GetProperty("instructionLayers")
+            Assert.That(continued.GetProperty("status").GetString(), Is.EqualTo("continuation"))
+            Assert.That(continued.GetProperty("complete").GetBoolean(), Is.False)
+            Assert.That(continued.GetProperty("message").GetString(), Does.Contain("initial hierarchy page"))
+            Assert.That(
+                System.Text.Encoding.UTF8.GetByteCount(continuation.RootElement.GetRawText()),
+                Is.LessThanOrEqualTo(640 * 1024))
+
+            // An available but corrupt role record is NOT an outage: it must
+            // continue to fail closed rather than return an incomplete warning.
+            Directory.Move(unavailable, binding.ApprovedFetchUrl)
+            let snapshot = LedgerStore.fetch binding |> success
+            let rolePath = "records/roles/Reviewer.json"
+            let _, oid = LedgerStore.readAt binding snapshot rolePath |> success
+            let badRecord =
+                """{"schemaVersion":1,"roleId":"OtherRole","purpose":"Review","instructions":"Untrusted","version":2,"updatedBy":"Lead","updatedSequence":999}"""
+            LedgerStore.transact binding
+                { OperationId = Guid.NewGuid(); Actor = "Fixture"; Kind = "CorruptRoleFixture"
+                  RequestJson = """{"fixture":true}""" }
+                (fun _ -> Ok [ { Path = rolePath; ExpectedBlobOid = oid; Content = badRecord } ])
+            |> success |> ignore
+            match retrieve "Reviewer 1" None with
+            | Error(Client.LedgerFailureError detail) ->
+                Assert.That(detail.Code, Is.EqualTo("LedgerIntegrityError"))
+            | other -> Assert.Fail(sprintf "Corrupt canonical role must be rejected: %A" other))
+
+
+    [<Test>]
+    member _.MalformedBoundAgentConfigurationFailsClosedDuringExplicitRetrieval() =
+        fixture (fun binding _ ->
+            let workspace = Path.GetDirectoryName(binding.RepositoryPath)
+            File.WriteAllText(Path.Combine(binding.RepositoryPath, "AGENTS.md"), "Valid local guidance.")
+            RoleInstructions.createRole binding "Lead" (Guid.NewGuid())
+                "Reviewer" "Review" "Valid canonical role guidance."
+            |> success |> ignore
+            RoleInstructions.attachRole binding "Lead" (Guid.NewGuid())
+                "Reviewer 1" "Reviewer" 0 |> success |> ignore
+            let rt = Client.Runtime(workspace)
+            let snapshot = LedgerStore.fetch binding |> success
+            match Client.OrchestrationApi.LedgerBindingConfig.bindExisting
+                    "owner" rt binding.ProjectId binding.LedgerId binding.Epoch
+                    binding.RemoteName binding.ApprovedFetchUrl binding.ApprovedPushUrl
+                    snapshot.Commit true with
+            | Error error -> Assert.Fail(sprintf "Cannot bind fixture ledger: %A" error)
+            | Ok _ -> ()
+
+            let configPath = "records/agent-instructions/" +
+                             Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes("Reviewer 1"))
+                                .TrimEnd('=').Replace('+', '-').Replace('/', '_') + ".json"
+            let _, oid = LedgerStore.readAt binding snapshot configPath |> success
+            let wrongIdentity =
+                """{"schemaVersion":1,"agentId":"Spoofed Agent","roleIds":["Reviewer"],"instructions":"","version":2,"updatedBy":"Lead","updatedSequence":999}"""
+            LedgerStore.transact binding
+                { OperationId = Guid.NewGuid(); Actor = "Fixture"; Kind = "CorruptAgentConfigFixture"
+                  RequestJson = """{"fixture":true}""" }
+                (fun _ ->
+                    Ok [ { Path = configPath; ExpectedBlobOid = oid; Content = wrongIdentity } ])
+            |> success |> ignore
+
+            let target =
+                Client.ProjectPaths.ProjectTarget.parse "owner"
+                |> function
+                    | Ok value -> value
+                    | Error failure -> failwithf "Invalid target: %A" failure
+            let command : Common.GetAgentInstructionsCommand =
+                { ProjectName = "owner"; AgentId = "Reviewer 1"; Directory = ""; Cursor = None }
+            match Client.AgentInstructions.getExplicit target command rt with
+            | Error(Client.LedgerFailureError detail) ->
+                Assert.That(detail.Code, Is.EqualTo("LedgerIntegrityError"))
+            | other ->
+                Assert.Fail(sprintf "Malformed agent config must not degrade into incomplete-role success: %A" other))

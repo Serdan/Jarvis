@@ -793,10 +793,11 @@ module McpToolHelpers =
 
                     do! publishChanges response
                     let evidence = completedToolEvidence command response
-                    // Re-publishing an advisory cache invalidation is safe.
-                    // This does not execute or reapply the original ledger write.
-                    if not (Object.ReferenceEquals(evidence, response)) then
-                        do! publishChanges evidence
+                    // Terminal evidence is returned to the polling caller. It
+                    // is not a new mutation: repeated polls must not replay
+                    // effects or repeatedly broadcast invalidation messages.
+                    // Other devices use the existing bounded cache TTL if no
+                    // direct update notification was delivered.
 
                     return
                         (match command with

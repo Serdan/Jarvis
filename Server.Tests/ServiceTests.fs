@@ -1536,7 +1536,7 @@ let polledToolJobsRestoreExactInstructionsAndMutationEvidence () =
 [<Test>]
 let pendingToolJobNeverAdvertisesAFalseEmptyMutationList () =
     let handle : ToolJobHandle =
-        { JobId = "pending-job"; Kind = "ToolOperation"; Status = "Running"
+        { JobId = "pending-job"; Kind = JobKind.ToolOperation; Status = "Running"
           ProjectName = Some "Jarvis"; AgentId = "Worker 1"
           OperationId = Some "original-id"; CommandName = "ReadFile"
           StartedAt = DateTimeOffset.UtcNow }

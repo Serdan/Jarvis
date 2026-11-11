@@ -217,7 +217,7 @@ module private Core =
               Args = job.Args
               Reason = job.Reason
               WorkingDirectory = job.WorkingDirectory
-              Kind = "Process"
+              Kind = JobKind.Process
               CommandName = None
               OperationId = None
               AgentId = None
@@ -427,7 +427,7 @@ module private ToolOperations =
                 let id = Guid.NewGuid().ToString("N")
                 let handle =
                     { JobId = id
-                      Kind = "ToolOperation"
+                      Kind = JobKind.ToolOperation
                       Status = "Running"
                       ProjectName = projectName
                       AgentId = actor
@@ -488,7 +488,7 @@ module private ToolOperations =
           Args = []
           Reason = None
           WorkingDirectory = None
-          Kind = "ToolOperation"
+          Kind = JobKind.ToolOperation
           CommandName = Some entry.Handle.CommandName
           OperationId = entry.Handle.OperationId
           AgentId = Some entry.Handle.AgentId
@@ -620,7 +620,12 @@ let getJobResultForProjectAsAgent (canonical: ProjectPaths.ProjectId option) act
     fun rt ->
         match ToolOperations.get canonical actor cmd.JobId with
         | Some result -> result
-        | None -> Core.getJobResultForProject canonical cmd rt
+        | None ->
+            match Core.getJobResultForProject canonical cmd rt with
+            | Error(NotFoundError _) ->
+                Error(NotFoundError
+                    $"Unknown job id: {cmd.JobId}. If this was a client-owned tool operation, the client may have restarted or evicted the job; reconcile a persisted write using its original operationId rather than blindly repeating it.")
+            | result -> result
 
 let getJobResultForProject (canonical: ProjectPaths.ProjectId option) (cmd: GetJobResultCommand) =
     getJobResultForProjectAsAgent canonical None cmd

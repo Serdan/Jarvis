@@ -28,6 +28,11 @@ type PermissionDecision =
     | RequireConfirmation
     | Deny
 
+[<JsonConverter(typeof<TypeSafeEnumConverter<JobKind>>)>]
+type JobKind =
+    | Process
+    | ToolOperation
+
 [<JsonConverter(typeof<UnionConverter<JobStatus>>)>]
 type JobStatus =
     | Running
@@ -500,7 +505,7 @@ type JobSummary =
       Reason: string option
       WorkingDirectory: string option
       /// Process and in-process tool operation jobs are separate kinds.
-      Kind: string
+      Kind: JobKind
       CommandName: string option
       OperationId: string option
       AgentId: string option
@@ -609,7 +614,7 @@ type AgentInboxActivation =
 /// An agent must poll by ID; neither state changes nor instructions are final yet.
 type ToolJobHandle =
     { JobId: string
-      Kind: string
+      Kind: JobKind
       Status: string
       ProjectName: string option
       AgentId: string
@@ -791,6 +796,17 @@ module AgentCommandInfo =
         | CancelJobCommand _ -> "CancelJob"
         | MessageCommand _ -> "Message"
         | GetClientActivityCommand _ -> "GetClientActivity"
+
+    /// Stable identity of the represented ledger write/recovery operation.
+    /// Do not infer it by scanning arbitrary JSON fields in other commands.
+    let operationId = function
+        | TaskWriteCommand cmd -> Some cmd.OperationId
+        | ReviewWriteCommand cmd -> Some cmd.OperationId
+        | LedgerWriteCommand cmd when cmd.Action <> "AcknowledgePendingOperation" -> Some cmd.OperationId
+        | RetryPendingIntentCommand cmd -> Some cmd.OperationId
+        | SupersedePendingIntentCommand cmd -> Some cmd.OperationId
+        | AbandonPendingIntentCommand cmd -> Some cmd.OperationId
+        | _ -> None
 
     let projectName = function
         | ListCommandsCommand

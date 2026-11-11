@@ -543,7 +543,7 @@ let toolOperationRegistryBoundsRunningAndQueuedJobs () =
     finally
         waiting.TrySetResult(completedToolResponse """{"ok":true}""") |> ignore
         for _, _, completion in entries do
-            completion.WaitAsync(TimeSpan.FromSeconds(10.)).GetAwaiter().GetResult()
+            completion.WaitAsync(TimeSpan.FromSeconds(10.)).GetAwaiter().GetResult() |> ignore
         Directory.Delete(root, true)
 
 
@@ -584,3 +584,87 @@ let stableOperationIdDoesNotDispatchOriginalCommandTwice () =
     | Choice1Of2 response -> Assert.That(response, Is.EqualTo(original))
     | Choice2Of2 _ -> Assert.Fail("Completed idempotent retry must replay the original result.")
     Assert.That(executed.Value, Is.EqualTo(1))
+
+
+[<Test>]
+let toolFailuresPreserveOriginalErrorWithoutRestart () =
+    let operationId = "failure-" + Guid.NewGuid().ToString("N")
+    let calls = ref 0
+    let registered =
+        match startToolOperation jobProject (Some "Project1") "Worker 1" "ReadFile"
+                (Some operationId) "throwing-command" (fun () ->
+                    calls.Value <- calls.Value + 1
+                    Task.FromException<AgentCommandResponse>(InvalidOperationException("synthetic command fault"))) with
+        | Ok job -> job
+        | Error error -> failwith $"Could not register faulting job: {error}"
+    let first = (awaitToolOperation registered (TimeSpan.FromSeconds 2.)).GetAwaiter().GetResult()
+    let outcome =
+        match first with
+        | Choice1Of2 response -> response
+        | Choice2Of2 _ -> failwith "Faulting task should finish before the deadline."
+    Assert.That(outcome.Error.IsSome, Is.True)
+    match outcome.Error with
+    | Some(ExecutionFailed message) -> Assert.That(message, Does.Contain("synthetic command fault"))
+    | other -> Assert.Fail($"Expected typed execution failure: {other}")
+    let handle, _ = registered
+    let root = createTempProject ()
+    try
+        let context = TestContext root
+        let result = getJobResultForProjectAsAgent jobProject (Some "Worker 1")
+                         { ProjectName = "Project1"; JobId = handle.JobId; AfterSequence = None } context
+        match result with
+        | Ok job ->
+            match job.Status with
+            | ToolFailed message -> Assert.That(message, Does.Contain("synthetic command fault"))
+            | other -> Assert.Fail($"Incorrect terminal status: {other}")
+            Assert.That(job.ToolResponse, Is.EqualTo(Some outcome))
+        | Error error -> Assert.Fail($"Failed to retrieve faulting job: {error}")
+    finally
+        Directory.Delete(root, true)
+    Assert.That(calls.Value, Is.EqualTo(1))
+
+[<Test>]
+let evictedToolJobsReturnExplicitExpiryAndBlockUnsafeRetry () =
+    let originalId = "evict-" + Guid.NewGuid().ToString("N")
+    let response = completedToolResponse """{"ok":true}"""
+    let start op =
+        match startToolOperation jobProject (Some "Project1") "Worker 1" "LedgerWrite"
+                (Some op) op (fun () -> Task.FromResult response) with
+        | Ok job -> job
+        | Error error -> failwith $"Cannot start retention fixture: {error}"
+    let first = start originalId
+    (snd first).WaitAsync(TimeSpan.FromSeconds 4.) |> fun task -> task.GetAwaiter().GetResult() |> ignore
+    for index in 1 .. 120 do
+        let other = start ("evict-fixture-" + Guid.NewGuid().ToString("N") + "-" + string index)
+        (snd other).WaitAsync(TimeSpan.FromSeconds 4.) |> fun task -> task.GetAwaiter().GetResult() |> ignore
+    let root = createTempProject ()
+    try
+        let context = TestContext root
+        let read = getJobResultForProjectAsAgent jobProject (Some "Worker 1")
+                       { ProjectName = "Project1"; JobId = (fst first).JobId; AfterSequence = None } context
+        match read with
+        | Error(NotFoundError reason) ->
+            Assert.That(reason, Does.Contain("expired"))
+            Assert.That(reason, Does.Contain("operationId"))
+        | other -> Assert.Fail($"Expected explicit expiry after bounded eviction: {other}")
+        match startToolOperation jobProject (Some "Project1") "Worker 1" "LedgerWrite"
+                  (Some originalId) originalId (fun () -> Task.FromResult response) with
+        | Error(NotFoundError reason) -> Assert.That(reason, Does.Contain("Reconcile"))
+        | other -> Assert.Fail($"Expired operation ID must not replay a write: {other}")
+    finally
+        Directory.Delete(root, true)
+
+[<Test>]
+let missingToolJobAfterClientRestartExplainsReconciliation () =
+    let root = createTempProject ()
+    try
+        let context = TestContext root
+        let unknown = Guid.NewGuid().ToString("N")
+        match getJobResultForProjectAsAgent jobProject (Some "Worker 1")
+                  { ProjectName = "Project1"; JobId = unknown; AfterSequence = None } context with
+        | Error(NotFoundError message) ->
+            Assert.That(message, Does.Contain("restarted"))
+            Assert.That(message, Does.Contain("operationId"))
+        | other -> Assert.Fail($"Unknown client-owned job must explain restart/expiry: {other}")
+    finally
+        Directory.Delete(root, true)

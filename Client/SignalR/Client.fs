@@ -697,11 +697,14 @@ let processIncomingCommand (rt: Runtime) (commandJson: string) (agentId: string)
                         // The caller's agentId belongs to the source project
                         // of a cross-project notification, not the destination.
                         let localAgentId =
-                            if isLocalAgentActivity command &&
-                               (match command with
-                                | GetJobResultCommand job -> not (JobManager.isToolOperationJob job.JobId)
-                                | CancelJobCommand job -> not (JobManager.isToolOperationJob job.JobId)
-                                | _ -> true) then agentId else ""
+                            // Job status, listing and cancellation are controls,
+                            // not evidence that the agent resumed its task.
+                            // Preserve the transport actor separately for job
+                            // authorization, including unknown/expired IDs.
+                            match command with
+                            | GetJobResultCommand _ | ListJobsCommand _ | CancelJobCommand _ -> ""
+                            | _ when isLocalAgentActivity command -> agentId
+                            | _ -> ""
                         if not (String.IsNullOrWhiteSpace localAgentId) then
                             target |> Option.iter (fun selected ->
                                 rt.Tui.RecordAgentSeen(AgentView.activityProject selected, localAgentId))
@@ -771,28 +774,10 @@ let private promotionThreshold () =
         TimeSpan.FromMilliseconds(float milliseconds)
     | _ -> TimeSpan.FromSeconds 3.
 
-let private tryOperationId (commandJson: string) =
-    try
-        use document = JsonDocument.Parse commandJson
-        let rec locate (node: JsonElement) =
-            match node.ValueKind with
-            | JsonValueKind.Object ->
-                node.EnumerateObject()
-                |> Seq.tryPick (fun property ->
-                    if String.Equals(property.Name, "operationId", StringComparison.OrdinalIgnoreCase)
-                       && property.Value.ValueKind = JsonValueKind.String then
-                        match property.Value.GetString() with
-                        | value when String.IsNullOrWhiteSpace value -> None
-                        | value -> Some value
-                    else locate property.Value)
-            | JsonValueKind.Array -> node.EnumerateArray() |> Seq.tryPick locate
-            | _ -> None
-        locate document.RootElement
-    with _ -> None
-
 let private shouldAutoPromote = function
     // Cheap controls must never wait for the command worker slots. They can
     // poll or inspect a slow task while every worker is occupied.
+    | StartJobCommand _ // Already returns its own OS process-job handle.
     | ListJobsCommand _
     | GetJobResultCommand _
     | CancelJobCommand _
@@ -818,7 +803,9 @@ let private executeOrPromote (rt: Runtime) (commandJson: string) (agentId: strin
                     | ActivityLabel _ | Unscoped -> None
                 let registered =
                     JobManager.startToolOperation canonical project agentId
-                        (AgentCommandInfo.protocolName command) (tryOperationId commandJson)
+                        (AgentCommandInfo.protocolName command)
+                        (AgentCommandInfo.operationId command
+                         |> Option.filter (String.IsNullOrWhiteSpace >> not))
                         (Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(commandJson))))
                         (fun () -> task {
                             let! _, _, outcome = processIncomingCommand rt commandJson agentId
@@ -902,4 +889,4 @@ let receiveCommandAndReply (connection: HubConnection) (rt: Runtime) (correlatio
     match ingress.TryDispatch(correlationId, fun () ->
         receiveCommandAndReplyCore connection rt correlationId commandJson agentId) with
     | Ok _ -> Task.CompletedTask
-    | Error reason -> Task.FromException(InvalidOperationException reason) :> Task
+    | Error reason -> Task.FromException(InvalidOperationException reason)

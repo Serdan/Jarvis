@@ -291,3 +291,31 @@ let incoming_activity_commands_accept_literal_history_labels () =
             run (MessageCommand { ProjectName = Some arbitrary; Message = "literal label" })
         Assert.That(arbitraryResult.IsOk, Is.True)
     }
+
+[<Test>]
+let jobControlReadsDoNotImplicitlyResumeAReadyAgent () =
+    task {
+        let root = Path.Combine(Path.GetTempPath(), "jarvis-job-control-seen-" + Guid.NewGuid().ToString("N"))
+        Directory.CreateDirectory(Path.Combine(root, "Project1")) |> ignore
+        let logPath = Path.Combine(root, "activity")
+        Directory.CreateDirectory logPath |> ignore
+        let settings : Client.ActivityLog.Settings =
+            { DirectoryPath = logPath; RetentionDays = 14; MaxFileBytes = 1024L * 1024L }
+        try
+            use store = new Client.ActivityLog.Store(settings)
+            let rt = Runtime(root, ConsoleTui.ConsoleTui(activityLog = store), FullTrust)
+            let commands : AgentCommand list =
+                [ ListJobsCommand { ProjectName = Some "Project1"; IncludeCompleted = true }
+                  GetJobResultCommand { ProjectName = "Project1"; JobId = "missing-job"; AfterSequence = None }
+                  CancelJobCommand { ProjectName = "Project1"; JobId = "missing-job" } ]
+            for command in commands do
+                let! _, _, response =
+                    Client.SignalR.Client.processIncomingCommand rt (JsonSerializer.Serialize<AgentCommand>(command)) "Ready Agent"
+                Assert.That(response.AgentStateChanges, Is.Empty)
+                Assert.That(response.InboxActivation.IsNone, Is.True)
+            let seen = store.LoadAgentSeen() |> Map.ofList
+            Assert.That(seen.ContainsKey("Project1::Ready Agent"), Is.False,
+                        "Status polling and job controls must not count as progress or reactivate a Ready assignment.")
+        finally
+            Directory.Delete(root, true)
+    }

@@ -135,6 +135,32 @@ type TaskWriteCommand =
       Evidence: string
       SessionId: string }
 
+/// Challenge condition owners and descriptions are explicit typed wire fields.
+type ChallengeConditionDefinition =
+    { OwnerAgentId: string
+      Description: string }
+
+type ChallengeReadCommand =
+    { ProjectName: string
+      ActorId: string
+      Action: string
+      ChallengeId: string }
+
+type ChallengeWriteCommand =
+    { ProjectName: string
+      ActorId: string
+      OperationId: string
+      Action: string
+      ChallengeId: string
+      ConditionId: string
+      ExpectedVersion: int
+      Title: string
+      TaskId: string
+      Conditions: ChallengeConditionDefinition list
+      Evidence: string
+      Reason: string
+      Outcome: string }
+
 type LedgerReadCommand =
     { ProjectName: string
       Action: string
@@ -625,6 +651,8 @@ type AgentCommand =
     | TaskReadCommand of TaskReadCommand
     | ObserveAgentCommand of ObserveAgentRequest
     | TaskWriteCommand of TaskWriteCommand
+    | ChallengeReadCommand of ChallengeReadCommand
+    | ChallengeWriteCommand of ChallengeWriteCommand
     | LedgerReadCommand of LedgerReadCommand
     | LedgerWriteCommand of LedgerWriteCommand
     | ReviewReadCommand of ReviewReadCommand
@@ -675,6 +703,8 @@ module AgentCommandInfo =
         | TaskReadCommand _ -> "TaskReadCommand"
         | ObserveAgentCommand _ -> "ObserveAgentCommand"
         | TaskWriteCommand _ -> "TaskWriteCommand"
+        | ChallengeReadCommand _ -> "ChallengeReadCommand"
+        | ChallengeWriteCommand _ -> "ChallengeWriteCommand"
         | LedgerReadCommand _ -> "LedgerReadCommand"
         | LedgerWriteCommand _ -> "LedgerWriteCommand"
         | ReviewReadCommand _ -> "ReviewReadCommand"
@@ -731,6 +761,8 @@ module AgentCommandInfo =
         | TaskReadCommand _ -> "TaskRead"
         | ObserveAgentCommand _ -> "ObserveAgent"
         | TaskWriteCommand _ -> "TaskWrite"
+        | ChallengeReadCommand _ -> "ChallengeRead"
+        | ChallengeWriteCommand _ -> "ChallengeWrite"
         | LedgerReadCommand _ -> "LedgerRead"
         | LedgerWriteCommand _ -> "LedgerWrite"
         | ReviewReadCommand _ -> "ReviewRead"
@@ -785,6 +817,8 @@ module AgentCommandInfo =
         | TaskReadCommand cmd -> Some cmd.ProjectName
         | ObserveAgentCommand cmd -> Some cmd.ProjectName
         | TaskWriteCommand cmd -> Some cmd.ProjectName
+        | ChallengeReadCommand cmd -> Some cmd.ProjectName
+        | ChallengeWriteCommand cmd -> Some cmd.ProjectName
         | LedgerReadCommand cmd -> Some cmd.ProjectName
         | LedgerWriteCommand cmd -> Some cmd.ProjectName
         | ReviewReadCommand cmd -> Some cmd.ProjectName
@@ -879,6 +913,8 @@ module AgentCommandInfo =
         | TaskReadCommand cmd -> Some(compact cmd.AgentId)
         | ObserveAgentCommand cmd -> Some(compact cmd.TargetAgentId)
         | TaskWriteCommand cmd -> Some(compact cmd.Action)
+        | ChallengeReadCommand cmd -> Some(compact cmd.Action)
+        | ChallengeWriteCommand cmd -> Some(compact cmd.Action)
         | LedgerReadCommand cmd -> Some(compact cmd.ProjectName)
         | LedgerWriteCommand cmd -> Some(compact cmd.Action)
         | ReviewReadCommand cmd -> Some(compact cmd.Action)
@@ -928,6 +964,8 @@ module AgentCommandInfo =
         | TaskReadCommand cmd -> Some(truncate 64 cmd.AgentId)
         | ObserveAgentCommand cmd -> Some(truncate 64 cmd.TargetAgentId)
         | TaskWriteCommand cmd -> Some(truncate 64 cmd.Action)
+        | ChallengeReadCommand cmd -> Some(truncate 64 cmd.Action)
+        | ChallengeWriteCommand cmd -> Some(truncate 64 cmd.Action)
         | LedgerReadCommand cmd -> Some(truncate 64 cmd.ProjectName)
         | LedgerWriteCommand cmd -> Some(truncate 64 cmd.Action)
         | ReviewReadCommand cmd -> Some(truncate 64 cmd.Action)
@@ -989,7 +1027,7 @@ module AgentCommandInfo =
         | None -> invocation command
 
 module AgentProtocol =
-    let version = "3.63"
+    let version = "3.65"
     let defaultPatchFuzzyContextLines = 3
     let maxResponseBytes = 900 * 1024
     let maxImageBytes = 8 * 1024 * 1024
@@ -1022,6 +1060,8 @@ module AgentProtocol =
           definition "TaskRead" "Reads a registered agent inbox from a single ledger snapshot." [ ReadOnly; NetworkAccess ] false false false
           definition "ObserveAgent" "Read an explicitly named target agent without attributing tool activity or beginning a Ready turn. Observer identity is independently verified." [ ReadOnly; NetworkAccess ] false false false
           definition "TaskWrite" "Creates/assigns/starts tasks and binds immutable review base." [ VersionControlWrite; NetworkAccess ] true true false
+          definition "ChallengeRead" "Read issued or owned durable challenge conditions from the verified ledger." [ ReadOnly; NetworkAccess ] false false false
+          definition "ChallengeWrite" "Atomically create, satisfy, block, reopen, or cancel durable agent challenges." [ VersionControlWrite; NetworkAccess ] true true false
           definition "LedgerRead" "Inspect the verified canonical Git ledger identity and trust head." [ ReadOnly; NetworkAccess ] false false false
           definition "LedgerWrite" "Explicitly bind, initialize or rebind the canonical ledger with privacy acknowledgment." [ VersionControlWrite; NetworkAccess ] true true false
           definition "ReviewRead" "Reads opt-in canonical review ledger requests and reviewer inboxes." [ ReadOnly; NetworkAccess ] false false false

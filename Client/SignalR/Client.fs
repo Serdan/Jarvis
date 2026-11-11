@@ -121,6 +121,8 @@ let private activatesAgent (agentId: string) command =
               "SetAttemptSource"; "SubmitIntegration"; "CompleteIntegration" ]
     | TaskReadCommand cmd ->
         String.IsNullOrWhiteSpace cmd.AgentId || cmd.AgentId = agentId
+    | ChallengeReadCommand cmd -> cmd.ActorId = agentId
+    | ChallengeWriteCommand cmd -> cmd.ActorId = agentId
     | LedgerWriteCommand _ | ReviewWriteCommand _
     | RetryPendingIntentCommand _ | SupersedePendingIntentCommand _
     | AbandonPendingIntentCommand _ -> false
@@ -426,6 +428,8 @@ let private dispatch (rt: Runtime) (target: ProjectPaths.ProjectTarget option)
         | Some context -> rt |> OrchestrationApi.TaskApi.writeForContext context cmd |> serialize'
         | None -> Error(Client.ValidationError "Task-spec source checkout was not resolved.") |> serialize'
     | TaskWriteCommand cmd -> rt |> OrchestrationApi.TaskApi.write cmd |> serialize'
+    | ChallengeReadCommand cmd -> rt |> OrchestrationApi.ChallengeApi.read cmd |> serialize'
+    | ChallengeWriteCommand cmd -> rt |> OrchestrationApi.ChallengeApi.write cmd |> serialize'
     | LedgerReadCommand cmd -> rt |> OrchestrationApi.LedgerApi.read cmd |> serialize'
     | LedgerWriteCommand cmd -> rt |> OrchestrationApi.LedgerApi.write cmd |> serialize'
     | ReviewReadCommand cmd -> rt |> OrchestrationApi.ReviewApi.read cmd |> serialize'

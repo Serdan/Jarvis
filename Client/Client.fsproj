@@ -73,6 +73,7 @@
         <Compile Include="Modules\AgentInstructions.fs"/>
         <Compile Include="Modules\WorkingTurnGuidance.fs"/>
         <Compile Include="Modules\SelfUpdate.fs"/>
+        <Compile Include="SignalR\CommandDispatch.fs"/>
         <Compile Include="SignalR\HubConnection.fs"/>
         <Compile Include="SignalR\Client.fs"/>
         <Compile Include="Program.fs"/>

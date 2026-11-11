@@ -105,15 +105,12 @@ let private isLocalAgentActivity = function
     | ObserveAgentCommand _ -> false // Neither observer nor target is acting.
     | _ -> true
 
-// These owner operations already change canonical task/attempt/agent versions
-// atomically, so a separate pre-dispatch activity write would invalidate the
-// caller's explicit optimistic concurrency token.
+// These owner transitions advance the canonical agent version and complete
+// promptly. Lease renewal before them could invalidate an exact version token.
 let private activityFencedByCommand agentId = function
     | TaskWriteCommand cmd when cmd.ActorId = agentId ->
         List.contains cmd.Action
-            [ "CheckpointAttempt"; "YieldAgent"; "CompleteAgentWork"
-              "BindAttemptSource"; "RebindAttemptSource"; "BindReviewBase"
-              "SetAttemptSource"; "CompleteIntegration" ]
+            [ "CheckpointAttempt"; "YieldAgent"; "CompleteAgentWork" ]
     | _ -> false
 
 // An agent's first ordinary tool call starts its Ready assignment.
@@ -157,6 +154,18 @@ let private activateReadyOnActivity (rt: Runtime) (agentId: string)
             let current =
                 cache.Get(DateTimeOffset.UtcNow, projectId, agentId, fun () ->
                     loadAgentState rt project agentId)
+            let renewWorkingLease (assignment: ReviewWorkflow.AgentAssignment) =
+                match OrchestrationApi.LedgerBindingConfig.load project rt with
+                | Error error -> Error(Client.ValidationError($"Cannot renew Working activity lease: {error}"))
+                | Ok binding ->
+                    match ReviewWorkflow.ReviewWorkflow.recordWorkingActivity binding
+                              (Guid.NewGuid()) agentId assignment.TaskId assignment.AttemptId with
+                    | Ok _ ->
+                        cache.Invalidate(projectId, agentId)
+                        Ok ()
+                    | Error error ->
+                        cache.Invalidate(projectId, agentId)
+                        Error(Client.ValidationError($"Cannot renew Working activity lease: {error}. Reread your agent inbox."))
             match current with
             | Some agent when agent.State = "Ready"
                               && not (isNull (box agent.CurrentAssignment))
@@ -181,54 +190,67 @@ let private activateReadyOnActivity (rt: Runtime) (agentId: string)
                               AfterState = Some "Working"
                               CommittedHead = Some write.CurrentHead
                               OperationId = Some write.Operation.OperationId }
-                        Ok (Client.LedgerStore.LedgerStore.changedAgentIds write, Some committed)
+                        match renewWorkingLease agent.CurrentAssignment with
+                        | Ok () -> Ok (Client.LedgerStore.LedgerStore.changedAgentIds write, Some committed)
+                        | Error error -> Error error
                     | Error(Client.LedgerStore.StaleEntityVersion _) ->
                         // Another concurrent tool may already have started this
                         // assignment. Do not reset its Working clock.
                         match ReviewWorkflow.ReviewWorkflow.getAgentWorkingTurn binding agentId with
-                        | Ok latest when latest.State = "Working" -> Ok ([], None)
+                        | Ok latest when latest.State = "Working"
+                                         && not (isNull (box latest.CurrentAssignment)) ->
+                            match renewWorkingLease latest.CurrentAssignment with
+                            | Ok () -> Ok ([], None)
+                            | Error error -> Error error
                         | _ -> Error(Client.ValidationError "Agent assignment changed before automatic activation.")
                     | Error error -> Error(Client.ValidationError($"Automatic agent activation failed: {error}"))
             | Some agent when agent.State = "Working"
                               && not (activityFencedByCommand agentId command) ->
-                // Every genuine call is fenced before its body runs. A separate
-                // device cannot race an old operator correction past this write.
-                let assignment = agent.CurrentAssignment
-                if isNull (box assignment) then
+                // A locally cached *canonical* lease guarantees that a
+                // correction cannot win before its expiry. Renew through Git
+                // only near expiry; never silently revive a corrected turn.
+                if isNull (box agent.CurrentAssignment) then
                     Error(Client.ValidationError "Working activity has no assigned attempt.")
+                elif ReviewWorkflow.ReviewWorkflow.workingActivityLeaseSufficient DateTimeOffset.UtcNow agent then
+                    Ok ([], None)
                 else
-                    match OrchestrationApi.LedgerBindingConfig.load project rt with
-                    | Error error -> Error(Client.ValidationError($"Cannot fence Working activity: {error}"))
-                    | Ok binding ->
-                        match ReviewWorkflow.ReviewWorkflow.recordWorkingActivity binding
-                                  (Guid.NewGuid()) agentId assignment.TaskId assignment.AttemptId with
-                        | Ok _ -> Ok ([], None)
-                        | Error(Client.LedgerStore.StaleEntityVersion _) ->
-                            // If a correction won the race, require a fresh
-                            // Ready -> Working activation before executing the tool.
-                            cache.Invalidate(projectId, agentId)
-                            match ReviewWorkflow.ReviewWorkflow.getAgentWorkingTurn binding agentId with
-                            | Ok latest when latest.State = "Ready"
-                                             && latest.CurrentAssignment = assignment ->
-                                match ReviewWorkflow.ReviewWorkflow.activateReadyAgent binding
-                                          (Guid.NewGuid()) assignment.TaskId agentId with
-                                | Ok write when write.AlreadyApplied -> Ok ([], None)
-                                | Ok write ->
-                                    let receipt : AgentInboxActivation =
-                                        { ProjectName = project; AgentId = agentId
-                                          ActivatedByThisCall = true
-                                          BeforeState = Some "Ready"
-                                          AfterState = Some "Working"
-                                          CommittedHead = Some write.CurrentHead
-                                          OperationId = Some write.Operation.OperationId }
-                                    Ok (Client.LedgerStore.LedgerStore.changedAgentIds write, Some receipt)
-                                | Error error ->
-                                    Error(Client.ValidationError($"Cannot reactivate corrected agent: {error}"))
-                            | _ ->
-                                Error(Client.ValidationError "Working assignment changed before tool activity; reread inbox.")
-                        | Error error ->
-                            Error(Client.ValidationError($"Cannot fence Working activity: {error}"))
+                    match renewWorkingLease agent.CurrentAssignment with
+                    | Ok () -> Ok ([], None)
+                    | Error error -> Error error
             | _ -> Ok ([], None)
+
+// Keep a canonical lease valid throughout long-running tools. An admitted
+// command can outlive its initial lease, so ingress-only renewal is not enough.
+// The interval is injectable for deterministic scheduling tests.
+let internal withActivityLeaseHeartbeat (interval: TimeSpan)
+                                        (renew: unit -> Result<unit, string>)
+                                        (work: unit -> Task<'t>) =
+    task {
+        use stop = new System.Threading.CancellationTokenSource()
+        let gate = obj()
+        let mutable renewalFailure : string option = None
+        let background =
+            Task.Run(System.Func<Task>(fun () ->
+                task {
+                    try
+                        while not stop.IsCancellationRequested do
+                            do! Task.Delay(interval, stop.Token)
+                            if not stop.IsCancellationRequested then
+                                match renew() with
+                                | Ok () -> ()
+                                | Error reason ->
+                                    lock gate (fun () -> renewalFailure <- Some reason)
+                                    stop.Cancel()
+                    with :? OperationCanceledException -> ()
+                } :> Task))
+        try
+            let! result = work()
+            stop.Cancel()
+            do! background
+            return result, lock gate (fun () -> renewalFailure)
+        finally
+            stop.Cancel()
+    }
 
 // Only the Working turn identifies a stable delivery scope. Ledger calls bootstrap
 // root guidance, while normal source operations discover deeper instructions.
@@ -745,8 +767,55 @@ let processIncomingCommand (rt: Runtime) (commandJson: string) (agentId: string)
                             | TaskReadCommand inbox, Some receipt when inbox.Action = "AgentInbox" ->
                                 inboxActivation <- Some receipt
                             | _ -> ()
-                            let! result, applicable, provenance =
-                                receiveCommandWithTypedInstructions rt target command
+                            let work () = receiveCommandWithTypedInstructions rt target command
+                            // The lease is renewed during long-running commands.
+                            // The canonical record (not local TUI last-seen)
+                            // determines whether administrative correction may run.
+                            let leaseContext =
+                                match target with
+                                | Some selected when not (String.IsNullOrWhiteSpace localAgentId)
+                                                     && activatesAgent localAgentId command
+                                                     && not (activityFencedByCommand localAgentId command) ->
+                                    let projectId = ProjectPaths.ProjectTarget.projectId selected
+                                    let project = ProjectPaths.ProjectId.value projectId
+                                    let cache = workingGuidanceCaches.GetValue(rt, fun _ ->
+                                        WorkingTurnGuidance.AgentCache(TimeSpan.FromMinutes 2.))
+                                    match cache.Get(DateTimeOffset.UtcNow, projectId, localAgentId,
+                                                    fun () -> loadAgentState rt project localAgentId) with
+                                    | Some active when active.State = "Working"
+                                                       && not (isNull (box active.CurrentAssignment)) ->
+                                        Some (project, projectId, active.CurrentAssignment)
+                                    | _ -> None
+                                | _ -> None
+                            let! (execution, renewalFailure) =
+                                match leaseContext with
+                                | None ->
+                                    task {
+                                        let! outcome = work()
+                                        return outcome, None
+                                    }
+                                | Some (project, projectId, assignment) ->
+                                    withActivityLeaseHeartbeat (TimeSpan.FromMinutes(2.))
+                                        (fun () ->
+                                            match OrchestrationApi.LedgerBindingConfig.load project rt with
+                                            | Error error -> Error(sprintf "Lease binding unavailable: %A" error)
+                                            | Ok binding ->
+                                                match ReviewWorkflow.ReviewWorkflow.recordWorkingActivity
+                                                          binding (Guid.NewGuid()) localAgentId
+                                                          assignment.TaskId assignment.AttemptId with
+                                                | Ok _ ->
+                                                    let cache = workingGuidanceCaches.GetValue(rt, fun _ ->
+                                                        WorkingTurnGuidance.AgentCache(TimeSpan.FromMinutes 2.))
+                                                    cache.Invalidate(projectId, localAgentId)
+                                                    Ok ()
+                                                | Error error -> Error(sprintf "Lease renewal rejected: %A" error))
+                                        work
+                            let returned, applicable, provenance = execution
+                            let result =
+                                match renewalFailure with
+                                | Some failure -> Error(Client.ValidationError(
+                                    $"Working activity lease expired or could not be renewed: {failure}. Reread the agent inbox."))
+                                | None -> returned
                             // A write may alter another agent's state, or none
                             // at all. Invalidate precisely the affected local
                             // cache entries before preparing turn guidance.

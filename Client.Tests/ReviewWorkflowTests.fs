@@ -297,12 +297,25 @@ type ReviewWorkflowTests() =
             Assert.That(history, Is.Empty)
             Assert.That((ReviewWorkflow.getAgentInbox first "Owner" |> success).Agent.State,
                         Is.EqualTo("Working"))
-            // Once an administrator has observed the new version, the exact
-            // correction remains available; recent activity cannot be mistaken
-            // for older activity, and the operator can still repair a bad state.
+            // Even the latest observed version is not sufficient while there
+            // is a live lease: the worker may still have a command in flight.
+            Assert.That(ReviewWorkflow.workingActivityLeaseSufficient DateTimeOffset.UtcNow after,
+                        Is.True)
+            expectStale
+                (ReviewWorkflow.correctAgentWorkingStateAs first "Lead" (Guid.NewGuid())
+                    "Lead" "Owner" taskId attempt.AttemptId task.Version attempt.Version
+                    after.Version attempt.AssignmentGeneration "Worker still active")
+            // Simulate a lease that elapsed after its last activity (without
+            // sleeping five minutes) and verify correction is then available.
+            ReviewWorkflow.recordWorkingActivityAt second (Guid.NewGuid())
+                "Owner" taskId attempt.AttemptId (DateTimeOffset.UtcNow.AddMinutes(-10.))
+            |> success |> ignore
+            let expired = (ReviewWorkflow.getAgentInbox first "Owner" |> success).Agent
+            Assert.That(ReviewWorkflow.workingActivityLeaseSufficient DateTimeOffset.UtcNow expired,
+                        Is.False)
             ReviewWorkflow.correctAgentWorkingStateAs first "Lead" (Guid.NewGuid())
                 "Lead" "Owner" taskId attempt.AttemptId task.Version attempt.Version
-                after.Version attempt.AssignmentGeneration "Inspected latest working state"
+                expired.Version attempt.AssignmentGeneration "Worker lease expired"
             |> success |> ignore
             Assert.That((ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent.State,
                         Is.EqualTo("Ready")))
@@ -359,12 +372,58 @@ type ReviewWorkflowTests() =
                 Assert.That(changes.AgentStateChanges, Is.Empty)
                 Assert.That((ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent.Version,
                             Is.EqualTo(after.Version))
+                // A second ordinary call reuses the canonical lease without a
+                // Git write or version bump.
+                let priorHead = (LedgerStore.fetch second |> success).Commit
                 let _, secondRead, _ = invoke selfRead "Owner"
                 Assert.That(secondRead.IsOk, Is.True)
+                Assert.That((LedgerStore.fetch second |> success).Commit, Is.EqualTo(priorHead))
                 Assert.That((ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent.Version,
-                            Is.EqualTo(after.Version + 1))
+                            Is.EqualTo(after.Version))
             finally
                 if File.Exists configPath then File.Delete configPath)
+
+    [<Test>]
+    member _.WorkingLeaseHeartbeatRenewsDuringLongToolAndStopsCleanly() =
+        let observed =
+            System.Threading.Tasks.TaskCompletionSource<unit>(
+                System.Threading.Tasks.TaskCreationOptions.RunContinuationsAsynchronously)
+        let calls = ref 0
+        let value, failure =
+            Client.SignalR.Client.withActivityLeaseHeartbeat
+                (TimeSpan.FromMilliseconds(15.))
+                (fun () ->
+                    calls.Value <- calls.Value + 1
+                    observed.TrySetResult(()) |> ignore
+                    Ok ())
+                (fun () ->
+                    task {
+                        do! observed.Task.WaitAsync(TimeSpan.FromSeconds(3.))
+                        return 42
+                    })
+            |> Async.AwaitTask |> Async.RunSynchronously
+        Assert.That(value, Is.EqualTo(42))
+        Assert.That(failure, Is.EqualTo(None : string option))
+        Assert.That(calls.Value, Is.GreaterThanOrEqualTo(1))
+
+    [<Test>]
+    member _.WorkingLeaseHeartbeatSurfacesRenewalFailure() =
+        let observed =
+            System.Threading.Tasks.TaskCompletionSource<unit>(
+                System.Threading.Tasks.TaskCreationOptions.RunContinuationsAsynchronously)
+        let _, failure =
+            Client.SignalR.Client.withActivityLeaseHeartbeat
+                (TimeSpan.FromMilliseconds(15.))
+                (fun () ->
+                    observed.TrySetResult(()) |> ignore
+                    Error "Lease CAS rejected")
+                (fun () ->
+                    task {
+                        do! observed.Task.WaitAsync(TimeSpan.FromSeconds(3.))
+                        return 42
+                    })
+            |> Async.AwaitTask |> Async.RunSynchronously
+        Assert.That(failure, Is.EqualTo(Some "Lease CAS rejected"))
 
     [<Test>]
     member _.AdministrativeCorrectionTypedApiUsesAuthenticatedOperatorAndSafeReplay() =

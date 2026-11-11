@@ -91,6 +91,9 @@ type ReviewAgent =
       StateSequence: int64
       StateEnteredAtUtc: string
       WorkingTurnStartedAtUtc: string
+      // Canonical bounded evidence of admitted Working activity. Null on
+      // legacy agents, before first ingress, and after leaving Working.
+      ActivityLeaseUntilUtc: string
       ActiveSessionId: string
       AssociatedSessionIds: string list }
     with
@@ -326,6 +329,7 @@ module ReviewWorkflow =
             { agent with Execution = execution; CurrentAssignment = assignment
                          UnassignedDisposition = disposition; StateEnteredAtUtc = now
                          WorkingTurnStartedAtUtc = if execution = "Working" then now else null
+                         ActivityLeaseUntilUtc = null
                          ActiveSessionId = if execution = "Working" then agent.ActiveSessionId else null }
 
     let private assigned taskId attemptId (agent: ReviewAgent) =
@@ -348,7 +352,8 @@ module ReviewWorkflow =
     let private resetSessions (agent: ReviewAgent) =
         { agent with ActiveSessionId = null
                      AssociatedSessionIds = []
-                     WorkingTurnStartedAtUtc = null }
+                     WorkingTurnStartedAtUtc = null
+                     ActivityLeaseUntilUtc = null }
 
     // An entity's schema is explicit on disk without adding boilerplate to
     // each in-memory record. Changing it requires an intentional upgrade path.
@@ -388,6 +393,8 @@ module ReviewWorkflow =
                         // other notification members remain mandatory.
                         || (typeof<'t> = typeof<AgentNotification>
                             && property = "fromProjectName")
+                        || (typeof<'t> = typeof<ReviewAgent>
+                            && property = "activityLeaseUntilUtc")
                         || (typeof<'t> = typeof<TaskLifecycleEvent>
                             && List.contains property
                                 [ "requestingAgentId"; "targetAgentId"
@@ -1103,8 +1110,8 @@ module ReviewWorkflow =
                               StateReason = "Registered without an assignment"
                               StateSequence = snapshot.Header.NextSequence
                               StateEnteredAtUtc = DateTimeOffset.UtcNow.ToString("O")
-                              WorkingTurnStartedAtUtc = null; ActiveSessionId = null
-                              AssociatedSessionIds = [] }
+                              WorkingTurnStartedAtUtc = null; ActivityLeaseUntilUtc = null
+                              ActiveSessionId = null; AssociatedSessionIds = [] }
                         return [ change (agentPath agentId) None agent ]
                     })
 
@@ -1439,6 +1446,7 @@ module ReviewWorkflow =
                                 { (associateSession sessionId agent) with
                                     Version = agent.Version + 1
                                     WorkingTurnStartedAtUtc = DateTimeOffset.UtcNow.ToString("O")
+                                    ActivityLeaseUntilUtc = null
                                     StateReason = $"Resumed task {taskId}"
                                     StateSequence = snapshot.Header.NextSequence }
                             return
@@ -1462,18 +1470,34 @@ module ReviewWorkflow =
     let activateReadyAgent binding operationId taskId agentId =
         resumeAgentCore binding operationId taskId agentId 0 0 0 "" false
 
-    // A tool call by an already-Working agent is real activity even when the
-    // requested operation is read-only. Fence that activity in the canonical
-    // ledger before dispatch, so an administrator cannot use an old agent
-    // version to stop work that happened since inspection. This does not
-    // restart the turn clock, manufacture a checkpoint or mutate the attempt.
-    let recordWorkingActivity binding operationId agentId taskId attemptId =
+    // Every admitted Working tool call is protected by a bounded canonical
+    // lease. The client renews at ingress only when the lease approaches expiry
+    // and periodically during long-running commands. An operator correction
+    // must reject live leases, even when its entity versions are otherwise
+    // current. The lease does not restart the turn or create worker evidence.
+    let private activityLeaseDuration = TimeSpan.FromMinutes(5.)
+    let private activityLeaseRenewalMargin = TimeSpan.FromMinutes(2.)
+
+    let private activityLeaseRemaining now (agent: ReviewAgent) =
+        let mutable expires = Unchecked.defaultof<DateTimeOffset>
+        if String.IsNullOrWhiteSpace agent.ActivityLeaseUntilUtc then TimeSpan.Zero
+        elif DateTimeOffset.TryParse(agent.ActivityLeaseUntilUtc, &expires) then expires - now
+        else TimeSpan.MaxValue // A malformed canonical lease is not proof of inactivity.
+
+    let workingActivityLeaseSufficient now (agent: ReviewAgent) =
+        let mutable expires = Unchecked.defaultof<DateTimeOffset>
+        agent.State = "Working"
+        && not (String.IsNullOrWhiteSpace agent.ActivityLeaseUntilUtc)
+        && DateTimeOffset.TryParse(agent.ActivityLeaseUntilUtc, &expires)
+        && expires - now > activityLeaseRenewalMargin
+
+    let internal recordWorkingActivityAt binding operationId agentId taskId attemptId (now: DateTimeOffset) =
         if not (validAgent agentId) || not (validTaskId taskId)
            || String.IsNullOrWhiteSpace attemptId then
             Error(InvalidBinding "Working activity requires an exact agent assignment.")
         else
             LedgerStore.transact binding
-                (intent operationId agentId "RecordWorkingActivity"
+                (intent operationId agentId "RenewWorkingActivityLease"
                     {| agentId = agentId; taskId = taskId; attemptId = attemptId |})
                 (fun snapshot -> result {
                     let! task, _, attempt, _ = getAttempt binding snapshot taskId
@@ -1485,13 +1509,16 @@ module ReviewWorkflow =
                        || agent.State <> "Working"
                        || not (matchesAssignment taskId attempt agent)
                        || agent.ActiveAttemptId <> attemptId then
-                        return! Error(StaleEntityVersion "Working assignment changed before tool activity.")
-                    // Version is the optimistic activity fence. In particular,
-                    // do not change StateSequence or WorkingTurnStartedAtUtc:
-                    // this is not a new Working turn or a guidance invalidation.
+                        return! Error(StaleEntityVersion "Working assignment changed before lease renewal.")
+                    // The version fences any stale operator snapshot, and the
+                    // deadline blocks corrections during the whole lease.
                     return [ change (agentPath agentId) (Some agentOid)
-                                 { agent with Version = agent.Version + 1 } ]
+                                 { agent with Version = agent.Version + 1
+                                              ActivityLeaseUntilUtc = (now + activityLeaseDuration).ToString("O") } ]
                 })
+
+    let recordWorkingActivity binding operationId agentId taskId attemptId =
+        recordWorkingActivityAt binding operationId agentId taskId attemptId DateTimeOffset.UtcNow
 
     let resumeAgent binding operationId taskId ownerId expectedAttemptVersion expectedAgentVersion generation =
         resumeAgentWithSession binding operationId taskId ownerId expectedAttemptVersion expectedAgentVersion generation ""
@@ -2073,6 +2100,7 @@ module ReviewWorkflow =
                        || attempt.Phase <> "Started"
                        || agent.Version <> expectedAgentVersion
                        || agent.State <> "Working"
+                       || activityLeaseRemaining DateTimeOffset.UtcNow agent > TimeSpan.Zero
                        || not (matchesAssignment taskId attempt agent)
                        || agent.ActiveAttemptId <> attempt.AttemptId then
                         return! Error(StaleEntityVersion "Administrative correction targets a stale or unrelated Working assignment.")

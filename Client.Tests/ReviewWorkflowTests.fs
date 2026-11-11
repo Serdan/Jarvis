@@ -356,7 +356,9 @@ type ReviewWorkflowTests() =
                 let _, readResult, _ = invoke selfRead "Owner"
                 Assert.That(readResult.IsOk, Is.True, sprintf "Self-read failed: %A" readResult)
                 let after = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
-                Assert.That(after.Version, Is.EqualTo(before.Version + 1))
+                // The durable reservation is stored independently of
+                // ReviewAgent.Version so owner CAS tokens remain valid.
+                Assert.That(after.Version, Is.EqualTo(before.Version))
                 Assert.That(after.State, Is.EqualTo("Working"))
                 Assert.That(after.WorkingTurnStartedAtUtc, Is.EqualTo(before.WorkingTurnStartedAtUtc))
                 expectStale
@@ -390,6 +392,12 @@ type ReviewWorkflowTests() =
                 Assert.That((LedgerStore.fetch second |> success).Commit, Is.EqualTo(priorHead))
                 Assert.That((ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent.Version,
                             Is.EqualTo(after.Version))
+                let selected =
+                    Client.ProjectPaths.ProjectTarget.parse "owner"
+                    |> function Ok target -> target | Error err -> failwithf "%A" err
+                Client.SignalR.Client.flushInFlightActivity runtime
+                    (Client.ProjectPaths.ProjectTarget.projectId selected) "Owner"
+                |> success |> ignore
             finally
                 if File.Exists configPath then File.Delete configPath)
 
@@ -456,6 +464,12 @@ type ReviewWorkflowTests() =
                     sprintf "100 mixed Working calls: %.0f ms (%.1f ms/call), ledger head changed=%b, UTC %s to %s"
                         timer.Elapsed.TotalMilliseconds (timer.Elapsed.TotalMilliseconds / 100.)
                         (startHead <> endHead) (began.ToString("O")) (ended.ToString("O")))
+                let selected =
+                    Client.ProjectPaths.ProjectTarget.parse "owner"
+                    |> function Ok target -> target | Error err -> failwithf "%A" err
+                Client.SignalR.Client.flushInFlightActivity runtime
+                    (Client.ProjectPaths.ProjectTarget.projectId selected) "Owner"
+                |> success |> ignore
             finally
                 if File.Exists configPath then File.Delete configPath)
 

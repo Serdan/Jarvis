@@ -93,3 +93,36 @@ absent from this local fixture.
 weakening cross-device correction safety; provide explicit authenticated
 orphan recovery backed by evidence that the original operation cannot still
 be executing. Blind expiry would reintroduce the original race.
+
+## Coalesced in-process reservation scopes: same workload
+
+A subsequent change shares **one canonical in-flight reservation per local
+agent/assignment across a continuous burst** and releases it 30 seconds
+after the last operation has finished. An active operation prevents
+idle release regardless of duration. The separate record preserves owner
+exact-version compare-and-swap and the cross-device correction veto.
+Ambiguous begin and release operations retain their IDs for idempotent retry.
+
+The same explicit 34 SearchText / 33 ReadFiles / 33 self NotifyAgent
+100-call fixture completed in **6,843 ms (68.4 ms/call)**. Git trace2 filtered
+to UTC 2026-11-11T08:29:36.6122039Z to 08:29:43.4551627Z found:
+
+| Metric | Per-call reservations | Coalesced reservations |
+| --- | ---: | ---: |
+| 100-call elapsed | 44,447 ms | **6,843 ms** |
+| Git process starts | 13,350 | **2,046** |
+| Git child starts | 3,199 | **495** |
+| Canonical commits/pushes during timed loop | 233 | **33** |
+
+All 33 writes within the coalesced timed interval are actual
+self-notifications; the single admission occurs before the measured interval
+and the final release after it. That gives ~6.5x lower end-to-end elapsed time
+and 85% fewer Git starts on this local fixture, without claiming production
+remote-latency equivalence. Benchmark command outcomes all passed.
+
+**Remaining safety gate:** implement audited orphan-reservation recovery on
+verified owner process termination. A crashed client must not leave stale
+agent correction permanently blocked, but auto-expiring an active reservation
+could permit unsafe correction during a disconnected long-running operation.
+Independent concurrency/failure review and full regression tests are still
+required before integration.

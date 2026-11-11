@@ -1,6 +1,7 @@
 module Client.SignalR.Client
 
 open System
+open System.Collections.Concurrent
 open System.Diagnostics
 open System.IO
 open System.Runtime.CompilerServices
@@ -18,10 +19,172 @@ let receiveMessage (rt: Runtime) message =
     rt.Tui.Log message
     Task.CompletedTask
 
+// A reservation is a canonical *in-flight* veto, not an expiring activity
+// lease. Keep one per process/assignment across a burst of calls and release
+// only after the last call has finished and an idle period has elapsed.
+// Neither the client cache nor a failed timer may clear the canonical record.
+type private ReservationSlot =
+    { Sync: obj
+      mutable Assignment: (string * string) option
+      mutable ReservationId: Guid option
+      mutable BeginOperationId: Guid
+      mutable ReleaseOperationId: Guid
+      mutable Confirmed: bool
+      mutable Release: (Guid -> Guid -> Result<unit, string>) option
+      mutable ActiveCalls: int
+      mutable LastFinishedAt: DateTimeOffset
+      mutable TimerRunning: bool
+      mutable ReleaseFailure: string option }
+
+type internal CoalescedReservationManager(idleDelay: TimeSpan, report: string -> unit) =
+    let slots = ConcurrentDictionary<string, ReservationSlot>(StringComparer.Ordinal)
+
+    let releaseCanonical (slot: ReservationSlot) =
+        match slot.ReservationId, slot.Release with
+        | None, None -> Ok ()
+        | Some reservationId, Some release when slot.Confirmed ->
+            let outcome =
+                try release reservationId slot.ReleaseOperationId
+                with ex -> Error ex.Message
+            match outcome with
+            | Ok () ->
+                slot.Assignment <- None
+                slot.ReservationId <- None
+                slot.Release <- None
+                slot.Confirmed <- false
+                slot.ReleaseFailure <- None
+                Ok ()
+            | Error failure ->
+                slot.ReleaseFailure <- Some failure
+                report (
+                    $"In-flight reservation {reservationId:N} could not be released: {failure}. " +
+                    "The canonical correction veto remains until recovery.")
+                Error failure
+        | _ -> Error "The canonical reservation admission outcome is uncertain."
+
+    let scheduleIdleRelease (slot: ReservationSlot) =
+        if not slot.TimerRunning then
+            slot.TimerRunning <- true
+            let rec finishWhenIdle () =
+                task {
+                    do! Task.Delay(idleDelay)
+                    let finished =
+                        lock slot.Sync (fun () ->
+                            if slot.ActiveCalls > 0
+                               || DateTimeOffset.UtcNow - slot.LastFinishedAt < idleDelay then
+                                false
+                            else
+                                if slot.ReservationId.IsSome then
+                                    releaseCanonical slot |> ignore
+                                slot.TimerRunning <- false
+                                true)
+                    if not finished then return! finishWhenIdle ()
+                }
+            Task.Run(Func<Task>(fun () -> finishWhenIdle () :> Task)) |> ignore
+
+    // The operation ID of an uncertain begin/release is reused on retries.
+    // This permits idempotent recovery after a push succeeded but the response
+    // was lost. Never create a second reservation while the first is uncertain.
+    member _.Run<'T>(key: string, taskId: string, attemptId: string,
+                      reserve: Guid -> Guid ->
+                          Result<(Guid -> Guid -> Result<unit, string>), string>,
+                      work: unit -> Task<'T>) : Task<Result<'T, string>> =
+        task {
+            let slot =
+                slots.GetOrAdd(key, fun _ ->
+                    { Sync = obj(); Assignment = None; ReservationId = None
+                      BeginOperationId = Guid.Empty; ReleaseOperationId = Guid.Empty
+                      Confirmed = false; Release = None; ActiveCalls = 0
+                      LastFinishedAt = DateTimeOffset.MinValue
+                      TimerRunning = false; ReleaseFailure = None })
+            let acquireFresh () =
+                let reservationId = Guid.NewGuid()
+                let beginId = Guid.NewGuid()
+                slot.Assignment <- Some(taskId, attemptId)
+                slot.ReservationId <- Some reservationId
+                slot.BeginOperationId <- beginId
+                slot.ReleaseOperationId <- Guid.NewGuid()
+                slot.Confirmed <- false
+                let result =
+                    try reserve reservationId beginId
+                    with ex -> Error ex.Message
+                match result with
+                | Ok release ->
+                    slot.Release <- Some release
+                    slot.Confirmed <- true
+                    slot.ReleaseFailure <- None
+                    slot.ActiveCalls <- slot.ActiveCalls + 1
+                    Ok ()
+                | Error failure ->
+                    Error($"Reservation {reservationId:N} admission uncertain: {failure}. " +
+                          "Retry this operation after checking its canonical status.")
+            let admission =
+                lock slot.Sync (fun () ->
+                    match slot.Assignment, slot.ReservationId with
+                    | None, None -> acquireFresh ()
+                    | Some (oldTask, oldAttempt), Some reservationId ->
+                        if not slot.Confirmed then
+                            if oldTask <> taskId || oldAttempt <> attemptId then
+                                Error "An uncertain reservation belongs to a different assignment."
+                            else
+                                let result =
+                                    try reserve reservationId slot.BeginOperationId
+                                    with ex -> Error ex.Message
+                                match result with
+                                | Ok release ->
+                                    slot.Release <- Some release
+                                    slot.Confirmed <- true
+                                    slot.ReleaseFailure <- None
+                                    slot.ActiveCalls <- slot.ActiveCalls + 1
+                                    Ok ()
+                                | Error failure ->
+                                    Error($"Reservation {reservationId:N} admission remains uncertain: {failure}")
+                        elif slot.ActiveCalls > 0 && (oldTask <> taskId || oldAttempt <> attemptId) then
+                            Error "Another assignment still has active calls in this client."
+                        elif slot.ReleaseFailure.IsSome
+                             || oldTask <> taskId || oldAttempt <> attemptId then
+                            match releaseCanonical slot with
+                            | Ok () -> acquireFresh ()
+                            | Error failure ->
+                                Error($"Cannot resolve prior in-flight reservation: {failure}")
+                        else
+                            slot.ActiveCalls <- slot.ActiveCalls + 1
+                            Ok ()
+                    | _ -> Error "Corrupt in-process reservation state.")
+            match admission with
+            | Error error -> return Error error
+            | Ok () ->
+                try
+                    let! outcome = work()
+                    return Ok outcome
+                finally
+                    lock slot.Sync (fun () ->
+                        slot.ActiveCalls <- slot.ActiveCalls - 1
+                        slot.LastFinishedAt <- DateTimeOffset.UtcNow
+                        if slot.ActiveCalls = 0 then scheduleIdleRelease slot)
+        }
+
+    member _.Flush(key: string) =
+        match slots.TryGetValue key with
+        | false, _ -> Ok ()
+        | true, slot ->
+            lock slot.Sync (fun () ->
+                if slot.ActiveCalls <> 0 then
+                    Error "Cannot release a reservation while commands are in flight."
+                else releaseCanonical slot)
+
 // Explicit agent labels identify the current work slot. Cache canonical
 // Working state for ordinary calls to avoid one remote git fetch per tool.
 let private workingGuidanceCaches = ConditionalWeakTable<Runtime, WorkingTurnGuidance.AgentCache>()
+let private inFlightManagers = ConditionalWeakTable<Runtime, CoalescedReservationManager>()
 let private instructionDeliveryCaches = ConditionalWeakTable<Runtime, AgentInstructions.DeliveryCache>()
+
+let internal flushInFlightActivity (rt: Runtime) projectId (agentId: string) =
+    let manager =
+        inFlightManagers.GetValue(rt, fun _ ->
+            CoalescedReservationManager(TimeSpan.FromSeconds(30.), rt.Tui.Log))
+    manager.Flush((ProjectPaths.ProjectId.value projectId)
+                  + "::" + agentId.ToUpperInvariant())
 let invalidateAgentStates (rt: Runtime) (projectName: string) (agentIds: string array) =
     // Server notifications only carry the logical project identity. Worktree
     // selectors share the canonical ledger/assignment cache by ProjectId.
@@ -121,21 +284,18 @@ let private isLocalAgentActivity = function
     | ObserveAgentCommand _ -> false // Neither observer nor target is acting.
     | _ -> true
 
-// Mutating or potentially extended operations need a durable in-flight
-// reservation before execution, not merely a time-bounded lease. Unlike a
-// ReviewAgent version increment, the separate reservation record preserves
-// exact optimistic concurrency tokens on owner task transitions.
+// An outstanding canonical reservation protects *every* admitted agent
+// command, including a read that takes longer than its former lease deadline.
+// Batched reservation scopes amortize the two Git writes across a burst, so
+// classifying by guessed command duration is unnecessary.
 let private requiresDurableActivityReservation agentId = function
     | TaskWriteCommand cmd -> cmd.ActorId = agentId
-    | WriteFileCommand _ | PatchFileCommand _ | GitCommitCommand _
-    | RunCommandCommand _ | RunProjectTaskCommand _
-    | ImportFileCommand _ | ExportFileCommand _
-    | CreateProjectCommand _ | CreateWorktreeCommand _
-    | RemoveWorktreeCommand _ | CreateSkillCommand _
-    | StartJobCommand _ | CancelJobCommand _
-    | SearchTextCommand _ | SearchFilesCommand _ | ReadFilesCommand _ ->
-        true
-    | _ -> false
+    | TaskReadCommand cmd -> String.IsNullOrWhiteSpace cmd.AgentId || cmd.AgentId = agentId
+    | LedgerWriteCommand _ | ReviewWriteCommand _
+    | RetryPendingIntentCommand _ | SupersedePendingIntentCommand _
+    | AbandonPendingIntentCommand _ | ObserveAgentCommand _ -> false
+    | LedgerReadCommand cmd when cmd.Action = "Health" -> false
+    | _ -> true
 
 // An agent's first ordinary tool call starts its Ready assignment.
 // No new session identifier or explicit resume tool is needed. Never
@@ -846,51 +1006,44 @@ let processIncomingCommand (rt: Runtime) (commandJson: string) (agentId: string)
                                         let! outcome = work()
                                         return outcome, None
                                     }
-                                | Some (project, _, assignment)
+                                | Some (project, projectId, assignment)
                                     when requiresDurableActivityReservation localAgentId command ->
-                                    // Admission and release are canonical Git transactions.
-                                    // The reservation survives lease expiry, even when a
-                                    // heartbeat could not reach the remote. Unlike a lease
-                                    // renewal, this does not alter the owner's CAS version.
+                                    // One canonical admission is reused throughout a
+                                    // continuous local burst. Concurrent calls share the
+                                    // same reservation, but can never release it while
+                                    // any source operation is still executing. The remote
+                                    // correction veto is not time-limited.
                                     task {
-                                        match OrchestrationApi.LedgerBindingConfig.load project rt with
-                                        | Error error ->
+                                        let manager =
+                                            inFlightManagers.GetValue(rt, fun _ ->
+                                                CoalescedReservationManager(
+                                                    TimeSpan.FromSeconds(30.), rt.Tui.Log))
+                                        let key =
+                                            (ProjectPaths.ProjectId.value projectId)
+                                            + "::" + localAgentId.ToUpperInvariant()
+                                        let! admitted =
+                                            manager.Run(key, assignment.TaskId, assignment.AttemptId,
+                                                (fun reservationId beginOperationId ->
+                                                    match OrchestrationApi.LedgerBindingConfig.load project rt with
+                                                    | Error error -> Error(sprintf "Binding: %A" error)
+                                                    | Ok binding ->
+                                                        match ReviewWorkflow.ReviewWorkflow.beginInFlightAgentOperation
+                                                                  binding beginOperationId localAgentId
+                                                                  assignment.TaskId assignment.AttemptId reservationId with
+                                                        | Error error -> Error(sprintf "Admission: %A" error)
+                                                        | Ok _ ->
+                                                            Ok (fun id releaseOperationId ->
+                                                                match ReviewWorkflow.ReviewWorkflow.endInFlightAgentOperation
+                                                                          binding releaseOperationId localAgentId id with
+                                                                | Ok _ -> Ok ()
+                                                                | Error error -> Error(sprintf "%A" error))),
+                                                work)
+                                        match admitted with
+                                        | Ok outcome -> return outcome, None
+                                        | Error failure ->
                                             return (Error(Client.ValidationError(
-                                                $"Cannot reserve in-flight activity: {error}")), [],
+                                                $"In-flight Working admission refused: {failure}")), [],
                                                 AgentInstructions.RootBootstrapRequired), None
-                                        | Ok binding ->
-                                            let reservationId = Guid.NewGuid()
-                                            match ReviewWorkflow.ReviewWorkflow.beginInFlightAgentOperation
-                                                      binding (Guid.NewGuid()) localAgentId
-                                                      assignment.TaskId assignment.AttemptId reservationId with
-                                            | Error error ->
-                                                return (Error(Client.ValidationError(
-                                                    $"Cannot reserve in-flight activity: {error}")), [],
-                                                    AgentInstructions.RootBootstrapRequired), None
-                                            | Ok _ ->
-                                                let releaseOperationId = Guid.NewGuid()
-                                                let mutable releaseFailure : string option = None
-                                                let release () =
-                                                    try
-                                                        match ReviewWorkflow.ReviewWorkflow.endInFlightAgentOperation
-                                                                  binding releaseOperationId localAgentId reservationId with
-                                                        | Ok _ -> ()
-                                                        | Error error ->
-                                                            releaseFailure <- Some (
-                                                                $"Reservation {reservationId:N} could not be released: {error}. " +
-                                                                "Correction stays blocked; the returned tool outcome is unchanged.")
-                                                    with ex ->
-                                                        releaseFailure <- Some (
-                                                            $"Reservation {reservationId:N} release threw: {ex.Message}. " +
-                                                            "Correction stays blocked; the returned tool outcome is unchanged.")
-                                                try
-                                                    let! outcome = work()
-                                                    release()
-                                                    return outcome, releaseFailure
-                                                with ex ->
-                                                    release()
-                                                    return (Error(ExceptionError ex), [],
-                                                            AgentInstructions.RootBootstrapRequired), releaseFailure
                                     }
                                 | Some (project, projectId, assignment) ->
                                     withActivityLeaseHeartbeat (TimeSpan.FromMinutes(2.))

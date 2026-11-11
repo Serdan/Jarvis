@@ -1,1 +1,1 @@
-{"schemaVersion":2,"taskId":"task-a03d7e2dc67e4182ae2b5552ed97f67b","title":"[P1] Support explicit taskless Working sessions for role-bearing agents","version":1,"lifecycle":"Open","specVersion":1,"attemptId":null}
+{"schemaVersion":2,"taskId":"task-a03d7e2dc67e4182ae2b5552ed97f67b","title":"[P1] Track taskless agents as active with client-visible execution state","version":2,"lifecycle":"Open","specVersion":2,"attemptId":null}

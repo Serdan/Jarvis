@@ -474,6 +474,41 @@ type ReviewWorkflowTests() =
                 if File.Exists configPath then File.Delete configPath)
 
     [<Test>]
+    member _.BoundLedgerRejectsUnknownAgentWithoutBlockingUnassignedInbox() =
+        withFixture (fun one _ first _ _ _ _ _ ->
+            let configPath = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
+            try
+                Client.OrchestrationApi.LedgerBindingConfig.bindExisting
+                    "owner" (GitCommandTests.TestContext(Path.GetDirectoryName one))
+                    first.ProjectId first.LedgerId first.Epoch first.RemoteName
+                    first.ApprovedFetchUrl first.ApprovedPushUrl
+                    (LedgerStore.fetch first |> success).Commit true
+                |> success |> ignore
+                let runtime =
+                    Client.Runtime(Path.GetDirectoryName one, Client.ConsoleTui.ConsoleTui(), Client.PartialTrust)
+                let inbox agentId : Common.AgentCommand =
+                    Common.TaskReadCommand
+                        { ProjectName = "owner"; AgentId = agentId; Action = "AgentInbox"
+                          TaskId = ""; AssignmentGeneration = 0
+                          CheckpointSequence = 0L; Cursor = ""; PageSize = 0
+                          BeforeOid = null; AfterOid = null; RelativePath = null }
+                let invoke agentId =
+                    Client.SignalR.Client.processIncomingCommand runtime
+                        (System.Text.Json.JsonSerializer.Serialize<Common.AgentCommand>(inbox agentId)) agentId
+                    |> Async.AwaitTask |> Async.RunSynchronously
+                let _, missing, _ = invoke "Ghost"
+                match missing with
+                | Error(Client.ValidationError message) ->
+                    Assert.That(message, Does.Contain("canonical agent state"))
+                | other -> Assert.Fail(sprintf "Unknown bound agent must fail closed: %A" other)
+                let _, registered, _ = invoke "Reviewer"
+                Assert.That(registered.IsOk, Is.True, sprintf "Parked inbox failed: %A" registered)
+                Assert.That((ReviewWorkflow.getAgentInbox first "Reviewer" |> success).Agent.State,
+                            Is.EqualTo("Parked"))
+            finally
+                if File.Exists configPath then File.Delete configPath)
+
+    [<Test>]
     member _.InFlightOwnerTransitionsBlockConcurrentCorrectionWithoutChangingExactVersions() =
         for transition in [ "Checkpoint"; "Yield"; "Complete" ] do
             for expired in [ false; true ] do

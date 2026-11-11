@@ -1,0 +1,53 @@
+# Administrative Working correction: server-mediated liveness design
+
+**Status:** design investigation with an isolated server coordination prototype (`Server/Services/AgentExecutionGate.fs`); not wired into MCP dispatch or approved.  
+**Task:** `task-c4460fbd65a244419650fc5ef5669a6f`, Worker 3.  
+**Context:** independent review `6fd76f4209ba4f75a86b05426e93803e` requested two P1 fixes for real worker admission and failed-heartbeat races. Jarvis Lead directed this design toward the rare correction path rather than new Git transactions per ordinary tool call.
+
+## Existing topology and measured costs
+
+All MCP tool requests in the current API pass through `Server/McpTools.fs:McpToolHelpers.send` and `ClientService.SendCommandToUser`; the latter chooses a registered SignalR client/device and tracks each pending response using `ClientResponseTracker`. The server is intentionally **single-instance**, with ephemeral `UserService` connection registrations; the orphan Git ledger remains authoritative for task/attempt/agent state. `FeedbackStore` already inserts a SQLite `operations` record before each MCP command and marks it completed when the *server-side* request returns.
+
+The existing telemetry is **not evidence of source-operation termination**: `ClientService.SendCommandToUser` can time out after 10 minutes, cancel its pending correlation or receive an HTTP cancellation while the client is still executing. `McpToolHelpers.finishOperation` then marks the telemetry record completed, even though the operation may still be running. Also `beginOperation` intentionally swallows SQLite errors and returns `None`; this is fine for advisory diagnostics but **not** for an authoritative negative liveness check. The telemetry has no agent, device generation, correlation or terminal-client-ack identity yet.
+
+The early canonical Git lease wrote on ordinary tool calls and was replaced by an in-flight reservation. One reservation **per** tool yielded a measured 100-call mixed load of **44.45 s, 233 Git writes and 13,350 Git process starts**. The current in-process coalesced scope avoids most of that: **6.84 s, 33 actual notification writes and 2,046 Git starts** (local fixture; same 34 searches / 33 file reads / 33 self-notifications). It still leaves an unbounded canonical blocker after process crash and can never safely self-expire solely by elapsed time.
+
+## Principle
+
+**The server can coordinate request admission, but cannot itself certify that a disconnected client or child process has stopped.** Its request table must be treated as a *conservative veto*, never as a second authority for task state. An operator correction still requires a single canonical Git transaction with exact task, attempt, agent version, assignment generation, nonempty reason and immutable audit event.
+
+On a healthy one-server installation, moving the hot-path in-flight reference count into the existing server request pipeline avoids canonical begin/end Git transactions. Expensive liveness verification is done only when an operator attempts a correction. If liveness is unknown, **refuse correction**, rather than guess inactivity.
+
+## Proposed admission/correction protocol
+
+1. **Before dispatch:** For each genuine initiating agent call, register a uniquely identified in-flight entry in a per-user, per-agent coordination gate. The server records the chosen device, connection generation, correlation ID and request identity *before* calling `ReceiveCommand`. The caller's actor identity is `RequestDeviceRouting.agentId()` (or the checked command actor); it is **not** a target-only `ObserveAgent` identity. Do not register a cross-project destination notification as activity by the source agent in the destination.
+2. **Alias safety:** Until the server knows a verified canonical project ID for every worktree selector, key the gate by `(authenticated user ID, normalized agent ID)` across projects. That may conservatively reject a rare correction while the same-named agent runs in another project; keying only by unverified project name would allow alias bypass. Project IDs may narrow keys later only after authoritative mapping.
+3. **Normal completion:** Mark an entry terminal only when a response from the **same device connection and generation** is accepted by the server's response tracker, or when the server has proved dispatch never occurred. Timeout, browser cancellation, SignalR loss, server restart and failure to deliver a response are *indeterminate*, not proof of termination.
+4. **Correction enters exclusive gate:** The operator's authenticated `CorrectAgentWorkingState` call targets `TaskWriteCommand.OwnerId`; acquire an exclusive gate for that user/target agent **before** checking liveness or dispatching the Git CAS. Reject when any work entry is active or indeterminate. While the exclusive gate is held, reject or queue new calls claiming that target agent. The operation must include pending-dispatch and not-yet-replied entries, not merely currently executing code.
+5. **Expensive correction-path verification:** Inspect durable indeterminate entries across registered and previously known devices. Ask connected clients to attest their current executing operations and detached job ownership using a typed protocol; reject if any relevant device cannot prove a safe terminal state. Last-seen timestamps and mere SignalR disconnection are not proof. If verification succeeds, issue the existing Git correction with exact expected identities and audit; release the server gate only after the correction's outcome is known/reconciled.
+6. **Trust boundary:** The server gate does **not** independently change `ReviewAgent.Execution`, agent versions, task generation or checkpoint. A user seeing `Ready` must be the result of the canonical ledger CAS, not a server presence projection. Any uncertainty only blocks the administrative mutation.
+7. **Restart:** Server memory alone is insufficient: a restart can erase in-flight entries while an earlier client request is still executing. Reuse/extend the existing SQLite operation telemetry with a **separate execution-terminal state**, agent/device identity and correlation data, and a fail-closed health bit when journaling is unavailable. Unlike the current `completed_at`, a client terminal receipt (or proven non-dispatch) is the only clearing event. On restart, all previously admitted nonterminal entries remain correction vetoes.
+8. **Client crash/disconnect:** A client process dying does not prove its spawned child or managed background job has ended. Recovery must be a separate operator-audited command backed by a device-specific terminal witness (e.g. local process/job-group/managed-job reconciliation from a reconnected, authenticated client), or the correction stays blocked. A server timer, idle period, generation change or client heartbeat alone cannot clear an outstanding execution.
+9. **Uncertain correction result:** Reuse the operator's stable `operationId`; query the canonical Git operation receipt to resolve whether CAS succeeded before releasing the exclusive gate. Return the real receipt and affected-agent invalidation metadata when available. Never replace committed command outcomes with a generic liveness error.
+
+## TOCTOU and negative-space acceptance cases
+
+- **Admission-before-correction**: blocked owner call starts, operator correction with all correct ledger versions returns stale/busy, owner finishes with unchanged assignment token.
+- **Correction-before-admission**: exclusive correction gate starts, concurrent self-agent command cannot be dispatched while correction CAS runs; once released it reloads canonical state and must not silently continue a stale execution.
+- **Timeout-after-dispatch**: server timeout or HTTP cancellation before terminal client acknowledgment leaves an indeterminate entry and refuses correction, even if telemetry says request completed.
+- **Disconnect/reconnect**: neither connection loss nor new device generation establishes a terminal receipt; review all unknown entries and possible surviving child jobs.
+- **Server crash/restart**: in-memory gate is empty, but SQLite nonterminal entries remain vetoes; SQLite missing/corrupt/unavailable state refuses correction.
+- **Aliased selectors**: an operation routed through a worktree alias prevents correction by logical project name for the same user/agent.
+- **Ambiguous Git outcome**: an operation that committed in the client but lost its SignalR response cannot cause a false terminal server result; canonical receipt recovery uses the original operation ID.
+- **Unassigned self-inbox**: a canonically registered Parked/NeedsWork agent can read its inbox without becoming Working; unknown/corrupt canonical agent state fails closed.
+- **Remote job lifetime**: an ordinary `start_job` request is terminal when its job handle has been durably persisted and returned, but correcting its agent while that independently executing job is still doing work requires explicit job-ownership policy; the tool response alone is not sufficient evidence of the job's termination.
+
+## Implementation scope and sequencing
+
+1. Introduce a typed `AgentExecutionGate` in server with deterministic admission/correction races and ownership; do **not** immediately remove the existing Git safety guard.
+2. Extend existing `FeedbackStore` operation records to preserve agent, device, generation and client-terminal versus indeterminate status without a second Git write path. Evaluate whether SQLite writes are affordable (they already occur) and fail closed when journaling is unavailable.
+3. Place the exclusive gate specifically around the operator correction in `McpToolHelpers.send`, including cross-device dispatch. Add safe reconciliation for client restarts before claiming complete crash-recovery support.
+4. After independent tests establish the new invariant, remove the client-side per-tool canonical reservation write path. Keep the canonical CAS and auditable operator reason untouched; decide whether bounded leases remain useful as advisory recent activity, not sole proof of quiescence.
+5. Independently review frozen source and full Release suites before merging. No live deploy without authorization.
+
+**Decision needed from Lead:** confirm that server SQLite is acceptable as a conservative execution *witness* (never authoritative task state), and whether correction should refuse while any previously dispatched operation remains indeterminate until explicit device/job reconciliation is implemented. That policy is materially safer than silently clearing an expired record and materially more useful than a permanent unowned Git reservation.

@@ -966,7 +966,7 @@ let processIncomingCommand (rt: Runtime) (commandJson: string) (agentId: string)
                             // The lease is renewed during long-running commands.
                             // The canonical record (not local TUI last-seen)
                             // determines whether administrative correction may run.
-                            let leaseContext =
+                            let leaseContext, verifiedUnassigned =
                                 match target with
                                 | Some selected when not (String.IsNullOrWhiteSpace localAgentId)
                                                      && activatesAgent localAgentId command ->
@@ -978,9 +978,14 @@ let processIncomingCommand (rt: Runtime) (commandJson: string) (agentId: string)
                                                     fun () -> loadAgentState rt project localAgentId) with
                                     | Some active when active.State = "Working"
                                                        && not (isNull (box active.CurrentAssignment)) ->
-                                        Some (project, projectId, active.CurrentAssignment)
-                                    | _ -> None
-                                | _ -> None
+                                        Some (project, projectId, active.CurrentAssignment), false
+                                    | Some inactive when isNull (box inactive.CurrentAssignment)
+                                                         && List.contains inactive.State [ "Parked"; "NeedsWork" ] ->
+                                        // A successfully decoded canonical unassigned agent
+                                        // can read their inbox without inventing Working activity.
+                                        None, true
+                                    | _ -> None, false
+                                | _ -> None, false
                             // A failed cache refresh must not silently
                             // turn a bound Working-agent call into an
                             // unreserved operation. Preserve source-only
@@ -995,7 +1000,7 @@ let processIncomingCommand (rt: Runtime) (commandJson: string) (agentId: string)
                                 | _ -> false
                             let! (execution, renewalFailure) =
                                 match leaseContext with
-                                | None when expectedFence ->
+                                | None when expectedFence && not verifiedUnassigned ->
                                     task {
                                         return (Error(Client.ValidationError(
                                             "Canonical Working activity state unavailable; the call was not executed.")),

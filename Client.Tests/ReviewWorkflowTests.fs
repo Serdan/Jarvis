@@ -4082,6 +4082,14 @@ type ReviewWorkflowTests() =
             for job in jobs do
                 match job.Result with
                 | Ok _ -> ()
+                | Error(Client.LedgerFailureError info) when info.Code = "TrustBindingContended" ->
+                    // Readers launched while the external lock is held now
+                    // fail promptly with typed, recoverable contention rather
+                    // than synchronously spinning for two seconds. Retry after
+                    // release must reverify the latest approved trust anchor.
+                    match Client.OrchestrationApi.LedgerBindingConfig.load "owner" ctx with
+                    | Ok _ -> ()
+                    | other -> Assert.Fail(sprintf "Contended load did not recover: %A" other)
                 | Error error -> Assert.Fail(sprintf "Concurrent verified load: %A" error)
             let config = System.Text.Json.JsonSerializer.Deserialize<Client.OrchestrationApi.LedgerTrustBinding>(
                 File.ReadAllText path)
@@ -4963,4 +4971,117 @@ type ReviewWorkflowTests() =
                     slowLoad.GetAwaiter().GetResult() |> ignore
             finally
                 if File.Exists configPath then File.Delete(configPath)
+                if File.Exists(configPath + ".lock") then File.Delete(configPath + ".lock"))
+
+
+    [<Test>]
+    member _.AgentsDashboardLiveLockContentionRecoversWithoutManualRefresh() =
+        withFixture (fun one _ first _ _ _ _ _ ->
+            let context = GitCommandTests.TestContext(Path.GetDirectoryName one)
+            let configPath = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
+            let initial = LedgerStore.fetch first |> success
+            try
+                Client.OrchestrationApi.LedgerBindingConfig.bindExisting
+                    "owner" context first.ProjectId first.LedgerId first.Epoch
+                    first.RemoteName first.ApprovedFetchUrl first.ApprovedPushUrl initial.Commit true
+                |> function
+                   | Ok _ -> ()
+                   | Error error -> failwithf "Could not bind test checkout: %A" error
+                let fresh = Client.AgentDashboard.load context |> success
+                Assert.That(fresh.Projects.Length, Is.EqualTo(1))
+                Assert.That(fresh.Projects.Head.Status, Is.EqualTo(Client.AgentView.Fresh))
+                Assert.That(fresh.Agents.Length, Is.EqualTo(2))
+                let held = new FileStream(configPath + ".lock",
+                                          FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None)
+                let during =
+                    try
+                        let watch = Stopwatch.StartNew()
+                        let blocked = Client.AgentDashboard.load context |> success
+                        watch.Stop()
+                        Assert.That(watch.ElapsedMilliseconds, Is.LessThan(500L),
+                                    "The live dashboard should not spin for two seconds on a held lock.")
+                        Assert.That(blocked.Projects.Length, Is.EqualTo(1))
+                        Assert.That(blocked.Projects.Head.Status,
+                                    Is.EqualTo(Client.AgentView.TemporarilyUnavailable))
+                        Assert.That(blocked.Projects.Head.Counts.IsNone, Is.True)
+                        let rendered = Client.AgentView.preserveTransientProjects (Some fresh) blocked
+                        Assert.That(rendered.Projects.Head.Status, Is.EqualTo(Client.AgentView.Stale))
+                        Assert.That(rendered.Projects.Head.Counts.Value.Tracked, Is.EqualTo(2))
+                        Assert.That(rendered.Agents.Length, Is.EqualTo(2))
+                        rendered
+                    finally held.Dispose()
+                // The TUI's normal refresh is just another Load and presentation
+                // pass. It must recover as soon as the lock is released.
+                let recovered =
+                    Client.AgentDashboard.load context |> success
+                    |> Client.AgentView.preserveTransientProjects (Some during)
+                Assert.That(recovered.Projects.Head.Status, Is.EqualTo(Client.AgentView.Fresh))
+                Assert.That(recovered.Projects.Head.Error.IsNone, Is.True)
+                Assert.That(recovered.Agents.Length, Is.EqualTo(2))
+                Assert.That(recovered.Agents |> List.forall (fun row ->
+                    not (row.ProjectLabel.Contains("[STALE]"))), Is.True)
+            finally
+                if File.Exists configPath then File.Delete(configPath)
+                if File.Exists(configPath + ".lock") then File.Delete(configPath + ".lock"))
+
+
+    [<Test>]
+    member _.RemoteRebindCannotOverwriteConcurrentTrustedHeadAdvance() =
+        withFixture (fun one _ first _ _ _ _ _ ->
+            let context = GitCommandTests.TestContext(Path.GetDirectoryName one)
+            let configPath = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
+            let initial = LedgerStore.fetch first |> success
+            try
+                Client.OrchestrationApi.LedgerBindingConfig.bindExisting
+                    "owner" context first.ProjectId first.LedgerId first.Epoch
+                    first.RemoteName first.ApprovedFetchUrl first.ApprovedPushUrl initial.Commit true
+                |> function
+                   | Ok _ -> ()
+                   | Error error -> failwithf "Cannot bind fixture: %A" error
+                use enteredFetch = new System.Threading.ManualResetEventSlim(false)
+                use releaseFetch = new System.Threading.ManualResetEventSlim(false)
+                let delayedFetch (_: LedgerBinding) =
+                    enteredFetch.Set()
+                    if not (releaseFetch.Wait(TimeSpan.FromSeconds(10.))) then
+                        failwith "Timed out releasing injected rebind fetch."
+                    Ok initial
+                let rebind =
+                    System.Threading.Tasks.Task.Run(fun () ->
+                        Client.OrchestrationApi.LedgerBindingConfig.rebindRemoteUsing delayedFetch
+                            "owner" context "mirror" first.ApprovedFetchUrl first.ApprovedPushUrl
+                            initial.Commit true)
+                try
+                    Assert.That(enteredFetch.Wait(TimeSpan.FromSeconds(5.)), Is.True)
+                    let watch = Stopwatch.StartNew()
+                    match Client.OrchestrationApi.LedgerBindingConfig.inspectLocal "owner" context with
+                    | Ok (binding, head) ->
+                        Assert.That(binding.RemoteName, Is.EqualTo("origin"))
+                        Assert.That(head, Is.EqualTo(initial.Commit))
+                    | other -> Assert.Fail(sprintf "Rebind must release lock during fetch: %A" other)
+                    watch.Stop()
+                    Assert.That(watch.ElapsedMilliseconds, Is.LessThan(500L))
+                    ReviewWorkflow.registerAgent first (Guid.NewGuid()) "Updated while rebinding"
+                    |> success |> ignore
+                    let advanced = LedgerStore.fetch first |> success
+                    Assert.That(advanced.Commit, Is.Not.EqualTo(initial.Commit))
+                    match Client.OrchestrationApi.LedgerBindingConfig.loadWithSnapshot "owner" context with
+                    | Ok (_, fetched) -> Assert.That(fetched.Commit, Is.EqualTo(advanced.Commit))
+                    | other -> Assert.Fail(sprintf "Cannot advance trusted head during pending rebind: %A" other)
+                    releaseFetch.Set()
+                    match rebind.GetAwaiter().GetResult() with
+                    | Error(Client.ValidationError message) ->
+                        Assert.That(message, Does.Contain("changed while rebinding"))
+                    | other -> Assert.Fail(sprintf "Concurrent rebind must fail instead of reverting anchor: %A" other)
+                    match Client.OrchestrationApi.LedgerBindingConfig.inspectLocal "owner" context with
+                    | Ok (binding, head) ->
+                        Assert.That(binding.RemoteName, Is.EqualTo("origin"),
+                                    "The failed rebind must not replace approved remote transport.")
+                        Assert.That(head, Is.EqualTo(advanced.Commit),
+                                    "The failed rebind must not lower the persisted trust anchor.")
+                    | other -> Assert.Fail(sprintf "Cannot inspect final binding: %A" other)
+                finally
+                    releaseFetch.Set()
+                    rebind.GetAwaiter().GetResult() |> ignore
+            finally
+                if File.Exists(configPath) then File.Delete(configPath)
                 if File.Exists(configPath + ".lock") then File.Delete(configPath + ".lock"))

@@ -360,5 +360,7 @@ let preserveTransientProjects (previous: Snapshot option) (latest: Snapshot) =
             let rows =
                 before.Agents
                 |> List.filter (fun row -> identities |> Set.exists (fun id -> row.Key.StartsWith(id + "::", StringComparison.Ordinal)))
-                |> List.map (fun row -> { row with ProjectLabel = row.ProjectLabel + " [STALE]" })
+                |> List.map (fun row ->
+                    if row.ProjectLabel.EndsWith(" [STALE]", StringComparison.Ordinal) then row
+                    else { row with ProjectLabel = row.ProjectLabel + " [STALE]" })
             { latest with Projects = projects; Agents = latest.Agents @ rows }

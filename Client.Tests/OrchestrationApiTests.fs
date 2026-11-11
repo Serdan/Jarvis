@@ -308,3 +308,53 @@ let trustBindingSharingContentionReturnsTypedErrorWithoutBlockingDashboard () =
         if File.Exists path then File.Delete(path)
         if File.Exists(path + ".lock") then File.Delete(path + ".lock")
         Directory.Delete(root, true)
+
+
+[<Test>]
+let trustBindingErrorClassifierRecognizesSharingOnlyNotOtherIoOrSecurityFailures () =
+    let classified = Client.OrchestrationApi.LedgerBindingConfig.isTransientSharingViolation
+    // Simulate errno 11 (Linux EAGAIN), errno 35 (macOS EAGAIN), and
+    // Windows ERROR_SHARING_VIOLATION=32 and ERROR_LOCK_VIOLATION=33.
+    for errno in [11; 32; 33; 35] do
+        let win32HResult = int 0x80070000u ||| errno
+        Assert.That(classified (IOException("in use", win32HResult)), Is.True,
+                    sprintf "Expected sharing violation %d to be transient." errno)
+        Assert.That(classified (IOException("in use", errno)), Is.True)
+    for errno in [2; 5; 13; 17; 20; 28; 36; 39; 80; 183] do
+        let win32HResult = int 0x80070000u ||| errno
+        Assert.That(classified (IOException("invalid/unauthorized", win32HResult)), Is.False,
+                    sprintf "Permanent file error %d cannot be reported as contention." errno)
+    Assert.That(classified (IOException("unrelated", int 0x80130020u)), Is.False,
+                "Only a known Win32-style HRESULT facility should classify as file contention.")
+    Assert.That(classified (IOException("generic")), Is.False)
+
+[<Test>]
+let missingMalformedOrMismatchedBindingIsNotTransientContention () =
+    let root, project = GitCommandTests.createTempProject ()
+    let bindingPath = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot project
+    try
+        let context = GitCommandTests.TestContext root
+        GitCommandTests.initRepo context
+        let inspect () = Client.OrchestrationApi.LedgerBindingConfig.inspectLocal "Project1" context
+        // A missing trust file is a permanent missing binding, not a mutex race.
+        match inspect () with
+        | Error(Client.ValidationError message) -> Assert.That(message, Does.Contain("no approved local binding"))
+        | other -> Assert.Fail(sprintf "Expected missing binding error: %A" other)
+        Directory.CreateDirectory(Path.GetDirectoryName(bindingPath)) |> ignore
+        File.WriteAllText(bindingPath, "{broken json")
+        match inspect () with
+        | Error(Client.ValidationError message) -> Assert.That(message, Does.Contain("Cannot read"))
+        | other -> Assert.Fail(sprintf "Expected malformed binding error: %A" other)
+        let wrong : Client.OrchestrationApi.LedgerTrustBinding =
+            { SchemaVersion = 1; Enabled = true; ProjectRoot = Path.Combine(root, "impostor")
+              ProjectId = Guid.NewGuid().ToString("D"); LedgerId = Guid.NewGuid().ToString("D")
+              Epoch = 1; RemoteName = "origin"; ApprovedFetchUrl = "local-test"
+              ApprovedPushUrl = "local-test"; HighestTrustedHead = String.replicate 40 "a" }
+        File.WriteAllText(bindingPath, System.Text.Json.JsonSerializer.Serialize(wrong))
+        match inspect () with
+        | Error(Client.ValidationError message) -> Assert.That(message, Does.Contain("pinned root"))
+        | other -> Assert.Fail(sprintf "Expected pinned identity mismatch: %A" other)
+    finally
+        if File.Exists(bindingPath) then File.Delete(bindingPath)
+        if File.Exists(bindingPath + ".lock") then File.Delete(bindingPath + ".lock")
+        Directory.Delete(root, true)

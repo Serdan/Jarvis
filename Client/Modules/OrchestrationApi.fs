@@ -63,9 +63,17 @@ module LedgerBindingConfig =
     // Sharing violations are recoverable contention, not malformed trust data.
     // Never retry an IOException thrown by the operation under the lock.
     let internal isTransientSharingViolation (error: IOException) =
-        match error.HResult &&& 0xFFFF with
-        | 11 | 32 | 33 | 35 -> true // Linux EAGAIN, Windows sharing/lock, macOS EAGAIN
-        | _ -> false
+        let hresult = error.HResult
+        // FileStream maps errno through FACILITY_WIN32 on .NET Unix; Windows
+        // sharing/lock violations use the same HRESULT facility. Do not
+        // classify an arbitrary HRESULT with matching low bits as contention.
+        let encodedErrno = (hresult &&& int 0xFFFF0000u) = int 0x80070000u
+        let rawErrno = hresult >= 0 && hresult <= 255
+        if not (encodedErrno || rawErrno) then false
+        else
+            match hresult &&& 0xFFFF with
+            | 11 | 32 | 33 | 35 -> true // Linux EAGAIN, Windows sharing/lock, macOS EAGAIN
+            | _ -> false
 
     let private withConfigLock (path: string) operation =
         try
@@ -337,8 +345,10 @@ module LedgerBindingConfig =
 
     // Rebind only to the same logical ledger/epoch. Deliberate recovery with a
     // new epoch is a separate backed-up restore operation.
-    let rebindRemote projectName rt remoteName approvedFetchUrl approvedPushUrl
-                     expectedTrustedHead acknowledgeVisibility =
+    let internal rebindRemoteUsing
+        (fetch: LedgerStore.LedgerBinding -> Result<LedgerStore.LedgerSnapshot, LedgerStore.LedgerFailure>)
+        projectName rt remoteName approvedFetchUrl approvedPushUrl
+        expectedTrustedHead acknowledgeVisibility =
         if not acknowledgeVisibility then
             Error(Client.ValidationError "Explicit rebind and remote visibility approval required.")
         else
@@ -367,7 +377,7 @@ module LedgerBindingConfig =
                                        ApprovedPushUrl = approvedPushUrl }
                         // No network or Git operations may run while holding the
                         // cross-process trust-binding lock.
-                        LedgerStore.LedgerStore.fetch newBinding
+                        fetch newBinding
                         |> Result.mapError LedgerErrors.toEffect
                         |> Result.bind (fun snapshot ->
                             LedgerStore.LedgerStore.verifyTrustedHead newBinding
@@ -404,6 +414,11 @@ module LedgerBindingConfig =
                                                     with ex ->
                                                         Error(Client.ValidationError
                                                             $" rebind backup failed: {ex.Message}"))))))))
+
+    let rebindRemote projectName rt remoteName approvedFetchUrl approvedPushUrl
+                     expectedTrustedHead acknowledgeVisibility =
+        rebindRemoteUsing LedgerStore.LedgerStore.fetch projectName rt remoteName
+            approvedFetchUrl approvedPushUrl expectedTrustedHead acknowledgeVisibility
 
 
 [<CLIMutable>]

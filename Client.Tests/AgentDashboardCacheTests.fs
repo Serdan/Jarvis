@@ -407,3 +407,77 @@ let identicalCanonicalHeadWithDifferingUnreadOrStateCannotChooseArbitraryAlias (
     Assert.That(data.Projects.Length, Is.EqualTo(1))
     Assert.That(data.Projects.Head.Counts.IsNone, Is.True)
     Assert.That(data.Projects.Head.Error.Value, Does.Contain("Inconsistent canonical ledger contents"))
+
+
+let private temporary project : AgentDashboard.ProjectResult =
+    { Project = project; Aliases = [project]
+      Result = Error (AgentDashboard.TemporaryBindingContention "Lock held by another client") }
+
+[<Test>]
+let transientDashboardContentionPreservesVerifiedRowsAsStaleThenRecoversFresh () =
+    let wayfold = "a:ledger-a:1"
+    let jarvis = "b:ledger-b:1"
+    let earlier =
+        AgentDashboard.snapshotFromResults
+            [ available "Wayfold" wayfold "H1" [agentRow "Wayfold" "Worker" "Working" 2] 3
+              available "Jarvis" jarvis "J1" [agentRow "Jarvis" "Lead" "Ready" 1] 1 ]
+    let contended =
+        AgentDashboard.snapshotFromResults
+            [ temporary "Wayfold"
+              available "Jarvis" jarvis "J2" [agentRow "Jarvis" "Lead" "Ready" 4] 1 ]
+    let temporaryProject = contended.Projects |> List.find (fun p -> p.Project = "Wayfold")
+    Assert.That(temporaryProject.Status, Is.EqualTo(AgentView.TemporarilyUnavailable))
+    let carried = AgentView.preserveTransientProjects (Some earlier) contended
+    Assert.That(carried.Projects.Length, Is.EqualTo(2))
+    Assert.That(carried.Agents.Length, Is.EqualTo(2))
+    let stale = carried.Projects |> List.find (fun p -> p.Project = "Wayfold")
+    let fresh = carried.Projects |> List.find (fun p -> p.Project = "Jarvis")
+    Assert.That(stale.Identity, Is.EqualTo(wayfold))
+    Assert.That(stale.Status, Is.EqualTo(AgentView.Stale))
+    Assert.That(stale.Counts.Value.Tracked, Is.EqualTo(1))
+    Assert.That(stale.Counts.Value.PendingReviews, Is.EqualTo(3))
+    Assert.That(stale.Error.Value, Does.Contain("stale"))
+    Assert.That(fresh.Status, Is.EqualTo(AgentView.Fresh))
+    Assert.That(fresh.Counts.Value.Unread, Is.EqualTo(4))
+    Assert.That((AgentView.totalCounts carried).Unread, Is.EqualTo(6))
+    let staleRow = carried.Agents |> List.find (fun row -> row.Key = wayfold + "::Worker")
+    Assert.That(staleRow.ProjectLabel, Does.EndWith(" [STALE]"))
+    Assert.That(AgentView.projectStatusLine 120 stale.Project stale, Does.Contain("STALE"))
+    let twice = AgentView.preserveTransientProjects (Some carried) contended
+    Assert.That(twice.Agents.Length, Is.EqualTo(2))
+    let repeatedRow = twice.Agents |> List.find (fun row -> row.Key = staleRow.Key)
+    Assert.That(repeatedRow.ProjectLabel, Is.EqualTo(staleRow.ProjectLabel),
+                "Repeated contention must not accumulate stale suffixes.")
+    let recovered =
+        AgentDashboard.snapshotFromResults
+            [ available "Wayfold" wayfold "H2" [agentRow "Wayfold" "Worker" "Ready" 0] 0
+              available "Jarvis" jarvis "J2" [agentRow "Jarvis" "Lead" "Ready" 4] 1 ]
+        |> AgentView.preserveTransientProjects (Some twice)
+    Assert.That(recovered.Projects |> List.forall (fun project -> project.Status = AgentView.Fresh), Is.True)
+    Assert.That(recovered.Agents |> List.exists (fun row -> row.ProjectLabel.Contains("[STALE]")), Is.False)
+    Assert.That((AgentView.totalCounts recovered).Unread, Is.EqualTo(4))
+
+[<Test>]
+let transientDashboardWithNoVerifiedSnapshotRemainsUnknownNotZero () =
+    let unknown = AgentDashboard.snapshotFromResults [temporary "Offline"]
+    let initial = AgentView.preserveTransientProjects None unknown
+    Assert.That(initial.Agents, Is.Empty)
+    Assert.That(initial.Projects.Head.Status, Is.EqualTo(AgentView.TemporarilyUnavailable))
+    Assert.That(initial.Projects.Head.Counts.IsNone, Is.True)
+    let detail = AgentView.projectStatusLine 120 "Offline" initial.Projects.Head
+    Assert.That(detail, Does.Contain("TEMPORARILY UNAVAILABLE"))
+    Assert.That(detail, Does.Contain("counts unknown"))
+    let resumed = AgentView.preserveTransientProjects (Some initial) unknown
+    Assert.That(resumed.Projects.Head.Counts.IsNone, Is.True)
+
+[<Test>]
+let permanentDashboardFailureNeverReusesPreviousTrustedRows () =
+    let old = AgentDashboard.snapshotFromResults
+                  [available "Wayfold" "a:ledger-a:1" "H1" [agentRow "Wayfold" "A" "Ready" 1] 2]
+    for reason in ["Malformed binding"; "Access denied"; "Ledger history unavailable"; "Remote unavailable"] do
+        let failed = AgentDashboard.snapshotFromResults [unavailable "Wayfold" reason]
+        let shown = AgentView.preserveTransientProjects (Some old) failed
+        Assert.That(shown.Projects.Head.Status, Is.EqualTo(AgentView.Unavailable))
+        Assert.That(shown.Projects.Head.Counts.IsNone, Is.True)
+        Assert.That(shown.Projects.Head.Error.Value, Does.Contain(reason))
+        Assert.That(shown.Agents, Is.Empty)

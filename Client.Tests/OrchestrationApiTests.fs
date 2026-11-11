@@ -274,3 +274,37 @@ let integrationSubmissionRoutesReviewIdAndTargetRefInCorrectOrder () =
     let noReviewId, sameTarget = Client.OrchestrationApi.TaskApi.integrationSubmissionReferences withoutReview
     Assert.That(noReviewId, Is.Empty)
     Assert.That(sameTarget, Is.EqualTo(cmd.TargetRef))
+
+
+[<Test>]
+let trustBindingSharingContentionReturnsTypedErrorWithoutBlockingDashboard () =
+    let root, project = GitCommandTests.createTempProject ()
+    let path = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot project
+    try
+        let context = GitCommandTests.TestContext root
+        GitCommandTests.initRepo context
+        Directory.CreateDirectory(Path.GetDirectoryName(path)) |> ignore
+        let record : Client.OrchestrationApi.LedgerTrustBinding =
+            { SchemaVersion = 1; Enabled = true; ProjectRoot = Path.GetFullPath(project)
+              ProjectId = Guid.NewGuid().ToString("D")
+              LedgerId = Guid.NewGuid().ToString("D"); Epoch = 1
+              RemoteName = "origin"; ApprovedFetchUrl = "local-test"
+              ApprovedPushUrl = "local-test"; HighestTrustedHead = String.replicate 40 "a" }
+        File.WriteAllText(path, System.Text.Json.JsonSerializer.Serialize(record))
+        use held = new FileStream(path + ".lock", FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None)
+        let watch = System.Diagnostics.Stopwatch.StartNew()
+        let contended = Client.OrchestrationApi.LedgerBindingConfig.inspectLocal "Project1" context
+        watch.Stop()
+        match contended with
+        | Error(Client.LedgerFailureError issue) when issue.Code = "TrustBindingContended" -> ()
+        | other -> Assert.Fail(sprintf "Expected typed transient sharing contention, got %A" other)
+        Assert.That(watch.ElapsedMilliseconds, Is.LessThan(500L),
+                    "Dashboard inspection must not wait for the previous 50x40ms synchronous retry loop.")
+        held.Dispose()
+        match Client.OrchestrationApi.LedgerBindingConfig.inspectLocal "Project1" context with
+        | Ok (_, head) -> Assert.That(head, Is.EqualTo(record.HighestTrustedHead))
+        | other -> Assert.Fail(sprintf "Expected recovery after lock release, got %A" other)
+    finally
+        if File.Exists path then File.Delete(path)
+        if File.Exists(path + ".lock") then File.Delete(path + ".lock")
+        Directory.Delete(root, true)

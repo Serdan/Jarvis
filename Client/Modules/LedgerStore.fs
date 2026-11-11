@@ -19,6 +19,7 @@ type LedgerFailure =
     | OperationIdReused
     | OutcomeUnknown of string
     | LedgerContended
+    | TrustBindingContended of string
     | GitFailure of string
     | SourceUnavailable of string
     | AgentBusy of string

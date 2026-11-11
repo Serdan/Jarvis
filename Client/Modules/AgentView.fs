@@ -39,11 +39,18 @@ type ProjectCounts =
       Waiting: int
       Parked: int }
 
+type ProjectStatus =
+    | Fresh
+    | TemporarilyUnavailable
+    | Stale
+    | Unavailable
+
 type ProjectSummary =
     { Project: string
       Aliases: string list
       Identity: string
       Counts: ProjectCounts option
+      Status: ProjectStatus
       Error: string option }
 
 type Snapshot =
@@ -164,20 +171,24 @@ let projectStatusLine width displayName (project: ProjectSummary) =
         elif length = 1 then "…"
         else value.Substring(0, length - 1) + "…"
     let label = ActivityFilter.projectToken displayName
+    let status = if project.Status = Stale then "STALE | " else ""
     let detail =
         match project.Counts with
+        | None when project.Status = TemporarilyUnavailable -> "TEMPORARILY UNAVAILABLE (counts unknown)"
         | None -> "UNAVAILABLE (counts unknown)"
         | Some c ->
             sprintf "Tracked %d | Review %d | Unread %d | Working %d | Ready %d | Waiting %d | Parked %d"
                 c.Tracked c.PendingReviews c.Unread c.Working c.Ready c.Waiting c.Parked
-    let full = label + " | " + detail
+    let full = label + " | " + status + detail
     if full.Length <= width then full
     else
         let compact =
             match project.Counts with
+            | None when project.Status = TemporarilyUnavailable -> "TEMP UNAVAILABLE (counts unknown)"
             | None -> "UNAVAILABLE (counts unknown)"
             | Some c ->
-                sprintf "T%d Rev%d U%d W%d Rd%d Wait%d P%d"
+                (if project.Status = Stale then "STALE " else "")
+                + sprintf "T%d Rev%d U%d W%d Rd%d Wait%d P%d"
                     c.Tracked c.PendingReviews c.Unread c.Working c.Ready c.Waiting c.Parked
         let budget = max 0 (width - compact.Length - 3)
         if budget > 0 then fitProjectLabel budget displayName + " | " + compact |> clip width
@@ -195,9 +206,12 @@ let projectStatusLines width displayName (project: ProjectSummary) =
             else value.Substring(0, width - 1) + "…"
         let tokens =
             match project.Counts with
+            | None when project.Status = TemporarilyUnavailable ->
+                ["TEMPORARILY"; "UNAVAILABLE"; "counts unknown"]
             | None -> ["UNAVAILABLE"; "counts unknown"]
             | Some c ->
-                [ sprintf "T%d" c.Tracked; sprintf "Rev%d" c.PendingReviews
+                [ if project.Status = Stale then "STALE"
+                  sprintf "T%d" c.Tracked; sprintf "Rev%d" c.PendingReviews
                   sprintf "U%d" c.Unread; sprintf "W%d" c.Working
                   sprintf "Rd%d" c.Ready; sprintf "Wait%d" c.Waiting
                   sprintf "P%d" c.Parked ]
@@ -306,3 +320,45 @@ let changedAgents (before: Snapshot) (after: Snapshot) =
             && previousRow.LatestNotification = row.LatestNotification -> None
         | _ -> Some row.Key)
     |> Set.ofList
+
+
+/// UI-only carry-forward of independently verified dashboard rows when a
+/// transient binding lock collision prevents a fresh read. Never authorize
+/// operations from these observations.
+let preserveTransientProjects (previous: Snapshot option) (latest: Snapshot) =
+    match previous with
+    | None -> latest
+    | Some before ->
+        let matchesAlias name (project: ProjectSummary) =
+            project.Aliases
+            |> List.exists (fun alias -> String.Equals(alias, name, StringComparison.OrdinalIgnoreCase))
+        let retained =
+            latest.Projects
+            |> List.choose (fun current ->
+                if current.Status <> TemporarilyUnavailable then None
+                else
+                    match before.Projects |> List.filter (matchesAlias current.Project) with
+                    | [previousProject] when previousProject.Counts.IsSome
+                                         && (previousProject.Status = Fresh || previousProject.Status = Stale)
+                                         && not (latest.Projects |> List.exists (fun p ->
+                                             p.Status = Fresh
+                                             && (p.Identity = previousProject.Identity
+                                                 || matchesAlias current.Project p))) ->
+                        Some (current, previousProject)
+                    | _ -> None)
+        if retained.IsEmpty then latest
+        else
+            let projects =
+                latest.Projects
+                |> List.map (fun project ->
+                    match retained |> List.tryFind (fun (current, _) -> current = project) with
+                    | Some (_, verified) ->
+                        { verified with Status = Stale
+                                        Error = Some "Temporary trust-binding contention; last verified counts shown as stale." }
+                    | None -> project)
+            let identities = retained |> List.map (fun (_, prior) -> prior.Identity) |> Set.ofList
+            let rows =
+                before.Agents
+                |> List.filter (fun row -> identities |> Set.exists (fun id -> row.Key.StartsWith(id + "::", StringComparison.Ordinal)))
+                |> List.map (fun row -> { row with ProjectLabel = row.ProjectLabel + " [STALE]" })
+            { latest with Projects = projects; Agents = latest.Agents @ rows }

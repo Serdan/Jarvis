@@ -35,6 +35,7 @@ module LedgerErrors =
             | LedgerStore.OperationIdReused -> "OperationIdReused"
             | LedgerStore.OutcomeUnknown _ -> "OutcomeUnknown"
             | LedgerStore.LedgerContended -> "LedgerContended"
+            | LedgerStore.TrustBindingContended _ -> "TrustBindingContended"
             | LedgerStore.GitFailure _ -> "GitFailure"
             | LedgerStore.SourceUnavailable _ -> "SourceUnavailable"
             | LedgerStore.AgentBusy _ -> "AgentBusy"
@@ -59,6 +60,13 @@ module LedgerBindingConfig =
 
     // The trust anchor is persisted independently of Git's replaceable cache.
     // Serialize checkout-local updates across threads AND client processes.
+    // Sharing violations are recoverable contention, not malformed trust data.
+    // Never retry an IOException thrown by the operation under the lock.
+    let internal isTransientSharingViolation (error: IOException) =
+        match error.HResult &&& 0xFFFF with
+        | 11 | 32 | 33 | 35 -> true // Linux EAGAIN, Windows sharing/lock, macOS EAGAIN
+        | _ -> false
+
     let private withConfigLock (path: string) operation =
         try
             let dir = Path.GetDirectoryName path
@@ -70,19 +78,31 @@ module LedgerBindingConfig =
                 if File.Exists(lockPath) && File.GetAttributes(lockPath).HasFlag(FileAttributes.ReparsePoint) then
                     Error(Client.ValidationError " binding lock must not be a symlink.")
                 else
-                    let rec obtain attempts =
+                    // One nonblocking attempt. The caller's next dashboard refresh
+                    // retries transient contention; remote fetches never run here.
+                    let acquired =
                         try
-                            use held = new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite,
-                                                      FileShare.None, 4096, FileOptions.None)
-                            if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
-                                File.SetUnixFileMode(lockPath, UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
-                            operation ()
-                        with :? IOException when attempts < 50 ->
-                            System.Threading.Thread.Sleep(40)
-                            obtain (attempts + 1)
-                    obtain 0
-        with ex ->
-            Error(Client.ValidationError $"Cannot lock  trust binding: {ex.Message}")
+                            Ok (new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite,
+                                               FileShare.None, 4096, FileOptions.None))
+                        with
+                        | :? IOException as ex when isTransientSharingViolation ex ->
+                            Error(LedgerErrors.toEffect (LedgerStore.TrustBindingContended ex.Message))
+                        | :? UnauthorizedAccessException as ex ->
+                            Error(Client.PermissionDenied $"Cannot access trust-binding lock: {ex.Message}")
+                        | :? IOException as ex ->
+                            Error(Client.ValidationError $"Cannot open trust-binding lock: {ex.Message}")
+                    match acquired with
+                    | Error error -> Error error
+                    | Ok stream ->
+                        use held = stream
+                        if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
+                            File.SetUnixFileMode(lockPath, UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
+                        operation ()
+        with
+        | :? UnauthorizedAccessException as ex ->
+            Error(Client.PermissionDenied $"Cannot access trust binding: {ex.Message}")
+        | ex ->
+            Error(Client.ValidationError $"Cannot access trust binding: {ex.Message}")
 
     let private readStored (path: string) =
         try
@@ -136,29 +156,62 @@ module LedgerBindingConfig =
     // Local binding is intentionally opt-in, separately from the normal Jarvis config.
     // A successful load never lowers its persisted trust anchor, even if another
     // client process observes a later head during our network operation.
-    let private loadAtRootWithSnapshot root =
+    // Remote Git I/O and ancestry verification MUST run without the process-shared
+    // binding lock. The second short lock is a compare-and-swap against the
+    // exact stored trust anchor read before the fetch.
+    let internal loadAtRootWithSnapshotUsing
+        (fetch: LedgerStore.LedgerBinding -> Result<LedgerStore.LedgerSnapshot, LedgerStore.LedgerFailure>) root =
         let path = pathForRoot root
         if not (File.Exists path) then
             Error(Client.ValidationError $" ledger disabled for this checkout. Approved binding required at {path}. No V1 fallback.")
         else
-            withConfigLock path (fun () ->
-                readStored path
-                |> Result.bind (fun stored ->
-                    validStored root stored
-                    |> Result.bind (fun binding ->
-                        LedgerStore.LedgerStore.fetch binding
-                        |> Result.mapError LedgerErrors.toEffect
-                        |> Result.bind (fun snapshot ->
-                            LedgerStore.LedgerStore.verifyTrustedHead binding
-                                stored.HighestTrustedHead snapshot.Commit
-                            |> Result.mapError LedgerErrors.toEffect
-                            |> Result.bind (fun () ->
-                                let persisted =
-                                    if stored.HighestTrustedHead = snapshot.Commit then Ok ()
-                                    else
-                                        writeStored path
-                                            { stored with HighestTrustedHead = snapshot.Commit } true
-                                persisted |> Result.map (fun () -> binding, snapshot))))))
+            let rec load remaining =
+                let initial =
+                    withConfigLock path (fun () ->
+                        readStored path
+                        |> Result.bind (fun stored ->
+                            validStored root stored
+                            |> Result.map (fun binding -> stored, binding)))
+                match initial with
+                | Error error -> Error error
+                | Ok (stored, binding) ->
+                    match fetch binding |> Result.mapError LedgerErrors.toEffect with
+                    | Error error -> Error error
+                    | Ok snapshot ->
+                        match LedgerStore.LedgerStore.verifyTrustedHead binding
+                                  stored.HighestTrustedHead snapshot.Commit
+                              |> Result.mapError LedgerErrors.toEffect with
+                        | Error error -> Error error
+                        | Ok () ->
+                            let committed =
+                                withConfigLock path (fun () ->
+                                    readStored path
+                                    |> Result.bind (fun current ->
+                                        validStored root current
+                                        |> Result.bind (fun currentBinding ->
+                                            if currentBinding <> binding
+                                               || { current with HighestTrustedHead = stored.HighestTrustedHead } <> stored then
+                                                Error(Client.ValidationError "Trust binding changed during fetch; refusing update.")
+                                            elif current.HighestTrustedHead = snapshot.Commit then
+                                                Ok (Some (binding, snapshot))
+                                            elif current.HighestTrustedHead <> stored.HighestTrustedHead then
+                                                // Another client advanced the trust anchor. Re-read,
+                                                // fetch and verify against its newer anchor.
+                                                Ok None
+                                            else
+                                                writeStored path
+                                                    { current with HighestTrustedHead = snapshot.Commit } true
+                                                |> Result.map (fun () -> Some (binding, snapshot)))))
+                            match committed with
+                            | Error error -> Error error
+                            | Ok (Some verified) -> Ok verified
+                            | Ok None when remaining > 0 -> load (remaining - 1)
+                            | Ok None ->
+                                Error(Client.ValidationError "Trusted ledger head advanced concurrently; retry the request.")
+            load 2
+
+    let private loadAtRootWithSnapshot root =
+        loadAtRootWithSnapshotUsing LedgerStore.LedgerStore.fetch root
 
     let private loadAtRoot root =
         loadAtRootWithSnapshot root |> Result.map fst
@@ -296,49 +349,61 @@ module LedgerBindingConfig =
                 | Error error -> Error error
                 | Ok(FolderPath root) ->
                     let path = pathForRoot root
-                    withConfigLock path (fun () ->
-                        readStored path
-                        |> Result.bind (fun stored ->
-                            validStored root stored
-                            |> Result.bind (fun current ->
-                                if current <> old then
-                                    Error(Client.ValidationError
-                                        " binding changed while rebinding; reload and retry.")
-                                else
-                                    let newBinding =
-                                        { old with RemoteName = remoteName
-                                                   ApprovedFetchUrl = approvedFetchUrl
-                                                   ApprovedPushUrl = approvedPushUrl }
-                                    LedgerStore.LedgerStore.fetch newBinding
-                                    |> Result.mapError LedgerErrors.toEffect
-                                    |> Result.bind (fun snapshot ->
-                                        // A caller-supplied anchor cannot replace what this
-                                        // checkout already trusted. Both must be ancestors.
-                                        LedgerStore.LedgerStore.verifyTrustedHead newBinding
-                                            stored.HighestTrustedHead snapshot.Commit
-                                        |> Result.mapError LedgerErrors.toEffect
-                                        |> Result.bind (fun () ->
-                                            LedgerStore.LedgerStore.verifyTrustedHead newBinding
-                                                expectedTrustedHead snapshot.Commit
-                                            |> Result.mapError LedgerErrors.toEffect
-                                            |> Result.bind (fun () ->
-                                                let replacement =
-                                                    { stored with RemoteName = remoteName
-                                                                  ApprovedFetchUrl = approvedFetchUrl
-                                                                  ApprovedPushUrl = approvedPushUrl
-                                                                  HighestTrustedHead = snapshot.Commit }
-                                                let backup =
-                                                    path + ".previous-" + Guid.NewGuid().ToString("N")
-                                                try
-                                                    File.WriteAllText(backup, JsonSerializer.Serialize(stored))
-                                                    if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
-                                                        File.SetUnixFileMode(backup,
-                                                            UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
-                                                    writeStored path replacement true
-                                                    |> Result.map (fun () -> replacement)
-                                                with ex ->
+                    let initial =
+                        withConfigLock path (fun () ->
+                            readStored path
+                            |> Result.bind (fun stored ->
+                                validStored root stored
+                                |> Result.bind (fun current ->
+                                    if current <> old then
+                                        Error(Client.ValidationError
+                                            " binding changed while rebinding; reload and retry.")
+                                    else Ok stored)))
+                    initial
+                    |> Result.bind (fun stored ->
+                        let newBinding =
+                            { old with RemoteName = remoteName
+                                       ApprovedFetchUrl = approvedFetchUrl
+                                       ApprovedPushUrl = approvedPushUrl }
+                        // No network or Git operations may run while holding the
+                        // cross-process trust-binding lock.
+                        LedgerStore.LedgerStore.fetch newBinding
+                        |> Result.mapError LedgerErrors.toEffect
+                        |> Result.bind (fun snapshot ->
+                            LedgerStore.LedgerStore.verifyTrustedHead newBinding
+                                stored.HighestTrustedHead snapshot.Commit
+                            |> Result.mapError LedgerErrors.toEffect
+                            |> Result.bind (fun () ->
+                                LedgerStore.LedgerStore.verifyTrustedHead newBinding
+                                    expectedTrustedHead snapshot.Commit
+                                |> Result.mapError LedgerErrors.toEffect
+                                |> Result.bind (fun () ->
+                                    withConfigLock path (fun () ->
+                                        readStored path
+                                        |> Result.bind (fun current ->
+                                            validStored root current
+                                            |> Result.bind (fun currentBinding ->
+                                                if current <> stored || currentBinding <> old then
                                                     Error(Client.ValidationError
-                                                        $" rebind backup failed: {ex.Message}")))))))
+                                                        "Trusted binding changed while rebinding; reload and retry.")
+                                                else
+                                                    let replacement =
+                                                        { current with RemoteName = remoteName
+                                                                       ApprovedFetchUrl = approvedFetchUrl
+                                                                       ApprovedPushUrl = approvedPushUrl
+                                                                       HighestTrustedHead = snapshot.Commit }
+                                                    let backup =
+                                                        path + ".previous-" + Guid.NewGuid().ToString("N")
+                                                    try
+                                                        File.WriteAllText(backup, JsonSerializer.Serialize(current))
+                                                        if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
+                                                            File.SetUnixFileMode(backup,
+                                                                UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
+                                                        writeStored path replacement true
+                                                        |> Result.map (fun () -> replacement)
+                                                    with ex ->
+                                                        Error(Client.ValidationError
+                                                            $" rebind backup failed: {ex.Message}"))))))))
 
 
 [<CLIMutable>]

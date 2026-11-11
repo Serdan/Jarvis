@@ -4905,3 +4905,62 @@ type ReviewWorkflowTests() =
                 push ()
                 reject "Gitlink task"
             finally git one [ "worktree"; "remove"; "--force"; auxiliary ] |> ignore)
+
+
+    [<Test>]
+    member _.SlowRemoteFetchDoesNotBlockDashboardAndCannotRegressTrustAnchor() =
+        withFixture (fun one _ first _ _ _ _ _ ->
+            let context = GitCommandTests.TestContext(Path.GetDirectoryName one)
+            let configPath = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
+            let initial = LedgerStore.fetch first |> success
+            try
+                Client.OrchestrationApi.LedgerBindingConfig.bindExisting
+                    "owner" context first.ProjectId first.LedgerId first.Epoch
+                    first.RemoteName first.ApprovedFetchUrl first.ApprovedPushUrl initial.Commit true
+                |> function
+                   | Ok _ -> ()
+                   | Error error -> failwithf "Cannot bind fixture: %A" error
+                use enteredFetch = new System.Threading.ManualResetEventSlim(false)
+                use releaseFetch = new System.Threading.ManualResetEventSlim(false)
+                let mutable firstCall = true
+                let delayedFetch binding =
+                    if firstCall then
+                        firstCall <- false
+                        enteredFetch.Set()
+                        if not (releaseFetch.Wait(TimeSpan.FromSeconds(10.))) then
+                            failwith "Timed out releasing injected network fetch."
+                        Ok initial
+                    else LedgerStore.fetch binding
+                let slowLoad =
+                    System.Threading.Tasks.Task.Run(fun () ->
+                        Client.OrchestrationApi.LedgerBindingConfig.loadAtRootWithSnapshotUsing delayedFetch one)
+                try
+                    Assert.That(enteredFetch.Wait(TimeSpan.FromSeconds(5.)), Is.True)
+                    let watch = Stopwatch.StartNew()
+                    match Client.OrchestrationApi.LedgerBindingConfig.inspectLocal "owner" context with
+                    | Ok (_, head) -> Assert.That(head, Is.EqualTo(initial.Commit))
+                    | other -> Assert.Fail(sprintf "Dashboard blocked by remote fetch: %A" other)
+                    watch.Stop()
+                    Assert.That(watch.ElapsedMilliseconds, Is.LessThan(500L))
+                    ReviewWorkflow.registerAgent first (Guid.NewGuid()) "Late worker"
+                    |> success |> ignore
+                    let newer = LedgerStore.fetch first |> success
+                    Assert.That(newer.Commit, Is.Not.EqualTo(initial.Commit))
+                    let updated = Client.OrchestrationApi.LedgerBindingConfig.loadWithSnapshot "owner" context
+                    match updated with
+                    | Ok (_, snapshot) -> Assert.That(snapshot.Commit, Is.EqualTo(newer.Commit))
+                    | other -> Assert.Fail(sprintf "Could not load a newer trusted head: %A" other)
+                    releaseFetch.Set()
+                    match slowLoad.GetAwaiter().GetResult() with
+                    | Ok (_, snapshot) -> Assert.That(snapshot.Commit, Is.EqualTo(newer.Commit))
+                    | other -> Assert.Fail(sprintf "Old concurrent fetch should retry safely: %A" other)
+                    match Client.OrchestrationApi.LedgerBindingConfig.inspectLocal "owner" context with
+                    | Ok (_, head) -> Assert.That(head, Is.EqualTo(newer.Commit),
+                                                  "A stale fetch must never lower the persisted trust anchor.")
+                    | other -> Assert.Fail(sprintf "Cannot inspect final anchor: %A" other)
+                finally
+                    releaseFetch.Set()
+                    slowLoad.GetAwaiter().GetResult() |> ignore
+            finally
+                if File.Exists configPath then File.Delete(configPath)
+                if File.Exists(configPath + ".lock") then File.Delete(configPath + ".lock"))

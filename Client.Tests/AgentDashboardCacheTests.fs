@@ -267,7 +267,7 @@ let private available project identity head agents reviews : AgentDashboard.Proj
       Result = Ok { Identity = identity; Head = head; Agents = agents; PendingReviews = reviews } }
 
 let private unavailable project reason : AgentDashboard.ProjectResult =
-    { Project = project; Aliases = [project]; Result = Error reason }
+    { Project = project; Aliases = [project]; Result = Error (AgentDashboard.OtherDashboardFailure reason) }
 
 [<Test>]
 let projectDashboardDeduplicatesSharedLedgersButNotSameNamedDistinctLedgers () =

@@ -2,9 +2,9 @@
 
     <PropertyGroup>
         <OutputType>Exe</OutputType>
-        <TargetFramework>net10.0</TargetFramework>
+        <TargetFramework>net11.0</TargetFramework>
         <AssemblyName>JarvisClient</AssemblyName>
-        <LangVersion>10.0</LangVersion>
+        <LangVersion>11.0</LangVersion>
         <JarvisServerUrl Condition="'$(JarvisServerUrl)' == ''">http://127.0.0.1:5095/client</JarvisServerUrl>
     </PropertyGroup>
 
@@ -79,9 +79,8 @@
     </ItemGroup>
 
     <ItemGroup>
-        <PackageReference Update="FSharp.Core" Version="10.1.203"/>
         <PackageReference Include="Kehlet.FSharp.IO" Version="1.1.0"/>
-        <PackageReference Include="Microsoft.AspNetCore.SignalR.Client" Version="10.0.13"/>
+        <PackageReference Include="Microsoft.AspNetCore.SignalR.Client" Version="11.0.0"/>
     </ItemGroup>
 
     <ItemGroup>

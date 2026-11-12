@@ -1,4 +1,4 @@
-﻿namespace Client
+namespace Client
 
 open System
 open System.IO
@@ -17,7 +17,7 @@ module Seq =
         |> Seq.filter (fun item -> filters |> Seq.forall (fun filter -> filter item))
 
 module String =
-    let startsWith value (s: string) =
+    let startsWith (value: string) (s: string) =
         s.StartsWith(value, StringComparison.InvariantCulture)
 
     let tryIndexOf' (value: string) (startIndex: int) (s: string) =

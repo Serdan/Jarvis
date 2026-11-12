@@ -5,9 +5,12 @@ open Microsoft.AspNetCore.SignalR
 type DispatchProbeHub() =
     inherit Hub()
     member _.AcceptReply(_correlationId: string) = System.Threading.Tasks.Task.CompletedTask
+    member this.AcceptWithAck(correlationId: string) =
+        this.Clients.Caller.SendCoreAsync("ReplyReceived", [| box correlationId |], System.Threading.CancellationToken.None)
 
 module DispatchProbeTests =
     open System
+    open System.IO
     open System.Threading
     open System.Threading.Tasks
     open Client.SignalR
@@ -208,6 +211,141 @@ module DispatchProbeTests =
         Assert.That(queue.TrySubmit("two", complete), Is.True)
         do! completed.Task.WaitAsync(TimeSpan.FromSeconds 5.0)
         do! queue.Complete().WaitAsync(TimeSpan.FromSeconds 5.0)
+    }
+
+    [<Test>]
+    let ``real SignalR overflow returns a response without executing a rejected command`` () = task {
+        let builder = WebApplication.CreateBuilder()
+        builder.WebHost.UseUrls("http://127.0.0.1:0") |> ignore
+        builder.Services.AddSignalR() |> ignore
+        use server = builder.Build()
+        server.MapHub<DispatchProbeHub>("/probe") |> ignore
+        do! server.StartAsync()
+        let endpoint = server.Urls |> Seq.head
+        let sender = server.Services.GetRequiredService<IHubContext<DispatchProbeHub>>()
+        let slowEntered = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let releaseSlow = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let rejected = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let executed = System.Collections.Concurrent.ConcurrentBag<string>()
+        let queue = CommandDispatchQueue(1, 1, (fun _ -> ()))
+        let connection = HubConnectionBuilder().WithUrl(endpoint + "/probe").Build()
+
+        use responseRegistration =
+            connection.On<string>(
+                "ReplyReceived",
+                Func<string, Task>(fun id ->
+                    if id = "overflow" then rejected.TrySetResult(()) |> ignore
+                    Task.CompletedTask))
+        use commandRegistration =
+            connection.On<string>(
+                "ReceiveCommand",
+                Func<string, Task>(fun id ->
+                    let execute () : Task = task {
+                        executed.Add(id)
+                        if id = "slow" then
+                            slowEntered.TrySetResult(()) |> ignore
+                            do! releaseSlow.Task
+                        do! connection.InvokeAsync("AcceptWithAck", id)
+                    }
+                    if queue.TrySubmit(id, execute) then Task.CompletedTask
+                    else
+                        // Production uses SendCoreAsync, not an awaited hub
+                        // invocation, for explicit saturation rejection.
+                        connection.SendCoreAsync(
+                            "AcceptWithAck", [| box id |], CancellationToken.None)))
+
+        do! connection.StartAsync()
+        do! sender.Clients.All.SendAsync("ReceiveCommand", "slow")
+        do! slowEntered.Task.WaitAsync(TimeSpan.FromSeconds 5.0)
+        do! sender.Clients.All.SendAsync("ReceiveCommand", "queued")
+        do! sender.Clients.All.SendAsync("ReceiveCommand", "overflow")
+        let! first = Task.WhenAny(rejected.Task, Task.Delay(1000))
+        let promptRejection = obj.ReferenceEquals(first, rejected.Task)
+        releaseSlow.TrySetResult(()) |> ignore
+        do! queue.Complete().WaitAsync(TimeSpan.FromSeconds 5.0)
+        do! connection.DisposeAsync().AsTask()
+        do! server.StopAsync()
+
+        Assert.That(promptRejection, Is.True,
+            "Queue saturation must produce a prompt correlated reply before a stalled command is released.")
+        Assert.That(executed.Count, Is.EqualTo(2),
+            "An overflow rejection must not execute a command or affect already admitted work.")
+        Assert.That(executed |> Seq.contains "slow", Is.True)
+        Assert.That(executed |> Seq.contains "queued", Is.True)
+    }
+
+    [<Test>]
+    let ``a failed recovery response cannot terminate the dispatch worker`` () = task {
+        let recovered = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let observations = System.Collections.Concurrent.ConcurrentBag<CommandDispatchTiming>()
+        let queue = CommandDispatchQueue(1, 2, observations.Add)
+        let throws () : Task = Task.FromException(InvalidOperationException("private-payload"))
+        let fallback (_: exn) : Task = Task.FromException(IOException("disconnected"))
+        let next () : Task = task { recovered.TrySetResult(()) |> ignore }
+        Assert.That(queue.TrySubmit("failure-id", throws, fallback), Is.True)
+        Assert.That(queue.TrySubmit("next-id", next), Is.True)
+        do! recovered.Task.WaitAsync(TimeSpan.FromSeconds 5.0)
+        do! queue.Complete().WaitAsync(TimeSpan.FromSeconds 5.0)
+        Assert.That(observations.Count, Is.EqualTo(2))
+        Assert.That(
+            observations |> Seq.exists (fun timing ->
+                timing.CorrelationId = "failure-id"
+                && timing.FailureType = Some "InvalidOperationException"), Is.True)
+        Assert.That(observations |> Seq.forall (fun timing ->
+            not (timing.ToString().Contains("private-payload"))), Is.True)
+    }
+
+    [<Test>]
+    let ``a blocked accepted command fails on disconnect and new work recovers after reconnect`` () = task {
+        let builder = WebApplication.CreateBuilder()
+        builder.WebHost.UseUrls("http://127.0.0.1:0") |> ignore
+        builder.Services.AddSignalR() |> ignore
+        use server = builder.Build()
+        server.MapHub<DispatchProbeHub>("/probe") |> ignore
+        do! server.StartAsync()
+        let endpoint = server.Urls |> Seq.head
+        let sender = server.Services.GetRequiredService<IHubContext<DispatchProbeHub>>()
+        let slowEntered = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let releaseSlow = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let unavailableReply = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let recovered = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let queue = CommandDispatchQueue(1, 4, (fun _ -> ()))
+        let connection = HubConnectionBuilder().WithUrl(endpoint + "/probe").Build()
+        use responseRegistration =
+            connection.On<string>(
+                "ReplyReceived",
+                Func<string, Task>(fun id ->
+                    if id = "after-reconnect" then recovered.TrySetResult(()) |> ignore
+                    Task.CompletedTask))
+        use commandRegistration =
+            connection.On<string>(
+                "ReceiveCommand",
+                Func<string, Task>(fun id ->
+                    let execute () : Task = task {
+                        if id = "before-disconnect" then
+                            slowEntered.TrySetResult(()) |> ignore
+                            do! releaseSlow.Task
+                        do! connection.InvokeAsync("AcceptWithAck", id)
+                    }
+                    let recover (_: exn) : Task = task {
+                        if id = "before-disconnect" then
+                            unavailableReply.TrySetResult(()) |> ignore
+                    }
+                    if queue.TrySubmit(id, execute, recover) then Task.CompletedTask
+                    else Task.FromException(InvalidOperationException("Unexpected saturation"))))
+
+        do! connection.StartAsync()
+        do! sender.Clients.All.SendAsync("ReceiveCommand", "before-disconnect")
+        do! slowEntered.Task.WaitAsync(TimeSpan.FromSeconds 5.0)
+        do! connection.StopAsync()
+        releaseSlow.TrySetResult(()) |> ignore
+        do! unavailableReply.Task.WaitAsync(TimeSpan.FromSeconds 5.0)
+        do! connection.StartAsync()
+        do! sender.Clients.All.SendAsync("ReceiveCommand", "after-reconnect")
+        do! recovered.Task.WaitAsync(TimeSpan.FromSeconds 5.0)
+        do! queue.Complete().WaitAsync(TimeSpan.FromSeconds 5.0)
+        do! connection.DisposeAsync().AsTask()
+        do! server.StopAsync()
     }
 
     [<Test>]

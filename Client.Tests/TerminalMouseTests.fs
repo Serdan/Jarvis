@@ -100,3 +100,15 @@ let terminalAppearanceSetsAndRestoresDefaultBackground () =
     Assert.That(Tracking.startSequence, Does.Contain("\u001b[49m"))
     Assert.That(Tracking.stopSequence, Does.Contain("\u001b]111\u001b\\"))
     Assert.That(Tracking.stopSequence, Does.Contain("\u001b[?25h"))
+
+[<Test>]
+let terminalExitRestoresModesAndClearsViewport () =
+    let sequence = Tracking.stopSequence
+    Assert.That(sequence, Does.StartWith("\u001b[?1006l\u001b[?1000l"))
+    Assert.That(sequence, Does.Contain("\u001b[?25h"))
+    Assert.That(sequence, Does.Contain("\u001b[0m"))
+    Assert.That(sequence, Does.Contain("\u001b]111\u001b\\"))
+    Assert.That(sequence, Does.EndWith("\u001b[2J\u001b[H"),
+                "Restore terminal appearance, then clear the TUI and home the shell prompt.")
+    Assert.That(sequence, Does.Not.Contain("\u001b[3J"),
+                "Clearing the TUI must not destroy the user's scrollback.")

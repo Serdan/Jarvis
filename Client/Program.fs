@@ -217,6 +217,9 @@ let private runClient args =
             Task.CompletedTask))
 
     task {
+        // Own terminal modes for the entire session. SignalR disposal can still
+        // redraw via its Closed callback after the input loop stops.
+        use tracking = Client.TerminalMouse.Tracking.enable()
         use cts = new CancellationTokenSource()
         let inputLoop = tui.RunInputLoop(cts.Token)
         let deviceId = DeviceIdentity.getOrCreate ()

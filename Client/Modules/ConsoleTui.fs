@@ -1034,6 +1034,11 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
             agentSnapshot
             |> Option.map (fun snap -> snap.Projects |> List.sumBy (fun p -> if p.Counts.IsNone then 1 else 0))
             |> Option.defaultValue 0
+        let stale =
+            agentSnapshot
+            |> Option.map (fun snap -> snap.Projects |> List.sumBy (fun p ->
+                if p.Status = AgentView.Stale then 1 else 0))
+            |> Option.defaultValue 0
         let projects =
             agentSnapshot
             |> Option.map (AgentView.visibleProjects agentFilter)
@@ -1099,6 +1104,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
             else ""
         draw.WriteLine $"Agents{filterSuffix}{historySuffix}"
         let partial = if unavailable = 0 then "" else sprintf " [PARTIAL: %d unavailable]" unavailable
+        let partial = partial + (if stale = 0 then "" else sprintf " [STALE: %d projects]" stale)
         let full =
             sprintf "Tracked: %d | Review: %d | Unread: %d | Working: %d | Ready: %d | Waiting: %d | Parked: %d"
                 totals.Tracked totals.PendingReviews totals.Unread totals.Working totals.Ready totals.Waiting totals.Parked
@@ -1108,8 +1114,8 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         if draw.Height >= 22 then draw.WriteLine "------"
         let summary = if (full + partial).Length <= width && draw.Height >= 22 then full else concise
         let summaryLine =
-            if unavailable > 0 && (summary + partial).Length > width then
-                sprintf "PARTIAL(%d) %s" unavailable summary
+            if (unavailable > 0 || stale > 0) && (summary + partial).Length > width then
+                sprintf "PARTIAL(%d)/STALE(%d) %s" unavailable stale summary
             else summary + partial
         draw.WriteLine (trim summaryLine width)
         if projects.Length > 0 then
@@ -1126,7 +1132,12 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
             for index = projectFirst to projectLast - 1 do
                 let project, lines = projectItems[index]
                 let previous = draw.ForegroundColor
-                draw.ForegroundColor <- if project.Error.IsSome then ConsoleColor.Red else projectColor project.Project
+                draw.ForegroundColor <-
+                    match project.Status with
+                    | AgentView.Stale -> ConsoleColor.DarkYellow
+                    | AgentView.TemporarilyUnavailable -> ConsoleColor.Yellow
+                    | AgentView.Unavailable -> ConsoleColor.Red
+                    | AgentView.Fresh -> projectColor project.Project
                 for line in lines do draw.WriteLine line
                 draw.ForegroundColor <- previous
         let refreshed =
@@ -1398,6 +1409,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                     agentRefreshing <- false
                     match result with
                     | Ok snapshot ->
+                        let snapshot = AgentView.preserveTransientProjects agentSnapshot snapshot
                         agentChanged <-
                             agentSnapshot
                             |> Option.map (fun before -> AgentView.changedAgents before snapshot)

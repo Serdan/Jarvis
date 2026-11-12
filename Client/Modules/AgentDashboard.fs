@@ -109,10 +109,23 @@ type internal DashboardRead =
       Agents: AgentView.AgentRow list
       PendingReviews: int }
 
+type internal DashboardFailure =
+    | TemporaryBindingContention of string
+    | OtherDashboardFailure of string
+
+let private classifyFailure (error: Client.EffectError) =
+    match error with
+    | Client.LedgerFailureError issue when issue.Code = "TrustBindingContended" ->
+        TemporaryBindingContention issue.Message
+    | _ -> OtherDashboardFailure (string error)
+
+let private failureMessage = function
+    | TemporaryBindingContention reason | OtherDashboardFailure reason -> reason
+
 type internal ProjectResult =
     { Project: string
       Aliases: string list
-      Result: Result<DashboardRead, string> }
+      Result: Result<DashboardRead, DashboardFailure> }
 
 let private bindingIdentity (binding: LedgerBinding) =
     binding.ProjectId.ToString("N") + ":" + binding.LedgerId.ToString("N") + ":" + string binding.Epoch
@@ -238,19 +251,23 @@ let internal snapshotFromResults (results: ProjectResult list) =
             // Preserve the unknown-state distinction even when other aliases
             // returned counts: the same identity cannot report two valid heads.
             let data = if error.IsSome then None else Some (first.Agents, first.PendingReviews)
-            project, aliases, identity, data, error)
+            project, aliases, identity, data, error, (if error.IsSome then AgentView.Unavailable else AgentView.Fresh))
     let unavailable =
         results
         |> List.choose (fun result ->
             match result.Result with
             | Ok _ -> None
             | Error reason ->
-                Some (result.Project, allNames result,
-                      "unavailable:" + result.Project, None, Some reason))
+                let status =
+                    match reason with
+                    | TemporaryBindingContention _ -> AgentView.TemporarilyUnavailable
+                    | OtherDashboardFailure _ -> AgentView.Unavailable
+                Some (result.Project, allNames result, "unavailable:" + result.Project,
+                      None, Some (failureMessage reason), status))
     let unique = bound @ unavailable
     let identityByAlias =
         unique
-        |> List.collect (fun (_, aliases, identity, _, _) ->
+        |> List.collect (fun (_, aliases, identity, _, _, _) ->
             aliases |> List.map (fun alias -> alias.ToUpperInvariant(), identity))
         |> List.groupBy fst
         |> List.map (fun (alias, entries) ->
@@ -263,11 +280,12 @@ let internal snapshotFromResults (results: ProjectResult list) =
             identities.Count = 1 && identities.Contains identity)
     let summaries : AgentView.ProjectSummary list =
         unique
-        |> List.map (fun (project, aliases, identity, data, error) ->
+        |> List.map (fun (project, aliases, identity, data, error, status) ->
             { Project = project
               Aliases = aliases
               Identity = identity
               Counts = data |> Option.map (fun (agents, reviews) -> AgentView.projectCounts agents reviews)
+              Status = status
               Error = error })
     let labelsSnapshot : AgentView.Snapshot =
         { Agents = []; Projects = summaries; Issues = []; RefreshedAt = DateTimeOffset.UtcNow }
@@ -277,7 +295,7 @@ let internal snapshotFromResults (results: ProjectResult list) =
         |> Map.ofList
     let rows =
         unique
-        |> List.collect (fun (project, aliases, identity, data, _) ->
+        |> List.collect (fun (project, aliases, identity, data, _, _) ->
             match data with
             | None -> []
             | Some (agents, _) ->
@@ -296,13 +314,13 @@ let internal snapshotFromResults (results: ProjectResult list) =
 /// refresh. Unbound ordinary Git projects remain absent from the Agents view.
 let private inspectProject project rt =
     match ProjectPaths.resolveProjectRoot project rt with
-    | Error error -> Error (string error)
+    | Error error -> Error (classifyFailure error)
     | Ok (FolderPath root) ->
         if not (File.Exists(OrchestrationApi.LedgerBindingConfig.pathForRoot root)) then Ok None
         else
             OrchestrationApi.LedgerBindingConfig.inspectLocal project rt
             |> Result.map Some
-            |> Result.mapError string
+            |> Result.mapError classifyFailure
 
 let private refreshGroup identity (members: (string * LedgerBinding * string) array) rt =
     let project, firstBinding, _ = members[0]
@@ -312,33 +330,36 @@ let private refreshGroup identity (members: (string * LedgerBinding * string) ar
         && binding.ApprovedPushUrl = firstBinding.ApprovedPushUrl
     let result =
         if members |> Array.exists (fun (_, binding, _) -> not (matchingTransport binding)) then
-            Error ("Aliases of " + project + " have conflicting approved ledger remotes; counts unavailable.")
+            Error (OtherDashboardFailure ("Aliases of " + project + " have conflicting approved ledger remotes; counts unavailable."))
         else
             match OrchestrationApi.LedgerBindingConfig.loadWithSnapshot project rt with
-            | Error error -> Error (string error)
+            | Error error -> Error (classifyFailure error)
             | Ok (verifiedBinding, snapshot) ->
                 if bindingIdentity verifiedBinding <> identity || not (matchingTransport verifiedBinding) then
-                    Error ("Canonical ledger binding changed during refresh of " + project)
+                    Error (OtherDashboardFailure ("Canonical ledger binding changed during refresh of " + project))
                 else
-                    // Re-read each anchor after the network fetch. One alias
-                    // could have a newer trusted head than the representative;
-                    // showing its older state as freshly verified would be wrong.
+                    // Every alias must still trust this exact snapshot.
                     let inconsistent =
                         members
                         |> Array.tryPick (fun (alias, _, _) ->
                             match OrchestrationApi.LedgerBindingConfig.inspectLocal alias rt with
-                            | Error error -> Some (alias + ": " + string error)
+                            | Error error -> Some (classifyFailure error)
                             | Ok (currentBinding, trustedHead) ->
                                 if bindingIdentity currentBinding <> identity
                                    || not (matchingTransport currentBinding) then
-                                    Some (alias + ": local ledger binding changed during refresh.")
+                                    Some (OtherDashboardFailure (alias + ": local ledger binding changed during refresh."))
                                 else
                                     match LedgerStore.verifyTrustedHead verifiedBinding trustedHead snapshot.Commit with
                                     | Ok () -> None
-                                    | Error error -> Some (alias + ": " + string error))
+                                    | Error error -> Some (OtherDashboardFailure (alias + ": " + string error)))
                     match inconsistent with
-                    | Some reason -> Error ("Cannot verify shared ledger aliases: " + reason)
-                    | None -> projectSnapshot project identity verifiedBinding snapshot
+                    | Some (TemporaryBindingContention reason) ->
+                        Error (TemporaryBindingContention reason)
+                    | Some reason ->
+                        Error (OtherDashboardFailure ("Cannot verify shared ledger aliases: " + failureMessage reason))
+                    | None ->
+                        projectSnapshot project identity verifiedBinding snapshot
+                        |> Result.mapError OtherDashboardFailure
     { Project = project; Aliases = aliases; Result = result }
 
 let load rt =

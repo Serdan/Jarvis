@@ -71,10 +71,12 @@ module ChallengeWorkflow =
     let private options =
         JsonSerializerOptions(PropertyNamingPolicy = JsonNamingPolicy.CamelCase, PropertyNameCaseInsensitive = true)
     let private json value = JsonSerializer.Serialize(value, options)
-    let private stored value =
+    let private stored<'t> (value: 't) =
         let body = json value
         if not (body.StartsWith("{", StringComparison.Ordinal)) then invalidArg "value" "Expected record."
-        "{\"schemaVersion\":2," + body.Substring(1)
+        let schema =
+            if List.contains typeof<'t>.Name [ "ReviewAgent"; "ReviewAttempt"; "BranchReview" ] then 3 else 2
+        $"{{\"schemaVersion\":{schema}," + body.Substring(1)
 
     let private path (challengeId: Guid) =
         "challenges/" + challengeId.ToString("N") + "/challenge.json"
@@ -410,3 +412,231 @@ module ChallengeWorkflow =
                 { SnapshotCommit = snapshot.Commit; Challenge = record
                   History = events |> List.sortBy _.Sequence }
         }
+
+
+    let private waitPath task attempt =
+        $"tasks/{task}/attempts/{attempt}/challenge-wait.json"
+
+    let private canonical<'t> binding snapshot file = result {
+        let! content, oid = LedgerStore.readAt binding snapshot file
+        match content, oid with
+        | Some body, Some blob ->
+            try
+                use doc = JsonDocument.Parse(body)
+                let expectedSchema =
+                    if typeof<'t> = typeof<ReviewTask> || typeof<'t> = typeof<AttemptChallengeWait> then 2
+                    else 3
+                if doc.RootElement.GetProperty("schemaVersion").GetInt32() <> expectedSchema then
+                    return! Error(LedgerIntegrityError ("Unexpected ledger schema for " + file))
+                let decoded = JsonSerializer.Deserialize<'t>(body, options)
+                if isNull (box decoded) then
+                    return! Error(LedgerIntegrityError ("Null canonical ledger entity: " + file))
+                return decoded, blob
+            with ex ->
+                return! Error(LedgerIntegrityError ("Invalid canonical ledger entity: " + ex.Message))
+        | None, None -> return! Error(StaleEntityVersion ("Missing canonical ledger entity: " + file))
+        | _ -> return! Error(LedgerIntegrityError ("Inconsistent canonical ledger entity: " + file))
+    }
+
+    let private lifecycle (task: ReviewTask) (attempt: ReviewAttempt) (operationId: Guid)
+                          actor action reason afterPhase afterGeneration sequence : TaskLifecycleEvent =
+        { TaskId = task.TaskId; AttemptId = attempt.AttemptId
+          OperationId = operationId.ToString("D")
+          Sequence = sequence; Action = action; ActorId = actor; Reason = reason
+          PreviousLifecycle = task.Lifecycle; NewLifecycle = task.Lifecycle
+          PreviousPhase = attempt.Phase; NewPhase = afterPhase
+          PreviousOwnerId = attempt.OwnerAgentId; NewOwnerId = attempt.OwnerAgentId
+          PreviousGeneration = attempt.AssignmentGeneration
+          NewGeneration = afterGeneration
+          ReviewRequestId = null; ReviewDisposition = "Unchanged"; Evidence = null }
+
+    let private issue (task: ReviewTask) (attempt: ReviewAttempt) (actor: string)
+                      (reason: string) sequence : AssignmentIssue =
+        { TaskId = task.TaskId; AttemptId = attempt.AttemptId
+          Generation = attempt.AssignmentGeneration
+          OwnerAgentId = attempt.OwnerAgentId; IssuerId = actor
+          IssuedSequence = sequence
+          Instructions = reason; Reason = "ChallengeUnblock"
+          SpecBlobOid = attempt.SpecBlobOid; SourceBaseCommit = attempt.BaseCommit
+          TargetRef = attempt.TargetRef
+          SourceRepositoryId = attempt.SourceRepositoryId
+          SourceRemote = attempt.SourceRemote
+          SourcePushRemote = attempt.SourcePushRemote
+          SourceRef = attempt.SourceRef
+          PreviousGeneration = attempt.AssignmentGeneration - 1 }
+
+    let private validatedAttempt binding snapshot actor task attemptId
+                                 expectedTaskVersion expectedAttemptVersion
+                                 expectedAgentVersion generation =
+        result {
+            let! record, _ = canonical<ReviewTask> binding snapshot (taskPath task)
+            if record.TaskId <> task || record.Lifecycle <> "InProgress"
+               || record.AttemptId <> attemptId || record.Version <> expectedTaskVersion then
+                return! Error(StaleEntityVersion "Task context changed before challenge dependency transition.")
+            let! attempt, attemptOid =
+                canonical<ReviewAttempt> binding snapshot
+                    ($"tasks/{task}/attempts/{attemptId}.json")
+            if attempt.TaskId <> task || attempt.AttemptId <> attemptId
+               || attempt.OwnerAgentId <> actor
+               || attempt.Version <> expectedAttemptVersion
+               || attempt.AssignmentGeneration <> generation then
+                return! Error(StaleEntityVersion "Attempt owner, generation or version changed.")
+            let! agent, agentOid = canonical<ReviewAgent> binding snapshot (agentPath actor)
+            if agent.AgentId <> actor || agent.Version <> expectedAgentVersion then
+                return! Error(StaleEntityVersion "Agent identity or version changed.")
+            return record, attempt, attemptOid, agent, agentOid
+        }
+
+    /// An owner may block their assigned attempt on zero (explicit manual),
+    /// one, or several existing challenges. All state changes form ONE ledger
+    /// CAS transaction; no scheduler, hidden agent activation or separate
+    /// notification is introduced.
+    let blockAttempt binding operationId actor task attemptId
+                     expectedTaskVersion expectedAttemptVersion expectedAgentVersion
+                     generation reason (challengeIds: string list) =
+        let normalized =
+            if isNull (box challengeIds) then [] else challengeIds
+        if operationId = Guid.Empty || not (agentId actor)
+           || String.IsNullOrWhiteSpace task || not (taskId task)
+           || (guidN attemptId).IsNone || generation < 1
+           || expectedTaskVersion < 1 || expectedAttemptVersion < 1
+           || expectedAgentVersion < 1 || not (text 2048 reason)
+           || normalized.Length > 16
+           || normalized.Length <> (normalized |> List.distinct |> List.length)
+           || (normalized |> List.exists (guidN >> Option.isNone)) then
+            Error(InvalidBinding "Block requires valid actor/task/attempt, exact versions, reason, and <=16 distinct challenge IDs.")
+        else
+            changed binding operationId actor "WaitOnChallenges"
+                {| taskId = task; attemptId = attemptId; reason = reason; challengeIds = normalized
+                   expectedTaskVersion = expectedTaskVersion
+                   expectedAttemptVersion = expectedAttemptVersion
+                   expectedAgentVersion = expectedAgentVersion; generation = generation |}
+                (fun snapshot -> result {
+                    let! currentTask, attempt, attemptOid, agent, agentOid =
+                        validatedAttempt binding snapshot actor task attemptId
+                            expectedTaskVersion expectedAttemptVersion expectedAgentVersion generation
+                    if not (List.contains attempt.Phase [ "Queued"; "Started" ])
+                       || isNull (box agent.CurrentAssignment)
+                       || agent.CurrentAssignment.TaskId <> task
+                       || agent.CurrentAssignment.AttemptId <> attemptId
+                       || (agent.Execution = "Working" && attempt.Phase <> "Started") then
+                        return! Error(AgentBusy "Cannot block an attempt without its current matching owner assignment.")
+                    let priorWaitPath = waitPath task attemptId
+                    let! priorContent, priorOid = LedgerStore.readAt binding snapshot priorWaitPath
+                    let! priorWait =
+                        match priorContent, priorOid with
+                        | None, None -> Ok None
+                        | Some _, Some _ ->
+                            canonical<AttemptChallengeWait> binding snapshot priorWaitPath
+                            |> Result.map (fun (record, _) ->
+                                Some record)
+                        | _ -> Error(LedgerIntegrityError "Invalid challenge dependency record.")
+                    if priorWait |> Option.exists (fun prior -> prior.Status <> "Requeued") then
+                        return! Error(StaleEntityVersion "A challenge dependency wait is already open.")
+                    for dependency in normalized do
+                        let! linked, _ = readChallenge binding snapshot (Guid.ParseExact(dependency, "N"))
+                        if linked.Status = "Cancelled" ||
+                           (not (String.IsNullOrEmpty linked.TaskId) && linked.TaskId <> task) then
+                            return! Error(StaleEntityVersion "Linked challenge was cancelled or belongs to another task.")
+                    let timestamp = DateTimeOffset.UtcNow.ToString("O")
+                    let wait : AttemptChallengeWait =
+                        { TaskId = task; AttemptId = attemptId; OwnerAgentId = actor
+                          Reason = reason; ChallengeIds = normalized
+                          Status = "Waiting"
+                          Version = priorWait |> Option.map (fun p -> p.Version + 1) |> Option.defaultValue 1
+                          BlockedAtUtc = timestamp; RequeuedAtUtc = null }
+                    let blockedAttempt =
+                        { attempt with Version = attempt.Version + 1; Phase = "Blocked" }
+                    let stoppedAgent =
+                        { agent with
+                            CurrentAssignment = Unchecked.defaultof<AgentAssignment>; Execution = "Stopped"
+                            UnassignedDisposition = "NeedsWork"
+                            Version = agent.Version + 1
+                            StateReason = reason
+                            StateSequence = snapshot.Header.NextSequence
+                            StateEnteredAtUtc = timestamp; WorkingTurnStartedAtUtc = null
+                            ActiveSessionId = null; AssociatedSessionIds = [] }
+                    let audit =
+                        lifecycle currentTask attempt operationId actor
+                            "WaitOnChallenges" reason "Blocked"
+                            generation snapshot.Header.NextSequence
+                    return
+                        [ change priorWaitPath priorOid wait
+                          change ($"tasks/{task}/attempts/{attemptId}.json") (Some attemptOid) blockedAttempt
+                          change (agentPath actor) (Some agentOid) stoppedAgent
+                          change ($"tasks/{task}/lifecycle/{snapshot.Header.NextSequence}.json") None audit ]
+                })
+
+    /// Requeue is explicit even after all challenges are satisfied.
+    /// The same pinned snapshot verifies EVERY dependency before transitioning
+    /// the attempt to Queued and assigning a new Ready (never Working) slot.
+    let requeueAttempt binding operationId actor task attemptId
+                       expectedTaskVersion expectedAttemptVersion expectedAgentVersion
+                       generation reason =
+        if operationId = Guid.Empty || not (agentId actor)
+           || String.IsNullOrWhiteSpace task || not (taskId task)
+           || (guidN attemptId).IsNone || generation < 1
+           || expectedTaskVersion < 1 || expectedAttemptVersion < 1
+           || expectedAgentVersion < 1 || not (text 2048 reason) then
+            Error(InvalidBinding "Requeue requires valid actor/task/attempt, exact versions and reason.")
+        else
+            changed binding operationId actor "RequeueChallengeBlockedAttempt"
+                {| taskId = task; attemptId = attemptId; reason = reason
+                   expectedTaskVersion = expectedTaskVersion
+                   expectedAttemptVersion = expectedAttemptVersion
+                   expectedAgentVersion = expectedAgentVersion; generation = generation |}
+                (fun snapshot -> result {
+                    let! currentTask, attempt, attemptOid, agent, agentOid =
+                        validatedAttempt binding snapshot actor task attemptId
+                            expectedTaskVersion expectedAttemptVersion expectedAgentVersion generation
+                    if attempt.Phase <> "Blocked" then
+                        return! Error(StaleEntityVersion "Only Blocked challenge-linked attempts can be requeued.")
+                    if not (isNull (box agent.CurrentAssignment)) || agent.Execution <> "Stopped"
+                       || agent.UnassignedDisposition <> "NeedsWork" then
+                        return! Error(AgentBusy "Cannot requeue while owner is assigned, Working, or explicitly Parked.")
+                    let waitingPath = waitPath task attemptId
+                    let! wait, waitOid = canonical<AttemptChallengeWait> binding snapshot waitingPath
+                    if wait.TaskId <> task || wait.AttemptId <> attemptId ||
+                       wait.OwnerAgentId <> actor || wait.Status <> "Waiting" then
+                        return! Error(StaleEntityVersion "Attempt's challenge dependency wait is missing or already requeued.")
+                    for dependency in wait.ChallengeIds do
+                        match guidN dependency with
+                        | None -> return! Error(LedgerIntegrityError "Invalid stored challenge dependency ID.")
+                        | Some id ->
+                            let! linked, _ = readChallenge binding snapshot id
+                            if linked.Status <> "Satisfied" then
+                                return! Error(StaleEntityVersion
+                                    ($"Challenge {dependency} is {linked.Status}; all must be Satisfied before requeue."))
+                    let sequence = snapshot.Header.NextSequence
+                    let timestamp = DateTimeOffset.UtcNow.ToString("O")
+                    let nextGen = generation + 1
+                    let readyAttempt =
+                        { attempt with
+                            Phase = "Queued"; Version = attempt.Version + 1
+                            AssignmentGeneration = nextGen; IssuedSequence = sequence }
+                    let readyAgent =
+                        { agent with
+                            Version = agent.Version + 1
+                            CurrentAssignment = { TaskId = task; AttemptId = attemptId }
+                            UnassignedDisposition = null
+                            Execution = "Stopped"
+                            StateEnteredAtUtc = timestamp
+                            StateReason = reason; StateSequence = sequence
+                            WorkingTurnStartedAtUtc = null
+                            ActiveSessionId = null; AssociatedSessionIds = [] }
+                    let requeued =
+                        { wait with
+                            Status = "Requeued"
+                            Version = wait.Version + 1
+                            RequeuedAtUtc = timestamp }
+                    let audit =
+                        lifecycle currentTask attempt operationId actor
+                            "RequeueChallengeBlockedAttempt" reason "Queued" nextGen sequence
+                    return
+                        [ change ($"tasks/{task}/attempts/{attemptId}.json") (Some attemptOid) readyAttempt
+                          change (agentPath actor) (Some agentOid) readyAgent
+                          change waitingPath (Some waitOid) requeued
+                          change ($"tasks/{task}/attempts/{attemptId}/assignments/{nextGen}.json") None
+                              (issue currentTask readyAttempt actor reason sequence)
+                          change ($"tasks/{task}/lifecycle/{sequence}.json") None audit ]
+                })

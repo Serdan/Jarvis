@@ -156,6 +156,12 @@ type ChallengeWriteCommand =
       ExpectedVersion: int
       Title: string
       TaskId: string
+      AttemptId: string
+      DependencyChallengeIds: string list
+      ExpectedTaskVersion: int
+      ExpectedAttemptVersion: int
+      ExpectedAgentVersion: int
+      AssignmentGeneration: int
       Conditions: ChallengeConditionDefinition list
       Evidence: string
       Reason: string

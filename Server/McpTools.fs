@@ -283,6 +283,11 @@ module McpToolHelpers =
         [ "SubmitReview"; "ClaimReview"; "DecideReview"; "ReleaseReview"; "WithdrawReview"
           "PutReviewDocument" ]
 
+    let private challengeReadMethods = [ "ListChallenges"; "GetChallenge" ]
+    let private challengeWriteMethods =
+        [ "CreateChallenge"; "ResolveChallengeCondition"; "ReopenChallengeCondition"
+          "CancelChallenge"; "BlockOnChallenges"; "RequeueChallengeBlockedAttempt" ]
+
     let private ledgerAliasCapabilities =
         let fromWire wireName publicName =
             AgentProtocol.capabilities
@@ -299,7 +304,9 @@ module McpToolHelpers =
           for name in ledgerReadMethods -> fromWire "LedgerRead" name
           for name in ledgerWriteMethods -> fromWire "LedgerWrite" name
           for name in ledgerReviewMethods -> fromWire "ReviewRead" name
-          for name in ledgerReviewWriteMethods -> fromWire "ReviewWrite" name ]
+          for name in ledgerReviewWriteMethods -> fromWire "ReviewWrite" name
+          for name in challengeReadMethods -> fromWire "ChallengeRead" name
+          for name in challengeWriteMethods -> fromWire "ChallengeWrite" name ]
 
     let mcpListCommandsResult : ListCommandsResult =
         { ProtocolVersion = AgentProtocol.version
@@ -308,7 +315,8 @@ module McpToolHelpers =
              |> List.filter (fun capability ->
                  capability.Name <> "ReviewRead" && capability.Name <> "ReviewWrite"
                  && capability.Name <> "TaskRead" && capability.Name <> "TaskWrite"
-                 && capability.Name <> "LedgerRead" && capability.Name <> "LedgerWrite"))
+                 && capability.Name <> "LedgerRead" && capability.Name <> "LedgerWrite"
+                 && capability.Name <> "ChallengeRead" && capability.Name <> "ChallengeWrite"))
             @ ledgerAliasCapabilities
             @ [ serverLocalCapability
                     "GetProfile"
@@ -1953,6 +1961,9 @@ type JarvisMcpTools =
         { ProjectName = projectName; ActorId = agentId; Action = action
           OperationId = operationId; ChallengeId = ""; ConditionId = ""
           ExpectedVersion = 0; Title = ""; TaskId = ""
+          AttemptId = ""; DependencyChallengeIds = []
+          ExpectedTaskVersion = 0; ExpectedAttemptVersion = 0
+          ExpectedAgentVersion = 0; AssignmentGeneration = 0
           Conditions = []; Evidence = ""; Reason = ""; Outcome = "" }
 
     [<McpServerTool(Title = "create challenge", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false);
@@ -2044,4 +2055,49 @@ type JarvisMcpTools =
         let body =
             { command with ChallengeId = challengeId
                            ExpectedVersion = expectedVersion; Reason = reason }
+        McpToolHelpers.send client http (ChallengeWriteCommand body)
+
+
+    [<McpServerTool(Title = "block on challenges", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false);
+      McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]""");
+      Description("Block your currently assigned task attempt with an explicit reason and zero to sixteen challenge dependencies. The agent becomes unassigned NeedsWork; task ownership and reviews are preserved, with a durable dependency record and immutable lifecycle audit. Supply the exact canonical task, attempt, agent versions and assignment generation. Does not resume or launch another agent.")>]
+    static member BlockOnChallenges(
+        projectName: string, taskId: string, attemptId: string, agentId: string,
+        reason: string, challengeIds: string array,
+        expectedTaskVersion: int, expectedAttemptVersion: int, expectedAgentVersion: int,
+        assignmentGeneration: int,
+        [<Optional; DefaultParameterValue("")>] operationId: string,
+        [<Optional; DefaultParameterValue("")>] deviceId: string,
+        client: ClientService, http: IHttpContextAccessor
+    ) =
+        let cmd = JarvisMcpTools.ChallengeWrite(projectName, agentId, "BlockAttempt", operationId)
+        let body =
+            { cmd with
+                TaskId = taskId; AttemptId = attemptId; Reason = reason
+                DependencyChallengeIds = if isNull challengeIds then [] else challengeIds |> Array.toList
+                ExpectedTaskVersion = expectedTaskVersion
+                ExpectedAttemptVersion = expectedAttemptVersion
+                ExpectedAgentVersion = expectedAgentVersion
+                AssignmentGeneration = assignmentGeneration }
+        McpToolHelpers.send client http (ChallengeWriteCommand body)
+
+    [<McpServerTool(Title = "requeue challenge-blocked attempt", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false);
+      McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]""");
+      Description("Explicitly requeue your own challenge-blocked task attempt after every linked challenge is Satisfied. Atomically release the wait, increment assignment generation, issue new instructions and set the owner Ready (never Working); rejects cancelled or incomplete dependencies and stale versions. Requires current task/attempt/agent versions and generation.")>]
+    static member RequeueChallengeBlockedAttempt(
+        projectName: string, taskId: string, attemptId: string, agentId: string,
+        expectedTaskVersion: int, expectedAttemptVersion: int, expectedAgentVersion: int,
+        assignmentGeneration: int, reason: string,
+        [<Optional; DefaultParameterValue("")>] operationId: string,
+        [<Optional; DefaultParameterValue("")>] deviceId: string,
+        client: ClientService, http: IHttpContextAccessor
+    ) =
+        let cmd = JarvisMcpTools.ChallengeWrite(projectName, agentId, "RequeueAttempt", operationId)
+        let body =
+            { cmd with
+                TaskId = taskId; AttemptId = attemptId; Reason = reason
+                ExpectedTaskVersion = expectedTaskVersion
+                ExpectedAttemptVersion = expectedAttemptVersion
+                ExpectedAgentVersion = expectedAgentVersion
+                AssignmentGeneration = assignmentGeneration }
         McpToolHelpers.send client http (ChallengeWriteCommand body)

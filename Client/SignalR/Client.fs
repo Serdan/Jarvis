@@ -121,7 +121,13 @@ let private activatesAgent (agentId: string) command =
               "SetAttemptSource"; "SubmitIntegration"; "CompleteIntegration" ]
     | TaskReadCommand cmd ->
         String.IsNullOrWhiteSpace cmd.AgentId || cmd.AgentId = agentId
-    | ChallengeReadCommand cmd -> cmd.ActorId = agentId
+    // Challenge inspection is observational. ReadOnly MCP methods must
+    // never activate a Ready assignment or change canonical ledger state.
+    | ChallengeReadCommand _ -> false
+    // Blocking an assigned task needs to preserve the exact supplied attempt
+    // and agent CAS versions. It is an explicit lifecycle transition, not a
+    // cheap read that should implicitly start Ready->Working first.
+    | ChallengeWriteCommand cmd when cmd.Action = "BlockAttempt" || cmd.Action = "RequeueAttempt" -> false
     | ChallengeWriteCommand cmd -> cmd.ActorId = agentId
     | LedgerWriteCommand _ | ReviewWriteCommand _
     | RetryPendingIntentCommand _ | SupersedePendingIntentCommand _

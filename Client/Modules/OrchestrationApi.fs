@@ -2441,6 +2441,18 @@ module ChallengeApi =
                                     ChallengeWorkflow.ChallengeWorkflow.cancel binding operationId cmd.ActorId
                                         cmd.ChallengeId cmd.ExpectedVersion cmd.Reason
                                     |> mapError
+                                | "BlockAttempt" ->
+                                    ChallengeWorkflow.ChallengeWorkflow.blockAttempt binding operationId cmd.ActorId
+                                        cmd.TaskId cmd.AttemptId
+                                        cmd.ExpectedTaskVersion cmd.ExpectedAttemptVersion cmd.ExpectedAgentVersion
+                                        cmd.AssignmentGeneration cmd.Reason cmd.DependencyChallengeIds
+                                    |> mapError
+                                | "RequeueAttempt" ->
+                                    ChallengeWorkflow.ChallengeWorkflow.requeueAttempt binding operationId cmd.ActorId
+                                        cmd.TaskId cmd.AttemptId
+                                        cmd.ExpectedTaskVersion cmd.ExpectedAttemptVersion cmd.ExpectedAgentVersion
+                                        cmd.AssignmentGeneration cmd.Reason
+                                    |> mapError
                                 | _ -> Error(Client.ValidationError "Unsupported challenge mutation.")
                             record)
                 result |> Result.map (fun receipt ->

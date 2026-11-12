@@ -274,6 +274,18 @@ type InboxTask =
       Attempt: ReviewAttempt }
 
 [<CLIMutable>]
+type AttemptChallengeWait =
+    { TaskId: string
+      AttemptId: string
+      OwnerAgentId: string
+      Reason: string
+      ChallengeIds: string list
+      Status: string
+      Version: int
+      BlockedAtUtc: string
+      RequeuedAtUtc: string }
+
+[<CLIMutable>]
 type AgentInbox =
     { SnapshotCommit: string
       Agent: ReviewAgent
@@ -284,6 +296,7 @@ type AgentInbox =
       RunnableQueue: InboxTask list
       Parked: InboxTask list
       Blocked: InboxTask list
+      BlockedChallengeWaits: AttemptChallengeWait list
       PendingReviews: BranchReview list
       AvailableReviews: BranchReview list
       UnacknowledgedFeedback: ReviewFeedbackNotice list
@@ -407,13 +420,15 @@ module ReviewWorkflow =
                         && (let mutable kind = Unchecked.defaultof<JsonElement>
                             root.TryGetProperty("kind", &kind) && kind.ValueKind = JsonValueKind.String)
                     | "IntegrationSubmission" -> status "status" [ "Pending"; "Integrated" ]
+                    | "AttemptChallengeWait" -> status "status" [ "Waiting"; "Requeued" ]
                     | "ReviewFeedbackNotice" -> status "status" [ "Accepted"; "ChangesRequested" ]
                     | "AgentCheckpoint" -> status "kind" [ "Yield"; "Completion"; "Recovery"; "Progress"; "Submission"; "Revision" ]
                     | "TaskLifecycleEvent" ->
-                        status "action" [ "ParkAttempt"; "BlockAttempt"; "ResumeAttempt"; "CancelTask";
+                        status "action" [ "WaitOnChallenges"; "RequeueChallengeBlockedAttempt";
+                                          "ParkAttempt"; "BlockAttempt"; "ResumeAttempt"; "CancelTask";
                                           "AbandonAttempt"; "TransferOwner"; "CloseTask"; "ReopenTask" ]
                     | "AssignmentIssue" ->
-                        status "reason" [ "Assignment"; "ReviewChanges"; "CompletionRequeue"; "Recovery"; "ExplicitReissue"; "AdministrativeResume"; "OwnershipTransfer"; "SpecAdoption" ]
+                        status "reason" [ "ChallengeUnblock"; "Assignment"; "ReviewChanges"; "CompletionRequeue"; "Recovery"; "ExplicitReissue"; "AdministrativeResume"; "OwnershipTransfer"; "SpecAdoption" ]
                     | "AssignmentReceipt" -> true
                     | _ -> true
                 if not unique then Error "Duplicate entity JSON member."
@@ -429,6 +444,8 @@ module ReviewWorkflow =
     let private specPath taskId = $"tasks/{taskId}/spec.html"
     let private importPath taskId sequence = $"tasks/{taskId}/imports/{sequence}.json"
     let private attemptPath taskId attemptId = $"tasks/{taskId}/attempts/{attemptId}.json"
+    let private challengeWaitPath taskId attemptId =
+        $"tasks/{taskId}/attempts/{attemptId}/challenge-wait.json"
     let private checkpointPath taskId attemptId sequence =
         $"tasks/{taskId}/attempts/{attemptId}/checkpoints/{sequence}.json"
     let private issuePath taskId attemptId generation =
@@ -2035,6 +2052,13 @@ module ReviewWorkflow =
                        generation = generation; reason = reason |})
                 (fun snapshot -> result {
                     let! task, taskOid, attempt, attemptOid = getAttempt binding snapshot taskId
+                    if action = "ResumeAttempt" && attempt.Phase = "Blocked" then
+                        let! wait = read<AttemptChallengeWait> binding snapshot (challengeWaitPath taskId attempt.AttemptId)
+                        match wait with
+                        | Some (record, _) when record.Status = "Waiting" ->
+                            return! Error(StaleEntityVersion
+                                "Challenge-blocked attempt must be requeued via RequeueChallengeBlockedAttempt after verifying every dependency.")
+                        | _ -> ()
                     if task.Version <> expectedTaskVersion
                        || not (task.Lifecycle = "InProgress"
                                || (task.Lifecycle = "Closed" && action = "AbandonAttempt"))
@@ -2499,6 +2523,23 @@ module ReviewWorkflow =
                         && agent.Execution <> "Working")
                     let parked = owned |> List.filter (fun entry -> entry.Attempt.Phase = "Deferred")
                     let blocked = owned |> List.filter (fun entry -> entry.Attempt.Phase = "Blocked")
+                    let mutable blockedWaits = []
+                    for entry in blocked do
+                        let! waiting = read<AttemptChallengeWait> binding snapshot
+                                          (challengeWaitPath entry.Task.TaskId entry.Attempt.AttemptId)
+                        match waiting with
+                        | None -> ()
+                        | Some (record, _) when record.Status = "Requeued" ->
+                            // Historical wait record: a later administrative
+                            // block may be unrelated to this completed fence.
+                            ()
+                        | Some (record, _) ->
+                            if record.TaskId <> entry.Task.TaskId
+                               || record.AttemptId <> entry.Attempt.AttemptId
+                               || record.OwnerAgentId <> agentId
+                               || record.Status <> "Waiting" then
+                                return! Error(LedgerIntegrityError "Blocked challenge dependency record disagrees with its attempt.")
+                            blockedWaits <- record :: blockedWaits
                     let reviewOrder (review: BranchReview) =
                         review.CreatedSequence, review.TaskId, review.ReviewId
                     let pending = pending |> List.sortBy reviewOrder
@@ -2513,6 +2554,7 @@ module ReviewWorkflow =
                           RunnableQueue = runnable
                           Parked = parked
                           Blocked = blocked
+                          BlockedChallengeWaits = List.rev blockedWaits
                           PendingReviews = pending
                           AvailableReviews = available
                           UnacknowledgedFeedback = feedback |> List.sortBy (fun notice -> notice.DecisionSequence)

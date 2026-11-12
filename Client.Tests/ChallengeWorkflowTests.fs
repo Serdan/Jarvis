@@ -81,6 +81,20 @@ type ChallengeTests() =
         let snapshot = LedgerStore.fetch binding |> ok
         ReviewWorkflow.pendingNotifications binding snapshot "Agent 3" |> ok
 
+    let assignment binding task =
+        ReviewWorkflow.createTask binding (Guid.NewGuid()) task task |> ok |> ignore
+        let attemptId = Guid.NewGuid().ToString("N")
+        ReviewWorkflow.assignTask binding (Guid.NewGuid()) task (Guid.Parse attemptId) "Agent 3"
+        |> ok |> ignore
+        ReviewWorkflow.beginAttempt binding (Guid.NewGuid()) task "Agent 3" 1 1
+        |> ok |> ignore
+        let _, taskRecord, maybeAttempt = ReviewWorkflow.getTask binding task |> ok
+        let attempt = maybeAttempt.Value
+        let inbox = ReviewWorkflow.getAgentInbox binding "Agent 3" |> ok
+        Assert.That(inbox.Agent.State, Is.EqualTo("Working"))
+        taskRecord.Version, attempt.Version, inbox.Agent.Version, attemptId
+
+
     [<Test>]
     member _.TwoOwnersCompleteOnlyAfterAllConditionsAndNotifyExactlyOnce() =
         withFixture (fun a b ->
@@ -214,4 +228,145 @@ type ChallengeTests() =
             Assert.That(finished.Challenge.Status, Is.EqualTo("Satisfied"))
             Assert.That(finished.Challenge.Conditions.Length, Is.EqualTo(2))
             Assert.That(notices a |> List.length, Is.EqualTo(1))
+        )
+
+
+    [<Test>]
+    member _.TwoDependentChallengesRequireExplicitRequeueWithoutLosingAttemptOrOwnership() =
+        withFixture (fun a b ->
+            let task = "blocked-by-challenges"
+            let taskVersion, attemptVersion, agentVersion, attemptId = assignment a task
+            let first =
+                ChallengeWorkflow.create a (Guid.NewGuid()) "Agent 3" "Integrate" task
+                    [ { OwnerAgentId = "Lead"; Description = "Review accepted" } ] |> ok
+            let second =
+                ChallengeWorkflow.create b (Guid.NewGuid()) "Agent 3" "Benchmark" task
+                    [ { OwnerAgentId = "Agent 8"; Description = "Native pass" } ] |> ok
+            let dependencyIds = [ first.ChallengeId; second.ChallengeId ]
+            let blockOp = Guid.NewGuid()
+            let blocked =
+                ChallengeWorkflow.blockAttempt a blockOp "Agent 3" task attemptId
+                    taskVersion attemptVersion agentVersion 1 "Waiting for approvals" dependencyIds |> ok
+            Assert.That(blocked.AlreadyApplied, Is.False)
+            Assert.That((ChallengeWorkflow.blockAttempt b blockOp "Agent 3" task attemptId
+                            taskVersion attemptVersion agentVersion 1 "Waiting for approvals" dependencyIds
+                         |> ok).AlreadyApplied, Is.True)
+            let inbox = ReviewWorkflow.getAgentInbox b "Agent 3" |> ok
+            Assert.That(inbox.Agent.State, Is.EqualTo("NeedsWork"))
+            Assert.That(inbox.Agent.CurrentAssignment, Is.Null)
+            Assert.That(inbox.Blocked.Length, Is.EqualTo(1))
+            Assert.That(inbox.Blocked[0].Attempt.AttemptId, Is.EqualTo(attemptId))
+            Assert.That(inbox.BlockedChallengeWaits.Length, Is.EqualTo(1))
+            Assert.That(inbox.BlockedChallengeWaits[0].ChallengeIds, Is.EqualTo(dependencyIds :> obj))
+            Assert.That(inbox.BlockedChallengeWaits[0].Reason, Is.EqualTo("Waiting for approvals"))
+            let _, taskAfter, attemptAfter = ReviewWorkflow.getTask b task |> ok
+            Assert.That(taskAfter.Lifecycle, Is.EqualTo("InProgress"))
+            Assert.That(attemptAfter.Value.Phase, Is.EqualTo("Blocked"))
+            Assert.That(attemptAfter.Value.OwnerAgentId, Is.EqualTo("Agent 3"))
+            Assert.That(attemptAfter.Value.AssignmentGeneration, Is.EqualTo(1))
+            let av = inbox.Agent.Version
+            let tv = taskAfter.Version
+            let pv = attemptAfter.Value.Version
+            // The old generic administrative resume path must not be able to
+            // bypass a challenge dependency fence.
+            failStale (ReviewWorkflow.changeAttemptAdministrationAs b "AuthenticatedUser" (Guid.NewGuid())
+                        task "ResumeAttempt" tv pv av 1 "ignore dependencies")
+            failStale (ChallengeWorkflow.requeueAttempt b (Guid.NewGuid()) "Agent 3" task attemptId
+                        tv pv av 1 "still waiting")
+            ChallengeWorkflow.resolve b (Guid.NewGuid()) "Lead" first.ChallengeId
+                first.ConditionIds.Head 1 "review:accepted" "" |> ok |> ignore
+            failStale (ChallengeWorkflow.requeueAttempt a (Guid.NewGuid()) "Agent 3" task attemptId
+                        tv pv av 1 "partial")
+            ChallengeWorkflow.resolve a (Guid.NewGuid()) "Agent 8" second.ChallengeId
+                second.ConditionIds.Head 1 "benchmark:pass" "" |> ok |> ignore
+            let stillBlocked = ReviewWorkflow.getAgentInbox a "Agent 3" |> ok
+            Assert.That(stillBlocked.Blocked.Length, Is.EqualTo(1))
+            Assert.That(stillBlocked.Agent.State, Is.EqualTo("NeedsWork"),
+                "Challenge completion may notify, never implicitly requeue or launch the owner.")
+            let requeueOp = Guid.NewGuid()
+            let requeued = ChallengeWorkflow.requeueAttempt b requeueOp "Agent 3" task attemptId
+                                tv pv av 1 "Review and benchmark done" |> ok
+            Assert.That(requeued.AlreadyApplied, Is.False)
+            Assert.That((ChallengeWorkflow.requeueAttempt a requeueOp "Agent 3" task attemptId
+                            tv pv av 1 "Review and benchmark done" |> ok).AlreadyApplied, Is.True)
+            let ready = ReviewWorkflow.getAgentInbox a "Agent 3" |> ok
+            Assert.That(ready.Agent.State, Is.EqualTo("Ready"))
+            Assert.That(ready.Agent.Execution, Is.EqualTo("Stopped"))
+            Assert.That(ready.Agent.CurrentAssignment.AttemptId, Is.EqualTo(attemptId))
+            Assert.That(ready.Blocked, Is.Empty)
+            Assert.That(ready.BlockedChallengeWaits, Is.Empty)
+            Assert.That(ready.RunnableQueue.Length, Is.EqualTo(1))
+            Assert.That(ready.RunnableQueue.Head.Attempt.AssignmentGeneration, Is.EqualTo(2))
+            Assert.That(ready.RunnableQueue.Head.Attempt.IssuedSequence, Is.EqualTo(requeued.Operation.Sequence))
+            let _, history = ReviewWorkflow.getTaskLifecycleHistory b task |> ok
+            Assert.That(history |> List.exists (fun item -> item.Action = "WaitOnChallenges"), Is.True)
+            Assert.That(history |> List.exists (fun item -> item.Action = "RequeueChallengeBlockedAttempt"), Is.True)
+            ReviewWorkflow.beginAttempt b (Guid.NewGuid()) task "Agent 3"
+                ready.RunnableQueue.Head.Attempt.Version 2 |> ok |> ignore
+            let started = ReviewWorkflow.getAgentInbox a "Agent 3" |> ok
+            Assert.That(started.Agent.State, Is.EqualTo("Working"))
+            Assert.That(started.Focused.Value.Attempt.AttemptId, Is.EqualTo(attemptId))
+        )
+
+    [<Test>]
+    member _.CancelledOrPartiallySatisfiedDependencyCannotRequeueUntilEveryChallengeSucceeds() =
+        withFixture (fun a b ->
+            let task = "cancelled-challenge-gate"
+            let tv, pv, av, attemptId = assignment a task
+            let first = ChallengeWorkflow.create a (Guid.NewGuid()) "Agent 3" "Needed" task
+                            [ { OwnerAgentId = "Lead"; Description = "Approval" } ] |> ok
+            let second = ChallengeWorkflow.create b (Guid.NewGuid()) "Agent 3" "Might cancel" task
+                             [ { OwnerAgentId = "Agent 8"; Description = "Native" } ] |> ok
+            let deps = [first.ChallengeId;second.ChallengeId]
+            let id = Guid.NewGuid()
+            ChallengeWorkflow.blockAttempt a id "Agent 3" task attemptId tv pv av 1 "dependencies" deps
+            |> ok |> ignore
+            let blocked = ReviewWorkflow.getAgentInbox b "Agent 3" |> ok
+            let pv2 = blocked.Blocked.Head.Attempt.Version
+            let av2 = blocked.Agent.Version
+            failStale (ChallengeWorkflow.requeueAttempt a (Guid.NewGuid()) "Agent 3" task attemptId
+                        tv pv2 av2 1 "not done")
+            ChallengeWorkflow.cancel b (Guid.NewGuid()) "Agent 3" second.ChallengeId 1
+                "No longer available" |> ok |> ignore
+            ChallengeWorkflow.resolve a (Guid.NewGuid()) "Lead" first.ChallengeId
+                first.ConditionIds.Head 1 "done" "" |> ok |> ignore
+            failStale (ChallengeWorkflow.requeueAttempt a (Guid.NewGuid()) "Agent 3" task attemptId
+                        tv pv2 av2 1 "cancelled must not count as satisfied")
+            let still = ReviewWorkflow.getAgentInbox a "Agent 3" |> ok
+            Assert.That(still.Agent.State, Is.EqualTo("NeedsWork"))
+            Assert.That(still.Blocked.Length, Is.EqualTo(1))
+            Assert.That(still.BlockedChallengeWaits.Head.ChallengeIds.Length, Is.EqualTo(2))
+            // Prevent an unrelated agent from editing the current owner attempt.
+            match ChallengeWorkflow.requeueAttempt b (Guid.NewGuid()) "Agent 8" task attemptId
+                      tv pv2 1 1 "spoofed requeue" with
+            | Error _ -> ()
+            | Ok _ -> Assert.Fail("Non-owner requeued a blocked task.")
+        )
+
+    [<Test>]
+    member _.ManualZeroDependencyBlockCanBeRequeuedExplicitlyAndRejectsStaleOrDuplicateIds() =
+        withFixture (fun a b ->
+            let task = "manual-block"
+            let tv, pv, av, attemptId = assignment a task
+            let invalid = Guid.NewGuid().ToString("N")
+            match ChallengeWorkflow.blockAttempt a (Guid.NewGuid()) "Agent 3" task attemptId
+                      tv pv av 1 "duplicate" [invalid; invalid] with
+            | Error(InvalidBinding _) -> ()
+            | other -> Assert.Fail(sprintf "Expected duplicate dependency rejection: %A" other)
+            let op = Guid.NewGuid()
+            ChallengeWorkflow.blockAttempt a op "Agent 3" task attemptId
+                tv pv av 1 "Waiting for user input" [] |> ok |> ignore
+            let blocked = ReviewWorkflow.getAgentInbox a "Agent 3" |> ok
+            Assert.That(blocked.Agent.State, Is.EqualTo("NeedsWork"))
+            Assert.That(blocked.BlockedChallengeWaits.Head.ChallengeIds, Is.Empty)
+            Assert.That(blocked.BlockedChallengeWaits.Head.Reason, Is.EqualTo("Waiting for user input"))
+            failStale (ChallengeWorkflow.requeueAttempt b (Guid.NewGuid()) "Agent 3" task attemptId
+                        tv pv blocked.Agent.Version 1 "outdated attempt version")
+            let nowAttempt = blocked.Blocked.Head.Attempt.Version
+            ChallengeWorkflow.requeueAttempt b (Guid.NewGuid()) "Agent 3" task attemptId
+                tv nowAttempt blocked.Agent.Version 1 "Manual condition cleared" |> ok |> ignore
+            let ready = ReviewWorkflow.getAgentInbox a "Agent 3" |> ok
+            Assert.That(ready.Agent.State, Is.EqualTo("Ready"))
+            Assert.That(ready.Agent.Execution, Is.EqualTo("Stopped"))
+            Assert.That(ready.RunnableQueue.Head.Attempt.AssignmentGeneration, Is.EqualTo(2))
         )

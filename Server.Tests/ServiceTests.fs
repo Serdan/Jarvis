@@ -470,7 +470,8 @@ let ``command catalog matches AgentCommand union and MCP tools`` () =
               "CompleteTask"; "GetTaskHistory"; "CompareWorktreeTasks"; "GetAgentAssignment"
               "AcknowledgeTask"; "GetOrchestrationSnapshot"; "RetireWorktree"; "BeginTask" ]
     // Orphan-ledger MCP tools route through eight versioned internal wire commands.
-    let ledgerWire = set [ "TaskRead"; "TaskWrite"; "ReviewRead"; "ReviewWrite"; "LedgerRead"; "LedgerWrite" ]
+    let ledgerWire = set [ "TaskRead"; "TaskWrite"; "ReviewRead"; "ReviewWrite";
+                          "LedgerRead"; "LedgerWrite"; "ChallengeRead"; "ChallengeWrite" ]
     let orchestrationTools =
         set [ "GetIntegrationSubmissions"; "SubmitIntegration"; "CompleteIntegration"; "NotifyAgent"; "AcknowledgeNotification"; "AgentInbox"; "GetAssignment"; "GetCheckpoint"; "InspectAttemptSource"; "TaskLifecycleHistory"; "GetTaskSpecPage"; "DiffTaskSpec"; "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "ReissueAssignment"; "CheckpointAttempt"
               "SetAttemptSource"; "YieldAgent"; "CompleteAgentWork"
@@ -481,6 +482,8 @@ let ``command catalog matches AgentCommand union and MCP tools`` () =
               "LedgerHealth"; "GetOperationStatus"; "PendingOperations"; "ReconcilePendingOperations"
               "PendingOperationSummary"; "PendingOperationsPage"; "InspectPendingOperation"
               "AcknowledgePendingOperation"; "InitializeLedger"; "BindExistingLedger"; "RebindLedgerRemote"
+              "CreateChallenge"; "ListChallenges"; "GetChallenge"; "ResolveChallengeCondition"
+              "ReopenChallengeCondition"; "CancelChallenge"; "BlockOnChallenges"; "RequeueChallengeBlockedAttempt"
               ]
     // Retired wire cases are deleted; public CreateTask/AssignTask are canonical ledger tools.
     unionNames |> shouldEqual catalogNames
@@ -565,7 +568,8 @@ let ``client-backed MCP tools expose an optional per-command deviceId`` () =
             |> Array.exists (fun parameter -> parameter.ParameterType = typeof<ClientService>))
     // Three additional read-only pending recovery views are public aliases
     // of LedgerRead; retry/supersede have distinct wire definitions.
-    clientMethods.Length |> shouldEqual (AgentProtocol.commandDefinitions.Length - 1 + 51)
+    // ChallengeRead/Write add two wire cases but eight public MCP aliases.
+    clientMethods.Length |> shouldEqual (AgentProtocol.commandDefinitions.Length - 1 + 57)
     for methodInfo in clientMethods do
         let deviceParam = methodInfo.GetParameters() |> Array.tryFind (fun parameter -> parameter.Name = "deviceId")
         match deviceParam with
@@ -983,7 +987,12 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
                   name, ledgerRead
               for name in [ "SubmitReview"; "ClaimReview"; "DecideReview"
                             "ReleaseReview"; "WithdrawReview"; "PutReviewDocument" ] ->
-                  name, ledgerWrite ]
+                  name, ledgerWrite
+              for name in [ "ListChallenges"; "GetChallenge" ] ->
+                  name, original["ChallengeRead"]
+              for name in [ "CreateChallenge"; "ResolveChallengeCondition"; "ReopenChallengeCondition"
+                            "CancelChallenge"; "BlockOnChallenges"; "RequeueChallengeBlockedAttempt" ] ->
+                  name, original["ChallengeWrite"] ]
         aliases |> List.fold (fun map (key, value) -> Map.add key value map) original
 
     let methods =

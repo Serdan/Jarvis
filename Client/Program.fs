@@ -209,16 +209,11 @@ let private runClient args =
                     let failure = timing.FailureType |> Option.defaultValue "none"
                     tui.Log $"MCP command {timing.CorrelationId}: queueMs={timing.QueueMilliseconds:F0} executionAndReplyMs={timing.ExecutionMilliseconds:F0} failureType={failure}")
 
-    let replyUnhandled (correlationId: string) (error: exn) : Task =
+    let replyUnhandled (correlationId: string) (commandJson: string) (error: exn) : Task =
         task {
             // The exception might follow a completed mutation. Never claim
             // that execution failed atomically or suggest blind replay.
-            let uncertain : AgentCommandResponse =
-                { Result = None
-                  Error =
-                    Some(ExecutionFailed
-                        "Jarvis client command terminated unexpectedly; the outcome may be committed. Verify the original operation ID before retrying a mutation.")
-                  Instructions = []; AgentStateChanges = []; InboxActivation = None }
+            let uncertain = CommandDispatchRecovery.unexpectedResponse commandJson
             let! send =
                 ResponseDelivery.sendWithReconnectRetry
                     (TimeSpan.FromMinutes 2.0)
@@ -240,7 +235,7 @@ let private runClient args =
                         if commandMs >= 200.0 || replyMs >= 1000.0 || not delivered then
                             tui.Log
                                 $"MCP stage {id}: commandMs={commandMs:F0} replyMs={replyMs:F0} replyAck={delivered}")),
-            (fun error -> replyUnhandled correlationId error)) then
+            (fun error -> replyUnhandled correlationId commandJson error)) then
             Task.CompletedTask
         else
             // No command was executed. Reply with an explicit overload error;
@@ -262,6 +257,9 @@ let private runClient args =
         connection.On<string, string, string>("ReceiveCommand", Func<string, string, string, Task>(receiveQueued))
         connection.On<string, string array>("InvalidateAgentStates", Func<string, string array, Task>(fun project agentIds ->
             Client.invalidateAgentStates rt project agentIds
+            Task.CompletedTask))
+        connection.On("InvalidateAllAgentStates", Func<Task>(fun () ->
+            Client.invalidateAllAgentStates rt
             Task.CompletedTask))
     }
 

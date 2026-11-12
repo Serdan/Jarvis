@@ -2,8 +2,30 @@ namespace Client.SignalR
 
 open System
 open System.Diagnostics
+open System.Text.Json
 open System.Threading.Channels
 open System.Threading.Tasks
+open Common
+
+/// Reconstruct a safe, correlated fallback without claiming a partially
+/// executed command made no changes. Never replay a write after this error.
+module CommandDispatchRecovery =
+    let unexpectedResponse (commandJson: string) : AgentCommandResponse =
+        let operationId =
+            try
+                JsonSerializer.Deserialize<AgentCommand>(commandJson)
+                |> AgentCommandInfo.recoveryOperationId
+            with _ -> None
+        { Result = None
+          Error =
+            Some(UncertainOutcome
+                { Message = "Jarvis client command terminated unexpectedly; the outcome may already be committed. Check the original operation ID before retrying."
+                  OperationId = operationId })
+          Instructions = []
+          // A zero-length list is only a known subset here, NOT confirmed zero.
+          // The typed UncertainOutcome controls public state-evidence metadata.
+          AgentStateChanges = []
+          InboxActivation = None }
 
 // A command must leave SignalR's receive callback before any local work
 // starts. Even Task-returning callbacks serialize subsequent notifications.

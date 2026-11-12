@@ -71,6 +71,7 @@ module ProjectNotificationRouting =
         | Some(ValidationFailed _) -> "ledger binding or project validation failed"
         | Some(Conflict _) -> "ledger health conflict"
         | Some(ExecutionFailed _) -> "ledger health execution failed or timed out"
+        | Some(UncertainOutcome _) -> "ledger health outcome is uncertain"
         | Some(OutputTruncated _) -> "ledger health response truncated"
         | Some(ConfirmationRequired _) -> "unexpected ledger health confirmation"
         | Some(LedgerFailure failure) -> $"ledger health failed ({failure.Code})"
@@ -129,6 +130,16 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
             |> Array.map (fun connectionId ->
                 ctx.Clients.Client(connectionId).InvalidateAgentStates(projectName, unique))
             |> Task.WhenAll
+
+    // A client exception after a possible mutation cannot identify all
+    // affected agents. Invalidate every cached agent for THIS authenticated
+    // user's registered devices, rather than declaring zero changes.
+    member _.InvalidateAllAgentStatesForUser(userId: string) : Task =
+        users.ListDevices(userId)
+        |> AgentStateInvalidationRouting.recipients
+        |> Array.map (fun connectionId ->
+            ctx.Clients.Client(connectionId).InvalidateAllAgentStates())
+        |> Task.WhenAll
 
     member private this.ResponseTimeout(command: AgentCommand) =
         let permissionMargin = TimeSpan.FromMinutes(5L)
@@ -241,8 +252,9 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                                     { Result = None
                                       Error =
                                         Some(
-                                            ExecutionFailed
-                                                $"{reason} Protocol {session.ProtocolVersion}, client {session.ClientVersion}, last seen {session.LastSeenAt:O}."
+                                            UncertainOutcome
+                                                { Message = $"{reason} Protocol {session.ProtocolVersion}, client {session.ClientVersion}, last seen {session.LastSeenAt:O}."
+                                                  OperationId = AgentCommandInfo.recoveryOperationId command }
                                         )
                                       Instructions = []; AgentStateChanges = []; InboxActivation = None }
                         with ex ->
@@ -266,7 +278,10 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                                 users.RecordDispatchFailure(userId, connectionId, reason)
                                 return
                                     { Result = None
-                                      Error = Some(ExecutionFailed reason)
+                                      Error =
+                                        Some(UncertainOutcome
+                                            { Message = reason
+                                              OperationId = AgentCommandInfo.recoveryOperationId command })
                                       Instructions = []; AgentStateChanges = []; InboxActivation = None }
         }
 

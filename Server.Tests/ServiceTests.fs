@@ -801,6 +801,37 @@ let mcp_project_tool_responses_always_expose_canonical_state_change_evidence () 
     Assert.That(effects.RootElement.TryGetProperty("agentInboxActivation", &absent), Is.False)
 
 [<Test>]
+let uncertain_mutation_response_does_not_claim_authoritative_empty_state_changes () =
+    let operationId = Guid.NewGuid().ToString("D")
+    let response : AgentCommandResponse =
+        { Result = None
+          Error =
+            Some(UncertainOutcome
+                { Message = "The local command ended after an unknown execution point."
+                  OperationId = Some operationId })
+          Instructions = []
+          AgentStateChanges = []
+          InboxActivation = None }
+    let restored =
+        JsonSerializer.Deserialize<AgentCommandResponse>(JsonSerializer.Serialize response)
+    Assert.That(AgentStateEvidence.isUnknown restored, Is.True)
+    let exposed =
+        restored
+        |> McpToolHelpers.toCallToolResult
+        |> McpToolHelpers.attachStateEffects restored
+    Assert.That(exposed.IsError, Is.EqualTo(Nullable true))
+    Assert.That(exposed.Meta["jarvis/agent_state_changes_status"].GetValue<string>(), Is.EqualTo("unknown"))
+    Assert.That(exposed.Meta["jarvis/recovery_operation_id"].GetValue<string>(), Is.EqualTo(operationId))
+    Assert.That(exposed.Meta.ContainsKey("jarvis/agent_state_changes"), Is.False,
+        "An empty known subset is not authoritative zero changes after a possible commit.")
+    use body = JsonDocument.Parse((exposed.Content[1] :?> TextContentBlock).Text)
+    Assert.That(body.RootElement.GetProperty("agentStateChangesStatus").GetString(), Is.EqualTo("unknown"))
+    Assert.That(body.RootElement.GetProperty("originalOperationId").GetString(), Is.EqualTo(operationId))
+    let mutable omitted = Unchecked.defaultof<JsonElement>
+    Assert.That(body.RootElement.TryGetProperty("agentStateChanges", &omitted), Is.False)
+    Assert.That((exposed.Content[0] :?> TextContentBlock).Text, Does.Contain(operationId))
+
+[<Test>]
 let cross_project_notify_merges_preflight_and_destination_state_changes () =
     let sourceActivation : AgentInboxActivation =
         { ProjectName = "Wayfold"; AgentId = "Worker 1"
@@ -1467,7 +1498,8 @@ let client_request_abort_cancels_outstanding_device_correlation_without_faulting
                     else
                         tracker.Complete(correlationId, user, connection, registered.Generation, expected) |> ignore
                     Task.CompletedTask
-                member _.InvalidateAgentStates(_, _) = Task.CompletedTask }
+                member _.InvalidateAgentStates(_, _) = Task.CompletedTask
+                member _.InvalidateAllAgentStates() = Task.CompletedTask }
         let clients =
             { new Microsoft.AspNetCore.SignalR.IHubClients<Common.SignalR.IClientService> with
                 member _.All = recipient

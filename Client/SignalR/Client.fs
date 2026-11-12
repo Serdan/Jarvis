@@ -647,6 +647,7 @@ let receiveCommandWithInstructions (rt: Runtime) command =
 let processIncomingCommand (rt: Runtime) (commandJson: string) (agentId: string) =
     task {
         let mutable parsedCommand = None
+        let mutable unexpectedFailure = false
         let mutable instructions: InstructionDocument list = []
         let mutable implicitChanges: string list = []
         let mutable inboxActivation: AgentInboxActivation option = None
@@ -719,6 +720,7 @@ let processIncomingCommand (rt: Runtime) (commandJson: string) (agentId: string)
                                     @ checkWorkingGuidance rt localAgentId target command
                             return result
                 with ex ->
+                    unexpectedFailure <- true
                     return Error(ExceptionError ex)
             }
         // The metadata is independent of the requested command outcome. A
@@ -739,6 +741,14 @@ let processIncomingCommand (rt: Runtime) (commandJson: string) (agentId: string)
             match parsedCommand with
             | Some command -> toAgentResponse command instructions changes inboxActivation response
             | None -> toAgentResponse ListCommandsCommand [] changes inboxActivation response
+        let agentResponse =
+            if unexpectedFailure then
+                // Even an exception caught by the command handler may occur
+                // after a ledger commit. Preserve any known activation and
+                // mark all remaining state effects as UNKNOWN.
+                { agentResponse with
+                    Error = (CommandDispatchRecovery.unexpectedResponse commandJson).Error }
+            else agentResponse
         return parsedCommand, (response |> Result.map (fun outcome -> outcome.Payload)), agentResponse
     }
 

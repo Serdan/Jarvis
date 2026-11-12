@@ -296,6 +296,50 @@ module DispatchProbeTests =
     }
 
     [<Test>]
+    let ``mutate then throw keeps original correlation and recovery operation ID without replay`` () = task {
+        let operationId = Guid.NewGuid().ToString("D")
+        let command : Common.AgentCommand =
+            Common.LedgerWriteCommand
+                { ProjectName = "Jarvis"; Action = "Write"
+                  OperationId = operationId; ProjectId = ""; LedgerId = ""
+                  Epoch = 0; RemoteName = ""; ApprovedFetchUrl = ""
+                  ApprovedPushUrl = ""; ExpectedTrustedHead = ""
+                  ExpectedRequestHash = ""; AcknowledgeVisibility = false }
+        let commandJson = System.Text.Json.JsonSerializer.Serialize command
+        let captured =
+            TaskCompletionSource<string * Common.AgentCommandResponse>(
+                TaskCreationOptions.RunContinuationsAsynchronously)
+        let mutable committedWrites = 0
+        let queue = CommandDispatchQueue(1, 4, (fun _ -> ()))
+        let correlationId = "original-correlation"
+        let execute () : Task =
+            Interlocked.Increment(&committedWrites) |> ignore
+            // Crash after a simulated durable mutation but before the
+            // regular response can be serialized or acknowledged.
+            Task.FromException(InvalidOperationException("failure after commit"))
+        let recover (_: exn) : Task =
+            let response = CommandDispatchRecovery.unexpectedResponse commandJson
+            captured.TrySetResult((correlationId, response)) |> ignore
+            Task.CompletedTask
+        Assert.That(queue.TrySubmit(correlationId, execute, recover), Is.True)
+        let! originalCorrelation, response = captured.Task.WaitAsync(TimeSpan.FromSeconds 5.0)
+        do! queue.Complete().WaitAsync(TimeSpan.FromSeconds 5.0)
+        Assert.That(originalCorrelation, Is.EqualTo(correlationId))
+        Assert.That(committedWrites, Is.EqualTo(1), "A failed response must not replay a mutation.")
+        Assert.That(Common.AgentStateEvidence.isUnknown response, Is.True)
+        match response.Error with
+        | Some(Common.UncertainOutcome info) ->
+            Assert.That(info.OperationId, Is.EqualTo(Some operationId))
+            Assert.That(info.Message, Does.Contain("may already be committed"))
+        | other -> Assert.Fail(sprintf "Expected typed uncertainty, got %A" other)
+        let restored =
+            System.Text.Json.JsonSerializer.Deserialize<Common.AgentCommandResponse>(
+                System.Text.Json.JsonSerializer.Serialize response)
+        Assert.That(Common.AgentStateEvidence.isUnknown restored, Is.True)
+        Assert.That(queue.TrySubmit(correlationId, execute, recover), Is.False)
+    }
+
+    [<Test>]
     let ``a blocked accepted command fails on disconnect and new work recovers after reconnect`` () = task {
         let builder = WebApplication.CreateBuilder()
         builder.WebHost.UseUrls("http://127.0.0.1:0") |> ignore

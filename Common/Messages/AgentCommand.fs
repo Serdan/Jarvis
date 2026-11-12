@@ -144,7 +144,10 @@ type ChallengeReadCommand =
     { ProjectName: string
       ActorId: string
       Action: string
-      ChallengeId: string }
+      ChallengeId: string
+      Limit: int
+      AfterChallengeId: string
+      ExpectedSnapshotCommit: string }
 
 type ChallengeWriteCommand =
     { ProjectName: string

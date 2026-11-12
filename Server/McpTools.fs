@@ -1988,12 +1988,17 @@ type JarvisMcpTools =
       Description("List challenges issued to or assigned to this registered agent, including their current Pending, Blocked, Satisfied or Cancelled status. No implicit state changes.")>]
     static member ListChallenges(
         projectName: string, agentId: string,
+        [<Optional; DefaultParameterValue(50)>] limit: int,
+        [<Optional; DefaultParameterValue("")>] afterChallengeId: string,
+        [<Optional; DefaultParameterValue("")>] expectedSnapshotCommit: string,
         [<Optional; DefaultParameterValue("")>] deviceId: string,
         client: ClientService, http: IHttpContextAccessor
     ) =
         McpToolHelpers.send client http
             (ChallengeReadCommand { ProjectName = projectName; ActorId = agentId
-                                    Action = "List"; ChallengeId = "" })
+                                    Action = "List"; ChallengeId = ""
+                                    Limit = limit; AfterChallengeId = afterChallengeId
+                                    ExpectedSnapshotCommit = expectedSnapshotCommit })
 
     [<McpServerTool(Title = "get challenge", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false);
       McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]""");
@@ -2005,7 +2010,8 @@ type JarvisMcpTools =
     ) =
         McpToolHelpers.send client http
             (ChallengeReadCommand { ProjectName = projectName; ActorId = agentId
-                                    Action = "Get"; ChallengeId = challengeId })
+                                    Action = "Get"; ChallengeId = challengeId
+                                    Limit = 0; AfterChallengeId = ""; ExpectedSnapshotCommit = "" })
 
     [<McpServerTool(Title = "resolve challenge condition", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false);
       McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]""");

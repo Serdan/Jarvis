@@ -2394,7 +2394,8 @@ module ChallengeApi =
         |> Result.bind (fun binding ->
             match cmd.Action with
             | "List" ->
-                ChallengeWorkflow.ChallengeWorkflow.list binding cmd.ActorId
+                ChallengeWorkflow.ChallengeWorkflow.listPage binding cmd.ActorId
+                    cmd.Limit cmd.AfterChallengeId cmd.ExpectedSnapshotCommit
                 |> mapError |> Result.map box
             | "Get" ->
                 ChallengeWorkflow.ChallengeWorkflow.get binding cmd.ActorId cmd.ChallengeId

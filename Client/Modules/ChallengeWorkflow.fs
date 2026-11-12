@@ -57,9 +57,24 @@ type ChallengeDetails =
       History: ChallengeEvent list }
 
 [<CLIMutable>]
+type ChallengeSummary =
+    { ChallengeId: string
+      IssuerAgentId: string
+      Title: string
+      TaskId: string
+      Status: string
+      Version: int
+      TotalConditions: int
+      PendingConditions: int
+      BlockedConditions: int
+      SatisfiedConditions: int
+      OwnedUnresolvedConditionIds: string list }
+
+[<CLIMutable>]
 type ChallengeList =
     { SnapshotCommit: string
-      Challenges: AgentChallenge list }
+      Challenges: ChallengeSummary list
+      NextCursor: string }
 
 [<CLIMutable>]
 type ChallengeCreated =
@@ -178,6 +193,36 @@ module ChallengeWorkflow =
             | Some _ -> ()
             | None -> return! Error(StaleEntityVersion "Challenge task context no longer exists.")
     }
+
+    /// Notifications have a strict 4 KiB ledger limit. Preserve every
+    /// condition's result in a compact summary and retain full evidence in
+    /// the challenge record and immutable audit events.
+    let private compact maxBytes (value: string) =
+        let input =
+            if isNull value then ""
+            else value.Replace("\r", " ").Replace("\n", " ")
+        if Encoding.UTF8.GetByteCount(input) <= maxBytes then input
+        else
+            let builder = StringBuilder()
+            let mutable count = 0
+            for rune in input.EnumerateRunes() do
+                if count + rune.Utf8SequenceLength <= maxBytes - 3 then
+                    builder.Append(rune.ToString()) |> ignore
+                    count <- count + rune.Utf8SequenceLength
+            builder.ToString() + "..."
+
+    let private completionNotice (challenge: AgentChallenge) =
+        let header =
+            $"Challenge '{compact 120 challenge.Title}' is satisfied ({challenge.ChallengeId})."
+        let results =
+            challenge.Conditions
+            |> List.mapi (fun index condition ->
+                $"{index + 1}. {compact 24 condition.OwnerAgentId}: {compact 24 condition.Description}; evidence: {compact 36 condition.Evidence}")
+            |> String.concat "\n"
+        header + "\n" + results + "\nFull evidence: get_challenge."
+
+    let private blockedNotice (challenge: AgentChallenge) actor evidence reason =
+        $"Challenge '{compact 120 challenge.Title}' blocked ({challenge.ChallengeId}); {compact 40 actor}: {compact 512 reason}. Evidence: {compact 512 evidence}. Full history: get_challenge."
 
     let private emitNotification (id: Guid) issuer taskId message timestamp : LedgerFileChange =
         let notification : AgentNotification =
@@ -318,17 +363,11 @@ module ChallengeWorkflow =
                               OccurredAtUtc = timestamp }
                         let extra =
                             if kind = "ResolveChallengeCondition" && nextStatus = "Satisfied" then
-                                let resultText =
-                                    nextConditions |> List.map (fun c ->
-                                        $"{c.OwnerAgentId}: {c.Description} (evidence: {c.Evidence})")
-                                    |> String.concat "; "
                                 [ emitNotification operationId challenge.IssuerAgentId challenge.TaskId
-                                    ($"Challenge '{challenge.Title}' is satisfied ({challengeId}). {resultText}")
-                                    timestamp ]
+                                    (completionNotice nextRecord) timestamp ]
                             elif kind = "ResolveChallengeCondition" && nextStatus = "Blocked" then
                                 [ emitNotification operationId challenge.IssuerAgentId challenge.TaskId
-                                    ($"Challenge '{challenge.Title}' blocked ({challengeId}); {actor}: {reason}. Evidence: {evidence}")
-                                    timestamp ]
+                                    (blockedNotice nextRecord actor evidence reason) timestamp ]
                             else []
                         return [ change (path id) (Some blob) nextRecord
                                  change (eventPath id snapshot.Header.NextSequence) None event ]
@@ -367,17 +406,54 @@ module ChallengeWorkflow =
         return records
     }
 
-    let list binding actor = result {
-        if not (agentId actor) then return! Error(InvalidBinding "Actor identity required.")
-        let! snapshot = LedgerStore.fetch binding
-        do! registered binding snapshot actor
-        let! all = listAt binding snapshot
-        return
-            { SnapshotCommit = snapshot.Commit
-              Challenges =
-                all |> List.filter (accessible actor)
-                    |> List.sortBy (fun c -> c.CreatedAtUtc, c.ChallengeId) }
-    }
+    /// Bounded cursor paging prevents a project with many large evidence
+    /// records from overflowing the MCP response. Titles and unresolved IDs
+    /// suffice to discover work; full evidence stays in get_challenge.
+    let listPage binding actor limit cursor expectedSnapshot =
+        if not (agentId actor) || limit < 1 || limit > 50
+           || (not (String.IsNullOrWhiteSpace cursor) && (guidN cursor).IsNone)
+           || (not (String.IsNullOrWhiteSpace expectedSnapshot)
+               && (expectedSnapshot.Length <> 40
+                   || not (expectedSnapshot |> Seq.forall Uri.IsHexDigit))) then
+            Error(InvalidBinding "Challenge list needs a registered actor, page size 1-50, and an optional canonical cursor/snapshot.")
+        else result {
+            let! snapshot = LedgerStore.fetch binding
+            if not (String.IsNullOrWhiteSpace expectedSnapshot)
+               && snapshot.Commit <> expectedSnapshot then
+                return! Error(StaleEntityVersion "Challenge list snapshot moved; start pagination again.")
+            do! registered binding snapshot actor
+            let! all = listAt binding snapshot
+            let sorted =
+                all
+                |> List.filter (accessible actor)
+                |> List.filter (fun challenge ->
+                    String.IsNullOrWhiteSpace cursor
+                    || String.CompareOrdinal(challenge.ChallengeId, cursor) > 0)
+                |> List.sortBy _.ChallengeId
+                |> List.truncate (limit + 1)
+            let page = sorted |> List.truncate limit
+            let summaries =
+                page |> List.map (fun c ->
+                    { ChallengeId = c.ChallengeId
+                      IssuerAgentId = c.IssuerAgentId
+                      Title = compact 160 c.Title
+                      TaskId = c.TaskId
+                      Status = c.Status; Version = c.Version
+                      TotalConditions = c.Conditions.Length
+                      PendingConditions = c.Conditions |> List.filter (fun x -> x.Status = "Pending") |> List.length
+                      BlockedConditions = c.Conditions |> List.filter (fun x -> x.Status = "Blocked") |> List.length
+                      SatisfiedConditions = c.Conditions |> List.filter (fun x -> x.Status = "Satisfied") |> List.length
+                      OwnedUnresolvedConditionIds =
+                        c.Conditions
+                        |> List.filter (fun x -> x.OwnerAgentId = actor && x.Status <> "Satisfied")
+                        |> List.map _.ConditionId })
+            return
+                { SnapshotCommit = snapshot.Commit
+                  Challenges = summaries
+                  NextCursor = if sorted.Length > limit then (page |> List.last).ChallengeId else null }
+        }
+
+    let list binding actor = listPage binding actor 50 "" ""
 
     let get binding actor challengeId =
         match guidN challengeId with

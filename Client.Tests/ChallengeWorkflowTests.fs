@@ -370,3 +370,83 @@ type ChallengeTests() =
             Assert.That(ready.Agent.Execution, Is.EqualTo("Stopped"))
             Assert.That(ready.RunnableQueue.Head.Attempt.AssignmentGeneration, Is.EqualTo(2))
         )
+
+
+    [<Test>]
+    member _.LongEvidenceAndAllConditionsFitDurableNotificationBudget() =
+        withFixture (fun a b ->
+            let title = String('T', 2048)
+            let description = String('D', 2048)
+            let evidence = String('E', 8192)
+            let first =
+                ChallengeWorkflow.create a (Guid.NewGuid()) "Agent 3" title ""
+                    [ { OwnerAgentId = "Lead"; Description = description }
+                      { OwnerAgentId = "Agent 8"; Description = description } ] |> ok
+            ChallengeWorkflow.resolve b (Guid.NewGuid()) "Lead" first.ChallengeId
+                first.ConditionIds.Head 1 evidence "" |> ok |> ignore
+            ChallengeWorkflow.resolve a (Guid.NewGuid()) "Agent 8" first.ChallengeId
+                first.ConditionIds.Tail.Head 2 evidence "" |> ok |> ignore
+            let doneNotice = notices b
+            Assert.That(doneNotice.Length, Is.EqualTo(1))
+            let body = doneNotice.Head.Message
+            Assert.That(System.Text.Encoding.UTF8.GetByteCount(body), Is.LessThanOrEqualTo(4096))
+            Assert.That(body, Does.Contain("1. Lead:"))
+            Assert.That(body, Does.Contain("2. Agent 8:"))
+            Assert.That(body, Does.Contain("Full evidence: get_challenge"))
+            let details = get b "Agent 3" first.ChallengeId
+            Assert.That(details.Challenge.Status, Is.EqualTo("Satisfied"))
+            Assert.That(details.Challenge.Conditions |> List.forall (fun c -> c.Evidence.Length = 8192), Is.True)
+            let blocked =
+                ChallengeWorkflow.create a (Guid.NewGuid()) "Agent 3" title ""
+                    [ { OwnerAgentId = "Lead"; Description = description } ] |> ok
+            let reason = String('R', 4096)
+            ChallengeWorkflow.resolve b (Guid.NewGuid()) "Lead" blocked.ChallengeId
+                blocked.ConditionIds.Head 1 evidence reason |> ok |> ignore
+            let notifications = notices a
+            Assert.That(notifications.Length, Is.EqualTo(2))
+            let blockedNotice = notifications |> List.find (fun n -> n.Message.Contains("blocked"))
+            Assert.That(System.Text.Encoding.UTF8.GetByteCount(blockedNotice.Message), Is.LessThanOrEqualTo(4096))
+            Assert.That(blockedNotice.Message, Does.Contain("Full history: get_challenge"))
+            let blockedEntity = get a "Agent 3" blocked.ChallengeId
+            Assert.That(blockedEntity.Challenge.Status, Is.EqualTo("Blocked"))
+            Assert.That(blockedEntity.Challenge.Conditions.Head.Reason.Length, Is.EqualTo(4096))
+            Assert.That(blockedEntity.Challenge.Conditions.Head.Evidence.Length, Is.EqualTo(8192))
+        )
+
+
+    [<Test>]
+    member _.ChallengeListPagesAreBoundedAndSnapshotPinned() =
+        withFixture (fun a b ->
+            let title = String('T', 2048)
+            let created =
+                [ for index in 1 .. 3 ->
+                    ChallengeWorkflow.create a (Guid.NewGuid()) "Agent 3" (title + string index) ""
+                        [ { OwnerAgentId = "Lead"; Description = "Check stage" } ] ]
+            // Max title size is 2048 bytes: use a valid bounded title.
+            Assert.That(created |> List.forall Result.isError, Is.True)
+            let ids =
+                [ for index in 1 .. 3 ->
+                    (ChallengeWorkflow.create a (Guid.NewGuid()) "Agent 3" title ""
+                         [ { OwnerAgentId = "Lead"; Description = $"Step {index}" } ] |> ok).ChallengeId ]
+            let first = ChallengeWorkflow.listPage b "Agent 3" 1 "" "" |> ok
+            Assert.That(first.Challenges.Length, Is.EqualTo(1))
+            Assert.That(first.NextCursor, Is.Not.Empty)
+            Assert.That(System.Text.Encoding.UTF8.GetByteCount(first.Challenges.Head.Title), Is.LessThanOrEqualTo(160))
+            Assert.That(first.Challenges.Head.OwnedUnresolvedConditionIds, Is.Empty)
+            let second = ChallengeWorkflow.listPage a "Agent 3" 1 first.NextCursor first.SnapshotCommit |> ok
+            Assert.That(second.Challenges.Length, Is.EqualTo(1))
+            Assert.That(second.NextCursor, Is.Not.Empty)
+            let third = ChallengeWorkflow.listPage b "Agent 3" 1 second.NextCursor first.SnapshotCommit |> ok
+            Assert.That(third.Challenges.Length, Is.EqualTo(1))
+            Assert.That(third.NextCursor, Is.Null)
+            let returned = [first; second; third] |> List.collect _.Challenges |> List.map _.ChallengeId
+            Assert.That(returned |> Set.ofList, Is.EqualTo((ids |> Set.ofList) :> obj))
+            match ChallengeWorkflow.listPage a "Agent 3" 51 "" "" with
+            | Error(InvalidBinding _) -> ()
+            | other -> Assert.Fail($"Expected list page limit rejection: {other}")
+            ChallengeWorkflow.create a (Guid.NewGuid()) "Agent 3" "new" ""
+                [ { OwnerAgentId = "Lead"; Description = "Extra" } ] |> ok |> ignore
+            match ChallengeWorkflow.listPage b "Agent 3" 1 first.NextCursor first.SnapshotCommit with
+            | Error(StaleEntityVersion _) -> ()
+            | other -> Assert.Fail($"Expected snapshot-pinned page failure after mutation: {other}")
+        )

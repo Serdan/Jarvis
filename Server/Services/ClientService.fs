@@ -1,6 +1,9 @@
 namespace Server.Services
 
 open System
+open System.Collections.Generic
+open System.Diagnostics
+open System.Diagnostics.Metrics
 open System.Threading
 open System.Threading.Tasks
 open System.Text.Json
@@ -8,7 +11,27 @@ open Common
 open Common.SignalR
 open Microsoft.AspNetCore.SignalR
 open Microsoft.AspNetCore.Http
+open Microsoft.Extensions.Logging
 open Microsoft.FSharp.Core
+
+// Bounded-cardinality production metrics for every dispatch. The correlation
+// ID is deliberately NOT a metric label; only the finite command and outcome
+// domains are tags. Slow requests are correlated through structured logs.
+module private ServerDispatchTelemetry =
+    let meter = new Meter("Jarvis.Server.Dispatch")
+    let route = meter.CreateHistogram<float>("jarvis.server.dispatch.route.ms", "ms")
+    let send = meter.CreateHistogram<float>("jarvis.server.dispatch.signalr_send.ms", "ms")
+    let reply = meter.CreateHistogram<float>("jarvis.server.dispatch.reply_wait.ms", "ms")
+    let total = meter.CreateHistogram<float>("jarvis.server.dispatch.total.ms", "ms")
+
+    let record commandName outcome routeMs sendMs replyMs totalMs =
+        let tags =
+            [| KeyValuePair<string, obj>("command", box commandName)
+               KeyValuePair<string, obj>("outcome", box outcome) |]
+        route.Record(routeMs, tags)
+        send.Record(sendMs, tags)
+        reply.Record(replyMs, tags)
+        total.Record(totalMs, tags)
 
 module ProjectNotificationRouting =
     // The client's LedgerApi accepts "Health", not the public MCP tool name
@@ -97,6 +120,7 @@ module ProjectNotificationRouting =
         | Some(ValidationFailed _) -> "ledger binding or project validation failed"
         | Some(Conflict _) -> "ledger health conflict"
         | Some(ExecutionFailed _) -> "ledger health execution failed or timed out"
+        | Some(UncertainOutcome _) -> "ledger health outcome is uncertain"
         | Some(OutputTruncated _) -> "ledger health response truncated"
         | Some(ConfirmationRequired _) -> "unexpected ledger health confirmation"
         | Some(LedgerFailure failure) -> $"ledger health failed ({failure.Code})"
@@ -141,7 +165,7 @@ module AgentStateInvalidationRouting =
                 project, (changes |> List.map _.AgentId |> List.distinct |> List.toArray))
 
 
-type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserService, tracker: ClientResponseTracker, http: IHttpContextAccessor) =
+type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserService, tracker: ClientResponseTracker, http: IHttpContextAccessor, logger: ILogger<ClientService>) =
     member this.SendMessageToAll(message) = ctx.Clients.All.ReceiveMessage(message)
 
     // Typed, per-agent invalidation only reaches authenticated registered
@@ -156,6 +180,16 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                 ctx.Clients.Client(connectionId).InvalidateAgentStates(projectName, unique))
             |> Task.WhenAll
 
+    // A client exception after a possible mutation cannot identify all
+    // affected agents. Invalidate every cached agent for THIS authenticated
+    // user's registered devices, rather than declaring zero changes.
+    member _.InvalidateAllAgentStatesForUser(userId: string) : Task =
+        users.ListDevices(userId)
+        |> AgentStateInvalidationRouting.recipients
+        |> Array.map (fun connectionId ->
+            ctx.Clients.Client(connectionId).InvalidateAllAgentStates())
+        |> Task.WhenAll
+
     member private this.ResponseTimeout(command: AgentCommand) =
         let permissionMargin = TimeSpan.FromMinutes(5L)
         match command with
@@ -166,6 +200,7 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
 
     member this.SendCommandToUser(userId: string, command: AgentCommand, ?conversationId: string, ?deviceId: string, ?agentId: string) =
         task {
+            let requestAcceptedAt = Stopwatch.GetTimestamp()
             let requestAborted =
                 match http.HttpContext with
                 | null -> CancellationToken.None
@@ -222,14 +257,43 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                         let correlationId, trackingTask = tracker.Register(userId, connectionId, session.Generation, this.ResponseTimeout command)
                         let client = ctx.Clients.Client(connectionId)
                         let commandJson = JsonSerializer.Serialize<AgentCommand>(command)
+                        let routeMs = Stopwatch.GetElapsedTime(requestAcceptedAt).TotalMilliseconds
+                        let mutable sendMs = 0.0
+                        let mutable replyMs = 0.0
+                        let report outcome =
+                            let totalMs = Stopwatch.GetElapsedTime(requestAcceptedAt).TotalMilliseconds
+                            // Telemetry must never alter mutation semantics or hide
+                            // an actual response because a logging sink failed.
+                            try
+                                ServerDispatchTelemetry.record commandName outcome routeMs sendMs replyMs totalMs
+                                if totalMs >= 2000.0 || outcome <> "completed" then
+                                    logger.LogInformation(
+                                        "MCP dispatch {CorrelationId} {Command} {Outcome}: routeMs={RouteMs:F1} signalrSendMs={SendMs:F1} replyWaitMs={ReplyMs:F1} totalMs={TotalMs:F1}",
+                                        correlationId, commandName, outcome, routeMs, sendMs, replyMs, totalMs)
+                            with _ ->
+                                ()
 
+                        let mutable replyStartedAt = None
+                        let dispatchAt = Stopwatch.GetTimestamp()
                         try
                             do! client.ReceiveCommand(correlationId, commandJson, defaultArg agentId "").WaitAsync(requestAborted)
+                            sendMs <- Stopwatch.GetElapsedTime(dispatchAt).TotalMilliseconds
                             users.RecordDispatchSuccess(userId, connectionId)
 
+                            let awaitReplyAt = Stopwatch.GetTimestamp()
+                            replyStartedAt <- Some awaitReplyAt
                             try
-                                return! trackingTask.WaitAsync(requestAborted)
+                                let! response = trackingTask.WaitAsync(requestAborted)
+                                replyMs <- Stopwatch.GetElapsedTime(awaitReplyAt).TotalMilliseconds
+                                report "completed"
+                                return response
                             with :? TaskCanceledException when not requestAborted.IsCancellationRequested ->
+                                replyMs <- Stopwatch.GetElapsedTime(awaitReplyAt).TotalMilliseconds
+                                let outcome =
+                                    match users.GetSessionByConnection(connectionId) with
+                                    | ValueSome active when active.State = Registered && active.Generation = session.Generation -> "tracker-timeout"
+                                    | _ -> "disconnected"
+                                report outcome
                                 let reason =
                                     $"Client response timeout for {session.DeviceName} generation {session.Generation}."
                                 users.RecordDispatchFailure(userId, connectionId, reason)
@@ -237,24 +301,36 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                                     { Result = None
                                       Error =
                                         Some(
-                                            ExecutionFailed
-                                                $"{reason} Protocol {session.ProtocolVersion}, client {session.ClientVersion}, last seen {session.LastSeenAt:O}."
+                                            UncertainOutcome
+                                                { Message = $"{reason} Protocol {session.ProtocolVersion}, client {session.ClientVersion}, last seen {session.LastSeenAt:O}."
+                                                  OperationId = AgentCommandInfo.recoveryOperationId command }
                                         )
                                       Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
                         with ex ->
+                            match replyStartedAt with
+                            | Some started when replyMs = 0.0 ->
+                                replyMs <- Stopwatch.GetElapsedTime(started).TotalMilliseconds
+                            | None ->
+                                sendMs <- Stopwatch.GetElapsedTime(dispatchAt).TotalMilliseconds
+                            | _ -> ()
                             tracker.Cancel(correlationId)
                             if requestAborted.IsCancellationRequested then
+                                report "upstream-abort"
                                 // The caller is gone, not the device. Keep
                                 // the client session healthy and remove the
                                 // now-unobservable correlation promptly.
                                 return raise (OperationCanceledException(requestAborted))
                             else
+                                report "signalr-send-failure"
                                 let reason =
                                     $"Dispatch failed for {session.DeviceName} generation {session.Generation}: {ex.Message}"
                                 users.RecordDispatchFailure(userId, connectionId, reason)
                                 return
                                     { Result = None
-                                      Error = Some(ExecutionFailed reason)
+                                      Error =
+                                        Some(UncertainOutcome
+                                            { Message = reason
+                                              OperationId = AgentCommandInfo.recoveryOperationId command })
                                       Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
         }
 

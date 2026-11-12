@@ -73,15 +73,28 @@ module ResponseDelivery =
 
             while result.IsNone && stopwatch.Elapsed < timeout do
                 if connectionState() = HubConnectionState.Connected then
-                    let! attempt = send()
+                    let remaining = timeout - stopwatch.Elapsed
+                    if remaining > TimeSpan.Zero then
+                        // A single InvokeAsync can hang while the connection
+                        // appears healthy. Bound the invocation itself, not
+                        // just the retry loop. A timed-out invocation may
+                        // still complete later, so NEVER retry it.
+                        let! attempt = task {
+                            try
+                                return! (send()).WaitAsync(remaining)
+                            with ex ->
+                                return Error ex
+                        }
 
-                    match attempt with
-                    | Ok() ->
-                        result <- Some(Ok())
-                    | Error ex when isRetryable (connectionState()) ex ->
-                        lastError <- Some ex
-                    | Error ex ->
-                        result <- Some(Error ex)
+                        match attempt with
+                        | Ok() ->
+                            result <- Some(Ok())
+                        | Error (:? TimeoutException as ex) ->
+                            result <- Some(Error ex)
+                        | Error ex when isRetryable (connectionState()) ex ->
+                            lastError <- Some ex
+                        | Error ex ->
+                            result <- Some(Error ex)
 
                 if result.IsNone then
                     let remaining = timeout - stopwatch.Elapsed

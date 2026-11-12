@@ -198,11 +198,68 @@ let private runClient args =
     connection.KeepAliveInterval <- TimeSpan.FromSeconds 10.0
     connection.ServerTimeout <- TimeSpan.FromSeconds 60.0
 
+    let dispatch =
+        CommandDispatchQueue(
+            8,
+            128,
+            fun timing ->
+                if timing.QueueMilliseconds >= 200.0
+                   || timing.ExecutionMilliseconds >= 2000.0
+                   || timing.FailureType.IsSome then
+                    let failure = timing.FailureType |> Option.defaultValue "none"
+                    tui.Log $"MCP command {timing.CorrelationId}: queueMs={timing.QueueMilliseconds:F0} executionAndReplyMs={timing.ExecutionMilliseconds:F0} failureType={failure}")
+
+    let replyUnhandled (correlationId: string) (commandJson: string) (error: exn) : Task =
+        task {
+            // The exception might follow a completed mutation. Never claim
+            // that execution failed atomically or suggest blind replay.
+            let uncertain = CommandDispatchRecovery.unexpectedResponse commandJson
+            let! send =
+                ResponseDelivery.sendWithReconnectRetry
+                    (TimeSpan.FromMinutes 2.0)
+                    (TimeSpan.FromMilliseconds 250.0)
+                    (fun () -> connection.State)
+                    (fun () -> connection.invokeAsync("SendClientResponse", correlationId, uncertain))
+            match send with
+            | Ok () -> ()
+            | Error deliveryError ->
+                tui.Log $"MCP command {correlationId}: unhandledType={error.GetType().Name} recoveryReplyType={deliveryError.GetType().Name}"
+        }
+
+    let receiveQueued correlationId commandJson agentId : Task =
+        if dispatch.TrySubmit(
+            correlationId,
+            (fun () ->
+                Client.receiveCommandAndReplyWithTiming connection rt correlationId commandJson agentId
+                    (fun id commandMs replyMs delivered ->
+                        if commandMs >= 200.0 || replyMs >= 1000.0 || not delivered then
+                            tui.Log
+                                $"MCP stage {id}: commandMs={commandMs:F0} replyMs={replyMs:F0} replyAck={delivered}")),
+            (fun error -> replyUnhandled correlationId commandJson error)) then
+            Task.CompletedTask
+        else
+            // No command was executed. Reply with an explicit overload error;
+            // SendCoreAsync does not await a hub invocation completion on
+            // SignalR's single receive callback.
+            let rejected : AgentCommandResponse =
+                { Result = None
+                  Error = Some(ExecutionFailed "Jarvis client dispatch capacity exhausted; this command was not executed.")
+                  Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+            task {
+                try
+                    do! connection.SendCoreAsync("SendClientResponse", [| box correlationId; box rejected |], CancellationToken.None)
+                with error ->
+                    tui.Log $"MCP overload response {correlationId} delivery failed ({error.GetType().Name})."
+            } :> Task
+
     ignoreAll {
         connection.On<string>("ReceiveMessage", Func<string, Task>(Client.receiveMessage rt))
-        connection.On<string, string, string>("ReceiveCommand", Func<string, string, string, Task>(Client.receiveCommandAndReply connection rt))
+        connection.On<string, string, string>("ReceiveCommand", Func<string, string, string, Task>(receiveQueued))
         connection.On<string, string array>("InvalidateAgentStates", Func<string, string array, Task>(fun project agentIds ->
             Client.invalidateAgentStates rt project agentIds
+            Task.CompletedTask))
+        connection.On("InvalidateAllAgentStates", Func<Task>(fun () ->
+            Client.invalidateAllAgentStates rt
             Task.CompletedTask))
     }
 
@@ -266,6 +323,11 @@ let private runClient args =
                     ()
 
         cts.Cancel()
+        // Keep the connection alive while accepted work and its replies drain.
+        try
+            do! dispatch.Complete().WaitAsync(TimeSpan.FromMinutes 2.0)
+        with :? TimeoutException ->
+            tui.Log "MCP dispatch shutdown exceeded two minutes; some command outcomes may be uncertain."
         do! connection.DisposeAsync()
 
         activityStore

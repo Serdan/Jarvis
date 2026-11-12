@@ -108,3 +108,24 @@ let ``response delivery times out while connection remains unavailable`` () =
     | Error (:? TimeoutException) -> ()
     | Error ex -> Assert.Fail($"Expected TimeoutException, got {ex.GetType().Name}.")
     | Ok() -> Assert.Fail("Expected timeout.")
+
+[<Test>]
+let ``an in flight reply invocation is bounded and never replayed on timeout`` () = task {
+    let mutable attempts = 0
+    let pending = TaskCompletionSource<Result<unit, exn>>(TaskCreationOptions.RunContinuationsAsynchronously)
+    let send () =
+        attempts <- attempts + 1
+        pending.Task
+    let! result =
+        ResponseDelivery.sendWithReconnectRetry
+            (TimeSpan.FromMilliseconds 40.0)
+            (TimeSpan.FromMilliseconds 1.0)
+            (fun () -> HubConnectionState.Connected)
+            send
+    match result with
+    | Error (:? TimeoutException) -> ()
+    | Error ex -> Assert.Fail($"Expected bounded timeout, got {ex.GetType().Name}.")
+    | Ok () -> Assert.Fail("A pending invocation cannot be acknowledged.")
+    Assert.That(attempts, Is.EqualTo(1), "Never retry a command response with an uncertain send.")
+    pending.TrySetResult(Ok()) |> ignore
+}

@@ -20,7 +20,7 @@ SSH verified live Nginx `nginx -T` and `nginx -t` (effective existing configurat
 | Nginx | **1.28.0 (Ubuntu)**, Certbot TLS termination, TLSv1.2/TLSv1.3; HTTP 80 redirects; `worker_processes auto`, `worker_connections 768` |
 | Routes | Static `/downloads/` and privacy routes; catch-all `location /` proxies `/mcp`, `/client`, OAuth metadata, exports and remaining routes to local Kestrel |
 | Proxy | HTTP/1.1, Upgrade/Connection forwarding; `proxy_read_timeout 3600`, `proxy_send_timeout 3600`, `proxy_connect_timeout 60` (seconds) |
-| Effective HTTP limits | No explicit `limit_req`, `limit_conn`, zones, header/body/keepalive/handshake timeout overrides or body-size override. **Nginx defaults still apply**: 60s header read, 60s body inter-read, 75s idle keepalive, 1-MiB HTTP request body, `proxy_request_buffering on`, `proxy_buffering on` |
+| Effective HTTP limits | No explicit `limit_req`, `limit_conn`, zones, header/body/keepalive timeout overrides or body-size override. **Nginx defaults still apply**: 60s `client_header_timeout` (also bounds HTTP TLS handshake time), 60s body inter-read, 75s idle keepalive, 1-MiB HTTP request body, `proxy_request_buffering on`, `proxy_buffering on` |
 | Host snapshot | Load average ~0.13/0.12/0.07, shown RAM 456 MiB total and ~203 MiB available, ~62 MiB swap used; root filesystem 74 percent used (~2.3 GiB free); ~43–49 established TCP sessions in two separate idle snapshots |
 | Services | `jarvis.service` active, ~172 MiB cgroup memory, `Restart=always`, no explicit cgroup memory high/max; Nginx active ~15 MiB memory; Nginx logrotate file present |
 | Kernel | `net.core.somaxconn=4096`, `tcp_max_syn_backlog=128`, `nf_conntrack_max=4096`. Nginx's 768 worker-connection setting also counts upstream sockets, not 768 guaranteed independent users |
@@ -30,7 +30,7 @@ SSH verified live Nginx `nginx -T` and `nginx -t` (effective existing configurat
 ## Threats and design limits
 
 - **Network floods:** DigitalOcean provides always-on volumetric/protocol protection on OSI L3/L4. This does not defend against HTTP GET/POST floods or slow pre-auth HTTP work.
-- **Stalled connections:** Nginx is event driven and already enforces defaults. Reducing TLS negotiation/header deadlines can reclaim sockets sooner, but high-latency clients must be tested. `client_body_timeout` measures inactivity **between reads**, not the total upload duration; a trickle attack can still persist.
+- **Stalled connections:** Nginx is event driven and already enforces defaults. In its HTTPS **HTTP** module, `client_header_timeout` also bounds TLS handshake time; reducing that deadline can reclaim sockets sooner, but high-latency clients must be tested. `client_body_timeout` measures inactivity **between reads**, not the total upload duration; a trickle attack can still persist.
 - **Request body abuse:** the current default 1-MiB body limit and `proxy_request_buffering on` bound some upstream exposure, but buffering can consume Nginx disk. Never raise body limits without accounting for temporary storage.
 - **Well-formed unauthorized floods:** Nginx still accepts TLS and proxies the request; the application evaluates OAuth after work is incurred. No magic local timeout eliminates valid-looking L7 request floods. A distributed attacker could exhaust CPU, memory and finite Nginx worker connections.
 - **Public paths:** `/downloads/` and some ASP.NET discovery/export routes legitimately accept anonymous traffic. Export URLs may include bearer-like path components; do not emit raw URLs/tokens in telemetry.
@@ -44,9 +44,8 @@ This is an **additive illustrative snippet**, not a complete replacement vhost o
 
 ```nginx
 # Existing HTTPS server { ... }:
-client_header_timeout 20s;  # complete HTTP headers; default 60s
+client_header_timeout 20s;  # TLS handshake + HTTP headers; default 60s
 client_body_timeout   30s;  # gap BETWEEN successive body reads; default 60s
-ssl_handshake_timeout 20s;  # unfinished TLS negotiation; default 60s
 keepalive_timeout     30s;  # idle HTTP keepalive; NOT active SSE/WebSocket
 
 # Existing location / { ... }:
@@ -54,7 +53,7 @@ proxy_connect_timeout 5s;  # replace 60s; only TCP dial to 127.0.0.1:5095
 # Keep proxy_read_timeout 3600; proxy_send_timeout 3600;
 ```
 
-These are *candidate test values*, **not production-proven thresholds**. They are not per-IP or user rate limits. A shorter local TCP connect timeout can return 502/504 more quickly under upstream overload; shorter idle keepalive can increase connection churn. If genuine MCP clients are harmed, leave that directive unchanged. They cannot fully prevent HTTP floods.
+These are *candidate test values*, **not production-proven thresholds**. They are not per-IP or user rate limits. There is **no separate `ssl_handshake_timeout` directive in Nginx's HTTP SSL module**; that directive belongs to Nginx stream/mail contexts. For HTTP HTTPS traffic, Nginx confirms that the TLS handshake is subject to `client_header_timeout` ([upstream ticket #2235](https://trac.nginx.org/nginx/ticket/2235)). A shorter local TCP connect timeout can return 502/504 more quickly under upstream overload; shorter idle keepalive can increase connection churn. If genuine MCP clients are harmed, leave that directive unchanged. These controls cannot fully prevent HTTP floods.
 
 There is **no Nginx, Docker or Podman** binary in the local developer environment, so a realistic staging configuration/syntax check was **not possible this turn**. A separate disposable host/container running Nginx 1.28 should syntax-check the *full vhost* with certificate placeholders; a successful `nginx -t` is necessary but not sufficient for behavior. **Never** test changes by editing or reloading the live host without explicit authorization.
 
@@ -71,4 +70,4 @@ A managed **L7 WAF/HTTP DDoS edge** (Cloudflare or equivalent) is warranted if a
 
 A larger Droplet is appropriate for demonstrated *legitimate* CPU, memory or latency pressure. Raising hardware capacity does not stop intentional L7 floods. For the present single-user deployment, keep NAT-friendly unlimited authenticated flow, collect low-cost aggregate evidence, and consider the timeout experiment before committing to an edge service.
 
-**Public technical references:** [DigitalOcean DDoS Protection](https://docs.digitalocean.com/platform/ddos-protection/) (L3/L4, no L7); [NGINX HTTP core](https://nginx.org/en/docs/http/ngx_http_core_module.html) (defaults and semantics); [NGINX proxy module](https://nginx.org/en/docs/http/ngx_http_proxy_module.html) (request/response buffering); [NGINX SSL module](https://nginx.org/en/docs/http/ngx_http_ssl_module.html) (TLS handshake deadline).
+**Public technical references:** [DigitalOcean DDoS Protection](https://docs.digitalocean.com/platform/ddos-protection/) (L3/L4, no L7); [NGINX HTTP core](https://nginx.org/en/docs/http/ngx_http_core_module.html) (defaults and semantics); [NGINX proxy module](https://nginx.org/en/docs/http/ngx_http_proxy_module.html) (request/response buffering); [NGINX HTTP SSL module](https://nginx.org/en/docs/http/ngx_http_ssl_module.html) (supported HTTP HTTPS directives); [NGINX issue #2235](https://trac.nginx.org/nginx/ticket/2235) (TLS handshake timing under `client_header_timeout` in HTTP).

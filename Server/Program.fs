@@ -1,7 +1,6 @@
 #nowarn "20"
 
 open System
-open System.Threading.RateLimiting
 open System.Threading.Tasks
 open Microsoft.AspNetCore.Authentication.JwtBearer
 open Microsoft.AspNetCore.Authorization
@@ -14,11 +13,8 @@ open Microsoft.Extensions.DependencyInjection
 open Microsoft.Extensions.Hosting
 open Microsoft.Extensions.Primitives
 open ModelContextProtocol.Server
-open ModelContextProtocol.Protocol
 open Server
 open Server.Services
-
-let rateLimiterPolicy = "Fixed"
 
 let private getConfiguredOptions (configuration: IConfiguration) =
     let options =
@@ -45,7 +41,6 @@ let private getDatabasePath (configuration: IConfiguration) =
 let configureServices (services: IServiceCollection) (configuration: IConfiguration) =
     let configured = getConfiguredOptions configuration
     let databasePath = getDatabasePath configuration
-    let mcpLimits = McpLoadSettings.fromConfiguration configuration
 
     services.Configure<JarvisOptions>(configuration) |> ignore
 
@@ -102,40 +97,12 @@ let configureServices (services: IServiceCollection) (configuration: IConfigurat
     |> ignore
 
     services.AddHttpContextAccessor() |> ignore
-    services.AddSingleton<McpUserCapacity>(fun _ -> new McpUserCapacity(mcpLimits)) |> ignore
 
     services
         .AddMcpServer(fun options -> options.ServerInstructions <- InstructionGuidance.Text)
         .WithHttpTransport(fun options -> options.Stateless <- true)
         .WithRequestFilters(fun filters ->
-            filters.AddCallToolFilter(
-                McpRequestFilter<_, _>(fun next ->
-                    McpRequestHandler<_, _>(fun context cancellation ->
-                    ValueTask<ModelContextProtocol.Protocol.CallToolResult>(
-                        task {
-                            let invoke () =
-                                RequestDeviceRouting.withMetadata context.Params (fun () ->
-                                    next.Invoke(context, cancellation).AsTask())
-                            // Do not let authenticated tokens without a usable
-                            // subject bypass capacity. The tool's own identity
-                            // check still reports the missing subject normally.
-                            let subject = Auth.tryUserId context.User |> Option.defaultValue "<missing-subject>"
-                            let capacity = context.Services.GetRequiredService<McpUserCapacity>()
-                            let! admitted = capacity.Execute(subject, cancellation, invoke)
-                            match admitted with
-                            | Executed response -> return response
-                            | Busy retrySeconds ->
-                                let result = CallToolResult()
-                                result.IsError <- Nullable true
-                                result.Content <-
-                                    ResizeArray<ContentBlock>(
-                                        [ TextContentBlock(Text =
-                                            $"Jarvis MCP tool capacity is busy. Retry after {retrySeconds} seconds.") :> ContentBlock ])
-                                return result
-                        }
-                    )))
-            )
-            |> ignore)
+            filters.AddCallToolFilter(McpEndpoint.deviceRoutingFilter()) |> ignore)
         .WithTools<JarvisMcpTools>()
     |> ignore
 
@@ -157,38 +124,7 @@ let configureServices (services: IServiceCollection) (configuration: IConfigurat
         .AddScoped<ClientService>()
     |> ignore
 
-    services.AddRateLimiter(fun options ->
-        options.OnRejected <- McpSubjectRate.onRejected
-
-        options.AddPolicy(
-            rateLimiterPolicy,
-            fun context ->
-                let partitionKey =
-                    match context.Connection.RemoteIpAddress with
-                    | null -> "unknown"
-                    | address -> address.ToString()
-
-                RateLimitPartition.GetFixedWindowLimiter(
-                    partitionKey,
-                    fun _ ->
-                        let limiter = FixedWindowRateLimiterOptions()
-                        limiter.PermitLimit <- 30
-                        limiter.Window <- TimeSpan.FromSeconds(10L)
-                        limiter.QueueProcessingOrder <- QueueProcessingOrder.OldestFirst
-                        limiter.QueueLimit <- 5
-                        limiter.AutoReplenishment <- true
-                        limiter
-                )
-        )
-        |> ignore
-        // Discovery remains outside the long-lived tools/call concurrency
-        // limiter; the HTTP budget applies across all authenticated MCP
-        // requests, partitioned by token subject rather than proxy IP.
-        options.AddPolicy(
-            McpSubjectRate.Policy,
-            McpSubjectRate.partition mcpLimits)
-        |> ignore)
-    |> ignore
+    services.AddRateLimiter(HttpRateLimitProtection.configure) |> ignore
 
 let configureApp (app: WebApplication) =
     let configured = app.Services.GetRequiredService<Microsoft.Extensions.Options.IOptions<JarvisOptions>>().Value
@@ -201,7 +137,7 @@ let configureApp (app: WebApplication) =
     app
         .MapHub<HubService>("/client")
         .RequireAuthorization(Auth.ClientConnectPolicy)
-        .RequireRateLimiting(rateLimiterPolicy)
+        .RequireRateLimiting(HttpRateLimitProtection.Policy)
     |> ignore
 
     app.MapGet("/", Func<string>(fun () -> "the future is tomorrow")) |> ignore
@@ -246,13 +182,14 @@ let configureApp (app: WebApplication) =
 
                 Results.Bytes(exported.Data, exported.MimeType) :> IResult)
     )
-    |> fun endpoint -> endpoint.RequireRateLimiting(rateLimiterPolicy)
+    |> fun endpoint -> endpoint.RequireRateLimiting(HttpRateLimitProtection.Policy)
     |> ignore
 
+    // No speculative concurrency or request-rate quota applies to authenticated MCP.
     // Authenticate MCP initialization/discovery at the HTTP boundary so clients
     // receive an OAuth Bearer challenge before accessing tools. Tool-specific
     // scope checks continue to run independently inside McpTools.
-    app.MapMcp("/mcp").RequireAuthorization().RequireRateLimiting(McpSubjectRate.Policy) |> ignore
+    McpEndpoint.map app
 
     app
 

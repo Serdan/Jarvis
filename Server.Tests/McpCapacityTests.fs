@@ -1,337 +1,206 @@
 module ServerMcpCapacityTests
 
 open System
+open System.Collections.Concurrent
 open System.Net
+open System.Net.Http
+open System.Net.Sockets
 open System.Security.Claims
-open System.Threading
-open System.Threading.RateLimiting
+open System.Text
+open System.Text.Json
 open System.Threading.Tasks
 open Microsoft.AspNetCore.Builder
 open Microsoft.AspNetCore.Hosting
 open Microsoft.AspNetCore.Http
 open Microsoft.AspNetCore.RateLimiting
-open Microsoft.Extensions.Configuration
 open Microsoft.Extensions.DependencyInjection
+open ModelContextProtocol.Server
 open NUnit.Framework
 open global.Server
 
-let private settings active queued waitMs =
-    { McpLoadSettings.defaults with
-        MaxConcurrentTools = active
-        MaxQueuedTools = queued
-        QueueWaitMilliseconds = waitMs }
+// Real MCP HTTP dispatch, but only deliberately tiny in-memory test tools.
+// No external client, Git ledger, auth provider, or production droplet is involved.
+module private ProbeState =
+    let mutable gate = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+    let entered = ConcurrentQueue<int>()
+    let reset () =
+        gate <- TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        entered.Clear()
 
-let private hold () = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+[<McpServerToolType>]
+type ConcurrencyProbeTools =
+    [<McpServerTool>]
+    static member Hold(callId: int) =
+        task {
+            ProbeState.entered.Enqueue(callId)
+            do! ProbeState.gate.Task
+            return callId
+        }
 
-let private succeeded = function
-    | Executed _ -> true
-    | Busy _ -> false
+let private unusedLoopbackPort () =
+    use listener = new TcpListener(IPAddress.Loopback, 0)
+    listener.Start()
+    (listener.LocalEndpoint :?> IPEndPoint).Port
 
-[<Test>]
-let configuration_defaults_support_the_observed_activity_burst () =
-    let config = ConfigurationBuilder().AddInMemoryCollection().Build()
-    let limits = McpLoadSettings.fromConfiguration config
-    Assert.That(limits.MaxConcurrentTools, Is.EqualTo(24))
-    Assert.That(limits.MaxQueuedTools, Is.EqualTo(16))
-    Assert.That(limits.QueueWaitMilliseconds, Is.EqualTo(5000))
-    Assert.That(limits.RequestsPerWindow, Is.EqualTo(240))
-    Assert.That(limits.WindowSeconds, Is.EqualTo(10))
-
-[<Test>]
-let capacity_configuration_overrides_are_validated () =
-    let from pairs =
-        let data = System.Collections.Generic.Dictionary<string, string>()
-        for key, value in pairs do data[key] <- value
-        ConfigurationBuilder().AddInMemoryCollection(data).Build()
-    let valid =
-        from [ "McpLimits:MaxConcurrentTools", "8"
-               "McpLimits:MaxQueuedTools", "0"
-               "McpLimits:QueueWaitMilliseconds", "250"
-               "McpLimits:RequestsPerWindow", "24"
-               "McpLimits:WindowSeconds", "5"
-               "McpLimits:BusyRetrySeconds", "3" ]
-        |> McpLoadSettings.fromConfiguration
-    Assert.That(valid.MaxConcurrentTools, Is.EqualTo(8))
-    Assert.That(valid.MaxQueuedTools, Is.Zero)
-    Assert.That(valid.QueueWaitMilliseconds, Is.EqualTo(250))
-    Assert.That(valid.RequestsPerWindow, Is.EqualTo(24))
-    Assert.That(valid.WindowSeconds, Is.EqualTo(5))
-    Assert.That(valid.BusyRetrySeconds, Is.EqualTo(3))
-    for key, value in [
-        "MaxConcurrentTools", "0"
-        "MaxQueuedTools", "-1"
-        "QueueWaitMilliseconds", "0"
-        "RequestsPerWindow", "0"
-        "WindowSeconds", "99999"
-        "BusyRetrySeconds", "garbage" ] do
-        let config = from [ "McpLimits:" + key, value ]
-        Assert.Throws<InvalidOperationException>(TestDelegate(fun () ->
-            McpLoadSettings.fromConfiguration(config) |> ignore)) |> ignore
-
-[<Test>]
-let subject_scoped_fixed_window_does_not_couple_same_ip_users_and_returns_retry_metadata () =
-    let configured = { McpLoadSettings.defaults with RequestsPerWindow = 4; WindowSeconds = 10 }
-    use limiter =
-        PartitionedRateLimiter.Create<HttpContext,string>(
-            fun context -> McpSubjectRate.partition configured context)
-    let contextFor userId =
-        let context = DefaultHttpContext()
-        context.Connection.RemoteIpAddress <- IPAddress.Loopback
-        context.User <-
-            ClaimsPrincipal(ClaimsIdentity([ Claim("sub", userId) ], "test-auth"))
-        context :> HttpContext
-    let a = contextFor "user-a"
-    let b = contextFor "user-b"
-    for i in 1 .. 4 do
-        use accepted = limiter.AttemptAcquire(a)
-        Assert.That(accepted.IsAcquired, Is.True, $"A request {i}")
-    use overloaded = limiter.AttemptAcquire(a)
-    Assert.That(overloaded.IsAcquired, Is.False)
-    match overloaded.TryGetMetadata(MetadataName.RetryAfter) with
-    | true, retryAfter ->
-        Assert.That(retryAfter, Is.GreaterThan(TimeSpan.Zero))
-        Assert.That(retryAfter, Is.LessThanOrEqualTo(TimeSpan.FromSeconds(10.)))
-    | _ -> Assert.Fail("Rejected HTTP MCP subject quota must give a Retry-After hint.")
-    for i in 1 .. 4 do
-        use accepted = limiter.AttemptAcquire(b)
-        Assert.That(accepted.IsAcquired, Is.True, $"B request {i}")
-    use overloadedB = limiter.AttemptAcquire(b)
-    Assert.That(overloadedB.IsAcquired, Is.False)
-
-[<Test>]
-let separate_users_get_independent_capacity_when_one_is_saturated () =
+let private startServer () =
     task {
-        let configured = settings 2 1 2000
-        let budget = McpUserCapacity(configured)
-        let release = hold()
-        let waiting value () =
-            task {
-                do! release.Task
-                return value
-            }
-        let a1 = budget.Execute("user-a", CancellationToken.None, waiting 1)
-        let a2 = budget.Execute("user-a", CancellationToken.None, waiting 2)
-        let a3 = budget.Execute("user-a", CancellationToken.None, waiting 3)
-        let! busy = budget.Execute("user-a", CancellationToken.None, fun () -> Task.FromResult 4)
-        match busy with
-        | Busy retry -> Assert.That(retry, Is.EqualTo(configured.BusyRetrySeconds))
-        | Executed _ -> Assert.Fail("User A should be full at two active and one queued.")
-        let! independent = budget.Execute("user-b", CancellationToken.None, fun () -> Task.FromResult 99)
-        Assert.That(independent, Is.EqualTo(Executed 99))
-        Assert.That(budget.ActiveSubjectCount, Is.EqualTo(1), "User B partition should retire immediately.")
-        release.SetResult(())
-        let! others = Task.WhenAll([| a1; a2; a3 |])
-        Assert.That(others |> Array.forall succeeded, Is.True)
-        Assert.That(budget.ActiveSubjectCount, Is.Zero)
-    }
-
-[<Test>]
-let queued_tool_calls_timeout_without_starting_work_or_retaining_subjects () =
-    task {
-        let budget = McpUserCapacity(settings 1 1 80)
-        let release = hold()
-        let first = budget.Execute("subject", CancellationToken.None, fun () ->
-            task {
-                do! release.Task
-                return 1
-            })
-        let mutable ran = false
-        let! waiting =
-            budget.Execute("subject", CancellationToken.None, fun () ->
-                task {
-                    ran <- true
-                    return 2
-                })
-        Assert.That(waiting, Is.EqualTo(box (Busy 2 : ToolAdmission<int>)))
-        Assert.That(ran, Is.False)
-        Assert.That(budget.ActiveSubjectCount, Is.EqualTo(1))
-        release.SetResult(())
-        let! finished = first
-        Assert.That(finished, Is.EqualTo(Executed 1))
-        Assert.That(budget.ActiveSubjectCount, Is.Zero)
-    }
-
-[<Test>]
-let cancelled_queued_tool_releases_its_slot_and_propagates_cancellation () =
-    task {
-        let budget = McpUserCapacity(settings 1 1 2000)
-        let release = hold()
-        let first = budget.Execute("subject", CancellationToken.None, fun () ->
-            task {
-                do! release.Task
-                return 1
-            })
-        use cancel = new CancellationTokenSource()
-        let second = budget.Execute("subject", cancel.Token, fun () -> Task.FromResult 2)
-        cancel.Cancel()
-        let! canceled =
-            task {
-                try
-                    let! _ = second
-                    return false
-                with :? OperationCanceledException -> return true
-            }
-        Assert.That(canceled, Is.True)
-        Assert.That(budget.ActiveSubjectCount, Is.EqualTo(1))
-        release.SetResult(())
-        let! _ = first
-        Assert.That(budget.ActiveSubjectCount, Is.Zero)
-    }
-
-[<Test>]
-let throwing_tool_does_not_leak_user_capacity () =
-    task {
-        let budget = McpUserCapacity(settings 1 0 100)
-        let! failed =
-            task {
-                try
-                    let! _ = budget.Execute<int>("subject", CancellationToken.None, fun () ->
-                        Task.FromException<int>(InvalidOperationException("expected")))
-                    return false
-                with :? InvalidOperationException -> return true
-            }
-        Assert.That(failed, Is.True)
-        Assert.That(budget.ActiveSubjectCount, Is.Zero)
-        let! next = budget.Execute("subject", CancellationToken.None, fun () -> Task.FromResult 7)
-        Assert.That(next, Is.EqualTo(Executed 7))
-    }
-
-[<Test>]
-let forty_simultaneous_agent_tools_fit_default_active_and_fifo_queue_limits () =
-    task {
-        let budget = McpUserCapacity(McpLoadSettings.defaults)
-        let release = hold()
-        let all =
-            [| for id in 1 .. 40 ->
-                   budget.Execute("single-operator", CancellationToken.None,
-                       fun () -> task {
-                           do! release.Task
-                           return id
-                       }) |]
-        Assert.That(budget.ActiveSubjectCount, Is.EqualTo(1))
-        let! overflow = budget.Execute("single-operator", CancellationToken.None, fun () -> Task.FromResult 41)
-        Assert.That(overflow, Is.EqualTo(box (Busy McpLoadSettings.defaults.BusyRetrySeconds : ToolAdmission<int>)))
-        release.SetResult(())
-        let! accepted = Task.WhenAll(all)
-        Assert.That(accepted |> Array.forall succeeded, Is.True)
-        Assert.That(budget.ActiveSubjectCount, Is.Zero)
-    }
-
-
-[<Test>]
-let http_mcp_subject_rate_returns_429_and_retry_after_without_limiting_unrelated_users_or_metadata () =
-    task {
-        // Real loopback HTTP middleware with test-only synthetic principals:
-        // exercises production partition and rejection handlers, not JWT parsing.
-        use listener = new System.Net.Sockets.TcpListener(IPAddress.Loopback, 0)
-        listener.Start()
-        let port = (listener.LocalEndpoint :?> IPEndPoint).Port
-        listener.Stop()
-        let endpoint = $"http://127.0.0.1:{port}"
-        let builder = Microsoft.AspNetCore.Builder.WebApplication.CreateBuilder()
+        let endpoint = sprintf "http://127.0.0.1:%d" (unusedLoopbackPort ())
+        let builder = WebApplication.CreateBuilder()
         builder.WebHost.UseUrls(endpoint) |> ignore
-        let configured = { McpLoadSettings.defaults with RequestsPerWindow = 4; WindowSeconds = 10 }
-        builder.Services.AddRateLimiter(fun options ->
-            options.OnRejected <- McpSubjectRate.onRejected
-            options.AddPolicy(McpSubjectRate.Policy, McpSubjectRate.partition configured) |> ignore)
+        builder.Services.AddAuthorization() |> ignore
+        builder.Services.AddRateLimiter(HttpRateLimitProtection.configure) |> ignore
+        builder.Services
+            .AddMcpServer()
+            .WithHttpTransport(fun options -> options.Stateless <- true)
+            .WithRequestFilters(fun filters ->
+                filters.AddCallToolFilter(McpEndpoint.deviceRoutingFilter()) |> ignore)
+            .WithTools<ConcurrencyProbeTools>()
         |> ignore
-        use app = builder.Build()
+
+        let app = builder.Build()
         app.UseRouting() |> ignore
+        // Trusted synthetic test principal. Production JWT and OAuth behavior
+        // is independently covered by McpAuthenticationTests.
         app.Use(
             Func<RequestDelegate, RequestDelegate>(fun next ->
                 RequestDelegate(fun context ->
-                    let subject = context.Request.Headers["X-Test-Subject"].ToString()
-                    context.User <- ClaimsPrincipal(ClaimsIdentity([ Claim("sub", subject) ], "test"))
+                    context.User <-
+                        ClaimsPrincipal(ClaimsIdentity([ Claim("sub", "one-operator") ], "test-auth"))
                     next.Invoke(context)))
         ) |> ignore
+        app.UseAuthorization() |> ignore
         app.UseRateLimiter() |> ignore
-        app.MapGet("/mcp", Func<string>(fun () -> "ok"))
-            .RequireRateLimiting(McpSubjectRate.Policy) |> ignore
-        app.MapGet("/metadata", Func<string>(fun () -> "public")) |> ignore
+
+        // Exercise the same map and rate policy modules as production.
+        McpEndpoint.map app
+        app.MapGet("/client", Func<string>(fun () -> "client"))
+            .RequireRateLimiting(HttpRateLimitProtection.Policy) |> ignore
+        app.MapGet("/exports/test", Func<string>(fun () -> "export"))
+            .RequireRateLimiting(HttpRateLimitProtection.Policy) |> ignore
+
         do! app.StartAsync()
-        use http = new System.Net.Http.HttpClient()
-        http.Timeout <- TimeSpan.FromSeconds 5L
-        let get (subject: string) (path: string) =
-            task {
-                use request = new System.Net.Http.HttpRequestMessage(
-                    System.Net.Http.HttpMethod.Get, endpoint + path)
-                request.Headers.Add("X-Test-Subject", subject)
-                return! http.SendAsync(request)
-            }
-        for i in 1 .. 4 do
-            use! accepted = get "a" "/mcp"
-            Assert.That(accepted.StatusCode, Is.EqualTo(HttpStatusCode.OK), $"subject A request {i}")
-        use! rejected = get "a" "/mcp"
-        Assert.That(rejected.StatusCode, Is.EqualTo(HttpStatusCode.TooManyRequests))
-        Assert.That(rejected.Headers.RetryAfter, Is.Not.Null)
-        Assert.That(rejected.Headers.RetryAfter.Delta.HasValue, Is.True)
-        Assert.That(rejected.Headers.RetryAfter.Delta.Value.TotalSeconds, Is.GreaterThanOrEqualTo(1.))
-        for i in 1 .. 4 do
-            use! accepted = get "b" "/mcp"
-            Assert.That(accepted.StatusCode, Is.EqualTo(HttpStatusCode.OK), $"subject B request {i}")
-        use! exempt = get "a" "/metadata"
-        Assert.That(exempt.StatusCode, Is.EqualTo(HttpStatusCode.OK))
-        do! app.StopAsync()
+        return app, endpoint
     }
 
-
-[<Test>]
-let queued_tools_start_in_fifo_order () =
+let private postMcp (http: HttpClient) (endpoint: string) (payload: string) =
     task {
-        let budget = McpUserCapacity(settings 1 2 2000)
-        let firstGate = hold()
-        let secondGate = hold()
-        let secondStarted = hold()
-        let thirdStarted = hold()
-        let first =
-            budget.Execute("same-subject", CancellationToken.None, fun () ->
-                task {
-                    do! firstGate.Task
-                    return 1
-                })
-        let second =
-            budget.Execute("same-subject", CancellationToken.None, fun () ->
-                task {
-                    secondStarted.TrySetResult(()) |> ignore
-                    do! secondGate.Task
-                    return 2
-                })
-        let third =
-            budget.Execute("same-subject", CancellationToken.None, fun () ->
-                task {
-                    thirdStarted.TrySetResult(()) |> ignore
-                    return 3
-                })
-        // The second admitted tool cannot be overtaken by the third.
-        firstGate.SetResult(())
-        do! secondStarted.Task.WaitAsync(TimeSpan.FromSeconds(2.))
-        Assert.That(thirdStarted.Task.IsCompleted, Is.False)
-        secondGate.SetResult(())
-        do! thirdStarted.Task.WaitAsync(TimeSpan.FromSeconds(2.))
-        let! values = Task.WhenAll([| first; second; third |])
-        Assert.That(values, Is.EqualTo([| Executed 1; Executed 2; Executed 3 |] :> obj))
-        Assert.That(budget.ActiveSubjectCount, Is.Zero)
+        use request = new HttpRequestMessage(HttpMethod.Post, endpoint + "/mcp")
+        request.Headers.TryAddWithoutValidation("Accept", "application/json, text/event-stream") |> ignore
+        request.Content <- new StringContent(payload, Encoding.UTF8, "application/json")
+        return! http.SendAsync(request)
     }
 
+let private initialize id =
+    sprintf """{"jsonrpc":"2.0","id":%d,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"quota-probe","version":"1"}}}""" id
+
+let private responseJson (body: string) =
+    let trimmed = body.TrimStart()
+    let json =
+        if trimmed.StartsWith("{", StringComparison.Ordinal) then trimmed
+        else
+            body.Split('\n')
+            |> Array.map (fun line -> line.Trim())
+            |> Array.find (fun line -> line.StartsWith("data: {", StringComparison.Ordinal))
+            |> fun line -> line.Substring(5).Trim()
+    JsonDocument.Parse(json)
 
 [<Test>]
-let admitted_tool_is_not_cancelled_by_expired_queue_wait_deadline () =
+let authenticated_mcp_http_accepts_more_than_240_rapid_requests_without_synthetic_429 () =
     task {
-        let budget = McpUserCapacity(settings 1 0 30)
-        let entered = hold()
-        let release = hold()
-        let running =
-            budget.Execute("subject", CancellationToken.None, fun () ->
+        let! instance, endpoint = startServer ()
+        use app = instance
+        use http = new HttpClient()
+        http.Timeout <- TimeSpan.FromSeconds(15.0)
+
+        // Eight controlled batches prevent unbounded test connections, yet
+        // exceed the retired 240/10s subject window on loopback.
+        let startedAt = System.Diagnostics.Stopwatch.StartNew()
+        for batch in 0 .. 7 do
+            let requests =
+                [| for offset in 1 .. 32 ->
+                    postMcp http endpoint (initialize (batch * 32 + offset)) |]
+            let! responses = Task.WhenAll(requests)
+            for response in responses do
+                use response = response
+                let! body = response.Content.ReadAsStringAsync()
+                Assert.That(response.StatusCode, Is.EqualTo(HttpStatusCode.OK), body)
+                Assert.That(body, Does.Not.Contain("capacity is busy"))
+        startedAt.Stop()
+        Assert.That(startedAt.Elapsed, Is.LessThan(TimeSpan.FromSeconds(10.0)),
+                    "The burst must fit within the retired 10-second subject window to be meaningful.")
+
+        // /client and /exports still share the original fixed-window IP
+        // protection; no MCP request consumed an HTTP limiter permit.
+        use! clientResponse = http.GetAsync(endpoint + "/client")
+        Assert.That(clientResponse.StatusCode, Is.EqualTo(HttpStatusCode.OK))
+        for _ in 1 .. 29 do
+            use! allowed = http.GetAsync(endpoint + "/exports/test")
+            Assert.That(allowed.StatusCode, Is.EqualTo(HttpStatusCode.OK))
+        // The live policy has a queue of five: a lone excess request
+        // waits for replenishment rather than receiving 429. Overflow it
+        // using eight bounded requests and cancel any queued survivors.
+        use overflowCancellation = new System.Threading.CancellationTokenSource(TimeSpan.FromSeconds(2.0))
+        let overflow =
+            [| for _ in 1 .. 8 ->
                 task {
-                    entered.TrySetResult(()) |> ignore
-                    do! release.Task
-                    return 101
-                })
-        do! entered.Task
-        do! Task.Delay(130)
-        Assert.That(running.IsCompleted, Is.False)
-        release.SetResult(())
-        let! result = running
-        Assert.That(result, Is.EqualTo(Executed 101))
-        Assert.That(budget.ActiveSubjectCount, Is.Zero)
+                    try
+                        use! response = http.GetAsync(endpoint + "/exports/test", overflowCancellation.Token)
+                        return response.StatusCode, response.Headers.RetryAfter <> null
+                    with :? OperationCanceledException ->
+                        return HttpStatusCode.RequestTimeout, false
+                } |]
+        let! outcomes = Task.WhenAll(overflow)
+        Assert.That(outcomes |> Array.exists (fun (status, retry) ->
+            status = HttpStatusCode.TooManyRequests && retry), Is.True,
+            "Unrelated /client and /exports protection must still return 429 with Retry-After.")
+    }
+
+[<Test>]
+let more_than_40_simultaneous_authenticated_mcp_tool_calls_enter_normal_handlers () =
+    task {
+        ProbeState.reset()
+        let! instance, endpoint = startServer ()
+        use app = instance
+        use handler = new SocketsHttpHandler(MaxConnectionsPerServer = 60)
+        use http = new HttpClient(handler)
+        http.Timeout <- TimeSpan.FromSeconds(20.0)
+
+        // Discover the real SDK-generated name instead of duplicating the
+        // tool naming convention in the test.
+        use! listing = postMcp http endpoint """{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"""
+        let! listedBody = listing.Content.ReadAsStringAsync()
+        Assert.That(listing.StatusCode, Is.EqualTo(HttpStatusCode.OK), listedBody)
+        use document = responseJson listedBody
+        let name =
+            document.RootElement.GetProperty("result").GetProperty("tools").EnumerateArray()
+            |> Seq.map (fun item -> item.GetProperty("name").GetString())
+            |> Seq.find (fun value -> value.Contains("hold", StringComparison.OrdinalIgnoreCase))
+
+        let count = 48
+        let responses =
+            [| for id in 1 .. count ->
+                let payload =
+                    sprintf """{"jsonrpc":"2.0","id":%d,"method":"tools/call","params":{"name":"%s","arguments":{"callId":%d}}}""" id name id
+                postMcp http endpoint payload |]
+        try
+            // Without the old 24 active / 16 queued cap, every handler can
+            // enter while the same gate holds all 48 calls in flight.
+            let mutable attempts = 0
+            while ProbeState.entered.Count < count && attempts < 300 do
+                attempts <- attempts + 1
+                do! Task.Delay(25)
+            Assert.That(ProbeState.entered.Count, Is.EqualTo(count),
+                        "All tool handlers should begin before any held call is released.")
+        finally
+            ProbeState.gate.TrySetResult(()) |> ignore
+
+        let! finished = Task.WhenAll(responses)
+        for response in finished do
+            use response = response
+            let! body = response.Content.ReadAsStringAsync()
+            Assert.That(response.StatusCode, Is.EqualTo(HttpStatusCode.OK), body)
+            Assert.That(body, Does.Not.Contain("capacity is busy"))
+            use result = responseJson body
+            Assert.That(result.RootElement.GetProperty("result").ValueKind, Is.EqualTo(JsonValueKind.Object))
+        Assert.That(ProbeState.entered.Count, Is.EqualTo(count))
     }

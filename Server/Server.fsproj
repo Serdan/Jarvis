@@ -10,7 +10,7 @@
         <Content Include="Structure.md"/>
         <Compile Include="JarvisOptions.fs"/>
         <Compile Include="Auth.fs"/>
-        <Compile Include="McpUserCapacity.fs"/>
+        <Compile Include="HttpRateLimitProtection.fs"/>
         <Compile Include="Services\ClientResponseTracker.fs"/>
         <Compile Include="Services\UserService.fs"/>
         <Compile Include="Services\ExportStore.fs"/>
@@ -18,6 +18,7 @@
         <Compile Include="Services\HubService.fs"/>
         <Compile Include="Services\ClientService.fs"/>
         <Compile Include="McpTools.fs"/>
+        <Compile Include="McpEndpoint.fs"/>
         <Compile Include="Program.fs"/>
     </ItemGroup>
 

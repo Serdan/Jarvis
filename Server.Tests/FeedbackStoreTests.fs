@@ -874,6 +874,39 @@ let ``legacy witness migration backfills known command and fails closed when tel
         |> shouldEqual true)
 
 [<Test>]
+let ``unknown future command type cannot certify client-terminal liveness`` () =
+    withStore (fun store ->
+        approveTestEpoch store
+        let user, agent, connection, generation = "alice", "Worker 3", "client", 2L
+        let beginAndDispatch tool correlation =
+            let operation =
+                store.TryBeginAgentOperation(
+                    user, agent, tool, Some "Jarvis", "server", None, None)
+                |> function Ok value -> value | Error error -> failwith error
+            store.TryMarkAgentDispatched(
+                user, operation.Id, "device", connection, generation, correlation)
+            |> shouldEqual (Ok ())
+            operation
+        let unknown = beginAndDispatch "FutureLongRunningCommand" "future-correlation"
+        store.TryRecordAgentClientTerminal(
+            user, connection, generation, "future-correlation").IsError
+        |> shouldEqual true
+        store.GetAgentExecutionResolution(user, unknown.Id)
+        |> shouldEqual (Ok ExecutionUnresolved)
+        // A known ordinary request remains independently terminal;
+        // a future possibly-detached command cannot be inferred safe.
+        let known = beginAndDispatch "ReadFiles" "known-correlation"
+        store.TryRecordAgentClientTerminal(
+            user, connection, generation, "known-correlation")
+        |> shouldEqual (Ok(Some known.Id))
+        use restarted = new FeedbackStore(store.DatabasePath)
+        restarted.GetAgentExecutionResolution(user, unknown.Id)
+        |> shouldEqual (Ok ExecutionUnresolved)
+        restarted.TryAcquireAgentCorrection(
+            user, agent, "operator-unknown-command").IsError
+        |> shouldEqual true)
+
+[<Test>]
 let ``freshly migrated witness table never proves an old protocol request inactive`` () =
     withStore (fun store ->
         // Simulate a 3.63 command dispatched by a pre-witness server. It

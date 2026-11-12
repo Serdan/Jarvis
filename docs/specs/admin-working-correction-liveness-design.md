@@ -180,8 +180,8 @@ in place. No merge/deploy.
 `StartJob` responds when its detached process starts, not when the process
 tree terminates. An authenticated `StartJobResult` is therefore **not**
 terminal execution evidence. `FeedbackStore.TryRecordAgentClientTerminal`
-now resolves the original admitted tool name through its durable operations
-row before accepting a terminal receipt. For `StartJob`, it explicitly
+reads the original admitted command classification from the durable
+execution witness, not time-pruned operation telemetry. For `StartJob`, it explicitly
 refuses the `Dispatched -> Terminal` transition, even when SignalR delivers
 the successful job handle. The client still receives its successful result,
 but an administrative correction remains vetoed by the unresolved witness,
@@ -266,3 +266,11 @@ best-effort kill requests are not independently reaped/attested as a
 persisted child-tree termination receipt. No generic process-command
 terminal response should be promoted to proof of complete process-tree
 quiescence without auditing that contract.
+
+The server's terminal-receipt policy recognizes only types in the current
+`AgentProtocol.commandDefinitions` catalog plus the synthetic `NotifyAgent`
+continuation, explicitly excluding `StartJob`. Unknown future or persisted
+tool classifications fail closed rather than inheriting generic terminal
+semantics. A regression admits a hypothetical `FutureLongRunningCommand`
+alongside an ordinary `ReadFiles`: only the known tool becomes Terminal,
+while the future command still blocks correction after restart.

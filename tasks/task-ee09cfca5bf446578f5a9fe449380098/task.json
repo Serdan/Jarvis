@@ -1,1 +1,1 @@
-{"schemaVersion":2,"taskId":"task-ee09cfca5bf446578f5a9fe449380098","title":"[P2 Security] Audit live Nginx L7 flood exposure without limiting authenticated agents","version":2,"lifecycle":"InProgress","specVersion":1,"attemptId":"d34f9c248a724c53ae081d12b859f94b"}
+{"schemaVersion":2,"taskId":"task-ee09cfca5bf446578f5a9fe449380098","title":"[P2 Security] Audit live Nginx L7 flood exposure without limiting authenticated agents","version":3,"lifecycle":"Closed","specVersion":1,"attemptId":"d34f9c248a724c53ae081d12b859f94b"}

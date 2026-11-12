@@ -480,6 +480,98 @@ let ``authenticated StartJob client response does not prove child process exit``
         |> shouldEqual true)
 
 [<Test>]
+let ``telemetry pruning never loses durable StartJob execution classification`` () =
+    withStore (fun store ->
+        approveTestEpoch store
+        let user, agent, connection, generation = "alice", "Worker 3", "client", 3L
+        let start =
+            store.TryBeginAgentOperation(
+                user, agent, "StartJob", Some "Jarvis",
+                "server", Some "client", Some Common.AgentProtocol.version)
+            |> function Ok activity -> activity | Error failure -> failwith failure
+        store.TryMarkAgentDispatched(
+            user, start.Id, "desktop", connection, generation, "start-correlation")
+        |> shouldEqual (Ok ())
+        // Simulate the independent 30-day telemetry retention. StartJob
+        // classification MUST remain on the durable witness, not the
+        // disposable operations table.
+        use db = new SqliteConnection($"Data Source={store.DatabasePath}")
+        db.Open()
+        use prune = db.CreateCommand()
+        prune.CommandText <- "DELETE FROM operations WHERE id = $id;"
+        prune.Parameters.AddWithValue("$id", start.Id) |> ignore
+        Assert.That(prune.ExecuteNonQuery(), Is.EqualTo(1))
+        use restarted = new FeedbackStore(store.DatabasePath)
+        restarted.TryRecordAgentClientTerminal(
+            user, connection, generation, "start-correlation").IsError
+        |> shouldEqual true
+        restarted.GetAgentExecutionResolution(user, start.Id)
+        |> shouldEqual (Ok ExecutionUnresolved)
+        restarted.TryAcquireAgentCorrection(user, agent, "operator-after-telemetry-prune").IsError
+        |> shouldEqual true
+        // Ordinary non-detached operations retain their classification
+        // after the same telemetry loss and can still accept exact replies.
+        let ordinary =
+            restarted.TryBeginAgentOperation(
+                user, agent, "ReadFile", Some "Jarvis",
+                "server", Some "client", Some Common.AgentProtocol.version)
+            |> function Ok activity -> activity | Error failure -> failwith failure
+        restarted.TryMarkAgentDispatched(
+            user, ordinary.Id, "desktop", connection, generation, "read-correlation")
+        |> shouldEqual (Ok ())
+        prune.Parameters["$id"].Value <- ordinary.Id
+        Assert.That(prune.ExecuteNonQuery(), Is.EqualTo(1))
+        restarted.TryRecordAgentClientTerminal(
+            user, connection, generation, "read-correlation")
+        |> shouldEqual (Ok(Some ordinary.Id))
+        restarted.CountUnresolvedAgentExecutions(user, agent) |> shouldEqual 1)
+
+[<Test>]
+let ``legacy witness migration backfills known command and fails closed when telemetry was lost`` () =
+    withStore (fun store ->
+        approveTestEpoch store
+        let user, agent = "alice", "Worker 3"
+        let known =
+            store.TryBeginAgentOperation(
+                user, agent, "ReadFile", Some "Jarvis",
+                "server", None, None)
+            |> function Ok activity -> activity | Error failure -> failwith failure
+        let unknown =
+            store.TryBeginAgentOperation(
+                user, agent, "StartJob", Some "Jarvis",
+                "server", None, None)
+            |> function Ok activity -> activity | Error failure -> failwith failure
+        store.TryMarkAgentDispatched(
+            user, known.Id, "desktop", "conn", 2L, "known-receipt")
+        |> shouldEqual (Ok ())
+        store.TryMarkAgentDispatched(
+            user, unknown.Id, "desktop", "conn", 2L, "unknown-receipt")
+        |> shouldEqual (Ok ())
+        // Emulate a pre-upgrade database lacking the new tool_name column.
+        // Its historical StartJob telemetry has already expired.
+        use db = new SqliteConnection($"Data Source={store.DatabasePath}")
+        db.Open()
+        use removeHistory = db.CreateCommand()
+        removeHistory.CommandText <- "DELETE FROM operations WHERE id = $id;"
+        removeHistory.Parameters.AddWithValue("$id", unknown.Id) |> ignore
+        Assert.That(removeHistory.ExecuteNonQuery(), Is.EqualTo(1))
+        use oldSchema = db.CreateCommand()
+        oldSchema.CommandText <-
+            "ALTER TABLE agent_execution_witness DROP COLUMN tool_name;"
+        oldSchema.ExecuteNonQuery() |> ignore
+        use migrated = new FeedbackStore(store.DatabasePath)
+        migrated.TryRecordAgentClientTerminal(
+            user, "conn", 2L, "known-receipt")
+        |> shouldEqual (Ok(Some known.Id))
+        migrated.TryRecordAgentClientTerminal(
+            user, "conn", 2L, "unknown-receipt").IsError
+        |> shouldEqual true
+        migrated.GetAgentExecutionResolution(user, unknown.Id)
+        |> shouldEqual (Ok ExecutionUnresolved)
+        migrated.TryAcquireAgentCorrection(user, agent, "operator-after-partial-migration").IsError
+        |> shouldEqual true)
+
+[<Test>]
 let ``freshly migrated witness table never proves an old protocol request inactive`` () =
     withStore (fun store ->
         // Simulate a 3.63 command dispatched by a pre-witness server. It

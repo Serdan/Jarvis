@@ -229,6 +229,7 @@ CREATE TABLE IF NOT EXISTS agent_execution_witness (
     user_id TEXT NOT NULL,
     agent_id TEXT NOT NULL,
     project_name TEXT NULL,
+    tool_name TEXT NULL,
     state TEXT NOT NULL CHECK(state IN ('Admitted','Dispatched','Terminal','NotDispatched')),
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -271,21 +272,42 @@ INSERT OR IGNORE INTO agent_execution_epoch
 
         // Retain compatibility with persisted pre-continuation witness data
         // without reinitializing the audit epoch or discarding unknown rows.
-        use witnessColumns = connection.CreateCommand()
-        witnessColumns.CommandText <- "PRAGMA table_info(agent_execution_witness);"
-        use witnessReader = witnessColumns.ExecuteReader()
-        let hasParentRequestColumn =
-            let mutable found = false
-            while witnessReader.Read() do
-                if witnessReader.GetString(1) = "parent_request_id" then
-                    found <- true
-            found
+        use witnessInspect = connection.CreateCommand()
+        witnessInspect.CommandText <- "PRAGMA table_info(agent_execution_witness);"
+        use witnessReader = witnessInspect.ExecuteReader()
+        let witnessColumns = HashSet<string>(StringComparer.Ordinal)
+        while witnessReader.Read() do
+            witnessColumns.Add(witnessReader.GetString 1) |> ignore
         witnessReader.Close()
-        if not hasParentRequestColumn then
-            use witnessMigration = connection.CreateCommand()
-            witnessMigration.CommandText <-
-                "ALTER TABLE agent_execution_witness ADD COLUMN parent_request_id TEXT NULL;"
-            witnessMigration.ExecuteNonQuery() |> ignore
+        for column, definition in
+            [ "parent_request_id", "TEXT NULL"
+              "tool_name", "TEXT NULL" ] do
+            if not (witnessColumns.Contains(column)) then
+                use witnessMigration = connection.CreateCommand()
+                witnessMigration.CommandText <-
+                    $"ALTER TABLE agent_execution_witness ADD COLUMN {column} {definition};"
+                witnessMigration.ExecuteNonQuery() |> ignore
+
+        // Telemetry is short-lived, but the execution classification must
+        // outlive it. Existing witnesses are backfilled while their telemetry
+        // still exists. A missing historical classification deliberately
+        // remains NULL and cannot be certified Terminal without recovery.
+        use backfill = connection.CreateCommand()
+        backfill.CommandText <-
+            """UPDATE agent_execution_witness
+               SET tool_name = (SELECT tool_name FROM operations
+                                WHERE operations.id = agent_execution_witness.request_id)
+               WHERE tool_name IS NULL AND request_id IN (SELECT id FROM operations);
+               UPDATE agent_execution_witness
+               SET tool_name = 'NotifyAgent'
+               WHERE tool_name IS NULL AND parent_request_id IS NOT NULL
+                 AND EXISTS (
+                     SELECT 1 FROM agent_execution_witness AS parent
+                     WHERE parent.request_id = agent_execution_witness.parent_request_id
+                       AND parent.user_id = agent_execution_witness.user_id
+                       AND parent.tool_name = 'NotifyAgent'
+                 );"""
+        backfill.ExecuteNonQuery() |> ignore
         use childIndex = connection.CreateCommand()
         childIndex.CommandText <-
             """CREATE UNIQUE INDEX IF NOT EXISTS ix_agent_execution_child_parent
@@ -606,15 +628,16 @@ INSERT INTO operations (
                     witness.CommandText <-
                         """INSERT INTO agent_execution_witness (
                                request_id, user_id, agent_id, project_name,
-                               state, created_at, updated_at
+                               tool_name, state, created_at, updated_at
                            ) VALUES (
                                $id, $userId, $agentId, $projectName,
-                               'Admitted', $createdAt, $createdAt
+                               $toolName, 'Admitted', $createdAt, $createdAt
                            );"""
                     addParameter witness "$id" requestId
                     addParameter witness "$userId" userId
                     addParameter witness "$agentId" normalized
                     addParameter witness "$projectName" (dbValue projectName)
+                    addParameter witness "$toolName" toolName
                     addParameter witness "$createdAt" (startedAt.ToString("O"))
                     witness.ExecuteNonQuery() |> ignore
                     transaction.Commit()
@@ -675,10 +698,10 @@ INSERT INTO operations (
                         insert.CommandText <-
                             """INSERT INTO agent_execution_witness (
                                    request_id, user_id, agent_id, project_name,
-                                   state, created_at, updated_at, parent_request_id
+                                   tool_name, state, created_at, updated_at, parent_request_id
                                ) VALUES (
                                    $childId, $userId, $agent, $project,
-                                   'Admitted', $now, $now, $parent
+                                   'NotifyAgent', 'Admitted', $now, $now, $parent
                                );"""
                         addParameter insert "$childId" childId
                         addParameter insert "$userId" userId
@@ -894,9 +917,8 @@ INSERT INTO operations (
                 use command = connection.CreateCommand()
                 command.Transaction <- transaction
                 command.CommandText <-
-                    """SELECT witness.request_id, witness.state, operation.tool_name
+                    """SELECT witness.request_id, witness.state, witness.tool_name
                        FROM agent_execution_witness AS witness
-                       LEFT JOIN operations AS operation ON operation.id = witness.request_id
                        WHERE witness.user_id = $userId AND witness.connection_id = $connectionId
                          AND witness.device_generation = $generation AND witness.correlation_id = $correlationId
                        LIMIT 1;"""
@@ -916,14 +938,18 @@ INSERT INTO operations (
                 match found with
                 | None -> Ok None // Untracked MCP replies do not carry an execution witness.
                 | Some (requestId, "Terminal", _) -> Ok(Some requestId) // idempotent late duplicate
+                | Some (_, "Dispatched", None) ->
+                    // Historical telemetry may already have been pruned before
+                    // migration. Without a durable command classification we
+                    // cannot rule out a detached job; fail closed.
+                    Error "The dispatched tool classification is unavailable; reconcile legacy execution before terminal proof."
                 | Some (_, "Dispatched", Some "StartJob") ->
-                    // The client has returned a job *handle*, not proof that
+                    // A StartJob response is only a handle, not proof that
                     // the process or descendants have exited. Preserve the
                     // original witness until durable authenticated job/tree
-                    // reconciliation is implemented. Server response tracking
-                    // still delivers the user's StartJob result unchanged.
+                    // reconciliation is implemented.
                     Error "StartJob client reply cannot prove detached process-tree termination."
-                | Some (requestId, "Dispatched", _) ->
+                | Some (requestId, "Dispatched", Some _) ->
                     use update = connection.CreateCommand()
                     update.Transaction <- transaction
                     update.CommandText <-

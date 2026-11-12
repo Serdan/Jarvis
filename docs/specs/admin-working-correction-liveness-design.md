@@ -205,3 +205,28 @@ late-terminal recovery, SQLite witness outage, replaced device generation,
 legacy protocol, missing device and unsupported command dispatch refusals.
 At this checkpoint, **Server Release 150/150 passes** (when validated).
 The old canonical Git reservation gate remains in place; no merge/deploy.
+
+## Tool classification must outlive disposable telemetry
+
+The execution witness now owns a durable `tool_name` independently of the
+30-day `operations` telemetry table. Both normal agent admission and the
+cross-project notification continuation record the command classification
+in the same SQLite writer transaction as admission. The authenticated
+terminal-receipt path reads the retained witness classification, not a
+LEFT JOIN against pruneable operation rows. `StartJob` can therefore never
+become a generic terminal receipt merely because its telemetry expired.
+
+Schema migration adds the column to earlier databases without resetting
+the protocol epoch, backfills existing witness types from any surviving
+operation rows, then labels child notifications only where the parent is
+provably a `NotifyAgent`. Historical rows whose command classification
+cannot be recovered remain NULL and **fail closed** on terminal receipt;
+the target actor stays blocked from correction until independently
+reconciled. Neither age nor a missing telemetry row constitutes evidence
+of inactivity.
+
+Regression tests cover retained `StartJob` and ordinary command labels
+after telemetry is deleted, and a legacy schema migration where one
+command's history survives while a second `StartJob` was pruned.
+The safe ordinary response can terminate; the unknown historical
+request remains unresolved.

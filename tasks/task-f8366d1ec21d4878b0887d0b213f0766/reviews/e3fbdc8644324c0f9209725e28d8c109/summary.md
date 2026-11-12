@@ -1,0 +1,1 @@
+net11 Release Server.Tests: 118/118 pass. Shared production endpoint and routing-filter tests: 48 simultaneous held tools; 256 authenticated rapid MCP initialize requests; /client and /exports 429 Retry-After retained. git diff --check clean. Source from local main c12d6cbc, remote comparison baseline ecb59e2. No merge/deploy authorized.

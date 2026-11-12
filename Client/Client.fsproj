@@ -46,6 +46,7 @@
         <Compile Include="Modules\AuditLog.fs"/>
         <Compile Include="Modules\PermissionPolicy.fs"/>
         <Compile Include="Modules\ActivityPresentation.fs"/>
+        <Compile Include="Modules\FilterSelectors.fs"/>
         <Compile Include="Modules\ActivityFilter.fs"/>
         <Compile Include="Modules\ActivityExport.fs"/>
         <Compile Include="Modules\ActivityLog.fs"/>

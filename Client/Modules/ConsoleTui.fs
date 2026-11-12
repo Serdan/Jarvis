@@ -254,7 +254,13 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         |> String.concat " "
 
     let filteredActivityUnsafe () =
-        let terms = ActivityFilter.parseTerms activityFilterText
+        let projectNames =
+            activity
+            |> Seq.choose _.ProjectName
+            |> Seq.distinct
+            |> Seq.collect (fun name -> [name; ActivityFilter.projectLabel name])
+            |> Seq.toList
+        let terms = ActivityFilter.parseTermsWithCandidates projectNames [] activityFilterText
         activity
         |> Seq.filter (fun entry ->
             (showObservers || entry.Origin <> "Observer")

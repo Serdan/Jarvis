@@ -10,29 +10,12 @@ type Status =
     | Failed
     | Informational
 
-type Terms =
-    { Text: string list
-      Projects: string list }
+type Terms = FilterSelectors.Terms
 
-let parseTerms (query: string) =
-    let tokens =
-        (if isNull query then "" else query).Split(
-            [| ' '; '\t' |],
-            StringSplitOptions.RemoveEmptyEntries ||| StringSplitOptions.TrimEntries)
-        |> Array.toList
+let parseTerms query = FilterSelectors.parseWithoutCandidates query
 
-    let projects, text =
-        tokens
-        |> List.fold (fun (projects, text) token ->
-            if token.StartsWith("@", StringComparison.Ordinal) && token.Length > 1 then
-                token.Substring(1) :: projects, text
-            elif token = "@" then
-                projects, text
-            else
-                projects, token :: text) ([], [])
-
-    { Text = List.rev text
-      Projects = List.rev projects }
+let parseTermsWithCandidates projectNames agentNames query =
+    FilterSelectors.parse projectNames agentNames query
 
 // Preserve raw command project IDs; normalize only their presentation.
 // Worktrees are addressed as "Project::worktree" or ".Project-worktrees/worktree".
@@ -67,12 +50,12 @@ let projectLabel (projectName: string) =
     | None -> projectName
 
 let projectToken (projectName: string) =
-    "@" + projectLabel projectName
+    "#" + projectLabel projectName
 
 let private containsIgnoreCase (needle: string) (haystack: string) =
     haystack.IndexOf(needle, StringComparison.OrdinalIgnoreCase) >= 0
 
-let matchesTerms terms projectName searchableText =
+let matchesTerms (terms: Terms) (projectName: string option) (searchableText: string) =
     let projectMatches =
         terms.Projects
         |> List.forall (fun term ->

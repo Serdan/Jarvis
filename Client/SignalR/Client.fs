@@ -926,22 +926,13 @@ let private receiveCommandAndReplyCore (connection: HubConnection) (rt: Runtime)
         | _ -> ()
     }
 
-let private commandIngress = ConditionalWeakTable<Runtime, BoundedResponseIngress>()
-
-/// Return to SignalR ingress immediately after bounded admission. The
-/// response task remains tracked until it is sent (or delivery fails), so
-/// concurrent cheap polling is not serialized behind a 3-second deadline.
+// Program.fs owns the single bounded CommandDispatchQueue. Its worker must await
+// this full execution+reply Task; detaching the response to a second ingress
+// prematurely releases the outer worker and can lose correlated failures.
 let receiveCommandAndReplyWithTiming (connection: HubConnection) (rt: Runtime)
     (correlationId: string) (commandJson: string) (agentId: string)
     (report: string -> float -> float -> bool -> unit) : Task =
-    let ingress =
-        commandIngress.GetValue(rt, fun _ ->
-            BoundedResponseIngress(96, fun ex ->
-                rt.Tui.Log $"Client command response failed: {ex.Message}"))
-    match ingress.TryDispatch(correlationId, fun () ->
-        receiveCommandAndReplyCore connection rt correlationId commandJson agentId report) with
-    | Ok _ -> Task.CompletedTask
-    | Error reason -> Task.FromException(InvalidOperationException reason)
+    receiveCommandAndReplyCore connection rt correlationId commandJson agentId report
 
 let receiveCommandAndReply (connection: HubConnection) (rt: Runtime)
     (correlationId: string) (commandJson: string) (agentId: string) : Task =

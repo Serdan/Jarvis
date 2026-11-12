@@ -274,6 +274,82 @@ let ``authenticated hub receipt survives SQLite write failure then late retry af
         | Error _ -> ())
 
 [<Test>]
+let ``authenticated StartJob handle survives SQLite receipt failure and late recovery without releasing correction`` () =
+    withStore (fun store ->
+        approveTestEpoch store
+        let user, agent, connection = "alice", "Worker 3", "job-storage-connection"
+        let users = UserService()
+        users.TransportConnected(user, connection)
+        let session =
+            users.Register(
+                user,
+                { DeviceId = "workstation"; DeviceName = "Workstation"
+                  ProtocolVersion = Common.AgentProtocol.version; ClientVersion = "test"
+                  SupportedCommands = [ "StartJob" ] },
+                connection)
+        let tracker = ClientResponseTracker()
+        let correlation, expected =
+            tracker.Register(user, connection, session.Generation, TimeSpan.FromSeconds(5.))
+        let request =
+            store.TryBeginAgentOperation(
+                user, agent, "StartJob", Some "Jarvis", "server", None,
+                Some Common.AgentProtocol.version)
+            |> function Ok admitted -> admitted | Error error -> failwith error
+        store.TryMarkAgentDispatched(
+            user, request.Id, "workstation", connection, session.Generation, correlation)
+        |> shouldEqual (Ok ())
+        let hub =
+            new HubService(
+                users, tracker, store,
+                Microsoft.Extensions.Logging.Abstractions.NullLogger<HubService>.Instance)
+        hub.Context <- signalRCaller user connection
+        let payload : Common.StartJobResult =
+            { JobId = Guid.NewGuid().ToString("N"); StartedAt = DateTimeOffset.UtcNow }
+        let response : Common.AgentCommandResponse =
+            { Result = Some(JsonSerializer.Serialize(payload))
+              Error = None; Instructions = []; AgentStateChanges = []; InboxActivation = None }
+        use db = new SqliteConnection($"Data Source={store.DatabasePath}")
+        db.Open()
+        use trigger = db.CreateCommand()
+        trigger.CommandText <-
+            """CREATE TRIGGER fail_job_identity_persistence
+               BEFORE UPDATE OF job_id ON agent_execution_witness
+               WHEN NEW.job_id IS NOT NULL
+               BEGIN SELECT RAISE(ABORT, 'simulated job-handle SQLite failure'); END;"""
+        trigger.ExecuteNonQuery() |> ignore
+        // Client command has already executed. A failed *audit* write must
+        // not turn its successful StartJob result into a failed tool call.
+        hub.SendClientResponse(correlation, response).GetAwaiter().GetResult()
+        Assert.That(expected.IsCompletedSuccessfully, Is.True)
+        expected.Result.Result |> shouldEqual response.Result
+        let inspect (current: FeedbackStore) =
+            match current.ListUnresolvedAgentExecutions(user, agent, 10) with
+            | Ok page -> page.Executions |> List.find (fun e -> e.RequestId = request.Id)
+            | Error error -> failwith error
+        (inspect store).JobId |> shouldEqual None
+        (inspect store).State |> shouldEqual "Dispatched"
+        store.TryAcquireAgentCorrection(user, agent, "operator-during-sqlite-failure").IsError
+        |> shouldEqual true
+        use recover = db.CreateCommand()
+        recover.CommandText <- "DROP TRIGGER fail_job_identity_persistence;"
+        recover.ExecuteNonQuery() |> ignore
+        // The original server tracker has evicted its correlation. The same
+        // authenticated client may retry the original response as evidence,
+        // but no handle response is terminal process-tree evidence.
+        hub.SendClientResponse(correlation, response).GetAwaiter().GetResult()
+        (inspect store).JobId |> shouldEqual (Some payload.JobId)
+        (inspect store).JobStartedAt |> shouldEqual (Some payload.StartedAt)
+        Assert.That((inspect store).JobReceiptAt.IsSome, Is.True)
+        use restarted = new FeedbackStore(store.DatabasePath)
+        let afterRestart = inspect restarted
+        afterRestart.JobId |> shouldEqual (Some payload.JobId)
+        afterRestart.State |> shouldEqual "Dispatched"
+        restarted.GetAgentExecutionResolution(user, request.Id)
+        |> shouldEqual (Ok ExecutionUnresolved)
+        restarted.TryAcquireAgentCorrection(user, agent, "operator-after-late-job-handle").IsError
+        |> shouldEqual true)
+
+[<Test>]
 let ``late SignalR receipt accepts exact active generation but rejects replaced device`` () =
     withStore (fun store ->
         approveTestEpoch store

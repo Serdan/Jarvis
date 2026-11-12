@@ -246,7 +246,15 @@ Neither recorded handles nor a later `GetJobResult` grant correction.
 
 Negative-space regression tests cover all these cases and confirm the
 original handle/first receipt persist across server restart and 30-day
-telemetry pruning.
+telemetry pruning. A real authenticated `HubService.SendClientResponse`
+fault-injection test also forces the SQLite `job_id` update to fail:
+the successful client response still reaches the original tracker and
+the witness stays `Dispatched` with no job identity. A later duplicate
+from the *same* authenticated device route after database recovery
+records the exact handle, even after the server tracker has evicted
+its correlation. It remains nonterminal; correction is vetoed across
+store restart. A missing receipt cannot be reconstructed from a
+client timeout, disconnected transport, or missing in-memory job.
 
 **Unresolved execution risk:** `Client/Modules/JobManager.fs` currently
 marks `Completed` on the tracked parent process exit and marks `Canceled`

@@ -324,11 +324,11 @@ task/agent ownership conflicts and shows handoff states:
   failures and conservative retirement-candidate counts
 
 The Agents screen follows Activity: a 12-row selectable list with colored
-`@project` labels, timestamps and inline details toggled by Enter.
+`#project` labels, timestamps and inline details toggled by Enter.
 Up/Down and Page Up/Down navigate; End selects the last row.
-Use `/` to filter by agent, task or worktree, or `@` to start a project
-filter; search terms can be combined just as in Activity. `f` remains an
-alias for text filtering. Press `r` to refresh and Escape to return.
+Use `/` to filter by agent, task or worktree, or `#` to start a project
+filter or `@` to start an agent filter; search terms can be combined just as in Activity. `f` remains an
+alias for text filtering. `Tab` extends a typed selector to the longest common local match without cycling. Press `r` to refresh and Escape to return.
 Permission requests appear below the details and open with `p`, using the
 same highlighting and controls as the Activity screen.
 

@@ -314,3 +314,52 @@ let narrowDistinctProjectLabelsKeepTheirLedgerSuffixes () =
     Assert.That(one, Does.Contain("[a1234567]"))
     Assert.That(two, Does.Contain("[b1234567]"))
     Assert.That(one, Is.Not.EqualTo(two))
+
+[<Test>]
+let projectAndAgentSelectorsAreIndependentAndConjunctive () =
+    let data = snapshot [ record "Wayfold" "Worker 1" "Ready" None;
+          record "Wayfold" "Worker 2" "Working" None;
+          record "Wayfold" "Worker 10" "Ready" None;
+          record "Wayfold" "GUI Agent" "Ready" None;
+          record "Jarvis" "Worker 1" "Working" None;
+          record "Projekt Loke" "GUI Agent" "Ready" None ]
+    let selected filter =
+        visibleRows filter data
+        |> List.map (fun row -> row.Project, row.Agent)
+        |> Set.ofList
+    let one = Set.singleton ("Wayfold", "Worker 1")
+    for filter in [ "#Wayfold@Worker 1"; "@Worker 1#Wayfold"; "@worker 1 #WAYFOLD"; "#wayfold @WORKER 1" ] do
+        Assert.That(selected filter = one, Is.True, filter)
+    Assert.That(selected "#Wayfold@Worker" = set [ ("Wayfold", "Worker 1"); ("Wayfold", "Worker 2"); ("Wayfold", "Worker 10") ], Is.True)
+    Assert.That(selected "@Worker 1" = set [("Jarvis", "Worker 1"); ("Wayfold", "Worker 1")], Is.True)
+    Assert.That(selected "#wayfold@GUI Agent" = Set.singleton ("Wayfold", "GUI Agent"), Is.True)
+    Assert.That(selected "@GUI Agent#projekt loke" = Set.singleton ("Projekt Loke", "GUI Agent"), Is.True)
+    Assert.That(selected "#missing@Worker 1", Is.Empty)
+    Assert.That(selected "#Wayfold@" = selected "#Wayfold", Is.True)
+    Assert.That(selected "@Worker 1 Review" = set [("Jarvis", "Worker 1"); ("Wayfold", "Worker 1")], Is.True)
+    Assert.That(selected "#Wayfold Ready" = set [("Wayfold", "Worker 1"); ("Wayfold", "Worker 10"); ("Wayfold", "GUI Agent")], Is.True)
+
+[<Test>]
+let completionOnlyOffersAgentsFromSelectedProject () =
+    let data = snapshot [ record "Wayfold" "Worker 1" "Ready" None;
+          record "Wayfold" "Worker 2" "Working" None;
+          record "Jarvis" "Worker 3" "Ready" None;
+          record "Jarvis" "GUI Agent" "Ready" None ]
+    let completed = completeFilter "#Wayfold@Wo" data
+    Assert.That(completed, Is.EqualTo("#Wayfold@Worker "))
+    Assert.That(completeFilter completed data, Is.EqualTo(completed))
+    Assert.That(completeFilter (completed + "1") data, Is.EqualTo("#Wayfold@Worker 1"))
+    Assert.That(completeFilter "#Jarvis@Wo" data, Is.EqualTo("#Jarvis@Worker 3"))
+    Assert.That(completeFilter "@Wo#Way" data, Is.EqualTo("@Wo#Wayfold"))
+    Assert.That(completeFilter "@Gu" data, Is.EqualTo("@GuI Agent"))
+    Assert.That(completeFilter "@Gu" (snapshot []), Is.EqualTo("@Gu"))
+    Assert.That(completeFilter "#W" (snapshot []), Is.EqualTo("#W"))
+
+[<Test>]
+let sameNamedAgentsAcrossProjectsKeepProjectSpecificFiltering () =
+    let data = snapshot [ { (record "Wayfold" "Worker 1" "Ready" None) with ProjectAliases = ["Wayfold"; "W"] };
+          { (record "Jarvis" "Worker 1" "Working" None) with ProjectAliases = ["Jarvis"; "J"] } ]
+    let selected filter = visibleRows filter data |> List.map _.Project
+    Assert.That(selected "#W@Worker 1" = ["Wayfold"], Is.True)
+    Assert.That(selected "@Worker 1#J" = ["Jarvis"], Is.True)
+    Assert.That(selected "#W@Worker 2", Is.Empty)

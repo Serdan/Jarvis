@@ -292,7 +292,7 @@ let lastSeenAt (agent: AgentRow) (seen: IDictionary<string, DateTimeOffset>) =
         | _ -> ()
     latest
 
-let private matchesTerms (terms: ActivityFilter.Terms) (allAgentNames: string list) (row: AgentRow) =
+let private matchesTerms (terms: ActivityFilter.Terms) (exactAgentNames: HashSet<string>) (row: AgentRow) =
     let searchable =
         [ row.Agent; row.State; row.Project; row.ProjectLabel; yield! row.ProjectAliases
           row.StateReason |> Option.defaultValue ""
@@ -303,25 +303,18 @@ let private matchesTerms (terms: ActivityFilter.Terms) (allAgentNames: string li
     let matchesAgent term =
         // Exact local names distinguish Worker 1 from Worker 10; otherwise
         // a partial @Worker selector matches all matching agent identities.
-        let exactExists =
-            allAgentNames
-            |> List.exists (fun name -> String.Equals(name, term, StringComparison.OrdinalIgnoreCase))
-        if exactExists then String.Equals(row.Agent, term, StringComparison.OrdinalIgnoreCase)
+        if exactAgentNames.Contains term then String.Equals(row.Agent, term, StringComparison.OrdinalIgnoreCase)
         else row.Agent.Contains(term, StringComparison.OrdinalIgnoreCase)
     matchesProjectAliases terms (row.ProjectLabel :: row.Project :: row.ProjectAliases)
     && (terms.Agents |> List.forall matchesAgent)
     && ActivityFilter.matchesTerms { terms with Projects = []; Agents = [] } None searchable
 
-let matches (filter: string) (row: AgentRow) =
-    let projects = row.ProjectLabel :: row.Project :: row.ProjectAliases
-    let terms = ActivityFilter.parseTermsWithCandidates projects [row.Agent] filter
-    matchesTerms terms [row.Agent] row
-
 let visibleRows filter snapshot =
     let agents = snapshot.Agents |> List.map _.Agent
     let terms = ActivityFilter.parseTermsWithCandidates (projectNames snapshot) agents filter
+    let exactAgentNames = HashSet<string>(agents, StringComparer.OrdinalIgnoreCase)
     rows snapshot
-    |> List.filter (fun row -> row.State <> "Parked" && matchesTerms terms agents row)
+    |> List.filter (fun row -> row.State <> "Parked" && matchesTerms terms exactAgentNames row)
 
 let displayState state = if state = "NeedsWork" then "Waiting" else state
 

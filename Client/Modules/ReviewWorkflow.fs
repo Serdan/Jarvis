@@ -236,6 +236,42 @@ type AgentNotification =
       AcknowledgedAtUtc: string }
 
 [<CLIMutable>]
+type BlockedNotificationSender =
+    { FromProjectName: string
+      FromAgentId: string
+      AutoReply: string }
+
+[<CLIMutable>]
+type AgentNotificationPreferences =
+    { AgentId: string
+      Version: int
+      MuteAll: bool
+      MuteAutoReply: string
+      BlockedSenders: BlockedNotificationSender list }
+
+[<CLIMutable>]
+type NotificationPreferencesSnapshot =
+    { SnapshotCommit: string
+      Preferences: AgentNotificationPreferences }
+
+// A blocked operation has one immutable decision receipt, not an inbox
+// notification. Retrying its UUID returns the original recipient decision.
+[<CLIMutable>]
+type NotificationSuppression =
+    { NotificationId: string
+      FromAgentId: string
+      FromProjectName: string
+      ToAgentId: string
+      AutoReply: string
+      CreatedAtUtc: string }
+
+[<CLIMutable>]
+type NotificationDelivery =
+    { Status: string
+      NotificationId: string
+      AutoReply: string }
+
+[<CLIMutable>]
 type IntegrationSubmission =
     { SubmissionId: string
       TaskId: string
@@ -453,19 +489,42 @@ module ReviewWorkflow =
 
     let private notificationPath (notificationId: Guid) =
         "notifications/" + notificationId.ToString("N") + ".json"
+    let private suppressionPath (notificationId: Guid) =
+        "records/notification-suppressions/" + notificationId.ToString("N") + ".json"
 
     let private reviewRef taskId requestId number = $"refs/heads/jarvis-review/{taskId}/{requestId}/r{number}"
-    let private agentPath (agentId: string) =
-        let safe =
-            Convert.ToBase64String(Encoding.UTF8.GetBytes agentId)
-                .TrimEnd('=').Replace('+', '-').Replace('/', '_')
-        $"agents/{safe}.json"
+    let private agentKey (agentId: string) =
+        Convert.ToBase64String(Encoding.UTF8.GetBytes agentId)
+            .TrimEnd('=').Replace('+', '-').Replace('/', '_')
+    let private agentPath (agentId: string) = $"agents/{agentKey agentId}.json"
+    let private notificationPreferencesPath agentId =
+        $"records/notification-preferences/{agentKey agentId}.json"
 
     let private validTaskId (taskId: string) = not (isNull taskId) && idPattern.IsMatch taskId
     let private validAgent (agent: string) =
         not (String.IsNullOrWhiteSpace agent) && Encoding.UTF8.GetByteCount(agent) <= 120
     let private validText limit (value: string) =
         not (String.IsNullOrWhiteSpace value) && Encoding.UTF8.GetByteCount(value) <= limit
+    let private validSenderProject (name: string) =
+        not (isNull name) && Encoding.UTF8.GetByteCount(name) <= 256
+        && not (name.Contains('/') || name.Contains('\\') || (name |> Seq.exists Char.IsControl))
+    let private validAutoReply (value: string) =
+        not (isNull value)
+        && Encoding.UTF8.GetByteCount(value) <= 512
+        && (value = "" || not (String.IsNullOrWhiteSpace value))
+        && not (value |> Seq.exists Char.IsControl)
+    let private validNotificationPreferences (preferences: AgentNotificationPreferences) =
+        validAgent preferences.AgentId && preferences.Version > 0
+        && validAutoReply preferences.MuteAutoReply
+        && not (isNull (box preferences.BlockedSenders))
+        && preferences.BlockedSenders.Length <= 32
+        && (preferences.BlockedSenders
+            |> List.forall (fun item ->
+                validSenderProject item.FromProjectName
+                && validAgent item.FromAgentId && validAutoReply item.AutoReply))
+        && ((preferences.BlockedSenders
+             |> List.map (fun item -> item.FromProjectName, item.FromAgentId)
+             |> List.distinct).Length = preferences.BlockedSenders.Length)
     // Canonical task specifications may contain markup, but must not embed
     // active browser content. Display surfaces must still treat HTML as untrusted.
     let private validTaskHtml (value: string) =
@@ -1007,6 +1066,111 @@ module ReviewWorkflow =
                 })
             }
 
+    let private emptyNotificationPreferences agentId =
+        { AgentId = agentId; Version = 0; MuteAll = false
+          MuteAutoReply = ""; BlockedSenders = [] }
+
+    let private notificationPreferencesAt binding snapshot agentId = result {
+        let! current = read<AgentNotificationPreferences> binding snapshot
+                           (notificationPreferencesPath agentId)
+        match current with
+        | None -> return emptyNotificationPreferences agentId, None
+        | Some(preferences, oid) when preferences.AgentId = agentId
+                                    && validNotificationPreferences preferences ->
+            return preferences, Some oid
+        | Some _ ->
+            return! Error(LedgerIntegrityError "Invalid recipient notification preferences.")
+    }
+
+    let getNotificationPreferences binding agentId =
+        if not (validAgent agentId) then Error(InvalidBinding "Invalid recipient agent.")
+        else result {
+            let! snapshot = LedgerStore.fetch binding
+            let! _ = required<ReviewAgent> binding snapshot (agentPath agentId)
+            let! preferences, _ = notificationPreferencesAt binding snapshot agentId
+            return { SnapshotCommit = snapshot.Commit; Preferences = preferences }
+        }
+
+    // Source project "" denotes the destination project itself, never an
+    // unverified wildcard. Cross-project sources retain verified names.
+    let private localOrSourceProject localProject sourceProject =
+        if String.IsNullOrWhiteSpace sourceProject || localProject = sourceProject
+        then "" else sourceProject
+
+    let setNotificationSenderBlock binding operationId actorId recipientId localProject
+                                   senderProject senderId blocked autoReply =
+        if actorId <> recipientId then
+            Error(ReviewAccessDenied "Only the recipient may change notification preferences.")
+        elif not (validAgent recipientId && validAgent senderId)
+             || not (validSenderProject localProject && validSenderProject senderProject)
+             || not (validAutoReply autoReply)
+             || (not blocked && autoReply <> "") then
+            Error(InvalidBinding "Invalid sender block or autoreply.")
+        else
+            let source = localOrSourceProject localProject senderProject
+            LedgerStore.transact binding
+                (intent operationId actorId "SetNotificationSenderBlock"
+                    {| recipientId = recipientId; senderProject = source; senderId = senderId
+                       blocked = blocked; autoReply = autoReply |})
+                (fun snapshot -> result {
+                    let! _ = required<ReviewAgent> binding snapshot (agentPath recipientId)
+                    let! preferences, oid = notificationPreferencesAt binding snapshot recipientId
+                    let remaining =
+                        preferences.BlockedSenders
+                        |> List.filter (fun item ->
+                            item.FromProjectName <> source || item.FromAgentId <> senderId)
+                    let senders =
+                        (if blocked then
+                            { FromProjectName = source; FromAgentId = senderId
+                              AutoReply = autoReply } :: remaining
+                         else remaining)
+                        |> List.sortBy (fun item -> item.FromProjectName, item.FromAgentId)
+                    let updated =
+                        { preferences with Version = preferences.Version + 1
+                                           BlockedSenders = senders }
+                    if not (validNotificationPreferences updated) then
+                        return! Error(InvalidBinding "Recipient has reached the 32-sender block limit.")
+                    return [ change (notificationPreferencesPath recipientId) oid updated ]
+                })
+
+    let setNotificationMute binding operationId actorId recipientId muted autoReply =
+        if actorId <> recipientId then
+            Error(ReviewAccessDenied "Only the recipient may change notification preferences.")
+        elif not (validAgent recipientId) || not (validAutoReply autoReply)
+             || (not muted && autoReply <> "") then
+            Error(InvalidBinding "Invalid notification mute or autoreply.")
+        else
+            LedgerStore.transact binding
+                (intent operationId actorId "SetNotificationMute"
+                    {| recipientId = recipientId; muted = muted; autoReply = autoReply |})
+                (fun snapshot -> result {
+                    let! _ = required<ReviewAgent> binding snapshot (agentPath recipientId)
+                    let! preferences, oid = notificationPreferencesAt binding snapshot recipientId
+                    let updated =
+                        { preferences with Version = preferences.Version + 1
+                                           MuteAll = muted; MuteAutoReply = autoReply }
+                    return [ change (notificationPreferencesPath recipientId) oid updated ]
+                })
+
+    // The sender receives only this typed outcome; other preferences stay private.
+    let notificationDelivery binding (write: LedgerWrite) =
+        let operationId = Guid.Parse write.Operation.OperationId
+        if write.Operation.Type <> "NotifyAgent" then
+            Error(InvalidBinding "Not a notification operation.")
+        elif write.Operation.Paths |> Array.contains (suppressionPath operationId) then
+            result {
+                let! snapshot = LedgerStore.fetch binding
+                let! suppressed, _ =
+                    required<NotificationSuppression> binding snapshot (suppressionPath operationId)
+                if suppressed.NotificationId <> operationId.ToString("N")
+                   || not (validAutoReply suppressed.AutoReply) then
+                    return! Error(LedgerIntegrityError "Notification suppression receipt is corrupt.")
+                return { Status = "Blocked"; NotificationId = null; AutoReply = suppressed.AutoReply }
+            }
+        elif write.Operation.Paths |> Array.contains (notificationPath operationId) then
+            Ok { Status = "Delivered"; NotificationId = operationId.ToString("N"); AutoReply = "" }
+        else Error(LedgerIntegrityError "Notification operation has no valid decision.")
+
     let notifyAgent binding operationId fromAgentId fromProjectName toAgentId taskId message =
         let crossProject = not (String.IsNullOrWhiteSpace fromProjectName)
         if not (validAgent fromAgentId) || not (validAgent toAgentId)
@@ -1029,7 +1193,27 @@ module ReviewWorkflow =
                     if not crossProject && not (String.IsNullOrWhiteSpace taskId) then
                         let! _ = required<ReviewTask> binding snapshot (taskPath taskId)
                         ()
-                    let notification =
+                    let! preferences, _ = notificationPreferencesAt binding snapshot toAgentId
+                    let senderBlock =
+                        preferences.BlockedSenders
+                        |> List.tryFind (fun item ->
+                            item.FromProjectName = (if crossProject then fromProjectName else "")
+                            && item.FromAgentId = fromAgentId)
+                    let suppressionReply =
+                        match senderBlock with
+                        | Some blocked -> Some blocked.AutoReply
+                        | None when preferences.MuteAll -> Some preferences.MuteAutoReply
+                        | None -> None
+                    match suppressionReply with
+                    | Some reply ->
+                        return [ change (suppressionPath operationId) None
+                                    { NotificationId = operationId.ToString("N")
+                                      FromAgentId = fromAgentId
+                                      FromProjectName = if crossProject then fromProjectName else ""
+                                      ToAgentId = toAgentId; AutoReply = reply
+                                      CreatedAtUtc = DateTimeOffset.UtcNow.ToString("O") } ]
+                    | None ->
+                      let notification =
                         { NotificationId = operationId.ToString("N")
                           FromAgentId = fromAgentId; FromProjectName = if crossProject then fromProjectName else ""
                           ToAgentId = toAgentId
@@ -1037,7 +1221,7 @@ module ReviewWorkflow =
                           Message = message
                           CreatedAtUtc = DateTimeOffset.UtcNow.ToString("O")
                           AcknowledgedAtUtc = null }
-                    return [ change (notificationPath operationId) None notification ]
+                      return [ change (notificationPath operationId) None notification ]
                 })
 
     let acknowledgeNotification binding operationId agentId notificationId =

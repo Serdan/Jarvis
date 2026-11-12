@@ -272,9 +272,9 @@ module McpToolHelpers =
           OutputSchemaJson = None }
 
     let private ledgerTaskReadMethods = [ "GetIntegrationSubmissions"; "AgentInbox"; "GetAssignment"; "GetCheckpoint";  "InspectAttemptSource"; "TaskLifecycleHistory"; "GetTaskSpecPage"; "DiffTaskSpec";
-                                         "GetRole"; "ListRoles"; "GetAgentInstructionConfig"; "ResolveAgentInstructions" ]
+                                         "GetRole"; "ListRoles"; "GetAgentInstructionConfig"; "ResolveAgentInstructions"; "GetNotificationPreferences" ]
     let private ledgerTaskWriteMethods =
-        [ "SubmitIntegration"; "CompleteIntegration"; "NotifyAgent"; "AcknowledgeNotification"; "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "ReissueAssignment"; "CheckpointAttempt"
+        [ "SubmitIntegration"; "CompleteIntegration"; "NotifyAgent"; "AcknowledgeNotification"; "SetNotificationSenderBlock"; "SetNotificationMute"; "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "ReissueAssignment"; "CheckpointAttempt"
           "SetAttemptSource"; "YieldAgent"; "CompleteAgentWork"
           "SetAgentState"; "ReissueQueuedAttempt"; "RecoverAgentAssignment"; "AcknowledgeReviewFeedback"
           "DeferAttempt"; "ResumeAttempt"; "AbandonAttempt"; "CancelTask"
@@ -1545,6 +1545,28 @@ type JarvisMcpTools =
     static member CompleteIntegration(projectName: string, taskId: string, agentId: string, submissionId: string, integratedCommit: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         let cmd = TaskCommands.write projectName "CompleteIntegration" operationId taskId agentId
         McpToolHelpers.send client http (TaskWriteCommand { cmd with AttemptId = submissionId; BaseOid = integratedCommit })
+
+    [<McpServerTool(Title = "get notification preferences", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read this registered agent's durable recipient-owned notification mute and sender blocks without changing them. The empty source project denotes this same project.")>]
+    static member GetNotificationPreferences(projectName: string, agentId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http
+            (TaskReadCommand
+                { ProjectName = projectName; AgentId = agentId; Action = "GetNotificationPreferences"
+                  TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L
+                  Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null })
+
+    [<McpServerTool(Title = "block or unblock notification sender", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Recipient-owned: block/unblock a specific project-qualified sender from durable coordination notifications. Omit senderProjectName for this project. Optional bounded autoreply is returned directly to a blocked sender, never delivered as another notification. Unblock requires an empty autoreply.")>]
+    static member SetNotificationSenderBlock(projectName: string, agentId: string, senderAgentId: string, blocked: bool, [<Optional; DefaultParameterValue("")>] senderProjectName: string, [<Optional; DefaultParameterValue("")>] autoReply: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        let cmd = TaskCommands.write projectName "SetNotificationSenderBlock" operationId "" agentId
+        McpToolHelpers.send client http
+            (TaskWriteCommand { cmd with OwnerId = senderAgentId; SourceRef = senderProjectName
+                                         Reason = (if blocked then "Block" else "Unblock"); Summary = autoReply })
+
+    [<McpServerTool(Title = "mute or unmute agent notifications", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Recipient-owned: mute/unmute all discretionary NotifyAgent coordination notifications. Optional bounded autoreply is returned to blocked senders directly; unmute requires an empty autoreply. Structured review, task and assignment events remain visible.")>]
+    static member SetNotificationMute(projectName: string, agentId: string, muted: bool, [<Optional; DefaultParameterValue("")>] autoReply: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        let cmd = TaskCommands.write projectName "SetNotificationMute" operationId "" agentId
+        McpToolHelpers.send client http
+            (TaskWriteCommand { cmd with Reason = (if muted then "Mute" else "Unmute")
+                                         Summary = autoReply })
 
     [<McpServerTool(Title = "notify agent", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Send a durable notification to an agent in the same project or in optional toProjectName. Cross-project sends verify the sender in the source ledger and write only to the destination Git ledger, routing to a connected client that has its binding. The recipient inbox exposes the source project and agent. Omit operationId for a generated ID; reuse the returned ID for an uncertain retry.")>]
     static member NotifyAgent(projectName: string, fromAgentId: string, toAgentId: string, message: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] taskId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, [<Optional; DefaultParameterValue("")>] toProjectName: string, client: ClientService, http: IHttpContextAccessor) =

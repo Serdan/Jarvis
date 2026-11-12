@@ -117,6 +117,7 @@ let private activatesAgent (agentId: string) command =
         && List.contains cmd.Action
             [ "CheckpointAttempt"; "YieldAgent"; "CompleteAgentWork"
               "AcknowledgeFeedback"; "AcknowledgeNotification"; "NotifyAgent"
+              "SetNotificationSenderBlock"; "SetNotificationMute"
               "BindAttemptSource"; "RebindAttemptSource"; "BindReviewBase"
               "SetAttemptSource"; "SubmitIntegration"; "CompleteIntegration" ]
     | TaskReadCommand cmd ->

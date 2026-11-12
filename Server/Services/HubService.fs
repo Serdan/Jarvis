@@ -147,8 +147,8 @@ type HubService(users: UserService, tracker: ClientResponseTracker, store: Feedb
                     correlationId, this.Context.ConnectionId)
             | Error message ->
                 logger.LogWarning(
-                    "Cannot persist authenticated client terminal witness {CorrelationId} on {ConnectionId}: {Error}. " +
-                    "The response outcome is unchanged but correction remains blocked.",
+                    "Cannot establish terminal execution liveness for {CorrelationId} on {ConnectionId}: {Error}. " +
+                    "The client response outcome is unchanged, but administrative correction remains blocked.",
                     correlationId, this.Context.ConnectionId, message)
             | _ -> ()
         | _ ->

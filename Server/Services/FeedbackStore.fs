@@ -894,9 +894,11 @@ INSERT INTO operations (
                 use command = connection.CreateCommand()
                 command.Transaction <- transaction
                 command.CommandText <-
-                    """SELECT request_id, state FROM agent_execution_witness
-                       WHERE user_id = $userId AND connection_id = $connectionId
-                         AND device_generation = $generation AND correlation_id = $correlationId
+                    """SELECT witness.request_id, witness.state, operation.tool_name
+                       FROM agent_execution_witness AS witness
+                       LEFT JOIN operations AS operation ON operation.id = witness.request_id
+                       WHERE witness.user_id = $userId AND witness.connection_id = $connectionId
+                         AND witness.device_generation = $generation AND witness.correlation_id = $correlationId
                        LIMIT 1;"""
                 addParameter command "$userId" userId
                 addParameter command "$connectionId" connectionId
@@ -904,13 +906,24 @@ INSERT INTO operations (
                 addParameter command "$correlationId" correlationId
                 use reader = command.ExecuteReader()
                 let found =
-                    if reader.Read() then Some(reader.GetString 0, reader.GetString 1)
+                    if reader.Read() then
+                        Some(
+                            reader.GetString 0,
+                            reader.GetString 1,
+                            if reader.IsDBNull 2 then None else Some(reader.GetString 2))
                     else None
                 reader.Close()
                 match found with
                 | None -> Ok None // Untracked MCP replies do not carry an execution witness.
-                | Some (requestId, "Terminal") -> Ok(Some requestId) // idempotent late duplicate
-                | Some (requestId, "Dispatched") ->
+                | Some (requestId, "Terminal", _) -> Ok(Some requestId) // idempotent late duplicate
+                | Some (_, "Dispatched", Some "StartJob") ->
+                    // The client has returned a job *handle*, not proof that
+                    // the process or descendants have exited. Preserve the
+                    // original witness until durable authenticated job/tree
+                    // reconciliation is implemented. Server response tracking
+                    // still delivers the user's StartJob result unchanged.
+                    Error "StartJob client reply cannot prove detached process-tree termination."
+                | Some (requestId, "Dispatched", _) ->
                     use update = connection.CreateCommand()
                     update.Transaction <- transaction
                     update.CommandText <-

@@ -174,3 +174,34 @@ and detached-child-job drain/recovery, full SignalR disconnect and SQLite
 failure-path integration tests, ambiguous Git result and audited orphan
 permit reconciliation. The old canonical Git reservation path remains
 in place. No merge/deploy.
+
+## Detached process-handle safety checkpoint
+
+`StartJob` responds when its detached process starts, not when the process
+tree terminates. An authenticated `StartJobResult` is therefore **not**
+terminal execution evidence. `FeedbackStore.TryRecordAgentClientTerminal`
+now resolves the original admitted tool name through its durable operations
+row before accepting a terminal receipt. For `StartJob`, it explicitly
+refuses the `Dispatched -> Terminal` transition, even when SignalR delivers
+the successful job handle. The client still receives its successful result,
+but an administrative correction remains vetoed by the unresolved witness,
+including after tracker eviction and later `GetJobResult` completion.
+
+This is a deliberately conservative temporary gate, **not job lifecycle
+reconciliation**. To release it safely, persist a child job identity with
+authenticated device/process-generation provenance, reconcile all descendants
+and external process-tree state, and atomically record certified terminal
+evidence. A lone `JobStatus.Completed` only reports the monitored parent
+process exit; descendants may remain. Canceled status may be observed before
+the process tree finishes termination. Do not auto-clear unresolved jobs by
+timeout, process restart, missing in-memory job handle, or a successful
+`GetJobResult` poll.
+
+Added a real authenticated `HubService.SendClientResponse` regression test
+for a successful `StartJob` handle and repeated receipt, followed by a
+separate terminal job-status poll: the original job witness remains unresolved
+and vetoes correction. Also added prior tests for exact authenticated
+late-terminal recovery, SQLite witness outage, replaced device generation,
+legacy protocol, missing device and unsupported command dispatch refusals.
+At this checkpoint, **Server Release 150/150 passes** (when validated).
+The old canonical Git reservation gate remains in place; no merge/deploy.

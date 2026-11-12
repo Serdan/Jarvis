@@ -413,6 +413,73 @@ let ``witness-bound ClientService rejects all known non-dispatch routes without 
         Assert.That(sends, Is.EqualTo(0), "No rejected route may reach ReceiveCommand."))
 
 [<Test>]
+let ``authenticated StartJob client response does not prove child process exit`` () =
+    withStore (fun store ->
+        approveTestEpoch store
+        let user, agent, conn = "alice", "Worker 3", "start-job-conn"
+        let users = UserService()
+        users.TransportConnected(user, conn)
+        let registered =
+            users.Register(
+                user,
+                { DeviceId = "start-job-device"
+                  DeviceName = "Workstation"
+                  ProtocolVersion = Common.AgentProtocol.version
+                  ClientVersion = "test"
+                  SupportedCommands = [ "StartJob"; "GetJobResult" ] },
+                conn)
+        let tracker = ClientResponseTracker()
+        let correlation, expected =
+            tracker.Register(user, conn, registered.Generation, TimeSpan.FromSeconds(5.))
+        let start =
+            store.TryBeginAgentOperation(
+                user, agent, "StartJob", Some "Jarvis", "server",
+                Some "test", Some Common.AgentProtocol.version)
+            |> function Ok operation -> operation | Error error -> failwith error
+        store.TryMarkAgentDispatched(
+            user, start.Id, "start-job-device", conn, registered.Generation, correlation)
+        |> shouldEqual (Ok ())
+        let hub =
+            new HubService(
+                users, tracker, store,
+                Microsoft.Extensions.Logging.Abstractions.NullLogger<HubService>.Instance)
+        hub.Context <- signalRCaller user conn
+        let payload : Common.StartJobResult =
+            { JobId = "job-child-still-running"; StartedAt = DateTimeOffset.UtcNow }
+        let response: Common.AgentCommandResponse =
+            { Result = Some(System.Text.Json.JsonSerializer.Serialize(payload))
+              Error = None; Instructions = []; AgentStateChanges = []; InboxActivation = None }
+        // The tool successfully returns the handle, but that does NOT
+        // establish whether its detached child process is still running.
+        hub.SendClientResponse(correlation, response).GetAwaiter().GetResult()
+        Assert.That(expected.IsCompletedSuccessfully, Is.True)
+        Assert.That(expected.Result.Result, Is.EqualTo(response.Result))
+        store.GetAgentExecutionResolution(user, start.Id)
+        |> shouldEqual (Ok ExecutionUnresolved)
+        store.TryAcquireAgentCorrection(user, agent, "operator-after-handle").IsError
+        |> shouldEqual true
+        hub.SendClientResponse(correlation, response).GetAwaiter().GetResult()
+        store.GetAgentExecutionResolution(user, start.Id)
+        |> shouldEqual (Ok ExecutionUnresolved)
+        // A completed GetJobResult request is distinct from a confirmed
+        // process-tree drain; it must not accidentally clear the StartJob.
+        let poll =
+            store.TryBeginAgentOperation(
+                user, agent, "GetJobResult", Some "Jarvis", "server",
+                Some "test", Some Common.AgentProtocol.version)
+            |> function Ok operation -> operation | Error error -> failwith error
+        store.TryMarkAgentDispatched(
+            user, poll.Id, "start-job-device", conn,
+            registered.Generation, "job-result-correlation")
+        |> shouldEqual (Ok ())
+        store.TryRecordAgentClientTerminal(
+            user, conn, registered.Generation, "job-result-correlation")
+        |> shouldEqual (Ok(Some poll.Id))
+        store.CountUnresolvedAgentExecutions(user, agent) |> shouldEqual 1
+        store.TryAcquireAgentCorrection(user, agent, "operator-after-poll").IsError
+        |> shouldEqual true)
+
+[<Test>]
 let ``freshly migrated witness table never proves an old protocol request inactive`` () =
     withStore (fun store ->
         // Simulate a 3.63 command dispatched by a pre-witness server. It

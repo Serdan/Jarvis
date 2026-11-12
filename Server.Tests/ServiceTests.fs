@@ -830,6 +830,26 @@ let uncertain_mutation_response_does_not_claim_authoritative_empty_state_changes
     let mutable omitted = Unchecked.defaultof<JsonElement>
     Assert.That(body.RootElement.TryGetProperty("agentStateChanges", &omitted), Is.False)
     Assert.That((exposed.Content[0] :?> TextContentBlock).Text, Does.Contain(operationId))
+    let known = { restored with AgentStateChanges = [ { ProjectName = "Jarvis"; AgentId = "Worker 5" } ] }
+    let partial =
+        known |> McpToolHelpers.toCallToolResult
+        |> McpToolHelpers.attachStateEffects known
+    Assert.That(partial.Meta.ContainsKey("jarvis/agent_state_changes"), Is.False)
+    Assert.That(partial.Meta["jarvis/known_agent_state_changes"].ToJsonString(),
+                Does.Contain("Worker 5"),
+                "Known partial changes must be retained without claiming they are complete.")
+    let rejected =
+        { restored with
+            Error = Some(ExecutionFailed "Dispatch capacity exhausted: command not executed.")
+            AgentStateChanges = [] }
+    let confirmed =
+        rejected |> McpToolHelpers.toCallToolResult
+        |> McpToolHelpers.attachStateEffects rejected
+    Assert.That(confirmed.Meta["jarvis/agent_state_changes_status"].GetValue<string>(),
+                Is.EqualTo("confirmed"))
+    Assert.That(confirmed.Meta["jarvis/agent_state_changes"].ToJsonString(), Is.EqualTo("[]"),
+                "Rejection before execution must retain authoritative zero mutations.")
+    Assert.That(confirmed.Meta.ContainsKey("jarvis/recovery_operation_id"), Is.False)
 
 [<Test>]
 let cross_project_notify_merges_preflight_and_destination_state_changes () =
@@ -1556,4 +1576,95 @@ let client_request_abort_cancels_outstanding_device_correlation_without_faulting
         Assert.That(
             measurements |> Seq.filter (fun (name, _) -> name = "jarvis.server.dispatch.total.ms") |> Seq.length,
             Is.GreaterThanOrEqualTo(2))
+    }
+
+[<Test>]
+let post_commit_uncertain_client_reply_remains_unknown_across_server_dispatch_and_public_mcp () =
+    task {
+        let user = "auth0|uncertain"
+        let connection = "conn-uncertain"
+        let users = UserService()
+        users.TransportConnected(user, connection)
+        let registered =
+            users.Register(user,
+                { DeviceId = "device-uncertain"
+                  DeviceName = "Fixture"
+                  ProtocolVersion = AgentProtocol.version
+                  ClientVersion = "test"
+                  SupportedCommands = [ "LedgerWrite" ] }, connection)
+        let tracker = ClientResponseTracker()
+        let operationId = Guid.NewGuid().ToString("D")
+        let request : AgentCommand =
+            LedgerWriteCommand
+                { ProjectName = "Jarvis"; Action = "Write"; OperationId = operationId
+                  ProjectId = ""; LedgerId = ""; Epoch = 0; RemoteName = ""
+                  ApprovedFetchUrl = ""; ApprovedPushUrl = ""; ExpectedTrustedHead = ""
+                  ExpectedRequestHash = ""; AcknowledgeVisibility = false }
+        let mutable dispatches = 0
+        let mutable working = false
+        let mutable cacheInvalidations = 0
+        let recipient =
+            { new Common.SignalR.IClientService with
+                member _.ReceiveMessage(_) = Task.CompletedTask
+                member _.ReceiveCommand(correlationId, commandJson, _) =
+                    task {
+                        let received = JsonSerializer.Deserialize<AgentCommand>(commandJson)
+                        Assert.That(AgentCommandInfo.recoveryOperationId received,
+                                    Is.EqualTo(Some operationId))
+                        System.Threading.Interlocked.Increment(&dispatches) |> ignore
+                        // Failure injection: canonical Ready -> Working commits,
+                        // then the normal response cannot be serialized.
+                        working <- true
+                        let uncertain : AgentCommandResponse =
+                            { Result = None; Instructions = []
+                              Error = Some(UncertainOutcome
+                                  { Message = "Command terminated after possible commit."
+                                    OperationId = Some operationId })
+                              AgentStateChanges = []; InboxActivation = None }
+                        tracker.Complete(correlationId, user, connection,
+                                         registered.Generation, uncertain) |> ignore
+                    } :> Task
+                member _.InvalidateAgentStates(_, _) = Task.CompletedTask
+                member _.InvalidateAllAgentStates() =
+                    System.Threading.Interlocked.Increment(&cacheInvalidations) |> ignore
+                    Task.CompletedTask }
+        let clients =
+            { new Microsoft.AspNetCore.SignalR.IHubClients<Common.SignalR.IClientService> with
+                member _.All = recipient
+                member _.AllExcept(_) = recipient
+                member _.Client(_) = recipient
+                member _.Clients(_) = recipient
+                member _.Group(_) = recipient
+                member _.GroupExcept(_, _) = recipient
+                member _.Groups(_) = recipient
+                member _.User(_) = recipient
+                member _.Users(_) = recipient }
+        let hub =
+            { new Microsoft.AspNetCore.SignalR.IHubContext<HubService, Common.SignalR.IClientService> with
+                member _.Clients = clients
+                member _.Groups = Unchecked.defaultof<_> }
+        let http = Microsoft.AspNetCore.Http.HttpContextAccessor()
+        http.HttpContext <- Microsoft.AspNetCore.Http.DefaultHttpContext()
+        let service =
+            ClientService(hub, users, tracker, http,
+                Microsoft.Extensions.Logging.Abstractions.NullLogger<ClientService>.Instance)
+        let! response = service.SendCommandToUser(user, request)
+        Assert.That(working, Is.True, "The injected activation committed before the response error.")
+        Assert.That(dispatches, Is.EqualTo(1), "The command must never be automatically replayed.")
+        Assert.That(AgentStateEvidence.isUnknown response, Is.True)
+        let tool =
+            response |> McpToolHelpers.toCallToolResult
+            |> McpToolHelpers.attachStateEffects response
+        Assert.That(tool.IsError, Is.EqualTo(Nullable true))
+        Assert.That(tool.Meta["jarvis/agent_state_changes_status"].GetValue<string>(), Is.EqualTo("unknown"))
+        Assert.That(tool.Meta["jarvis/recovery_operation_id"].GetValue<string>(), Is.EqualTo(operationId))
+        Assert.That(tool.Meta.ContainsKey("jarvis/agent_state_changes"), Is.False,
+                    "Post-commit uncertainty cannot claim a confirmed empty state-change list.")
+        use body = JsonDocument.Parse((tool.Content[1] :?> TextContentBlock).Text)
+        Assert.That(body.RootElement.GetProperty("agentStateChangesStatus").GetString(), Is.EqualTo("unknown"))
+        let mutable absent = Unchecked.defaultof<JsonElement>
+        Assert.That(body.RootElement.TryGetProperty("agentStateChanges", &absent), Is.False)
+        do! service.InvalidateAllAgentStatesForUser(user)
+        Assert.That(cacheInvalidations, Is.EqualTo(1), "Unknown mutations require conservative cache invalidation.")
+        Assert.That(dispatches, Is.EqualTo(1))
     }

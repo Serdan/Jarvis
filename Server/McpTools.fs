@@ -399,6 +399,7 @@ module McpToolHelpers =
             details["agentStateChanges"] <- JsonSerializer.SerializeToNode changes
             metadata["jarvis/agent_state_changes"] <- JsonSerializer.SerializeToNode changes
             details["agentStateChangesStatus"] <- JsonSerializer.SerializeToNode "confirmed"
+            metadata["jarvis/agent_state_changes_status"] <- JsonSerializer.SerializeToNode "confirmed"
         match response.InboxActivation with
         | None -> ()
         | Some activation ->

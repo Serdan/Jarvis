@@ -186,6 +186,232 @@ let private approveTestEpoch (store: FeedbackStore) =
     | Ok () -> ()
     | Error error -> failwith error
 
+// Simulate the exact authenticated SignalR identity contract used by
+// HubService.SendClientResponse rather than calling the SQLite store directly.
+let private signalRCaller userId connectionId =
+    let principal =
+        ClaimsPrincipal(ClaimsIdentity([ Claim("sub", userId) ], "test"))
+    let items =
+        System.Collections.Generic.Dictionary<obj, obj>()
+        :> System.Collections.Generic.IDictionary<obj, obj>
+    let features =
+        Microsoft.AspNetCore.Http.Features.FeatureCollection()
+        :> Microsoft.AspNetCore.Http.Features.IFeatureCollection
+    { new Microsoft.AspNetCore.SignalR.HubCallerContext() with
+        member _.ConnectionId = connectionId
+        member _.UserIdentifier = userId
+        member _.User = principal
+        member _.Items = items
+        member _.Features = features
+        member _.ConnectionAborted = System.Threading.CancellationToken.None
+        member _.Abort() = () }
+
+[<Test>]
+let ``authenticated hub receipt survives SQLite write failure then late retry after tracker completes`` () =
+    withStore (fun store ->
+        approveTestEpoch store
+        let user, agent, connectionId = "alice", "Worker 3", "auth-signalr-conn"
+        let users = UserService()
+        users.TransportConnected(user, connectionId)
+        let session =
+            users.Register(
+                user,
+                { DeviceId = "device"
+                  DeviceName = "Workstation"
+                  ProtocolVersion = Common.AgentProtocol.version
+                  ClientVersion = "test"
+                  SupportedCommands = [ "TaskRead" ] },
+                connectionId)
+        let tracker = ClientResponseTracker()
+        let correlationId, trackingTask =
+            tracker.Register(user, connectionId, session.Generation,
+                             TimeSpan.FromSeconds(5.))
+        let request = beginWitness store user agent
+        store.TryMarkAgentDispatched(
+            user, request.Id, "device", connectionId, session.Generation, correlationId)
+        |> shouldEqual (Ok ())
+        let hub =
+            new HubService(
+                users, tracker, store,
+                Microsoft.Extensions.Logging.Abstractions.NullLogger<HubService>.Instance)
+        hub.Context <- signalRCaller user connectionId
+        let response: Common.AgentCommandResponse =
+            { Result = Some "{}"; Error = None; Instructions = []
+              AgentStateChanges = []; InboxActivation = None }
+        use db = new SqliteConnection($"Data Source={store.DatabasePath}")
+        db.Open()
+        use failUpdate = db.CreateCommand()
+        failUpdate.CommandText <-
+            """CREATE TRIGGER simulated_sqlite_terminal_failure
+               BEFORE UPDATE OF state ON agent_execution_witness
+               WHEN NEW.state = 'Terminal'
+               BEGIN SELECT RAISE(FAIL, 'simulated terminal witness storage outage'); END;"""
+        failUpdate.ExecuteNonQuery() |> ignore
+        // The canonical result is already from the client. Losing a SQLite
+        // receipt must NOT turn that result into a tool error or falsely
+        // advance the witness to Terminal.
+        hub.SendClientResponse(correlationId, response).GetAwaiter().GetResult()
+        Assert.That(trackingTask.IsCompletedSuccessfully, Is.True)
+        Assert.That(trackingTask.Result.Result, Is.EqualTo(Some "{}"))
+        store.GetAgentExecutionResolution(user, request.Id)
+        |> shouldEqual (Ok ExecutionUnresolved)
+        store.TryAcquireAgentCorrection(user, agent, "operator-before-recovery").IsError
+        |> shouldEqual true
+        use recover = db.CreateCommand()
+        recover.CommandText <- "DROP TRIGGER simulated_sqlite_terminal_failure;"
+        recover.ExecuteNonQuery() |> ignore
+        // The tracker has already evicted its correlation. Authenticated
+        // duplicate terminal evidence must still complete the durable row.
+        hub.SendClientResponse(correlationId, response).GetAwaiter().GetResult()
+        store.GetAgentExecutionResolution(user, request.Id)
+        |> shouldEqual (Ok AuthenticatedClientFinished)
+        let permit = store.TryAcquireAgentCorrection(user, agent, "operator-after-recovery")
+        Assert.That(permit.IsOk, Is.True)
+        match permit with
+        | Ok id ->
+            store.TryReleaseAgentCorrection(user, agent, id, true)
+            |> shouldEqual (Ok ())
+        | Error _ -> ())
+
+[<Test>]
+let ``late SignalR receipt accepts exact active generation but rejects replaced device`` () =
+    withStore (fun store ->
+        approveTestEpoch store
+        let user, agent, deviceId = "alice", "Worker 3", "device"
+        let users = UserService()
+        let registration: Common.SignalR.ClientRegistration =
+            { DeviceId = deviceId; DeviceName = "Workstation"
+              ProtocolVersion = Common.AgentProtocol.version
+              ClientVersion = "test"; SupportedCommands = [ "TaskRead" ] }
+        users.TransportConnected(user, "old-conn")
+        let prior = users.Register(user, registration, "old-conn")
+        let tracker = ClientResponseTracker()
+        let correlationLate, timedOut =
+            tracker.Register(user, "old-conn", prior.Generation, TimeSpan.FromMilliseconds(30.))
+        let first = beginWitness store user agent
+        store.TryMarkAgentDispatched(
+            user, first.Id, deviceId, "old-conn", prior.Generation, correlationLate)
+        |> shouldEqual (Ok ())
+        Assert.That(
+            System.Threading.SpinWait.SpinUntil(
+                (fun () -> timedOut.IsCanceled), TimeSpan.FromSeconds(3.)),
+            Is.True, "The server-side response correlation must time out first.")
+        let response: Common.AgentCommandResponse =
+            { Result = Some "{}"; Error = None; Instructions = []
+              AgentStateChanges = []; InboxActivation = None }
+        let hubFrom connection =
+            let result =
+                new HubService(
+                    users, tracker, store,
+                    Microsoft.Extensions.Logging.Abstractions.NullLogger<HubService>.Instance)
+            result.Context <- signalRCaller user connection
+            result
+        let oldHub = hubFrom "old-conn"
+        // The late client reply is authenticated by the still-current route,
+        // even though ClientResponseTracker has evicted its correlation.
+        oldHub.SendClientResponse(correlationLate, response).GetAwaiter().GetResult()
+        store.GetAgentExecutionResolution(user, first.Id)
+        |> shouldEqual (Ok AuthenticatedClientFinished)
+        let correlationReplaced, _ =
+            tracker.Register(user, "old-conn", prior.Generation, TimeSpan.FromSeconds(5.))
+        let second = beginWitness store user agent
+        store.TryMarkAgentDispatched(
+            user, second.Id, deviceId, "old-conn", prior.Generation, correlationReplaced)
+        |> shouldEqual (Ok ())
+        users.TransportConnected(user, "new-conn")
+        let nextGeneration = users.Register(user, registration, "new-conn")
+        Assert.That(nextGeneration.Generation, Is.GreaterThan(prior.Generation))
+        // A reply from either connection must NOT reuse the old exact route:
+        // the old connection is no longer registered, while the new
+        // generation lacks the old correlation/connection binding.
+        oldHub.SendClientResponse(correlationReplaced, response).GetAwaiter().GetResult()
+        let newHub = hubFrom "new-conn"
+        newHub.SendClientResponse(correlationReplaced, response).GetAwaiter().GetResult()
+        store.GetAgentExecutionResolution(user, second.Id)
+        |> shouldEqual (Ok ExecutionUnresolved)
+        store.TryAcquireAgentCorrection(user, agent, "operator-after-reconnect").IsError
+        |> shouldEqual true)
+
+[<Test>]
+let ``witness-bound ClientService rejects all known non-dispatch routes without invoking client`` () =
+    withStore (fun store ->
+        approveTestEpoch store
+        let user, agent = "alice", "Worker 3"
+        let users = UserService()
+        let tracker = ClientResponseTracker()
+        let mutable sends = 0
+        let recipient =
+            { new Common.SignalR.IClientService with
+                member _.ReceiveMessage(_) = Task.CompletedTask
+                member _.InvalidateAgentStates(_, _) = Task.CompletedTask
+                member _.ReceiveCommand(_, _, _) =
+                    sends <- sends + 1
+                    Task.CompletedTask }
+        let clients =
+            { new Microsoft.AspNetCore.SignalR.IHubClients<Common.SignalR.IClientService> with
+                member _.All = recipient
+                member _.AllExcept(_) = recipient
+                member _.Client(_) = recipient
+                member _.Clients(_) = recipient
+                member _.Group(_) = recipient
+                member _.GroupExcept(_, _) = recipient
+                member _.Groups(_) = recipient
+                member _.User(_) = recipient
+                member _.Users(_) = recipient }
+        let hub =
+            { new Microsoft.AspNetCore.SignalR.IHubContext<HubService, Common.SignalR.IClientService> with
+                member _.Clients = clients
+                member _.Groups = Unchecked.defaultof<_> }
+        let accessor = HttpContextAccessor()
+        accessor.HttpContext <- DefaultHttpContext()
+        let service = ClientService(hub, users, tracker, accessor, store)
+        let attempt requestId =
+            service.SendCommandToUser(
+                user, Common.ListProjectsCommand,
+                agentId = agent, activityRequestId = requestId)
+            |> fun command -> command.GetAwaiter().GetResult()
+        // No selected device: the original request is admitted but cannot
+        // be sent, so only explicit verified pre-send cleanup may close it.
+        let missing = beginWitness store user agent
+        Assert.That((attempt missing.Id).Error.IsSome, Is.True)
+        store.GetAgentExecutionResolution(user, missing.Id)
+        |> shouldEqual (Ok ExecutionUnresolved)
+        store.TryMarkAgentNotDispatched(user, missing.Id) |> shouldEqual (Ok ())
+        users.TransportConnected(user, "conn")
+        let register protocol capabilities =
+            users.Register(
+                user,
+                { DeviceId = "device"; DeviceName = "Workstation"
+                  ProtocolVersion = protocol; ClientVersion = "test"
+                  SupportedCommands = capabilities },
+                "conn") |> ignore
+        // 3.63 has no durable witness contract, even when it advertises a
+        // compatible command name. Reject before SignalR ReceiveCommand.
+        register "3.63" [ "ListProjects" ]
+        let legacy = beginWitness store user agent
+        Assert.That((attempt legacy.Id).Error.IsSome, Is.True)
+        store.GetAgentExecutionResolution(user, legacy.Id)
+        |> shouldEqual (Ok ExecutionUnresolved)
+        store.TryMarkAgentNotDispatched(user, legacy.Id) |> shouldEqual (Ok ())
+        // Matching protocol without the exact advertised capability must
+        // also be pre-send refused.
+        register Common.AgentProtocol.version []
+        let unsupported = beginWitness store user agent
+        Assert.That((attempt unsupported.Id).Error.IsSome, Is.True)
+        store.GetAgentExecutionResolution(user, unsupported.Id)
+        |> shouldEqual (Ok ExecutionUnresolved)
+        store.TryMarkAgentNotDispatched(user, unsupported.Id)
+        |> shouldEqual (Ok ())
+        // Even if a route is viable, a failed durable route bind prevents
+        // dispatch, independently of SignalR transport readiness.
+        register Common.AgentProtocol.version [ "ListProjects" ]
+        let invalid = beginWitness store user agent
+        store.TryMarkAgentNotDispatched(user, invalid.Id) |> shouldEqual (Ok ())
+        Assert.That((attempt invalid.Id).Error.IsSome, Is.True)
+        store.GetAgentExecutionResolution(user, invalid.Id)
+        |> shouldEqual (Ok NeverDispatched)
+        Assert.That(sends, Is.EqualTo(0), "No rejected route may reach ReceiveCommand."))
+
 [<Test>]
 let ``freshly migrated witness table never proves an old protocol request inactive`` () =
     withStore (fun store ->

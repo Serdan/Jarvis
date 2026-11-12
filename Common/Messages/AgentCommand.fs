@@ -138,6 +138,7 @@ type TaskWriteCommand =
 /// Challenge condition owners and descriptions are explicit typed wire fields.
 type ChallengeConditionDefinition =
     { OwnerAgentId: string
+      SuggestedAgentId: string
       Description: string }
 
 type ChallengeReadCommand =
@@ -169,7 +170,9 @@ type ChallengeWriteCommand =
       Conditions: ChallengeConditionDefinition list
       Evidence: string
       Reason: string
-      Outcome: string }
+      Outcome: string
+      NewOwnerAgentId: string
+      Subscribe: bool }
 
 type LedgerReadCommand =
     { ProjectName: string

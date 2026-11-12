@@ -69,8 +69,8 @@ type ChallengeTests() =
             Directory.Delete(root, true)
 
     let definitions =
-        [ { OwnerAgentId = "Lead"; Description = "Integrate accepted changes" }
-          { OwnerAgentId = "Agent 8"; Description = "Run native benchmark" } ]
+        [ { OwnerAgentId = "Lead"; SuggestedAgentId = ""; Description = "Integrate accepted changes" }
+          { OwnerAgentId = "Agent 8"; SuggestedAgentId = ""; Description = "Run native benchmark" } ]
 
     let create binding =
         ChallengeWorkflow.create binding (Guid.NewGuid()) "Agent 3" "Release gate" "" definitions |> ok
@@ -239,10 +239,10 @@ type ChallengeTests() =
             let taskVersion, attemptVersion, agentVersion, attemptId = assignment a task
             let first =
                 ChallengeWorkflow.create a (Guid.NewGuid()) "Agent 3" "Integrate" task
-                    [ { OwnerAgentId = "Lead"; Description = "Review accepted" } ] |> ok
+                    [ { OwnerAgentId = "Lead"; SuggestedAgentId = ""; Description = "Review accepted" } ] |> ok
             let second =
                 ChallengeWorkflow.create b (Guid.NewGuid()) "Agent 3" "Benchmark" task
-                    [ { OwnerAgentId = "Agent 8"; Description = "Native pass" } ] |> ok
+                    [ { OwnerAgentId = "Agent 8"; SuggestedAgentId = ""; Description = "Native pass" } ] |> ok
             let dependencyIds = [ first.ChallengeId; second.ChallengeId ]
             let blockOp = Guid.NewGuid()
             let blocked =
@@ -317,9 +317,9 @@ type ChallengeTests() =
             let task = "cancelled-challenge-gate"
             let tv, pv, av, attemptId = assignment a task
             let first = ChallengeWorkflow.create a (Guid.NewGuid()) "Agent 3" "Needed" task
-                            [ { OwnerAgentId = "Lead"; Description = "Approval" } ] |> ok
+                            [ { OwnerAgentId = "Lead"; SuggestedAgentId = ""; Description = "Approval" } ] |> ok
             let second = ChallengeWorkflow.create b (Guid.NewGuid()) "Agent 3" "Might cancel" task
-                             [ { OwnerAgentId = "Agent 8"; Description = "Native" } ] |> ok
+                             [ { OwnerAgentId = "Agent 8"; SuggestedAgentId = ""; Description = "Native" } ] |> ok
             let deps = [first.ChallengeId;second.ChallengeId]
             let id = Guid.NewGuid()
             ChallengeWorkflow.blockAttempt a id "Agent 3" task attemptId tv pv av 1 "dependencies" deps
@@ -360,7 +360,7 @@ type ChallengeTests() =
             | other -> Assert.Fail(sprintf "Expected duplicate dependency rejection: %A" other)
             let foreign =
                 ChallengeWorkflow.create a (Guid.NewGuid()) "Lead" "Private" task
-                    [ { OwnerAgentId = "Agent 8"; Description = "Not Agent 3's condition" } ] |> ok
+                    [ { OwnerAgentId = "Agent 8"; SuggestedAgentId = ""; Description = "Not Agent 3's condition" } ] |> ok
             match ChallengeWorkflow.blockAttempt b (Guid.NewGuid()) "Agent 3" task attemptId
                       tv pv av 1 "Unrelated private challenge"
                       [foreign.ChallengeId] with
@@ -400,8 +400,8 @@ type ChallengeTests() =
             let evidence = String('E', 8192)
             let first =
                 ChallengeWorkflow.create a (Guid.NewGuid()) "Agent 3" title ""
-                    [ { OwnerAgentId = "Lead"; Description = description }
-                      { OwnerAgentId = "Agent 8"; Description = description } ] |> ok
+                    [ { OwnerAgentId = "Lead"; SuggestedAgentId = ""; Description = description }
+                      { OwnerAgentId = "Agent 8"; SuggestedAgentId = ""; Description = description } ] |> ok
             ChallengeWorkflow.resolve b (Guid.NewGuid()) "Lead" first.ChallengeId
                 first.ConditionIds.Head 1 evidence "" |> ok |> ignore
             ChallengeWorkflow.resolve a (Guid.NewGuid()) "Agent 8" first.ChallengeId
@@ -413,7 +413,7 @@ type ChallengeTests() =
             Assert.That(details.Challenge.Conditions |> List.forall (fun c -> c.Evidence.Length = 8192), Is.True)
             let blocked =
                 ChallengeWorkflow.create a (Guid.NewGuid()) "Agent 3" title ""
-                    [ { OwnerAgentId = "Lead"; Description = description } ] |> ok
+                    [ { OwnerAgentId = "Lead"; SuggestedAgentId = ""; Description = description } ] |> ok
             let reason = String('R', 4096)
             ChallengeWorkflow.resolve b (Guid.NewGuid()) "Lead" blocked.ChallengeId
                 blocked.ConditionIds.Head 1 evidence reason |> ok |> ignore
@@ -433,13 +433,13 @@ type ChallengeTests() =
             let created =
                 [ for index in 1 .. 3 ->
                     ChallengeWorkflow.create a (Guid.NewGuid()) "Agent 3" (title + string index) ""
-                        [ { OwnerAgentId = "Lead"; Description = "Check stage" } ] ]
+                        [ { OwnerAgentId = "Lead"; SuggestedAgentId = ""; Description = "Check stage" } ] ]
             // Max title size is 2048 bytes: use a valid bounded title.
             Assert.That(created |> List.forall Result.isError, Is.True)
             let ids =
                 [ for index in 1 .. 3 ->
                     (ChallengeWorkflow.create a (Guid.NewGuid()) "Agent 3" title ""
-                         [ { OwnerAgentId = "Lead"; Description = $"Step {index}" } ] |> ok).ChallengeId ]
+                         [ { OwnerAgentId = "Lead"; SuggestedAgentId = ""; Description = $"Step {index}" } ] |> ok).ChallengeId ]
             let first = ChallengeWorkflow.listPage b "Agent 3" 1 "" "" |> ok
             Assert.That(first.Challenges.Length, Is.EqualTo(1))
             Assert.That(first.NextCursor, Is.Not.Empty)
@@ -457,7 +457,7 @@ type ChallengeTests() =
             | Error(InvalidBinding _) -> ()
             | other -> Assert.Fail($"Expected list page limit rejection: {other}")
             ChallengeWorkflow.create a (Guid.NewGuid()) "Agent 3" "new" ""
-                [ { OwnerAgentId = "Lead"; Description = "Extra" } ] |> ok |> ignore
+                [ { OwnerAgentId = "Lead"; SuggestedAgentId = ""; Description = "Extra" } ] |> ok |> ignore
             match ChallengeWorkflow.listPage b "Agent 3" 1 first.NextCursor first.SnapshotCommit with
             | Error(StaleEntityVersion _) -> ()
             | other -> Assert.Fail($"Expected snapshot-pinned page failure after mutation: {other}")
@@ -469,7 +469,7 @@ type ChallengeTests() =
         withFixture (fun a b ->
             let first =
                 ChallengeWorkflow.create a (Guid.NewGuid()) "Agent 3" "Repeated block/reopen" ""
-                    [ { OwnerAgentId = "Lead"; Description = "Reopenable condition" } ] |> ok
+                    [ { OwnerAgentId = "Lead"; SuggestedAgentId = ""; Description = "Reopenable condition" } ] |> ok
             let id = first.ChallengeId
             let condition = first.ConditionIds.Head
             for round in 0 .. 9 do
@@ -580,4 +580,76 @@ type ChallengeTests() =
             Assert.That(afterReblock.History.Length, Is.EqualTo(5))
             Assert.That(notices a, Is.Empty,
                 "Re-blocking after reopening must update durable state but never notify.")
+        )
+
+
+    [<Test>]
+    member _.OptionalAssigneeSubscriptionAndCASDispatchWithoutClaimOrNotifications() =
+        withFixture (fun a b ->
+            let created =
+                ChallengeWorkflow.create a (Guid.NewGuid()) "Agent 3" "Benchmark" ""
+                    [ { OwnerAgentId = ""; SuggestedAgentId = "Agent 8"; Description = "Run native benchmark" } ]
+                |> ok
+            let conditionId = created.ConditionIds.Head
+            let issuer = get a "Agent 3" created.ChallengeId
+            Assert.That(issuer.Challenge.Conditions.Head.OwnerAgentId, Is.Empty)
+            Assert.That(issuer.Challenge.Conditions.Head.SuggestedAgentId, Is.EqualTo("Agent 8"))
+            Assert.That((ChallengeWorkflow.list a "Lead" |> ok).Challenges, Is.Empty)
+            let before = LedgerStore.fetch a |> ok
+            let unsubscribed =
+                ReviewWorkflow.getAgentInboxAt a before "Lead" |> ok
+                |> ChallengeWorkflow.enrichInboxAt a before "Lead" |> ok
+            Assert.That(unsubscribed.ChallengeTriage, Is.Empty)
+            failDenied (ChallengeWorkflow.resolve b (Guid.NewGuid()) "Lead"
+                            created.ChallengeId conditionId 1 "spoof" "")
+            let subscribeOp = Guid.NewGuid()
+            let firstSub = ChallengeWorkflow.setSubscription b subscribeOp "Lead" true |> ok
+            Assert.That(firstSub.AlreadyApplied, Is.False)
+            Assert.That((ChallengeWorkflow.setSubscription a subscribeOp "Lead" true |> ok).AlreadyApplied, Is.True)
+            let after = LedgerStore.fetch a |> ok
+            let inbox =
+                ReviewWorkflow.getAgentInboxAt a after "Lead" |> ok
+                |> ChallengeWorkflow.enrichInboxAt a after "Lead" |> ok
+            Assert.That(inbox.ChallengeSubscribed, Is.True)
+            Assert.That(inbox.ChallengeTriage.Length, Is.EqualTo(1))
+            Assert.That(inbox.ChallengeTriage.Head.ConditionId, Is.EqualTo(conditionId))
+            Assert.That(inbox.ChallengeTriage.Head.SuggestedAgentId, Is.EqualTo("Agent 8"))
+            Assert.That((ChallengeWorkflow.list a "Lead" |> ok).Challenges.Length, Is.EqualTo(1))
+            match ChallengeWorkflow.assignCondition b (Guid.NewGuid()) "Intruder"
+                    created.ChallengeId conditionId 1 "Lead" with
+            | Error(StaleEntityVersion _) | Error(ReviewAccessDenied _) -> ()
+            | other -> Assert.Fail($"Only issuer or subscribed dispatcher can assign: {other}")
+            ChallengeWorkflow.setSubscription a (Guid.NewGuid()) "Intruder" true |> ok |> ignore
+            let assignOp = Guid.NewGuid()
+            let assigned =
+                ChallengeWorkflow.assignCondition b assignOp "Lead"
+                    created.ChallengeId conditionId 1 "Agent 8" |> ok
+            Assert.That(assigned.AlreadyApplied, Is.False)
+            Assert.That((ChallengeWorkflow.assignCondition a assignOp "Lead"
+                            created.ChallengeId conditionId 1 "Agent 8" |> ok).AlreadyApplied, Is.True)
+            let assignment = get a "Agent 8" created.ChallengeId
+            Assert.That(assignment.Challenge.Version, Is.EqualTo(2))
+            Assert.That(assignment.Challenge.Conditions.Head.OwnerAgentId, Is.EqualTo("Agent 8"))
+            Assert.That(assignment.Challenge.Conditions.Head.ConditionId, Is.EqualTo(conditionId))
+            Assert.That(assignment.History.Length, Is.EqualTo(2))
+            Assert.That(assignment.History.Tail.Head.BeforeOwnerAgentId, Is.Empty)
+            Assert.That(assignment.History.Tail.Head.AfterOwnerAgentId, Is.EqualTo("Agent 8"))
+            failStale (ChallengeWorkflow.assignCondition a (Guid.NewGuid()) "Lead"
+                           created.ChallengeId conditionId 1 "Intruder")
+            let assignedInbox = LedgerStore.fetch b |> ok
+            let receiver =
+                ReviewWorkflow.getAgentInboxAt b assignedInbox "Agent 8" |> ok
+                |> ChallengeWorkflow.enrichInboxAt b assignedInbox "Agent 8" |> ok
+            Assert.That(receiver.ChallengeAssigned.Length, Is.EqualTo(1))
+            Assert.That(receiver.ChallengeAssigned.Head.ConditionId, Is.EqualTo(conditionId))
+            ChallengeWorkflow.resolve a (Guid.NewGuid()) "Agent 8" created.ChallengeId
+                conditionId 2 "benchmark-pass" "" |> ok |> ignore
+            let completed = LedgerStore.fetch b |> ok
+            let issuerInbox =
+                ReviewWorkflow.getAgentInboxAt b completed "Agent 3" |> ok
+                |> ChallengeWorkflow.enrichInboxAt b completed "Agent 3" |> ok
+            Assert.That(issuerInbox.ChallengeRecent.Length, Is.EqualTo(1))
+            Assert.That(issuerInbox.ChallengeRecent.Head.EvidencePreview, Is.EqualTo("benchmark-pass"))
+            Assert.That(issuerInbox.ChallengeRecent.Head.ChallengeStatus, Is.EqualTo("Satisfied"))
+            Assert.That(notices b, Is.Empty)
         )

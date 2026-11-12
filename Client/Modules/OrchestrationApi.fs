@@ -2171,7 +2171,11 @@ module TaskApi =
                 ReviewWorkflow.ReviewWorkflow.getIntegrationSubmissions binding cmd.TaskId
                 |> mapError |> Result.map box
             | "AgentInbox" ->
-                ReviewWorkflow.ReviewWorkflow.getBranchAgentInbox binding cmd.AgentId
+                LedgerStore.LedgerStore.fetch binding
+                |> Result.bind (fun snapshot ->
+                    ReviewWorkflow.ReviewWorkflow.getAgentInboxAt binding snapshot cmd.AgentId
+                    |> Result.bind (fun inbox ->
+                        ChallengeWorkflow.ChallengeWorkflow.enrichInboxAt binding snapshot cmd.AgentId inbox))
                 |> mapError |> Result.map box
             | "GetAssignment" ->
                 ReviewWorkflow.ReviewWorkflow.getAssignment binding cmd.TaskId cmd.AssignmentGeneration
@@ -2420,10 +2424,20 @@ module ChallengeApi =
                                         let definitions : ChallengeWorkflow.ChallengeConditionSpec list =
                                             cmd.Conditions |> List.map (fun definition ->
                                                 { OwnerAgentId = definition.OwnerAgentId
+                                                  SuggestedAgentId = definition.SuggestedAgentId
                                                   Description = definition.Description })
                                         ChallengeWorkflow.ChallengeWorkflow.create
                                             binding operationId cmd.ActorId cmd.Title cmd.TaskId definitions
                                         |> mapError |> Result.map _.Receipt
+                                | "Subscribe" ->
+                                    ChallengeWorkflow.ChallengeWorkflow.setSubscription
+                                        binding operationId cmd.ActorId cmd.Subscribe
+                                    |> mapError
+                                | "Assign" ->
+                                    ChallengeWorkflow.ChallengeWorkflow.assignCondition
+                                        binding operationId cmd.ActorId cmd.ChallengeId
+                                        cmd.ConditionId cmd.ExpectedVersion cmd.NewOwnerAgentId
+                                    |> mapError
                                 | "Resolve" ->
                                     if cmd.Outcome <> "Satisfied" && cmd.Outcome <> "Blocked" then
                                         Error(Client.ValidationError "Challenge condition outcome must be Satisfied or Blocked.")

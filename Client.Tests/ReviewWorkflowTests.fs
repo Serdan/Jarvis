@@ -4917,7 +4917,7 @@ type ReviewWorkflowTests() =
             let issued =
                 Client.ChallengeWorkflow.ChallengeWorkflow.create first
                     (Guid.NewGuid()) "Owner" "Ready-state read check" taskId
-                    [ { OwnerAgentId = "Reviewer"; Description = "Approval" } ]
+                    [ { OwnerAgentId = "Reviewer"; SuggestedAgentId = ""; Description = "Approval" } ]
                 |> success
             let before = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
             Assert.That(before.State, Is.EqualTo("Ready"))
@@ -4971,7 +4971,8 @@ type ReviewWorkflowTests() =
                           AttemptId = ""; DependencyChallengeIds = []
                           ExpectedTaskVersion = 0; ExpectedAttemptVersion = 0
                           ExpectedAgentVersion = 0; AssignmentGeneration = 0
-                          Conditions = []; Evidence = ""; Reason = "forged actor"; Outcome = "" }
+                          Conditions = []; Evidence = ""; Reason = "forged actor"; Outcome = ""
+                          NewOwnerAgentId = ""; Subscribe = false }
                 for command in [ forgedRead; forgedWrite ] do
                     let payload = System.Text.Json.JsonSerializer.Serialize(command)
                     let _, result, response =

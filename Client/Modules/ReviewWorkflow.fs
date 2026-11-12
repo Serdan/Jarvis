@@ -286,6 +286,22 @@ type AttemptChallengeWait =
       RequeuedAtUtc: string }
 
 [<CLIMutable>]
+type InboxChallengeItem =
+    { ChallengeId: string
+      ConditionId: string
+      IssuerAgentId: string
+      OwnerAgentId: string
+      SuggestedAgentId: string
+      Title: string
+      DescriptionPreview: string
+      ChallengeStatus: string
+      ConditionStatus: string
+      Version: int
+      EvidencePreview: string
+      ReasonPreview: string
+      UpdatedAtUtc: string }
+
+[<CLIMutable>]
 type AgentInbox =
     { SnapshotCommit: string
       Agent: ReviewAgent
@@ -297,6 +313,15 @@ type AgentInbox =
       Parked: InboxTask list
       Blocked: InboxTask list
       BlockedChallengeWaits: AttemptChallengeWait list
+      ChallengeSubscribed: bool
+      ChallengeAssigned: InboxChallengeItem list
+      ChallengeTriage: InboxChallengeItem list
+      ChallengeRecent: InboxChallengeItem list
+      ChallengeDependencies: InboxChallengeItem list
+      ChallengeAssignedOmitted: int
+      ChallengeTriageOmitted: int
+      ChallengeRecentOmitted: int
+      ChallengeDependenciesOmitted: int
       PendingReviews: BranchReview list
       AvailableReviews: BranchReview list
       UnacknowledgedFeedback: ReviewFeedbackNotice list
@@ -2555,6 +2580,15 @@ module ReviewWorkflow =
                           Parked = parked
                           Blocked = blocked
                           BlockedChallengeWaits = List.rev blockedWaits
+                          ChallengeSubscribed = false
+                          ChallengeAssigned = []
+                          ChallengeTriage = []
+                          ChallengeRecent = []
+                          ChallengeDependencies = []
+                          ChallengeAssignedOmitted = 0
+                          ChallengeTriageOmitted = 0
+                          ChallengeRecentOmitted = 0
+                          ChallengeDependenciesOmitted = 0
                           PendingReviews = pending
                           AvailableReviews = available
                           UnacknowledgedFeedback = feedback |> List.sortBy (fun notice -> notice.DecisionSequence)

@@ -11,12 +11,14 @@ open Client.ReviewWorkflow
 [<CLIMutable>]
 type ChallengeConditionSpec =
     { OwnerAgentId: string
+      SuggestedAgentId: string
       Description: string }
 
 [<CLIMutable>]
 type ChallengeCondition =
     { ConditionId: string
       OwnerAgentId: string
+      SuggestedAgentId: string
       Description: string
       Status: string
       Evidence: string
@@ -44,10 +46,19 @@ type ChallengeEvent =
       Action: string
       BeforeStatus: string
       AfterStatus: string
+      BeforeOwnerAgentId: string
+      AfterOwnerAgentId: string
       Evidence: string
       Reason: string
       Sequence: int64
       OccurredAtUtc: string }
+
+[<CLIMutable>]
+type ChallengeSubscription =
+    { AgentId: string
+      Enabled: bool
+      Version: int
+      UpdatedAtUtc: string }
 
 [<CLIMutable>]
 type ChallengeDetails =
@@ -97,6 +108,10 @@ module ChallengeWorkflow =
         "challenges/" + challengeId.ToString("N") + "/challenge.json"
     let private eventPath (challengeId: Guid) sequence =
         "challenges/" + challengeId.ToString("N") + "/events/" + string sequence + ".json"
+    let private subscriptionPath (agent: string) =
+        let safe = Convert.ToBase64String(Encoding.UTF8.GetBytes agent)
+                       .TrimEnd('=').Replace('+', '-').Replace('/', '_')
+        "agents/" + safe + ".challenge-subscription.json"
     let private taskPath taskId = "tasks/" + taskId + "/task.json"
     let private agentPath (agentId: string) =
         let safe = Convert.ToBase64String(Encoding.UTF8.GetBytes(agentId))
@@ -145,7 +160,9 @@ module ChallengeWorkflow =
         && ids.Length <= 32
         && ids.Length = (ids |> List.distinct |> List.length)
         && (challenge.Conditions |> List.forall (fun c ->
-            (guidN c.ConditionId).IsSome && agentId c.OwnerAgentId
+            (guidN c.ConditionId).IsSome
+            && (String.IsNullOrEmpty c.OwnerAgentId || agentId c.OwnerAgentId)
+            && (String.IsNullOrEmpty c.SuggestedAgentId || agentId c.SuggestedAgentId)
             && text 2048 c.Description
             && List.contains c.Status [ "Pending"; "Blocked"; "Satisfied" ]
             && (c.Status <> "Blocked" || text 4096 c.Reason)))
@@ -211,20 +228,65 @@ module ChallengeWorkflow =
                         (plan: LedgerSnapshot -> Result<LedgerFileChange list, LedgerFailure>) =
         LedgerStore.transact binding (intent operationId actor kind payload) plan
 
+    /// An explicit, per-agent project subscription controls visibility of
+    /// unassigned conditions. No Lead-name privilege and no notification state.
+    let private subscribedAt binding snapshot actor = result {
+        let! body, _ = LedgerStore.readAt binding snapshot (subscriptionPath actor)
+        match body with
+        | None -> return false
+        | Some value ->
+            try
+                use doc = JsonDocument.Parse(value)
+                let sub = JsonSerializer.Deserialize<ChallengeSubscription>(value, options)
+                if doc.RootElement.GetProperty("schemaVersion").GetInt32() <> 2
+                   || isNull (box sub) || sub.AgentId <> actor || sub.Version < 1 then
+                    return! Error(LedgerIntegrityError "Invalid challenge subscription identity or schema.")
+                return sub.Enabled
+            with ex ->
+                return! Error(LedgerIntegrityError ("Invalid challenge subscription: " + ex.Message))
+    }
+
+    let setSubscription binding operationId actor enabled =
+        if operationId = Guid.Empty || not (agentId actor) then
+            Error(InvalidBinding "Subscription requires registered actor and stable operation ID.")
+        else
+            changed binding operationId actor "SetChallengeSubscription"
+                {| enabled = enabled |}
+                (fun snapshot -> result {
+                    do! registered binding snapshot actor
+                    let target = subscriptionPath actor
+                    let! previous, blob = LedgerStore.readAt binding snapshot target
+                    let! version =
+                        match previous with
+                        | None -> Ok 1
+                        | Some _ ->
+                            subscribedAt binding snapshot actor
+                            |> Result.map (fun _ ->
+                                use doc = JsonDocument.Parse(previous.Value)
+                                doc.RootElement.GetProperty("version").GetInt32() + 1)
+                    let record =
+                        { AgentId = actor; Enabled = enabled; Version = version
+                          UpdatedAtUtc = DateTimeOffset.UtcNow.ToString("O") }
+                    return [ change target blob record ]
+                })
+
     let create binding operationId issuer title task
                (definitions: ChallengeConditionSpec list) =
         if operationId = Guid.Empty || not (agentId issuer)
            || not (text 2048 title) || not (taskId task)
            || List.isEmpty definitions || List.length definitions > 32
            || (definitions |> List.exists (fun d ->
-               not (agentId d.OwnerAgentId) || not (text 2048 d.Description))) then
+               (not (String.IsNullOrWhiteSpace d.OwnerAgentId) && not (agentId d.OwnerAgentId))
+               || (not (String.IsNullOrWhiteSpace d.SuggestedAgentId) && not (agentId d.SuggestedAgentId))
+               || not (text 2048 d.Description))) then
             Error(InvalidBinding "Challenge requires valid issuer, title, optional task, and 1-32 owned conditions.")
         else
             let challengeId = operationId
             let conditions =
                 definitions |> List.mapi (fun index definition ->
                     { ConditionId = conditionId challengeId index
-                      OwnerAgentId = definition.OwnerAgentId
+                      OwnerAgentId = if String.IsNullOrWhiteSpace definition.OwnerAgentId then "" else definition.OwnerAgentId
+                      SuggestedAgentId = if String.IsNullOrWhiteSpace definition.SuggestedAgentId then "" else definition.SuggestedAgentId
                       Description = definition.Description
                       Status = "Pending"; Evidence = null; Reason = null
                       UpdatedAtUtc = null })
@@ -233,8 +295,11 @@ module ChallengeWorkflow =
                     ({| title = title; taskId = task; conditions = definitions |})
                     (fun snapshot -> result {
                     do! registered binding snapshot issuer
-                    for definition in definitions |> List.distinctBy _.OwnerAgentId do
-                        do! registered binding snapshot definition.OwnerAgentId
+                    for definition in definitions do
+                        if not (String.IsNullOrWhiteSpace definition.OwnerAgentId) then
+                            do! registered binding snapshot definition.OwnerAgentId
+                        if not (String.IsNullOrWhiteSpace definition.SuggestedAgentId) then
+                            do! registered binding snapshot definition.SuggestedAgentId
                     do! existingTask binding snapshot task
                     let timestamp = DateTimeOffset.UtcNow.ToString("O")
                     let entity =
@@ -248,6 +313,7 @@ module ChallengeWorkflow =
                         { ChallengeId = entity.ChallengeId
                           ConditionId = ""; ActorId = issuer; Action = "Created"
                           BeforeStatus = ""; AfterStatus = "Pending"
+                          BeforeOwnerAgentId = ""; AfterOwnerAgentId = ""
                           Evidence = ""; Reason = ""; Sequence = snapshot.Header.NextSequence
                           OccurredAtUtc = timestamp }
                     return [ change (path challengeId) None entity
@@ -329,7 +395,10 @@ module ChallengeWorkflow =
                             { ChallengeId = challengeId
                               ConditionId = eventCondition; ActorId = actor
                               Action = kind; BeforeStatus = priorState
-                              AfterStatus = nextStatus; Evidence = evidence
+                              AfterStatus = nextStatus
+                              BeforeOwnerAgentId = target |> Option.map _.OwnerAgentId |> Option.defaultValue ""
+                              AfterOwnerAgentId = target |> Option.map _.OwnerAgentId |> Option.defaultValue ""
+                              Evidence = evidence
                               Reason = reason; Sequence = snapshot.Header.NextSequence
                               OccurredAtUtc = timestamp }
                         // The one Git ledger transaction records only challenge
@@ -348,9 +417,65 @@ module ChallengeWorkflow =
     let cancel binding operationId issuer challengeId version reason =
         update binding operationId issuer challengeId "" version "CancelChallenge" "" reason
 
+    /// The issuer may assign/reassign a Pending condition directly. A
+    /// subscriber may dispatch only an unassigned condition. Both routes use
+    /// the challenge version as one CAS precondition and preserve its ID.
+    let assignCondition binding operationId actor challengeId conditionId
+                        expectedVersion newOwner =
+        match guidN challengeId with
+        | None -> Error(InvalidBinding "Invalid challenge ID.")
+        | Some id when operationId = Guid.Empty || not (agentId actor)
+                       || not (agentId newOwner) || expectedVersion < 1 ->
+            Error(InvalidBinding "Assignment requires actor, target owner, ID and exact version.")
+        | Some id ->
+            changed binding operationId actor "AssignChallengeCondition"
+                {| challengeId = challengeId; conditionId = conditionId
+                   expectedVersion = expectedVersion; newOwner = newOwner |}
+                (fun snapshot -> result {
+                    do! registered binding snapshot actor
+                    do! registered binding snapshot newOwner
+                    let! challenge, blob = readChallenge binding snapshot id
+                    if challenge.Version <> expectedVersion
+                       || List.contains challenge.Status [ "Satisfied"; "Cancelled" ] then
+                        return! Error(StaleEntityVersion "Challenge version or terminal status changed before dispatch.")
+                    let! subscribed = subscribedAt binding snapshot actor
+                    let target = challenge.Conditions |> List.tryFind (fun c -> c.ConditionId = conditionId)
+                    let! condition =
+                        match target with
+                        | Some c when c.Status <> "Pending" ->
+                            Error(StaleEntityVersion "Only Pending conditions can be assigned.")
+                        | Some c when actor = challenge.IssuerAgentId ||
+                                      (subscribed && String.IsNullOrWhiteSpace c.OwnerAgentId) -> Ok c
+                        | Some _ -> Error(ReviewAccessDenied "Only issuer or a subscribed dispatcher of unassigned work may assign.")
+                        | None -> Error(InvalidBinding "Unknown condition ID.")
+                    if condition.OwnerAgentId = newOwner then
+                        return! Error(StaleEntityVersion "Condition already has this assignee.")
+                    let timestamp = DateTimeOffset.UtcNow.ToString("O")
+                    let conditions =
+                        challenge.Conditions |> List.map (fun c ->
+                            if c.ConditionId = conditionId then
+                                { c with OwnerAgentId = newOwner; UpdatedAtUtc = timestamp }
+                            else c)
+                    let updated = { challenge with Version = challenge.Version + 1; Conditions = conditions; UpdatedAtUtc = timestamp }
+                    let event =
+                        { ChallengeId = challengeId; ConditionId = conditionId
+                          ActorId = actor; Action = "AssignChallengeCondition"
+                          BeforeStatus = challenge.Status; AfterStatus = challenge.Status
+                          BeforeOwnerAgentId = condition.OwnerAgentId; AfterOwnerAgentId = newOwner
+                          Evidence = ""; Reason = ""; Sequence = snapshot.Header.NextSequence
+                          OccurredAtUtc = timestamp }
+                    return [ change (path id) (Some blob) updated
+                             change (eventPath id snapshot.Header.NextSequence) None event ]
+                })
+
     let private accessible actor (challenge: AgentChallenge) =
         challenge.IssuerAgentId = actor
         || challenge.Conditions |> List.exists (fun c -> c.OwnerAgentId = actor)
+
+    let private visible actor subscribed (challenge: AgentChallenge) =
+        accessible actor challenge
+        || (subscribed && challenge.Conditions |> List.exists (fun c ->
+            c.Status = "Pending" && String.IsNullOrWhiteSpace c.OwnerAgentId))
 
     let private listAt binding snapshot = result {
         let! paths = LedgerStore.listAt binding snapshot "challenges"
@@ -371,6 +496,75 @@ module ChallengeWorkflow =
         return records
     }
 
+    /// Enrich the ordinary self-inbox using the SAME verified snapshot.
+    /// This is a bounded read projection, never a notification or activation.
+    let enrichInboxAt binding snapshot actor (inbox: AgentInbox) = result {
+        if inbox.SnapshotCommit <> snapshot.Commit || inbox.Agent.AgentId <> actor then
+            return! Error(LedgerIntegrityError "Challenge inbox must use the same self-agent snapshot.")
+        let! enabled = subscribedAt binding snapshot actor
+        let! challenges = listAt binding snapshot
+        let item (challenge: AgentChallenge) (condition: ChallengeCondition) : InboxChallengeItem =
+            { ChallengeId = challenge.ChallengeId
+              ConditionId = condition.ConditionId
+              IssuerAgentId = challenge.IssuerAgentId
+              OwnerAgentId = condition.OwnerAgentId
+              SuggestedAgentId = condition.SuggestedAgentId
+              Title = compact 120 challenge.Title
+              DescriptionPreview = compact 144 condition.Description
+              ChallengeStatus = challenge.Status
+              ConditionStatus = condition.Status
+              Version = challenge.Version
+              EvidencePreview = compact 120 condition.Evidence
+              ReasonPreview = compact 120 condition.Reason
+              UpdatedAtUtc = condition.UpdatedAtUtc }
+        let allItems =
+            [ for challenge in challenges do
+                for condition in challenge.Conditions do
+                    yield challenge, condition, item challenge condition ]
+        let newest items =
+            items |> List.sortByDescending (fun (entry: InboxChallengeItem) ->
+                entry.UpdatedAtUtc, entry.ChallengeId, entry.ConditionId)
+        let assigned =
+            allItems
+            |> List.choose (fun (_, c, item) ->
+                if c.OwnerAgentId = actor && c.Status = "Pending" then Some item else None)
+            |> newest
+        let triage =
+            if enabled then
+                allItems
+                |> List.choose (fun (_, c, item) ->
+                    if c.Status = "Pending" && String.IsNullOrWhiteSpace c.OwnerAgentId
+                    then Some item else None)
+                |> newest
+            else []
+        let recent =
+            allItems
+            |> List.choose (fun (challenge, c, item) ->
+                if challenge.IssuerAgentId = actor && c.Status <> "Pending"
+                then Some item else None)
+            |> newest
+        let linked =
+            inbox.BlockedChallengeWaits |> List.collect _.ChallengeIds |> Set.ofList
+        let dependencies =
+            allItems
+            |> List.choose (fun (challenge, _, item) ->
+                if Set.contains challenge.ChallengeId linked
+                   && challenge.Conditions.Head.ConditionId = item.ConditionId
+                then Some item else None)
+            |> newest
+        let cap items = items |> List.truncate 12
+        return { inbox with
+                    ChallengeSubscribed = enabled
+                    ChallengeAssigned = cap assigned
+                    ChallengeTriage = cap triage
+                    ChallengeRecent = cap recent
+                    ChallengeDependencies = cap dependencies
+                    ChallengeAssignedOmitted = max 0 (assigned.Length - 12)
+                    ChallengeTriageOmitted = max 0 (triage.Length - 12)
+                    ChallengeRecentOmitted = max 0 (recent.Length - 12)
+                    ChallengeDependenciesOmitted = max 0 (dependencies.Length - 12) }
+    }
+
     /// Bounded cursor paging prevents a project with many large evidence
     /// records from overflowing the MCP response. Titles and unresolved IDs
     /// suffice to discover work; full evidence stays in get_challenge.
@@ -387,10 +581,11 @@ module ChallengeWorkflow =
                && snapshot.Commit <> expectedSnapshot then
                 return! Error(StaleEntityVersion "Challenge list snapshot moved; start pagination again.")
             do! registered binding snapshot actor
+            let! subscribed = subscribedAt binding snapshot actor
             let! all = listAt binding snapshot
             let sorted =
                 all
-                |> List.filter (accessible actor)
+                |> List.filter (visible actor subscribed)
                 |> List.filter (fun challenge ->
                     String.IsNullOrWhiteSpace cursor
                     || String.CompareOrdinal(challenge.ChallengeId, cursor) > 0)
@@ -438,8 +633,9 @@ module ChallengeWorkflow =
                && snapshot.Commit <> expectedSnapshot then
                 return! Error(StaleEntityVersion "Challenge detail snapshot moved; start paging again.")
             do! registered binding snapshot actor
+            let! subscribed = subscribedAt binding snapshot actor
             let! record, _ = readChallenge binding snapshot id
-            if not (accessible actor record) then
+            if not (visible actor subscribed record) then
                 return! Error(ReviewAccessDenied "Only issuer and condition owners can inspect a challenge.")
             let! paths =
                 LedgerStore.listAt binding snapshot

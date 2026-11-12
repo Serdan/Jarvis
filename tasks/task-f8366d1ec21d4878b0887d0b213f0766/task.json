@@ -1,1 +1,1 @@
-{"schemaVersion":2,"taskId":"task-f8366d1ec21d4878b0887d0b213f0766","title":"[P1 URGENT] Remove unmeasured per-user MCP tool concurrency limiter","version":2,"lifecycle":"InProgress","specVersion":1,"attemptId":"c10e8ee4f0e64b1fa0d66fe5c0f62f11"}
+{"schemaVersion":2,"taskId":"task-f8366d1ec21d4878b0887d0b213f0766","title":"[P1 URGENT] Remove arbitrary authenticated MCP concurrency and rate limits","version":3,"lifecycle":"InProgress","specVersion":2,"attemptId":"c10e8ee4f0e64b1fa0d66fe5c0f62f11"}

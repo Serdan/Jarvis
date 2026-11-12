@@ -108,6 +108,11 @@ type ReviewAgent =
         member this.ActiveAttemptId =
             if this.Execution = "Working" then this.FocusAttemptId else null
 
+/// A read-only decision, never a pre-activation mutation or durable operation.
+type AutomaticActivationDecision =
+    | ActivationEligible of taskId: string
+    | ActivationIneligible of reason: string
+
 [<CLIMutable>]
 type ReviewAttempt =
     { TaskId: string
@@ -2353,6 +2358,38 @@ module ReviewWorkflow =
     let getAgentWorkingTurn binding agentId =
         LedgerStore.fetch binding
         |> Result.bind (fun snapshot -> getAgentWorkingTurnAt binding snapshot agentId)
+
+    /// Read-only activation eligibility at one canonical snapshot. A retained
+    /// assignment may have Execution=Stopped and therefore derived State=Ready
+    /// even after its task is explicitly Closed. That is a completion candidate,
+    /// not permission to restart the task.
+    let inspectAutomaticActivation binding agentId =
+        result {
+            let! snapshot = LedgerStore.fetch binding
+            let! agent = getAgentWorkingTurnAt binding snapshot agentId
+            match box agent.CurrentAssignment with
+            | null -> return ActivationIneligible "Agent has no current assignment."
+            | _ when agent.State <> "Ready" ->
+                return ActivationIneligible $"Agent is {agent.State}, not Ready."
+            | _ ->
+                let assignment = agent.CurrentAssignment
+                let! task, attempt = getTaskAt binding snapshot assignment.TaskId
+                if task.Lifecycle <> "InProgress" then
+                    return ActivationIneligible $"Task {task.TaskId} is {task.Lifecycle}; no automatic start is permitted."
+                elif task.AttemptId <> assignment.AttemptId then
+                    return ActivationIneligible $"Task {task.TaskId} has a different current attempt."
+                else
+                    match attempt with
+                    | Some current when current.OwnerAgentId = agentId
+                                        && current.AttemptId = assignment.AttemptId
+                                        && (current.Phase = "Queued" || current.Phase = "Started") ->
+                        return ActivationEligible task.TaskId
+                    | Some current ->
+                        return ActivationIneligible $"Attempt {current.AttemptId} is {current.Phase} or belongs to another agent."
+                    | None ->
+                        return ActivationIneligible $"Task {task.TaskId} has no current attempt."
+        }
+
 
     // Resolve agent association from the canonical ledger even after a client
     // restart. This is identity for activity tracking, not evidence of Working.

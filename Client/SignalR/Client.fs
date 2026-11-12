@@ -115,7 +115,7 @@ let private activatesAgent (agentId: string) command =
     | TaskWriteCommand cmd ->
         cmd.ActorId = agentId
         && List.contains cmd.Action
-            [ "CheckpointAttempt"; "YieldAgent"; "CompleteAgentWork"
+            [ "CheckpointAttempt"; "YieldAgent"
               "AcknowledgeFeedback"; "AcknowledgeNotification"; "NotifyAgent"
               "BindAttemptSource"; "RebindAttemptSource"; "BindReviewBase"
               "SetAttemptSource"; "SubmitIntegration"; "CompleteIntegration" ]
@@ -151,33 +151,48 @@ let private activateReadyOnActivity (rt: Runtime) (agentId: string)
                               && not (isNull (box agent.CurrentAssignment))
                               && not (String.IsNullOrWhiteSpace agent.CurrentAssignment.TaskId) ->
                 match OrchestrationApi.LedgerBindingConfig.load project rt with
-                | Error error -> Error(Client.ValidationError($"Cannot activate Ready agent: {error}"))
+                | Error error -> Error(Client.ValidationError($"Cannot inspect Ready agent: {error}"))
                 | Ok binding ->
-                    let result =
-                        ReviewWorkflow.ReviewWorkflow.activateReadyAgent binding (Guid.NewGuid())
-                            agent.CurrentAssignment.TaskId agentId
-                    cache.Invalidate(projectId, agentId)
-                    match result with
-                    | Ok write when write.AlreadyApplied -> Ok ([], None)
-                    | Ok write ->
-                        // Only a successfully committed Ready-to-Working write
-                        // provides evidence of a transition performed here.
-                        let committed : AgentInboxActivation =
-                            { ProjectName = project
-                              AgentId = agentId
-                              ActivatedByThisCall = true
-                              BeforeState = Some "Ready"
-                              AfterState = Some "Working"
-                              CommittedHead = Some write.CurrentHead
-                              OperationId = Some write.Operation.OperationId }
-                        Ok (Client.LedgerStore.LedgerStore.changedAgentIds write, Some committed)
-                    | Error(Client.LedgerStore.StaleEntityVersion _) ->
-                        // Another concurrent tool may already have started this
-                        // assignment. Do not reset its Working clock.
-                        match ReviewWorkflow.ReviewWorkflow.getAgentWorkingTurn binding agentId with
-                        | Ok latest when latest.State = "Working" -> Ok ([], None)
-                        | _ -> Error(Client.ValidationError "Agent assignment changed before automatic activation.")
-                    | Error error -> Error(Client.ValidationError($"Automatic agent activation failed: {error}"))
+                    // A Ready cache entry cannot establish the current task
+                    // lifecycle. Closure may deliberately retain Started+Ready
+                    // so the owner can record a completion checkpoint.
+                    match ReviewWorkflow.ReviewWorkflow.inspectAutomaticActivation binding agentId with
+                    | Error error ->
+                        Error(Client.ValidationError($"Cannot inspect automatic activation eligibility: {error}"))
+                    | Ok(Client.ReviewWorkflow.ActivationIneligible _) ->
+                        cache.Invalidate(projectId, agentId)
+                        Ok ([], None)
+                    | Ok(Client.ReviewWorkflow.ActivationEligible currentTaskId) ->
+                        let result =
+                            ReviewWorkflow.ReviewWorkflow.activateReadyAgent binding (Guid.NewGuid())
+                                currentTaskId agentId
+                        cache.Invalidate(projectId, agentId)
+                        match result with
+                        | Ok write when write.AlreadyApplied -> Ok ([], None)
+                        | Ok write ->
+                            // Only committed transitions emit Working metadata.
+                            let committed : AgentInboxActivation =
+                                { ProjectName = project
+                                  AgentId = agentId
+                                  ActivatedByThisCall = true
+                                  BeforeState = Some "Ready"
+                                  AfterState = Some "Working"
+                                  CommittedHead = Some write.CurrentHead
+                                  OperationId = Some write.Operation.OperationId }
+                            Ok (Client.LedgerStore.LedgerStore.changedAgentIds write, Some committed)
+                        | Error(Client.LedgerStore.StaleEntityVersion detail) ->
+                            // Another call may have started or closed the task
+                            // after eligibility was read. Reinspect canonically.
+                            match ReviewWorkflow.ReviewWorkflow.inspectAutomaticActivation binding agentId with
+                            | Ok(Client.ReviewWorkflow.ActivationIneligible _) -> Ok ([], None)
+                            | Ok(Client.ReviewWorkflow.ActivationEligible latestTaskId) ->
+                                Error(Client.ValidationError(
+                                    $"Automatic activation conflicted with current Ready task {latestTaskId}: {detail}"))
+                            | Error error ->
+                                Error(Client.ValidationError(
+                                    $"Cannot reconcile concurrent automatic activation: {error}"))
+                        | Error error ->
+                            Error(Client.ValidationError($"Automatic agent activation failed: {error}"))
             | _ -> Ok ([], None)
 
 // Only the Working turn identifies a stable delivery scope. Ledger calls bootstrap

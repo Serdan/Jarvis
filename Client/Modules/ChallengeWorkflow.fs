@@ -362,11 +362,21 @@ module ChallengeWorkflow =
                               AfterStatus = nextStatus; Evidence = evidence
                               Reason = reason; Sequence = snapshot.Header.NextSequence
                               OccurredAtUtc = timestamp }
+                        // Notifications describe the *condition transition*, not
+                        // just the aggregate challenge state. A different owner can
+                        // satisfy a Pending condition while the challenge remains
+                        // Blocked; that must not emit a false blocked notification.
+                        // Distinct newly blocked conditions each notify exactly once.
+                        let newlyBlocked =
+                            kind = "ResolveChallengeCondition"
+                            && (nextConditions |> List.exists (fun condition ->
+                                condition.ConditionId = eventCondition
+                                && condition.Status = "Blocked"))
                         let extra =
                             if kind = "ResolveChallengeCondition" && nextStatus = "Satisfied" then
                                 [ emitNotification operationId challenge.IssuerAgentId challenge.TaskId
                                     (completionNotice nextRecord) timestamp ]
-                            elif kind = "ResolveChallengeCondition" && nextStatus = "Blocked" then
+                            elif newlyBlocked then
                                 [ emitNotification operationId challenge.IssuerAgentId challenge.TaskId
                                     (blockedNotice nextRecord actor evidence reason) timestamp ]
                             else []

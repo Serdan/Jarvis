@@ -507,3 +507,76 @@ type ChallengeTests() =
             Assert.That(last.History.Length, Is.EqualTo(16))
             Assert.That(last.NextEventSequence, Is.GreaterThan(0L))
         )
+
+
+    [<Test>]
+    member _.SatisfyingAnotherConditionWhileBlockedDoesNotEmitFalseBlockedNotification() =
+        withFixture (fun a b ->
+            let created = create a
+            let leadId, benchmarkId = created.ConditionIds.Head, created.ConditionIds.Tail.Head
+            let blockedOperation = Guid.NewGuid()
+            ChallengeWorkflow.resolve a blockedOperation "Lead" created.ChallengeId
+                leadId 1 "review requested" "Awaiting approval" |> ok |> ignore
+            let blockedNotices = notices b
+            Assert.That(blockedNotices.Length, Is.EqualTo(1))
+            Assert.That(blockedNotices.Head.Message, Does.Contain("Lead: Awaiting approval"))
+            let satisfiedOperation = Guid.NewGuid()
+            ChallengeWorkflow.resolve b satisfiedOperation "Agent 8" created.ChallengeId
+                benchmarkId 2 "benchmark:passed" "" |> ok |> ignore
+            // Replaying the successful transition does not add a notification.
+            Assert.That((ChallengeWorkflow.resolve a satisfiedOperation "Agent 8"
+                            created.ChallengeId benchmarkId 2 "benchmark:passed" "" |> ok).AlreadyApplied,
+                        Is.True)
+            let after = get a "Agent 3" created.ChallengeId
+            Assert.That(after.Challenge.Status, Is.EqualTo("Blocked"))
+            Assert.That(after.Challenge.Conditions.Head.Status, Is.EqualTo("Blocked"))
+            Assert.That(after.Challenge.Conditions.Tail.Head.Status, Is.EqualTo("Satisfied"))
+            Assert.That(after.History.Length, Is.EqualTo(3))
+            Assert.That(notices a |> List.length, Is.EqualTo(1),
+                "Satisfying a different condition while aggregate remains Blocked cannot send a blocked notice.")
+            ChallengeWorkflow.reopen b (Guid.NewGuid()) "Agent 3" created.ChallengeId
+                leadId 3 "Review finished" |> ok |> ignore
+            Assert.That((get a "Agent 3" created.ChallengeId).Challenge.Status, Is.EqualTo("Pending"))
+            ChallengeWorkflow.resolve a (Guid.NewGuid()) "Lead" created.ChallengeId
+                leadId 4 "accepted" "" |> ok |> ignore
+            let final = get b "Agent 3" created.ChallengeId
+            Assert.That(final.Challenge.Status, Is.EqualTo("Satisfied"))
+            let allNotices = notices b
+            Assert.That(allNotices.Length, Is.EqualTo(2))
+            Assert.That(allNotices |> List.filter (fun n -> n.Message.Contains("is satisfied")) |> List.length,
+                        Is.EqualTo(1))
+        )
+
+    [<Test>]
+    member _.IndependentNewlyBlockedConditionsEachNotifyOnceWithoutExtraOnReopen() =
+        withFixture (fun a b ->
+            let created = create a
+            let leadId, benchmarkId = created.ConditionIds.Head, created.ConditionIds.Tail.Head
+            let firstOperation = Guid.NewGuid()
+            ChallengeWorkflow.resolve a firstOperation "Lead" created.ChallengeId
+                leadId 1 "review evidence" "Blocked by review" |> ok |> ignore
+            let first = notices b
+            Assert.That(first.Length, Is.EqualTo(1))
+            Assert.That(first.Head.Message, Does.Contain("Lead: Blocked by review"))
+            let secondOperation = Guid.NewGuid()
+            ChallengeWorkflow.resolve b secondOperation "Agent 8" created.ChallengeId
+                benchmarkId 2 "benchmark failed" "Blocked by benchmark" |> ok |> ignore
+            let two = notices a
+            Assert.That(two.Length, Is.EqualTo(2),
+                "Two distinct Pending-to-Blocked conditions should each notify their issuer.")
+            Assert.That(two |> List.exists (fun n -> n.Message.Contains("Agent 8: Blocked by benchmark")), Is.True)
+            Assert.That((ChallengeWorkflow.resolve a secondOperation "Agent 8" created.ChallengeId
+                            benchmarkId 2 "benchmark failed" "Blocked by benchmark" |> ok).AlreadyApplied, Is.True)
+            Assert.That(notices b |> List.length, Is.EqualTo(2))
+            ChallengeWorkflow.reopen a (Guid.NewGuid()) "Agent 3" created.ChallengeId
+                benchmarkId 3 "Retry benchmark" |> ok |> ignore
+            Assert.That((get b "Agent 3" created.ChallengeId).Challenge.Status, Is.EqualTo("Blocked"))
+            Assert.That(notices a |> List.length, Is.EqualTo(2),
+                "Reopen is not a newly blocked condition.")
+            ChallengeWorkflow.resolve b (Guid.NewGuid()) "Agent 8" created.ChallengeId
+                benchmarkId 4 "retry failed" "New benchmark blocker" |> ok |> ignore
+            let afterReblock = notices a
+            Assert.That(afterReblock.Length, Is.EqualTo(3),
+                "A new Pending-to-Blocked transition after reopen is a separate legitimate notice.")
+            Assert.That(afterReblock |> List.exists (fun n -> n.Message.Contains("New benchmark blocker")), Is.True)
+        )

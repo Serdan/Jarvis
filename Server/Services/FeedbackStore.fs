@@ -4,6 +4,8 @@ open System
 open System.Collections.Generic
 open System.IO
 open System.Threading
+open System.Text.Json
+open Common
 open Microsoft.Data.Sqlite
 
 [<CLIMutable>]
@@ -82,6 +84,9 @@ type UnresolvedAgentExecution =
       DeviceGeneration: int64 option
       CorrelationId: string option
       ParentRequestId: string option
+      JobId: string option
+      JobStartedAt: DateTimeOffset option
+      JobReceiptAt: DateTimeOffset option
       CreatedAt: DateTimeOffset }
 
 type UnresolvedAgentExecutionPage =
@@ -256,7 +261,10 @@ CREATE TABLE IF NOT EXISTS agent_execution_witness (
     device_generation INTEGER NULL,
     correlation_id TEXT UNIQUE NULL,
     terminal_at TEXT NULL,
-    parent_request_id TEXT NULL
+    parent_request_id TEXT NULL,
+    job_id TEXT NULL,
+    job_started_at TEXT NULL,
+    job_receipt_at TEXT NULL
 );
 CREATE INDEX IF NOT EXISTS ix_agent_execution_witness_pending
     ON agent_execution_witness(user_id, agent_id, state);
@@ -299,7 +307,10 @@ INSERT OR IGNORE INTO agent_execution_epoch
         witnessReader.Close()
         for column, definition in
             [ "parent_request_id", "TEXT NULL"
-              "tool_name", "TEXT NULL" ] do
+              "tool_name", "TEXT NULL"
+              "job_id", "TEXT NULL"
+              "job_started_at", "TEXT NULL"
+              "job_receipt_at", "TEXT NULL" ] do
             if not (witnessColumns.Contains(column)) then
                 use witnessMigration = connection.CreateCommand()
                 witnessMigration.CommandText <-
@@ -332,6 +343,15 @@ INSERT OR IGNORE INTO agent_execution_epoch
                ON agent_execution_witness(parent_request_id)
                WHERE parent_request_id IS NOT NULL;"""
         childIndex.ExecuteNonQuery() |> ignore
+        // Job IDs belong to an authenticated client device, not a project or
+        // process-wide ephemeral job registry. Duplicate IDs on that device
+        // would make a later reconciliation ambiguous; fail the receipt.
+        use jobIndex = connection.CreateCommand()
+        jobIndex.CommandText <-
+            """CREATE UNIQUE INDEX IF NOT EXISTS ix_agent_execution_job_device
+               ON agent_execution_witness(user_id, device_id, job_id)
+               WHERE job_id IS NOT NULL;"""
+        jobIndex.ExecuteNonQuery() |> ignore
 
         use inspect = connection.CreateCommand()
         inspect.CommandText <- "PRAGMA table_info(feedback);"
@@ -923,7 +943,8 @@ INSERT INTO operations (
     // Match the persisted route exactly and accept a late response even if
     // ClientResponseTracker already timed out and forgot its correlation.
     member _.TryRecordAgentClientTerminal(
-        userId: string, connectionId: string, generation: int64, correlationId: string
+        userId: string, connectionId: string, generation: int64, correlationId: string,
+        ?clientResponse: AgentCommandResponse
     ) : Result<string option, string> =
         if [ userId; connectionId; correlationId ] |> List.exists String.IsNullOrWhiteSpace
            || generation < 1L then
@@ -961,12 +982,51 @@ INSERT INTO operations (
                     // migration. Without a durable command classification we
                     // cannot rule out a detached job; fail closed.
                     Error "The dispatched tool classification is unavailable; reconcile legacy execution before terminal proof."
-                | Some (_, "Dispatched", Some "StartJob") ->
-                    // A StartJob response is only a handle, not proof that
-                    // the process or descendants have exited. Preserve the
-                    // original witness until durable authenticated job/tree
-                    // reconciliation is implemented.
-                    Error "StartJob client reply cannot prove detached process-tree termination."
+                | Some (requestId, "Dispatched", Some "StartJob") ->
+                    // The client reply is only a job handle. Persist its exact
+                    // identity under the authenticated route for later process
+                    // tree reconciliation, but NEVER mark this witness Terminal
+                    // or release a correction permit on a mere StartJob reply.
+                    let launch =
+                        match clientResponse with
+                        | Some { Result = Some payload; Error = None } ->
+                            try
+                                let result = JsonSerializer.Deserialize<StartJobResult>(payload)
+                                if isNull (box result)
+                                   || String.IsNullOrWhiteSpace result.JobId
+                                   || result.JobId.Length > 128
+                                   || result.StartedAt = DateTimeOffset.MinValue then
+                                    Error "StartJob did not return a bounded job identity and start timestamp."
+                                else Ok result
+                            with :? JsonException ->
+                                Error "StartJob returned an invalid job identity payload."
+                        | _ ->
+                            Error "StartJob has no authenticated successful launch receipt; process liveness is unresolved."
+                    match launch with
+                    | Error failure -> Error failure
+                    | Ok job ->
+                        let launchedAt = job.StartedAt.ToString("O")
+                        use launchReceipt = connection.CreateCommand()
+                        launchReceipt.Transaction <- transaction
+                        launchReceipt.CommandText <-
+                            """UPDATE agent_execution_witness
+                               SET job_id = $jobId,
+                                   job_started_at = $jobStartedAt,
+                                   job_receipt_at = COALESCE(job_receipt_at, $now),
+                                   updated_at = $now
+                               WHERE request_id = $requestId
+                                 AND state = 'Dispatched' AND tool_name = 'StartJob'
+                                 AND (job_id IS NULL OR job_id = $jobId)
+                                 AND (job_started_at IS NULL OR job_started_at = $jobStartedAt);"""
+                        addParameter launchReceipt "$requestId" requestId
+                        addParameter launchReceipt "$jobId" job.JobId
+                        addParameter launchReceipt "$jobStartedAt" launchedAt
+                        addParameter launchReceipt "$now" (DateTimeOffset.UtcNow.ToString("O"))
+                        if launchReceipt.ExecuteNonQuery() <> 1 then
+                            Error "Conflicting StartJob launch receipts for one authenticated request."
+                        else
+                            transaction.Commit()
+                            Error "StartJob handle recorded; detached process-tree termination remains unverified."
                 | Some (requestId, "Dispatched", Some _) ->
                     use update = connection.CreateCommand()
                     update.Transaction <- transaction
@@ -1012,7 +1072,8 @@ INSERT INTO operations (
                 command.CommandText <-
                     """SELECT request_id, tool_name, project_name, state,
                               device_id, connection_id, device_generation,
-                              correlation_id, parent_request_id, created_at
+                              correlation_id, parent_request_id, created_at,
+                              job_id, job_started_at, job_receipt_at
                        FROM agent_execution_witness
                        WHERE user_id = $userId AND agent_id = $agentId
                          AND state NOT IN ('Terminal', 'NotDispatched')
@@ -1035,7 +1096,12 @@ INSERT INTO operations (
                               if reader.IsDBNull 6 then None else Some(reader.GetInt64 6)
                           CorrelationId = optionText reader 7
                           ParentRequestId = optionText reader 8
-                          CreatedAt = DateTimeOffset.Parse(reader.GetString 9) }
+                          CreatedAt = DateTimeOffset.Parse(reader.GetString 9)
+                          JobId = optionText reader 10
+                          JobStartedAt =
+                              optionText reader 11 |> Option.map DateTimeOffset.Parse
+                          JobReceiptAt =
+                              optionText reader 12 |> Option.map DateTimeOffset.Parse }
                 Ok { Executions = results |> Seq.truncate limit |> Seq.toList
                      HasMore = results.Count > limit }
             with ex -> Error $"Cannot inspect unresolved agent execution evidence: {ex.Message}"

@@ -132,7 +132,8 @@ type HubService(users: UserService, tracker: ClientResponseTracker, store: Feedb
             // A late response after tracker timeout still records termination.
             let durable =
                 store.TryRecordAgentClientTerminal(
-                    this.UserId, this.Context.ConnectionId, session.Generation, correlationId)
+                    this.UserId, this.Context.ConnectionId, session.Generation, correlationId,
+                    clientResponse = response)
             let accepted =
                 tracker.Complete(correlationId, this.UserId, this.Context.ConnectionId,
                                  session.Generation, response)

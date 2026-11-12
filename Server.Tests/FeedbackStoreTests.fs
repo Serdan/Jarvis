@@ -445,7 +445,7 @@ let ``authenticated StartJob client response does not prove child process exit``
                 Microsoft.Extensions.Logging.Abstractions.NullLogger<HubService>.Instance)
         hub.Context <- signalRCaller user conn
         let payload : Common.StartJobResult =
-            { JobId = "job-child-still-running"; StartedAt = DateTimeOffset.UtcNow }
+            { JobId = "0123456789abcdef0123456789abcdef"; StartedAt = DateTimeOffset.UtcNow }
         let response: Common.AgentCommandResponse =
             { Result = Some(System.Text.Json.JsonSerializer.Serialize(payload))
               Error = None; Instructions = []; AgentStateChanges = []; InboxActivation = None }
@@ -456,9 +456,23 @@ let ``authenticated StartJob client response does not prove child process exit``
         Assert.That(expected.Result.Result, Is.EqualTo(response.Result))
         store.GetAgentExecutionResolution(user, start.Id)
         |> shouldEqual (Ok ExecutionUnresolved)
+        let exact =
+            match store.ListUnresolvedAgentExecutions(user, agent, 10) with
+            | Ok page -> page.Executions |> List.find (fun item -> item.RequestId = start.Id)
+            | Error error -> failwith error
+        exact.JobId |> shouldEqual (Some payload.JobId)
+        exact.JobStartedAt |> shouldEqual (Some payload.StartedAt)
+        Assert.That(exact.JobReceiptAt.IsSome, Is.True)
+        let firstReceiptAt = exact.JobReceiptAt
         store.TryAcquireAgentCorrection(user, agent, "operator-after-handle").IsError
         |> shouldEqual true
         hub.SendClientResponse(correlation, response).GetAwaiter().GetResult()
+        let duplicate =
+            match store.ListUnresolvedAgentExecutions(user, agent, 10) with
+            | Ok page -> page.Executions |> List.find (fun item -> item.RequestId = start.Id)
+            | Error error -> failwith error
+        duplicate.JobId |> shouldEqual (Some payload.JobId)
+        duplicate.JobReceiptAt |> shouldEqual firstReceiptAt
         store.GetAgentExecutionResolution(user, start.Id)
         |> shouldEqual (Ok ExecutionUnresolved)
         // A completed GetJobResult request is distinct from a confirmed

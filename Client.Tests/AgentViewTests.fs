@@ -233,9 +233,9 @@ let projectStatusTotalsStayWholeWhenOnlyAgentRowsAreTextFiltered () =
     let b = { Project = "Jarvis"; Aliases = ["Jarvis"]; Identity = "pid:22222222:1"; Counts = Some (projectCounts [ record "Jarvis" "Lead" "Parked" None ] 0); Status = Fresh; Error = None }
     let data = { snapshot [] with Projects = [b; a] }
     visibleProjects "Agent" data |> List.map _.Project |> shouldEqual ["Jarvis"; "Wayfold"]
-    visibleProjects "@way Agent" data |> List.map _.Project |> shouldEqual ["Wayfold"]
-    visibleProjects "@jar" data |> List.map _.Project |> shouldEqual ["Jarvis"]
-    visibleProjects "@missing" data |> shouldEqual []
+    visibleProjects "#way Agent" data |> List.map _.Project |> shouldEqual ["Wayfold"]
+    visibleProjects "#jar" data |> List.map _.Project |> shouldEqual ["Jarvis"]
+    visibleProjects "#missing" data |> shouldEqual []
     totalCounts data |> fun total ->
         Assert.That(total.Tracked, Is.EqualTo(2))
         Assert.That(total.Working, Is.EqualTo(1))
@@ -292,14 +292,14 @@ let narrowProjectStatusWrapsAllCountersWithoutDroppingTheProjectLabel () =
     for width in [12; 24; 40; 54] do
         let lines = projectStatusLines width entry.Project entry
         Assert.That(lines.Length, Is.GreaterThan(1))
-        Assert.That(lines.Head, Does.StartWith("@"))
+        Assert.That(lines.Head, Does.StartWith("#"))
         for line in lines do Assert.That(line.Length, Is.LessThanOrEqualTo(width))
         let joined = String.concat " " lines
         for token in ["T1"; "Rev2"; "U0"; "W1"; "Rd0"; "Wait0"; "P0"] do
             Assert.That(joined, Does.Contain(token))
     let unavailable = { entry with Counts = None; Status = Unavailable; Error = Some "Remote unreachable" }
     let offlineLines = projectStatusLines 24 unavailable.Project unavailable
-    Assert.That(offlineLines.Head, Does.StartWith("@Wayfold"))
+    Assert.That(offlineLines.Head, Does.StartWith("#Wayfold"))
     Assert.That(String.concat " " offlineLines, Does.Contain("UNAVAILABLE"))
     Assert.That(String.concat " " offlineLines, Does.Contain("counts unknown"))
 

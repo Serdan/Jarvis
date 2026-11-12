@@ -570,16 +570,22 @@ module ChallengeWorkflow =
     let blockAttempt binding operationId actor task attemptId
                      expectedTaskVersion expectedAttemptVersion expectedAgentVersion
                      generation reason (challengeIds: string list) =
-        let normalized =
+        let requested =
             if isNull (box challengeIds) then [] else challengeIds
+        // Normalize UUID spelling BEFORE checking uniqueness or storing
+        // dependencies; case differences cannot represent distinct challenges.
+        let normalized =
+            requested
+            |> List.choose (fun raw ->
+                guidN raw |> Option.map (fun id -> id.ToString("N")))
         if operationId = Guid.Empty || not (agentId actor)
            || String.IsNullOrWhiteSpace task || not (taskId task)
            || (guidN attemptId).IsNone || generation < 1
            || expectedTaskVersion < 1 || expectedAttemptVersion < 1
            || expectedAgentVersion < 1 || not (text 2048 reason)
+           || requested.Length <> normalized.Length
            || normalized.Length > 16
-           || normalized.Length <> (normalized |> List.distinct |> List.length)
-           || (normalized |> List.exists (guidN >> Option.isNone)) then
+           || normalized.Length <> (normalized |> List.distinct |> List.length) then
             Error(InvalidBinding "Block requires valid actor/task/attempt, exact versions, reason, and <=16 distinct challenge IDs.")
         else
             changed binding operationId actor "WaitOnChallenges"
@@ -611,6 +617,9 @@ module ChallengeWorkflow =
                         return! Error(StaleEntityVersion "A challenge dependency wait is already open.")
                     for dependency in normalized do
                         let! linked, _ = readChallenge binding snapshot (Guid.ParseExact(dependency, "N"))
+                        if not (accessible actor linked) then
+                            return! Error(ReviewAccessDenied
+                                "Attempt owner must be the challenge issuer or a condition owner to link it.")
                         if linked.Status = "Cancelled" ||
                            (not (String.IsNullOrEmpty linked.TaskId) && linked.TaskId <> task) then
                             return! Error(StaleEntityVersion "Linked challenge was cancelled or belongs to another task.")

@@ -4905,3 +4905,82 @@ type ReviewWorkflowTests() =
                 push ()
                 reject "Gitlink task"
             finally git one [ "worktree"; "remove"; "--force"; auxiliary ] |> ignore)
+
+
+    [<Test>]
+    member _.ChallengeReadsDoNotActivateReadyAgentOrPublishCanonicalChanges() =
+        withFixture (fun one _ first second _ _ _ _ ->
+            let taskId = "read-only-challenge-agent"
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId taskId |> success |> ignore
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner"
+            |> success |> ignore
+            let issued =
+                Client.ChallengeWorkflow.ChallengeWorkflow.create first
+                    (Guid.NewGuid()) "Owner" "Ready-state read check" taskId
+                    [ { OwnerAgentId = "Reviewer"; Description = "Approval" } ]
+                |> success
+            let before = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
+            Assert.That(before.State, Is.EqualTo("Ready"))
+            let head = (LedgerStore.fetch first |> success).Commit
+            let configPath = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
+            try
+                let context = GitCommandTests.TestContext(Path.GetDirectoryName one)
+                Client.OrchestrationApi.LedgerBindingConfig.bindExisting
+                    "owner" context first.ProjectId first.LedgerId first.Epoch
+                    first.RemoteName first.ApprovedFetchUrl first.ApprovedPushUrl head true
+                |> success |> ignore
+                let runtime =
+                    Client.Runtime(Path.GetDirectoryName one, Client.ConsoleTui.ConsoleTui(), Client.PartialTrust)
+                for action, challengeId in [ "List", ""; "Get", issued.ChallengeId ] do
+                    let command : Common.AgentCommand =
+                        Common.ChallengeReadCommand
+                            { ProjectName = "owner"; ActorId = "Owner"
+                              Action = action; ChallengeId = challengeId
+                              Limit = if action = "List" then 10 else 0
+                              AfterChallengeId = ""; ExpectedSnapshotCommit = "" }
+                    let serialized = System.Text.Json.JsonSerializer.Serialize(command)
+                    let _, result, response =
+                        Client.SignalR.Client.processIncomingCommand runtime serialized "Owner"
+                        |> Async.AwaitTask |> Async.RunSynchronously
+                    match result with
+                    | Error error -> Assert.Fail($"Read-only Challenge{action} failed: {error}")
+                    | Ok payload ->
+                        use doc = System.Text.Json.JsonDocument.Parse(payload)
+                        Assert.That(doc.RootElement.GetProperty("SnapshotCommit").GetString(), Is.EqualTo(head))
+                    Assert.That(response.AgentStateChanges, Is.Empty)
+                    let after = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
+                    Assert.That(after, Is.EqualTo(before),
+                        $"Challenge {action} must not activate an assigned Ready agent.")
+                    Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(head),
+                        $"Challenge {action} must not write the canonical ledger.")
+                // The command's claimed issuer or condition owner cannot
+                // override the independently supplied initiating actor.
+                let forgedRead : Common.AgentCommand =
+                    Common.ChallengeReadCommand
+                        { ProjectName = "owner"; ActorId = "Owner"
+                          Action = "Get"; ChallengeId = issued.ChallengeId
+                          Limit = 0; AfterChallengeId = ""; ExpectedSnapshotCommit = "" }
+                let forgedWrite : Common.AgentCommand =
+                    Common.ChallengeWriteCommand
+                        { ProjectName = "owner"; ActorId = "Owner"
+                          OperationId = Guid.NewGuid().ToString("D")
+                          Action = "Cancel"; ChallengeId = issued.ChallengeId
+                          ConditionId = ""; ExpectedVersion = 1; Title = ""; TaskId = ""
+                          AttemptId = ""; DependencyChallengeIds = []
+                          ExpectedTaskVersion = 0; ExpectedAttemptVersion = 0
+                          ExpectedAgentVersion = 0; AssignmentGeneration = 0
+                          Conditions = []; Evidence = ""; Reason = "forged actor"; Outcome = "" }
+                for command in [ forgedRead; forgedWrite ] do
+                    let payload = System.Text.Json.JsonSerializer.Serialize(command)
+                    let _, result, response =
+                        Client.SignalR.Client.processIncomingCommand runtime payload "Reviewer"
+                        |> Async.AwaitTask |> Async.RunSynchronously
+                    match result with
+                    | Error(Client.ValidationError _) -> ()
+                    | other -> Assert.Fail($"Forged challenge actor unexpectedly accepted: {other}")
+                    Assert.That(response.AgentStateChanges, Is.Empty)
+                Assert.That((ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent,
+                    Is.EqualTo(before), "Forged challenge actor must not change the issuer's Ready state.")
+                Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(head))
+            finally
+                if File.Exists configPath then File.Delete configPath)

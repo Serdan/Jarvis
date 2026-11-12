@@ -685,6 +685,18 @@ let processIncomingCommand (rt: Runtime) (commandJson: string) (agentId: string)
                             when String.IsNullOrWhiteSpace agentId
                                  || not (String.Equals(observation.ObserverAgentId, agentId, StringComparison.Ordinal)) ->
                             Error(Client.ValidationError "Observation actor label does not match the initiating tool-call actor.")
+                        // Challenge authorization is based on the registered
+                        // issuer/condition owner. The independently supplied
+                        // invocation actor must match BEFORE any project
+                        // resolution, implicit activity or ledger read/write.
+                        | ChallengeReadCommand read
+                            when String.IsNullOrWhiteSpace agentId
+                                 || not (String.Equals(read.ActorId, agentId, StringComparison.Ordinal)) ->
+                            Error(Client.ValidationError "Challenge read actor differs from the initiating tool-call actor.")
+                        | ChallengeWriteCommand write
+                            when String.IsNullOrWhiteSpace agentId
+                                 || not (String.Equals(write.ActorId, agentId, StringComparison.Ordinal)) ->
+                            Error(Client.ValidationError "Challenge write actor differs from the initiating tool-call actor.")
                         | _ -> classifyProject command
                     match project with
                     | Error error -> return Error error

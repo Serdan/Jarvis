@@ -353,6 +353,19 @@ type ChallengeTests() =
                       tv pv av 1 "duplicate" [invalid; invalid] with
             | Error(InvalidBinding _) -> ()
             | other -> Assert.Fail(sprintf "Expected duplicate dependency rejection: %A" other)
+            let foreign =
+                ChallengeWorkflow.create a (Guid.NewGuid()) "Lead" "Private" task
+                    [ { OwnerAgentId = "Agent 8"; Description = "Not Agent 3's condition" } ] |> ok
+            match ChallengeWorkflow.blockAttempt b (Guid.NewGuid()) "Agent 3" task attemptId
+                      tv pv av 1 "Unrelated private challenge"
+                      [foreign.ChallengeId] with
+            | Error(ReviewAccessDenied _) -> ()
+            | other -> Assert.Fail(sprintf "Unrelated challenge reference must be inaccessible: %A" other)
+            match ChallengeWorkflow.blockAttempt b (Guid.NewGuid()) "Agent 3" task attemptId
+                      tv pv av 1 "Mixed-case duplicate"
+                      [foreign.ChallengeId; foreign.ChallengeId.ToUpperInvariant()] with
+            | Error(InvalidBinding _) -> ()
+            | other -> Assert.Fail(sprintf "Canonical duplicate challenge IDs must be rejected: %A" other)
             let op = Guid.NewGuid()
             ChallengeWorkflow.blockAttempt a op "Agent 3" task attemptId
                 tv pv av 1 "Waiting for user input" [] |> ok |> ignore

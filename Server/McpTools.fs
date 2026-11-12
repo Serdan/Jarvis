@@ -1968,7 +1968,7 @@ type JarvisMcpTools =
 
     [<McpServerTool(Title = "create challenge", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false);
       McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]""");
-      Description("Create a durable ALL-policy agent challenge with 1-32 explicit condition owners. Stable challenge and condition IDs derive from the operation UUID, returned by this tool. Resolution creates exactly one issuer notification; it never starts an agent.")>]
+      Description("Create a durable ALL-policy agent challenge with 1-32 explicit condition owners. Stable challenge and condition IDs derive from the operation UUID, returned by this tool. Completion and evidence are recorded only in the canonical challenge ledger. No notifications or automatic agent activation.")>]
     static member CreateChallenge(
         projectName: string, agentId: string, title: string,
         conditions: ChallengeConditionDefinition array,
@@ -2021,7 +2021,7 @@ type JarvisMcpTools =
 
     [<McpServerTool(Title = "resolve challenge condition", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false);
       McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]""");
-      Description("As the assigned condition owner, atomically resolve a Pending condition as Satisfied (with evidence) or Blocked (with required reason and optional evidence). Use exact challenge version for CAS; reused operation IDs are idempotent. A blocked condition notifies the issuer but never satisfies the challenge.")>]
+      Description("As the assigned condition owner, atomically resolve a Pending condition as Satisfied (with evidence) or Blocked (with required reason and optional evidence). Use exact challenge version for CAS; reused operation IDs are idempotent. A blocked condition never satisfies the challenge; its reason and evidence are visible through the challenge query. No notifications.")>]
     static member ResolveChallengeCondition(
         projectName: string, agentId: string, challengeId: string,
         conditionId: string, expectedVersion: int, outcome: string, evidence: string,
@@ -2055,7 +2055,7 @@ type JarvisMcpTools =
 
     [<McpServerTool(Title = "cancel challenge", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false);
       McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]""");
-      Description("Issuer-only: cancel a Pending or Blocked challenge at its current version with a durable reason. Cancellation cannot trigger onSatisfied, erase history or automatically change agent/task state.")>]
+      Description("Issuer-only: cancel a Pending or Blocked challenge at its current version with a durable reason. Cancellation never creates notifications, erases history or automatically changes agent/task state.")>]
     static member CancelChallenge(
         projectName: string, agentId: string, challengeId: string,
         expectedVersion: int, reason: string,

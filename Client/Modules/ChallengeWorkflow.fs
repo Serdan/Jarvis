@@ -31,7 +31,6 @@ type AgentChallenge =
       TaskId: string
       Version: int
       CompletionPolicy: string
-      OnSatisfied: string
       Status: string
       Conditions: ChallengeCondition list
       CreatedAtUtc: string
@@ -98,8 +97,6 @@ module ChallengeWorkflow =
         "challenges/" + challengeId.ToString("N") + "/challenge.json"
     let private eventPath (challengeId: Guid) sequence =
         "challenges/" + challengeId.ToString("N") + "/events/" + string sequence + ".json"
-    let private notificationPath (operationId: Guid) =
-        "notifications/" + operationId.ToString("N") + ".json"
     let private taskPath taskId = "tasks/" + taskId + "/task.json"
     let private agentPath (agentId: string) =
         let safe = Convert.ToBase64String(Encoding.UTF8.GetBytes(agentId))
@@ -143,7 +140,6 @@ module ChallengeWorkflow =
         && text 2048 challenge.Title
         && taskId challenge.TaskId
         && challenge.CompletionPolicy = "All"
-        && challenge.OnSatisfied = "Notify"
         && List.contains challenge.Status [ "Pending"; "Blocked"; "Satisfied"; "Cancelled" ]
         && not (List.isEmpty ids)
         && ids.Length <= 32
@@ -195,9 +191,8 @@ module ChallengeWorkflow =
             | None -> return! Error(StaleEntityVersion "Challenge task context no longer exists.")
     }
 
-    /// Notifications have a strict 4 KiB ledger limit. Preserve every
-    /// condition's result in a compact summary and retain full evidence in
-    /// the challenge record and immutable audit events.
+    /// Keep list previews bounded; full descriptions and evidence remain in
+    /// canonical challenge records and audit events.
     let private compact maxBytes (value: string) =
         let input =
             if isNull value then ""
@@ -211,31 +206,6 @@ module ChallengeWorkflow =
                     builder.Append(rune.ToString()) |> ignore
                     count <- count + rune.Utf8SequenceLength
             builder.ToString() + "..."
-
-    let private completionNotice (challenge: AgentChallenge) =
-        let header =
-            $"Challenge '{compact 120 challenge.Title}' is satisfied ({challenge.ChallengeId})."
-        let results =
-            challenge.Conditions
-            |> List.mapi (fun index condition ->
-                $"{index + 1}. {compact 24 condition.OwnerAgentId}: {compact 24 condition.Description}; evidence: {compact 36 condition.Evidence}")
-            |> String.concat "\n"
-        header + "\n" + results + "\nFull evidence: get_challenge."
-
-    let private blockedNotice (challenge: AgentChallenge) actor evidence reason =
-        $"Challenge '{compact 120 challenge.Title}' blocked ({challenge.ChallengeId}); {compact 40 actor}: {compact 512 reason}. Evidence: {compact 512 evidence}. Full history: get_challenge."
-
-    let private emitNotification (id: Guid) issuer taskId message timestamp : LedgerFileChange =
-        let notification : AgentNotification =
-            { NotificationId = id.ToString("N")
-              FromAgentId = issuer
-              FromProjectName = ""
-              ToAgentId = issuer
-              TaskId = taskId
-              Message = message
-              CreatedAtUtc = timestamp
-              AcknowledgedAtUtc = null }
-        change (notificationPath id) None notification
 
     let private changed binding operationId actor kind payload
                         (plan: LedgerSnapshot -> Result<LedgerFileChange list, LedgerFailure>) =
@@ -271,7 +241,7 @@ module ChallengeWorkflow =
                         { ChallengeId = challengeId.ToString("N")
                           IssuerAgentId = issuer; Title = title
                           TaskId = if isNull task then "" else task
-                          Version = 1; CompletionPolicy = "All"; OnSatisfied = "Notify"
+                          Version = 1; CompletionPolicy = "All"
                           Status = "Pending"; Conditions = conditions
                           CreatedAtUtc = timestamp; UpdatedAtUtc = timestamp }
                     let event =
@@ -315,11 +285,11 @@ module ChallengeWorkflow =
                         let timestamp = DateTimeOffset.UtcNow.ToString("O")
                         let target =
                             challenge.Conditions |> List.tryFind (fun c -> c.ConditionId = conditionId)
-                        let! nextConditions, eventCondition, message =
+                        let! nextConditions, eventCondition =
                             match kind with
                             | "CancelChallenge" when actor = challenge.IssuerAgentId
                                 && text 4096 reason ->
-                                Ok(challenge.Conditions, "", None)
+                                Ok(challenge.Conditions, "")
                             | "ReopenChallengeCondition" when actor = challenge.IssuerAgentId
                                                            && text 4096 reason ->
                                 match target with
@@ -327,7 +297,7 @@ module ChallengeWorkflow =
                                     Ok(challenge.Conditions |> List.map (fun c ->
                                         if c.ConditionId = conditionId then
                                             { c with Status = "Pending"; UpdatedAtUtc = timestamp }
-                                        else c), conditionId, None)
+                                        else c), conditionId)
                                 | _ -> Error(StaleEntityVersion "Only an existing Blocked condition can be reopened.")
                             | "ResolveChallengeCondition" ->
                                 match target with
@@ -341,7 +311,7 @@ module ChallengeWorkflow =
                                                      Evidence = evidence; Reason = reason
                                                      UpdatedAtUtc = timestamp }
                                         else c)
-                                    Ok(next, conditionId, None)
+                                    Ok(next, conditionId)
                                 | Some _ when target.Value.OwnerAgentId <> actor ->
                                     Error(ReviewAccessDenied "Only the condition owner can resolve their condition.")
                                 | _ -> Error(StaleEntityVersion "Condition is not pending or lacks evidence/reason.")
@@ -362,27 +332,11 @@ module ChallengeWorkflow =
                               AfterStatus = nextStatus; Evidence = evidence
                               Reason = reason; Sequence = snapshot.Header.NextSequence
                               OccurredAtUtc = timestamp }
-                        // Notifications describe the *condition transition*, not
-                        // just the aggregate challenge state. A different owner can
-                        // satisfy a Pending condition while the challenge remains
-                        // Blocked; that must not emit a false blocked notification.
-                        // Distinct newly blocked conditions each notify exactly once.
-                        let newlyBlocked =
-                            kind = "ResolveChallengeCondition"
-                            && (nextConditions |> List.exists (fun condition ->
-                                condition.ConditionId = eventCondition
-                                && condition.Status = "Blocked"))
-                        let extra =
-                            if kind = "ResolveChallengeCondition" && nextStatus = "Satisfied" then
-                                [ emitNotification operationId challenge.IssuerAgentId challenge.TaskId
-                                    (completionNotice nextRecord) timestamp ]
-                            elif newlyBlocked then
-                                [ emitNotification operationId challenge.IssuerAgentId challenge.TaskId
-                                    (blockedNotice nextRecord actor evidence reason) timestamp ]
-                            else []
+                        // The one Git ledger transaction records only challenge
+                        // state and its immutable event. Notification settings,
+                        // recipient blocks, and delivery cannot affect progress.
                         return [ change (path id) (Some blob) nextRecord
                                  change (eventPath id snapshot.Header.NextSequence) None event ]
-                               @ extra
                     })
 
     let resolve binding operationId actor challengeId conditionId version evidence blockedReason =

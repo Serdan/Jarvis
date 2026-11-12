@@ -115,7 +115,7 @@ let private activatesAgent (agentId: string) command =
     | TaskWriteCommand cmd ->
         cmd.ActorId = agentId
         && List.contains cmd.Action
-            [ "CheckpointAttempt"; "YieldAgent"; "CompleteAgentWork"
+            [ "CheckpointAttempt"; "YieldAgent"
               "AcknowledgeFeedback"; "AcknowledgeNotification"; "NotifyAgent"
               "BindAttemptSource"; "RebindAttemptSource"; "BindReviewBase"
               "SetAttemptSource"; "SubmitIntegration"; "CompleteIntegration" ]
@@ -159,10 +159,10 @@ let private activateReadyOnActivity (rt: Runtime) (agentId: string)
                     match ReviewWorkflow.ReviewWorkflow.inspectAutomaticActivation binding agentId with
                     | Error error ->
                         Error(Client.ValidationError($"Cannot inspect automatic activation eligibility: {error}"))
-                    | Ok(ActivationIneligible _) ->
+                    | Ok(Client.ReviewWorkflow.ActivationIneligible _) ->
                         cache.Invalidate(projectId, agentId)
                         Ok ([], None)
-                    | Ok(ActivationEligible currentTaskId) ->
+                    | Ok(Client.ReviewWorkflow.ActivationEligible currentTaskId) ->
                         let result =
                             ReviewWorkflow.ReviewWorkflow.activateReadyAgent binding (Guid.NewGuid())
                                 currentTaskId agentId
@@ -184,8 +184,8 @@ let private activateReadyOnActivity (rt: Runtime) (agentId: string)
                             // Another call may have started or closed the task
                             // after eligibility was read. Reinspect canonically.
                             match ReviewWorkflow.ReviewWorkflow.inspectAutomaticActivation binding agentId with
-                            | Ok(ActivationIneligible _) -> Ok ([], None)
-                            | Ok(ActivationEligible latestTaskId) ->
+                            | Ok(Client.ReviewWorkflow.ActivationIneligible _) -> Ok ([], None)
+                            | Ok(Client.ReviewWorkflow.ActivationEligible latestTaskId) ->
                                 Error(Client.ValidationError(
                                     $"Automatic activation conflicted with current Ready task {latestTaskId}: {detail}"))
                             | Error error ->

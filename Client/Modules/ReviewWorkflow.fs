@@ -2367,11 +2367,12 @@ module ReviewWorkflow =
         result {
             let! snapshot = LedgerStore.fetch binding
             let! agent = getAgentWorkingTurnAt binding snapshot agentId
-            match agent.CurrentAssignment with
+            match box agent.CurrentAssignment with
             | null -> return ActivationIneligible "Agent has no current assignment."
-            | assignment when agent.State <> "Ready" ->
+            | _ when agent.State <> "Ready" ->
                 return ActivationIneligible $"Agent is {agent.State}, not Ready."
-            | assignment ->
+            | _ ->
+                let assignment = agent.CurrentAssignment
                 let! task, attempt = getTaskAt binding snapshot assignment.TaskId
                 if task.Lifecycle <> "InProgress" then
                     return ActivationIneligible $"Task {task.TaskId} is {task.Lifecycle}; no automatic start is permitted."

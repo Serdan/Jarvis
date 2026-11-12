@@ -2206,6 +2206,157 @@ type ReviewWorkflowTests() =
             Assert.That((LedgerStore.readDashboardRecordsAt first initial |> success) = records, Is.True))
 
     [<Test>]
+    member _.ClosedStartedAssignmentCanReadAndCompleteThroughSignalRWithoutReactivation() =
+        withFixture (fun one _ first second _ _ _ _ ->
+            let taskId = "closed-signalr-completion"
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Closed completion"
+            |> success |> ignore
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner"
+            |> success |> ignore
+            ReviewWorkflow.resumeAgent first (Guid.NewGuid()) taskId "Owner" 0 0 0
+            |> success |> ignore
+            let context = GitCommandTests.TestContext(Path.GetDirectoryName one)
+            let configPath = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
+            try
+                let head = (LedgerStore.fetch first |> success).Commit
+                Client.OrchestrationApi.LedgerBindingConfig.bindExisting
+                    "owner" context first.ProjectId first.LedgerId first.Epoch
+                    first.RemoteName first.ApprovedFetchUrl first.ApprovedPushUrl head true
+                |> success |> ignore
+                let runtime =
+                    Client.Runtime(Path.GetDirectoryName one, Client.ConsoleTui.ConsoleTui(), Client.PartialTrust)
+                let invoke command =
+                    Client.SignalR.Client.processIncomingCommand runtime
+                        (System.Text.Json.JsonSerializer.Serialize<Common.AgentCommand>(command)) "Owner"
+                    |> Async.AwaitTask |> Async.RunSynchronously
+                let read action =
+                    Common.TaskReadCommand
+                        { ProjectName = "owner"; AgentId = "Owner"; Action = action
+                          TaskId = taskId; AssignmentGeneration = 1; CheckpointSequence = 0L
+                          Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null }
+
+                // A warm Working cache on one client is not invalidated when
+                // another client closes the task without an agent-state change.
+                let _, workingRead, workingReceipt = invoke (read "GetAssignment")
+                Assert.That(workingRead.IsOk, Is.True)
+                Assert.That(workingReceipt.AgentStateChanges, Is.Empty)
+                ReviewWorkflow.yieldAgent second (Guid.NewGuid()) taskId "Owner" 0 0 0
+                    "Implementation integrated" "Record final completion"
+                |> success |> ignore
+                let stopped = (ReviewWorkflow.getAgentInbox first "Owner" |> success).Agent
+                Assert.That(stopped.Execution, Is.EqualTo("Stopped"))
+                Assert.That(stopped.State, Is.EqualTo("Ready"))
+                Assert.That(stopped.CurrentAssignment, Is.Not.Null)
+                let _, activeTask, unfinished = ReviewWorkflow.getTask first taskId |> success
+                ReviewWorkflow.closeTask second (Guid.NewGuid()) taskId activeTask.Version
+                |> success |> ignore
+                let _, staleRead, staleReceipt = invoke (read "GetAssignment")
+                Assert.That(staleRead.IsOk, Is.True)
+                Assert.That(staleReceipt.AgentStateChanges, Is.Empty)
+
+                // Self-inbox always invalidates cache, then reads the closed
+                // assignment. It must not call ResumeAgent or claim Working.
+                let _, inboxResult, inboxReceipt = invoke (read "AgentInbox")
+                Assert.That(inboxResult.IsOk, Is.True)
+                Assert.That(inboxReceipt.AgentStateChanges, Is.Empty)
+                Assert.That(inboxReceipt.InboxActivation.IsSome, Is.True)
+                Assert.That(inboxReceipt.InboxActivation.Value.ActivatedByThisCall, Is.False)
+                Assert.That(inboxReceipt.InboxActivation.Value.OperationId.IsNone, Is.True)
+                let beforeComplete = (ReviewWorkflow.getAgentInbox first "Owner" |> success).Agent
+                Assert.That(beforeComplete.Execution, Is.EqualTo("Stopped"))
+                Assert.That(beforeComplete.Version, Is.EqualTo(stopped.Version))
+                Assert.That(beforeComplete.State, Is.EqualTo("Ready"))
+                Assert.That((ReviewWorkflow.getTask second taskId |> success |> fun (_, task, _) -> task.Lifecycle),
+                            Is.EqualTo("Closed"))
+
+                let completion : Common.TaskWriteCommand =
+                    { ProjectName = "owner"; Action = "CompleteAgentWork"
+                      OperationId = Guid.NewGuid().ToString("D")
+                      TaskId = taskId; AttemptId = ""; ActorId = "Owner"; OwnerId = ""
+                      Title = ""; Html = ""; ExpectedVersion = unfinished.Value.Version
+                      ExpectedAgentVersion = beforeComplete.Version; ExpectedTaskVersion = 0
+                      AssignmentGeneration = 1; Summary = "Completed after closure"
+                      NextAction = ""; Reason = ""; BaseOid = ""; TargetRef = ""
+                      SourceRef = ""; AllowDetached = false; AllowUncommitted = false
+                      DecisionSequence = 0L; Evidence = ""; SessionId = "" }
+                let _, finished, finishedReceipt = invoke (Common.TaskWriteCommand completion)
+                Assert.That(finished.IsOk, Is.True, sprintf "%A" finished)
+                Assert.That(finishedReceipt.AgentStateChanges |> List.map _.AgentId,
+                            Is.EqualTo([ "Owner" ] :> obj))
+                Assert.That(finishedReceipt.InboxActivation.IsNone, Is.True)
+                let final = ReviewWorkflow.getAgentInbox first "Owner" |> success
+                Assert.That(final.Agent.State, Is.EqualTo("NeedsWork"))
+                Assert.That(final.Agent.CurrentAssignment, Is.Null)
+                let _, closedTask, doneAttempt = ReviewWorkflow.getTask second taskId |> success
+                Assert.That(closedTask.Lifecycle, Is.EqualTo("Closed"))
+                Assert.That(doneAttempt.Value.Phase, Is.EqualTo("Finished"))
+                let _, completedOperation =
+                    LedgerStore.getOperationStatus second (Guid.Parse completion.OperationId) |> success
+                let _, checkpoint =
+                    ReviewWorkflow.getCheckpoint second taskId completedOperation.Value.Sequence |> success
+                Assert.That(checkpoint.Kind, Is.EqualTo("Completion"))
+                Assert.That(checkpoint.AttemptId, Is.EqualTo(doneAttempt.Value.AttemptId))
+            finally
+                if File.Exists configPath then File.Delete configPath)
+
+    [<Test>]
+    member _.ClosedQueuedAssignmentIsReadableButCannotFabricateCompletion() =
+        withFixture (fun one _ first second _ _ _ _ ->
+            let taskId = "closed-queued-signalr"
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Closed before start"
+            |> success |> ignore
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner"
+            |> success |> ignore
+            let _, assignedTask, assignedAttempt = ReviewWorkflow.getTask first taskId |> success
+            ReviewWorkflow.closeTask first (Guid.NewGuid()) taskId assignedTask.Version
+            |> success |> ignore
+            let context = GitCommandTests.TestContext(Path.GetDirectoryName one)
+            let configPath = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
+            try
+                let head = (LedgerStore.fetch first |> success).Commit
+                Client.OrchestrationApi.LedgerBindingConfig.bindExisting
+                    "owner" context first.ProjectId first.LedgerId first.Epoch
+                    first.RemoteName first.ApprovedFetchUrl first.ApprovedPushUrl head true
+                |> success |> ignore
+                let runtime =
+                    Client.Runtime(Path.GetDirectoryName one, Client.ConsoleTui.ConsoleTui(), Client.PartialTrust)
+                let invoke command =
+                    Client.SignalR.Client.processIncomingCommand runtime
+                        (System.Text.Json.JsonSerializer.Serialize<Common.AgentCommand>(command)) "Owner"
+                    |> Async.AwaitTask |> Async.RunSynchronously
+                let read : Common.AgentCommand =
+                    Common.TaskReadCommand
+                        { ProjectName = "owner"; AgentId = "Owner"; Action = "AgentInbox"
+                          TaskId = ""; AssignmentGeneration = 0; CheckpointSequence = 0L
+                          Cursor = ""; PageSize = 0; BeforeOid = null; AfterOid = null; RelativePath = null }
+                let _, inbox, receipt = invoke read
+                Assert.That(inbox.IsOk, Is.True)
+                Assert.That(receipt.InboxActivation.Value.ActivatedByThisCall, Is.False)
+                Assert.That(receipt.AgentStateChanges, Is.Empty)
+                let agent = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
+                Assert.That(agent.State, Is.EqualTo("Ready"))
+                Assert.That(agent.Execution, Is.EqualTo("Stopped"))
+                let completion : Common.TaskWriteCommand =
+                    { ProjectName = "owner"; Action = "CompleteAgentWork"
+                      OperationId = Guid.NewGuid().ToString("D")
+                      TaskId = taskId; AttemptId = ""; ActorId = "Owner"; OwnerId = ""
+                      Title = ""; Html = ""; ExpectedVersion = assignedAttempt.Value.Version
+                      ExpectedAgentVersion = agent.Version; ExpectedTaskVersion = 0
+                      AssignmentGeneration = 1; Summary = "Must not complete queued work"
+                      NextAction = ""; Reason = ""; BaseOid = ""; TargetRef = ""
+                      SourceRef = ""; AllowDetached = false; AllowUncommitted = false
+                      DecisionSequence = 0L; Evidence = ""; SessionId = "" }
+                let _, rejected, rejectedReceipt = invoke (Common.TaskWriteCommand completion)
+                Assert.That(rejected.IsError, Is.True)
+                Assert.That(rejectedReceipt.AgentStateChanges, Is.Empty)
+                let persisted = ReviewWorkflow.getAgentInbox second "Owner" |> success
+                Assert.That(persisted.Agent.Version, Is.EqualTo(agent.Version))
+                Assert.That(persisted.Focused.Value.Attempt.Phase, Is.EqualTo("Queued"))
+                Assert.That(persisted.Focused.Value.Task.Lifecycle, Is.EqualTo("Closed"))
+            finally
+                if File.Exists configPath then File.Delete configPath)
+
+    [<Test>]
     member _.ImplicitActivityStartsReadyAssignmentAndPreservesWorkingClock() =
         withFixture (fun one _ first second _ _ _ _ ->
             let taskId = "implicit-inbox-start"

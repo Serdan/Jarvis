@@ -480,6 +480,67 @@ let ``authenticated StartJob client response does not prove child process exit``
         |> shouldEqual true)
 
 [<Test>]
+let ``unresolved evidence pages preserve exact device routing across restart and telemetry loss`` () =
+    withStore (fun store ->
+        approveTestEpoch store
+        let user, agent = "alice", "Worker 3"
+        let job =
+            store.TryBeginAgentOperation(
+                user, agent, "StartJob", Some "Jarvis", "server", None, None)
+            |> function Ok activity -> activity | Error failure -> failwith failure
+        store.TryMarkAgentDispatched(
+            user, job.Id, "workstation", "device-connection", 7L, "job-correlation")
+        |> shouldEqual (Ok ())
+        let pending = beginWitness store user agent
+        let other = beginWitness store user "Other Agent"
+        use db = new SqliteConnection($"Data Source={store.DatabasePath}")
+        db.Open()
+        use prune = db.CreateCommand()
+        prune.CommandText <- "DELETE FROM operations WHERE id IN ($first, $second);"
+        prune.Parameters.AddWithValue("$first", job.Id) |> ignore
+        prune.Parameters.AddWithValue("$second", pending.Id) |> ignore
+        prune.ExecuteNonQuery() |> ignore
+        use restarted = new FeedbackStore(store.DatabasePath)
+        let page =
+            restarted.ListUnresolvedAgentExecutions(user, "worker 3", 1)
+            |> function Ok results -> results | Error failure -> failwith failure
+        page.Executions.Length |> shouldEqual 1
+        page.HasMore |> shouldEqual true
+        let complete =
+            restarted.ListUnresolvedAgentExecutions(user, agent, 10)
+            |> function Ok results -> results | Error failure -> failwith failure
+        complete.HasMore |> shouldEqual false
+        complete.Executions.Length |> shouldEqual 2
+        let detached =
+            complete.Executions |> List.find (fun record -> record.RequestId = job.Id)
+        detached.ToolName |> shouldEqual (Some "StartJob")
+        detached.State |> shouldEqual "Dispatched"
+        detached.ProjectName |> shouldEqual (Some "Jarvis")
+        detached.DeviceId |> shouldEqual (Some "workstation")
+        detached.ConnectionId |> shouldEqual (Some "device-connection")
+        detached.DeviceGeneration |> shouldEqual (Some 7L)
+        detached.CorrelationId |> shouldEqual (Some "job-correlation")
+        detached.ParentRequestId |> shouldEqual None
+        let admitted =
+            complete.Executions |> List.find (fun record -> record.RequestId = pending.Id)
+        admitted.State |> shouldEqual "Admitted"
+        admitted.DeviceGeneration |> shouldEqual None
+        let otherPage =
+            restarted.ListUnresolvedAgentExecutions(user, "Other Agent", 10)
+            |> function Ok results -> results | Error failure -> failwith failure
+        Assert.That(otherPage.Executions |> List.exists (fun x -> x.RequestId = other.Id), Is.True)
+        restarted.ListUnresolvedAgentExecutions("bob", agent, 10)
+        |> shouldEqual (Ok { Executions = []; HasMore = false })
+        restarted.ListUnresolvedAgentExecutions(user, agent, 0).IsError
+        |> shouldEqual true
+        restarted.ListUnresolvedAgentExecutions(user, agent, 501).IsError
+        |> shouldEqual true
+        // The audit page never constitutes permission to correct: both
+        // unrelated pending admissions and detached child work still veto it.
+        restarted.TryAcquireAgentCorrection(user, agent, "operator-with-audit-page").IsError
+        |> shouldEqual true)
+
+[<Test>]
 let ``telemetry pruning never loses durable StartJob execution classification`` () =
     withStore (fun store ->
         approveTestEpoch store

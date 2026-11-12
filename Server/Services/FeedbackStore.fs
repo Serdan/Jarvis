@@ -70,6 +70,24 @@ type AgentExecutionResolution =
     | AuthenticatedClientFinished
     | ExecutionUnresolved
 
+/// Read-only evidence for operator reconciliation. Missing fields remain
+/// optional, and a truncated page must never be mistaken for full quiescence.
+type UnresolvedAgentExecution =
+    { RequestId: string
+      ToolName: string option
+      ProjectName: string option
+      State: string
+      DeviceId: string option
+      ConnectionId: string option
+      DeviceGeneration: int64 option
+      CorrelationId: string option
+      ParentRequestId: string option
+      CreatedAt: DateTimeOffset }
+
+type UnresolvedAgentExecutionPage =
+    { Executions: UnresolvedAgentExecution list
+      HasMore: bool }
+
 [<CLIMutable>]
 type ConnectionEventEntry =
     { CreatedAt: DateTimeOffset
@@ -976,6 +994,51 @@ INSERT INTO operations (
         addParameter command "$userId" userId
         addParameter command "$agentId" (agentId.ToUpperInvariant())
         Convert.ToInt32(command.ExecuteScalar())
+
+    /// Bounded, read-only audit projection. It cannot certify quiescence:
+    /// HasMore means additional unresolved evidence exists, and even an
+    /// empty page cannot replace the verified legacy epoch or child-job gate.
+    member _.ListUnresolvedAgentExecutions(
+        userId: string, agentId: string, limit: int
+    ) : Result<UnresolvedAgentExecutionPage, string> =
+        if String.IsNullOrWhiteSpace userId
+           || String.IsNullOrWhiteSpace agentId
+           || agentId.Length > 256 || limit < 1 || limit > 500 then
+            Error "Authenticated user, bounded agent and page size 1..500 are required."
+        else
+            try
+                use connection = openConnection()
+                use command = connection.CreateCommand()
+                command.CommandText <-
+                    """SELECT request_id, tool_name, project_name, state,
+                              device_id, connection_id, device_generation,
+                              correlation_id, parent_request_id, created_at
+                       FROM agent_execution_witness
+                       WHERE user_id = $userId AND agent_id = $agentId
+                         AND state NOT IN ('Terminal', 'NotDispatched')
+                       ORDER BY created_at ASC, request_id ASC
+                       LIMIT $maxRows;"""
+                addParameter command "$userId" userId
+                addParameter command "$agentId" (agentId.ToUpperInvariant())
+                addParameter command "$maxRows" (limit + 1)
+                use reader = command.ExecuteReader()
+                let results = ResizeArray<UnresolvedAgentExecution>()
+                while reader.Read() do
+                    results.Add
+                        { RequestId = reader.GetString 0
+                          ToolName = optionText reader 1
+                          ProjectName = optionText reader 2
+                          State = reader.GetString 3
+                          DeviceId = optionText reader 4
+                          ConnectionId = optionText reader 5
+                          DeviceGeneration =
+                              if reader.IsDBNull 6 then None else Some(reader.GetInt64 6)
+                          CorrelationId = optionText reader 7
+                          ParentRequestId = optionText reader 8
+                          CreatedAt = DateTimeOffset.Parse(reader.GetString 9) }
+                Ok { Executions = results |> Seq.truncate limit |> Seq.toList
+                     HasMore = results.Count > limit }
+            with ex -> Error $"Cannot inspect unresolved agent execution evidence: {ex.Message}"
 
     member _.CompleteOperation(operationId: string, success: bool, errorCategory: string option, durationMs: int64) =
         use connection = openConnection()

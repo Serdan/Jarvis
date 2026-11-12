@@ -992,11 +992,16 @@ INSERT INTO operations (
                         | Some { Result = Some payload; Error = None } ->
                             try
                                 let result = JsonSerializer.Deserialize<StartJobResult>(payload)
+                                let mutable parsedJobId = Guid.Empty
                                 if isNull (box result)
                                    || String.IsNullOrWhiteSpace result.JobId
-                                   || result.JobId.Length > 128
+                                   || not (Guid.TryParseExact(result.JobId, "N", &parsedJobId))
+                                   || parsedJobId = Guid.Empty
+                                   || not (String.Equals(result.JobId, parsedJobId.ToString("N"), StringComparison.Ordinal))
                                    || result.StartedAt = DateTimeOffset.MinValue then
-                                    Error "StartJob did not return a bounded job identity and start timestamp."
+                                    // JobManager generates exactly Guid.NewGuid().ToString("N").
+                                    // A free-form string is not a reconcilable client identity.
+                                    Error "StartJob requires a canonical nonempty GUID-N job identity and start timestamp."
                                 else Ok result
                             with :? JsonException ->
                                 Error "StartJob returned an invalid job identity payload."

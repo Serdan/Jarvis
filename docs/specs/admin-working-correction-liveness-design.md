@@ -230,3 +230,31 @@ after telemetry is deleted, and a legacy schema migration where one
 command's history survives while a second `StartJob` was pruned.
 The safe ordinary response can terminate; the unknown historical
 request remains unresolved.
+
+## Exact detached launch identity and adversarial receipts
+
+An authenticated successful `StartJob` response stores the immutable
+`JobManager` GUID-N job ID, client-reported launch timestamp and first
+receipt time alongside the original device/connection/generation/correlation.
+Only the canonical 32-character lowercase nonempty GUID-N form emitted by
+`JobManager` is accepted. A replayed matching receipt is idempotent; a
+different job ID or start time, a reused job ID on the same device, a stale
+device generation, wrong connection or wrong user must not overwrite the
+original evidence. Malformed JSON, missing or failed responses and
+noncanonical identities leave the witness unresolved with no job identity.
+Neither recorded handles nor a later `GetJobResult` grant correction.
+
+Negative-space regression tests cover all these cases and confirm the
+original handle/first receipt persist across server restart and 30-day
+telemetry pruning.
+
+**Unresolved execution risk:** `Client/Modules/JobManager.fs` currently
+marks `Completed` on the tracked parent process exit and marks `Canceled`
+before proven descendant exit. Its job registry is process-local. Neither
+status proves an OS-level detached process tree is quiescent, especially
+across client restart. Separately `BoundedProcess.runWithCancellation`
+uses OS process-group cleanup (Linux/macOS) or Job Objects (Windows), but
+best-effort kill requests are not independently reaped/attested as a
+persisted child-tree termination receipt. No generic process-command
+terminal response should be promoted to proof of complete process-tree
+quiescence without auditing that contract.

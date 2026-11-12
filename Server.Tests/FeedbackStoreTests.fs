@@ -494,6 +494,157 @@ let ``authenticated StartJob client response does not prove child process exit``
         |> shouldEqual true)
 
 [<Test>]
+let ``StartJob launch receipt cannot be replaced, reused or forged across device identity`` () =
+    withStore (fun store ->
+        approveTestEpoch store
+        let user, agent, connection, device, generation =
+            "alice", "Worker 3", "device-session", "workstation", 4L
+        let admit correlation =
+            let operation =
+                store.TryBeginAgentOperation(
+                    user, agent, "StartJob", Some "Jarvis", "server",
+                    Some "client", Some Common.AgentProtocol.version)
+                |> function Ok value -> value | Error failure -> failwith failure
+            store.TryMarkAgentDispatched(user, operation.Id, device, connection, generation, correlation)
+            |> shouldEqual (Ok ())
+            operation.Id
+        let firstRequest = admit "first-launch-correlation"
+        let startedAt = DateTimeOffset.UtcNow
+        let jobId = Guid.NewGuid().ToString("N")
+        let payload id start : Common.StartJobResult = { JobId = id; StartedAt = start }
+        let response id start : Common.AgentCommandResponse =
+            { Result = Some(JsonSerializer.Serialize(payload id start))
+              Error = None; Instructions = []
+              AgentStateChanges = []; InboxActivation = None }
+        let firstResponse = response jobId startedAt
+        // Successful launch is a nonterminal result: the handle is durable.
+        store.TryRecordAgentClientTerminal(
+            user, connection, generation, "first-launch-correlation",
+            clientResponse = firstResponse).IsError
+        |> shouldEqual true
+        let read request =
+            match store.ListUnresolvedAgentExecutions(user, agent, 100) with
+            | Ok page -> page.Executions |> List.find (fun item -> item.RequestId = request)
+            | Error failure -> failwith failure
+        let first = read firstRequest
+        first.JobId |> shouldEqual (Some jobId)
+        first.JobStartedAt |> shouldEqual (Some startedAt)
+        Assert.That(first.JobReceiptAt.IsSome, Is.True)
+        let receiptTime = first.JobReceiptAt
+        // Neither an unrelated authenticated connection nor a replacement
+        // generation may register a handle for the original routed request.
+        store.TryRecordAgentClientTerminal(
+            user, "other-connection", generation, "first-launch-correlation",
+            clientResponse = response (Guid.NewGuid().ToString("N")) startedAt)
+        |> shouldEqual (Ok None)
+        store.TryRecordAgentClientTerminal(
+            user, connection, generation + 1L, "first-launch-correlation",
+            clientResponse = response (Guid.NewGuid().ToString("N")) startedAt)
+        |> shouldEqual (Ok None)
+        store.TryRecordAgentClientTerminal(
+            "bob", connection, generation, "first-launch-correlation",
+            clientResponse = response (Guid.NewGuid().ToString("N")) startedAt)
+        |> shouldEqual (Ok None)
+        // Same routed identity but changed jobId or launch timestamp is also
+        // rejected without replacing the first authenticated receipt.
+        for bad in
+            [ response (Guid.NewGuid().ToString("N")) startedAt
+              response jobId (startedAt.AddSeconds(1.0)) ] do
+            store.TryRecordAgentClientTerminal(
+                user, connection, generation, "first-launch-correlation",
+                clientResponse = bad).IsError |> shouldEqual true
+        store.TryRecordAgentClientTerminal(
+            user, connection, generation, "first-launch-correlation",
+            clientResponse = firstResponse).IsError |> shouldEqual true
+        let retained = read firstRequest
+        retained.JobId |> shouldEqual first.JobId
+        retained.JobStartedAt |> shouldEqual first.JobStartedAt
+        retained.JobReceiptAt |> shouldEqual receiptTime
+        // Two concurrent starts on one physical device cannot legitimately
+        // identify the same job. Reject second receipt rather than creating
+        // ambiguous evidence that a later drain might incorrectly reuse.
+        let secondRequest = admit "second-launch-correlation"
+        store.TryRecordAgentClientTerminal(
+            user, connection, generation, "second-launch-correlation",
+            clientResponse = firstResponse).IsError |> shouldEqual true
+        (read secondRequest).JobId |> shouldEqual None
+        // Classification and first handle persist after telemetry pruning
+        // and full FeedbackStore reconstruction.
+        use db = new SqliteConnection($"Data Source={store.DatabasePath}")
+        db.Open()
+        use prune = db.CreateCommand()
+        prune.CommandText <- "DELETE FROM operations WHERE id IN ($first, $second);"
+        prune.Parameters.AddWithValue("$first", firstRequest) |> ignore
+        prune.Parameters.AddWithValue("$second", secondRequest) |> ignore
+        prune.ExecuteNonQuery() |> shouldEqual 2
+        use restarted = new FeedbackStore(store.DatabasePath)
+        let afterRestart =
+            match restarted.ListUnresolvedAgentExecutions(user, agent, 100) with
+            | Ok page -> page.Executions |> List.find (fun item -> item.RequestId = firstRequest)
+            | Error failure -> failwith failure
+        afterRestart.JobId |> shouldEqual (Some jobId)
+        afterRestart.JobStartedAt |> shouldEqual (Some startedAt)
+        afterRestart.JobReceiptAt |> shouldEqual receiptTime
+        restarted.CountUnresolvedAgentExecutions(user, agent) |> shouldEqual 2
+        restarted.TryAcquireAgentCorrection(user, agent, "operator-after-job-evidence").IsError
+        |> shouldEqual true)
+
+[<Test>]
+let ``StartJob missing malformed and noncanonical receipts never certify liveness`` () =
+    withStore (fun store ->
+        approveTestEpoch store
+        let user, agent, device, connection, generation =
+            "alice", "Worker 3", "workstation", "session", 2L
+        let validId = Guid.NewGuid().ToString("N")
+        let successful payload : Common.AgentCommandResponse =
+            { Result = Some payload; Error = None; Instructions = []
+              AgentStateChanges = []; InboxActivation = None }
+        let payload id timestamp =
+            JsonSerializer.Serialize(
+                { JobId = id; StartedAt = timestamp } : Common.StartJobResult)
+        let responses : Common.AgentCommandResponse list =
+            [ successful "{}"
+              successful "not valid JSON"
+              successful (payload "" DateTimeOffset.UtcNow)
+              successful (payload "job-child-still-running" DateTimeOffset.UtcNow)
+              successful (payload (validId.ToUpperInvariant()) DateTimeOffset.UtcNow)
+              successful (payload (Guid.Empty.ToString("N")) DateTimeOffset.UtcNow)
+              successful (payload validId DateTimeOffset.MinValue)
+              { Result = None; Error = Some(Common.ExecutionFailed "Client denied execution")
+                Instructions = []; AgentStateChanges = []; InboxActivation = None }
+              { Result = None; Error = None; Instructions = []
+                AgentStateChanges = []; InboxActivation = None } ]
+        let allRequests =
+            responses
+            |> List.mapi (fun i failed ->
+                let req =
+                    store.TryBeginAgentOperation(
+                        user, agent, "StartJob", Some "Jarvis", "server", None, None)
+                    |> function Ok value -> value | Error failure -> failwith failure
+                let correlation = $"invalid-job-{i}"
+                store.TryMarkAgentDispatched(
+                    user, req.Id, device, connection, generation, correlation)
+                |> shouldEqual (Ok ())
+                store.TryRecordAgentClientTerminal(
+                    user, connection, generation, correlation,
+                    clientResponse = failed).IsError |> shouldEqual true
+                req.Id)
+        use restarted = new FeedbackStore(store.DatabasePath)
+        let evidence =
+            match restarted.ListUnresolvedAgentExecutions(user, agent, 100) with
+            | Ok page -> page.Executions
+            | Error failure -> failwith failure
+        evidence.Length |> shouldEqual allRequests.Length
+        for item in evidence do
+            item.ToolName |> shouldEqual (Some "StartJob")
+            item.JobId |> shouldEqual None
+            item.JobStartedAt |> shouldEqual None
+            item.JobReceiptAt |> shouldEqual None
+            item.State |> shouldEqual "Dispatched"
+        restarted.TryAcquireAgentCorrection(user, agent, "operator-after-invalid-launch").IsError
+        |> shouldEqual true)
+
+[<Test>]
 let ``unresolved evidence pages preserve exact device routing across restart and telemetry loss`` () =
     withStore (fun store ->
         approveTestEpoch store

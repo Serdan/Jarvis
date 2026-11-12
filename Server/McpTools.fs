@@ -380,35 +380,61 @@ module McpToolHelpers =
     /// The separate activation receipt is richer only when the ledger has
     /// actually confirmed the requesting agent's Ready -> Working transition.
     let attachStateEffects (response: AgentCommandResponse) (result: CallToolResult) =
-        let changes =
-            if isNull (box response.AgentStateChanges) then [] else response.AgentStateChanges
-        let details = JsonObject()
-        details["agentStateChanges"] <- JsonSerializer.SerializeToNode changes
-        let metadata = if isNull result.Meta then JsonObject() else result.Meta
-        metadata["jarvis/agent_state_changes"] <- JsonSerializer.SerializeToNode changes
-        match response.InboxActivation with
-        | None -> ()
-        | Some activation ->
-            details["agentInboxActivation"] <- JsonSerializer.SerializeToNode activation
-            metadata["jarvis/inbox_activation"] <- JsonSerializer.SerializeToNode activation
-        result.Meta <- metadata
-        if isNull result.Content then result.Content <- ResizeArray<ContentBlock>()
-        result.Content.Add(textContent (details.ToJsonString()))
-        result
+        if response.PendingJob.IsSome then result
+        else
+            let changes =
+                if isNull (box response.AgentStateChanges) then [] else response.AgentStateChanges
+            let details = JsonObject()
+            details["agentStateChanges"] <- JsonSerializer.SerializeToNode changes
+            let metadata = if isNull result.Meta then JsonObject() else result.Meta
+            metadata["jarvis/agent_state_changes"] <- JsonSerializer.SerializeToNode changes
+            match response.InboxActivation with
+            | None -> ()
+            | Some activation ->
+                details["agentInboxActivation"] <- JsonSerializer.SerializeToNode activation
+                metadata["jarvis/inbox_activation"] <- JsonSerializer.SerializeToNode activation
+            result.Meta <- metadata
+            if isNull result.Content then result.Content <- ResizeArray<ContentBlock>()
+            result.Content.Add(textContent (details.ToJsonString()))
+            result
 
     /// Preliminary and final dispatches may independently mutate canonical
     /// state (notably a cross-project notification sender validation). Never
     /// lose the preliminary mutation from the caller-visible result.
     let mergeStateEffects (prior: AgentCommandResponse) (final: AgentCommandResponse) =
+        // Unknown final effects are NOT an empty list. A promoted destination
+        // must carry its source evidence into the client-owned job, so that
+        // polling eventually returns both confirmed sets of mutations.
+        let changes =
+            if final.PendingJob.IsSome || isNull (box final.AgentStateChanges) then
+                Unchecked.defaultof<AgentStateChange list>
+            else
+                let source =
+                    if isNull (box prior.AgentStateChanges) then [] else prior.AgentStateChanges
+                (source @ final.AgentStateChanges) |> List.distinct
         { final with
-            AgentStateChanges =
-                (prior.AgentStateChanges @ final.AgentStateChanges) |> List.distinct
+            AgentStateChanges = changes
             InboxActivation =
-                match final.InboxActivation with
-                | Some _ -> final.InboxActivation
-                | None ->
-                    prior.InboxActivation
-                    |> Option.filter (fun receipt -> receipt.ActivatedByThisCall) }
+                if final.PendingJob.IsSome then None
+                else
+                    match final.InboxActivation with
+                    | Some _ -> final.InboxActivation
+                    | None ->
+                        prior.InboxActivation
+                        |> Option.filter (fun receipt -> receipt.ActivatedByThisCall) }
+
+    /// A polled tool job carries the exact original response as typed data.
+    /// Present its instructions and canonical side effects with the polling
+    /// envelope, rather than substituting invented empty metadata.
+    let completedToolEvidence command (response: AgentCommandResponse) =
+        match command, response.Result with
+        | GetJobResultCommand _, Some payload ->
+            try
+                let job = JsonSerializer.Deserialize<JobResult>(payload)
+                if isNull (box job) then response
+                else job.ToolResponse |> Option.defaultValue response
+            with _ -> response
+        | _ -> response
 
     let private imageResult (response: AgentCommandResponse) =
         match response.Result, response.Error with
@@ -505,6 +531,7 @@ module McpToolHelpers =
         | CreateProjectCommand _
         | RemoveWorktreeCommand _
         | TaskWriteCommand _
+        | CrossProjectNotificationCommand _
         | LedgerWriteCommand _
         | ReviewWriteCommand _
         | RetryPendingIntentCommand _
@@ -695,6 +722,43 @@ module McpToolHelpers =
                                         let logger = factory.CreateLogger("Jarvis.AgentStateInvalidation")
                                         logger.LogWarning(ex, "Could not deliver agent-state invalidation hints.")
                         }
+                    // Cross-project notifications validate the sender before
+                    // dispatching to the destination. A promoted source read
+                    // is NOT proof of successful validation: resolve the
+                    // original result via its client-owned job first.
+                    let resolveSenderValidation (project: string) (source: AgentCommandResponse) deadline =
+                        task {
+                            match source.PendingJob with
+                            | None -> return source
+                            | Some handle ->
+                                match handle.DeviceId with
+                                | None ->
+                                    return
+                                        { source with
+                                            Result = None
+                                            Error = Some(ExecutionFailed
+                                                "Source validation job has no bound device; cannot safely poll a different candidate.")
+                                            PendingJob = None
+                                            AgentStateChanges = [] }
+                                | Some originalDevice ->
+                                    // Shared typed resolver checks the job ID, project,
+                                    // actor, terminal status and deadline. The callback
+                                    // always polls the exact verified source device.
+                                    return!
+                                        ProjectNotificationRouting.resolveHealth project
+                                            (defaultArg (RequestDeviceRouting.agentId()) "")
+                                            deadline source
+                                            (fun query ->
+                                                task {
+                                                    do! Task.Delay(500, context.RequestAborted)
+                                                    return!
+                                                        client.SendCommandToUser(
+                                                            userId, GetJobResultCommand query,
+                                                            ?conversationId = RequestDeviceRouting.session(),
+                                                            deviceId = originalDevice,
+                                                            ?agentId = RequestDeviceRouting.agentId())
+                                                })
+                        }
                     let! response =
                         match command with
                         | TaskWriteCommand notification when notification.Action = "NotifyAgent"
@@ -714,15 +778,28 @@ module McpToolHelpers =
                                     ?conversationId = RequestDeviceRouting.session(),
                                     ?deviceId = RequestDeviceRouting.deviceOverride(),
                                                      ?agentId = RequestDeviceRouting.agentId())
+                                let! sender =
+                                    resolveSenderValidation notification.SourceRef sender
+                                        (DateTimeOffset.UtcNow.AddMinutes(5.))
                                 do! publishChanges sender
                                 match sender.Result, sender.Error with
-                                | Some _, None ->
-                                    let! destination = client.SendCommandToProject(
-                                        userId, notification.ProjectName, command,
+                                | Some _, None when sender.PendingJob.IsNone ->
+                                    // Carry source activation evidence into
+                                    // the destination client's ORIGINAL task.
+                                    // Its normal pending handle and subsequent
+                                    // get_job_result now recover both projects'
+                                    // terminal effects, even if the first reply
+                                    // is lost. No server-owned task store.
+                                    let forwarded =
+                                        CrossProjectNotificationCommand
+                                            { Notification = notification
+                                              SourceStateChanges = sender.AgentStateChanges
+                                              SourceInboxActivation = sender.InboxActivation }
+                                    return! client.SendCommandToProject(
+                                        userId, notification.ProjectName, forwarded,
                                         ?conversationId = RequestDeviceRouting.session(),
                                         ?deviceId = RequestDeviceRouting.deviceOverride(),
                                                      ?agentId = RequestDeviceRouting.agentId())
-                                    return mergeStateEffects sender destination
                                 | _ -> return sender
                             }
                         | _ ->
@@ -734,17 +811,23 @@ module McpToolHelpers =
                     finishOperation tracking response stopwatch.ElapsedMilliseconds
 
                     do! publishChanges response
+                    let evidence = completedToolEvidence command response
+                    // Terminal evidence is returned to the polling caller. It
+                    // is not a new mutation: repeated polls must not replay
+                    // effects or repeatedly broadcast invalidation messages.
+                    // Other devices use the existing bounded cache TTL if no
+                    // direct update notification was delivered.
 
                     return
                         (match command with
                          | ReadImageCommand _ -> imageResult response
                          | ExportFileCommand _ -> exportResult context response
                          | _ -> toCallToolResult response)
-                        |> attachStateEffects response
-                        |> attachInstructions response.Instructions
+                        |> attachStateEffects evidence
+                        |> attachInstructions evidence.Instructions
                         |> attachOperationId tracking
                         |> attachGeneratedOperationId generatedId
-                        |> attachGeneratedTaskId (if response.Result.IsSome && response.Error.IsNone then generatedTaskId else None)
+                        |> attachGeneratedTaskId (if response.Result.IsSome && response.Error.IsNone && response.PendingJob.IsNone then generatedTaskId else None)
                 | Some _ ->
                     if not (Auth.hasScope scope context.User) then
                         return authorizationErrorResult context scope

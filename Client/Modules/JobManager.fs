@@ -4,6 +4,8 @@ open System
 open System.Collections.Concurrent
 open System.Diagnostics
 open System.IO
+open System.Threading
+open System.Threading.Tasks
 open System.Text
 open Common
 open Client.Effect
@@ -215,6 +217,10 @@ module private Core =
               Args = job.Args
               Reason = job.Reason
               WorkingDirectory = job.WorkingDirectory
+              Kind = JobKind.Process
+              CommandName = None
+              OperationId = None
+              AgentId = None
               Status = job.Status
               StartedAt = job.StartedAt
               CompletedAt = job.CompletedAt })
@@ -248,7 +254,9 @@ module private Core =
                           Status = job.Status
                           Events = events
                           NextSequence = job.NextSequence
-                          Truncated = job.OutputTruncated })
+                          Truncated = job.OutputTruncated
+                          ToolResponse = None
+                          OperationId = None })
 
     let cancelJobForProject (canonical: ProjectPaths.ProjectId option) (cmd: CancelJobCommand) =
         fun _ ->
@@ -271,6 +279,311 @@ module private Core =
                     else
                         Ok()
 
+// Tool operations are intentionally separate from OS processes. Admission is
+// bounded before scheduling; the original task owns the one canonical result.
+type private ToolOperationRecord =
+    { Handle: ToolJobHandle
+      CanonicalProject: ProjectPaths.ProjectId option
+      CommandHash: string
+      OperationKey: string option
+      Completion: TaskCompletionSource<AgentCommandResponse>
+      PreserveEvidence: AgentCommandResponse -> AgentCommandResponse
+      mutable Status: JobStatus
+      mutable StartedExecution: bool
+      mutable Counted: bool
+      mutable Exposed: bool
+      mutable CompletedAt: DateTimeOffset option }
+
+module private ToolOperations =
+    let private gate = obj()
+    let private records = ConcurrentDictionary<string, ToolOperationRecord>(StringComparer.Ordinal)
+    let private expired = ConcurrentDictionary<string, DateTimeOffset>(StringComparer.Ordinal)
+    // Stable original operation IDs prevent duplicate execution on retry or
+    // after losing the first response. Keep a bounded tombstone after eviction.
+    let private byOperation =
+        System.Collections.Generic.Dictionary<string, struct (string * string * DateTimeOffset)>(StringComparer.Ordinal)
+    let private workerSlots = new SemaphoreSlim(8, 8)
+    let private maxInFlight = 32
+    let private maxRetained = 100
+    let private terminalAge = TimeSpan.FromMinutes(30.)
+    let mutable private inFlight = 0
+
+    let private prune now =
+        // Caller holds gate. Running operations are never evicted.
+        let completed =
+            records.Values
+            |> Seq.filter (fun entry -> entry.Status <> Running)
+            |> Seq.sortByDescending (fun entry -> entry.CompletedAt |> Option.defaultValue entry.Handle.StartedAt)
+            |> Seq.toArray
+        completed
+        |> Array.iteri (fun index entry ->
+            if index >= maxRetained
+               || (entry.CompletedAt |> Option.exists (fun time -> now - time >= terminalAge)) then
+                match records.TryRemove entry.Handle.JobId with
+                | true, _ -> expired[entry.Handle.JobId] <- now
+                | _ -> ())
+        for KeyValue(id, whenExpired) in expired do
+            if now - whenExpired > terminalAge then
+                let mutable value = Unchecked.defaultof<DateTimeOffset>
+                expired.TryRemove(id, &value) |> ignore
+        // Preserve deduplication for retained jobs and a short bounded
+        // reconciliation window after result eviction.
+        for KeyValue(key, struct (jobId, _, admitted)) in byOperation |> Seq.toArray do
+            if not (records.ContainsKey jobId)
+               && (now - admitted >= terminalAge || byOperation.Count > 512) then
+                byOperation.Remove(key) |> ignore
+        // Expiry markers are diagnostic, never a second unbounded registry.
+        if expired.Count > 200 then
+            expired |> Seq.sortBy (fun entry -> entry.Value)
+            |> Seq.truncate (expired.Count - 200)
+            |> Seq.iter (fun entry ->
+                let mutable ignored = Unchecked.defaultof<DateTimeOffset>
+                expired.TryRemove(entry.Key, &ignored) |> ignore)
+
+    let private failedResponse (message: string) : AgentCommandResponse =
+        { Result = None
+          Error = Some(ExecutionFailed message)
+          Instructions = []
+          AgentStateChanges = []
+          InboxActivation = None
+          PendingJob = None }
+
+    let private complete (entry: ToolOperationRecord) (response: AgentCommandResponse) =
+        lock gate (fun () ->
+            // The only other terminal path is cancellation BEFORE execution.
+            if entry.Status = Running then
+                entry.Status <-
+                    match response.Error with
+                    | Some error -> ToolFailed(sprintf "%A" error)
+                    | None -> ToolCompleted
+                entry.CompletedAt <- Some DateTimeOffset.UtcNow
+                entry.Completion.TrySetResult(response) |> ignore
+            // Cancellation of a queued job may already have released its slot.
+            if entry.Counted then
+                entry.Counted <- false
+                inFlight <- inFlight - 1
+            prune DateTimeOffset.UtcNow)
+
+    let private schedule (entry: ToolOperationRecord) (execute: unit -> Task<AgentCommandResponse>) =
+        // At most 32 accepted work items, of which at most 8 can execute.
+        // Task.Run is bounded by admission and keeps synchronous F# work out
+        // of SignalR ingress; all faults are observed and become typed results.
+        Task.Run(Func<Task>(fun () ->
+            task {
+                try
+                    do! workerSlots.WaitAsync()
+                    try
+                        let shouldExecute =
+                            lock gate (fun () ->
+                                if entry.Status = Running then
+                                    entry.StartedExecution <- true
+                                    true
+                                else false)
+                        if shouldExecute then
+                            let! response =
+                                task {
+                                    try return! execute ()
+                                    with ex -> return entry.PreserveEvidence (failedResponse ("Tool operation failed: " + ex.Message))
+                                }
+                            complete entry response
+                        else
+                            // Queue cancellation released admission immediately.
+                            lock gate (fun () -> prune DateTimeOffset.UtcNow)
+                    finally
+                        workerSlots.Release() |> ignore
+                with ex ->
+                    complete entry (entry.PreserveEvidence (failedResponse ("Tool operation dispatch failed: " + ex.Message)))
+            } :> Task))
+        |> ignore
+
+    let start canonical projectName actor commandName operationId commandHash execute preserveEvidence =
+        lock gate (fun () ->
+            prune DateTimeOffset.UtcNow
+            let identity = canonical |> Option.map ProjectPaths.ProjectId.value |> Option.defaultValue "@unscoped"
+            let key =
+                operationId |> Option.filter (String.IsNullOrWhiteSpace >> not)
+                |> Option.map (fun op -> identity + "\u001f" + actor + "\u001f" + op)
+            let duplicate =
+                match key with
+                | None -> None
+                | Some value ->
+                    match byOperation.TryGetValue value with
+                    | false, _ -> None
+                    | true, struct (jobId, priorHash, _) when priorHash <> commandHash ->
+                        Some(Error(Client.ValidationError
+                            "An existing operationId was reused for different tool arguments."))
+                    | true, struct (jobId, _, _) ->
+                        match records.TryGetValue jobId with
+                        | true, existing ->
+                            Some(Ok(existing.Handle, existing.Completion.Task))
+                        | false, _ ->
+                            Some(Error(Client.NotFoundError
+                                "The original tool job has expired. Reconcile its persisted operationId rather than rerunning it."))
+            match duplicate with
+            | Some result -> result
+            | None when inFlight >= maxInFlight ->
+                Error(Client.ContextError
+                    "The client has reached its bounded tool-operation capacity (32 running/queued). Retry after an existing job finishes.")
+            | None ->
+                let id = Guid.NewGuid().ToString("N")
+                let handle =
+                    { JobId = id
+                      Kind = JobKind.ToolOperation
+                      Status = "Running"
+                      ProjectName = projectName
+                      DeviceId = None
+                      AgentId = actor
+                      OperationId = operationId
+                      CommandName = commandName
+                      StartedAt = DateTimeOffset.UtcNow }
+                let entry =
+                    { Handle = handle
+                      CanonicalProject = canonical
+                      CommandHash = commandHash
+                      OperationKey = key
+                      Completion = TaskCompletionSource<AgentCommandResponse>(TaskCreationOptions.RunContinuationsAsynchronously)
+                      PreserveEvidence = preserveEvidence
+                      Status = Running
+                      StartedExecution = false
+                      Counted = true
+                      Exposed = false
+                      CompletedAt = None }
+                if not (records.TryAdd(id, entry)) then
+                    Error(Client.ContextError "Unable to register client-owned tool operation.")
+                else
+                    inFlight <- inFlight + 1
+                    key |> Option.iter (fun value ->
+                        byOperation[value] <- struct (id, commandHash, handle.StartedAt))
+                    schedule entry execute
+                    Ok(handle, entry.Completion.Task))
+
+    let promote jobId =
+        lock gate (fun () ->
+            match records.TryGetValue jobId with
+            | true, entry -> entry.Exposed <- true
+            | _ -> ())
+
+    let forgetQuick jobId =
+        lock gate (fun () ->
+            match records.TryGetValue jobId with
+            | true, entry when not entry.Exposed && entry.Status <> Running
+                                && entry.OperationKey.IsNone ->
+                let mutable ignored = Unchecked.defaultof<ToolOperationRecord>
+                records.TryRemove(jobId, &ignored) |> ignore
+            | _ -> ())
+
+    let contains jobId = records.ContainsKey jobId
+
+    let private authorize (entry: ToolOperationRecord) canonical agent =
+        match agent with
+        | Some actor when not (String.Equals(entry.Handle.AgentId, actor, StringComparison.Ordinal)) ->
+            Error(Client.ValidationError "Tool job belongs to another initiating agent.")
+        | _ ->
+            // Local TUI access has no actor but remains confined to this client.
+            if canonical <> entry.CanonicalProject && agent.IsSome then
+                Error(Client.ValidationError "Tool job belongs to a different project; use its project selector.")
+            else Ok ()
+
+    let private toSummary (entry: ToolOperationRecord) =
+        { JobId = entry.Handle.JobId
+          ProjectName = entry.Handle.ProjectName |> Option.defaultValue ""
+          Executable = ""
+          Args = []
+          Reason = None
+          WorkingDirectory = None
+          Kind = JobKind.ToolOperation
+          CommandName = Some entry.Handle.CommandName
+          OperationId = entry.Handle.OperationId
+          AgentId = Some entry.Handle.AgentId
+          Status = entry.Status
+          StartedAt = entry.Handle.StartedAt
+          CompletedAt = entry.CompletedAt }
+
+    let list canonical actor includeCompleted =
+        lock gate (fun () ->
+            prune DateTimeOffset.UtcNow
+            records.Values
+            |> Seq.filter (fun entry ->
+                entry.Exposed
+                && (canonical |> Option.forall (fun requested -> Some requested = entry.CanonicalProject))
+                && (actor |> Option.forall (fun id -> id = entry.Handle.AgentId))
+                && (includeCompleted || entry.Status = Running))
+            |> Seq.map toSummary
+            |> Seq.toList)
+
+    let get canonical actor jobId : Client.Result<JobResult> option =
+        lock gate (fun () ->
+            prune DateTimeOffset.UtcNow
+            match records.TryGetValue jobId with
+            | true, entry ->
+                let result =
+                    match authorize entry canonical actor with
+                    | Error error -> Error error
+                    | Ok () ->
+                        let response =
+                            if entry.Completion.Task.IsCompletedSuccessfully then
+                                Some entry.Completion.Task.Result
+                            else None
+                        Ok
+                            { JobId = jobId
+                              Status = entry.Status
+                              Events = []
+                              NextSequence = 0L
+                              Truncated = false
+                              ToolResponse = response
+                              OperationId = entry.Handle.OperationId }
+                Some result
+            | _ when expired.ContainsKey jobId ->
+                Some(Error(Client.NotFoundError
+                    "Tool job result expired or was evicted from client memory. Reconcile any committed write by its stable operationId; do not blindly rerun it."))
+            | _ -> None)
+
+    let cancel canonical actor jobId : Client.Result<unit> option =
+        lock gate (fun () ->
+            match records.TryGetValue jobId with
+            | false, _ -> None
+            | true, entry ->
+                let response =
+                    match authorize entry canonical actor with
+                    | Error error -> Error error
+                    | Ok () when entry.Status <> Running -> Ok ()
+                    | Ok () when entry.StartedExecution ->
+                        Error(Client.ValidationError
+                            "Cannot cancel an executing tool operation: a ledger write may already have committed. Stop waiting instead.")
+                    | Ok () ->
+                        entry.Status <- Canceled
+                        entry.CompletedAt <- Some DateTimeOffset.UtcNow
+                        if entry.Counted then
+                            entry.Counted <- false
+                            inFlight <- inFlight - 1
+                        entry.Completion.TrySetResult(entry.PreserveEvidence (failedResponse "Tool operation canceled before execution.")) |> ignore
+                        prune DateTimeOffset.UtcNow
+                        Ok ()
+                Some response)
+
+let startToolOperation canonical projectName actor commandName operationId commandHash execute =
+    ToolOperations.start canonical projectName actor commandName operationId commandHash execute id
+
+let startToolOperationWithCancelEvidence canonical projectName actor commandName operationId commandHash execute preserveEvidence =
+    ToolOperations.start canonical projectName actor commandName operationId commandHash execute preserveEvidence
+
+let promoteToolOperation jobId = ToolOperations.promote jobId
+let forgetQuickToolOperation jobId = ToolOperations.forgetQuick jobId
+let isToolOperationJob jobId = ToolOperations.contains jobId
+
+let awaitToolOperation (handle: ToolJobHandle, completion: Task<AgentCommandResponse>) (threshold: TimeSpan) =
+    task {
+        let! winner = Task.WhenAny(completion :> Task, Task.Delay(threshold))
+        if Object.ReferenceEquals(winner, completion :> Task) then
+            let! response = completion
+            forgetQuickToolOperation handle.JobId
+            return Choice1Of2 response
+        else
+            promoteToolOperation handle.JobId
+            return Choice2Of2 handle
+    }
+
+
 let private projectId raw =
     ProjectPaths.ProjectTarget.parse raw
     |> Result.map ProjectPaths.ProjectTarget.projectId
@@ -288,7 +601,16 @@ let startJob (cmd: StartJobCommand) =
         return! Core.startJobForTarget target cmd
     }
 
-let listJobsForProject (canonical: ProjectPaths.ProjectId option) (cmd: ListJobsCommand) = Core.listJobsForProject canonical cmd
+let listJobsForProjectAsAgent (canonical: ProjectPaths.ProjectId option) actor (cmd: ListJobsCommand) =
+    fun rt ->
+        match Core.listJobsForProject canonical cmd rt with
+        | Error error -> Error error
+        | Ok processJobs ->
+            let toolJobs = ToolOperations.list canonical actor cmd.IncludeCompleted
+            Ok { Jobs = processJobs.Jobs @ toolJobs }
+
+let listJobsForProject (canonical: ProjectPaths.ProjectId option) (cmd: ListJobsCommand) =
+    listJobsForProjectAsAgent canonical None cmd
 
 let listJobs (cmd: ListJobsCommand) =
     fun rt ->
@@ -298,20 +620,39 @@ let listJobs (cmd: ListJobsCommand) =
             | Some name -> projectId name |> Result.map Some
         match project with
         | Error error -> Error error
-        | Ok canonical -> Core.listJobsForProject canonical cmd rt
+        | Ok canonical -> listJobsForProject canonical cmd rt
 
-let getJobResultForProject (canonical: ProjectPaths.ProjectId option) (cmd: GetJobResultCommand) = Core.getJobResultForProject canonical cmd
+let getJobResultForProjectAsAgent (canonical: ProjectPaths.ProjectId option) actor (cmd: GetJobResultCommand) =
+    fun rt ->
+        match ToolOperations.get canonical actor cmd.JobId with
+        | Some result -> result
+        | None ->
+            match Core.getJobResultForProject canonical cmd rt with
+            | Error(NotFoundError _) ->
+                Error(NotFoundError
+                    $"Unknown job id: {cmd.JobId}. If this was a client-owned tool operation, the client may have restarted or evicted the job; reconcile a persisted write using its original operationId rather than blindly repeating it.")
+            | result -> result
+
+let getJobResultForProject (canonical: ProjectPaths.ProjectId option) (cmd: GetJobResultCommand) =
+    getJobResultForProjectAsAgent canonical None cmd
 
 let getJobResult (cmd: GetJobResultCommand) =
     fun rt ->
         match optionalProjectId cmd.ProjectName with
         | Error error -> Error error
-        | Ok canonical -> Core.getJobResultForProject canonical cmd rt
+        | Ok canonical -> getJobResultForProject canonical cmd rt
 
-let cancelJobForProject (canonical: ProjectPaths.ProjectId option) (cmd: CancelJobCommand) = Core.cancelJobForProject canonical cmd
+let cancelJobForProjectAsAgent (canonical: ProjectPaths.ProjectId option) actor (cmd: CancelJobCommand) =
+    fun rt ->
+        match ToolOperations.cancel canonical actor cmd.JobId with
+        | Some result -> result
+        | None -> Core.cancelJobForProject canonical cmd rt
+
+let cancelJobForProject (canonical: ProjectPaths.ProjectId option) (cmd: CancelJobCommand) =
+    cancelJobForProjectAsAgent canonical None cmd
 
 let cancelJob (cmd: CancelJobCommand) =
     fun rt ->
         match optionalProjectId cmd.ProjectName with
         | Error error -> Error error
-        | Ok canonical -> Core.cancelJobForProject canonical cmd rt
+        | Ok canonical -> cancelJobForProject canonical cmd rt

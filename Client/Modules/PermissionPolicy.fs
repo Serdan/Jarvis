@@ -158,7 +158,8 @@ let private requiresConfirmation command =
         confirmation "RunProjectTask" (Some cmd.ProjectName) [ ProcessExecution ] [] None [ cmd.TaskName ] $"Run project task {cmd.TaskName}" false
     | RemoveWorktreeCommand cmd ->
         confirmation "RemoveWorktree" (Some cmd.ProjectName) [ VersionControlWrite; Destructive ] [] (Some "git") [ cmd.WorktreePath ] $"Remove worktree {cmd.WorktreePath}" false
-    | TaskWriteCommand cmd ->
+    | TaskWriteCommand cmd
+    | CrossProjectNotificationCommand { Notification = cmd } ->
         confirmation ("Task" + cmd.Action) (Some cmd.ProjectName)
             [ VersionControlWrite; NetworkAccess ] [] (Some "git")
             [ cmd.TaskId; cmd.AttemptId; cmd.OperationId ]

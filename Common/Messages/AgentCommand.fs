@@ -28,12 +28,19 @@ type PermissionDecision =
     | RequireConfirmation
     | Deny
 
+[<JsonConverter(typeof<TypeSafeEnumConverter<JobKind>>)>]
+type JobKind =
+    | Process
+    | ToolOperation
+
 [<JsonConverter(typeof<UnionConverter<JobStatus>>)>]
 type JobStatus =
     | Running
     | Completed of exitCode: int
     | FailedToStart of message: string
     | Canceled
+    | ToolCompleted
+    | ToolFailed of message: string
 
 type CommandCapability =
     { Name: string
@@ -498,6 +505,11 @@ type JobSummary =
       Args: string list
       Reason: string option
       WorkingDirectory: string option
+      /// Process and in-process tool operation jobs are separate kinds.
+      Kind: JobKind
+      CommandName: string option
+      OperationId: string option
+      AgentId: string option
       Status: JobStatus
       StartedAt: DateTimeOffset
       CompletedAt: DateTimeOffset option }
@@ -518,13 +530,6 @@ type GetJobResultCommand =
     { ProjectName: string
       JobId: string
       AfterSequence: int64 option }
-
-type JobResult =
-    { JobId: string
-      Status: JobStatus
-      Events: JobOutputEvent list
-      NextSequence: int64
-      Truncated: bool }
 
 type CancelJobCommand = { ProjectName: string; JobId: string }
 
@@ -606,12 +611,47 @@ type AgentInboxActivation =
       CommittedHead: string option
       OperationId: string option }
 
+/// A pending tool call is still executing in this exact client process.
+/// An agent must poll by ID; neither state changes nor instructions are final yet.
+type ToolJobHandle =
+    { JobId: string
+      Kind: JobKind
+      Status: string
+      ProjectName: string option
+      /// Destination routing provenance is attached by the server, never inferred from a default device.
+      DeviceId: string option
+      AgentId: string
+      OperationId: string option
+      CommandName: string
+      StartedAt: DateTimeOffset }
+
 type AgentCommandResponse =
     { Result: string option
       Error: AgentError option
       Instructions: InstructionDocument list
       AgentStateChanges: AgentStateChange list
-      InboxActivation: AgentInboxActivation option }
+      InboxActivation: AgentInboxActivation option
+      PendingJob: ToolJobHandle option }
+
+/// Internal server-to-client envelope for verified source-side mutation
+/// evidence of a cross-project notification. The destination client owns the
+/// full combined terminal response and its resumable job; no server task store.
+/// This command is not exposed through public MCP actions.
+type CrossProjectNotificationCommand =
+    { Notification: TaskWriteCommand
+      SourceStateChanges: AgentStateChange list
+      SourceInboxActivation: AgentInboxActivation option }
+
+/// Process output and complete, immutable tool response share a lookup API.
+/// ToolResponse contains the ORIGINAL response, not reconstructed polling metadata.
+type JobResult =
+    { JobId: string
+      Status: JobStatus
+      Events: JobOutputEvent list
+      NextSequence: int64
+      Truncated: bool
+      ToolResponse: AgentCommandResponse option
+      OperationId: string option }
 
 [<JsonConverter(typeof<UnionConverter<AgentCommand>>)>]
 type AgentCommand =
@@ -626,6 +666,7 @@ type AgentCommand =
     | TaskReadCommand of TaskReadCommand
     | ObserveAgentCommand of ObserveAgentRequest
     | TaskWriteCommand of TaskWriteCommand
+    | CrossProjectNotificationCommand of CrossProjectNotificationCommand
     | LedgerReadCommand of LedgerReadCommand
     | LedgerWriteCommand of LedgerWriteCommand
     | ReviewReadCommand of ReviewReadCommand
@@ -675,7 +716,8 @@ module AgentCommandInfo =
         | RemoveWorktreeCommand _ -> "RemoveWorktreeCommand"
         | TaskReadCommand _ -> "TaskReadCommand"
         | ObserveAgentCommand _ -> "ObserveAgentCommand"
-        | TaskWriteCommand _ -> "TaskWriteCommand"
+        | TaskWriteCommand _
+        | CrossProjectNotificationCommand _ -> "TaskWriteCommand"
         | LedgerReadCommand _ -> "LedgerReadCommand"
         | LedgerWriteCommand _ -> "LedgerWriteCommand"
         | ReviewReadCommand _ -> "ReviewReadCommand"
@@ -731,7 +773,8 @@ module AgentCommandInfo =
         | RemoveWorktreeCommand _ -> "RemoveWorktree"
         | TaskReadCommand _ -> "TaskRead"
         | ObserveAgentCommand _ -> "ObserveAgent"
-        | TaskWriteCommand _ -> "TaskWrite"
+        | TaskWriteCommand _
+        | CrossProjectNotificationCommand _ -> "TaskWrite"
         | LedgerReadCommand _ -> "LedgerRead"
         | LedgerWriteCommand _ -> "LedgerWrite"
         | ReviewReadCommand _ -> "ReviewRead"
@@ -769,6 +812,18 @@ module AgentCommandInfo =
         | MessageCommand _ -> "Message"
         | GetClientActivityCommand _ -> "GetClientActivity"
 
+    /// Stable identity of the represented ledger write/recovery operation.
+    /// Do not infer it by scanning arbitrary JSON fields in other commands.
+    let operationId = function
+        | TaskWriteCommand cmd -> Some cmd.OperationId
+        | CrossProjectNotificationCommand envelope -> Some envelope.Notification.OperationId
+        | ReviewWriteCommand cmd -> Some cmd.OperationId
+        | LedgerWriteCommand cmd when cmd.Action <> "AcknowledgePendingOperation" -> Some cmd.OperationId
+        | RetryPendingIntentCommand cmd -> Some cmd.OperationId
+        | SupersedePendingIntentCommand cmd -> Some cmd.OperationId
+        | AbandonPendingIntentCommand cmd -> Some cmd.OperationId
+        | _ -> None
+
     let projectName = function
         | ListCommandsCommand
         | ListProjectsCommand
@@ -786,6 +841,7 @@ module AgentCommandInfo =
         | TaskReadCommand cmd -> Some cmd.ProjectName
         | ObserveAgentCommand cmd -> Some cmd.ProjectName
         | TaskWriteCommand cmd -> Some cmd.ProjectName
+        | CrossProjectNotificationCommand envelope -> Some envelope.Notification.ProjectName
         | LedgerReadCommand cmd -> Some cmd.ProjectName
         | LedgerWriteCommand cmd -> Some cmd.ProjectName
         | ReviewReadCommand cmd -> Some cmd.ProjectName
@@ -879,7 +935,8 @@ module AgentCommandInfo =
         | RemoveWorktreeCommand cmd -> Some(compact cmd.WorktreePath)
         | TaskReadCommand cmd -> Some(compact cmd.AgentId)
         | ObserveAgentCommand cmd -> Some(compact cmd.TargetAgentId)
-        | TaskWriteCommand cmd -> Some(compact cmd.Action)
+        | TaskWriteCommand cmd
+        | CrossProjectNotificationCommand { Notification = cmd } -> Some(compact cmd.Action)
         | LedgerReadCommand cmd -> Some(compact cmd.ProjectName)
         | LedgerWriteCommand cmd -> Some(compact cmd.Action)
         | ReviewReadCommand cmd -> Some(compact cmd.Action)
@@ -928,7 +985,8 @@ module AgentCommandInfo =
         | RemoveWorktreeCommand cmd -> Some(truncate 64 cmd.WorktreePath)
         | TaskReadCommand cmd -> Some(truncate 64 cmd.AgentId)
         | ObserveAgentCommand cmd -> Some(truncate 64 cmd.TargetAgentId)
-        | TaskWriteCommand cmd -> Some(truncate 64 cmd.Action)
+        | TaskWriteCommand cmd
+        | CrossProjectNotificationCommand { Notification = cmd } -> Some(truncate 64 cmd.Action)
         | LedgerReadCommand cmd -> Some(truncate 64 cmd.ProjectName)
         | LedgerWriteCommand cmd -> Some(truncate 64 cmd.Action)
         | ReviewReadCommand cmd -> Some(truncate 64 cmd.Action)
@@ -990,7 +1048,7 @@ module AgentCommandInfo =
         | None -> invocation command
 
 module AgentProtocol =
-    let version = "3.63"
+    let version = "3.64"
     let defaultPatchFuzzyContextLines = 3
     let maxResponseBytes = 900 * 1024
     let maxImageBytes = 8 * 1024 * 1024

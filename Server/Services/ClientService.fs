@@ -16,6 +16,55 @@ module ProjectNotificationRouting =
     let healthProbe projectName =
         LedgerReadCommand { ProjectName = projectName; Action = "Health"; OperationId = ""; Cursor = ""; PageSize = 0 }
 
+    /// A promoted health check has not validated this device yet. Resolve the
+    /// EXACT client's original job, never issue a second health probe or accept
+    /// the handle as proof of a verified destination ledger.
+    let resolveHealth (projectName: string) (expectedActor: string)
+                      (deadline: DateTimeOffset) (initial: AgentCommandResponse)
+                      (poll: GetJobResultCommand -> Task<AgentCommandResponse>) =
+        let failure detail : AgentCommandResponse =
+            { Result = None
+              Error = Some(ExecutionFailed("Ledger health not verified: " + detail))
+              Instructions = []
+              AgentStateChanges = []
+              InboxActivation = None
+              PendingJob = None }
+        let rec resolve (current: AgentCommandResponse) =
+            task {
+                match current.PendingJob with
+                | None -> return current
+                | Some handle when handle.Kind <> JobKind.ToolOperation
+                                   || handle.ProjectName <> Some projectName
+                                   || handle.AgentId <> expectedActor ->
+                    return failure "pending handle does not belong to the verified project and initiating actor."
+                | Some handle when DateTimeOffset.UtcNow >= deadline ->
+                    return failure "pending health job did not finish before the bounded routing deadline."
+                | Some handle ->
+                    let! returned =
+                        poll { ProjectName = projectName
+                               JobId = handle.JobId
+                               AfterSequence = None }
+                    match returned.Result, returned.Error, returned.PendingJob with
+                    | Some payload, None, None ->
+                        try
+                            let job = JsonSerializer.Deserialize<JobResult>(payload)
+                            if isNull (box job) || job.JobId <> handle.JobId then
+                                return failure "poll returned a different or malformed job."
+                            else
+                                match job.ToolResponse, job.Status with
+                                | Some terminal, ToolCompleted when terminal.PendingJob.IsNone ->
+                                    return terminal
+                                | Some terminal, ToolFailed _ when terminal.PendingJob.IsNone && terminal.Error.IsSome ->
+                                    return terminal
+                                | None, Running ->
+                                    return! resolve current
+                                | _ ->
+                                    return failure "health job ended without a terminal verified result."
+                        with _ -> return failure "health job returned an invalid typed response."
+                    | _ -> return failure "health job could not be read from its original device."
+            }
+        resolve initial
+
     let ordered (selected: ClientSessionStatus voption) (sessions: ClientSessionStatus list)
                 (explicitDevice: bool) =
         if explicitDevice then
@@ -130,12 +179,12 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                         ValidationFailed "deviceId must be a nonempty device ID of at most 256 characters."
                     else
                         NotFound $"Jarvis device '{requested}' is not registered for the authenticated user. Use ListDevices to find available devices."
-                return { Result = None; Error = Some error; Instructions = []; AgentStateChanges = []; InboxActivation = None }
+                return { Result = None; Error = Some error; Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
             | ValueNone ->
                 return
                     { Result = None
                       Error = Some(NotFound "No Jarvis client has registered for the authenticated user.")
-                      Instructions = []; AgentStateChanges = []; InboxActivation = None }
+                      Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
             | ValueSome session ->
                 match session.State, session.ConnectionId with
                 | Disconnected, _ ->
@@ -147,7 +196,7 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                                 ExecutionFailed
                                     $"Jarvis device {session.DeviceName} is disconnected (generation {session.Generation}, protocol {session.ProtocolVersion}, last seen {session.LastSeenAt:O}). Reason: {reason}"
                             )
-                          Instructions = []; AgentStateChanges = []; InboxActivation = None }
+                          Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
                 | Registered, None ->
                     return
                         { Result = None
@@ -156,7 +205,7 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                                 ExecutionFailed
                                     $"Jarvis device {session.DeviceName} generation {session.Generation} is registered without an active connection."
                             )
-                          Instructions = []; AgentStateChanges = []; InboxActivation = None }
+                          Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
                 | Registered, Some connectionId ->
                     let commandName = AgentCommandInfo.protocolName command
 
@@ -168,7 +217,7 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                                     ExecutionFailed
                                         $"Jarvis device {session.DeviceName} does not advertise support for {commandName}. Client {session.ClientVersion} uses protocol {session.ProtocolVersion}; the server uses protocol {AgentProtocol.version}. Update Jarvis to a compatible version and reconnect."
                                 )
-                              Instructions = []; AgentStateChanges = []; InboxActivation = None }
+                              Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
                     else
                         let correlationId, trackingTask = tracker.Register(userId, connectionId, session.Generation, this.ResponseTimeout command)
                         let client = ctx.Clients.Client(connectionId)
@@ -191,7 +240,7 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                                             ExecutionFailed
                                                 $"{reason} Protocol {session.ProtocolVersion}, client {session.ClientVersion}, last seen {session.LastSeenAt:O}."
                                         )
-                                      Instructions = []; AgentStateChanges = []; InboxActivation = None }
+                                      Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
                         with ex ->
                             tracker.Cancel(correlationId)
                             if requestAborted.IsCancellationRequested then
@@ -206,7 +255,7 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                                 return
                                     { Result = None
                                       Error = Some(ExecutionFailed reason)
-                                      Instructions = []; AgentStateChanges = []; InboxActivation = None }
+                                      Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
         }
 
 
@@ -223,6 +272,7 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                 match command with
                 | TaskWriteCommand write when write.Action = "NotifyAgent"
                       && not (String.IsNullOrWhiteSpace write.SourceRef) -> true
+                | CrossProjectNotificationCommand _ -> true
                 | _ -> false
             let ordered = ProjectNotificationRouting.ordered selected sessions deviceId.IsSome
             let eligible =
@@ -235,20 +285,53 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                         return { Result = None
                                  Error = Some(NotFound(ProjectNotificationRouting.failureMessage projectName commandName
                                       requireCurrentProtocol deviceId.IsSome ordered (List.rev probeFailures)))
-                                 Instructions = []; AgentStateChanges = []; InboxActivation = None }
+                                 Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
                     | session :: rest ->
                         let! health = this.SendCommandToUser(
                             userId,
                             ProjectNotificationRouting.healthProbe projectName,
                             ?conversationId = conversationId, deviceId = session.DeviceId, ?agentId = agentId)
-                        match health.Result, health.Error with
-                        | Some _, None ->
-                            // Never automatically repeat a write on another client:
-                            // an uncertain result may already have been committed.
-                            return! this.SendCommandToUser(userId, command,
-                                                            ?conversationId = conversationId, deviceId = session.DeviceId, ?agentId = agentId)
+                        let! verified =
+                            ProjectNotificationRouting.resolveHealth projectName (defaultArg agentId "")
+                                (DateTimeOffset.UtcNow.AddMinutes(2.)) health
+                                (fun query ->
+                                    task {
+                                        do! Task.Delay(250)
+                                        return! this.SendCommandToUser(
+                                            userId, GetJobResultCommand query,
+                                            ?conversationId = conversationId,
+                                            deviceId = session.DeviceId, ?agentId = agentId)
+                                    })
+                        let stillSameDevice =
+                            match users.GetSessionByDevice(userId, session.DeviceId) with
+                            | ValueSome current ->
+                                current.State = Registered
+                                && current.ConnectionId = session.ConnectionId
+                                && current.Generation = session.Generation
+                            | ValueNone -> false
+                        match verified.Result, verified.Error, verified.PendingJob, stillSameDevice with
+                        | Some _, None, None, true ->
+                            // A verified ledger binding on the same connected
+                            // device is required before any destination write.
+                            // Once dispatched, NEVER retry a potentially
+                            // committed mutation against another client.
+                            let! destination =
+                                this.SendCommandToUser(userId, command,
+                                    ?conversationId = conversationId, deviceId = session.DeviceId, ?agentId = agentId)
+                            // Bind the pending handle to this verified device.
+                            // A later poll MUST NOT fall back to the user's current default device.
+                            return
+                                match destination.PendingJob with
+                                | None -> destination
+                                | Some handle ->
+                                    let routed = { handle with DeviceId = Some session.DeviceId }
+                                    { destination with
+                                        PendingJob = Some routed
+                                        Result = Some(JsonSerializer.Serialize routed) }
                         | _ ->
-                            let reason = ProjectNotificationRouting.probeFailure health
+                            let reason =
+                                if not stillSameDevice then "candidate device session changed during ledger verification"
+                                else ProjectNotificationRouting.probeFailure verified
                             return! dispatch rest ((session.DeviceName, reason) :: probeFailures)
                 }
             return! dispatch eligible []

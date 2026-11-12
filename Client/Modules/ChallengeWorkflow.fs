@@ -54,7 +54,8 @@ type ChallengeEvent =
 type ChallengeDetails =
     { SnapshotCommit: string
       Challenge: AgentChallenge
-      History: ChallengeEvent list }
+      History: ChallengeEvent list
+      NextEventSequence: int64 }
 
 [<CLIMutable>]
 type ChallengeSummary =
@@ -455,12 +456,23 @@ module ChallengeWorkflow =
 
     let list binding actor = listPage binding actor 50 "" ""
 
-    let get binding actor challengeId =
+    // Audit events are immutable but can grow without limit across repeated
+    // block/reopen cycles. Read a bounded page, tied to a verified snapshot,
+    // instead of making a single unlimited MCP response.
+    let getPage binding actor challengeId limit afterSequence expectedSnapshot =
         match guidN challengeId with
         | None -> Error(InvalidBinding "Invalid challenge ID.")
+        | Some id when not (agentId actor) || limit < 1 || limit > 16
+                       || afterSequence < 0L
+                       || (not (String.IsNullOrWhiteSpace expectedSnapshot)
+                           && (expectedSnapshot.Length <> 40
+                               || not (expectedSnapshot |> Seq.forall Uri.IsHexDigit))) ->
+            Error(InvalidBinding "Challenge detail needs actor, event page size 1-16, and valid sequence/snapshot.")
         | Some id -> result {
-            if not (agentId actor) then return! Error(InvalidBinding "Actor identity required.")
             let! snapshot = LedgerStore.fetch binding
+            if not (String.IsNullOrWhiteSpace expectedSnapshot)
+               && snapshot.Commit <> expectedSnapshot then
+                return! Error(StaleEntityVersion "Challenge detail snapshot moved; start paging again.")
             do! registered binding snapshot actor
             let! record, _ = readChallenge binding snapshot id
             if not (accessible actor record) then
@@ -468,8 +480,20 @@ module ChallengeWorkflow =
             let! paths =
                 LedgerStore.listAt binding snapshot
                     ("challenges/" + id.ToString("N") + "/events")
-            let mutable events = []
+            let mutable available = []
             for item in paths do
+                let basename = item.Substring(item.LastIndexOf('/') + 1)
+                let raw = basename.Substring(0, basename.Length - 5)
+                match Int64.TryParse raw with
+                | true, sequence when sequence > 0L ->
+                    if sequence > afterSequence then
+                        available <- (sequence, item) :: available
+                | _ -> return! Error(LedgerIntegrityError "Invalid immutable challenge event filename.")
+            let page =
+                available |> List.sortBy fst |> List.truncate (limit + 1)
+            let selected = page |> List.truncate limit
+            let mutable events = []
+            for sequence, item in selected do
                 let! contents, _ = LedgerStore.readAt binding snapshot item
                 match contents with
                 | None -> return! Error(LedgerIntegrityError "Missing immutable challenge event.")
@@ -479,16 +503,20 @@ module ChallengeWorkflow =
                         if doc.RootElement.GetProperty("schemaVersion").GetInt32() <> 2 then
                             return! Error(LedgerIntegrityError "Invalid challenge event schema.")
                         let entry = JsonSerializer.Deserialize<ChallengeEvent>(value, options)
-                        if isNull (box entry) || entry.ChallengeId <> record.ChallengeId then
-                            return! Error(LedgerIntegrityError "Invalid challenge event record.")
+                        if isNull (box entry) || entry.ChallengeId <> record.ChallengeId
+                           || entry.Sequence <> sequence then
+                            return! Error(LedgerIntegrityError "Invalid immutable challenge event identity.")
                         events <- entry :: events
                     with ex ->
                         return! Error(LedgerIntegrityError ("Invalid challenge event: " + ex.Message))
             return
                 { SnapshotCommit = snapshot.Commit; Challenge = record
-                  History = events |> List.sortBy _.Sequence }
+                  History = List.rev events
+                  NextEventSequence =
+                    if page.Length > limit then selected |> List.last |> fst else 0L }
         }
 
+    let get binding actor challengeId = getPage binding actor challengeId 16 0L ""
 
     let private waitPath task attempt =
         $"tasks/{task}/attempts/{attempt}/challenge-wait.json"

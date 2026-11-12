@@ -15,7 +15,7 @@ A challenge has a stable 32-character lowercase UUID (N format), an issuing agen
 
 Only the named condition owner can resolve that condition as **Satisfied** (with evidence) or **Blocked** (with a reason and optional evidence). A blocked condition produces a normal issuer notification, retaining full reason/evidence in the ledger. The issuer alone may reopen a blocked condition or cancel an unfinished challenge. Reopening resets that condition to Pending; its prior outcome remains in the immutable event history. Already Satisfied and Cancelled challenges are immutable.
 
-The issuing agent and condition owners may read the challenge, including its full evidence and history. Other agents cannot. `list_challenges` returns compact issued/owned challenge summaries (status, condition counts and caller-owned unresolved condition IDs), not full evidence. It has `limit` (1–50, default 50), optional `afterChallengeId`, and optional `expectedSnapshotCommit` for consistency across pages. Read the response `NextCursor` and `SnapshotCommit` from the previous page; if the ledger moves, restart paging instead of combining different snapshots. `get_challenge` returns one snapshot and its full immutable event sequence. These reads do **not** implicitly start a Ready agent.
+The issuing agent and condition owners may read the challenge, including its full evidence and history. Other agents cannot. `list_challenges` returns compact issued/owned challenge summaries (status, condition counts and caller-owned unresolved condition IDs), not full evidence. It has `limit` (1–50, default 50), optional `afterChallengeId`, and optional `expectedSnapshotCommit` for consistency across pages. Read the response `NextCursor` and `SnapshotCommit` from the previous page; if the ledger moves, restart paging instead of combining different snapshots. `get_challenge` returns a snapshot with condition evidence and a bounded, immutable **audit-event page**. It accepts `eventLimit` (1–16, default 16), optional `afterEventSequence`, and optional `expectedSnapshotCommit`; read `NextEventSequence` and `SnapshotCommit` from its previous page to retrieve all history without exceeding response limits. `NextEventSequence` of zero means the last page. These reads do **not** implicitly start a Ready agent.
 
 ## Public MCP tools
 
@@ -25,7 +25,7 @@ All tools require `projectName` and the requesting `agentId`. The authenticated 
 | --- | --- | --- |
 | `create_challenge` | `title`, `conditions: [{ownerAgentId, description}, ...]` | Optional `taskId`, `operationId` |
 | `list_challenges` | — | — |
-| `get_challenge` | `challengeId` | — |
+| `get_challenge` | `challengeId` | Optional `eventLimit`, `afterEventSequence`, `expectedSnapshotCommit` |
 | `resolve_challenge_condition` | `challengeId`, `conditionId`, `expectedVersion`, `outcome` (`Satisfied`/`Blocked`), `evidence` | `reason` required for Blocked |
 | `reopen_challenge_condition` | `challengeId`, `conditionId`, `expectedVersion`, `reason` | — |
 | `cancel_challenge` | `challengeId`, `expectedVersion`, `reason` | — |

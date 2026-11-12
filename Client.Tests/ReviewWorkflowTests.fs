@@ -4936,8 +4936,9 @@ type ReviewWorkflowTests() =
                         Common.ChallengeReadCommand
                             { ProjectName = "owner"; ActorId = "Owner"
                               Action = action; ChallengeId = challengeId
-                              Limit = if action = "List" then 10 else 0
-                              AfterChallengeId = ""; ExpectedSnapshotCommit = "" }
+                              Limit = if action = "List" then 10 else 16
+                              AfterChallengeId = ""; AfterEventSequence = 0L
+                              ExpectedSnapshotCommit = "" }
                     let serialized = System.Text.Json.JsonSerializer.Serialize(command)
                     let _, result, response =
                         Client.SignalR.Client.processIncomingCommand runtime serialized "Owner"
@@ -4959,7 +4960,8 @@ type ReviewWorkflowTests() =
                     Common.ChallengeReadCommand
                         { ProjectName = "owner"; ActorId = "Owner"
                           Action = "Get"; ChallengeId = issued.ChallengeId
-                          Limit = 0; AfterChallengeId = ""; ExpectedSnapshotCommit = "" }
+                          Limit = 16; AfterChallengeId = ""; AfterEventSequence = 0L
+                          ExpectedSnapshotCommit = "" }
                 let forgedWrite : Common.AgentCommand =
                     Common.ChallengeWriteCommand
                         { ProjectName = "owner"; ActorId = "Owner"

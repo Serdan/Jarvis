@@ -463,3 +463,47 @@ type ChallengeTests() =
             | Error(StaleEntityVersion _) -> ()
             | other -> Assert.Fail($"Expected snapshot-pinned page failure after mutation: {other}")
         )
+
+
+    [<Test>]
+    member _.EventHistoryPagesAreSnapshotPinnedAndBoundedAfterRepeatedReopen() =
+        withFixture (fun a b ->
+            let first =
+                ChallengeWorkflow.create a (Guid.NewGuid()) "Agent 3" "Repeated block/reopen" ""
+                    [ { OwnerAgentId = "Lead"; Description = "Reopenable condition" } ] |> ok
+            let id = first.ChallengeId
+            let condition = first.ConditionIds.Head
+            for round in 0 .. 9 do
+                let version = 1 + round * 2
+                ChallengeWorkflow.resolve b (Guid.NewGuid()) "Lead" id
+                    condition version "blocked evidence" $"blocked round {round}" |> ok |> ignore
+                ChallengeWorkflow.reopen a (Guid.NewGuid()) "Agent 3" id
+                    condition (version + 1) "retry" |> ok |> ignore
+            let page1 = ChallengeWorkflow.getPage b "Agent 3" id 8 0L "" |> ok
+            Assert.That(page1.Challenge.Status, Is.EqualTo("Pending"))
+            Assert.That(page1.History.Length, Is.EqualTo(8))
+            Assert.That(page1.NextEventSequence, Is.GreaterThan(0L))
+            let page2 =
+                ChallengeWorkflow.getPage a "Agent 3" id 8
+                    page1.NextEventSequence page1.SnapshotCommit |> ok
+            Assert.That(page2.History.Length, Is.EqualTo(8))
+            Assert.That(page2.NextEventSequence, Is.GreaterThan(page1.NextEventSequence))
+            let page3 =
+                ChallengeWorkflow.getPage b "Agent 3" id 8
+                    page2.NextEventSequence page1.SnapshotCommit |> ok
+            Assert.That(page3.History.Length, Is.EqualTo(5))
+            Assert.That(page3.NextEventSequence, Is.EqualTo(0L))
+            let all = [page1; page2; page3] |> List.collect _.History
+            Assert.That(all.Length, Is.EqualTo(21))
+            let sequences = all |> List.map _.Sequence
+            Assert.That(sequences, Is.EqualTo((sequences |> List.sort) :> obj))
+            Assert.That((sequences |> List.distinct).Length, Is.EqualTo(21))
+            let fromOldSnapshot = page1.SnapshotCommit
+            ChallengeWorkflow.cancel a (Guid.NewGuid()) "Agent 3" id 21 "end" |> ok |> ignore
+            failStale (ChallengeWorkflow.getPage b "Agent 3" id 8
+                            page1.NextEventSequence fromOldSnapshot)
+            let last = ChallengeWorkflow.get b "Agent 3" id |> ok
+            Assert.That(last.Challenge.Status, Is.EqualTo("Cancelled"))
+            Assert.That(last.History.Length, Is.EqualTo(16))
+            Assert.That(last.NextEventSequence, Is.GreaterThan(0L))
+        )

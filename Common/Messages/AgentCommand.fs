@@ -147,6 +147,7 @@ type ChallengeReadCommand =
       ChallengeId: string
       Limit: int
       AfterChallengeId: string
+      AfterEventSequence: int64
       ExpectedSnapshotCommit: string }
 
 type ChallengeWriteCommand =

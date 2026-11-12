@@ -1998,6 +1998,7 @@ type JarvisMcpTools =
             (ChallengeReadCommand { ProjectName = projectName; ActorId = agentId
                                     Action = "List"; ChallengeId = ""
                                     Limit = limit; AfterChallengeId = afterChallengeId
+                                    AfterEventSequence = 0L
                                     ExpectedSnapshotCommit = expectedSnapshotCommit })
 
     [<McpServerTool(Title = "get challenge", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false);
@@ -2005,13 +2006,18 @@ type JarvisMcpTools =
       Description("Read a challenge by its UUID, including owned conditions, evidence and immutable transition history. Accessible only to the issuer or named condition owners.")>]
     static member GetChallenge(
         projectName: string, agentId: string, challengeId: string,
+        [<Optional; DefaultParameterValue(16)>] eventLimit: int,
+        [<Optional; DefaultParameterValue(0L)>] afterEventSequence: int64,
+        [<Optional; DefaultParameterValue("")>] expectedSnapshotCommit: string,
         [<Optional; DefaultParameterValue("")>] deviceId: string,
         client: ClientService, http: IHttpContextAccessor
     ) =
         McpToolHelpers.send client http
             (ChallengeReadCommand { ProjectName = projectName; ActorId = agentId
                                     Action = "Get"; ChallengeId = challengeId
-                                    Limit = 0; AfterChallengeId = ""; ExpectedSnapshotCommit = "" })
+                                    Limit = eventLimit; AfterChallengeId = ""
+                                    AfterEventSequence = afterEventSequence
+                                    ExpectedSnapshotCommit = expectedSnapshotCommit })
 
     [<McpServerTool(Title = "resolve challenge condition", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false);
       McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]""");

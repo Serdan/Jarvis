@@ -2398,7 +2398,8 @@ module ChallengeApi =
                     cmd.Limit cmd.AfterChallengeId cmd.ExpectedSnapshotCommit
                 |> mapError |> Result.map box
             | "Get" ->
-                ChallengeWorkflow.ChallengeWorkflow.get binding cmd.ActorId cmd.ChallengeId
+                ChallengeWorkflow.ChallengeWorkflow.getPage binding cmd.ActorId cmd.ChallengeId
+                    cmd.Limit cmd.AfterEventSequence cmd.ExpectedSnapshotCommit
                 |> mapError |> Result.map box
             | _ -> Error(Client.ValidationError "Unsupported challenge read action."))
 

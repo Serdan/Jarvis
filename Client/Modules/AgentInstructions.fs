@@ -409,7 +409,7 @@ let private explicitPage (documents: (string * string) list) (segment: (Explicit
 let private explicitPageSize (page: JsonObject) =
     page.ToJsonString() |> Encoding.UTF8.GetByteCount
 
-let getExplicit (target: ProjectPaths.ProjectTarget) (command: GetAgentInstructionsCommand) (rt: Runtime) =
+let private getExplicitRepository (target: ProjectPaths.ProjectTarget) (command: GetAgentInstructionsCommand) (rt: Runtime) pageBudget =
     ProjectPaths.resolveProjectContextForTarget target rt
     |> Result.bind (fun project ->
         explicitSources rt project (if isNull command.Directory then "" else command.Directory)
@@ -447,7 +447,7 @@ let getExplicit (target: ProjectPaths.ProjectTarget) (command: GetAgentInstructi
                         Ok(explicitPage documents None None)
                     else
                         let source = items[index]
-                        readExplicitSegment source offset explicitPageBytes
+                        readExplicitSegment source offset pageBudget
                         |> Result.bind (fun text ->
                             let endOffset = offset + int64 (utf8.GetByteCount text)
                             let complete = endOffset = source.Bytes
@@ -458,7 +458,7 @@ let getExplicit (target: ProjectPaths.ProjectTarget) (command: GetAgentInstructi
                                 if offset > 0L || not complete then Some(source, offset, endOffset)
                                 else None
                             let page = explicitPage candidate chunk (cursorAt nextIndex nextOffset)
-                            if complete && explicitPageSize page <= explicitPageBytes then
+                            if complete && explicitPageSize page <= pageBudget then
                                 if offset > 0L then
                                     // Final continuation piece still needs its
                                     // byte-offset metadata; do not discard it
@@ -489,10 +489,81 @@ let getExplicit (target: ProjectPaths.ProjectTarget) (command: GetAgentInstructi
                                             else None
                                         let fitted =
                                             explicitPage [source.Key, prefix] part (cursorAt nextIndex nextOffset)
-                                        if explicitPageSize fitted <= explicitPageBytes then Ok fitted
+                                        if explicitPageSize fitted <= pageBudget then Ok fitted
                                         else fit (chars / 2)
                                 fit text.Length)
                 assemble start offset [])))
+
+// Durable role and agent layers are read from the verified project ledger,
+// never from the source checkout or a cached instruction delivery response.
+// The first page resolves roles from the live ledger; local AGENTS.md must
+// remain retrievable if that remote ledger is transiently unavailable.
+// Continuation pages refer to the initial role resolution instead of making
+// one new remote request per repository chunk.
+let private unresolvedInstructionLayers (status: string) (code: string) (message: string) =
+    let node = JsonObject()
+    node["status"] <- JsonValue.Create(status)
+    node["complete"] <- JsonValue.Create(false)
+    node["code"] <- JsonValue.Create(code)
+    node["message"] <- JsonValue.Create(message)
+    node :> JsonNode
+
+let private transientLedgerError = function
+    | Client.LedgerFailureError failure
+        when failure.Code = "RemoteUnavailable" || failure.Code = "LedgerContended" -> true
+    | _ -> false
+
+let getExplicit (target: ProjectPaths.ProjectTarget) (command: GetAgentInstructionsCommand) (rt: Runtime) =
+    ProjectPaths.resolveProjectContextForTarget target rt
+    |> Result.bind (fun project ->
+        let projectName =
+            ProjectPaths.ProjectTarget.projectName (ProjectPaths.ResolvedProject.target project)
+        ProjectPaths.resolveProjectRoot projectName rt
+        |> Result.bind (fun (FolderPath root) ->
+            // Resolve the local hierarchy independently, including its
+            // source-validation errors, before any optional remote ledger I/O.
+            getExplicitRepository target command rt (explicitPageBytes - 1024)
+            |> Result.bind (fun localPage ->
+                let ledgerConfigured =
+                    File.Exists(OrchestrationApi.LedgerBindingConfig.pathForRoot root)
+                let layerNode =
+                    if String.IsNullOrWhiteSpace command.AgentId || not ledgerConfigured then Ok None
+                    elif command.Cursor.IsSome then
+                        Ok(Some(unresolvedInstructionLayers "continuation" "RoleLayersNotRepeated"
+                            "Role and individual instructions are checked only on the initial hierarchy page, not repeated here. Use that page's instructionLayers if present; restart without a cursor to refresh."))
+                    else
+                        OrchestrationApi.LedgerBindingConfig.loadWithSnapshot projectName rt
+                        |> Result.bind (fun (binding, snapshot) ->
+                            RoleInstructions.RoleInstructions.tryResolveAt binding snapshot command.AgentId
+                            |> Result.mapError OrchestrationApi.LedgerErrors.toEffect)
+                        |> function
+                            | Ok resolved -> Ok(resolved |> Option.map JsonSerializer.SerializeToNode)
+                            | Error failure when transientLedgerError failure ->
+                                let code =
+                                    match failure with
+                                    | Client.LedgerFailureError detail -> detail.Code
+                                    | _ -> "RoleLayersUnavailable"
+                                Ok(Some(unresolvedInstructionLayers "unavailable" code
+                                    "INCOMPLETE INSTRUCTIONS: the canonical role and agent layers could not be verified and were NOT loaded. Local AGENTS.md is available independently. Retry the initial request when the ledger is reachable."))
+                            | Error failure -> Error failure
+                layerNode
+                |> Result.bind (fun layerNode ->
+                    // A role body may be large. Repage only if the local page
+                    // does not fit alongside the verified role payload.
+                    let layerBytes =
+                        layerNode
+                        |> Option.map (fun node -> Encoding.UTF8.GetByteCount(node.ToJsonString()))
+                        |> Option.defaultValue 0
+                    let pageBudget = max 1024 (explicitPageBytes - layerBytes - 1024)
+                    let fitted =
+                        if explicitPageSize localPage <= pageBudget then Ok localPage
+                        else getExplicitRepository target command rt pageBudget
+                    fitted
+                    |> Result.map (fun page ->
+                        match layerNode with
+                        | Some node -> page["instructionLayers"] <- node
+                        | None -> ()
+                        page)))))
 
 // This snapshot must travel from instruction selection to authorization and
 // execution: a mutable .jarvis.json must not be parsed twice for one call.

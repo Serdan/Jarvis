@@ -351,7 +351,7 @@ let private explicitInstructions (rt: Runtime) selector directory cursor =
         ProjectPaths.ProjectTarget.parse selector
         |> function Ok found -> found | Error error -> failwithf "Invalid checkout selector: %A" error
     getExplicit target
-        { ProjectName = selector; Directory = directory; Cursor = cursor } rt
+        { ProjectName = selector; AgentId = ""; Directory = directory; Cursor = cursor } rt
 
 [<Test>]
 let registered_worktrees_resolve_distinct_instructions_from_actual_checkout_roots () =
@@ -743,7 +743,7 @@ let explicit_tool_transport_returns_safe_page_and_continuation () =
             while not complete && pages < 10 do
                 let cmd : AgentCommand =
                     GetAgentInstructionsCommand
-                        { ProjectName = "Demo"; Directory = ""; Cursor = cursor }
+                        { ProjectName = "Demo"; AgentId = ""; Directory = ""; Cursor = cursor }
                 let input = System.Text.Json.JsonSerializer.Serialize<AgentCommand>(cmd)
                 let! _, result, envelope =
                     Client.SignalR.Client.processIncomingCommand rt input ""
@@ -773,7 +773,7 @@ let explicit_command_routes_through_client_without_auto_hierarchy_injection () =
             create root "AGENTS.md" "workspace guidance" |> ignore
             create root "Demo/AGENTS.md" "project guidance" |> ignore
             let cmd = GetAgentInstructionsCommand
-                          { ProjectName = "Demo"; Directory = ""; Cursor = None }
+                          { ProjectName = "Demo"; AgentId = ""; Directory = ""; Cursor = None }
             let! response, auto = Client.SignalR.Client.receiveCommandWithInstructions (Runtime(root)) cmd
             Assert.That(auto, Is.Empty)
             match response with

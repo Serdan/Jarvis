@@ -7,6 +7,7 @@ open System.Text.RegularExpressions
 open System.Security.Cryptography
 open FsToolkit.ErrorHandling
 open Client.LedgerStore
+open Client.RoleInstructions
 
 [<CLIMutable>]
 type ReviewTask =
@@ -289,6 +290,7 @@ type AgentInbox =
       UnacknowledgedFeedback: ReviewFeedbackNotice list
       PendingNotifications: AgentNotification list
       IntegrationSubmissions: IntegrationSubmission list
+      InstructionLayers: InstructionResolution
       SlotAvailable: bool
       Unassigned: bool }
 
@@ -2384,6 +2386,7 @@ module ReviewWorkflow =
             result {
                 let! records = LedgerStore.readAgentInboxRecordsAt binding snapshot
                 let! agent = requiredFromRecords<ReviewAgent> records (agentPath agentId)
+                let! instructionLayers = RoleInstructions.resolveAtKnownAgent binding snapshot agentId
                 let paths = records |> Map.toList |> List.map fst
                 let mutable notifications = []
                 for path in paths do
@@ -2518,6 +2521,7 @@ module ReviewWorkflow =
                           UnacknowledgedFeedback = feedback |> List.sortBy (fun notice -> notice.DecisionSequence)
                           PendingNotifications = notifications
                           IntegrationSubmissions = integrationRecords |> List.sortBy (fun item -> item.CreatedSequence)
+                          InstructionLayers = instructionLayers
                           SlotAvailable = isNull (box agent.CurrentAssignment)
                           Unassigned = isNull (box agent.CurrentAssignment) }
             }

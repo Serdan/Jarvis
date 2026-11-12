@@ -1058,7 +1058,8 @@ module LedgerStore =
                 |> Result.map (fun content -> Some content, Some oid)
 
     let listAt (binding: LedgerBinding) (snapshot: LedgerSnapshot) (prefix: string) =
-        if prefix <> "tasks" && prefix <> "agents" && prefix <> "notifications" then
+        if prefix <> "tasks" && prefix <> "agents" && prefix <> "notifications"
+           && prefix <> "records/roles" then
             Error(InvalidBinding "Unsupported ledger enumeration prefix.")
         else
             run binding.RepositoryPath [ "ls-tree"; "-r"; "--name-only"; snapshot.Commit; "--"; prefix ]

@@ -1179,8 +1179,8 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
 
         renderPermissionPreviewUnsafe width
 
-    let settingKeys = [| "machine-name"; "workspace-path"; "trust-level"; "allowed-environment-variables"; "max-import-bytes" |]
-    let settingLabels = [| "Machine name"; "Workspace directory"; "Trust level"; "Allowed environment variables"; "Maximum import bytes" |]
+    let settingKeys = [| "machine-name"; "workspace-path"; "trust-level"; "allowed-environment-variables"; "max-import-bytes"; "browser-port" |]
+    let settingLabels = [| "Machine name"; "Workspace directory"; "Trust level"; "Allowed environment variables"; "Maximum import bytes"; "Browser bridge port" |]
 
     let settingsValue key (stored: ClientStoredConfig) =
         match key with
@@ -1189,6 +1189,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         | "trust-level" -> stored.TrustLevel
         | "allowed-environment-variables" -> stored.AllowedEnvironmentVariables |> Option.map (String.concat ",")
         | "max-import-bytes" -> stored.MaxImportBytes |> Option.map string
+        | "browser-port" -> stored.BrowserPort |> Option.map string
         | _ -> None
 
     let settingsEffective key (config: ClientEffectiveConfig) =
@@ -1198,6 +1199,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         | "trust-level" -> config.TrustLevel
         | "allowed-environment-variables" -> String.concat "," config.AllowedEnvironmentVariables
         | "max-import-bytes" -> string config.MaxImportBytes
+        | "browser-port" -> config.BrowserPort |> Option.map string |> Option.defaultValue "disabled"
         | _ -> ""
 
     let openSettingsUnsafe () =
@@ -1254,6 +1256,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                         | "workspace-path" -> "workspacePath"
                         | "trust-level" -> "trustLevel"
                         | "allowed-environment-variables" -> "allowedEnvironmentVariables"
+                        | "browser-port" -> "browserPort"
                         | _ -> "maxImportBytes") -> " [startup override]"
                     | _ -> ""
                 let marker = if settingsSelected = index then ">" else " "

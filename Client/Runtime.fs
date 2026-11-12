@@ -8,6 +8,8 @@ open Common
 type Runtime(root: string, tui: ConsoleTui, trustLevel: TrustLevel, maxImportBytes: int64) =
     member _.Tui = tui
     member _.MaxImportBytes = maxImportBytes
+    member val Browser: BrowserBridge.Service option = None with get, set
+    member val BrowserScheduler: BrowserSchedules.Service option = None with get, set
 
     new(root: string, tui: ConsoleTui, trustLevel: TrustLevel) =
         Runtime(root, tui, trustLevel, AgentProtocol.defaultMaxImportBytes)

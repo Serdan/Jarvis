@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Jarvis dynamic DOM fixture</title></head>
+<body>
+<h1>Dynamic content test</h1>
+<div id="app" data-state="loading">Waiting for JavaScript…</div>
+<script>
+  // The initial response contains no #results element.
+  setTimeout(() => {
+    const results = document.createElement("section");
+    results.id = "results";
+    results.textContent = "Ready: data was rendered after hydration";
+    document.getElementById("app").replaceChildren(results);
+    document.getElementById("app").dataset.state = "ready";
+    document.dispatchEvent(new CustomEvent("results:ready"));
+  }, 2000);
+</script>
+</body>
+</html>

@@ -3,6 +3,8 @@ module Program
 open System
 open System.IO
 open System.Reflection
+open System.Text
+open System.Text.Json
 open System.Threading
 open System.Threading.Tasks
 open Client
@@ -46,6 +48,7 @@ let private runConfigCommand (args: string array) =
                 printfn "Trust: %s" config.TrustLevel
                 printfn "Allowed environment variables: %s" (String.concat ", " config.AllowedEnvironmentVariables)
                 printfn "Maximum import bytes: %d" config.MaxImportBytes
+                printfn "Browser bridge port: %s" (config.BrowserPort |> Option.map string |> Option.defaultValue "disabled")
                 0
         match args |> Array.toList with
         | [ "config"; "path" ] -> printfn "%s" snapshot.Path; 0
@@ -129,7 +132,7 @@ let private runClient args =
         | Ok result -> result
         | Error message ->
             eprintfn "%s" message
-            eprintfn "Usage: JarvisClient [--path <workspace>] [--machine-name <name>] [--trust none|partial|full] [--allow-env NAME]... [--max-import-bytes BYTES]"
+            eprintfn "Usage: JarvisClient [--path <workspace>] [--machine-name <name>] [--trust none|partial|full] [--allow-env NAME]... [--max-import-bytes BYTES] [--browser-port PORT]"
             exit 2
 
     let dir = effective.WorkspacePath
@@ -158,6 +161,62 @@ let private runClient args =
           Effective = effective }
     ProcessEnvironment.configureAllowedEnvironmentVariables allowedEnvironmentVariables
     let rt = Runtime(getDir dir, tui, trustLevel, maxImportBytes)
+    // Opt-in local browser bridge. The extension must authenticate and register a tab.
+    let browserPort = effective.BrowserPort
+    let browser =
+        browserPort |> Option.map (fun port ->
+            let bridge = BrowserBridge.Service(port, BrowserBridge.getOrCreateSecret())
+            bridge.Start()
+            rt.Browser <- Some bridge
+            tui.Log $"Browser bridge listening on 127.0.0.1:{port}; registered windows and explicit tab registrations required."
+            bridge)
+
+    // Persistent one-shot browser actions. The script always comes from an ordinary
+    // project file, re-resolved under the usual worktree/symlink restrictions at execution.
+    let scheduler =
+        browser |> Option.map (fun bridge ->
+            let executeAction (action: BrowserSchedules.ScheduledAction) = task {
+                let script =
+                    match ProjectPaths.validateProjectRelativePath action.ScriptPath with
+                    | Error e -> Error(sprintf "%A" e)
+                    | Ok _ when not (action.ScriptPath.EndsWith(".js", StringComparison.OrdinalIgnoreCase)) ->
+                        Error "InvalidScriptPath"
+                    | Ok _ ->
+                        match ProjectPaths.resolveProjectFile action.ProjectName action.ScriptPath rt with
+                        | Error e -> Error(sprintf "%A" e)
+                        | Ok(FilePath path) ->
+                            try
+                                if FileInfo(path).Length > int64 BrowserBridge.MaxScriptBytes then Error "InputTooLarge"
+                                else Ok(File.ReadAllText(path, UTF8Encoding(false, true)))
+                            with e -> Error("ScriptUnavailable:" + e.GetType().Name)
+                match script with
+                | Error e -> return Error("", e)
+                | Ok source ->
+                    let mutable connected = false
+                    let mutable tries = 0
+                    while not connected && tries < 60 do
+                        connected <- bridge.ListWindows().IsOk
+                        if not connected then
+                            tries <- tries + 1
+                            do! Task.Delay(500)
+                    if not connected then return Error("", "ExtensionDisconnected")
+                    else
+                        let! result = BrowserBridge.runInNewTab bridge action.WindowRegistration
+                                            action.Url action.Alias action.Active source action.ArgsJson
+                                            30000 action.CloseTabAfterExecution
+                        match result with
+                        | Error (registrationId, reason) ->
+                            if reason.StartsWith("UiIncompatible:", StringComparison.Ordinal) then
+                                tui.Log $"Browser schedule '{action.Id}' suspended: {reason}; inspect tab {registrationId} and update provider script."
+                            return Error(registrationId, reason)
+                        | Ok json -> return Ok json
+            }
+            let store = BrowserSchedules.Service(BrowserSchedules.defaultPath(), executeAction)
+            rt.BrowserScheduler <- Some store
+            store.Start()
+            tui.Log "Persistent browser scheduler enabled (one-shot or recurring, no replay of uncertain occurrences)."
+            store)
+
     let formatJobResult value = value |> Result.mapError (fun error -> sprintf "%A" error)
     tui.SetJobAccess
         { List = (fun () ->
@@ -266,6 +325,8 @@ let private runClient args =
                     ()
 
         cts.Cancel()
+        scheduler |> Option.iter (fun store -> (store :> IDisposable).Dispose())
+        browser |> Option.iter (fun bridge -> (bridge :> IDisposable).Dispose())
         do! connection.DisposeAsync()
 
         activityStore
@@ -285,6 +346,15 @@ let private runClient args =
 let main args =
     if args.Length > 0 && args[0] = BoundedProcess.groupHostFlag then
         BoundedProcess.runInternalGroupHost (args |> Array.skip 1)
+    elif args.Length = 2 && args[0] = "browser" && args[1] = "pair" then
+        printfn "Pairing secret (keep private): %s" (BrowserBridge.getOrCreateSecret())
+        0
+    elif args.Length = 2 && args[0] = "browser" && args[1] = "revoke" then
+        let path = BrowserBridge.secretFile()
+        if File.Exists(path) then File.Delete(path)
+        printfn "Previous browser extension pairing revoked. Restart JarvisClient to apply."
+        0
+
     elif args.Length = 2 && args[0] = "config" && args[1] = "path" then
         printfn "%s" (ClientConfig.configPath())
         0

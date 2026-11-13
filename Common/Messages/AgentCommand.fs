@@ -70,6 +70,63 @@ type ListCommandsResult =
 
 type ListProjectsCommand = struct end
 
+type BrowserListTabsCommand = struct end
+type BrowserListWindowsCommand = struct end
+type ScheduleBrowserExecutionCommand =
+    { ScheduleId: string
+      RunAfterSeconds: int
+      Url: string
+      ProjectName: string
+      ScriptPath: string
+      ArgsJson: string option
+      Alias: string option
+      Active: bool option
+      WindowRegistration: string option
+      CloseTabAfterExecution: bool option
+      RepeatEverySeconds: int option }
+type ListScheduledBrowserExecutionsCommand = struct end
+type CancelScheduledBrowserExecutionCommand = { ScheduleId: string }
+
+type BrowserOpenTabCommand =
+    { WindowRegistration: string
+      Url: string
+      Alias: string option
+      Active: bool option }
+
+type BrowserCloseTabCommand = { TabRegistration: string }
+type BrowserRunInNewTabCommand =
+    { WindowRegistration: string
+      Url: string
+      ProjectName: string
+      ScriptPath: string
+      ArgsJson: string option
+      Active: bool option
+      CloseTabAfterExecution: bool option
+      TimeoutMs: int option }
+
+type BrowserExecuteFileCommand =
+    { ProjectName: string
+      ScriptPath: string
+      TabRegistration: string
+      ArgsJson: string option
+      TimeoutMs: int option }
+type BrowserExecuteJsCommand =
+    { TabRegistration: string
+      Code: string
+      ArgsJson: string option
+      TimeoutMs: int option }
+type BrowserCaptureDomCommand =
+    { TabRegistration: string
+      WaitJson: string option
+      CaptureSelector: string option
+      TimeoutMs: int option }
+type BrowserExportDomCommand =
+    { TabRegistration: string
+      ProjectName: string
+      FilePath: string
+      WaitJson: string option
+      CaptureSelector: string option
+      TimeoutMs: int option }
 type CreateProjectCommand =
     { Name: string
       InitializeGit: bool
@@ -664,6 +721,18 @@ type JobResult =
 type AgentCommand =
     | ListCommandsCommand
     | ListProjectsCommand
+    | BrowserListTabsCommand
+    | BrowserListWindowsCommand
+    | BrowserCloseTabCommand of BrowserCloseTabCommand
+    | BrowserRunInNewTabCommand of BrowserRunInNewTabCommand
+    | ScheduleBrowserExecutionCommand of ScheduleBrowserExecutionCommand
+    | ListScheduledBrowserExecutionsCommand
+    | CancelScheduledBrowserExecutionCommand of CancelScheduledBrowserExecutionCommand
+    | BrowserOpenTabCommand of BrowserOpenTabCommand
+    | BrowserExecuteFileCommand of BrowserExecuteFileCommand
+    | BrowserExecuteJsCommand of BrowserExecuteJsCommand
+    | BrowserCaptureDomCommand of BrowserCaptureDomCommand
+    | BrowserExportDomCommand of BrowserExportDomCommand
     | CreateProjectCommand of CreateProjectCommand
     | ListWorktreesCommand of ListWorktreesCommand
     | GetWorktreeCommand of GetWorktreeCommand
@@ -737,6 +806,18 @@ module AgentCommandInfo =
     let name = function
         | ListCommandsCommand -> "ListCommandsCommand"
         | ListProjectsCommand -> "ListProjectsCommand"
+        | BrowserListTabsCommand -> "BrowserListTabsCommand"
+        | BrowserListWindowsCommand -> "BrowserListWindowsCommand"
+        | BrowserCloseTabCommand _ -> "BrowserCloseTabCommand"
+        | BrowserRunInNewTabCommand _ -> "BrowserRunInNewTabCommand"
+        | ScheduleBrowserExecutionCommand _ -> "ScheduleBrowserExecutionCommand"
+        | ListScheduledBrowserExecutionsCommand -> "ListScheduledBrowserExecutionsCommand"
+        | CancelScheduledBrowserExecutionCommand _ -> "CancelScheduledBrowserExecutionCommand"
+        | BrowserOpenTabCommand _ -> "BrowserOpenTabCommand"
+        | BrowserExecuteFileCommand _ -> "BrowserExecuteFileCommand"
+        | BrowserExecuteJsCommand _ -> "BrowserExecuteJsCommand"
+        | BrowserCaptureDomCommand _ -> "BrowserCaptureDomCommand"
+        | BrowserExportDomCommand _ -> "BrowserExportDomCommand"
         | CreateProjectCommand _ -> "CreateProjectCommand"
         | ListWorktreesCommand _ -> "ListWorktreesCommand"
         | GetWorktreeCommand _ -> "GetWorktreeCommand"
@@ -794,6 +875,18 @@ module AgentCommandInfo =
     let displayName = function
         | ListCommandsCommand -> "ListCommands"
         | ListProjectsCommand -> "ListProjects"
+        | BrowserListTabsCommand -> "BrowserListTabs"
+        | BrowserListWindowsCommand -> "BrowserListWindows"
+        | BrowserCloseTabCommand _ -> "BrowserCloseTab"
+        | BrowserRunInNewTabCommand _ -> "BrowserRunInNewTab"
+        | ScheduleBrowserExecutionCommand _ -> "ScheduleBrowserExecution"
+        | ListScheduledBrowserExecutionsCommand -> "ListScheduledBrowserExecutions"
+        | CancelScheduledBrowserExecutionCommand _ -> "CancelScheduledBrowserExecution"
+        | BrowserOpenTabCommand _ -> "BrowserOpenTab"
+        | BrowserExecuteFileCommand _ -> "BrowserExecuteFile"
+        | BrowserExecuteJsCommand _ -> "BrowserExecuteJs"
+        | BrowserCaptureDomCommand _ -> "BrowserCaptureDom"
+        | BrowserExportDomCommand _ -> "BrowserExportDom"
         | CreateProjectCommand _ -> "CreateProject"
         | ListWorktreesCommand _ -> "ListWorktrees"
         | GetWorktreeCommand _ -> "GetWorktree"
@@ -856,12 +949,24 @@ module AgentCommandInfo =
     let projectName = function
         | ListCommandsCommand
         | ListProjectsCommand
+        | BrowserListTabsCommand
+        | BrowserListWindowsCommand
+        | BrowserCloseTabCommand _
+        | ListScheduledBrowserExecutionsCommand
+        | CancelScheduledBrowserExecutionCommand _
+        | BrowserOpenTabCommand _
+        | BrowserExecuteJsCommand _
+        | BrowserCaptureDomCommand _
         | CreateProjectCommand _
         | UpdateClientCommand -> None
         | GetJobResultCommand cmd -> Some cmd.ProjectName
         | CancelJobCommand cmd -> Some cmd.ProjectName
         | MessageCommand cmd -> cmd.ProjectName
         | GetClientActivityCommand cmd -> cmd.ProjectName
+        | ScheduleBrowserExecutionCommand cmd -> Some cmd.ProjectName
+        | BrowserRunInNewTabCommand cmd -> Some cmd.ProjectName
+        | BrowserExecuteFileCommand cmd -> Some cmd.ProjectName
+        | BrowserExportDomCommand cmd -> Some cmd.ProjectName
         | ListWorktreesCommand cmd -> Some cmd.ProjectName
         | GetWorktreeCommand cmd -> Some cmd.ProjectName
         | CreateWorktreeCommand cmd -> Some cmd.ProjectName
@@ -939,6 +1044,21 @@ module AgentCommandInfo =
         |> String.concat " "
 
     let fullDetail = function
+        | ScheduleBrowserExecutionCommand cmd -> Some($"schedule {cmd.ScheduleId}: {cmd.ProjectName}/{cmd.ScriptPath} in {cmd.RunAfterSeconds}s")
+        | ListScheduledBrowserExecutionsCommand -> None
+        | CancelScheduledBrowserExecutionCommand cmd -> Some cmd.ScheduleId
+        | BrowserListTabsCommand -> None
+        | BrowserListWindowsCommand -> None
+        | BrowserCloseTabCommand cmd -> Some("agent-created tab " + cmd.TabRegistration)
+        | BrowserRunInNewTabCommand cmd -> Some(cmd.ProjectName + "/" + cmd.ScriptPath + " -> " + cmd.WindowRegistration)
+        | BrowserOpenTabCommand cmd ->
+            match Uri.TryCreate(cmd.Url, UriKind.Absolute) with
+            | true, uri when uri.Scheme = "https" || uri.Scheme = "http" -> Some(uri.GetLeftPart(UriPartial.Authority) + " (new tab)")
+            | _ -> Some "(new browser tab)"
+        | BrowserExecuteFileCommand cmd -> Some(cmd.ScriptPath + " -> " + cmd.TabRegistration)
+        | BrowserExecuteJsCommand cmd -> Some("registered tab " + cmd.TabRegistration)
+        | BrowserCaptureDomCommand cmd -> Some("DOM snapshot from " + cmd.TabRegistration)
+        | BrowserExportDomCommand cmd -> Some("DOM snapshot to " + cmd.ProjectName + "/" + cmd.FilePath)
         | ListDirectoryCommand cmd -> Some(compact cmd.FolderPath)
         | SearchFilesCommand cmd -> Some(sprintf "\"%s\"" (compact cmd.Query))
         | SearchTextCommand cmd -> Some(sprintf "\"%s\"" (compact cmd.Query))
@@ -989,6 +1109,21 @@ module AgentCommandInfo =
         | ListJobsCommand _ -> None
 
     let detail = function
+        | ScheduleBrowserExecutionCommand cmd -> Some($"schedule {cmd.ScheduleId} in {cmd.RunAfterSeconds}s")
+        | ListScheduledBrowserExecutionsCommand -> None
+        | CancelScheduledBrowserExecutionCommand cmd -> Some cmd.ScheduleId
+        | BrowserListTabsCommand
+        | BrowserListWindowsCommand -> None
+        | BrowserCloseTabCommand cmd -> Some("agent-created tab " + cmd.TabRegistration)
+        | BrowserRunInNewTabCommand cmd -> Some(cmd.ScriptPath + " -> window " + cmd.WindowRegistration)
+        | BrowserOpenTabCommand cmd ->
+            match Uri.TryCreate(cmd.Url, UriKind.Absolute) with
+            | true, uri when uri.Scheme = "https" || uri.Scheme = "http" -> Some(uri.GetLeftPart(UriPartial.Authority) + " (new tab)")
+            | _ -> Some "(new browser tab)"
+        | BrowserExecuteFileCommand cmd -> Some(cmd.ScriptPath + " -> " + cmd.TabRegistration)
+        | BrowserExecuteJsCommand cmd -> Some("registered tab " + cmd.TabRegistration)
+        | BrowserCaptureDomCommand cmd -> Some("DOM snapshot from " + cmd.TabRegistration)
+        | BrowserExportDomCommand cmd -> Some("DOM snapshot to " + cmd.ProjectName + "/" + cmd.FilePath)
         | ListDirectoryCommand cmd -> Some(truncate 64 cmd.FolderPath)
         | SearchFilesCommand cmd -> Some(quoted cmd.Query)
         | SearchTextCommand cmd -> Some(quoted cmd.Query)
@@ -1102,6 +1237,18 @@ module AgentProtocol =
     let commandDefinitions =
         [ definition "ListCommands" "Lists supported Jarvis commands." [ ReadOnly ] false false false
           definition "ListProjects" "Lists configured projects." [ ReadOnly ] false false false
+          definition "BrowserListWindows" "Lists user-registered browser windows, without exposing unrelated windows or tabs." [ ReadOnly ] false false false
+          definition "BrowserCloseTab" "Closes only a Jarvis-created tab with verified identity." [ ProcessExecution ] true true false
+          definition "BrowserRunInNewTab" "Creates a tab in a registered window, runs a project script, and optionally closes the tab." [ ProcessExecution; NetworkAccess ] true true false
+          definition "BrowserListTabs" "Lists tabs registered through the extension, including opted-in agent-created tabs." [ ReadOnly ] false false false
+          definition "ScheduleBrowserExecution" "Persist a one-shot or recurring action that runs a project JS file in a new tab in a registered window." [ ProcessExecution; NetworkAccess ] true true false
+          definition "ListScheduledBrowserExecutions" "List queued, completed and failed local browser actions without disclosing scripts or arguments." [ ReadOnly ] false false false
+          definition "CancelScheduledBrowserExecution" "Cancel a pending one-shot or recurring browser action." [ ProcessExecution ] true true false
+          definition "BrowserOpenTab" "Opens a new background tab in a user-registered window on an explicitly permitted site." [ ProcessExecution; NetworkAccess ] true true false
+          definition "BrowserExecuteFile" "Executes JavaScript from a bounded project file in a registered tab." [ ProcessExecution; NetworkAccess ] true true false
+          definition "BrowserExecuteJs" "Executes supplied JavaScript in a registered browser tab." [ ProcessExecution; NetworkAccess ] true true false
+          definition "BrowserCaptureDom" "Capture live DOM markup after an explicit wait condition." [ ProcessExecution ] false true false
+          definition "BrowserExportDom" "Write an explicitly requested live DOM snapshot to a project file." [ ProcessExecution; WorkspaceWrite ] true true false
           definition "CreateProject" "Create a new workspace folder with optional Git, starter files and remote-backed ledger." [ WorkspaceWrite; VersionControlWrite; NetworkAccess ] true true false
           definition "ListWorktrees" "Lists Git worktrees registered for a project." [ ReadOnly ] false false false
           definition "GetWorktree" "Inspects a registered Git worktree." [ ReadOnly ] false false false

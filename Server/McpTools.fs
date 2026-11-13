@@ -510,10 +510,13 @@ module McpToolHelpers =
         | None, None ->
             errorResult (ExecutionFailed "Invalid Jarvis response: neither result nor error was set.")
 
-    let private requiredScope command =
+    let private requiredScopes command =
         match command with
         | ListCommandsCommand
         | ListProjectsCommand
+        | BrowserListTabsCommand
+        | BrowserListWindowsCommand
+        | ListScheduledBrowserExecutionsCommand
         | ListWorktreesCommand _
         | GetWorktreeCommand _
         | InspectWorktreeRemovalCommand _
@@ -539,16 +542,24 @@ module McpToolHelpers =
         | ListJobsCommand _
         | GetJobResultCommand _
         | MessageCommand _
-        | GetClientActivityCommand _ -> Auth.WorkspaceRead
+        | GetClientActivityCommand _ -> [ Auth.WorkspaceRead ]
         | ImportFileCommand _
         | WriteFileCommand _
         | CreateSkillCommand _
-        | PatchFileCommand _ -> Auth.WorkspaceWrite
-        | UpdateClientCommand -> Auth.ProcessExecute
+        | PatchFileCommand _ -> [ Auth.WorkspaceWrite ]
+        | UpdateClientCommand -> [ Auth.ProcessExecute ]
+        | ScheduleBrowserExecutionCommand _
+        | CancelScheduledBrowserExecutionCommand _
+        | BrowserOpenTabCommand _
+        | BrowserCloseTabCommand _
+        | BrowserRunInNewTabCommand _
+        | BrowserExecuteFileCommand _
+        | BrowserExecuteJsCommand _
+        | BrowserCaptureDomCommand _
         | RunCommandCommand _
         | RunProjectTaskCommand _
         | StartJobCommand _
-        | CancelJobCommand _ -> Auth.ProcessExecute
+        | CancelJobCommand _ -> [ Auth.ProcessExecute ]
         | GitCommitCommand _
         | CreateWorktreeCommand _
         | CreateProjectCommand _
@@ -559,7 +570,11 @@ module McpToolHelpers =
         | ReviewWriteCommand _
         | RetryPendingIntentCommand _
         | SupersedePendingIntentCommand _
-        | AbandonPendingIntentCommand _ -> Auth.GitWrite
+        | AbandonPendingIntentCommand _ -> [ Auth.GitWrite ]
+
+        // File export both executes browser code and writes into the workspace.
+        // Check *both* OAuth scopes before any client command is dispatched.
+        | BrowserExportDomCommand _ -> [ Auth.WorkspaceWrite; Auth.ProcessExecute ]
 
     let private oauthErrorResult (context: HttpContext) errorCode description scope =
         let response = errorResult (PermissionDenied description)
@@ -719,10 +734,12 @@ module McpToolHelpers =
                         TaskWriteCommand { cmd with TaskId = taskId },
                         (if generated then Some taskId else None)
                     | _ -> command, None
-                let scope = requiredScope command
+                let scopes = requiredScopes command
+                let missingScope =
+                    scopes |> List.tryFind (fun scope -> not (Auth.hasScope scope context.User))
 
                 match Auth.tryUserId context.User with
-                | Some userId when Auth.hasScope scope context.User &&
+                | Some userId when missingScope.IsNone &&
                                    (AgentCommandInfo.projectName command = None ||
                                     AgentCommandInfo.projectName command = Some "@global" ||
                                     Auth.hasScope Auth.WorkspaceRead context.User) ->
@@ -863,12 +880,11 @@ module McpToolHelpers =
                         |> attachGeneratedOperationId generatedId
                         |> attachGeneratedTaskId (if response.Result.IsSome && response.Error.IsNone && response.PendingJob.IsNone then generatedTaskId else None)
                 | Some _ ->
-                    if not (Auth.hasScope scope context.User) then
-                        return authorizationErrorResult context scope
-                    else
-                        return authorizationErrorResult context Auth.WorkspaceRead
+                    match missingScope with
+                    | Some scope -> return authorizationErrorResult context scope
+                    | None -> return authorizationErrorResult context Auth.WorkspaceRead
                 | None ->
-                    return authenticationErrorResult context (Some scope)
+                    return authenticationErrorResult context (Some(String.concat " " scopes))
         }
 
     let getProfile (http: IHttpContextAccessor) =
@@ -1886,6 +1902,149 @@ type JarvisMcpTools =
             IncludeGlobs = includeGlobs |> Array.toList
             ExcludeGlobs = excludeGlobs |> Array.toList
             MaxResults = McpToolHelpers.optionOfNullable maxResults })
+
+    [<McpServerTool(Title = "List registered browser tabs", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false);
+      McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]""");
+      Description("List only tabs manually registered by the user in the local Jarvis browser extension.")>]
+    static member BrowserListTabs(agentId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http BrowserListTabsCommand
+
+    [<McpServerTool(Title = "List registered browser windows", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false);
+      McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]""");
+      Description("List only browser windows explicitly registered through the extension.")>]
+    static member BrowserListWindows(agentId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http BrowserListWindowsCommand
+
+    [<McpServerTool(Title = "Schedule browser execution", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false);
+      McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["process:execute","workspace:read"]}]""");
+      Description("Persist one-shot or repeating browser launch in an explicitly registered window, executing a project JavaScript file with optional cleanup. No replay of uncertain occurrences.")>]
+    static member ScheduleBrowserExecution(scheduleId: string, runAfterSeconds: int, url: string, projectName: string, agentId: string,
+                                           [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, scriptPath: string,
+                                           [<Optional; DefaultParameterValue("")>] argsJson: string,
+                                           [<Optional; DefaultParameterValue("")>] alias: string,
+                                           [<Optional; DefaultParameterValue(false)>] active: bool,
+                                           [<Optional; DefaultParameterValue("")>] deviceId: string,
+                                           [<Optional; DefaultParameterValue("")>] windowRegistration: string,
+                                           [<Optional; DefaultParameterValue(false)>] closeTabAfterExecution: bool,
+                                           repeatEverySeconds: Nullable<int>,
+                                           client: ClientService, http: IHttpContextAccessor) =
+        let projectName = McpToolHelpers.projectWithWorktreeName projectName worktreeName
+        McpToolHelpers.send client http (ScheduleBrowserExecutionCommand {
+            ScheduleId = scheduleId; RunAfterSeconds = runAfterSeconds; Url = url
+            ProjectName = projectName; ScriptPath = scriptPath
+            ArgsJson = McpToolHelpers.optionOfString argsJson
+            Alias = McpToolHelpers.optionOfString alias
+            Active = Some active; WindowRegistration = McpToolHelpers.optionOfString windowRegistration
+            CloseTabAfterExecution = Some closeTabAfterExecution
+            RepeatEverySeconds = McpToolHelpers.optionOfNullable repeatEverySeconds })
+
+    [<McpServerTool(Title = "List scheduled browser executions", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false);
+      McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]""");
+      Description("List local one-shot and recurring browser actions, next due times and last launch status, without revealing script arguments.")>]
+    static member ListScheduledBrowserExecutions(agentId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http ListScheduledBrowserExecutionsCommand
+
+    [<McpServerTool(Title = "Cancel pending browser execution", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false);
+      McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["process:execute"]}]""");
+      Description("Cancel a pending local browser schedule (including recurring); an in-progress occurrence cannot be undone.")>]
+    static member CancelScheduledBrowserExecution(scheduleId: string, agentId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http (CancelScheduledBrowserExecutionCommand { ScheduleId = scheduleId })
+
+    [<McpServerTool(Title = "Open browser tab", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false);
+      McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["process:execute"]}]""");
+      Description("Open and automatically register a new browser tab on a site previously authorized by the user. Requires the extension's explicit agent-created-tabs opt-in; never grants access to existing unregistered tabs. Defaults to background. Do not blindly retry after timeout.")>]
+    static member BrowserOpenTab(url: string, agentId: string,
+                                  [<Optional; DefaultParameterValue("")>] alias: string,
+                                  [<Optional; DefaultParameterValue(false)>] active: bool,
+                                  [<Optional; DefaultParameterValue("")>] deviceId: string,
+                                  [<Optional; DefaultParameterValue("")>] windowRegistration: string,
+                                  client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http (BrowserOpenTabCommand {
+            WindowRegistration = windowRegistration
+            Url = url; Alias = McpToolHelpers.optionOfString alias; Active = Some active })
+
+    [<McpServerTool(Title = "Close Jarvis-created browser tab", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false);
+      McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["process:execute"]}]""");
+      Description("Close only a verified Jarvis-created tab, never a manually registered tab or browser window.")>]
+    static member BrowserCloseTab(tabRegistration: string, agentId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http (BrowserCloseTabCommand { TabRegistration = tabRegistration })
+
+    [<McpServerTool(Title = "Run project script in a new browser tab", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false);
+      McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["process:execute","workspace:read"]}]""");
+      Description("Create a new tab in a registered browser window, run a project .js file, and optionally close it. Never retries uncertain page effects.")>]
+    static member BrowserRunInNewTab(windowRegistration: string, url: string, projectName: string, agentId: string,
+                                      [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, scriptPath: string,
+                                      [<Optional; DefaultParameterValue("")>] argsJson: string,
+                                      [<Optional; DefaultParameterValue(false)>] active: bool,
+                                      [<Optional; DefaultParameterValue(true)>] closeTabAfterExecution: bool,
+                                      timeoutMs: Nullable<int>,
+                                      [<Optional; DefaultParameterValue("")>] deviceId: string,
+                                      client: ClientService, http: IHttpContextAccessor) =
+        let projectName = McpToolHelpers.projectWithWorktreeName projectName worktreeName
+        McpToolHelpers.send client http (BrowserRunInNewTabCommand {
+            WindowRegistration = windowRegistration; Url = url; ProjectName = projectName
+            ScriptPath = scriptPath; ArgsJson = McpToolHelpers.optionOfString argsJson
+            Active = Some active; CloseTabAfterExecution = Some closeTabAfterExecution
+            TimeoutMs = McpToolHelpers.optionOfNullable timeoutMs })
+
+    [<McpServerTool(Title = "Execute browser project script", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false);
+      McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["process:execute","workspace:read"]}]""");
+      Description("Execute a project-relative .js file inside a user-registered browser tab. argsJson is a JSON object. Side effects may persist even if transport times out.")>]
+    static member BrowserExecuteFile(projectName: string, agentId: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, scriptPath: string, tabRegistration: string,
+                                      [<Optional; DefaultParameterValue("")>] argsJson: string,
+                                      timeoutMs: Nullable<int>,
+                                      [<Optional; DefaultParameterValue("")>] deviceId: string,
+                                      client: ClientService, http: IHttpContextAccessor) =
+        let projectName = McpToolHelpers.projectWithWorktreeName projectName worktreeName
+        McpToolHelpers.send client http (BrowserExecuteFileCommand {
+            ProjectName = projectName; ScriptPath = scriptPath; TabRegistration = tabRegistration
+            ArgsJson = McpToolHelpers.optionOfString argsJson
+            TimeoutMs = McpToolHelpers.optionOfNullable timeoutMs })
+
+    [<McpServerTool(Title = "Execute browser JavaScript", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false);
+      McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["process:execute"]}]""");
+      Description("Execute inline JavaScript in a manually registered browser tab. Only intended for investigation; use BrowserExecuteFile for maintained scripts.")>]
+    static member BrowserExecuteJs(tabRegistration: string, code: string, agentId: string,
+                                    [<Optional; DefaultParameterValue("")>] argsJson: string,
+                                    timeoutMs: Nullable<int>,
+                                    [<Optional; DefaultParameterValue("")>] deviceId: string,
+                                    client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http (BrowserExecuteJsCommand {
+            TabRegistration = tabRegistration; Code = code
+            ArgsJson = McpToolHelpers.optionOfString argsJson
+            TimeoutMs = McpToolHelpers.optionOfNullable timeoutMs })
+
+
+    [<McpServerTool(Title = "Capture rendered browser DOM", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false);
+      McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["process:execute"]}]""");
+      Description("Capture live post-JavaScript HTML from an authorized tab, optionally waiting for delay, selector state or DOM event. waitJson examples: {\"kind\":\"delay\",\"milliseconds\":1500}, {\"kind\":\"selector\",\"selector\":\"#results\",\"state\":\"exists\"}, {\"kind\":\"event\",\"target\":\"document\",\"name\":\"ready\"}. Inline output is bounded; use BrowserExportDom for large pages.")>]
+    static member BrowserCaptureDom(tabRegistration: string, agentId: string,
+                                    [<Optional; DefaultParameterValue("")>] waitJson: string,
+                                    [<Optional; DefaultParameterValue("")>] captureSelector: string,
+                                    timeoutMs: Nullable<int>,
+                                    [<Optional; DefaultParameterValue("")>] deviceId: string,
+                                    client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http (BrowserCaptureDomCommand {
+            TabRegistration = tabRegistration
+            WaitJson = McpToolHelpers.optionOfString waitJson
+            CaptureSelector = McpToolHelpers.optionOfString captureSelector
+            TimeoutMs = McpToolHelpers.optionOfNullable timeoutMs })
+
+    [<McpServerTool(Title = "Export rendered browser DOM", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false);
+      McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:write","process:execute"]}]""");
+      Description("Capture up to 8 MiB of live rendered HTML into an explicit project-relative new file. Uses bounded, checksummed chunk transfer and atomic write; refuses overwrite. A tab must be authorized.")>]
+    static member BrowserExportDom(projectName: string, agentId: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, filePath: string, tabRegistration: string,
+                                   [<Optional; DefaultParameterValue("")>] waitJson: string,
+                                   [<Optional; DefaultParameterValue("")>] captureSelector: string,
+                                   timeoutMs: Nullable<int>,
+                                   [<Optional; DefaultParameterValue("")>] deviceId: string,
+                                   client: ClientService, http: IHttpContextAccessor) =
+        let projectName = McpToolHelpers.projectWithWorktreeName projectName worktreeName
+        McpToolHelpers.send client http (BrowserExportDomCommand {
+            ProjectName = projectName; FilePath = filePath; TabRegistration = tabRegistration
+            WaitJson = McpToolHelpers.optionOfString waitJson
+            CaptureSelector = McpToolHelpers.optionOfString captureSelector
+            TimeoutMs = McpToolHelpers.optionOfNullable timeoutMs })
 
     [<McpServerTool(Title = "Read file", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read one small source file or inclusive one-based line range. File/line limits are enforced before allocation; use ReadFilePage to inspect large UTF-8 files.")>]
     static member ReadFile(projectName: string, agentId: string, [<Optional; DefaultParameterValue(""); Description("Optional name of a Git-registered worktree; omitted targets the project main checkout.")>] worktreeName: string, filePath: string, startLine: Nullable<int>, endLine: Nullable<int>, includeLineNumbers: Nullable<bool>, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =

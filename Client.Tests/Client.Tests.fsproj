@@ -50,6 +50,8 @@
         <Compile Include="SelfUpdateTests.fs"/>
         <Compile Include="ImportNetworkTests.fs"/>
         <Compile Include="PermissionPolicyTests.fs"/>
+        <Compile Include="BrowserBridgeTests.fs"/>
+        <Compile Include="BrowserSchedulesTests.fs"/>
         <Compile Include="AgentCommandInfoTests.fs"/>
         <Compile Include="ActivityPresentationTests.fs"/>
         <Compile Include="Program.fs"/>

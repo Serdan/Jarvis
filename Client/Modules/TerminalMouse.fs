@@ -123,7 +123,9 @@ module Tracking =
     // margins and unpainted cells. OSC 111 restores the user's color scheme.
     // Selection highlights still use per-cell RGB backgrounds.
     let startSequence = "\u001b]11;#101010\u001b\\\u001b[49m\u001b[?25l\u001b[?1000h\u001b[?1006h"
-    let stopSequence = "\u001b[?1006l\u001b[?1000l\u001b[?25h\u001b[49m\u001b]111\u001b\\"
+    // Restore input, cursor, and appearance before removing the TUI from the visible screen.
+    // CSI 2J clears the viewport (not scrollback); CSI H homes the shell prompt.
+    let stopSequence = "\u001b[?1006l\u001b[?1000l\u001b[?25h\u001b[0m\u001b]111\u001b\\\u001b[2J\u001b[H"
 
     let enable () : IDisposable =
         if Console.IsInputRedirected || Console.IsOutputRedirected

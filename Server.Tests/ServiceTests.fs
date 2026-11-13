@@ -1086,6 +1086,13 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
         scheme.GetProperty("type").GetString() |> shouldEqual "oauth2"
         let scopes = scheme.GetProperty("scopes")
         scopes[0].GetString() |> shouldEqual scope
+        if methodInfo.Name = "BrowserExportDom" then
+            // Export requires both the workspace-writing and page-execution
+            // privileges, not merely the primary scope used in older tools.
+            scopes.GetArrayLength() |> shouldEqual 2
+            scopes[1].GetString() |> shouldEqual Auth.ProcessExecute
+        elif methodInfo.Name = "BrowserCaptureDom" then
+            scopes.GetArrayLength() |> shouldEqual 1
 
 
 [<Test>]
@@ -1961,3 +1968,117 @@ let mergingSourceWithPendingDestinationPreservesUnknownChangesAndOriginalJobHand
             merged |> McpToolHelpers.toCallToolResult
             |> McpToolHelpers.attachStateEffects merged
         Assert.That(result.Meta, Is.Null, "Unverified effects must not appear as committed on a pending reply.")
+let browser_dom_mcp_tools_route_only_when_all_required_oauth_scopes_are_present () = task {
+    // Exercise the two public MCP methods, the real server scope gate and the
+    // ClientService dispatch path. Neither an interface-only metadata check nor
+    // the client-side browser mock catches an omitted server command case.
+    let userId = "auth0|browser-scope-test"
+    let connectionId = "browser-scope-connection"
+    let users = UserService()
+    users.TransportConnected(userId, connectionId)
+    let registration =
+        users.Register(userId,
+            { DeviceId = "browser-test-device"; DeviceName = "Browser Test"
+              ProtocolVersion = AgentProtocol.version
+              ClientVersion = "test"
+              SupportedCommands = [ "BrowserCaptureDom"; "BrowserExportDom" ] }, connectionId)
+    let tracker = ClientResponseTracker()
+    let dispatched = ResizeArray<AgentCommand>()
+    let recipient =
+        { new Common.SignalR.IClientService with
+            member _.ReceiveMessage(_) = Task.CompletedTask
+            member _.ReceiveCommand(correlationId, commandJson, _) =
+                let command = JsonSerializer.Deserialize<AgentCommand>(commandJson)
+                lock dispatched (fun () -> dispatched.Add(command))
+                tracker.Complete(correlationId, userId, connectionId, registration.Generation,
+                    { Result = Some """{"status":"ok"}"""
+                      Error = None; Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }) |> ignore
+                Task.CompletedTask
+            member _.InvalidateAgentStates(_, _) = Task.CompletedTask }
+    let clients =
+        { new Microsoft.AspNetCore.SignalR.IHubClients<Common.SignalR.IClientService> with
+            member _.All = recipient
+            member _.AllExcept(_) = recipient
+            member _.Client(_) = recipient
+            member _.Clients(_) = recipient
+            member _.Group(_) = recipient
+            member _.GroupExcept(_, _) = recipient
+            member _.Groups(_) = recipient
+            member _.User(_) = recipient
+            member _.Users(_) = recipient }
+    let hub =
+        { new Microsoft.AspNetCore.SignalR.IHubContext<HubService, Common.SignalR.IClientService> with
+            member _.Clients = clients
+            member _.Groups = Unchecked.defaultof<_> }
+    let services =
+        Microsoft.Extensions.DependencyInjection.ServiceCollection()
+        :> Microsoft.Extensions.DependencyInjection.IServiceCollection
+    Microsoft.Extensions.DependencyInjection.ServiceCollectionServiceExtensions.AddSingleton<Microsoft.Extensions.Options.IOptions<JarvisOptions>>(
+        services,
+        Microsoft.Extensions.Options.Options.Create(
+            { Auth0Domain = "auth.example"; Audience = "https://example.test"; OpenAIAppsChallenge = "" }))
+    |> ignore
+    use provider =
+        Microsoft.Extensions.DependencyInjection.ServiceCollectionContainerBuilderExtensions.BuildServiceProvider(services)
+    let context = Microsoft.AspNetCore.Http.DefaultHttpContext()
+    context.RequestServices <- provider
+    let accessor = Microsoft.AspNetCore.Http.HttpContextAccessor()
+    accessor.HttpContext <- context
+    let client = ClientService(hub, users, tracker, accessor)
+
+    let setScopes scopes =
+        let identity =
+            System.Security.Claims.ClaimsIdentity(
+                [ System.Security.Claims.Claim("sub", userId)
+                  System.Security.Claims.Claim("scope", String.concat " " scopes) ], "test")
+        context.User <- System.Security.Claims.ClaimsPrincipal(identity)
+    let dispatchCount () = lock dispatched (fun () -> dispatched.Count)
+    let assertDenied (expectedScope: string) (result: CallToolResult) =
+        Assert.That(result.IsError, Is.EqualTo(Nullable true))
+        let challenges = result.Meta["mcp/www_authenticate"] :?> JsonArray
+        Assert.That(challenges.Count, Is.EqualTo(1))
+        let challenge = challenges[0].GetValue<string>()
+        Assert.That(challenge, Does.Contain("insufficient_scope"))
+        Assert.That(challenge, Does.Contain(expectedScope))
+    let capture () =
+        JarvisMcpTools.BrowserCaptureDom("tab-registered", "Browser Agent",
+                                        """{"kind":"immediate"}""", "", Nullable(), "", client, accessor)
+    let export () =
+        JarvisMcpTools.BrowserExportDom("Jarvis", "Browser Agent", "browser-bridge",
+                                       "snapshots/dom.html", "tab-registered",
+                                       """{"kind":"immediate"}""", "", Nullable(), "", client, accessor)
+    let assertRouted (kind: string) (result: CallToolResult) =
+        Assert.That(result.IsError, Is.EqualTo(Nullable false))
+        let command = lock dispatched (fun () -> dispatched[dispatched.Count-1])
+        Assert.That(AgentCommandInfo.protocolName command, Is.EqualTo(kind))
+
+    setScopes [Auth.ProcessExecute]
+    let! captured = capture()
+    assertRouted "BrowserCaptureDom" captured
+    Assert.That(dispatchCount(), Is.EqualTo(1))
+    setScopes [Auth.WorkspaceRead; Auth.WorkspaceWrite]
+    let! deniedCapture = capture()
+    assertDenied Auth.ProcessExecute deniedCapture
+    Assert.That(dispatchCount(), Is.EqualTo(1))
+
+    setScopes [Auth.WorkspaceRead; Auth.WorkspaceWrite; Auth.ProcessExecute]
+    let! exported = export()
+    assertRouted "BrowserExportDom" exported
+    Assert.That(dispatchCount(), Is.EqualTo(2))
+    match lock dispatched (fun () -> dispatched[1]) with
+    | BrowserExportDomCommand cmd ->
+        Assert.That(cmd.ProjectName, Is.EqualTo("Jarvis::browser-bridge"))
+        Assert.That(cmd.FilePath, Is.EqualTo("snapshots/dom.html"))
+    | _ -> Assert.Fail("Expected exported DOM command.")
+
+    setScopes [Auth.WorkspaceRead; Auth.WorkspaceWrite]
+    let! noExecute = export()
+    assertDenied Auth.ProcessExecute noExecute
+    setScopes [Auth.WorkspaceRead; Auth.ProcessExecute]
+    let! noWrite = export()
+    assertDenied Auth.WorkspaceWrite noWrite
+    setScopes [Auth.WorkspaceWrite; Auth.ProcessExecute]
+    let! noProjectRead = export()
+    assertDenied Auth.WorkspaceRead noProjectRead
+    Assert.That(dispatchCount(), Is.EqualTo(2), "Denied requests must never reach ClientService.")
+}

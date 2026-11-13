@@ -775,6 +775,9 @@ type ChallengeTests() =
                 task8State.Version attempt8State.Value.Version inbox8.Agent.Version 1
                 "Shared dependency" [ challenge.ChallengeId ] |> ok |> ignore
 
+            let pinned = LedgerStore.fetch a |> ok
+            let links = LedgerStore.listAt a pinned ("challenge-waits/by-challenge/" + challenge.ChallengeId) |> ok
+            Assert.That(links.Length, Is.EqualTo(2), "Both dependent attempts must have reverse-index entries.")
             ChallengeWorkflow.resolve b (Guid.NewGuid()) "Lead" challenge.ChallengeId
                 challenge.ConditionIds.Head 1 "integrated" "" |> ok |> ignore
             Assert.That((ReviewWorkflow.getAgentInbox a "Agent 3" |> ok).Blocked.Length, Is.EqualTo(1))
@@ -789,5 +792,125 @@ type ChallengeTests() =
             Assert.That(ready8.Agent.CurrentAssignment.AttemptId, Is.EqualTo(attempt8))
             Assert.That(ready3.BlockedChallengeWaits, Is.Empty)
             Assert.That(ready8.BlockedChallengeWaits, Is.Empty)
+            Assert.That(notices b, Is.Empty)
+        )
+
+
+    [<Test>]
+    member _.AlreadySatisfiedDependenciesCannotCreateAnUnwakeableWait() =
+        withFixture (fun a b ->
+            let gate =
+                ChallengeWorkflow.create a (Guid.NewGuid()) "Agent 3" "Completed gate" ""
+                    [ { OwnerAgentId = "Lead"; SuggestedAgentId = ""; Description = "Complete work" } ] |> ok
+            ChallengeWorkflow.resolve b (Guid.NewGuid()) "Lead" gate.ChallengeId
+                gate.ConditionIds.Head 1 "completed" "" |> ok |> ignore
+            let task = "all-done-before-block"
+            let tv, pv, av, attemptId = assignment a task
+            failStale (ChallengeWorkflow.blockAttempt b (Guid.NewGuid()) "Agent 3" task attemptId
+                           tv pv av 1 "Wait for completed gate" [ gate.ChallengeId ])
+            let inbox = ReviewWorkflow.getAgentInbox a "Agent 3" |> ok
+            Assert.That(inbox.Agent.State, Is.EqualTo("Working"))
+            Assert.That(inbox.Blocked, Is.Empty)
+            Assert.That(inbox.BlockedChallengeWaits, Is.Empty)
+            Assert.That(notices b, Is.Empty)
+        )
+
+    [<Test>]
+    member _.OnePreviouslySatisfiedDependencyStillAllowsBlockingOnRemainingWork() =
+        withFixture (fun a b ->
+            let first =
+                ChallengeWorkflow.create a (Guid.NewGuid()) "Agent 3" "Earlier gate" ""
+                    [ { OwnerAgentId = "Lead"; SuggestedAgentId = ""; Description = "Approve first" } ] |> ok
+            ChallengeWorkflow.resolve b (Guid.NewGuid()) "Lead" first.ChallengeId
+                first.ConditionIds.Head 1 "approved" "" |> ok |> ignore
+            let second =
+                ChallengeWorkflow.create a (Guid.NewGuid()) "Agent 3" "Remaining gate" ""
+                    [ { OwnerAgentId = "Agent 8"; SuggestedAgentId = ""; Description = "Verify second" } ] |> ok
+            let task = "partly-complete-before-block"
+            let tv, pv, av, attemptId = assignment b task
+            ChallengeWorkflow.blockAttempt a (Guid.NewGuid()) "Agent 3" task attemptId
+                tv pv av 1 "Remaining gate must finish"
+                [ first.ChallengeId; second.ChallengeId ] |> ok |> ignore
+            Assert.That((ReviewWorkflow.getAgentInbox b "Agent 3" |> ok).Blocked.Length, Is.EqualTo(1))
+            ChallengeWorkflow.resolve a (Guid.NewGuid()) "Agent 8" second.ChallengeId
+                second.ConditionIds.Head 1 "verified" "" |> ok |> ignore
+            let ready = ReviewWorkflow.getAgentInbox b "Agent 3" |> ok
+            Assert.That(ready.Agent.State, Is.EqualTo("Ready"))
+            Assert.That(ready.Agent.CurrentAssignment.AttemptId, Is.EqualTo(attemptId))
+            Assert.That(ready.BlockedChallengeWaits, Is.Empty)
+            Assert.That(notices a, Is.Empty)
+        )
+
+
+    [<Test>]
+    member _.BlockingAnotherAssignmentWakesPreviouslyEligibleWork() =
+        withFixture (fun a b ->
+            let taskA = "eligible-after-release"
+            let tvA, pvA, avA, attemptA = assignment a taskA
+            let gateA =
+                ChallengeWorkflow.create b (Guid.NewGuid()) "Agent 3" "Previous gate" ""
+                    [ { OwnerAgentId = "Lead"; SuggestedAgentId = ""; Description = "Finish prior dependency" } ] |> ok
+            ChallengeWorkflow.blockAttempt a (Guid.NewGuid()) "Agent 3" taskA attemptA
+                tvA pvA avA 1 "Wait for prior gate" [ gateA.ChallengeId ] |> ok |> ignore
+            let taskB = "blocking-the-current-assignment"
+            let tvB, pvB, avB, attemptB = assignment b taskB
+            ChallengeWorkflow.resolve a (Guid.NewGuid()) "Lead" gateA.ChallengeId
+                gateA.ConditionIds.Head 1 "finished" "" |> ok |> ignore
+            let pending = ReviewWorkflow.getAgentInbox b "Agent 3" |> ok
+            Assert.That(pending.Agent.CurrentAssignment.AttemptId, Is.EqualTo(attemptB))
+            Assert.That(pending.BlockedChallengeWaits.Head.Status, Is.EqualTo("Eligible"))
+            let gateB =
+                ChallengeWorkflow.create b (Guid.NewGuid()) "Agent 3" "New gate" ""
+                    [ { OwnerAgentId = "Agent 8"; SuggestedAgentId = ""; Description = "New unfinished dependency" } ] |> ok
+            ChallengeWorkflow.blockAttempt a (Guid.NewGuid()) "Agent 3" taskB attemptB
+                tvB pvB pending.Agent.Version 1 "Wait for new gate" [ gateB.ChallengeId ] |> ok |> ignore
+            let awakened = ReviewWorkflow.getAgentInbox a "Agent 3" |> ok
+            Assert.That(awakened.Agent.State, Is.EqualTo("Ready"))
+            Assert.That(awakened.Agent.CurrentAssignment.AttemptId, Is.EqualTo(attemptA))
+            Assert.That(awakened.BlockedChallengeWaits.Length, Is.EqualTo(1))
+            Assert.That(awakened.BlockedChallengeWaits.Head.TaskId, Is.EqualTo(taskB))
+            Assert.That(awakened.BlockedChallengeWaits.Head.Status, Is.EqualTo("Waiting"))
+            Assert.That(awakened.RunnableQueue.Head.Attempt.AssignmentGeneration, Is.EqualTo(2))
+            Assert.That(notices a, Is.Empty)
+        )
+
+
+    [<Test>]
+    member _.ReblockingAnAttemptUsesNewGenerationWithoutReusingStaleIndex() =
+        withFixture (fun a b ->
+            let task = "reblocked-index-generation"
+            let tv, pv, av, attemptId = assignment a task
+            let first =
+                ChallengeWorkflow.create a (Guid.NewGuid()) "Agent 3" "First gate" ""
+                    [ { OwnerAgentId = "Lead"; SuggestedAgentId = ""; Description = "First resolution" } ] |> ok
+            ChallengeWorkflow.blockAttempt b (Guid.NewGuid()) "Agent 3" task attemptId
+                tv pv av 1 "First wait" [ first.ChallengeId ] |> ok |> ignore
+            ChallengeWorkflow.resolve a (Guid.NewGuid()) "Lead" first.ChallengeId
+                first.ConditionIds.Head 1 "done" "" |> ok |> ignore
+            let _, _, queued = ReviewWorkflow.getTask b task |> ok
+            Assert.That(queued.Value.AssignmentGeneration, Is.EqualTo(2))
+            ReviewWorkflow.beginAttempt a (Guid.NewGuid()) task "Agent 3" queued.Value.Version 2
+                |> ok |> ignore
+            let _, nextTask, nextAttempt = ReviewWorkflow.getTask b task |> ok
+            let working = ReviewWorkflow.getAgentInbox a "Agent 3" |> ok
+            let second =
+                ChallengeWorkflow.create b (Guid.NewGuid()) "Agent 3" "Second gate" ""
+                    [ { OwnerAgentId = "Agent 8"; SuggestedAgentId = ""; Description = "Second resolution" } ] |> ok
+            ChallengeWorkflow.blockAttempt a (Guid.NewGuid()) "Agent 3" task attemptId
+                nextTask.Version nextAttempt.Value.Version working.Agent.Version 2
+                "Second wait" [ second.ChallengeId ] |> ok |> ignore
+            ChallengeWorkflow.resolve b (Guid.NewGuid()) "Agent 8" second.ChallengeId
+                second.ConditionIds.Head 1 "done again" "" |> ok |> ignore
+            let ready = ReviewWorkflow.getAgentInbox a "Agent 3" |> ok
+            Assert.That(ready.Agent.State, Is.EqualTo("Ready"))
+            Assert.That(ready.RunnableQueue.Head.Attempt.AssignmentGeneration, Is.EqualTo(3))
+            Assert.That(ready.BlockedChallengeWaits, Is.Empty)
+            let snapshot = LedgerStore.fetch b |> ok
+            let oldLinks =
+                LedgerStore.listAt b snapshot ("challenge-waits/by-challenge/" + first.ChallengeId) |> ok
+            let newLinks =
+                LedgerStore.listAt b snapshot ("challenge-waits/by-challenge/" + second.ChallengeId) |> ok
+            Assert.That(oldLinks.Length, Is.EqualTo(1))
+            Assert.That(newLinks.Length, Is.EqualTo(1))
             Assert.That(notices b, Is.Empty)
         )

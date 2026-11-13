@@ -54,9 +54,13 @@ Challenge records and events live on the existing verified orphan Git ledger bra
 - `challenges/<challenge-id>/challenge.json`: typed versioned challenge state, conditions, current results and evidence.
 - `challenges/<challenge-id>/events/<ledger-sequence>.json`: immutable create/resolve/reopen/cancel events, action, actor, evidence, reason and time.
 - `tasks/<task-id>/attempts/<attempt-id>/challenge-wait.json`: versioned attempt dependency, reason, owner, linked challenge IDs, wait state and timestamps.
+- `challenge-waits/by-challenge/<challenge-id>/<task-id>/<attempt-id>/<generation>.json`: immutable reverse link for final-condition wakeups.
+- `challenge-waits/by-owner/<base64url-agent-id>/<task-id>/<attempt-id>/<generation>.json`: immutable reverse link for owner-slot release reconciliation.
 - Existing task, attempt, agent, assignment and lifecycle audit records are updated **atomically** when an attempt blocks, its final linked challenge automatically releases it, or an eligible wait reconciles on owner-slot release.
 
 Canonical state plus immutable events and the operation journal provide exactly-once durable mutation semantics despite duplicate requests, retries and multiple Git clients. An accepted transition and its event are one Git ledger transaction with expected blob OIDs. **No notification entity is part of this transaction**; recipient notification settings never affect CAS, challenge completion, or evidence persistence.
+
+Dependency reverse links are written atomically with the initial block. They constrain reads to the relevant challenge or owner instead of walking all historical tasks. Each candidate is revalidated against its canonical wait, active task, attempt owner, and assignment generation; stale links from earlier generations cannot wake superseded work. The indexes are not independently authoritative.
 
 The canonical pending-operation journal protects uncertain requests and exact operation-ID replay. Every mutation fails closed for unavailable, untrusted or mismatched ledger bindings.
 
@@ -66,7 +70,7 @@ A **Blocked challenge** differs from a **Blocked task attempt**. The latter uses
 
 Challenges are **non-blocking by default**. Only an attempt explicitly linked with `block_on_challenges` waits. Upon final ALL satisfaction, the same canonical Git transaction also rechecks each linked wait's entire dependency set. Eligible blocked attempts with an idle `NeedsWork` owner atomically become `Queued` and assigned `Ready` (never `Working`): assignment generation, challenge wait status, and lifecycle event are persisted together without a notification. A later agent tool call activates its Ready slot normally. Partial, Blocked, Cancelled, or stale dependencies cannot release attempts.
 
-If the owner is occupied or Parked, the wait becomes durably `Eligible` and does not change that owner's current assignment. Canonical owner-slot release and NeedsWork transition paths reconcile eligibility, revalidate the task, attempt, and every linked challenge, and requeue at most one pending attempt per available slot. Additional eligible waits remain durable until subsequent releases. The generic administrative ResumeAttempt API cannot bypass `Waiting` or `Eligible` links. The explicit `requeue_challenge_blocked_attempt` path remains available for manual zero-dependency blocks; it does not replace automatic challenge wakeups. No scheduler or session launcher is involved.
+If the owner is occupied or Parked, the wait becomes durably `Eligible` and does not change that owner's current assignment. Canonical owner-slot release (including completion, administrative release, or blocking another assignment) and NeedsWork transition paths reconcile eligibility, revalidate the task, attempt, and every linked challenge, and requeue at most one pending attempt per available slot. Additional eligible waits remain durable until subsequent releases. Blocking is rejected when **all** supplied nonempty challenge dependencies are already Satisfied: no future condition resolution could wake such a wait. Mixed satisfied and unfinished dependencies remain valid. The generic administrative ResumeAttempt API cannot bypass `Waiting` or `Eligible` links. The explicit `requeue_challenge_blocked_attempt` path remains available for manual zero-dependency blocks; it does not replace automatic challenge wakeups. No scheduler or session launcher is involved.
 
 ## Limits, testing and rollout
 

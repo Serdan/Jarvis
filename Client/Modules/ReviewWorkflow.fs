@@ -285,6 +285,16 @@ type AttemptChallengeWait =
       BlockedAtUtc: string
       RequeuedAtUtc: string }
 
+// Immutable reverse-index locator. A wait may be requeued and later blocked
+// again under a newer assignment generation; old index entries are harmless
+// because the canonical wait and current attempt must still match.
+[<CLIMutable>]
+type AttemptChallengeWaitIndex =
+    { TaskId: string
+      AttemptId: string
+      OwnerAgentId: string
+      AssignmentGeneration: int }
+
 [<CLIMutable>]
 type InboxChallengeItem =
     { ChallengeId: string
@@ -501,6 +511,18 @@ module ReviewWorkflow =
                 .TrimEnd('=').Replace('+', '-').Replace('/', '_')
         $"agents/{safe}.json"
 
+    // Reverse indexes constrain dependency lookups to one challenge or one
+    // owner rather than scanning historical task records at every transition.
+    let internal challengeWaitIndexPrefix challengeId =
+        $"challenge-waits/by-challenge/{challengeId}"
+    let internal ownerWaitIndexPrefix (ownerId: string) =
+        let safe =
+            Convert.ToBase64String(Encoding.UTF8.GetBytes ownerId)
+                .TrimEnd('=').Replace('+', '-').Replace('/', '_')
+        $"challenge-waits/by-owner/{safe}"
+    let internal waitIndexPath prefix taskId attemptId generation =
+        $"{prefix}/{taskId}/{attemptId}/{generation}.json"
+
     let private validTaskId (taskId: string) = not (isNull taskId) && idPattern.IsMatch taskId
     let private validAgent (agent: string) =
         not (String.IsNullOrWhiteSpace agent) && Encoding.UTF8.GetByteCount(agent) <= 120
@@ -643,10 +665,10 @@ module ReviewWorkflow =
             return issuance
         }
 
-// Called by canonical agent-slot release transitions. Eligibility is
+    // Called by canonical agent-slot release transitions. Eligibility is
     // durable; release requeues at most one blocked attempt and never preempts
     // an occupied owner or enters Working.
-    let private reconcileEligibleOnRelease binding snapshot (operationId: Guid) actor
+    let internal reconcileEligibleOnRelease binding snapshot (operationId: Guid) actor
                                          (released: ReviewAgent) = result {
         let ownerId = released.AgentId
         if not (isNull (box released.CurrentAssignment))
@@ -654,28 +676,35 @@ module ReviewWorkflow =
            || released.UnassignedDisposition <> "NeedsWork" then
             return released, []
         else
-            let! paths = LedgerStore.listAt binding snapshot "tasks"
-            let waits =
+            let ownerPrefix = ownerWaitIndexPrefix ownerId
+            let! paths = LedgerStore.listAt binding snapshot ownerPrefix
+            let indexPaths =
                 paths
-                |> List.filter (fun p -> p.EndsWith("/challenge-wait.json", StringComparison.Ordinal))
+                |> List.filter (fun p -> p.EndsWith(".json", StringComparison.Ordinal))
                 |> List.sort
-            if waits.Length > 4096 then
-                return! Error(InvalidBinding "Challenge wait reconciliation exceeded bounded limit.")
             let mutable updated = released
             let mutable writes : LedgerFileChange list = []
             let mutable claimed = false
-            for file in waits do
+            for indexPath in indexPaths do
                 if not claimed then
+                    let! locator, _ = required<AttemptChallengeWaitIndex> binding snapshot indexPath
+                    if indexPath <> waitIndexPath ownerPrefix locator.TaskId locator.AttemptId locator.AssignmentGeneration
+                       || locator.OwnerAgentId <> ownerId
+                       || locator.AssignmentGeneration < 1 then
+                        return! Error(LedgerIntegrityError "Owner wait-index identity mismatch.")
+                    let file = challengeWaitPath locator.TaskId locator.AttemptId
                     let! wait, waitOid = required<AttemptChallengeWait> binding snapshot file
                     if file <> challengeWaitPath wait.TaskId wait.AttemptId then
                         return! Error(LedgerIntegrityError "Challenge wait path/identity mismatch.")
-                    if wait.OwnerAgentId = ownerId && wait.Status = "Eligible" then
+                    if wait.OwnerAgentId = ownerId && wait.Status = "Eligible"
+                       && wait.TaskId = locator.TaskId && wait.AttemptId = locator.AttemptId then
                         let! task, _ = required<ReviewTask> binding snapshot (taskPath wait.TaskId)
                         let! attempt, attemptOid =
                             required<ReviewAttempt> binding snapshot (attemptPath wait.TaskId wait.AttemptId)
                         if task.Lifecycle = "InProgress" && task.AttemptId = wait.AttemptId
                            && attempt.TaskId = wait.TaskId
                            && attempt.AttemptId = wait.AttemptId
+                           && attempt.AssignmentGeneration = locator.AssignmentGeneration
                            && attempt.OwnerAgentId = ownerId && attempt.Phase = "Blocked" then
                             let mutable satisfied = not (List.isEmpty wait.ChallengeIds)
                             for dependency in wait.ChallengeIds do

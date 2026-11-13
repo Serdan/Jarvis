@@ -285,7 +285,7 @@ module McpToolHelpers =
 
     let private challengeReadMethods = [ "ListChallenges"; "GetChallenge" ]
     let private challengeWriteMethods =
-        [ "CreateChallenge"; "SetChallengeSubscription"; "AssignChallengeCondition"
+        [ "CreateChallenge"; "SetChallengeSubscription"; "AssignChallengeCondition"; "SplitChallengeCondition"
           "ResolveChallengeCondition"; "ReopenChallengeCondition"
           "CancelChallenge"; "BlockOnChallenges"; "RequeueChallengeBlockedAttempt" ]
 
@@ -2012,6 +2012,23 @@ type JarvisMcpTools =
             (ChallengeWriteCommand { cmd with ChallengeId = challengeId; ConditionId = conditionId
                                               ExpectedVersion = expectedVersion; NewOwnerAgentId = newOwnerAgentId })
 
+
+
+    [<McpServerTool(Title = "split challenge condition", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false);
+      McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]""");
+      Description("Atomically split one Pending condition into 2-32 parts with an exact challenge version. The original condition ID is retained for the first part, deterministic new IDs are returned, and prior meaning/evidence are preserved in immutable history. The issuer may split directly; any subscribed agent may split unassigned conditions. No notifications or task ownership changes.")>]
+    static member SplitChallengeCondition(
+        projectName: string, agentId: string, challengeId: string,
+        conditionId: string, expectedVersion: int, parts: ChallengeConditionDefinition array,
+        [<Optional; DefaultParameterValue("")>] operationId: string,
+        [<Optional; DefaultParameterValue("")>] deviceId: string,
+        client: ClientService, http: IHttpContextAccessor
+    ) =
+        let cmd = JarvisMcpTools.ChallengeWrite(projectName, agentId, "Split", operationId)
+        let definitions = if isNull parts then [] else parts |> Array.toList
+        McpToolHelpers.send client http
+            (ChallengeWriteCommand { cmd with ChallengeId = challengeId; ConditionId = conditionId
+                                              ExpectedVersion = expectedVersion; Conditions = definitions })
     [<McpServerTool(Title = "list challenges", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false);
       McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]""");
       Description("List challenges issued to or assigned to this registered agent, including their current Pending, Blocked, Satisfied or Cancelled status. No implicit state changes.")>]

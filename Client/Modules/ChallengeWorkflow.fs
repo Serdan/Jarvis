@@ -324,6 +324,129 @@ module ChallengeWorkflow =
                   ConditionIds = conditions |> List.map _.ConditionId
                   Receipt = receipt })
 
+// Resolve challenge state and dependent attempt wakeups in one Git CAS.
+    // Scanning canonical waits is bounded; no side-channel notification is used.
+    let private pinned<'t> binding snapshot file schema = result {
+        let! content, oid = LedgerStore.readAt binding snapshot file
+        match content, oid with
+        | Some body, Some blob ->
+            try
+                use doc = JsonDocument.Parse(body)
+                if doc.RootElement.GetProperty("schemaVersion").GetInt32() <> schema then
+                    return! Error(LedgerIntegrityError ("Invalid dependency schema: " + file))
+                let record = JsonSerializer.Deserialize<'t>(body, options)
+                if isNull (box record) then
+                    return! Error(LedgerIntegrityError ("Null dependency entity: " + file))
+                return record, blob
+            with ex ->
+                return! Error(LedgerIntegrityError ("Invalid dependency entity: " + ex.Message))
+        | _ -> return! Error(LedgerIntegrityError ("Missing dependency entity: " + file))
+    }
+
+    let private wakeDependents binding snapshot (operationId: Guid) actor
+                               (completed: AgentChallenge) timestamp = result {
+        let! paths = LedgerStore.listAt binding snapshot "tasks"
+        let waits =
+            paths
+            |> List.filter (fun p -> p.EndsWith("/challenge-wait.json", StringComparison.Ordinal))
+            |> List.sort
+        if waits.Length > 4096 then
+            return! Error(InvalidBinding "Challenge dependency scan exceeded the bounded limit.")
+        let mutable writes : LedgerFileChange list = []
+        let mutable claimedOwners = Set.empty<string>
+        for file in waits do
+            let! wait, waitOid = pinned<AttemptChallengeWait> binding snapshot file 2
+            if file <> $"tasks/{wait.TaskId}/attempts/{wait.AttemptId}/challenge-wait.json" then
+                return! Error(LedgerIntegrityError "Challenge wait identity/path mismatch.")
+            if wait.Status = "Waiting" && List.contains completed.ChallengeId wait.ChallengeIds then
+                let mutable allSatisfied = true
+                for dependency in wait.ChallengeIds do
+                    match guidN dependency with
+                    | None -> return! Error(LedgerIntegrityError "Invalid stored dependency UUID.")
+                    | Some id ->
+                        let! linked =
+                            if dependency = completed.ChallengeId then Ok completed
+                            else readChallenge binding snapshot id |> Result.map fst
+                        if linked.Status <> "Satisfied" then allSatisfied <- false
+                if allSatisfied then
+                    let taskPath = $"tasks/{wait.TaskId}/task.json"
+                    let attemptPath = $"tasks/{wait.TaskId}/attempts/{wait.AttemptId}.json"
+                    let! task, _ = pinned<ReviewTask> binding snapshot taskPath 2
+                    let! attempt, attemptOid = pinned<ReviewAttempt> binding snapshot attemptPath 3
+                    let! owner, ownerOid =
+                        pinned<ReviewAgent> binding snapshot (agentPath wait.OwnerAgentId) 3
+                    // Terminal or superseded attempt links are inert.
+                    if task.TaskId = wait.TaskId && task.Lifecycle = "InProgress"
+                       && task.AttemptId = wait.AttemptId && attempt.TaskId = wait.TaskId
+                       && attempt.AttemptId = wait.AttemptId
+                       && attempt.OwnerAgentId = wait.OwnerAgentId
+                       && attempt.Phase = "Blocked" then
+                        let free =
+                            isNull (box owner.CurrentAssignment)
+                            && owner.Execution = "Stopped"
+                            && owner.UnassignedDisposition = "NeedsWork"
+                            && not (Set.contains owner.AgentId claimedOwners)
+                        if free then
+                            let sequence = snapshot.Header.NextSequence
+                            let generation = attempt.AssignmentGeneration + 1
+                            let reason = "All explicitly linked challenges satisfied"
+                            let nextAttempt =
+                                { attempt with Version = attempt.Version + 1
+                                               Phase = "Queued"
+                                               AssignmentGeneration = generation
+                                               IssuedSequence = sequence }
+                            let nextOwner =
+                                { owner with Version = owner.Version + 1
+                                             CurrentAssignment = { TaskId = wait.TaskId; AttemptId = wait.AttemptId }
+                                             Execution = "Stopped"; UnassignedDisposition = null
+                                             StateReason = reason; StateSequence = sequence
+                                             StateEnteredAtUtc = timestamp
+                                             WorkingTurnStartedAtUtc = null
+                                             ActiveSessionId = null; AssociatedSessionIds = [] }
+                            let nextWait =
+                                { wait with Version = wait.Version + 1
+                                            Status = "Requeued"; RequeuedAtUtc = timestamp }
+                            let issue : AssignmentIssue =
+                                { TaskId = wait.TaskId; AttemptId = wait.AttemptId
+                                  Generation = generation; OwnerAgentId = wait.OwnerAgentId
+                                  IssuerId = actor; IssuedSequence = sequence
+                                  Instructions = reason; Reason = "ChallengeUnblock"
+                                  SpecBlobOid = nextAttempt.SpecBlobOid
+                                  SourceBaseCommit = nextAttempt.BaseCommit
+                                  TargetRef = nextAttempt.TargetRef
+                                  SourceRepositoryId = nextAttempt.SourceRepositoryId
+                                  SourceRemote = nextAttempt.SourceRemote
+                                  SourcePushRemote = nextAttempt.SourcePushRemote
+                                  SourceRef = nextAttempt.SourceRef
+                                  PreviousGeneration = attempt.AssignmentGeneration }
+                            let audit : TaskLifecycleEvent =
+                                { TaskId = wait.TaskId; AttemptId = wait.AttemptId
+                                  OperationId = operationId.ToString("D")
+                                  Sequence = sequence; Action = "RequeueChallengeBlockedAttempt"
+                                  ActorId = actor; Reason = reason
+                                  PreviousLifecycle = task.Lifecycle; NewLifecycle = task.Lifecycle
+                                  PreviousPhase = attempt.Phase; NewPhase = "Queued"
+                                  PreviousOwnerId = attempt.OwnerAgentId
+                                  NewOwnerId = attempt.OwnerAgentId
+                                  PreviousGeneration = attempt.AssignmentGeneration
+                                  NewGeneration = generation
+                                  ReviewRequestId = null
+                                  ReviewDisposition = "Unchanged"; Evidence = null }
+                            writes <- [
+                                change file (Some waitOid) nextWait
+                                change attemptPath (Some attemptOid) nextAttempt
+                                change (agentPath owner.AgentId) (Some ownerOid) nextOwner
+                                change ($"tasks/{wait.TaskId}/attempts/{wait.AttemptId}/assignments/{generation}.json") None issue
+                                change ($"tasks/{wait.TaskId}/lifecycle/{sequence}.json") None audit
+                            ] @ writes
+                            claimedOwners <- Set.add owner.AgentId claimedOwners
+                        else
+                            // Persist wake eligibility while the owner is occupied;
+                            // it can be reconciled when their slot is later released.
+                            writes <- change file (Some waitOid)
+                                          { wait with Version = wait.Version + 1; Status = "Eligible" } :: writes
+        return List.rev writes
+    }
     let private update binding operationId actor challengeId conditionId expectedVersion kind
                        evidence reason =
         match guidN challengeId with
@@ -404,8 +527,12 @@ module ChallengeWorkflow =
                         // The one Git ledger transaction records only challenge
                         // state and its immutable event. Notification settings,
                         // recipient blocks, and delivery cannot affect progress.
+                        let! wakeups =
+                            if nextStatus = "Satisfied" && priorState <> "Satisfied" then
+                                wakeDependents binding snapshot operationId actor nextRecord timestamp
+                            else Ok []
                         return [ change (path id) (Some blob) nextRecord
-                                 change (eventPath id snapshot.Header.NextSequence) None event ]
+                                 change (eventPath id snapshot.Header.NextSequence) None event ] @ wakeups
                     })
 
     let resolve binding operationId actor challengeId conditionId version evidence blockedReason =
@@ -468,6 +595,98 @@ module ChallengeWorkflow =
                              change (eventPath id snapshot.Header.NextSequence) None event ]
                 })
 
+
+
+    // The first split part retains the original condition ID; additional IDs
+    // are derived from the stable operation ID. The event preserves prior
+    // meaning/evidence so a split never rewrites history invisibly.
+    let splitCondition binding (operationId: Guid) actor challengeId conditionId
+                       expectedVersion (parts: ChallengeConditionSpec list) =
+        match guidN challengeId with
+        | None -> Error(InvalidBinding "Split requires a canonical challenge UUID.")
+        | Some id when operationId = Guid.Empty || not (agentId actor)
+                       || expectedVersion < 1 || parts.Length < 2 || parts.Length > 32
+                       || (parts |> List.exists (fun d ->
+                           not (text 2048 d.Description)
+                           || (not (String.IsNullOrWhiteSpace d.OwnerAgentId) && not (agentId d.OwnerAgentId))
+                           || (not (String.IsNullOrWhiteSpace d.SuggestedAgentId) && not (agentId d.SuggestedAgentId)))) ->
+            Error(InvalidBinding "Split requires 2-32 valid condition definitions and exact version.")
+        | Some id ->
+            let childId index =
+                let bytes = SHA256.HashData(Encoding.UTF8.GetBytes(
+                    id.ToString("N") + ":split:" + operationId.ToString("N") + ":" + string index))
+                Guid(bytes.AsSpan(0, 16)).ToString("N")
+            let ids = conditionId :: [ for index in 1 .. parts.Length - 1 -> childId index ]
+            let result =
+                changed binding operationId actor "SplitChallengeCondition"
+                    {| challengeId = challengeId; conditionId = conditionId
+                       expectedVersion = expectedVersion; parts = parts |}
+                    (fun snapshot -> result {
+                        do! registered binding snapshot actor
+                        for part in parts do
+                            if not (String.IsNullOrWhiteSpace part.OwnerAgentId) then
+                                do! registered binding snapshot part.OwnerAgentId
+                            if not (String.IsNullOrWhiteSpace part.SuggestedAgentId) then
+                                do! registered binding snapshot part.SuggestedAgentId
+                        let! challenge, blob = readChallenge binding snapshot id
+                        if challenge.Version <> expectedVersion
+                           || List.contains challenge.Status [ "Satisfied"; "Cancelled" ] then
+                            return! Error(StaleEntityVersion "Challenge version or terminal state changed before split.")
+                        if challenge.Conditions.Length + parts.Length - 1 > 32 then
+                            return! Error(InvalidBinding "A challenge cannot exceed 32 conditions after splitting.")
+                        let! subscribed = subscribedAt binding snapshot actor
+                        let! original =
+                            match challenge.Conditions |> List.tryFind (fun c -> c.ConditionId = conditionId) with
+                            | None -> Error(InvalidBinding "Unknown challenge condition for split.")
+                            | Some c when c.Status <> "Pending" ->
+                                Error(StaleEntityVersion "Only Pending conditions can be split.")
+                            | Some c when actor = challenge.IssuerAgentId
+                                      || (subscribed && String.IsNullOrWhiteSpace c.OwnerAgentId) ->
+                                Ok c
+                            | Some _ ->
+                                Error(ReviewAccessDenied "Only issuer or subscribed dispatcher of unassigned work can split.")
+                        let collisions = ids.Tail |> List.exists (fun nextId ->
+                            challenge.Conditions |> List.exists (fun c -> c.ConditionId = nextId))
+                        if collisions then
+                            return! Error(LedgerIntegrityError "Deterministic split condition ID collision.")
+                        let timestamp = DateTimeOffset.UtcNow.ToString("O")
+                        let normalized (value: string) =
+                            if String.IsNullOrWhiteSpace value then "" else value
+                        let replacement =
+                            (parts, ids)
+                            ||> List.map2 (fun part targetId ->
+                                { ConditionId = targetId
+                                  OwnerAgentId = normalized part.OwnerAgentId
+                                  SuggestedAgentId = normalized part.SuggestedAgentId
+                                  Description = part.Description
+                                  Status = "Pending"; Evidence = null; Reason = null
+                                  UpdatedAtUtc = timestamp })
+                        let revised =
+                            { challenge with Version = challenge.Version + 1
+                                             Conditions = challenge.Conditions |> List.collect (fun c ->
+                                                 if c.ConditionId = original.ConditionId then replacement else [c])
+                                             UpdatedAtUtc = timestamp }
+                        let audit =
+                            { ChallengeId = challenge.ChallengeId; ConditionId = original.ConditionId
+                              ActorId = actor; Action = "SplitChallengeCondition"
+                              BeforeStatus = challenge.Status; AfterStatus = revised.Status
+                              BeforeOwnerAgentId = original.OwnerAgentId
+                              AfterOwnerAgentId = replacement.Head.OwnerAgentId
+                              Evidence = json {| previousDescription = original.Description
+                                                 previousEvidence = original.Evidence
+                                                 previousReason = original.Reason
+                                                 parts = replacement |> List.map (fun c ->
+                                                    {| id = c.ConditionId; owner = c.OwnerAgentId
+                                                       suggestion = c.SuggestedAgentId
+                                                       description = c.Description |}) |}
+                              Reason = ""
+                              Sequence = snapshot.Header.NextSequence
+                              OccurredAtUtc = timestamp }
+                        return [ change (path id) (Some blob) revised
+                                 change (eventPath id snapshot.Header.NextSequence) None audit ]
+                    })
+            result |> Result.map (fun receipt ->
+                { ChallengeId = id.ToString("N"); ConditionIds = ids; Receipt = receipt })
     let private accessible actor (challenge: AgentChallenge) =
         challenge.IssuerAgentId = actor
         || challenge.Conditions |> List.exists (fun c -> c.OwnerAgentId = actor)

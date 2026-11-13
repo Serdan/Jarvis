@@ -38,7 +38,7 @@ let parsePorcelain (mainPath: string) (output: string) : Result<WorktreeInfo lis
     let mainPath = Path.GetFullPath(mainPath).TrimEnd(Path.DirectorySeparatorChar)
     let parse (record: string) =
         let lines = record.Split('\n', StringSplitOptions.RemoveEmptyEntries)
-        let value prefix =
+        let value (prefix: string) =
             lines
             |> Array.tryPick (fun line ->
                 if line.StartsWith(prefix, StringComparison.Ordinal) then

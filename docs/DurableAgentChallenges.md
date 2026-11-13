@@ -4,7 +4,7 @@ Challenges coordinate agents through the existing **verified Git orchestration l
 
 ## Challenge state and ownership
 
-A challenge has a stable 32-character lowercase UUID (N format), an issuing agent, title, optional task context, version, 1–32 ordered conditions, state, timestamps and completion policy `All`. Each condition has a deterministic ID, a registered owner agent ID, description, state, evidence, reason and update timestamp.
+A challenge has a stable 32-character lowercase UUID (N format), an issuing agent, title, optional task context, version, 1–32 ordered conditions, state, timestamps and completion policy `All`. Each condition has a deterministic ID, an optional registered assignee, optional suggested assignee, description, state, evidence, reason and update timestamp. A registered project agent can explicitly subscribe to unassigned challenge dispatch without any name-based role privilege. The Lead role should instruct its holders to subscribe and promptly triage these conditions.
 
 | Challenge state | Condition states | Meaning |
 | --- | --- | --- |
@@ -23,7 +23,10 @@ All methods require `projectName` and `agentId`. The authenticated OAuth user an
 
 | Tool | Required domain arguments | Optional inputs |
 | --- | --- | --- |
-| `create_challenge` | `title`, `conditions: [{ownerAgentId, description}, ...]` | `taskId`, `operationId` |
+| `create_challenge` | `title`, `conditions: [{ownerAgentId, suggestedAgentId, description}, ...]` | `taskId`, `operationId`; owner may be empty |
+| `set_challenge_subscription` | `subscribed` (bool) | `operationId` |
+| `assign_challenge_condition` | `challengeId`, `conditionId`, `expectedVersion`, `newOwnerAgentId` | `operationId` |
+| `split_challenge_condition` | `challengeId`, `conditionId`, `expectedVersion`, `parts: [{ownerAgentId, suggestedAgentId, description}, ...]` (2–32) | `operationId` |
 | `list_challenges` | — | `limit`, `afterChallengeId`, `expectedSnapshotCommit` |
 | `get_challenge` | `challengeId` | `eventLimit`, `afterEventSequence`, `expectedSnapshotCommit` |
 | `resolve_challenge_condition` | `challengeId`, `conditionId`, `expectedVersion`, `outcome` (`Satisfied`/`Blocked`), `evidence` | `reason` (required if Blocked), `operationId` |
@@ -32,9 +35,11 @@ All methods require `projectName` and `agentId`. The authenticated OAuth user an
 | `block_on_challenges` | `taskId`, `attemptId`, `reason`, `challengeIds`, `expectedTaskVersion`, `expectedAttemptVersion`, `expectedAgentVersion`, `assignmentGeneration` | `challengeIds` may be empty (manual wait); `operationId` |
 | `requeue_challenge_blocked_attempt` | `taskId`, `attemptId`, `reason`, task/attempt/agent expected versions, `assignmentGeneration` | `operationId` |
 
-The issuer and condition owners can read a challenge's full current evidence and history. Unrelated agents cannot. `list_challenges` gives compact summaries of issued/owned challenges, condition counts, state, and the caller's outstanding condition IDs, **without copying large evidence payloads**. It is paginated with `limit` 1–50 (default 50); use response `NextCursor` and `SnapshotCommit` for subsequent pages. `get_challenge` gives current full condition state and evidence plus a bounded audit-event page of 1–16 events (default 16); use response `NextEventSequence` and `SnapshotCommit` to page through immutable history. Cursor zero ends the event stream. If the ledger snapshot changes, restart pagination. These challenge reads are **observational**: they do not implicitly activate a Ready agent.
+The issuer and condition owners can read a challenge's full current evidence and history. Subscribed agents can view unassigned pending conditions for triage; unrelated unsubscribed agents cannot. A subscribed dispatcher may CAS-assign an **unassigned Pending** condition to a registered agent, while the issuer may directly assign or reassign. Version races fail closed and every assignment has an immutable audit event. Subscription does not grant condition resolution rights: only the actual assignee resolves. Neither assignment nor subscription reassigns a canonical task.
 
-Writes use an optional caller-stable operation UUID. A new challenge ID is the create operation UUID in N format; condition IDs derive deterministically from it and their positions. A retry with the **same operation ID and exact arguments** returns the original durable receipt without executing another transition. Reusing an operation ID with different arguments is rejected. Mutations compare the exact challenge version; task/attempt transitions compare task, attempt, agent versions and assignment generation. Competing clients must reread stale versions.
+The self-`agent_inbox` includes snapshot-consistent, bounded challenge sections: owned Pending conditions, subscribed unassigned triage conditions, recent issuer outcomes, and conditions attached to its blocked attempt. Each section has stable IDs, short previews, and omitted counts; `list_challenges` is **not** a mandatory extra polling step. `list_challenges` gives paginated summaries of visible challenges (`limit` 1–50); `get_challenge` provides full current evidence and a bounded event page (`eventLimit` 1–16). Use `NextCursor`/`NextEventSequence` and `SnapshotCommit` for consistent paging, restarting after a snapshot change. Challenge reads remain observational and do not activate Ready agents.
+
+Writes use an optional caller-stable operation UUID. A new challenge ID is the create operation UUID in N format; condition IDs derive deterministically from it and their positions. Splitting one Pending condition into two or more parts retains its original ID for the first part and derives all additional IDs from the split operation UUID; the old description and evidence remain in immutable history. The issuer or an explicitly subscribed dispatcher of unassigned work may split, without changing canonical task ownership. A retry with the **same operation ID and exact arguments** returns the original durable receipt without executing another transition. Reusing an operation ID with different arguments is rejected. Mutations compare the exact challenge version; task/attempt transitions compare task, attempt, agent versions and assignment generation. Competing clients must reread stale versions.
 
 ## Ledger records
 
@@ -43,22 +48,24 @@ Challenge records and events live on the existing verified orphan Git ledger bra
 - `challenges/<challenge-id>/challenge.json`: typed versioned challenge state, conditions, current results and evidence.
 - `challenges/<challenge-id>/events/<ledger-sequence>.json`: immutable create/resolve/reopen/cancel events, action, actor, evidence, reason and time.
 - `tasks/<task-id>/attempts/<attempt-id>/challenge-wait.json`: versioned attempt dependency, reason, owner, linked challenge IDs, wait state and timestamps.
-- Existing task, attempt, agent, assignment and lifecycle audit records are updated **atomically** when the attempt blocks or explicitly requeues.
+- Existing task, attempt, agent, assignment and lifecycle audit records are updated **atomically** when an attempt blocks, its final linked challenge automatically releases it, or an eligible wait reconciles on owner-slot release.
 
 Canonical state plus immutable events and the operation journal provide exactly-once durable mutation semantics despite duplicate requests, retries and multiple Git clients. An accepted transition and its event are one Git ledger transaction with expected blob OIDs. **No notification entity is part of this transaction**; recipient notification settings never affect CAS, challenge completion, or evidence persistence.
 
 The canonical pending-operation journal protects uncertain requests and exact operation-ID replay. Every mutation fails closed for unavailable, untrusted or mismatched ledger bindings.
 
-## Blocked attempts and explicit requeue
+## Explicit challenge dependencies and automatic requeue
 
 A **Blocked challenge** differs from a **Blocked task attempt**. The latter uses the existing attempt phase `Blocked`, not a new execution state. `block_on_challenges`, authorized by the active attempt owner, atomically validates up to 16 distinct challenge IDs and the current assignment, pins the reason/dependencies, moves the attempt to `Blocked`, releases the agent from Working to an unassigned disposition `NeedsWork`, and preserves its task owner, generation and review/integration history. Linking a challenge requires issuer/condition-owner visibility. An empty dependency list is an explicit **manual block**. The inbox exposes `Blocked` and `BlockedChallengeWaits` with reason and links. No notification is generated.
 
-Condition satisfaction changes only the challenge record and event; blocked attempts are never automatically requeued. After **every** linked challenge reaches Satisfied, the same attempt owner may call `requeue_challenge_blocked_attempt` with exact versions and a reason. Requeue atomically marks the wait Requeued, increments generation, creates a new assignment issue, and puts the owner **Ready, never Working**. An ordinary later agent activity starts Working. Partial satisfaction, cancelled/blocked dependency, stale identity, mismatched task or busy owner reject requeue. The generic administrative ResumeAttempt API cannot bypass an active challenge wait. Taskless agents retain their existing unassigned state; no fabricated Waiting state or scheduler is introduced.
+Challenges are **non-blocking by default**. Only an attempt explicitly linked with `block_on_challenges` waits. Upon final ALL satisfaction, the same canonical Git transaction also rechecks each linked wait's entire dependency set. Eligible blocked attempts with an idle `NeedsWork` owner atomically become `Queued` and assigned `Ready` (never `Working`): assignment generation, challenge wait status, and lifecycle event are persisted together without a notification. A later agent tool call activates its Ready slot normally. Partial, Blocked, Cancelled, or stale dependencies cannot release attempts.
+
+If the owner is occupied or Parked, the wait becomes durably `Eligible` and does not change that owner's current assignment. Canonical owner-slot release and NeedsWork transition paths reconcile eligibility, revalidate the task, attempt, and every linked challenge, and requeue at most one pending attempt per available slot. Additional eligible waits remain durable until subsequent releases. The generic administrative ResumeAttempt API cannot bypass `Waiting` or `Eligible` links. The explicit `requeue_challenge_blocked_attempt` path remains available for manual zero-dependency blocks; it does not replace automatic challenge wakeups. No scheduler or session launcher is involved.
 
 ## Limits, testing and rollout
 
 A challenge has 1–32 conditions; titles/descriptions up to 2048 UTF-8 bytes each, evidence 8192 bytes per condition and reason 4096 bytes. Challenge summaries cap title previews at 160 UTF-8 bytes. Lists and history are paginated; **full evidence is retained unchanged** in canonical records/events.
 
-Two independent Git-clone tests cover independent condition owners, partial/final satisfaction, concurrent condition races, operation-ID retries, authorization, Blocked/reopen/cancel and audit history, maximum-size evidence, paginated reads, zero notification creation on every challenge transition, blocked-attempt dependencies, administrative bypass rejection and explicit Ready requeue.
+Independent two-clone Git tests cover condition owners, partial/final satisfaction, concurrent CAS and retries, authorization, Blocked/reopen/cancel and history, maximum-size evidence, paginated reads, zero challenge notification side effects, automatic Ready requeue, multiple dependencies, busy-owner durable eligibility, and administrative bypass rejection.
 
-Protocol **3.65** adds typed `ChallengeRead` and `ChallengeWrite` wire commands and eight MCP methods. Coordinate client/server release and refresh the public tool catalog. The source branch initially targets .NET 10; integrate carefully with current .NET 11 main and already-integrated auto-job protocol changes, and rerun .NET 11 Release tests after conflicts are resolved. **Do not deploy without explicit operator approval.**
+Protocol **3.65** introduces typed `ChallengeRead` and `ChallengeWrite` wire commands and eleven MCP methods. Coordinate client/server release and refresh the public tool catalog. Integrate with current .NET 11 main and the auto-job protocol changes, and rerun .NET 11 Release tests after resolving source conflicts. **Do not deploy without explicit operator approval.**

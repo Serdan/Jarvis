@@ -445,7 +445,7 @@ module ReviewWorkflow =
                         && (let mutable kind = Unchecked.defaultof<JsonElement>
                             root.TryGetProperty("kind", &kind) && kind.ValueKind = JsonValueKind.String)
                     | "IntegrationSubmission" -> status "status" [ "Pending"; "Integrated" ]
-                    | "AttemptChallengeWait" -> status "status" [ "Waiting"; "Requeued" ]
+                    | "AttemptChallengeWait" -> status "status" [ "Waiting"; "Eligible"; "Requeued" ]
                     | "ReviewFeedbackNotice" -> status "status" [ "Accepted"; "ChangesRequested" ]
                     | "AgentCheckpoint" -> status "kind" [ "Yield"; "Completion"; "Recovery"; "Progress"; "Submission"; "Revision" ]
                     | "TaskLifecycleEvent" ->
@@ -643,6 +643,110 @@ module ReviewWorkflow =
             return issuance
         }
 
+// Called by canonical agent-slot release transitions. Eligibility is
+    // durable; release requeues at most one blocked attempt and never preempts
+    // an occupied owner or enters Working.
+    let private reconcileEligibleOnRelease binding snapshot (operationId: Guid) actor
+                                         (released: ReviewAgent) = result {
+        if not (isNull (box released.CurrentAssignment))
+           || released.Execution <> "Stopped"
+           || released.UnassignedDisposition <> "NeedsWork" then
+            return released, []
+        else
+            let! paths = LedgerStore.listAt binding snapshot "tasks"
+            let waits =
+                paths
+                |> List.filter (fun p -> p.EndsWith("/challenge-wait.json", StringComparison.Ordinal))
+                |> List.sort
+            if waits.Length > 4096 then
+                return! Error(InvalidBinding "Challenge wait reconciliation exceeded bounded limit.")
+            let mutable updated = released
+            let mutable writes : LedgerFileChange list = []
+            let mutable claimed = false
+            for file in waits do
+                if not claimed then
+                    let! wait, waitOid = required<AttemptChallengeWait> binding snapshot file
+                    if file <> challengeWaitPath wait.TaskId wait.AttemptId then
+                        return! Error(LedgerIntegrityError "Challenge wait path/identity mismatch.")
+                    if wait.OwnerAgentId = actor && wait.Status = "Eligible" then
+                        let! task, _ = required<ReviewTask> binding snapshot (taskPath wait.TaskId)
+                        let! attempt, attemptOid =
+                            required<ReviewAttempt> binding snapshot (attemptPath wait.TaskId wait.AttemptId)
+                        if task.Lifecycle = "InProgress" && task.AttemptId = wait.AttemptId
+                           && attempt.TaskId = wait.TaskId
+                           && attempt.AttemptId = wait.AttemptId
+                           && attempt.OwnerAgentId = actor && attempt.Phase = "Blocked" then
+                            let mutable satisfied = not (List.isEmpty wait.ChallengeIds)
+                            for dependency in wait.ChallengeIds do
+                                match Guid.TryParseExact(dependency, "N") with
+                                | false, _ -> return! Error(LedgerIntegrityError "Invalid stored challenge UUID.")
+                                | true, id ->
+                                    let path = "challenges/" + id.ToString("N") + "/challenge.json"
+                                    let! content, oid = LedgerStore.readAt binding snapshot path
+                                    match content, oid with
+                                    | Some body, Some _ ->
+                                        try
+                                            use doc = JsonDocument.Parse(body)
+                                            let root = doc.RootElement
+                                            let conditions =
+                                                root.GetProperty("conditions").EnumerateArray()
+                                                |> Seq.map (fun c -> c.GetProperty("status").GetString())
+                                                |> Seq.toList
+                                            let state = root.GetProperty("status").GetString()
+                                            if root.GetProperty("schemaVersion").GetInt32() <> 2
+                                               || root.GetProperty("challengeId").GetString() <> dependency
+                                               || root.GetProperty("completionPolicy").GetString() <> "All"
+                                               || List.isEmpty conditions
+                                               || (state = "Satisfied"
+                                                   && not (conditions |> List.forall ((=) "Satisfied"))) then
+                                                return! Error(LedgerIntegrityError "Dependency challenge identity mismatch.")
+                                            if state <> "Satisfied" then
+                                                satisfied <- false
+                                        with ex ->
+                                            return! Error(LedgerIntegrityError ("Invalid dependency challenge: " + ex.Message))
+                                    | _ -> return! Error(LedgerIntegrityError "Dependency challenge is missing.")
+                            if satisfied then
+                                let sequence = snapshot.Header.NextSequence
+                                let timestamp = DateTimeOffset.UtcNow.ToString("O")
+                                let generation = attempt.AssignmentGeneration + 1
+                                let reason = "Satisfied challenge dependencies requeued after owner release"
+                                let readyAttempt =
+                                    { attempt with Version = attempt.Version + 1
+                                                   Phase = "Queued"
+                                                   AssignmentGeneration = generation
+                                                   IssuedSequence = sequence }
+                                updated <-
+                                    { released with CurrentAssignment = { TaskId = wait.TaskId; AttemptId = wait.AttemptId }
+                                                    UnassignedDisposition = null
+                                                    Execution = "Stopped"
+                                                    StateReason = reason; StateSequence = sequence
+                                                    StateEnteredAtUtc = timestamp
+                                                    WorkingTurnStartedAtUtc = null
+                                                    ActiveSessionId = null; AssociatedSessionIds = [] }
+                                let audit : TaskLifecycleEvent =
+                                    { TaskId = wait.TaskId; AttemptId = wait.AttemptId
+                                      OperationId = operationId.ToString("D")
+                                      Sequence = sequence; Action = "RequeueChallengeBlockedAttempt"
+                                      ActorId = actor; Reason = reason
+                                      PreviousLifecycle = task.Lifecycle; NewLifecycle = task.Lifecycle
+                                      PreviousPhase = "Blocked"; NewPhase = "Queued"
+                                      PreviousOwnerId = actor; NewOwnerId = actor
+                                      PreviousGeneration = attempt.AssignmentGeneration
+                                      NewGeneration = generation
+                                      ReviewRequestId = null
+                                      ReviewDisposition = "Unchanged"; Evidence = null }
+                                writes <- [
+                                    change file (Some waitOid)
+                                        { wait with Version = wait.Version + 1
+                                                    Status = "Requeued"; RequeuedAtUtc = timestamp }
+                                    change (attemptPath wait.TaskId wait.AttemptId) (Some attemptOid) readyAttempt
+                                    change (issuePath wait.TaskId wait.AttemptId generation) None
+                                        (issue wait.TaskId readyAttempt generation actor "ChallengeUnblock" reason sequence)
+                                    change (lifecycleEventPath wait.TaskId sequence) None audit
+                                ]
+                                claimed <- true
+            return updated, writes
+    }
     let createTaskWithSpecAs binding actor operationId taskId title html =
         if not (validTaskId taskId) || not (validText 512 title)
            || not (validTaskHtml html) then
@@ -1531,14 +1635,17 @@ module ReviewWorkflow =
                               NextAction = "Assignment completed"
                               Kind = "Completion"
                               SourceCommit = null; Evidence = null; EvidenceStatus = "NotProvided" }
+                        let released =
+                            enterState "Completed" agent |> fun updated ->
+                                { updated with Version = agent.Version + 1
+                                               StateReason = summary; StateSequence = snapshot.Header.NextSequence }
+                        let! nextAgent, wakeups =
+                            reconcileEligibleOnRelease binding snapshot operationId ownerId released
                         return
                             [ change (checkpointPath taskId attempt.AttemptId snapshot.Header.NextSequence) None checkpoint
                               change (attemptPath taskId attempt.AttemptId) (Some attemptOid)
                                 { attempt with Version = attempt.Version + 1; Phase = "Finished" }
-                              change (agentPath ownerId) (Some agentOid)
-                                (enterState "Completed" agent |> fun updated ->
-                                    { updated with Version = agent.Version + 1
-                                                   StateReason = summary; StateSequence = snapshot.Header.NextSequence }) ]
+                              change (agentPath ownerId) (Some agentOid) nextAgent ] @ wakeups
 
                     })
 
@@ -1681,12 +1788,14 @@ module ReviewWorkflow =
                            || not (List.contains agent.State [ "NeedsWork"; "Parked" ])
                            || not (isNull (box agent.CurrentAssignment)) then
                             return! Error(StaleEntityVersion "Administrative state change cannot interrupt an assignment.")
-                        return
-                            [ change (agentPath agentId) (Some agentOid)
-                                { (enterState "NeedsWork" agent) with
-                                    Version = agent.Version + 1
-                                    StateReason = reason
-                                    StateSequence = snapshot.Header.NextSequence } ]
+                        let released =
+                            { (enterState "NeedsWork" agent) with
+                                Version = agent.Version + 1
+                                StateReason = reason
+                                StateSequence = snapshot.Header.NextSequence }
+                        let! nextAgent, wakeups =
+                            reconcileEligibleOnRelease binding snapshot operationId agentId released
+                        return [ change (agentPath agentId) (Some agentOid) nextAgent ] @ wakeups
                     })
 
     // Source repository identity is an endpoint fingerprint independent from
@@ -2035,7 +2144,7 @@ module ReviewWorkflow =
 
     // Only clear a focus that still belongs to this attempt. Never interrupt
     // an owner's newer assignment, or turn agent Parked into an attempt phase.
-    let private clearAdministrativeFocus binding snapshot (attempt: ReviewAttempt) expectedAgentVersion reason =
+    let private clearAdministrativeFocus binding snapshot (attempt: ReviewAttempt) expectedAgentVersion reason operationId =
         result {
             let! agent, agentOid = required<ReviewAgent> binding snapshot (agentPath attempt.OwnerAgentId)
             if agent.Version <> expectedAgentVersion then
@@ -2058,8 +2167,13 @@ module ReviewWorkflow =
                     return! Error(LedgerIntegrityError "Agent Working slot disagrees with attempt phase/focus.")
                 if agent.Execution <> "Working" && not (String.IsNullOrWhiteSpace agent.ActiveAttemptId) then
                     return! Error(LedgerIntegrityError "Nonworking attempt unexpectedly holds an active slot.")
-                return [ change (agentPath attempt.OwnerAgentId) (Some agentOid)
-                             (enterState "Completed" agent |> fun updated -> { updated with Version = agent.Version + 1; StateReason = reason; StateSequence = snapshot.Header.NextSequence }) ]
+                let released =
+                    enterState "Completed" agent |> fun updated ->
+                        { updated with Version = agent.Version + 1
+                                       StateReason = reason; StateSequence = snapshot.Header.NextSequence }
+                let! nextAgent, wakeups =
+                    reconcileEligibleOnRelease binding snapshot operationId attempt.OwnerAgentId released
+                return [ change (agentPath attempt.OwnerAgentId) (Some agentOid) nextAgent ] @ wakeups
         }
 
     let changeAttemptAdministrationAs binding actor operationId taskId action expectedTaskVersion expectedAttemptVersion
@@ -2080,7 +2194,7 @@ module ReviewWorkflow =
                     if action = "ResumeAttempt" && attempt.Phase = "Blocked" then
                         let! wait = read<AttemptChallengeWait> binding snapshot (challengeWaitPath taskId attempt.AttemptId)
                         match wait with
-                        | Some (record, _) when record.Status = "Waiting" ->
+                        | Some (record, _) when List.contains record.Status [ "Waiting"; "Eligible" ] ->
                             return! Error(StaleEntityVersion
                                 "Challenge-blocked attempt must be requeued via RequeueChallengeBlockedAttempt after verifying every dependency.")
                         | _ -> ()
@@ -2112,7 +2226,7 @@ module ReviewWorkflow =
                                              Version = agent.Version + 1
                                              StateReason = reason
                                              StateSequence = snapshot.Header.NextSequence } ]
-                        else clearAdministrativeFocus binding snapshot attempt expectedAgentVersion reason
+                        else clearAdministrativeFocus binding snapshot attempt expectedAgentVersion reason operationId
                     let nextPhase =
                         match action with
                         | "ParkAttempt" -> "Deferred" | "BlockAttempt" -> "Blocked"
@@ -2214,7 +2328,7 @@ module ReviewWorkflow =
                        || not (String.IsNullOrWhiteSpace nextOwnerAgent.ActiveAttemptId) then
                         return! Error(AgentBusy "New owner is not idle.")
                     let! previousAgentChanges =
-                        clearAdministrativeFocus binding snapshot attempt expectedAgentVersion reason
+                        clearAdministrativeFocus binding snapshot attempt expectedAgentVersion reason operationId
                     let next =
                         { attempt with AttemptId = newId; Version = 1
                                        OwnerAgentId = newOwner; Phase = "Queued"
@@ -2562,7 +2676,7 @@ module ReviewWorkflow =
                             if record.TaskId <> entry.Task.TaskId
                                || record.AttemptId <> entry.Attempt.AttemptId
                                || record.OwnerAgentId <> agentId
-                               || record.Status <> "Waiting" then
+                               || not (List.contains record.Status [ "Waiting"; "Eligible" ]) then
                                 return! Error(LedgerIntegrityError "Blocked challenge dependency record disagrees with its attempt.")
                             blockedWaits <- record :: blockedWaits
                     let reviewOrder (review: BranchReview) =

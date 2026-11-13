@@ -2433,6 +2433,19 @@ module ChallengeApi =
                                     ChallengeWorkflow.ChallengeWorkflow.setSubscription
                                         binding operationId cmd.ActorId cmd.Subscribe
                                     |> mapError
+                                | "Split" ->
+                                    if isNull (box cmd.Conditions) then
+                                        Error(Client.ValidationError "Split parts are required.")
+                                    else
+                                        let parts : ChallengeWorkflow.ChallengeConditionSpec list =
+                                            cmd.Conditions |> List.map (fun part ->
+                                                { OwnerAgentId = part.OwnerAgentId
+                                                  SuggestedAgentId = part.SuggestedAgentId
+                                                  Description = part.Description })
+                                        ChallengeWorkflow.ChallengeWorkflow.splitCondition
+                                            binding operationId cmd.ActorId cmd.ChallengeId
+                                            cmd.ConditionId cmd.ExpectedVersion parts
+                                        |> mapError |> Result.map _.Receipt
                                 | "Assign" ->
                                     ChallengeWorkflow.ChallengeWorkflow.assignCondition
                                         binding operationId cmd.ActorId cmd.ChallengeId
@@ -2472,14 +2485,24 @@ module ChallengeApi =
                                 | _ -> Error(Client.ValidationError "Unsupported challenge mutation.")
                             record)
                 result |> Result.map (fun receipt ->
-                    if cmd.Action = "Create" then
+                    if cmd.Action = "Create" || cmd.Action = "Split" then
                         let challengeId = operationId.ToString("N")
+                        let challengeId =
+                            if cmd.Action = "Split" then Guid.Parse(cmd.ChallengeId).ToString("N")
+                            else challengeId
                         let conditionIds =
-                            cmd.Conditions
-                            |> List.mapi (fun index _ ->
-                                let digest = SHA256.HashData(Encoding.UTF8.GetBytes(
-                                    challengeId + ":condition:" + string index))
-                                Guid(digest.AsSpan(0, 16)).ToString("N"))
+                            if cmd.Action = "Split" then
+                                cmd.ConditionId ::
+                                    (List.init (cmd.Conditions.Length - 1) (fun index ->
+                                        let digest =
+                                            SHA256.HashData(Encoding.UTF8.GetBytes(
+                                                challengeId + ":split:" + operationId.ToString("N")
+                                                + ":" + string (index + 1)))
+                                        Guid(digest.AsSpan(0, 16)).ToString("N")))
+                            else
+                                cmd.Conditions |> List.mapi (fun index _ ->
+                                    let digest = SHA256.HashData(Encoding.UTF8.GetBytes(challengeId + ":condition:" + string index))
+                                    Guid(digest.AsSpan(0, 16)).ToString("N"))
                         box {| challengeId = challengeId
                                conditionIds = conditionIds
                                receipt = OperationResponse.present receipt |}

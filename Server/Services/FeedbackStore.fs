@@ -151,12 +151,27 @@ type FeedbackStore(databasePath: string, ?telemetryRetention: TimeSpan) =
         builder.Cache <- SqliteCacheMode.Shared
         builder.ToString()
 
-    // Future command variants must not silently gain permission to certify
-    // execution liveness. A known, bounded tool response can be terminal;
-    // StartJob is explicitly excluded because its child process persists.
+    // Pending handles can be recorded for any known command, including a
+    // process runner; recording is NEVER equivalent to terminal proof.
+    let knownCommandTypes =
+        AgentProtocol.commandDefinitions
+        |> Seq.map (fun definition -> definition.Name)
+        |> Set.ofSeq
+        |> Set.add "NotifyAgent"
+
+    // A transport response cannot certify descendant-process quiescence.
+    // Commands capable of launching work that outlives the immediate client
+    // task require separate OS-backed terminal evidence. This is a conservative
+    // known-command whitelist: future variants never inherit terminal status.
     // NotifyAgent is a synthetic second-stage witness, not an MCP tool name.
     let terminalCommandTypes =
         AgentProtocol.commandDefinitions
+        |> Seq.filter (fun definition ->
+            not (definition.Permissions |> List.contains ProcessExecution)
+            // Git commit hooks may leave detached children; scheduling creates
+            // future work after the initiating command has returned.
+            && not (List.contains definition.Name
+                [ "GitCommit"; "ScheduleBrowserExecution" ]))
         |> Seq.map (fun definition -> definition.Name)
         |> Set.ofSeq
         |> Set.add "NotifyAgent"
@@ -1055,7 +1070,7 @@ INSERT INTO operations (
                 | None -> Ok None
                 | Some (requestId, actor, Some tool, "Dispatched", witnessProject, parent)
                     when actor = actorId.ToUpperInvariant()
-                         && terminalCommandTypes.Contains tool
+                         && knownCommandTypes.Contains tool
                          && (projectName.IsNone || projectName = witnessProject)
                          && (tool = commandName && tool <> "StartJob"
                              // NotifyAgent is a logical two-stage command:

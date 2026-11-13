@@ -1158,6 +1158,46 @@ let ``promoted cross-project notification stages retain exact job operation and 
         |> shouldEqual true)
 
 [<Test>]
+let ``process-running and scheduled commands require more than an ordinary client reply`` () =
+    withStore (fun store ->
+        approveTestEpoch store
+        let user, agent, connection, generation =
+            "alice", "Worker 3", "client", 5L
+        for tool in
+            [ "RunCommand"; "RunProjectTask"; "UpdateClient"; "CancelJob"
+              "BrowserRunInNewTab"; "ScheduleBrowserExecution"; "GitCommit" ] do
+            let witness =
+                store.TryBeginAgentOperation(
+                    user, agent, tool, Some "Jarvis", "server", None, None)
+                |> function Ok value -> value | Error failure -> failwith failure
+            let correlation = "not-quiescent-" + tool
+            store.TryMarkAgentDispatched(
+                user, witness.Id, "device", connection, generation, correlation)
+            |> shouldEqual (Ok ())
+            // Parent-process exit, cancellation acknowledgement or successful
+            // scheduling is NOT durable proof that descendants are quiescent.
+            store.TryRecordAgentClientTerminal(
+                user, connection, generation, correlation).IsError
+            |> shouldEqual true
+            store.GetAgentExecutionResolution(user, witness.Id)
+            |> shouldEqual (Ok ExecutionUnresolved)
+        let read =
+            store.TryBeginAgentOperation(
+                user, agent, "ReadFiles", Some "Jarvis", "server", None, None)
+            |> function Ok value -> value | Error failure -> failwith failure
+        store.TryMarkAgentDispatched(
+            user, read.Id, "device", connection, generation, "bounded-read")
+        |> shouldEqual (Ok ())
+        store.TryRecordAgentClientTerminal(
+            user, connection, generation, "bounded-read")
+        |> shouldEqual (Ok (Some read.Id))
+        use restarted = new FeedbackStore(store.DatabasePath)
+        restarted.CountUnresolvedAgentExecutions(user, agent) |> shouldEqual 7
+        restarted.TryAcquireAgentCorrection(
+            user, agent, "operator-after-process-reply").IsError
+        |> shouldEqual true)
+
+[<Test>]
 let ``unknown future command type cannot certify client-terminal liveness`` () =
     withStore (fun store ->
         approveTestEpoch store

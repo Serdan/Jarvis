@@ -112,6 +112,9 @@ let private isLocalAgentActivity = function
 let private activatesAgent (agentId: string) command =
     match command with
     | _ when not (isLocalAgentActivity command) -> false
+    // Explicit taskless work must never be inferred from routine activity.
+    | TaskWriteCommand cmd when cmd.Action = "StartTasklessWork" || cmd.Action = "YieldTasklessWork" ->
+        false
     | TaskWriteCommand cmd ->
         cmd.ActorId = agentId
         && List.contains cmd.Action
@@ -924,10 +927,9 @@ let processIncomingCommand (rt: Runtime) (commandJson: string) (agentId: string)
                             when String.IsNullOrWhiteSpace agentId
                                  || not (String.Equals(observation.ObserverAgentId, agentId, StringComparison.Ordinal)) ->
                             Error(Client.ValidationError "Observation actor label does not match the initiating tool-call actor.")
-                        // Challenge authorization is based on the registered
-                        // issuer/condition owner. The independently supplied
-                        // invocation actor must match BEFORE any project
-                        // resolution, implicit activity or ledger read/write.
+                        // All challenge and taskless commands must bind the
+                        // stated actor to the independently authenticated tool actor
+                        // before scope resolution or implicit activity.
                         | ChallengeReadCommand read
                             when String.IsNullOrWhiteSpace agentId
                                  || not (String.Equals(read.ActorId, agentId, StringComparison.Ordinal)) ->
@@ -936,6 +938,12 @@ let processIncomingCommand (rt: Runtime) (commandJson: string) (agentId: string)
                             when String.IsNullOrWhiteSpace agentId
                                  || not (String.Equals(write.ActorId, agentId, StringComparison.Ordinal)) ->
                             Error(Client.ValidationError "Challenge write actor differs from the initiating tool-call actor.")
+                        | TaskWriteCommand taskless
+                            when (taskless.Action = "StartTasklessWork" || taskless.Action = "YieldTasklessWork")
+                                 && (String.IsNullOrWhiteSpace agentId
+                                     || not (String.Equals(taskless.ActorId, agentId, StringComparison.Ordinal))
+                                     || not (String.IsNullOrWhiteSpace taskless.TaskId)) ->
+                            Error(Client.ValidationError "Taskless execution requires the initiating agent identity and no task ID.")
                         | _ -> classifyProject command
                     match project with
                     | Error error -> return Error error

@@ -276,6 +276,7 @@ module McpToolHelpers =
     let private ledgerTaskWriteMethods =
         [ "SubmitIntegration"; "CompleteIntegration"; "NotifyAgent"; "AcknowledgeNotification"; "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "ReissueAssignment"; "CheckpointAttempt"
           "SetAttemptSource"; "YieldAgent"; "CompleteAgentWork"
+          "StartTasklessWork"; "YieldTasklessWork"; "RecoverTasklessWork"
           "SetAgentState"; "ReissueQueuedAttempt"; "RecoverAgentAssignment"; "AcknowledgeReviewFeedback"
           "DeferAttempt"; "ResumeAttempt"; "AbandonAttempt"; "CancelTask"
           "CreateRole"; "UpdateRole"; "AttachRole"; "DetachRole"; "SetAgentInstructions"
@@ -1665,6 +1666,21 @@ type JarvisMcpTools =
         let cmd = TaskCommands.write projectName "AcknowledgeFeedback" operationId taskId agentId
         McpToolHelpers.send client http (TaskWriteCommand { cmd with DecisionSequence = decisionSequence })
 
+    [<McpServerTool(Title = "start taskless work", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Explicitly start an unassigned registered agent's Working session with an activity description. Does not claim a task or review or modify role membership. Requires the exact current agent version; an idle agent's inbox does not start it.")>]
+    static member StartTasklessWork(projectName: string, agentId: string, activity: string, expectedAgentVersion: int, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        let cmd = TaskCommands.write projectName "StartTasklessWork" operationId "" agentId
+        McpToolHelpers.send client http (TaskWriteCommand { cmd with Summary = activity; ExpectedAgentVersion = expectedAgentVersion })
+
+    [<McpServerTool(Title = "yield taskless work", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Explicitly end an unassigned agent's Working session and return to Parked, preserving roles and independent reviews. Requires the exact current agent version and a summary.")>]
+    static member YieldTasklessWork(projectName: string, agentId: string, summary: string, expectedAgentVersion: int, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        let cmd = TaskCommands.write projectName "YieldTasklessWork" operationId "" agentId
+        McpToolHelpers.send client http (TaskWriteCommand { cmd with Summary = summary; ExpectedAgentVersion = expectedAgentVersion })
+
+    [<McpServerTool(Title = "recover taskless work", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Explicit authenticated administrative recovery of an active taskless agent to Parked, preserving roles and independent reviews. Requires the exact agent version, target agent ID and reason. Does not alter implementation assignments.")>]
+    static member RecoverTasklessWork(projectName: string, agentId: string, targetAgentId: string, expectedAgentVersion: int, reason: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        let cmd = TaskCommands.write projectName "RecoverTasklessWork" operationId "" targetAgentId
+        McpToolHelpers.send client http (TaskWriteCommand { cmd with Reason = reason; ExpectedAgentVersion = expectedAgentVersion })
+
     [<McpServerTool(Title = "yield agent", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Yield the current Working assignment to Ready with a checkpoint and continuation instruction. Omit version/generation arguments to resolve the current ledger snapshot, or supply them as exact assertions.")>]
     static member YieldAgent(projectName: string, taskId: string, agentId: string, summary: string, nextAction: string, [<Optional; DefaultParameterValue(0)>] expectedAttemptVersion: int, [<Optional; DefaultParameterValue(0)>] expectedAgentVersion: int, [<Optional; DefaultParameterValue(0)>] assignmentGeneration: int, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         let cmd = TaskCommands.write projectName "YieldAgent" operationId taskId agentId
@@ -1675,7 +1691,7 @@ type JarvisMcpTools =
         let cmd = TaskCommands.write projectName "CompleteAgentWork" operationId taskId agentId
         McpToolHelpers.send client http (TaskWriteCommand { cmd with ExpectedVersion = expectedAttemptVersion; ExpectedAgentVersion = expectedAgentVersion; AssignmentGeneration = assignmentGeneration; Summary = summary })
 
-    [<McpServerTool(Title = "set agent state", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Administratively park or unpark an unassigned agent. Only NeedsWork and Parked are valid; assigned Ready is controlled by assignment lifecycle and Working starts automatically on agent activity. Requires current agent version and a reason.")>]
+    [<McpServerTool(Title = "set agent state", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Administratively park or unpark an idle, unassigned agent. Only NeedsWork and Parked are valid; assigned Ready starts through ordinary activity, but taskless Working requires explicit StartTasklessWork. An active taskless session must use YieldTasklessWork or RecoverTasklessWork. Requires current agent version and a reason.")>]
     static member SetAgentState(projectName: string, agentId: string, targetAgentId: string, state: AdministrativeAgentState, expectedAgentVersion: int, reason: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         let cmd = TaskCommands.write projectName "SetAgentState" operationId "" targetAgentId
         McpToolHelpers.send client http (TaskWriteCommand { cmd with Summary = state.ToString(); ExpectedAgentVersion = expectedAgentVersion; Reason = reason })

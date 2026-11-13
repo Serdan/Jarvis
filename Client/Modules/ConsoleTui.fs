@@ -956,10 +956,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         let flag = if Set.contains row.Key agentChanged then "*" else " "
         let mail = if row.PendingNotifications = 0 then "" else $"[{row.PendingNotifications}]"
         let state = AgentView.displayState row.State
-        let task =
-            row.Focus
-            |> Option.map (fun focus -> $"#{focus.TaskId} {focus.Title}")
-            |> Option.defaultValue ""
+        let task = AgentView.agentContext row
         let writeCell value cellWidth color =
             draw.ForegroundColor <- color
             draw.Write(agentColumn value cellWidth)
@@ -1004,7 +1001,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
             | Some row when draw.Height < 32 ->
                 // Preserve a useful selected-agent context without letting the
                 // details pane consume the table on an ordinary 24-row terminal.
-                let task = row.Focus |> Option.map (fun t -> "#" + t.TaskId + " " + t.Title) |> Option.defaultValue ""
+                let task = AgentView.agentContext row
                 draw.WriteLine ""
                 draw.WriteLine (trim (sprintf "Details: %s | %s | %s" row.Agent (AgentView.displayState row.State) task) width)
             | Some row ->
@@ -1014,6 +1011,9 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                 writeDetailField width "Agent" row.Agent
                 writeDetailField width "Project" (ActivityFilter.projectToken row.ProjectLabel)
                 writeDetailField width "State" (AgentView.displayState row.State)
+                if not row.RoleIds.IsEmpty then writeDetailField width "Roles" (String.concat ", " row.RoleIds)
+                row.Activity |> Option.iter (writeDetailField width "Activity")
+                row.ReviewContext |> Option.iter (writeDetailField width "Review")
                 seenAt row
                 |> Option.iter (fun seen -> writeDetailField width "Last seen" (seen.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss")))
                 if row.PendingNotifications > 0 then

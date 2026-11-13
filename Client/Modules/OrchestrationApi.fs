@@ -984,6 +984,9 @@ module PendingIntentJournal =
                     attempt @ [ "ExpectedTaskVersion", "expectedTaskVersion"
                                 "BaseOid", "expectedCurrentSpecOid"; "Summary", "instructions" ]
                 | "TaskWrite", "RegisterAgent" -> [ "ActorId", "agentId" ]
+                | "TaskWrite", (("StartTasklessWork" | "YieldTasklessWork") as action) ->
+                    [ "ActorId", "agentId"; "ExpectedAgentVersion", "expectedAgentVersion"
+                      "Summary", (if action = "StartTasklessWork" then "activity" else "summary") ]
                 | "TaskWrite", "AssignTask" ->
                     common @ [ "AttemptId", "attemptId"; "OwnerId", "ownerId" ]
                 | "TaskWrite", "AcknowledgeAssignment" ->
@@ -1021,6 +1024,8 @@ module PendingIntentJournal =
                 | "TaskWrite", "SetAgentState" ->
                     [ "ActorId", "targetAgentId"; "Summary", "state"
                       "ExpectedAgentVersion", "expectedAgentVersion"; "Reason", "reason" ]
+                | "TaskWrite", "RecoverTasklessWork" ->
+                    [ "ActorId", "agentId"; "ExpectedAgentVersion", "expectedAgentVersion"; "Reason", "reason" ]
                 | "TaskWrite", "ReissueQueuedAttempt"
                 | "TaskWrite", "RecoverAgentAssignment" ->
                     attempt @ [ "Reason", "reason" ]
@@ -2371,6 +2376,12 @@ module TaskApi =
                                 withAdministrativeActor (fun actor ->
                                     ReviewWorkflow.ReviewWorkflow.registerAgentAs binding actor operationId cmd.ActorId
                                     |> mapError)
+                            | "StartTasklessWork" ->
+                                ReviewWorkflow.ReviewWorkflow.startTasklessWork binding operationId
+                                    cmd.ActorId cmd.ExpectedAgentVersion cmd.Summary |> mapError
+                            | "YieldTasklessWork" ->
+                                ReviewWorkflow.ReviewWorkflow.yieldTasklessWork binding operationId
+                                    cmd.ActorId cmd.ExpectedAgentVersion cmd.Summary |> mapError
                             | "CreateRole" ->
                                 withAdministrativeActor (fun actor ->
                                     RoleInstructions.RoleInstructions.createRole binding actor operationId
@@ -2473,6 +2484,10 @@ module TaskApi =
                                 withAdministrativeActor (fun actor ->
                                     ReviewWorkflow.ReviewWorkflow.reopenTaskAs binding actor operationId
                                         cmd.TaskId cmd.ExpectedTaskVersion cmd.Reason |> mapError)
+                            | "RecoverTasklessWork" ->
+                                withAdministrativeActor (fun actor ->
+                                    ReviewWorkflow.ReviewWorkflow.recoverTasklessWorkAs binding actor operationId
+                                        cmd.ActorId cmd.ExpectedAgentVersion cmd.Reason |> mapError)
                             | "SetAgentState" ->
                                 withAdministrativeActor (fun actor ->
                                     ReviewWorkflow.ReviewWorkflow.setAgentAdministrativeStateAs binding actor operationId

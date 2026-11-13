@@ -1086,7 +1086,7 @@ module LedgerStore =
 
     let internal dashboardBlobCacheStats () = dashboardBlobCache.Counts
 
-    let private dashboardRecordPath includeIntegrations (path: string) =
+    let private dashboardRecordPath includeIntegrations includeInstructionConfigs (path: string) =
         (path.StartsWith("agents/", StringComparison.Ordinal)
          && path.EndsWith(".json", StringComparison.Ordinal))
         || (path.StartsWith("notifications/", StringComparison.Ordinal)
@@ -1097,11 +1097,15 @@ module LedgerStore =
                 || (Regex.IsMatch(path, "^tasks/[A-Za-z0-9_-]+/attempts/[a-f0-9]{32}[.]json$"))
                 || (includeIntegrations &&
                     Regex.IsMatch(path, "^tasks/[A-Za-z0-9_-]+/integrations/[a-f0-9]{32}[.]json$"))))
+        || (includeInstructionConfigs
+            && path.StartsWith("records/agent-instructions/", StringComparison.Ordinal)
+            && path.EndsWith(".json", StringComparison.Ordinal))
 
     // One immutable tree listing and one cat-file batch (only for previously
     // unseen blobs), instead of two Git processes per entity.
     let private readSelectedRecordsAt (prefixes: string list) includePath (binding: LedgerBinding) (snapshot: LedgerSnapshot) =
         let repo = binding.RepositoryPath
+        // The caller supplies the scoped prefixes and path predicate.
         let treeArgs = [ "ls-tree"; "-r"; "-z"; snapshot.Commit; "--" ] @ prefixes
         match gitRaw repo treeArgs |> requireSuccess "Dashboard tree listing" with
         | Error error -> Error error
@@ -1188,24 +1192,26 @@ module LedgerStore =
                 |> Map.ofArray
                 |> Ok
 
-    let private readViewRecordsAt includeIntegrations binding snapshot =
-        readSelectedRecordsAt [ "agents"; "tasks"; "notifications" ]
-            (dashboardRecordPath includeIntegrations) binding snapshot
+    let private readViewRecordsAt includeIntegrations includeInstructionConfigs binding snapshot =
+        let prefixes = [ "agents"; "tasks"; "notifications" ]
+                       @ (if includeInstructionConfigs then [ "records/agent-instructions" ] else [])
+        readSelectedRecordsAt prefixes
+            (dashboardRecordPath includeIntegrations includeInstructionConfigs) binding snapshot
 
     // These are derived read models only. Both entrypoints require a freshly
     // fetched/verified snapshot and only read blobs reachable from its OID.
     // The OID-keyed immutable blob cache never decides which paths exist.
     let internal readDashboardRecordsWithOidsAt binding snapshot =
-        readViewRecordsAt false binding snapshot
+        readViewRecordsAt false true binding snapshot
 
     let private stripOids records =
         records |> Map.map (fun _ (struct (_, content)) -> content)
 
     let readDashboardRecordsAt binding snapshot =
-        readViewRecordsAt false binding snapshot |> Result.map stripOids
+        readViewRecordsAt false true binding snapshot |> Result.map stripOids
 
     let readAgentInboxRecordsAt binding snapshot =
-        readViewRecordsAt true binding snapshot |> Result.map stripOids
+        readViewRecordsAt true false binding snapshot |> Result.map stripOids
 
     // Challenge inbox projections consult only scoped materialized indexes.
     // Prefixes cannot escape the caller's encoded agent key. Missing indexes

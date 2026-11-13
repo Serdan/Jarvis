@@ -97,8 +97,8 @@ type ReviewAgent =
     with
         [<System.Text.Json.Serialization.JsonIgnore>]
         member this.State =
-            if not (isNull (box this.CurrentAssignment)) then
-                if this.Execution = "Working" then "Working" else "Ready"
+            if this.Execution = "Working" then "Working"
+            elif not (isNull (box this.CurrentAssignment)) then "Ready"
             elif this.UnassignedDisposition = "Parked" then "Parked"
             else "NeedsWork"
         [<System.Text.Json.Serialization.JsonIgnore>]
@@ -360,6 +360,7 @@ module ReviewWorkflow =
         let assignment = if List.contains state [ "Completed"; "Parked"; "NeedsWork" ] then Unchecked.defaultof<AgentAssignment> else agent.CurrentAssignment
         let disposition =
             if state = "Parked" then "Parked"
+            elif execution = "Working" then null
             elif isNull (box assignment) then "NeedsWork" else null
         let sameAssignment =
             if isNull (box agent.CurrentAssignment) then isNull (box assignment)
@@ -451,8 +452,10 @@ module ReviewWorkflow =
                             root.TryGetProperty("currentAssignment", &current)
                             && root.TryGetProperty("unassignedDisposition", &disposition)
                             && (if current.ValueKind = JsonValueKind.Null then
-                                    status "unassignedDisposition" [ "NeedsWork"; "Parked" ]
-                                    && status "execution" [ "Stopped" ]
+                                    (status "execution" [ "Working" ]
+                                     && disposition.ValueKind = JsonValueKind.Null)
+                                    || (status "execution" [ "Stopped" ]
+                                        && status "unassignedDisposition" [ "NeedsWork"; "Parked" ])
                                 else current.ValueKind = JsonValueKind.Object
                                      && disposition.ValueKind = JsonValueKind.Null))
                     | "ReviewAttempt" -> status "phase" [ "Queued"; "Started"; "Finished"; "Deferred"; "Blocked";
@@ -1280,6 +1283,73 @@ module ReviewWorkflow =
 
     let registerAgent binding operationId agentId =
         registerAgentAs binding legacyAdministrativeActor operationId agentId
+
+    // Taskless execution is explicit and independent of roles and attempts.
+    // The agent record and durable operation arbitrate concurrent devices.
+    let startTasklessWork binding operationId agentId expectedAgentVersion activity =
+        if not (validAgent agentId) || expectedAgentVersion < 1 || not (validText 2048 activity) then
+            Error(InvalidBinding "Starting taskless work requires a registered agent, exact version and activity.")
+        else
+            LedgerStore.transact binding
+                (intent operationId agentId "StartTasklessWork"
+                    {| agentId = agentId; expectedAgentVersion = expectedAgentVersion; activity = activity |})
+                (fun snapshot -> result {
+                    let! agent, agentOid = required<ReviewAgent> binding snapshot (agentPath agentId)
+                    if agent.Version <> expectedAgentVersion
+                       || not (isNull (box agent.CurrentAssignment))
+                       || agent.Execution <> "Stopped"
+                       || not (List.contains agent.State [ "Parked"; "NeedsWork" ]) then
+                        return! Error(StaleEntityVersion "StartTasklessWork requires an idle unassigned agent at the exact version.")
+                    let updated = enterState "Working" (resetSessions agent)
+                    return [ change (agentPath agentId) (Some agentOid)
+                                 { updated with Version = agent.Version + 1
+                                                StateReason = activity
+                                                StateSequence = snapshot.Header.NextSequence } ]
+                })
+
+    let yieldTasklessWork binding operationId agentId expectedAgentVersion summary =
+        if not (validAgent agentId) || expectedAgentVersion < 1 || not (validText 2048 summary) then
+            Error(InvalidBinding "Yielding taskless work requires an exact agent version and summary.")
+        else
+            LedgerStore.transact binding
+                (intent operationId agentId "YieldTasklessWork"
+                    {| agentId = agentId; expectedAgentVersion = expectedAgentVersion; summary = summary |})
+                (fun snapshot -> result {
+                    let! agent, agentOid = required<ReviewAgent> binding snapshot (agentPath agentId)
+                    if agent.Version <> expectedAgentVersion
+                       || not (isNull (box agent.CurrentAssignment))
+                       || agent.Execution <> "Working" then
+                        return! Error(StaleEntityVersion "YieldTasklessWork requires this agent's active taskless session at the exact version.")
+                    let updated = enterState "Parked" (resetSessions agent)
+                    return [ change (agentPath agentId) (Some agentOid)
+                                 { updated with Version = agent.Version + 1
+                                                StateReason = summary
+                                                StateSequence = snapshot.Header.NextSequence } ]
+                })
+
+    // Explicit authenticated administrative recovery is distinct from an
+    // agent's self-yield. It never releases a task or an independent review.
+    let recoverTasklessWorkAs binding actor operationId agentId expectedAgentVersion reason =
+        if not (validAgent agentId) || expectedAgentVersion < 1 || not (validText 2048 reason)
+           || String.IsNullOrWhiteSpace actor then
+            Error(InvalidBinding "Recovery requires an authenticated actor, an exact agent version and a reason.")
+        else
+            LedgerStore.transact binding
+                (intent operationId actor "RecoverTasklessWork"
+                    {| agentId = agentId; expectedAgentVersion = expectedAgentVersion
+                       reason = reason |})
+                (fun snapshot -> result {
+                    let! agent, agentOid = required<ReviewAgent> binding snapshot (agentPath agentId)
+                    if agent.Version <> expectedAgentVersion
+                       || not (isNull (box agent.CurrentAssignment))
+                       || agent.Execution <> "Working" then
+                        return! Error(StaleEntityVersion "Recovery requires an active, unassigned agent at the exact version.")
+                    let updated = enterState "Parked" (resetSessions agent)
+                    return [ change (agentPath agentId) (Some agentOid)
+                                 { updated with Version = agent.Version + 1
+                                                StateReason = reason
+                                                StateSequence = snapshot.Header.NextSequence } ]
+                })
 
     let assignTaskAs binding actor operationId taskId attemptId ownerId =
         if not (validTaskId taskId) || attemptId = Guid.Empty
@@ -2723,6 +2793,9 @@ module ReviewWorkflow =
                         | "Working", Some entry ->
                             entry.Attempt.Phase = "Started"
                             && agent.ActiveAttemptId = entry.Attempt.AttemptId
+                        | "Working", None ->
+                            // Explicit taskless execution owns no implementation attempt.
+                            isNull (box agent.CurrentAssignment) && String.IsNullOrWhiteSpace agent.ActiveAttemptId
                         | _ -> false
                     if not focusValid then
                         return! Error(LedgerIntegrityError "Agent state/focused attempt mismatch.")
@@ -2779,7 +2852,7 @@ module ReviewWorkflow =
                           PendingNotifications = notifications
                           IntegrationSubmissions = integrationRecords |> List.sortBy (fun item -> item.CreatedSequence)
                           InstructionLayers = instructionLayers
-                          SlotAvailable = isNull (box agent.CurrentAssignment)
+                          SlotAvailable = isNull (box agent.CurrentAssignment) && agent.Execution <> "Working"
                           Unassigned = isNull (box agent.CurrentAssignment) }
             }
 

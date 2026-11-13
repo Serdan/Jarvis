@@ -480,6 +480,7 @@ let ``command catalog matches AgentCommand union and MCP tools`` () =
               "GetRole"; "ListRoles"; "GetAgentInstructionConfig"; "ResolveAgentInstructions"
               "CreateRole"; "UpdateRole"; "AttachRole"; "DetachRole"; "SetAgentInstructions"
               "SetAttemptSource"; "YieldAgent"; "CompleteAgentWork"
+              "StartTasklessWork"; "YieldTasklessWork"; "RecoverTasklessWork"
               "SetAgentState"; "ReissueQueuedAttempt"; "RecoverAgentAssignment"; "AcknowledgeReviewFeedback"; "DeferAttempt"; "ResumeAttempt"; "AbandonAttempt"; "CancelTask"; "TransferOwner"; "CloseTask"; "ReopenTask"; "ImportTaskSpec"; "ExportTaskSpec"
               "GetTask"; "TaskOverview"; "ReviewDetails"; "ReviewerInbox"; "ListReviewDocuments"; "ReadReviewDocument"
               "SubmitReview"; "ClaimReview"; "DecideReview"
@@ -572,10 +573,9 @@ let ``client-backed MCP tools expose an optional per-command deviceId`` () =
         |> Array.filter (fun methodInfo ->
             methodInfo.GetParameters()
             |> Array.exists (fun parameter -> parameter.ParameterType = typeof<ClientService>))
-    // Preserve main-side role/instruction tools and the challenge-domain
-    // public aliases; both groups contribute nine aliases outside the wire
-    // command definitions. Every client-backed method needs a deviceId.
-    clientMethods.Length |> shouldEqual (AgentProtocol.commandDefinitions.Length - 1 + 69)
+    // Include role/instruction aliases, challenge-domain endpoints and the
+    // three taskless lifecycle methods without dropping device routing.
+    clientMethods.Length |> shouldEqual (AgentProtocol.commandDefinitions.Length - 1 + 72)
     for methodInfo in clientMethods do
         let deviceParam = methodInfo.GetParameters() |> Array.tryFind (fun parameter -> parameter.Name = "deviceId")
         match deviceParam with
@@ -990,6 +990,7 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
               for name in [ "SubmitIntegration"; "CompleteIntegration"; "NotifyAgent"; "AcknowledgeNotification"; "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "ReissueAssignment"; "CheckpointAttempt"
                             "CreateRole"; "UpdateRole"; "AttachRole"; "DetachRole"; "SetAgentInstructions";
                             "SetAttemptSource"; "YieldAgent"; "CompleteAgentWork";
+                            "StartTasklessWork"; "YieldTasklessWork"; "RecoverTasklessWork";
                             "SetAgentState"; "ReissueQueuedAttempt"; "RecoverAgentAssignment"; "AcknowledgeReviewFeedback"; "DeferAttempt"; "ResumeAttempt"; "AbandonAttempt"; "CancelTask"; "TransferOwner"; "CloseTask"; "ReopenTask"; "ImportTaskSpec"; "ExportTaskSpec" ] -> name, taskWrite
               for name in [ "GetTask"; "TaskOverview"; "ReviewDetails"; "ReviewerInbox"; "ListReviewDocuments"; "ReadReviewDocument" ] ->
                   name, ledgerRead

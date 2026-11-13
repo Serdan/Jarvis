@@ -7,6 +7,7 @@ open System.IO
 open System.Text.Json
 open Client.LedgerStore
 open Client.ReviewWorkflow
+open Client.RoleInstructions
 
 let private options =
     JsonSerializerOptions(PropertyNamingPolicy = JsonNamingPolicy.CamelCase, PropertyNameCaseInsensitive = true)
@@ -98,6 +99,12 @@ let private stateTime (agent: ReviewAgent) =
 let private stringOption value =
     if String.IsNullOrWhiteSpace value then None else Some value
 
+let private agentConfigPath (agentId: string) =
+    let key =
+        Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(agentId))
+            .TrimEnd('=').Replace('+', '-').Replace('/', '_')
+    $"records/agent-instructions/{key}.json"
+
 // Snapshot contents are immutable at a canonical Git commit. Reuse derived
 // rows when the remote head has not changed, including notification summaries.
 let private cachedProjects =
@@ -148,16 +155,30 @@ let private projectSnapshot project identity binding snapshot =
             let reviewRecords = taskPaths |> List.filter (fun path -> path.EndsWith("/review.json", StringComparison.Ordinal))
             let tasks = taskRecords |> List.map (read<ReviewTask> records)
             let agents = agentPaths |> List.map (read<ReviewAgent> records)
+            let configs =
+                paths
+                |> List.filter (fun path -> path.StartsWith("records/agent-instructions/", StringComparison.Ordinal))
+                |> List.map (fun path ->
+                    read<AgentInstructionConfig> records path
+                    |> Result.bind (fun config ->
+                        if path = agentConfigPath config.AgentId
+                           && not (isNull (box config.RoleIds)) && config.RoleIds.Length <= 16 && config.Version > 0 then
+                            Ok config
+                        else Error ("Invalid canonical role attachment: " + path)))
             let reviews = reviewRecords |> List.map (read<BranchReview> records)
             let notifications = notificationSummaries records
             let firstError values = values |> List.tryPick (function Error message -> Some message | Ok _ -> None)
-            match firstError tasks, firstError agents, firstError reviews, notifications with
-            | Some error, _, _, _ | _, Some error, _, _ | _, _, Some error, _ -> Error error
-            | _, _, _, Error error -> Error error
-            | None, None, None, Ok notificationCounts ->
+            match firstError tasks, firstError agents, firstError reviews, firstError configs, notifications with
+            | Some error, _, _, _, _ | _, Some error, _, _, _
+            | _, _, Some error, _, _ | _, _, _, Some error, _ -> Error error
+            | _, _, _, _, Error error -> Error error
+            | None, None, None, None, Ok notificationCounts ->
                 let tasks = tasks |> List.choose (function Ok item -> Some item | _ -> None)
                 let agents = agents |> List.choose (function Ok item -> Some item | _ -> None)
                 let reviews = reviews |> List.choose (function Ok item -> Some item | _ -> None)
+                let roleConfigs =
+                    configs |> List.choose (function Ok item -> Some (item.AgentId, item.RoleIds) | _ -> None)
+                    |> Map.ofList
                 // A focus is an attempt ID, not a source worktree or historical task owner.
                 let attemptForTask (task: ReviewTask) =
                     if String.IsNullOrWhiteSpace task.AttemptId then Ok None
@@ -195,6 +216,15 @@ let private projectSnapshot project identity binding snapshot =
                                ProjectAliases = [project]; State = agent.State
                                StateEnteredAt = stateTime agent; StateReason = stringOption agent.StateReason
                                Focus = focus
+                               RoleIds = roleConfigs |> Map.tryFind agent.AgentId |> Option.defaultValue []
+                               Activity =
+                                   if agent.State = "Working" && isNull (box agent.CurrentAssignment) then
+                                       stringOption agent.StateReason
+                                   else None
+                               ReviewContext =
+                                   reviews |> List.tryFind (fun review ->
+                                       review.Status = "Claimed" && review.ReviewerId = agent.AgentId)
+                                   |> Option.map (fun review -> $"#{review.ReviewId} {review.Kind}")
                                PendingNotifications = notification.Pending
                                LatestNotification = notification.Latest
                                ActivityKeys = [] } : AgentView.AgentRow)))

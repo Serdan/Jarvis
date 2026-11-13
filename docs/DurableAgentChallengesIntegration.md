@@ -42,6 +42,12 @@ The reviewed `c5a839d6` source was reconciled against `main` at `b24d4358` on a 
 - The combined MCP method catalog contains nine additional client-backed aliases beyond either single-side formula; reflect the union in `ServiceTests` (`commandDefinitions.Length - 1 + 69`). The combined optional-operation-ID contract enumerates 49 mutating tools.
 - Focused integrated ChallengeTests: **23/23 passed**; complete integrated Client.Tests: **634/634 passed**; complete integrated Server.Tests: **124/124 passed**. All were executed on .NET 11 Release before the staging branch was frozen.
 
+## Independent integration review P2 follow-up
+
+Reviewer 1 requested changes on frozen `cfed037c` (review `686e7e1fca404da48c7c2e47678cb4b9`): the self-inbox unconditionally enumerated all historical challenge files, spawning two Git processes per challenge and failing after 4,096 records. The revised staging branch writes owner-specific active-ID shards, subscribed-unassigned active-ID shards and a bounded issuer-recent index in **the same CAS transaction** as each canonical challenge/event update. Each ordinary inbox reads only actor-scoped indexes, linked dependencies, and their canonical challenge records via the existing snapshot-pinned batched Git object reader. Terminal history remains immutable but is not walked on every self-inbox; there is no hard historical-volume cap for those reads.
+
+`list_challenges` now pages explicitly requested history with batched canonical reads and no global 4,096-record refusal. A deterministic regression seeds 4,100 archived terminal challenges alongside a live owned/unassigned challenge, verifies subscribed and assigned inbox rows, cancellation, paged history and a strict bound on measured Git subprocess starts per ordinary inbox. Preserve this test and the negative-space check when integrating further changes. The feature source branch and `main` remain untouched.
+
 ## Verification and approval
 
 Run `dotnet test Client.Tests/Client.Tests.fsproj -c Release` and `dotnet test Server.Tests/Server.Tests.fsproj -c Release` against the integrated .NET 11 tree. Also test multi-client competing condition resolution, stale wakeups, multiple dependents, busy/Parked owner releases, zero-notification paths, and MCP metadata coverage.

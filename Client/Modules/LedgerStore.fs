@@ -1100,9 +1100,9 @@ module LedgerStore =
 
     // One immutable tree listing and one cat-file batch (only for previously
     // unseen blobs), instead of two Git processes per entity.
-    let private readViewRecordsAt includeIntegrations (binding: LedgerBinding) (snapshot: LedgerSnapshot) =
+    let private readSelectedRecordsAt (prefixes: string list) includePath (binding: LedgerBinding) (snapshot: LedgerSnapshot) =
         let repo = binding.RepositoryPath
-        let treeArgs = [ "ls-tree"; "-r"; "-z"; snapshot.Commit; "--"; "agents"; "tasks"; "notifications" ]
+        let treeArgs = [ "ls-tree"; "-r"; "-z"; snapshot.Commit; "--" ] @ prefixes
         match gitRaw repo treeArgs |> requireSuccess "Dashboard tree listing" with
         | Error error -> Error error
         | Ok listing ->
@@ -1115,7 +1115,7 @@ module LedgerStore =
                     else
                         let header = entry.Substring(0, separator).Split(' ')
                         let path = entry.Substring(separator + 1)
-                        if ledgerPath.IsMatch path && dashboardRecordPath includeIntegrations path then
+                        if ledgerPath.IsMatch path && includePath path then
                             if header.Length = 3 && header[0] = "100644"
                                && header[1] = "blob" && oidPattern.IsMatch(header[2]) then
                                 Some(path, header[2])
@@ -1188,6 +1188,10 @@ module LedgerStore =
                 |> Map.ofArray
                 |> Ok
 
+    let private readViewRecordsAt includeIntegrations binding snapshot =
+        readSelectedRecordsAt [ "agents"; "tasks"; "notifications" ]
+            (dashboardRecordPath includeIntegrations) binding snapshot
+
     // These are derived read models only. Both entrypoints require a freshly
     // fetched/verified snapshot and only read blobs reachable from its OID.
     // The OID-keyed immutable blob cache never decides which paths exist.
@@ -1202,6 +1206,45 @@ module LedgerStore =
 
     let readAgentInboxRecordsAt binding snapshot =
         readViewRecordsAt true binding snapshot |> Result.map stripOids
+
+    // Challenge inbox projections consult only scoped materialized indexes.
+    // Prefixes cannot escape the caller's encoded agent key. Missing indexes
+    // are an empty projection, not a reason to scan immutable challenge history.
+    let readChallengeInboxIndexRecordsAt binding snapshot (actorKey: string) subscribed =
+        if not (Regex.IsMatch(actorKey, "^[A-Za-z0-9_-]{1,160}$")) then
+            Error(InvalidBinding "Invalid encoded challenge-inbox agent identity.")
+        else
+            let owned = "records/challenge-index-owned/" + actorKey
+            let triage = "records/challenge-index-triage"
+            let recent = "records/challenge-index-recent/" + actorKey + ".json"
+            let prefixes = [ owned; recent ] @ (if subscribed then [ triage ] else [])
+            let allowed (path: string) =
+                let shard prefix =
+                    path.StartsWith(prefix + "/", StringComparison.Ordinal)
+                    && Regex.IsMatch(path.Substring(prefix.Length + 1), "^[a-f0-9]{2}[.]json$")
+                shard owned || (subscribed && shard triage) || path = recent
+            readSelectedRecordsAt prefixes allowed binding snapshot |> Result.map stripOids
+
+    // Read only canonical challenge blobs referenced by active indexes or
+    // explicit blocked-dependency links. Use bounded Git argv and cat-file
+    // batches; neither historical count nor index size multiplies processes
+    // per entity. All paths and blobs come from the SAME pinned snapshot.
+    let readChallengeEntitiesAt binding snapshot (ids: string list) =
+        let ids = ids |> List.distinct
+        if ids |> List.exists (fun id -> not (Regex.IsMatch(id, "^[a-f0-9]{32}$"))) then
+            Error(InvalidBinding "Invalid challenge ID in inbox index.")
+        else
+            ids
+            |> List.map (fun id -> "challenges/" + id + "/challenge.json")
+            |> List.chunkBySize 128
+            |> List.fold (fun (state: Result<Map<string, string>, LedgerFailure>) paths ->
+                state |> Result.bind (fun accumulated ->
+                    let required = paths |> Set.ofList
+                    readSelectedRecordsAt paths (fun path -> Set.contains path required) binding snapshot
+                    |> Result.map (fun records ->
+                        records |> stripOids
+                        |> Map.fold (fun result path content -> Map.add path content result) accumulated)))
+                (Ok Map.empty)
 
     let verifySourceCommit (binding: LedgerBinding) (sourceRef: string) (commit: string) =
         if not (sourceRef.StartsWith("refs/heads/", StringComparison.Ordinal))

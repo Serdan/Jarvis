@@ -93,6 +93,20 @@ type ChallengeCreated =
       ConditionIds: string list
       Receipt: LedgerWrite }
 
+// These are materialized, snapshot-derived read indexes, never authority for
+// challenge mutation. Immutable canonical challenge records and audit remain
+// under challenges/<id>. A shard is bounded by its 2-hex-character prefix
+// and contains only currently actionable challenge identities.
+[<CLIMutable>]
+type ChallengeActiveShard =
+    { ChallengeIds: string list }
+
+[<CLIMutable>]
+type ChallengeRecentIndex =
+    { IssuerAgentId: string
+      TotalCurrentOutcomes: int
+      Items: InboxChallengeItem list }
+
 module ChallengeWorkflow =
     let private options =
         JsonSerializerOptions(PropertyNamingPolicy = JsonNamingPolicy.CamelCase, PropertyNameCaseInsensitive = true)
@@ -224,6 +238,147 @@ module ChallengeWorkflow =
                     count <- count + rune.Utf8SequenceLength
             builder.ToString() + "..."
 
+    // Keep historical challenge bodies in the canonical ledger, but never
+    // enumerate them for a self-inbox. Mutable materialized read indexes are
+    // updated atomically with every canonical challenge transition.
+    let private encodedActor (actor: string) =
+        Convert.ToBase64String(Encoding.UTF8.GetBytes actor)
+            .TrimEnd('=').Replace('+', '-').Replace('/', '_')
+
+    let private activeOwners (challenge: AgentChallenge) =
+        if challenge.Status <> "Pending" && challenge.Status <> "Blocked" then Set.empty
+        else
+            challenge.Conditions
+            |> List.choose (fun c ->
+                if c.Status = "Pending" && not (String.IsNullOrWhiteSpace c.OwnerAgentId)
+                then Some c.OwnerAgentId else None)
+            |> Set.ofList
+
+    let private hasTriage (challenge: AgentChallenge) =
+        (challenge.Status = "Pending" || challenge.Status = "Blocked")
+        && (challenge.Conditions |> List.exists (fun c ->
+            c.Status = "Pending" && String.IsNullOrWhiteSpace c.OwnerAgentId))
+
+    let private inboxItem (challenge: AgentChallenge) (condition: ChallengeCondition) : InboxChallengeItem =
+        { ChallengeId = challenge.ChallengeId
+          ConditionId = condition.ConditionId
+          IssuerAgentId = challenge.IssuerAgentId
+          OwnerAgentId = condition.OwnerAgentId
+          SuggestedAgentId = condition.SuggestedAgentId
+          Title = compact 120 challenge.Title
+          DescriptionPreview = compact 144 condition.Description
+          ChallengeStatus = challenge.Status
+          ConditionStatus = condition.Status
+          Version = challenge.Version
+          EvidencePreview = compact 120 condition.Evidence
+          ReasonPreview = compact 120 condition.Reason
+          UpdatedAtUtc =
+              if challenge.Status = "Cancelled" then challenge.UpdatedAtUtc
+              else condition.UpdatedAtUtc }
+
+    let private outcomes (challenge: AgentChallenge) =
+        if challenge.Status = "Cancelled" then
+            [ inboxItem challenge challenge.Conditions.Head ]
+        else
+            challenge.Conditions
+            |> List.filter (fun c -> c.Status <> "Pending")
+            |> List.map (inboxItem challenge)
+
+    let private ownedShard actor (challengeId: string) =
+        "records/challenge-index-owned/" + encodedActor actor + "/" + challengeId.Substring(0, 2) + ".json"
+
+    let private triageShard (challengeId: string) =
+        "records/challenge-index-triage/" + challengeId.Substring(0, 2) + ".json"
+
+    let private recentPath actor =
+        "records/challenge-index-recent/" + encodedActor actor + ".json"
+
+    let private readIndex<'t> binding snapshot file = result {
+        let! contents, oid = LedgerStore.readAt binding snapshot file
+        match contents, oid with
+        | None, None -> return None, None
+        | Some body, Some blob ->
+            try
+                use doc = JsonDocument.Parse body
+                if doc.RootElement.GetProperty("schemaVersion").GetInt32() <> 2 then
+                    return! Error(LedgerIntegrityError ("Unsupported challenge inbox index schema: " + file))
+                let value = JsonSerializer.Deserialize<'t>(body, options)
+                if isNull (box value) then
+                    return! Error(LedgerIntegrityError ("Null challenge inbox index: " + file))
+                return Some value, Some blob
+            with ex ->
+                return! Error(LedgerIntegrityError ("Invalid challenge inbox index: " + ex.Message))
+        | _ -> return! Error(LedgerIntegrityError ("Inconsistent challenge inbox index: " + file))
+    }
+
+    let private updateShard binding snapshot file challengeId includeChallenge = result {
+        let! prior, oid = readIndex<ChallengeActiveShard> binding snapshot file
+        let! current =
+            match prior with
+            | None -> Ok Set.empty
+            | Some index when not (isNull (box index.ChallengeIds))
+                              && (index.ChallengeIds |> List.forall (fun id -> (guidN id).IsSome)) ->
+                Ok (index.ChallengeIds |> Set.ofList)
+            | Some _ -> Error(LedgerIntegrityError ("Invalid challenge inbox shard: " + file))
+        let updated =
+            if includeChallenge then Set.add challengeId current
+            else Set.remove challengeId current
+        if current = updated then return []
+        else return [ change file oid { ChallengeIds = updated |> Set.toList } ]
+    }
+
+    let private updateRecent binding snapshot (before: AgentChallenge option)
+                             (next: AgentChallenge) = result {
+        let previousItems = before |> Option.map outcomes |> Option.defaultValue []
+        let currentItems = outcomes next
+        if previousItems = currentItems then return []
+        else
+            let file = recentPath next.IssuerAgentId
+            let! previous, oid = readIndex<ChallengeRecentIndex> binding snapshot file
+            let! prior =
+                match previous with
+                | Some value when value.IssuerAgentId = next.IssuerAgentId
+                                  && value.TotalCurrentOutcomes >= 0
+                                  && not (isNull (box value.Items)) ->
+                    Ok value
+                | None ->
+                    Ok { IssuerAgentId = next.IssuerAgentId
+                         TotalCurrentOutcomes = 0; Items = [] }
+                | _ -> Error(LedgerIntegrityError "Invalid issuer recent challenge index.")
+            let total = prior.TotalCurrentOutcomes - previousItems.Length + currentItems.Length
+            if total < 0 then
+                return! Error(LedgerIntegrityError "Inconsistent issuer challenge outcome count.")
+            // Recent is a deliberately bounded rolling projection. Older
+            // outcomes and immutable audit always remain in get_challenge.
+            let items =
+                (currentItems @ (prior.Items |> List.filter (fun item ->
+                    item.ChallengeId <> next.ChallengeId)))
+                |> List.sortByDescending (fun item ->
+                    item.UpdatedAtUtc, item.ChallengeId, item.ConditionId)
+                |> List.truncate 36
+            return [ change file oid { prior with TotalCurrentOutcomes = total; Items = items } ]
+    }
+
+    let private indexWrites binding snapshot (before: AgentChallenge option)
+                            (next: AgentChallenge) = result {
+        let oldOwners = before |> Option.map activeOwners |> Option.defaultValue Set.empty
+        let newOwners = activeOwners next
+        let mutable changes: LedgerFileChange list = []
+        for owner in Set.union oldOwners newOwners do
+            if Set.contains owner oldOwners <> Set.contains owner newOwners then
+                let! writes = updateShard binding snapshot (ownedShard owner next.ChallengeId)
+                                  next.ChallengeId (Set.contains owner newOwners)
+                changes <- writes @ changes
+        let oldTriage = before |> Option.exists hasTriage
+        let newTriage = hasTriage next
+        if oldTriage <> newTriage then
+            let! writes = updateShard binding snapshot (triageShard next.ChallengeId)
+                              next.ChallengeId newTriage
+            changes <- writes @ changes
+        let! recent = updateRecent binding snapshot before next
+        return List.rev changes @ recent
+    }
+
     let private changed binding operationId actor kind payload
                         (plan: LedgerSnapshot -> Result<LedgerFileChange list, LedgerFailure>) =
         LedgerStore.transact binding (intent operationId actor kind payload) plan
@@ -316,8 +471,9 @@ module ChallengeWorkflow =
                           BeforeOwnerAgentId = ""; AfterOwnerAgentId = ""
                           Evidence = ""; Reason = ""; Sequence = snapshot.Header.NextSequence
                           OccurredAtUtc = timestamp }
+                    let! indexes = indexWrites binding snapshot None entity
                     return [ change (path challengeId) None entity
-                             change (eventPath challengeId snapshot.Header.NextSequence) None event ]
+                             change (eventPath challengeId snapshot.Header.NextSequence) None event ] @ indexes
                 })
             created |> Result.map (fun receipt ->
                 { ChallengeId = challengeId.ToString("N")
@@ -537,8 +693,10 @@ module ChallengeWorkflow =
                             if nextStatus = "Satisfied" && priorState <> "Satisfied" then
                                 wakeDependents binding snapshot operationId actor nextRecord timestamp
                             else Ok []
+                        let! indexes = indexWrites binding snapshot (Some challenge) nextRecord
                         return [ change (path id) (Some blob) nextRecord
-                                 change (eventPath id snapshot.Header.NextSequence) None event ] @ wakeups
+                                 change (eventPath id snapshot.Header.NextSequence) None event ]
+                               @ wakeups @ indexes
                     })
 
     let resolve binding operationId actor challengeId conditionId version evidence blockedReason =
@@ -597,8 +755,9 @@ module ChallengeWorkflow =
                           BeforeOwnerAgentId = condition.OwnerAgentId; AfterOwnerAgentId = newOwner
                           Evidence = ""; Reason = ""; Sequence = snapshot.Header.NextSequence
                           OccurredAtUtc = timestamp }
+                    let! indexes = indexWrites binding snapshot (Some challenge) updated
                     return [ change (path id) (Some blob) updated
-                             change (eventPath id snapshot.Header.NextSequence) None event ]
+                             change (eventPath id snapshot.Header.NextSequence) None event ] @ indexes
                 })
 
 
@@ -688,8 +847,9 @@ module ChallengeWorkflow =
                               Reason = ""
                               Sequence = snapshot.Header.NextSequence
                               OccurredAtUtc = timestamp }
+                        let! indexes = indexWrites binding snapshot (Some challenge) revised
                         return [ change (path id) (Some blob) revised
-                                 change (eventPath id snapshot.Header.NextSequence) None audit ]
+                                 change (eventPath id snapshot.Header.NextSequence) None audit ] @ indexes
                     })
             result |> Result.map (fun receipt ->
                 { ChallengeId = id.ToString("N"); ConditionIds = ids; Receipt = receipt })
@@ -702,98 +862,150 @@ module ChallengeWorkflow =
         || (subscribed && challenge.Conditions |> List.exists (fun c ->
             c.Status = "Pending" && String.IsNullOrWhiteSpace c.OwnerAgentId))
 
-    let private listAt binding snapshot = result {
+    // Explicit historical listing may traverse older challenge paths, but
+    // reads only enough CURRENT snapshot records for the requested page.
+    // Unlike ordinary inboxes, this is a caller-requested paginated search.
+    // Each batch is one ls-tree and one cat-file --batch, not two Git
+    // subprocesses per historical challenge. There is no hard total cap.
+    let private listVisiblePageAt binding snapshot actor subscribed limit cursor = result {
         let! paths = LedgerStore.listAt binding snapshot "challenges"
-        let paths =
-            paths |> List.filter (fun p -> p.EndsWith("/challenge.json", StringComparison.Ordinal))
-        if paths.Length > 4096 then
-            return! Error(InvalidBinding "Too many challenges to scan; use a narrower project.")
-        let mutable records = []
+        let mutable names: string list = []
         for item in paths do
-            let components = item.Split('/')
-            if components.Length <> 3 then
-                return! Error(LedgerIntegrityError "Invalid challenge ledger path.")
-            match guidN components[1] with
-            | None -> return! Error(LedgerIntegrityError "Invalid challenge identity in ledger path.")
-            | Some id ->
-                let! record, _ = readChallenge binding snapshot id
-                records <- record :: records
-        return records
+            if item.EndsWith("/challenge.json", StringComparison.Ordinal) then
+                let components = item.Split('/')
+                if components.Length <> 3 || (guidN components[1]).IsNone then
+                    return! Error(LedgerIntegrityError "Invalid challenge identity in ledger tree.")
+                if String.IsNullOrWhiteSpace cursor
+                   || String.CompareOrdinal(components[1], cursor) > 0 then
+                    names <- components[1] :: names
+        let mutable selected: AgentChallenge list = []
+        for batch in names |> List.sort |> List.chunkBySize 128 do
+            if selected.Length <= limit then
+                let! bodies = LedgerStore.readChallengeEntitiesAt binding snapshot batch
+                for id in batch do
+                    let file = "challenges/" + id + "/challenge.json"
+                    match Map.tryFind file bodies with
+                    | None -> return! Error(LedgerIntegrityError ("Missing challenge in historical page: " + id))
+                    | Some body ->
+                        try
+                            use doc = JsonDocument.Parse body
+                            let challenge = JsonSerializer.Deserialize<AgentChallenge>(body, options)
+                            if doc.RootElement.GetProperty("schemaVersion").GetInt32() <> 2
+                               || isNull (box challenge) || challenge.ChallengeId <> id
+                               || not (check challenge) then
+                                return! Error(LedgerIntegrityError ("Invalid paged challenge entity: " + id))
+                            if visible actor subscribed challenge then
+                                selected <- challenge :: selected
+                        with ex ->
+                            return! Error(LedgerIntegrityError ("Malformed paged challenge: " + ex.Message))
+        return selected |> List.rev |> List.truncate (limit + 1)
     }
 
-    /// Enrich the ordinary self-inbox using the SAME verified snapshot.
-    /// This is a bounded read projection, never a notification or activation.
+    /// Enrich the ordinary self-inbox from materialized ACTIVE challenge IDs,
+    /// bounded issuer outcomes, and explicitly linked dependencies. Every read
+    /// uses the same verified snapshot; historical challenge records are never
+    /// enumerated. No notification or activation is caused by this projection.
     let enrichInboxAt binding snapshot actor (inbox: AgentInbox) = result {
         if inbox.SnapshotCommit <> snapshot.Commit || inbox.Agent.AgentId <> actor then
             return! Error(LedgerIntegrityError "Challenge inbox must use the same self-agent snapshot.")
         let! enabled = subscribedAt binding snapshot actor
-        let! challenges = listAt binding snapshot
-        let item (challenge: AgentChallenge) (condition: ChallengeCondition) : InboxChallengeItem =
-            { ChallengeId = challenge.ChallengeId
-              ConditionId = condition.ConditionId
-              IssuerAgentId = challenge.IssuerAgentId
-              OwnerAgentId = condition.OwnerAgentId
-              SuggestedAgentId = condition.SuggestedAgentId
-              Title = compact 120 challenge.Title
-              DescriptionPreview = compact 144 condition.Description
-              ChallengeStatus = challenge.Status
-              ConditionStatus = condition.Status
-              Version = challenge.Version
-              EvidencePreview = compact 120 condition.Evidence
-              ReasonPreview = compact 120 condition.Reason
-              // Cancellation is a challenge-level transition. Its conditions
-              // retain their historical timestamps, but the issuer outcome
-              // must sort by the cancellation time.
-              UpdatedAtUtc =
-                  if challenge.Status = "Cancelled" then challenge.UpdatedAtUtc
-                  else condition.UpdatedAtUtc }
-        let allItems =
-            [ for challenge in challenges do
-                for condition in challenge.Conditions do
-                    yield challenge, condition, item challenge condition ]
+        let actorKey = encodedActor actor
+        let ownedPrefix = "records/challenge-index-owned/" + actorKey + "/"
+        let triagePrefix = "records/challenge-index-triage/"
+        let! indexBodies = LedgerStore.readChallengeInboxIndexRecordsAt binding snapshot actorKey enabled
+
+        let mutable assignedIds: Set<string> = Set.empty
+        let mutable triageIds: Set<string> = Set.empty
+        for KeyValue(file, body) in indexBodies do
+            if file.StartsWith(ownedPrefix, StringComparison.Ordinal)
+               || file.StartsWith(triagePrefix, StringComparison.Ordinal) then
+                try
+                    use doc = JsonDocument.Parse body
+                    let shard = JsonSerializer.Deserialize<ChallengeActiveShard>(body, options)
+                    let bucket = file.Substring(file.Length - 7, 2)
+                    if doc.RootElement.GetProperty("schemaVersion").GetInt32() <> 2
+                       || isNull (box shard) || isNull (box shard.ChallengeIds)
+                       || shard.ChallengeIds |> List.exists (fun id ->
+                           (guidN id).IsNone || not (id.StartsWith(bucket, StringComparison.Ordinal))) then
+                        return! Error(LedgerIntegrityError ("Invalid active challenge inbox shard: " + file))
+                    let ids = shard.ChallengeIds |> Set.ofList
+                    if file.StartsWith(ownedPrefix, StringComparison.Ordinal) then
+                        assignedIds <- Set.union assignedIds ids
+                    else
+                        triageIds <- Set.union triageIds ids
+                with ex ->
+                    return! Error(LedgerIntegrityError ("Malformed active challenge inbox shard: " + ex.Message))
+
+        let! recentIndex =
+            match Map.tryFind (recentPath actor) indexBodies with
+            | None ->
+                Ok { IssuerAgentId = actor; TotalCurrentOutcomes = 0; Items = [] }
+            | Some body ->
+                try
+                    use doc = JsonDocument.Parse body
+                    let value = JsonSerializer.Deserialize<ChallengeRecentIndex>(body, options)
+                    if doc.RootElement.GetProperty("schemaVersion").GetInt32() <> 2
+                       || isNull (box value) || value.IssuerAgentId <> actor
+                       || isNull (box value.Items) || value.Items.Length > 36
+                       || value.TotalCurrentOutcomes < value.Items.Length then
+                        Error(LedgerIntegrityError "Invalid issuer challenge inbox recent index.")
+                    else Ok value
+                with ex ->
+                    Error(LedgerIntegrityError ("Malformed issuer challenge inbox recent index: " + ex.Message))
+
+        let linked =
+            inbox.BlockedChallengeWaits
+            |> List.collect _.ChallengeIds
+            |> Set.ofList
+        let requested =
+            [ assignedIds; triageIds; linked ]
+            |> List.fold Set.union Set.empty
+            |> Set.toList
+        let! bodies = LedgerStore.readChallengeEntitiesAt binding snapshot requested
+        let mutable current: Map<string, AgentChallenge> = Map.empty
+        for id in requested do
+            let file = "challenges/" + id + "/challenge.json"
+            match Map.tryFind file bodies with
+            | None -> return! Error(LedgerIntegrityError ("Active challenge index target is missing: " + id))
+            | Some body ->
+                try
+                    use doc = JsonDocument.Parse body
+                    let challenge = JsonSerializer.Deserialize<AgentChallenge>(body, options)
+                    if doc.RootElement.GetProperty("schemaVersion").GetInt32() <> 2
+                       || isNull (box challenge) || challenge.ChallengeId <> id
+                       || not (check challenge) then
+                        return! Error(LedgerIntegrityError ("Invalid challenge indexed by inbox: " + id))
+                    current <- Map.add id challenge current
+                with ex ->
+                    return! Error(LedgerIntegrityError ("Malformed indexed challenge: " + ex.Message))
+
         let newest items =
-            items |> List.sortByDescending (fun (entry: InboxChallengeItem) ->
-                entry.UpdatedAtUtc, entry.ChallengeId, entry.ConditionId)
-        // Condition status alone is not enough: cancellation is terminal
-        // without rewriting the individual condition's immutable outcome.
-        let actionable (challenge: AgentChallenge) =
-            challenge.Status = "Pending" || challenge.Status = "Blocked"
+            items |> List.sortByDescending (fun (item: InboxChallengeItem) ->
+                item.UpdatedAtUtc, item.ChallengeId, item.ConditionId)
         let assigned =
-            allItems
-            |> List.choose (fun (challenge, c, item) ->
-                if actionable challenge && c.OwnerAgentId = actor && c.Status = "Pending"
-                then Some item else None)
+            [ for id in assignedIds do
+                let challenge = current[id]
+                if challenge.Status = "Pending" || challenge.Status = "Blocked" then
+                    for c in challenge.Conditions do
+                        if c.Status = "Pending" && c.OwnerAgentId = actor then
+                            yield inboxItem challenge c ]
             |> newest
         let triage =
             if enabled then
-                allItems
-                |> List.choose (fun (challenge, c, item) ->
-                    if actionable challenge && c.Status = "Pending"
-                       && String.IsNullOrWhiteSpace c.OwnerAgentId
-                    then Some item else None)
+                [ for id in triageIds do
+                    let challenge = current[id]
+                    if challenge.Status = "Pending" || challenge.Status = "Blocked" then
+                        for c in challenge.Conditions do
+                            if c.Status = "Pending" && String.IsNullOrWhiteSpace c.OwnerAgentId then
+                                yield inboxItem challenge c ]
                 |> newest
             else []
-        let recent =
-            allItems
-            |> List.choose (fun (challenge, c, item) ->
-                // A cancelled challenge may have only Pending conditions.
-                // Show one terminal issuer outcome without falsifying their
-                // per-condition states or flooding the recent inbox.
-                if challenge.IssuerAgentId = actor
-                   && (if challenge.Status = "Cancelled" then
-                           challenge.Conditions.Head.ConditionId = c.ConditionId
-                       else c.Status <> "Pending")
-                then Some item else None)
-            |> newest
-        let linked =
-            inbox.BlockedChallengeWaits |> List.collect _.ChallengeIds |> Set.ofList
         let dependencies =
-            allItems
-            |> List.choose (fun (challenge, _, item) ->
-                if Set.contains challenge.ChallengeId linked
-                   && challenge.Conditions.Head.ConditionId = item.ConditionId
-                then Some item else None)
+            [ for id in linked do
+                let challenge = current[id]
+                yield inboxItem challenge challenge.Conditions.Head ]
             |> newest
+        let recent = recentIndex.Items |> newest
         let cap items = items |> List.truncate 12
         return { inbox with
                     ChallengeSubscribed = enabled
@@ -803,7 +1015,7 @@ module ChallengeWorkflow =
                     ChallengeDependencies = cap dependencies
                     ChallengeAssignedOmitted = max 0 (assigned.Length - 12)
                     ChallengeTriageOmitted = max 0 (triage.Length - 12)
-                    ChallengeRecentOmitted = max 0 (recent.Length - 12)
+                    ChallengeRecentOmitted = max 0 (recentIndex.TotalCurrentOutcomes - min 12 recent.Length)
                     ChallengeDependenciesOmitted = max 0 (dependencies.Length - 12) }
     }
 
@@ -824,15 +1036,7 @@ module ChallengeWorkflow =
                 return! Error(StaleEntityVersion "Challenge list snapshot moved; start pagination again.")
             do! registered binding snapshot actor
             let! subscribed = subscribedAt binding snapshot actor
-            let! all = listAt binding snapshot
-            let sorted =
-                all
-                |> List.filter (visible actor subscribed)
-                |> List.filter (fun challenge ->
-                    String.IsNullOrWhiteSpace cursor
-                    || String.CompareOrdinal(challenge.ChallengeId, cursor) > 0)
-                |> List.sortBy _.ChallengeId
-                |> List.truncate (limit + 1)
+            let! sorted = listVisiblePageAt binding snapshot actor subscribed limit cursor
             let page = sorted |> List.truncate limit
             let summaries =
                 page |> List.map (fun c ->

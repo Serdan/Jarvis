@@ -1010,3 +1010,97 @@ type ChallengeTests() =
             Assert.That(full.History.Length, Is.EqualTo(3))
             Assert.That(notices b, Is.Empty)
         )
+
+
+    [<Test>]
+    member _.HistoricalChallengeVolumeDoesNotDisableTargetedInboxOrAmplifyGitProcesses() =
+        withFixture (fun a b ->
+            // Seed well beyond the former hard failure threshold in a single
+            // historical ledger commit. Every entity is a syntactically valid
+            // terminal challenge; the inbox must never enumerate this history.
+            let initial = LedgerStore.fetch a |> ok
+            let history = Path.Combine(Path.GetDirectoryName(a.RepositoryPath), "historical-challenges")
+            git a.RepositoryPath [ "worktree"; "add"; "--detach"; history; initial.Commit ] |> ignore
+            try
+                git history [ "config"; "user.name"; "Fixture" ] |> ignore
+                git history [ "config"; "user.email"; "fixture@example.test" ] |> ignore
+                let stamp = "2026-11-13T00:00:00.0000000Z"
+                for number in 1 .. 4100 do
+                    let challengeId = Guid.NewGuid().ToString("N")
+                    let conditionId = Guid.NewGuid().ToString("N")
+                    let status = if number % 2 = 0 then "Cancelled" else "Satisfied"
+                    let body =
+                        System.Text.Json.JsonSerializer.Serialize(
+                            {| schemaVersion = 2; challengeId = challengeId
+                               issuerAgentId = "Agent 3"; title = "Archived challenge"
+                               taskId = ""; version = 2; completionPolicy = "All"
+                               status = status
+                               conditions =
+                                   [ {| conditionId = conditionId; ownerAgentId = "Lead"
+                                        suggestedAgentId = ""; description = "Archived work"
+                                        status = "Satisfied"; evidence = "archived"
+                                        reason = ""; updatedAtUtc = stamp |} ]
+                               createdAtUtc = stamp; updatedAtUtc = stamp |})
+                    let folder = Path.Combine(history, "challenges", challengeId)
+                    Directory.CreateDirectory folder |> ignore
+                    File.WriteAllText(Path.Combine(folder, "challenge.json"), body)
+                git history [ "add"; "challenges" ] |> ignore
+                git history [ "commit"; "-m"; "Fixture archived challenge history" ] |> ignore
+                git history [ "push"; "origin"; "HEAD:refs/heads/jarvis-orchestration" ] |> ignore
+            finally
+                git a.RepositoryPath [ "worktree"; "remove"; "--force"; history ] |> ignore
+
+            let created =
+                ChallengeWorkflow.create a (Guid.NewGuid()) "Agent 3" "Current actionable" ""
+                    [ { OwnerAgentId = "Lead"; SuggestedAgentId = ""; Description = "Owned live work" }
+                      { OwnerAgentId = ""; SuggestedAgentId = "Agent 8"; Description = "Unassigned live work" } ]
+                |> ok
+            ChallengeWorkflow.setSubscription b (Guid.NewGuid()) "Lead" true |> ok |> ignore
+            let snapshot = LedgerStore.fetch a |> ok
+            let paths = LedgerStore.listAt a snapshot "challenges" |> ok
+            Assert.That(paths |> List.filter (fun p -> p.EndsWith("/challenge.json")) |> List.length,
+                        Is.GreaterThan(4096))
+
+            // Explicit historical listing is paginated and uses bounded Git
+            // batches too; the old 4096 hard cap cannot strand audit searches.
+            let firstPage, pageMetrics =
+                LedgerStore.measureGitReads (fun () ->
+                    ChallengeWorkflow.listPage b "Agent 3" 25 "" "" |> ok)
+            Assert.That(firstPage.Challenges.Length, Is.EqualTo(25))
+            Assert.That(String.IsNullOrWhiteSpace firstPage.NextCursor, Is.False)
+            Assert.That(pageMetrics.ProcessStarts, Is.LessThan(30))
+            let nextPage =
+                ChallengeWorkflow.listPage a "Agent 3" 25 firstPage.NextCursor firstPage.SnapshotCommit |> ok
+            Assert.That(nextPage.Challenges.Length, Is.EqualTo(25))
+
+            let readLead snap =
+                ReviewWorkflow.getAgentInboxAt b snap "Lead" |> ok
+                |> ChallengeWorkflow.enrichInboxAt b snap "Lead" |> ok
+            let inbox, metrics =
+                LedgerStore.measureGitReads (fun () -> readLead snapshot)
+            Assert.That(inbox.ChallengeAssigned |> List.map _.ChallengeId,
+                        Is.EquivalentTo([ created.ChallengeId ]))
+            Assert.That(inbox.ChallengeTriage |> List.map _.ChallengeId,
+                        Is.EquivalentTo([ created.ChallengeId ]))
+            Assert.That(metrics.ProcessStarts, Is.LessThan(40),
+                        "Ordinary inbox must not spawn Git processes per archived challenge.")
+            Assert.That(metrics.IndividualBlobReads, Is.LessThan(10),
+                        "Canonical active challenges should be loaded by batched blob reads.")
+            Assert.That(inbox.ChallengeAssignedOmitted, Is.Zero)
+            Assert.That(inbox.ChallengeTriageOmitted, Is.Zero)
+
+            ChallengeWorkflow.cancel b (Guid.NewGuid()) "Agent 3" created.ChallengeId
+                1 "Work superseded" |> ok |> ignore
+            let cancelledSnapshot = LedgerStore.fetch a |> ok
+            let after, afterMetrics =
+                LedgerStore.measureGitReads (fun () -> readLead cancelledSnapshot)
+            Assert.That(after.ChallengeAssigned, Is.Empty)
+            Assert.That(after.ChallengeTriage, Is.Empty)
+            Assert.That(afterMetrics.ProcessStarts, Is.LessThan(40))
+            let issuer =
+                ReviewWorkflow.getAgentInboxAt a cancelledSnapshot "Agent 3" |> ok
+                |> ChallengeWorkflow.enrichInboxAt a cancelledSnapshot "Agent 3" |> ok
+            Assert.That(issuer.ChallengeRecent |> List.exists (fun item ->
+                item.ChallengeId = created.ChallengeId && item.ChallengeStatus = "Cancelled"), Is.True)
+            Assert.That(notices a, Is.Empty)
+        )

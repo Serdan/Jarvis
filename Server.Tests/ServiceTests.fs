@@ -310,7 +310,8 @@ let ``client service rejects commands not negotiated by the registered client`` 
         |> ignore
 
         let client = ClientService(Unchecked.defaultof<_>, users, ClientResponseTracker(),
-                                   Microsoft.AspNetCore.Http.HttpContextAccessor())
+                                   Microsoft.AspNetCore.Http.HttpContextAccessor(),
+                                   Unchecked.defaultof<FeedbackStore>)
         let command =
             WriteFileCommand
                 { ProjectName = "Jarvis"
@@ -479,7 +480,7 @@ let ``command catalog matches AgentCommand union and MCP tools`` () =
               "GetRole"; "ListRoles"; "GetAgentInstructionConfig"; "ResolveAgentInstructions"
               "CreateRole"; "UpdateRole"; "AttachRole"; "DetachRole"; "SetAgentInstructions"
               "SetAttemptSource"; "YieldAgent"; "CompleteAgentWork"
-              "SetAgentState"; "ReissueQueuedAttempt"; "RecoverAgentAssignment"; "AcknowledgeReviewFeedback"; "DeferAttempt"; "ResumeAttempt"; "AbandonAttempt"; "CancelTask"; "TransferOwner"; "CloseTask"; "ReopenTask"; "ImportTaskSpec"; "ExportTaskSpec"
+              "SetAgentState"; "CorrectAgentWorkingState"; "ReissueQueuedAttempt"; "RecoverAgentAssignment"; "AcknowledgeReviewFeedback"; "DeferAttempt"; "ResumeAttempt"; "AbandonAttempt"; "CancelTask"; "TransferOwner"; "CloseTask"; "ReopenTask"; "ImportTaskSpec"; "ExportTaskSpec"
               "GetTask"; "TaskOverview"; "ReviewDetails"; "ReviewerInbox"; "ListReviewDocuments"; "ReadReviewDocument"
               "SubmitReview"; "ClaimReview"; "DecideReview"
               "ReleaseReview"; "WithdrawReview"; "PutReviewDocument"
@@ -571,7 +572,9 @@ let ``client-backed MCP tools expose an optional per-command deviceId`` () =
             |> Array.exists (fun parameter -> parameter.ParameterType = typeof<ClientService>))
     // Nine role/instruction tools are public aliases of the existing ledger wire
     // protocol; they have independent methods and the same device routing rule.
-    clientMethods.Length |> shouldEqual (AgentProtocol.commandDefinitions.Length - 1 + 60)
+    // Administrative correction is an additional typed MCP operation,
+    // not another client protocol command definition.
+    clientMethods.Length |> shouldEqual (AgentProtocol.commandDefinitions.Length - 1 + 61)
     for methodInfo in clientMethods do
         let deviceParam = methodInfo.GetParameters() |> Array.tryFind (fun parameter -> parameter.Name = "deviceId")
         match deviceParam with
@@ -986,7 +989,7 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
               for name in [ "SubmitIntegration"; "CompleteIntegration"; "NotifyAgent"; "AcknowledgeNotification"; "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "ReissueAssignment"; "CheckpointAttempt"
                             "CreateRole"; "UpdateRole"; "AttachRole"; "DetachRole"; "SetAgentInstructions";
                             "SetAttemptSource"; "YieldAgent"; "CompleteAgentWork";
-                            "SetAgentState"; "ReissueQueuedAttempt"; "RecoverAgentAssignment"; "AcknowledgeReviewFeedback"; "DeferAttempt"; "ResumeAttempt"; "AbandonAttempt"; "CancelTask"; "TransferOwner"; "CloseTask"; "ReopenTask"; "ImportTaskSpec"; "ExportTaskSpec" ] -> name, taskWrite
+                            "SetAgentState"; "CorrectAgentWorkingState"; "ReissueQueuedAttempt"; "RecoverAgentAssignment"; "AcknowledgeReviewFeedback"; "DeferAttempt"; "ResumeAttempt"; "AbandonAttempt"; "CancelTask"; "TransferOwner"; "CloseTask"; "ReopenTask"; "ImportTaskSpec"; "ExportTaskSpec" ] -> name, taskWrite
               for name in [ "GetTask"; "TaskOverview"; "ReviewDetails"; "ReviewerInbox"; "ListReviewDocuments"; "ReadReviewDocument" ] ->
                   name, ledgerRead
               for name in [ "SubmitReview"; "ClaimReview"; "DecideReview"
@@ -1482,7 +1485,7 @@ let client_request_abort_cancels_outstanding_device_correlation_without_faulting
         context.RequestAborted <- abort.Token
         let http = Microsoft.AspNetCore.Http.HttpContextAccessor()
         http.HttpContext <- context
-        let service = ClientService(hub, users, tracker, http)
+        let service = ClientService(hub, users, tracker, http, Unchecked.defaultof<FeedbackStore>)
         let pending = service.SendCommandToUser(user, ListProjectsCommand)
         let! correlationId = dispatched.Task.WaitAsync(TimeSpan.FromSeconds(4.))
         abort.Cancel()
@@ -1621,7 +1624,8 @@ let private routedNotificationFixture (reply: string -> AgentCommand -> string -
                 member _.Groups = Unchecked.defaultof<_> }
         let http = Microsoft.AspNetCore.Http.HttpContextAccessor()
         http.HttpContext <- Microsoft.AspNetCore.Http.DefaultHttpContext()
-        let service = ClientService(hub, users, tracker, http)
+        // This routing fixture does not attribute a durable agent witness.
+        let service = ClientService(hub, users, tracker, http, Unchecked.defaultof<FeedbackStore>)
         let notification : TaskWriteCommand =
             { ProjectName = "Wayfold"; Action = "NotifyAgent"; OperationId = Guid.NewGuid().ToString("D")
               TaskId = "task-1"; AttemptId = ""; ActorId = actor; OwnerId = ""; Title = ""; Html = ""
@@ -1841,7 +1845,7 @@ let browser_dom_mcp_tools_route_only_when_all_required_oauth_scopes_are_present 
     context.RequestServices <- provider
     let accessor = Microsoft.AspNetCore.Http.HttpContextAccessor()
     accessor.HttpContext <- context
-    let client = ClientService(hub, users, tracker, accessor)
+    let client = ClientService(hub, users, tracker, accessor, Unchecked.defaultof<FeedbackStore>)
 
     let setScopes scopes =
         let identity =

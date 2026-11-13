@@ -141,7 +141,7 @@ module AgentStateInvalidationRouting =
                 project, (changes |> List.map _.AgentId |> List.distinct |> List.toArray))
 
 
-type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserService, tracker: ClientResponseTracker, http: IHttpContextAccessor) =
+type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserService, tracker: ClientResponseTracker, http: IHttpContextAccessor, witnessStore: FeedbackStore) =
     member this.SendMessageToAll(message) = ctx.Clients.All.ReceiveMessage(message)
 
     // Typed, per-agent invalidation only reaches authenticated registered
@@ -164,7 +164,7 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
             TimeSpan.FromSeconds(float executionSeconds) + permissionMargin
         | _ -> TimeSpan.FromMinutes(10L)
 
-    member this.SendCommandToUser(userId: string, command: AgentCommand, ?conversationId: string, ?deviceId: string, ?agentId: string) =
+    member this.SendCommandToUser(userId: string, command: AgentCommand, ?conversationId: string, ?deviceId: string, ?agentId: string, ?activityRequestId: string) =
         task {
             let requestAborted =
                 match http.HttpContext with
@@ -209,7 +209,16 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                 | Registered, Some connectionId ->
                     let commandName = AgentCommandInfo.protocolName command
 
-                    if not (session.SupportedCommands |> List.contains commandName) then
+                    if activityRequestId.IsSome && session.ProtocolVersion <> AgentProtocol.version then
+                        // Old 3.63 clients may have undiscoverable in-flight
+                        // work from before the durable witness epoch. Never
+                        // route a newly admitted command through one.
+                        return { Result = None
+                                 Error = Some(ExecutionFailed(
+                                     $"Device {session.DeviceName} has protocol {session.ProtocolVersion}; " +
+                                     $"attributed commands require witness-capable protocol {AgentProtocol.version}."))
+                                 Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+                    elif not (session.SupportedCommands |> List.contains commandName) then
                         return
                             { Result = None
                               Error =
@@ -220,42 +229,55 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                               Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
                     else
                         let correlationId, trackingTask = tracker.Register(userId, connectionId, session.Generation, this.ResponseTimeout command)
-                        let client = ctx.Clients.Client(connectionId)
-                        let commandJson = JsonSerializer.Serialize<AgentCommand>(command)
-
-                        try
-                            do! client.ReceiveCommand(correlationId, commandJson, defaultArg agentId "").WaitAsync(requestAborted)
-                            users.RecordDispatchSuccess(userId, connectionId)
+                        // A durable witness is bound to this exact authenticated
+                        // device generation before SignalR dispatch. The caller
+                        // cannot proceed when SQLite admission is unavailable.
+                        let route =
+                            match activityRequestId with
+                            | None -> Ok ()
+                            | Some _ when isNull (box witnessStore) ->
+                                Error "Durable agent activity store is unavailable."
+                            | Some id ->
+                                witnessStore.TryMarkAgentDispatched(
+                                    userId, id, session.DeviceId, connectionId,
+                                    session.Generation, correlationId)
+                        if route.IsError then
+                            tracker.Cancel(correlationId)
+                            return { Result = None
+                                     Error = Some(ExecutionFailed(
+                                         "Cannot durably record the selected client dispatch: " +
+                                         (match route with Error error -> error | Ok () -> "")))
+                                     Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+                        else
+                            let client = ctx.Clients.Client(connectionId)
+                            let commandJson = JsonSerializer.Serialize<AgentCommand>(command)
 
                             try
-                                return! trackingTask.WaitAsync(requestAborted)
-                            with :? TaskCanceledException when not requestAborted.IsCancellationRequested ->
-                                let reason =
-                                    $"Client response timeout for {session.DeviceName} generation {session.Generation}."
-                                users.RecordDispatchFailure(userId, connectionId, reason)
-                                return
-                                    { Result = None
-                                      Error =
-                                        Some(
-                                            ExecutionFailed
-                                                $"{reason} Protocol {session.ProtocolVersion}, client {session.ClientVersion}, last seen {session.LastSeenAt:O}."
-                                        )
-                                      Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
-                        with ex ->
-                            tracker.Cancel(correlationId)
-                            if requestAborted.IsCancellationRequested then
-                                // The caller is gone, not the device. Keep
-                                // the client session healthy and remove the
-                                // now-unobservable correlation promptly.
-                                return raise (OperationCanceledException(requestAborted))
-                            else
-                                let reason =
-                                    $"Dispatch failed for {session.DeviceName} generation {session.Generation}: {ex.Message}"
-                                users.RecordDispatchFailure(userId, connectionId, reason)
-                                return
-                                    { Result = None
-                                      Error = Some(ExecutionFailed reason)
-                                      Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+                                do! client.ReceiveCommand(correlationId, commandJson, defaultArg agentId "").WaitAsync(requestAborted)
+                                users.RecordDispatchSuccess(userId, connectionId)
+                                try
+                                    return! trackingTask.WaitAsync(requestAborted)
+                                with :? TaskCanceledException when not requestAborted.IsCancellationRequested ->
+                                    let reason =
+                                        $"Client response timeout for {session.DeviceName} generation {session.Generation}."
+                                    users.RecordDispatchFailure(userId, connectionId, reason)
+                                    return
+                                        { Result = None
+                                          Error = Some(ExecutionFailed
+                                              $"{reason} Protocol {session.ProtocolVersion}, client {session.ClientVersion}, last seen {session.LastSeenAt:O}.")
+                                          Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+                            with ex ->
+                                tracker.Cancel(correlationId)
+                                if requestAborted.IsCancellationRequested then
+                                    return raise (OperationCanceledException(requestAborted))
+                                else
+                                    let reason =
+                                        $"Dispatch failed for {session.DeviceName} generation {session.Generation}: {ex.Message}"
+                                    users.RecordDispatchFailure(userId, connectionId, reason)
+                                    return
+                                        { Result = None
+                                          Error = Some(ExecutionFailed reason)
+                                          Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
         }
 
 
@@ -263,12 +285,14 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
     // destination's verified ledger binding instead of assuming the sender's
     // selected device has the destination project.
     member this.SendCommandToProject(userId: string, projectName: string, command: AgentCommand,
-                                     ?conversationId: string, ?deviceId: string, ?agentId: string) =
+                                     ?conversationId: string, ?deviceId: string, ?agentId: string,
+                                     ?activityRequestId: string) =
         task {
             let selected = users.GetSelectedSession(userId, conversationId, deviceId)
             let sessions = users.ListDevices(userId) |> Array.toList
             let commandName = AgentCommandInfo.protocolName command
             let requireCurrentProtocol =
+                activityRequestId.IsSome ||
                 match command with
                 | TaskWriteCommand write when write.Action = "NotifyAgent"
                       && not (String.IsNullOrWhiteSpace write.SourceRef) -> true
@@ -317,7 +341,8 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                             // committed mutation against another client.
                             let! destination =
                                 this.SendCommandToUser(userId, command,
-                                    ?conversationId = conversationId, deviceId = session.DeviceId, ?agentId = agentId)
+                                    ?conversationId = conversationId, deviceId = session.DeviceId,
+                                    ?agentId = agentId, ?activityRequestId = activityRequestId)
                             // Bind the pending handle to this verified device.
                             // A later poll MUST NOT fall back to the user's current default device.
                             return

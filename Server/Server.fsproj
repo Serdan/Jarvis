@@ -14,6 +14,7 @@
         <Compile Include="Auth.fs"/>
         <Compile Include="HttpRateLimitProtection.fs"/>
         <Compile Include="Services\ClientResponseTracker.fs"/>
+        <Compile Include="Services\AgentExecutionGate.fs"/>
         <Compile Include="Services\UserService.fs"/>
         <Compile Include="Services\ExportStore.fs"/>
         <Compile Include="Services\FeedbackStore.fs"/>

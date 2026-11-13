@@ -276,7 +276,7 @@ module McpToolHelpers =
     let private ledgerTaskWriteMethods =
         [ "SubmitIntegration"; "CompleteIntegration"; "NotifyAgent"; "AcknowledgeNotification"; "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "ReissueAssignment"; "CheckpointAttempt"
           "SetAttemptSource"; "YieldAgent"; "CompleteAgentWork"
-          "SetAgentState"; "ReissueQueuedAttempt"; "RecoverAgentAssignment"; "AcknowledgeReviewFeedback"
+          "SetAgentState"; "CorrectAgentWorkingState"; "ReissueQueuedAttempt"; "RecoverAgentAssignment"; "AcknowledgeReviewFeedback"
           "DeferAttempt"; "ResumeAttempt"; "AbandonAttempt"; "CancelTask"
           "CreateRole"; "UpdateRole"; "AttachRole"; "DetachRole"; "SetAgentInstructions"
           "TransferOwner"; "CloseTask"; "ReopenTask"; "ImportTaskSpec"; "ExportTaskSpec" ]
@@ -720,7 +720,77 @@ module McpToolHelpers =
                                    (AgentCommandInfo.projectName command = None ||
                                     AgentCommandInfo.projectName command = Some "@global" ||
                                     Auth.hasScope Auth.WorkspaceRead context.User) ->
-                    let tracking = beginOperation context userId command
+                    // The authenticated MCP actor, not a notification's
+                    // destination/observed target, owns an execution witness.
+                    // Registration is a target-only operation, not agent
+                    // activity by the freshly registered label.
+                    let sourceAgent =
+                        match command with
+                        | TaskWriteCommand write when write.Action = "RegisterAgent" -> None
+                        | TaskWriteCommand write when
+                            not (String.IsNullOrWhiteSpace write.ActorId)
+                            && write.ActorId <> TaskCommands.legacyAdministrativePlaceholder ->
+                            Some write.ActorId
+                        | TaskReadCommand read when read.Action = "AgentInbox" ->
+                            Some read.AgentId
+                        | ObserveAgentCommand observer -> Some observer.ObserverAgentId
+                        | _ -> RequestDeviceRouting.agentId()
+                    let admission =
+                        match sourceAgent with
+                        | None -> Ok(beginOperation context userId command, None)
+                        | Some agent when String.IsNullOrWhiteSpace agent ->
+                            Error "Initiating agent label is empty; no client operation was dispatched."
+                        | Some agent ->
+                            let store = context.RequestServices.GetService<FeedbackStore>()
+                            if isNull (box store) then
+                                Error "Durable agent execution storage is unavailable; command not dispatched."
+                            else
+                                let users = context.RequestServices.GetService<UserService>()
+                                let clientVersion, protocolVersion =
+                                    if isNull (box users) then None, None
+                                    else
+                                        match users.GetSelectedSession(
+                                            userId, RequestDeviceRouting.session(),
+                                            RequestDeviceRouting.deviceOverride()) with
+                                        | ValueSome session -> Some session.ClientVersion, Some session.ProtocolVersion
+                                        | ValueNone -> None, None
+                                let witnessProject =
+                                    match command with
+                                    | TaskWriteCommand notification when
+                                          notification.Action = "NotifyAgent"
+                                          && not (String.IsNullOrWhiteSpace notification.SourceRef)
+                                          && notification.SourceRef <> notification.ProjectName ->
+                                        Some notification.SourceRef
+                                    | _ -> AgentCommandInfo.projectName command
+                                match store.TryBeginAgentOperation(
+                                          userId, agent, toolName command,
+                                          witnessProject,
+                                          serverVersion, clientVersion, protocolVersion) with
+                                | Ok started -> Ok(Some(store, started), Some started.Id)
+                                | Error failure -> Error failure
+                    let tracking, activityRequestId, admissionFailure =
+                        match admission with
+                        | Ok (record, request) -> record, request, None
+                        | Error failure -> None, None, Some failure
+                    // The same durable SQLite writer-transaction domain gates
+                    // initiating commands and administrative correction. The
+                    // permit targets the Working owner, NOT the operator.
+                    // Take it before any client-side Git correction can run.
+                    let correctionPermit, correctionFailure =
+                        match command, admissionFailure with
+                        | TaskWriteCommand correction, None
+                            when correction.Action = "CorrectAgentWorkingState" ->
+                            let store = context.RequestServices.GetService<FeedbackStore>()
+                            if isNull (box store) then
+                                None, Some "Durable correction barrier is unavailable."
+                            else
+                                match store.TryAcquireAgentCorrection(
+                                        userId, correction.OwnerId, correction.OperationId) with
+                                | Ok permitId -> Some(correction.OwnerId, permitId), None
+                                | Error failure -> None, Some failure
+                        | _ -> None, None
+                    let dispatchFailure =
+                        admissionFailure |> Option.orElse correctionFailure
                     let stopwatch = Stopwatch.StartNew()
                     // A tool can commit a Ready->Working transition before
                     // failing its requested operation. Publish typed mutation
@@ -763,7 +833,7 @@ module McpToolHelpers =
                                     // always polls the exact verified source device.
                                     return!
                                         ProjectNotificationRouting.resolveHealth project
-                                            (defaultArg (RequestDeviceRouting.agentId()) "")
+                                            (defaultArg sourceAgent "")
                                             deadline source
                                             (fun query ->
                                                 task {
@@ -773,18 +843,29 @@ module McpToolHelpers =
                                                             userId, GetJobResultCommand query,
                                                             ?conversationId = RequestDeviceRouting.session(),
                                                             deviceId = originalDevice,
-                                                            ?agentId = RequestDeviceRouting.agentId())
+                                                            ?agentId = sourceAgent)
                                                 })
                         }
-                    let! response =
-                        match command with
-                        | TaskWriteCommand notification when notification.Action = "NotifyAgent"
-                            && not (String.IsNullOrWhiteSpace notification.SourceRef)
-                            && notification.SourceRef <> notification.ProjectName ->
+                    let! response, continuationId =
+                        match dispatchFailure, command with
+                        | Some failure, _ ->
+                            Task.FromResult(
+                                { Result = None
+                                  Error = Some(ExecutionFailed(
+                                      $"Durable MCP activity admission refused: {failure}"))
+                                  Instructions = []
+                                  AgentStateChanges = []
+                                  InboxActivation = None
+                                  PendingJob = None }, None)
+                        | None, TaskWriteCommand notification
+                            when notification.Action = "NotifyAgent"
+                                 && not (String.IsNullOrWhiteSpace notification.SourceRef)
+                                 && notification.SourceRef <> notification.ProjectName ->
                             task {
-                                // Validate sender in its source project's verified ledger.
-                                // The destination project alone owns the notification.
-                                let! sender = client.SendCommandToProject(
+                                // The original sender read owns the parent
+                                // witness. Health probes are routing checks,
+                                // not evidence that the sender completed.
+                                let! initialSender = client.SendCommandToProject(
                                     userId, notification.SourceRef,
                                     TaskReadCommand
                                         { ProjectName = notification.SourceRef
@@ -794,36 +875,103 @@ module McpToolHelpers =
                                           AfterOid = null; RelativePath = null },
                                     ?conversationId = RequestDeviceRouting.session(),
                                     ?deviceId = RequestDeviceRouting.deviceOverride(),
-                                                     ?agentId = RequestDeviceRouting.agentId())
+                                    ?agentId = sourceAgent,
+                                    ?activityRequestId = activityRequestId)
                                 let! sender =
-                                    resolveSenderValidation notification.SourceRef sender
+                                    resolveSenderValidation notification.SourceRef initialSender
                                         (DateTimeOffset.UtcNow.AddMinutes(5.))
                                 do! publishChanges sender
-                                match sender.Result, sender.Error with
-                                | Some _, None when sender.PendingJob.IsNone ->
-                                    // Carry source activation evidence into
-                                    // the destination client's ORIGINAL task.
-                                    // Its normal pending handle and subsequent
-                                    // get_job_result now recover both projects'
-                                    // terminal effects, even if the first reply
-                                    // is lost. No server-owned task store.
-                                    let forwarded =
-                                        CrossProjectNotificationCommand
-                                            { Notification = notification
-                                              SourceStateChanges = sender.AgentStateChanges
-                                              SourceInboxActivation = sender.InboxActivation }
-                                    return! client.SendCommandToProject(
-                                        userId, notification.ProjectName, forwarded,
-                                        ?conversationId = RequestDeviceRouting.session(),
-                                        ?deviceId = RequestDeviceRouting.deviceOverride(),
-                                                     ?agentId = RequestDeviceRouting.agentId())
-                                | _ -> return sender
+                                match sender.Result, sender.Error, sender.PendingJob with
+                                | Some _, None, None ->
+                                    let continuation =
+                                        match activityRequestId with
+                                        | None -> Ok None
+                                        | Some parentId ->
+                                            let store = context.RequestServices.GetService<FeedbackStore>()
+                                            if isNull (box store) then
+                                                Error "Durable execution continuation store is unavailable."
+                                            else
+                                                store.TryBeginAgentContinuation(
+                                                    userId, parentId, notification.ProjectName)
+                                                |> Result.map Some
+                                    match continuation with
+                                    | Error failure ->
+                                        return
+                                            { sender with
+                                                Result = None
+                                                Error = Some(ExecutionFailed(
+                                                    $"Cross-project continuation refused: {failure}"))
+                                                PendingJob = None }, None
+                                    | Ok childId ->
+                                        // Mainline's one logical destination
+                                        // job preserves the sender's activation
+                                        // evidence across promoted completions.
+                                        let forwarded =
+                                            CrossProjectNotificationCommand
+                                                { Notification = notification
+                                                  SourceStateChanges = sender.AgentStateChanges
+                                                  SourceInboxActivation = sender.InboxActivation }
+                                        let! destination = client.SendCommandToProject(
+                                            userId, notification.ProjectName, forwarded,
+                                            ?conversationId = RequestDeviceRouting.session(),
+                                            ?deviceId = RequestDeviceRouting.deviceOverride(),
+                                            ?agentId = sourceAgent,
+                                            ?activityRequestId = childId)
+                                        return destination, childId
+                                | _ -> return sender, None
                             }
-                        | _ ->
-                            client.SendCommandToUser(userId, command,
-                                                     ?conversationId = RequestDeviceRouting.session(),
-                                                     ?deviceId = RequestDeviceRouting.deviceOverride(),
-                                                     ?agentId = RequestDeviceRouting.agentId())
+                        | None, _ ->
+                            task {
+                                let! forwarded = client.SendCommandToUser(
+                                    userId, command,
+                                    ?conversationId = RequestDeviceRouting.session(),
+                                    ?deviceId = RequestDeviceRouting.deviceOverride(),
+                                    ?agentId = sourceAgent,
+                                    ?activityRequestId = activityRequestId)
+                                return forwarded, None
+                            }
+                    // A failed stage can clear only its own *Admitted*
+                    // witness. A bound SignalR route is Dispatched; even a
+                    // timeout or lost response must remain unresolved.
+                    // Infrastructure health probes do not carry an agent ID.
+                    match response.Error with
+                    | Some _ ->
+                        let store = context.RequestServices.GetService<FeedbackStore>()
+                        if not (isNull (box store)) then
+                            for requestId in [ activityRequestId; continuationId ] |> List.choose id do
+                                store.TryMarkAgentNotDispatched(userId, requestId) |> ignore
+                    | None -> ()
+                    // A correction permit is a crash-stable exclusion, not a
+                    // timeout lease. Release it only on proven non-dispatch or
+                    // on a durable authenticated client-terminal witness AND
+                    // a confirmed successful canonical Git command result.
+                    // Failed/uncertain Git results require receipt reconciliation
+                    // and deliberately keep the exclusive permit.
+                    match correctionPermit, activityRequestId with
+                    | Some (targetAgent, permitId), Some requestId ->
+                        let store = context.RequestServices.GetService<FeedbackStore>()
+                        if not (isNull (box store)) then
+                            let resolved =
+                                match store.GetAgentExecutionResolution(userId, requestId) with
+                                | Ok NeverDispatched -> true
+                                | Ok AuthenticatedClientFinished
+                                    when response.Result.IsSome && response.Error.IsNone
+                                         && response.PendingJob.IsNone -> true
+                                | _ -> false
+                            if resolved then
+                                match store.TryReleaseAgentCorrection(
+                                        userId, targetAgent, permitId, true) with
+                                | Ok () -> ()
+                                | Error failure ->
+                                    let loggerFactory =
+                                        context.RequestServices.GetService<ILoggerFactory>()
+                                    if not (isNull loggerFactory) then
+                                        loggerFactory.CreateLogger("Jarvis.AgentCorrectionGate")
+                                            .LogWarning(
+                                                "Correction {OperationId} succeeded or was not dispatched, " +
+                                                "but exclusive permit {PermitId} could not be released: {Error}",
+                                                requestId, permitId, failure)
+                    | _ -> ()
                     stopwatch.Stop()
                     finishOperation tracking response stopwatch.ElapsedMilliseconds
 
@@ -1665,6 +1813,16 @@ type JarvisMcpTools =
     static member SetAgentState(projectName: string, agentId: string, targetAgentId: string, state: AdministrativeAgentState, expectedAgentVersion: int, reason: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         let cmd = TaskCommands.write projectName "SetAgentState" operationId "" targetAgentId
         McpToolHelpers.send client http (TaskWriteCommand { cmd with Summary = state.ToString(); ExpectedAgentVersion = expectedAgentVersion; Reason = reason })
+
+    [<McpServerTool(Title = "correct working agent state", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Administratively correct one exact assigned Working agent to Ready without creating a worker checkpoint, reissuing an assignment or changing last-seen activity. Requires exact task/attempt identity, task/attempt/agent versions, assignment generation and a reason; records an immutable operator-attributed lifecycle event.")>]
+    static member CorrectAgentWorkingState(projectName: string, agentId: string, targetAgentId: string, taskId: string, attemptId: string, expectedTaskVersion: int, expectedAttemptVersion: int, expectedAgentVersion: int, assignmentGeneration: int, reason: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        let cmd = TaskCommands.write projectName "CorrectAgentWorkingState" operationId taskId agentId
+        McpToolHelpers.send client http
+            (TaskWriteCommand
+                { cmd with OwnerId = targetAgentId; AttemptId = attemptId
+                           ExpectedTaskVersion = expectedTaskVersion; ExpectedVersion = expectedAttemptVersion
+                           ExpectedAgentVersion = expectedAgentVersion; AssignmentGeneration = assignmentGeneration
+                           Reason = reason })
 
     [<McpServerTool(Title = "reissue queued task", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Explicitly assign a queued attempt to an unoccupied agent. Does not preempt a current Ready or Working assignment.")>]
     static member ReissueQueuedAttempt(projectName: string, taskId: string, agentId: string, expectedAttemptVersion: int, expectedAgentVersion: int, assignmentGeneration: int, reason: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =

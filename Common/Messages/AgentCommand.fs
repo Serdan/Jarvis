@@ -1183,7 +1183,9 @@ module AgentCommandInfo =
         | None -> invocation command
 
 module AgentProtocol =
-    let version = "3.64"
+    // Witness-capable admission and deferred ToolOperation receipts require
+    // a newer end-to-end protocol than deployed mainline 3.64.
+    let version = "3.65"
     let defaultPatchFuzzyContextLines = 3
     let maxResponseBytes = 900 * 1024
     let maxImageBytes = 8 * 1024 * 1024

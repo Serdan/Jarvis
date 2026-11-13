@@ -16,6 +16,7 @@ let private agent state since =
       UnassignedDisposition = if state = "Parked" then "Parked" elif state = "Completed" || state = "NeedsWork" then "NeedsWork" else null
       StateReason = ""; StateSequence = 2L
       StateEnteredAtUtc = since; WorkingTurnStartedAtUtc = since
+      ActivityLeaseUntilUtc = null
       ActiveSessionId = null; AssociatedSessionIds = [] }
 
 [<Test>]

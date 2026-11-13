@@ -125,8 +125,42 @@ type HubService(users: UserService, tracker: ClientResponseTracker, store: Feedb
         users.TouchConnection(this.Context.ConnectionId)
         match users.GetSessionByConnection(this.Context.ConnectionId) with
         | ValueSome session when session.State = Registered && session.ConnectionId = Some this.Context.ConnectionId ->
-            if not (tracker.Complete(correlationId, this.UserId, this.Context.ConnectionId, session.Generation, response)) then
-                logger.LogWarning("Rejected unexpected or stale Jarvis response {CorrelationId} from {ConnectionId}.", correlationId, this.Context.ConnectionId)
+            // A promoted tool job has returned only a handle: its original
+            // command is still running. Record that handle against the exact
+            // authenticated route, NEVER as a terminal execution witness.
+            // A client result remains deliverable even if SQLite fails; the
+            // correction gate then remains unresolved and fail-closed.
+            let durable =
+                match response.PendingJob with
+                | Some handle when handle.Kind = JobKind.ToolOperation ->
+                    store.TryRecordAgentDeferredToolJob(
+                        this.UserId, this.Context.ConnectionId, session.Generation,
+                        correlationId, handle.AgentId, handle.CommandName,
+                        handle.JobId, handle.StartedAt)
+                | Some _ ->
+                    Error "Unsupported pending job kind; execution remains unresolved."
+                | None ->
+                    store.TryRecordAgentClientTerminal(
+                        this.UserId, this.Context.ConnectionId, session.Generation,
+                        correlationId, clientResponse = response)
+            let accepted =
+                tracker.Complete(correlationId, this.UserId, this.Context.ConnectionId,
+                                 session.Generation, response)
+            match durable with
+            | Ok None when not accepted ->
+                logger.LogWarning(
+                    "Rejected unexpected or stale Jarvis response {CorrelationId} from {ConnectionId}.",
+                    correlationId, this.Context.ConnectionId)
+            | Ok(Some _) when not accepted ->
+                logger.LogInformation(
+                    "Authenticated late Jarvis terminal receipt for {CorrelationId} on {ConnectionId}.",
+                    correlationId, this.Context.ConnectionId)
+            | Error message ->
+                logger.LogWarning(
+                    "Cannot establish terminal execution liveness for {CorrelationId} on {ConnectionId}: {Error}. " +
+                    "The client response outcome is unchanged, but administrative correction remains blocked.",
+                    correlationId, this.Context.ConnectionId, message)
+            | _ -> ()
         | _ ->
             logger.LogWarning("Rejected Jarvis response {CorrelationId} from inactive connection {ConnectionId}.", correlationId, this.Context.ConnectionId)
         Task.CompletedTask

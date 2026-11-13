@@ -92,6 +92,9 @@ type ReviewAgent =
       StateSequence: int64
       StateEnteredAtUtc: string
       WorkingTurnStartedAtUtc: string
+      // Canonical bounded evidence of admitted Working activity. Null on
+      // legacy agents, before first ingress, and after leaving Working.
+      ActivityLeaseUntilUtc: string
       ActiveSessionId: string
       AssociatedSessionIds: string list }
     with
@@ -215,7 +218,14 @@ type TaskLifecycleEvent =
       NewGeneration: int
       ReviewRequestId: string
       ReviewDisposition: string
-      Evidence: string }
+      Evidence: string
+      // Optional for historical schema-v2 lifecycle events.
+      RequestingAgentId: string
+      TargetAgentId: string
+      PreviousAgentState: string
+      NewAgentState: string
+      PreviousAgentVersion: int
+      NewAgentVersion: int }
 
 [<CLIMutable>]
 type ReviewFeedbackNotice =
@@ -239,6 +249,25 @@ type AgentNotification =
       Message: string
       CreatedAtUtc: string
       AcknowledgedAtUtc: string }
+
+// These canonical records are independent of ReviewAgent.Version: a worker
+// with an exact expectedAgentVersion must be able to admit its own operation
+// without invalidating that assertion. A reservation has no expiration: a
+// failed heartbeat cannot silently make an active mutating operation correctable.
+[<CLIMutable>]
+type InFlightAgentOperation =
+    { Id: string
+      TaskId: string
+      AttemptId: string
+      StartedAtUtc: string }
+
+[<CLIMutable>]
+type AgentInFlightReservations =
+    { AgentId: string
+      Operations: InFlightAgentOperation list
+      // Completion remains recent even when no agent-version field changed.
+      // This rejects stale corrections immediately following a real call.
+      RecentlyCompletedUntilUtc: string }
 
 [<CLIMutable>]
 type IntegrationSubmission =
@@ -326,6 +355,7 @@ module ReviewWorkflow =
             { agent with Execution = execution; CurrentAssignment = assignment
                          UnassignedDisposition = disposition; StateEnteredAtUtc = now
                          WorkingTurnStartedAtUtc = if execution = "Working" then now else null
+                         ActivityLeaseUntilUtc = null
                          ActiveSessionId = if execution = "Working" then agent.ActiveSessionId else null }
 
     let private assigned taskId attemptId (agent: ReviewAgent) =
@@ -348,7 +378,8 @@ module ReviewWorkflow =
     let private resetSessions (agent: ReviewAgent) =
         { agent with ActiveSessionId = null
                      AssociatedSessionIds = []
-                     WorkingTurnStartedAtUtc = null }
+                     WorkingTurnStartedAtUtc = null
+                     ActivityLeaseUntilUtc = null }
 
     // An entity's schema is explicit on disk without adding boilerplate to
     // each in-memory record. Changing it requires an intentional upgrade path.
@@ -387,7 +418,14 @@ module ReviewWorkflow =
                         // were already stored. Missing means same-project; all
                         // other notification members remain mandatory.
                         || (typeof<'t> = typeof<AgentNotification>
-                            && property = "fromProjectName"))
+                            && property = "fromProjectName")
+                        || (typeof<'t> = typeof<ReviewAgent>
+                            && property = "activityLeaseUntilUtc")
+                        || (typeof<'t> = typeof<TaskLifecycleEvent>
+                            && List.contains property
+                                [ "requestingAgentId"; "targetAgentId"
+                                  "previousAgentState"; "newAgentState"
+                                  "previousAgentVersion"; "newAgentVersion" ]))
                 let status (name: string) (allowed: string list) =
                     let mutable field = Unchecked.defaultof<JsonElement>
                     root.TryGetProperty(name, &field)
@@ -418,7 +456,8 @@ module ReviewWorkflow =
                     | "AgentCheckpoint" -> status "kind" [ "Yield"; "Completion"; "Recovery"; "Progress"; "Submission"; "Revision" ]
                     | "TaskLifecycleEvent" ->
                         status "action" [ "ParkAttempt"; "BlockAttempt"; "ResumeAttempt"; "CancelTask";
-                                          "AbandonAttempt"; "TransferOwner"; "CloseTask"; "ReopenTask" ]
+                                          "AbandonAttempt"; "TransferOwner"; "CloseTask"; "ReopenTask";
+                                          "CorrectAgentWorkingState" ]
                     | "AssignmentIssue" ->
                         status "reason" [ "Assignment"; "ReviewChanges"; "CompletionRequeue"; "Recovery"; "ExplicitReissue"; "AdministrativeResume"; "OwnershipTransfer"; "SpecAdoption" ]
                     | "AssignmentReceipt" -> true
@@ -465,6 +504,11 @@ module ReviewWorkflow =
             Convert.ToBase64String(Encoding.UTF8.GetBytes agentId)
                 .TrimEnd('=').Replace('+', '-').Replace('/', '_')
         $"agents/{safe}.json"
+
+    // The separate record is checked in the *same* ledger transaction as an
+    // operator correction; reservation acquisition and correction serialize.
+    let private inFlightPath agentId =
+        "records/working-activity/" + (agentPath agentId).Substring("agents/".Length)
 
     let private validTaskId (taskId: string) = not (isNull taskId) && idPattern.IsMatch taskId
     let private validAgent (agent: string) =
@@ -1097,8 +1141,8 @@ module ReviewWorkflow =
                               StateReason = "Registered without an assignment"
                               StateSequence = snapshot.Header.NextSequence
                               StateEnteredAtUtc = DateTimeOffset.UtcNow.ToString("O")
-                              WorkingTurnStartedAtUtc = null; ActiveSessionId = null
-                              AssociatedSessionIds = [] }
+                              WorkingTurnStartedAtUtc = null; ActivityLeaseUntilUtc = null
+                              ActiveSessionId = null; AssociatedSessionIds = [] }
                         return [ change (agentPath agentId) None agent ]
                     })
 
@@ -1433,6 +1477,7 @@ module ReviewWorkflow =
                                 { (associateSession sessionId agent) with
                                     Version = agent.Version + 1
                                     WorkingTurnStartedAtUtc = DateTimeOffset.UtcNow.ToString("O")
+                                    ActivityLeaseUntilUtc = null
                                     StateReason = $"Resumed task {taskId}"
                                     StateSequence = snapshot.Header.NextSequence }
                             return
@@ -1455,6 +1500,140 @@ module ReviewWorkflow =
     // concurrent calls must never restart a Working agent's clock.
     let activateReadyAgent binding operationId taskId agentId =
         resumeAgentCore binding operationId taskId agentId 0 0 0 "" false
+
+    // Every admitted Working tool call is protected by a bounded canonical
+    // lease. The client renews at ingress only when the lease approaches expiry
+    // and periodically during long-running commands. An operator correction
+    // must reject live leases, even when its entity versions are otherwise
+    // current. The lease does not restart the turn or create worker evidence.
+    let private activityLeaseDuration = TimeSpan.FromMinutes(5.)
+    let private activityLeaseRenewalMargin = TimeSpan.FromMinutes(2.)
+
+    let private activityLeaseRemaining now (agent: ReviewAgent) =
+        let mutable expires = Unchecked.defaultof<DateTimeOffset>
+        if String.IsNullOrWhiteSpace agent.ActivityLeaseUntilUtc then TimeSpan.Zero
+        elif DateTimeOffset.TryParse(agent.ActivityLeaseUntilUtc, &expires) then expires - now
+        else TimeSpan.MaxValue // A malformed canonical lease is not proof of inactivity.
+
+    let workingActivityLeaseSufficient now (agent: ReviewAgent) =
+        let mutable expires = Unchecked.defaultof<DateTimeOffset>
+        agent.State = "Working"
+        && not (String.IsNullOrWhiteSpace agent.ActivityLeaseUntilUtc)
+        && DateTimeOffset.TryParse(agent.ActivityLeaseUntilUtc, &expires)
+        && expires - now > activityLeaseRenewalMargin
+
+    let internal recordWorkingActivityAt binding operationId agentId taskId attemptId (now: DateTimeOffset) =
+        if not (validAgent agentId) || not (validTaskId taskId)
+           || String.IsNullOrWhiteSpace attemptId then
+            Error(InvalidBinding "Working activity requires an exact agent assignment.")
+        else
+            LedgerStore.transact binding
+                (intent operationId agentId "RenewWorkingActivityLease"
+                    {| agentId = agentId; taskId = taskId; attemptId = attemptId |})
+                (fun snapshot -> result {
+                    let! task, _, attempt, _ = getAttempt binding snapshot taskId
+                    let! agent, agentOid = required<ReviewAgent> binding snapshot (agentPath agentId)
+                    // A task may be closed independently while its owner is
+                    // still Working and finishing the attempt. Correction
+                    // remains InProgress-only, but ordinary tool ingress must
+                    // not break after administrative closure.
+                    if not (List.contains task.Lifecycle [ "InProgress"; "Closed" ])
+                       || attempt.AttemptId <> attemptId
+                       || attempt.OwnerAgentId <> agentId
+                       || attempt.Phase <> "Started"
+                       || agent.State <> "Working"
+                       || not (matchesAssignment taskId attempt agent)
+                       || agent.ActiveAttemptId <> attemptId then
+                        return! Error(StaleEntityVersion "Working assignment changed before lease renewal.")
+                    // The version fences any stale operator snapshot, and the
+                    // deadline blocks corrections during the whole lease.
+                    return [ change (agentPath agentId) (Some agentOid)
+                                 { agent with Version = agent.Version + 1
+                                              ActivityLeaseUntilUtc = (now + activityLeaseDuration).ToString("O") } ]
+                })
+
+    let recordWorkingActivity binding operationId agentId taskId attemptId =
+        recordWorkingActivityAt binding operationId agentId taskId attemptId DateTimeOffset.UtcNow
+
+    // Durable in-flight reservations protect potentially long-running or
+    // mutating commands independently of the expiring cheap-read lease.
+    // They do NOT change ReviewAgent.Version, so owner commands with exact
+    // expected versions remain valid. No TTL: a failed release must block
+    // administrative correction, not silently declare running work stale.
+    let beginInFlightAgentOperation binding operationId agentId taskId attemptId (reservationId: Guid) =
+        if not (validAgent agentId) || not (validTaskId taskId)
+           || String.IsNullOrWhiteSpace attemptId || reservationId = Guid.Empty then
+            Error(InvalidBinding "In-flight activity requires exact agent, task, attempt and reservation ID.")
+        else
+            LedgerStore.transact binding
+                (intent operationId agentId "BeginInFlightAgentOperation"
+                    {| agentId = agentId; taskId = taskId; attemptId = attemptId
+                       reservationId = reservationId.ToString("N") |})
+                (fun snapshot -> result {
+                    let! task, _, attempt, _ = getAttempt binding snapshot taskId
+                    let! agent, _ = required<ReviewAgent> binding snapshot (agentPath agentId)
+                    if not (List.contains task.Lifecycle [ "InProgress"; "Closed" ])
+                       || attempt.AttemptId <> attemptId
+                       || attempt.OwnerAgentId <> agentId
+                       || attempt.Phase <> "Started"
+                       || agent.State <> "Working"
+                       || not (matchesAssignment taskId attempt agent) then
+                        return! Error(StaleEntityVersion "Assignment changed before in-flight activity admission.")
+                    let path = inFlightPath agentId
+                    let! existing = read<AgentInFlightReservations> binding snapshot path
+                    let entries, oid =
+                        match existing with
+                        | None -> [], None
+                        | Some (record, oid) ->
+                            (if record.AgentId = agentId && not (isNull (box record.Operations))
+                             then record.Operations else []), Some oid
+                    match existing with
+                    | Some (record, _) when record.AgentId <> agentId
+                                           || isNull (box record.Operations) ->
+                        return! Error(LedgerIntegrityError "Invalid in-flight reservation record.")
+                    | _ -> ()
+                    if entries.Length >= 128 || entries |> List.exists (fun entry ->
+                           entry.Id = reservationId.ToString("N")) then
+                        return! Error(StaleEntityVersion "In-flight reservation already exists or limit reached.")
+                    let entry =
+                        { Id = reservationId.ToString("N"); TaskId = taskId; AttemptId = attemptId
+                          StartedAtUtc = DateTimeOffset.UtcNow.ToString("O") }
+                    let previousUntil =
+                        existing |> Option.map (fun (value, _) -> value.RecentlyCompletedUntilUtc)
+                                 |> Option.defaultValue null
+                    return [ change path oid
+                                 { AgentId = agentId; Operations = entries @ [ entry ]
+                                   RecentlyCompletedUntilUtc = previousUntil } ]
+                })
+
+    let internal endInFlightAgentOperationAt binding operationId agentId (reservationId: Guid) (now: DateTimeOffset) =
+        if not (validAgent agentId) || reservationId = Guid.Empty then
+            Error(InvalidBinding "Releasing activity requires exact agent and reservation.")
+        else
+            LedgerStore.transact binding
+                (intent operationId agentId "EndInFlightAgentOperation"
+                    {| agentId = agentId; reservationId = reservationId.ToString("N") |})
+                (fun snapshot -> result {
+                    let path = inFlightPath agentId
+                    let! record, oid =
+                        required<AgentInFlightReservations> binding snapshot path
+                    if record.AgentId <> agentId
+                       || isNull (box record.Operations) then
+                        return! Error(LedgerIntegrityError "Invalid in-flight reservation record.")
+                    if not (record.Operations |> List.exists
+                               (fun entry -> entry.Id = reservationId.ToString("N"))) then
+                        return! Error(StaleEntityVersion "In-flight reservation already released.")
+                    let remaining =
+                        record.Operations
+                        |> List.filter (fun entry -> entry.Id <> reservationId.ToString("N"))
+                    return [ change path (Some oid)
+                                 { record with Operations = remaining
+                                               RecentlyCompletedUntilUtc =
+                                                   (now.AddMinutes(5.)).ToString("O") } ]
+                })
+
+    let endInFlightAgentOperation binding operationId agentId reservationId =
+        endInFlightAgentOperationAt binding operationId agentId reservationId DateTimeOffset.UtcNow
 
     let resumeAgent binding operationId taskId ownerId expectedAttemptVersion expectedAgentVersion generation =
         resumeAgentWithSession binding operationId taskId ownerId expectedAttemptVersion expectedAgentVersion generation ""
@@ -1996,7 +2175,88 @@ module ReviewWorkflow =
           NewOwnerId = nextOwner
           PreviousGeneration = attempt |> Option.map (fun a -> a.AssignmentGeneration) |> Option.defaultValue 0
           NewGeneration = attempt |> Option.map (fun a -> a.AssignmentGeneration) |> Option.defaultValue 0
-          ReviewRequestId = reviewId; ReviewDisposition = reviewDisposition; Evidence = evidence }
+          ReviewRequestId = reviewId; ReviewDisposition = reviewDisposition; Evidence = evidence
+          RequestingAgentId = null; TargetAgentId = null
+          PreviousAgentState = null; NewAgentState = null
+          PreviousAgentVersion = 0; NewAgentVersion = 0 }
+
+    // Operator-authorized correction of stale Working state. The requesting
+    // agent identity is supplied provenance, while actor is the authenticated
+    // operator identity. This does not create a checkpoint or reissue work.
+    let correctAgentWorkingStateAs binding actor operationId requestingAgentId targetAgentId
+                                   taskId attemptId expectedTaskVersion expectedAttemptVersion
+                                   expectedAgentVersion generation reason =
+        if not (validAgent actor) || not (validAgent requestingAgentId)
+           || not (validAgent targetAgentId) || not (validTaskId taskId)
+           || String.IsNullOrWhiteSpace attemptId
+           || expectedTaskVersion < 1 || expectedAttemptVersion < 1
+           || expectedAgentVersion < 1 || generation < 1
+           || not (validText 2048 reason) then
+            Error(InvalidBinding "Administrative Working-to-Ready correction requires exact identities, versions, generation and reason.")
+        else
+            LedgerStore.transact binding
+                (intent operationId actor "CorrectAgentWorkingState"
+                    {| requestingAgentId = requestingAgentId; targetAgentId = targetAgentId
+                       taskId = taskId; attemptId = attemptId
+                       expectedTaskVersion = expectedTaskVersion
+                       expectedAttemptVersion = expectedAttemptVersion
+                       expectedAgentVersion = expectedAgentVersion
+                       generation = generation; reason = reason |})
+                (fun snapshot -> result {
+                    let! task, _, attempt, _ = getAttempt binding snapshot taskId
+                    let! agent, agentOid =
+                        required<ReviewAgent> binding snapshot (agentPath targetAgentId)
+                    // A durable reservation fences an admitted operation even
+                    // if the network is down and its time-bounded lease has
+                    // expired. This read is in the same optimistic Git
+                    // transaction as the correction's agent-state update.
+                    let! reservations =
+                        read<AgentInFlightReservations> binding snapshot (inFlightPath targetAgentId)
+                    match reservations with
+                    | Some (record, _) when record.AgentId <> targetAgentId
+                                           || isNull (box record.Operations) ->
+                        return! Error(LedgerIntegrityError "Corrupt target agent reservation record.")
+                    | Some (record, _) when not (List.isEmpty record.Operations) ->
+                        return! Error(StaleEntityVersion "Cannot correct agent with in-flight operations.")
+                    | Some (record, _) when not (String.IsNullOrWhiteSpace record.RecentlyCompletedUntilUtc) ->
+                        let mutable recentUntil = Unchecked.defaultof<DateTimeOffset>
+                        if not (DateTimeOffset.TryParse(record.RecentlyCompletedUntilUtc, &recentUntil))
+                           || recentUntil > DateTimeOffset.UtcNow then
+                            return! Error(StaleEntityVersion "Agent recently completed a genuine operation.")
+                    | _ -> ()
+                    if task.Version <> expectedTaskVersion
+                       || task.Lifecycle <> "InProgress"
+                       || attempt.AttemptId <> attemptId
+                       || attempt.OwnerAgentId <> targetAgentId
+                       || attempt.Version <> expectedAttemptVersion
+                       || attempt.AssignmentGeneration <> generation
+                       || attempt.Phase <> "Started"
+                       || agent.Version <> expectedAgentVersion
+                       || agent.State <> "Working"
+                       || activityLeaseRemaining DateTimeOffset.UtcNow agent > TimeSpan.Zero
+                       || not (matchesAssignment taskId attempt agent)
+                       || agent.ActiveAttemptId <> attempt.AttemptId then
+                        return! Error(StaleEntityVersion "Administrative correction targets a stale or unrelated Working assignment.")
+                    let correction =
+                        enterState "Ready" agent
+                        |> fun updated ->
+                            { updated with Version = agent.Version + 1
+                                           StateReason = reason
+                                           StateSequence = snapshot.Header.NextSequence }
+                    let audit =
+                        { adminEvent actor task (Some attempt) operationId snapshot.Header.NextSequence
+                              "CorrectAgentWorkingState" reason task.Lifecycle attempt.Phase
+                              targetAgentId null "Unchanged" null with
+                            RequestingAgentId = requestingAgentId
+                            TargetAgentId = targetAgentId
+                            PreviousAgentState = agent.State
+                            NewAgentState = correction.State
+                            PreviousAgentVersion = agent.Version
+                            NewAgentVersion = correction.Version }
+                    return
+                        [ change (agentPath targetAgentId) (Some agentOid) correction
+                          change (lifecycleEventPath taskId snapshot.Header.NextSequence) None audit ]
+                })
 
     // Only clear a focus that still belongs to this attempt. Never interrupt
     // an owner's newer assignment, or turn agent Parked into an attempt phase.
@@ -2358,6 +2618,24 @@ module ReviewWorkflow =
     let getAgentWorkingTurn binding agentId =
         LedgerStore.fetch binding
         |> Result.bind (fun snapshot -> getAgentWorkingTurnAt binding snapshot agentId)
+
+    /// Closure retains the owner assignment for final inspection/checkpoint.
+    /// This is a read-only verification at one canonical snapshot, NOT an
+    /// authorization to start or resume an execution.
+    let isStoppedClosedAssignment binding agentId =
+        result {
+            let! snapshot = LedgerStore.fetch binding
+            let! agent = getAgentWorkingTurnAt binding snapshot agentId
+            match box agent.CurrentAssignment with
+            | null -> return false
+            | _ when agent.Execution <> "Stopped" || agent.State <> "Ready" ->
+                return false
+            | _ ->
+                let assignment = agent.CurrentAssignment
+                let! task, _ = getTaskAt binding snapshot assignment.TaskId
+                return task.Lifecycle = "Closed"
+                       && task.AttemptId = assignment.AttemptId
+        }
 
     /// Read-only activation eligibility at one canonical snapshot. A retained
     /// assignment may have Execution=Stopped and therefore derived State=Ready

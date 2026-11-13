@@ -140,6 +140,591 @@ type ReviewWorkflowTests() =
             Assert.That(history.Head.NewPhase, Is.EqualTo("Blocked")))
 
     [<Test>]
+    member _.AdministrativeCorrectionIsAuditedWithoutReissuingOrInventingWorkerEvidence() =
+        withFixture (fun _ _ first second _ _ _ _ ->
+            let taskId = "admin-working-ready"
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Audited correction"
+            |> success |> ignore
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner"
+            |> success |> ignore
+            ReviewWorkflow.beginAttemptWithSession first (Guid.NewGuid()) taskId "Owner"
+                1 1 "real-owner-session" |> success |> ignore
+            let progress =
+                ReviewWorkflow.checkpointAttempt first (Guid.NewGuid()) taskId "Owner"
+                    2 3 1 "Real owner progress" "Continue implementation" "" ""
+                |> success
+            let _, task, maybeAttempt = ReviewWorkflow.getTask first taskId |> success
+            let attempt = maybeAttempt.Value
+            let before = (ReviewWorkflow.getAgentInbox first "Owner" |> success).Agent
+            Assert.That(before.State, Is.EqualTo("Working"))
+            let operationId = Guid.NewGuid()
+            let correct () =
+                ReviewWorkflow.correctAgentWorkingStateAs first "Lead" operationId
+                    "Lead" "Owner" taskId attempt.AttemptId task.Version attempt.Version
+                    before.Version attempt.AssignmentGeneration "Operator verified stale Working state"
+            let corrected = correct () |> success
+            Assert.That(corrected.AlreadyApplied, Is.False)
+            Assert.That(corrected.Operation.Actor, Is.EqualTo("Lead"))
+            let _, taskAfter, maybeAttemptAfter = ReviewWorkflow.getTask second taskId |> success
+            let after = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
+            Assert.That(taskAfter, Is.EqualTo(task :> obj))
+            Assert.That(maybeAttemptAfter.Value, Is.EqualTo(attempt :> obj))
+            Assert.That(after.State, Is.EqualTo("Ready"))
+            Assert.That(after.Execution, Is.EqualTo("Stopped"))
+            Assert.That(after.CurrentAssignment, Is.EqualTo(before.CurrentAssignment :> obj))
+            Assert.That(after.Version, Is.EqualTo(before.Version + 1))
+            Assert.That(after.WorkingTurnStartedAtUtc, Is.Null)
+            Assert.That(after.ActiveSessionId, Is.Null)
+            Assert.That(after.AssociatedSessionIds, Is.EqualTo(before.AssociatedSessionIds :> obj))
+            let _, checkpoint =
+                ReviewWorkflow.getCheckpoint second taskId progress.Operation.Sequence |> success
+            Assert.That(checkpoint.Kind, Is.EqualTo("Progress"))
+            Assert.That(checkpoint.Summary, Is.EqualTo("Real owner progress"))
+            match ReviewWorkflow.getCheckpoint second taskId corrected.Operation.Sequence with
+            | Error _ -> ()
+            | Ok _ -> Assert.Fail("Administrative correction must not fabricate a worker checkpoint.")
+            let _, history = ReviewWorkflow.getTaskLifecycleHistory second taskId |> success
+            Assert.That(history.Length, Is.EqualTo(1))
+            let audit = history.Head
+            Assert.That(audit.Action, Is.EqualTo("CorrectAgentWorkingState"))
+            Assert.That(audit.OperationId, Is.EqualTo(operationId.ToString("D")))
+            Assert.That(audit.ActorId, Is.EqualTo("Lead"))
+            Assert.That(audit.RequestingAgentId, Is.EqualTo("Lead"))
+            Assert.That(audit.TargetAgentId, Is.EqualTo("Owner"))
+            Assert.That(audit.Reason, Is.EqualTo("Operator verified stale Working state"))
+            Assert.That(audit.PreviousAgentState, Is.EqualTo("Working"))
+            Assert.That(audit.NewAgentState, Is.EqualTo("Ready"))
+            Assert.That(audit.PreviousAgentVersion, Is.EqualTo(before.Version))
+            Assert.That(audit.NewAgentVersion, Is.EqualTo(after.Version))
+            Assert.That(audit.PreviousGeneration, Is.EqualTo(attempt.AssignmentGeneration))
+            Assert.That(audit.NewGeneration, Is.EqualTo(attempt.AssignmentGeneration))
+            let replay = correct () |> success
+            Assert.That(replay.AlreadyApplied, Is.True)
+            let _, replayHistory = ReviewWorkflow.getTaskLifecycleHistory first taskId |> success
+            Assert.That(replayHistory.Length, Is.EqualTo(1))
+            // The worker's own subsequent yield remains worker-attributed and creates a Yield checkpoint.
+            ReviewWorkflow.resumeAgent first (Guid.NewGuid()) taskId "Owner"
+                attempt.Version after.Version attempt.AssignmentGeneration |> success |> ignore
+            let _, _, resumedAttempt = ReviewWorkflow.getTask first taskId |> success
+            let resumedAgent = (ReviewWorkflow.getAgentInbox first "Owner" |> success).Agent
+            let yielded =
+                ReviewWorkflow.yieldAgent first (Guid.NewGuid()) taskId "Owner"
+                    resumedAttempt.Value.Version resumedAgent.Version attempt.AssignmentGeneration
+                    "Worker resumed and yielded" "Continue normally" |> success
+            let _, ownCheckpoint =
+                ReviewWorkflow.getCheckpoint second taskId yielded.Operation.Sequence |> success
+            Assert.That(ownCheckpoint.Kind, Is.EqualTo("Yield"))
+            Assert.That(ownCheckpoint.OwnerAgentId, Is.EqualTo("Owner"))
+            let _, finalHistory = ReviewWorkflow.getTaskLifecycleHistory second taskId |> success
+            Assert.That(finalHistory.Length, Is.EqualTo(1)))
+
+    [<Test>]
+    member _.AdministrativeCorrectionRejectsStaleIdentityVersionsAndGenuineWorkerYieldWithoutMutation() =
+        withFixture (fun _ _ first second _ _ _ _ ->
+            let taskId = "admin-correction-cas"
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "CAS correction"
+            |> success |> ignore
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner"
+            |> success |> ignore
+            ReviewWorkflow.beginAttempt first (Guid.NewGuid()) taskId "Owner" 1 1
+            |> success |> ignore
+            let _, task, maybeAttempt = ReviewWorkflow.getTask first taskId |> success
+            let attempt = maybeAttempt.Value
+            let agent = (ReviewWorkflow.getAgentInbox first "Owner" |> success).Agent
+            let head = (LedgerStore.fetch first |> success).Commit
+            let correct actor target requestedTask requestedAttempt taskVersion attemptVersion agentVersion generation reason =
+                ReviewWorkflow.correctAgentWorkingStateAs first actor (Guid.NewGuid())
+                    "Lead" target requestedTask requestedAttempt taskVersion attemptVersion
+                    agentVersion generation reason
+            let reject result =
+                Assert.That((match result with Error _ -> true | Ok _ -> false), Is.True)
+                Assert.That((LedgerStore.fetch first |> success).Commit, Is.EqualTo(head))
+            reject (correct "" "Owner" taskId attempt.AttemptId task.Version attempt.Version agent.Version 1 "No actor")
+            reject (correct "Lead" "Reviewer" taskId attempt.AttemptId task.Version attempt.Version agent.Version 1 "Wrong agent")
+            reject (correct "Lead" "Owner" taskId "wrong-attempt" task.Version attempt.Version agent.Version 1 "Wrong attempt")
+            reject (correct "Lead" "Owner" "missing-task" attempt.AttemptId task.Version attempt.Version agent.Version 1 "Missing task")
+            reject (correct "Lead" "Owner" taskId attempt.AttemptId (task.Version + 1) attempt.Version agent.Version 1 "Wrong task version")
+            reject (correct "Lead" "Owner" taskId attempt.AttemptId task.Version (attempt.Version + 1) agent.Version 1 "Wrong attempt version")
+            reject (correct "Lead" "Owner" taskId attempt.AttemptId task.Version attempt.Version (agent.Version + 1) 1 "Wrong agent version")
+            reject (correct "Lead" "Owner" taskId attempt.AttemptId task.Version attempt.Version agent.Version 2 "Wrong generation")
+            reject (correct "Lead" "Owner" taskId attempt.AttemptId task.Version attempt.Version agent.Version 1 "")
+            // A genuine worker transition wins over a stale administrative CAS.
+            let yielded =
+                ReviewWorkflow.yieldAgent first (Guid.NewGuid()) taskId "Owner"
+                    attempt.Version agent.Version 1 "Owner's own work" "Continue later" |> success
+            expectStale (correct "Lead" "Owner" taskId attempt.AttemptId task.Version
+                             attempt.Version agent.Version 1 "Stale operator correction")
+            let after = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
+            Assert.That(after.State, Is.EqualTo("Ready"))
+            let _, ownCheckpoint =
+                ReviewWorkflow.getCheckpoint second taskId yielded.Operation.Sequence |> success
+            Assert.That(ownCheckpoint.Kind, Is.EqualTo("Yield"))
+            let _, history = ReviewWorkflow.getTaskLifecycleHistory second taskId |> success
+            Assert.That(history, Is.Empty))
+
+    [<Test>]
+    member _.OrdinaryWorkingActivityFencesStaleAdministrativeCorrectionAcrossClones() =
+        withFixture (fun _ _ first second _ _ _ _ ->
+            let taskId = "admin-activity-fence"
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Working activity fence"
+            |> success |> ignore
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner"
+            |> success |> ignore
+            ReviewWorkflow.beginAttempt first (Guid.NewGuid()) taskId "Owner" 1 1
+            |> success |> ignore
+            let _, task, maybeAttempt = ReviewWorkflow.getTask first taskId |> success
+            let attempt = maybeAttempt.Value
+            let before = (ReviewWorkflow.getAgentInbox first "Owner" |> success).Agent
+            let activity =
+                ReviewWorkflow.recordWorkingActivity second (Guid.NewGuid())
+                    "Owner" taskId attempt.AttemptId |> success
+            Assert.That(activity.Operation.Actor, Is.EqualTo("Owner"))
+            let after = (ReviewWorkflow.getAgentInbox first "Owner" |> success).Agent
+            Assert.That(after.State, Is.EqualTo("Working"))
+            Assert.That(after.Version, Is.EqualTo(before.Version + 1))
+            Assert.That(after.StateSequence, Is.EqualTo(before.StateSequence))
+            Assert.That(after.WorkingTurnStartedAtUtc, Is.EqualTo(before.WorkingTurnStartedAtUtc))
+            Assert.That(after.StateEnteredAtUtc, Is.EqualTo(before.StateEnteredAtUtc))
+            Assert.That(after.CurrentAssignment, Is.EqualTo(before.CurrentAssignment :> obj))
+            let _, taskAfter, attemptAfter = ReviewWorkflow.getTask first taskId |> success
+            Assert.That(taskAfter, Is.EqualTo(task :> obj))
+            Assert.That(attemptAfter.Value, Is.EqualTo(attempt :> obj))
+            expectStale
+                (ReviewWorkflow.correctAgentWorkingStateAs first "Lead" (Guid.NewGuid())
+                    "Lead" "Owner" taskId attempt.AttemptId task.Version attempt.Version
+                    before.Version attempt.AssignmentGeneration "Old observation")
+            let _, history = ReviewWorkflow.getTaskLifecycleHistory second taskId |> success
+            Assert.That(history, Is.Empty)
+            Assert.That((ReviewWorkflow.getAgentInbox first "Owner" |> success).Agent.State,
+                        Is.EqualTo("Working"))
+            // Even the latest observed version is not sufficient while there
+            // is a live lease: the worker may still have a command in flight.
+            Assert.That(ReviewWorkflow.workingActivityLeaseSufficient DateTimeOffset.UtcNow after,
+                        Is.True)
+            expectStale
+                (ReviewWorkflow.correctAgentWorkingStateAs first "Lead" (Guid.NewGuid())
+                    "Lead" "Owner" taskId attempt.AttemptId task.Version attempt.Version
+                    after.Version attempt.AssignmentGeneration "Worker still active")
+            // Simulate a lease that elapsed after its last activity (without
+            // sleeping five minutes) and verify correction is then available.
+            ReviewWorkflow.recordWorkingActivityAt second (Guid.NewGuid())
+                "Owner" taskId attempt.AttemptId (DateTimeOffset.UtcNow.AddMinutes(-10.))
+            |> success |> ignore
+            let expired = (ReviewWorkflow.getAgentInbox first "Owner" |> success).Agent
+            Assert.That(ReviewWorkflow.workingActivityLeaseSufficient DateTimeOffset.UtcNow expired,
+                        Is.False)
+            ReviewWorkflow.correctAgentWorkingStateAs first "Lead" (Guid.NewGuid())
+                "Lead" "Owner" taskId attempt.AttemptId task.Version attempt.Version
+                expired.Version attempt.AssignmentGeneration "Worker lease expired"
+            |> success |> ignore
+            Assert.That((ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent.State,
+                        Is.EqualTo("Ready")))
+
+    [<Test>]
+    member _.OrdinarySelfReadRecordsCanonicalActivityBeforeReturningAcrossDevices() =
+        withFixture (fun one _ first second _ _ _ _ ->
+            let taskId = "admin-activity-read"
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Activity read"
+            |> success |> ignore
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner"
+            |> success |> ignore
+            ReviewWorkflow.beginAttempt first (Guid.NewGuid()) taskId "Owner" 1 1
+            |> success |> ignore
+            let _, task, maybeAttempt = ReviewWorkflow.getTask first taskId |> success
+            let attempt = maybeAttempt.Value
+            let before = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
+            let configPath = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
+            try
+                Client.OrchestrationApi.LedgerBindingConfig.bindExisting
+                    "owner" (GitCommandTests.TestContext(Path.GetDirectoryName one))
+                    first.ProjectId first.LedgerId first.Epoch first.RemoteName
+                    first.ApprovedFetchUrl first.ApprovedPushUrl
+                    (LedgerStore.fetch first |> success).Commit true
+                |> success |> ignore
+                let runtime =
+                    Client.Runtime(Path.GetDirectoryName one, Client.ConsoleTui.ConsoleTui(), Client.PartialTrust)
+                let selfRead : Common.AgentCommand =
+                    Common.TaskReadCommand
+                        { ProjectName = "owner"; AgentId = "Owner"; Action = "GetAssignment"
+                          TaskId = taskId; AssignmentGeneration = 1
+                          CheckpointSequence = 0L; Cursor = ""; PageSize = 0
+                          BeforeOid = null; AfterOid = null; RelativePath = null }
+                let invoke command actor =
+                    Client.SignalR.Client.processIncomingCommand runtime
+                        (System.Text.Json.JsonSerializer.Serialize<Common.AgentCommand>(command)) actor
+                    |> Async.AwaitTask |> Async.RunSynchronously
+                let _, readResult, _ = invoke selfRead "Owner"
+                Assert.That(readResult.IsOk, Is.True, sprintf "Self-read failed: %A" readResult)
+                let after = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
+                // The durable reservation is stored independently of
+                // ReviewAgent.Version so owner CAS tokens remain valid.
+                Assert.That(after.Version, Is.EqualTo(before.Version))
+                Assert.That(after.State, Is.EqualTo("Working"))
+                Assert.That(after.WorkingTurnStartedAtUtc, Is.EqualTo(before.WorkingTurnStartedAtUtc))
+                expectStale
+                    (ReviewWorkflow.correctAgentWorkingStateAs second "Lead" (Guid.NewGuid())
+                        "Lead" "Owner" taskId attempt.AttemptId task.Version attempt.Version
+                        before.Version attempt.AssignmentGeneration "Concurrent tool activity")
+                // A target-only observation is explicitly not self activity.
+                let observe : Common.AgentCommand =
+                    Common.ObserveAgentCommand
+                        { ProjectName = "owner"; ObserverAgentId = "Reviewer"; TargetAgentId = "Owner" }
+                let _, observationResult, changes = invoke observe "Reviewer"
+                Assert.That(observationResult.IsOk, Is.True)
+                Assert.That(changes.AgentStateChanges, Is.Empty)
+                Assert.That((ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent.Version,
+                            Is.EqualTo(after.Version))
+                // Repeated ordinary reads reuse the lease without 100
+                // separate canonical Git writes. Benchmark elapsed wall time
+                // but do not assert a hardware/network-dependent time limit.
+                let priorHead = (LedgerStore.fetch second |> success).Commit
+                let beganAt = DateTimeOffset.UtcNow
+                let watch = Stopwatch.StartNew()
+                for _ in 1..100 do
+                    let _, read, _ = invoke selfRead "Owner"
+                    Assert.That(read.IsOk, Is.True)
+                watch.Stop()
+                let endedAt = DateTimeOffset.UtcNow
+                TestContext.Out.WriteLine(
+                    sprintf "Canonical Working lease: 100 reads, %.1f ms total (%.2f ms/read), 0 new ledger commits; UTC window %s to %s"
+                        watch.Elapsed.TotalMilliseconds (watch.Elapsed.TotalMilliseconds / 100.)
+                        (beganAt.ToString("O")) (endedAt.ToString("O")))
+                Assert.That((LedgerStore.fetch second |> success).Commit, Is.EqualTo(priorHead))
+                Assert.That((ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent.Version,
+                            Is.EqualTo(after.Version))
+                let selected =
+                    Client.ProjectPaths.ProjectTarget.parse "owner"
+                    |> function Ok target -> target | Error err -> failwithf "%A" err
+                Client.SignalR.Client.flushInFlightActivity runtime
+                    (Client.ProjectPaths.ProjectTarget.projectId selected) "Owner"
+                |> success |> ignore
+            finally
+                if File.Exists configPath then File.Delete configPath)
+
+    // Optional diagnostic; intentionally excluded from routine CI because it
+    // performs 100 real Git-backed ingress calls and records latency rather
+    // than imposing a machine-dependent performance threshold.
+    [<Test; Explicit("Run manually when assessing reservation hot-path cost")>]
+    member _.BenchmarkHundredMixedWorkingCalls() =
+        withFixture (fun one _ first second _ _ _ _ ->
+            let taskId = "benchmark-inflight-hotpath"
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Benchmark ingress"
+            |> success |> ignore
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner"
+            |> success |> ignore
+            ReviewWorkflow.beginAttempt first (Guid.NewGuid()) taskId "Owner" 1 1
+            |> success |> ignore
+            let configPath = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
+            try
+                Client.OrchestrationApi.LedgerBindingConfig.bindExisting
+                    "owner" (GitCommandTests.TestContext(Path.GetDirectoryName one))
+                    first.ProjectId first.LedgerId first.Epoch first.RemoteName
+                    first.ApprovedFetchUrl first.ApprovedPushUrl
+                    (LedgerStore.fetch first |> success).Commit true
+                |> success |> ignore
+                let runtime =
+                    Client.Runtime(Path.GetDirectoryName one, Client.ConsoleTui.ConsoleTui(), Client.PartialTrust)
+                let read : Common.AgentCommand =
+                    Common.ReadFilesCommand { ProjectName = "owner"; FilePaths = [ "source.txt" ] }
+                let search : Common.AgentCommand =
+                    Common.SearchTextCommand
+                        { ProjectName = "owner"; Query = "base"; FolderPath = None
+                          IncludeGlobs = [ "*.txt" ]; ExcludeGlobs = []; MaxResults = Some 10 }
+                let notify (): Common.AgentCommand =
+                    Common.TaskWriteCommand
+                        { ProjectName = "owner"; Action = "NotifyAgent"
+                          OperationId = Guid.NewGuid().ToString("D")
+                          TaskId = ""; AttemptId = ""; ActorId = "Owner"
+                          OwnerId = "Reviewer"; Title = ""; Html = ""
+                          ExpectedVersion = 0; ExpectedAgentVersion = 0; ExpectedTaskVersion = 0
+                          AssignmentGeneration = 0; Summary = "Benchmark notice"
+                          NextAction = ""; Reason = ""; BaseOid = ""; TargetRef = ""
+                          SourceRef = ""; AllowDetached = false; AllowUncommitted = false
+                          DecisionSequence = 0L; Evidence = ""; SessionId = "" }
+                let invoke command =
+                    Client.SignalR.Client.processIncomingCommand runtime
+                        (System.Text.Json.JsonSerializer.Serialize<Common.AgentCommand>(command)) "Owner"
+                    |> Async.AwaitTask |> Async.RunSynchronously
+                let _, initial, _ = invoke read
+                Assert.That(initial.IsOk, Is.True)
+                let startHead = (LedgerStore.fetch second |> success).Commit
+                let began = DateTimeOffset.UtcNow
+                let timer = Stopwatch.StartNew()
+                for i in 1 .. 100 do
+                    let command =
+                        if i % 3 = 0 then read
+                        elif i % 3 = 1 then search
+                        else notify ()
+                    let _, outcome, _ = invoke command
+                    Assert.That(outcome.IsOk, Is.True, sprintf "Call %d: %A" i outcome)
+                timer.Stop()
+                let ended = DateTimeOffset.UtcNow
+                let endHead = (LedgerStore.fetch second |> success).Commit
+                TestContext.Out.WriteLine(
+                    sprintf "100 mixed Working calls: %.0f ms (%.1f ms/call), ledger head changed=%b, UTC %s to %s"
+                        timer.Elapsed.TotalMilliseconds (timer.Elapsed.TotalMilliseconds / 100.)
+                        (startHead <> endHead) (began.ToString("O")) (ended.ToString("O")))
+                let selected =
+                    Client.ProjectPaths.ProjectTarget.parse "owner"
+                    |> function Ok target -> target | Error err -> failwithf "%A" err
+                Client.SignalR.Client.flushInFlightActivity runtime
+                    (Client.ProjectPaths.ProjectTarget.projectId selected) "Owner"
+                |> success |> ignore
+            finally
+                if File.Exists configPath then File.Delete configPath)
+
+    [<Test>]
+    member _.BoundLedgerRejectsUnknownAgentWithoutBlockingUnassignedInbox() =
+        withFixture (fun one _ first _ _ _ _ _ ->
+            let configPath = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
+            try
+                Client.OrchestrationApi.LedgerBindingConfig.bindExisting
+                    "owner" (GitCommandTests.TestContext(Path.GetDirectoryName one))
+                    first.ProjectId first.LedgerId first.Epoch first.RemoteName
+                    first.ApprovedFetchUrl first.ApprovedPushUrl
+                    (LedgerStore.fetch first |> success).Commit true
+                |> success |> ignore
+                let runtime =
+                    Client.Runtime(Path.GetDirectoryName one, Client.ConsoleTui.ConsoleTui(), Client.PartialTrust)
+                let inbox agentId : Common.AgentCommand =
+                    Common.TaskReadCommand
+                        { ProjectName = "owner"; AgentId = agentId; Action = "AgentInbox"
+                          TaskId = ""; AssignmentGeneration = 0
+                          CheckpointSequence = 0L; Cursor = ""; PageSize = 0
+                          BeforeOid = null; AfterOid = null; RelativePath = null }
+                let invoke agentId =
+                    Client.SignalR.Client.processIncomingCommand runtime
+                        (System.Text.Json.JsonSerializer.Serialize<Common.AgentCommand>(inbox agentId)) agentId
+                    |> Async.AwaitTask |> Async.RunSynchronously
+                let _, missing, _ = invoke "Ghost"
+                match missing with
+                | Error(Client.ValidationError message) ->
+                    Assert.That(message, Does.Contain("canonical agent state"))
+                | other -> Assert.Fail(sprintf "Unknown bound agent must fail closed: %A" other)
+                let _, registered, _ = invoke "Reviewer"
+                Assert.That(registered.IsOk, Is.True, sprintf "Parked inbox failed: %A" registered)
+                Assert.That((ReviewWorkflow.getAgentInbox first "Reviewer" |> success).Agent.State,
+                            Is.EqualTo("Parked"))
+            finally
+                if File.Exists configPath then File.Delete configPath)
+
+    [<Test>]
+    member _.InFlightOwnerTransitionsBlockConcurrentCorrectionWithoutChangingExactVersions() =
+        for transition in [ "Checkpoint"; "Yield"; "Complete" ] do
+            for expired in [ false; true ] do
+                withFixture (fun _ _ first second _ _ _ _ ->
+                    let taskId =
+                        sprintf "inflight-%s-%s" (transition.ToLowerInvariant())
+                            (if expired then "expired" else "legacy")
+                    ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "In-flight owner transition"
+                    |> success |> ignore
+                    ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner"
+                    |> success |> ignore
+                    ReviewWorkflow.beginAttempt first (Guid.NewGuid()) taskId "Owner" 1 1
+                    |> success |> ignore
+                    let _, taskInfo, attemptOpt = ReviewWorkflow.getTask first taskId |> success
+                    let attempt = attemptOpt.Value
+                    if expired then
+                        ReviewWorkflow.recordWorkingActivityAt first (Guid.NewGuid())
+                            "Owner" taskId attempt.AttemptId (DateTimeOffset.UtcNow.AddMinutes(-10.))
+                        |> success |> ignore
+                    let owner = (ReviewWorkflow.getAgentInbox first "Owner" |> success).Agent
+                    Assert.That(owner.State, Is.EqualTo("Working"))
+                    Assert.That(String.IsNullOrWhiteSpace owner.ActivityLeaseUntilUtc || expired, Is.True)
+                    let reservation = Guid.NewGuid()
+                    ReviewWorkflow.beginInFlightAgentOperation second (Guid.NewGuid())
+                        "Owner" taskId attempt.AttemptId reservation |> success |> ignore
+                    let observed = (ReviewWorkflow.getAgentInbox first "Owner" |> success).Agent
+                    // A reservation must not invalidate an owner transition's
+                    // supplied expected agent version.
+                    Assert.That(observed.Version, Is.EqualTo(owner.Version))
+                    let gate =
+                        System.Threading.Tasks.TaskCompletionSource<unit>(
+                            System.Threading.Tasks.TaskCreationOptions.RunContinuationsAsynchronously)
+                    let pending = task {
+                        do! gate.Task
+                        let result =
+                            match transition with
+                            | "Checkpoint" ->
+                                ReviewWorkflow.checkpointAttempt second (Guid.NewGuid()) taskId "Owner"
+                                    attempt.Version owner.Version attempt.AssignmentGeneration
+                                    "Worker progress" "Continue" null null
+                            | "Yield" ->
+                                ReviewWorkflow.yieldAgent second (Guid.NewGuid()) taskId "Owner"
+                                    attempt.Version owner.Version attempt.AssignmentGeneration
+                                    "Paused" "Resume later"
+                            | "Complete" ->
+                                ReviewWorkflow.completeAgentWork second (Guid.NewGuid()) taskId "Owner"
+                                    attempt.Version owner.Version attempt.AssignmentGeneration "Completed"
+                            | _ -> failwith "Unknown test transition"
+                        let finish =
+                            ReviewWorkflow.endInFlightAgentOperation first (Guid.NewGuid())
+                                "Owner" reservation
+                        return result, finish
+                    }
+                    // The operator has *current* versions and a Working agent
+                    // with no valid lease, but cannot interrupt genuine
+                    // admitted work, even from another Git clone.
+                    for clone in [ first; second ] do
+                        expectStale
+                            (ReviewWorkflow.correctAgentWorkingStateAs clone "Lead" (Guid.NewGuid())
+                                "Lead" "Owner" taskId attempt.AttemptId taskInfo.Version attempt.Version
+                                observed.Version attempt.AssignmentGeneration "False inactivity")
+                    let _, beforeHistory = ReviewWorkflow.getTaskLifecycleHistory first taskId |> success
+                    Assert.That(beforeHistory, Is.Empty)
+                    gate.SetResult(())
+                    let result, release =
+                        pending |> Async.AwaitTask |> Async.RunSynchronously
+                    result |> success |> ignore
+                    release |> success |> ignore
+                    let after = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
+                    if transition = "Checkpoint" then
+                        Assert.That(after.State, Is.EqualTo("Working"))
+                        let _, currentTask, updatedAttemptOpt =
+                            ReviewWorkflow.getTask first taskId |> success
+                        expectStale
+                            (ReviewWorkflow.correctAgentWorkingStateAs first "Lead" (Guid.NewGuid())
+                                "Lead" "Owner" taskId attempt.AttemptId
+                                currentTask.Version updatedAttemptOpt.Value.Version
+                                after.Version attempt.AssignmentGeneration "Just completed call")
+                    else
+                        Assert.That(after.State, Is.Not.EqualTo("Working"))
+                    let _, history = ReviewWorkflow.getTaskLifecycleHistory second taskId |> success
+                    Assert.That(history, Is.Empty))
+
+    [<Test>]
+    member _.WorkingLeaseSurvivesIndependentTaskClosureAndPreservesOwnerCompletion() =
+        withFixture (fun _ _ first second _ _ _ _ ->
+            let taskId = "closed-working-lease"
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Closed lease"
+            |> success |> ignore
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner"
+            |> success |> ignore
+            ReviewWorkflow.beginAttempt first (Guid.NewGuid()) taskId "Owner" 1 1
+            |> success |> ignore
+            let _, task, maybeAttempt = ReviewWorkflow.getTask first taskId |> success
+            let attempt = maybeAttempt.Value
+            ReviewWorkflow.closeTaskAs first "Lead" (Guid.NewGuid()) taskId task.Version
+            |> success |> ignore
+            let _, closed, _ = ReviewWorkflow.getTask second taskId |> success
+            Assert.That(closed.Lifecycle, Is.EqualTo("Closed"))
+            let before = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
+            ReviewWorkflow.recordWorkingActivity second (Guid.NewGuid())
+                "Owner" taskId attempt.AttemptId |> success |> ignore
+            let after = (ReviewWorkflow.getAgentInbox first "Owner" |> success).Agent
+            Assert.That(after.State, Is.EqualTo("Working"))
+            Assert.That(after.Version, Is.EqualTo(before.Version + 1))
+            expectStale
+                (ReviewWorkflow.correctAgentWorkingStateAs first "Lead" (Guid.NewGuid())
+                    "Lead" "Owner" taskId attempt.AttemptId closed.Version attempt.Version
+                    after.Version attempt.AssignmentGeneration "Cannot correct closed task")
+            let finished =
+                ReviewWorkflow.completeAgentWork first (Guid.NewGuid()) taskId "Owner"
+                    attempt.Version after.Version attempt.AssignmentGeneration "Finished closed assignment"
+                |> success
+            Assert.That(finished.AlreadyApplied, Is.False)
+            Assert.That((ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent.State,
+                        Is.EqualTo("NeedsWork")))
+
+    [<Test>]
+    member _.WorkingLeaseHeartbeatRenewsDuringLongToolAndStopsCleanly() =
+        let observed =
+            System.Threading.Tasks.TaskCompletionSource<unit>(
+                System.Threading.Tasks.TaskCreationOptions.RunContinuationsAsynchronously)
+        let calls = ref 0
+        let value, failure =
+            Client.SignalR.Client.withActivityLeaseHeartbeat
+                (TimeSpan.FromMilliseconds(15.))
+                (fun () ->
+                    calls.Value <- calls.Value + 1
+                    observed.TrySetResult(()) |> ignore
+                    Ok ())
+                (fun () ->
+                    task {
+                        do! observed.Task.WaitAsync(TimeSpan.FromSeconds(3.))
+                        return 42
+                    })
+            |> Async.AwaitTask |> Async.RunSynchronously
+        Assert.That(value, Is.EqualTo(42))
+        Assert.That(failure, Is.EqualTo(None : string option))
+        Assert.That(calls.Value, Is.GreaterThanOrEqualTo(1))
+
+    [<Test>]
+    member _.WorkingLeaseHeartbeatSurfacesRenewalFailure() =
+        let observed =
+            System.Threading.Tasks.TaskCompletionSource<unit>(
+                System.Threading.Tasks.TaskCreationOptions.RunContinuationsAsynchronously)
+        let _, failure =
+            Client.SignalR.Client.withActivityLeaseHeartbeat
+                (TimeSpan.FromMilliseconds(15.))
+                (fun () ->
+                    observed.TrySetResult(()) |> ignore
+                    Error "Lease CAS rejected")
+                (fun () ->
+                    task {
+                        do! observed.Task.WaitAsync(TimeSpan.FromSeconds(3.))
+                        return 42
+                    })
+            |> Async.AwaitTask |> Async.RunSynchronously
+        Assert.That(failure, Is.EqualTo(Some "Lease CAS rejected"))
+
+    [<Test>]
+    member _.AdministrativeCorrectionTypedApiUsesAuthenticatedOperatorAndSafeReplay() =
+        withFixture (fun one _ first second _ _ _ _ ->
+            let taskId = "admin-correction-api"
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Typed correction"
+            |> success |> ignore
+            ReviewWorkflow.assignTask first (Guid.NewGuid()) taskId (Guid.NewGuid()) "Owner"
+            |> success |> ignore
+            ReviewWorkflow.beginAttempt first (Guid.NewGuid()) taskId "Owner" 1 1
+            |> success |> ignore
+            let _, task, maybeAttempt = ReviewWorkflow.getTask first taskId |> success
+            let attempt = maybeAttempt.Value
+            let agent = (ReviewWorkflow.getAgentInbox first "Owner" |> success).Agent
+            let configPath = Client.OrchestrationApi.LedgerBindingConfig.pathForRoot one
+            Directory.CreateDirectory(Path.GetDirectoryName configPath) |> ignore
+            let approved : Client.OrchestrationApi.LedgerTrustBinding =
+                { SchemaVersion = 1; Enabled = true; ProjectRoot = one
+                  ProjectId = first.ProjectId.ToString("D")
+                  LedgerId = first.LedgerId.ToString("D"); Epoch = first.Epoch
+                  RemoteName = first.RemoteName
+                  ApprovedFetchUrl = first.ApprovedFetchUrl
+                  ApprovedPushUrl = first.ApprovedPushUrl
+                  HighestTrustedHead = (LedgerStore.fetch first |> success).Commit }
+            File.WriteAllText(configPath, System.Text.Json.JsonSerializer.Serialize(approved))
+            let ctx = GitCommandTests.TestContext(Path.GetDirectoryName one)
+            let operationId = Guid.NewGuid()
+            let command : Common.TaskWriteCommand =
+                { ProjectName = "owner"; Action = "CorrectAgentWorkingState"
+                  OperationId = operationId.ToString("D"); TaskId = taskId
+                  AttemptId = attempt.AttemptId; ActorId = "Lead"; OwnerId = "Owner"
+                  Title = ""; Html = ""; ExpectedVersion = attempt.Version
+                  ExpectedAgentVersion = agent.Version; ExpectedTaskVersion = task.Version
+                  AssignmentGeneration = attempt.AssignmentGeneration
+                  Summary = ""; NextAction = ""; Reason = "Operator reclassified stale state"
+                  BaseOid = ""; TargetRef = ""; SourceRef = ""
+                  AllowDetached = false; AllowUncommitted = false
+                  DecisionSequence = 0L; Evidence = ""; SessionId = "" }
+            let invoke cmd =
+                Client.OrchestrationApi.TaskApi.write cmd ctx
+                |> function
+                    | Ok value -> value
+                    | Error error -> failwithf "Administrative correction API failed: %A" error
+            invoke command |> ignore
+            invoke command |> ignore
+            let _, history = ReviewWorkflow.getTaskLifecycleHistory second taskId |> success
+            Assert.That(history.Length, Is.EqualTo(1))
+            Assert.That(history.Head.ActorId, Is.EqualTo("AuthenticatedUser"))
+            Assert.That(history.Head.RequestingAgentId, Is.EqualTo("Lead"))
+            Assert.That(history.Head.TargetAgentId, Is.EqualTo("Owner"))
+            let corrected = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
+            Assert.That(corrected.State, Is.EqualTo("Ready"))
+            match Client.OrchestrationApi.TaskApi.write
+                      { command with Reason = "Different payload for same operation" } ctx with
+            | Error _ -> ()
+            | Ok _ -> Assert.Fail("A reused operation ID with different input must fail."))
+
+    [<Test>]
     member _.AdministrativeActorUsesAuthenticatedUserAndHistoricalReceipt() =
         withFixture (fun _ _ first second _ _ _ _ ->
             let resolve id session =

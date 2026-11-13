@@ -479,6 +479,7 @@ let ``command catalog matches AgentCommand union and MCP tools`` () =
               "GetRole"; "ListRoles"; "GetAgentInstructionConfig"; "ResolveAgentInstructions"
               "CreateRole"; "UpdateRole"; "AttachRole"; "DetachRole"; "SetAgentInstructions"
               "SetAttemptSource"; "YieldAgent"; "CompleteAgentWork"
+              "StartTasklessWork"; "YieldTasklessWork"; "RecoverTasklessWork"
               "SetAgentState"; "ReissueQueuedAttempt"; "RecoverAgentAssignment"; "AcknowledgeReviewFeedback"; "DeferAttempt"; "ResumeAttempt"; "AbandonAttempt"; "CancelTask"; "TransferOwner"; "CloseTask"; "ReopenTask"; "ImportTaskSpec"; "ExportTaskSpec"
               "GetTask"; "TaskOverview"; "ReviewDetails"; "ReviewerInbox"; "ListReviewDocuments"; "ReadReviewDocument"
               "SubmitReview"; "ClaimReview"; "DecideReview"
@@ -571,7 +572,7 @@ let ``client-backed MCP tools expose an optional per-command deviceId`` () =
             |> Array.exists (fun parameter -> parameter.ParameterType = typeof<ClientService>))
     // Nine role/instruction tools are public aliases of the existing ledger wire
     // protocol; they have independent methods and the same device routing rule.
-    clientMethods.Length |> shouldEqual (AgentProtocol.commandDefinitions.Length - 1 + 60)
+    clientMethods.Length |> shouldEqual (AgentProtocol.commandDefinitions.Length - 1 + 63)
     for methodInfo in clientMethods do
         let deviceParam = methodInfo.GetParameters() |> Array.tryFind (fun parameter -> parameter.Name = "deviceId")
         match deviceParam with
@@ -986,6 +987,7 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
               for name in [ "SubmitIntegration"; "CompleteIntegration"; "NotifyAgent"; "AcknowledgeNotification"; "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "ReissueAssignment"; "CheckpointAttempt"
                             "CreateRole"; "UpdateRole"; "AttachRole"; "DetachRole"; "SetAgentInstructions";
                             "SetAttemptSource"; "YieldAgent"; "CompleteAgentWork";
+                            "StartTasklessWork"; "YieldTasklessWork"; "RecoverTasklessWork";
                             "SetAgentState"; "ReissueQueuedAttempt"; "RecoverAgentAssignment"; "AcknowledgeReviewFeedback"; "DeferAttempt"; "ResumeAttempt"; "AbandonAttempt"; "CancelTask"; "TransferOwner"; "CloseTask"; "ReopenTask"; "ImportTaskSpec"; "ExportTaskSpec" ] -> name, taskWrite
               for name in [ "GetTask"; "TaskOverview"; "ReviewDetails"; "ReviewerInbox"; "ListReviewDocuments"; "ReadReviewDocument" ] ->
                   name, ledgerRead

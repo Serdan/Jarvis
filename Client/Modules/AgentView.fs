@@ -24,6 +24,10 @@ type AgentRow =
       StateEnteredAt: DateTimeOffset option
       StateReason: string option
       Focus: TaskFocus option
+      RoleIds: string list
+      // Activity and review context are independent of implementation focus.
+      Activity: string option
+      ReviewContext: string option
       PendingNotifications: int
       LatestNotification: string option
       /// Project aliases that can unambiguously identify local tool-call activity.
@@ -275,6 +279,8 @@ let matches (filter: string) (row: AgentRow) =
     let terms = ActivityFilter.parseTerms filter
     let searchable =
         [ row.Agent; row.State; row.Project; row.ProjectLabel; yield! row.ProjectAliases
+          yield! row.RoleIds
+          row.Activity |> Option.defaultValue ""; row.ReviewContext |> Option.defaultValue ""
           row.StateReason |> Option.defaultValue ""
           match row.Focus with
           | Some task -> yield! [ task.TaskId; task.Title; task.Lifecycle; task.Phase; task.SourceRef |> Option.defaultValue "" ]
@@ -300,6 +306,21 @@ let stateColor = function
     | "Parked" -> ConsoleColor.DarkGray
     | _ -> ConsoleColor.Gray
 
+/// Shared task-or-activity display. No synthetic task identifiers are needed.
+let agentContext (row: AgentRow) =
+    [ match row.Focus with
+      | Some focus -> $"#{focus.TaskId} {focus.Title}"
+      | None -> ()
+      if not row.RoleIds.IsEmpty then
+          "Roles: " + String.concat ", " row.RoleIds
+      match row.Activity with
+      | Some text -> "Activity: " + text
+      | None -> ()
+      match row.ReviewContext with
+      | Some text -> text
+      | None -> () ]
+    |> String.concat " | "
+
 let agentSummary (row: AgentRow) =
     match row.Focus with
     | Some task -> sprintf "#%s - %s" task.TaskId (displayState row.State)
@@ -316,6 +337,9 @@ let changedAgents (before: Snapshot) (after: Snapshot) =
             && previousRow.StateEnteredAt = row.StateEnteredAt
             && previousRow.StateReason = row.StateReason
             && previousRow.Focus = row.Focus
+            && previousRow.RoleIds = row.RoleIds
+            && previousRow.Activity = row.Activity
+            && previousRow.ReviewContext = row.ReviewContext
             && previousRow.PendingNotifications = row.PendingNotifications
             && previousRow.LatestNotification = row.LatestNotification -> None
         | _ -> Some row.Key)

@@ -1082,7 +1082,7 @@ module LedgerStore =
 
     let internal dashboardBlobCacheStats () = dashboardBlobCache.Counts
 
-    let private dashboardRecordPath includeIntegrations (path: string) =
+    let private dashboardRecordPath includeIntegrations includeInstructionConfigs (path: string) =
         (path.StartsWith("agents/", StringComparison.Ordinal)
          && path.EndsWith(".json", StringComparison.Ordinal))
         || (path.StartsWith("notifications/", StringComparison.Ordinal)
@@ -1093,12 +1093,17 @@ module LedgerStore =
                 || (Regex.IsMatch(path, "^tasks/[A-Za-z0-9_-]+/attempts/[a-f0-9]{32}[.]json$"))
                 || (includeIntegrations &&
                     Regex.IsMatch(path, "^tasks/[A-Za-z0-9_-]+/integrations/[a-f0-9]{32}[.]json$"))))
+        || (includeInstructionConfigs
+            && path.StartsWith("records/agent-instructions/", StringComparison.Ordinal)
+            && path.EndsWith(".json", StringComparison.Ordinal))
 
     // One immutable tree listing and one cat-file batch (only for previously
     // unseen blobs), instead of two Git processes per entity.
-    let private readViewRecordsAt includeIntegrations (binding: LedgerBinding) (snapshot: LedgerSnapshot) =
+    let private readViewRecordsAt includeIntegrations includeInstructionConfigs (binding: LedgerBinding) (snapshot: LedgerSnapshot) =
         let repo = binding.RepositoryPath
-        let treeArgs = [ "ls-tree"; "-r"; "-z"; snapshot.Commit; "--"; "agents"; "tasks"; "notifications" ]
+        let prefixes = [ "agents"; "tasks"; "notifications" ]
+                       @ if includeInstructionConfigs then [ "records/agent-instructions" ] else []
+        let treeArgs = [ "ls-tree"; "-r"; "-z"; snapshot.Commit; "--" ] @ prefixes
         match gitRaw repo treeArgs |> requireSuccess "Dashboard tree listing" with
         | Error error -> Error error
         | Ok listing ->
@@ -1111,7 +1116,7 @@ module LedgerStore =
                     else
                         let header = entry.Substring(0, separator).Split(' ')
                         let path = entry.Substring(separator + 1)
-                        if ledgerPath.IsMatch path && dashboardRecordPath includeIntegrations path then
+                        if ledgerPath.IsMatch path && dashboardRecordPath includeIntegrations includeInstructionConfigs path then
                             if header.Length = 3 && header[0] = "100644"
                                && header[1] = "blob" && oidPattern.IsMatch(header[2]) then
                                 Some(path, header[2])
@@ -1188,16 +1193,16 @@ module LedgerStore =
     // fetched/verified snapshot and only read blobs reachable from its OID.
     // The OID-keyed immutable blob cache never decides which paths exist.
     let internal readDashboardRecordsWithOidsAt binding snapshot =
-        readViewRecordsAt false binding snapshot
+        readViewRecordsAt false true binding snapshot
 
     let private stripOids records =
         records |> Map.map (fun _ (struct (_, content)) -> content)
 
     let readDashboardRecordsAt binding snapshot =
-        readViewRecordsAt false binding snapshot |> Result.map stripOids
+        readViewRecordsAt false true binding snapshot |> Result.map stripOids
 
     let readAgentInboxRecordsAt binding snapshot =
-        readViewRecordsAt true binding snapshot |> Result.map stripOids
+        readViewRecordsAt true false binding snapshot |> Result.map stripOids
 
     let verifySourceCommit (binding: LedgerBinding) (sourceRef: string) (commit: string) =
         if not (sourceRef.StartsWith("refs/heads/", StringComparison.Ordinal))

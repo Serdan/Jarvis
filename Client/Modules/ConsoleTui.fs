@@ -88,7 +88,7 @@ type AgentUiAccess =
 
 type OperatorChallengeUiAccess =
     { Load: unit -> Result<OperatorChallengeSnapshot, string>
-      Reply: OperatorChallengeReply -> Result<unit, string> }
+      Reply: OperatorChallengeReply -> Result<unit, OperatorChallengeReplyFailure> }
 
 type SettingsUiAccess =
     { Load: unit -> Result<ClientConfigSnapshot, string>
@@ -166,6 +166,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
     let mutable challengeReplyText = ""
     let mutable challengeReplyOperationId = ""
     let mutable challengeReplyTarget: OperatorChallengeEntry option = None
+    let mutable challengeReplyNeedsRebase = false
     let mutable permissionReturnMode = ActivityMode
     let mutable jobCancelReturnMode = JobsMode
     let mutable settingsAccess: SettingsUiAccess option = None
@@ -215,7 +216,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         for label, target in
             [ "Activity", SwitchActivity; "Agents", SwitchAgents
               "Jobs", SwitchJobs;
-              (sprintf "Challenges(%d)" (challengeItems |> List.filter (fun c -> c.ConditionStatus = "Pending") |> List.length)), SwitchChallenges;
+              (sprintf "Challenges(%d)" (OperatorChallengePresentation.pendingCount challengeItems)), SwitchChallenges;
               "Settings", SwitchSettings ] do
             let x = draw.CursorLeft
             let text = if currentModeIs target then $"[{label}] " else $" {label}  "
@@ -1212,17 +1213,35 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
 
     let beginChallengeReplyUnsafe () =
         match currentChallengeUnsafe () with
-        | Some item when item.ConditionStatus = "Pending" ->
-            challengeReplyTarget <- Some item
-            challengeReplyText <- ""
-            challengeReplyOperationId <- Guid.NewGuid().ToString("D")
+        | Some item when OperatorChallengePresentation.isActionable item ->
+            match challengeReplyTarget with
+            | Some previous when OperatorChallengePresentation.sameCondition previous item
+                                 && not (String.IsNullOrWhiteSpace challengeReplyOperationId) ->
+                // Returning to the same question must not delete an unsent draft.
+                if challengeReplyNeedsRebase then
+                    let draft = { Target = previous; Text = challengeReplyText
+                                  OperationId = challengeReplyOperationId }
+                    match OperatorChallengePresentation.rebaseAfterDefinitiveStale
+                              draft (Some item) (Guid.NewGuid().ToString("D")) with
+                    | Some recovered ->
+                        challengeReplyTarget <- Some recovered.Target
+                        challengeReplyText <- recovered.Text
+                        challengeReplyOperationId <- recovered.OperationId
+                        challengeReplyNeedsRebase <- false
+                        challengeNotice <- Some "Fresh challenge version loaded; draft preserved. Review before sending."
+                    | None -> ()
+            | _ ->
+                challengeReplyTarget <- Some item
+                challengeReplyText <- ""
+                challengeReplyOperationId <- Guid.NewGuid().ToString("D")
+                challengeReplyNeedsRebase <- false
             challengeError <- None
             challengeDetailScroll <- 0
             mode <- ChallengeReplyMode
         | _ -> ()
 
     let renderChallengesUnsafe width =
-        let pending = challengeItems |> List.filter (fun c -> c.ConditionStatus = "Pending") |> List.length
+        let pending = OperatorChallengePresentation.pendingCount challengeItems
         let refreshing = if challengeRefreshing then " (refreshing)" else ""
         draw.WriteLine (trim (sprintf "Operator challenges: %d pending, %d total%s" pending challengeItems.Length refreshing) width)
         draw.WriteLine (trim "Up/Down select | Left/Right scroll details | Enter reply | r refresh | Esc return" width)
@@ -1233,7 +1252,10 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         for i = challengeScroll to min (challengeItems.Length - 1) (challengeScroll + rows - 1) do
             let item = challengeItems[i]
             let mark = if challengeSelected = i then ">" else " "
-            let state = if item.ConditionStatus = "Pending" then "?" else "done"
+            let state =
+                if OperatorChallengePresentation.isActionable item then "?"
+                elif item.ChallengeStatus = "Cancelled" then "cancelled"
+                else "done"
             registerMouseHit 0 width (SelectChallenge i)
             draw.WriteLine(trim (sprintf "%s [%s] %s / %s: %s" mark state item.ProjectName item.IssuerAgentId item.Title) width)
         if challengeItems.IsEmpty then draw.WriteLine "No operator-input challenges in trusted projects."
@@ -1260,9 +1282,16 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                   if item.ConditionStatus = "Satisfied" then
                       yield "Recorded answer:"
                       yield! wrappedLines (width - 2) item.Evidence |> List.map (fun line -> "  " + line)
-                  elif mode = ChallengeReplyMode then
-                      yield "Reply (Enter submits, Esc returns, Backspace edits):"
+                      match OperatorChallengePresentation.provenanceLine item with
+                      | Some provenance -> yield! wrappedLines (width - 2) provenance
+                      | None -> yield "  Provenance unavailable in this ledger snapshot"
+                  if mode = ChallengeReplyMode then
+                      if not (OperatorChallengePresentation.isActionable item) then
+                          yield "Response disabled: this challenge is no longer waiting for input."
+                      yield "Reply (Enter submits, Esc returns, F5 refresh, Backspace edits):"
                       yield! wrappedLines (width - 2) challengeReplyText |> List.map (fun line -> "  " + line)
+                      if challengeReplyNeedsRebase then
+                          yield "  Response paused: waiting to verify an updated active challenge version."
                       if challengeSubmitting then yield "Persisting response..." ]
             challengeDetailTotalRows <- detailLines.Length
             challengeDetailPageRows <- max 1 (TerminalLayout.availableRows draw.Height draw.CursorTop 2)
@@ -1518,6 +1547,36 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                             match snapshot.Warnings with
                             | [] -> None
                             | warnings -> Some(String.concat "; " warnings)
+                        if challengeReplyNeedsRebase then
+                            match challengeReplyTarget with
+                            | Some prior ->
+                                let updated =
+                                    challengeItems |> List.tryFind (OperatorChallengePresentation.sameCondition prior)
+                                let draft = { Target = prior; Text = challengeReplyText
+                                              OperationId = challengeReplyOperationId }
+                                match OperatorChallengePresentation.rebaseAfterDefinitiveStale
+                                          draft updated (Guid.NewGuid().ToString("D")) with
+                                | Some recovered ->
+                                    // Definitive stale only: a new intent UUID is safe once
+                                    // canonical reload shows the same condition still actionable.
+                                    challengeReplyTarget <- Some recovered.Target
+                                    challengeReplyText <- recovered.Text
+                                    challengeReplyOperationId <- recovered.OperationId
+                                    challengeReplyNeedsRebase <- false
+                                    challengeError <- None
+                                    challengeNotice <- Some "Challenge changed; response draft preserved. Review and press Enter to retry."
+                                | None ->
+                                    let message =
+                                        match updated with
+                                        | Some item when not (OperatorChallengePresentation.isActionable item) ->
+                                            // Show the canonical terminal state and any immutable response provenance,
+                                            // but keep the unsent draft accessible for inspection/copy.
+                                            challengeReplyTarget <- Some item
+                                            "This condition was answered or cancelled; draft retained, response disabled."
+                                        | Some _ -> "No newer active challenge version was found; draft retained. Press F5 to refresh."
+                                        | None -> "The question is unavailable in the refreshed snapshot; draft retained."
+                                    challengeError <- Some message
+                            | None -> ()
                         match selected with
                         | Some old ->
                             match challengeItems |> List.tryFindIndex (fun c ->
@@ -1533,6 +1592,8 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
     let submitChallengeReplyUnsafe () =
         match challengeAccess, challengeReplyTarget with
         | Some access, Some target when not challengeSubmitting
+                                   && not challengeReplyNeedsRebase
+                                   && OperatorChallengePresentation.isActionable target
                                    && not (String.IsNullOrWhiteSpace challengeReplyText) ->
             let request: OperatorChallengeReply =
                 { ProjectName = target.ProjectName
@@ -1546,7 +1607,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
             Task.Run(Action(fun () ->
                 let response =
                     try access.Reply request
-                    with ex -> Error ex.Message
+                    with ex -> Error(OtherOperatorReplyFailure ex.Message)
                 lock syncRoot (fun () ->
                     challengeSubmitting <- false
                     match response with
@@ -1556,9 +1617,17 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                         challengeReplyTarget <- None
                         challengeReplyText <- ""
                         challengeReplyOperationId <- ""
+                        challengeReplyNeedsRebase <- false
                         mode <- ChallengesMode
                         startChallengeRefreshUnsafe()
-                    | Error error -> challengeError <- Some error
+                    | Error (StaleOperatorReply error) ->
+                        challengeReplyNeedsRebase <- true
+                        challengeError <- Some("Challenge version changed: " + error)
+                        startChallengeRefreshUnsafe()
+                    | Error (OtherOperatorReplyFailure error) ->
+                        // Outcome might be uncertain. Never mint a new operation
+                        // UUID until a definitive stale result and fresh read.
+                        challengeError <- Some("Reply failed/uncertain. Same operation ID retained for safe retry: " + error)
                     renderUnsafe()))) |> ignore
         | _ -> ()
 
@@ -1972,6 +2041,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                                     if not challengeSubmitting then
                                         match keyInfo.Key with
                                         | ConsoleKey.Enter -> submitChallengeReplyUnsafe()
+                                        | ConsoleKey.F5 -> startChallengeRefreshUnsafe()
                                         | ConsoleKey.Escape -> mode <- ChallengesMode
                                         | ConsoleKey.LeftArrow ->
                                             challengeDetailScroll <- max 0 (challengeDetailScroll - 1)

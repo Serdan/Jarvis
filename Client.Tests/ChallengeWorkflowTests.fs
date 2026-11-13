@@ -965,6 +965,13 @@ type ChallengeTests() =
             let operatorView = ChallengeWorkflow.listOperator b "Wayfold" |> ok
             Assert.That(operatorView.Head.ConditionStatus, Is.EqualTo("Satisfied"))
             Assert.That(operatorView.Head.Evidence, Is.EqualTo(answer))
+            Assert.That(operatorView.Head.RespondedBy, Is.EqualTo("operator:authenticated-subject"))
+            Assert.That(operatorView.Head.RespondedAtUtc, Is.EqualTo(completed.History.Tail.Head.OccurredAtUtc))
+            Assert.That(operatorView.Head.ResponseEventSequence, Is.EqualTo(completed.History.Tail.Head.Sequence))
+            let provenance = Client.OperatorChallengePresentation.provenanceLine operatorView.Head
+            Assert.That(provenance.IsSome, Is.True)
+            Assert.That(provenance.Value, Does.Contain("operator:authenticated-subject"))
+            Assert.That(provenance.Value, Does.Contain(completed.History.Tail.Head.OccurredAtUtc))
             failStale (ChallengeWorkflow.respondOperator a (Guid.NewGuid()) "operator:other"
                            cid condition 1 "conflicting answer")
             failStale (ChallengeWorkflow.respondOperator b (Guid.NewGuid()) "operator:other"
@@ -1015,4 +1022,111 @@ type ChallengeTests() =
             Assert.That(notices a, Is.Empty)
             failStale (ChallengeWorkflow.blockAttempt b (Guid.NewGuid()) "Agent 3" task attemptId
                            tv pv av 1 "Too late" [ created.ChallengeId ])
+        )
+
+    [<Test>]
+    member _.CancelledOperatorRequestRemainsInHistoryButIsNotActionableInClient() =
+        withFixture (fun a b ->
+            let created =
+                ChallengeWorkflow.create a (Guid.NewGuid()) "Agent 3" "Cancelled operator request" ""
+                    [ { OwnerKind = "Operator"; OwnerAgentId = ""; SuggestedAgentId = ""
+                        Description = "Review the new layout" } ] |> ok
+            let pending = ChallengeWorkflow.listOperator b "Jarvis" |> ok
+            Assert.That(Client.OperatorChallengePresentation.pendingCount pending, Is.EqualTo(1))
+            ChallengeWorkflow.cancel b (Guid.NewGuid()) "Agent 3"
+                created.ChallengeId 1 "No longer required" |> ok |> ignore
+            let cancelled = ChallengeWorkflow.listOperator a "Jarvis" |> ok
+            Assert.That(cancelled.Length, Is.EqualTo(1), "Cancelled requests remain readable history.")
+            Assert.That(cancelled.Head.ChallengeStatus, Is.EqualTo("Cancelled"))
+            Assert.That(cancelled.Head.ConditionStatus, Is.EqualTo("Pending"),
+                        "Historical condition status must not be rewritten for presentation.")
+            Assert.That(Client.OperatorChallengePresentation.pendingCount cancelled, Is.Zero)
+            Assert.That(Client.OperatorChallengePresentation.isActionable cancelled.Head, Is.False)
+            failStale (ChallengeWorkflow.respondOperator a (Guid.NewGuid()) "operator:human"
+                           created.ChallengeId created.ConditionIds.Head 2 "Too late")
+            Assert.That(notices b, Is.Empty)
+        )
+
+    [<Test>]
+    member _.UnrelatedConditionResolutionRebasesOperatorDraftOnVerifiedNewVersion() =
+        withFixture (fun a b ->
+            let created =
+                ChallengeWorkflow.create a (Guid.NewGuid()) "Agent 3" "Mixed review" ""
+                    [ { OwnerKind = "Operator"; OwnerAgentId = ""; SuggestedAgentId = ""
+                        Description = "Provide one-shot opinion" }
+                      { OwnerKind = "Agent"; OwnerAgentId = "Agent 8"; SuggestedAgentId = ""
+                        Description = "Perform validation" } ] |> ok
+            let original = (ChallengeWorkflow.listOperator b "Jarvis" |> ok).Head
+            Assert.That(original.Version, Is.EqualTo(1))
+            ChallengeWorkflow.resolve b (Guid.NewGuid()) "Agent 8" created.ChallengeId
+                created.ConditionIds.Tail.Head 1 "validated" "" |> ok |> ignore
+            let draft = "The UI layout is clear, but preserve scroll state."
+            failStale (ChallengeWorkflow.respondOperator a (Guid.NewGuid()) "operator:human"
+                           created.ChallengeId created.ConditionIds.Head original.Version draft)
+            let fresh = (ChallengeWorkflow.listOperator a "Jarvis" |> ok).Head
+            let rebase =
+                Client.OperatorChallengePresentation.updatedActionableVersion original (Some fresh)
+            Assert.That(rebase.IsSome, Is.True)
+            Assert.That(rebase.Value.Version, Is.EqualTo(2))
+            Assert.That(Client.OperatorChallengePresentation.updatedActionableVersion fresh (Some original),
+                        Is.EqualTo(None))
+            let priorOperation = Guid.NewGuid().ToString("D")
+            let nextOperation = Guid.NewGuid().ToString("D")
+            let typedDraft: Client.OperatorChallengeDraft =
+                { Target = original; Text = draft; OperationId = priorOperation }
+            let recovered =
+                Client.OperatorChallengePresentation.rebaseAfterDefinitiveStale
+                    typedDraft (Some fresh) nextOperation
+            Assert.That(recovered.IsSome, Is.True)
+            Assert.That(recovered.Value.Text, Is.EqualTo(draft))
+            Assert.That(recovered.Value.OperationId, Is.EqualTo(nextOperation))
+            Assert.That(recovered.Value.OperationId, Is.Not.EqualTo(priorOperation))
+            Assert.That(recovered.Value.Target.Version, Is.EqualTo(2))
+            Assert.That(Client.OperatorChallengePresentation.rebaseAfterDefinitiveStale
+                            typedDraft (Some original) nextOperation,
+                        Is.EqualTo(None), "No new canonical version means no new intent.")
+            Assert.That(Client.OperatorChallengePresentation.rebaseAfterDefinitiveStale
+                            typedDraft (Some fresh) priorOperation,
+                        Is.EqualTo(None), "An idempotent retry must keep the prior operation ID.")
+            let operation = Guid.NewGuid()
+            ChallengeWorkflow.respondOperator b operation "operator:human"
+                created.ChallengeId created.ConditionIds.Head rebase.Value.Version draft
+                |> ok |> ignore
+            let final = (ChallengeWorkflow.listOperator a "Jarvis" |> ok).Head
+            Assert.That(final.ChallengeStatus, Is.EqualTo("Satisfied"))
+            Assert.That(final.Evidence, Is.EqualTo(draft))
+            Assert.That(final.RespondedBy, Is.EqualTo("operator:human"))
+            Assert.That(final.ResponseEventSequence, Is.GreaterThan(0L))
+            Assert.That(Client.OperatorChallengePresentation.updatedActionableVersion original (Some final),
+                        Is.EqualTo(None), "An answered condition must not be re-armed by a stale draft.")
+            Assert.That(Client.OperatorChallengePresentation.rebaseAfterDefinitiveStale
+                            typedDraft (Some final) (Guid.NewGuid().ToString("D")),
+                        Is.EqualTo(None), "Answered input cannot reuse the unsent draft.")
+            Assert.That(notices a, Is.Empty)
+        )
+
+    [<Test>]
+    member _.CancelledChallengeNeverCreatesAgentInboxWorkAndIssuerSeesOneTerminalOutcome() =
+        withFixture (fun a b ->
+            ChallengeWorkflow.setSubscription a (Guid.NewGuid()) "Lead" true |> ok |> ignore
+            let created =
+                ChallengeWorkflow.create a (Guid.NewGuid()) "Agent 3" "Withdrawn request" ""
+                    [ { OwnerKind = "Agent"; OwnerAgentId = "Lead"
+                        SuggestedAgentId = ""; Description = "Review code" }
+                      { OwnerKind = "Unassigned"; OwnerAgentId = ""
+                        SuggestedAgentId = ""; Description = "Run benchmark" } ] |> ok
+            ChallengeWorkflow.cancel b (Guid.NewGuid()) "Agent 3"
+                created.ChallengeId 1 "Cancelled by issuer" |> ok |> ignore
+            let snapshot = LedgerStore.fetch a |> ok
+            let assigned =
+                ReviewWorkflow.getAgentInboxAt a snapshot "Lead" |> ok
+                |> ChallengeWorkflow.enrichInboxAt a snapshot "Lead" |> ok
+            Assert.That(assigned.ChallengeAssigned, Is.Empty)
+            Assert.That(assigned.ChallengeTriage, Is.Empty)
+            let issuer =
+                ReviewWorkflow.getAgentInboxAt a snapshot "Agent 3" |> ok
+                |> ChallengeWorkflow.enrichInboxAt a snapshot "Agent 3" |> ok
+            Assert.That(issuer.ChallengeRecent.Length, Is.EqualTo(1))
+            Assert.That(issuer.ChallengeRecent.Head.ChallengeStatus, Is.EqualTo("Cancelled"))
+            Assert.That(notices b, Is.Empty)
         )

@@ -25,7 +25,10 @@ type ChallengeCondition =
       Status: string
       Evidence: string
       Reason: string
-      UpdatedAtUtc: string }
+      UpdatedAtUtc: string
+      // A direct immutable audit-event locator. Zero means no operator reply.
+      // Defaults to zero when reading pre-feature challenge ledger documents.
+      ResponseEventSequence: int64 }
 
 [<CLIMutable>]
 type AgentChallenge =
@@ -324,7 +327,7 @@ module ChallengeWorkflow =
                       SuggestedAgentId = if String.IsNullOrWhiteSpace definition.SuggestedAgentId then "" else definition.SuggestedAgentId
                       Description = definition.Description
                       Status = "Pending"; Evidence = null; Reason = null
-                      UpdatedAtUtc = null })
+                      UpdatedAtUtc = null; ResponseEventSequence = 0L })
             let created =
                 changed binding operationId issuer "CreateChallenge"
                     ({| title = title; taskId = task; conditions = definitions |})
@@ -539,7 +542,8 @@ module ChallengeWorkflow =
                                     Ok(challenge.Conditions |> List.map (fun c ->
                                         if c.ConditionId = conditionId then
                                             { c with Status = "Satisfied"; Evidence = evidence
-                                                     Reason = null; UpdatedAtUtc = timestamp }
+                                                     Reason = null; UpdatedAtUtc = timestamp
+                                                     ResponseEventSequence = snapshot.Header.NextSequence }
                                         else c), conditionId)
                                 | Some condition when ownerOf condition <> Some ChallengeOwner.Operator ->
                                     Error(ReviewAccessDenied "This challenge condition is not assigned to the human operator.")
@@ -730,7 +734,7 @@ module ChallengeWorkflow =
                                   SuggestedAgentId = normalized part.SuggestedAgentId
                                   Description = part.Description
                                   Status = "Pending"; Evidence = null; Reason = null
-                                  UpdatedAtUtc = timestamp })
+                                  UpdatedAtUtc = timestamp; ResponseEventSequence = 0L })
                         let revised =
                             { challenge with Version = challenge.Version + 1
                                              Conditions = challenge.Conditions |> List.collect (fun c ->
@@ -790,23 +794,58 @@ module ChallengeWorkflow =
     let listOperator binding projectName = result {
         let! snapshot = LedgerStore.fetch binding
         let! challenges = listAt binding snapshot
-        return
-            [ for challenge in challenges do
-                for condition in challenge.Conditions do
-                    if ownerOf condition = Some ChallengeOwner.Operator then
-                        yield { ProjectName = projectName
-                                ChallengeId = challenge.ChallengeId
-                                ConditionId = condition.ConditionId
-                                IssuerAgentId = challenge.IssuerAgentId
-                                Title = challenge.Title
-                                TaskId = challenge.TaskId
-                                Question = condition.Description
-                                ChallengeStatus = challenge.Status
-                                ConditionStatus = condition.Status
-                                Version = challenge.Version
-                                Evidence = condition.Evidence
-                                CreatedAtUtc = challenge.CreatedAtUtc
-                                UpdatedAtUtc = condition.UpdatedAtUtc } ]
+        let mutable entries: OperatorChallengeEntry list = []
+        for challenge in challenges do
+            for condition in challenge.Conditions do
+                if ownerOf condition = Some ChallengeOwner.Operator then
+                    let! respondedBy, respondedAt =
+                        if condition.Status <> "Satisfied" || condition.ResponseEventSequence = 0L then
+                            Ok("", "")
+                        else
+                            let challengeGuid = Guid.Parse challenge.ChallengeId
+                            result {
+                                let! content, _ = LedgerStore.readAt binding snapshot
+                                                      (eventPath challengeGuid condition.ResponseEventSequence)
+                                match content with
+                                | None -> return! Error(LedgerIntegrityError "Missing operator response audit event.")
+                                | Some body ->
+                                    try
+                                        use json = JsonDocument.Parse(body)
+                                        if json.RootElement.GetProperty("schemaVersion").GetInt32() <> 2 then
+                                            return! Error(LedgerIntegrityError "Invalid operator response event schema.")
+                                        let event = JsonSerializer.Deserialize<ChallengeEvent>(body, options)
+                                        if isNull (box event)
+                                           || event.ChallengeId <> challenge.ChallengeId
+                                           || event.ConditionId <> condition.ConditionId
+                                           || event.Sequence <> condition.ResponseEventSequence
+                                           || event.Action <> "RespondOperatorCondition"
+                                           || not (event.ActorId.StartsWith("operator:", StringComparison.Ordinal))
+                                           || String.IsNullOrWhiteSpace event.OccurredAtUtc
+                                           || event.OccurredAtUtc <> condition.UpdatedAtUtc
+                                           || event.Evidence <> condition.Evidence then
+                                            return! Error(LedgerIntegrityError "Operator response event does not match canonical condition.")
+                                        return event.ActorId, event.OccurredAtUtc
+                                    with ex ->
+                                        return! Error(LedgerIntegrityError ("Unable to verify operator response provenance: " + ex.Message))
+                            }
+                    entries <-
+                        { ProjectName = projectName
+                          ChallengeId = challenge.ChallengeId
+                          ConditionId = condition.ConditionId
+                          IssuerAgentId = challenge.IssuerAgentId
+                          Title = challenge.Title
+                          TaskId = challenge.TaskId
+                          Question = condition.Description
+                          ChallengeStatus = challenge.Status
+                          ConditionStatus = condition.Status
+                          Version = challenge.Version
+                          Evidence = condition.Evidence
+                          CreatedAtUtc = challenge.CreatedAtUtc
+                          UpdatedAtUtc = condition.UpdatedAtUtc
+                          RespondedBy = respondedBy
+                          RespondedAtUtc = respondedAt
+                          ResponseEventSequence = condition.ResponseEventSequence } :: entries
+        return List.rev entries
     }
 
     /// Enrich the ordinary self-inbox using the SAME verified snapshot.
@@ -829,7 +868,9 @@ module ChallengeWorkflow =
               Version = challenge.Version
               EvidencePreview = compact 120 condition.Evidence
               ReasonPreview = compact 120 condition.Reason
-              UpdatedAtUtc = condition.UpdatedAtUtc }
+              UpdatedAtUtc =
+                  if challenge.Status = "Cancelled" then challenge.UpdatedAtUtc
+                  else condition.UpdatedAtUtc }
         let allItems =
             [ for challenge in challenges do
                 for condition in challenge.Conditions do
@@ -837,23 +878,33 @@ module ChallengeWorkflow =
         let newest items =
             items |> List.sortByDescending (fun (entry: InboxChallengeItem) ->
                 entry.UpdatedAtUtc, entry.ChallengeId, entry.ConditionId)
+        // Preserve the accepted durable-challenges cancellation semantics:
+        // historical per-condition Pending does not imply actionable work.
+        let actionable (challenge: AgentChallenge) =
+            challenge.Status = "Pending" || challenge.Status = "Blocked"
         let assigned =
             allItems
-            |> List.choose (fun (_, c, item) ->
-                if ownerOf c = Some(ChallengeOwner.Agent actor) && c.Status = "Pending" then Some item else None)
+            |> List.choose (fun (challenge, c, item) ->
+                if actionable challenge
+                   && ownerOf c = Some(ChallengeOwner.Agent actor)
+                   && c.Status = "Pending" then Some item else None)
             |> newest
         let triage =
             if enabled then
                 allItems
-                |> List.choose (fun (_, c, item) ->
-                    if c.Status = "Pending" && ownerOf c = Some ChallengeOwner.Unassigned
+                |> List.choose (fun (challenge, c, item) ->
+                    if actionable challenge && c.Status = "Pending"
+                       && ownerOf c = Some ChallengeOwner.Unassigned
                     then Some item else None)
                 |> newest
             else []
         let recent =
             allItems
             |> List.choose (fun (challenge, c, item) ->
-                if challenge.IssuerAgentId = actor && c.Status <> "Pending"
+                if challenge.IssuerAgentId = actor
+                   && (if challenge.Status = "Cancelled" then
+                           challenge.Conditions.Head.ConditionId = c.ConditionId
+                       else c.Status <> "Pending")
                 then Some item else None)
             |> newest
         let linked =

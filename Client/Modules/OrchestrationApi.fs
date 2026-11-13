@@ -2645,7 +2645,7 @@ module OperatorChallengeApi =
                         | Ok items -> items, []
                         | Error error -> [], [ sprintf "%s: %A" project error ])
             { Items = results |> List.collect fst |> List.sortByDescending (fun item ->
-                          item.ConditionStatus = "Pending", item.CreatedAtUtc)
+                          OperatorChallengePresentation.isActionable item, item.CreatedAtUtc)
               Warnings = results |> List.collect snd })
 
     let details projectName challengeId rt =

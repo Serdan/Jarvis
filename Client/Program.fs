@@ -212,13 +212,19 @@ let private runClient args =
             |> operatorActorFromAccessToken
         with _ -> None
     let toUiError result = result |> Result.mapError (fun error -> sprintf "%A" error)
+    let toReplyError = function
+        | LedgerFailureError failure when failure.Code = "StaleEntityVersion" ->
+            StaleOperatorReply failure.Message
+        // Every other failed/uncertain write retains the exact retry operation ID.
+        // Only a definitive CAS stale response can authorize a new intent.
+        | error -> OtherOperatorReplyFailure(sprintf "%A" error)
     match authenticatedOperator with
     | Some actor ->
         tui.SetChallengeAccess
             { Load = (fun () -> OrchestrationApi.OperatorChallengeApi.list rt |> toUiError)
               Reply = (fun request ->
                   OrchestrationApi.OperatorChallengeApi.reply actor request rt
-                  |> Result.map ignore |> toUiError) }
+                  |> Result.map ignore |> Result.mapError toReplyError) }
     | None ->
         tui.Log "Operator challenge replies unavailable: authenticated OAuth subject missing."
 

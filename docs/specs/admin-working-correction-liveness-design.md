@@ -374,7 +374,7 @@ of a prior Ready epoch requires a separately designed audited transition;
 the production drain verifier is still not implemented.
 
 Validation on the isolated .NET 11 candidate after these changes:
-158/158 server Release tests and 620/620 client Release tests pass.
+159/159 server Release tests and 620/620 client Release tests pass.
 A promoted tool handle now also preserves the first authenticated
 `OperationId` alongside its job ID/start time. An exact replay is
 idempotent, while conflicting operation identities or projects cannot

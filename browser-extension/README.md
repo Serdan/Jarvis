@@ -14,7 +14,7 @@ The extension pairs with a **local JarvisClient** over authenticated loopback We
 
 The extension accepts only registered windows; neither Jarvis nor a webpage may register an arbitrary window. A browser restart or closed window invalidates the window registration until you reauthorize it from the popup. Moving a created tab outside its registered window suspends script execution.
 
-Manually registering a **tab** is still supported for existing-page inspections, and those registrations are bound to the exact URL. A manual tab is **not required** for creating agent tabs. **Unregister window** blocks new launches and revokes the permissions derived from that window, but does not close its tabs. **Unregister current tab** applies only to that tab.
+Manually registering a **tab** is still supported for existing-page inspections, and those registrations are bound to the exact URL. A manual tab is **not required** for creating agent tabs. Closing a tab removes its registration automatically; stale records for already-closed tabs are pruned on startup or refresh. An existing tab that navigates outside its authorized scope remains registered but requires reauthorization. **Unregister window** blocks new launches and revokes the permissions derived from that window, but does not close its tabs. **Unregister current tab** applies only to that tab.
 
 ## Browser commands
 

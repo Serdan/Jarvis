@@ -62,7 +62,7 @@ function createHarness(initialStorage = {}, initialSession = {}) {
         createdTabs.push(tab);
         return tab;
       },
-      remove: async id => { tabs.delete(id); },
+      remove: async id => { tabs.delete(id); listeners.removed?.(id); },
       get: async id => {
         if (!tabs.has(id)) throw Error("Missing tab");
         return tabs.get(id);
@@ -220,9 +220,11 @@ test("navigation permanently suspends registration until manual reauthorization"
   await h.message("register", { tabId: 17, alias: "agent-7" });
   const restored = await h.message("getState");
   assert.equal(restored.registrations[0].availability, "ready");
+  h.tabs.delete(17);
   h.listeners.removed(17);
   await tick(); await tick();
-  assert.equal((await h.message("getState")).registrations[0].availability, "needsReauthorization");
+  assert.equal((await h.message("getState")).registrations.length, 0);
+  assert.equal(h.storage.get("registrations").length, 0);
 });
 
 test("browser restart leaves old registrations unavailable without user reauthorization", async () => {
@@ -240,6 +242,69 @@ test("browser restart leaves old registrations unavailable without user reauthor
   assert.notEqual(second.session.get("browserSessionEpoch"), oldEpoch);
   await second.message("register", { tabId: 17, alias: "agent-7" });
   assert.equal((await second.message("getState")).registrations[0].availability, "ready");
+});
+
+test("closing a registered tab removes its record and advertises the new registry", async () => {
+  const h = createHarness();
+  await tick(); await tick();
+  await h.message("register", { tabId: 17, alias: "manual" });
+  await h.message("pair", { port: 43822, secret: "a".repeat(64) });
+  await tick(); await tick();
+  const ws = h.sockets[0];
+  await h.deliver(ws, { kind: "challenge", nonce: "b".repeat(64) });
+  await h.deliver(ws, { kind: "ready", connectionId: "epoch-1" });
+  h.tabs.delete(17);
+  h.listeners.removed(17);
+  await tick(); await tick();
+  assert.equal((await h.message("getState")).registrations.length, 0);
+  assert.equal(h.storage.get("registrations").length, 0);
+  assert.equal(ws.sent.filter(m => m.kind === "registrations").at(-1).tabs.length, 0);
+  assert.equal(h.tabs.has(18), true, "Unregistered tabs remain untouched");
+});
+
+test("cold startup prunes orphaned registrations even if previously blocked", async () => {
+  const first = createHarness();
+  await tick(); await tick();
+  await first.message("register", { tabId: 17, alias: "closed" });
+  await first.message("register", { tabId: 18, alias: "still-open" });
+  const previous = JSON.parse(JSON.stringify(first.storage.get("registrations")));
+  previous.find(r => r.tabId === 17).blocked = true;
+  const second = createHarness({ registrations: previous });
+  second.tabs.delete(17);
+  await tick(); await tick();
+  const state = await second.message("getState");
+  assert.equal(state.registrations.length, 1);
+  assert.equal(state.registrations[0].alias, "still-open");
+  assert.equal(state.registrations[0].availability, "needsReauthorization");
+  assert.equal(second.storage.get("registrations").length, 1);
+});
+
+test("user-closing a Jarvis-created tab frees its alias for a new tab", async () => {
+  const h = createHarness();
+  await tick(); await tick();
+  await h.message("registerWindow", { windowId: 1, alias: "agents" });
+  await h.message("setAgentCreatedTabs", { allowed: true });
+  await h.message("pair", { port: 43822, secret: "c".repeat(64) });
+  await tick(); await tick();
+  const ws = h.sockets[0];
+  await h.deliver(ws, { kind: "challenge", nonce: "d".repeat(64) });
+  await h.deliver(ws, { kind: "ready", connectionId: "epoch-1" });
+  const open = requestId => h.deliver(ws, {
+    kind: "openTab", requestId, connectionId: "epoch-1",
+    url: "https://example.test/new", windowRegistration: "agents", alias: "reusable"
+  });
+  await open("first");
+  const first = ws.sent.find(m => m.requestId === "first" && m.kind === "tabOpened").tab;
+  const tab = h.createdTabs[0];
+  h.tabs.delete(tab.id);
+  h.listeners.removed(tab.id);
+  await tick(); await tick();
+  assert.equal((await h.message("getState")).registrations.length, 0);
+  await open("second");
+  const second = ws.sent.find(m => m.requestId === "second" && m.kind === "tabOpened")?.tab;
+  assert.ok(second, "Closed tab must not reserve its alias");
+  assert.notEqual(second.registrationId, first.registrationId);
+  assert.equal((await h.message("getState")).registrations.length, 1);
 });
 
 test("opening tabs requires registered window and explicit opt-in", async () => {

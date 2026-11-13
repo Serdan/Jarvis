@@ -87,6 +87,9 @@ type UnresolvedAgentExecution =
       JobId: string option
       JobStartedAt: DateTimeOffset option
       JobReceiptAt: DateTimeOffset option
+      DeferredToolJobId: string option
+      DeferredToolJobStartedAt: DateTimeOffset option
+      DeferredToolJobReceiptAt: DateTimeOffset option
       CreatedAt: DateTimeOffset }
 
 type UnresolvedAgentExecutionPage =
@@ -275,7 +278,10 @@ CREATE TABLE IF NOT EXISTS agent_execution_witness (
     parent_request_id TEXT NULL,
     job_id TEXT NULL,
     job_started_at TEXT NULL,
-    job_receipt_at TEXT NULL
+    job_receipt_at TEXT NULL,
+    tool_job_id TEXT NULL,
+    tool_job_started_at TEXT NULL,
+    tool_job_receipt_at TEXT NULL
 );
 CREATE INDEX IF NOT EXISTS ix_agent_execution_witness_pending
     ON agent_execution_witness(user_id, agent_id, state);
@@ -321,7 +327,10 @@ INSERT OR IGNORE INTO agent_execution_epoch
               "tool_name", "TEXT NULL"
               "job_id", "TEXT NULL"
               "job_started_at", "TEXT NULL"
-              "job_receipt_at", "TEXT NULL" ] do
+              "job_receipt_at", "TEXT NULL"
+              "tool_job_id", "TEXT NULL"
+              "tool_job_started_at", "TEXT NULL"
+              "tool_job_receipt_at", "TEXT NULL" ] do
             if not (witnessColumns.Contains(column)) then
                 use witnessMigration = connection.CreateCommand()
                 witnessMigration.CommandText <-
@@ -363,6 +372,15 @@ INSERT OR IGNORE INTO agent_execution_epoch
                ON agent_execution_witness(user_id, device_id, job_id)
                WHERE job_id IS NOT NULL;"""
         jobIndex.ExecuteNonQuery() |> ignore
+        // Promoted MCP tool jobs share the same client registry as explicit
+        // StartJob process jobs. Reusing either ID on a device is ambiguous.
+        use deferredJobIndex = connection.CreateCommand()
+        deferredJobIndex.CommandText <-
+            """CREATE UNIQUE INDEX IF NOT EXISTS ix_agent_execution_any_job_device
+               ON agent_execution_witness(
+                   user_id, device_id, COALESCE(job_id, tool_job_id))
+               WHERE job_id IS NOT NULL OR tool_job_id IS NOT NULL;"""
+        deferredJobIndex.ExecuteNonQuery() |> ignore
 
         use inspect = connection.CreateCommand()
         inspect.CommandText <- "PRAGMA table_info(feedback);"
@@ -949,6 +967,82 @@ INSERT INTO operations (
                 | _ -> Error "Execution witness was not found for authenticated request."
             with ex -> Error $"Cannot read exact execution witness: {ex.Message}"
 
+    // A promoted MCP ToolOperation has returned a handle while the original
+    // command is STILL RUNNING. Persist the handle on the exact routed witness,
+    // never advance its state to Terminal, and never infer completion from a
+    // subsequent polling response until a separate authenticated end-to-end
+    // completion protocol is available.
+    member _.TryRecordAgentDeferredToolJob(
+        userId: string, connectionId: string, generation: int64,
+        correlationId: string, actorId: string, commandName: string,
+        jobId: string, startedAt: DateTimeOffset
+    ) : Result<string option, string> =
+        let mutable parsedId = Guid.Empty
+        if [userId; connectionId; correlationId; actorId; commandName; jobId]
+            |> List.exists String.IsNullOrWhiteSpace
+           || generation < 1L
+           || not (Guid.TryParseExact(jobId, "N", &parsedId))
+           || parsedId = Guid.Empty
+           || not (String.Equals(jobId, parsedId.ToString("N"), StringComparison.Ordinal))
+           || startedAt = DateTimeOffset.MinValue then
+            Error "Deferred tool-job receipt requires an authenticated route and canonical GUID-N job handle."
+        else
+            try
+                use connection = openConnection()
+                use transaction = connection.BeginTransaction()
+                use lookup = connection.CreateCommand()
+                lookup.Transaction <- transaction
+                lookup.CommandText <-
+                    """SELECT request_id, agent_id, tool_name, state
+                       FROM agent_execution_witness
+                       WHERE user_id = $userId AND connection_id = $connectionId
+                         AND device_generation = $generation AND correlation_id = $correlationId
+                       LIMIT 1;"""
+                addParameter lookup "$userId" userId
+                addParameter lookup "$connectionId" connectionId
+                addParameter lookup "$generation" generation
+                addParameter lookup "$correlationId" correlationId
+                use reader = lookup.ExecuteReader()
+                let found =
+                    if reader.Read() then
+                        Some (reader.GetString 0, reader.GetString 1,
+                              optionText reader 2, reader.GetString 3)
+                    else None
+                reader.Close()
+                match found with
+                | None -> Ok None
+                | Some (requestId, actor, Some tool, "Dispatched")
+                    when actor = actorId.ToUpperInvariant()
+                         && tool = commandName && tool <> "StartJob"
+                         && terminalCommandTypes.Contains tool ->
+                    use record = connection.CreateCommand()
+                    record.Transaction <- transaction
+                    record.CommandText <-
+                        """UPDATE agent_execution_witness
+                           SET tool_job_id = $jobId,
+                               tool_job_started_at = $startedAt,
+                               tool_job_receipt_at = COALESCE(tool_job_receipt_at, $now),
+                               updated_at = $now
+                           WHERE request_id = $requestId
+                             AND state = 'Dispatched' AND tool_name = $tool
+                             AND job_id IS NULL
+                             AND (tool_job_id IS NULL OR tool_job_id = $jobId)
+                             AND (tool_job_started_at IS NULL OR tool_job_started_at = $startedAt);"""
+                    addParameter record "$requestId" requestId
+                    addParameter record "$tool" tool
+                    addParameter record "$jobId" jobId
+                    addParameter record "$startedAt" (startedAt.ToString("O"))
+                    addParameter record "$now" (DateTimeOffset.UtcNow.ToString("O"))
+                    if record.ExecuteNonQuery() <> 1 then
+                        Error "Conflicting deferred tool-job receipt; execution remains unresolved."
+                    else
+                        transaction.Commit()
+                        Ok (Some requestId)
+                | Some _ ->
+                    Error "Deferred job does not match the admitted agent, command or unresolved route."
+            with ex ->
+                Error $"Cannot durably record deferred tool-job identity: {ex.Message}"
+
     // The transport server must verify the authenticated sender's active
     // device registration before passing its connection/generation here.
     // Match the persisted route exactly and accept a late response even if
@@ -1054,7 +1148,8 @@ INSERT INTO operations (
                     update.CommandText <-
                         """UPDATE agent_execution_witness
                            SET state = 'Terminal', updated_at = $now, terminal_at = $now
-                           WHERE request_id = $requestId AND state = 'Dispatched';"""
+                           WHERE request_id = $requestId AND state = 'Dispatched'
+                             AND tool_job_id IS NULL;"""
                     addParameter update "$now" (DateTimeOffset.UtcNow.ToString("O"))
                     addParameter update "$requestId" requestId
                     if update.ExecuteNonQuery() <> 1 then
@@ -1094,7 +1189,8 @@ INSERT INTO operations (
                     """SELECT request_id, tool_name, project_name, state,
                               device_id, connection_id, device_generation,
                               correlation_id, parent_request_id, created_at,
-                              job_id, job_started_at, job_receipt_at
+                              job_id, job_started_at, job_receipt_at,
+                              tool_job_id, tool_job_started_at, tool_job_receipt_at
                        FROM agent_execution_witness
                        WHERE user_id = $userId AND agent_id = $agentId
                          AND state NOT IN ('Terminal', 'NotDispatched')
@@ -1122,7 +1218,12 @@ INSERT INTO operations (
                           JobStartedAt =
                               optionText reader 11 |> Option.map DateTimeOffset.Parse
                           JobReceiptAt =
-                              optionText reader 12 |> Option.map DateTimeOffset.Parse }
+                              optionText reader 12 |> Option.map DateTimeOffset.Parse
+                          DeferredToolJobId = optionText reader 13
+                          DeferredToolJobStartedAt =
+                              optionText reader 14 |> Option.map DateTimeOffset.Parse
+                          DeferredToolJobReceiptAt =
+                              optionText reader 15 |> Option.map DateTimeOffset.Parse }
                 Ok { Executions = results |> Seq.truncate limit |> Seq.toList
                      HasMore = results.Count > limit }
             with ex -> Error $"Cannot inspect unresolved agent execution evidence: {ex.Message}"

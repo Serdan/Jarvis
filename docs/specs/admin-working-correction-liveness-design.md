@@ -274,3 +274,40 @@ tool classifications fail closed rather than inheriting generic terminal
 semantics. A regression admits a hypothetical `FutureLongRunningCommand`
 alongside an ordinary `ReadFiles`: only the known tool becomes Terminal,
 while the future command still blocks correction after restart.
+
+## Mainline promoted ToolOperation compatibility (integration blocker)
+
+Mainline now automatically promotes slow MCP commands to client-owned
+`ToolOperation` jobs. An `AgentCommandResponse.PendingJob` handle is a
+**nonterminal response**: the original command can still be executing,
+including Git mutations. P1's generic authenticated terminal-receipt path
+must never accept that handle as `AuthenticatedClientFinished`. The
+client-owned job can outlive the HTTP request, and a later ordinary
+`GetJobResult` response is not inherently proof of the original actor's
+operation ending. A premature Terminal witness here could authorize
+administrative correction against genuine work.
+
+The SQLite witness now has a separate immutable pending-job identity
+(`tool_job_id`, `tool_job_started_at`, `tool_job_receipt_at`) linked
+to the exact authenticated original user/connection/generation/correlation
+and initiating agent/command, distinct from `StartJob` process handles.
+`TryRecordAgentDeferredToolJob` only accepts a canonical GUID-N handle,
+rejects mismatched actor/command/route and conflicting/reused job IDs,
+and **keeps the original witness Dispatched**. The generic terminal UPDATE
+also explicitly excludes rows with a durable pending-job ID, so an ordinary
+late terminal receipt cannot bypass the marker. Neither age, poll timeout,
+nor a failed/missing job lookup may release it.
+
+**Not yet wired:** the current P1 branch predates the mainline
+`PendingJob` protocol field. During integration, HubService MUST
+dispatch `PendingJob = Some handle` to the promotion method *instead of*
+the generic terminal method, using the original authenticated route, and
+must not mark a promoted operation finished until an independently verified
+typed terminal job result is bound to that exact original witness.
+Cross-project NotifyAgent's source/destination continuation requires the
+same treatment. An isolated no-commit merge preview with main at
+`4dc2b489` exposed six conflicts (Client/SignalR/Client.fs,
+Common/Messages/AgentCommand.fs, two Server.Tests files,
+Server/McpTools.fs, Server/Services/ClientService.fs); the preview was
+aborted and its clean worktree deleted. No shared branch was merged,
+rebased or deployed.

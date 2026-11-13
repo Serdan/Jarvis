@@ -874,6 +874,122 @@ let ``legacy witness migration backfills known command and fails closed when tel
         |> shouldEqual true)
 
 [<Test>]
+let ``promoted tool job remains nonterminal despite its ordinary client reply and survives restart`` () =
+    withStore (fun store ->
+        approveTestEpoch store
+        let user, agent, conn, device, generation =
+            "alice", "Worker 3", "workstation-conn", "workstation", 3L
+        let admit tool correlation =
+            let request =
+                store.TryBeginAgentOperation(
+                    user, agent, tool, Some "Jarvis", "server", None,
+                    Some Common.AgentProtocol.version)
+                |> function Ok row -> row | Error failure -> failwith failure
+            store.TryMarkAgentDispatched(
+                user, request.Id, device, conn, generation, correlation)
+            |> shouldEqual (Ok ())
+            request.Id
+        let requestId = admit "RunCommand" "original-correlation"
+        let startedAt = DateTimeOffset.UtcNow
+        let jobId = Guid.NewGuid().ToString("N")
+        let promote actorId commandName route generation jobId =
+            store.TryRecordAgentDeferredToolJob(
+                user, route, generation, "original-correlation",
+                actorId, commandName, jobId, startedAt)
+        use failureDb = new SqliteConnection($"Data Source={store.DatabasePath}")
+        failureDb.Open()
+        use blockReceipt = failureDb.CreateCommand()
+        blockReceipt.CommandText <-
+            """CREATE TRIGGER fail_promoted_job_receipt
+               BEFORE UPDATE OF tool_job_id ON agent_execution_witness
+               WHEN NEW.tool_job_id IS NOT NULL
+               BEGIN SELECT RAISE(ABORT, 'simulated promoted-job storage failure'); END;"""
+        blockReceipt.ExecuteNonQuery() |> ignore
+        promote agent "RunCommand" conn generation jobId
+        |> fun result -> result.IsError |> shouldEqual true
+        store.GetAgentExecutionResolution(user, requestId)
+        |> shouldEqual (Ok ExecutionUnresolved)
+        use restore = failureDb.CreateCommand()
+        restore.CommandText <- "DROP TRIGGER fail_promoted_job_receipt;"
+        restore.ExecuteNonQuery() |> ignore
+        promote agent "RunCommand" conn generation jobId
+        |> shouldEqual (Ok (Some requestId))
+        let inspect (source: FeedbackStore) request =
+            match source.ListUnresolvedAgentExecutions(user, agent, 100) with
+            | Ok page -> page.Executions |> List.find (fun e -> e.RequestId = request)
+            | Error failure -> failwith failure
+        let original = inspect store requestId
+        original.DeferredToolJobId |> shouldEqual (Some jobId)
+        original.DeferredToolJobStartedAt |> shouldEqual (Some startedAt)
+        Assert.That(original.DeferredToolJobReceiptAt.IsSome, Is.True)
+        original.State |> shouldEqual "Dispatched"
+        // A reply with PendingJob is not a terminal command response. Even a
+        // buggy later generic-terminal call cannot bypass this durable marker.
+        store.TryRecordAgentClientTerminal(
+            user, conn, generation, "original-correlation").IsError
+        |> shouldEqual true
+        store.GetAgentExecutionResolution(user, requestId)
+        |> shouldEqual (Ok ExecutionUnresolved)
+        // Identical retry is idempotent and preserves the first receipt.
+        promote agent "RunCommand" conn generation jobId
+        |> shouldEqual (Ok (Some requestId))
+        (inspect store requestId).DeferredToolJobReceiptAt
+        |> shouldEqual original.DeferredToolJobReceiptAt
+        promote "Other Agent" "RunCommand" conn generation jobId
+        |> fun r -> r.IsError |> shouldEqual true
+        promote agent "ReadFiles" conn generation jobId
+        |> fun r -> r.IsError |> shouldEqual true
+        promote agent "RunCommand" "different-conn" generation jobId
+        |> shouldEqual (Ok None)
+        promote agent "RunCommand" conn (generation + 1L) jobId
+        |> shouldEqual (Ok None)
+        promote agent "RunCommand" conn generation (Guid.NewGuid().ToString("N"))
+        |> fun r -> r.IsError |> shouldEqual true
+        let second = admit "ReadFiles" "second-correlation"
+        store.TryRecordAgentDeferredToolJob(
+            user, conn, generation, "second-correlation",
+            agent, "ReadFiles", jobId, startedAt).IsError
+        |> shouldEqual true
+        (inspect store second).DeferredToolJobId |> shouldEqual None
+        // Explicit process jobs and promoted tool jobs use the same client
+        // registry; their IDs must not become ambiguous on one device.
+        let processRequest = admit "StartJob" "process-correlation"
+        let startResult : Common.StartJobResult =
+            { JobId = jobId; StartedAt = startedAt }
+        let response : Common.AgentCommandResponse =
+            { Result = Some(JsonSerializer.Serialize(startResult)); Error = None
+              Instructions = []; AgentStateChanges = []; InboxActivation = None }
+        store.TryRecordAgentClientTerminal(
+            user, conn, generation, "process-correlation",
+            clientResponse = response).IsError
+        |> shouldEqual true
+        (inspect store processRequest).JobId |> shouldEqual None
+        // Promoted tool identity is also immutable across start-time changes
+        // and invalid/corrupt handle encodings.
+        store.TryRecordAgentDeferredToolJob(
+            user, conn, generation, "original-correlation",
+            agent, "RunCommand", jobId, startedAt.AddSeconds(1.)).IsError
+        |> shouldEqual true
+        promote agent "RunCommand" conn generation (jobId.ToUpperInvariant())
+        |> fun r -> r.IsError |> shouldEqual true
+        use db = new SqliteConnection($"Data Source={store.DatabasePath}")
+        db.Open()
+        use prune = db.CreateCommand()
+        prune.CommandText <- "DELETE FROM operations WHERE id = $requestId;"
+        prune.Parameters.AddWithValue("$requestId", requestId) |> ignore
+        prune.ExecuteNonQuery() |> shouldEqual 1
+        use restarted = new FeedbackStore(store.DatabasePath)
+        let recovered = inspect restarted requestId
+        recovered.DeferredToolJobId |> shouldEqual (Some jobId)
+        recovered.DeferredToolJobStartedAt |> shouldEqual (Some startedAt)
+        recovered.DeferredToolJobReceiptAt |> shouldEqual original.DeferredToolJobReceiptAt
+        restarted.TryRecordAgentClientTerminal(
+            user, conn, generation, "original-correlation").IsError
+        |> shouldEqual true
+        restarted.TryAcquireAgentCorrection(user, agent, "operator-pending-tool-job").IsError
+        |> shouldEqual true)
+
+[<Test>]
 let ``unknown future command type cannot certify client-terminal liveness`` () =
     withStore (fun store ->
         approveTestEpoch store

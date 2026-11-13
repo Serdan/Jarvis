@@ -2376,3 +2376,91 @@ let ``explicit agent metadata is isolated between concurrent calls`` () =
         values[1] |> shouldEqual (Some "Agent B")
         RequestDeviceRouting.agentId() |> shouldEqual None
     }
+
+[<Test; Explicit("Manual 100-call attributed MCP and authenticated SignalR performance measurement")>]
+let BenchmarkHundredRoutedMcpWitnessCalls () =
+    withStore (fun store ->
+        approveTestEpoch store
+        let userId, actor, connection = "alice", "Worker 3", "routed-benchmark-connection"
+        let users = new UserService()
+        users.TransportConnected(userId, connection)
+        users.Register(
+            userId,
+            { DeviceId = "routed-benchmark-device"
+              DeviceName = "Benchmark workstation"
+              ProtocolVersion = Common.AgentProtocol.version
+              ClientVersion = "test"
+              SupportedCommands = [ "TaskRead" ] },
+            connection) |> ignore
+        let tracker = new ClientResponseTracker()
+        let terminal: Common.AgentCommandResponse =
+            { Result = Some "{}"; Error = None
+              Instructions = []; AgentStateChanges = []
+              InboxActivation = None; PendingJob = None }
+        let clientHub =
+            new HubService(
+                users, tracker, store,
+                Microsoft.Extensions.Logging.Abstractions.NullLogger<HubService>.Instance)
+        clientHub.Context <- signalRCaller userId connection
+        let mutable dispatched = 0
+        let recipient =
+            { new Common.SignalR.IClientService with
+                member _.ReceiveMessage(_) = Task.CompletedTask
+                member _.InvalidateAgentStates(_, _) = Task.CompletedTask
+                member _.ReceiveCommand(correlationId, _, invokingAgentId) =
+                    Assert.That(invokingAgentId, Is.EqualTo(actor))
+                    dispatched <- dispatched + 1
+                    clientHub.SendClientResponse(correlationId, terminal).GetAwaiter().GetResult()
+                    Task.CompletedTask }
+        let clients =
+            { new Microsoft.AspNetCore.SignalR.IHubClients<Common.SignalR.IClientService> with
+                member _.All = recipient
+                member _.AllExcept(_) = recipient
+                member _.Client(_) = recipient
+                member _.Clients(_) = recipient
+                member _.Group(_) = recipient
+                member _.GroupExcept(_, _) = recipient
+                member _.Groups(_) = recipient
+                member _.User(_) = recipient
+                member _.Users(_) = recipient }
+        let hubContext =
+            { new Microsoft.AspNetCore.SignalR.IHubContext<HubService, Common.SignalR.IClientService> with
+                member _.Clients = clients
+                member _.Groups = Unchecked.defaultof<_> }
+        let services =
+            Microsoft.Extensions.DependencyInjection.ServiceCollection()
+            :> Microsoft.Extensions.DependencyInjection.IServiceCollection
+        Microsoft.Extensions.DependencyInjection.ServiceCollectionServiceExtensions.AddSingleton<FeedbackStore>(
+            services, store) |> ignore
+        Microsoft.Extensions.DependencyInjection.ServiceCollectionServiceExtensions.AddSingleton<UserService>(
+            services, users) |> ignore
+        use provider =
+            Microsoft.Extensions.DependencyInjection.ServiceCollectionContainerBuilderExtensions.BuildServiceProvider(services)
+        let context = DefaultHttpContext()
+        context.User <-
+            ClaimsPrincipal(
+                ClaimsIdentity(
+                    [ Claim("sub", userId); Claim("scope", Auth.WorkspaceRead) ], "test"))
+        context.RequestServices <- provider
+        let http = HttpContextAccessor()
+        http.HttpContext <- context
+        let service = new ClientService(hubContext, users, tracker, http, store)
+        let latencies = ResizeArray<float>(100)
+        let stopwatch = System.Diagnostics.Stopwatch.StartNew()
+        for _ in 1 .. 100 do
+            let started = System.Diagnostics.Stopwatch.GetTimestamp()
+            let result =
+                JarvisMcpTools.AgentInbox("Jarvis", actor, "", service, http)
+                |> Async.AwaitTask
+                |> Async.RunSynchronously
+            Assert.That(result.IsError, Is.EqualTo(Nullable false),
+                        sprintf "Attributed routed request failed: %A" result.Content)
+            latencies.Add(System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds)
+        stopwatch.Stop()
+        Assert.That(dispatched, Is.EqualTo(100))
+        Assert.That(store.CountUnresolvedAgentExecutions(userId, actor), Is.Zero)
+        let ordered = latencies |> Seq.sort |> Seq.toArray
+        TestContext.Out.WriteLine(
+            sprintf "100 MCP/SignalR attributed admissions/routes/terminals: %.1f ms total, %.2f ms/call, p95 %.2f ms"
+                stopwatch.Elapsed.TotalMilliseconds
+                (stopwatch.Elapsed.TotalMilliseconds / 100.) ordered[94]))

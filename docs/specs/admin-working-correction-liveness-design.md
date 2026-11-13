@@ -1,6 +1,6 @@
 # Administrative Working correction: server-mediated liveness design
 
-**Status:** design investigation with an isolated server coordination prototype (`Server/Services/AgentExecutionGate.fs`); not wired into MCP dispatch or approved.
+**Status:** isolated protocol-3.65 compatibility candidate with durable MCP admission and correction permits; not reviewed, integrated or deployed. Legacy-client drain and detached process-tree termination proof remain unimplemented rollout blockers.
 **Task:** `task-c4460fbd65a244419650fc5ef5669a6f`, Worker 3.
 **Context:** independent review `6fd76f4209ba4f75a86b05426e93803e` requested two P1 fixes for real worker admission and failed-heartbeat races. Jarvis Lead directed this design toward the rare correction path rather than new Git transactions per ordinary tool call.
 
@@ -428,6 +428,22 @@ The explicit .NET 11 Release SQLite test ran 100 admission,
 authenticated dispatch-route and ordinary terminal receipt cycles
 in 52.0 ms total (0.52 ms/call mean; 0.45 ms p95 per operation).
 The fixture verifies zero unresolved witnesses at completion.
-This is a local SQLite microbenchmark, not end-to-end MCP or
-SignalR latency; a separate 100-call routed benchmark with p95
-remains a review/acceptance requirement.
+This is a local SQLite microbenchmark, not routed MCP/SignalR latency.
+The separate 100-call simulated server-routing measurement follows;
+deployed end-to-end latency remains a review/acceptance requirement.
+
+### Routed 100-call MCP/SignalR witness benchmark (2026-11-13)
+
+A separate explicit .NET 11 Release test, `BenchmarkHundredRoutedMcpWitnessCalls`,
+drives 100 attributed `AgentInbox` calls through `JarvisMcpTools`,
+`ClientService` routing, a simulated SignalR client, and authenticated
+`HubService.SendClientResponse` into the durable SQLite witness store.
+All 100 routes completed successfully with zero outstanding execution witnesses.
+One run measured **314.5 ms total**, **3.15 ms/call mean** and
+**1.30 ms p95/call**; startup outliers explain why the mean exceeds p95.
+
+This measures the in-process server MCP/SignalR routing and SQLite path,
+not a real network connection, client Git ledger operation or deployed
+end-to-end latency. It does not waive the legacy drain and process-tree
+terminal attestation requirements. An independent frozen review is still
+required before any integration.

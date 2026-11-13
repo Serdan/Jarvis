@@ -297,8 +297,8 @@ CREATE TABLE IF NOT EXISTS agent_correction_permit (
     PRIMARY KEY(user_id, agent_id)
 );
 
--- A migration from pre-witness server protocol 3.63 cannot infer safety from
--- zero rows: an old MCP request may still be executing on another device.
+-- A migration from pre-witness server protocols through 3.64 cannot infer
+-- safety from zero rows: an old MCP request may still execute on another device.
 -- Explicit authenticated drain proof is required before ANY correction.
 CREATE TABLE IF NOT EXISTS agent_execution_epoch (
     epoch_id INTEGER PRIMARY KEY CHECK(epoch_id = 1),

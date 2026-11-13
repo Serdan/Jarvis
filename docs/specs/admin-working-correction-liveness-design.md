@@ -90,7 +90,7 @@ then remove the old Git reservation path only after independent review.
 ## Legacy-protocol migration barrier (next checkpoint)
 
 Lead identified a missing negative case: **the first upgraded server may have
-zero entries in the new witness table even while an old 3.63 request is still
+zero entries in the new witness table even while a pre-witness 3.63/3.64 request is still
 executing on a client**. Empty tables are not proof of inactivity.
 
 Every new or migrated SQLite database now seeds a singleton
@@ -104,7 +104,7 @@ external legacy process/job quiescence verifier. It atomically records the
 approval after checking the unresolved witness table, persists across server
 restart, and only accepts idempotent retries with the same approval ID.
 
-Tests model a legacy 3.63 operation in old telemetry with no witness,
+Tests model legacy 3.64 operations in old telemetry with no witness,
 a server timeout, and server restart. Correction remains blocked before the
 explicit verified drain. Tests also cover rejected verifier results,
 idempotent approval replay, conflicting approval rejection and durable ready
@@ -299,7 +299,12 @@ late terminal receipt cannot bypass the marker. Neither age, poll timeout,
 nor a failed/missing job lookup may release it.
 
 **Not yet wired:** the current P1 branch predates the mainline
-`PendingJob` protocol field. During integration, HubService MUST
+`PendingJob` protocol field. The P1 witness protocol is now **3.65**,
+not 3.64: deployed mainline 3.64 clients already promote long-running
+tools but lack the complete P1 witness and terminal contract. Both
+3.63 and 3.64 belong to the legacy drain epoch and MUST be excluded
+from witnessed dispatch until protocol 3.65 is deployed end-to-end.
+During integration, HubService MUST
 dispatch `PendingJob = Some handle` to the promotion method *instead of*
 the generic terminal method, using the original authenticated route, and
 must not mark a promoted operation finished until an independently verified
@@ -311,3 +316,19 @@ Common/Messages/AgentCommand.fs, two Server.Tests files,
 Server/McpTools.fs, Server/Services/ClientService.fs); the preview was
 aborted and its clean worktree deleted. No shared branch was merged,
 rebased or deployed.
+
+### Required rollout and proof boundaries
+
+A safe deployment is a coordinated protocol transition, not simply a
+server merge. Deliver 3.65-capable clients to every participating device,
+deploy a server which authenticates and durably records pending handles
+before it acknowledges them, and keep `AwaitingLegacyDrain` in force.
+Only authenticated evidence that **all** 3.63/3.64 client executions,
+outstanding tool jobs, detached process trees and obsolete server
+instances are drained can justify the separate durable epoch transition.
+Do not treat an empty witness table, a timed-out MCP request or a device
+disconnect as that proof. The epoch verifier and real job terminal
+attestation remain unimplemented, so the correction endpoint must stay
+inaccessible in production. A successful read of a promoted job handle
+must never release the correction permit, including in the
+`CorrectAgentWorkingState` response path.

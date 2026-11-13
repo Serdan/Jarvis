@@ -461,14 +461,16 @@ let ``witness-bound ClientService rejects all known non-dispatch routes without 
                   ProtocolVersion = protocol; ClientVersion = "test"
                   SupportedCommands = capabilities },
                 "conn") |> ignore
-        // 3.63 has no durable witness contract, even when it advertises a
-        // compatible command name. Reject before SignalR ReceiveCommand.
-        register "3.63" [ "ListProjects" ]
-        let legacy = beginWitness store user agent
-        Assert.That((attempt legacy.Id).Error.IsSome, Is.True)
-        store.GetAgentExecutionResolution(user, legacy.Id)
-        |> shouldEqual (Ok ExecutionUnresolved)
-        store.TryMarkAgentNotDispatched(user, legacy.Id) |> shouldEqual (Ok ())
+        // Neither 3.63 nor deployed mainline 3.64 has the complete P1
+        // authenticated witness and deferred ToolOperation terminal contract,
+        // even when the advertised command capability itself matches.
+        for legacyProtocol in [ "3.63"; "3.64" ] do
+            register legacyProtocol [ "ListProjects" ]
+            let legacy = beginWitness store user agent
+            Assert.That((attempt legacy.Id).Error.IsSome, Is.True)
+            store.GetAgentExecutionResolution(user, legacy.Id)
+            |> shouldEqual (Ok ExecutionUnresolved)
+            store.TryMarkAgentNotDispatched(user, legacy.Id) |> shouldEqual (Ok ())
         // Matching protocol without the exact advertised capability must
         // also be pre-send refused.
         register Common.AgentProtocol.version []
@@ -1025,11 +1027,11 @@ let ``unknown future command type cannot certify client-terminal liveness`` () =
 [<Test>]
 let ``freshly migrated witness table never proves an old protocol request inactive`` () =
     withStore (fun store ->
-        // Simulate a 3.63 command dispatched by a pre-witness server. It
-        // contributes to the legacy telemetry table, not the new witness.
+        // Simulate a deployed 3.64 command dispatched by a pre-witness
+        // server. It contributes to the old telemetry, not the new witness.
         let prior = store.BeginOperation(
-            "alice", "RunCommand", Some "Jarvis", "server-v3.63",
-            Some "old-client", Some "3.63")
+            "alice", "RunCommand", Some "Jarvis", "server-v3.64",
+            Some "old-client", Some "3.64")
         store.CountUnresolvedAgentExecutions("alice", "Worker 3") |> shouldEqual 0
         store.GetAgentExecutionReadiness() |> shouldEqual (Ok LegacyDrainUnverified)
         store.TryAcquireAgentCorrection("alice", "Worker 3", "operator-pre-drain").IsError

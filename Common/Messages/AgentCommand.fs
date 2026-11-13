@@ -989,9 +989,11 @@ module AgentCommandInfo =
         | None -> invocation command
 
 module AgentProtocol =
-    // 3.64 introduces mandatory durable server-side execution witnesses for
-    // attributed MCP calls. Older clients cannot safely satisfy the gate.
-    let version = "3.64"
+    // 3.65 is the first protocol epoch for P1 durable execution witnesses.
+    // Deployed 3.64 clients already support deferred ToolOperation handles
+    // but cannot provide the authenticated witness/terminal contract.
+    // Reusing 3.64 would silently admit pre-witness clients.
+    let version = "3.65"
     let defaultPatchFuzzyContextLines = 3
     let maxResponseBytes = 900 * 1024
     let maxImageBytes = 8 * 1024 * 1024

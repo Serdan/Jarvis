@@ -548,6 +548,7 @@ let ``authenticated promoted ToolOperation receipt is never original terminal ev
             | Error failure -> failwith failure
         let witnessed = inspect store
         witnessed.DeferredToolJobId |> shouldEqual (Some handle.JobId)
+        witnessed.DeferredToolJobOperationId |> shouldEqual handle.OperationId
         witnessed.DeferredToolJobStartedAt |> shouldEqual (Some handle.StartedAt)
         Assert.That(witnessed.DeferredToolJobReceiptAt.IsSome, Is.True)
         witnessed.State |> shouldEqual "Dispatched"
@@ -1065,6 +1066,95 @@ let ``promoted tool job remains nonterminal despite its ordinary client reply an
             user, conn, generation, "original-correlation").IsError
         |> shouldEqual true
         restarted.TryAcquireAgentCorrection(user, agent, "operator-pending-tool-job").IsError
+        |> shouldEqual true)
+
+[<Test>]
+let ``promoted cross-project notification stages retain exact job operation and project provenance`` () =
+    withStore (fun store ->
+        approveTestEpoch store
+        let user, agent, connection, generation =
+            "alice", "Sender", "notify-connection", 3L
+        let beginSource correlation =
+            let request =
+                store.TryBeginAgentOperation(
+                    user, agent, "NotifyAgent", Some "Source",
+                    "server", None, Some Common.AgentProtocol.version)
+                |> function Ok value -> value | Error failure -> failwith failure
+            store.TryMarkAgentDispatched(
+                user, request.Id, "device", connection, generation, correlation)
+            |> shouldEqual (Ok ())
+            request.Id
+        let read requestId =
+            match store.ListUnresolvedAgentExecutions(user, agent, 20) with
+            | Ok page -> page.Executions |> List.find (fun item -> item.RequestId = requestId)
+            | Error failure -> failwith failure
+        let startedAt = DateTimeOffset.UtcNow
+        // The cross-project source agent-inbox read uses the TaskRead wire
+        // name, while the logical MCP action is witnessed as NotifyAgent.
+        let source = beginSource "source-pending-correlation"
+        let sourceJob = Guid.NewGuid().ToString("N")
+        store.TryRecordAgentDeferredToolJob(
+            user, connection, generation, "source-pending-correlation",
+            agent, "TaskRead", sourceJob, startedAt,
+            projectName = "Source")
+        |> shouldEqual (Ok (Some source))
+        (read source).DeferredToolJobId |> shouldEqual (Some sourceJob)
+        (read source).DeferredToolJobOperationId |> shouldEqual None
+        store.TryBeginAgentContinuation(user, source, "Destination").IsError
+        |> shouldEqual true
+        // A second, genuinely terminal source may create one separate
+        // destination witness. The mainline envelope is a TaskWrite job.
+        let finishedSource = beginSource "source-finished-correlation"
+        store.TryRecordAgentClientTerminal(
+            user, connection, generation, "source-finished-correlation")
+        |> shouldEqual (Ok (Some finishedSource))
+        let child =
+            store.TryBeginAgentContinuation(user, finishedSource, "Destination")
+            |> function Ok id -> id | Error failure -> failwith failure
+        store.TryMarkAgentDispatched(
+            user, child, "device", connection, generation, "destination-correlation")
+        |> shouldEqual (Ok ())
+        let destinationJob = Guid.NewGuid().ToString("N")
+        let operationId = Guid.NewGuid().ToString("D")
+        let destination job op project =
+            store.TryRecordAgentDeferredToolJob(
+                user, connection, generation, "destination-correlation",
+                agent, "TaskWrite", job, startedAt,
+                operationId = op, projectName = project)
+        destination destinationJob operationId "WrongProject"
+        |> fun result -> result.IsError |> shouldEqual true
+        destination destinationJob operationId "Destination"
+        |> shouldEqual (Ok (Some child))
+        let evidence = read child
+        evidence.ParentRequestId |> shouldEqual (Some finishedSource)
+        evidence.ProjectName |> shouldEqual (Some "Destination")
+        evidence.DeferredToolJobId |> shouldEqual (Some destinationJob)
+        evidence.DeferredToolJobOperationId |> shouldEqual (Some operationId)
+        evidence.DeferredToolJobStartedAt |> shouldEqual (Some startedAt)
+        Assert.That(evidence.DeferredToolJobReceiptAt.IsSome, Is.True)
+        destination destinationJob operationId "Destination"
+        |> shouldEqual (Ok (Some child))
+        (read child).DeferredToolJobReceiptAt
+        |> shouldEqual evidence.DeferredToolJobReceiptAt
+        destination destinationJob (Guid.NewGuid().ToString("D")) "Destination"
+        |> fun result -> result.IsError |> shouldEqual true
+        destination (Guid.NewGuid().ToString("N")) operationId "Destination"
+        |> fun result -> result.IsError |> shouldEqual true
+        store.TryRecordAgentDeferredToolJob(
+            user, connection, generation, "destination-correlation",
+            agent, "TaskRead", destinationJob, startedAt,
+            operationId = operationId, projectName = "Destination").IsError
+        |> shouldEqual true
+        store.TryRecordAgentClientTerminal(
+            user, connection, generation, "destination-correlation").IsError
+        |> shouldEqual true
+        use restarted = new FeedbackStore(store.DatabasePath)
+        let recovered =
+            match restarted.ListUnresolvedAgentExecutions(user, agent, 20) with
+            | Ok page -> page.Executions |> List.find (fun item -> item.RequestId = child)
+            | Error failure -> failwith failure
+        recovered.DeferredToolJobOperationId |> shouldEqual (Some operationId)
+        restarted.TryAcquireAgentCorrection(user, agent, "operator-with-pending-notification").IsError
         |> shouldEqual true)
 
 [<Test>]

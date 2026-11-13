@@ -136,7 +136,9 @@ type HubService(users: UserService, tracker: ClientResponseTracker, store: Feedb
                     store.TryRecordAgentDeferredToolJob(
                         this.UserId, this.Context.ConnectionId, session.Generation,
                         correlationId, handle.AgentId, handle.CommandName,
-                        handle.JobId, handle.StartedAt)
+                        handle.JobId, handle.StartedAt,
+                        ?operationId = handle.OperationId,
+                        ?projectName = handle.ProjectName)
                 | Some _ ->
                     Error "Unsupported pending job kind; execution remains unresolved."
                 | None ->

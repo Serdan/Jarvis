@@ -374,7 +374,16 @@ of a prior Ready epoch requires a separately designed audited transition;
 the production drain verifier is still not implemented.
 
 Validation on the isolated .NET 11 candidate after these changes:
-157/157 server Release tests and 620/620 client Release tests pass.
+158/158 server Release tests and 620/620 client Release tests pass.
+A promoted tool handle now also preserves the first authenticated
+`OperationId` alongside its job ID/start time. An exact replay is
+idempotent, while conflicting operation identities or projects cannot
+overwrite provenance. `NotifyAgent` accepts only its known logical
+wire stages (source `TaskRead`, destination `TaskWrite`) at the
+original actor/device/correlation, with distinct parent-child witnesses.
+Neither stage's pending job authorizes correction or creates the
+continuation before the parent has actual terminal evidence.
+
 The candidate remains unreviewed; authenticated terminal ToolOperation
 reconciliation, detached process-tree proof, cross-device legacy drain,
 and review/performance gates remain open.

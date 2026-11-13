@@ -88,6 +88,7 @@ type UnresolvedAgentExecution =
       JobStartedAt: DateTimeOffset option
       JobReceiptAt: DateTimeOffset option
       DeferredToolJobId: string option
+      DeferredToolJobOperationId: string option
       DeferredToolJobStartedAt: DateTimeOffset option
       DeferredToolJobReceiptAt: DateTimeOffset option
       CreatedAt: DateTimeOffset }
@@ -280,6 +281,7 @@ CREATE TABLE IF NOT EXISTS agent_execution_witness (
     job_started_at TEXT NULL,
     job_receipt_at TEXT NULL,
     tool_job_id TEXT NULL,
+    tool_job_operation_id TEXT NULL,
     tool_job_started_at TEXT NULL,
     tool_job_receipt_at TEXT NULL
 );
@@ -346,6 +348,7 @@ INSERT OR IGNORE INTO agent_execution_epoch
               "job_started_at", "TEXT NULL"
               "job_receipt_at", "TEXT NULL"
               "tool_job_id", "TEXT NULL"
+              "tool_job_operation_id", "TEXT NULL"
               "tool_job_started_at", "TEXT NULL"
               "tool_job_receipt_at", "TEXT NULL" ] do
             if not (witnessColumns.Contains(column)) then
@@ -1007,7 +1010,8 @@ INSERT INTO operations (
     member _.TryRecordAgentDeferredToolJob(
         userId: string, connectionId: string, generation: int64,
         correlationId: string, actorId: string, commandName: string,
-        jobId: string, startedAt: DateTimeOffset
+        jobId: string, startedAt: DateTimeOffset,
+        ?operationId: string, ?projectName: string
     ) : Result<string option, string> =
         let mutable parsedId = Guid.Empty
         if [userId; connectionId; correlationId; actorId; commandName; jobId]
@@ -1016,8 +1020,12 @@ INSERT INTO operations (
            || not (Guid.TryParseExact(jobId, "N", &parsedId))
            || parsedId = Guid.Empty
            || not (String.Equals(jobId, parsedId.ToString("N"), StringComparison.Ordinal))
-           || startedAt = DateTimeOffset.MinValue then
-            Error "Deferred tool-job receipt requires an authenticated route and canonical GUID-N job handle."
+           || startedAt = DateTimeOffset.MinValue
+           || (operationId |> Option.exists (fun id ->
+                String.IsNullOrWhiteSpace id || id.Length > 256))
+           || (projectName |> Option.exists (fun project ->
+                String.IsNullOrWhiteSpace project || project.Length > 256)) then
+            Error "Deferred tool-job receipt requires authenticated bounded provenance and canonical GUID-N job identity."
         else
             try
                 use connection = openConnection()
@@ -1025,7 +1033,8 @@ INSERT INTO operations (
                 use lookup = connection.CreateCommand()
                 lookup.Transaction <- transaction
                 lookup.CommandText <-
-                    """SELECT request_id, agent_id, tool_name, state
+                    """SELECT request_id, agent_id, tool_name, state,
+                              project_name, parent_request_id
                        FROM agent_execution_witness
                        WHERE user_id = $userId AND connection_id = $connectionId
                          AND device_generation = $generation AND correlation_id = $correlationId
@@ -1038,31 +1047,44 @@ INSERT INTO operations (
                 let found =
                     if reader.Read() then
                         Some (reader.GetString 0, reader.GetString 1,
-                              optionText reader 2, reader.GetString 3)
+                              optionText reader 2, reader.GetString 3,
+                              optionText reader 4, optionText reader 5)
                     else None
                 reader.Close()
                 match found with
                 | None -> Ok None
-                | Some (requestId, actor, Some tool, "Dispatched")
+                | Some (requestId, actor, Some tool, "Dispatched", witnessProject, parent)
                     when actor = actorId.ToUpperInvariant()
-                         && tool = commandName && tool <> "StartJob"
-                         && terminalCommandTypes.Contains tool ->
+                         && terminalCommandTypes.Contains tool
+                         && (projectName.IsNone || projectName = witnessProject)
+                         && (tool = commandName && tool <> "StartJob"
+                             // NotifyAgent is a logical two-stage command:
+                             // source is a TaskRead, and destination is a
+                             // TaskWrite. Both retain the original actor and
+                             // must match an exact authenticated route.
+                             || tool = "NotifyAgent"
+                                && (commandName = "TaskWrite"
+                                    || parent.IsNone && commandName = "TaskRead")) ->
                     use record = connection.CreateCommand()
                     record.Transaction <- transaction
                     record.CommandText <-
                         """UPDATE agent_execution_witness
                            SET tool_job_id = $jobId,
+                               tool_job_operation_id = $operationId,
                                tool_job_started_at = $startedAt,
                                tool_job_receipt_at = COALESCE(tool_job_receipt_at, $now),
                                updated_at = $now
                            WHERE request_id = $requestId
                              AND state = 'Dispatched' AND tool_name = $tool
                              AND job_id IS NULL
-                             AND (tool_job_id IS NULL OR tool_job_id = $jobId)
-                             AND (tool_job_started_at IS NULL OR tool_job_started_at = $startedAt);"""
+                             AND (tool_job_id IS NULL
+                                  OR (tool_job_id = $jobId
+                                      AND tool_job_started_at = $startedAt
+                                      AND tool_job_operation_id IS $operationId));"""
                     addParameter record "$requestId" requestId
                     addParameter record "$tool" tool
                     addParameter record "$jobId" jobId
+                    addParameter record "$operationId" (dbValue operationId)
                     addParameter record "$startedAt" (startedAt.ToString("O"))
                     addParameter record "$now" (DateTimeOffset.UtcNow.ToString("O"))
                     if record.ExecuteNonQuery() <> 1 then
@@ -1222,7 +1244,8 @@ INSERT INTO operations (
                               device_id, connection_id, device_generation,
                               correlation_id, parent_request_id, created_at,
                               job_id, job_started_at, job_receipt_at,
-                              tool_job_id, tool_job_started_at, tool_job_receipt_at
+                              tool_job_id, tool_job_started_at, tool_job_receipt_at,
+                              tool_job_operation_id
                        FROM agent_execution_witness
                        WHERE user_id = $userId AND agent_id = $agentId
                          AND state NOT IN ('Terminal', 'NotDispatched')
@@ -1252,6 +1275,7 @@ INSERT INTO operations (
                           JobReceiptAt =
                               optionText reader 12 |> Option.map DateTimeOffset.Parse
                           DeferredToolJobId = optionText reader 13
+                          DeferredToolJobOperationId = optionText reader 16
                           DeferredToolJobStartedAt =
                               optionText reader 14 |> Option.map DateTimeOffset.Parse
                           DeferredToolJobReceiptAt =

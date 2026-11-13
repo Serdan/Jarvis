@@ -105,6 +105,22 @@ module private TaskCommands =
           Evidence = ""
           SessionId = "" }
 
+module NotificationCommands =
+    // Retain the caller's original selected checkout until source ledger
+    // verification succeeds. A fabricated checkout must not inherit authority
+    // from its canonical project before it has been resolved.
+    let create projectName fromAgentId toAgentId message operationId taskId toProjectName =
+        let destination =
+            if String.IsNullOrWhiteSpace toProjectName then projectName else toProjectName
+        let cmd = TaskCommands.write destination "NotifyAgent" operationId taskId fromAgentId
+        { cmd with OwnerId = toAgentId; Summary = message
+                   SourceRef = if projectName = destination then "" else projectName }
+
+    // Call only after the source selector was verified against its ledger.
+    let canonicalVerified (notification: Common.TaskWriteCommand) =
+        Common.ProjectSelector.notificationSource notification.SourceRef notification.ProjectName
+        |> Option.map (fun source -> { notification with SourceRef = source })
+
 module RequestDeviceRouting =
     // Per-invocation context: never use shared defaults to represent a ChatGPT conversation.
     let private currentSession = AsyncLocal<string option>()
@@ -784,22 +800,24 @@ module McpToolHelpers =
                                 do! publishChanges sender
                                 match sender.Result, sender.Error with
                                 | Some _, None when sender.PendingJob.IsNone ->
-                                    // Carry source activation evidence into
-                                    // the destination client's ORIGINAL task.
-                                    // Its normal pending handle and subsequent
-                                    // get_job_result now recover both projects'
-                                    // terminal effects, even if the first reply
-                                    // is lost. No server-owned task store.
-                                    let forwarded =
-                                        CrossProjectNotificationCommand
-                                            { Notification = notification
-                                              SourceStateChanges = sender.AgentStateChanges
-                                              SourceInboxActivation = sender.InboxActivation }
-                                    return! client.SendCommandToProject(
-                                        userId, notification.ProjectName, forwarded,
-                                        ?conversationId = RequestDeviceRouting.session(),
-                                        ?deviceId = RequestDeviceRouting.deviceOverride(),
-                                                     ?agentId = RequestDeviceRouting.agentId())
+                                    match NotificationCommands.canonicalVerified notification with
+                                    | None ->
+                                        return { sender with Result = None
+                                                             Error = Some(ValidationFailed "Invalid source or destination project selector.") }
+                                    | Some canonical ->
+                                        // Preserve source activation while forwarding
+                                        // only the verified canonical sender identity.
+                                        // No server-owned task store or retry writes.
+                                        let forwarded =
+                                            CrossProjectNotificationCommand
+                                                { Notification = canonical
+                                                  SourceStateChanges = sender.AgentStateChanges
+                                                  SourceInboxActivation = sender.InboxActivation }
+                                        return! client.SendCommandToProject(
+                                            userId, notification.ProjectName, forwarded,
+                                            ?conversationId = RequestDeviceRouting.session(),
+                                            ?deviceId = RequestDeviceRouting.deviceOverride(),
+                                                         ?agentId = RequestDeviceRouting.agentId())
                                 | _ -> return sender
                             }
                         | _ ->
@@ -1570,12 +1588,10 @@ type JarvisMcpTools =
 
     [<McpServerTool(Title = "notify agent", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Send a durable notification to an agent in the same project or in optional toProjectName. Cross-project sends verify the sender in the source ledger and write only to the destination Git ledger, routing to a connected client that has its binding. The recipient inbox exposes the source project and agent. Omit operationId for a generated ID; reuse the returned ID for an uncertain retry.")>]
     static member NotifyAgent(projectName: string, fromAgentId: string, toAgentId: string, message: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] taskId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, [<Optional; DefaultParameterValue("")>] toProjectName: string, client: ClientService, http: IHttpContextAccessor) =
-        let crossProject = not (String.IsNullOrWhiteSpace toProjectName) && toProjectName <> projectName
-        let destination = if crossProject then toProjectName else projectName
-        let cmd = TaskCommands.write destination "NotifyAgent" operationId taskId fromAgentId
-        McpToolHelpers.send client http (TaskWriteCommand
-            { cmd with OwnerId = toAgentId; Summary = message
-                       SourceRef = if crossProject then projectName else "" })
+        let command =
+            NotificationCommands.create projectName fromAgentId toAgentId message
+                operationId taskId toProjectName
+        McpToolHelpers.send client http (TaskWriteCommand command)
 
     [<McpServerTool(Title = "acknowledge notification", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]"""); Description("Mark an existing agent coordination notification as read by its recipient. Preserves the message in the Git ledger; unrelated tasks, assignments, reviews and execution states are unchanged.")>]
     static member AcknowledgeNotification(projectName: string, agentId: string, notificationId: string, [<Optional; DefaultParameterValue("")>] operationId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =

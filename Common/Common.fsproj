@@ -8,6 +8,7 @@
     <ItemGroup>
         <Content Include="Structure.md"/>
         <Compile Include="ValueOption.fs"/>
+        <Compile Include="ProjectSelector.fs"/>
         <Compile Include="Messages\AgentCommand.fs"/>
         <Compile Include="SignalR\IHubService.fs"/>
         <Compile Include="SignalR\IClientService.fs"/>

@@ -1478,6 +1478,62 @@ type ReviewWorkflowTests() =
             | other -> Assert.Fail(sprintf "Unrelated actor must not change recipient policy: %A" other))
 
     [<Test>]
+    member _.ProjectWorktreeAliasCannotBypassRecipientBlock() =
+        withFixture (fun _ _ first second _ _ _ _ ->
+            let routed = Common.ProjectSelector.notificationSource
+            Assert.That(routed "Jarvis::worktree-one" "Jarvis", Is.EqualTo(Some ""))
+            Assert.That(routed "Jarvis" "Jarvis::worktree-two", Is.EqualTo(Some ""))
+            Assert.That(routed "Wayfold::worktree-one" "Jarvis", Is.EqualTo(Some "Wayfold"))
+            Assert.That(routed "Jarvis::bad/name" "Wayfold", Is.EqualTo(None))
+
+            ReviewWorkflow.setNotificationSenderBlock first (Guid.NewGuid())
+                "Reviewer" "Reviewer" "Jarvis::recipient-checkout" "Wayfold::source-checkout"
+                "Owner" true "Use the review queue."
+            |> success |> ignore
+            let preferences = (ReviewWorkflow.getNotificationPreferences second "Reviewer" |> success).Preferences
+            Assert.That(preferences.BlockedSenders.Head.FromProjectName, Is.EqualTo("Wayfold"))
+            let send id source =
+                let write = ReviewWorkflow.notifyAgent first id "Owner" source "Reviewer" "" "Hello"
+                            |> success
+                write, ReviewWorkflow.notificationDelivery second write |> success
+            let originalId = Guid.NewGuid()
+            let _, blocked = send originalId "Wayfold::source-checkout"
+            Assert.That(blocked.Status, Is.EqualTo("Blocked"))
+            Assert.That(blocked.AutoReply, Is.EqualTo("Use the review queue."))
+            Assert.That((ReviewWorkflow.getAgentInbox second "Reviewer" |> success).PendingNotifications,
+                        Is.Empty)
+            ReviewWorkflow.setNotificationSenderBlock first (Guid.NewGuid())
+                "Reviewer" "Reviewer" "Jarvis" "Wayfold" "Owner" true "Updated reply."
+            |> success |> ignore
+            let retry, original = send originalId "Wayfold"
+            Assert.That(retry.AlreadyApplied, Is.True)
+            Assert.That(original.AutoReply, Is.EqualTo("Use the review queue."))
+            Assert.That((snd (send (Guid.NewGuid()) "Wayfold")).AutoReply,
+                        Is.EqualTo("Updated reply."))
+            Assert.That((snd (send (Guid.NewGuid()) "Elsewhere")).Status, Is.EqualTo("Delivered"))
+
+            ReviewWorkflow.setNotificationSenderBlock first (Guid.NewGuid())
+                "Reviewer" "Reviewer" "Jarvis::recipient-checkout" "Jarvis::source-checkout"
+                "Owner" true "Local policy."
+            |> success |> ignore
+            let localSource = routed "Jarvis::source-checkout" "Jarvis" |> Option.get
+            Assert.That((snd (send (Guid.NewGuid()) localSource)).AutoReply,
+                        Is.EqualTo("Local policy."))
+            Assert.That((ReviewWorkflow.getAgentInbox second "Reviewer" |> success).PendingNotifications.Length,
+                        Is.EqualTo(1), "Blocked aliases must never append inbox notifications")
+            match ReviewWorkflow.notifyAgent first (Guid.NewGuid()) "Owner"
+                    "Wayfold::bad/name" "Reviewer" "" "Bad source" with
+            | Error(InvalidBinding _) -> ()
+            | other -> Assert.Fail(sprintf "Malformed source selector must fail closed: %A" other)
+            ReviewWorkflow.setNotificationSenderBlock first (Guid.NewGuid())
+                "Reviewer" "Reviewer" "Jarvis" "Wayfold" "Owner" false ""
+            |> success |> ignore
+            Assert.That((snd (send (Guid.NewGuid()) "Wayfold::source-checkout")).Status,
+                        Is.EqualTo("Delivered"))
+            Assert.That((ReviewWorkflow.getAgentInbox second "Reviewer" |> success).PendingNotifications.Length,
+                        Is.EqualTo(2)))
+
+    [<Test>]
     member _.CrossProjectSenderBlocksAreQualifiedAndMuteNeverCreatesInboxNotifications() =
         withFixture (fun _ _ first second _ _ _ _ ->
             ReviewWorkflow.setNotificationSenderBlock first (Guid.NewGuid())

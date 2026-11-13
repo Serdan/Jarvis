@@ -1092,22 +1092,28 @@ module ReviewWorkflow =
         }
 
     // Source project "" denotes the destination project itself, never an
-    // unverified wildcard. Cross-project sources retain verified names.
+    // unverified wildcard. Checkout aliases are not separate project identities.
     let private localOrSourceProject localProject sourceProject =
-        if String.IsNullOrWhiteSpace sourceProject || localProject = sourceProject
-        then "" else sourceProject
+        match Common.ProjectSelector.identity localProject with
+        | None -> None
+        | Some local when sourceProject = "" -> Some ""
+        | Some local ->
+            Common.ProjectSelector.identity sourceProject
+            |> Option.map (fun source -> if source = local then "" else source)
 
     let setNotificationSenderBlock binding operationId actorId recipientId localProject
                                    senderProject senderId blocked autoReply =
+        let source = localOrSourceProject localProject senderProject
         if actorId <> recipientId then
             Error(ReviewAccessDenied "Only the recipient may change notification preferences.")
         elif not (validAgent recipientId && validAgent senderId)
              || not (validSenderProject localProject && validSenderProject senderProject)
+             || source.IsNone
              || not (validAutoReply autoReply)
              || (not blocked && autoReply <> "") then
             Error(InvalidBinding "Invalid sender block or autoreply.")
         else
-            let source = localOrSourceProject localProject senderProject
+            let source = Option.get source
             LedgerStore.transact binding
                 (intent operationId actorId "SetNotificationSenderBlock"
                     {| recipientId = recipientId; senderProject = source; senderId = senderId
@@ -1172,13 +1178,17 @@ module ReviewWorkflow =
         else Error(LedgerIntegrityError "Notification operation has no valid decision.")
 
     let notifyAgent binding operationId fromAgentId fromProjectName toAgentId taskId message =
-        let crossProject = not (String.IsNullOrWhiteSpace fromProjectName)
+        let source =
+            if fromProjectName = "" then Some ""
+            else Common.ProjectSelector.identity fromProjectName
+        let crossProject = source <> Some ""
         if not (validAgent fromAgentId) || not (validAgent toAgentId)
-           || (crossProject && (fromProjectName.Length > 256 || fromProjectName.Contains('/')))
+           || source.IsNone || not (validSenderProject fromProjectName)
            || not (validText 4096 message)
            || (not (String.IsNullOrWhiteSpace taskId) && not (validTaskId taskId)) then
             Error(InvalidBinding "Invalid notification sender, recipient, task or message.")
         else
+            let fromProjectName = Option.get source
             // Operation ID is also the stable notification ID: retries cannot duplicate messages.
             LedgerStore.transact binding
                 (intent operationId fromAgentId "NotifyAgent"

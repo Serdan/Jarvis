@@ -14,6 +14,35 @@ open Server
 open Server.Services
 
 [<Test>]
+let notificationToolCanonicalizesWorktreeAliases () =
+    let build source destination =
+        Server.NotificationCommands.create source "Owner" "Reviewer" "Hello"
+            "stable-operation" "" destination
+    let afterVerification command =
+        Server.NotificationCommands.canonicalVerified command |> Option.get
+    let local = build "Jarvis::source" "Jarvis"
+    Assert.That(local.SourceRef, Is.EqualTo("Jarvis::source"),
+                "Do not discard the selected checkout before source verification")
+    Assert.That((afterVerification local).SourceRef, Is.Empty)
+    let sameAlias = build "Jarvis" "Jarvis::destination"
+    Assert.That(sameAlias.SourceRef, Is.EqualTo("Jarvis"))
+    Assert.That((afterVerification sameAlias).SourceRef, Is.Empty)
+    Assert.That((build "Jarvis::source" "").SourceRef, Is.Empty)
+    let cross = build "Jarvis::source" "Wayfold::destination"
+    Assert.That(cross.SourceRef, Is.EqualTo("Jarvis::source"))
+    Assert.That((afterVerification cross).SourceRef, Is.EqualTo("Jarvis"))
+    Assert.That(cross.ProjectName, Is.EqualTo("Wayfold::destination"))
+    Assert.That(cross.ActorId, Is.EqualTo("Owner"))
+    Assert.That((build "Elsewhere" "Wayfold").SourceRef, Is.EqualTo("Elsewhere"))
+    let invalid = build "Jarvis::bad/name" "Wayfold"
+    Assert.That(invalid.SourceRef, Is.EqualTo("Jarvis::bad/name"))
+    Assert.That(Server.NotificationCommands.canonicalVerified invalid, Is.EqualTo(None),
+                "Malformed selectors must fail instead of gaining authority via canonical project")
+    let invalidDestination = build "Jarvis" "Wayfold::bad/name"
+    Assert.That(Server.NotificationCommands.canonicalVerified invalidDestination, Is.EqualTo(None),
+                "An unresolvable destination must also fail closed before any destination write")
+
+[<Test>]
 let invalidation_routes_only_to_connected_devices_of_authenticated_user () =
     let users = UserService()
     let register userId device connection =

@@ -26,6 +26,7 @@ let configuredPort = 43822;
 let secret = "";
 let allowAgentCreatedTabs = false;
 let openQueue = Promise.resolve();
+let registryWriteQueue = Promise.resolve();
 let initPromise = null;
 
 function randomId() {
@@ -83,8 +84,18 @@ function safeState(r) {
     availability: r.availability
   };
 }
-async function persist() {
-  await chrome.storage.local.set({ [REGISTRY_KEY]: registrations });
+function persist() {
+  // Chrome snapshots the value when storage.set is called. Serialize writes
+  // and capture the latest registry only when our turn in the queue starts:
+  // otherwise an older pending write can resurrect a subsequently closed tab.
+  const write = registryWriteQueue.then(() =>
+    chrome.storage.local.set({
+      [REGISTRY_KEY]: registrations.map(reg => ({ ...reg }))
+    }));
+  // A failed write must reject its caller, but must not permanently prevent
+  // later writes from persisting the current registry.
+  registryWriteQueue = write.catch(() => {});
+  return write;
 }
 function windowState(w) {
   return { windowRegistration: w.registrationId, alias: w.alias,
@@ -119,7 +130,13 @@ async function assess(reg) {
   // Check existence before authorization state so old closed registrations can be pruned.
   let tab;
   try { tab = await chrome.tabs.get(reg.tabId); }
-  catch { return "missing"; }
+  catch (error) {
+    // Only an explicit nonexistent-tab error proves closure. A transient
+    // Chrome API failure must not permanently revoke a real registration.
+    const reason = String(error?.message || error);
+    return /^No tab with id:?\s*\d+\.?$/i.test(reason)
+      ? "missing" : "needsReauthorization";
+  }
   if (reg.blocked || reg.sessionEpoch !== sessionEpoch) return "needsReauthorization";
   if (reg.agentCreated &&
       (!allowAgentCreatedTabs || !reg.windowRegistration ||
@@ -161,7 +178,7 @@ async function assess(reg) {
     if (tab.frozen) return "frozen";
     if (tab.status === "loading") return "loading";
     return "ready";
-  } catch { return "missing"; }
+  } catch { return "needsReauthorization"; }
 }
 async function refreshRegistrations() {
   const missing = new Set();

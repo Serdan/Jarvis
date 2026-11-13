@@ -2269,7 +2269,11 @@ module TaskApi =
                 ReviewWorkflow.ReviewWorkflow.getIntegrationSubmissions binding cmd.TaskId
                 |> mapError |> Result.map box
             | "AgentInbox" ->
-                ReviewWorkflow.ReviewWorkflow.getBranchAgentInbox binding cmd.AgentId
+                LedgerStore.LedgerStore.fetch binding
+                |> Result.bind (fun snapshot ->
+                    ReviewWorkflow.ReviewWorkflow.getAgentInboxAt binding snapshot cmd.AgentId
+                    |> Result.bind (fun inbox ->
+                        ChallengeWorkflow.ChallengeWorkflow.enrichInboxAt binding snapshot cmd.AgentId inbox))
                 |> mapError |> Result.map box
             | "GetAssignment" ->
                 ReviewWorkflow.ReviewWorkflow.getAssignment binding cmd.TaskId cmd.AssignmentGeneration
@@ -2497,6 +2501,130 @@ module TaskApi =
 
     let write (cmd: TaskWriteCommand) rt =
         writeUsingContext None cmd rt
+
+module ChallengeApi =
+    let private mapError (result: Result<'a, LedgerStore.LedgerFailure>) =
+        result |> Result.mapError LedgerErrors.toEffect
+
+    let private guid (raw: string) =
+        match Guid.TryParse raw with
+        | true, id when id <> Guid.Empty -> Ok id
+        | _ -> Error(Client.ValidationError "A stable nonempty operation UUID is required.")
+
+    let read (cmd: ChallengeReadCommand) rt =
+        LedgerBindingConfig.load cmd.ProjectName rt
+        |> Result.bind (fun binding ->
+            match cmd.Action with
+            | "List" ->
+                ChallengeWorkflow.ChallengeWorkflow.listPage binding cmd.ActorId
+                    cmd.Limit cmd.AfterChallengeId cmd.ExpectedSnapshotCommit
+                |> mapError |> Result.map box
+            | "Get" ->
+                ChallengeWorkflow.ChallengeWorkflow.getPage binding cmd.ActorId cmd.ChallengeId
+                    cmd.Limit cmd.AfterEventSequence cmd.ExpectedSnapshotCommit
+                |> mapError |> Result.map box
+            | _ -> Error(Client.ValidationError "Unsupported challenge read action."))
+
+    let write (cmd: ChallengeWriteCommand) rt =
+        LedgerBindingConfig.load cmd.ProjectName rt
+        |> Result.bind (fun binding ->
+            guid cmd.OperationId
+            |> Result.bind (fun operationId ->
+                let result =
+                    PendingIntentJournal.executeLedgerWrite binding operationId "ChallengeWrite" cmd
+                        (fun () ->
+                            let record =
+                                match cmd.Action with
+                                | "Create" ->
+                                    if isNull (box cmd.Conditions) then
+                                        Error(Client.ValidationError "Conditions are required.")
+                                    else
+                                        let definitions : ChallengeWorkflow.ChallengeConditionSpec list =
+                                            cmd.Conditions |> List.map (fun definition ->
+                                                { OwnerAgentId = definition.OwnerAgentId
+                                                  SuggestedAgentId = definition.SuggestedAgentId
+                                                  Description = definition.Description })
+                                        ChallengeWorkflow.ChallengeWorkflow.create
+                                            binding operationId cmd.ActorId cmd.Title cmd.TaskId definitions
+                                        |> mapError |> Result.map _.Receipt
+                                | "Subscribe" ->
+                                    ChallengeWorkflow.ChallengeWorkflow.setSubscription
+                                        binding operationId cmd.ActorId cmd.Subscribe
+                                    |> mapError
+                                | "Split" ->
+                                    if isNull (box cmd.Conditions) then
+                                        Error(Client.ValidationError "Split parts are required.")
+                                    else
+                                        let parts : ChallengeWorkflow.ChallengeConditionSpec list =
+                                            cmd.Conditions |> List.map (fun part ->
+                                                { OwnerAgentId = part.OwnerAgentId
+                                                  SuggestedAgentId = part.SuggestedAgentId
+                                                  Description = part.Description })
+                                        ChallengeWorkflow.ChallengeWorkflow.splitCondition
+                                            binding operationId cmd.ActorId cmd.ChallengeId
+                                            cmd.ConditionId cmd.ExpectedVersion parts
+                                        |> mapError |> Result.map _.Receipt
+                                | "Assign" ->
+                                    ChallengeWorkflow.ChallengeWorkflow.assignCondition
+                                        binding operationId cmd.ActorId cmd.ChallengeId
+                                        cmd.ConditionId cmd.ExpectedVersion cmd.NewOwnerAgentId
+                                    |> mapError
+                                | "Resolve" ->
+                                    if cmd.Outcome <> "Satisfied" && cmd.Outcome <> "Blocked" then
+                                        Error(Client.ValidationError "Challenge condition outcome must be Satisfied or Blocked.")
+                                    elif cmd.Outcome = "Satisfied" && not (String.IsNullOrWhiteSpace cmd.Reason) then
+                                        Error(Client.ValidationError "Satisfied condition does not accept a blocked reason.")
+                                    elif cmd.Outcome = "Blocked" && String.IsNullOrWhiteSpace cmd.Reason then
+                                        Error(Client.ValidationError "Blocked condition requires a reason.")
+                                    else
+                                        ChallengeWorkflow.ChallengeWorkflow.resolve binding operationId cmd.ActorId
+                                            cmd.ChallengeId cmd.ConditionId cmd.ExpectedVersion cmd.Evidence cmd.Reason
+                                        |> mapError
+                                | "Reopen" ->
+                                    ChallengeWorkflow.ChallengeWorkflow.reopen binding operationId cmd.ActorId
+                                        cmd.ChallengeId cmd.ConditionId cmd.ExpectedVersion cmd.Reason
+                                    |> mapError
+                                | "Cancel" ->
+                                    ChallengeWorkflow.ChallengeWorkflow.cancel binding operationId cmd.ActorId
+                                        cmd.ChallengeId cmd.ExpectedVersion cmd.Reason
+                                    |> mapError
+                                | "BlockAttempt" ->
+                                    ChallengeWorkflow.ChallengeWorkflow.blockAttempt binding operationId cmd.ActorId
+                                        cmd.TaskId cmd.AttemptId
+                                        cmd.ExpectedTaskVersion cmd.ExpectedAttemptVersion cmd.ExpectedAgentVersion
+                                        cmd.AssignmentGeneration cmd.Reason cmd.DependencyChallengeIds
+                                    |> mapError
+                                | "RequeueAttempt" ->
+                                    ChallengeWorkflow.ChallengeWorkflow.requeueAttempt binding operationId cmd.ActorId
+                                        cmd.TaskId cmd.AttemptId
+                                        cmd.ExpectedTaskVersion cmd.ExpectedAttemptVersion cmd.ExpectedAgentVersion
+                                        cmd.AssignmentGeneration cmd.Reason
+                                    |> mapError
+                                | _ -> Error(Client.ValidationError "Unsupported challenge mutation.")
+                            record)
+                result |> Result.map (fun receipt ->
+                    if cmd.Action = "Create" || cmd.Action = "Split" then
+                        let challengeId = operationId.ToString("N")
+                        let challengeId =
+                            if cmd.Action = "Split" then Guid.Parse(cmd.ChallengeId).ToString("N")
+                            else challengeId
+                        let conditionIds =
+                            if cmd.Action = "Split" then
+                                cmd.ConditionId ::
+                                    (List.init (cmd.Conditions.Length - 1) (fun index ->
+                                        let digest =
+                                            SHA256.HashData(Encoding.UTF8.GetBytes(
+                                                challengeId + ":split:" + operationId.ToString("N")
+                                                + ":" + string (index + 1)))
+                                        Guid(digest.AsSpan(0, 16)).ToString("N")))
+                            else
+                                cmd.Conditions |> List.mapi (fun index _ ->
+                                    let digest = SHA256.HashData(Encoding.UTF8.GetBytes(challengeId + ":condition:" + string index))
+                                    Guid(digest.AsSpan(0, 16)).ToString("N"))
+                        box {| challengeId = challengeId
+                               conditionIds = conditionIds
+                               receipt = OperationResponse.present receipt |}
+                    else OperationResponse.present receipt)))
 
 // Operator-only recovery re-enters the current typed writers. Archived or
 // retired lifecycle commands cannot be made executable by choosing a new

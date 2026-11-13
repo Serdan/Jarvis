@@ -292,6 +292,12 @@ module McpToolHelpers =
         [ "SubmitReview"; "ClaimReview"; "DecideReview"; "ReleaseReview"; "WithdrawReview"
           "PutReviewDocument" ]
 
+    let private challengeReadMethods = [ "ListChallenges"; "GetChallenge" ]
+    let private challengeWriteMethods =
+        [ "CreateChallenge"; "SetChallengeSubscription"; "AssignChallengeCondition"; "SplitChallengeCondition"
+          "ResolveChallengeCondition"; "ReopenChallengeCondition"
+          "CancelChallenge"; "BlockOnChallenges"; "RequeueChallengeBlockedAttempt" ]
+
     let private ledgerAliasCapabilities =
         let fromWire wireName publicName =
             AgentProtocol.capabilities
@@ -308,7 +314,9 @@ module McpToolHelpers =
           for name in ledgerReadMethods -> fromWire "LedgerRead" name
           for name in ledgerWriteMethods -> fromWire "LedgerWrite" name
           for name in ledgerReviewMethods -> fromWire "ReviewRead" name
-          for name in ledgerReviewWriteMethods -> fromWire "ReviewWrite" name ]
+          for name in ledgerReviewWriteMethods -> fromWire "ReviewWrite" name
+          for name in challengeReadMethods -> fromWire "ChallengeRead" name
+          for name in challengeWriteMethods -> fromWire "ChallengeWrite" name ]
 
     let mcpListCommandsResult : ListCommandsResult =
         { ProtocolVersion = AgentProtocol.version
@@ -317,7 +325,8 @@ module McpToolHelpers =
              |> List.filter (fun capability ->
                  capability.Name <> "ReviewRead" && capability.Name <> "ReviewWrite"
                  && capability.Name <> "TaskRead" && capability.Name <> "TaskWrite"
-                 && capability.Name <> "LedgerRead" && capability.Name <> "LedgerWrite"))
+                 && capability.Name <> "LedgerRead" && capability.Name <> "LedgerWrite"
+                 && capability.Name <> "ChallengeRead" && capability.Name <> "ChallengeWrite"))
             @ ledgerAliasCapabilities
             @ [ serverLocalCapability
                     "GetProfile"
@@ -498,6 +507,7 @@ module McpToolHelpers =
         | GetWorktreeCommand _
         | InspectWorktreeRemovalCommand _
         | TaskReadCommand _
+        | ChallengeReadCommand _
         | ObserveAgentCommand _
         | LedgerReadCommand _
         | ReviewReadCommand _
@@ -543,6 +553,7 @@ module McpToolHelpers =
         | RemoveWorktreeCommand _
         | TaskWriteCommand _
         | CrossProjectNotificationCommand _
+        | ChallengeWriteCommand _
         | LedgerWriteCommand _
         | ReviewWriteCommand _
         | RetryPendingIntentCommand _
@@ -660,6 +671,9 @@ module McpToolHelpers =
         | TaskWriteCommand cmd ->
             let id, generated = resolveOperationId cmd.OperationId
             TaskWriteCommand { cmd with OperationId = id }, (if generated then Some id else None)
+        | ChallengeWriteCommand cmd ->
+            let id, generated = resolveOperationId cmd.OperationId
+            ChallengeWriteCommand { cmd with OperationId = id }, (if generated then Some id else None)
         | ReviewWriteCommand cmd ->
             let id, generated = resolveOperationId cmd.OperationId
             ReviewWriteCommand { cmd with OperationId = id }, (if generated then Some id else None)
@@ -2235,3 +2249,206 @@ type JarvisMcpTools =
             ProjectName = McpToolHelpers.optionOfString projectName
             Limit = Some boundedLimit
             IncludeObservers = Some includeObservers })
+
+
+    static member private ChallengeWrite(projectName, agentId, action, operationId) : ChallengeWriteCommand =
+        { ProjectName = projectName; ActorId = agentId; Action = action
+          OperationId = operationId; ChallengeId = ""; ConditionId = ""
+          ExpectedVersion = 0; Title = ""; TaskId = ""
+          AttemptId = ""; DependencyChallengeIds = []
+          ExpectedTaskVersion = 0; ExpectedAttemptVersion = 0
+          ExpectedAgentVersion = 0; AssignmentGeneration = 0
+          Conditions = []; Evidence = ""; Reason = ""; Outcome = ""
+          NewOwnerAgentId = ""; Subscribe = false }
+
+    [<McpServerTool(Title = "create challenge", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false);
+      McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]""");
+      Description("Create a durable ALL-policy agent challenge with 1-32 explicit condition owners. Stable challenge and condition IDs derive from the operation UUID, returned by this tool. Completion and evidence are recorded only in the canonical challenge ledger. No notifications or automatic agent activation.")>]
+    static member CreateChallenge(
+        projectName: string, agentId: string, title: string,
+        conditions: ChallengeConditionDefinition array,
+        [<Optional; DefaultParameterValue("")>] taskId: string,
+        [<Optional; DefaultParameterValue("")>] operationId: string,
+        [<Optional; DefaultParameterValue("")>] deviceId: string,
+        client: ClientService, http: IHttpContextAccessor
+    ) =
+        let command = JarvisMcpTools.ChallengeWrite(projectName, agentId, "Create", operationId)
+        let body =
+            { command with Title = title; TaskId = taskId
+                           Conditions = if isNull conditions then [] else conditions |> Array.toList }
+        McpToolHelpers.send client http (ChallengeWriteCommand body)
+
+    [<McpServerTool(Title = "set challenge subscription", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false);
+      McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]""");
+      Description("Subscribe or unsubscribe this registered agent to unassigned challenge conditions in this project. Subscription is durable; any agent can subscribe without role-name privileges. Only affects structured inbox/triage visibility, never notifications.")>]
+    static member SetChallengeSubscription(
+        projectName: string, agentId: string, subscribed: bool,
+        [<Optional; DefaultParameterValue("")>] operationId: string,
+        [<Optional; DefaultParameterValue("")>] deviceId: string,
+        client: ClientService, http: IHttpContextAccessor
+    ) =
+        let cmd = JarvisMcpTools.ChallengeWrite(projectName, agentId, "Subscribe", operationId)
+        McpToolHelpers.send client http (ChallengeWriteCommand { cmd with Subscribe = subscribed })
+
+    [<McpServerTool(Title = "assign challenge condition", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false);
+      McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]""");
+      Description("Atomically assign a Pending challenge condition using its exact challenge version. The issuer may directly assign or reassign; any subscribed agent may dispatch an unassigned condition without becoming owner. Stale concurrent dispatch fails closed; condition identity and event history are preserved. No notifications.")>]
+    static member AssignChallengeCondition(
+        projectName: string, agentId: string, challengeId: string,
+        conditionId: string, expectedVersion: int, newOwnerAgentId: string,
+        [<Optional; DefaultParameterValue("")>] operationId: string,
+        [<Optional; DefaultParameterValue("")>] deviceId: string,
+        client: ClientService, http: IHttpContextAccessor
+    ) =
+        let cmd = JarvisMcpTools.ChallengeWrite(projectName, agentId, "Assign", operationId)
+        McpToolHelpers.send client http
+            (ChallengeWriteCommand { cmd with ChallengeId = challengeId; ConditionId = conditionId
+                                              ExpectedVersion = expectedVersion; NewOwnerAgentId = newOwnerAgentId })
+
+
+
+    [<McpServerTool(Title = "split challenge condition", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false);
+      McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]""");
+      Description("Atomically split one Pending condition into 2-32 parts with an exact challenge version. The original condition ID is retained for the first part, deterministic new IDs are returned, and prior meaning/evidence are preserved in immutable history. The issuer may split directly; any subscribed agent may split unassigned conditions. No notifications or task ownership changes.")>]
+    static member SplitChallengeCondition(
+        projectName: string, agentId: string, challengeId: string,
+        conditionId: string, expectedVersion: int, parts: ChallengeConditionDefinition array,
+        [<Optional; DefaultParameterValue("")>] operationId: string,
+        [<Optional; DefaultParameterValue("")>] deviceId: string,
+        client: ClientService, http: IHttpContextAccessor
+    ) =
+        let cmd = JarvisMcpTools.ChallengeWrite(projectName, agentId, "Split", operationId)
+        let definitions = if isNull parts then [] else parts |> Array.toList
+        McpToolHelpers.send client http
+            (ChallengeWriteCommand { cmd with ChallengeId = challengeId; ConditionId = conditionId
+                                              ExpectedVersion = expectedVersion; Conditions = definitions })
+    [<McpServerTool(Title = "list challenges", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false);
+      McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]""");
+      Description("List challenges issued to or assigned to this registered agent, including their current Pending, Blocked, Satisfied or Cancelled status. No implicit state changes.")>]
+    static member ListChallenges(
+        projectName: string, agentId: string,
+        [<Optional; DefaultParameterValue(50)>] limit: int,
+        [<Optional; DefaultParameterValue("")>] afterChallengeId: string,
+        [<Optional; DefaultParameterValue("")>] expectedSnapshotCommit: string,
+        [<Optional; DefaultParameterValue("")>] deviceId: string,
+        client: ClientService, http: IHttpContextAccessor
+    ) =
+        McpToolHelpers.send client http
+            (ChallengeReadCommand { ProjectName = projectName; ActorId = agentId
+                                    Action = "List"; ChallengeId = ""
+                                    Limit = limit; AfterChallengeId = afterChallengeId
+                                    AfterEventSequence = 0L
+                                    ExpectedSnapshotCommit = expectedSnapshotCommit })
+
+    [<McpServerTool(Title = "get challenge", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false);
+      McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]""");
+      Description("Read a challenge by its UUID, including owned conditions, evidence and immutable transition history. Accessible only to the issuer or named condition owners.")>]
+    static member GetChallenge(
+        projectName: string, agentId: string, challengeId: string,
+        [<Optional; DefaultParameterValue(16)>] eventLimit: int,
+        [<Optional; DefaultParameterValue(0L)>] afterEventSequence: int64,
+        [<Optional; DefaultParameterValue("")>] expectedSnapshotCommit: string,
+        [<Optional; DefaultParameterValue("")>] deviceId: string,
+        client: ClientService, http: IHttpContextAccessor
+    ) =
+        McpToolHelpers.send client http
+            (ChallengeReadCommand { ProjectName = projectName; ActorId = agentId
+                                    Action = "Get"; ChallengeId = challengeId
+                                    Limit = eventLimit; AfterChallengeId = ""
+                                    AfterEventSequence = afterEventSequence
+                                    ExpectedSnapshotCommit = expectedSnapshotCommit })
+
+    [<McpServerTool(Title = "resolve challenge condition", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false);
+      McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]""");
+      Description("As the assigned condition owner, atomically resolve a Pending condition as Satisfied (with evidence) or Blocked (with required reason and optional evidence). Use exact challenge version for CAS; reused operation IDs are idempotent. A blocked condition never satisfies the challenge; its reason and evidence are visible through the challenge query. No notifications.")>]
+    static member ResolveChallengeCondition(
+        projectName: string, agentId: string, challengeId: string,
+        conditionId: string, expectedVersion: int, outcome: string, evidence: string,
+        [<Optional; DefaultParameterValue("")>] reason: string,
+        [<Optional; DefaultParameterValue("")>] operationId: string,
+        [<Optional; DefaultParameterValue("")>] deviceId: string,
+        client: ClientService, http: IHttpContextAccessor
+    ) =
+        let command = JarvisMcpTools.ChallengeWrite(projectName, agentId, "Resolve", operationId)
+        let body =
+            { command with ChallengeId = challengeId; ConditionId = conditionId
+                           ExpectedVersion = expectedVersion; Outcome = outcome
+                           Evidence = evidence; Reason = reason }
+        McpToolHelpers.send client http (ChallengeWriteCommand body)
+
+    [<McpServerTool(Title = "reopen challenge condition", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false);
+      McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]""");
+      Description("Issuer-only: reopen a Blocked challenge condition with a recorded reason and exact challenge version. Preserve its evidence history; the challenge returns to Pending only when no other condition remains Blocked.")>]
+    static member ReopenChallengeCondition(
+        projectName: string, agentId: string, challengeId: string,
+        conditionId: string, expectedVersion: int, reason: string,
+        [<Optional; DefaultParameterValue("")>] operationId: string,
+        [<Optional; DefaultParameterValue("")>] deviceId: string,
+        client: ClientService, http: IHttpContextAccessor
+    ) =
+        let command = JarvisMcpTools.ChallengeWrite(projectName, agentId, "Reopen", operationId)
+        let body =
+            { command with ChallengeId = challengeId; ConditionId = conditionId
+                           ExpectedVersion = expectedVersion; Reason = reason }
+        McpToolHelpers.send client http (ChallengeWriteCommand body)
+
+    [<McpServerTool(Title = "cancel challenge", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false);
+      McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]""");
+      Description("Issuer-only: cancel a Pending or Blocked challenge at its current version with a durable reason. Cancellation never creates notifications, erases history or automatically changes agent/task state.")>]
+    static member CancelChallenge(
+        projectName: string, agentId: string, challengeId: string,
+        expectedVersion: int, reason: string,
+        [<Optional; DefaultParameterValue("")>] operationId: string,
+        [<Optional; DefaultParameterValue("")>] deviceId: string,
+        client: ClientService, http: IHttpContextAccessor
+    ) =
+        let command = JarvisMcpTools.ChallengeWrite(projectName, agentId, "Cancel", operationId)
+        let body =
+            { command with ChallengeId = challengeId
+                           ExpectedVersion = expectedVersion; Reason = reason }
+        McpToolHelpers.send client http (ChallengeWriteCommand body)
+
+
+    [<McpServerTool(Title = "block on challenges", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false);
+      McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]""");
+      Description("Block your currently assigned task attempt with an explicit reason and zero to sixteen challenge dependencies. The agent becomes unassigned NeedsWork; task ownership and reviews are preserved, with a durable dependency record and immutable lifecycle audit. Supply the exact canonical task, attempt, agent versions and assignment generation. Does not resume or launch another agent.")>]
+    static member BlockOnChallenges(
+        projectName: string, taskId: string, attemptId: string, agentId: string,
+        reason: string, challengeIds: string array,
+        expectedTaskVersion: int, expectedAttemptVersion: int, expectedAgentVersion: int,
+        assignmentGeneration: int,
+        [<Optional; DefaultParameterValue("")>] operationId: string,
+        [<Optional; DefaultParameterValue("")>] deviceId: string,
+        client: ClientService, http: IHttpContextAccessor
+    ) =
+        let cmd = JarvisMcpTools.ChallengeWrite(projectName, agentId, "BlockAttempt", operationId)
+        let body =
+            { cmd with
+                TaskId = taskId; AttemptId = attemptId; Reason = reason
+                DependencyChallengeIds = if isNull challengeIds then [] else challengeIds |> Array.toList
+                ExpectedTaskVersion = expectedTaskVersion
+                ExpectedAttemptVersion = expectedAttemptVersion
+                ExpectedAgentVersion = expectedAgentVersion
+                AssignmentGeneration = assignmentGeneration }
+        McpToolHelpers.send client http (ChallengeWriteCommand body)
+
+    [<McpServerTool(Title = "requeue challenge-blocked attempt", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false);
+      McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]""");
+      Description("Explicitly requeue your own challenge-blocked task attempt after every linked challenge is Satisfied. Atomically release the wait, increment assignment generation, issue new instructions and set the owner Ready (never Working); rejects cancelled or incomplete dependencies and stale versions. Requires current task/attempt/agent versions and generation.")>]
+    static member RequeueChallengeBlockedAttempt(
+        projectName: string, taskId: string, attemptId: string, agentId: string,
+        expectedTaskVersion: int, expectedAttemptVersion: int, expectedAgentVersion: int,
+        assignmentGeneration: int, reason: string,
+        [<Optional; DefaultParameterValue("")>] operationId: string,
+        [<Optional; DefaultParameterValue("")>] deviceId: string,
+        client: ClientService, http: IHttpContextAccessor
+    ) =
+        let cmd = JarvisMcpTools.ChallengeWrite(projectName, agentId, "RequeueAttempt", operationId)
+        let body =
+            { cmd with
+                TaskId = taskId; AttemptId = attemptId; Reason = reason
+                ExpectedTaskVersion = expectedTaskVersion
+                ExpectedAttemptVersion = expectedAttemptVersion
+                ExpectedAgentVersion = expectedAgentVersion
+                AssignmentGeneration = assignmentGeneration }
+        McpToolHelpers.send client http (ChallengeWriteCommand body)

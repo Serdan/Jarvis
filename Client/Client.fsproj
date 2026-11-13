@@ -67,6 +67,7 @@
         <Compile Include="Modules\\LedgerStore.fs"/>
         <Compile Include="Modules\RoleInstructions.fs"/>
         <Compile Include="Modules\\ReviewWorkflow.fs"/>
+        <Compile Include="Modules\\ChallengeWorkflow.fs"/>
         <Compile Include="Modules\\OrchestrationApi.fs"/>
         <Compile Include="Modules\ProjectCreation.fs"/>
         <Compile Include="Modules\AgentDashboard.fs"/>

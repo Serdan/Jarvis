@@ -10,20 +10,25 @@ open Client.ReviewWorkflow
 
 [<CLIMutable>]
 type ChallengeConditionSpec =
-    { OwnerAgentId: string
+    { OwnerKind: string
+      OwnerAgentId: string
       SuggestedAgentId: string
       Description: string }
 
 [<CLIMutable>]
 type ChallengeCondition =
     { ConditionId: string
+      OwnerKind: string
       OwnerAgentId: string
       SuggestedAgentId: string
       Description: string
       Status: string
       Evidence: string
       Reason: string
-      UpdatedAtUtc: string }
+      UpdatedAtUtc: string
+      // A direct immutable audit-event locator. Zero means no operator reply.
+      // Defaults to zero when reading pre-feature challenge ledger documents.
+      ResponseEventSequence: int64 }
 
 [<CLIMutable>]
 type AgentChallenge =
@@ -106,6 +111,11 @@ type ChallengeRecentIndex =
     { IssuerAgentId: string
       TotalCurrentOutcomes: int
       Items: InboxChallengeItem list }
+[<RequireQualifiedAccess>]
+type ChallengeOwner =
+    | Unassigned
+    | Agent of string
+    | Operator
 
 module ChallengeWorkflow =
     let private options =
@@ -137,6 +147,28 @@ module ChallengeWorkflow =
         | _ -> None
     let private agentId (name: string) =
         not (String.IsNullOrWhiteSpace name) && Encoding.UTF8.GetByteCount name <= 120
+    // The persisted discriminator is explicit for new conditions; older schema-2
+    // challenges had only OwnerAgentId and are interpreted without rewriting them.
+    let private owner kind agent =
+        match kind with
+        | null | "" ->
+            if String.IsNullOrWhiteSpace agent then Some ChallengeOwner.Unassigned
+            else Some(ChallengeOwner.Agent agent)
+        | "Unassigned" when String.IsNullOrWhiteSpace agent -> Some ChallengeOwner.Unassigned
+        | "Agent" when not (String.IsNullOrWhiteSpace agent) -> Some(ChallengeOwner.Agent agent)
+        | "Operator" when String.IsNullOrWhiteSpace agent -> Some ChallengeOwner.Operator
+        | _ -> None
+
+    let private ownerOf (condition: ChallengeCondition) =
+        owner condition.OwnerKind condition.OwnerAgentId
+
+    let private ownerKind kind agent =
+        match owner kind agent with
+        | Some ChallengeOwner.Operator -> "Operator"
+        | Some ChallengeOwner.Unassigned -> "Unassigned"
+        | Some(ChallengeOwner.Agent _) -> "Agent"
+        | None -> invalidArg "condition" "Invalid condition owner."
+
     let private text maxBytes (value: string) =
         not (String.IsNullOrWhiteSpace value) && Encoding.UTF8.GetByteCount value <= maxBytes
     let private taskId (value: string) =
@@ -175,7 +207,9 @@ module ChallengeWorkflow =
         && ids.Length = (ids |> List.distinct |> List.length)
         && (challenge.Conditions |> List.forall (fun c ->
             (guidN c.ConditionId).IsSome
+            && (ownerOf c).IsSome
             && (String.IsNullOrEmpty c.OwnerAgentId || agentId c.OwnerAgentId)
+            && (c.OwnerKind <> "Operator" || String.IsNullOrWhiteSpace c.SuggestedAgentId)
             && (String.IsNullOrEmpty c.SuggestedAgentId || agentId c.SuggestedAgentId)
             && text 2048 c.Description
             && List.contains c.Status [ "Pending"; "Blocked"; "Satisfied" ]
@@ -250,14 +284,17 @@ module ChallengeWorkflow =
         else
             challenge.Conditions
             |> List.choose (fun c ->
-                if c.Status = "Pending" && not (String.IsNullOrWhiteSpace c.OwnerAgentId)
-                then Some c.OwnerAgentId else None)
+                if c.Status = "Pending" then
+                    match ownerOf c with
+                    | Some(ChallengeOwner.Agent name) -> Some name
+                    | _ -> None
+                else None)
             |> Set.ofList
 
     let private hasTriage (challenge: AgentChallenge) =
         (challenge.Status = "Pending" || challenge.Status = "Blocked")
         && (challenge.Conditions |> List.exists (fun c ->
-            c.Status = "Pending" && String.IsNullOrWhiteSpace c.OwnerAgentId))
+            c.Status = "Pending" && ownerOf c = Some ChallengeOwner.Unassigned))
 
     let private inboxItem (challenge: AgentChallenge) (condition: ChallengeCondition) : InboxChallengeItem =
         { ChallengeId = challenge.ChallengeId
@@ -431,7 +468,9 @@ module ChallengeWorkflow =
            || not (text 2048 title) || not (taskId task)
            || List.isEmpty definitions || List.length definitions > 32
            || (definitions |> List.exists (fun d ->
-               (not (String.IsNullOrWhiteSpace d.OwnerAgentId) && not (agentId d.OwnerAgentId))
+               (owner d.OwnerKind d.OwnerAgentId).IsNone
+               || (d.OwnerKind = "Operator" && not (String.IsNullOrWhiteSpace d.SuggestedAgentId))
+               || (not (String.IsNullOrWhiteSpace d.OwnerAgentId) && not (agentId d.OwnerAgentId))
                || (not (String.IsNullOrWhiteSpace d.SuggestedAgentId) && not (agentId d.SuggestedAgentId))
                || not (text 2048 d.Description))) then
             Error(InvalidBinding "Challenge requires valid issuer, title, optional task, and 1-32 owned conditions.")
@@ -440,18 +479,20 @@ module ChallengeWorkflow =
             let conditions =
                 definitions |> List.mapi (fun index definition ->
                     { ConditionId = conditionId challengeId index
+                      OwnerKind = ownerKind definition.OwnerKind definition.OwnerAgentId
                       OwnerAgentId = if String.IsNullOrWhiteSpace definition.OwnerAgentId then "" else definition.OwnerAgentId
                       SuggestedAgentId = if String.IsNullOrWhiteSpace definition.SuggestedAgentId then "" else definition.SuggestedAgentId
                       Description = definition.Description
                       Status = "Pending"; Evidence = null; Reason = null
-                      UpdatedAtUtc = null })
+                      UpdatedAtUtc = null; ResponseEventSequence = 0L })
             let created =
                 changed binding operationId issuer "CreateChallenge"
                     ({| title = title; taskId = task; conditions = definitions |})
                     (fun snapshot -> result {
                     do! registered binding snapshot issuer
                     for definition in definitions do
-                        if not (String.IsNullOrWhiteSpace definition.OwnerAgentId) then
+                        if owner definition.OwnerKind definition.OwnerAgentId <> Some ChallengeOwner.Operator
+                           && not (String.IsNullOrWhiteSpace definition.OwnerAgentId) then
                             do! registered binding snapshot definition.OwnerAgentId
                         if not (String.IsNullOrWhiteSpace definition.SuggestedAgentId) then
                             do! registered binding snapshot definition.SuggestedAgentId
@@ -631,7 +672,8 @@ module ChallengeWorkflow =
                             return! Error(StaleEntityVersion "Challenge changed; re-read its current version.")
                         if List.contains challenge.Status [ "Satisfied"; "Cancelled" ] then
                             return! Error(StaleEntityVersion "Completed and cancelled challenges cannot be mutated.")
-                        do! registered binding snapshot actor
+                        if kind <> "RespondOperatorCondition" then
+                            do! registered binding snapshot actor
                         let priorState = challenge.Status
                         let timestamp = DateTimeOffset.UtcNow.ToString("O")
                         let target =
@@ -650,9 +692,23 @@ module ChallengeWorkflow =
                                             { c with Status = "Pending"; UpdatedAtUtc = timestamp }
                                         else c), conditionId)
                                 | _ -> Error(StaleEntityVersion "Only an existing Blocked condition can be reopened.")
+                            | "RespondOperatorCondition" ->
+                                match target with
+                                | Some condition when ownerOf condition = Some ChallengeOwner.Operator
+                                                      && condition.Status = "Pending"
+                                                      && text 8192 evidence ->
+                                    Ok(challenge.Conditions |> List.map (fun c ->
+                                        if c.ConditionId = conditionId then
+                                            { c with Status = "Satisfied"; Evidence = evidence
+                                                     Reason = null; UpdatedAtUtc = timestamp
+                                                     ResponseEventSequence = snapshot.Header.NextSequence }
+                                        else c), conditionId)
+                                | Some condition when ownerOf condition <> Some ChallengeOwner.Operator ->
+                                    Error(ReviewAccessDenied "This challenge condition is not assigned to the human operator.")
+                                | _ -> Error(StaleEntityVersion "Operator condition is not pending or response is empty.")
                             | "ResolveChallengeCondition" ->
                                 match target with
-                                | Some condition when condition.OwnerAgentId = actor
+                                | Some condition when ownerOf condition = Some(ChallengeOwner.Agent actor)
                                                       && condition.Status = "Pending"
                                                       && (text 8192 evidence || text 4096 reason) ->
                                     let blocked = text 4096 reason
@@ -663,7 +719,7 @@ module ChallengeWorkflow =
                                                      UpdatedAtUtc = timestamp }
                                         else c)
                                     Ok(next, conditionId)
-                                | Some _ when target.Value.OwnerAgentId <> actor ->
+                                | Some _ when ownerOf target.Value <> Some(ChallengeOwner.Agent actor) ->
                                     Error(ReviewAccessDenied "Only the condition owner can resolve their condition.")
                                 | _ -> Error(StaleEntityVersion "Condition is not pending or lacks evidence/reason.")
                             | "CancelChallenge" | "ReopenChallengeCondition" ->
@@ -698,6 +754,12 @@ module ChallengeWorkflow =
                                  change (eventPath id snapshot.Header.NextSequence) None event ]
                                @ wakeups @ indexes
                     })
+
+    // Caller is the authenticated local TUI, never a remote agent command.
+    // One response resolves the operator input request; it is not a chat message.
+    let respondOperator binding operationId operatorActor challengeId conditionId version response =
+        update binding operationId operatorActor challengeId conditionId version
+            "RespondOperatorCondition" response ""
 
     let resolve binding operationId actor challengeId conditionId version evidence blockedReason =
         update binding operationId actor challengeId conditionId version
@@ -735,8 +797,10 @@ module ChallengeWorkflow =
                         match target with
                         | Some c when c.Status <> "Pending" ->
                             Error(StaleEntityVersion "Only Pending conditions can be assigned.")
+                        | Some c when ownerOf c = Some ChallengeOwner.Operator ->
+                            Error(ReviewAccessDenied "Operator input cannot be reassigned or dispatched.")
                         | Some c when actor = challenge.IssuerAgentId ||
-                                      (subscribed && String.IsNullOrWhiteSpace c.OwnerAgentId) -> Ok c
+                                      (subscribed && ownerOf c = Some ChallengeOwner.Unassigned) -> Ok c
                         | Some _ -> Error(ReviewAccessDenied "Only issuer or a subscribed dispatcher of unassigned work may assign.")
                         | None -> Error(InvalidBinding "Unknown condition ID.")
                     if condition.OwnerAgentId = newOwner then
@@ -745,7 +809,7 @@ module ChallengeWorkflow =
                     let conditions =
                         challenge.Conditions |> List.map (fun c ->
                             if c.ConditionId = conditionId then
-                                { c with OwnerAgentId = newOwner; UpdatedAtUtc = timestamp }
+                                { c with OwnerKind = "Agent"; OwnerAgentId = newOwner; UpdatedAtUtc = timestamp }
                             else c)
                     let updated = { challenge with Version = challenge.Version + 1; Conditions = conditions; UpdatedAtUtc = timestamp }
                     let event =
@@ -772,7 +836,9 @@ module ChallengeWorkflow =
         | Some id when operationId = Guid.Empty || not (agentId actor)
                        || expectedVersion < 1 || parts.Length < 2 || parts.Length > 32
                        || (parts |> List.exists (fun d ->
-                           not (text 2048 d.Description)
+                           (owner d.OwnerKind d.OwnerAgentId).IsNone
+                           || (d.OwnerKind = "Operator" && not (String.IsNullOrWhiteSpace d.SuggestedAgentId))
+                           || not (text 2048 d.Description)
                            || (not (String.IsNullOrWhiteSpace d.OwnerAgentId) && not (agentId d.OwnerAgentId))
                            || (not (String.IsNullOrWhiteSpace d.SuggestedAgentId) && not (agentId d.SuggestedAgentId)))) ->
             Error(InvalidBinding "Split requires 2-32 valid condition definitions and exact version.")
@@ -789,7 +855,8 @@ module ChallengeWorkflow =
                     (fun snapshot -> result {
                         do! registered binding snapshot actor
                         for part in parts do
-                            if not (String.IsNullOrWhiteSpace part.OwnerAgentId) then
+                            if owner part.OwnerKind part.OwnerAgentId <> Some ChallengeOwner.Operator
+                               && not (String.IsNullOrWhiteSpace part.OwnerAgentId) then
                                 do! registered binding snapshot part.OwnerAgentId
                             if not (String.IsNullOrWhiteSpace part.SuggestedAgentId) then
                                 do! registered binding snapshot part.SuggestedAgentId
@@ -803,10 +870,12 @@ module ChallengeWorkflow =
                         let! original =
                             match challenge.Conditions |> List.tryFind (fun c -> c.ConditionId = conditionId) with
                             | None -> Error(InvalidBinding "Unknown challenge condition for split.")
+                            | Some c when ownerOf c = Some ChallengeOwner.Operator ->
+                                Error(ReviewAccessDenied "Operator input conditions cannot be split.")
                             | Some c when c.Status <> "Pending" ->
                                 Error(StaleEntityVersion "Only Pending conditions can be split.")
                             | Some c when actor = challenge.IssuerAgentId
-                                      || (subscribed && String.IsNullOrWhiteSpace c.OwnerAgentId) ->
+                                      || (subscribed && ownerOf c = Some ChallengeOwner.Unassigned) ->
                                 Ok c
                             | Some _ ->
                                 Error(ReviewAccessDenied "Only issuer or subscribed dispatcher of unassigned work can split.")
@@ -821,11 +890,12 @@ module ChallengeWorkflow =
                             (parts, ids)
                             ||> List.map2 (fun part targetId ->
                                 { ConditionId = targetId
+                                  OwnerKind = ownerKind part.OwnerKind part.OwnerAgentId
                                   OwnerAgentId = normalized part.OwnerAgentId
                                   SuggestedAgentId = normalized part.SuggestedAgentId
                                   Description = part.Description
                                   Status = "Pending"; Evidence = null; Reason = null
-                                  UpdatedAtUtc = timestamp })
+                                  UpdatedAtUtc = timestamp; ResponseEventSequence = 0L })
                         let revised =
                             { challenge with Version = challenge.Version + 1
                                              Conditions = challenge.Conditions |> List.collect (fun c ->
@@ -855,12 +925,12 @@ module ChallengeWorkflow =
                 { ChallengeId = id.ToString("N"); ConditionIds = ids; Receipt = receipt })
     let private accessible actor (challenge: AgentChallenge) =
         challenge.IssuerAgentId = actor
-        || challenge.Conditions |> List.exists (fun c -> c.OwnerAgentId = actor)
+        || challenge.Conditions |> List.exists (fun c -> ownerOf c = Some(ChallengeOwner.Agent actor))
 
     let private visible actor subscribed (challenge: AgentChallenge) =
         accessible actor challenge
         || (subscribed && challenge.Conditions |> List.exists (fun c ->
-            c.Status = "Pending" && String.IsNullOrWhiteSpace c.OwnerAgentId))
+            c.Status = "Pending" && ownerOf c = Some ChallengeOwner.Unassigned))
 
     // Explicit historical listing may traverse older challenge paths, but
     // reads only enough CURRENT snapshot records for the requested page.
@@ -899,6 +969,93 @@ module ChallengeWorkflow =
                         with ex ->
                             return! Error(LedgerIntegrityError ("Malformed paged challenge: " + ex.Message))
         return selected |> List.rev |> List.truncate (limit + 1)
+    }
+
+    /// Local authenticated operator UI only. This has no MCP route and does
+    /// not treat the human as a registered agent or a subscriber.
+    let listOperator binding projectName = result {
+        let! snapshot = LedgerStore.fetch binding
+        // Explicit operator-panel retrieval, never part of a routine agent inbox.
+        // Read canonical challenge records in bounded Git blob batches from
+        // a single verified ledger snapshot.
+        let! paths = LedgerStore.listAt binding snapshot "challenges"
+        let mutable names: string list = []
+        for item in paths do
+            if item.EndsWith("/challenge.json", StringComparison.Ordinal) then
+                let components = item.Split('/')
+                if components.Length <> 3 || (guidN components[1]).IsNone then
+                    return! Error(LedgerIntegrityError "Invalid operator challenge identity in ledger tree.")
+                names <- components[1] :: names
+        let mutable challenges: AgentChallenge list = []
+        for batch in names |> List.sort |> List.chunkBySize 128 do
+            let! bodies = LedgerStore.readChallengeEntitiesAt binding snapshot batch
+            for id in batch do
+                let file = "challenges/" + id + "/challenge.json"
+                match Map.tryFind file bodies with
+                | None -> return! Error(LedgerIntegrityError ("Missing operator challenge record: " + id))
+                | Some body ->
+                    try
+                        use doc = JsonDocument.Parse body
+                        let challenge = JsonSerializer.Deserialize<AgentChallenge>(body, options)
+                        if doc.RootElement.GetProperty("schemaVersion").GetInt32() <> 2
+                           || isNull (box challenge) || challenge.ChallengeId <> id
+                           || not (check challenge) then
+                            return! Error(LedgerIntegrityError ("Invalid operator challenge record: " + id))
+                        challenges <- challenge :: challenges
+                    with ex ->
+                        return! Error(LedgerIntegrityError ("Malformed operator challenge record: " + ex.Message))
+        let mutable entries: OperatorChallengeEntry list = []
+        for challenge in challenges do
+            for condition in challenge.Conditions do
+                if ownerOf condition = Some ChallengeOwner.Operator then
+                    let! respondedBy, respondedAt =
+                        if condition.Status <> "Satisfied" || condition.ResponseEventSequence = 0L then
+                            Ok("", "")
+                        else
+                            let challengeGuid = Guid.Parse challenge.ChallengeId
+                            result {
+                                let! content, _ = LedgerStore.readAt binding snapshot
+                                                      (eventPath challengeGuid condition.ResponseEventSequence)
+                                match content with
+                                | None -> return! Error(LedgerIntegrityError "Missing operator response audit event.")
+                                | Some body ->
+                                    try
+                                        use json = JsonDocument.Parse(body)
+                                        if json.RootElement.GetProperty("schemaVersion").GetInt32() <> 2 then
+                                            return! Error(LedgerIntegrityError "Invalid operator response event schema.")
+                                        let event = JsonSerializer.Deserialize<ChallengeEvent>(body, options)
+                                        if isNull (box event)
+                                           || event.ChallengeId <> challenge.ChallengeId
+                                           || event.ConditionId <> condition.ConditionId
+                                           || event.Sequence <> condition.ResponseEventSequence
+                                           || event.Action <> "RespondOperatorCondition"
+                                           || not (event.ActorId.StartsWith("operator:", StringComparison.Ordinal))
+                                           || String.IsNullOrWhiteSpace event.OccurredAtUtc
+                                           || event.OccurredAtUtc <> condition.UpdatedAtUtc
+                                           || event.Evidence <> condition.Evidence then
+                                            return! Error(LedgerIntegrityError "Operator response event does not match canonical condition.")
+                                        return event.ActorId, event.OccurredAtUtc
+                                    with ex ->
+                                        return! Error(LedgerIntegrityError ("Unable to verify operator response provenance: " + ex.Message))
+                            }
+                    entries <-
+                        { ProjectName = projectName
+                          ChallengeId = challenge.ChallengeId
+                          ConditionId = condition.ConditionId
+                          IssuerAgentId = challenge.IssuerAgentId
+                          Title = challenge.Title
+                          TaskId = challenge.TaskId
+                          Question = condition.Description
+                          ChallengeStatus = challenge.Status
+                          ConditionStatus = condition.Status
+                          Version = challenge.Version
+                          Evidence = condition.Evidence
+                          CreatedAtUtc = challenge.CreatedAtUtc
+                          UpdatedAtUtc = condition.UpdatedAtUtc
+                          RespondedBy = respondedBy
+                          RespondedAtUtc = respondedAt
+                          ResponseEventSequence = condition.ResponseEventSequence } :: entries
+        return List.rev entries
     }
 
     /// Enrich the ordinary self-inbox from materialized ACTIVE challenge IDs,
@@ -987,7 +1144,7 @@ module ChallengeWorkflow =
                 let challenge = current[id]
                 if challenge.Status = "Pending" || challenge.Status = "Blocked" then
                     for c in challenge.Conditions do
-                        if c.Status = "Pending" && c.OwnerAgentId = actor then
+                        if c.Status = "Pending" && ownerOf c = Some(ChallengeOwner.Agent actor) then
                             yield inboxItem challenge c ]
             |> newest
         let triage =
@@ -996,7 +1153,7 @@ module ChallengeWorkflow =
                     let challenge = current[id]
                     if challenge.Status = "Pending" || challenge.Status = "Blocked" then
                         for c in challenge.Conditions do
-                            if c.Status = "Pending" && String.IsNullOrWhiteSpace c.OwnerAgentId then
+                            if c.Status = "Pending" && ownerOf c = Some ChallengeOwner.Unassigned then
                                 yield inboxItem challenge c ]
                 |> newest
             else []
@@ -1051,7 +1208,7 @@ module ChallengeWorkflow =
                       SatisfiedConditions = c.Conditions |> List.filter (fun x -> x.Status = "Satisfied") |> List.length
                       OwnedUnresolvedConditionIds =
                         c.Conditions
-                        |> List.filter (fun x -> x.OwnerAgentId = actor && x.Status <> "Satisfied")
+                        |> List.filter (fun x -> ownerOf x = Some(ChallengeOwner.Agent actor) && x.Status <> "Satisfied")
                         |> List.map _.ConditionId })
             return
                 { SnapshotCommit = snapshot.Commit
@@ -1064,10 +1221,10 @@ module ChallengeWorkflow =
     // Audit events are immutable but can grow without limit across repeated
     // block/reopen cycles. Read a bounded page, tied to a verified snapshot,
     // instead of making a single unlimited MCP response.
-    let getPage binding actor challengeId limit afterSequence expectedSnapshot =
+    let private getPageFor operatorView binding actor challengeId limit afterSequence expectedSnapshot =
         match guidN challengeId with
         | None -> Error(InvalidBinding "Invalid challenge ID.")
-        | Some id when not (agentId actor) || limit < 1 || limit > 16
+        | Some id when (not operatorView && not (agentId actor)) || limit < 1 || limit > 16
                        || afterSequence < 0L
                        || (not (String.IsNullOrWhiteSpace expectedSnapshot)
                            && (expectedSnapshot.Length <> 40
@@ -1078,10 +1235,16 @@ module ChallengeWorkflow =
             if not (String.IsNullOrWhiteSpace expectedSnapshot)
                && snapshot.Commit <> expectedSnapshot then
                 return! Error(StaleEntityVersion "Challenge detail snapshot moved; start paging again.")
-            do! registered binding snapshot actor
-            let! subscribed = subscribedAt binding snapshot actor
+            if not operatorView then
+                do! registered binding snapshot actor
             let! record, _ = readChallenge binding snapshot id
-            if not (visible actor subscribed record) then
+            let! subscribed =
+                if operatorView then Ok false else subscribedAt binding snapshot actor
+            let canView =
+                if operatorView then
+                    record.Conditions |> List.exists (fun c -> ownerOf c = Some ChallengeOwner.Operator)
+                else visible actor subscribed record
+            if not canView then
                 return! Error(ReviewAccessDenied "Only issuer and condition owners can inspect a challenge.")
             let! paths =
                 LedgerStore.listAt binding snapshot
@@ -1121,6 +1284,14 @@ module ChallengeWorkflow =
                   NextEventSequence =
                     if page.Length > limit then selected |> List.last |> fst else 0L }
         }
+
+    let getPage binding actor challengeId limit afterSequence expectedSnapshot =
+        getPageFor false binding actor challengeId limit afterSequence expectedSnapshot
+
+    // The Program/TUI access closure is the authentication boundary; no
+    // remote TaskRead or MCP path calls this operator-only reader.
+    let getOperatorPage binding challengeId limit afterSequence expectedSnapshot =
+        getPageFor true binding "AuthenticatedOperator" challengeId limit afterSequence expectedSnapshot
 
     let get binding actor challengeId = getPage binding actor challengeId 16 0L ""
 

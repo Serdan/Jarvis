@@ -139,3 +139,84 @@ type IgnoreBuilder() =
     member inline _.Yield _ = ()
     member inline _.Combine((), ()) = ()
     member inline _.Zero() = ()
+
+
+// Local TUI contracts for authenticated operator input. The implementation
+// is deliberately not exposed through agent-attributed MCP commands.
+type OperatorChallengeEntry =
+    { ProjectName: string
+      ChallengeId: string
+      ConditionId: string
+      IssuerAgentId: string
+      Title: string
+      TaskId: string
+      Question: string
+      ChallengeStatus: string
+      ConditionStatus: string
+      Version: int
+      Evidence: string
+      CreatedAtUtc: string
+      UpdatedAtUtc: string
+      RespondedBy: string
+      RespondedAtUtc: string
+      ResponseEventSequence: int64 }
+
+type OperatorChallengeReplyFailure =
+    | StaleOperatorReply of string
+    | OtherOperatorReplyFailure of string
+
+type OperatorChallengeDraft =
+    { Target: OperatorChallengeEntry
+      Text: string
+      OperationId: string }
+
+module OperatorChallengePresentation =
+    let isActionable (item: OperatorChallengeEntry) =
+        (item.ChallengeStatus = "Pending" || item.ChallengeStatus = "Blocked")
+        && item.ConditionStatus = "Pending"
+
+    let pendingCount (entries: OperatorChallengeEntry list) =
+        entries |> List.filter isActionable |> List.length
+
+    let sameCondition (left: OperatorChallengeEntry) (right: OperatorChallengeEntry) =
+        left.ProjectName = right.ProjectName
+        && left.ChallengeId = right.ChallengeId
+        && left.ConditionId = right.ConditionId
+
+    // Recover only after a canonical reload proves that the same unanswered
+    // condition is active on a newer version. Unknown writes retain their ID.
+    let updatedActionableVersion oldEntry candidate =
+        candidate
+        |> Option.filter (fun current ->
+            sameCondition oldEntry current
+            && isActionable current
+            && current.Version > oldEntry.Version)
+
+    let rebaseAfterDefinitiveStale (draft: OperatorChallengeDraft) current newOperationId =
+        updatedActionableVersion draft.Target current
+        |> Option.filter (fun _ ->
+            not (String.IsNullOrWhiteSpace newOperationId)
+            && newOperationId <> draft.OperationId)
+        |> Option.map (fun latest ->
+            { draft with Target = latest; OperationId = newOperationId })
+
+    let provenanceLine (item: OperatorChallengeEntry) =
+        if item.ConditionStatus = "Satisfied"
+           && not (String.IsNullOrWhiteSpace item.RespondedBy)
+           && not (String.IsNullOrWhiteSpace item.RespondedAtUtc)
+           && item.ResponseEventSequence > 0L then
+            Some(sprintf "Answered by %s at %s (event #%d)"
+                     item.RespondedBy item.RespondedAtUtc item.ResponseEventSequence)
+        else None
+
+type OperatorChallengeReply =
+    { ProjectName: string
+      ChallengeId: string
+      ConditionId: string
+      ExpectedVersion: int
+      Response: string
+      OperationId: string }
+
+type OperatorChallengeSnapshot =
+    { Items: OperatorChallengeEntry list
+      Warnings: string list }

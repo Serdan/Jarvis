@@ -2585,7 +2585,8 @@ module ChallengeApi =
                                     else
                                         let definitions : ChallengeWorkflow.ChallengeConditionSpec list =
                                             cmd.Conditions |> List.map (fun definition ->
-                                                { OwnerAgentId = definition.OwnerAgentId
+                                                { OwnerKind = definition.OwnerKind
+                                                  OwnerAgentId = definition.OwnerAgentId
                                                   SuggestedAgentId = definition.SuggestedAgentId
                                                   Description = definition.Description })
                                         ChallengeWorkflow.ChallengeWorkflow.create
@@ -2601,7 +2602,8 @@ module ChallengeApi =
                                     else
                                         let parts : ChallengeWorkflow.ChallengeConditionSpec list =
                                             cmd.Conditions |> List.map (fun part ->
-                                                { OwnerAgentId = part.OwnerAgentId
+                                                { OwnerKind = part.OwnerKind
+                                                  OwnerAgentId = part.OwnerAgentId
                                                   SuggestedAgentId = part.SuggestedAgentId
                                                   Description = part.Description })
                                         ChallengeWorkflow.ChallengeWorkflow.splitCondition
@@ -2785,3 +2787,51 @@ module PendingRecoveryApi =
                            reason = recorded.archive.Reason
                            taskStateProof = recorded.archive.ObsoleteTask
                            reviewStateProof = recorded.archive.ObsoleteReview |})))
+
+// Intentionally local-only: never route these through ChallengeWriteCommand
+// or an agent-attributed MCP tool. The TUI supplies the authenticated OAuth
+// operator principal through its Program-owned closure.
+module OperatorChallengeApi =
+    let private mapError result = Result.mapError LedgerErrors.toEffect result
+
+    let list rt =
+        ProjectBrowser.listGitProjects rt
+        |> Result.map (fun projects ->
+            let results =
+                projects
+                |> List.map (fun (ProjectName project) ->
+                    match LedgerBindingConfig.load project rt with
+                    | Error _ -> [], [] // Unbound projects cannot be read as trusted ledgers.
+                    | Ok binding ->
+                        match ChallengeWorkflow.ChallengeWorkflow.listOperator binding project with
+                        | Ok items -> items, []
+                        | Error error -> [], [ sprintf "%s: %A" project error ])
+            { Items = results |> List.collect fst |> List.sortByDescending (fun item ->
+                          OperatorChallengePresentation.isActionable item, item.CreatedAtUtc)
+              Warnings = results |> List.collect snd })
+
+    let details projectName challengeId rt =
+        LedgerBindingConfig.load projectName rt
+        |> Result.bind (fun binding ->
+            ChallengeWorkflow.ChallengeWorkflow.getOperatorPage binding challengeId 16 0L ""
+            |> mapError)
+
+    let reply (authenticatedOperator: string) (request: OperatorChallengeReply) rt =
+        if String.IsNullOrWhiteSpace authenticatedOperator
+           || not (authenticatedOperator.StartsWith("operator:", StringComparison.Ordinal))
+           || authenticatedOperator.Length > 120 then
+            Error(Client.PermissionDenied "An authenticated operator identity is required.")
+        else
+            match Guid.TryParse request.OperationId with
+            | false, _ -> Error(Client.ValidationError "An operator response requires a stable operation UUID.")
+            | true, id when id = Guid.Empty ->
+                Error(Client.ValidationError "An operator response requires a nonempty operation UUID.")
+            | true, id ->
+                LedgerBindingConfig.load request.ProjectName rt
+                |> Result.bind (fun binding ->
+                    PendingIntentJournal.executeLedgerWrite binding id "OperatorChallengeReply" request
+                        (fun () ->
+                            ChallengeWorkflow.ChallengeWorkflow.respondOperator binding id
+                                authenticatedOperator request.ChallengeId request.ConditionId
+                                request.ExpectedVersion request.Response
+                            |> mapError))

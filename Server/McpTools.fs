@@ -2317,7 +2317,7 @@ type JarvisMcpTools =
 
     [<McpServerTool(Title = "create challenge", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false);
       McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["git:write"]}]""");
-      Description("Create a durable ALL-policy agent challenge with 1-32 explicit condition owners. Stable challenge and condition IDs derive from the operation UUID, returned by this tool. Completion and evidence are recorded only in the canonical challenge ledger. No notifications or automatic agent activation.")>]
+      Description("Create a durable ALL-policy challenge with 1-32 conditions. Set ownerKind=Operator and leave ownerAgentId/suggestedAgentId empty for a one-shot human response; ordinary agent conditions use ownerKind=Agent (or omit it for backwards compatibility) and ownerAgentId, or leave the owner unassigned. The operator answers through the local Jarvis client, not an agent MCP tool. Stable challenge and condition IDs derive from the operation UUID. Evidence remains in the canonical ledger and ordinary agent inbox. No notifications or automatic activation.")>]
     static member CreateChallenge(
         projectName: string, agentId: string, title: string,
         conditions: ChallengeConditionDefinition array,

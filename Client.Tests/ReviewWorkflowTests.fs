@@ -5637,7 +5637,7 @@ type ReviewWorkflowTests() =
             let issued =
                 Client.ChallengeWorkflow.ChallengeWorkflow.create first
                     (Guid.NewGuid()) "Owner" "Ready-state read check" taskId
-                    [ { OwnerAgentId = "Reviewer"; SuggestedAgentId = ""; Description = "Approval" } ]
+                    [ { OwnerKind = ""; OwnerAgentId = "Reviewer"; SuggestedAgentId = ""; Description = "Approval" } ]
                 |> success
             let before = (ReviewWorkflow.getAgentInbox second "Owner" |> success).Agent
             Assert.That(before.State, Is.EqualTo("Ready"))

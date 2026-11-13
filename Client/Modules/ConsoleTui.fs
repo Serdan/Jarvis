@@ -14,10 +14,12 @@ type private MouseTarget =
     | SwitchActivity
     | SwitchAgents
     | SwitchJobs
+    | SwitchChallenges
     | SwitchSettings
     | SelectAgent of string
     | SelectActivity of int
     | SelectJob of string
+    | SelectChallenge of int
     | SelectPermission of int
     | SelectSetting of int
 
@@ -61,6 +63,8 @@ type private TuiMode =
     | FilterMode
     | CopyRecentMode
     | JobsMode
+    | ChallengesMode
+    | ChallengeReplyMode
     | JobDetailsMode
     | JobCancelMode
     | JobFilterMode
@@ -81,6 +85,10 @@ type JobUiAccess =
 
 type AgentUiAccess =
     { Load: unit -> Result<AgentView.Snapshot, string> }
+
+type OperatorChallengeUiAccess =
+    { Load: unit -> Result<OperatorChallengeSnapshot, string>
+      Reply: OperatorChallengeReply -> Result<unit, OperatorChallengeReplyFailure> }
 
 type SettingsUiAccess =
     { Load: unit -> Result<ClientConfigSnapshot, string>
@@ -142,6 +150,23 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
     let mutable jobOutputScroll = 0
     let mutable jobError: string option = None
     let mutable jobLastPoll = DateTimeOffset.MinValue
+    let mutable challengeAccess: OperatorChallengeUiAccess option = None
+    let mutable challengeItems: OperatorChallengeEntry list = []
+    let mutable challengeSelected = 0
+    let mutable challengeScroll = 0
+    let mutable challengePageRows = 1
+    let mutable challengeDetailScroll = 0
+    let mutable challengeDetailPageRows = 1
+    let mutable challengeDetailTotalRows = 0
+    let mutable challengeLastPoll = DateTimeOffset.MinValue
+    let mutable challengeRefreshing = false
+    let mutable challengeSubmitting = false
+    let mutable challengeError: string option = None
+    let mutable challengeNotice: string option = None
+    let mutable challengeReplyText = ""
+    let mutable challengeReplyOperationId = ""
+    let mutable challengeReplyTarget: OperatorChallengeEntry option = None
+    let mutable challengeReplyNeedsRebase = false
     let mutable permissionReturnMode = ActivityMode
     let mutable jobCancelReturnMode = JobsMode
     let mutable settingsAccess: SettingsUiAccess option = None
@@ -183,13 +208,16 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         | SwitchActivity, (ActivityMode | FilterMode | CopyRecentMode | PermissionMode) -> true
         | SwitchAgents, (AgentsMode | AgentFilterMode) -> true
         | SwitchJobs, (JobsMode | JobDetailsMode | JobCancelMode | JobFilterMode) -> true
+        | SwitchChallenges, (ChallengesMode | ChallengeReplyMode) -> true
         | SwitchSettings, (SettingsMode | SettingsEditMode | SettingsConfirmMode) -> true
         | _ -> false
 
     let writeNavigation () =
         for label, target in
             [ "Activity", SwitchActivity; "Agents", SwitchAgents
-              "Jobs", SwitchJobs; "Settings", SwitchSettings ] do
+              "Jobs", SwitchJobs;
+              (sprintf "Challenges(%d)" (OperatorChallengePresentation.pendingCount challengeItems)), SwitchChallenges;
+              "Settings", SwitchSettings ] do
             let x = draw.CursorLeft
             let text = if currentModeIs target then $"[{label}] " else $" {label}  "
             registerMouseHit x text.Length target
@@ -1191,6 +1219,117 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
 
         renderPermissionPreviewUnsafe width
 
+    let currentChallengeUnsafe () =
+        challengeItems |> List.tryItem challengeSelected
+
+    let selectChallengeUnsafe index =
+        let previous = challengeSelected
+        if challengeItems.IsEmpty then
+            challengeSelected <- 0
+            challengeScroll <- 0
+        else
+            challengeSelected <- min (challengeItems.Length - 1) (max 0 index)
+            if challengeSelected < challengeScroll then challengeScroll <- challengeSelected
+            elif challengeSelected >= challengeScroll + challengePageRows then
+                challengeScroll <- challengeSelected - challengePageRows + 1
+        if challengeSelected <> previous then challengeDetailScroll <- 0
+
+    let beginChallengeReplyUnsafe () =
+        match currentChallengeUnsafe () with
+        | Some item when OperatorChallengePresentation.isActionable item ->
+            match challengeReplyTarget with
+            | Some previous when OperatorChallengePresentation.sameCondition previous item
+                                 && not (String.IsNullOrWhiteSpace challengeReplyOperationId) ->
+                // Returning to the same question must not delete an unsent draft.
+                if challengeReplyNeedsRebase then
+                    let draft = { Target = previous; Text = challengeReplyText
+                                  OperationId = challengeReplyOperationId }
+                    match OperatorChallengePresentation.rebaseAfterDefinitiveStale
+                              draft (Some item) (Guid.NewGuid().ToString("D")) with
+                    | Some recovered ->
+                        challengeReplyTarget <- Some recovered.Target
+                        challengeReplyText <- recovered.Text
+                        challengeReplyOperationId <- recovered.OperationId
+                        challengeReplyNeedsRebase <- false
+                        challengeNotice <- Some "Fresh challenge version loaded; draft preserved. Review before sending."
+                    | None -> ()
+            | _ ->
+                challengeReplyTarget <- Some item
+                challengeReplyText <- ""
+                challengeReplyOperationId <- Guid.NewGuid().ToString("D")
+                challengeReplyNeedsRebase <- false
+            challengeError <- None
+            challengeDetailScroll <- 0
+            mode <- ChallengeReplyMode
+        | _ -> ()
+
+    let renderChallengesUnsafe width =
+        let pending = OperatorChallengePresentation.pendingCount challengeItems
+        let refreshing = if challengeRefreshing then " (refreshing)" else ""
+        draw.WriteLine (trim (sprintf "Operator challenges: %d pending, %d total%s" pending challengeItems.Length refreshing) width)
+        draw.WriteLine (trim "Up/Down select | Left/Right scroll details | Enter reply | r refresh | Esc return" width)
+        draw.WriteLine ""
+        let rows = max 1 (min 10 (TerminalLayout.availableRows draw.Height draw.CursorTop 11))
+        challengePageRows <- rows
+        selectChallengeUnsafe challengeSelected
+        for i = challengeScroll to min (challengeItems.Length - 1) (challengeScroll + rows - 1) do
+            let item = challengeItems[i]
+            let mark = if challengeSelected = i then ">" else " "
+            let state =
+                if OperatorChallengePresentation.isActionable item then "?"
+                elif item.ChallengeStatus = "Cancelled" then "cancelled"
+                else "done"
+            registerMouseHit 0 width (SelectChallenge i)
+            draw.WriteLine(trim (sprintf "%s [%s] %s / %s: %s" mark state item.ProjectName item.IssuerAgentId item.Title) width)
+        if challengeItems.IsEmpty then draw.WriteLine "No operator-input challenges in trusted projects."
+        draw.WriteLine ""
+        let details = if mode = ChallengeReplyMode then challengeReplyTarget else currentChallengeUnsafe()
+        match details with
+        | Some item ->
+            let task = if String.IsNullOrWhiteSpace item.TaskId then "(none)" else item.TaskId
+            draw.WriteLine(trim (sprintf "Project: %s | Agent: %s | Task: %s" item.ProjectName item.IssuerAgentId task) width)
+            draw.WriteLine(trim (sprintf "Challenge: %s" item.ChallengeId) width)
+            draw.WriteLine(trim (sprintf "Condition: %s | Version %d" item.ConditionId item.Version) width)
+            let age =
+                match DateTimeOffset.TryParse item.CreatedAtUtc with
+                | true, created ->
+                    let elapsed = DateTimeOffset.UtcNow - created
+                    if elapsed.TotalDays >= 1. then sprintf "%.0fd" elapsed.TotalDays
+                    elif elapsed.TotalHours >= 1. then sprintf "%.0fh" elapsed.TotalHours
+                    else sprintf "%.0fm" (max 0. elapsed.TotalMinutes)
+                | _ -> "?"
+            draw.WriteLine(trim (sprintf "Created: %s (%s ago) | %s" item.CreatedAtUtc age item.ChallengeStatus) width)
+            let detailLines =
+                [ yield "Question:"
+                  yield! wrappedLines (width - 2) item.Question |> List.map (fun line -> "  " + line)
+                  if item.ConditionStatus = "Satisfied" then
+                      yield "Recorded answer:"
+                      yield! wrappedLines (width - 2) item.Evidence |> List.map (fun line -> "  " + line)
+                      match OperatorChallengePresentation.provenanceLine item with
+                      | Some provenance -> yield! wrappedLines (width - 2) provenance
+                      | None -> yield "  Provenance unavailable in this ledger snapshot"
+                  if mode = ChallengeReplyMode then
+                      if not (OperatorChallengePresentation.isActionable item) then
+                          yield "Response disabled: this challenge is no longer waiting for input."
+                      yield "Reply (Enter submits, Esc returns, F5 refresh, Backspace edits):"
+                      yield! wrappedLines (width - 2) challengeReplyText |> List.map (fun line -> "  " + line)
+                      if challengeReplyNeedsRebase then
+                          yield "  Response paused: waiting to verify an updated active challenge version."
+                      if challengeSubmitting then yield "Persisting response..." ]
+            challengeDetailTotalRows <- detailLines.Length
+            challengeDetailPageRows <- max 1 (TerminalLayout.availableRows draw.Height draw.CursorTop 2)
+            challengeDetailScroll <-
+                min (max 0 (challengeDetailTotalRows - challengeDetailPageRows)) (max 0 challengeDetailScroll)
+            let last = min challengeDetailTotalRows (challengeDetailScroll + challengeDetailPageRows)
+            for index = challengeDetailScroll to last - 1 do
+                draw.WriteLine(trim detailLines[index] width)
+            if challengeDetailTotalRows > challengeDetailPageRows then
+                draw.WriteLine(trim (sprintf "Details %d-%d/%d: Left/Right to scroll"
+                                    (challengeDetailScroll + 1) last challengeDetailTotalRows) width)
+        | None -> ()
+        challengeNotice |> Option.iter (fun value -> draw.WriteLine(trim value width))
+        challengeError |> Option.iter (fun error -> draw.WriteLine(trim ("Error: " + error) width))
+
     let settingKeys = [| "machine-name"; "workspace-path"; "trust-level"; "allowed-environment-variables"; "max-import-bytes"; "browser-port" |]
     let settingLabels = [| "Machine name"; "Workspace directory"; "Trust level"; "Allowed environment variables"; "Maximum import bytes"; "Browser bridge port" |]
 
@@ -1339,6 +1478,9 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                     writeFilterHotkeys()
                 | JobsMode | JobFilterMode ->
                     writeJobsHotkeys()
+                | ChallengesMode | ChallengeReplyMode ->
+                    draw.WriteLine "Challenges: select and answer a one-shot operator request"
+
                 | JobDetailsMode | JobCancelMode ->
                     writeJobDetailsHotkeys()
                 | SettingsMode | SettingsEditMode | SettingsConfirmMode ->
@@ -1352,6 +1494,8 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                 renderAgentsUnsafe width
             | JobsMode | JobDetailsMode | JobCancelMode | JobFilterMode ->
                 renderJobsUnsafe width
+            | ChallengesMode | ChallengeReplyMode ->
+                renderChallengesUnsafe width
             | SettingsMode | SettingsEditMode | SettingsConfirmMode ->
                 renderSettingsUnsafe width
             | _ ->
@@ -1407,6 +1551,112 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
             frameSize <- 0, 0
             lastRenderError <- Some ex.Message
 
+    let startChallengeRefreshUnsafe () =
+        if not challengeRefreshing then
+            challengeRefreshing <- true
+            challengeLastPoll <- DateTimeOffset.UtcNow
+            let provider = challengeAccess
+            Task.Run(Action(fun () ->
+                let result =
+                    try
+                        match provider with
+                        | Some access -> access.Load()
+                        | None -> Error "Operator challenges are unavailable."
+                    with ex -> Error ex.Message
+                lock syncRoot (fun () ->
+                    challengeRefreshing <- false
+                    match result with
+                    | Ok snapshot ->
+                        let selected = currentChallengeUnsafe()
+                        challengeItems <- snapshot.Items
+                        challengeError <-
+                            match snapshot.Warnings with
+                            | [] -> None
+                            | warnings -> Some(String.concat "; " warnings)
+                        if challengeReplyNeedsRebase then
+                            match challengeReplyTarget with
+                            | Some prior ->
+                                let updated =
+                                    challengeItems |> List.tryFind (OperatorChallengePresentation.sameCondition prior)
+                                let draft = { Target = prior; Text = challengeReplyText
+                                              OperationId = challengeReplyOperationId }
+                                match OperatorChallengePresentation.rebaseAfterDefinitiveStale
+                                          draft updated (Guid.NewGuid().ToString("D")) with
+                                | Some recovered ->
+                                    // Definitive stale only: a new intent UUID is safe once
+                                    // canonical reload shows the same condition still actionable.
+                                    challengeReplyTarget <- Some recovered.Target
+                                    challengeReplyText <- recovered.Text
+                                    challengeReplyOperationId <- recovered.OperationId
+                                    challengeReplyNeedsRebase <- false
+                                    challengeError <- None
+                                    challengeNotice <- Some "Challenge changed; response draft preserved. Review and press Enter to retry."
+                                | None ->
+                                    let message =
+                                        match updated with
+                                        | Some item when not (OperatorChallengePresentation.isActionable item) ->
+                                            // Show the canonical terminal state and any immutable response provenance,
+                                            // but keep the unsent draft accessible for inspection/copy.
+                                            challengeReplyTarget <- Some item
+                                            "This condition was answered or cancelled; draft retained, response disabled."
+                                        | Some _ -> "No newer active challenge version was found; draft retained. Press F5 to refresh."
+                                        | None -> "The question is unavailable in the refreshed snapshot; draft retained."
+                                    challengeError <- Some message
+                            | None -> ()
+                        match selected with
+                        | Some old ->
+                            match challengeItems |> List.tryFindIndex (fun c ->
+                                c.ProjectName = old.ProjectName
+                                && c.ChallengeId = old.ChallengeId
+                                && c.ConditionId = old.ConditionId) with
+                            | Some index -> selectChallengeUnsafe index
+                            | None -> selectChallengeUnsafe 0
+                        | None -> selectChallengeUnsafe 0
+                    | Error error -> challengeError <- Some error
+                    renderUnsafe()))) |> ignore
+
+    let submitChallengeReplyUnsafe () =
+        match challengeAccess, challengeReplyTarget with
+        | Some access, Some target when not challengeSubmitting
+                                   && not challengeReplyNeedsRebase
+                                   && OperatorChallengePresentation.isActionable target
+                                   && not (String.IsNullOrWhiteSpace challengeReplyText) ->
+            let request: OperatorChallengeReply =
+                { ProjectName = target.ProjectName
+                  ChallengeId = target.ChallengeId
+                  ConditionId = target.ConditionId
+                  ExpectedVersion = target.Version
+                  Response = challengeReplyText
+                  OperationId = challengeReplyOperationId }
+            challengeSubmitting <- true
+            // Preserve draft and operation UUID on failure, including unknown outcome.
+            Task.Run(Action(fun () ->
+                let response =
+                    try access.Reply request
+                    with ex -> Error(OtherOperatorReplyFailure ex.Message)
+                lock syncRoot (fun () ->
+                    challengeSubmitting <- false
+                    match response with
+                    | Ok () ->
+                        challengeNotice <- Some "Response persisted; it may not yet have been read by the agent."
+                        challengeError <- None
+                        challengeReplyTarget <- None
+                        challengeReplyText <- ""
+                        challengeReplyOperationId <- ""
+                        challengeReplyNeedsRebase <- false
+                        mode <- ChallengesMode
+                        startChallengeRefreshUnsafe()
+                    | Error (StaleOperatorReply error) ->
+                        challengeReplyNeedsRebase <- true
+                        challengeError <- Some("Challenge version changed: " + error)
+                        startChallengeRefreshUnsafe()
+                    | Error (OtherOperatorReplyFailure error) ->
+                        // Outcome might be uncertain. Never mint a new operation
+                        // UUID until a definitive stale result and fresh read.
+                        challengeError <- Some("Reply failed/uncertain. Same operation ID retained for safe retry: " + error)
+                    renderUnsafe()))) |> ignore
+        | _ -> ()
+
     // Git-backed inspection can take time. Do not block the terminal or UI lock.
     let startAgentRefreshUnsafe () =
         if not agentRefreshing then
@@ -1443,6 +1693,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
             | AgentsMode -> moveAgentSelectionUnsafe (direction * 3)
             | ActivityMode -> moveActivitySelectionUnsafe (direction * 3)
             | JobsMode -> moveJobSelectionUnsafe (direction * 3)
+            | ChallengesMode -> selectChallengeUnsafe (challengeSelected + direction * 3)
             | JobDetailsMode ->
                 jobFollow <- false
                 jobOutputScroll <- max 0 (min (max 0 (jobOutputLines.Length - 1)) (jobOutputScroll - direction * 3))
@@ -1466,6 +1717,9 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                     lastMouseClick <- Some(hit.Target, now)
                     match hit.Target with
                     | SwitchActivity -> mode <- ActivityMode
+                    | SwitchChallenges ->
+                        mode <- ChallengesMode
+                        startChallengeRefreshUnsafe()
                     | SwitchAgents ->
                         mode <- AgentsMode
                         normalizeAgentSelectionUnsafe()
@@ -1480,6 +1734,9 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                     | SelectActivity id when mode = ActivityMode ->
                         selectedActivityId <- Some id
                         if isDouble then showActivityDetails <- true
+                    | SelectChallenge i when mode = ChallengesMode ->
+                        selectChallengeUnsafe i
+                        if isDouble then beginChallengeReplyUnsafe()
                     | SelectJob id when mode = JobsMode ->
                         jobSelectedId <- Some id
                         if isDouble then openJobDetailsUnsafe()
@@ -1588,6 +1845,11 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
 
     member _.SetSettingsAccess(access: SettingsUiAccess) =
         lock syncRoot (fun () -> settingsAccess <- Some access)
+
+    member _.SetChallengeAccess(access: OperatorChallengeUiAccess) =
+        lock syncRoot (fun () ->
+            challengeAccess <- Some access
+            startChallengeRefreshUnsafe())
 
     member _.SetJobAccess(access: JobUiAccess) =
         lock syncRoot (fun () -> jobsAccess <- Some access)
@@ -1772,6 +2034,9 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                         lock syncRoot (fun () ->
                             pollJobsUnsafe()
                             renderUnsafe())
+                    if challengeAccess.IsSome
+                       && DateTimeOffset.UtcNow - challengeLastPoll > TimeSpan.FromSeconds(30.) then
+                        lock syncRoot startChallengeRefreshUnsafe
                     if (mode = AgentsMode || mode = AgentFilterMode)
                        && DateTimeOffset.UtcNow - agentLastPoll > TimeSpan.FromSeconds(45.) then
                         lock syncRoot (fun () -> startAgentRefreshUnsafe())
@@ -1797,7 +2062,27 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                                 handleMouseUnsafe mouse
                                 renderUnsafe())
                         | Key keyInfo ->
-                            if mode = SettingsEditMode then
+                            if mode = ChallengeReplyMode then
+                                lock syncRoot (fun () ->
+                                    if not challengeSubmitting then
+                                        match keyInfo.Key with
+                                        | ConsoleKey.Enter -> submitChallengeReplyUnsafe()
+                                        | ConsoleKey.F5 -> startChallengeRefreshUnsafe()
+                                        | ConsoleKey.Escape -> mode <- ChallengesMode
+                                        | ConsoleKey.LeftArrow ->
+                                            challengeDetailScroll <- max 0 (challengeDetailScroll - 1)
+                                        | ConsoleKey.RightArrow ->
+                                            challengeDetailScroll <- challengeDetailScroll + 1
+                                        | ConsoleKey.Backspace when challengeReplyText.Length > 0 ->
+                                            challengeReplyText <- challengeReplyText.Substring(0, challengeReplyText.Length - 1)
+                                            challengeDetailScroll <- Int32.MaxValue
+                                        | _ when not (Char.IsControl keyInfo.KeyChar)
+                                                 && System.Text.Encoding.UTF8.GetByteCount(challengeReplyText + string keyInfo.KeyChar) <= 8192 ->
+                                            challengeReplyText <- challengeReplyText + string keyInfo.KeyChar
+                                            challengeDetailScroll <- Int32.MaxValue
+                                        | _ -> ()
+                                    renderUnsafe())
+                            elif mode = SettingsEditMode then
                                 lock syncRoot (fun () ->
                                     match keyInfo.Key with
                                     | ConsoleKey.Enter -> applySettingsEditUnsafe()
@@ -1949,6 +2234,14 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                                     lock syncRoot (fun () ->
                                         beginFilterUnsafe "#"
                                         renderUnsafe())
+                                | _, ConsoleKey.LeftArrow when mode = ChallengesMode ->
+                                    lock syncRoot (fun () ->
+                                        challengeDetailScroll <- max 0 (challengeDetailScroll - 1)
+                                        renderUnsafe())
+                                | _, ConsoleKey.RightArrow when mode = ChallengesMode ->
+                                    lock syncRoot (fun () ->
+                                        challengeDetailScroll <- challengeDetailScroll + 1
+                                        renderUnsafe())
                                 | _, ConsoleKey.UpArrow ->
                                     lock syncRoot (fun () ->
                                         match mode with
@@ -1958,6 +2251,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                                         | SettingsMode -> settingsSelected <- max 0 (settingsSelected - 1)
                                         | AgentsMode -> moveAgentSelectionUnsafe -1
                                         | JobsMode -> moveJobSelectionUnsafe -1
+                                        | ChallengesMode -> selectChallengeUnsafe (challengeSelected - 1)
                                         | JobDetailsMode ->
                                             jobFollow <- false
                                             jobOutputScroll <- min (jobOutputLines.Length - 1 |> max 0) (jobOutputScroll + 1)
@@ -1973,6 +2267,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                                         | SettingsMode -> settingsSelected <- min (settingKeys.Length - 1) (settingsSelected + 1)
                                         | AgentsMode -> moveAgentSelectionUnsafe 1
                                         | JobsMode -> moveJobSelectionUnsafe 1
+                                        | ChallengesMode -> selectChallengeUnsafe (challengeSelected + 1)
                                         | JobDetailsMode ->
                                             jobOutputScroll <- max 0 (jobOutputScroll - 1)
                                             if jobOutputScroll = 0 then jobFollow <- true
@@ -1984,6 +2279,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                                         | ActivityMode -> moveActivitySelectionUnsafe -(activityViewportRows())
                                         | AgentsMode -> moveAgentSelectionUnsafe -(agentViewportRows())
                                         | JobsMode -> moveJobSelectionUnsafe -(jobViewportRows())
+                                        | ChallengesMode -> selectChallengeUnsafe (challengeSelected - challengePageRows)
                                         | JobDetailsMode ->
                                             jobFollow <- false
                                             jobOutputScroll <- min (jobOutputLines.Length - 1 |> max 0) (jobOutputScroll + jobOutputPageRows)
@@ -1995,6 +2291,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                                         | ActivityMode -> moveActivitySelectionUnsafe (activityViewportRows())
                                         | AgentsMode -> moveAgentSelectionUnsafe (agentViewportRows())
                                         | JobsMode -> moveJobSelectionUnsafe (jobViewportRows())
+                                        | ChallengesMode -> selectChallengeUnsafe (challengeSelected + challengePageRows)
                                         | JobDetailsMode ->
                                             jobOutputScroll <- max 0 (jobOutputScroll - jobOutputPageRows)
                                             if jobOutputScroll = 0 then jobFollow <- true
@@ -2014,12 +2311,24 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                                             showActivityDetails <- not showActivityDetails
                                         elif mode = AgentsMode && agentSelected.IsSome then showAgentDetails <- not showAgentDetails
                                         elif mode = JobsMode then openJobDetailsUnsafe()
+                                        elif mode = ChallengesMode then beginChallengeReplyUnsafe()
                                         elif mode = SettingsMode then
                                             settingsEditing <- settingsValue settingKeys[settingsSelected] settingsStaged
                                                                |> Option.defaultValue ""
                                             settingsError <- None
                                             mode <- SettingsEditMode
                                         renderUnsafe())
+                                | _, ConsoleKey.H when mode = ActivityMode || mode = JobsMode || mode = AgentsMode || mode = SettingsMode ->
+                                    lock syncRoot (fun () ->
+                                        mode <- ChallengesMode
+                                        startChallengeRefreshUnsafe()
+                                        renderUnsafe())
+                                | _, ConsoleKey.R when mode = ChallengesMode ->
+                                    lock syncRoot (fun () ->
+                                        startChallengeRefreshUnsafe()
+                                        renderUnsafe())
+                                | _, ConsoleKey.Escape when mode = ChallengesMode ->
+                                    lock syncRoot (fun () -> mode <- ActivityMode; renderUnsafe())
                                 | _, ConsoleKey.G when mode = ActivityMode || mode = JobsMode || mode = AgentsMode ->
                                     lock syncRoot (fun () ->
                                         openSettingsUnsafe()

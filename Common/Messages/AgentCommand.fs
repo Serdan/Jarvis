@@ -201,7 +201,8 @@ type TaskWriteCommand =
 
 /// Challenge condition owners and descriptions are explicit typed wire fields.
 type ChallengeConditionDefinition =
-    { OwnerAgentId: string
+    { OwnerKind: string
+      OwnerAgentId: string
       SuggestedAgentId: string
       Description: string }
 

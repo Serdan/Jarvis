@@ -1994,7 +1994,8 @@ let browser_dom_mcp_tools_route_only_when_all_required_oauth_scopes_are_present 
                     { Result = Some """{"status":"ok"}"""
                       Error = None; Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }) |> ignore
                 Task.CompletedTask
-            member _.InvalidateAgentStates(_, _) = Task.CompletedTask }
+            member _.InvalidateAgentStates(_, _) = Task.CompletedTask
+            member _.InvalidateAllAgentStates() = Task.CompletedTask }
     let clients =
         { new Microsoft.AspNetCore.SignalR.IHubClients<Common.SignalR.IClientService> with
             member _.All = recipient
@@ -2024,7 +2025,7 @@ let browser_dom_mcp_tools_route_only_when_all_required_oauth_scopes_are_present 
     context.RequestServices <- provider
     let accessor = Microsoft.AspNetCore.Http.HttpContextAccessor()
     accessor.HttpContext <- context
-    let client = ClientService(hub, users, tracker, accessor)
+    let client = ClientService(hub, users, tracker, accessor, Microsoft.Extensions.Logging.Abstractions.NullLogger<ClientService>.Instance)
 
     let setScopes scopes =
         let identity =

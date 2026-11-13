@@ -8,6 +8,24 @@ type DispatchProbeHub() =
     member this.AcceptWithAck(correlationId: string) =
         this.Clients.Caller.SendCoreAsync("ReplyReceived", [| box correlationId |], System.Threading.CancellationToken.None)
 
+// Gated real Hub acknowledgement proves that the production command reply
+// handler returns its end-to-end Task, rather than detaching a second queue.
+type ResponseCompletionGate() =
+    member val Entered =
+        System.Threading.Tasks.TaskCompletionSource<string>(
+            System.Threading.Tasks.TaskCreationOptions.RunContinuationsAsynchronously) with get
+    member val Release =
+        System.Threading.Tasks.TaskCompletionSource<unit>(
+            System.Threading.Tasks.TaskCreationOptions.RunContinuationsAsynchronously) with get
+
+type ResponseCompletionHub(gate: ResponseCompletionGate) =
+    inherit Hub()
+    member _.SendClientResponse(correlationId: string, _payload: obj) : System.Threading.Tasks.Task =
+        task {
+            gate.Entered.TrySetResult(correlationId) |> ignore
+            do! gate.Release.Task
+        } :> System.Threading.Tasks.Task
+
 module DispatchProbeTests =
     open System
     open System.IO
@@ -475,4 +493,103 @@ module DispatchProbeTests =
         Assert.That(afterEarly, Is.True, "Fast operations should all complete while the slow action is still held.")
         Assert.That(after50, Is.LessThan(before50))
         do! server.StopAsync()
+    }
+
+    [<Test>]
+    let productionResponseHandlerHoldsTaskUntilCorrelatedReplyAck () = task {
+        let builder = WebApplication.CreateBuilder()
+        builder.WebHost.UseUrls("http://127.0.0.1:0") |> ignore
+        builder.Services.AddSignalR() |> ignore
+        let gate = ResponseCompletionGate()
+        builder.Services.AddSingleton<ResponseCompletionGate>(gate) |> ignore
+        use server = builder.Build()
+        server.MapHub<ResponseCompletionHub>("/probe") |> ignore
+        do! server.StartAsync()
+
+        let endpoint = server.Urls |> Seq.head
+        let connection = HubConnectionBuilder().WithUrl(endpoint + "/probe").Build()
+        do! connection.StartAsync()
+        let runtime = Client.Runtime(".", Client.ConsoleTui.ConsoleTui(), Client.PartialTrust)
+        let command : Common.AgentCommand =
+            Common.MessageCommand { ProjectName = None; Message = "reply-gate-probe" }
+        let commandJson = System.Text.Json.JsonSerializer.Serialize<Common.AgentCommand>(command)
+        let correlationId = "original-reply-id"
+        let mutable delivered = false
+
+        // Test the actual function called by Program.fs. A nested second
+        // ingress previously returned Task.CompletedTask before the hub replied.
+        let pending : Task =
+            Client.SignalR.Client.receiveCommandAndReplyWithTiming
+                connection runtime correlationId commandJson "Worker"
+                (fun _ _ _ ok -> delivered <- ok)
+        let! observed = gate.Entered.Task.WaitAsync(TimeSpan.FromSeconds 5.0)
+        let releasedEarly = pending.IsCompleted
+        gate.Release.TrySetResult(()) |> ignore
+        do! pending.WaitAsync(TimeSpan.FromSeconds 5.0)
+        do! connection.DisposeAsync().AsTask()
+        do! server.StopAsync()
+
+        Assert.That(observed, Is.EqualTo(correlationId))
+        Assert.That(releasedEarly, Is.False,
+                    "The worker must await the real reply Task, not a detached ingress.")
+        Assert.That(delivered, Is.True)
+    }
+
+
+    [<Test>]
+    let productionDispatchSaturationCountsCommandsUntilTheirRepliesFinish () = task {
+        let builder = WebApplication.CreateBuilder()
+        builder.WebHost.UseUrls("http://127.0.0.1:0") |> ignore
+        builder.Services.AddSignalR() |> ignore
+        let gate = ResponseCompletionGate()
+        builder.Services.AddSingleton<ResponseCompletionGate>(gate) |> ignore
+        use server = builder.Build()
+        server.MapHub<ResponseCompletionHub>("/probe") |> ignore
+        do! server.StartAsync()
+        let endpoint = server.Urls |> Seq.head
+        let connection = HubConnectionBuilder().WithUrl(endpoint + "/probe").Build()
+        do! connection.StartAsync()
+
+        let runtime = Client.Runtime(".", Client.ConsoleTui.ConsoleTui(), Client.PartialTrust)
+        let command : Common.AgentCommand =
+            Common.MessageCommand { ProjectName = None; Message = "saturation-gate-probe" }
+        let commandJson = System.Text.Json.JsonSerializer.Serialize<Common.AgentCommand>(command)
+        let queue = CommandDispatchQueue(1, 2, (fun _ -> ()))
+        let mutable started = 0
+        let reported = System.Collections.Concurrent.ConcurrentBag<string>()
+        let failures = System.Collections.Concurrent.ConcurrentBag<string>()
+        let execute id () : Task =
+            Interlocked.Increment(&started) |> ignore
+            Client.SignalR.Client.receiveCommandAndReplyWithTiming
+                connection runtime id commandJson "Worker"
+                (fun corr _ _ delivered ->
+                    if delivered then reported.Add(corr)
+                    else failures.Add(corr))
+        let onUnhandled (error: exn) : Task =
+            failures.Add(error.GetType().Name)
+            Task.CompletedTask
+
+        Assert.That(queue.TrySubmit("one", execute "one", onUnhandled), Is.True)
+        let! first = gate.Entered.Task.WaitAsync(TimeSpan.FromSeconds 5.0)
+        Assert.That(first, Is.EqualTo("one"))
+        Assert.That(queue.TrySubmit("two", execute "two", onUnhandled), Is.True)
+        Assert.That(queue.TrySubmit("three", execute "three", onUnhandled), Is.True)
+        // Give the worker enough time to drain if the response handler
+        // incorrectly detaches work to a second BoundedResponseIngress.
+        do! Task.Delay(150)
+        let startedBeforeRelease = Volatile.Read(&started)
+        let overflowWasRejected = not (queue.TrySubmit("four", execute "four", onUnhandled))
+
+        gate.Release.TrySetResult(()) |> ignore
+        do! queue.Complete().WaitAsync(TimeSpan.FromSeconds 8.0)
+        do! connection.DisposeAsync().AsTask()
+        do! server.StopAsync()
+
+        Assert.That(startedBeforeRelease, Is.EqualTo(1),
+            "While the reply is pending, the sole worker must not start queued commands.")
+        Assert.That(overflowWasRejected, Is.True,
+            "Only work with no available execution or queue slot may be rejected.")
+        Assert.That(started, Is.EqualTo(3))
+        Assert.That(reported.Count, Is.EqualTo(3))
+        Assert.That(failures, Is.Empty)
     }

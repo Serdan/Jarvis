@@ -23,29 +23,41 @@ let private words (value: string) =
     |> Array.toList
 
 /// Markers may touch, e.g. #Wayfold@Worker 1, but ordinary prose containing
-/// an embedded @ or # does not start a selector.
+/// an embedded @ or # does not start a selector. A whitespace-delimited "--"
+/// ends the current selector and resumes descriptive text. This is explicit:
+/// a multiword name is never split based on which agents happen to exist.
 let private chunks (query: string) =
     let query = if isNull query then "" else query
     let result = ResizeArray<Chunk>()
     let mutable kind: SelectorKind option = None
     let mutable start = 0
-    for index = 0 to query.Length - 1 do
-        let marker =
-            match query[index] with
-            | '#' -> Some Project
-            | '@' -> Some Agent
-            | _ -> None
-        match marker with
-        | Some next when index = 0 || Char.IsWhiteSpace query[index - 1] || kind.IsSome ->
+    let mutable index = 0
+    while index < query.Length do
+        let textSeparator =
+            index + 1 < query.Length
+            && query[index] = '-' && query[index + 1] = '-'
+            && (index = 0 || Char.IsWhiteSpace query[index - 1])
+            && (index + 2 = query.Length || Char.IsWhiteSpace query[index + 2])
+        if textSeparator then
             result.Add({ Kind = kind; Value = query.Substring(start, index - start) })
-            kind <- Some next
-            start <- index + 1
-        | _ -> ()
+            kind <- None
+            index <- index + 2
+            start <- index
+        else
+            let marker =
+                match query[index] with
+                | '#' -> Some Project
+                | '@' -> Some Agent
+                | _ -> None
+            match marker with
+            | Some next when index = 0 || Char.IsWhiteSpace query[index - 1] || kind.IsSome ->
+                result.Add({ Kind = kind; Value = query.Substring(start, index - start) })
+                kind <- Some next
+                start <- index + 1
+            | _ -> ()
+            index <- index + 1
     result.Add({ Kind = kind; Value = query.Substring(start) })
     result |> Seq.toList
-
-let private containsCaseInsensitive (needle: string) (value: string) =
-    value.IndexOf(needle, StringComparison.OrdinalIgnoreCase) >= 0
 
 /// Agent selectors use case-insensitive substring matching. When the selector
 /// ends in a digit, require the numeric token to end at a name boundary:
@@ -67,29 +79,12 @@ let matchesAgentTerm (term: string) (agentName: string) =
                 else search (index + 1)
         search 0
 
-/// A selector with embedded spaces is resolved against the current local
-/// snapshot. The longest name-compatible token prefix belongs to the selector;
-/// remaining words are ordinary descriptive search terms. Without a known
-/// name, only its first word is a selector. The ambiguity cannot be resolved
-/// from raw text alone without quotations or local candidates.
-let private selectorAndText (names: string list) (value: string) =
-    let tokens = words value
-    if List.isEmpty tokens then "", []
-    else
-        let array = tokens |> List.toArray
-        let maximum =
-            [1 .. array.Length]
-            |> List.filter (fun length ->
-                let prefix = array[0 .. length - 1] |> String.concat " "
-                names |> List.exists (containsCaseInsensitive prefix))
-            |> List.tryLast
-            |> Option.defaultValue 1
-        (array[0 .. maximum - 1] |> String.concat " "),
-        (array[maximum ..] |> Array.toList)
-
+/// A selector consumes its entire segment, including spaces; only another
+/// #/@ marker or whitespace-delimited "--" ends it. Thus @Worker 1 cannot
+/// silently become @Worker plus descriptive "1" when the agent is absent.
 /// Text and multiple selectors combine with AND semantics. Empty #/@ markers
-/// are deliberately ignored while the user is in live filter-editing mode.
-let parse (projects: string list) (agents: string list) (query: string) =
+/// are ignored while the user is in live filter-editing mode.
+let parse (query: string) =
     let mutable text = []
     let mutable projectTerms = []
     let mutable agentTerms = []
@@ -98,17 +93,14 @@ let parse (projects: string list) (agents: string list) (query: string) =
         | None ->
             for word in words chunk.Value do text <- word :: text
         | Some kind ->
-            let name, trailing = selectorAndText (if kind = Project then projects else agents) chunk.Value
+            let name = words chunk.Value |> String.concat " "
             if not (String.IsNullOrWhiteSpace name) then
                 match kind with
                 | Project -> projectTerms <- name :: projectTerms
                 | Agent -> agentTerms <- name :: agentTerms
-            for word in trailing do text <- word :: text
     { Text = List.rev text
       Projects = List.rev projectTerms
       Agents = List.rev agentTerms }
-
-let parseWithoutCandidates query = parse [] [] query
 
 let private orderedUniqueNames names =
     names

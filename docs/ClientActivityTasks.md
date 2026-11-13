@@ -84,6 +84,9 @@ The receive timestamp remains fixed when the row is updated.
   - `/` edits a free-text activity filter and applies it live while typing.
   - Pressing `#` from the activity view enters filter editing with a `#` project term ready to type.
   - Terms prefixed with `#` match project names case-insensitively by substring; e.g. `#Loke` matches `Projekt Loke`.
+  - A multiword project selector extends until the next `#` or `@` marker or standalone `--`; the syntax does not depend on the current project list.
+    For example `#Projekt Loke -- RunCommand` matches activity from Projekt Loke whose command text contains RunCommand.
+    Free text may also precede a selector, as in `RunCommand #Projekt Loke`.
   - `Tab` extends the trailing `#` project selector to the longest shared prefix of local project names; no cycling or network lookup.
   - Other terms match command name, activity text, full reason/detail, and retained failure text case-insensitively.
   - Multiple text/project terms are combined with AND semantics.

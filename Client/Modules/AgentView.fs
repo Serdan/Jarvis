@@ -150,7 +150,7 @@ let private projectNames (snapshot: Snapshot) =
 /// Text and agent selectors narrow rows, not project totals.
 /// Only #project selectors narrow project summaries.
 let visibleProjects filter (snapshot: Snapshot) =
-    let terms = ActivityFilter.parseTermsWithCandidates (projectNames snapshot) [] filter
+    let terms = ActivityFilter.parseTerms filter
     snapshot.Projects
     |> List.filter (fun project ->
         matchesProjectAliases terms (projectDisplayName snapshot project :: project.Project :: project.Aliases))
@@ -159,7 +159,7 @@ let visibleProjects filter (snapshot: Snapshot) =
 let completeFilter filter (snapshot: Snapshot) =
     let projects = projectNames snapshot
     let allAgents = snapshot.Agents |> List.map _.Agent
-    let terms = ActivityFilter.parseTermsWithCandidates projects allAgents filter
+    let terms = ActivityFilter.parseTerms filter
     let agents =
         snapshot.Agents
         |> List.filter (fun row -> matchesProjectAliases terms (row.ProjectLabel :: row.Project :: row.ProjectAliases))
@@ -305,8 +305,7 @@ let private matchesTerms (terms: ActivityFilter.Terms) (row: AgentRow) =
     && ActivityFilter.matchesTerms { terms with Projects = []; Agents = [] } None searchable
 
 let visibleRows filter snapshot =
-    let agents = snapshot.Agents |> List.map _.Agent
-    let terms = ActivityFilter.parseTermsWithCandidates (projectNames snapshot) agents filter
+    let terms = ActivityFilter.parseTerms filter
     rows snapshot
     |> List.filter (fun row -> row.State <> "Parked" && matchesTerms terms row)
 

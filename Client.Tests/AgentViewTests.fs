@@ -233,7 +233,7 @@ let projectStatusTotalsStayWholeWhenOnlyAgentRowsAreTextFiltered () =
     let b = { Project = "Jarvis"; Aliases = ["Jarvis"]; Identity = "pid:22222222:1"; Counts = Some (projectCounts [ record "Jarvis" "Lead" "Parked" None ] 0); Status = Fresh; Error = None }
     let data = { snapshot [] with Projects = [b; a] }
     visibleProjects "Agent" data |> List.map _.Project |> shouldEqual ["Jarvis"; "Wayfold"]
-    visibleProjects "#way Agent" data |> List.map _.Project |> shouldEqual ["Wayfold"]
+    visibleProjects "#way -- Agent" data |> List.map _.Project |> shouldEqual ["Wayfold"]
     visibleProjects "#jar" data |> List.map _.Project |> shouldEqual ["Jarvis"]
     visibleProjects "#missing" data |> shouldEqual []
     totalCounts data |> fun total ->
@@ -336,8 +336,8 @@ let projectAndAgentSelectorsAreIndependentAndConjunctive () =
     Assert.That(selected "@GUI Agent#projekt loke" = Set.singleton ("Projekt Loke", "GUI Agent"), Is.True)
     Assert.That(selected "#missing@Worker 1", Is.Empty)
     Assert.That(selected "#Wayfold@" = selected "#Wayfold", Is.True)
-    Assert.That(selected "@Worker 1 Review" = set [("Jarvis", "Worker 1"); ("Wayfold", "Worker 1")], Is.True)
-    Assert.That(selected "#Wayfold Ready" = set [("Wayfold", "Worker 1"); ("Wayfold", "Worker 10"); ("Wayfold", "GUI Agent")], Is.True)
+    Assert.That(selected "@Worker 1 -- Review" = set [("Jarvis", "Worker 1"); ("Wayfold", "Worker 1")], Is.True)
+    Assert.That(selected "#Wayfold -- Ready" = set [("Wayfold", "Worker 1"); ("Wayfold", "Worker 10"); ("Wayfold", "GUI Agent")], Is.True)
 
 [<Test>]
 let completionOnlyOffersAgentsFromSelectedProject () =
@@ -407,3 +407,26 @@ let completionWithExactBareWorkerNameRetainsAmbiguityAndDoesNotChangeFilterSeman
     Assert.That(completeFilter "#Wayfold@Worker " withoutBare, Is.EqualTo("#Wayfold@Worker "))
     Assert.That(completeFilter "#Wayfold@Worker 1" withBare, Is.EqualTo("#Wayfold@Worker 1"))
     Assert.That(completeFilter "#Jarvis@Wo" withBare, Is.EqualTo("#Jarvis@Worker 3"))
+
+[<Test>]
+let missingNumericAndMultiwordAgentSelectorsNeverTurnIntoTaskText () =
+    let taskWithOne = { focused with Title = "Sprint 1 follow-up; GUI Agent coverage" }
+    let wayfoldWorker2 = record "Wayfold" "Worker 2" "Ready" (Some taskWithOne)
+    let jarvisWorker1 = record "Jarvis" "Worker 1" "Ready" (Some taskWithOne)
+    let projectWorker1 = record "Wayfold" "Worker 1" "Ready" (Some taskWithOne)
+    let selected roster filter =
+        visibleRows filter (snapshot roster) |> List.map _.Key |> Set.ofList
+    let worker2 = Set.singleton "Wayfold::Worker 2"
+    for roster in [[wayfoldWorker2]; [wayfoldWorker2; jarvisWorker1]] do
+        // No matching Wayfold identity, even though the task title contains 1.
+        Assert.That(selected roster "#Wayfold@Worker 1", Is.Empty)
+        Assert.That(selected roster "#Wayfold@GUI Agent", Is.Empty)
+        Assert.That(selected roster "@Worker 1#Wayfold", Is.Empty)
+        Assert.That(selected roster "#Wayfold@Worker 2" = worker2, Is.True)
+        Assert.That(selected roster "#Wayfold@Worker" = worker2, Is.True)
+        Assert.That(selected roster "#Wayfold@Worker 2 -- Sprint" = worker2, Is.True)
+        Assert.That(selected roster "#Wayfold@Worker 2 -- absent", Is.Empty)
+    let withSameProject = [wayfoldWorker2; projectWorker1]
+    Assert.That(selected withSameProject "#Wayfold@Worker 1" =
+                    Set.singleton "Wayfold::Worker 1", Is.True)
+    Assert.That(selected withSameProject "#Wayfold@Worker 10", Is.Empty)

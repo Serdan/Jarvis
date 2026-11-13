@@ -12,7 +12,7 @@ let ``plain terms are text filters`` () =
 
 [<Test>]
 let ``hash terms are project filters`` () =
-    let terms = ActivityFilter.parseTerms "#Wayfold sprite"
+    let terms = ActivityFilter.parseTerms "#Wayfold -- sprite"
     terms.Text |> shouldEqual [ "sprite" ]
     terms.Projects |> shouldEqual [ "Wayfold" ]
 
@@ -24,7 +24,7 @@ let ``project filters use case insensitive substring matching`` () =
 
 [<Test>]
 let ``text and project terms are combined`` () =
-    let terms = ActivityFilter.parseTerms "#way render sprite"
+    let terms = ActivityFilter.parseTerms "#way -- render sprite"
     ActivityFilter.matchesTerms terms (Some "Wayfold") "Render modern sprite system"
     |> shouldEqual true
     ActivityFilter.matchesTerms terms (Some "Wayfold") "Render inventory"

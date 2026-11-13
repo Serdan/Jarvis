@@ -12,10 +12,7 @@ type Status =
 
 type Terms = FilterSelectors.Terms
 
-let parseTerms query = FilterSelectors.parseWithoutCandidates query
-
-let parseTermsWithCandidates projectNames agentNames query =
-    FilterSelectors.parse projectNames agentNames query
+let parseTerms query = FilterSelectors.parse query
 
 // Preserve raw command project IDs; normalize only their presentation.
 // Worktrees are addressed as "Project::worktree" or ".Project-worktrees/worktree".

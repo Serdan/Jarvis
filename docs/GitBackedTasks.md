@@ -328,7 +328,12 @@ The Agents screen follows Activity: a 12-row selectable list with colored
 Up/Down and Page Up/Down navigate; End selects the last row.
 Use `/` to filter by agent, task or worktree, or `#` to start a project
 filter or `@` to start an agent filter; search terms can be combined just as
-in Activity. `@Worker` matches every agent name containing `Worker`,
+in Activity. Selector names extend through spaces until another `#` or `@`
+selector, or a standalone `--` delimiter, without consulting the current roster
+to decide where they end. Use `#Wayfold@Worker 1 -- Sprint` to combine a multiword
+agent selector with descriptive text after it; `Sprint #Wayfold@Worker 1`
+also works. Without `--`, `@Worker 1 Sprint` is one agent selector,
+not a search for task text `Sprint`. `@Worker` matches every agent name containing `Worker`,
 including a bare `Worker` and numbered workers. A numeric selector token
 such as `@Worker 1` ends at a token boundary, so it does not match
 `Worker 10`, regardless of the currently visible roster.

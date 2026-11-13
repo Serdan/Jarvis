@@ -261,7 +261,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         |> Seq.toList
 
     let filteredActivityUnsafe () =
-        let terms = ActivityFilter.parseTermsWithCandidates (activityProjectNamesUnsafe()) [] activityFilterText
+        let terms = ActivityFilter.parseTerms activityFilterText
         activity
         |> Seq.filter (fun entry ->
             (showObservers || entry.Origin <> "Observer")
@@ -514,10 +514,11 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         writeMnemonic 'q' "quit"; draw.WriteLine ""
 
     let writeFilterHotkeys () =
-        draw.Write "Filter: type text; "
+        draw.Write "Filter: "
         writeHotkeyToken "#"; draw.Write " project, "
         if mode = AgentFilterMode then
             writeHotkeyToken "@"; draw.Write " agent, "
+        draw.Write "-- text, "
         writeHotkeyToken "Tab"; draw.Write " completes prefix, "
         writeHotkeyToken "Backspace"; draw.Write " edits, "
         writeHotkeyToken "Enter"; draw.Write " applies, "

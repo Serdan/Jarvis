@@ -3,8 +3,7 @@ module FilterSelectorTests
 open Client
 open NUnit.Framework
 
-let private parse query =
-    FilterSelectors.parse ["Wayfold"; "Projekt Loke"; "Jarvis"] ["Worker 1"; "Worker 2"; "GUI Agent"] query
+let private parse query = FilterSelectors.parse query
 
 [<Test>]
 let ``selectors distinguish projects from agents in either contiguous order`` () =
@@ -22,7 +21,7 @@ let ``name fragments match case insensitively with multiword names`` () =
 
 [<Test>]
 let ``unrelated descriptive text remains text and selector terms combine with AND`` () =
-    let terms = parse "commit #wayfold@worker 1 Review regression"
+    let terms = parse "commit #wayfold@worker 1 -- Review regression"
     Assert.That(terms.Text = ["commit"; "Review"; "regression"], Is.True)
     Assert.That(terms.Projects = ["wayfold"], Is.True)
     Assert.That(terms.Agents = ["worker 1"], Is.True)
@@ -33,11 +32,11 @@ let ``bare text stays searchable and partial markers do not filter`` () =
     Assert.That(terms.Text = ["render"], Is.True)
     Assert.That(terms.Projects, Is.Empty)
     Assert.That(terms.Agents, Is.Empty)
-    Assert.That(FilterSelectors.parse [] [] "#", Is.EqualTo(FilterSelectors.parse [] [] ""))
+    Assert.That(FilterSelectors.parse "#", Is.EqualTo(FilterSelectors.parse ""))
 
 [<Test>]
-let ``malformed selector with missing local snapshot still preserves its first word`` () =
-    let terms = FilterSelectors.parse [] [] "#unknown @missing"
+let ``explicit selector intent is independent of a snapshot`` () =
+    let terms = FilterSelectors.parse "#unknown @missing"
     Assert.That(terms.Projects = ["unknown"], Is.True)
     Assert.That(terms.Agents = ["missing"], Is.True)
 
@@ -88,7 +87,7 @@ let ``shortcut appends selectors without clearing previous filters`` () =
 let ``project worktree labels are valid selector completions`` () =
     let names = ["Wayfold/silver-ring-trade"; "Wayfold/tooltip-fix"]
     Assert.That(FilterSelectors.completeTrailing names [] "#Wayfold/s", Is.EqualTo("#Wayfold/silver-ring-trade"))
-    let terms = FilterSelectors.parse names [] "#Wayfold/silver-ring-trade"
+    let terms = FilterSelectors.parse "#Wayfold/silver-ring-trade"
     Assert.That(terms.Projects = ["Wayfold/silver-ring-trade"], Is.True)
 
 [<Test>]
@@ -109,3 +108,54 @@ let numericAgentTokensRespectBoundariesWithoutSuppressingPartialWorkerMatches ()
     Assert.That(FilterSelectors.matchesAgentTerm "Worker 10" "Worker 100", Is.False)
     Assert.That(FilterSelectors.matchesAgentTerm "Worker" "GUI Agent", Is.False)
     Assert.That(FilterSelectors.matchesAgentTerm "GUI Ag" "GUI Agent", Is.True)
+
+[<Test>]
+let ``absent multiword selector does not depend on candidates`` () =
+    let absentNumeric = parse "#Wayfold@Worker 1"
+    Assert.That(absentNumeric.Projects = ["Wayfold"], Is.True)
+    Assert.That(absentNumeric.Agents = ["Worker 1"], Is.True)
+    Assert.That(absentNumeric.Text, Is.Empty)
+    let absentName = parse "#Projekt Loke@GUI Agent"
+    Assert.That(absentName.Projects = ["Projekt Loke"], Is.True)
+    Assert.That(absentName.Agents = ["GUI Agent"], Is.True)
+    Assert.That(absentName.Text, Is.Empty)
+
+[<Test>]
+let ``explicit text separator and multiple selectors have stable AND semantics`` () =
+    let terms = parse "review #Wayfold@Worker 1 -- sprint 1 @GUI Agent"
+    Assert.That(terms.Text = ["review"; "sprint"; "1"], Is.True)
+    Assert.That(terms.Projects = ["Wayfold"], Is.True)
+    Assert.That(terms.Agents = ["Worker 1"; "GUI Agent"], Is.True)
+    let projectText = parse "#Projekt Loke -- audio fix"
+    Assert.That(projectText.Projects = ["Projekt Loke"], Is.True)
+    Assert.That(projectText.Text = ["audio"; "fix"], Is.True)
+    Assert.That((parse "#Wayfold -- ready").Text = ["ready"], Is.True)
+    Assert.That((parse "ready #Wayfold").Text = ["ready"], Is.True)
+
+[<Test>]
+let ``selector grammar handles missing names and live partial input without text leakage`` () =
+    for query, expected in
+        [ "@Worker 1", "Worker 1"
+          "@Worker 10", "Worker 10"
+          "@GUI Agent", "GUI Agent"
+          "@Nobody Here", "Nobody Here"
+          "@Worker 1 ", "Worker 1" ] do
+        let terms = parse query
+        Assert.That(terms.Agents = [expected], Is.True, query)
+        Assert.That(terms.Text, Is.Empty, query)
+    Assert.That((parse "#Wayfold@").Projects = ["Wayfold"], Is.True)
+    Assert.That((parse "#Wayfold@").Agents, Is.Empty)
+    Assert.That((parse "#Wayfold --").Projects = ["Wayfold"], Is.True)
+    Assert.That((parse "#Wayfold --").Text, Is.Empty)
+    Assert.That((parse "#").Projects, Is.Empty)
+    Assert.That((parse "--").Text, Is.Empty)
+
+[<Test>]
+let ``delimiter must be standalone and embedded markers stay ordinary text`` () =
+    let text = parse "mail user@example.test progress--followup"
+    Assert.That(text.Text = ["mail"; "user@example.test"; "progress--followup"], Is.True)
+    let terms = parse "@Worker 1--test"
+    Assert.That(terms.Agents = ["Worker 1--test"], Is.True)
+    Assert.That(terms.Text, Is.Empty)
+    Assert.That(FilterSelectors.completeTrailing ["Wayfold"] [] "#Wayfold -- sprint", Is.EqualTo("#Wayfold -- sprint"))
+    Assert.That(FilterSelectors.completeTrailing ["Wayfold"] [] "#Wa --", Is.EqualTo("#Wa --"))

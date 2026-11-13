@@ -7,14 +7,14 @@ Make the local Jarvis client activity view compact enough to scan at a glance wh
 The primary activity format is one mutable row per command:
 
 ```text
-20.47.52 @Jarvis ReadFileCommand(docs/AI.md) …
-20.47.52 @Jarvis ReadFileCommand(docs/AI.md) (842 ms)
+20.47.52 #Jarvis ReadFileCommand(docs/AI.md) …
+20.47.52 #Jarvis ReadFileCommand(docs/AI.md) (842 ms)
 ```
 
-Worktree activity uses `@Project/worktree`, for example `@Wayfold/silver-ring-trade`.
-Main checkout activity remains `@Project`. A worktree can arrive as either
+Worktree activity uses `#Project/worktree`, for example `#Wayfold/silver-ring-trade`.
+Main checkout activity remains `#Project`. A worktree can arrive as either
 `Project::worktree` or `.Project-worktrees/worktree`; both display as
-`@Project/worktree`. The raw project identifier stays unchanged in the command,
+`#Project/worktree`. The raw project identifier stays unchanged in the command,
 persisted activity, and API results. Filters accept the display label and the raw
 selector. Worktrees share the parent project's color.
 
@@ -38,7 +38,7 @@ The receive timestamp remains fixed when the row is updated.
   - Include the configured Jarvis server host without adding connection events to normal command activity.
 
 - [x] **4. Color project labels consistently.**
-  - Apply a deterministic terminal color to `@Project`.
+  - Apply a deterministic terminal color to `#Project`.
   - The same project must receive the same color for the life of the client.
   - Non-project/global commands remain uncolored.
 
@@ -82,8 +82,12 @@ The receive timestamp remains fixed when the row is updated.
 
 - [x] **10. Add activity filtering.**
   - `/` edits a free-text activity filter and applies it live while typing.
-  - Pressing `@` from the activity view enters filter editing with an `@` project term ready to type.
-  - Terms prefixed with `@` match project names case-insensitively by substring; e.g. `@Loke` matches `Projekt Loke`.
+  - Pressing `#` from the activity view enters filter editing with a `#` project term ready to type.
+  - Terms prefixed with `#` match project names case-insensitively by substring; e.g. `#Loke` matches `Projekt Loke`.
+  - A multiword project selector extends until the next `#` or `@` marker or standalone `--`; the syntax does not depend on the current project list.
+    For example `#Projekt Loke -- RunCommand` matches activity from Projekt Loke whose command text contains RunCommand.
+    Free text may also precede a selector, as in `RunCommand #Projekt Loke`.
+  - `Tab` extends the trailing `#` project selector to the longest shared prefix of local project names; no cycling or network lookup.
   - Other terms match command name, activity text, full reason/detail, and retained failure text case-insensitively.
   - Multiple text/project terms are combined with AND semantics.
   - `S` cycles the predefined status filter: All, Running, Awaiting, Completed, Failed, Info.

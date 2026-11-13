@@ -363,14 +363,14 @@ let projectSelectorsMatchAllAliasesWithoutCrossLedgerLeakage () =
         AgentView.visibleProjects filter data |> List.map _.Identity
     let selectedRows filter =
         AgentView.visibleRows filter data |> List.map _.Key
-    Assert.That(selectedProjects "@owner" = [shared], Is.True)
-    Assert.That(selectedProjects "@reviewer", Is.EquivalentTo([shared; distinct]))
-    Assert.That(selectedProjects "@owner @reviewer" = [shared], Is.True)
-    Assert.That(selectedProjects "@other", Is.Empty)
-    Assert.That(selectedRows "@owner" = [shared + "::Lead"], Is.True)
-    Assert.That(selectedRows "@reviewer", Is.EquivalentTo([shared + "::Lead"; distinct + "::Other"]))
-    Assert.That(selectedRows "@owner @reviewer" = [shared + "::Lead"], Is.True)
-    Assert.That(selectedRows "@owner Other", Is.Empty)
+    Assert.That(selectedProjects "#owner" = [shared], Is.True)
+    Assert.That(selectedProjects "#reviewer", Is.EquivalentTo([shared; distinct]))
+    Assert.That(selectedProjects "#owner #reviewer" = [shared], Is.True)
+    Assert.That(selectedProjects "#other", Is.Empty)
+    Assert.That(selectedRows "#owner" = [shared + "::Lead"], Is.True)
+    Assert.That(selectedRows "#reviewer", Is.EquivalentTo([shared + "::Lead"; distinct + "::Other"]))
+    Assert.That(selectedRows "#owner #reviewer" = [shared + "::Lead"], Is.True)
+    Assert.That(selectedRows "#owner Other", Is.Empty)
     let sharedAgent = data.Agents |> List.find (fun row -> row.Key = shared + "::Lead")
     let otherAgent = data.Agents |> List.find (fun row -> row.Key = distinct + "::Other")
     Assert.That(sharedAgent.ProjectAliases, Is.EquivalentTo(["owner"; "reviewer"]))
@@ -393,8 +393,8 @@ let differingCanonicalHeadsFailClosedRatherThanSelectingAStaleAlias () =
         Assert.That(project.Counts.IsNone, Is.True,
                     "A fresh dashboard must not publish arbitrary stale counts from a different head.")
         Assert.That(project.Error.Value, Does.Contain("Inconsistent canonical ledger heads"))
-        Assert.That(AgentView.visibleProjects "@owner" data |> List.length, Is.EqualTo(1))
-        Assert.That(AgentView.visibleProjects "@reviewer" data |> List.length, Is.EqualTo(1))
+        Assert.That(AgentView.visibleProjects "#owner" data |> List.length, Is.EqualTo(1))
+        Assert.That(AgentView.visibleProjects "#reviewer" data |> List.length, Is.EqualTo(1))
         Assert.That((AgentView.totalCounts data).Tracked, Is.EqualTo(0))
 
 [<Test>]

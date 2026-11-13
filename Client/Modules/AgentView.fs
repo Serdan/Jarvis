@@ -101,23 +101,15 @@ let totalCounts (snapshot: Snapshot) =
           Waiting = sum.Waiting + item.Waiting
           Parked = sum.Parked + item.Parked }) zeroCounts
 
-/// Each @selector can match any alias of the same canonical ledger. A project
+/// Each #selector can match any alias of the same canonical ledger. A project
 /// is never matched through the alias of a different ledger with that name.
-let private matchesProjectAliases (terms: ActivityFilter.Terms) aliases =
+let private matchesProjectAliases (terms: ActivityFilter.Terms) (aliases: string list) =
     terms.Projects
     |> List.forall (fun projectTerm ->
         aliases
         |> List.exists (fun alias ->
-            ActivityFilter.matchesTerms
-                { Text = []; Projects = [projectTerm] } (Some alias) ""))
-
-/// Text search narrows agent rows, not per-project totals. Only @project
-/// selectors narrow the project summary.
-let visibleProjects filter (snapshot: Snapshot) =
-    let terms = ActivityFilter.parseTerms filter
-    snapshot.Projects
-    |> List.filter (fun project -> matchesProjectAliases terms project.Aliases)
-    |> List.sortBy (fun project -> project.Project.ToLowerInvariant(), project.Identity)
+            alias.Contains(projectTerm, StringComparison.OrdinalIgnoreCase)
+            || (ActivityFilter.projectLabel alias).Contains(projectTerm, StringComparison.OrdinalIgnoreCase)))
 
 let projectDisplayName (snapshot: Snapshot) (project: ProjectSummary) =
     let duplicates =
@@ -144,6 +136,35 @@ let projectDisplayName (snapshot: Snapshot) (project: ProjectSummary) =
                 others |> List.forall (fun other -> prefix length key <> prefix length other))
             |> Option.defaultValue key.Length
         project.Project + " [" + prefix length key + "]"
+
+let private projectNames (snapshot: Snapshot) =
+    [ for project in snapshot.Projects do
+          yield project.Project
+          yield projectDisplayName snapshot project
+          yield! project.Aliases
+      for row in snapshot.Agents do
+          yield row.ProjectLabel
+          yield row.Project
+          yield! row.ProjectAliases ]
+
+/// Text and agent selectors narrow rows, not project totals.
+/// Only #project selectors narrow project summaries.
+let visibleProjects filter (snapshot: Snapshot) =
+    let terms = ActivityFilter.parseTerms filter
+    snapshot.Projects
+    |> List.filter (fun project ->
+        matchesProjectAliases terms (projectDisplayName snapshot project :: project.Project :: project.Aliases))
+    |> List.sortBy (fun project -> project.Project.ToLowerInvariant(), project.Identity)
+
+let completeFilter filter (snapshot: Snapshot) =
+    let projects = projectNames snapshot
+    let allAgents = snapshot.Agents |> List.map _.Agent
+    let terms = ActivityFilter.parseTerms filter
+    let agents =
+        snapshot.Agents
+        |> List.filter (fun row -> matchesProjectAliases terms (row.ProjectLabel :: row.Project :: row.ProjectAliases))
+        |> List.map _.Agent
+    FilterSelectors.completeTrailing projects agents filter
 
 /// Preserve the distinguishing ledger suffix when a long project name
 /// exceeds the available terminal columns.
@@ -271,8 +292,7 @@ let lastSeenAt (agent: AgentRow) (seen: IDictionary<string, DateTimeOffset>) =
         | _ -> ()
     latest
 
-let matches (filter: string) (row: AgentRow) =
-    let terms = ActivityFilter.parseTerms filter
+let private matchesTerms (terms: ActivityFilter.Terms) (row: AgentRow) =
     let searchable =
         [ row.Agent; row.State; row.Project; row.ProjectLabel; yield! row.ProjectAliases
           row.StateReason |> Option.defaultValue ""
@@ -280,12 +300,14 @@ let matches (filter: string) (row: AgentRow) =
           | Some task -> yield! [ task.TaskId; task.Title; task.Lifecycle; task.Phase; task.SourceRef |> Option.defaultValue "" ]
           | None -> () ]
         |> String.concat " "
-    matchesProjectAliases terms row.ProjectAliases
-    && ActivityFilter.matchesTerms { terms with Projects = [] } None searchable
+    matchesProjectAliases terms (row.ProjectLabel :: row.Project :: row.ProjectAliases)
+    && (terms.Agents |> List.forall (fun term -> FilterSelectors.matchesAgentTerm term row.Agent))
+    && ActivityFilter.matchesTerms { terms with Projects = []; Agents = [] } None searchable
 
 let visibleRows filter snapshot =
+    let terms = ActivityFilter.parseTerms filter
     rows snapshot
-    |> List.filter (fun row -> row.State <> "Parked" && matches filter row)
+    |> List.filter (fun row -> row.State <> "Parked" && matchesTerms terms row)
 
 let displayState state = if state = "NeedsWork" then "Waiting" else state
 

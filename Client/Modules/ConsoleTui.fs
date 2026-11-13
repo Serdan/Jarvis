@@ -253,6 +253,13 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
           yield entry.FailureDetail |> Option.defaultValue "" ]
         |> String.concat " "
 
+    let activityProjectNamesUnsafe () =
+        activity
+        |> Seq.choose _.ProjectName
+        |> Seq.distinct
+        |> Seq.collect (fun name -> [name; ActivityFilter.projectLabel name])
+        |> Seq.toList
+
     let filteredActivityUnsafe () =
         let terms = ActivityFilter.parseTerms activityFilterText
         activity
@@ -485,7 +492,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         writeHotkeyToken "End"; draw.Write " latest, "
         writeHotkeyToken "Enter"; draw.Write " details, "
         writeHotkeyToken "/"; draw.Write " filter, "
-        writeHotkeyToken "@"; draw.Write " project, "
+        writeHotkeyToken "#"; draw.Write " project, "
         writeMnemonic 's' "status"; draw.Write ", "
         writeMnemonic 'c' "clear"; draw.Write ", "
         writeMnemonic 'p' "permissions"; draw.Write ", "
@@ -507,8 +514,12 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         writeMnemonic 'q' "quit"; draw.WriteLine ""
 
     let writeFilterHotkeys () =
-        draw.Write "Filter: type text; "
-        writeHotkeyToken "@"; draw.Write "term filters project, "
+        draw.Write "Filter: "
+        writeHotkeyToken "#"; draw.Write " project, "
+        if mode = AgentFilterMode then
+            writeHotkeyToken "@"; draw.Write " agent, "
+        draw.Write "-- text, "
+        writeHotkeyToken "Tab"; draw.Write " completes prefix, "
         writeHotkeyToken "Backspace"; draw.Write " edits, "
         writeHotkeyToken "Enter"; draw.Write " applies, "
         writeHotkeyToken "Esc"; draw.WriteLine " cancels"
@@ -910,7 +921,8 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         writeHotkeyToken "End"; draw.Write " last, "
         writeHotkeyToken "Enter"; draw.Write " details, "
         writeHotkeyToken "/"; draw.Write " filter, "
-        writeHotkeyToken "@"; draw.Write " project, "
+        writeHotkeyToken "#"; draw.Write " project, "
+        writeHotkeyToken "@"; draw.Write " agent, "
         writeMnemonic 'r' "refresh"; draw.Write ", "
         writeMnemonic 'p' "permissions"; draw.Write ", "
         writeHotkeyToken "Esc"; draw.Write " activity, "
@@ -1152,7 +1164,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
         if draw.Height >= 22 && not agentChanged.IsEmpty then
             draw.WriteLine $"Updated agents: {agentChanged.Count} (*)"
         agentError |> Option.iter (fun error -> draw.WriteLine(trim ("Error: " + compact error) width))
-        if mode = AgentFilterMode then draw.WriteLine $"Filter: {trim (compact agentFilter) (max 20 (width - 9))}"
+        if mode = AgentFilterMode then draw.WriteLine $"Filter (#project @agent; Tab extends): {trim (compact agentFilter) (max 20 (width - 39))}"
         if agentSnapshot.IsNone && not agentRefreshing then
             draw.WriteLine "No snapshot loaded. Press r to refresh."
         elif filtered.Length = 0 then
@@ -1830,6 +1842,13 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                                     | ConsoleKey.Backspace when agentFilter.Length > 0 ->
                                         agentFilter <- agentFilter.Substring(0, agentFilter.Length - 1)
                                         normalizeAgentSelectionUnsafe()
+                                    | ConsoleKey.Tab ->
+                                        let completed =
+                                            agentSnapshot
+                                            |> Option.map (AgentView.completeFilter agentFilter)
+                                            |> Option.defaultValue agentFilter
+                                        agentFilter <- completed
+                                        normalizeAgentSelectionUnsafe()
                                     | _ when not (Char.IsControl keyInfo.KeyChar) ->
                                         agentFilter <- agentFilter + string keyInfo.KeyChar
                                         normalizeAgentSelectionUnsafe()
@@ -1911,6 +1930,10 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                                         mode <- ActivityMode
                                         resetFilteredViewUnsafe()
                                         renderUnsafe())
+                                | ConsoleKey.Tab ->
+                                    lock syncRoot (fun () ->
+                                        updateFilterTextUnsafe (FilterSelectors.completeTrailing (activityProjectNamesUnsafe()) [] activityFilterText)
+                                        renderUnsafe())
                                 | _ when not (Char.IsControl keyInfo.KeyChar) ->
                                     lock syncRoot (fun () ->
                                         updateFilterTextUnsafe (activityFilterText + string keyInfo.KeyChar)
@@ -1922,9 +1945,9 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                                     lock syncRoot (fun () ->
                                         beginFilterUnsafe ""
                                         renderUnsafe())
-                                | '@', _ when mode = ActivityMode ->
+                                | '#', _ when mode = ActivityMode ->
                                     lock syncRoot (fun () ->
-                                        beginFilterUnsafe "@"
+                                        beginFilterUnsafe "#"
                                         renderUnsafe())
                                 | _, ConsoleKey.UpArrow ->
                                     lock syncRoot (fun () ->
@@ -2029,10 +2052,10 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                                         agentOriginalFilter <- agentFilter
                                         mode <- AgentFilterMode
                                         renderUnsafe())
-                                | '@', _ when mode = AgentsMode ->
+                                | ('@' | '#') as marker, _ when mode = AgentsMode ->
                                     lock syncRoot (fun () ->
                                         agentOriginalFilter <- agentFilter
-                                        agentFilter <- "@"
+                                        agentFilter <- FilterSelectors.appendSelector marker agentFilter
                                         normalizeAgentSelectionUnsafe()
                                         mode <- AgentFilterMode
                                         renderUnsafe())

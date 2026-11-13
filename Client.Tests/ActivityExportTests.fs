@@ -31,7 +31,7 @@ let ``recent command export is concise and chronological`` () =
 
     ActivityExport.formatRecent entries
     |> shouldEqual
-        "Jarvis recent commands (2, oldest to newest)\n[18:31:47] @Wayfold SearchText\n  Detail: \"CreatureRenderer\"\n  Status: Completed | 7 ms | 2 matches\n\n[18:32:01] @Jarvis RunCommand\n  Reason: Verify tests\n  Detail: dotnet test\n  Status: Completed | 812 ms | exit 0"
+        "Jarvis recent commands (2, oldest to newest)\n[18:31:47] #Wayfold SearchText\n  Detail: \"CreatureRenderer\"\n  Status: Completed | 7 ms | 2 matches\n\n[18:32:01] #Jarvis RunCommand\n  Reason: Verify tests\n  Detail: dotnet test\n  Status: Completed | 812 ms | exit 0"
 
 [<Test>]
 let ``recent command export uses readable worktree labels`` () =
@@ -45,7 +45,7 @@ let ``recent command export uses readable worktree labels`` () =
           DurationMs = Some 200L
           Result = Some "exit 0" }
     let exported = ActivityExport.formatRecent [ entry ]
-    exported.Contains("[02:30:00] @Wayfold/silver-ring-trade RunCommand")
+    exported.Contains("[02:30:00] #Wayfold/silver-ring-trade RunCommand")
     |> shouldEqual true
     exported.Contains("Wayfold::silver-ring-trade") |> shouldEqual false
 
@@ -61,6 +61,6 @@ let ``recent command export translates hidden worktree path labels`` () =
           DurationMs = Some 200L
           Result = Some "exit 0" }
     let exported = ActivityExport.formatRecent [ entry ]
-    exported.Contains("[02:30:00] @Wayfold/silver-ring-trade RunCommand")
+    exported.Contains("[02:30:00] #Wayfold/silver-ring-trade RunCommand")
     |> shouldEqual true
     exported.Contains(".Wayfold-worktrees/") |> shouldEqual false

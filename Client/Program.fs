@@ -3,6 +3,9 @@ module Program
 open System
 open System.IO
 open System.Reflection
+open System.Text
+open System.Text.Json
+open System.Security.Cryptography
 open System.Threading
 open System.Threading.Tasks
 open Client
@@ -108,6 +111,25 @@ let connect (tui: ConsoleTui) (connection: HubConnection) =
             return false
     }
 
+// Identity is derived from the successful local OAuth login, not from a
+// remotely supplied agentId or a TUI text field. Hash the subject so ledger
+// evidence distinguishes operators without copying Auth0 account identifiers.
+let private operatorActorFromAccessToken (token: string) =
+    try
+        let pieces = token.Split('.')
+        if pieces.Length <> 3 then None
+        else
+            let data = pieces[1].Replace('-', '+').Replace('_', '/')
+            let bytes = Convert.FromBase64String(data.PadRight(((data.Length + 3) / 4) * 4, '='))
+            use json = JsonDocument.Parse(Encoding.UTF8.GetString(bytes))
+            let subject = json.RootElement.GetProperty("sub").GetString()
+            if String.IsNullOrWhiteSpace subject then None
+            else
+                SHA256.HashData(Encoding.UTF8.GetBytes subject)
+                |> Convert.ToHexString
+                |> fun hash -> Some("operator:" + hash.ToLowerInvariant())
+    with _ -> None
+
 let private runClient args =
     let activityStore, activityStoreError =
         try
@@ -183,6 +205,22 @@ let private runClient args =
         OAuth.login tui.Log
         |> Async.AwaitTask
         |> Async.RunSynchronously
+
+    let authenticatedOperator =
+        try
+            oauth.GetAccessTokenAsync().GetAwaiter().GetResult()
+            |> operatorActorFromAccessToken
+        with _ -> None
+    let toUiError result = result |> Result.mapError (fun error -> sprintf "%A" error)
+    match authenticatedOperator with
+    | Some actor ->
+        tui.SetChallengeAccess
+            { Load = (fun () -> OrchestrationApi.OperatorChallengeApi.list rt |> toUiError)
+              Reply = (fun request ->
+                  OrchestrationApi.OperatorChallengeApi.reply actor request rt
+                  |> Result.map ignore |> toUiError) }
+    | None ->
+        tui.Log "Operator challenge replies unavailable: authenticated OAuth subject missing."
 
     let connection =
         HubConnectionBuilder()

@@ -26,7 +26,8 @@ let private unusedLoopbackPort () =
 let unauthenticated_mcp_requests_get_http_oauth_challenge_but_resource_metadata_remains_public () =
     let configuration = DirectoryInfo(AppContext.BaseDirectory).Parent.Name
     let serverDll =
-        Path.Combine(repositoryRoot (), "Server", "bin", configuration, "net10.0", "JarvisServer.dll")
+        Path.Combine(repositoryRoot (), "Server", "bin", configuration,
+                     DirectoryInfo(AppContext.BaseDirectory).Name, "JarvisServer.dll")
     Assert.That(File.Exists(serverDll), Is.True, $"Missing server executable: {serverDll}")
 
     let tempDirectory = Path.Combine(Path.GetTempPath(), "jarvis-mcp-auth-" + Guid.NewGuid().ToString("N"))
@@ -105,7 +106,8 @@ let unauthenticated_mcp_requests_get_http_oauth_challenge_but_resource_metadata_
 let server_does_not_serve_readiness_routes_when_feedback_database_cannot_initialize () =
     let configuration = DirectoryInfo(AppContext.BaseDirectory).Parent.Name
     let serverDll =
-        Path.Combine(repositoryRoot (), "Server", "bin", configuration, "net10.0", "JarvisServer.dll")
+        Path.Combine(repositoryRoot (), "Server", "bin", configuration,
+                     DirectoryInfo(AppContext.BaseDirectory).Name, "JarvisServer.dll")
     Assert.That(File.Exists(serverDll), Is.True)
     let tempDirectory = Path.Combine(Path.GetTempPath(), "jarvis-server-readiness-" + Guid.NewGuid().ToString("N"))
     Directory.CreateDirectory(tempDirectory) |> ignore

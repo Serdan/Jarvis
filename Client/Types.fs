@@ -139,3 +139,33 @@ type IgnoreBuilder() =
     member inline _.Yield _ = ()
     member inline _.Combine((), ()) = ()
     member inline _.Zero() = ()
+
+
+// Local TUI contracts for authenticated operator input. The implementation
+// is deliberately not exposed through agent-attributed MCP commands.
+type OperatorChallengeEntry =
+    { ProjectName: string
+      ChallengeId: string
+      ConditionId: string
+      IssuerAgentId: string
+      Title: string
+      TaskId: string
+      Question: string
+      ChallengeStatus: string
+      ConditionStatus: string
+      Version: int
+      Evidence: string
+      CreatedAtUtc: string
+      UpdatedAtUtc: string }
+
+type OperatorChallengeReply =
+    { ProjectName: string
+      ChallengeId: string
+      ConditionId: string
+      ExpectedVersion: int
+      Response: string
+      OperationId: string }
+
+type OperatorChallengeSnapshot =
+    { Items: OperatorChallengeEntry list
+      Warnings: string list }

@@ -21,6 +21,11 @@ function createHarness(initialStorage = {}, initialSession = {}) {
   const createdTabs = [];
   let nextCreatedId = 19;
   let hostPermissionGranted = true;
+  let failNextPermissionQuery = false;
+  let failNextTabQuery = false;
+  let failNextRegistryWrite = false;
+  let holdNextRegistryWrite = false;
+  let releaseRegistryWrite = null;
   class FakeWebSocket {
     static OPEN = 1;
     static CONNECTING = 0;
@@ -41,7 +46,22 @@ function createHarness(initialStorage = {}, initialSession = {}) {
       local: {
         setAccessLevel: async () => {},
         get: async names => Object.fromEntries(names.filter(x => storage.has(x)).map(x => [x, storage.get(x)])),
-        set: async obj => { for (const [k, v] of Object.entries(obj)) storage.set(k, v); },
+        set: async obj => {
+          // Model Chrome's structured-clone snapshot, not the mutable live array.
+          const saved = JSON.parse(JSON.stringify(obj));
+          if (Object.hasOwn(saved, "registrations")) {
+            if (failNextRegistryWrite) {
+              failNextRegistryWrite = false;
+              throw Error("Temporary storage write failure");
+            }
+            if (holdNextRegistryWrite) {
+              holdNextRegistryWrite = false;
+              await new Promise(resolve => { releaseRegistryWrite = resolve; });
+              releaseRegistryWrite = null;
+            }
+          }
+          for (const [k, v] of Object.entries(saved)) storage.set(k, v);
+        },
         remove: async key => { storage.delete(key); }
       },
       session: {
@@ -62,9 +82,13 @@ function createHarness(initialStorage = {}, initialSession = {}) {
         createdTabs.push(tab);
         return tab;
       },
-      remove: async id => { tabs.delete(id); },
+      remove: async id => { tabs.delete(id); listeners.removed?.(id); },
       get: async id => {
-        if (!tabs.has(id)) throw Error("Missing tab");
+        if (failNextTabQuery) {
+          failNextTabQuery = false;
+          throw Error("Temporary tabs API failure");
+        }
+        if (!tabs.has(id)) throw Error(`No tab with id: ${id}.`);
         return tabs.get(id);
       },
       onUpdated: { addListener: cb => { listeners.updated = cb; } },
@@ -75,7 +99,13 @@ function createHarness(initialStorage = {}, initialSession = {}) {
       onRemoved: { addListener: cb => { listeners.windowRemoved = cb; } }
     },
     webNavigation: { onHistoryStateUpdated: { addListener: cb => { listeners.history = cb; } } },
-    permissions: { contains: async () => hostPermissionGranted },
+    permissions: { contains: async () => {
+      if (failNextPermissionQuery) {
+        failNextPermissionQuery = false;
+        throw Error("Temporary permission API failure");
+      }
+      return hostPermissionGranted;
+    } },
     alarms: {
       create: () => {},
       onAlarm: { addListener: cb => { listeners.alarm = cb; } }
@@ -105,7 +135,13 @@ function createHarness(initialStorage = {}, initialSession = {}) {
   };
   return { storage, session, tabs, createdTabs, sockets, calls, listeners, message, deliver,
     userScripts: chrome.userScripts,
-    setHostPermissionGranted: granted => { hostPermissionGranted = granted; } };
+    setHostPermissionGranted: granted => { hostPermissionGranted = granted; },
+    failPermissionQueryOnce: () => { failNextPermissionQuery = true; },
+    failTabQueryOnce: () => { failNextTabQuery = true; },
+    failRegistryWriteOnce: () => { failNextRegistryWrite = true; },
+    delayNextRegistryWrite: () => { holdNextRegistryWrite = true; },
+    hasDelayedRegistryWrite: () => Boolean(releaseRegistryWrite),
+    releaseDelayedRegistryWrite: () => releaseRegistryWrite?.() };
 }
 
 test("registration requires a user action and unregistered tabs stay private", async () => {
@@ -220,9 +256,11 @@ test("navigation permanently suspends registration until manual reauthorization"
   await h.message("register", { tabId: 17, alias: "agent-7" });
   const restored = await h.message("getState");
   assert.equal(restored.registrations[0].availability, "ready");
+  h.tabs.delete(17);
   h.listeners.removed(17);
   await tick(); await tick();
-  assert.equal((await h.message("getState")).registrations[0].availability, "needsReauthorization");
+  assert.equal((await h.message("getState")).registrations.length, 0);
+  assert.equal(h.storage.get("registrations").length, 0);
 });
 
 test("browser restart leaves old registrations unavailable without user reauthorization", async () => {
@@ -240,6 +278,69 @@ test("browser restart leaves old registrations unavailable without user reauthor
   assert.notEqual(second.session.get("browserSessionEpoch"), oldEpoch);
   await second.message("register", { tabId: 17, alias: "agent-7" });
   assert.equal((await second.message("getState")).registrations[0].availability, "ready");
+});
+
+test("closing a registered tab removes its record and advertises the new registry", async () => {
+  const h = createHarness();
+  await tick(); await tick();
+  await h.message("register", { tabId: 17, alias: "manual" });
+  await h.message("pair", { port: 43822, secret: "a".repeat(64) });
+  await tick(); await tick();
+  const ws = h.sockets[0];
+  await h.deliver(ws, { kind: "challenge", nonce: "b".repeat(64) });
+  await h.deliver(ws, { kind: "ready", connectionId: "epoch-1" });
+  h.tabs.delete(17);
+  h.listeners.removed(17);
+  await tick(); await tick();
+  assert.equal((await h.message("getState")).registrations.length, 0);
+  assert.equal(h.storage.get("registrations").length, 0);
+  assert.equal(ws.sent.filter(m => m.kind === "registrations").at(-1).tabs.length, 0);
+  assert.equal(h.tabs.has(18), true, "Unregistered tabs remain untouched");
+});
+
+test("cold startup prunes orphaned registrations even if previously blocked", async () => {
+  const first = createHarness();
+  await tick(); await tick();
+  await first.message("register", { tabId: 17, alias: "closed" });
+  await first.message("register", { tabId: 18, alias: "still-open" });
+  const previous = JSON.parse(JSON.stringify(first.storage.get("registrations")));
+  previous.find(r => r.tabId === 17).blocked = true;
+  const second = createHarness({ registrations: previous });
+  second.tabs.delete(17);
+  await tick(); await tick();
+  const state = await second.message("getState");
+  assert.equal(state.registrations.length, 1);
+  assert.equal(state.registrations[0].alias, "still-open");
+  assert.equal(state.registrations[0].availability, "needsReauthorization");
+  assert.equal(second.storage.get("registrations").length, 1);
+});
+
+test("user-closing a Jarvis-created tab frees its alias for a new tab", async () => {
+  const h = createHarness();
+  await tick(); await tick();
+  await h.message("registerWindow", { windowId: 1, alias: "agents" });
+  await h.message("setAgentCreatedTabs", { allowed: true });
+  await h.message("pair", { port: 43822, secret: "c".repeat(64) });
+  await tick(); await tick();
+  const ws = h.sockets[0];
+  await h.deliver(ws, { kind: "challenge", nonce: "d".repeat(64) });
+  await h.deliver(ws, { kind: "ready", connectionId: "epoch-1" });
+  const open = requestId => h.deliver(ws, {
+    kind: "openTab", requestId, connectionId: "epoch-1",
+    url: "https://example.test/new", windowRegistration: "agents", alias: "reusable"
+  });
+  await open("first");
+  const first = ws.sent.find(m => m.requestId === "first" && m.kind === "tabOpened").tab;
+  const tab = h.createdTabs[0];
+  h.tabs.delete(tab.id);
+  h.listeners.removed(tab.id);
+  await tick(); await tick();
+  assert.equal((await h.message("getState")).registrations.length, 0);
+  await open("second");
+  const second = ws.sent.find(m => m.requestId === "second" && m.kind === "tabOpened")?.tab;
+  assert.ok(second, "Closed tab must not reserve its alias");
+  assert.notEqual(second.registrationId, first.registrationId);
+  assert.equal((await h.message("getState")).registrations.length, 1);
 });
 
 test("opening tabs requires registered window and explicit opt-in", async () => {
@@ -694,4 +795,61 @@ test("snapshot rejects unbounded conditions before executing page code", async (
   await x.capture("bad-wait",{wait:{kind:"delay",milliseconds:6000000}});
   const result=await x.response("bad-wait");
   assert.equal(result.error,"InvalidSnapshotOptions");
+});
+
+test("closed tab must stay removed from storage despite an older pending registration write", async () => {
+  const h = createHarness();
+  await tick(); await tick();
+  assert.equal((await h.message("register", { tabId: 17, alias: "closed" })).ok, true);
+  h.delayNextRegistryWrite();
+  const adding = h.message("register", { tabId: 18, alias: "new" });
+  for (let i = 0; i < 20 && !h.hasDelayedRegistryWrite(); i++) await tick();
+  assert.equal(h.hasDelayedRegistryWrite(), true, "An older registration write must be pending");
+  h.tabs.delete(17);
+  h.listeners.removed(17);
+  await tick(); await tick();
+  assert.deepEqual(Array.from((await h.message("getState")).registrations, r => r.tabId), [18],
+    "Removal must update the live registry even while a prior write is pending");
+  h.releaseDelayedRegistryWrite();
+  assert.equal((await adding).ok, true);
+  for (let i = 0; i < 20; i++) await tick();
+  assert.deepEqual(h.storage.get("registrations").map(r => r.tabId), [18],
+    "Serial writes must leave the latest state durable, never resurrect the closed tab");
+});
+
+test("transient permissions API rejection preserves an existing tab registration", async () => {
+  const h = createHarness();
+  await tick(); await tick();
+  assert.equal((await h.message("register", { tabId: 17, alias: "manual" })).ok, true);
+  h.failPermissionQueryOnce();
+  const state = await h.message("getState");
+  assert.equal(h.tabs.has(17), true);
+  assert.equal(state.registrations.length, 1);
+  assert.equal(state.registrations[0].availability, "needsReauthorization");
+  assert.equal(h.storage.get("registrations").length, 1);
+  assert.equal((await h.message("getState")).registrations[0].availability, "ready",
+    "A later successful permission check should restore availability");
+});
+
+test("transient tabs API rejection preserves an existing tab registration", async () => {
+  const h = createHarness();
+  await tick(); await tick();
+  assert.equal((await h.message("register", { tabId: 17, alias: "manual" })).ok, true);
+  h.failTabQueryOnce();
+  const state = await h.message("getState");
+  assert.equal(state.registrations.length, 1);
+  assert.equal(state.registrations[0].availability, "needsReauthorization");
+  assert.equal(h.storage.get("registrations").length, 1);
+  assert.equal((await h.message("getState")).registrations[0].availability, "ready");
+});
+
+test("failed registry write does not poison later persistence", async () => {
+  const h = createHarness();
+  await tick(); await tick();
+  h.failRegistryWriteOnce();
+  const failed = await h.message("register", { tabId: 17, alias: "first" });
+  assert.equal(failed.ok, false);
+  const next = await h.message("register", { tabId: 18, alias: "second" });
+  assert.equal(next.ok, true);
+  assert.deepEqual(h.storage.get("registrations").map(r => r.tabId), [17, 18]);
 });

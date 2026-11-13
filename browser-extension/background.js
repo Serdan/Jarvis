@@ -1,5 +1,5 @@
 // Jarvis Browser Bridge - Manifest V3 service worker.
-// Only the extension popup may create, update, or remove registrations.
+// Only the extension popup may authorize registrations; closed tabs are forgotten automatically.
 // The public MCP server has no browser access without this paired local bridge.
 const PROTOCOL = 2;
 const REGISTRY_KEY = "registrations";
@@ -26,6 +26,7 @@ let configuredPort = 43822;
 let secret = "";
 let allowAgentCreatedTabs = false;
 let openQueue = Promise.resolve();
+let registryWriteQueue = Promise.resolve();
 let initPromise = null;
 
 function randomId() {
@@ -83,8 +84,18 @@ function safeState(r) {
     availability: r.availability
   };
 }
-async function persist() {
-  await chrome.storage.local.set({ [REGISTRY_KEY]: registrations });
+function persist() {
+  // Chrome snapshots the value when storage.set is called. Serialize writes
+  // and capture the latest registry only when our turn in the queue starts:
+  // otherwise an older pending write can resurrect a subsequently closed tab.
+  const write = registryWriteQueue.then(() =>
+    chrome.storage.local.set({
+      [REGISTRY_KEY]: registrations.map(reg => ({ ...reg }))
+    }));
+  // A failed write must reject its caller, but must not permanently prevent
+  // later writes from persisting the current registry.
+  registryWriteQueue = write.catch(() => {});
+  return write;
 }
 function windowState(w) {
   return { windowRegistration: w.registrationId, alias: w.alias,
@@ -116,6 +127,16 @@ async function advertiseWindows() {
 }
 
 async function assess(reg) {
+  // Check existence before authorization state so old closed registrations can be pruned.
+  let tab;
+  try { tab = await chrome.tabs.get(reg.tabId); }
+  catch (error) {
+    // Only an explicit nonexistent-tab error proves closure. A transient
+    // Chrome API failure must not permanently revoke a real registration.
+    const reason = String(error?.message || error);
+    return /^No tab with id:?\s*\d+\.?$/i.test(reason)
+      ? "missing" : "needsReauthorization";
+  }
   if (reg.blocked || reg.sessionEpoch !== sessionEpoch) return "needsReauthorization";
   if (reg.agentCreated &&
       (!allowAgentCreatedTabs || !reg.windowRegistration ||
@@ -125,7 +146,6 @@ async function assess(reg) {
     return "needsReauthorization";
   }
   try {
-    const tab = await chrome.tabs.get(reg.tabId);
     const pendingInitialNavigation = reg.agentCreated && tab.status === "loading" &&
       tab.pendingUrl === reg.boundUrl &&
       (!isAllowedUrl(tab.url) || tab.url === "about:blank");
@@ -158,10 +178,23 @@ async function assess(reg) {
     if (tab.frozen) return "frozen";
     if (tab.status === "loading") return "loading";
     return "ready";
-  } catch { return "missing"; }
+  } catch { return "needsReauthorization"; }
 }
 async function refreshRegistrations() {
-  for (const reg of registrations) reg.availability = await assess(reg);
+  const missing = new Set();
+  for (const reg of [...registrations]) {
+    const availability = await assess(reg);
+    if (availability === "missing") missing.add(reg.registrationId);
+    else reg.availability = availability;
+  }
+  if (missing.size) {
+    // Filter the current array: an async refresh must never resurrect removed tabs
+    // or discard registrations added while the availability checks were pending.
+    registrations = registrations.filter(reg => !missing.has(reg.registrationId));
+    await persist();
+    return true;
+  }
+  return false;
 }
 async function advertise() {
   await refreshRegistrations();
@@ -700,7 +733,9 @@ async function register(tabId, alias) {
   await advertise();
 }
 async function unregister(tabId) {
+  const previousCount = registrations.length;
   registrations = registrations.filter(r => r.tabId !== tabId);
+  if (registrations.length === previousCount) return;
   await persist();
   await advertise();
 }
@@ -713,7 +748,8 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
   (async () => {
     await initialize();
     if (message.kind === "getState") {
-      await refreshRegistrations();
+      const removed = await refreshRegistrations();
+      if (removed && connected) send({ kind: "registrations", tabs: registrations.map(safeState) });
       return { connected, paired: Boolean(secret), port: configuredPort,
         allowAgentCreatedTabs,
         registrations: registrations.map(r => ({ ...safeState(r), tabId: r.tabId })),
@@ -769,12 +805,12 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
             e => respond({ ok: false, error: String(e.message || e) }));
   return true;
 });
-async function observeNavigation(tabId, url, removed = false) {
+async function observeNavigation(tabId, url) {
   let changed = false;
   for (const r of registrations) {
     if (r.tabId === tabId &&
-        (removed || (url && (r.agentCreated ?
-          !isAllowedUrl(url) || new URL(url).origin !== r.boundOrigin : r.boundUrl !== url)))) {
+        url && (r.agentCreated ?
+          !isAllowedUrl(url) || new URL(url).origin !== r.boundOrigin : r.boundUrl !== url)) {
       r.blocked = true;
       changed = true;
     }
@@ -791,7 +827,7 @@ chrome.windows.onRemoved.addListener(windowId => {
   void persistWindows(); void advertiseWindows(); void advertise();
 });
 chrome.tabs.onRemoved.addListener((tabId) => {
-  void observeNavigation(tabId, null, true);
+  void unregister(tabId);
 });
 chrome.webNavigation?.onHistoryStateUpdated?.addListener((details) => {
   if (details.frameId === 0) void observeNavigation(details.tabId, details.url);

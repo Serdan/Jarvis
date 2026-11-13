@@ -2026,7 +2026,9 @@ let ``concurrent SQLite correction and admission cannot both pass`` () =
 let ``benchmark hundred durable SQLite admissions and authenticated terminal receipts`` () =
     withStore (fun store ->
         let stopwatch = System.Diagnostics.Stopwatch.StartNew()
+        let latencies = ResizeArray<float>()
         for i in 1 .. 100 do
+            let started = System.Diagnostics.Stopwatch.GetTimestamp()
             let req = beginWitness store "alice" "Worker 3"
             let correlation = sprintf "corr-%d" i
             match store.TryMarkAgentDispatched(
@@ -2038,12 +2040,15 @@ let ``benchmark hundred durable SQLite admissions and authenticated terminal rec
                 "alice", "connection-1", 1L, correlation) with
             | Ok receipt -> Assert.That(receipt, Is.EqualTo(Some req.Id))
             | Error error -> Assert.Fail(error)
+            latencies.Add(System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds)
         stopwatch.Stop()
         Assert.That(store.CountUnresolvedAgentExecutions("alice", "Worker 3"), Is.Zero)
+        let ordered = latencies |> Seq.sort |> Seq.toArray
+        let p95 = ordered[94]
         TestContext.Out.WriteLine(
-            sprintf "100 durable SQLite admissions/routes/terminals: %.1f ms total, %.2f ms/call"
+            sprintf "100 durable SQLite admissions/routes/terminals: %.1f ms total, %.2f ms/call, p95 %.2f ms"
                 stopwatch.Elapsed.TotalMilliseconds
-                (stopwatch.Elapsed.TotalMilliseconds / 100.)))
+                (stopwatch.Elapsed.TotalMilliseconds / 100.) p95))
 
 [<Test>]
 let ``existing feedback database migrates without losing records`` () =

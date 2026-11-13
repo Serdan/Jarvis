@@ -421,3 +421,13 @@ injected SQLite terminal-update failure with late exact recovery.
 The production legacy drain, process-tree proof, independent frozen
 review and performance acceptance gates remain open. No shared
 integration or deployment has occurred.
+
+### Local 100-operation witness microbenchmark (2026-11-13)
+
+The explicit .NET 11 Release SQLite test ran 100 admission,
+authenticated dispatch-route and ordinary terminal receipt cycles
+in 52.0 ms total (0.52 ms/call mean; 0.45 ms p95 per operation).
+The fixture verifies zero unresolved witnesses at completion.
+This is a local SQLite microbenchmark, not end-to-end MCP or
+SignalR latency; a separate 100-call routed benchmark with p95
+remains a review/acceptance requirement.

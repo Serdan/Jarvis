@@ -1744,7 +1744,6 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
     member _.RunInputLoop(cancellationToken: CancellationToken) =
         task {
             let decoder = Decoder()
-            use tracking = Tracking.enable()
             render()
 
             while not shouldQuit && not cancellationToken.IsCancellationRequested do

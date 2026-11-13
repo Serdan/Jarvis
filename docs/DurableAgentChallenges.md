@@ -41,6 +41,12 @@ The self-`agent_inbox` includes snapshot-consistent, bounded challenge sections:
 
 Writes use an optional caller-stable operation UUID. A new challenge ID is the create operation UUID in N format; condition IDs derive deterministically from it and their positions. Splitting one Pending condition into two or more parts retains its original ID for the first part and derives all additional IDs from the split operation UUID; the old description and evidence remain in immutable history. The issuer or an explicitly subscribed dispatcher of unassigned work may split, without changing canonical task ownership. A retry with the **same operation ID and exact arguments** returns the original durable receipt without executing another transition. Reusing an operation ID with different arguments is rejected. Mutations compare the exact challenge version; task/attempt transitions compare task, attempt, agent versions and assignment generation. Competing clients must reread stale versions.
 
+### Persistent Lead-role instruction for rollout
+
+Include this instruction in the persisted Lead role when the role system is integrated:
+
+> Subscribe once to unassigned challenge conditions in each Jarvis project you lead using `set_challenge_subscription(subscribed: true)`. On each self-inbox, promptly triage unassigned challenges. Assign a registered condition owner, or split a broad condition into smaller work items using the challenge's current version and atomic dispatch tools. Treat stale-version results as a signal to reread and retry intentionally. A Lead subscription is an ordinary opt-in, not a privileged agent identity. Do not rely on notifications to drive challenge work.
+
 ## Ledger records
 
 Challenge records and events live on the existing verified orphan Git ledger branch, independent of source branches:

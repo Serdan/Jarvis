@@ -648,6 +648,7 @@ module ReviewWorkflow =
     // an occupied owner or enters Working.
     let private reconcileEligibleOnRelease binding snapshot (operationId: Guid) actor
                                          (released: ReviewAgent) = result {
+        let ownerId = released.AgentId
         if not (isNull (box released.CurrentAssignment))
            || released.Execution <> "Stopped"
            || released.UnassignedDisposition <> "NeedsWork" then
@@ -668,14 +669,14 @@ module ReviewWorkflow =
                     let! wait, waitOid = required<AttemptChallengeWait> binding snapshot file
                     if file <> challengeWaitPath wait.TaskId wait.AttemptId then
                         return! Error(LedgerIntegrityError "Challenge wait path/identity mismatch.")
-                    if wait.OwnerAgentId = actor && wait.Status = "Eligible" then
+                    if wait.OwnerAgentId = ownerId && wait.Status = "Eligible" then
                         let! task, _ = required<ReviewTask> binding snapshot (taskPath wait.TaskId)
                         let! attempt, attemptOid =
                             required<ReviewAttempt> binding snapshot (attemptPath wait.TaskId wait.AttemptId)
                         if task.Lifecycle = "InProgress" && task.AttemptId = wait.AttemptId
                            && attempt.TaskId = wait.TaskId
                            && attempt.AttemptId = wait.AttemptId
-                           && attempt.OwnerAgentId = actor && attempt.Phase = "Blocked" then
+                           && attempt.OwnerAgentId = ownerId && attempt.Phase = "Blocked" then
                             let mutable satisfied = not (List.isEmpty wait.ChallengeIds)
                             for dependency in wait.ChallengeIds do
                                 match Guid.TryParseExact(dependency, "N") with
@@ -730,7 +731,7 @@ module ReviewWorkflow =
                                       ActorId = actor; Reason = reason
                                       PreviousLifecycle = task.Lifecycle; NewLifecycle = task.Lifecycle
                                       PreviousPhase = "Blocked"; NewPhase = "Queued"
-                                      PreviousOwnerId = actor; NewOwnerId = actor
+                                      PreviousOwnerId = ownerId; NewOwnerId = ownerId
                                       PreviousGeneration = attempt.AssignmentGeneration
                                       NewGeneration = generation
                                       ReviewRequestId = null
@@ -1794,7 +1795,7 @@ module ReviewWorkflow =
                                 StateReason = reason
                                 StateSequence = snapshot.Header.NextSequence }
                         let! nextAgent, wakeups =
-                            reconcileEligibleOnRelease binding snapshot operationId agentId released
+                            reconcileEligibleOnRelease binding snapshot operationId actor released
                         return [ change (agentPath agentId) (Some agentOid) nextAgent ] @ wakeups
                     })
 
@@ -2144,7 +2145,7 @@ module ReviewWorkflow =
 
     // Only clear a focus that still belongs to this attempt. Never interrupt
     // an owner's newer assignment, or turn agent Parked into an attempt phase.
-    let private clearAdministrativeFocus binding snapshot (attempt: ReviewAttempt) expectedAgentVersion reason operationId =
+    let private clearAdministrativeFocus binding snapshot (attempt: ReviewAttempt) expectedAgentVersion reason operationId actor =
         result {
             let! agent, agentOid = required<ReviewAgent> binding snapshot (agentPath attempt.OwnerAgentId)
             if agent.Version <> expectedAgentVersion then
@@ -2172,7 +2173,7 @@ module ReviewWorkflow =
                         { updated with Version = agent.Version + 1
                                        StateReason = reason; StateSequence = snapshot.Header.NextSequence }
                 let! nextAgent, wakeups =
-                    reconcileEligibleOnRelease binding snapshot operationId attempt.OwnerAgentId released
+                    reconcileEligibleOnRelease binding snapshot operationId actor released
                 return [ change (agentPath attempt.OwnerAgentId) (Some agentOid) nextAgent ] @ wakeups
         }
 
@@ -2226,7 +2227,7 @@ module ReviewWorkflow =
                                              Version = agent.Version + 1
                                              StateReason = reason
                                              StateSequence = snapshot.Header.NextSequence } ]
-                        else clearAdministrativeFocus binding snapshot attempt expectedAgentVersion reason operationId
+                        else clearAdministrativeFocus binding snapshot attempt expectedAgentVersion reason operationId actor
                     let nextPhase =
                         match action with
                         | "ParkAttempt" -> "Deferred" | "BlockAttempt" -> "Blocked"
@@ -2328,7 +2329,7 @@ module ReviewWorkflow =
                        || not (String.IsNullOrWhiteSpace nextOwnerAgent.ActiveAttemptId) then
                         return! Error(AgentBusy "New owner is not idle.")
                     let! previousAgentChanges =
-                        clearAdministrativeFocus binding snapshot attempt expectedAgentVersion reason operationId
+                        clearAdministrativeFocus binding snapshot attempt expectedAgentVersion reason operationId actor
                     let next =
                         { attempt with AttemptId = newId; Version = 1
                                        OwnerAgentId = newOwner; Phase = "Queued"

@@ -1,6 +1,6 @@
 # Jarvis Browser Bridge — System Specification
 
-**Status:** Browser bridge, registered-window launch, safe tab close, and one-shot/recurring scheduling implemented on this unmerged worktree; **live Edge acceptance and deployment pending**
+**Status:** Browser Bridge deployed and live-tested with Edge/ChatGPT on 2026-11-13. Original design/history sections below may still refer to predeployment plans.
 **Scope:** Jarvis server, JarvisClient, Chromium extension, and project-owned JavaScript scripts
 **Initial implementation worktree:** `Jarvis::browser-bridge` (`feature/browser-bridge`)
 **Related task:** [Local browser bridge and MCP command routing](tasks/2026-10-26-browser-bridge-jarvis.html)
@@ -243,8 +243,8 @@ Closes **only a tab created by Jarvis in a registered window**, using the exact 
 {
   "windowRegistration": "agents",
   "url": "https://chatgpt.com/",
-  "projectName": "Userscripts",
-  "scriptPath": "chatgpt/launchAgent.js",
+  "projectName": "Jarvis",
+  "scriptPath": "browser-scripts/chatgpt/launchAgent.js",
   "argsJson": "{\"prompt\":\"Start a new session and read current Jarvis assignment.\"}",
   "active": false,
   "closeTabAfterExecution": true,
@@ -254,9 +254,9 @@ Closes **only a tab created by Jarvis in a registered window**, using the exact 
 
 This **generic** composite command is the preferred single call for an orchestrator that wants to launch a fresh agent immediately. JarvisClient performs `open → await ready → execute project script → capture result → close created tab`, using the same extension validation as the separate tools. The page JavaScript **does not** need privileged window/tab APIs and cannot choose or close arbitrary browser tabs.
 
-The client distinguishes `notSubmitted`, `submitted`, and `outcomeUnknown` **when the project script exposes those semantics**; for a generic script, use completed/failed/uncertain execution results without pretending it submitted ChatGPT content. After confirmed completion, close the newly created tab when `closeTabAfterExecution` is true. On a definitive pre-dispatch failure, cleanup is safe; after an ambiguous send, preserve the tab for inspection unless an explicit separate close is requested. Report script outcome and cleanup outcome separately. Never automatically repeat a possible page-side effect.
+Only an explicit `TabUnavailable:loading` denial from the extension's pre-injection readiness check may be retried within the bounded readiness window; an ambiguous send, execution timeout, or other post-dispatch outcome is never retried. The client distinguishes `notSubmitted`, `submitted`, and `outcomeUnknown` **when the project script exposes those semantics**; for a generic script, use completed/failed/uncertain execution results without pretending it submitted ChatGPT content. After confirmed completion, close the newly created tab when `closeTabAfterExecution` is true. On a definitive pre-dispatch failure, cleanup is safe; after an ambiguous send, preserve the tab for inspection unless an explicit separate close is requested. Report script outcome and cleanup outcome separately. Never automatically repeat a possible page-side effect.
 
-`closeTabAfterExecution` defaults **false** for compatibility with existing generic operations, but the ChatGPT launcher supplies **true**. A successful submission is **not** a completed Jarvis task.
+`BrowserRunInNewTab` defaults `closeTabAfterExecution` to **true**. Set it to **false** when you want to inspect the new conversation in Edge. A successful submission is **not** a completed Jarvis task.
 
 The delayed scheduler's due-time callback should reuse the same underlying open/execute/close service rather than reimplementing a second browser launcher. `ScheduleBrowserExecution` gains `windowRegistration` and optional `closeTabAfterExecution`; new schedules must name an authorized window. Existing persisted schedules without a window target must surface a clear reconfiguration-needed state, not silently select the active window.
 

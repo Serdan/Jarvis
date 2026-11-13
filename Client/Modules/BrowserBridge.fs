@@ -690,9 +690,25 @@ let runInNewTab (bridge: Service) (windowRegistration: string) (url: string)
                 if String.IsNullOrWhiteSpace(registrationId) then
                     return Error("", "OutcomeUnknown: created tab response lacked registration ID")
                 else
+                    // Readiness advertised by the extension is not atomic with
+                    // Chrome's live tab status. A page can start another load
+                    // between ListTabs and the extension's execute preflight.
+                    let readinessStarted = Stopwatch.GetTimestamp()
+                    let withinReadinessBudget () =
+                        Stopwatch.GetElapsedTime(readinessStarted) < TimeSpan.FromSeconds(30.0)
+                    let cleanupNotReady () = task {
+                        // No user script was injected; cleanup cannot cancel a submission.
+                        if closeAfterExecution then
+                            match! bridge.CloseTab(registrationId) with
+                            | Ok _ -> return Error(registrationId, "TabNotReady; cleanup=closed")
+                            | Error e ->
+                                let safe = if e.Length > 100 then e.Substring(0, 100) else e
+                                return Error(registrationId, "TabNotReady; cleanupFailed:" + safe)
+                        else
+                            return Error(registrationId, "TabNotReady; cleanup=retained")
+                    }
                     let mutable ready = false
-                    let mutable attempts = 0
-                    while not ready && attempts < 60 do
+                    while not ready && withinReadinessBudget() do
                         match bridge.ListTabs() with
                         | Ok listing ->
                             use listDoc = JsonDocument.Parse(listing)
@@ -701,24 +717,27 @@ let runInNewTab (bridge: Service) (windowRegistration: string) (url: string)
                                          tab.GetProperty("registrationId").GetString() = registrationId &&
                                          tab.GetProperty("availability").GetString() = "ready")
                         | Error _ -> ()
-                        if not ready then
-                            attempts <- attempts + 1
-                            do! Task.Delay(500)
+                        if not ready then do! Task.Delay(500)
                     if not ready then
-                        // No page script was dispatched; cleanup cannot interrupt a submission.
-                        if closeAfterExecution then
-                            match! bridge.CloseTab(registrationId) with
-                            | Ok _ -> return Error(registrationId, "TabNotReady; cleanup=closed")
-                            | Error e ->
-                                // Report that an owned tab may remain instead of
-                                // silently discarding a failed cleanup attempt.
-                                let safe = if e.Length > 100 then e.Substring(0, 100) else e
-                                return Error(registrationId, "TabNotReady; cleanupFailed:" + safe)
-                        else
-                            return Error(registrationId, "TabNotReady; cleanup=retained")
+                        return! cleanupNotReady()
                     else
-                        let! script = bridge.Execute(registrationId, source, argsJson, timeoutMs, false)
+                        // These two exact errors are emitted only BEFORE script
+                        // injection (Service.Execute's local preflight or the
+                        // extension's assess() preflight). They are safe to retry.
+                        // All post-dispatch errors remain uncertain: NEVER replay.
+                        let isLoadingPreflight = function
+                            | "TabUnavailable:loading"
+                            | "BrowserExecutionError:TabUnavailable:loading" -> true
+                            | _ -> false
+                        let mutable execution : Result<string, string> option = None
+                        while execution.IsNone && withinReadinessBudget() do
+                            let! attempt = bridge.Execute(registrationId, source, argsJson, timeoutMs, false)
+                            match attempt with
+                            | Error e when isLoadingPreflight e -> do! Task.Delay(500)
+                            | _ -> execution <- Some attempt
+                        let script = defaultArg execution (Error "TabUnavailable:loading")
                         match script with
+                        | Error e when isLoadingPreflight e -> return! cleanupNotReady()
                         | Error e -> return Error(registrationId, "OutcomeUnknown: " + e)
                         | Ok result ->
                             use doc = JsonDocument.Parse(result)

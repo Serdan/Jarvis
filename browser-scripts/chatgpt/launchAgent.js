@@ -70,6 +70,10 @@ async function execute(args) {
   const sendSelector = 'button[type="submit"][aria-label="Send"]:not(:disabled)';
   const initialUrl = location.href;
   const initialTurns = document.querySelectorAll('[data-message-author-role="user"]').length;
+  // Current ChatGPT renders user messages under data-user-message-bubble,
+  // without the older data-message-author-role marker.
+  const initialBubbles = document.querySelectorAll('[data-user-message-bubble]').length;
+  const normalizedPrompt = prompt.replace(/\r\n/g, "\n").replace(/\u00a0/g, " ").trim();
   const composer = await until(() => document.querySelector(composerSelector));
   if (!composer) return incompatible("composer", "ComposerUnavailable");
   const readEditor = () => composer.innerText.replace(/\r\n/g, "\n").replace(/\u00a0/g, " ");
@@ -96,14 +100,21 @@ async function execute(args) {
   }
 
   const evidence = await until(() => {
-    const newUserTurn = document.querySelectorAll('[data-message-author-role="user"]').length > initialTurns;
+    const legacyTurn = document.querySelectorAll('[data-message-author-role="user"]').length > initialTurns;
+    // Match the actual newly rendered user bubble, not a sidebar title or
+    // arbitrary page text. Never include prompt content in diagnostics.
+    const matchingBubble = Array.from(document.querySelectorAll('[data-user-message-bubble]'))
+      .slice(initialBubbles)
+      .some(bubble => (bubble.innerText || "").replace(/\r\n/g, "\n").replace(/\u00a0/g, " ").trim() === normalizedPrompt);
+    const newUserTurn = legacyTurn || matchingBubble;
     const routeChanged = location.href !== initialUrl && location.origin === new URL(startUrl).origin;
     const composerCleared = readEditor().trim().length === 0;
-    // A new user turn is positive evidence. Some ChatGPT builds only expose route
-    // transition plus cleared composer and a visible generation control.
+    // Some builds only expose route transition plus cleared composer and a
+    // generation control. A matching user bubble is stronger evidence even if
+    // generation already completed before acknowledgement was checked.
     const generating = Boolean(document.querySelector('[aria-label="Stop generating"], [data-testid="stop-button"]'));
     if (newUserTurn || (routeChanged && composerCleared && generating)) {
-      return { newUserTurn, routeChanged };
+      return { newUserTurn, routeChanged, matchingBubble };
     }
     return null;
   });
@@ -114,7 +125,10 @@ async function execute(args) {
   const conversationUrl = await until(() => {
     if (location.origin !== new URL(startUrl).origin) return null;
     const current = new URL(location.href);
-    if (!/^\/c\/[^/]+\/?$/.test(current.pathname)) return null;
+    // ChatGPT can first navigate to a temporary /c/local-chatgpt:... route.
+    // Only the server-issued UUID is a durable conversation URL. Closing
+    // an agent tab on the optimistic route risks interrupting creation.
+    if (!/^\/c\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\/?$/i.test(current.pathname)) return null;
     current.search = "";
     current.hash = "";
     return current.href;
@@ -125,6 +139,7 @@ async function execute(args) {
     conversationUrl,
     evidence: [
       ...(evidence.newUserTurn ? ["newUserTurn"] : []),
+      ...(evidence.matchingBubble ? ["matchingUserBubble"] : []),
       "conversationRoute"
     ],
     submittedAtUtc: new Date().toISOString()

@@ -1,9 +1,9 @@
 # ChatGPT Ephemeral Agent Launcher — Design Specification
 
-**Status:** Implemented on `feature/browser-bridge`; **not yet deployed or verified in live Edge/ChatGPT**
-**Worktree:** `Jarvis::browser-bridge` (`feature/browser-bridge`)
+**Status:** Browser Bridge deployed and live-tested with Edge/ChatGPT on 2026-11-13; one-command readiness and acknowledgement reliability improvements under review.
+**Implementation:** `browser-scripts/chatgpt/launchAgent.js` and `Client/Modules/BrowserBridge.fs`
 **Depends on:** [Browser bridge](BrowserBridgeSystem.md), [implemented one-shot scheduler](BrowserOneShotScheduler.md)
-**Scope:** User-registered browser-window targets, a generic immediate open/execute/close operation, project-owned ChatGPT UI automation, and optional scheduled repetition. These additions are specified here but **not yet implemented**.
+**Scope:** User-registered browser-window targets, the implemented immediate open/execute/optional-close operation, project-owned ChatGPT UI automation, and optional scheduling.
 
 ## 1. Objective
 
@@ -44,7 +44,7 @@ This is primarily a **project-owned script** on the generic browser bridge, not 
 6. Existing one-shot scheduling gains `windowRegistration`, uses the shared immediate workflow, and optional **recurring fixed-interval schedules** may launch later. Scheduling is not needed for immediate orchestrator handoffs.
 7. Documentation and regression tests spanning UI changes, window revocation/restart, duplicate dispatch, permissions, registration capacity, and live Edge.
 
-The registered-window workflow, immediate composite operation, safe tab-close and recurrence are implemented with simulated tests. **Live Edge/ChatGPT acceptance is not yet complete; no deployment, merge or rollout has occurred.**
+The registered-window workflow, immediate composite operation, safe tab-close and recurrence are deployed. Live Edge testing on 2026-11-13 successfully sent one greeting and observed a response; that test also exposed a tab-loading race and false-negative submission acknowledgement, addressed by isolated regression fixes.
 
 ## 3. Architecture and ownership
 
@@ -87,8 +87,8 @@ Example **implemented immediate command**:
 {
   "windowRegistration": "agents",
   "url": "https://chatgpt.com/",
-  "projectName": "Userscripts",
-  "scriptPath": "chatgpt/launchAgent.js",
+  "projectName": "Jarvis",
+  "scriptPath": "browser-scripts/chatgpt/launchAgent.js",
   "argsJson": "{\"role\":\"worker\",\"agentId\":\"3\",\"projectName\":\"Wayfold\",\"prompt\":\"You are Worker 3. Read the latest Jarvis assignment, relevant AGENTS.md, task and spec. Follow current instructions and continue the assigned work; do not assume previous conversation state. End with the required checkpoint/Next line.\"}",
   "active": false,
   "closeTabAfterExecution": true
@@ -119,7 +119,7 @@ Prefer the account's already configured UI defaults when the caller does not spe
 ### 5.1 Tab readiness
 
 - Open a **new** agent-created tab **in the specified user-registered browser window** on the separately approved `chatgpt.com` origin. Do not claim, enumerate, or alter existing unregistered tabs.
-- Await a ready registration/document; the extension rechecks current origin and identity before execution.
+- Await a ready registration/document; the extension rechecks current origin and identity before execution. A subsequent explicit `TabUnavailable:loading` from the extension's **pre-injection check** is safe to retry within the 30-second readiness budget. Never retry an uncertain or post-injection failure.
 - The script must wait for React/ProseMirror hydration and composer availability with a bounded deadline; merely finding a DOM node before hydration is insufficient.
 - Support background tabs by default, but test behavior under Chromium background throttling. Configurable `active=true` exists for diagnostics or an identified site limitation; don't steal focus unconditionally.
 - Reject ChatGPT login, challenge, error, suspended account, wrong project/GPT, permission prompts, or otherwise blocked UI states when detectable. Report actionable categories; do not attempt to bypass a challenge.
@@ -185,20 +185,20 @@ Allow narrowly scoped, ordered fallback selectors only when empirically verified
 
 ### 5.5 Launch acknowledgement and conversation URL
 
-After the click, wait within the **single overall UI deadline** for positive evidence that the turn was accepted. Examples to verify in live Edge:
+After the click, wait within the **single overall UI deadline** for positive evidence that the turn was accepted. Current ChatGPT user turns are marked by `[data-user-message-bubble]` (the old `[data-message-author-role="user"]` may not exist). Match the newly added bubble's rendered text against the submitted prompt; do not infer success from a sidebar title or URL alone. This remains valid when model generation has already finished. Examples to verify in live Edge:
 - A new ChatGPT conversation route becomes visible in `location.href`, including project/GPT-specific route shapes (not exclusively `/c/<id>`).
 - A new user-message turn appears in the conversation and the composer has transitioned to a submitted/empty or generating state.
 - Other observable stable UI transition proven to indicate submission, not merely a button click.
 
 A changing URL alone can mean routing without submission, so route change is **not** proof unless accompanied by an appropriate post-submit state. Similarly, the editor clearing alone should not be treated as the only proof. The implementation should define an evidence precedence and test it against live ChatGPT.
 
-After submission evidence, **continue waiting for the actual new `/c/<conversation-id>` URL** before returning `submitted` or allowing automatic tab closure. An acknowledged user turn without a stable route is `outcomeUnknown` (`ConversationUrlUnavailable`) and retains the tab; never invent a URL or resubmit. On success return:
+After submission evidence, **continue waiting for the actual server-issued `/c/<conversation-UUID>` URL** before returning `submitted` or allowing automatic tab closure. ChatGPT can first navigate to an optimistic `/c/local-chatgpt:...` route (percent-encoded in the address bar); that temporary route is **not** proof of a durable conversation. An acknowledged user turn without a stable route is `outcomeUnknown` (`ConversationUrlUnavailable`) and retains the tab; never invent a URL or resubmit. On success return:
 
 ```json
 {
   "status": "submitted",
   "conversationUrl": "https://chatgpt.com/c/illustrative-id",
-  "evidence": ["newUserTurn", "conversationRoute"],
+  "evidence": ["newUserTurn", "matchingUserBubble", "conversationRoute"],
   "submittedAtUtc": "2026-10-30T00:00:00Z"
 }
 ```
@@ -277,8 +277,8 @@ Add an explicit repeat mode (e.g. `repeatEverySeconds`) without changing one-sho
   "repeatEverySeconds": 3600,
   "windowRegistration": "agents",
   "url": "https://chatgpt.com/",
-  "projectName": "Userscripts",
-  "scriptPath": "chatgpt/launchAgent.js",
+  "projectName": "Jarvis",
+  "scriptPath": "browser-scripts/chatgpt/launchAgent.js",
   "argsJson": "{\"role\":\"orchestrator\",\"prompt\":\"Start a fresh orchestration pass. Read Jarvis activity and task state first; if an orchestrator is already active, exit without taking work.\"}",
   "closeTabAfterExecution": true,
   "active": false

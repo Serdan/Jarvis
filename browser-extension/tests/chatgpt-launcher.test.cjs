@@ -10,6 +10,7 @@ function harness(options = {}) {
   const site = { origin: "https://chatgpt.com", href: options.startUrl || "https://chatgpt.com/" };
   let content = options.existingDraft || "";
   let userTurns = 0;
+  let renderedBubble = null;
   let clicks = 0;
   let focused = false;
   let mode = options.initialMode || "Chat";
@@ -37,9 +38,18 @@ function harness(options = {}) {
   const send = { click() {
     clicks++;
     if (options.noAcknowledgement) return;
+    if (options.optimisticLocalRoute) {
+      site.href = "https://chatgpt.com/c/local-chatgpt%3Aclient-only-placeholder";
+    }
     if (!options.noRoute) setTimeout(() => { site.href = "https://chatgpt.com/c/00000000-0000-0000-0000-000000000001"; }, options.routeDelayMs || 0);
+    const submittedText = content;
     content = "";
     userTurns++;
+    if (options.renderUserBubble) {
+      setTimeout(() => {
+        renderedBubble = options.bubbleTextOverride ?? submittedText;
+      }, options.bubbleDelayMs || 0);
+    }
   }};
   const document = {
     readyState: "complete",
@@ -68,7 +78,11 @@ function harness(options = {}) {
       if (selector === 'button[type="button"][aria-pressed]') {
         return options.noModeToggle ? [] : [chatMode, workMode];
       }
-      return selector.includes('data-message-author-role="user"') ? Array(userTurns).fill({}) : [];
+      if (selector === '[data-user-message-bubble]') {
+        return renderedBubble === null ? [] : [{ innerText: renderedBubble }];
+      }
+      return selector.includes('data-message-author-role="user"') && !options.noLegacyTurnMarkers
+        ? Array(userTurns).fill({}) : [];
     }
   };
   const ctx = vm.createContext({ document, location: site, setTimeout, Date, URL });
@@ -217,4 +231,66 @@ test("unexpected pre-send DOM exception returns incompatibility without leaking 
   assert.equal(result.stage, "unexpected");
   assert.equal(h.clicks, 0);
   assert.equal(JSON.stringify(result).includes("PRIVATE PROMPT"), false);
+});
+
+
+test("current ChatGPT user bubble confirms successful delivery after generation already finished", async () => {
+  const h = harness({
+    noLegacyTurnMarkers: true, renderUserBubble: true,
+    routeDelayMs: 10, bubbleDelayMs: 80
+  });
+  const result = await h.run("Hi, ChatGPT!");
+  assert.equal(result.status, "submitted");
+  assert.equal(result.conversationUrl, h.site.href);
+  assert.deepEqual(Array.from(result.evidence),
+    ["newUserTurn", "matchingUserBubble", "conversationRoute"]);
+  assert.equal(h.clicks, 1);
+});
+
+test("different user bubble and changed route cannot falsely confirm prompt delivery", async () => {
+  const h = harness({
+    noLegacyTurnMarkers: true, renderUserBubble: true,
+    bubbleTextOverride: "Someone else's message", timeoutMs: 160
+  });
+  const result = await h.run("Hi, ChatGPT!");
+  assert.equal(result.status, "outcomeUnknown");
+  assert.equal(result.reason, "SubmissionUnconfirmed");
+  assert.equal(h.clicks, 1);
+  assert.equal(JSON.stringify(result).includes("Hi, ChatGPT!"), false);
+});
+
+test("a delayed route still resolves after current ChatGPT renders the matching user bubble", async () => {
+  const h = harness({
+    noLegacyTurnMarkers: true, renderUserBubble: true,
+    bubbleDelayMs: 10, routeDelayMs: 135
+  });
+  const result = await h.run("Hi, ChatGPT!");
+  assert.equal(result.status, "submitted");
+  assert.equal(result.conversationUrl, h.site.href);
+  assert.equal(h.clicks, 1);
+});
+
+
+test("waits through optimistic local-chatgpt URL until a server-issued conversation UUID exists", async () => {
+  const h = harness({
+    noLegacyTurnMarkers: true, renderUserBubble: true,
+    optimisticLocalRoute: true, routeDelayMs: 180, bubbleDelayMs: 5
+  });
+  const result = await h.run("Hi, ChatGPT!");
+  assert.equal(result.status, "submitted");
+  assert.equal(result.conversationUrl,
+    "https://chatgpt.com/c/00000000-0000-0000-0000-000000000001");
+  assert.equal(h.clicks, 1);
+});
+
+test("only a client-local temporary conversation route is still uncertain and cannot close the tab", async () => {
+  const h = harness({
+    noLegacyTurnMarkers: true, renderUserBubble: true,
+    optimisticLocalRoute: true, noRoute: true, timeoutMs: 170
+  });
+  const result = await h.run("Hi, ChatGPT!");
+  assert.equal(result.status, "outcomeUnknown");
+  assert.equal(result.reason, "ConversationUrlUnavailable");
+  assert.equal(h.clicks, 1);
+  assert.equal(result.conversationUrl, undefined);
 });

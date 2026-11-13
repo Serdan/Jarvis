@@ -305,6 +305,100 @@ let immediateLaunchUsesRegisteredWindowAndClosesOnlyCreatedTab () = task {
         Assert.That(json, Does.Contain("https://chatgpt.com/c/test"))
 }
 
+
+[<Test>]
+let compositeLaunchRetriesOnlyConfirmedPreInjectionLoadingFailures () = task {
+    let port = findPort()
+    use bridge = new BrowserBridge.Service(port, "test-secret")
+    bridge.Start()
+    let! client, connectionId = handshake port "test-secret"
+    use socket = client
+    let launch = BrowserBridge.runInNewTab bridge "agents" "https://chatgpt.com/" "" false
+                     "async function execute(args) { return { status: 'submitted' }; }"
+                     """{"prompt":"Hi"}""" 5000 false
+    let! opened = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
+    Assert.That(property opened "kind", Is.EqualTo("openTab"))
+
+    // New tab advertises loading before navigating; composite must not inject
+    // until it observes ready, even if tabOpened was already acknowledged.
+    do! send socket """{"version":2,"kind":"registrations","tabs":[{"registrationId":"retry-tab","availability":"loading","registrationGeneration":1}]}"""
+    do! send socket (JsonSerializer.Serialize({|
+        version = 2; kind = "tabOpened"; requestId = property opened "requestId"
+        connectionId = connectionId
+        tab = {| registrationId = "retry-tab"; availability = "loading"; agentCreated = true |}
+    |}))
+    do! Task.Delay(80)
+    do! send socket """{"version":2,"kind":"registrations","tabs":[{"registrationId":"retry-tab","availability":"ready","registrationGeneration":1}]}"""
+    let! firstExecute = (receive socket).WaitAsync(TimeSpan.FromSeconds(4.0))
+    Assert.That(property firstExecute "kind", Is.EqualTo("executeJs"))
+    Assert.That(property firstExecute "registrationId", Is.EqualTo("retry-tab"))
+
+    // Chrome navigated again just after ListTabs returned ready. The real
+    // extension checks availability before injecting and explicitly rejects.
+    // This negative acknowledgement is safe to retry, unlike a transport
+    // timeout or an exception after script execution.
+    do! send socket (JsonSerializer.Serialize({|
+        version = 2; kind = "error"; error = "TabUnavailable:loading"
+        requestId = property firstExecute "requestId"; connectionId = connectionId
+        registrationId = "retry-tab"; registrationGeneration = 1
+    |}))
+    let! retryExecute = (receive socket).WaitAsync(TimeSpan.FromSeconds(4.0))
+    Assert.That(property retryExecute "kind", Is.EqualTo("executeJs"))
+    Assert.That(property retryExecute "registrationId", Is.EqualTo("retry-tab"))
+    Assert.That(property retryExecute "requestId", Is.Not.EqualTo(property firstExecute "requestId"))
+    do! send socket (JsonSerializer.Serialize({|
+        version = 2; kind = "result"; requestId = property retryExecute "requestId"
+        connectionId = connectionId; registrationId = "retry-tab"
+        registrationGeneration = 1; status = "completed"
+        result = {| status = "submitted"; conversationUrl = "https://chatgpt.com/c/once" |}
+    |}))
+    let! result = launch
+    match result with
+    | Ok value ->
+        Assert.That(value, Does.Contain("submitted"))
+        Assert.That(value, Does.Contain("https://chatgpt.com/c/once"))
+        Assert.That(value, Does.Contain("retained"))
+    | Error (_, why) -> Assert.Fail("Pre-injection retry should succeed: " + why)
+}
+
+
+[<Test>]
+let compositeLaunchNeverReplaysUncertainPostInjectionOutcome () = task {
+    let port = findPort()
+    use bridge = new BrowserBridge.Service(port, "test-secret")
+    bridge.Start()
+    let! client, connectionId = handshake port "test-secret"
+    use socket = client
+    let launch = BrowserBridge.runInNewTab bridge "agents" "https://chatgpt.com/" "" false
+                     "async function execute(args) { submitMessage(); return args; }" "{}" 5000 true
+    let! opened = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
+    do! send socket """{"version":2,"kind":"registrations","tabs":[{"registrationId":"uncertain-tab","availability":"ready","registrationGeneration":1}]}"""
+    do! send socket (JsonSerializer.Serialize({|
+        version = 2; kind = "tabOpened"; requestId = property opened "requestId"
+        connectionId = connectionId
+        tab = {| registrationId = "uncertain-tab"; availability = "ready"; agentCreated = true |}
+    |}))
+    let! executed = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
+    Assert.That(property executed "kind", Is.EqualTo("executeJs"))
+    // The extension may discover a registration change AFTER the JavaScript
+    // has already run. Never interpret this as a safe preflight or resubmit.
+    do! send socket (JsonSerializer.Serialize({|
+        version = 2; kind = "error"; error = "OutcomeUnknown:RegistrationChangedDuringExecution"
+        requestId = property executed "requestId"; connectionId = connectionId
+        registrationId = "uncertain-tab"; registrationGeneration = 1
+    |}))
+    let! outcome = launch.WaitAsync(TimeSpan.FromSeconds(3.0))
+    match outcome with
+    | Error (registrationId, why) ->
+        Assert.That(registrationId, Is.EqualTo("uncertain-tab"))
+        Assert.That(why, Does.Contain("OutcomeUnknown:RegistrationChangedDuringExecution"))
+        // Retain tab for manual reconciliation; never close after uncertain effects.
+        match bridge.ListTabs() with
+        | Ok listing -> Assert.That(listing, Does.Contain("uncertain-tab"))
+        | Error error -> Assert.Fail(error)
+    | Ok _ -> Assert.Fail("Post-dispatch unknown cannot be treated as a successful submission")
+}
+
 [<Test>]
 let compositeLaunchRejectsInvalidInputsBeforeOpeningTab () = task {
     let port = findPort()

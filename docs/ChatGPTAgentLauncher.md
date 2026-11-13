@@ -1,6 +1,6 @@
 # ChatGPT Ephemeral Agent Launcher — Design Specification
 
-**Status:** Browser Bridge deployed and live-tested with Edge/ChatGPT on 2026-11-13; one-command readiness and acknowledgement reliability improvements under review.
+**Status:** Browser Bridge deployed and live-tested with Edge/ChatGPT on 2026-11-13; one-command readiness and acknowledgement reliability accepted, integrated and live-tested. Thinking-effort enforcement is a separate independently reviewed addition.
 **Implementation:** `browser-scripts/chatgpt/launchAgent.js` and `Client/Modules/BrowserBridge.fs`
 **Depends on:** [Browser bridge](BrowserBridgeSystem.md), [implemented one-shot scheduler](BrowserOneShotScheduler.md)
 **Scope:** User-registered browser-window targets, the implemented immediate open/execute/optional-close operation, project-owned ChatGPT UI automation, and optional scheduling.
@@ -104,15 +104,21 @@ Recommended argument contract:
 | `prompt` | Yes | Exact bootstrap text to submit; nonempty, bounded, may contain newlines |
 | `role` / `agentId` / `projectName` | No | Caller-owned metadata for logs/correlation; **not** alternative sources of instructions |
 | `timeoutMs` | No | One overall UI deadline for hydration, insertion, submission confirmation and conversation URL capture (defaults to 27 s; capped at 27 s) |
+| `thinkingEffort` | No | Explicit `Instant`, `Medium`, `High`, or `Extra High`; select and verify before sending, or fail closed; omission preserves the UI default |
+| `preflightOnly` | No | When `true`, exercise mode, draft and effort preflight but never insert or send; returns `notSubmitted` / `PreflightOnly` with optional verified effort |
 | `debug` | No | Reserved for future diagnostics; the current script always returns only sanitized structural counts on compatibility errors |
 
 Jarvis browser-workflow parameters, **not** ChatGPT script arguments, control `windowRegistration`, `active`, `closeTabAfterExecution`, and device selection. Only **scheduled** calls have delay and repeat interval. An orchestrator normally invokes the immediate workflow, rather than scheduling a zero-delay job.
 
-**Fixed ChatGPT entry point:** `https://chatgpt.com/`. The ChatGPT-specific launcher does not accept alternate origins, Project URLs, GPT URLs, or existing conversation URLs. The generic bridge remains URL-agnostic, but callers of this script always supply the fixed URL. The script rejects an unexpected starting URL before typing. Model selection, project navigation and alternate entry points require a separate explicit feature if desired.
+**Fixed ChatGPT entry point:** `https://chatgpt.com/`. The ChatGPT-specific launcher does not accept alternate origins, Project URLs, GPT URLs, or existing conversation URLs. The generic bridge remains URL-agnostic, but callers of this script always supply the fixed URL. The script rejects an unexpected starting URL before typing. Explicit model selection, project navigation and alternate entry points require a separate feature if desired.
 
 ### Model and thinking effort
 
-Prefer the account's already configured UI defaults when the caller does not specify them. If supplied, a future explicit `model` or `thinkingEffort` option must be implemented as actual UI interaction + verification, not by forging backend parameters or assuming a saved setting. The initial launcher may omit this feature. Unsupported requested settings fail clearly instead of falling back silently.
+The launcher supports an explicit `thinkingEffort` argument: `Instant`, `Medium`, `High`, or `Extra High` (case, whitespace and hyphen variants are accepted). If omitted, the launch **does not change** the account's current effort. For unattended agents where quality matters, the orchestrator should explicitly pass `"thinkingEffort":"Extra High"` rather than rely on a persistent ChatGPT preference. The script does not select a different model; that remains a separate feature.
+
+After selecting **Chat** and confirming an empty composer, the launcher checks the unique `button[aria-label="Select ChatGPT model"]` and its rendered "Thinking effort" label. If different from the requested value, it opens the model picker, locates the visible `[role="menuitem"][aria-label="Power"][data-reasoning-slider="true"]` slider, and uses its advertised **ArrowLeft/ArrowRight** keyboard control. The currently observed UI exposes the four slider values `0..3` in the same order as the four labels above. Each step verifies the numerical slider value **and** rendered label; an unexpected range, unavailable/locked control, changed UI, or failed transition is an explicit **pre-send** incompatibility. New effort-specific polling has shorter per-stage deadlines so a failed selection is reported before the overall bridge execution timeout. The picker is closed via Escape only if still open, because clicking its trigger after the slider auto-closes can reopen it. The requested effort is checked again immediately before Send.
+
+The existing-draft guard runs **before any effort change** and again before insertion. No prompt is sent when a requested effort cannot be verified; there is no silent downgrade, guessed selection, private ChatGPT API call, or backend parameter forgery. On confirmed submission, `scriptResult.thinkingEffort` reports the explicitly verified label; it is omitted if the caller did not request an effort. For safe live verification without a conversation, pass `preflightOnly: true`; the script may adjust the requested effort but will not enter a prompt or click Send, returning `notSubmitted` / `PreflightOnly` and the verified `thinkingEffort`.
 
 ## 5. ChatGPT UI automation contract
 

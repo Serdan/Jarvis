@@ -6,6 +6,13 @@ async function execute(args) {
   if (typeof prompt !== "string" || !prompt.trim() || prompt.length > 24000) {
     return { status: "notSubmitted", reason: "InvalidPrompt" };
   }
+  const effortLabels = ["Instant", "Medium", "High", "Extra High"];
+  const rawEffort = args?.thinkingEffort;
+  const normalizedEffort = typeof rawEffort === "string"
+    ? rawEffort.trim().toLowerCase().replace(/[\s_-]/g, "") : null;
+  const effortIndex = rawEffort === undefined ? null
+    : effortLabels.findIndex(label => label.toLowerCase().replace(/\s/g, "") === normalizedEffort);
+  if (effortIndex === -1) return { status: "notSubmitted", reason: "InvalidThinkingEffort" };
   if (location.href !== startUrl) {
     return { status: "notSubmitted", reason: "UnexpectedStartUrl" };
   }
@@ -22,6 +29,17 @@ async function execute(args) {
     }
     return predicate();
   };
+  // Effort-selection failures must resolve well before the generic 30-second
+  // browser execution deadline; no possible Send has happened at this stage.
+  const untilWithin = async (predicate, maxMs) => {
+    const stop = Math.min(deadline, Date.now() + maxMs);
+    while (Date.now() < stop) {
+      const value = predicate();
+      if (value) return value;
+      await delay(Math.min(75, Math.max(1, stop - Date.now())));
+    }
+    return predicate();
+  };
   // No arbitrary DOM, innerHTML, draft text, or cookies leave the page.
   // Only bounded, structural selector observations useful for repairing the script.
   const selectorCounts = () => ({
@@ -32,7 +50,9 @@ async function execute(args) {
       .filter(button => button.textContent.trim() === "Work").length,
     composers: document.querySelectorAll('[data-composer-input-layout] [contenteditable="true"][role="textbox"]').length,
     editableTextboxes: document.querySelectorAll('[contenteditable="true"][role="textbox"]').length,
-    sendButtons: document.querySelectorAll('button[type="submit"][aria-label="Send"]').length
+    sendButtons: document.querySelectorAll('button[type="submit"][aria-label="Send"]').length,
+    modelPickers: document.querySelectorAll('button[aria-label="Select ChatGPT model"]').length,
+    effortSliders: document.querySelectorAll('[role="slider"][aria-valuenow]').length
   });
   const incompatible = (stage, reason) => ({
     status: "uiIncompatible",
@@ -80,6 +100,95 @@ async function execute(args) {
   if (readEditor().trim()) return { status: "notSubmitted", reason: "ExistingDraft" };
   if (document.querySelector(sendSelector)) return { status: "notSubmitted", reason: "UnexpectedSendState" };
 
+  // An explicit effort request must be selected through the actual UI.
+  // Omitting thinkingEffort leaves the account's current choice alone.
+  const modelPicker = () => {
+    const matches = Array.from(document.querySelectorAll('button[aria-label="Select ChatGPT model"]'));
+    return matches.length === 1 ? matches[0] : null;
+  };
+  const currentEffort = () => {
+    const lines = (modelPicker()?.innerText || "").split(/\r?\n/).map(x => x.trim()).filter(Boolean);
+    return lines.length === 2 && lines[0] === "Thinking effort" && effortLabels.includes(lines[1])
+      ? lines[1] : null;
+  };
+  if (effortIndex !== null) {
+    const picker = await untilWithin(modelPicker, 4500);
+    if (!picker) return incompatible("effortSelection", "ModelPickerUnavailable");
+    const requested = effortLabels[effortIndex];
+    const selected = await untilWithin(currentEffort, 4500);
+    if (!selected) return incompatible("effortSelection", "EffortLabelUnavailable");
+    if (selected !== requested) {
+      picker.click();
+      const powerControl = () => {
+        const visible = Array.from(document.querySelectorAll('[role="menu"]'))
+          .filter(menu => menu.getClientRects().length > 0);
+        const matching = visible.filter(menu =>
+          menu.querySelector('[role="menuitem"][aria-label="Power"][data-reasoning-slider="true"]'));
+        return matching.length === 1
+          ? matching[0].querySelector('[role="menuitem"][aria-label="Power"][data-reasoning-slider="true"]')
+          : null;
+      };
+      const sliderState = () => {
+        const power = powerControl();
+        const slider = power?.querySelector('[role="slider"][aria-valuenow]');
+        if (!slider || slider.getAttribute("aria-valuemin") !== "0" ||
+            slider.getAttribute("aria-valuemax") !== String(effortLabels.length - 1) ||
+            slider.closest('[aria-disabled="true"]') ||
+            !power.getAttribute("aria-keyshortcuts")?.includes("ArrowLeft") ||
+            !power.getAttribute("aria-keyshortcuts")?.includes("ArrowRight")) return null;
+        const index = Number(slider.getAttribute("aria-valuenow"));
+        return Number.isInteger(index) && index >= 0 && index < effortLabels.length
+          ? { power, index } : null;
+      };
+      const initialSlider = await untilWithin(sliderState, 3000);
+      if (!initialSlider) return incompatible("effortSelection", "EffortSliderUnavailable");
+      if (effortLabels[initialSlider.index] !== selected)
+        return incompatible("effortSelection", "EffortSliderLabelMismatch");
+      for (let index = initialSlider.index; index !== effortIndex;) {
+        const step = effortIndex > index ? 1 : -1;
+        const key = step > 0 ? "ArrowRight" : "ArrowLeft";
+        const state = sliderState();
+        if (!state || state.index !== index)
+          return incompatible("effortSelection", "EffortSliderChanged");
+        state.power.focus();
+        state.power.dispatchEvent(new KeyboardEvent("keydown", {
+          key, code: key, bubbles: true, cancelable: true
+        }));
+        const next = index + step;
+        const advanced = await untilWithin(() => {
+          const updated = sliderState();
+          return updated?.index === next && currentEffort() === effortLabels[next];
+        }, 1800);
+        if (!advanced) return incompatible("effortSelection", "EffortChangeUnconfirmed");
+        index = next;
+      }
+      if (currentEffort() !== requested)
+        return incompatible("effortSelection", "EffortSelectionUnconfirmed");
+      // Radix may close the menu automatically. Clicking the trigger again
+      // can reopen it, so close an actually open menu with Escape instead.
+      if (picker.getAttribute("aria-expanded") === "true") {
+        const menu = Array.from(document.querySelectorAll('[role="menu"]'))
+          .find(item => item.getClientRects().length > 0 &&
+            item.querySelector('[role="menuitem"][aria-label="Power"][data-reasoning-slider="true"]'));
+        if (!menu) return incompatible("effortSelection", "EffortMenuUnavailable");
+        menu.dispatchEvent(new KeyboardEvent("keydown", {
+          key: "Escape", code: "Escape", bubbles: true, cancelable: true
+        }));
+        if (!await untilWithin(() => picker.getAttribute("aria-expanded") === "false", 2000))
+          return incompatible("effortSelection", "ModelPickerDidNotClose");
+      }
+    }
+    if (currentEffort() !== requested)
+      return incompatible("effortSelection", "EffortSelectionUnconfirmed");
+  }
+  // The composer can receive a restored draft during the mode/effort transition.
+  if (readEditor().trim()) return { status: "notSubmitted", reason: "ExistingDraft" };
+  // Safe live preflight: exercise selectors/settings without editing or sending.
+  if (args?.preflightOnly === true) return {
+    status: "notSubmitted", reason: "PreflightOnly",
+    ...(effortIndex !== null ? { thinkingEffort: effortLabels[effortIndex] } : {})
+  };
+
   composer.focus();
   // ProseMirror must observe the editing operation. Setting textContent bypasses its state.
   const inserted = document.execCommand("insertText", false, prompt);
@@ -90,6 +199,9 @@ async function execute(args) {
   if (!send) return incompatible("submitControl", "SendUnavailable");
   if (readEditor() !== prompt.replace(/\r\n/g, "\n")) {
     return incompatible("composer", "ComposerChanged");
+  }
+  if (effortIndex !== null && currentEffort() !== effortLabels[effortIndex]) {
+    return incompatible("effortSelection", "EffortChangedBeforeSend");
   }
   // Once this click is attempted the effect is non-idempotent. Never try again.
   try {
@@ -137,6 +249,7 @@ async function execute(args) {
   return {
     status: "submitted",
     conversationUrl,
+    ...(effortIndex !== null ? { thinkingEffort: effortLabels[effortIndex] } : {}),
     evidence: [
       ...(evidence.newUserTurn ? ["newUserTurn"] : []),
       ...(evidence.matchingBubble ? ["matchingUserBubble"] : []),

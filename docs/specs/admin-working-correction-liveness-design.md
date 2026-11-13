@@ -332,3 +332,16 @@ attestation remain unimplemented, so the correction endpoint must stay
 inaccessible in production. A successful read of a promoted job handle
 must never release the correction permit, including in the
 `CorrectAgentWorkingState` response path.
+
+Mainline `JobManager` reports `ToolCompleted` or `ToolFailed` only after
+its original operation task has finished and stores its `ToolResponse`.
+`GetJobResult` supplies that response plus the stable `OperationId`,
+but not the original client boot identity or job start time; the start
+time must therefore come from the separately authenticated original
+`ToolJobHandle`. Any future terminal transition must verify the
+original project/actor/command, exact job ID, original operation ID,
+authenticated device incarnation, non-pending terminal response and
+typed job status. `Running`, missing/expired handles, transport
+timeouts and unverified cancellations are never terminal evidence.
+Even a `ToolCompleted` whose original command was `StartJob` is only
+a **process handle** and cannot certify its detached child tree.

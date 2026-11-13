@@ -148,8 +148,8 @@ let write_tools_expose_optional_operation_ids () =
                               "InspectPendingOperation"; "RetryPendingIntent"; "SupersedePendingIntent"; "AbandonPendingIntent" ]) ->
                 Some (methodInfo.Name, id)
             | _ -> None)
-    // Eight challenge-domain mutators share the same stable operation UUID contract.
-    Assert.That(writeMethods.Length, Is.EqualTo(43), String.concat ", " (writeMethods |> Array.map fst))
+    // Challenge-domain mutators share the same stable operation UUID contract.
+    Assert.That(writeMethods.Length, Is.EqualTo(44), String.concat ", " (writeMethods |> Array.map fst))
     for name, id in writeMethods do
         Assert.That(id.IsOptional, Is.True, $"operationId is required on {name}")
         Assert.That(id.DefaultValue, Is.EqualTo(""), $"operationId default differs on {name}")

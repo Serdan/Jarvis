@@ -163,7 +163,7 @@ module LedgerStore =
     let private options = JsonSerializerOptions(PropertyNamingPolicy = JsonNamingPolicy.CamelCase, PropertyNameCaseInsensitive = true)
     let private oidPattern = Regex("^[0-9a-f]{40}([0-9a-f]{24})?$", RegexOptions.Compiled)
     let private recordPath = Regex("^records/[A-Za-z0-9_-]+(/[A-Za-z0-9_.-]+)*[.]json$", RegexOptions.Compiled)
-    let private ledgerPath = Regex("^(tasks/[A-Za-z0-9_-]+/(task[.]json|spec[.]html|attempts/[a-f0-9]{32}([.]json|/challenge-wait[.]json|/checkpoints/[0-9]+[.]json|/events/[0-9]+[.]json|/assignments/[0-9]+([.]json|[.]ack[.]json))|imports/[0-9]+[.]json|lifecycle/[0-9]+[.]json|approvals/non-source/[0-9]+[.]json|reviews/[a-f0-9]{32}/(review[.]json|summary[.]md|findings/[a-z0-9][a-z0-9_-]{0,79}[.]md)|integrations/[a-f0-9]{32}[.]json)|challenges/[a-f0-9]{32}/(challenge[.]json|events/[0-9]+[.]json)|agents/[A-Za-z0-9_-]+([.]challenge-subscription)?[.]json|notifications/[a-f0-9]{32}[.]json|records/[A-Za-z0-9_-]+(/[A-Za-z0-9_.-]+)*[.]json)$", RegexOptions.Compiled)
+    let private ledgerPath = Regex("^(tasks/[A-Za-z0-9_-]+/(task[.]json|spec[.]html|attempts/[a-f0-9]{32}([.]json|/challenge-wait[.]json|/checkpoints/[0-9]+[.]json|/events/[0-9]+[.]json|/assignments/[0-9]+([.]json|[.]ack[.]json))|imports/[0-9]+[.]json|lifecycle/[0-9]+[.]json|approvals/non-source/[0-9]+[.]json|reviews/[a-f0-9]{32}/(review[.]json|summary[.]md|findings/[a-z0-9][a-z0-9_-]{0,79}[.]md)|integrations/[a-f0-9]{32}[.]json)|challenges/[a-f0-9]{32}/(challenge[.]json|events/[0-9]+[.]json)|agents/[A-Za-z0-9_-]+([.]challenge-subscription)?[.]json|notifications/[a-f0-9]{32}[.]json|challenge-waits/(by-challenge/[a-f0-9]{32}|by-owner/[A-Za-z0-9_-]{1,160})/[A-Za-z0-9_-]+/[a-f0-9]{32}/[0-9]+[.]json|records/[A-Za-z0-9_-]+(/[A-Za-z0-9_.-]+)*[.]json)$", RegexOptions.Compiled)
     let private remotePattern = Regex("^[A-Za-z0-9][A-Za-z0-9_.-]*$", RegexOptions.Compiled)
 
     type private GitOutput =
@@ -1060,7 +1060,9 @@ module LedgerStore =
     let listAt (binding: LedgerBinding) (snapshot: LedgerSnapshot) (prefix: string) =
         if prefix <> "tasks" && prefix <> "agents" && prefix <> "notifications"
            && prefix <> "challenges"
-           && not (Regex.IsMatch(prefix, "^challenges/[a-f0-9]{32}/events$")) then
+           && not (Regex.IsMatch(prefix, "^challenges/[a-f0-9]{32}/events$"))
+           && not (Regex.IsMatch(prefix, "^challenge-waits/by-challenge/[a-f0-9]{32}$"))
+           && not (Regex.IsMatch(prefix, "^challenge-waits/by-owner/[A-Za-z0-9_-]{1,160}$")) then
             Error(InvalidBinding "Unsupported ledger enumeration prefix.")
         else
             run binding.RepositoryPath [ "ls-tree"; "-r"; "--name-only"; snapshot.Commit; "--"; prefix ]

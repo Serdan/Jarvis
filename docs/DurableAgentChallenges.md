@@ -60,7 +60,7 @@ Challenge records and events live on the existing verified orphan Git ledger bra
 
 Canonical state plus immutable events and the operation journal provide exactly-once durable mutation semantics despite duplicate requests, retries and multiple Git clients. An accepted transition and its event are one Git ledger transaction with expected blob OIDs. **No notification entity is part of this transaction**; recipient notification settings never affect CAS, challenge completion, or evidence persistence.
 
-Dependency reverse links are written atomically with the initial block. They constrain reads to the relevant challenge or owner instead of walking all historical tasks. Each candidate is revalidated against its canonical wait, active task, attempt owner, and assignment generation; stale links from earlier generations cannot wake superseded work. The indexes are not independently authoritative.
+Dependency reverse links are written atomically with the initial block. They constrain reads to the relevant challenge or owner instead of walking all historical tasks. Ledger enumeration explicitly allows only a canonical challenge-ID or encoded owner-ID index prefix, not the full index namespace. Each candidate is revalidated against its canonical wait, active task, attempt owner, and assignment generation; stale links from earlier generations cannot wake superseded work. The indexes are not independently authoritative.
 
 The canonical pending-operation journal protects uncertain requests and exact operation-ID replay. Every mutation fails closed for unavailable, untrusted or mismatched ledger bindings.
 

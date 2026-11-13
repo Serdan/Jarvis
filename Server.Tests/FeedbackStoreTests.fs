@@ -568,6 +568,243 @@ let ``authenticated promoted ToolOperation receipt is never original terminal ev
         |> shouldEqual true)
 
 [<Test>]
+let ``authenticated promoted job poll proves terminal only on original route`` () =
+    withStore (fun store ->
+        approveTestEpoch store
+        let user, actor, device, connection = "alice", "Worker 3", "device-a", "client-a"
+        let users = UserService()
+        users.TransportConnected(user, connection)
+        let session = users.Register(user,
+            { DeviceId = device; DeviceName = "Workstation"
+              ProtocolVersion = Common.AgentProtocol.version; ClientVersion = "test"
+              SupportedCommands = [ "ReadFiles"; "GetJobResult" ] }, connection)
+        let tracker = ClientResponseTracker()
+        let makeHub (source: FeedbackStore) =
+            let hub = HubService(users, tracker, source,
+                Microsoft.Extensions.Logging.Abstractions.NullLogger<HubService>.Instance)
+            hub.Context <- signalRCaller user connection
+            hub
+        let correlation, initial =
+            tracker.Register(user, connection, session.Generation, TimeSpan.FromSeconds(5.))
+        let witness =
+            store.TryBeginAgentOperation(
+                user, actor, "ReadFiles", Some "Jarvis", "server", None,
+                Some Common.AgentProtocol.version)
+            |> function Ok row -> row | Error failure -> failwith failure
+        store.TryMarkAgentDispatched(user, witness.Id, device,
+            connection, session.Generation, correlation) |> shouldEqual (Ok ())
+        let handle : Common.ToolJobHandle =
+            { JobId = Guid.NewGuid().ToString("N")
+              Kind = Common.JobKind.ToolOperation; Status = "Running"
+              ProjectName = Some "Jarvis"; DeviceId = None; AgentId = actor
+              OperationId = Some(Guid.NewGuid().ToString("D"))
+              CommandName = "ReadFiles"; StartedAt = DateTimeOffset.UtcNow }
+        let ordinary payload : Common.AgentCommandResponse =
+            { Result = Some payload; Error = None; Instructions = []
+              AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+        let pending = { (ordinary(JsonSerializer.Serialize(handle))) with PendingJob = Some handle }
+        (makeHub store).SendClientResponse(correlation, pending).GetAwaiter().GetResult()
+        Assert.That(initial.IsCompletedSuccessfully, Is.True)
+        let bindPoll route (source: FeedbackStore) =
+            source.TryRecordAgentToolJobPollDispatch(user, device, connection,
+                session.Generation, route, actor, "Jarvis", handle.JobId)
+        let result status final op : Common.JobResult =
+            { JobId = handle.JobId; Status = status; Events = []
+              NextSequence = 0L; Truncated = false; ToolResponse = final; OperationId = op }
+        let poll status final op =
+            ordinary(JsonSerializer.Serialize(result status final op))
+        let readStatus (source: FeedbackStore) =
+            source.GetAgentExecutionResolution(user, witness.Id)
+        let first, _ = tracker.Register(user, connection, session.Generation, TimeSpan.FromSeconds(5.))
+        bindPoll first store |> shouldEqual (Ok(Some witness.Id))
+        (makeHub store).SendClientResponse(
+            first, poll Common.Running None handle.OperationId).GetAwaiter().GetResult()
+        readStatus store |> shouldEqual (Ok ExecutionUnresolved)
+        let wrong, _ = tracker.Register(user, connection, session.Generation, TimeSpan.FromSeconds(5.))
+        bindPoll wrong store |> shouldEqual (Ok(Some witness.Id))
+        (makeHub store).SendClientResponse(wrong,
+            poll Common.ToolCompleted (Some(ordinary "{}"))
+                (Some(Guid.NewGuid().ToString("D")))).GetAwaiter().GetResult()
+        readStatus store |> shouldEqual (Ok ExecutionUnresolved)
+        store.TryRecordAgentToolJobPollDispatch(user, "other-device", connection,
+            session.Generation, "wrong-device-poll", actor, "Jarvis", handle.JobId)
+        |> shouldEqual (Ok None)
+        store.TryRecordAgentToolJobPollDispatch(user, device, connection,
+            session.Generation, "wrong-project-poll", actor, "OtherProject", handle.JobId)
+        |> shouldEqual (Ok None)
+        store.TryRecordAgentToolJobPollDispatch(user, device, connection,
+            session.Generation, "wrong-actor-poll", "Other Agent", "Jarvis", handle.JobId)
+        |> shouldEqual (Ok None)
+        let last, awaited = tracker.Register(user, connection, session.Generation, TimeSpan.FromSeconds(5.))
+        bindPoll last store |> shouldEqual (Ok(Some witness.Id))
+        use restarted = new FeedbackStore(store.DatabasePath)
+        let hub = makeHub restarted
+        let finished = poll Common.ToolCompleted (Some(ordinary "{}")) handle.OperationId
+        // The caller gets the genuine result even if SQLite fails to persist
+        // termination. The original must remain unresolved until an exact
+        // authenticated late retry succeeds after the storage fault clears.
+        use db = new SqliteConnection($"Data Source={store.DatabasePath}")
+        db.Open()
+        use reject = db.CreateCommand()
+        reject.CommandText <-
+            $"CREATE TRIGGER reject_terminal_job BEFORE UPDATE OF state ON agent_execution_witness " +
+            $"WHEN NEW.state = 'Terminal' AND NEW.request_id = '{witness.Id}' " +
+            "BEGIN SELECT RAISE(ABORT, 'simulated terminal attestation failure'); END;"
+        reject.ExecuteNonQuery() |> ignore
+        hub.SendClientResponse(last, finished).GetAwaiter().GetResult()
+        Assert.That(awaited.IsCompletedSuccessfully, Is.True)
+        readStatus restarted |> shouldEqual (Ok ExecutionUnresolved)
+        use recover = db.CreateCommand()
+        recover.CommandText <- "DROP TRIGGER reject_terminal_job;"
+        recover.ExecuteNonQuery() |> ignore
+        hub.SendClientResponse(last, finished).GetAwaiter().GetResult()
+        readStatus restarted |> shouldEqual (Ok AuthenticatedClientFinished)
+        hub.SendClientResponse(last, finished).GetAwaiter().GetResult()
+        readStatus restarted |> shouldEqual (Ok AuthenticatedClientFinished))
+
+[<Test>]
+let ``ClientService binds GetJobResult before dispatch and HubService attests original`` () =
+    withStore (fun store ->
+        approveTestEpoch store
+        let user, actor, device, connection = "alice", "Worker 3", "device", "conn"
+        let users = UserService()
+        users.TransportConnected(user, connection)
+        let session =
+            users.Register(user,
+                { DeviceId = device; DeviceName = "Workstation"
+                  ProtocolVersion = Common.AgentProtocol.version
+                  ClientVersion = "test"
+                  SupportedCommands = [ "ReadFiles"; "GetJobResult" ] },
+                connection)
+        let tracker = ClientResponseTracker()
+        let clientHub =
+            HubService(users, tracker, store,
+                Microsoft.Extensions.Logging.Abstractions.NullLogger<HubService>.Instance)
+        clientHub.Context <- signalRCaller user connection
+        let originalCorrelation, _ =
+            tracker.Register(user, connection, session.Generation, TimeSpan.FromSeconds(5.))
+        let original =
+            store.TryBeginAgentOperation(
+                user, actor, "ReadFiles", Some "Jarvis", "server", None,
+                Some Common.AgentProtocol.version)
+            |> function Ok row -> row | Error failure -> failwith failure
+        store.TryMarkAgentDispatched(user, original.Id, device,
+            connection, session.Generation, originalCorrelation)
+        |> shouldEqual (Ok ())
+        let handle : Common.ToolJobHandle =
+            { JobId = Guid.NewGuid().ToString("N")
+              Kind = Common.JobKind.ToolOperation; Status = "Running"
+              ProjectName = Some "Jarvis"; DeviceId = None; AgentId = actor
+              OperationId = Some(Guid.NewGuid().ToString("D"))
+              CommandName = "ReadFiles"; StartedAt = DateTimeOffset.UtcNow }
+        let terminal : Common.AgentCommandResponse =
+            { Result = Some "{}"; Error = None
+              Instructions = []; AgentStateChanges = []
+              InboxActivation = None; PendingJob = None }
+        let initial =
+            { terminal with Result = Some(JsonSerializer.Serialize(handle))
+                            PendingJob = Some handle }
+        clientHub.SendClientResponse(originalCorrelation, initial).GetAwaiter().GetResult()
+        let mutable dispatched = 0
+        let recipient =
+            { new Common.SignalR.IClientService with
+                member _.ReceiveMessage(_) = Task.CompletedTask
+                member _.InvalidateAgentStates(_, _) = Task.CompletedTask
+                member _.ReceiveCommand(correlationId, commandJson, routedActor) =
+                    dispatched <- dispatched + 1
+                    Assert.That(routedActor, Is.EqualTo(actor))
+                    match JsonSerializer.Deserialize<Common.AgentCommand>(commandJson) with
+                    | Common.GetJobResultCommand request ->
+                        Assert.That(request.JobId, Is.EqualTo(handle.JobId))
+                        let result : Common.JobResult =
+                            { JobId = handle.JobId; Status = Common.ToolCompleted
+                              Events = []; NextSequence = 0L; Truncated = false
+                              ToolResponse = Some terminal; OperationId = handle.OperationId }
+                        clientHub.SendClientResponse(
+                            correlationId,
+                            { terminal with Result = Some(JsonSerializer.Serialize(result)) }
+                        ).GetAwaiter().GetResult()
+                        Task.CompletedTask
+                    | _ -> failwith "Unexpected client command." }
+        let clients =
+            { new Microsoft.AspNetCore.SignalR.IHubClients<Common.SignalR.IClientService> with
+                member _.All = recipient
+                member _.AllExcept(_) = recipient
+                member _.Client(_) = recipient
+                member _.Clients(_) = recipient
+                member _.Group(_) = recipient
+                member _.GroupExcept(_, _) = recipient
+                member _.Groups(_) = recipient
+                member _.User(_) = recipient
+                member _.Users(_) = recipient }
+        let hubContext =
+            { new Microsoft.AspNetCore.SignalR.IHubContext<HubService, Common.SignalR.IClientService> with
+                member _.Clients = clients
+                member _.Groups = Unchecked.defaultof<_> }
+        let accessor = HttpContextAccessor()
+        accessor.HttpContext <- DefaultHttpContext()
+        let service = ClientService(hubContext, users, tracker, accessor, store)
+        let response =
+            service.SendCommandToUser(
+                user, Common.GetJobResultCommand
+                    { ProjectName = "Jarvis"; JobId = handle.JobId; AfterSequence = None },
+                agentId = actor)
+            |> fun task -> task.GetAwaiter().GetResult()
+        Assert.That(response.Error.IsNone, Is.True)
+        Assert.That(dispatched, Is.EqualTo(1))
+        store.GetAgentExecutionResolution(user, original.Id)
+        |> shouldEqual (Ok AuthenticatedClientFinished))
+
+[<Test>]
+let ``completed ToolOperation poll cannot clear process-running execution witness`` () =
+    withStore (fun store ->
+        approveTestEpoch store
+        let user, agent, device, connection, generation =
+            "alice", "Worker 3", "device", "conn", 8L
+        let request =
+            store.TryBeginAgentOperation(
+                user, agent, "RunCommand", Some "Jarvis", "server", None,
+                Some Common.AgentProtocol.version)
+            |> function Ok row -> row | Error failure -> failwith failure
+        store.TryMarkAgentDispatched(
+            user, request.Id, device, connection, generation, "process-correlation")
+        |> shouldEqual (Ok ())
+        let jobId, operationId = Guid.NewGuid().ToString("N"), Guid.NewGuid().ToString("D")
+        let startedAt = DateTimeOffset.UtcNow
+        store.TryRecordAgentDeferredToolJob(
+            user, connection, generation, "process-correlation",
+            agent, "RunCommand", jobId, startedAt,
+            operationId = operationId, projectName = "Jarvis")
+        |> shouldEqual (Ok(Some request.Id))
+        store.TryRecordAgentToolJobPollDispatch(
+            user, device, connection, generation, "job-poll",
+            agent, "Jarvis", jobId)
+        |> shouldEqual (Ok(Some request.Id))
+        let completed : Common.AgentCommandResponse =
+            { Result = Some "{}"; Error = None; Instructions = []
+              AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+        let result : Common.JobResult =
+            { JobId = jobId; Status = Common.ToolCompleted; Events = []
+              NextSequence = 0L; Truncated = false
+              ToolResponse = Some completed; OperationId = Some operationId }
+        let poll = { completed with Result = Some(JsonSerializer.Serialize(result)) }
+        store.TryRecordAgentToolJobPollTerminal(
+            user, "different-connection", generation, "job-poll", poll)
+        |> shouldEqual (Ok None)
+        store.TryRecordAgentToolJobPollTerminal(
+            user, connection, generation + 1L, "job-poll", poll)
+        |> shouldEqual (Ok None)
+        store.TryRecordAgentToolJobPollTerminal(
+            user, connection, generation, "job-poll", poll).IsError
+        |> shouldEqual true
+        store.GetAgentExecutionResolution(user, request.Id)
+        |> shouldEqual (Ok ExecutionUnresolved)
+        use restarted = new FeedbackStore(store.DatabasePath)
+        restarted.TryAcquireAgentCorrection(
+            user, agent, "operator-on-process-poll").IsError
+        |> shouldEqual true)
+
+[<Test>]
 let ``authenticated StartJob client response does not prove child process exit`` () =
     withStore (fun store ->
         approveTestEpoch store
@@ -1102,6 +1339,29 @@ let ``promoted cross-project notification stages retain exact job operation and 
         (read source).DeferredToolJobOperationId |> shouldEqual None
         store.TryBeginAgentContinuation(user, source, "Destination").IsError
         |> shouldEqual true
+        // A verified result of the exact source TaskRead job now permits the
+        // NotifyAgent continuation, but the pending handle alone did not.
+        store.TryRecordAgentToolJobPollDispatch(
+            user, "device", connection, generation, "source-job-poll",
+            agent, "Source", sourceJob)
+        |> shouldEqual (Ok (Some source))
+        let terminal : Common.AgentCommandResponse =
+            { Result = Some "{}"; Error = None
+              Instructions = []; AgentStateChanges = []
+              InboxActivation = None; PendingJob = None }
+        let sourceResult : Common.JobResult =
+            { JobId = sourceJob; Status = Common.ToolCompleted
+              Events = []; NextSequence = 0L; Truncated = false
+              ToolResponse = Some terminal; OperationId = None }
+        store.TryRecordAgentToolJobPollTerminal(
+            user, connection, generation, "source-job-poll",
+            { terminal with Result = Some(JsonSerializer.Serialize(sourceResult)) })
+        |> shouldEqual (Ok (Some source))
+        store.GetAgentExecutionResolution(user, source)
+        |> shouldEqual (Ok AuthenticatedClientFinished)
+        let _reconciledSourceChild =
+            store.TryBeginAgentContinuation(user, source, "Destination")
+            |> function Ok id -> id | Error failure -> failwith failure
         // A second, genuinely terminal source may create one separate
         // destination witness. The mainline envelope is a TaskWrite job.
         let finishedSource = beginSource "source-finished-correlation"

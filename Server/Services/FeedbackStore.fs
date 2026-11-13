@@ -303,6 +303,25 @@ CREATE TABLE IF NOT EXISTS agent_execution_witness (
 CREATE INDEX IF NOT EXISTS ix_agent_execution_witness_pending
     ON agent_execution_witness(user_id, agent_id, state);
 
+-- Before sending GetJobResult, record the exact authenticated poll route
+-- against its original still-dispatched pending execution. An arbitrary
+-- response-shaped JSON value must never attest some other agent's job.
+-- Retain this across timeouts/restarts; no telemetry TTL applies.
+CREATE TABLE IF NOT EXISTS agent_tool_job_poll (
+    correlation_id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    device_id TEXT NOT NULL,
+    connection_id TEXT NOT NULL,
+    device_generation INTEGER NOT NULL,
+    agent_id TEXT NOT NULL,
+    project_name TEXT NOT NULL,
+    job_id TEXT NOT NULL,
+    original_request_id TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_agent_tool_job_poll_original
+    ON agent_tool_job_poll(user_id, original_request_id);
+
 -- The correction barrier must survive a server restart or lost HTTP result.
 -- It serializes with agent admission under a SQLite writer transaction.
 CREATE TABLE IF NOT EXISTS agent_correction_permit (
@@ -1017,6 +1036,76 @@ INSERT INTO operations (
                 | _ -> Error "Execution witness was not found for authenticated request."
             with ex -> Error $"Cannot read exact execution witness: {ex.Message}"
 
+    /// Persist the exact server-issued GetJobResult route before dispatch.
+    /// The client reply cannot authoritatively finish any other job or actor.
+    /// Missing original evidence is normal for unrelated job polling and
+    /// cannot be treated as proof of completion.
+    member _.TryRecordAgentToolJobPollDispatch(
+        userId: string, deviceId: string, connectionId: string,
+        generation: int64, correlationId: string, agentId: string,
+        projectName: string, jobId: string
+    ) : Result<string option, string> =
+        let mutable parsed = Guid.Empty
+        if [userId; deviceId; connectionId; correlationId; agentId; projectName; jobId]
+           |> List.exists (fun value -> String.IsNullOrWhiteSpace value || value.Length > 512)
+           || generation < 1L
+           || not (Guid.TryParseExact(jobId, "N", &parsed))
+           || parsed = Guid.Empty
+           || jobId <> parsed.ToString("N") then
+            Error "Authenticated bounded GetJobResult dispatch route and canonical job identity are required."
+        else
+            try
+                use connection = openConnection()
+                use transaction = connection.BeginTransaction()
+                use lookup = connection.CreateCommand()
+                lookup.Transaction <- transaction
+                lookup.CommandText <-
+                    """SELECT request_id FROM agent_execution_witness
+                       WHERE user_id = $userId AND agent_id = $agentId
+                         AND device_id = $deviceId
+                         AND connection_id = $connectionId
+                         AND device_generation = $generation
+                         AND project_name = $projectName
+                         AND tool_job_id = $jobId
+                         AND state = 'Dispatched'
+                         AND tool_job_receipt_at IS NOT NULL
+                       LIMIT 1;"""
+                addParameter lookup "$userId" userId
+                addParameter lookup "$agentId" (agentId.ToUpperInvariant())
+                addParameter lookup "$deviceId" deviceId
+                addParameter lookup "$connectionId" connectionId
+                addParameter lookup "$generation" generation
+                addParameter lookup "$projectName" projectName
+                addParameter lookup "$jobId" jobId
+                match lookup.ExecuteScalar() with
+                | :? string as requestId ->
+                    use record = connection.CreateCommand()
+                    record.Transaction <- transaction
+                    record.CommandText <-
+                        """INSERT INTO agent_tool_job_poll
+                           (correlation_id, user_id, device_id, connection_id,
+                            device_generation, agent_id, project_name, job_id,
+                            original_request_id, created_at)
+                           VALUES ($correlation, $userId, $deviceId, $connectionId,
+                                   $generation, $agentId, $projectName, $jobId,
+                                   $requestId, $now);"""
+                    addParameter record "$correlation" correlationId
+                    addParameter record "$userId" userId
+                    addParameter record "$deviceId" deviceId
+                    addParameter record "$connectionId" connectionId
+                    addParameter record "$generation" generation
+                    addParameter record "$agentId" (agentId.ToUpperInvariant())
+                    addParameter record "$projectName" projectName
+                    addParameter record "$jobId" jobId
+                    addParameter record "$requestId" requestId
+                    addParameter record "$now" (DateTimeOffset.UtcNow.ToString("O"))
+                    record.ExecuteNonQuery() |> ignore
+                    transaction.Commit()
+                    Ok(Some requestId)
+                | _ -> Ok None
+            with ex ->
+                Error $"Cannot durably bind an authenticated tool-job poll: {ex.Message}"
+
     // A promoted MCP ToolOperation has returned a handle while the original
     // command is STILL RUNNING. Persist the handle on the exact routed witness,
     // never advance its state to Terminal, and never infer completion from a
@@ -1111,6 +1200,107 @@ INSERT INTO operations (
                     Error "Deferred job does not match the admitted agent, command or unresolved route."
             with ex ->
                 Error $"Cannot durably record deferred tool-job identity: {ex.Message}"
+
+    /// A tool-job result can close the original witness only when its
+    /// GetJobResult dispatch was durably bound to the exact authenticated
+    /// client route before the poll. A returned JSON body alone is not proof.
+    member _.TryRecordAgentToolJobPollTerminal(
+        userId: string, connectionId: string, generation: int64,
+        correlationId: string, clientResponse: AgentCommandResponse
+    ) : Result<string option, string> =
+        if [userId; connectionId; correlationId] |> List.exists String.IsNullOrWhiteSpace
+           || generation < 1L then
+            Error "Authenticated GetJobResult route is required."
+        else
+            try
+                use connection = openConnection()
+                use transaction = connection.BeginTransaction()
+                use lookup = connection.CreateCommand()
+                lookup.Transaction <- transaction
+                lookup.CommandText <-
+                    """SELECT original.request_id, original.state,
+                              original.tool_name, original.tool_job_id,
+                              original.tool_job_operation_id
+                       FROM agent_tool_job_poll AS poll
+                       JOIN agent_execution_witness AS original
+                         ON original.request_id = poll.original_request_id
+                         AND original.user_id = poll.user_id
+                         AND original.agent_id = poll.agent_id
+                         AND original.project_name = poll.project_name
+                         AND original.device_id = poll.device_id
+                         AND original.connection_id = poll.connection_id
+                         AND original.device_generation = poll.device_generation
+                         AND original.tool_job_id = poll.job_id
+                       WHERE poll.user_id = $userId
+                         AND poll.connection_id = $connectionId
+                         AND poll.device_generation = $generation
+                         AND poll.correlation_id = $correlationId
+                       LIMIT 1;"""
+                addParameter lookup "$userId" userId
+                addParameter lookup "$connectionId" connectionId
+                addParameter lookup "$generation" generation
+                addParameter lookup "$correlationId" correlationId
+                use reader = lookup.ExecuteReader()
+                let found =
+                    if reader.Read() then
+                        Some(reader.GetString 0, reader.GetString 1,
+                             optionText reader 2, reader.GetString 3,
+                             optionText reader 4)
+                    else None
+                reader.Close()
+                match found with
+                | None -> Ok None
+                | Some (requestId, "Terminal", _, _, _) ->
+                    Ok(Some requestId) // authenticated idempotent replay
+                | Some (_, "Dispatched", Some tool, _, _)
+                    when not (terminalCommandTypes.Contains tool) ->
+                    Error $"Tool {tool} still requires independent liveness evidence."
+                | Some (requestId, "Dispatched", Some _, jobId, operationId) ->
+                    let verified =
+                        match clientResponse.Result, clientResponse.Error,
+                              clientResponse.PendingJob with
+                        | Some payload, None, None ->
+                            try
+                                let result = JsonSerializer.Deserialize<JobResult>(payload)
+                                if isNull (box result) || result.JobId <> jobId
+                                   || result.OperationId <> operationId then
+                                    Error "Job or original operation identity differs from authenticated poll."
+                                else
+                                    match result.Status, result.ToolResponse with
+                                    | ToolCompleted, Some final
+                                        when final.PendingJob.IsNone && final.Error.IsNone -> Ok true
+                                    | ToolFailed _, Some final
+                                        when final.PendingJob.IsNone && final.Error.IsSome -> Ok true
+                                    | Running, None -> Ok false // normal polling, not an error
+                                    | _ -> Error "Job result does not prove completed tool execution."
+                            with :? JsonException ->
+                                Error "Malformed typed job-result response."
+                        | _ -> Error "GetJobResult has no successful non-pending response."
+                    match verified with
+                    | Error reason -> Error reason
+                    | Ok false -> Ok None // no terminal change while still running
+                    | Ok true ->
+                        use update = connection.CreateCommand()
+                        update.Transaction <- transaction
+                        update.CommandText <-
+                            """UPDATE agent_execution_witness
+                               SET state = 'Terminal', updated_at = $now,
+                                   terminal_at = $now
+                               WHERE request_id = $requestId AND state = 'Dispatched'
+                                 AND tool_job_id = $jobId
+                                 AND tool_job_operation_id IS $operationId;"""
+                        addParameter update "$requestId" requestId
+                        addParameter update "$jobId" jobId
+                        addParameter update "$operationId" (dbValue operationId)
+                        addParameter update "$now" (DateTimeOffset.UtcNow.ToString("O"))
+                        if update.ExecuteNonQuery() <> 1 then
+                            Error "Tool-job terminal proof raced conflicting execution evidence."
+                        else
+                            transaction.Commit()
+                            Ok(Some requestId)
+                | Some _ -> Error "Poll does not match unresolved dispatched execution."
+            with ex ->
+                Error $"Cannot attest authenticated tool-job termination: {ex.Message}"
 
     // The transport server must verify the authenticated sender's active
     // device registration before passing its connection/generation here.

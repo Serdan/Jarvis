@@ -241,12 +241,30 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                                 witnessStore.TryMarkAgentDispatched(
                                     userId, id, session.DeviceId, connectionId,
                                     session.Generation, correlationId)
-                        if route.IsError then
+                        // A poll used to reconcile a pending execution needs
+                        // its own durable server-issued correlation before the
+                        // client can reply. An unrelated job poll is still valid.
+                        let routed =
+                            match route, command, agentId with
+                            | Ok (), GetJobResultCommand poll, Some actor
+                                when not (String.IsNullOrWhiteSpace actor)
+                                     && not (isNull (box witnessStore)) ->
+                                // Read-only status lookup can still be delivered
+                                // in unbound/client-only contexts. Without a
+                                // witness store it cannot prove terminal liveness
+                                // or release any administrative correction gate.
+                                witnessStore.TryRecordAgentToolJobPollDispatch(
+                                    userId, session.DeviceId, connectionId,
+                                    session.Generation, correlationId,
+                                    actor, poll.ProjectName, poll.JobId)
+                                |> Result.map ignore
+                            | _ -> route
+                        if routed.IsError then
                             tracker.Cancel(correlationId)
                             return { Result = None
                                      Error = Some(ExecutionFailed(
                                          "Cannot durably record the selected client dispatch: " +
-                                         (match route with Error error -> error | Ok () -> "")))
+                                         (match routed with Error error -> error | Ok () -> "")))
                                      Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
                         else
                             let client = ctx.Clients.Client(connectionId)

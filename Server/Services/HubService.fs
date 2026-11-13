@@ -145,9 +145,27 @@ type HubService(users: UserService, tracker: ClientResponseTracker, store: Feedb
                     store.TryRecordAgentClientTerminal(
                         this.UserId, this.Context.ConnectionId, session.Generation,
                         correlationId, clientResponse = response)
+            // An ordinary GetJobResult reply can certify a prior promoted
+            // invocation only if its *dispatch* was durably tied to the exact
+            // original device, agent, project and job before this reply.
+            // Neither an arbitrary JSON response nor a reconnection is proof.
+            let completedJob =
+                match durable, response.PendingJob with
+                | Ok _, None ->
+                    store.TryRecordAgentToolJobPollTerminal(
+                        this.UserId, this.Context.ConnectionId, session.Generation,
+                        correlationId, response)
+                | _ -> Ok None
             let accepted =
                 tracker.Complete(correlationId, this.UserId, this.Context.ConnectionId,
                                  session.Generation, response)
+            match completedJob with
+            | Error failure ->
+                logger.LogWarning(
+                    "Cannot attest deferred tool-job completion for {CorrelationId} on {ConnectionId}: {Error}; " +
+                    "original execution remains unresolved.",
+                    correlationId, this.Context.ConnectionId, failure)
+            | _ -> ()
             match durable with
             | Ok None when not accepted ->
                 logger.LogWarning(

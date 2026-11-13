@@ -374,7 +374,7 @@ of a prior Ready epoch requires a separately designed audited transition;
 the production drain verifier is still not implemented.
 
 Validation on the isolated .NET 11 candidate after these changes:
-159/159 server Release tests and 620/620 client Release tests pass.
+162/162 server Release tests and 620/620 client Release tests pass.
 A promoted tool handle now also preserves the first authenticated
 `OperationId` alongside its job ID/start time. An exact replay is
 idempotent, while conflicting operation identities or projects cannot
@@ -387,3 +387,37 @@ continuation before the parent has actual terminal evidence.
 The candidate remains unreviewed; authenticated terminal ToolOperation
 reconciliation, detached process-tree proof, cross-device legacy drain,
 and review/performance gates remain open.
+
+### Authenticated deferred ToolOperation termination reconciliation (2026-11-13)
+
+GetJobResult can now certify an original pending *non-process* execution
+only when the server recorded that precise poll before SignalR dispatch.
+The durable agent_tool_job_poll table binds the original unresolved
+witness to the authenticated user, device ID, connection/generation,
+initiating agent, project, job ID and exact poll correlation. The original
+pending handle separately retains immutable job ID, start time and
+operation ID. The typed JobResult and original ToolResponse must agree.
+
+Only ToolCompleted with a successful non-pending original response, or
+ToolFailed with a non-pending original error, may advance the original
+witness from Dispatched to Terminal. Running is an ordinary nonterminal
+poll. A mismatched device/connection, actor, project, job/operation ID,
+malformed result, cancellation, timeout or persistence error cannot
+establish completion. An authenticated late retry can recover after
+SQLite failure while the client receives its original result unchanged.
+A completed source-side NotifyAgent TaskRead can now support its separate
+destination continuation; the pending source handle cannot.
+
+Commands involving process execution, scheduling or Git hooks remain
+ineligible for this typed terminal promotion until OS-backed descendant
+termination evidence exists. Client-only read-only polls still work
+without the witness store, but produce no correction evidence.
+
+Isolated .NET 11 verification: 162/162 server Release tests; unchanged
+client source previously passed 620/620. Coverage includes actual
+ClientService to HubService dispatch, wrong identities, Running and
+process jobs, cross-project source continuation, restart/replay, and
+injected SQLite terminal-update failure with late exact recovery.
+The production legacy drain, process-tree proof, independent frozen
+review and performance acceptance gates remain open. No shared
+integration or deployment has occurred.

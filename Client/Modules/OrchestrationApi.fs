@@ -1951,17 +1951,21 @@ module OperationResponse =
           head: string
           alreadyApplied: bool
           originalResult: JsonElement
+          notificationDelivery: Client.ReviewWorkflow.NotificationDelivery option
           [<System.Text.Json.Serialization.JsonIgnore>]
           changedAgentIds: string list }
 
-    let present (write: LedgerStore.LedgerWrite) =
+    let presentWithNotification (notification: Client.ReviewWorkflow.NotificationDelivery option) (write: LedgerStore.LedgerWrite) =
         use document = JsonDocument.Parse(write.Operation.OriginalResultJson)
         box
             { operation = write.Operation
               head = write.CurrentHead
               alreadyApplied = write.AlreadyApplied
               originalResult = document.RootElement.Clone()
+              notificationDelivery = notification
               changedAgentIds = LedgerStore.LedgerStore.changedAgentIds write }
+
+    let present write = presentWithNotification None write
 
 module LedgerApi =
     let private id label (raw: string) =
@@ -2261,6 +2265,9 @@ module TaskApi =
             | "GetAgentInstructionConfig" ->
                 RoleInstructions.RoleInstructions.getAgentConfig binding cmd.AgentId
                 |> mapError |> Result.map box
+            | "GetNotificationPreferences" ->
+                ReviewWorkflow.ReviewWorkflow.getNotificationPreferences binding cmd.AgentId
+                |> mapError |> Result.map box
             | "ResolveAgentInstructions" ->
                 RoleInstructions.RoleInstructions.resolve binding cmd.AgentId
                 |> mapError |> Result.map box
@@ -2343,6 +2350,22 @@ module TaskApi =
                             | "NotifyAgent" ->
                                 ReviewWorkflow.ReviewWorkflow.notifyAgent binding operationId
                                     cmd.ActorId cmd.SourceRef cmd.OwnerId cmd.TaskId cmd.Summary |> mapError
+                            | "SetNotificationSenderBlock" ->
+                                match cmd.Reason with
+                                | "Block" | "Unblock" ->
+                                    ReviewWorkflow.ReviewWorkflow.setNotificationSenderBlock
+                                        binding operationId cmd.ActorId cmd.ActorId cmd.ProjectName
+                                        cmd.SourceRef cmd.OwnerId (cmd.Reason = "Block") cmd.Summary
+                                    |> mapError
+                                | _ -> Error(Client.ValidationError "Expected Block or Unblock.")
+                            | "SetNotificationMute" ->
+                                match cmd.Reason with
+                                | "Mute" | "Unmute" ->
+                                    ReviewWorkflow.ReviewWorkflow.setNotificationMute
+                                        binding operationId cmd.ActorId cmd.ActorId
+                                        (cmd.Reason = "Mute") cmd.Summary
+                                    |> mapError
+                                | _ -> Error(Client.ValidationError "Expected Mute or Unmute.")
                             | "AcknowledgeNotification" ->
                                 guid "notificationId" cmd.AttemptId
                                 |> Result.bind (fun notificationId ->
@@ -2508,7 +2531,13 @@ module TaskApi =
                                 |> mapError
                             | _ -> Error(Client.ValidationError "Unsupported  task operation.")
                         )
-                    result |> Result.map OperationResponse.present))
+                    result |> Result.bind (fun write ->
+                        if cmd.Action = "NotifyAgent" then
+                            ReviewWorkflow.ReviewWorkflow.notificationDelivery binding write
+                            |> mapError
+                            |> Result.map (fun delivery ->
+                                OperationResponse.presentWithNotification (Some delivery) write)
+                        else Ok(OperationResponse.present write))))
 
 
     let writeForContext (context: ProjectPaths.ResolvedProject) (cmd: TaskWriteCommand) rt =

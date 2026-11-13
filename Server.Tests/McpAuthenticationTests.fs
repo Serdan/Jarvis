@@ -148,9 +148,8 @@ let write_tools_expose_optional_operation_ids () =
                               "InspectPendingOperation"; "RetryPendingIntent"; "SupersedePendingIntent"; "AbandonPendingIntent" ]) ->
                 Some (methodInfo.Name, id)
             | _ -> None)
-    // Both nine challenge-domain writes and three taskless lifecycle writes
-    // preserve the optional operation-ID contract for public mutators.
-    Assert.That(writeMethods.Length, Is.EqualTo(52), String.concat ", " (writeMethods |> Array.map fst))
+    // Preserve challenge-domain, taskless and recipient-notification writes.
+    Assert.That(writeMethods.Length, Is.EqualTo(54), String.concat ", " (writeMethods |> Array.map fst))
     for newTool in [ "StartTasklessWork"; "YieldTasklessWork"; "RecoverTasklessWork" ] do
         Assert.That(writeMethods |> Array.exists (fun (name, _) -> name = newTool), Is.True,
                     $"Taskless lifecycle tool {newTool} missing from the public MCP surface.")

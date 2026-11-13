@@ -23,22 +23,14 @@ type ResolvedProject = private { Target: ProjectTarget; WorkspaceRoot: FolderPat
 
 module ProjectTarget =
     let parse (input: string) : Client.Result<ProjectTarget> =
-        if String.IsNullOrWhiteSpace input then
+        match Common.ProjectSelector.parse input with
+        | Some(project, None) ->
+            Ok { Project = ProjectId project; Checkout = Main }
+        | Some(project, Some checkout) ->
+            Ok { Project = ProjectId project; Checkout = Registered(WorktreeId checkout) }
+        | None when String.IsNullOrWhiteSpace input ->
             Error(ValidationError "Project identifier cannot be empty.")
-        else
-            let sections = input.Split([| "::" |], StringSplitOptions.None)
-            let validComponent (part: string) =
-                not (String.IsNullOrWhiteSpace part)
-                && part <> "." && part <> ".."
-                && not (part.Contains('/')) && not (part.Contains('\\'))
-                && not (part.Contains("..", StringComparison.Ordinal))
-                && not (part.Contains(':'))
-            match sections with
-            | [| project |] when validComponent project ->
-                Ok { Project = ProjectId project; Checkout = Main }
-            | [| project; checkout |] when validComponent project && validComponent checkout ->
-                Ok { Project = ProjectId project; Checkout = Registered(WorktreeId checkout) }
-            | _ -> Error(ValidationError "Invalid project or worktree selector.")
+        | None -> Error(ValidationError "Invalid project or worktree selector.")
 
     let projectId target = target.Project
     let projectName target = let (ProjectId name) = target.Project in name

@@ -1428,6 +1428,148 @@ type ReviewWorkflowTests() =
             | other -> Assert.Fail(sprintf "Already acknowledged notification: %A" other))
 
     [<Test>]
+    member _.NotificationBlockAutoreplyAndOriginalRetryAreDurable() =
+        withFixture (fun _ _ first second _ _ _ _ ->
+            let initial = ReviewWorkflow.getNotificationPreferences first "Reviewer" |> success
+            Assert.That(initial.Preferences.Version, Is.EqualTo(0))
+            Assert.That(initial.Preferences.BlockedSenders, Is.Empty)
+            let blockId = Guid.NewGuid()
+            let block () =
+                ReviewWorkflow.setNotificationSenderBlock first blockId "Reviewer" "Reviewer"
+                    "Jarvis" "" "Owner" true "Use the review queue."
+            Assert.That((block () |> success).AlreadyApplied, Is.False)
+            Assert.That((block () |> success).AlreadyApplied, Is.True)
+            let prefs = (ReviewWorkflow.getNotificationPreferences second "Reviewer" |> success).Preferences
+            Assert.That(prefs.Version, Is.EqualTo(1))
+            Assert.That(prefs.BlockedSenders.Head.FromAgentId, Is.EqualTo("Owner"))
+            Assert.That(prefs.BlockedSenders.Head.FromProjectName, Is.Empty)
+            let id = Guid.NewGuid()
+            let send () = ReviewWorkflow.notifyAgent first id "Owner" "" "Reviewer" "" "Please review."
+            let blocked = send () |> success
+            Assert.That(blocked.AlreadyApplied, Is.False)
+            let receipt = ReviewWorkflow.notificationDelivery second blocked |> success
+            Assert.That(receipt.Status, Is.EqualTo("Blocked"))
+            Assert.That(receipt.NotificationId, Is.Null)
+            Assert.That(receipt.AutoReply, Is.EqualTo("Use the review queue."))
+            Assert.That((ReviewWorkflow.getAgentInbox second "Reviewer" |> success).PendingNotifications, Is.Empty)
+            Assert.That((send () |> success).AlreadyApplied, Is.True)
+            let newReply = ReviewWorkflow.setNotificationSenderBlock first (Guid.NewGuid())
+                               "Reviewer" "Reviewer" "Jarvis" "" "Owner" true "Stop messaging." |> success
+            Assert.That(newReply.AlreadyApplied, Is.False)
+            let original = ReviewWorkflow.notificationDelivery first (send () |> success) |> success
+            Assert.That(original.AutoReply, Is.EqualTo("Use the review queue."),
+                        "Operation replay must retain the original recipient decision")
+            ReviewWorkflow.setNotificationSenderBlock first (Guid.NewGuid())
+                "Reviewer" "Reviewer" "Jarvis" "" "Owner" false "" |> success |> ignore
+            let stillBlocked = ReviewWorkflow.notificationDelivery first (send () |> success) |> success
+            Assert.That(stillBlocked.Status, Is.EqualTo("Blocked"))
+            let nextId = Guid.NewGuid()
+            let delivered = ReviewWorkflow.notifyAgent first nextId "Owner" "" "Reviewer" "" "New message"
+                            |> success
+                            |> ReviewWorkflow.notificationDelivery first
+                            |> success
+            Assert.That(delivered.Status, Is.EqualTo("Delivered"))
+            Assert.That(delivered.NotificationId, Is.EqualTo(nextId.ToString("N")))
+            Assert.That((ReviewWorkflow.getAgentInbox second "Reviewer" |> success).PendingNotifications.Length,
+                        Is.EqualTo(1))
+            match ReviewWorkflow.setNotificationSenderBlock first (Guid.NewGuid())
+                    "Owner" "Reviewer" "Jarvis" "" "Owner" true "" with
+            | Error(ReviewAccessDenied _) -> ()
+            | other -> Assert.Fail(sprintf "Unrelated actor must not change recipient policy: %A" other))
+
+    [<Test>]
+    member _.ProjectWorktreeAliasCannotBypassRecipientBlock() =
+        withFixture (fun _ _ first second _ _ _ _ ->
+            let routed = Common.ProjectSelector.notificationSource
+            Assert.That(routed "Jarvis::worktree-one" "Jarvis", Is.EqualTo(Some ""))
+            Assert.That(routed "Jarvis" "Jarvis::worktree-two", Is.EqualTo(Some ""))
+            Assert.That(routed "Wayfold::worktree-one" "Jarvis", Is.EqualTo(Some "Wayfold"))
+            Assert.That(routed "Jarvis::bad/name" "Wayfold", Is.EqualTo(None))
+
+            ReviewWorkflow.setNotificationSenderBlock first (Guid.NewGuid())
+                "Reviewer" "Reviewer" "Jarvis::recipient-checkout" "Wayfold::source-checkout"
+                "Owner" true "Use the review queue."
+            |> success |> ignore
+            let preferences = (ReviewWorkflow.getNotificationPreferences second "Reviewer" |> success).Preferences
+            Assert.That(preferences.BlockedSenders.Head.FromProjectName, Is.EqualTo("Wayfold"))
+            let send id source =
+                let write = ReviewWorkflow.notifyAgent first id "Owner" source "Reviewer" "" "Hello"
+                            |> success
+                write, ReviewWorkflow.notificationDelivery second write |> success
+            let originalId = Guid.NewGuid()
+            let _, blocked = send originalId "Wayfold::source-checkout"
+            Assert.That(blocked.Status, Is.EqualTo("Blocked"))
+            Assert.That(blocked.AutoReply, Is.EqualTo("Use the review queue."))
+            Assert.That((ReviewWorkflow.getAgentInbox second "Reviewer" |> success).PendingNotifications,
+                        Is.Empty)
+            ReviewWorkflow.setNotificationSenderBlock first (Guid.NewGuid())
+                "Reviewer" "Reviewer" "Jarvis" "Wayfold" "Owner" true "Updated reply."
+            |> success |> ignore
+            let retry, original = send originalId "Wayfold"
+            Assert.That(retry.AlreadyApplied, Is.True)
+            Assert.That(original.AutoReply, Is.EqualTo("Use the review queue."))
+            Assert.That((snd (send (Guid.NewGuid()) "Wayfold")).AutoReply,
+                        Is.EqualTo("Updated reply."))
+            Assert.That((snd (send (Guid.NewGuid()) "Elsewhere")).Status, Is.EqualTo("Delivered"))
+
+            ReviewWorkflow.setNotificationSenderBlock first (Guid.NewGuid())
+                "Reviewer" "Reviewer" "Jarvis::recipient-checkout" "Jarvis::source-checkout"
+                "Owner" true "Local policy."
+            |> success |> ignore
+            let localSource = routed "Jarvis::source-checkout" "Jarvis" |> Option.get
+            Assert.That((snd (send (Guid.NewGuid()) localSource)).AutoReply,
+                        Is.EqualTo("Local policy."))
+            Assert.That((ReviewWorkflow.getAgentInbox second "Reviewer" |> success).PendingNotifications.Length,
+                        Is.EqualTo(1), "Blocked aliases must never append inbox notifications")
+            match ReviewWorkflow.notifyAgent first (Guid.NewGuid()) "Owner"
+                    "Wayfold::bad/name" "Reviewer" "" "Bad source" with
+            | Error(InvalidBinding _) -> ()
+            | other -> Assert.Fail(sprintf "Malformed source selector must fail closed: %A" other)
+            ReviewWorkflow.setNotificationSenderBlock first (Guid.NewGuid())
+                "Reviewer" "Reviewer" "Jarvis" "Wayfold" "Owner" false ""
+            |> success |> ignore
+            Assert.That((snd (send (Guid.NewGuid()) "Wayfold::source-checkout")).Status,
+                        Is.EqualTo("Delivered"))
+            Assert.That((ReviewWorkflow.getAgentInbox second "Reviewer" |> success).PendingNotifications.Length,
+                        Is.EqualTo(2)))
+
+    [<Test>]
+    member _.CrossProjectSenderBlocksAreQualifiedAndMuteNeverCreatesInboxNotifications() =
+        withFixture (fun _ _ first second _ _ _ _ ->
+            ReviewWorkflow.setNotificationSenderBlock first (Guid.NewGuid())
+                "Reviewer" "Reviewer" "Jarvis" "Wayfold" "Owner" true "Use the queue."
+            |> success |> ignore
+            let send fromProject id =
+                ReviewWorkflow.notifyAgent first id "Owner" fromProject "Reviewer" "" "Hello"
+                |> success
+                |> ReviewWorkflow.notificationDelivery second
+                |> success
+            Assert.That((send "Wayfold" (Guid.NewGuid())).Status, Is.EqualTo("Blocked"))
+            Assert.That((send "" (Guid.NewGuid())).Status, Is.EqualTo("Delivered"),
+                        "Same agent name in another project must not inherit the block")
+            ReviewWorkflow.setNotificationMute first (Guid.NewGuid()) "Reviewer" "Reviewer"
+                true "Use the review queue."
+            |> success |> ignore
+            let mutedId = Guid.NewGuid()
+            let muted = send "Elsewhere" mutedId
+            Assert.That(muted.Status, Is.EqualTo("Blocked"))
+            Assert.That(muted.AutoReply, Is.EqualTo("Use the review queue."))
+            for _ in 1..3 do
+                let outcome = send "Elsewhere" (Guid.NewGuid())
+                Assert.That(outcome.Status, Is.EqualTo("Blocked"))
+            Assert.That((ReviewWorkflow.getAgentInbox second "Reviewer" |> success).PendingNotifications.Length,
+                        Is.EqualTo(1), "Muting must never append inbox notices")
+            ReviewWorkflow.setNotificationMute first (Guid.NewGuid()) "Reviewer" "Reviewer" false ""
+            |> success |> ignore
+            Assert.That((send "Elsewhere" (Guid.NewGuid())).Status, Is.EqualTo("Delivered"))
+            Assert.That((send "Wayfold" (Guid.NewGuid())).Status, Is.EqualTo("Blocked"))
+            let invalid = ReviewWorkflow.setNotificationMute first (Guid.NewGuid())
+                              "Reviewer" "Reviewer" true "Line one\nLine two"
+            match invalid with
+            | Error(InvalidBinding _) -> ()
+            | other -> Assert.Fail(sprintf "Control-character autoreply must be rejected: %A" other))
+
+    [<Test>]
     member _.LegacyNotificationWithoutSourceProjectRemainsReadableAndAcknowledgable() =
         withFixture (fun one _ first second _ _ _ _ ->
             let id = Guid.NewGuid()

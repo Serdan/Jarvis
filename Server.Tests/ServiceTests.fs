@@ -14,6 +14,35 @@ open Server
 open Server.Services
 
 [<Test>]
+let notificationToolCanonicalizesWorktreeAliases () =
+    let build source destination =
+        Server.NotificationCommands.create source "Owner" "Reviewer" "Hello"
+            "stable-operation" "" destination
+    let afterVerification command =
+        Server.NotificationCommands.canonicalVerified command |> Option.get
+    let local = build "Jarvis::source" "Jarvis"
+    Assert.That(local.SourceRef, Is.EqualTo("Jarvis::source"),
+                "Do not discard the selected checkout before source verification")
+    Assert.That((afterVerification local).SourceRef, Is.Empty)
+    let sameAlias = build "Jarvis" "Jarvis::destination"
+    Assert.That(sameAlias.SourceRef, Is.EqualTo("Jarvis"))
+    Assert.That((afterVerification sameAlias).SourceRef, Is.Empty)
+    Assert.That((build "Jarvis::source" "").SourceRef, Is.Empty)
+    let cross = build "Jarvis::source" "Wayfold::destination"
+    Assert.That(cross.SourceRef, Is.EqualTo("Jarvis::source"))
+    Assert.That((afterVerification cross).SourceRef, Is.EqualTo("Jarvis"))
+    Assert.That(cross.ProjectName, Is.EqualTo("Wayfold::destination"))
+    Assert.That(cross.ActorId, Is.EqualTo("Owner"))
+    Assert.That((build "Elsewhere" "Wayfold").SourceRef, Is.EqualTo("Elsewhere"))
+    let invalid = build "Jarvis::bad/name" "Wayfold"
+    Assert.That(invalid.SourceRef, Is.EqualTo("Jarvis::bad/name"))
+    Assert.That(Server.NotificationCommands.canonicalVerified invalid, Is.EqualTo(None),
+                "Malformed selectors must fail instead of gaining authority via canonical project")
+    let invalidDestination = build "Jarvis" "Wayfold::bad/name"
+    Assert.That(Server.NotificationCommands.canonicalVerified invalidDestination, Is.EqualTo(None),
+                "An unresolvable destination must also fail closed before any destination write")
+
+[<Test>]
 let invalidation_routes_only_to_connected_devices_of_authenticated_user () =
     let users = UserService()
     let register userId device connection =
@@ -476,7 +505,7 @@ let ``command catalog matches AgentCommand union and MCP tools`` () =
     let ledgerWire = set [ "TaskRead"; "TaskWrite"; "ReviewRead"; "ReviewWrite";
                           "LedgerRead"; "LedgerWrite"; "ChallengeRead"; "ChallengeWrite" ]
     let orchestrationTools =
-        set [ "GetIntegrationSubmissions"; "SubmitIntegration"; "CompleteIntegration"; "NotifyAgent"; "AcknowledgeNotification"; "AgentInbox"; "GetAssignment"; "GetCheckpoint"; "InspectAttemptSource"; "TaskLifecycleHistory"; "GetTaskSpecPage"; "DiffTaskSpec"; "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "ReissueAssignment"; "CheckpointAttempt"
+        set [ "GetIntegrationSubmissions"; "SubmitIntegration"; "CompleteIntegration"; "NotifyAgent"; "AcknowledgeNotification"; "GetNotificationPreferences"; "SetNotificationSenderBlock"; "SetNotificationMute"; "AgentInbox"; "GetAssignment"; "GetCheckpoint"; "InspectAttemptSource"; "TaskLifecycleHistory"; "GetTaskSpecPage"; "DiffTaskSpec"; "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "ReissueAssignment"; "CheckpointAttempt"
               "GetRole"; "ListRoles"; "GetAgentInstructionConfig"; "ResolveAgentInstructions"
               "CreateRole"; "UpdateRole"; "AttachRole"; "DetachRole"; "SetAgentInstructions"
               "SetAttemptSource"; "YieldAgent"; "CompleteAgentWork"
@@ -573,9 +602,9 @@ let ``client-backed MCP tools expose an optional per-command deviceId`` () =
         |> Array.filter (fun methodInfo ->
             methodInfo.GetParameters()
             |> Array.exists (fun parameter -> parameter.ParameterType = typeof<ClientService>))
-    // Include role/instruction aliases, challenge-domain endpoints and the
-    // three taskless lifecycle methods without dropping device routing.
-    clientMethods.Length |> shouldEqual (AgentProtocol.commandDefinitions.Length - 1 + 72)
+    // Preserve role/instruction aliases, Challenges, taskless execution and
+    // recipient-notification public methods, all with device routing.
+    clientMethods.Length |> shouldEqual (AgentProtocol.commandDefinitions.Length - 1 + 75)
     for methodInfo in clientMethods do
         let deviceParam = methodInfo.GetParameters() |> Array.tryFind (fun parameter -> parameter.Name = "deviceId")
         match deviceParam with
@@ -983,11 +1012,11 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
                             "PendingOperationSummary"; "PendingOperationsPage"; "InspectPendingOperation" ] -> name, ledgerRead
               for name in [ "InitializeLedger"; "BindExistingLedger"; "RebindLedgerRemote"; "AcknowledgePendingOperation" ] -> name, ledgerWrite
               for name in [ "GetIntegrationSubmissions"; "AgentInbox"; "GetAssignment"; "GetCheckpoint"; "InspectAttemptSource"; "TaskLifecycleHistory"; "GetTaskSpecPage"; "DiffTaskSpec";
-                            "GetRole"; "ListRoles"; "GetAgentInstructionConfig"; "ResolveAgentInstructions" ] ->
+                            "GetRole"; "ListRoles"; "GetAgentInstructionConfig"; "ResolveAgentInstructions"; "GetNotificationPreferences" ] ->
                   name, (if name = "AgentInbox" then
                              { taskRead with MutatesState = true }
                          else taskRead)
-              for name in [ "SubmitIntegration"; "CompleteIntegration"; "NotifyAgent"; "AcknowledgeNotification"; "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "ReissueAssignment"; "CheckpointAttempt"
+              for name in [ "SubmitIntegration"; "CompleteIntegration"; "NotifyAgent"; "AcknowledgeNotification"; "SetNotificationSenderBlock"; "SetNotificationMute"; "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "ReissueAssignment"; "CheckpointAttempt"
                             "CreateRole"; "UpdateRole"; "AttachRole"; "DetachRole"; "SetAgentInstructions";
                             "SetAttemptSource"; "YieldAgent"; "CompleteAgentWork";
                             "StartTasklessWork"; "YieldTasklessWork"; "RecoverTasklessWork";

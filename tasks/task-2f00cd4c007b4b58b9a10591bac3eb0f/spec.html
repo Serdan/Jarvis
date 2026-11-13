@@ -1,0 +1,17 @@
+<h1>Register an agent with optional role and task</h1>
+<p><strong>Purpose:</strong> Make the common agent-creation flow a single call while preserving the existing bare <code>register_agent</code> behavior. Today callers must independently register, attach a role with a version check, and assign an Open task with a caller-created attempt UUID.</p>
+<h2>API and semantics</h2>
+<ul>
+<li>Add optional <code>roleId</code> and <code>taskId</code> arguments to <code>register_agent(projectName, agentId, ...)</code>. No breaking changes to existing callers or the independent <code>attach_role</code>/<code>assign_task</code> APIs. A single role is sufficient for initial registration; additional roles can be attached later.</li>
+<li>Apply registration, optional role attachment and optional task assignment <strong>atomically in one canonical Git ledger transaction</strong>, not as three independently committed operations. Validate the referenced role exists and that the task is Open, has an intact canonical spec and no owner; if any prerequisite fails, create nothing. Preserve the existing authenticated actor attribution, project binding, role validation, task exclusivity, and operation-ID replay/conflict behavior.</li>
+<li>When <code>taskId</code> is present, generate a fresh stable attempt ID inside the operation and create the usual queued attempt, issuance/assignment generation, pinned spec, task InProgress update, and agent <code>Ready</code> state using the same invariants as <code>assign_task</code>. Return the new attempt ID and setup result. A task-assigned agent is <em>not</em> automatically Working.</li>
+<li>Without a task, the newly registered agent remains <code>Stopped</code>/<code>Parked</code> with no assignment; attaching only a role never activates the agent. Without a role, no persistent instruction config need be created. With a role, establish the normal persistent role membership from the outset; no role-derived permissions are granted. If neither option is supplied, behavior is unchanged.</li>
+<li>Do not launch a browser tab, resume an agent, infer a task from its role, create placeholder tasks, or silently overwrite an existing registered agent. Taskless execution remains a separate concern.</li>
+</ul>
+<h2>Acceptance</h2>
+<ol>
+<li>Test all four combinations: bare registration; role only (Parked); task only (Ready and queued attempt); role plus task (both applied exactly once). Confirm ordinary <code>agent_inbox</code> resolves the attached role and pinned task specification.</li>
+<li>Missing role, missing/non-Open/owned task, corrupt spec, duplicate agent ID and simultaneous conflicting registrations cause explicit failure with no partial registration, role membership or assignment writes.</li>
+<li>Duplicate requests with the same operation ID and arguments return the same registration/attempt receipt; an operation ID reused with changed arguments is rejected. Concurrent task claim/registration races cannot double-assign.</li>
+<li>Existing separate register/attach/assign tests still pass; run .NET 11 Release tests and obtain independent frozen review before merge/deploy.</li>
+</ol>

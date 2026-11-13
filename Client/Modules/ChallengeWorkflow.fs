@@ -741,7 +741,12 @@ module ChallengeWorkflow =
               Version = challenge.Version
               EvidencePreview = compact 120 condition.Evidence
               ReasonPreview = compact 120 condition.Reason
-              UpdatedAtUtc = condition.UpdatedAtUtc }
+              // Cancellation is a challenge-level transition. Its conditions
+              // retain their historical timestamps, but the issuer outcome
+              // must sort by the cancellation time.
+              UpdatedAtUtc =
+                  if challenge.Status = "Cancelled" then challenge.UpdatedAtUtc
+                  else condition.UpdatedAtUtc }
         let allItems =
             [ for challenge in challenges do
                 for condition in challenge.Conditions do
@@ -749,23 +754,35 @@ module ChallengeWorkflow =
         let newest items =
             items |> List.sortByDescending (fun (entry: InboxChallengeItem) ->
                 entry.UpdatedAtUtc, entry.ChallengeId, entry.ConditionId)
+        // Condition status alone is not enough: cancellation is terminal
+        // without rewriting the individual condition's immutable outcome.
+        let actionable (challenge: AgentChallenge) =
+            challenge.Status = "Pending" || challenge.Status = "Blocked"
         let assigned =
             allItems
-            |> List.choose (fun (_, c, item) ->
-                if c.OwnerAgentId = actor && c.Status = "Pending" then Some item else None)
+            |> List.choose (fun (challenge, c, item) ->
+                if actionable challenge && c.OwnerAgentId = actor && c.Status = "Pending"
+                then Some item else None)
             |> newest
         let triage =
             if enabled then
                 allItems
-                |> List.choose (fun (_, c, item) ->
-                    if c.Status = "Pending" && String.IsNullOrWhiteSpace c.OwnerAgentId
+                |> List.choose (fun (challenge, c, item) ->
+                    if actionable challenge && c.Status = "Pending"
+                       && String.IsNullOrWhiteSpace c.OwnerAgentId
                     then Some item else None)
                 |> newest
             else []
         let recent =
             allItems
             |> List.choose (fun (challenge, c, item) ->
-                if challenge.IssuerAgentId = actor && c.Status <> "Pending"
+                // A cancelled challenge may have only Pending conditions.
+                // Show one terminal issuer outcome without falsifying their
+                // per-condition states or flooding the recent inbox.
+                if challenge.IssuerAgentId = actor
+                   && (if challenge.Status = "Cancelled" then
+                           challenge.Conditions.Head.ConditionId = c.ConditionId
+                       else c.Status <> "Pending")
                 then Some item else None)
             |> newest
         let linked =

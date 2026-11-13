@@ -914,3 +914,99 @@ type ChallengeTests() =
             Assert.That(newLinks.Length, Is.EqualTo(1))
             Assert.That(notices b, Is.Empty)
         )
+
+
+    [<Test>]
+    member _.CancelledChallengeConditionsDoNotRemainActionableInInbox() =
+        withFixture (fun a b ->
+            let unassigned =
+                ChallengeWorkflow.create a (Guid.NewGuid()) "Agent 3" "Unassigned cancelled gate" ""
+                    [ { OwnerAgentId = ""; SuggestedAgentId = "Agent 8"
+                        Description = "Unassigned work" } ] |> ok
+            let assigned =
+                ChallengeWorkflow.create b (Guid.NewGuid()) "Agent 3" "Assigned cancelled gate" ""
+                    [ { OwnerAgentId = "Lead"; SuggestedAgentId = ""
+                        Description = "Assigned work" } ] |> ok
+            ChallengeWorkflow.setSubscription a (Guid.NewGuid()) "Lead" true |> ok |> ignore
+            let before = LedgerStore.fetch b |> ok
+            let projectLead snapshot =
+                ReviewWorkflow.getAgentInboxAt a snapshot "Lead" |> ok
+                |> ChallengeWorkflow.enrichInboxAt a snapshot "Lead" |> ok
+            let beforeInbox = projectLead before
+            Assert.That(beforeInbox.ChallengeSubscribed, Is.True)
+            Assert.That(beforeInbox.ChallengeTriage |> List.exists (fun c ->
+                c.ChallengeId = unassigned.ChallengeId), Is.True)
+            Assert.That(beforeInbox.ChallengeAssigned |> List.exists (fun c ->
+                c.ChallengeId = assigned.ChallengeId), Is.True)
+
+            ChallengeWorkflow.cancel b (Guid.NewGuid()) "Agent 3" unassigned.ChallengeId
+                1 "Unassigned requirement withdrawn" |> ok |> ignore
+            ChallengeWorkflow.cancel a (Guid.NewGuid()) "Agent 3" assigned.ChallengeId
+                1 "Assigned requirement withdrawn" |> ok |> ignore
+            let after = LedgerStore.fetch b |> ok
+            let afterInbox = projectLead after
+            Assert.That(afterInbox.ChallengeTriage, Is.Empty)
+            Assert.That(afterInbox.ChallengeAssigned, Is.Empty)
+            Assert.That(afterInbox.ChallengeTriageOmitted, Is.Zero)
+            Assert.That(afterInbox.ChallengeAssignedOmitted, Is.Zero)
+
+            // A previously pinned snapshot still shows the earlier actionable
+            // state. Cancellation never silently edits historical records.
+            let original = projectLead before
+            Assert.That(original.ChallengeTriage.Length, Is.EqualTo(1))
+            Assert.That(original.ChallengeAssigned.Length, Is.EqualTo(1))
+            let issuer =
+                ReviewWorkflow.getAgentInboxAt b after "Agent 3" |> ok
+                |> ChallengeWorkflow.enrichInboxAt b after "Agent 3" |> ok
+            Assert.That(issuer.ChallengeRecent |> List.filter (fun c ->
+                c.ChallengeStatus = "Cancelled") |> List.map _.ChallengeId |> Set.ofList,
+                Is.EquivalentTo(Set.ofList [ unassigned.ChallengeId; assigned.ChallengeId ]))
+            for challengeId in [ unassigned.ChallengeId; assigned.ChallengeId ] do
+                let full = ChallengeWorkflow.get b "Agent 3" challengeId |> ok
+                Assert.That(full.Challenge.Status, Is.EqualTo("Cancelled"))
+                Assert.That(full.Challenge.Conditions.Head.Status, Is.EqualTo("Pending"))
+                let summary = issuer.ChallengeRecent |> List.find (fun item ->
+                    item.ChallengeId = challengeId)
+                Assert.That(summary.UpdatedAtUtc, Is.EqualTo(full.Challenge.UpdatedAtUtc))
+                Assert.That(full.History.Length, Is.EqualTo(2))
+                Assert.That(full.History.Tail.Head.Action, Is.EqualTo("CancelChallenge"))
+            Assert.That(notices a, Is.Empty)
+            Assert.That(notices b, Is.Empty)
+        )
+
+    [<Test>]
+    member _.CancellationRetainsPartialEvidenceButNoPendingOwnerWork() =
+        withFixture (fun a b ->
+            let created =
+                ChallengeWorkflow.create a (Guid.NewGuid()) "Agent 3" "Partially complete gate" ""
+                    [ { OwnerAgentId = "Lead"; SuggestedAgentId = ""; Description = "Completed work" }
+                      { OwnerAgentId = "Agent 8"; SuggestedAgentId = ""; Description = "Pending work" } ] |> ok
+            ChallengeWorkflow.resolve b (Guid.NewGuid()) "Lead" created.ChallengeId
+                created.ConditionIds.Head 1 "review evidence" "" |> ok |> ignore
+            let before = LedgerStore.fetch a |> ok
+            let priorOwner =
+                ReviewWorkflow.getAgentInboxAt a before "Agent 8" |> ok
+                |> ChallengeWorkflow.enrichInboxAt a before "Agent 8" |> ok
+            Assert.That(priorOwner.ChallengeAssigned.Length, Is.EqualTo(1))
+            ChallengeWorkflow.cancel a (Guid.NewGuid()) "Agent 3" created.ChallengeId
+                2 "No longer required" |> ok |> ignore
+            let now = LedgerStore.fetch b |> ok
+            let owner =
+                ReviewWorkflow.getAgentInboxAt b now "Agent 8" |> ok
+                |> ChallengeWorkflow.enrichInboxAt b now "Agent 8" |> ok
+            Assert.That(owner.ChallengeAssigned, Is.Empty)
+            let issuer =
+                ReviewWorkflow.getAgentInboxAt b now "Agent 3" |> ok
+                |> ChallengeWorkflow.enrichInboxAt b now "Agent 3" |> ok
+            let cancelled = issuer.ChallengeRecent |> List.filter (fun c ->
+                c.ChallengeId = created.ChallengeId)
+            Assert.That(cancelled.Length, Is.EqualTo(1),
+                "One cancelled challenge should produce one issuer summary.")
+            Assert.That(cancelled.Head.ChallengeStatus, Is.EqualTo("Cancelled"))
+            let full = ChallengeWorkflow.get a "Agent 3" created.ChallengeId |> ok
+            Assert.That(full.Challenge.Conditions.Head.Status, Is.EqualTo("Satisfied"))
+            Assert.That(full.Challenge.Conditions.Head.Evidence, Is.EqualTo("review evidence"))
+            Assert.That(full.Challenge.Conditions.Tail.Head.Status, Is.EqualTo("Pending"))
+            Assert.That(full.History.Length, Is.EqualTo(3))
+            Assert.That(notices b, Is.Empty)
+        )

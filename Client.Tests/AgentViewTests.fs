@@ -363,3 +363,47 @@ let sameNamedAgentsAcrossProjectsKeepProjectSpecificFiltering () =
     Assert.That(selected "#W@Worker 1" = ["Wayfold"], Is.True)
     Assert.That(selected "@Worker 1#J" = ["Jarvis"], Is.True)
     Assert.That(selected "#W@Worker 2", Is.Empty)
+
+[<Test>]
+let partialWorkerSelectorIncludesBareAndNumberedNamesWithoutRosterDependentModeSwitch () =
+    let numbered =
+        [ record "Wayfold" "Worker 1" "Ready" None;
+          record "Wayfold" "Worker 2" "Ready" None;
+          record "Wayfold" "Worker 10" "Working" None;
+          record "Jarvis" "Worker 3" "Ready" None ]
+    let bare = record "Wayfold" "Worker" "Ready" None
+    let selected roster filter =
+        visibleRows filter (snapshot roster)
+        |> List.map (fun row -> row.Project, row.Agent)
+        |> Set.ofList
+    let numberedResult =
+        set [ ("Wayfold", "Worker 1"); ("Wayfold", "Worker 2"); ("Wayfold", "Worker 10") ]
+    Assert.That(selected numbered "#Wayfold@Worker" = numberedResult, Is.True)
+    Assert.That(selected (bare :: numbered) "#Wayfold@Worker" =
+                    Set.add ("Wayfold", "Worker") numberedResult, Is.True)
+    Assert.That(selected (bare :: numbered) "#wayfold@WORK" =
+                    Set.add ("Wayfold", "Worker") numberedResult, Is.True)
+    // Numeric tokens have stable boundaries regardless of an exact bare agent.
+    for roster in [ numbered; bare :: numbered ] do
+        Assert.That(selected roster "#Wayfold@Worker 1" =
+                        Set.singleton ("Wayfold", "Worker 1"), Is.True)
+        Assert.That(selected roster "@Worker 10#Wayfold" =
+                        Set.singleton ("Wayfold", "Worker 10"), Is.True)
+        Assert.That(selected roster "#Jarvis@Worker" =
+                        Set.singleton ("Jarvis", "Worker 3"), Is.True)
+
+[<Test>]
+let completionWithExactBareWorkerNameRetainsAmbiguityAndDoesNotChangeFilterSemantics () =
+    let numbered =
+        [ record "Wayfold" "Worker 1" "Ready" None;
+          record "Wayfold" "Worker 2" "Working" None;
+          record "Jarvis" "Worker 3" "Ready" None ]
+    let withBare = snapshot (record "Wayfold" "Worker" "Ready" None :: numbered)
+    let withoutBare = snapshot numbered
+    let query = "#Wayfold@Wo"
+    Assert.That(completeFilter query withBare, Is.EqualTo("#Wayfold@Worker"))
+    Assert.That(completeFilter "#Wayfold@Worker" withBare, Is.EqualTo("#Wayfold@Worker"))
+    Assert.That(completeFilter query withoutBare, Is.EqualTo("#Wayfold@Worker "))
+    Assert.That(completeFilter "#Wayfold@Worker " withoutBare, Is.EqualTo("#Wayfold@Worker "))
+    Assert.That(completeFilter "#Wayfold@Worker 1" withBare, Is.EqualTo("#Wayfold@Worker 1"))
+    Assert.That(completeFilter "#Jarvis@Wo" withBare, Is.EqualTo("#Jarvis@Worker 3"))

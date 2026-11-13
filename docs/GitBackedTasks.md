@@ -327,8 +327,13 @@ The Agents screen follows Activity: a 12-row selectable list with colored
 `#project` labels, timestamps and inline details toggled by Enter.
 Up/Down and Page Up/Down navigate; End selects the last row.
 Use `/` to filter by agent, task or worktree, or `#` to start a project
-filter or `@` to start an agent filter; search terms can be combined just as in Activity. `f` remains an
-alias for text filtering. `Tab` extends a typed selector to the longest common local match without cycling. Press `r` to refresh and Escape to return.
+filter or `@` to start an agent filter; search terms can be combined just as
+in Activity. `@Worker` matches every agent name containing `Worker`,
+including a bare `Worker` and numbered workers. A numeric selector token
+such as `@Worker 1` ends at a token boundary, so it does not match
+`Worker 10`, regardless of the currently visible roster.
+`f` remains an alias for text filtering. `Tab` extends a typed selector
+to the longest common local match without cycling. Press `r` to refresh and Escape to return.
 Permission requests appear below the details and open with `p`, using the
 same highlighting and controls as the Activity screen.
 

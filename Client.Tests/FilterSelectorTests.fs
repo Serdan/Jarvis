@@ -96,3 +96,16 @@ let ``repeat selectors keep their explicit AND meaning`` () =
     let terms = parse "#Wayfold #Jarvis @Worker @GUI"
     Assert.That(terms.Projects = ["Wayfold"; "Jarvis"], Is.True)
     Assert.That(terms.Agents = ["Worker"; "GUI"], Is.True)
+
+[<Test>]
+let numericAgentTokensRespectBoundariesWithoutSuppressingPartialWorkerMatches () =
+    for name in ["Worker"; "Worker 1"; "Worker 10"; "PreWorker 1"; "Worker 1_backup"] do
+        Assert.That(FilterSelectors.matchesAgentTerm "worker" name, Is.True, name)
+    for name in ["Worker 10"; "Worker 11"; "Worker 1a"; "Worker 1_backup"] do
+        Assert.That(FilterSelectors.matchesAgentTerm "Worker 1" name, Is.False, name)
+    for name in ["Worker 1"; "PreWorker 1"; "Worker 101 Worker 1"; "Worker 1-support"] do
+        Assert.That(FilterSelectors.matchesAgentTerm "wOrKeR 1" name, Is.True, name)
+    Assert.That(FilterSelectors.matchesAgentTerm "Worker 1" "Worker 10 Worker 1", Is.True)
+    Assert.That(FilterSelectors.matchesAgentTerm "Worker 10" "Worker 100", Is.False)
+    Assert.That(FilterSelectors.matchesAgentTerm "Worker" "GUI Agent", Is.False)
+    Assert.That(FilterSelectors.matchesAgentTerm "GUI Ag" "GUI Agent", Is.True)

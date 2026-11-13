@@ -47,6 +47,26 @@ let private chunks (query: string) =
 let private containsCaseInsensitive (needle: string) (value: string) =
     value.IndexOf(needle, StringComparison.OrdinalIgnoreCase) >= 0
 
+/// Agent selectors use case-insensitive substring matching. When the selector
+/// ends in a digit, require the numeric token to end at a name boundary:
+/// @Worker matches Worker and Worker 1, but @Worker 1 cannot match Worker 10.
+/// This is a property of the query syntax, never of which names are present.
+let matchesAgentTerm (term: string) (agentName: string) =
+    if String.IsNullOrEmpty term then true
+    elif isNull agentName then false
+    else
+        let requiresTokenBoundary = Char.IsDigit term[term.Length - 1]
+        let isTokenContinuation character = Char.IsLetterOrDigit character || character = '_'
+        let rec search start =
+            let index = agentName.IndexOf(term, start, StringComparison.OrdinalIgnoreCase)
+            if index < 0 then false
+            else
+                let after = index + term.Length
+                if not requiresTokenBoundary || after = agentName.Length
+                   || not (isTokenContinuation agentName[after]) then true
+                else search (index + 1)
+        search 0
+
 /// A selector with embedded spaces is resolved against the current local
 /// snapshot. The longest name-compatible token prefix belongs to the selector;
 /// remaining words are ordinary descriptive search terms. Without a known

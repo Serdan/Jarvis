@@ -292,7 +292,7 @@ let lastSeenAt (agent: AgentRow) (seen: IDictionary<string, DateTimeOffset>) =
         | _ -> ()
     latest
 
-let private matchesTerms (terms: ActivityFilter.Terms) (exactAgentNames: HashSet<string>) (row: AgentRow) =
+let private matchesTerms (terms: ActivityFilter.Terms) (row: AgentRow) =
     let searchable =
         [ row.Agent; row.State; row.Project; row.ProjectLabel; yield! row.ProjectAliases
           row.StateReason |> Option.defaultValue ""
@@ -300,21 +300,15 @@ let private matchesTerms (terms: ActivityFilter.Terms) (exactAgentNames: HashSet
           | Some task -> yield! [ task.TaskId; task.Title; task.Lifecycle; task.Phase; task.SourceRef |> Option.defaultValue "" ]
           | None -> () ]
         |> String.concat " "
-    let matchesAgent term =
-        // Exact local names distinguish Worker 1 from Worker 10; otherwise
-        // a partial @Worker selector matches all matching agent identities.
-        if exactAgentNames.Contains term then String.Equals(row.Agent, term, StringComparison.OrdinalIgnoreCase)
-        else row.Agent.Contains(term, StringComparison.OrdinalIgnoreCase)
     matchesProjectAliases terms (row.ProjectLabel :: row.Project :: row.ProjectAliases)
-    && (terms.Agents |> List.forall matchesAgent)
+    && (terms.Agents |> List.forall (fun term -> FilterSelectors.matchesAgentTerm term row.Agent))
     && ActivityFilter.matchesTerms { terms with Projects = []; Agents = [] } None searchable
 
 let visibleRows filter snapshot =
     let agents = snapshot.Agents |> List.map _.Agent
     let terms = ActivityFilter.parseTermsWithCandidates (projectNames snapshot) agents filter
-    let exactAgentNames = HashSet<string>(agents, StringComparer.OrdinalIgnoreCase)
     rows snapshot
-    |> List.filter (fun row -> row.State <> "Parked" && matchesTerms terms exactAgentNames row)
+    |> List.filter (fun row -> row.State <> "Parked" && matchesTerms terms row)
 
 let displayState state = if state = "NeedsWork" then "Waiting" else state
 

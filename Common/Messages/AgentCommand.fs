@@ -199,6 +199,45 @@ type TaskWriteCommand =
       Evidence: string
       SessionId: string }
 
+/// Challenge condition owners and descriptions are explicit typed wire fields.
+type ChallengeConditionDefinition =
+    { OwnerAgentId: string
+      SuggestedAgentId: string
+      Description: string }
+
+type ChallengeReadCommand =
+    { ProjectName: string
+      ActorId: string
+      Action: string
+      ChallengeId: string
+      Limit: int
+      AfterChallengeId: string
+      AfterEventSequence: int64
+      ExpectedSnapshotCommit: string }
+
+type ChallengeWriteCommand =
+    { ProjectName: string
+      ActorId: string
+      OperationId: string
+      Action: string
+      ChallengeId: string
+      ConditionId: string
+      ExpectedVersion: int
+      Title: string
+      TaskId: string
+      AttemptId: string
+      DependencyChallengeIds: string list
+      ExpectedTaskVersion: int
+      ExpectedAttemptVersion: int
+      ExpectedAgentVersion: int
+      AssignmentGeneration: int
+      Conditions: ChallengeConditionDefinition list
+      Evidence: string
+      Reason: string
+      Outcome: string
+      NewOwnerAgentId: string
+      Subscribe: bool }
+
 type LedgerReadCommand =
     { ProjectName: string
       Action: string
@@ -736,6 +775,8 @@ type AgentCommand =
     | ObserveAgentCommand of ObserveAgentRequest
     | TaskWriteCommand of TaskWriteCommand
     | CrossProjectNotificationCommand of CrossProjectNotificationCommand
+    | ChallengeReadCommand of ChallengeReadCommand
+    | ChallengeWriteCommand of ChallengeWriteCommand
     | LedgerReadCommand of LedgerReadCommand
     | LedgerWriteCommand of LedgerWriteCommand
     | ReviewReadCommand of ReviewReadCommand
@@ -799,6 +840,8 @@ module AgentCommandInfo =
         | ObserveAgentCommand _ -> "ObserveAgentCommand"
         | TaskWriteCommand _
         | CrossProjectNotificationCommand _ -> "TaskWriteCommand"
+        | ChallengeReadCommand _ -> "ChallengeReadCommand"
+        | ChallengeWriteCommand _ -> "ChallengeWriteCommand"
         | LedgerReadCommand _ -> "LedgerReadCommand"
         | LedgerWriteCommand _ -> "LedgerWriteCommand"
         | ReviewReadCommand _ -> "ReviewReadCommand"
@@ -868,6 +911,8 @@ module AgentCommandInfo =
         | ObserveAgentCommand _ -> "ObserveAgent"
         | TaskWriteCommand _
         | CrossProjectNotificationCommand _ -> "TaskWrite"
+        | ChallengeReadCommand _ -> "ChallengeRead"
+        | ChallengeWriteCommand _ -> "ChallengeWrite"
         | LedgerReadCommand _ -> "LedgerRead"
         | LedgerWriteCommand _ -> "LedgerWrite"
         | ReviewReadCommand _ -> "ReviewRead"
@@ -947,6 +992,8 @@ module AgentCommandInfo =
         | ObserveAgentCommand cmd -> Some cmd.ProjectName
         | TaskWriteCommand cmd -> Some cmd.ProjectName
         | CrossProjectNotificationCommand envelope -> Some envelope.Notification.ProjectName
+        | ChallengeReadCommand cmd -> Some cmd.ProjectName
+        | ChallengeWriteCommand cmd -> Some cmd.ProjectName
         | LedgerReadCommand cmd -> Some cmd.ProjectName
         | LedgerWriteCommand cmd -> Some cmd.ProjectName
         | ReviewReadCommand cmd -> Some cmd.ProjectName
@@ -1057,6 +1104,8 @@ module AgentCommandInfo =
         | ObserveAgentCommand cmd -> Some(compact cmd.TargetAgentId)
         | TaskWriteCommand cmd
         | CrossProjectNotificationCommand { Notification = cmd } -> Some(compact cmd.Action)
+        | ChallengeReadCommand cmd -> Some(compact cmd.Action)
+        | ChallengeWriteCommand cmd -> Some(compact cmd.Action)
         | LedgerReadCommand cmd -> Some(compact cmd.ProjectName)
         | LedgerWriteCommand cmd -> Some(compact cmd.Action)
         | ReviewReadCommand cmd -> Some(compact cmd.Action)
@@ -1122,6 +1171,8 @@ module AgentCommandInfo =
         | ObserveAgentCommand cmd -> Some(truncate 64 cmd.TargetAgentId)
         | TaskWriteCommand cmd
         | CrossProjectNotificationCommand { Notification = cmd } -> Some(truncate 64 cmd.Action)
+        | ChallengeReadCommand cmd -> Some(truncate 64 cmd.Action)
+        | ChallengeWriteCommand cmd -> Some(truncate 64 cmd.Action)
         | LedgerReadCommand cmd -> Some(truncate 64 cmd.ProjectName)
         | LedgerWriteCommand cmd -> Some(truncate 64 cmd.Action)
         | ReviewReadCommand cmd -> Some(truncate 64 cmd.Action)
@@ -1183,7 +1234,7 @@ module AgentCommandInfo =
         | None -> invocation command
 
 module AgentProtocol =
-    let version = "3.64"
+    let version = "3.66"
     let defaultPatchFuzzyContextLines = 3
     let maxResponseBytes = 900 * 1024
     let maxImageBytes = 8 * 1024 * 1024
@@ -1228,6 +1279,8 @@ module AgentProtocol =
           definition "TaskRead" "Reads a registered agent inbox from a single ledger snapshot." [ ReadOnly; NetworkAccess ] false false false
           definition "ObserveAgent" "Read an explicitly named target agent without attributing tool activity or beginning a Ready turn. Observer identity is independently verified." [ ReadOnly; NetworkAccess ] false false false
           definition "TaskWrite" "Creates/assigns/starts tasks and binds immutable review base." [ VersionControlWrite; NetworkAccess ] true true false
+          definition "ChallengeRead" "Read issued or owned durable challenge conditions from the verified ledger." [ ReadOnly; NetworkAccess ] false false false
+          definition "ChallengeWrite" "Atomically create, satisfy, block, reopen, or cancel durable agent challenges." [ VersionControlWrite; NetworkAccess ] true true false
           definition "LedgerRead" "Inspect the verified canonical Git ledger identity and trust head." [ ReadOnly; NetworkAccess ] false false false
           definition "LedgerWrite" "Explicitly bind, initialize or rebind the canonical ledger with privacy acknowledgment." [ VersionControlWrite; NetworkAccess ] true true false
           definition "ReviewRead" "Reads opt-in canonical review ledger requests and reviewer inboxes." [ ReadOnly; NetworkAccess ] false false false

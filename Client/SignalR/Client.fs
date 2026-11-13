@@ -121,6 +121,14 @@ let private activatesAgent (agentId: string) command =
               "SetAttemptSource"; "SubmitIntegration"; "CompleteIntegration" ]
     | TaskReadCommand cmd ->
         String.IsNullOrWhiteSpace cmd.AgentId || cmd.AgentId = agentId
+    // Challenge inspection is observational. ReadOnly MCP methods must
+    // never activate a Ready assignment or change canonical ledger state.
+    | ChallengeReadCommand _ -> false
+    // Blocking an assigned task needs to preserve the exact supplied attempt
+    // and agent CAS versions. It is an explicit lifecycle transition, not a
+    // cheap read that should implicitly start Ready->Working first.
+    | ChallengeWriteCommand cmd when cmd.Action = "BlockAttempt" || cmd.Action = "RequeueAttempt" -> false
+    | ChallengeWriteCommand cmd -> cmd.ActorId = agentId
     | LedgerWriteCommand _ | ReviewWriteCommand _
     | RetryPendingIntentCommand _ | SupersedePendingIntentCommand _
     | AbandonPendingIntentCommand _ -> false
@@ -658,6 +666,8 @@ let private dispatch (rt: Runtime) (target: ProjectPaths.ProjectTarget option)
     | TaskWriteCommand cmd -> rt |> OrchestrationApi.TaskApi.write cmd |> serialize'
     | CrossProjectNotificationCommand _ ->
         Error(Client.ValidationError "Forwarded notification must be normalized before client dispatch.") |> serialize'
+    | ChallengeReadCommand cmd -> rt |> OrchestrationApi.ChallengeApi.read cmd |> serialize'
+    | ChallengeWriteCommand cmd -> rt |> OrchestrationApi.ChallengeApi.write cmd |> serialize'
     | LedgerReadCommand cmd -> rt |> OrchestrationApi.LedgerApi.read cmd |> serialize'
     | LedgerWriteCommand cmd -> rt |> OrchestrationApi.LedgerApi.write cmd |> serialize'
     | ReviewReadCommand cmd -> rt |> OrchestrationApi.ReviewApi.read cmd |> serialize'
@@ -914,6 +924,18 @@ let processIncomingCommand (rt: Runtime) (commandJson: string) (agentId: string)
                             when String.IsNullOrWhiteSpace agentId
                                  || not (String.Equals(observation.ObserverAgentId, agentId, StringComparison.Ordinal)) ->
                             Error(Client.ValidationError "Observation actor label does not match the initiating tool-call actor.")
+                        // Challenge authorization is based on the registered
+                        // issuer/condition owner. The independently supplied
+                        // invocation actor must match BEFORE any project
+                        // resolution, implicit activity or ledger read/write.
+                        | ChallengeReadCommand read
+                            when String.IsNullOrWhiteSpace agentId
+                                 || not (String.Equals(read.ActorId, agentId, StringComparison.Ordinal)) ->
+                            Error(Client.ValidationError "Challenge read actor differs from the initiating tool-call actor.")
+                        | ChallengeWriteCommand write
+                            when String.IsNullOrWhiteSpace agentId
+                                 || not (String.Equals(write.ActorId, agentId, StringComparison.Ordinal)) ->
+                            Error(Client.ValidationError "Challenge write actor differs from the initiating tool-call actor.")
                         | _ -> classifyProject command
                     match project with
                     | Error error -> return Error error

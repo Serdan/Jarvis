@@ -473,7 +473,8 @@ let ``command catalog matches AgentCommand union and MCP tools`` () =
               "CompleteTask"; "GetTaskHistory"; "CompareWorktreeTasks"; "GetAgentAssignment"
               "AcknowledgeTask"; "GetOrchestrationSnapshot"; "RetireWorktree"; "BeginTask" ]
     // Orphan-ledger MCP tools route through eight versioned internal wire commands.
-    let ledgerWire = set [ "TaskRead"; "TaskWrite"; "ReviewRead"; "ReviewWrite"; "LedgerRead"; "LedgerWrite" ]
+    let ledgerWire = set [ "TaskRead"; "TaskWrite"; "ReviewRead"; "ReviewWrite";
+                          "LedgerRead"; "LedgerWrite"; "ChallengeRead"; "ChallengeWrite" ]
     let orchestrationTools =
         set [ "GetIntegrationSubmissions"; "SubmitIntegration"; "CompleteIntegration"; "NotifyAgent"; "AcknowledgeNotification"; "AgentInbox"; "GetAssignment"; "GetCheckpoint"; "InspectAttemptSource"; "TaskLifecycleHistory"; "GetTaskSpecPage"; "DiffTaskSpec"; "CreateTask"; "ReviseTaskSpec"; "RegisterAgent"; "AssignTask"; "ReissueAssignment"; "CheckpointAttempt"
               "GetRole"; "ListRoles"; "GetAgentInstructionConfig"; "ResolveAgentInstructions"
@@ -486,6 +487,8 @@ let ``command catalog matches AgentCommand union and MCP tools`` () =
               "LedgerHealth"; "GetOperationStatus"; "PendingOperations"; "ReconcilePendingOperations"
               "PendingOperationSummary"; "PendingOperationsPage"; "InspectPendingOperation"
               "AcknowledgePendingOperation"; "InitializeLedger"; "BindExistingLedger"; "RebindLedgerRemote"
+              "CreateChallenge"; "SetChallengeSubscription"; "AssignChallengeCondition"; "SplitChallengeCondition"; "ListChallenges"; "GetChallenge"; "ResolveChallengeCondition"
+              "ReopenChallengeCondition"; "CancelChallenge"; "BlockOnChallenges"; "RequeueChallengeBlockedAttempt"
               ]
     // Retired wire cases are deleted; public CreateTask/AssignTask are canonical ledger tools.
     unionNames |> shouldEqual catalogNames
@@ -569,9 +572,10 @@ let ``client-backed MCP tools expose an optional per-command deviceId`` () =
         |> Array.filter (fun methodInfo ->
             methodInfo.GetParameters()
             |> Array.exists (fun parameter -> parameter.ParameterType = typeof<ClientService>))
-    // Nine role/instruction tools are public aliases of the existing ledger wire
-    // protocol; they have independent methods and the same device routing rule.
-    clientMethods.Length |> shouldEqual (AgentProtocol.commandDefinitions.Length - 1 + 60)
+    // Preserve main-side role/instruction tools and the challenge-domain
+    // public aliases; both groups contribute nine aliases outside the wire
+    // command definitions. Every client-backed method needs a deviceId.
+    clientMethods.Length |> shouldEqual (AgentProtocol.commandDefinitions.Length - 1 + 69)
     for methodInfo in clientMethods do
         let deviceParam = methodInfo.GetParameters() |> Array.tryFind (fun parameter -> parameter.Name = "deviceId")
         match deviceParam with
@@ -991,7 +995,13 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
                   name, ledgerRead
               for name in [ "SubmitReview"; "ClaimReview"; "DecideReview"
                             "ReleaseReview"; "WithdrawReview"; "PutReviewDocument" ] ->
-                  name, ledgerWrite ]
+                  name, ledgerWrite
+              for name in [ "ListChallenges"; "GetChallenge" ] ->
+                  name, original["ChallengeRead"]
+              for name in [ "CreateChallenge"; "SetChallengeSubscription"; "AssignChallengeCondition"; "SplitChallengeCondition"
+                            "ResolveChallengeCondition"; "ReopenChallengeCondition"
+                            "CancelChallenge"; "BlockOnChallenges"; "RequeueChallengeBlockedAttempt" ] ->
+                  name, original["ChallengeWrite"] ]
         aliases |> List.fold (fun map (key, value) -> Map.add key value map) original
 
     let methods =

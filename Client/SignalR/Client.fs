@@ -304,6 +304,15 @@ let private auditDetails command =
     match command with
     | ImportFileCommand cmd -> Some("ImportFile", Some cmd.ProjectName, [ WorkspaceWrite; NetworkAccess ], [ cmd.FilePath ], None, [])
     | UpdateClientCommand -> Some("UpdateClient", None, [ ProcessExecution; NetworkAccess; Destructive ], [], None, [])
+    | ScheduleBrowserExecutionCommand cmd -> Some("ScheduleBrowserExecution", Some cmd.ProjectName, [ ProcessExecution; NetworkAccess ], [cmd.ScriptPath], None, [])
+    | CancelScheduledBrowserExecutionCommand _ -> Some("CancelScheduledBrowserExecution", None, [ ProcessExecution ], [], None, [])
+    | BrowserOpenTabCommand _ -> Some("BrowserOpenTab", None, [ ProcessExecution; NetworkAccess ], [], None, [])
+    | BrowserRunInNewTabCommand cmd -> Some("BrowserRunInNewTab", Some cmd.ProjectName, [ ProcessExecution; NetworkAccess ], [cmd.ScriptPath], None, [])
+    | BrowserCloseTabCommand _ -> Some("BrowserCloseTab", None, [ ProcessExecution ], [], None, [])
+    | BrowserExecuteFileCommand cmd -> Some("BrowserExecuteFile", Some cmd.ProjectName, [ ProcessExecution; NetworkAccess ], [cmd.ScriptPath], None, [])
+    | BrowserExecuteJsCommand cmd -> Some("BrowserExecuteJs", None, [ ProcessExecution; NetworkAccess ], [], None, [])
+    | BrowserCaptureDomCommand _ -> Some("BrowserCaptureDom", None, [ ProcessExecution; NetworkAccess ], [], None, [])
+    | BrowserExportDomCommand cmd -> Some("BrowserExportDom", Some cmd.ProjectName, [ ProcessExecution; NetworkAccess; WorkspaceWrite ], [cmd.FilePath], None, [])
     | WriteFileCommand cmd -> Some("WriteFile", Some cmd.ProjectName, [ WorkspaceWrite ], [ cmd.FilePath ], None, [])
     | PatchFileCommand cmd -> Some("PatchFile", Some cmd.ProjectName, [ WorkspaceWrite ], [ cmd.FilePath ], None, [])
     | RunCommandCommand cmd -> Some("RunCommand", Some cmd.ProjectName, [ ProcessExecution ], [], Some cmd.Executable, cmd.Args)
@@ -430,10 +439,209 @@ let private sourceOperation resolved withContext legacy =
     | Some project -> withContext project
     | None -> legacy()
 
+// Browser actions return bounded serialized JSON; adapt their transport result
+// to the current command-dispatch contract without inventing agent state changes.
+let private fromBrowser (operation: ValueTask<Result<string, EffectError>>) =
+    ValueTask<Result<DispatchedResult, EffectError>>(task {
+        let! result = operation
+        return result |> Result.map (fun payload ->
+            { Payload = payload; ChangedAgentIds = [] })
+    })
+
 let private dispatch (rt: Runtime) (target: ProjectPaths.ProjectTarget option)
                      (resolved: ProjectPaths.ResolvedProject option) (agentId: string) (command: AgentCommand) =
     match command with
     | ListCommandsCommand -> rt |> ProjectBrowser.listCommands |> serialize'
+    | BrowserListWindowsCommand ->
+        fromBrowser (
+            match rt.Browser with
+            | None -> ValueTask<Result<string,EffectError>>(Error(Client.ValidationError "BridgeDisabled"))
+            | Some bridge ->
+                ValueTask<Result<string,EffectError>>(bridge.ListWindows() |> Result.mapError Client.ValidationError)
+        )
+    | BrowserListTabsCommand ->
+        fromBrowser (
+            match rt.Browser with
+            | None -> ValueTask<Result<string,EffectError>>(Error(Client.ValidationError "BridgeDisabled"))
+            | Some bridge ->
+                let result = bridge.ListTabs() |> Result.mapError Client.ValidationError
+                ValueTask<Result<string,EffectError>>(result)
+        )
+    | ListScheduledBrowserExecutionsCommand ->
+        fromBrowser (
+            match rt.BrowserScheduler with
+            | None -> ValueTask<Result<string,EffectError>>(Error(Client.ValidationError "BridgeDisabled"))
+            | Some scheduler -> ValueTask<Result<string,EffectError>>(Ok(scheduler.List()))
+        )
+    | CancelScheduledBrowserExecutionCommand cmd ->
+        fromBrowser (
+            match rt.BrowserScheduler with
+            | None -> ValueTask<Result<string,EffectError>>(Error(Client.ValidationError "BridgeDisabled"))
+            | Some scheduler ->
+                let result =
+                    scheduler.Cancel(cmd.ScheduleId)
+                    |> Result.map (fun () -> """{"canceled":true}""")
+                    |> Result.mapError Client.ValidationError
+                ValueTask<Result<string,EffectError>>(result)
+        )
+    | ScheduleBrowserExecutionCommand cmd ->
+        fromBrowser (
+            let result =
+                match rt.BrowserScheduler with
+                | None -> Error(Client.ValidationError "BridgeDisabled")
+                | Some scheduler ->
+                    match ProjectPaths.validateProjectRelativePath cmd.ScriptPath with
+                    | Error error -> Error error
+                    | Ok _ when not (cmd.ScriptPath.EndsWith(".js", StringComparison.OrdinalIgnoreCase)) ->
+                        Error(Client.ValidationError "Browser script must be a .js file.")
+                    | Ok _ ->
+                        match ProjectPaths.resolveProjectFile cmd.ProjectName cmd.ScriptPath rt with
+                        | Error error -> Error error
+                        | Ok(FilePath filename) ->
+                            try
+                                if FileInfo(filename).Length > int64 BrowserBridge.MaxScriptBytes then
+                                    Error(Client.ValidationError "InputTooLarge: script exceeds 64 KiB.")
+                                else
+                                    let date = scheduler.Schedule(cmd.ScheduleId, cmd.RunAfterSeconds, cmd.Url,
+                                                    cmd.ProjectName, cmd.ScriptPath, defaultArg cmd.Alias "",
+                                                    defaultArg cmd.ArgsJson "{}", defaultArg cmd.Active false,
+                                                    ?windowRegistration = cmd.WindowRegistration,
+                                                    ?closeAfter = cmd.CloseTabAfterExecution,
+                                                    ?repeatEverySeconds = cmd.RepeatEverySeconds)
+                                    date
+                                    |> Result.map (fun due -> JsonSerializer.Serialize({| scheduleId = cmd.ScheduleId; dueAtUtc = due; status = "pending" |}))
+                                    |> Result.mapError Client.ValidationError
+                            with ex -> Error(Client.ExceptionError ex)
+            ValueTask<Result<string,EffectError>>(result)
+        )
+    | BrowserOpenTabCommand cmd ->
+        fromBrowser (
+            ValueTask<Result<string,EffectError>>(task {
+                match rt.Browser with
+                | None -> return Error(Client.ValidationError "BridgeDisabled")
+                | Some bridge ->
+                    let! result = bridge.OpenTab(cmd.WindowRegistration, cmd.Url, defaultArg cmd.Alias "", defaultArg cmd.Active false)
+                    return result |> Result.mapError Client.ValidationError
+            })
+        )
+    | BrowserCloseTabCommand cmd ->
+        fromBrowser (
+            ValueTask<Result<string,EffectError>>(task {
+                match rt.Browser with
+                | None -> return Error(Client.ValidationError "BridgeDisabled")
+                | Some bridge ->
+                    let! result = bridge.CloseTab(cmd.TabRegistration)
+                    return result |> Result.mapError Client.ValidationError
+            })
+        )
+    | BrowserRunInNewTabCommand cmd ->
+        fromBrowser (
+            ValueTask<Result<string,EffectError>>(task {
+                match rt.Browser with
+                | None -> return Error(Client.ValidationError "BridgeDisabled")
+                | Some bridge ->
+                    match ProjectPaths.validateProjectRelativePath cmd.ScriptPath with
+                    | Error e -> return Error e
+                    | Ok _ when not (cmd.ScriptPath.EndsWith(".js", StringComparison.OrdinalIgnoreCase)) ->
+                        return Error(Client.ValidationError "Browser script must be a .js file.")
+                    | Ok _ ->
+                        match ProjectPaths.resolveProjectFile cmd.ProjectName cmd.ScriptPath rt with
+                        | Error e -> return Error e
+                        | Ok(FilePath path) ->
+                            try
+                                if FileInfo(path).Length > int64 BrowserBridge.MaxScriptBytes then
+                                    return Error(Client.ValidationError "InputTooLarge: script exceeds 64 KiB.")
+                                else
+                                    let source = File.ReadAllText(path, UTF8Encoding(false, true))
+                                    let args = defaultArg cmd.ArgsJson "{}"
+                                    use validatedArgs = JsonDocument.Parse(args)
+                                    let! result = BrowserBridge.runInNewTab bridge cmd.WindowRegistration cmd.Url "" (defaultArg cmd.Active false) source args (defaultArg cmd.TimeoutMs 30000) (defaultArg cmd.CloseTabAfterExecution false)
+                                    return result
+                                           |> Result.mapError (fun (registrationId,error) ->
+                                               let detail =
+                                                   if String.IsNullOrWhiteSpace(registrationId) then error
+                                                   else error + " [tabRegistration=" + registrationId + "]"
+                                               Client.ValidationError detail)
+                            with
+                            | :? DecoderFallbackException -> return Error(Client.ValidationError "InvalidUtf8")
+                            | :? JsonException -> return Error(Client.ValidationError "InvalidArgumentsJson")
+                            | :? FileNotFoundException -> return Error(Client.NotFoundError "ScriptNotFound")
+                            | ex -> return Error(Client.ExceptionError ex)
+            })
+        )
+    | BrowserExecuteFileCommand cmd ->
+        fromBrowser (
+            ValueTask<Result<string,EffectError>>(task {
+                match rt.Browser with
+                | None -> return Error(Client.ValidationError "BridgeDisabled")
+                | Some bridge ->
+                    match ProjectPaths.validateProjectRelativePath cmd.ScriptPath with
+                    | Error error -> return Error error
+                    | Ok _ when not (cmd.ScriptPath.EndsWith(".js", StringComparison.OrdinalIgnoreCase)) ->
+                        return Error(Client.ValidationError "Browser script must be a .js file.")
+                    | Ok _ ->
+                        match ProjectPaths.resolveProjectFile cmd.ProjectName cmd.ScriptPath rt with
+                        | Error error -> return Error error
+                        | Ok(FilePath path) ->
+                            try
+                                let info = FileInfo(path)
+                                if info.Length > int64 BrowserBridge.MaxScriptBytes then
+                                    return Error(Client.ValidationError "InputTooLarge: script exceeds 64 KiB.")
+                                else
+                                    let source = File.ReadAllText(path, UTF8Encoding(false, true))
+                                    let! outcome = bridge.Execute(cmd.TabRegistration, source, defaultArg cmd.ArgsJson "{}", defaultArg cmd.TimeoutMs 15000, false)
+                                    return outcome |> Result.mapError Client.ValidationError
+                            with
+                            | :? DecoderFallbackException ->
+                                return Error(Client.ValidationError "InvalidUtf8")
+                            | :? FileNotFoundException ->
+                                return Error(Client.NotFoundError "ScriptNotFound")
+                            | ex -> return Error(Client.ExceptionError ex)
+            })
+        )
+    | BrowserCaptureDomCommand cmd ->
+        fromBrowser (
+            ValueTask<Result<string,EffectError>>(task {
+                match rt.Browser with
+                | None -> return Error(Client.ValidationError "BridgeDisabled")
+                | Some bridge ->
+                    let! result = bridge.CaptureDom(cmd.TabRegistration,
+                        defaultArg cmd.WaitJson """{"kind":"immediate"}""",
+                        defaultArg cmd.CaptureSelector "", defaultArg cmd.TimeoutMs 30000, None)
+                    return result |> Result.mapError Client.ValidationError
+            })
+        )
+    | BrowserExportDomCommand cmd ->
+        fromBrowser (
+            ValueTask<Result<string,EffectError>>(task {
+                match rt.Browser with
+                | None -> return Error(Client.ValidationError "BridgeDisabled")
+                | Some bridge ->
+                    match ProjectPaths.resolveWritableProjectFile cmd.ProjectName cmd.FilePath rt with
+                    | Error e -> return Error e
+                    | Ok(FilePath destination) ->
+                        let! result = bridge.CaptureDom(cmd.TabRegistration,
+                            defaultArg cmd.WaitJson """{"kind":"immediate"}""",
+                            defaultArg cmd.CaptureSelector "", defaultArg cmd.TimeoutMs 30000, Some destination)
+                        match result with
+                        | Error reason -> return Error(Client.ValidationError reason)
+                        | Ok json ->
+                            use snapshot = JsonDocument.Parse(json)
+                            return Ok(JsonSerializer.Serialize(
+                                {| projectName = cmd.ProjectName; filePath = cmd.FilePath
+                                   snapshot = snapshot.RootElement.Clone() |}))
+            })
+        )
+    | BrowserExecuteJsCommand cmd ->
+        fromBrowser (
+            ValueTask<Result<string,EffectError>>(task {
+                match rt.Browser with
+                | None -> return Error(Client.ValidationError "BridgeDisabled")
+                | Some bridge ->
+                    let! outcome = bridge.Execute(cmd.TabRegistration, cmd.Code, defaultArg cmd.ArgsJson "{}", defaultArg cmd.TimeoutMs 15000, true)
+                    return outcome |> Result.mapError Client.ValidationError
+            })
+        )
     | ListWorktreesCommand cmd -> rt |> Worktrees.listWorktrees cmd |> serialize'
     | GetWorktreeCommand cmd -> rt |> Worktrees.getWorktree cmd |> serialize'
     | CreateWorktreeCommand cmd -> rt |> Worktrees.createWorktree cmd |> serialize'

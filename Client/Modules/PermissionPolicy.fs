@@ -108,6 +108,9 @@ let private requiresConfirmation command =
     match command with
     | ListCommandsCommand
     | ListProjectsCommand
+    | BrowserListTabsCommand
+    | BrowserListWindowsCommand
+    | ListScheduledBrowserExecutionsCommand
     | ListWorktreesCommand _
     | GetWorktreeCommand _
     | InspectWorktreeRemovalCommand _
@@ -134,6 +137,33 @@ let private requiresConfirmation command =
     | GetJobResultCommand _
     | MessageCommand _
     | GetClientActivityCommand _ -> readOnly
+    | ScheduleBrowserExecutionCommand cmd ->
+        confirmation "ScheduleBrowserExecution" (Some cmd.ProjectName) [ ProcessExecution; NetworkAccess ]
+            [ cmd.ScriptPath ] None [] ("Schedule browser execution " + cmd.ScheduleId) false
+    | CancelScheduledBrowserExecutionCommand cmd ->
+        confirmation "CancelScheduledBrowserExecution" None [ ProcessExecution ] [] None [] ("Cancel scheduled browser action " + cmd.ScheduleId) false
+    | BrowserOpenTabCommand cmd ->
+        let origin =
+            match Uri.TryCreate(cmd.Url, UriKind.Absolute) with
+            | true, uri when uri.Scheme = "https" || uri.Scheme = "http" -> uri.GetLeftPart(UriPartial.Authority)
+            | _ -> "(invalid URL)"
+        confirmation "BrowserOpenTab" None [ ProcessExecution; NetworkAccess ] [] None [] ("Open browser tab on " + origin) false
+    | BrowserCloseTabCommand cmd ->
+        confirmation "BrowserCloseTab" None [ ProcessExecution ] [] None [] ("Close Jarvis-created tab " + cmd.TabRegistration) false
+    | BrowserRunInNewTabCommand cmd ->
+        confirmation "BrowserRunInNewTab" (Some cmd.ProjectName) [ ProcessExecution; NetworkAccess ] [cmd.ScriptPath] None []
+            ("Open browser tab in " + cmd.WindowRegistration + " and execute " + cmd.ScriptPath) false
+    | BrowserExecuteFileCommand cmd ->
+        confirmation "BrowserExecuteFile" (Some cmd.ProjectName) [ ProcessExecution; NetworkAccess ] [ cmd.ScriptPath ] None [] ("Execute browser script in registered tab " + cmd.TabRegistration) false
+    | BrowserExecuteJsCommand cmd ->
+        confirmation "BrowserExecuteJs" None [ ProcessExecution; NetworkAccess ] [] None [] ("Execute JavaScript in registered tab " + cmd.TabRegistration) false
+    | BrowserCaptureDomCommand cmd ->
+        confirmation "BrowserCaptureDom" None [ ProcessExecution; NetworkAccess ] [] None []
+            ("Capture rendered DOM in registered tab " + cmd.TabRegistration) false
+    | BrowserExportDomCommand cmd ->
+        confirmation "BrowserExportDom" (Some cmd.ProjectName)
+            [ ProcessExecution; NetworkAccess; WorkspaceWrite ] [ cmd.FilePath ] None []
+            ("Export rendered DOM from " + cmd.TabRegistration + " into " + cmd.ProjectName + "/" + cmd.FilePath) false
     | ImportFileCommand cmd ->
         // Never show a temporary signed file URL (query credentials) in
         // confirmation dialogs, audits or error messages.
@@ -210,14 +240,21 @@ let private requiresConfirmation command =
 let private trustAllows trustLevel command =
     match trustLevel, command with
     | FullTrust, _ -> true
-    // The public MCP tool uses an OpenAI file param, but neither its file ID
-    // nor its URL should be trusted as authority by themselves. Only URLs
-    // from the known delivery domain are auto-approved under PartialTrust.
-    | PartialTrust, ImportFileCommand cmd -> ImportNetwork.isKnownAttachment cmd.DownloadUrl
+    | PartialTrust, ScheduleBrowserExecutionCommand _
+    | PartialTrust, CancelScheduledBrowserExecutionCommand _
+    | PartialTrust, BrowserOpenTabCommand _
+    | PartialTrust, BrowserCloseTabCommand _
+    | PartialTrust, BrowserRunInNewTabCommand _
+    | PartialTrust, BrowserExecuteFileCommand _
+    | PartialTrust, BrowserExecuteJsCommand _
+    | PartialTrust, BrowserCaptureDomCommand _
+    | PartialTrust, BrowserExportDomCommand _
     | PartialTrust, RunCommandCommand _
     | PartialTrust, RunProjectTaskCommand _
     | PartialTrust, StartJobCommand _
     | PartialTrust, CancelJobCommand _ -> false
+    // A trusted attachment URL may be imported in PartialTrust.
+    | PartialTrust, ImportFileCommand cmd -> ImportNetwork.isKnownAttachment cmd.DownloadUrl
     | PartialTrust, _ -> true
     | NoTrust, _ -> false
 

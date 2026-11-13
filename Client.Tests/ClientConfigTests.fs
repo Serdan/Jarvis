@@ -35,7 +35,7 @@ let ``saved configuration persists independently of executable and preserves unk
                 WorkspacePath = Some root
                 TrustLevel = Some "none"
                 AllowedEnvironmentVariables = Some [ "TEST_KEY" ]
-                MaxImportBytes = Some 0L }
+                MaxImportBytes = Some 0L; BrowserPort = Some 43822 }
         let saved =
             match ClientConfig.save snapshot changed with
             | Ok x -> x
@@ -81,14 +81,17 @@ let ``configured defaults and startup flags use deterministic precedence`` () =
             WorkspacePath = Some "/tmp"
             TrustLevel = Some "none"
             MaxImportBytes = Some 10L
+            BrowserPort = None
             AllowedEnvironmentVariables = Some [ "CUSTOM_VAR" ] }
-    match ClientConfig.resolve stored [ "--machine-name"; "Worker"; "--trust"; "partial"; "--max-import-bytes"; "64" ] with
+    match ClientConfig.resolve stored [ "--machine-name"; "Worker"; "--trust"; "partial"; "--max-import-bytes"; "64"; "--browser-port"; "43822" ] with
     | Error e -> failwith e
     | Ok effective ->
         effective.MachineName |> shouldEqual "Worker"
         effective.WorkspacePath |> shouldEqual "/tmp"
         effective.TrustLevel |> shouldEqual "partial"
         effective.MaxImportBytes |> shouldEqual 64L
+        effective.BrowserPort |> shouldEqual (Some 43822)
+        effective.Overrides.Contains("browserPort") |> shouldEqual true
         effective.AllowedEnvironmentVariables |> List.contains "CUSTOM_VAR" |> shouldEqual true
         effective.Overrides.Contains("machineName") |> shouldEqual true
         effective.Overrides.Contains("workspacePath") |> shouldEqual false
@@ -125,3 +128,18 @@ let ``CLI override does not mutate persisted configuration`` () =
         (ClientConfig.loadAt path |> Result.defaultWith failwith).Stored.MachineName |> shouldEqual (Some "Configured")
     finally
         Directory.Delete(root, true)
+
+
+[<Test>]
+let browserPortValidation () =
+    let blank = ClientConfig.resolve ClientConfig.empty []
+    match blank with
+    | Ok effective -> effective.BrowserPort |> shouldEqual None
+    | Error e -> Assert.Fail(e)
+    match ClientConfig.updateKey "browser-port" "43822" ClientConfig.empty with
+    | Error e -> Assert.Fail(e)
+    | Ok stored -> stored.BrowserPort |> shouldEqual (Some 43822)
+    for value in [ "0"; "1023"; "65536"; "nope" ] do
+        match ClientConfig.updateKey "browser-port" value ClientConfig.empty with
+        | Error _ -> ()
+        | Ok _ -> Assert.Fail("Accepted invalid port: " + value)

@@ -1,0 +1,27 @@
+{
+  "manifest_version": 3,
+  "name": "Jarvis Browser Bridge",
+  "version": "0.2.0",
+  "description": "Registered-window browser automation bridge for Jarvis.",
+  "minimum_chrome_version": "138",
+  "permissions": [
+    "storage",
+    "tabs",
+    "userScripts",
+    "alarms", "webNavigation"
+  ],
+  "optional_host_permissions": [
+    "http://*/*",
+    "https://*/*"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Jarvis Browser Bridge",
+    "default_popup": "popup.html"
+  }
+}

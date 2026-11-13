@@ -1,0 +1,27 @@
+﻿{
+  "schemaVersion": 1,
+  "id": "2026-10-26-browser-bridge-jarvis",
+  "title": "Local browser bridge and MCP command routing",
+  "status": "active",
+  "dependencies": [],
+  "owner": null,
+  "updatedAt": "2026-10-28T21:20:51.4192462\u002B00:00",
+  "checkpoint": {
+    "summary": "Implemented a generic, persistent, one-shot JarvisClient browser scheduler in commit 7ef47e4. MCP ScheduleBrowserExecution/ListScheduledBrowserExecutions/CancelScheduledBrowserExecution schedule an open-tab\u002Bproject-script action by ID and delay. Jobs survive client restart; the client marks a job running before dispatch, never replays uncertain work, and needs no watchdog or agent-specific role state. Tab aliases can be generated uniquely. Browser consent remains extension-controlled.",
+    "nextAction": "Independent code review and real Edge acceptance: pair extension, manually register an origin, opt into agent-created tabs, schedule a short new-tab execution from a real project JavaScript file, verify it runs once and persists across client restart, and check revoke/cancel. Then integrate and deploy coordinated server/client/extension if accepted. No rollout yet.",
+    "verified": [
+      "dotnet test Jarvis.slnx --no-restore: 60 server and 279 client tests passed",
+      "node --test browser-extension/tests/bridge.test.cjs: 9 passed",
+      "git diff --check: passed",
+      "Commit 7ef47e4; worktree clean",
+      "Client.Tests BrowserSchedulesTests: persistence, cancellation, no-replay and validation passed"
+    ],
+    "blocker": null,
+    "lastCommit": "7ef47e41b6395d9fd1ddba12d641d53dbce90a4f"
+  },
+  "nextActor": "reviewer",
+  "lastUpdatedBy": {
+    "role": "agent",
+    "id": "BrowserBridge implementer"
+  }
+}

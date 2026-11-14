@@ -24,6 +24,7 @@ type private JobRecord =
       StartedAt: DateTimeOffset
       Process: Process
       TerminateGroup: unit -> unit
+      LaunchGate: obj
       SyncRoot: obj
       Events: ResizeArray<JobOutputEvent>
       MaxOutputBytes: int
@@ -229,6 +230,7 @@ module private Core =
                       StartedAt = DateTimeOffset.UtcNow
                       Process = proc
                       TerminateGroup = terminateGroup
+                      LaunchGate = obj()
                       SyncRoot = obj()
                       Events = ResizeArray()
                       MaxOutputBytes = maxOutputBytes
@@ -245,60 +247,77 @@ module private Core =
                 proc.ErrorDataReceived.Add(fun event ->
                     appendEvent job JobOutputStream.StdErr event.Data)
 
-                proc.Exited.Add(fun _ ->
-                    // Kill remaining group members BEFORE WaitForExit: they
-                    // may retain the redirected streams after leader exit.
-                    // This is cleanup, NOT a durable OS reaping attestation.
-                    try terminateGroup() with _ -> ()
-                    try proc.WaitForExit()
-                    with _ -> ()
+                let mutable completedHandled = false
+                let completeObservedExit () =
+                    if transferred && not completedHandled then
+                        completedHandled <- true
+                        // Kill remaining group members BEFORE WaitForExit:
+                        // descendants may retain redirected pipes. This is
+                        // cleanup, NOT durable OS reaping attestation.
+                        try terminateGroup() with _ -> ()
+                        try proc.WaitForExit()
+                        with _ -> ()
 
-                    lock job.SyncRoot (fun () ->
-                        if job.CancellationRequested then
-                            job.Status <- Canceled
-                        else
-                            try job.Status <- Completed proc.ExitCode
-                            with _ -> job.Status <- FailedToStart "Process exited before an exit code was available."
-                        job.CompletedAt <- Some DateTimeOffset.UtcNow)
-                    releaseSupervisor()
-                    pruneCompletedJobs())
+                        lock job.SyncRoot (fun () ->
+                            if job.CancellationRequested then
+                                job.Status <- Canceled
+                            else
+                                try job.Status <- Completed proc.ExitCode
+                                with _ -> job.Status <- FailedToStart "Process exited before an exit code was available."
+                            job.CompletedAt <- Some DateTimeOffset.UtcNow)
+                        releaseSupervisor()
+                        pruneCompletedJobs()
+
+                proc.Exited.Add(fun _ ->
+                    // Exited can be raised before launch handoff completes.
+                    // The launcher also checks HasExited after transferring
+                    // ownership, so an early one-shot event is not lost.
+                    lock job.LaunchGate completeObservedExit)
 
                 if not (jobs.TryAdd(jobId, job)) then
                     releaseSupervisor()
                     proc.Dispose()
                     Error(Client.ContextError "Failed to register job.")
                 else
-                    try
-                        if not (proc.Start()) then
+                    // A job is inserted before Start to receive asynchronous
+                    // output. Hold its launch gate through OS assignment,
+                    // stream setup and ownership transfer. Both cancellation
+                    // and Exited wait for this handoff instead of racing it.
+                    lock job.LaunchGate (fun () ->
+                        try
+                            if not (proc.Start()) then
+                                releaseSupervisor()
+                                let mutable removed = Unchecked.defaultof<JobRecord>
+                                jobs.TryRemove(jobId, &removed) |> ignore
+                                proc.Dispose()
+                                Error(Client.ContextError "Failed to start job.")
+                            else
+                                if windows then
+                                    if not (BoundedProcess.Native.AssignProcessToJobObject(
+                                        windowsJob, proc.Handle)) then
+                                        raise (System.ComponentModel.Win32Exception(
+                                            System.Runtime.InteropServices.Marshal.GetLastWin32Error()))
+                                    // All descendants inherit the assigned job.
+                                    readiness |> Option.iter (fun ready -> ready.Set() |> ignore)
+                                proc.BeginOutputReadLine()
+                                proc.BeginErrorReadLine()
+                                transferred <- true
+                                // If Exited fired during initialization, its
+                                // callback could not finalize yet. Detect an
+                                // already-dead leader and finalize exactly once.
+                                if proc.HasExited then completeObservedExit()
+                                Ok { JobId = jobId; StartedAt = job.StartedAt }
+                        with ex ->
+                            try
+                                try terminateGroup() with _ -> ()
+                                if not proc.HasExited then proc.Kill(entireProcessTree = true)
+                            with _ -> ()
+                            try proc.WaitForExit(250) |> ignore with _ -> ()
                             releaseSupervisor()
                             let mutable removed = Unchecked.defaultof<JobRecord>
                             jobs.TryRemove(jobId, &removed) |> ignore
                             proc.Dispose()
-                            Error(Client.ContextError "Failed to start job.")
-                        else
-                            if windows then
-                                if not (BoundedProcess.Native.AssignProcessToJobObject(
-                                    windowsJob, proc.Handle)) then
-                                    raise (System.ComponentModel.Win32Exception(
-                                        System.Runtime.InteropServices.Marshal.GetLastWin32Error()))
-                                // The helper is blocked on this event, so all
-                                // of its children inherit the Job Object.
-                                readiness |> Option.iter (fun ready -> ready.Set() |> ignore)
-                            proc.BeginOutputReadLine()
-                            proc.BeginErrorReadLine()
-                            transferred <- true
-                            Ok { JobId = jobId; StartedAt = job.StartedAt }
-                    with ex ->
-                        try
-                            try terminateGroup() with _ -> ()
-                            if not proc.HasExited then proc.Kill(entireProcessTree = true)
-                        with _ -> ()
-                        try proc.WaitForExit(250) |> ignore with _ -> ()
-                        releaseSupervisor()
-                        let mutable removed = Unchecked.defaultof<JobRecord>
-                        jobs.TryRemove(jobId, &removed) |> ignore
-                        proc.Dispose()
-                        Error(ExceptionError ex)
+                            Error(ExceptionError ex))
         with ex ->
             Error(ExceptionError ex)
 
@@ -379,28 +398,36 @@ module private Core =
                 | Error error -> Error error
                 | Ok () ->
                     // Requesting cancellation is NOT a terminal process
-                    // observation: Kill(entireProcessTree) initiates shutdown
-                    // but does not prove the leader, let alone every
-                    // descendant, has exited. The Exited callback alone
-                    // changes Running to Canceled once the parent has exited.
-                    let shouldCancel =
-                        lock job.SyncRoot (fun () ->
-                            if job.Status = Running then
-                                job.CancellationRequested <- true
-                                true
-                            else false)
-                    if shouldCancel then
-                        try
-                            job.TerminateGroup()
-                            if not job.Process.HasExited then job.Process.Kill(entireProcessTree = true)
-                            Ok()
-                        with ex ->
-                            // A failed kill attempt does not revoke the
-                            // cancellation request; the caller may retry and
-                            // the eventual Exited event retains its history.
-                            Error(ExceptionError ex)
-                    else
-                        Ok()
+                    // observation. Decide whether to cancel WHILE holding
+                    // the launch/exit gate: the Exited callback must not
+                    // complete a job and release its process-group identity
+                    // between our status check and kill request.
+                    lock job.LaunchGate (fun () ->
+                        // Process.HasExited may synchronously invoke Exited,
+                        // whose WaitForExit drains async output callbacks that
+                        // require SyncRoot. Never query it under SyncRoot.
+                        let alreadyExited = job.Process.HasExited
+                        let shouldCancel =
+                            lock job.SyncRoot (fun () ->
+                                // Skip an already-observed dead leader. A
+                                // subsequent exit may race the signal because
+                                // no pidfd/cgroup lifetime handle exists.
+                                if job.Status = Running && not alreadyExited then
+                                    job.CancellationRequested <- true
+                                    true
+                                else false)
+                        if shouldCancel then
+                            try
+                                job.TerminateGroup()
+                                if not job.Process.HasExited then
+                                    job.Process.Kill(entireProcessTree = true)
+                                Ok()
+                            with ex ->
+                                // A failed kill attempt does not revoke the
+                                // cancellation request. The caller may retry.
+                                Error(ExceptionError ex)
+                        else
+                            Ok())
 
 // Tool operations are intentionally separate from OS processes. Admission is
 // bounded before scheduling; the original task owns the one canonical result.

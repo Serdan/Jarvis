@@ -907,3 +907,43 @@ No server `Dispatched` execution witness is promoted to `Terminal` by
 this change. Independent OS-backed per-incarnation termination certificates,
 crash-resilient reconciliation, and the global pre-witness legacy drain
 remain prerequisites for activating administrative correction.
+
+### StartJob launch/exit ownership handshake (2026-11-14)
+
+An additional concurrency audit found that OS group ownership was not yet
+atomic with the job's startup. The `Process.Exited` handler could run as soon
+as `Process.Start` succeeded, before a short-lived Windows helper had been
+assigned to its kill-on-close Job Object and before its redirected stream
+readers were initialized. Premature `releaseSupervisor()` could close the
+Windows job handle during assignment or make the launcher return failure
+after a real process had run. An independently racing `CancelJob` checked
+`Running` before obtaining the launcher lock, allowing the Exited callback
+to complete and release group ownership between the status check and a
+later attempt to signal that historical process group.
+
+All three paths now acquire **the same per-job launch/exit gate**. The
+launcher holds the gate across native process start, Windows Job Object
+assignment/readiness notification, stdout/stderr reader initialization, and
+transfer of resource ownership to Exited. The Exited callback waits for
+that transfer and ignores a failed launch whose cleanup retained ownership.
+`CancelJob` checks `Running`, records the cancellation request and
+initiates group termination under the same gate; `SyncRoot` continues
+to own output/status. A canceled job still becomes terminal only when
+its parent exit is observed, not when Kill returns.
+
+Focused regressions exercise 24 concurrent very short-lived `StartJob`
+processes and 12 concurrent short-lived parent exits racing two
+cancellation requests per job, in addition to the explicit live descendant
+and cancellation tests. This closes an in-process handoff race only.
+Neither the lock nor the job's terminal status attests crash-stable
+descendant reaping, detached process escape, an obsolete client incarnation,
+or fleet-wide legacy quiescence. The corrective operator endpoint and
+legacy execution epoch remain disabled pending independent proof.
+
+A one-shot `Exited` notification raised before launch handoff cannot be lost: after transferring native ownership, the launcher checks `HasExited` and invokes the same idempotent completion routine for an already-dead leader. The `CompletedAt` timestamp continues to mean **observed parent exit only**, never verified process-tree quiescence.
+
+If cancellation arrives after the leader has exited but before its callback recorded completion, the caller observes `HasExited` while holding `LaunchGate`, does not set `CancellationRequested`, and does not send a signal to the historical process-group ID. The normal exit finalizer remains responsible for group cleanup and preserving a completed exit code; this avoids a late cancel signaling an OS-reused group identity.
+
+This `HasExited` check is only a best-effort stale-signal avoidance, **not** a PID-reuse-safe kill primitive: a leader can exit between observation and `killpg`. Proving correct group identity and complete termination across that race requires an OS-backed lifetime handle (for example a scoped cgroup/job supervisor) and durable birth/boot identity. The server's unresolved process witnesses continue to veto correction regardless of these client statuses.
+
+Lock ordering is deliberately `LaunchGate` before `SyncRoot` across both cancellation and `Exited`. `Process.HasExited` can itself raise `Exited`, which may call `WaitForExit` and drain output-event callbacks requiring `SyncRoot`. A draft that queried `HasExited` while holding `SyncRoot` stalled the focused test host; the final version queries it under `LaunchGate` **before** taking `SyncRoot`. The 24-test focused .NET 11 Release suite then completed successfully. Windows Job Object lifetime behavior still requires execution on Windows for platform-specific assurance.

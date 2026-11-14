@@ -880,8 +880,16 @@ Thread.Sleep(TimeSpan.FromSeconds(45.0))
                         |> function
                            | Ok jobs -> jobs.Jobs |> List.find (fun j -> j.JobId = jobId)
                            | Error error -> failwithf "Cannot inspect active job: %A" error
-                    Assert.That(summary.CompletedAt.IsNone, Is.True,
-                                "A cancellation request cannot publish a terminal timestamp.")
+                    // The first GetJobResult and this ListJobs snapshot are
+                    // separate observations: Exited may run between them.
+                    // Check the status and timestamp from ONE atomic summary.
+                    match summary.Status with
+                    | Running ->
+                        Assert.That(summary.CompletedAt.IsNone, Is.True,
+                                    "A cancellation request cannot publish a terminal timestamp.")
+                    | Canceled ->
+                        Assert.That(summary.CompletedAt.IsSome, Is.True)
+                    | other -> Assert.Fail($"Unexpected cancellation status: {other}")
                     Thread.Sleep 25
                     awaitTerminal ()
                 | Canceled ->
@@ -1023,3 +1031,98 @@ let startJobCleansUpProcessGroupAfterParentExit () =
 [<Test>]
 let cancelJobKillsSupervisedDescendants () =
     verifyStartJobDescendantContainment true
+
+[<Test>]
+let rapidConcurrentStartJobsDoNotLoseLaunchOrExitHandoff () =
+    let root = createTempProject()
+    let context = TestContext root
+    let mutable started = Array.empty<string>
+    try
+        // Short-lived command completion can race Process.Start, the Windows
+        // readiness-gate assignment and async stdout reader initialization.
+        // Exercise multiple launchers so an Exited event must not dispose a
+        // shared supervisor before its launcher has transferred ownership.
+        let start =
+            { ProjectName = "Project1"
+              Executable = "dotnet"
+              Args = [ "--version" ]
+              Reason = Some "Exercise StartJob launch and exit handoff"
+              WorkingDirectory = None
+              MaxOutputBytes = Some 1024 }
+        let concurrent =
+            [| for _ in 1 .. 24 ->
+                Task.Run(fun () ->
+                    match startJob start context with
+                    | Ok result -> result.JobId
+                    | Error error -> failwithf "A fast StartJob launch was lost: %A" error) |]
+        Task.WaitAll(concurrent |> Array.map (fun task -> task :> Task))
+        started <- concurrent |> Array.map (fun task -> task.Result)
+        let deadline = Stopwatch.StartNew()
+        let getStatus jobId =
+            match getJobResult
+                { ProjectName = "Project1"; JobId = jobId; AfterSequence = None } context with
+            | Ok result -> result.Status
+            | Error error -> failwithf "Fast StartJob handle disappeared: %A" error
+        while started |> Array.exists (fun jobId -> getStatus jobId = Running)
+              && deadline.Elapsed < TimeSpan.FromSeconds(30.0) do
+            Thread.Sleep 25
+        for jobId in started do
+            Assert.That(getStatus jobId, Is.EqualTo(Completed 0),
+                        "The launch/exit handoff must preserve every fast job's terminal result.")
+            cancelJob { ProjectName = "Project1"; JobId = jobId } context
+            |> shouldEqual (Ok ())
+            Assert.That(getStatus jobId, Is.EqualTo(Completed 0),
+                        "Canceling after observed exit cannot rewrite Completed as Canceled.")
+    finally
+        for jobId in started do
+            cancelJob { ProjectName = "Project1"; JobId = jobId } context |> ignore
+        if Directory.Exists root then Directory.Delete(root, true)
+
+[<Test>]
+let cancellationRacingShortJobExitIsIdempotent () =
+    let root = createTempProject()
+    let context = TestContext root
+    let mutable started = Array.empty<string>
+    try
+        let command =
+            { ProjectName = "Project1"
+              Executable = "dotnet"
+              Args = [ "--version" ]
+              Reason = Some "Exercise cancellation vs observed exit"
+              WorkingDirectory = None
+              MaxOutputBytes = Some 1024 }
+        let cancellationTasks =
+            [| for _ in 1 .. 12 ->
+                Task.Run(fun () ->
+                    let jobId =
+                        match startJob command context with
+                        | Ok result -> result.JobId
+                        | Error error -> failwithf "Fast job failed to start: %A" error
+                    let first =
+                        cancelJob { ProjectName = "Project1"; JobId = jobId } context
+                    let second =
+                        cancelJob { ProjectName = "Project1"; JobId = jobId } context
+                    jobId, first, second) |]
+        Task.WaitAll(cancellationTasks |> Array.map (fun task -> task :> Task))
+        let results = cancellationTasks |> Array.map (fun task -> task.Result)
+        started <- results |> Array.map (fun (jobId, _, _) -> jobId)
+        for _, first, second in results do
+            first |> shouldEqual (Ok ())
+            second |> shouldEqual (Ok ())
+        let timer = Stopwatch.StartNew()
+        let status id =
+            match getJobResult
+                { ProjectName = "Project1"; JobId = id; AfterSequence = None } context with
+            | Ok result -> result.Status
+            | Error error -> failwithf "Unexpected lost job: %A" error
+        while (started |> Array.exists (fun jobId -> status jobId = Running))
+              && timer.Elapsed < TimeSpan.FromSeconds(30.0) do
+            Thread.Sleep 25
+        for id in started do
+            match status id with
+            | Completed 0 | Canceled -> ()
+            | unexpected -> Assert.Fail($"A racing cancellation must observe parent exit: {unexpected}")
+    finally
+        for id in started do
+            cancelJob { ProjectName = "Project1"; JobId = id } context |> ignore
+        if Directory.Exists root then Directory.Delete(root, true)

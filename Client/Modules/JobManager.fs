@@ -28,6 +28,7 @@ type private JobRecord =
       NativeScoped: bool
       LaunchGate: obj
       SyncRoot: obj
+      OutputEnded: Task
       Events: ResizeArray<JobOutputEvent>
       MaxOutputBytes: int
       mutable OutputBytes: int
@@ -153,6 +154,14 @@ module private Core =
                 job.OutputBytes <- job.OutputBytes + addedBytes
                 job.OutputTruncated <- job.OutputTruncated || addedBytes < valueBytes)
 
+    // A successful native cgroup kill does not guarantee that redirected
+    // pipes have closed: an escaped child can still hold their write ends.
+    // Report terminal status only after both EOF callbacks or a finite bound.
+    let private drainNativeOutputBounded (job: JobRecord) =
+        if job.NativeScoped &&
+           not (job.OutputEnded.Wait(TimeSpan.FromSeconds(1.))) then
+            lock job.SyncRoot (fun () -> job.OutputTruncated <- true)
+
     let private startProcess projectName workingDirectory executable args reason maxOutputBytes : Client.Result<StartJobResult> =
         try
             match validateExecutable executable with
@@ -262,6 +271,9 @@ module private Core =
                 proc.EnableRaisingEvents <- true
                 hostedArgs |> List.iter proc.StartInfo.ArgumentList.Add
 
+                let stdoutEnded = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+                let stderrEnded = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
                 let job =
                     { JobId = jobId
                       ProjectName = projectName
@@ -275,6 +287,7 @@ module private Core =
                       NativeScoped = nativeScope.IsSome
                       LaunchGate = obj()
                       SyncRoot = obj()
+                      OutputEnded = (Task.WhenAll([| stdoutEnded.Task; stderrEnded.Task |]) :> Task)
                       Events = ResizeArray()
                       MaxOutputBytes = maxOutputBytes
                       OutputBytes = 0
@@ -285,10 +298,16 @@ module private Core =
                       CompletedAt = None }
 
                 proc.OutputDataReceived.Add(fun event ->
-                    appendEvent job JobOutputStream.StdOut event.Data)
+                    if isNull event.Data then
+                        stdoutEnded.TrySetResult(()) |> ignore
+                    else
+                        appendEvent job JobOutputStream.StdOut event.Data)
 
                 proc.ErrorDataReceived.Add(fun event ->
-                    appendEvent job JobOutputStream.StdErr event.Data)
+                    if isNull event.Data then
+                        stderrEnded.TrySetResult(()) |> ignore
+                    else
+                        appendEvent job JobOutputStream.StdErr event.Data)
 
                 let mutable completedHandled = false
                 let completeObservedExit () =
@@ -310,6 +329,8 @@ module private Core =
                                 try terminateGroup() with _ -> ()
                                 try proc.WaitForExit() with _ -> ()
                                 None
+                        if Option.isNone cleanupError then
+                            drainNativeOutputBounded job
                         lock job.SyncRoot (fun () ->
                             match cleanupError with
                             | Some issue -> job.Status <- CleanupUnverified issue
@@ -509,8 +530,11 @@ module private Core =
                                     // against an asynchronously exited helper.
                                     job.Process.Kill(entireProcessTree = true)
                                 if retryCleanup then
+                                    let exitedAfterCleanup = alreadyExited || job.Process.HasExited
+                                    if exitedAfterCleanup then
+                                        drainNativeOutputBounded job
                                     lock job.SyncRoot (fun () ->
-                                        if alreadyExited || job.Process.HasExited then
+                                        if exitedAfterCleanup then
                                             if job.CancellationRequested then
                                                 job.Status <- Canceled
                                             else

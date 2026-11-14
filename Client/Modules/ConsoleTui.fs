@@ -884,7 +884,7 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                     field "Finished" (job.CompletedAt |> Option.map (fun value -> value.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss")) |> Option.defaultValue "-")
                     field "Duration" (JobView.duration DateTimeOffset.UtcNow job)
                 field "Status" (JobView.statusText job.Status)
-                if jobOutputTruncated then draw.WriteLine "Output capture truncated at the job's byte limit."
+                if jobOutputTruncated then draw.WriteLine "Output may be incomplete (byte limit or EOF timeout)."
                 draw.WriteLine (if jobFollow then "Output (following)" else "Output (scroll paused; b to follow)")
                 draw.WriteLine "---------------------"
                 let lines = jobOutputLines |> List.toArray

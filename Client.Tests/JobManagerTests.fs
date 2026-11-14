@@ -1882,3 +1882,74 @@ let nativeScopedCancelCanRetryFailedKernelKillBeforeParentExit () =
             with _ -> ())
         Environment.SetEnvironmentVariable("JARVIS_STARTJOB_CGROUP_V2", previous)
         if Directory.Exists root then Directory.Delete(root, true)
+
+
+[<Test; NonParallelizable>]
+let nativeScopedTerminalIncludesBothStreamTails () =
+    if not (OperatingSystem.IsLinux()) then Assert.Ignore("Linux cgroup v2 only.")
+    if not (File.Exists "/usr/bin/python3") then
+        Assert.Ignore("Python3 is required for native output-drain coverage.")
+    let previous = Environment.GetEnvironmentVariable("JARVIS_STARTJOB_CGROUP_V2")
+    let root = createTempProject()
+    let context = TestContext root
+    let mutable jobId: string option = None
+    let mutable nativeDirectory: string option = None
+    try
+        Environment.SetEnvironmentVariable("JARVIS_STARTJOB_CGROUP_V2", "1")
+        let probe =
+            try LinuxJobScope.create(Guid.NewGuid().ToString("N"))
+            with
+            | :? IOException
+            | :? UnauthorizedAccessException
+            | :? InvalidOperationException ->
+                Assert.Ignore("Writable cgroup-v2 delegation unavailable.")
+                None
+        probe |> Option.iter (fun scope -> Directory.Delete scope.Directory)
+        let python =
+            "import sys; print('stdout-tail', flush=True); " +
+            "print('stderr-tail', file=sys.stderr, flush=True)"
+        let started =
+            match startJob
+                    { ProjectName = "Project1"; Executable = "/usr/bin/python3"
+                      Args = [ "-c"; python ]; Reason = Some "Verify bounded native output drain"
+                      WorkingDirectory = None; MaxOutputBytes = Some 4096 } context with
+            | Ok value -> value
+            | Error failure -> failwithf "Unable to start native output fixture: %A" failure
+        jobId <- Some started.JobId
+        let journal =
+            ProcessOwnershipJournal.inspectAt
+                (ProcessOwnershipJournal.defaultDirectory()) started.JobId
+            |> function
+               | Ok evidence -> evidence
+               | Error failure -> failwithf "Missing native output fixture journal: %s" failure
+        nativeDirectory <- journal.NativeScope |> Option.map (fun scope -> scope.LinuxCgroupPath)
+        let read () =
+            match getJobResult
+                    { ProjectName = "Project1"; JobId = started.JobId; AfterSequence = None }
+                    context with
+            | Ok result -> result
+            | Error failure -> failwithf "Native output fixture result unavailable: %A" failure
+        let deadline = DateTimeOffset.UtcNow.AddSeconds 15.
+        let mutable result = read()
+        while result.Status = Running && DateTimeOffset.UtcNow < deadline do
+            Thread.Sleep 25
+            result <- read()
+        Assert.That(result.Status, Is.EqualTo(Completed 0))
+        Assert.That(result.Truncated, Is.False,
+            "A naturally closed native job must not lose trailing buffered output.")
+        Assert.That(
+            result.Events |> List.exists (fun item ->
+                item.Stream = JobOutputStream.StdOut && item.Text.Contains("stdout-tail")),
+            Is.True, "Terminal stdout omitted the last complete callback.")
+        Assert.That(
+            result.Events |> List.exists (fun item ->
+                item.Stream = JobOutputStream.StdErr && item.Text.Contains("stderr-tail")),
+            Is.True, "Terminal stderr omitted the last complete callback.")
+    finally
+        jobId |> Option.iter (fun id ->
+            try cancelJob { ProjectName = "Project1"; JobId = id } context |> ignore
+            with _ -> ())
+        nativeDirectory |> Option.iter (fun path ->
+            try Directory.Delete path with _ -> ())
+        Environment.SetEnvironmentVariable("JARVIS_STARTJOB_CGROUP_V2", previous)
+        if Directory.Exists root then Directory.Delete(root, true)

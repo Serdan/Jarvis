@@ -4,6 +4,15 @@
 <h2>Motivating case</h2>
 <p>Use Jarvis task <code>task-c4460fbd65a244419650fc5ef5669a6f</code> (audited administrative Working-to-Ready correction) as a concrete case study. Its original contract is a version-checked, auditable ledger state transition preserving assignment and checkpoint evidence. The work expanded into native process-tree containment, cgroups, cross-restart descendant-reaping certificates, fleet protocol drain, and an operator-only production safety decision. Trace exactly which steps were genuinely required by the task, which were additional product ambitions or speculative threat models, and where independent review or the Lead could have identified the divergence. Do not prejudge every safety concern as invalid; explain its relevance or irrelevance to the original acceptance criteria.</p>
 
+<h2>Instruction-first prevention model (primary deliverable)</h2>
+<p>Test the following three ordinary role behaviors as the default solution. Do not begin by designing new Jarvis state, permissions, or policy infrastructure.</p>
+<ol>
+<li><strong>Worker — flag scope expansion early.</strong> Keep the original task description and acceptance criteria as the authority. When a discovered concern appears to require a new subsystem, a materially stronger invariant, a new platform guarantee, or significantly more work, stop that expansion before investing in it. Raise a concise <strong>Challenge to Lead</strong> through Jarvis's canonical challenge mechanism: quote the specific original requirement at risk, give a concrete failure scenario, explain why the existing design cannot meet it, offer the smallest feasible remedy, and distinguish a genuine blocker from optional hardening. Continue clearly in-scope work when safe. Do not expand the task unilaterally.</li>
+<li><strong>Reviewer — skeptical, task-anchored review.</strong> Independently compare the implementation and its claimed blockers to the <em>original and explicitly approved revised</em> task specification, not merely the worker's latest rationale. Explicitly assess both technical correctness <em>and</em> scope fidelity before acceptance. Challenge newly invented assumptions and distinguish must-fix deviations from separate improvements. Reviewing a technically sound solution to an unrequested problem is not sufficient. A review finding does not automatically rewrite the task's requirements.</li>
+<li><strong>Lead — resolve the challenge and enforce scope.</strong> Evaluate the causal evidence independently, not by counting supporting commits, tests or reviewer endorsements. Reject unproven prerequisites, choose the smallest correct solution, or deliberately revise the canonical task if expansion is justified. Escalate material changes in product intent, risk contract or effort to the operator. At integration, verify the reviewed work satisfies the approved task and has no unapproved scope expansion.</li>
+</ol>
+<p>Keep this proportional: trivial internal refactors and locally necessary details do not require a Challenge; substantial new objectives or hard blockers do. A Challenge is a decision point, not an invitation to build an entire second governance process. If a proposed dependency is not necessary for acceptance, record it as a separate follow-up rather than making it a silent completion gate.</p>
+
 <h2>Investigation</h2>
 <ul>
 <li>Reconstruct the sequence of task specs, checkpoints, reviews, instructions, changes and escalations. Identify the first material scope increase, who introduced it, how it was justified, and why it was not challenged or explicitly approved.</li>
@@ -25,8 +34,8 @@
 <ol>
 <li>Concise retrospective of the Worker 3 case with specific source/task/review milestones and at least one earlier intervention point that would have saved effort without sacrificing a real correctness guarantee.</li>
 <li>Two or more contrasting task examples demonstrate that the proposal catches unjustified expansion but does not suppress necessary fixes.</li>
-<li>Deliver a short, concrete workflow or instruction text ready for operator review, including what counts as an out-of-scope blocker and an example of an appropriate escalation.</li>
+<li>Deliver concise, immediately usable persistent instruction wording for workers, reviewers and Lead embodying the three behaviors above. Include a short Challenge-to-Lead example, a task-to-implementation acceptance check, and an example of justified expansion.</li>
 <li>Test the proposed check retrospectively against the case and apply it to at least one current task in dry-run form. State false-positive/false-negative risks and expected coordination overhead.</li>
-<li>Present explicit recommendation and any operator decision required. No automatic bulk edits to agents, roles or project processes and no deployment without approval.</li>
+<li>Present an explicit recommendation prioritizing role/AGENTS.md instructions over new tooling, and any operator decision required. No automatic bulk edits to agents, roles or project processes and no deployment without approval.</li>
 </ol>
 <p><strong>Constraints:</strong> The goal is better judgment and throughput, not weaker engineering standards. No Codex through Jarvis. Keep the investigation bounded and focus on preventing a repeat of the same failure mode.</p>

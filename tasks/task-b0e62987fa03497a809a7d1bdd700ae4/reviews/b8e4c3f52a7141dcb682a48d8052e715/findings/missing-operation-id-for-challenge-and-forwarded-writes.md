@@ -1,0 +1,11 @@
+# P1 — Write recovery omits Challenge and cross-project operation identity
+
+**Frozen commit:** `cb36a17610ea308e3c78f9dc6f6340f61d292549`
+
+**Locations:** `Common/Messages/AgentCommand.fs:833-846, 983-993`; `Client/SignalR/Client.fs:1088-1103, 1117-1132`; `Server/Services/ClientService.fs:290-334`.
+
+The newly introduced `AgentCommandInfo.recoveryOperationId` matches TaskWrite, LedgerWrite, ReviewWrite, and recovery journal operations, but **does not match `ChallengeWriteCommand` or `CrossProjectNotificationCommand`**. Both carry durable write operation IDs (`ChallengeWriteCommand.OperationId` and `envelope.Notification.OperationId`). Thus a timeout or post-execution exception on either command returns `UncertainOutcome(OperationId=None)` despite having the original operation ID in the request. This breaks the promised recovery pointer for exactly the ambiguous post-commit window.
+
+There is a second, related hole in `AgentCommandInfo.operationId`: it recognizes cross-project envelopes but **not `ChallengeWriteCommand`**. The generic auto-promotion path passes that extractor to `JobManager.startToolOperationWithCancelEvidence`. A Challenge write slower than the promotion threshold therefore exposes a pending job with no operation ID, and retrying its same canonical operation while the first job is in flight admits a second client-owned execution instead of deduplicating to the first handle. Underlying ledger CAS/idempotency may prevent a duplicate durable mutation, but it does not restore the original terminal result or avoid concurrent duplicate execution. This omission in the preexisting extractor becomes an integration correctness gate for the new uncertainty/recovery implementation.
+
+**Required:** Recognize Challenge writes in both identity extractors, and cross-project notifications in `recoveryOperationId` (preserving and normalizing the original UUID); test post-execution exception, server timeout/send failure, pending-job handle identity and identical-ID retry. Ensure the same original operation ID appears in typed error and public recovery metadata.

@@ -11,3 +11,10 @@ Frozen e54eba2d over independently accepted e076cc38 changes only Client.Tests/J
 **Independent .NET 11 Release validation:** `dotnet test Client.Tests/Client.Tests.fsproj -c Release --no-restore --filter FullyQualifiedName~nativeScoped --logger console;verbosity=minimal` on frozen source: **5 passed, 0 failed, 0 skipped (16s)**, including the escaped-descendant negative test. `dotnet test Server.Tests/Server.Tests.fsproj -c Release --no-restore` finished **exit 0**; output was unavailable for count, so no count asserted. `git diff --check` exit 0; clean worktree confirmed by `get_git_status`. Full unfiltered Client.Tests was not independently rerun; task submitter reports focused 5/5 and targeted 1/1.
 
 **Verdict:** Accept this narrowly scoped **test-only evidence hardening**. Neither the original empty cgroup nor these observations prove reaping of an escaped child, and this acceptance is not consent to deploy/enable native cgroup StartJob. All broader production gates—cross-incarnation proof, Git/tool receipts, legacy fleet drain, operator approval—remain unresolved. Reviewer made no source edits, merge, deployment, restart, or opt-in enablement.
+
+
+---
+
+## Owner exact-head complete Release validation (recorded after verdict)
+
+On the immutable, pushed and independently accepted `e54eba2d1512fe9f1d274fecbf2d6e3c8f91d1c5`, `dotnet test Client.Tests/Client.Tests.fsproj -c Release --no-build --no-restore -v minimal` under SDK 11.0.100 completed with **exit code 0, 720 passed, 0 failed** (7m 18s). Exact Jarvis ToolOperation job: `a07b956846214190a64acf71a3a26ad9` (`ToolCompleted`, `TimedOut=false`). The harness emitted activity-persistence failure-injection diagnostics and a separately labeled skipped opt-in benchmark; test summary reports 720/720 and Skipped 0. This is owner-run post-review evidence, not independent reviewer testing. No source modifications since the verdict, no merge, deployment, restart or native opt-in, and the OS/canonical Git/legacy drain safety blockers are unchanged.

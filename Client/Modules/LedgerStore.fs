@@ -1586,6 +1586,51 @@ module LedgerStore =
                          SelectedWorktreeDirty = dirty }
                 | _ -> Error(SourceUnavailable "Cannot inspect registered source worktrees.")
 
+    // Convenience path for SubmitReview(headOid=""): resolve the one currently
+    // checked-out source branch, and refuse dirty, detached or ambiguous trees.
+    // An explicit headOid continues to work independently of worktree state.
+    let committedWorktreeHead (binding: LedgerBinding) (sourceRef: string) =
+        if isNull sourceRef || not (Regex.IsMatch(sourceRef, "^refs/heads/[A-Za-z0-9][A-Za-z0-9_./-]*$"))
+           || sourceRef.Contains("..") || sourceRef.EndsWith("/")
+           || sourceRef.StartsWith("refs/heads/jarvis-review/", StringComparison.Ordinal)
+           || sourceRef.StartsWith("refs/heads/jarvis-integration/", StringComparison.Ordinal) then
+            Error(InvalidBinding "A normal fully qualified checked-out source branch is required.")
+        else
+            match sourceRepositoryIdentity binding with
+            | Error error -> Error error
+            | Ok _ ->
+                match run binding.RepositoryPath [ "worktree"; "list"; "--porcelain" ] with
+                | Error error -> Error error
+                | Ok listing ->
+                    let candidates =
+                        listing.Split([| "\n\n" |], StringSplitOptions.RemoveEmptyEntries)
+                        |> Array.choose (fun block ->
+                            let lines = block.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                            let branch = lines |> Array.exists (fun line -> line = "branch " + sourceRef)
+                            let prunable = lines |> Array.exists (fun line -> line.StartsWith("prunable ", StringComparison.Ordinal))
+                            let path =
+                                lines |> Array.tryPick (fun line ->
+                                    if line.StartsWith("worktree ", StringComparison.Ordinal) then
+                                        Some(line.Substring(9))
+                                    else None)
+                            match path with
+                            | Some root when branch && not prunable && Directory.Exists root -> Some root
+                            | _ -> None)
+                    if candidates.Length <> 1 then
+                        Error(SourceUnavailable "Review HEAD resolution requires exactly one live checkout of the source branch.")
+                    else
+                        let root = candidates[0]
+                        match run root [ "status"; "--porcelain"; "--untracked-files=all" ],
+                              run root [ "symbolic-ref"; "--quiet"; "HEAD" ],
+                              run root [ "rev-parse"; "--verify"; "HEAD^{commit}" ],
+                              run binding.RepositoryPath [ "rev-parse"; "--verify"; $"{sourceRef}^{{commit}}" ] with
+                        | Ok status, Ok currentRef, Ok head, Ok branchHead
+                            when String.IsNullOrWhiteSpace status
+                                 && currentRef = sourceRef
+                                 && head = branchHead
+                                 && validSourceCommitOid head -> Ok head
+                        | _ ->
+                            Error(SourceUnavailable "Source worktree is dirty, detached, uncommitted, or changed during inspection.")
     let private safeReviewRef (gitRef: string) =
         not (isNull gitRef)
         && Regex.IsMatch(gitRef, "^refs/heads/jarvis-review/[A-Za-z0-9_-]+/[a-f0-9]{32}/r[1-9][0-9]*$")
@@ -1631,6 +1676,45 @@ module LedgerStore =
                             | _ -> Error(OutcomeUnknown $"Cannot confirm source publication at {gitRef}.")
                         | Error _ -> Error(OutcomeUnknown $"Cannot verify source publication at {gitRef}.")
 
+    // A submission owns a create-only source snapshot, independently fetchable on
+    // a different machine even after its contributor branch moves or disappears.
+    let private safeIntegrationRef (gitRef: string) =
+        not (isNull gitRef)
+        && Regex.IsMatch(gitRef, "^refs/heads/jarvis-integration/[a-f0-9]{32}$")
+
+    let inspectRemoteIntegrationRef (binding: LedgerBinding) gitRef =
+        if not (safeIntegrationRef gitRef) then
+            Error(InvalidBinding "Invalid managed integration ref.")
+        else
+            validate binding
+            |> Result.bind (fun () -> remoteReviewRef binding gitRef)
+
+    let publishIntegrationRef (binding: LedgerBinding) gitRef headOid =
+        if not (safeIntegrationRef gitRef) || not (validSourceCommitOid headOid) then
+            Error(InvalidBinding "Invalid managed integration ref or pinned commit.")
+        else
+            match validate binding with
+            | Error error -> Error error
+            | Ok () ->
+                match verifySourceObject binding headOid with
+                | Error error -> Error error
+                | Ok () ->
+                    match remoteReviewRef binding gitRef with
+                    | Error error -> Error error
+                    | Ok(Some current) when current = headOid -> Ok ()
+                    | Ok(Some _) -> Error(SourceReviewRefUnavailable "Managed integration ref already points to another commit.")
+                    | Ok None ->
+                        let pushed =
+                            git binding.RepositoryPath
+                                [ "push"; "--porcelain"; $"--force-with-lease={gitRef}:"; binding.RemoteName; $"{headOid}:{gitRef}" ]
+                        match remoteReviewRef binding gitRef with
+                        | Ok(Some observed) when observed = headOid -> Ok ()
+                        | Ok(Some _) -> Error(SourceReviewRefUnavailable "Managed integration ref changed during publication.")
+                        | Ok None ->
+                            match pushed with
+                            | Ok output when output.ExitCode <> 0 -> Error(GitFailure $"Integration snapshot publication rejected: {output.Stderr}")
+                            | _ -> Error(OutcomeUnknown $"Cannot confirm managed integration snapshot at {gitRef}.")
+                        | Error _ -> Error(OutcomeUnknown $"Cannot verify managed integration snapshot at {gitRef}.")
     // Inspect the source remote without altering a local branch/worktree.
     // Only parser-validated review refs in one task namespace are returned.
     let listRemoteReviewRefs (binding: LedgerBinding) taskId =
@@ -1696,8 +1780,8 @@ module LedgerStore =
                             | _ ->
                                 Error(OutcomeUnknown "Cannot confirm guarded review ref deletion.")))
 
-    let fetchReviewRef (binding: LedgerBinding) gitRef headOid =
-        if not (safeReviewRef gitRef) || isNull headOid || not (oidPattern.IsMatch headOid) then
+    let private fetchManagedRef (safeRef: string -> bool) (binding: LedgerBinding) gitRef headOid =
+        if not (safeRef gitRef) || isNull headOid || not (oidPattern.IsMatch headOid) then
             Error(InvalidBinding "Invalid review source locator.")
         else
             match validate binding with
@@ -1724,6 +1808,11 @@ module LedgerStore =
 
 
 
+    let fetchReviewRef (binding: LedgerBinding) gitRef headOid =
+        fetchManagedRef safeReviewRef binding gitRef headOid
+
+    let fetchIntegrationRef (binding: LedgerBinding) gitRef headOid =
+        fetchManagedRef safeIntegrationRef binding gitRef headOid
     // Read-only source-remote verification. A temporary namespace is used so a
     // local worktree, source branch and remote-tracking refs are never changed.
     let private validTargetRef (targetRef: string) =
@@ -1733,6 +1822,7 @@ module LedgerStore =
         && not (targetRef.EndsWith("/"))
         && targetRef <> "refs/heads/jarvis-orchestration"
         && not (targetRef.StartsWith("refs/heads/jarvis-review/", StringComparison.Ordinal))
+        && not (targetRef.StartsWith("refs/heads/jarvis-integration/", StringComparison.Ordinal))
 
     let readRemoteTarget (binding: LedgerBinding) targetRef =
         if not (validTargetRef targetRef) then

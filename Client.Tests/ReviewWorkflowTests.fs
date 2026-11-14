@@ -1294,8 +1294,42 @@ type ReviewWorkflowTests() =
             | Error(InvalidBinding _) -> () // Remote drift blocks authority; it never frees the slot.
             | other -> Assert.Fail(sprintf "Unapproved ledger endpoint must be rejected: %A" other))
     [<Test>]
+    member _.ReviewHeadCanResolveOneCleanCommittedWorktreeAndRejectsDirtyOrDetached() =
+        withFixture (fun one _ first _ baseOid sourceRef newCommit _ ->
+            let taskId = "committed-head"
+            let committed = newCommit "Local committed source" "committed"
+            let requestId = Guid.NewGuid()
+            // Blank headOid is the opt-in convenience mode. The source HEAD
+            // has not been pushed to the contributor's ordinary remote branch.
+            Assert.That(git one [ "ls-remote"; "origin"; sourceRef ],
+                        Does.StartWith(baseOid))
+            ReviewWorkflow.submitBranchReview first (Guid.NewGuid()) taskId "Owner"
+                requestId sourceRef "" "Clean checkout" "" "" |> success |> ignore
+            let published = ReviewWorkflow.getBranchReview first taskId requestId |> success
+            Assert.That(published.Review.ReviewedHeadOid, Is.EqualTo(committed))
+            Assert.That(published.HeadCommit, Is.EqualTo(committed))
+            File.WriteAllText(Path.Combine(one, "source.txt"), "dirty and uncommitted")
+            let dirtyId = Guid.NewGuid()
+            match ReviewWorkflow.submitBranchReview first (Guid.NewGuid()) taskId "Owner"
+                    dirtyId sourceRef "" "Dirty checkout" "" "" with
+            | Error(SourceUnavailable _) -> ()
+            | other -> Assert.Fail(sprintf "Dirty worktree was used for automatic review HEAD: %A" other)
+            Assert.That(LedgerStore.inspectRemoteReviewRef first
+                            ($"refs/heads/jarvis-review/{taskId}/{dirtyId:N}/r1") |> success,
+                        Is.EqualTo(None))
+            git one [ "reset"; "--hard"; committed ] |> ignore
+            git one [ "checkout"; "--detach"; committed ] |> ignore
+            let detachedId = Guid.NewGuid()
+            match ReviewWorkflow.submitBranchReview first (Guid.NewGuid()) taskId "Owner"
+                    detachedId sourceRef "" "Detached checkout" "" "" with
+            | Error(SourceUnavailable _) -> ()
+            | other -> Assert.Fail(sprintf "Detached checkout was used as source HEAD: %A" other)
+            Assert.That(LedgerStore.inspectRemoteReviewRef first
+                            ($"refs/heads/jarvis-review/{taskId}/{detachedId:N}/r1") |> success,
+                        Is.EqualTo(None)))
+    [<Test>]
     member _.IntegrationSubmissionsProtectExactCommitsWhenBranchAdvances() =
-        withFixture (fun one _ first second baseOid _ newCommit _ ->
+        withFixture (fun one two first second _ _ newCommit _ ->
             let mainBranch = git one [ "branch"; "--show-current" ]
             let target = "refs/heads/" + mainBranch
             let source = "refs/heads/feature/integration-boundary"
@@ -1303,64 +1337,84 @@ type ReviewWorkflowTests() =
             |> success |> ignore
             git one [ "checkout"; "-b"; "feature/integration-boundary" ] |> ignore
             let firstCommit = newCommit "First reviewed slice" "first"
+            let acceptReview reviewId =
+                ReviewWorkflow.claimBranchReview second (Guid.NewGuid()) "boundary" reviewId "Reviewer" 1
+                |> success |> ignore
+                ReviewWorkflow.decideBranchReview second (Guid.NewGuid()) "boundary" reviewId "Reviewer" 2 Accept
+                |> success |> ignore
             let reviewId = Guid.NewGuid()
             ReviewWorkflow.submitBranchReview first (Guid.NewGuid()) "boundary" "Owner"
                 reviewId source firstCommit "Frozen first slice" "Intermediate" target
             |> success |> ignore
+            acceptReview reviewId
+            // The contributor has never pushed this source branch. The other
+            // checkout can still submit via the accepted immutable review ref.
+            Assert.That(git one [ "ls-remote"; "origin"; source ], Is.Empty)
+            Assert.That(git two [ "branch"; "--list"; "feature/integration-boundary" ], Is.Empty)
             let submission1 = Guid.NewGuid()
             let operation1 = Guid.NewGuid()
             let submit1 reviewFormat =
-                ReviewWorkflow.submitIntegration first operation1 "boundary" "Owner"
-                    submission1 source firstCommit (reviewId.ToString(reviewFormat)) target
-            // MCP review requests use D UUIDs while ledger paths use N UUIDs.
-            // Both formats must resolve to one canonical submission and journal identity.
+                ReviewWorkflow.submitIntegration second operation1 "boundary" "Owner"
+                    submission1 "" "" (reviewId.ToString(reviewFormat)) target
             Assert.That((submit1 "D" |> success).AlreadyApplied, Is.False)
             Assert.That((submit1 "N" |> success).AlreadyApplied, Is.True)
             let canonical = ReviewWorkflow.getIntegrationSubmissions first "boundary" |> success
-            Assert.That(canonical.Submissions.Head.ReviewId, Is.EqualTo(reviewId.ToString("N")))
+            let initialRecord = canonical.Submissions.Head
+            Assert.That(initialRecord.ReviewId, Is.EqualTo(reviewId.ToString("N")))
+            Assert.That(initialRecord.ReviewedHeadOid, Is.EqualTo(firstCommit))
+            Assert.That(initialRecord.SubmittedCommit, Is.EqualTo(firstCommit))
+            Assert.That(initialRecord.ReviewRef,
+                        Is.EqualTo($"refs/heads/jarvis-review/boundary/{reviewId:N}/r1"))
+            Assert.That(initialRecord.IntegrationRef,
+                        Is.EqualTo($"refs/heads/jarvis-integration/{submission1:N}"))
+            Assert.That((LedgerStore.inspectRemoteIntegrationRef second initialRecord.IntegrationRef |> success),
+                        Is.EqualTo(Some firstCommit))
             let secondCommit = newCommit "Further work in progress" "second"
-            match ReviewWorkflow.submitIntegration first (Guid.NewGuid()) "boundary" "Owner"
-                    (Guid.NewGuid()) source secondCommit (reviewId.ToString("N")) target with
+            match ReviewWorkflow.submitIntegration second (Guid.NewGuid()) "boundary" "Owner"
+                    (Guid.NewGuid()) "" secondCommit (reviewId.ToString("N")) target with
             | Error(InvalidBinding _) -> ()
-            | other -> Assert.Fail(sprintf "Submitted commit must match frozen review: %A" other)
+            | other -> Assert.Fail(sprintf "Must not substitute newer source HEAD for approved SHA: %A" other)
+            let review2 = Guid.NewGuid()
+            ReviewWorkflow.submitBranchReview first (Guid.NewGuid()) "boundary" "Owner"
+                review2 source secondCommit "Frozen second slice" "Intermediate" target
+            |> success |> ignore
+            acceptReview review2
             let submission2 = Guid.NewGuid()
-            ReviewWorkflow.submitIntegration first (Guid.NewGuid()) "boundary" "Owner"
-                submission2 source secondCommit "" target |> success |> ignore
-            let initial = ReviewWorkflow.getIntegrationSubmissions first "boundary" |> success
+            ReviewWorkflow.submitIntegration second (Guid.NewGuid()) "boundary" "Owner"
+                submission2 "" "" (review2.ToString("N")) target |> success |> ignore
+            git one [ "branch"; "-m"; "feature/integration-boundary"; "feature/moved-source" ]
+            |> ignore
+            let initial = ReviewWorkflow.getIntegrationSubmissions second "boundary" |> success
             Assert.That(initial.Submissions.Length, Is.EqualTo(2))
             Assert.That(initial.Latest.Value.SubmittedCommit, Is.EqualTo(secondCommit))
             Assert.That(initial.Submissions.Head.SubmittedCommit, Is.EqualTo(firstCommit))
             Assert.That(initial.Submissions |> List.forall (fun s -> s.Status = "Pending"), Is.True)
-            match ReviewWorkflow.completeIntegration first (Guid.NewGuid()) "boundary" "Reviewer"
-                    submission1 firstCommit with
+            // The only permitted fast-forward completion is the exact reviewed
+            // object, not an unreviewed merge commit containing it.
+            match ReviewWorkflow.completeIntegration second (Guid.NewGuid()) "boundary" "Reviewer"
+                    submission1 secondCommit with
             | Error(InvalidBinding _) -> ()
-            | other -> Assert.Fail(sprintf "Must verify remote integration before completion: %A" other)
+            | other -> Assert.Fail(sprintf "Unreviewed integration commit was allowed: %A" other)
             git one [ "checkout"; mainBranch ] |> ignore
-            git one [ "merge"; "--no-ff"; "-m"; "Integrate only first reviewed slice"; firstCommit ] |> ignore
-            let integrationCommit = git one [ "rev-parse"; "HEAD" ]
+            git one [ "merge"; "--ff-only"; firstCommit ] |> ignore
             git one [ "push"; "origin"; mainBranch ] |> ignore
             let completionId = Guid.NewGuid()
             let complete () =
                 ReviewWorkflow.completeIntegration second completionId "boundary" "Reviewer"
-                    submission1 integrationCommit
+                    submission1 firstCommit
             Assert.That((complete () |> success).AlreadyApplied, Is.False)
             Assert.That((complete () |> success).AlreadyApplied, Is.True)
             let after = ReviewWorkflow.getIntegrationSubmissions second "boundary" |> success
             Assert.That(after.Submissions.Length, Is.EqualTo(2))
             Assert.That(after.Submissions.Head.Status, Is.EqualTo("Integrated"))
-            Assert.That(after.Submissions.Head.IntegratedCommit, Is.EqualTo(integrationCommit))
+            Assert.That(after.Submissions.Head.IntegratedCommit, Is.EqualTo(firstCommit))
             Assert.That(after.Submissions[1].Status, Is.EqualTo("Pending"))
-            Assert.That(after.Latest.Value.SubmittedCommit, Is.EqualTo(secondCommit))
-            Assert.That(after.Latest.Value.Status, Is.EqualTo("Pending"))
             Assert.That((ReviewWorkflow.getAgentInbox first "Owner" |> success).IntegrationSubmissions.Length,
-                        Is.EqualTo(2))
-            let targetUnchanged = git one [ "rev-parse"; mainBranch ]
-            Assert.That(targetUnchanged, Is.EqualTo(integrationCommit))
-            )
+                        Is.EqualTo(2)))
 
     [<Test>]
-    member _.IntegrationRejectsBranchHistoryRewriteWhileEarlierSubmissionPending() =
-        withFixture (fun one _ first _ baseOid _ newCommit _ ->
+    member _.IntegrationRejectsUnacceptedReviewsAndRetainsRewrittenIndependentSnapshots() =
+        withFixture (fun one _ first second baseOid _ newCommit _ ->
             let mainBranch = git one [ "branch"; "--show-current" ]
             let target = "refs/heads/" + mainBranch
             let source = "refs/heads/feature/force-rewritten"
@@ -1368,19 +1422,122 @@ type ReviewWorkflowTests() =
             |> success |> ignore
             git one [ "checkout"; "-b"; "feature/force-rewritten" ] |> ignore
             let firstCommit = newCommit "Committed slice" "one"
-            ReviewWorkflow.submitIntegration first (Guid.NewGuid()) "rewrite" "Owner"
-                (Guid.NewGuid()) source firstCommit "" target |> success |> ignore
+            let denied = Guid.NewGuid()
+            ReviewWorkflow.submitBranchReview first (Guid.NewGuid()) "rewrite" "Owner"
+                denied source firstCommit "Request changes" "" target |> success |> ignore
+            let trySubmit (id: Guid) =
+                ReviewWorkflow.submitIntegration second (Guid.NewGuid()) "rewrite" "Owner"
+                    (Guid.NewGuid()) "" "" (id.ToString("N")) target
+            match trySubmit denied with
+            | Error(InvalidBinding _) -> ()
+            | other -> Assert.Fail(sprintf "Unclaimed review authorized integration: %A" other)
+            ReviewWorkflow.claimBranchReview second (Guid.NewGuid()) "rewrite" denied "Reviewer" 1
+            |> success |> ignore
+            ReviewWorkflow.decideBranchReview second (Guid.NewGuid()) "rewrite" denied "Reviewer" 2 RequestChanges
+            |> success |> ignore
+            match trySubmit denied with
+            | Error(InvalidBinding _) -> ()
+            | other -> Assert.Fail(sprintf "ChangesRequested review authorized integration: %A" other)
+            let accept head =
+                let id = Guid.NewGuid()
+                ReviewWorkflow.submitBranchReview first (Guid.NewGuid()) "rewrite" "Owner"
+                    id source head "Independently accepted" "" target |> success |> ignore
+                ReviewWorkflow.claimBranchReview second (Guid.NewGuid()) "rewrite" id "Reviewer" 1
+                |> success |> ignore
+                ReviewWorkflow.decideBranchReview second (Guid.NewGuid()) "rewrite" id "Reviewer" 2 Accept
+                |> success |> ignore
+                id
+            let acceptedFirst = accept firstCommit
+            let submission1 = Guid.NewGuid()
+            ReviewWorkflow.submitIntegration second (Guid.NewGuid()) "rewrite" "Owner"
+                submission1 "" "" (acceptedFirst.ToString("N")) target |> success |> ignore
             git one [ "reset"; "--hard"; baseOid ] |> ignore
             let replacement = newCommit "Unrelated replacement" "replacement"
-            match ReviewWorkflow.submitIntegration first (Guid.NewGuid()) "rewrite" "Owner"
-                    (Guid.NewGuid()) source replacement "" target with
-            | Error(InvalidBinding _) -> ()
-            | other -> Assert.Fail(sprintf "Pending submitted history cannot silently be replaced: %A" other)
-            let latest = ReviewWorkflow.getIntegrationSubmissions first "rewrite" |> success
-            Assert.That(latest.Submissions.Length, Is.EqualTo(1))
-            Assert.That(latest.Latest.Value.SubmittedCommit, Is.EqualTo(firstCommit))
-            )
+            let acceptedSecond = accept replacement
+            let submission2 = Guid.NewGuid()
+            ReviewWorkflow.submitIntegration second (Guid.NewGuid()) "rewrite" "Owner"
+                submission2 "" "" (acceptedSecond.ToString("N")) target |> success |> ignore
+            let latest = ReviewWorkflow.getIntegrationSubmissions second "rewrite" |> success
+            Assert.That(latest.Submissions.Length, Is.EqualTo(2))
+            Assert.That(latest.Submissions.Head.SubmittedCommit, Is.EqualTo(firstCommit))
+            Assert.That(latest.Latest.Value.SubmittedCommit, Is.EqualTo(replacement))
+            Assert.That(latest.Submissions.Head.IntegrationRef,
+                        Is.Not.EqualTo(latest.Latest.Value.IntegrationRef))
+            Assert.That(latest.Submissions |> List.forall (fun s -> s.Status = "Pending"), Is.True))
+    [<Test>]
+    member _.ManagedIntegrationRefIsCreateOnlyAndIdempotentAcrossCheckouts() =
+        withFixture (fun _ _ first second _ _ newCommit _ ->
+            let pinned = newCommit "Pinned managed integration source" "pinned"
+            let managed = $"refs/heads/jarvis-integration/{Guid.NewGuid():N}"
+            LedgerStore.publishIntegrationRef first managed pinned |> success
+            LedgerStore.publishIntegrationRef first managed pinned |> success
+            LedgerStore.fetchIntegrationRef second managed pinned |> success
+            let replacement = newCommit "Attempted ref rewrite" "replacement"
+            match LedgerStore.publishIntegrationRef first managed replacement with
+            | Error(SourceReviewRefUnavailable _) -> ()
+            | other -> Assert.Fail(sprintf "Managed integration ref was moved: %A" other)
+            Assert.That(LedgerStore.inspectRemoteIntegrationRef second managed |> success,
+                        Is.EqualTo(Some pinned))
+            match LedgerStore.fetchIntegrationRef second managed replacement with
+            | Error(SourceReviewRefUnavailable _) -> ()
+            | other -> Assert.Fail(sprintf "Mismatched managed ref was fetched: %A" other))
 
+    [<Test>]
+    member _.AcceptedReviewWithRemovedRemoteSourceFailsClosed() =
+        withFixture (fun one _ first second _ sourceRef newCommit _ ->
+            let taskId = "missing-source"
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Missing source"
+            |> success |> ignore
+            let committed = newCommit "Review remote later vanished" "candidate"
+            let id = Guid.NewGuid()
+            ReviewWorkflow.submitBranchReview first (Guid.NewGuid()) taskId "Owner"
+                id sourceRef committed "Snapshot" "" "" |> success |> ignore
+            ReviewWorkflow.claimBranchReview second (Guid.NewGuid()) taskId id "Reviewer" 1
+            |> success |> ignore
+            ReviewWorkflow.decideBranchReview second (Guid.NewGuid()) taskId id "Reviewer" 2 Accept
+            |> success |> ignore
+            let frozen = $"refs/heads/jarvis-review/{taskId}/{id:N}/r1"
+            // Simulate a remote actor bypassing mandatory host ref protection.
+            git one [ "push"; "origin"; ":" + frozen ] |> ignore
+            let submission = Guid.NewGuid()
+            let target = "refs/heads/" + git one [ "branch"; "--show-current" ]
+            match ReviewWorkflow.submitIntegration second (Guid.NewGuid()) taskId "Owner"
+                    submission "" "" (id.ToString("N")) target with
+            | Error(SourceReviewRefUnavailable _) -> ()
+            | other -> Assert.Fail(sprintf "Missing review ref authorized integration: %A" other)
+            Assert.That(LedgerStore.inspectRemoteIntegrationRef second
+                            ($"refs/heads/jarvis-integration/{submission:N}") |> success,
+                        Is.EqualTo(None))
+            Assert.That((ReviewWorkflow.getIntegrationSubmissions second taskId |> success).Submissions, Is.Empty))
+    [<Test>]
+    member _.AcceptedSnapshotCannotBypassAdvancedRemoteTarget() =
+        withFixture (fun one _ first second _ _ newCommit _ ->
+            let mainBranch = git one [ "branch"; "--show-current" ]
+            let target = "refs/heads/" + mainBranch
+            let source = "refs/heads/feature/stale-target"
+            let taskId = "target-advanced"
+            ReviewWorkflow.createTask first (Guid.NewGuid()) taskId "Target advanced"
+            |> success |> ignore
+            git one [ "checkout"; "-b"; "feature/stale-target" ] |> ignore
+            let candidate = newCommit "Candidate from older main" "candidate"
+            let id = Guid.NewGuid()
+            ReviewWorkflow.submitBranchReview first (Guid.NewGuid()) taskId "Owner"
+                id source candidate "Old target" "" target |> success |> ignore
+            ReviewWorkflow.claimBranchReview second (Guid.NewGuid()) taskId id "Reviewer" 1
+            |> success |> ignore
+            ReviewWorkflow.decideBranchReview second (Guid.NewGuid()) taskId id "Reviewer" 2 Accept
+            |> success |> ignore
+            git one [ "checkout"; mainBranch ] |> ignore
+            newCommit "Independent target update" "new target" |> ignore
+            git one [ "push"; "origin"; mainBranch ] |> ignore
+            let submission = Guid.NewGuid()
+            match ReviewWorkflow.submitIntegration second (Guid.NewGuid()) taskId "Owner"
+                    submission "" "" (id.ToString("N")) target with
+            | Error(InvalidBinding _) -> ()
+            | other -> Assert.Fail(sprintf "Stale accepted review bypassed target advancement: %A" other)
+            Assert.That(LedgerStore.inspectRemoteIntegrationRef second
+                            ($"refs/heads/jarvis-integration/{submission:N}") |> success,
+                        Is.EqualTo(None)))
     [<Test>]
     member _.AgentNotificationIsDurableAndAcknowledgedByRecipientOnly() =
         withFixture (fun _ _ first second _ _ _ _ ->
@@ -5268,7 +5425,7 @@ type ReviewWorkflowTests() =
                     write $"tasks/{taskId}/reviews/{reviewId}/review.json" 3
                         ({ ReviewId = reviewId; TaskId = taskId; AttemptId = attemptId
                            OwnerAgentId = (if i % 10 = 0 then "Owner" else "Reviewer")
-                           Kind = "Implementation"; TaskRef = null; ReviewRef = null
+                           Kind = "Implementation"; TaskRef = null; ReviewRef = null; SourceVersion = 0; ReviewedHeadOid = null
                            BaseCommit = null; TargetRef = null
                            Status = (if i % 3 = 0 then "Unclaimed" else "Accepted")
                            ReviewerId = "Owner"; Version = 2
@@ -5279,6 +5436,8 @@ type ReviewWorkflowTests() =
                         ({ SubmissionId = submissionId; TaskId = taskId
                            ActorId = (if i % 7 = 0 then "Owner" else "Reviewer")
                            SourceRef = null; SubmittedCommit = null; ReviewId = reviewId
+                           ReviewRef = null; ReviewVersion = 0; ReviewedHeadOid = null
+                           IntegrationRef = null; TargetHeadAtSubmission = null
                            TargetRef = null; Status = "Integrated"
                            CreatedSequence = int64 i + 10L
                            IntegratedCommit = null; CompletedAtUtc = "2026-01-01T00:00:00Z" } : IntegrationSubmission)

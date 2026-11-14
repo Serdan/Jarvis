@@ -169,6 +169,8 @@ type BranchReview =
       Kind: string
       TaskRef: string
       ReviewRef: string
+      SourceVersion: int
+      ReviewedHeadOid: string
       BaseCommit: string
       TargetRef: string
       Status: string
@@ -284,6 +286,11 @@ type IntegrationSubmission =
       SourceRef: string
       SubmittedCommit: string
       ReviewId: string
+      ReviewRef: string
+      ReviewVersion: int
+      ReviewedHeadOid: string
+      IntegrationRef: string
+      TargetHeadAtSubmission: string
       TargetRef: string
       Status: string
       CreatedSequence: int64
@@ -1160,20 +1167,26 @@ module ReviewWorkflow =
                      Submissions = submissions }
         }
 
+    // Every new integration is authorized by an Accepted, pinned review, not
+    // by the contributor's mutable branch. Old branch-only submissions remain
+    // readable and completable, but cannot be created after this migration.
     let submitIntegration binding operationId taskId actorId submissionId
-                          sourceRef submittedCommit reviewId targetRef =
+                          sourceRef submittedCommit (reviewId: string) targetRef =
         if not (validTaskId taskId) || not (validAgent actorId)
-           || submissionId = Guid.Empty || not (validBranch sourceRef)
-           || not (validBranch targetRef)
-           || (not (String.IsNullOrWhiteSpace reviewId)
-               && not (match Guid.TryParse reviewId with true, id when id <> Guid.Empty -> true | _ -> false)) then
-            Error(InvalidBinding "Invalid integration submission.")
+           || submissionId = Guid.Empty || not (validBranch targetRef)
+           || targetRef = "refs/heads/jarvis-orchestration"
+           || targetRef.StartsWith("refs/heads/jarvis-review/", StringComparison.Ordinal)
+           || targetRef.StartsWith("refs/heads/jarvis-integration/", StringComparison.Ordinal)
+           || (not (String.IsNullOrWhiteSpace sourceRef) && not (validBranch sourceRef))
+           || (not (String.IsNullOrWhiteSpace submittedCommit)
+               && not (LedgerStore.validSourceCommitOid submittedCommit))
+           || (not (match Guid.TryParse reviewId with
+                    | true, id when id <> Guid.Empty -> true
+                    | _ -> false)) then
+            Error(InvalidBinding "Integration requires a valid Accepted review ID and a normal target branch.")
         else
-            // API callers may supply the ordinary hyphenated UUID; ledger paths use N.
-            // Normalize before journaling so D and N spellings are idempotent.
-            let reviewId =
-                if String.IsNullOrWhiteSpace reviewId then ""
-                else (Guid.Parse reviewId).ToString("N")
+            // Normalize D and N UUID spellings before creating the ledger intent.
+            let reviewId = (Guid.Parse reviewId).ToString("N")
             let action = intent operationId actorId "SubmitIntegration"
                             {| taskId = taskId; submissionId = submissionId
                                sourceRef = sourceRef; submittedCommit = submittedCommit
@@ -1182,43 +1195,67 @@ module ReviewWorkflow =
             | Error failure -> Error failure
             | Ok(Some applied) -> Ok applied
             | Ok None -> result {
-                do! LedgerStore.verifySourceCommit binding sourceRef submittedCommit
                 let! snapshot = LedgerStore.fetch binding
                 let! _ = required<ReviewTask> binding snapshot (taskPath taskId)
-                if reviewId <> "" then
-                    let! review, _ = required<BranchReview> binding snapshot
-                                        (branchReviewPath taskId reviewId)
-                    if review.TaskRef <> sourceRef then
-                        return! Error(InvalidBinding "Review belongs to another source branch.")
-                    let! reviewed = LedgerStore.inspectRemoteReviewRef binding review.ReviewRef
-                    if reviewed <> Some submittedCommit then
-                        return! Error(InvalidBinding "Submitted commit differs from the frozen review snapshot.")
+                let path = branchReviewPath taskId reviewId
+                let! review, _ = required<BranchReview> binding snapshot path
+                if review.TaskId <> taskId || review.ReviewId <> reviewId
+                   || review.Status <> "Accepted" || review.DecisionSequence <= 0L
+                   || String.IsNullOrWhiteSpace review.ReviewerId then
+                    return! Error(InvalidBinding "Integration requires an Accepted canonical review.")
+                let expectedReviewRef = reviewRef taskId reviewId review.SourceVersion
+                if review.SourceVersion < 1
+                   || review.ReviewRef <> expectedReviewRef then
+                    return! Error(LedgerIntegrityError "Accepted review has an invalid managed source ref.")
+                if not (LedgerStore.validSourceCommitOid review.ReviewedHeadOid) then
+                    return! Error(InvalidBinding "Historical review has no canonical pinned SHA; resubmit it for independent review.")
+                let pinned = review.ReviewedHeadOid
+                if (not (String.IsNullOrWhiteSpace submittedCommit) && submittedCommit <> pinned)
+                   || (not (String.IsNullOrWhiteSpace sourceRef)
+                       && not (String.IsNullOrWhiteSpace review.TaskRef)
+                       && sourceRef <> review.TaskRef) then
+                    return! Error(InvalidBinding "Submitted source does not match the accepted review snapshot.")
+                if not (String.IsNullOrWhiteSpace review.TargetRef)
+                   && review.TargetRef <> targetRef then
+                    return! Error(InvalidBinding "Integration target differs from the accepted review target.")
+                // This fetch proves that the exact reviewed commit is available
+                // from the authoritative remote, even with no source branch here.
+                do! LedgerStore.fetchReviewRef binding review.ReviewRef pinned
+                let! targetHead = LedgerStore.readRemoteTarget binding targetRef
+                // No unreviewed merge or conflict-resolution commit can be a
+                // fast-forward of this snapshot. Such work needs a new review.
+                do! LedgerStore.verifySourceAncestry binding targetHead pinned
+                let managedRef = $"refs/heads/jarvis-integration/{submissionId:N}"
+                do! LedgerStore.publishIntegrationRef binding managedRef pinned
+                do! LedgerStore.fetchIntegrationRef binding managedRef pinned
                 return! LedgerStore.transact binding action (fun current -> result {
                     let! _ = required<ReviewTask> binding current (taskPath taskId)
                     let! _ = required<ReviewAgent> binding current (agentPath actorId)
-                    let path = integrationPath taskId submissionId
-                    let! previous = read<IntegrationSubmission> binding current path
+                    let! latestReview, _ = required<BranchReview> binding current path
+                    if latestReview.Status <> "Accepted"
+                       || latestReview.Version <> review.Version
+                       || latestReview.ReviewRef <> review.ReviewRef
+                       || latestReview.ReviewedHeadOid <> pinned then
+                        return! Error(StaleEntityVersion "Accepted review changed during integration publication.")
+                    let recordPath = integrationPath taskId submissionId
+                    let! previous = read<IntegrationSubmission> binding current recordPath
                     if previous.IsSome then
                         return! Error(StaleEntityVersion "Integration submission ID already exists.")
-                    let! submissions = integrationSubmissionsAt binding current taskId
-                    let branchSubmissions =
-                        submissions |> List.filter (fun item -> item.SourceRef = sourceRef)
-                    // A newer submission must preserve every older unintegrated slice;
-                    // the branch cannot silently rewrite a pending integration boundary.
-                    for prior in branchSubmissions do
-                        if prior.Status = "Pending" then
-                            do! LedgerStore.verifySourceAncestry binding prior.SubmittedCommit submittedCommit
+                    // Independent immutable submissions cannot replace an older
+                    // pending slice, even when their descriptive TaskRef matches.
                     let record =
                         { SubmissionId = submissionId.ToString("N")
                           TaskId = taskId; ActorId = actorId
-                          SourceRef = sourceRef; SubmittedCommit = submittedCommit
-                          ReviewId = reviewId; TargetRef = targetRef
+                          SourceRef = if String.IsNullOrWhiteSpace review.TaskRef then "" else review.TaskRef
+                          SubmittedCommit = pinned; ReviewId = reviewId
+                          ReviewRef = review.ReviewRef; ReviewVersion = review.SourceVersion
+                          ReviewedHeadOid = pinned; IntegrationRef = managedRef
+                          TargetHeadAtSubmission = targetHead; TargetRef = targetRef
                           Status = "Pending"; CreatedSequence = current.Header.NextSequence
                           IntegratedCommit = null; CompletedAtUtc = null }
-                    return [ change path None record ]
+                    return [ change recordPath None record ]
                 })
             }
-
     let completeIntegration binding operationId taskId actorId submissionId integratedCommit =
         if not (validTaskId taskId) || not (validAgent actorId)
            || submissionId = Guid.Empty then
@@ -1236,6 +1273,21 @@ module ReviewWorkflow =
                 let! currentRecord, _ = required<IntegrationSubmission> binding snapshot path
                 if currentRecord.Status <> "Pending" then
                     return! Error(StaleEntityVersion "Integration submission is already completed.")
+                // Historical branch-only records have no IntegrationRef and
+                // retain their original completion behavior. New managed
+                // submissions never authorize an unreviewed merge commit.
+                if not (String.IsNullOrWhiteSpace currentRecord.IntegrationRef) then
+                    let expectedRef = $"refs/heads/jarvis-integration/{submissionId:N}"
+                    if currentRecord.IntegrationRef <> expectedRef
+                       || currentRecord.ReviewedHeadOid <> currentRecord.SubmittedCommit
+                       || not (LedgerStore.validSourceCommitOid currentRecord.TargetHeadAtSubmission) then
+                        return! Error(LedgerIntegrityError "Managed integration provenance is inconsistent.")
+                    if integratedCommit <> currentRecord.SubmittedCommit then
+                        return! Error(InvalidBinding "Conflict-resolution or merge commits require a fresh Accepted review.")
+                    do! LedgerStore.fetchReviewRef binding currentRecord.ReviewRef currentRecord.SubmittedCommit
+                    do! LedgerStore.fetchIntegrationRef binding currentRecord.IntegrationRef currentRecord.SubmittedCommit
+                    do! LedgerStore.verifySourceAncestry binding
+                            currentRecord.TargetHeadAtSubmission currentRecord.SubmittedCommit
                 do! LedgerStore.verifyIntegrationOnRemote binding currentRecord.TargetRef
                         currentRecord.SubmittedCommit integratedCommit
                 return! LedgerStore.transact binding action (fun current -> result {
@@ -3127,6 +3179,9 @@ module ReviewWorkflow =
             | Error failure -> Error failure
             | Ok(Some applied) -> Ok applied
             | Ok None -> result {
+                let! sourceHead =
+                    if String.IsNullOrWhiteSpace sourceHead then LedgerStore.committedWorktreeHead binding sourceRef
+                    else Ok sourceHead
                 let! snapshot = LedgerStore.fetch binding
                 let! baseOid =
                     if String.IsNullOrWhiteSpace targetRef then Ok sourceHead
@@ -3143,7 +3198,7 @@ module ReviewWorkflow =
                     let review =
                         { ReviewId = id; TaskId = taskId; AttemptId = null
                           OwnerAgentId = requesterId; Kind = (if isNull purpose then "" else purpose)
-                          TaskRef = sourceRef; ReviewRef = refName; BaseCommit = baseOid
+                          TaskRef = sourceRef; ReviewRef = refName; SourceVersion = 1; ReviewedHeadOid = sourceHead; BaseCommit = baseOid
                           TargetRef = targetRef; Status = "Unclaimed"; ReviewerId = null
                           Version = 1; CreatedSequence = current.Header.NextSequence
                           DecisionSequence = 0L; Acknowledged = false }
@@ -3151,11 +3206,9 @@ module ReviewWorkflow =
                              { Path = reviewDocumentPath taskId id "summary.md"
                                ExpectedBlobOid = None; Content = summary } ]
                 })
-                match writeResult with
-                | Error(StaleEntityVersion _ | ReviewVersionConflict _ | ReviewAlreadyClaimed _) ->
-                    LedgerStore.deleteReservedReviewRef binding refName sourceHead |> ignore
-                    return! writeResult
-                | _ -> return! writeResult
+                // Never delete a ref after a ledger race: another submitter
+                // may have accepted the identical immutable object.
+                return! writeResult
             }
 
     let replaceBranchReview binding operationId taskId requesterId reviewId expectedVersion
@@ -3176,6 +3229,9 @@ module ReviewWorkflow =
             | Error failure -> Error failure
             | Ok(Some applied) -> Ok applied
             | Ok None -> result {
+                let! sourceHead =
+                    if String.IsNullOrWhiteSpace sourceHead then LedgerStore.committedWorktreeHead binding sourceRef
+                    else Ok sourceHead
                 let! snapshot = LedgerStore.fetch binding
                 let! existing, _ = required<BranchReview> binding snapshot (branchReviewPath taskId id)
                 if existing.Version <> expectedVersion || existing.Status <> "Unclaimed" then
@@ -3195,15 +3251,14 @@ module ReviewWorkflow =
                             LedgerStore.readAt binding current (reviewDocumentPath taskId id "summary.md")
                         return [ change (branchReviewPath taskId id) (Some reviewOid)
                                    { review with Version = review.Version + 1
-                                                 ReviewRef = refName; BaseCommit = baseOid; TaskRef = if String.IsNullOrWhiteSpace sourceRef then review.TaskRef else sourceRef }
+                                                 ReviewRef = refName; SourceVersion = expectedVersion + 1; ReviewedHeadOid = sourceHead
+                                                 BaseCommit = baseOid; TaskRef = if String.IsNullOrWhiteSpace sourceRef then review.TaskRef else sourceRef }
                                  { Path = reviewDocumentPath taskId id "summary.md"
                                    ExpectedBlobOid = summaryOid; Content = summary } ]
                     })
-                match writeResult with
-                | Error(StaleEntityVersion _ | ReviewVersionConflict _ | ReviewAlreadyClaimed _) ->
-                    LedgerStore.deleteReservedReviewRef binding refName sourceHead |> ignore
-                    return! writeResult
-                | _ -> return! writeResult
+                // Orphans are retained for audited, delayed CAS cleanup.
+                // Immediate deletion can erase a concurrent winner's ref.
+                return! writeResult
             }
 
     let claimBranchReview binding operationId taskId reviewId reviewerId expectedVersion =

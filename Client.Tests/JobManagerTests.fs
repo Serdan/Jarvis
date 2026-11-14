@@ -3,6 +3,7 @@ module JobManagerTests
 open System
 open System.Diagnostics
 open System.IO
+open System.Reflection
 open System.Text
 open System.Threading
 open System.Threading.Tasks
@@ -183,50 +184,63 @@ let ``startJob strips sensitive inherited environment`` () =
     let root = createTempProject ()
     let variable = "JARVIS_TEST_JOB_SECRET_TOKEN"
     let original = Environment.GetEnvironmentVariable variable
+    let mutable startedJobId = None
 
     try
         Environment.SetEnvironmentVariable(variable, "hidden-job-value")
         ProcessEnvironment.configureAllowedEnvironmentVariables []
 
-        let project = Path.Combine(root, "Project1")
-        File.WriteAllText(
-            Path.Combine(project, "environment.fsx"),
-            """open System
-printfn "%s" (Environment.GetEnvironmentVariable("JARVIS_TEST_JOB_SECRET_TOKEN") |> Option.ofObj |> Option.defaultValue "missing")"""
-        )
+        // Reuse the test assembly's tiny child-process probe. FSI startup can
+        // dominate this security test under parallel Release-suite load.
+        let testHost = Assembly.GetExecutingAssembly().Location
 
         let context = TestContext root
         let start =
             { ProjectName = "Project1"
               Executable = "dotnet"
-              Args = [ "fsi"; "--exec"; "environment.fsx" ]
+              Args = [ testHost; "--job-environment-probe"; variable ]
               Reason = None
               WorkingDirectory = None
               MaxOutputBytes = Some 4096 }
 
         let jobId =
             match startJob start context with
-            | Ok result -> result.JobId
+            | Ok result ->
+                startedJobId <- Some result.JobId
+                result.JobId
             | Error error -> failwith $"Expected StartJob Ok, got {error}"
 
-        // dotnet fsi startup varies across hosts; use the same measured deadline
-        // as the neighboring cross-stream job test, not five seconds of polling.
+        // The lightweight test host should finish quickly. This deadline allows
+        // for loaded CI machines without silently accepting a stuck child job.
         let deadline = Stopwatch.StartNew()
         let rec waitForCompletion () =
             match getJobResult { ProjectName = "Project1"; JobId = jobId; AfterSequence = Some 0L } context with
-            | Error error -> failwith $"Expected GetJobResult Ok, got {error}"
+            | Error error -> failwith $"Environment probe job {jobId}: GetJobResult failed: {error}"
             | Ok result when result.Status <> Running -> result
-            | Ok _ when deadline.Elapsed >= TimeSpan.FromSeconds 20.0 -> failwith "Job did not complete in 20 seconds."
+            | Ok result when deadline.Elapsed >= TimeSpan.FromSeconds 20.0 ->
+                failwithf
+                    "Environment probe job %s remained Running after %.1f seconds (events=%d, nextSequence=%d, truncated=%b)."
+                    jobId deadline.Elapsed.TotalSeconds result.Events.Length result.NextSequence result.Truncated
             | Ok _ ->
                 Thread.Sleep 50
                 waitForCompletion ()
 
         let result = waitForCompletion ()
+        match result.Status with
+        | Completed 0 -> ()
+        | other ->
+            Assert.Fail($"Environment probe job {jobId} ended with {other}; output events={result.Events.Length}.")
+
         let output = result.Events |> List.map (fun event -> event.Text) |> String.concat ""
 
-        output.Contains("missing") |> shouldEqual true
-        output.Contains("hidden-job-value") |> shouldEqual false
+        Assert.That(output.Contains("missing"), Is.True, "The child did not report the secret as absent.")
+        Assert.That(output.Contains("hidden-job-value"), Is.False, "A sensitive environment variable leaked to the child.")
     finally
+        // A timed-out assertion must not leave its child process running and
+        // competing with subsequent Release tests.
+        startedJobId
+        |> Option.iter (fun id ->
+            cancelJob { ProjectName = "Project1"; JobId = id } (TestContext root) |> ignore)
         ProcessEnvironment.configureAllowedEnvironmentVariables []
         Environment.SetEnvironmentVariable(variable, original)
         Directory.Delete(root, true)

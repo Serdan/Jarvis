@@ -8,6 +8,13 @@ open Client.Effect
 [<EntryPoint>]
 let main args =
     match args with
+    | [| "--job-environment-probe"; variable |] ->
+        // Test the actual inherited environment without the variable startup cost of FSI.
+        Environment.GetEnvironmentVariable(variable)
+        |> Option.ofObj
+        |> Option.defaultValue "missing"
+        |> printfn "%s"
+        0
     | [| "--self-update-test-host"; livePath; stagedPath; backupPath; markerPath; errorPath; forwardedArgument |] ->
         let update: SelfUpdate.PreparedUpdate =
             { LivePath = livePath

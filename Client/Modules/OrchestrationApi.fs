@@ -2803,7 +2803,13 @@ module OperatorChallengeApi =
                     match LedgerBindingConfig.load project rt with
                     | Error _ -> [], [] // Unbound projects cannot be read as trusted ledgers.
                     | Ok binding ->
-                        match ChallengeWorkflow.ChallengeWorkflow.listOperator binding project with
+                        // On legacy ledgers, bootstrap a complete projection
+                        // once before the periodic read-only TUI refresh.
+                        // Failed migrations are surfaced, never hidden as zero.
+                        let observed =
+                            ChallengeWorkflow.ChallengeWorkflow.ensureOperatorIndex binding
+                            |> Result.bind (fun () -> ChallengeWorkflow.ChallengeWorkflow.listOperator binding project)
+                        match observed with
                         | Ok items -> items, []
                         | Error error -> [], [ sprintf "%s: %A" project error ])
             { Items = results |> List.collect fst |> List.sortByDescending (fun item ->

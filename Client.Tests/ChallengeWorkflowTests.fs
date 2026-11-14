@@ -98,6 +98,46 @@ type ChallengeTests() =
         taskRecord.Version, attempt.Version, inbox.Agent.Version, attemptId
 
 
+    // Publish canonical schema-2 records through the real CAS ledger, but omit
+    // the operator index exactly as the pre-index implementation did. The
+    // immutable Created event and advancing ledger sequence are preserved.
+    let seedPreIndexOperator binding =
+        let challengeId = Guid.NewGuid().ToString("N")
+        let conditionId = Guid.NewGuid().ToString("N")
+        let created = DateTimeOffset.UtcNow.ToString("O")
+        let body =
+            System.Text.Json.JsonSerializer.Serialize(
+                {| schemaVersion = 2; challengeId = challengeId
+                   issuerAgentId = "Agent 3"; title = "Pre-index human question"
+                   taskId = ""; version = 1; completionPolicy = "All"
+                   status = "Pending"
+                   conditions =
+                       [ {| conditionId = conditionId; ownerKind = "Operator"
+                            ownerAgentId = ""; suggestedAgentId = ""
+                            description = "Should the harbor waves be smaller?"
+                            status = "Pending"; evidence = (null: string)
+                            reason = (null: string); updatedAtUtc = (null: string)
+                            responseEventSequence = 0L |} ]
+                   createdAtUtc = created; updatedAtUtc = created |})
+        let operation: LedgerIntent =
+            { OperationId = Guid.NewGuid(); Actor = "Agent 3"
+              Kind = "LegacyChallengeCreate"; RequestJson = """{"legacyChallenge":true}""" }
+        LedgerStore.transact binding operation (fun snapshot ->
+            let sequence = snapshot.Header.NextSequence
+            let audit =
+                System.Text.Json.JsonSerializer.Serialize(
+                    {| schemaVersion = 2; challengeId = challengeId
+                       conditionId = ""; actorId = "Agent 3"; action = "Created"
+                       beforeStatus = ""; afterStatus = "Pending"
+                       beforeOwnerAgentId = ""; afterOwnerAgentId = ""
+                       evidence = ""; reason = ""; sequence = sequence
+                       occurredAtUtc = created |})
+            Ok [ { Path = "challenges/" + challengeId + "/challenge.json"
+                   ExpectedBlobOid = None; Content = body }
+                 { Path = "challenges/" + challengeId + "/events/" + string sequence + ".json"
+                   ExpectedBlobOid = None; Content = audit } ])
+        |> ok |> ignore
+        challengeId, conditionId
     [<Test>]
     member _.TwoOwnersCompleteOnlyAfterAllConditionsWithoutNotifications() =
         withFixture (fun a b ->
@@ -1028,9 +1068,11 @@ type ChallengeTests() =
                 for number in 1 .. 4100 do
                     let challengeId = Guid.NewGuid().ToString("N")
                     let conditionId = Guid.NewGuid().ToString("N")
-                    let status = if number % 2 = 0 then "Cancelled" else "Satisfied"
                     let ownerKind, ownerAgentId =
                         if number % 3 = 0 then "Operator", "" else "Agent", "Lead"
+                    let status =
+                        if ownerKind = "Operator" || number % 2 = 0 then "Cancelled" else "Satisfied"
+                    let conditionStatus = if ownerKind = "Operator" then "Pending" else "Satisfied"
                     let body =
                         System.Text.Json.JsonSerializer.Serialize(
                             {| schemaVersion = 2; challengeId = challengeId
@@ -1041,7 +1083,7 @@ type ChallengeTests() =
                                    [ {| conditionId = conditionId; ownerKind = ownerKind
                                         ownerAgentId = ownerAgentId
                                         suggestedAgentId = ""; description = "Archived work"
-                                        status = "Satisfied"; evidence = "archived"
+                                        status = conditionStatus; evidence = "archived"
                                         reason = ""; updatedAtUtc = stamp |} ]
                                createdAtUtc = stamp; updatedAtUtc = stamp |})
                     let folder = Path.Combine(history, "challenges", challengeId)
@@ -1071,9 +1113,10 @@ type ChallengeTests() =
             let pendingOperator, operatorMetrics =
                 LedgerStore.measureGitReads (fun () ->
                     ChallengeWorkflow.listOperator a "Jarvis" |> ok)
-            Assert.That(pendingOperator.Length, Is.EqualTo(1),
-                        "Archived and nonoperator challenges must not enter the operator queue.")
-            Assert.That(pendingOperator.Head.ChallengeId, Is.EqualTo(operatorCreated.ChallengeId))
+            Assert.That(pendingOperator.Length, Is.EqualTo(37),
+                        "Backfill preserves bounded archived operator outcomes, not the whole history.")
+            let actionable = pendingOperator |> List.filter Client.OperatorChallengePresentation.isActionable
+            Assert.That(actionable |> List.map _.ChallengeId, Is.EquivalentTo([ operatorCreated.ChallengeId ]))
             Assert.That(Client.OperatorChallengePresentation.pendingCount pendingOperator, Is.EqualTo(1))
             Assert.That(operatorMetrics.ProcessStarts, Is.LessThan(40),
                         "Operator TUI polls must not scan 4,100 archived challenge blobs.")
@@ -1085,9 +1128,10 @@ type ChallengeTests() =
             let recentOperator, recentMetrics =
                 LedgerStore.measureGitReads (fun () ->
                     ChallengeWorkflow.listOperator b "Jarvis" |> ok)
-            Assert.That(recentOperator.Length, Is.EqualTo(1))
+            Assert.That(recentOperator.Length, Is.EqualTo(36))
             Assert.That(Client.OperatorChallengePresentation.pendingCount recentOperator, Is.Zero)
-            Assert.That(recentOperator.Head.RespondedBy, Is.EqualTo("operator:human"))
+            let answered = recentOperator |> List.find (fun item -> item.ChallengeId = operatorCreated.ChallengeId)
+            Assert.That(answered.RespondedBy, Is.EqualTo("operator:human"))
             Assert.That(recentMetrics.ProcessStarts, Is.LessThan(40))
             Assert.That(recentMetrics.IndividualBlobReads, Is.LessThan(10))
 
@@ -1422,4 +1466,103 @@ type ChallengeTests() =
             let old = ChallengeWorkflow.getOperatorPage b ids[0] 16 0L "" |> ok
             Assert.That(old.Challenge.Status, Is.EqualTo("Cancelled"))
             Assert.That(old.History.Tail.Head.Action, Is.EqualTo("CancelChallenge"))
+        )
+    [<Test>]
+    member _.PreIndexPendingOperatorQuestionIsBackfilledOnceBeforeUiReads() =
+        withFixture (fun a b ->
+            let legacyId, conditionId = seedPreIndexOperator a
+            match ChallengeWorkflow.listOperator b "Jarvis" with
+            | Error(LedgerIntegrityError _) -> ()
+            | other -> Assert.Fail(sprintf "Pre-index queue must fail closed: %A" other)
+
+            let before = LedgerStore.fetch b |> ok
+            ChallengeWorkflow.ensureOperatorIndex b |> ok
+            let migrated = LedgerStore.fetch b |> ok
+            Assert.That(migrated.Commit, Is.Not.EqualTo(before.Commit))
+            ChallengeWorkflow.ensureOperatorIndex a |> ok
+            let afterSecondRead = LedgerStore.fetch a |> ok
+            Assert.That(afterSecondRead.Commit, Is.EqualTo(migrated.Commit),
+                        "An already covered ledger must not be rewritten on the next TUI poll.")
+
+            let active = ChallengeWorkflow.listOperator a "Jarvis" |> ok
+            Assert.That(Client.OperatorChallengePresentation.pendingCount active, Is.EqualTo(1))
+            Assert.That(active.Head.ChallengeId, Is.EqualTo(legacyId))
+            Assert.That(active.Head.ConditionId, Is.EqualTo(conditionId))
+            Assert.That(active.Head.Question, Is.EqualTo("Should the harbor waves be smaller?"))
+            ChallengeWorkflow.respondOperator b (Guid.NewGuid()) "operator:human"
+                legacyId conditionId 1 "Reduce waves near the harbor." |> ok |> ignore
+
+            let completed = ChallengeWorkflow.listOperator a "Jarvis" |> ok
+            Assert.That(Client.OperatorChallengePresentation.pendingCount completed, Is.Zero)
+            Assert.That(completed.Head.ConditionStatus, Is.EqualTo("Satisfied"))
+            Assert.That(completed.Head.RespondedBy, Is.EqualTo("operator:human"))
+            let audit = ChallengeWorkflow.getOperatorPage b legacyId 16 0L "" |> ok
+            Assert.That(audit.History.Length, Is.EqualTo(2))
+            Assert.That(audit.History.Tail.Head.Action, Is.EqualTo("RespondOperatorCondition"))
+            Assert.That(notices a, Is.Empty)
+        )
+
+    [<Test>]
+    member _.KnownIdOperatorReplyBootstrapsLegacyIndexInSameCasTransaction() =
+        withFixture (fun a b ->
+            let legacyId, conditionId = seedPreIndexOperator a
+            // This path must succeed even when the TUI has not initialized a
+            // legacy ledger yet. The response itself safely seeds the index.
+            ChallengeWorkflow.respondOperator b (Guid.NewGuid()) "operator:human"
+                legacyId conditionId 1 "Yes, smaller waves." |> ok |> ignore
+            let current = ChallengeWorkflow.listOperator a "Jarvis" |> ok
+            Assert.That(current.Length, Is.EqualTo(1))
+            Assert.That(current.Head.ChallengeId, Is.EqualTo(legacyId))
+            Assert.That(current.Head.ConditionStatus, Is.EqualTo("Satisfied"))
+            Assert.That(current.Head.RespondedBy, Is.EqualTo("operator:human"))
+            let snapshot = LedgerStore.fetch b |> ok
+            let marker, _ =
+                LedgerStore.readAt b snapshot "records/challenge-index-operator-coverage.json" |> ok
+            Assert.That(marker.IsSome, Is.True)
+            let details = ChallengeWorkflow.getOperatorPage a legacyId 16 0L "" |> ok
+            Assert.That(details.History.Length, Is.EqualTo(2))
+            Assert.That(notices b, Is.Empty)
+        )
+    [<Test>]
+    member _.ConcurrentLegacyOperatorIndexBootstrapsShareOneCasCoverage() =
+        withFixture (fun a b ->
+            let firstId, _ = seedPreIndexOperator a
+            let secondId, _ = seedPreIndexOperator b
+            let first = Task.Run(fun () -> ChallengeWorkflow.ensureOperatorIndex a)
+            let second = Task.Run(fun () -> ChallengeWorkflow.ensureOperatorIndex b)
+            Task.WaitAll(first :> Task, second :> Task)
+            first.Result |> ok
+            second.Result |> ok
+            let visible = ChallengeWorkflow.listOperator a "Jarvis" |> ok
+            Assert.That(Client.OperatorChallengePresentation.pendingCount visible, Is.EqualTo(2))
+            Assert.That(visible |> List.map _.ChallengeId,
+                        Is.EquivalentTo([firstId; secondId]))
+            let snapshot = LedgerStore.fetch a |> ok
+            ChallengeWorkflow.ensureOperatorIndex b |> ok
+            Assert.That((LedgerStore.fetch b |> ok).Commit, Is.EqualTo(snapshot.Commit))
+        )
+
+    [<Test>]
+    member _.CoveredOperatorIndexMissingRecentFileFailsClosed() =
+        withFixture (fun a b ->
+            let legacyId, _ = seedPreIndexOperator a
+            ChallengeWorkflow.ensureOperatorIndex b |> ok
+            let snapshot = LedgerStore.fetch a |> ok
+            let worktree = Path.Combine(Path.GetDirectoryName(a.RepositoryPath), "missing-operator-recent")
+            git a.RepositoryPath [ "worktree"; "add"; "--detach"; worktree; snapshot.Commit ] |> ignore
+            try
+                git worktree [ "config"; "user.name"; "Fixture" ] |> ignore
+                git worktree [ "config"; "user.email"; "fixture@example.test" ] |> ignore
+                git worktree [ "rm"; "records/challenge-index-operator-recent.json" ] |> ignore
+                git worktree [ "commit"; "-m"; "Fixture missing covered operator index" ] |> ignore
+                git worktree [ "push"; "origin"; "HEAD:refs/heads/jarvis-orchestration" ] |> ignore
+            finally
+                git a.RepositoryPath [ "worktree"; "remove"; "--force"; worktree ] |> ignore
+            match ChallengeWorkflow.listOperator b "Jarvis" with
+            | Error(LedgerIntegrityError _) -> ()
+            | other -> Assert.Fail(sprintf "Covered index loss must fail closed: %A" other)
+            // Canonical state and immutable history were not altered by the
+            // corrupt projection, so the outstanding question still exists.
+            let old = ChallengeWorkflow.getOperatorPage a legacyId 16 0L "" |> ok
+            Assert.That(old.Challenge.Status, Is.EqualTo("Pending"))
         )

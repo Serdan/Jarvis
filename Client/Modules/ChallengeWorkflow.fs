@@ -126,6 +126,11 @@ type OperatorChallengeRecentIndex =
       TotalCurrentOutcomes: int
       Items: OperatorChallengeRecentItem list }
 
+[<CLIMutable>]
+type OperatorChallengeIndexCoverage =
+    { Version: int
+      CompletedAtUtc: string }
+
 [<RequireQualifiedAccess>]
 type ChallengeOwner =
     | Unassigned
@@ -349,6 +354,7 @@ module ChallengeWorkflow =
         "records/challenge-index-operator-active/" + challengeId.Substring(0, 2) + ".json"
 
     let private operatorRecentPath = "records/challenge-index-operator-recent.json"
+    let private operatorCoveragePath = "records/challenge-index-operator-coverage.json"
 
     let private hasOperatorPending (challenge: AgentChallenge) =
         (challenge.Status = "Pending" || challenge.Status = "Blocked")
@@ -383,6 +389,20 @@ module ChallengeWorkflow =
             with ex ->
                 return! Error(LedgerIntegrityError ("Invalid challenge inbox index: " + ex.Message))
         | _ -> return! Error(LedgerIntegrityError ("Inconsistent challenge inbox index: " + file))
+    }
+
+    // A coverage marker is committed in the SAME CAS as a full historical
+    // projection. Absence is not an empty queue: older live operator questions
+    // may exist, so indexed readers must refuse to return incomplete data.
+    let private operatorCoverageAt binding snapshot = result {
+        let! value, _ = readIndex<OperatorChallengeIndexCoverage>
+                            binding snapshot operatorCoveragePath
+        match value with
+        | None -> return false
+        | Some marker when marker.Version = 1
+                           && not (String.IsNullOrWhiteSpace marker.CompletedAtUtc) ->
+            return true
+        | _ -> return! Error(LedgerIntegrityError "Invalid operator challenge index coverage marker.")
     }
 
     let private updateShard binding snapshot file challengeId includeChallenge = result {
@@ -433,6 +453,101 @@ module ChallengeWorkflow =
             return [ change file oid { prior with TotalCurrentOutcomes = total; Items = items } ]
     }
 
+// One-off, pinned-snapshot backfill for ledgers written before this index
+    // existed. A full rebuild is never part of the steady-state operator poll.
+    // Every canonical challenge is validated before the marker can be written.
+    // An in-flight challenge transition replaces its old snapshot body so the
+    // backfill and that transition commit their projection in one Git CAS.
+    let private bootstrapOperatorIndexesAt binding snapshot (replacement: AgentChallenge option) = result {
+        let! covered = operatorCoverageAt binding snapshot
+        if covered then
+            return! Error(StaleEntityVersion "Operator challenge index was already initialized.")
+        let! paths = LedgerStore.listAt binding snapshot "challenges"
+        let mutable ids: string list = []
+        for file in paths do
+            if file.EndsWith("/challenge.json", StringComparison.Ordinal) then
+                let parts = file.Split('/')
+                if parts.Length <> 3
+                   || (guidN parts[1]).IsNone
+                   || parts[1] <> (Guid.Parse parts[1]).ToString("N") then
+                    return! Error(LedgerIntegrityError "Invalid challenge identity during operator index backfill.")
+                ids <- parts[1] :: ids
+        let! bodies = LedgerStore.readChallengeEntitiesAt binding snapshot ids
+        let mutable all: Map<string, AgentChallenge> = Map.empty
+        for id in ids do
+            let file = "challenges/" + id + "/challenge.json"
+            match Map.tryFind file bodies with
+            | None -> return! Error(LedgerIntegrityError ("Missing challenge during operator backfill: " + id))
+            | Some body ->
+                try
+                    use doc = JsonDocument.Parse body
+                    let challenge = JsonSerializer.Deserialize<AgentChallenge>(body, options)
+                    if doc.RootElement.GetProperty("schemaVersion").GetInt32() <> 2
+                       || isNull (box challenge) || challenge.ChallengeId <> id
+                       || not (check challenge) then
+                        return! Error(LedgerIntegrityError ("Invalid canonical challenge during operator backfill: " + id))
+                    all <- Map.add id challenge all
+                with ex ->
+                    return! Error(LedgerIntegrityError ("Malformed canonical operator backfill challenge: " + ex.Message))
+        match replacement with
+        | Some current -> all <- Map.add current.ChallengeId current all
+        | None -> ()
+
+        let mutable active: Map<string, string list> = Map.empty
+        let mutable totalOutcomes = 0
+        let mutable latest: OperatorChallengeRecentItem list = []
+        for KeyValue(id, challenge) in all do
+            if hasOperatorPending challenge then
+                let file = operatorActiveShard id
+                active <- Map.add file (id :: (Map.tryFind file active |> Option.defaultValue [])) active
+            let outcomes = operatorOutcomes challenge
+            totalOutcomes <- totalOutcomes + outcomes.Length
+            if not (List.isEmpty outcomes) then
+                latest <-
+                    (outcomes @ latest)
+                    |> List.sortByDescending (fun item ->
+                        item.UpdatedAtUtc, item.ChallengeId, item.ConditionId)
+                    |> List.truncate 36
+
+        // Reconcile possible unmarked shards left by older partial releases.
+        // Never trust their contents to decide which historical IDs exist.
+        let! existing = LedgerStore.readChallengeOperatorIndexRecordsAt binding snapshot
+        let activePrefix = "records/challenge-index-operator-active/"
+        let oldPaths =
+            existing
+            |> Map.toSeq
+            |> Seq.choose (fun (file, _) ->
+                if file.StartsWith(activePrefix, StringComparison.Ordinal) then Some file else None)
+            |> Set.ofSeq
+        let desiredPaths = active |> Map.toSeq |> Seq.map fst |> Set.ofSeq
+        let mutable changes: LedgerFileChange list = []
+        for file in Set.union oldPaths desiredPaths do
+            let! previous, oid = readIndex<ChallengeActiveShard> binding snapshot file
+            let! before =
+                match previous with
+                | None -> Ok Set.empty
+                | Some shard when not (isNull (box shard.ChallengeIds))
+                                  && shard.ChallengeIds.Length = (shard.ChallengeIds |> Set.ofList |> Set.count)
+                                  && (shard.ChallengeIds |> List.forall (fun id ->
+                                      (guidN id).IsSome
+                                      && id.StartsWith(file.Substring(activePrefix.Length, 2), StringComparison.Ordinal))) ->
+                    Ok(Set.ofList shard.ChallengeIds)
+                | _ -> Error(LedgerIntegrityError ("Invalid operator shard during backfill: " + file))
+            let desired = Map.tryFind file active |> Option.defaultValue [] |> Set.ofList
+            if before <> desired then
+                changes <- change file oid { ChallengeIds = desired |> Set.toList } :: changes
+
+        let! _, recentOid = readIndex<OperatorChallengeRecentIndex>
+                                binding snapshot operatorRecentPath
+        let recent =
+            { ActiveChallengeCount = active |> Map.toSeq |> Seq.sumBy (fun (_, ids) -> ids.Length)
+              TotalCurrentOutcomes = totalOutcomes
+              Items = latest }
+        let coverage = { Version = 1; CompletedAtUtc = DateTimeOffset.UtcNow.ToString("O") }
+        return List.rev changes
+               @ [ change operatorRecentPath recentOid recent
+                   change operatorCoveragePath None coverage ]
+    }
     let private updateOperatorRecent binding snapshot (before: AgentChallenge option)
                                      (next: AgentChallenge) = result {
         let oldItems = before |> Option.map operatorOutcomes |> Option.defaultValue []
@@ -451,7 +566,7 @@ module ChallengeWorkflow =
                                   && index.Items.Length <= 36
                                   && index.TotalCurrentOutcomes >= index.Items.Length ->
                     Ok index
-                | None -> Ok { ActiveChallengeCount = 0; TotalCurrentOutcomes = 0; Items = [] }
+                | None -> Error(LedgerIntegrityError "Covered operator recent challenge index is missing.")
                 | _ -> Error(LedgerIntegrityError "Invalid operator recent challenge index.")
             let total = prior.TotalCurrentOutcomes - oldItems.Length + newItems.Length
             let activeCount = prior.ActiveChallengeCount
@@ -485,20 +600,55 @@ module ChallengeWorkflow =
             let! writes = updateShard binding snapshot (triageShard next.ChallengeId)
                               next.ChallengeId newTriage
             changes <- writes @ changes
-        let oldOperator = before |> Option.exists hasOperatorPending
-        let newOperator = hasOperatorPending next
-        if oldOperator <> newOperator then
-            let! writes = updateShard binding snapshot (operatorActiveShard next.ChallengeId)
-                              next.ChallengeId newOperator
-            changes <- writes @ changes
+        let! covered = operatorCoverageAt binding snapshot
+        let! operatorWrites =
+            if not covered then
+                // Also protect known-ID replies before the TUI has run its
+                // one-time migration. Snapshot and transition commit together.
+                bootstrapOperatorIndexesAt binding snapshot (Some next)
+            else result {
+                let oldOperator = before |> Option.exists hasOperatorPending
+                let newOperator = hasOperatorPending next
+                let! shard =
+                    if oldOperator <> newOperator then
+                        updateShard binding snapshot (operatorActiveShard next.ChallengeId)
+                            next.ChallengeId newOperator
+                    else Ok []
+                let! recent = updateOperatorRecent binding snapshot before next
+                return shard @ recent
+            }
         let! recent = updateRecent binding snapshot before next
-        let! operatorRecent = updateOperatorRecent binding snapshot before next
-        return List.rev changes @ recent @ operatorRecent
+        return List.rev changes @ recent @ operatorWrites
     }
 
     let private changed binding operationId actor kind payload
                         (plan: LedgerSnapshot -> Result<LedgerFileChange list, LedgerFailure>) =
         LedgerStore.transact binding (intent operationId actor kind payload) plan
+
+    /// The authenticated local operator UI initializes a legacy ledger once
+    /// before it can display indexed actions. CAS retries recompute from the
+    /// current verified snapshot; missing coverage is never an empty queue.
+    let ensureOperatorIndex binding = result {
+        let! snapshot = LedgerStore.fetch binding
+        let! covered = operatorCoverageAt binding snapshot
+        if not covered then
+            let id = Guid.NewGuid()
+            let migration =
+                changed binding id "operator-index-bootstrap"
+                    "BackfillOperatorChallengeIndex" {| coverageVersion = 1 |}
+                    (fun current -> bootstrapOperatorIndexesAt binding current None)
+            match migration with
+            | Ok _ -> ()
+            | Error error ->
+                // Concurrent migration or uncertain push: only a verified
+                // coverage marker can turn this into success.
+                let verified =
+                    LedgerStore.fetch binding
+                    |> Result.bind (operatorCoverageAt binding)
+                match verified with
+                | Ok true -> ()
+                | _ -> return! Error error
+    }
 
     /// An explicit, per-agent project subscription controls visibility of
     /// unassigned conditions. No Lead-name privilege and no notification state.
@@ -1055,6 +1205,10 @@ module ChallengeWorkflow =
     /// not treat the human as a registered agent or a subscriber.
     let listOperator binding projectName = result {
         let! snapshot = LedgerStore.fetch binding
+        let! covered = operatorCoverageAt binding snapshot
+        if not covered then
+            return! Error(LedgerIntegrityError
+                "Operator Challenge index needs one-time migration before a complete queue can be read.")
         // Only indexed active operator IDs and bounded recent outcome locators
         // are read. No historical canonical challenge enumeration on TUI polls.
         let! indexBodies = LedgerStore.readChallengeOperatorIndexRecordsAt binding snapshot
@@ -1080,7 +1234,7 @@ module ChallengeWorkflow =
 
         let! recentIndex =
             match Map.tryFind operatorRecentPath indexBodies with
-            | None -> Ok { ActiveChallengeCount = 0; TotalCurrentOutcomes = 0; Items = [] }
+            | None -> Error(LedgerIntegrityError "Covered operator recent challenge index is missing.")
             | Some body ->
                 try
                     use doc = JsonDocument.Parse body

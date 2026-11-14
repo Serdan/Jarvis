@@ -2641,3 +2641,55 @@ let ``authenticated stale correction cannot release an unresolved permit`` () =
         // an operator shortcut exposed by MCP.
         restarted.TryReleaseAgentCorrection(user, target, permit, true)
         |> shouldEqual (Ok ()))
+
+[<Test>]
+let ``correction permit inspection is read only user scoped and restart durable`` () =
+    withStore (fun store ->
+        approveTestEpoch store
+        let user, agent = "alice", "Worker 3"
+        store.InspectAgentCorrectionPermit(user, agent) |> shouldEqual (Ok None)
+        let permit =
+            store.TryAcquireAgentCorrection(user, agent, "operator-correction-proof")
+            |> function Ok id -> id | Error error -> failwith error
+        let read (source: FeedbackStore) userId targetId =
+            source.InspectAgentCorrectionPermit(userId, targetId)
+        let first =
+            match read store user "worker 3" with
+            | Ok(Some evidence) -> evidence
+            | other -> failwithf "Expected durable operator recovery evidence: %A" other
+        first.TargetAgentId |> shouldEqual "WORKER 3"
+        first.PermitId |> shouldEqual permit
+        first.OperationId |> shouldEqual "operator-correction-proof"
+        Assert.That(first.CreatedAt, Is.GreaterThan(DateTimeOffset.MinValue))
+        read store "bob" agent |> shouldEqual (Ok None)
+        read store user "other agent" |> shouldEqual (Ok None)
+        Assert.That((read store user "").IsError, Is.True)
+        Assert.That((read store "" agent).IsError, Is.True)
+        use restarted = new FeedbackStore(store.DatabasePath)
+        read restarted user agent |> shouldEqual (Ok(Some first))
+        Assert.That(restarted.TryBeginAgentOperation(
+            user, agent, "ReadFiles", Some "Jarvis", "server", None, None).IsError,
+            Is.True, "A read-only permit inspection may never clear agent exclusion.")
+        use database = new SqliteConnection($"Data Source={store.DatabasePath}")
+        database.Open()
+        let replace column value =
+            use command = database.CreateCommand()
+            command.CommandText <-
+                $"UPDATE agent_correction_permit SET {column} = $value " +
+                "WHERE user_id = $user AND agent_id = $agent;"
+            command.Parameters.AddWithValue("$value", value) |> ignore
+            command.Parameters.AddWithValue("$user", user) |> ignore
+            command.Parameters.AddWithValue("$agent", "WORKER 3") |> ignore
+            command.ExecuteNonQuery() |> shouldEqual 1
+        replace "created_at" "invalid-time"
+        Assert.That((read store user agent).IsError, Is.True,
+                    "Corrupt audit timestamps cannot be presented as verified.")
+        replace "created_at" (first.CreatedAt.ToString("O"))
+        replace "operation_id" " "
+        Assert.That((read restarted user agent).IsError, Is.True,
+                    "A malformed operation ID cannot authorize recovery.")
+        replace "operation_id" first.OperationId
+        read restarted user agent |> shouldEqual (Ok(Some first))
+        store.TryReleaseAgentCorrection(user, agent, permit, true)
+        |> shouldEqual (Ok ())
+        read restarted user agent |> shouldEqual (Ok None))

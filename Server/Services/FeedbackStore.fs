@@ -72,6 +72,14 @@ type AgentExecutionResolution =
     | AuthenticatedClientFinished
     | ExecutionUnresolved
 
+/// Read-only operator recovery evidence for a single authenticated user's
+/// target agent. This is NOT permission to release the durable exclusion.
+type AgentCorrectionPermitEvidence =
+    { TargetAgentId: string
+      PermitId: string
+      OperationId: string
+      CreatedAt: DateTimeOffset }
+
 /// Read-only evidence for operator reconciliation. Missing fields remain
 /// optional, and a truncated page must never be mistaken for full quiescence.
 type UnresolvedAgentExecution =
@@ -978,6 +986,48 @@ INSERT INTO operations (
                 if command.ExecuteNonQuery() = 1 then Ok ()
                 else Error "Unknown or stale correction permit."
             with ex -> Error $"Cannot release correction barrier: {ex.Message}"
+
+    /// Inspect exactly one unresolved correction permit without admitting work,
+    /// changing its owner or clearing the gate. A missing permit is not proof
+    /// that an agent is inactive: also check execution witnesses and epoch.
+    member _.InspectAgentCorrectionPermit(
+        userId: string, targetAgentId: string
+    ) : Result<AgentCorrectionPermitEvidence option, string> =
+        if String.IsNullOrWhiteSpace userId
+           || String.IsNullOrWhiteSpace targetAgentId
+           || targetAgentId.Length > 256 then
+            Error "Authenticated user and bounded target agent are required."
+        else
+            try
+                use connection = openConnection()
+                use command = connection.CreateCommand()
+                command.CommandText <-
+                    """SELECT agent_id, permit_id, operation_id, created_at
+                       FROM agent_correction_permit
+                       WHERE user_id = $userId AND agent_id = $agentId LIMIT 1;"""
+                addParameter command "$userId" userId
+                addParameter command "$agentId" (targetAgentId.ToUpperInvariant())
+                use reader = command.ExecuteReader()
+                if not (reader.Read()) then Ok None
+                elif [0; 1; 2; 3] |> List.exists reader.IsDBNull then
+                    Error "Durable correction permit is incomplete."
+                else
+                    let agentId = reader.GetString 0
+                    let permitId = reader.GetString 1
+                    let operationId = reader.GetString 2
+                    let timestamp = reader.GetString 3
+                    if String.IsNullOrWhiteSpace agentId
+                       || String.IsNullOrWhiteSpace permitId
+                       || String.IsNullOrWhiteSpace operationId then
+                        Error "Durable correction permit identity is malformed."
+                    else
+                        match DateTimeOffset.TryParse timestamp with
+                        | true, at ->
+                            Ok(Some
+                                { TargetAgentId = agentId; PermitId = permitId
+                                  OperationId = operationId; CreatedAt = at })
+                        | _ -> Error "Durable correction permit timestamp is malformed."
+            with ex -> Error $"Cannot inspect correction permit evidence: {ex.Message}"
 
     // Bind the exact routed connection before SignalR dispatch is attempted.
     // Once bound, an HTTP cancellation or server timeout leaves the witness

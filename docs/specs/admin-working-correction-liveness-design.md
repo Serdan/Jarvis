@@ -490,3 +490,20 @@ plus independent termination proof. A bare `StaleEntityVersion`,
 `GitFailure`, timeout or absence at one observed ledger head is not that
 proof. The `TryAcquireAgentCorrection` API and existing fail-closed
 recovery semantics remain unchanged.
+
+### Read-only correction permit provenance for operator recovery (2026-11-14)
+
+A bounded `FeedbackStore.InspectAgentCorrectionPermit(userId, targetAgentId)`
+query now exposes the exact persisted permit ID, original operation ID,
+normalized target agent and creation timestamp to a caller that already
+supplies the authenticated user ID. It changes no execution or ledger state,
+retains user isolation, works across server restarts, and rejects malformed
+persisted identity/timestamp values instead of silently treating them as
+absence. Negative tests also confirm that inspecting a held permit cannot
+release its target-agent admission fence.
+
+This is an internal **read-only recovery building block**, not an exposed
+operator mutation, and does not by itself justify releasing or superseding
+an orphaned permit. An operator must still reconcile the exact canonical Git
+operation status and independently prove any outstanding execution has ended.
+If the Git result or client process remains uncertain, the permit stays held.

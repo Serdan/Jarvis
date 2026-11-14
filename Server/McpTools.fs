@@ -19,6 +19,8 @@ open System
 open System.ComponentModel
 open System.Diagnostics
 open System.Runtime.InteropServices
+open System.Security.Cryptography
+open System.Text
 open System.Text.Json
 open System.Text.Json.Nodes
 open System.Threading.Tasks
@@ -784,9 +786,37 @@ module McpToolHelpers =
                             if isNull (box store) then
                                 None, Some "Durable correction barrier is unavailable."
                             else
-                                match store.TryAcquireAgentCorrection(
-                                        userId, correction.OwnerId, correction.OperationId) with
-                                | Ok permitId -> Some(correction.OwnerId, permitId), None
+                                let serialized = JsonSerializer.Serialize correction
+                                let fingerprint =
+                                    SHA256.HashData(Encoding.UTF8.GetBytes serialized)
+                                    |> Convert.ToHexString
+                                let users = context.RequestServices.GetService<UserService>()
+                                let selectedDevice =
+                                    if isNull (box users) then None
+                                    else
+                                        match users.GetSelectedSession(
+                                            userId, RequestDeviceRouting.session(),
+                                            RequestDeviceRouting.deviceOverride()) with
+                                        | ValueSome session when session.State = Registered ->
+                                            Some(session.DeviceId, session.Generation)
+                                        | _ -> None
+                                let deviceId, generation =
+                                    selectedDevice |> Option.defaultValue ("", 0L)
+                                let binding : AgentCorrectionRequestBinding =
+                                    { ProjectName = correction.ProjectName
+                                      RequestingAgentId = correction.ActorId
+                                      RequestFingerprint = fingerprint
+                                      InitiatingRequestId = activityRequestId |> Option.defaultValue ""
+                                      DeviceId = deviceId
+                                      DeviceGeneration = generation }
+                                // The initiator's durable admitted witness must
+                                // agree with this exact request. A reused UUID
+                                // from another project/actor/payload cannot
+                                // borrow an unresolved target exclusion.
+                                match store.TryAcquireAgentCorrectionForRequest(
+                                        userId, correction.OwnerId, correction.OperationId,
+                                        binding) with
+                                | Ok permitId -> Some(correction.OwnerId, permitId, deviceId), None
                                 | Error failure -> None, Some failure
                         | _ -> None, None
                     let dispatchFailure =
@@ -922,10 +952,14 @@ module McpToolHelpers =
                             }
                         | None, _ ->
                             task {
+                                let selectedDevice =
+                                    match correctionPermit with
+                                    | Some (_, _, boundDeviceId) -> Some boundDeviceId
+                                    | None -> RequestDeviceRouting.deviceOverride()
                                 let! forwarded = client.SendCommandToUser(
                                     userId, command,
                                     ?conversationId = RequestDeviceRouting.session(),
-                                    ?deviceId = RequestDeviceRouting.deviceOverride(),
+                                    ?deviceId = selectedDevice,
                                     ?agentId = sourceAgent,
                                     ?activityRequestId = activityRequestId)
                                 return forwarded, None
@@ -948,7 +982,7 @@ module McpToolHelpers =
                     // Failed/uncertain Git results require receipt reconciliation
                     // and deliberately keep the exclusive permit.
                     match correctionPermit, activityRequestId with
-                    | Some (targetAgent, permitId), Some requestId ->
+                    | Some (targetAgent, permitId, _), Some requestId ->
                         let store = context.RequestServices.GetService<FeedbackStore>()
                         if not (isNull (box store)) then
                             let resolved =

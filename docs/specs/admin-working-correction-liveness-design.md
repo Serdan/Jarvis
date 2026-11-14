@@ -507,3 +507,60 @@ operator mutation, and does not by itself justify releasing or superseding
 an orphaned permit. An operator must still reconcile the exact canonical Git
 operation status and independently prove any outstanding execution has ended.
 If the Git result or client process remains uncertain, the permit stays held.
+
+### Exact correction-command provenance (2026-11-14)
+
+A stable correction UUID alone is **not** sufficient to replay a held
+administrative permit: the same UUID could otherwise be reused in a different
+project or with another requesting agent, target task, CAS version or reason.
+`McpToolHelpers.send` now hashes the complete server-constructed
+`TaskWriteCommand` and supplies that fingerprint, the project selector,
+initiating agent and its freshly admitted SQLite request witness to
+`TryAcquireAgentCorrectionForRequest`. The permit persists this provenance
+atomically with target-agent exclusion; it is retained across server restarts.
+
+Replays are allowed only for exactly matching immutable command provenance,
+and only through a fresh authenticated, same-user/source/project
+`TaskWrite` admission. The original witness identity must itself still
+exist and have matching user, source and project. A mismatch, missing/corrupt
+original witness, reused operation ID with altered inputs, or a cross-user
+witness fails closed without releasing or overwriting the existing permit.
+SQLite migrations add nullable columns but **never backfill evidence** for a
+pre-upgrade permit: unbound historical permits cannot be borrowed by newly
+bound retries.
+
+The service also retains a legacy internal test entrypoint, which cannot
+borrow a bound production permit. It is not exposed as an MCP mutation.
+Persisted permit inspection now includes the original command fingerprint,
+initiator, project and request ID for future audited reconciliation.
+
+**This does not prove two different devices' same-named project selectors
+resolve to the same canonical Git ledger.** A follow-on device/generation
+pinning or canonical ledger-identity proof is required before cross-device
+replays may be considered safe; orphaned/uncertain permits remain blocked
+rather than force-released.
+
+### Device and connection-generation correction routing (2026-11-14)
+
+Request-bound correction permits now also persist the selected authenticated
+Jarvis device ID and its registration generation. A new correction (and each
+exact replay) writes the same expected device/generation to its initiating
+`agent_execution_witness` inside the SQLite writer transaction acquiring
+or resuming the permit. The routing layer explicitly addresses the pinned
+device; `TryMarkAgentDispatched` checks that the actual SignalR-selected
+device and generation match the persisted expectation before dispatch.
+Reusing the same request witness with an identical pin is idempotent; attempting
+to change its device/generation fails.
+
+The read-only permit inspection exposes this route provenance. Migrations add
+nullable device fields without inventing missing prior device evidence.
+Cross-device/cross-generation permit replay is rejected, including reconnects
+and concurrent selected-device changes. New negative tests verify a mismatched
+device/generation cannot be marked Dispatched even when the command UUID,
+target, project name, source label and fingerprint are identical.
+
+A device's canonical ledger trust binding may still change while its SignalR
+registration remains active. This safety barrier therefore does not replace
+exact canonical ledger identity verification, the legacy-client/process
+quiescence barrier or audited orphaned-permit reconciliation. All uncertainty
+continues to hold the correction exclusion; no deployment is authorized.

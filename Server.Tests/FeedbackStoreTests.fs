@@ -2567,11 +2567,13 @@ let ``authenticated stale correction cannot release an unresolved permit`` () =
                 users, tracker, store,
                 Microsoft.Extensions.Logging.Abstractions.NullLogger<HubService>.Instance)
         clientHub.Context <- signalRCaller user connection
+        let mutable dispatches = 0
         let recipient =
             { new Common.SignalR.IClientService with
                 member _.ReceiveMessage(_) = Task.CompletedTask
                 member _.InvalidateAgentStates(_, _) = Task.CompletedTask
                 member _.ReceiveCommand(correlationId, _, invokingAgent) =
+                    dispatches <- dispatches + 1
                     Assert.That(invokingAgent, Is.EqualTo(actor))
                     let answer: Common.AgentCommandResponse =
                         { Result = None
@@ -2624,11 +2626,40 @@ let ``authenticated stale correction cannot release an unresolved permit`` () =
                 operationId, "", service, accessor)
             |> Async.AwaitTask |> Async.RunSynchronously
         Assert.That(result.IsError, Is.EqualTo(Nullable true))
+        Assert.That(dispatches, Is.EqualTo(1))
+        let exactRetry =
+            JarvisMcpTools.CorrectAgentWorkingState(
+                "Jarvis", actor, target, "task-1", "attempt-1",
+                1, 1, 1, 1, "Operator proved stale Working state",
+                operationId, "", service, accessor)
+            |> Async.AwaitTask |> Async.RunSynchronously
+        Assert.That(exactRetry.IsError, Is.EqualTo(Nullable true))
+        Assert.That(dispatches, Is.EqualTo(2),
+                    "An exact retry may be routed under the original exclusive permit.")
+        let changedRetry =
+            JarvisMcpTools.CorrectAgentWorkingState(
+                "Jarvis", actor, target, "task-1", "attempt-1",
+                1, 1, 1, 1, "Different correction reason with same operation UUID",
+                operationId, "", service, accessor)
+            |> Async.AwaitTask |> Async.RunSynchronously
+        Assert.That(changedRetry.IsError, Is.EqualTo(Nullable true))
+        Assert.That(dispatches, Is.EqualTo(2),
+                    "Mismatched canonical command must be rejected before routing.")
         // The authenticated client has ended, but the error category alone
         // cannot prove no earlier remote push took place during retries.
-        let permit =
-            store.TryAcquireAgentCorrection(user, target, operationId)
-            |> function Ok id -> id | Error error -> failwith error
+        let provenance =
+            store.InspectAgentCorrectionPermit(user, target)
+            |> function Ok(Some evidence) -> evidence
+                        | other -> failwithf "Expected unresolved correction: %A" other
+        provenance.ProjectName |> shouldEqual (Some "Jarvis")
+        provenance.RequestingAgentId |> shouldEqual (Some actor)
+        Assert.That(provenance.RequestFingerprint.IsSome, Is.True)
+        Assert.That(provenance.InitiatingRequestId.IsSome, Is.True)
+        provenance.DeviceId |> shouldEqual (Some "device")
+        Assert.That(provenance.DeviceGeneration.IsSome, Is.True)
+        let permit = provenance.PermitId
+        Assert.That(store.TryAcquireAgentCorrection(user, target, operationId).IsError,
+                    Is.True, "Unbound callers cannot replay a bound operator correction.")
         Assert.That(store.TryAcquireAgentCorrection(
             user, target, "different-operation").IsError, Is.True)
         Assert.That(store.TryBeginAgentOperation(
@@ -2693,3 +2724,163 @@ let ``correction permit inspection is read only user scoped and restart durable`
         store.TryReleaseAgentCorrection(user, agent, permit, true)
         |> shouldEqual (Ok ())
         read restarted user agent |> shouldEqual (Ok None))
+
+[<Test>]
+let ``bound correction permits reject cross project actor and payload replay after restart`` () =
+    withStore (fun store ->
+        approveTestEpoch store
+        let user, target, actor, project, operationId =
+            "alice", "Worker 3", "Admin 1", "Jarvis", "same-stable-operation"
+        let fingerprint = String.replicate 64 "A"
+        let beginSource name sourceProject sourceUser tool =
+            store.TryBeginAgentOperation(
+                sourceUser, name, tool, Some sourceProject,
+                "server", None, Some Common.AgentProtocol.version)
+            |> function Ok started -> started | Error failure -> failwith failure
+        let request = beginSource actor project user "TaskWrite"
+        let bound : AgentCorrectionRequestBinding =
+            { ProjectName = project
+              RequestingAgentId = actor
+              RequestFingerprint = fingerprint
+              InitiatingRequestId = request.Id
+              DeviceId = "device-a"
+              DeviceGeneration = 1L }
+        let acquire (source: FeedbackStore) (requestBinding: AgentCorrectionRequestBinding) =
+            source.TryAcquireAgentCorrectionForRequest(user, target, operationId, requestBinding)
+        let permit =
+            acquire store bound
+            |> function Ok id -> id | Error failure -> failwith failure
+        let record =
+            store.InspectAgentCorrectionPermit(user, target)
+            |> function Ok(Some value) -> value
+                        | other -> failwithf "Missing bound permit: %A" other
+        record.PermitId |> shouldEqual permit
+        record.ProjectName |> shouldEqual (Some project)
+        record.RequestingAgentId |> shouldEqual (Some actor)
+        record.RequestFingerprint |> shouldEqual (Some fingerprint)
+        record.InitiatingRequestId |> shouldEqual (Some request.Id)
+        record.DeviceId |> shouldEqual (Some "device-a")
+        record.DeviceGeneration |> shouldEqual (Some 1L)
+        Assert.That(store.TryMarkAgentDispatched(
+            user, request.Id, "device-b", "conn-b", 1L, "wrong-device").IsError,
+            Is.True, "A permit cannot dispatch through a different device.")
+        Assert.That(store.TryMarkAgentDispatched(
+            user, request.Id, "device-a", "conn-new", 2L, "wrong-generation").IsError,
+            Is.True, "Reconnected generation cannot inherit the original route.")
+        store.TryMarkAgentDispatched(
+            user, request.Id, "device-a", "conn-a", 1L, "original-route")
+        |> shouldEqual (Ok ())
+        use restarted = new FeedbackStore(store.DatabasePath)
+        let second = beginSource actor project user "TaskWrite"
+        let retry = { bound with InitiatingRequestId = second.Id }
+        acquire restarted retry |> shouldEqual (Ok permit)
+        Assert.That((acquire restarted
+            { retry with DeviceId = "device-b" }).IsError, Is.True,
+            "Another device cannot borrow a permit even for the same project label.")
+        Assert.That((acquire restarted
+            { retry with DeviceGeneration = 2L }).IsError, Is.True,
+            "A replacement registration generation cannot borrow a prior correction.")
+        Assert.That(restarted.TryMarkAgentDispatched(
+            user, second.Id, "device-a", "conn-new", 2L, "retry-bad-generation").IsError,
+            Is.True, "Pinned retry cannot dispatch after a reconnect.")
+        Assert.That(restarted.TryMarkAgentDispatched(
+            user, second.Id, "device-b", "conn-b", 1L, "retry-bad-device").IsError,
+            Is.True, "Pinned retry cannot switch its chosen device.")
+        restarted.InspectAgentCorrectionPermit(user, target) |> shouldEqual (Ok(Some record))
+        let otherProject = beginSource actor "OtherProject" user "TaskWrite"
+        Assert.That((acquire restarted
+            { bound with ProjectName = "OtherProject"; InitiatingRequestId = otherProject.Id }).IsError,
+            Is.True, "An ID reused in another ledger project cannot borrow the original permit.")
+        let otherActor = beginSource "Admin 2" project user "TaskWrite"
+        Assert.That((acquire restarted
+            { bound with RequestingAgentId = "Admin 2"; InitiatingRequestId = otherActor.Id }).IsError,
+            Is.True, "An ID reused by a second operator cannot borrow another request.")
+        Assert.That((acquire restarted
+            { retry with RequestFingerprint = String.replicate 64 "B" }).IsError,
+            Is.True, "Same UUID with altered CAS versions or reason must fail.")
+        Assert.That((acquire restarted
+            { retry with InitiatingRequestId = "missing-request" }).IsError,
+            Is.True, "A nonexistent first-party witness cannot authorize replay.")
+        let wrongTool = beginSource actor project user "ReadFiles"
+        Assert.That((acquire restarted
+            { retry with InitiatingRequestId = wrongTool.Id }).IsError,
+            Is.True, "An unrelated command witness cannot authorize correction.")
+        let otherUser = beginSource actor project "bob" "TaskWrite"
+        Assert.That((acquire restarted
+            { retry with InitiatingRequestId = otherUser.Id }).IsError,
+            Is.True, "A different authenticated user's witness cannot authorize replay.")
+        // The original source receipt must also survive independently. An
+        // attacker or storage fault cannot replace the original route with
+        // an arbitrary nonempty request ID and inherit its correction fence.
+        use db = new SqliteConnection($"Data Source={store.DatabasePath}")
+        db.Open()
+        let changeOriginalProject value =
+            use update = db.CreateCommand()
+            update.CommandText <-
+                """UPDATE agent_execution_witness SET project_name = $project
+                   WHERE request_id = $requestId AND user_id = $userId;"""
+            update.Parameters.AddWithValue("$project", value) |> ignore
+            update.Parameters.AddWithValue("$requestId", request.Id) |> ignore
+            update.Parameters.AddWithValue("$userId", user) |> ignore
+            update.ExecuteNonQuery() |> shouldEqual 1
+        changeOriginalProject "OtherProject"
+        Assert.That((acquire restarted retry).IsError, Is.True,
+                    "An original witness retargeted to another project must veto replay.")
+        changeOriginalProject project
+        acquire restarted retry |> shouldEqual (Ok permit)
+        store.TryMarkAgentNotDispatched(user, second.Id) |> shouldEqual (Ok ())
+        Assert.That((acquire restarted retry).IsError, Is.True,
+                    "A terminated request witness cannot be recycled to re-enter the correction.")
+        Assert.That(restarted.TryAcquireAgentCorrection(
+            user, target, operationId).IsError, Is.True,
+            "An old unbound client cannot borrow the new protocol's correction permit.")
+        restarted.InspectAgentCorrectionPermit(user, target) |> shouldEqual (Ok(Some record))
+        restarted.TryReleaseAgentCorrection(user, target, permit, true) |> shouldEqual (Ok ()))
+
+[<Test>]
+let ``old unbound correction permit survives migration but cannot authorize typed replay`` () =
+    withStore (fun store ->
+        approveTestEpoch store
+        let user, target, operationId = "alice", "Worker 3", "legacy-unbound-operation"
+        let oldPermit =
+            store.TryAcquireAgentCorrection(user, target, operationId)
+            |> function Ok id -> id | Error error -> failwith error
+        use connection = new SqliteConnection($"Data Source={store.DatabasePath}")
+        connection.Open()
+        // Recreate exactly the previous persisted permit table and leave the
+        // unknown in-flight correction intact, as on an old-server upgrade.
+        use migrate = connection.CreateCommand()
+        migrate.CommandText <-
+            """DROP TABLE agent_correction_permit;
+               CREATE TABLE agent_correction_permit (
+                   user_id TEXT NOT NULL, agent_id TEXT NOT NULL,
+                   permit_id TEXT NOT NULL UNIQUE, operation_id TEXT NOT NULL,
+                   created_at TEXT NOT NULL, PRIMARY KEY(user_id, agent_id));
+               INSERT INTO agent_correction_permit
+                   (user_id, agent_id, permit_id, operation_id, created_at)
+               VALUES ('alice', 'WORKER 3', $permit, 'legacy-unbound-operation', $at);"""
+        migrate.Parameters.AddWithValue("$permit", oldPermit) |> ignore
+        migrate.Parameters.AddWithValue("$at", DateTimeOffset.UtcNow.ToString("O")) |> ignore
+        migrate.ExecuteNonQuery() |> ignore
+        use upgraded = new FeedbackStore(store.DatabasePath)
+        let preserved =
+            upgraded.InspectAgentCorrectionPermit(user, target)
+            |> function Ok(Some evidence) -> evidence
+                        | other -> failwithf "Prior permit was discarded: %A" other
+        preserved.PermitId |> shouldEqual oldPermit
+        preserved.RequestFingerprint |> shouldEqual None
+        let admitted =
+            upgraded.TryBeginAgentOperation(
+                user, "Admin 1", "TaskWrite", Some "Jarvis",
+                "server", None, Some Common.AgentProtocol.version)
+            |> function Ok row -> row | Error failure -> failwith failure
+        let typed : AgentCorrectionRequestBinding =
+            { ProjectName = "Jarvis"; RequestingAgentId = "Admin 1"
+              RequestFingerprint = String.replicate 64 "A"
+              InitiatingRequestId = admitted.Id
+              DeviceId = "device-a"; DeviceGeneration = 1L }
+        Assert.That(upgraded.TryAcquireAgentCorrectionForRequest(
+            user, target, operationId, typed).IsError, Is.True,
+            "Missing old immutable request provenance must never be backfilled from a retry.")
+        upgraded.InspectAgentCorrectionPermit(user, target) |> shouldEqual (Ok(Some preserved))
+        upgraded.TryReleaseAgentCorrection(user, target, oldPermit, true) |> shouldEqual (Ok ()))

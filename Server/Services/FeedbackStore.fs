@@ -78,7 +78,24 @@ type AgentCorrectionPermitEvidence =
     { TargetAgentId: string
       PermitId: string
       OperationId: string
-      CreatedAt: DateTimeOffset }
+      CreatedAt: DateTimeOffset
+      ProjectName: string option
+      RequestingAgentId: string option
+      RequestFingerprint: string option
+      InitiatingRequestId: string option
+      DeviceId: string option
+      DeviceGeneration: int64 option }
+
+/// Bound server-side provenance for the entire immutable correction command.
+/// The witness is the server's durable pre-dispatch record for this invocation;
+/// the fingerprint is computed by the server from the COMPLETE command.
+type AgentCorrectionRequestBinding =
+    { ProjectName: string
+      RequestingAgentId: string
+      RequestFingerprint: string
+      InitiatingRequestId: string
+      DeviceId: string
+      DeviceGeneration: int64 }
 
 /// Read-only evidence for operator reconciliation. Missing fields remain
 /// optional, and a truncated page must never be mistaken for full quiescence.
@@ -306,7 +323,9 @@ CREATE TABLE IF NOT EXISTS agent_execution_witness (
     tool_job_id TEXT NULL,
     tool_job_operation_id TEXT NULL,
     tool_job_started_at TEXT NULL,
-    tool_job_receipt_at TEXT NULL
+    tool_job_receipt_at TEXT NULL,
+    expected_device_id TEXT NULL,
+    expected_device_generation INTEGER NULL
 );
 CREATE INDEX IF NOT EXISTS ix_agent_execution_witness_pending
     ON agent_execution_witness(user_id, agent_id, state);
@@ -338,6 +357,12 @@ CREATE TABLE IF NOT EXISTS agent_correction_permit (
     permit_id TEXT NOT NULL UNIQUE,
     operation_id TEXT NOT NULL,
     created_at TEXT NOT NULL,
+    project_name TEXT NULL,
+    requesting_agent_id TEXT NULL,
+    request_fingerprint TEXT NULL,
+    initiating_request_id TEXT NULL,
+    device_id TEXT NULL,
+    device_generation INTEGER NULL,
     PRIMARY KEY(user_id, agent_id)
 );
 
@@ -374,6 +399,31 @@ INSERT OR IGNORE INTO agent_execution_epoch
                 "ALTER TABLE agent_execution_epoch ADD COLUMN protocol_version TEXT NULL;"
             epochMigration.ExecuteNonQuery() |> ignore
 
+        // A permit created by an older server has NO authenticated command
+        // binding. Do not invent/backfill one: its retry is uncertain and
+        // cannot borrow the new protocol's proof of exact request identity.
+        use permitInfo = connection.CreateCommand()
+        permitInfo.CommandText <- "PRAGMA table_info(agent_correction_permit);"
+        use permitReader = permitInfo.ExecuteReader()
+        let permitColumns = HashSet<string>(StringComparer.Ordinal)
+        while permitReader.Read() do
+            permitColumns.Add(permitReader.GetString 1) |> ignore
+        permitReader.Close()
+        for column in
+            [ "project_name"; "requesting_agent_id"; "request_fingerprint"
+              "initiating_request_id"; "device_id" ] do
+            if not (permitColumns.Contains(column)) then
+                use migration = connection.CreateCommand()
+                migration.CommandText <-
+                    $"ALTER TABLE agent_correction_permit ADD COLUMN {column} TEXT NULL;"
+                migration.ExecuteNonQuery() |> ignore
+
+        if not (permitColumns.Contains("device_generation")) then
+            use migration = connection.CreateCommand()
+            migration.CommandText <-
+                "ALTER TABLE agent_correction_permit ADD COLUMN device_generation INTEGER NULL;"
+            migration.ExecuteNonQuery() |> ignore
+
         // Retain compatibility with persisted pre-continuation witness data
         // without reinitializing the audit epoch or discarding unknown rows.
         use witnessInspect = connection.CreateCommand()
@@ -392,7 +442,9 @@ INSERT OR IGNORE INTO agent_execution_epoch
               "tool_job_id", "TEXT NULL"
               "tool_job_operation_id", "TEXT NULL"
               "tool_job_started_at", "TEXT NULL"
-              "tool_job_receipt_at", "TEXT NULL" ] do
+              "tool_job_receipt_at", "TEXT NULL"
+              "expected_device_id", "TEXT NULL"
+              "expected_device_generation", "INTEGER NULL" ] do
             if not (witnessColumns.Contains(column)) then
                 use witnessMigration = connection.CreateCommand()
                 witnessMigration.CommandText <-
@@ -897,14 +949,23 @@ INSERT INTO operations (
     // Claim the exclusive operator correction barrier in the same SQLite
     // writer-serialization domain as TryBeginAgentOperation. A pending or
     // dispatched request vetoes it, including after server restart.
-    member this.TryAcquireAgentCorrection(
-        userId: string, targetAgentId: string, operationId: string
+    member private this.AcquireAgentCorrectionCore(
+        userId: string, targetAgentId: string, operationId: string,
+        requestBinding: AgentCorrectionRequestBinding option
     ) : Result<string, string> =
         if String.IsNullOrWhiteSpace userId
            || String.IsNullOrWhiteSpace targetAgentId
            || targetAgentId.Length > 256
-           || String.IsNullOrWhiteSpace operationId then
-            Error "Correction requires an authenticated user, target agent and stable operation ID."
+           || String.IsNullOrWhiteSpace operationId
+           || (requestBinding |> Option.exists (fun request ->
+                  [ request.ProjectName; request.RequestingAgentId
+                    request.InitiatingRequestId; request.DeviceId ]
+                  |> List.exists String.IsNullOrWhiteSpace
+                  || request.DeviceGeneration < 1L
+                  || String.IsNullOrWhiteSpace request.RequestFingerprint
+                  || request.RequestFingerprint.Length <> 64
+                  || not (request.RequestFingerprint |> Seq.forall Uri.IsHexDigit))) then
+            Error "Correction requires authenticated, bounded, request-bound identities and operation fingerprint."
         else
             try
                 let agent = targetAgentId.ToUpperInvariant()
@@ -913,15 +974,94 @@ INSERT INTO operations (
                 use current = connection.CreateCommand()
                 current.Transaction <- transaction
                 current.CommandText <-
-                    """SELECT permit_id, operation_id FROM agent_correction_permit
+                    """SELECT permit_id, operation_id, project_name,
+                              requesting_agent_id, request_fingerprint,
+                              initiating_request_id, device_id,
+                              device_generation FROM agent_correction_permit
                        WHERE user_id = $userId AND agent_id = $agentId LIMIT 1;"""
                 addParameter current "$userId" userId
                 addParameter current "$agentId" agent
                 use existing = current.ExecuteReader()
                 let prior =
-                    if existing.Read() then Some(existing.GetString 0, existing.GetString 1)
+                    if existing.Read() then
+                        Some(existing.GetString 0, existing.GetString 1,
+                             optionText existing 2, optionText existing 3,
+                             optionText existing 4, optionText existing 5,
+                             optionText existing 6,
+                             (if existing.IsDBNull 7 then None else Some(existing.GetInt64 7)))
                     else None
                 existing.Close()
+                // The initiator's own pre-dispatch witness must exist, be
+                // owned by the authenticated user and match the exact source
+                // agent/project before any target exclusion can be borrowed.
+                // A fresh retry has its own witness; the original witness ID
+                // remains immutable in the persisted permit for reconciliation.
+                let witnessMatches (requestId: string) (sourceAgent: string)
+                                   (sourceProject: string) (requiresAdmission: bool) =
+                    use witness = connection.CreateCommand()
+                    witness.Transaction <- transaction
+                    witness.CommandText <-
+                        """SELECT 1 FROM agent_execution_witness
+                           WHERE user_id = $userId AND request_id = $requestId
+                             AND agent_id = $actor AND project_name = $project
+                             AND tool_name = 'TaskWrite'
+                             AND ($admitted = 0 OR state = 'Admitted')
+                           LIMIT 1;"""
+                    addParameter witness "$userId" userId
+                    addParameter witness "$requestId" requestId
+                    addParameter witness "$actor" (sourceAgent.ToUpperInvariant())
+                    addParameter witness "$project" sourceProject
+                    addParameter witness "$admitted" (if requiresAdmission then 1 else 0)
+                    not (isNull (witness.ExecuteScalar()))
+                let requestAdmitted =
+                    match requestBinding with
+                    | None -> true // legacy internal test entrypoint only
+                    | Some request ->
+                        witnessMatches request.InitiatingRequestId
+                            request.RequestingAgentId request.ProjectName true
+                // Pin the selected device and registration generation while
+                // the same SQLite writer transaction holds the target permit.
+                let pinRoute () =
+                    match requestBinding with
+                    | None -> Ok ()
+                    | Some request ->
+                        use pin = connection.CreateCommand()
+                        pin.Transaction <- transaction
+                        pin.CommandText <-
+                            """UPDATE agent_execution_witness
+                               SET expected_device_id = $device,
+                                   expected_device_generation = $generation
+                               WHERE user_id = $userId AND request_id = $requestId
+                                 AND state = 'Admitted'
+                                 AND ((expected_device_id IS NULL
+                                       AND expected_device_generation IS NULL)
+                                      OR (expected_device_id = $device
+                                          AND expected_device_generation = $generation));"""
+                        addParameter pin "$userId" userId
+                        addParameter pin "$requestId" request.InitiatingRequestId
+                        addParameter pin "$device" request.DeviceId
+                        addParameter pin "$generation" request.DeviceGeneration
+                        if pin.ExecuteNonQuery() = 1 then Ok ()
+                        else Error "Correction route could not be pinned to the admitted initiating witness."
+                let matchesPrior priorProject priorActor priorFingerprint priorRequest priorDevice
+                                 (priorGeneration: int64 option) =
+                    match requestBinding with
+                    | None ->
+                        ([ priorProject; priorActor; priorFingerprint; priorRequest; priorDevice ]
+                         |> List.forall Option.isNone)
+                        && Option.isNone priorGeneration
+                    | Some request ->
+                        priorProject = Some request.ProjectName
+                        && priorActor = Some request.RequestingAgentId
+                        && priorFingerprint = Some request.RequestFingerprint
+                        && priorDevice = Some request.DeviceId
+                        && priorGeneration = Some request.DeviceGeneration
+                        // An old permit whose original witness was lost or
+                        // rewritten is never a valid source of replay proof.
+                        && (priorRequest |> Option.exists (fun original ->
+                            not (String.IsNullOrWhiteSpace original)
+                            && witnessMatches original request.RequestingAgentId
+                                request.ProjectName false))
                 let epochReady =
                     match this.ReadVerifiedExecutionEpoch(connection, Some transaction) with
                     | Ok (LegacyDrainVerified _) -> true
@@ -929,8 +1069,18 @@ INSERT INTO operations (
                 match prior with
                 | _ when not epochReady ->
                     Error "Protocol epoch has not proven pre-witness legacy activity quiescent."
-                | Some (permit, previousOperation) when previousOperation = operationId ->
-                    Ok permit // idempotent recovery of the same unresolved permit
+                | _ when not requestAdmitted ->
+                    Error "Administrative correction has no matching durable initiating request witness."
+                | Some (permit, previousOperation, project, actor, fingerprint, requestId, device, generation)
+                    when previousOperation = operationId
+                         && matchesPrior project actor fingerprint requestId device generation ->
+                    match pinRoute() with
+                    | Error failure -> Error failure
+                    | Ok () ->
+                        transaction.Commit()
+                        Ok permit // exact command, immutable device and generation
+                | Some (_, previousOperation, _, _, _, _, _, _) when previousOperation = operationId ->
+                    Error "Correction operation ID was reused for a different project, actor or command."
                 | Some _ -> Error "Another administrative correction is unresolved."
                 | None ->
                     use busy = connection.CreateCommand()
@@ -950,18 +1100,47 @@ INSERT INTO operations (
                         insert.Transaction <- transaction
                         insert.CommandText <-
                             """INSERT INTO agent_correction_permit
-                               (user_id, agent_id, permit_id, operation_id, created_at)
-                               VALUES ($userId, $agentId, $permit, $operationId, $now);"""
+                               (user_id, agent_id, permit_id, operation_id, created_at,
+                                project_name, requesting_agent_id, request_fingerprint,
+                                initiating_request_id, device_id, device_generation)
+                               VALUES ($userId, $agentId, $permit, $operationId, $now,
+                                       $project, $actor, $fingerprint, $requestId,
+                                       $device, $generation);"""
                         addParameter insert "$userId" userId
                         addParameter insert "$agentId" agent
                         addParameter insert "$permit" permit
                         addParameter insert "$operationId" operationId
                         addParameter insert "$now" (DateTimeOffset.UtcNow.ToString("O"))
-                        insert.ExecuteNonQuery() |> ignore
-                        transaction.Commit()
-                        Ok permit
+                        addParameter insert "$project"
+                            (requestBinding |> Option.map _.ProjectName |> dbValue)
+                        addParameter insert "$actor"
+                            (requestBinding |> Option.map _.RequestingAgentId |> dbValue)
+                        addParameter insert "$fingerprint"
+                            (requestBinding |> Option.map _.RequestFingerprint |> dbValue)
+                        addParameter insert "$requestId"
+                            (requestBinding |> Option.map _.InitiatingRequestId |> dbValue)
+                        addParameter insert "$device"
+                            (requestBinding |> Option.map _.DeviceId |> dbValue)
+                        addParameter insert "$generation"
+                            (requestBinding |> Option.map _.DeviceGeneration |> dbValue)
+                        match pinRoute() with
+                        | Error failure -> Error failure
+                        | Ok () ->
+                            insert.ExecuteNonQuery() |> ignore
+                            transaction.Commit()
+                            Ok permit
             with ex ->
                 Error $"Cannot acquire durable correction barrier: {ex.Message}"
+
+    // Retain the existing internal test/legacy overload. It may not replay
+    // a fully bound production permit or authorize any unbound migrated row.
+    member this.TryAcquireAgentCorrection(userId, targetAgentId, operationId) =
+        this.AcquireAgentCorrectionCore(userId, targetAgentId, operationId, None)
+
+    member this.TryAcquireAgentCorrectionForRequest(
+        userId, targetAgentId, operationId, requestBinding: AgentCorrectionRequestBinding
+    ) =
+        this.AcquireAgentCorrectionCore(userId, targetAgentId, operationId, Some requestBinding)
 
     // A correction gate does not disappear on timeout, network failure or
     // server restart. The caller must first establish a definitive canonical
@@ -1002,7 +1181,10 @@ INSERT INTO operations (
                 use connection = openConnection()
                 use command = connection.CreateCommand()
                 command.CommandText <-
-                    """SELECT agent_id, permit_id, operation_id, created_at
+                    """SELECT agent_id, permit_id, operation_id, created_at,
+                              project_name, requesting_agent_id,
+                              request_fingerprint, initiating_request_id,
+                              device_id, device_generation
                        FROM agent_correction_permit
                        WHERE user_id = $userId AND agent_id = $agentId LIMIT 1;"""
                 addParameter command "$userId" userId
@@ -1023,9 +1205,27 @@ INSERT INTO operations (
                     else
                         match DateTimeOffset.TryParse timestamp with
                         | true, at ->
-                            Ok(Some
-                                { TargetAgentId = agentId; PermitId = permitId
-                                  OperationId = operationId; CreatedAt = at })
+                            let project, actor, fingerprint, requestId =
+                                optionText reader 4, optionText reader 5,
+                                optionText reader 6, optionText reader 7
+                            let deviceId = optionText reader 8
+                            let generation =
+                                if reader.IsDBNull 9 then None else Some(reader.GetInt64 9)
+                            let bound = [ project; actor; fingerprint; requestId; deviceId ]
+                            if bound |> List.exists (Option.exists String.IsNullOrWhiteSpace)
+                               || (bound |> List.exists Option.isSome
+                                   && (bound |> List.exists Option.isNone
+                                       || generation.IsNone))
+                               || (generation |> Option.exists (fun value -> value < 1L))
+                               || (generation.IsSome && bound |> List.forall Option.isNone) then
+                                Error "Durable correction permit provenance is incomplete."
+                            else
+                                Ok(Some
+                                    { TargetAgentId = agentId; PermitId = permitId
+                                      OperationId = operationId; CreatedAt = at
+                                      ProjectName = project; RequestingAgentId = actor
+                                      RequestFingerprint = fingerprint; InitiatingRequestId = requestId
+                                      DeviceId = deviceId; DeviceGeneration = generation })
                         | _ -> Error "Durable correction permit timestamp is malformed."
             with ex -> Error $"Cannot inspect correction permit evidence: {ex.Message}"
 
@@ -1052,7 +1252,10 @@ INSERT INTO operations (
                            device_generation = $generation, correlation_id = $correlationId,
                            updated_at = $now
                        WHERE user_id = $userId AND request_id = $requestId
-                           AND state = 'Admitted';"""
+                           AND state = 'Admitted'
+                           AND ((expected_device_id IS NULL AND expected_device_generation IS NULL)
+                                OR (expected_device_id = $deviceId
+                                    AND expected_device_generation = $generation));"""
                 addParameter command "$userId" userId
                 addParameter command "$requestId" requestId
                 addParameter command "$deviceId" deviceId

@@ -1,0 +1,19 @@
+<h1>Bootstrap project-scoped Manager heartbeat and bounded agent launches</h1>
+<p>Jarvis now has a reviewed general execution scheduler (task-00f0eb2ebac84f06a911e8494aa38ca2). Turn it into an operational <strong>per-project Manager</strong> workflow, without building recursive delegation or a global cross-project manager.</p>
+<h2>Scope</h2>
+<ul>
+<li>Define a reusable persistent Manager role and project-specific configuration. A Manager reads canonical tasks, agent states, independent review queue, challenges, current activity and project priorities. It makes the next bounded scheduling decision; individual workers/reviewers do not launch successors.</li>
+<li>Provide an operator-controlled launch script/command using the existing browser bridge (or the agreed launcher) and one <code>AfterAgentIdle(project, Manager, 15m)</code> schedule. The Manager's attributed Jarvis activity resets the idle timer. Use the scheduler's existing single-flight, 30m stale-invocation recovery and no-replay semantics; do not implement a competing loop.</li>
+<li>Respect configurable per-project budgets, initially up to <strong>5 workers and 3 reviewers</strong>. Count live/uncertain launches and existing agents; do not over-launch on a race, stale cache or missing status. A project-wide hard bound is a safety guard; agent IDs are coordination labels, not security principals.</li>
+<li>Prioritize ready implementation work and unclaimed frozen reviews. Reviews are claimed from the shared reviewer queue by eligible reviewers; Managers must not send named review notifications. Coordinate through roles, canonical task/review state and challenges, using notifications only for genuinely exceptional gaps.</li>
+<li>Use an idempotent, auditable launch decision. Do not launch a new tab for an agent already working or whose prior launch is still pending/uncertain; never recursively delegate launch authority to the newly launched agent.</li>
+<li>Make the one project Manager schedule easy to inspect, disable and resume. Disabling it stops future automated agent launches without killing work already in progress.</li>
+</ul>
+<h2>Validation and rollout</h2>
+<ul>
+<li>Use deterministic dry-run fixtures for 0, under-budget, full-budget, stale and uncertain agents, pending reviews, multi-project separation, duplicate timer ticks, and scheduler restart.</li>
+<li>Document the exact startup, health check, stop and recovery commands. Do not silently initialize a Manager schedule or launch live browser tabs during tests.</li>
+<li>Check deployed client/server tool availability before live wiring; reviewed code on main is not proof of deployment. No client/server deployment, restart or live recurring launch without operator authorization.</li>
+<li>Submit implementation in isolated worktree for independent frozen review and exact-commit integration. Use .NET 11 Release tests where applicable. Never launch Codex through Jarvis.</li>
+</ul>
+<h2>Out of scope</h2><p>Agent-ID-based authorization gates, arbitrary global orchestrators, message-thread frameworks, and redesigning the completed general scheduler.</p>

@@ -1,0 +1,35 @@
+<h2>Goal</h2>
+<p>Generalize Jarvis's existing persistent client-local browser scheduler into a <strong>durable, agent-accessible execution scheduler</strong>. Agents can schedule one-off and repeating CLI commands or browser-bridge scripts. The immediate use case is a <strong>per-project Manager heartbeat</strong>: run a Manager launch script when the Manager has not communicated with Jarvis for 15 minutes, so one Manager makes bounded decisions about which workers/reviewers to launch instead of recursively spawning agents.</p>
+<h2>Triggers</h2>
+<ul>
+<li><strong>Once:</strong> execute at an absolute UTC time or after a relative delay.</li>
+<li><strong>Every:</strong> execute at a configurable interval, with an optional initial delay. Skip missed intervals after client downtime; never replay a backlog.</li>
+<li><strong>AfterAgentIdle:</strong> identify an agent by <code>(projectName, agentId)</code>; run when <code>now &gt;= lastAttributedJarvisActivity + idleSeconds</code>. Any new attributed tool activity resets the deadline. The schedule re-arms after subsequent activity, rather than firing continuously throughout one silent period. Define predictable behavior when the agent has never been seen (an initial delayed launch).</li>
+</ul>
+<h2>Actions</h2>
+<ul>
+<li><strong>RunCommand:</strong> defer the existing <code>run_command</code> semantics (executable, arguments, selected project/worktree, working directory, timeout, output bounds, and device target). Support any CLI executable the current Jarvis command path permits; do not introduce an artificial command allowlist or a shell requirement. Reuse existing process execution, job/result logging, permissions and termination behavior.</li>
+<li><strong>BrowserScript:</strong> defer the existing authorized browser workflow (registered window/site, project-relative JavaScript script path, JSON arguments, optional new tab and cleanup) by reusing <code>BrowserRunInNewTab</code> / browser bridge execution, not a new browser automation transport.</li>
+</ul>
+<h2>Public operations and persistence</h2>
+<ul>
+<li>Expose a small agent-facing surface to create/replace, list, inspect and cancel schedules, e.g. <code>ScheduleExecution</code>, <code>ListScheduledExecutions</code>, <code>GetScheduledExecution</code> and <code>CancelScheduledExecution</code>. Stable schedule IDs, trigger/action details, next due time, attempt/status, last result/error and cancellation must be visible. A schedule can be disabled without changing already-running jobs.</li>
+<li>Extend or migrate <code>Client/Modules/BrowserSchedules.fs</code> and its persisted private <code>browser-schedules.json</code>; maintain one scheduling loop, not parallel specialized schedulers. Preserve existing browser schedules and their safety semantics during migration.</li>
+<li>Persistence survives client restarts. Atomically claim each due occurrence before dispatch, record an attempt ID and outcome, and do not automatically replay work with an uncertain execution result. Recurring schedules advance to a future eligible occurrence, with no catch-up storm.</li>
+<li>Permission and device checks apply to scheduled actions as to direct execution. Granting a schedule must not silently elevate an agent's capabilities or bypass browser-window/site consent; revoked authorization should fail closed at execution. Agent IDs are coordination handles, not security principals.</li>
+</ul>
+<h2>Agent-aware scheduling</h2>
+<ul>
+<li>The current <code>lastSeenAtUtc</code> observation is a <em>client-local cache</em>; it is not authoritative across connected Jarvis clients. Implement an attributed activity signal or reconciliation mechanism adequate for scheduler decisions across devices. Do not infer an agent's activity from another agent observing it, and do not use self-<code>agent_inbox</code> polling to inspect or wake a target. Avoid a canonical Git-ledger write per heartbeat if possible.</li>
+<li>Use a single-flight check for a Manager invocation. An idle trigger may become due after 15 minutes but must not launch overlapping Managers when a prior attempt is still active/uncertain. A silent or stalled invocation may be replaced after a bounded stale cutoff (30 minutes without Jarvis activity is the existing operator-accepted safety threshold), with stable attempt identity/cooldown to avoid duplicate work and runaway retries.</li>
+<li>Manager scheduling is <em>per project</em> and one schedule can be turned off to stop future manager launches. The launched Manager reads Jarvis state, prioritizes assignments and launches other agents under existing operational budgets. No recursive delegation framework, Manager role implementation, or agent-ID-based authorization enforcement is part of this task.</li>
+</ul>
+<h2>Acceptance criteria</h2>
+<ol>
+<li>One-off and interval schedules invoke both a CLI command and a browser project script through the existing command paths; list/inspect/cancel/replace behave predictably.</li>
+<li>Deterministic clock-driven tests cover due times, idle deadline resets, repeated manager activity, initial unseen Manager, missed ticks, restart persistence, cancellation, and uncertainty/no-replay behavior.</li>
+<li>Multi-client activity tests prove that activity from a different Jarvis client postpones an agent-idle launch; another agent's <code>observe_agent</code> does not count as the Manager's activity.</li>
+<li>Manager heartbeat test: 15 minutes after Manager's last attributed tool call a single authorized launch is queued; no additional launches occur for the same idle episode; the next Manager tool call re-arms it; a stalled launch respects the 30-minute recovery cutoff.</li>
+<li>Permission-denied and revoked browser-authorization cases fail without executing; concurrent ticks/restarts do not double-dispatch one occurrence. Expose sufficient status for an agent/operator to diagnose skipped, pending, running, failed and uncertain occurrences.</li>
+<li>Use .NET 11 Release tests and focused browser regression coverage, document the new command contract and migration, and submit a frozen source commit for independent Jarvis review. <strong>Do not merge or deploy</strong> until that review is accepted. Never use Codex through Jarvis.</li>
+</ol>

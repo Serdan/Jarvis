@@ -469,3 +469,24 @@ This strengthens the fail-closed barrier but does **not** implement authenticate
 legacy-client/process/job quiescence attestation. The production epoch remains
 `AwaitingLegacyDrain` until independently witnessed and approved; no operator
 shortcut, integration or deployment is authorized by this change.
+
+### Why a typed stale error is not enough to release an orphaned permit (2026-11-14)
+
+An attempted shortcut was investigated and deliberately **not retained**:
+releasing a newly acquired correction permit whenever the authenticated
+client reports `LedgerFailure(StaleEntityVersion)`. Although the correction
+planner can reject stale task/attempt/agent versions before constructing any
+Git change, `LedgerStore.transact` also retries after a push attempt when
+the subsequent verified snapshot does not contain the operation. A later
+planner rejection does not certify that *no push was attempted earlier in the
+same transaction*, nor rule out a delayed remote outcome.
+
+Consequently the existing release rule remains conservative: proven
+non-dispatch or a verified terminal successful canonical result can release
+the permit; an error code by itself cannot. A correct recovery design needs
+a per-operation, immutable, authenticated **never-pushed** attestation
+covering all internal retries, or exact canonical receipt reconciliation
+plus independent termination proof. A bare `StaleEntityVersion`,
+`GitFailure`, timeout or absence at one observed ledger head is not that
+proof. The `TryAcquireAgentCorrection` API and existing fail-closed
+recovery semantics remain unchanged.

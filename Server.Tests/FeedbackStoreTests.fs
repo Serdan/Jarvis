@@ -2548,3 +2548,96 @@ let BenchmarkHundredRoutedMcpWitnessCalls () =
             sprintf "100 MCP/SignalR attributed admissions/routes/terminals: %.1f ms total, %.2f ms/call, p95 %.2f ms"
                 stopwatch.Elapsed.TotalMilliseconds
                 (stopwatch.Elapsed.TotalMilliseconds / 100.) ordered[94]))
+
+[<Test>]
+let ``authenticated stale correction cannot release an unresolved permit`` () =
+    withStore (fun store ->
+        approveTestEpoch store
+        let user, actor, target, connection =
+            "alice", "Admin 1", "Worker 3", "stale-correction-client"
+        let users = new UserService()
+        users.TransportConnected(user, connection)
+        users.Register(user,
+            { DeviceId = "device"; DeviceName = "Workstation"
+              ProtocolVersion = Common.AgentProtocol.version; ClientVersion = "test"
+              SupportedCommands = [ "TaskWrite" ] }, connection) |> ignore
+        let tracker = new ClientResponseTracker()
+        let clientHub =
+            new HubService(
+                users, tracker, store,
+                Microsoft.Extensions.Logging.Abstractions.NullLogger<HubService>.Instance)
+        clientHub.Context <- signalRCaller user connection
+        let recipient =
+            { new Common.SignalR.IClientService with
+                member _.ReceiveMessage(_) = Task.CompletedTask
+                member _.InvalidateAgentStates(_, _) = Task.CompletedTask
+                member _.ReceiveCommand(correlationId, _, invokingAgent) =
+                    Assert.That(invokingAgent, Is.EqualTo(actor))
+                    let answer: Common.AgentCommandResponse =
+                        { Result = None
+                          Error = Some(Common.LedgerFailure
+                              { Code = "StaleEntityVersion"
+                                Message = "Task or agent changed before correction"
+                                OperationId = None; VerifiedLedgerHead = None })
+                          Instructions = []; AgentStateChanges = []
+                          InboxActivation = None; PendingJob = None }
+                    clientHub.SendClientResponse(correlationId, answer).GetAwaiter().GetResult()
+                    Task.CompletedTask }
+        let clients =
+            { new Microsoft.AspNetCore.SignalR.IHubClients<Common.SignalR.IClientService> with
+                member _.All = recipient
+                member _.AllExcept(_) = recipient
+                member _.Client(_) = recipient
+                member _.Clients(_) = recipient
+                member _.Group(_) = recipient
+                member _.GroupExcept(_, _) = recipient
+                member _.Groups(_) = recipient
+                member _.User(_) = recipient
+                member _.Users(_) = recipient }
+        let hub =
+            { new Microsoft.AspNetCore.SignalR.IHubContext<HubService, Common.SignalR.IClientService> with
+                member _.Clients = clients
+                member _.Groups = Unchecked.defaultof<_> }
+        let services =
+            Microsoft.Extensions.DependencyInjection.ServiceCollection()
+            :> Microsoft.Extensions.DependencyInjection.IServiceCollection
+        Microsoft.Extensions.DependencyInjection.ServiceCollectionServiceExtensions.AddSingleton<FeedbackStore>(
+            services, store) |> ignore
+        Microsoft.Extensions.DependencyInjection.ServiceCollectionServiceExtensions.AddSingleton<UserService>(
+            services, users) |> ignore
+        use provider =
+            Microsoft.Extensions.DependencyInjection.ServiceCollectionContainerBuilderExtensions.BuildServiceProvider(services)
+        let context = DefaultHttpContext()
+        context.User <-
+            ClaimsPrincipal(
+                ClaimsIdentity([ Claim("sub", user)
+                                 Claim("scope", Auth.WorkspaceRead + " " + Auth.GitWrite) ], "test"))
+        context.RequestServices <- provider
+        let accessor = HttpContextAccessor()
+        accessor.HttpContext <- context
+        let service = new ClientService(hub, users, tracker, accessor, store)
+        let operationId = "auth-stale-correction"
+        let result =
+            JarvisMcpTools.CorrectAgentWorkingState(
+                "Jarvis", actor, target, "task-1", "attempt-1",
+                1, 1, 1, 1, "Operator proved stale Working state",
+                operationId, "", service, accessor)
+            |> Async.AwaitTask |> Async.RunSynchronously
+        Assert.That(result.IsError, Is.EqualTo(Nullable true))
+        // The authenticated client has ended, but the error category alone
+        // cannot prove no earlier remote push took place during retries.
+        let permit =
+            store.TryAcquireAgentCorrection(user, target, operationId)
+            |> function Ok id -> id | Error error -> failwith error
+        Assert.That(store.TryAcquireAgentCorrection(
+            user, target, "different-operation").IsError, Is.True)
+        Assert.That(store.TryBeginAgentOperation(
+            user, target, "ReadFiles", Some "Jarvis", "server", None, None).IsError,
+            Is.True, "The owner must remain fenced after a failed correction.")
+        use restarted = new FeedbackStore(store.DatabasePath)
+        Assert.That(restarted.TryAcquireAgentCorrection(
+            user, target, "different-after-restart").IsError, Is.True)
+        // Only the test fixture supplies a verified resolution; this is NOT
+        // an operator shortcut exposed by MCP.
+        restarted.TryReleaseAgentCorrection(user, target, permit, true)
+        |> shouldEqual (Ok ()))

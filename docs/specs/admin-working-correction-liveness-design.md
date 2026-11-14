@@ -860,3 +860,12 @@ pre-witness client and obsolete server, prove OS-backed descendant reaping
 across every participating device/process incarnation, reconcile the exact
 canonical Git correction UUID outcome and review a frozen tested source.
 No production operator approval tool or automatic cleanup is exposed.
+
+Normal protocol-3.66 Git-backed client replies and successful `StartJob`
+handle receipts deliberately return an unresolved process-liveness
+classification after storing the authenticated reply. `HubService`
+logs these **expected** nonterminal observations at Debug rather than
+Warning, including exact deferred ToolOperation completion. Corrupt,
+unrecognized, conflicting, unauthenticated, or missing receipts remain
+warnings. Ordinary Git reads therefore do not flood the operator's
+diagnostic logs merely because their process-tree proof is still pending.

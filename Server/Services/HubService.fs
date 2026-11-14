@@ -160,6 +160,11 @@ type HubService(users: UserService, tracker: ClientResponseTracker, store: Feedb
                 tracker.Complete(correlationId, this.UserId, this.Context.ConnectionId,
                                  session.Generation, response)
             match completedJob with
+            | Error expected when expected.EndsWith(
+                  "client completion witnessed; process-tree liveness is unverified.",
+                  StringComparison.Ordinal) ->
+                logger.LogDebug("Authenticated deferred reply {CorrelationId} recorded; process quiescence remains unresolved.",
+                                correlationId)
             | Error failure ->
                 logger.LogWarning(
                     "Cannot attest deferred tool-job completion for {CorrelationId} on {ConnectionId}: {Error}; " +
@@ -175,6 +180,13 @@ type HubService(users: UserService, tracker: ClientResponseTracker, store: Feedb
                 logger.LogInformation(
                     "Authenticated late Jarvis terminal receipt for {CorrelationId} on {ConnectionId}.",
                     correlationId, this.Context.ConnectionId)
+            | Error expected when
+                expected.EndsWith("descendant/process liveness remains unverified.", StringComparison.Ordinal)
+                || expected = "StartJob handle recorded; detached process-tree termination remains unverified." ->
+                // Every Git-backed read/write and process runner normally
+                // preserves the client reply while withholding quiescence.
+                logger.LogDebug("Authenticated reply {CorrelationId} recorded without process-tree proof.",
+                                correlationId)
             | Error message ->
                 logger.LogWarning(
                     "Cannot establish terminal execution liveness for {CorrelationId} on {ConnectionId}: {Error}. " +

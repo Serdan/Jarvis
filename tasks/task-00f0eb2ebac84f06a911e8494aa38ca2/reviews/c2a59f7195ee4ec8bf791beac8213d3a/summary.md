@@ -1,1 +1,23 @@
-Frozen re-review after changes requested in 3f4fc8760c2c45e38f5e68a2848dbbac (decision seq 2157, acknowledged). Source exact pushed 5afad770e0d7cd237d8c7d9f9d044674951a990f, parent 2ad69b6c. P1 cross-device: server SQLite user/project/agent last attributed activity monotonic persisted before remote execution; authenticated registered-client GetAgentActivity read-only SignalR snapshot; every due AfterAgentIdle requires fresh verified roundtrip and fails closed offline, missed-hint/reconnect and error paths; waiting schedules reconcile with bounded checks; observer reads/job polls cannot reset clock; failed SQLite writes poison verification until repaired. P1 concurrent claims: exclusive lifetime .owner.lock FileStream acquired before schedule load, second JarvisClient remains connected but scheduling disabled; deterministic two-Service test only one side effect, clean handoff and no replay. P2 power-loss: fsync temp and Unix containing directory after atomic rename (Windows MoveFileEx write-through) before dispatch; exception fails closed. No other worktrees edited. .NET 11 Release full Client.Tests 699/699 PASS job ac4e440529f24c93b8a49c138743fb4a; focused BrowserSchedulesTests 16/16 PASS job dd952e72ad6f4d279615fdc72e4c67ad; full Server.Tests 131/131 PASS job 1540f5911fae498eb0b511dfbeab7992; Jarvis.slnx Release build succeeds, git diff --check clean, branch pushed/clean. Docs cover filesystem and independent-device leader limitation. No merge/deploy/live Manager activation.
+# Reviewer 2 independent re-review — ChangesRequested
+
+- **Frozen commit:** `5afad770e0d7cd237d8c7d9f9d044674951a990f` (`feature/general-execution-scheduling`).
+- **Base:** `b9b9e7a4b201b9baf581a644c1a7ca451f2943ba`.
+- **Scope:** durable CLI/browser scheduling, cross-device `AfterAgentIdle` Manager safety, claim durability, replacement and retry behavior; no merge/deploy.
+
+## Independent evidence
+
+- Inspected source/transport/permissions and server persistence changes at the exact frozen commit, plus the canonical task specification and worker's evidence.
+- Created an isolated reviewer worktree at that commit; the 16 existing `BrowserSchedulesTests` passed under .NET 11 (`11.0.100`) Release, job `6a9816dfb981436194fd385cef6d030e`.
+- Added and ran a temporary deterministic negative case only in the reviewer worktree: replacing the schedule ID during A's pending remote verification caused an unauthorized B launch (`Expected: 0; But was: 1`, job `d9ed91215b1b454e989e2473b1ce5c02`). Restored the temporary file afterward; reviewer worktree clean.
+- Worker reports full Client 699/699, focused 16/16, Server 131/131 and Release solution build passing. These positive tests do not cover the identified safety interleavings.
+
+## Blocking findings
+
+1. **P1 — Activity write failure fails open:** `findings/activity-write-fail-open.md`. An attributed tool executes after failed durable watermark persistence; in-memory poison is lost on server restart, permitting an old watermark to look authoritative.
+2. **P1 — Replaced schedule consumes another agent's verification:** `findings/schedule-replacement-verification-race.md`. Fully reproduced with a deterministic failing test on the frozen commit.
+
+## Additional finding
+
+3. **P2 — Manager launch with no first tool call never recovers:** `findings/manager-first-activity-stall.md`. `waitingActivity` has no stale timeout after a successfully returned launch.
+
+**Decision:** ChangesRequested. Fix both P1 safety gaps and add negative regressions before a new frozen review. Clarify or correct the stale Manager launch recovery. The work has not been merged or deployed.

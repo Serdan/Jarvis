@@ -2919,3 +2919,165 @@ let ``old unbound correction permit survives migration but cannot authorize type
             "Missing old immutable request provenance must never be backfilled from a retry.")
         upgraded.InspectAgentCorrectionPermit(user, target) |> shouldEqual (Ok(Some preserved))
         upgraded.TryReleaseAgentCorrection(user, target, oldPermit, true) |> shouldEqual (Ok ()))
+
+[<Test>]
+let ``durable device registration generations remain distinct across server restart and parallel allocators`` () =
+    withStore (fun store ->
+        let makeUsers (database: FeedbackStore) =
+            UserService((fun () -> DateTimeOffset.UtcNow),
+                        UserRetentionPolicy.defaults,
+                        generationAllocator = (fun () ->
+                            database.AllocateDeviceRegistrationGeneration()))
+        let registration device : Common.SignalR.ClientRegistration =
+            { DeviceId = device; DeviceName = device
+              ClientVersion = "test"; ProtocolVersion = Common.AgentProtocol.version
+              SupportedCommands = [ "TaskWrite" ] }
+        let firstUsers = makeUsers store
+        firstUsers.TransportConnected("alice", "first-connection")
+        let first = firstUsers.Register(
+            "alice", registration "workstation", "first-connection")
+        Assert.That(first.Generation, Is.GreaterThan(0L))
+        store.AddConnectionEvent(
+            "alice", "Registered", "first-connection",
+            Some "workstation", Some "workstation", Some first.Generation,
+            Some "test", Some Common.AgentProtocol.version,
+            None, None, None)
+        // Connection diagnostics expire; generation provenance must not.
+        store.PruneTelemetry(DateTimeOffset.UtcNow.AddDays(45.0))
+        use restarted = new FeedbackStore(store.DatabasePath)
+        let secondUsers = makeUsers restarted
+        secondUsers.TransportConnected("alice", "second-connection")
+        let second = secondUsers.Register(
+            "alice", registration "workstation", "second-connection")
+        Assert.That(second.Generation, Is.GreaterThan(first.Generation),
+                    "A server restart must not reuse a prior client's registration generation.")
+        secondUsers.TransportConnected("bob", "bob-connection")
+        let other = secondUsers.Register(
+            "bob", registration "workstation", "bob-connection")
+        Assert.That(other.Generation, Is.GreaterThan(second.Generation),
+                    "Generation identity must be unique across users, not just per device.")
+        use third = new FeedbackStore(store.DatabasePath)
+        let later = third.AllocateDeviceRegistrationGeneration()
+        Assert.That(later, Is.GreaterThan(other.Generation))
+        let parallel =
+            [| for i in 1 .. 16 ->
+                 Task.Run(fun () ->
+                     if i % 2 = 0 then store.AllocateDeviceRegistrationGeneration()
+                     else restarted.AllocateDeviceRegistrationGeneration()) |]
+        Task.WaitAll(parallel |> Array.map (fun task -> task :> Task))
+        let distinct = parallel |> Array.map _.Result |> Set.ofArray
+        Assert.That(distinct.Count, Is.EqualTo(parallel.Length),
+                    "Two server/store instances must not allocate the same generation.")
+        Assert.That(distinct |> Seq.min, Is.GreaterThan(later)))
+
+[<Test>]
+let ``new device allocator seeds above old execution witnesses and correction permits`` () =
+    withStore (fun store ->
+        approveTestEpoch store
+        let original =
+            store.TryBeginAgentOperation(
+                "alice", "Worker 3", "TaskRead", Some "Jarvis",
+                "server", None, Some Common.AgentProtocol.version)
+            |> function Ok row -> row | Error error -> failwith error
+        store.TryMarkAgentDispatched(
+            "alice", original.Id, "desktop", "old-connection",
+            745L, "old-correlation") |> shouldEqual (Ok ())
+        let operator =
+            store.TryBeginAgentOperation(
+                "alice", "Admin 1", "TaskWrite", Some "Jarvis",
+                "server", None, Some Common.AgentProtocol.version)
+            |> function Ok row -> row | Error error -> failwith error
+        let bound : AgentCorrectionRequestBinding =
+            { ProjectName = "Jarvis"; RequestingAgentId = "Admin 1"
+              RequestFingerprint = String.replicate 64 "A"
+              InitiatingRequestId = operator.Id
+              DeviceId = "desktop"; DeviceGeneration = 802L }
+        let permit =
+            store.TryAcquireAgentCorrectionForRequest(
+                "alice", "Worker 4", "correction-during-upgrade", bound)
+            |> function Ok id -> id | Error error -> failwith error
+        // Simulate installing the first allocator-capable server on an
+        // existing database with no durable generation table at all.
+        use sql = new SqliteConnection($"Data Source={store.DatabasePath}")
+        sql.Open()
+        use reset = sql.CreateCommand()
+        reset.CommandText <- "DROP TABLE device_registration_sequence;"
+        reset.ExecuteNonQuery() |> ignore
+        use upgraded = new FeedbackStore(store.DatabasePath)
+        let afterMigration = upgraded.AllocateDeviceRegistrationGeneration()
+        Assert.That(afterMigration, Is.GreaterThan(802L),
+                    "The first upgraded server must exceed ALL persisted generations.")
+        let stillHeld =
+            upgraded.InspectAgentCorrectionPermit("alice", "Worker 4")
+            |> function
+                | Ok (Some evidence) -> evidence
+                | other -> failwithf "Lost original permit while migrating allocator: %A" other
+        stillHeld.PermitId |> shouldEqual permit
+        stillHeld.DeviceGeneration |> shouldEqual (Some 802L)
+        Assert.That(upgraded.TryMarkAgentDispatched(
+            "alice", operator.Id, "desktop", "new-connection",
+            afterMigration, "replacement-correlation").IsError, Is.True,
+            "Fresh registration identities cannot inherit an old correction.")
+        upgraded.TryReleaseAgentCorrection(
+            "alice", "Worker 4", permit, true) |> shouldEqual (Ok ()))
+
+[<Test>]
+let ``device registration fails without durable generation and preserves prior routing`` () =
+    withStore (fun store ->
+        let users = UserService((fun () -> DateTimeOffset.UtcNow),
+                                UserRetentionPolicy.defaults,
+                                generationAllocator = (fun () ->
+                                    store.AllocateDeviceRegistrationGeneration()))
+        let registration device : Common.SignalR.ClientRegistration =
+            { DeviceId = device; DeviceName = device
+              ClientVersion = "test"; ProtocolVersion = Common.AgentProtocol.version
+              SupportedCommands = [ "TaskRead" ] }
+        users.TransportConnected("alice", "old-connection")
+        let first = users.Register(
+            "alice", registration "workstation", "old-connection")
+        users.TransportConnected("alice", "replacement-connection")
+        use connection = new SqliteConnection($"Data Source={store.DatabasePath}")
+        connection.Open()
+        use drop = connection.CreateCommand()
+        drop.CommandText <- "DROP TABLE device_registration_sequence;"
+        drop.ExecuteNonQuery() |> ignore
+        Assert.That(
+            (fun () -> users.Register(
+                "alice", registration "workstation", "replacement-connection")
+                      |> ignore),
+            Throws.Exception,
+            "An unavailable durable allocator must abort device registration.")
+        match users.GetSessionByConnection("old-connection") with
+        | ValueSome session ->
+            session.Generation |> shouldEqual first.Generation
+            session.State |> shouldEqual Registered
+            session.ConnectionId |> shouldEqual (Some "old-connection")
+        | ValueNone -> Assert.Fail("Failed registration replaced a valid active session.")
+        match users.GetTransportConnection("replacement-connection") with
+        | ValueSome transport -> transport.RegisteredDeviceId |> shouldEqual None
+        | ValueNone -> Assert.Fail("New transport was unexpectedly removed.")
+        let invalidUsers =
+            UserService((fun () -> DateTimeOffset.UtcNow),
+                        UserRetentionPolicy.defaults,
+                        generationAllocator = (fun () -> 0L))
+        invalidUsers.TransportConnected("bob", "bad-connection")
+        Assert.That(
+            (fun () -> invalidUsers.Register(
+                "bob", registration "workstation", "bad-connection") |> ignore),
+            Throws.Exception,
+            "A persisted allocator returning zero must never create a routable session.")
+        Assert.That(invalidUsers.ListDevices("bob"), Is.Empty)
+        let duplicateUsers =
+            UserService((fun () -> DateTimeOffset.UtcNow),
+                        UserRetentionPolicy.defaults,
+                        generationAllocator = (fun () -> 1L))
+        duplicateUsers.TransportConnected("bob", "first")
+        let first = duplicateUsers.Register("bob", registration "workstation", "first")
+        duplicateUsers.TransportConnected("bob", "second")
+        Assert.That((fun () ->
+            duplicateUsers.Register("bob", registration "workstation", "second")
+            |> ignore), Throws.Exception,
+            "Even a buggy allocator returning the same positive value cannot replace a live session.")
+        match duplicateUsers.GetSessionByConnection("first") with
+        | ValueSome prior -> prior.Generation |> shouldEqual first.Generation
+        | ValueNone -> Assert.Fail("Duplicate generation replaced the original route."))

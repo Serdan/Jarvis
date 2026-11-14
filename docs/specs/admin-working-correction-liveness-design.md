@@ -564,3 +564,52 @@ registration remains active. This safety barrier therefore does not replace
 exact canonical ledger identity verification, the legacy-client/process
 quiescence barrier or audited orphaned-permit reconciliation. All uncertainty
 continues to hold the correction exclusion; no deployment is authorized.
+
+### Crash-stable SignalR registration generations (2026-11-14)
+
+The 3.65 correction permit now pins an initiating request to its device ID
+**and registration generation**. Audit found that `UserService` originally
+allocated that generation with a process-local counter resetting to `1`
+after a server restart. Consequently, a replacement registration after a
+restart could collide with a persisted pre-restart permit even when the
+device ID and full correction command fingerprint matched. Persisting the
+permit generation alone did **not** close that hole.
+
+Production `Program.configureServices` now explicitly injects a
+`FeedbackStore.AllocateDeviceRegistrationGeneration` callback into
+`UserService`. SQLite atomically increments and returns a **server-wide,
+never-pruned** integer high-water mark in a dedicated
+`device_registration_sequence` table. It is independent of the pruned
+`connection_events` table and in-memory registration lifetime, and uses a
+SQLite writer transaction so separate store instances serialize their
+allocations. A missing/corrupt/exhausted allocator refuses registration;
+it cannot silently fall back to process-local generation. The service
+checks each result against the largest generation already registered
+within its own lifetime, rejecting invalid or duplicate values.
+
+For a first install on a pre-allocator DB, initialization seeds the
+persistent high-water above all **persisted** witness, permit and
+connection-event generation values. This migration does not declare
+legacy activity quiescent or mint missing old execution evidence.
+`UserService.Register` allocates before changing live routing ownership,
+so an allocator failure cannot partially replace a registered session.
+The parameterless and clock-test `UserService` constructors retain a
+process-local counter for isolated tests only; production uses the
+explicit durable dependency.
+
+Negative tests recreate services against the same SQLite database,
+remove connection telemetry, allocate concurrently from independent
+`FeedbackStore` instances, migrate a pre-counter database with an
+unresolved witness and permit, corrupt/remove the live allocator,
+and provide a deliberately duplicate-generation callback. They verify
+strictly distinct registrations, unchanged held permit and prior live
+route, and fail-closed behavior when storage cannot certify a new
+generation.
+
+**Remaining trust boundary:** this counter prevents ordinary same-database
+server restarts from recycling generations. It does not attest that a
+historical pre-witness device stopped executing, prove a detached process
+tree terminated, or protect against restoration of an arbitrary stale
+SQLite backup while an older server/client process continues running.
+Those cases still require authenticated global legacy drain evidence and
+the separate correction exclusion; keep `AwaitingLegacyDrain` in effect.

@@ -300,6 +300,18 @@ CREATE TABLE IF NOT EXISTS connection_events (
 CREATE INDEX IF NOT EXISTS ix_connection_events_user_created
     ON connection_events(user_id, created_at DESC);
 
+-- A SignalR registration generation is durable protocol identity, not merely
+-- a process-local counter. Reusing generation 1 after a server restart would
+-- let a replacement client match an unresolved correction permit from an
+-- earlier server boot. Never prune, reset or infer this counter from the
+-- in-memory device/session registry.
+CREATE TABLE IF NOT EXISTS device_registration_sequence (
+    singleton_id INTEGER PRIMARY KEY CHECK(singleton_id = 1),
+    generation INTEGER NOT NULL CHECK(generation >= 0)
+);
+INSERT OR IGNORE INTO device_registration_sequence
+    (singleton_id, generation) VALUES (1, 0);
+
 -- Independent from 30-day operation telemetry retention: unresolved client
 -- executions are never pruned by age. The Git ledger remains task authority.
 CREATE TABLE IF NOT EXISTS agent_execution_witness (
@@ -496,6 +508,25 @@ INSERT OR IGNORE INTO agent_execution_epoch
                WHERE job_id IS NOT NULL OR tool_job_id IS NOT NULL;"""
         deferredJobIndex.ExecuteNonQuery() |> ignore
 
+        // Upgrades from pre-allocator builds already have durable SignalR
+        // witness/permit generations. Never start at 1 if an unresolved
+        // permit or earlier device registration recorded a higher identity.
+        // The high-water mark survives telemetry pruning and server restart.
+        use generationFloor = connection.CreateCommand()
+        generationFloor.CommandText <-
+            """UPDATE device_registration_sequence
+               SET generation = MAX(
+                   generation,
+                   COALESCE((SELECT MAX(device_generation)
+                             FROM agent_execution_witness), 0),
+                   COALESCE((SELECT MAX(device_generation)
+                             FROM agent_correction_permit), 0),
+                   COALESCE((SELECT MAX(generation)
+                             FROM connection_events), 0))
+               WHERE singleton_id = 1;"""
+        if generationFloor.ExecuteNonQuery() <> 1 then
+            invalidOp "Device registration generation allocator is missing."
+
         use inspect = connection.CreateCommand()
         inspect.CommandText <- "PRAGMA table_info(feedback);"
         use reader = inspect.ExecuteReader()
@@ -537,6 +568,27 @@ INSERT OR IGNORE INTO agent_execution_epoch
         member _.Dispose() = pruneTimer.Dispose()
 
     member _.DatabasePath = databasePath
+
+    /// Allocate one permanent, server-wide SignalR device incarnation ID.
+    /// SQLite's serialized UPDATE RETURNING never reissues an identity after
+    /// server restart, concurrent registration or disconnected-device pruning.
+    /// A missing/corrupt store or counter exhaustion must refuse registration.
+    member _.AllocateDeviceRegistrationGeneration() : int64 =
+        use connection = openConnection()
+        use transaction = connection.BeginTransaction()
+        use command = connection.CreateCommand()
+        command.Transaction <- transaction
+        command.CommandText <-
+            """UPDATE device_registration_sequence
+               SET generation = generation + 1
+               WHERE singleton_id = 1 AND generation < 9223372036854775807
+               RETURNING generation;"""
+        let generation =
+            match command.ExecuteScalar() with
+            | :? int64 as value when value > 0L -> value
+            | _ -> invalidOp "Durable device generation is missing, corrupt or exhausted."
+        transaction.Commit()
+        generation
 
     member _.AddConnectionEvent(
         userId: string,

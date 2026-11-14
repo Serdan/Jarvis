@@ -1452,3 +1452,208 @@ let processOwnershipEvidenceWireReadRejectsForeignDeviceAndPreservesUncertainty 
             let file = Path.Combine(directory, id + ".intent.json")
             if File.Exists file then File.Delete file
         Directory.Delete(root, true)
+
+
+[<Test>]
+let linuxNativeJobScopeParsesOnlyExplicitKernelPopulation () =
+    Assert.That(LinuxJobScope.inspectEvents "populated 0\nfrozen 0\n",
+                Is.EqualTo(LinuxJobScope.Empty))
+    Assert.That(LinuxJobScope.inspectEvents "populated 1\nfrozen 0\n",
+                Is.EqualTo(LinuxJobScope.Occupied))
+    for invalid in [ ""; "frozen 0"; "populated 2"; "populated -1";
+                     "populated 0\npopulated 0"; "populated 0\npopulated 1";
+                     "populated"; "populated 0 1" ] do
+        match LinuxJobScope.inspectEvents invalid with
+        | LinuxJobScope.Unverified _ -> ()
+        | result -> Assert.Fail($"Malformed kernel scope occupancy was accepted: {result}")
+
+    let forged : LinuxJobScope.Identity =
+        { JobId = Guid.NewGuid().ToString("N")
+          Directory = Path.GetTempPath()
+          BootId = Guid.NewGuid().ToString("D") }
+    match LinuxJobScope.inspect forged with
+    | LinuxJobScope.Unverified _ -> ()
+    | result -> Assert.Fail($"A non-cgroup path was treated as kernel-owned: {result}")
+    match LinuxJobScope.tryKill forged with
+    | Error _ -> ()
+    | Ok () -> Assert.Fail("A forged kernel scope was accepted for termination.")
+
+
+[<Test; NonParallelizable>]
+let linuxNativeStartJobScopeAttachesBeforeExecAndRemainsDiagnostic () =
+    if not (OperatingSystem.IsLinux()) then Assert.Ignore("Linux cgroup-v2 only.")
+    let prior = Environment.GetEnvironmentVariable("JARVIS_STARTJOB_CGROUP_V2")
+    let root = createTempProject()
+    let mutable jobId : string option = None
+    let mutable nativeDirectory : string option = None
+    try
+        Environment.SetEnvironmentVariable("JARVIS_STARTJOB_CGROUP_V2", "1")
+        // On hosts without delegated cgroup creation the feature must refuse
+        // admission; do not report a false native reaping guarantee.
+        let probeId = Guid.NewGuid().ToString("N")
+        let probe =
+            try LinuxJobScope.create probeId
+            with
+            | :? UnauthorizedAccessException
+            | :? IOException
+            | :? InvalidOperationException ->
+                Assert.Ignore("Kernel cgroup-v2 delegation unavailable.")
+                None
+        probe |> Option.iter (fun scope -> Directory.Delete scope.Directory)
+        let context = TestContext root
+        let command =
+            { ProjectName = "Project1"; Executable = "dotnet"
+              Args = [ "--version" ]; Reason = Some "Native scope admission test"
+              WorkingDirectory = None; MaxOutputBytes = Some 2048 }
+        let started =
+            match startJob command context with
+            | Ok result -> result
+            | Error error -> failwithf "Opt-in native StartJob did not start: %A" error
+        jobId <- Some started.JobId
+        let recovered =
+            ProcessOwnershipJournal.inspectAt
+                (ProcessOwnershipJournal.defaultDirectory()) started.JobId
+            |> function
+               | Ok evidence -> evidence
+               | Error problem -> failwithf "Native scope journal unreadable: %s" problem
+        let stage =
+            recovered.NativeScope
+            |> Option.defaultWith (fun () -> failwith "Native scope stage was not durably recorded.")
+        nativeDirectory <- Some stage.LinuxCgroupPath
+        Assert.That(stage.JobId, Is.EqualTo(started.JobId))
+        Assert.That(recovered.Launch.IsSome, Is.True)
+        let identity : LinuxJobScope.Identity =
+            { JobId = started.JobId
+              Directory = stage.LinuxCgroupPath; BootId = stage.LinuxBootId }
+        let deadline = DateTimeOffset.UtcNow.AddSeconds(15.)
+        let mutable population = LinuxJobScope.inspect identity
+        while population <> LinuxJobScope.Empty && DateTimeOffset.UtcNow < deadline do
+            Thread.Sleep 50
+            population <- LinuxJobScope.inspect identity
+        Assert.That(population, Is.EqualTo(LinuxJobScope.Empty),
+            "The cgroup must be empty after the OS reaps the launch helper and descendants.")
+        match getProcessOwnershipEvidence
+                  { ProjectName = "Project1"; JobId = started.JobId } context with
+        | Ok evidence ->
+            Assert.That(evidence.ProcessTreeStatus, Is.EqualTo("Unverified"),
+                "Even an empty kernel cgroup cannot authorize arbitrary descendant-escape proofs.")
+        | Error error -> Assert.Fail($"Native process evidence could not be read: {error}")
+    finally
+        jobId |> Option.iter (fun id ->
+            try cancelJob { ProjectName = "Project1"; JobId = id } (TestContext root) |> ignore
+            with _ -> ())
+        nativeDirectory |> Option.iter (fun path ->
+            try Directory.Delete path with _ -> ())
+        Environment.SetEnvironmentVariable("JARVIS_STARTJOB_CGROUP_V2", prior)
+        if Directory.Exists root then Directory.Delete(root, true)
+
+
+[<Test; NonParallelizable>]
+let linuxNativeStartJobScopeRetainsAndKillsDescendants () =
+    if not (OperatingSystem.IsLinux()) then Assert.Ignore("Linux cgroup-v2 only.")
+    if not (File.Exists "/usr/bin/python3") then
+        Assert.Ignore("Python3 is required for this native containment fixture.")
+    let prior = Environment.GetEnvironmentVariable("JARVIS_STARTJOB_CGROUP_V2")
+    let root = createTempProject()
+    let context = TestContext root
+    let marker = Path.Combine(root, "Project1", "native-child.pid")
+    let mutable jobId : string option = None
+    let mutable nativeDirectory : string option = None
+    try
+        Environment.SetEnvironmentVariable("JARVIS_STARTJOB_CGROUP_V2", "1")
+        let probe =
+            try LinuxJobScope.create (Guid.NewGuid().ToString("N"))
+            with
+            | :? UnauthorizedAccessException
+            | :? IOException
+            | :? InvalidOperationException ->
+                Assert.Ignore("Kernel cgroup-v2 delegation unavailable.")
+                None
+        probe |> Option.iter (fun scope -> Directory.Delete scope.Directory)
+        let python =
+            "import subprocess,time,pathlib; " +
+            "p=subprocess.Popen(['/usr/bin/sleep','30']); " +
+            "pathlib.Path('native-child.pid').write_text(str(p.pid)); " +
+            "time.sleep(30)"
+        let cmd =
+            { ProjectName = "Project1"; Executable = "/usr/bin/python3"
+              Args = [ "-c"; python ]; Reason = Some "Verify native descendant containment"
+              WorkingDirectory = None; MaxOutputBytes = Some 2048 }
+        let started =
+            match startJob cmd context with
+            | Ok result -> result
+            | Error error -> failwithf "Scoped StartJob launch failed: %A" error
+        jobId <- Some started.JobId
+        let journal =
+            ProcessOwnershipJournal.inspectAt
+                (ProcessOwnershipJournal.defaultDirectory()) started.JobId
+            |> function
+               | Ok evidence -> evidence
+               | Error failure -> failwithf "Could not read native scope journal: %s" failure
+        let stage =
+            journal.NativeScope
+            |> Option.defaultWith (fun () -> failwith "Native scope stage missing.")
+        nativeDirectory <- Some stage.LinuxCgroupPath
+        let identity : LinuxJobScope.Identity =
+            { JobId = started.JobId; Directory = stage.LinuxCgroupPath
+              BootId = stage.LinuxBootId }
+        let deadline = DateTimeOffset.UtcNow.AddSeconds(15.)
+        while not (File.Exists marker) && DateTimeOffset.UtcNow < deadline do
+            Thread.Sleep 40
+        Assert.That(File.Exists marker, Is.True, "Child process never started.")
+        let childPid = Int32.Parse(File.ReadAllText(marker).Trim())
+        let members = File.ReadAllLines(Path.Combine(stage.LinuxCgroupPath, "cgroup.procs"))
+        Assert.That(members, Does.Contain(string childPid),
+            "The real child must inherit the exact pre-exec kernel scope.")
+        Assert.That(LinuxJobScope.inspect identity, Is.EqualTo(LinuxJobScope.Occupied))
+        match cancelJob { ProjectName = "Project1"; JobId = started.JobId } context with
+        | Ok _ -> ()
+        | Error issue -> Assert.Fail($"Unable to cancel scoped job: {issue}")
+        let cleanupDeadline = DateTimeOffset.UtcNow.AddSeconds(15.)
+        let mutable state = LinuxJobScope.inspect identity
+        while state <> LinuxJobScope.Empty && DateTimeOffset.UtcNow < cleanupDeadline do
+            Thread.Sleep 40
+            state <- LinuxJobScope.inspect identity
+        Assert.That(state, Is.EqualTo(LinuxJobScope.Empty),
+            "Native cgroup.kill must reap the scoped descendants even if their parent was canceled.")
+        let evidence =
+            getProcessOwnershipEvidence
+                { ProjectName = "Project1"; JobId = started.JobId } context
+        match evidence with
+        | Ok read -> Assert.That(read.ProcessTreeStatus, Is.EqualTo("Unverified"))
+        | Error failure -> Assert.Fail($"Historical read-only identity lookup failed: {failure}")
+    finally
+        jobId |> Option.iter (fun id ->
+            try cancelJob { ProjectName = "Project1"; JobId = id } context |> ignore
+            with _ -> ())
+        nativeDirectory |> Option.iter (fun path ->
+            try Directory.Delete path with _ -> ())
+        Environment.SetEnvironmentVariable("JARVIS_STARTJOB_CGROUP_V2", prior)
+        if Directory.Exists root then Directory.Delete(root, true)
+
+[<Test>]
+let nativeScopeJournalRejectsForgedDigestAndMissingKernelScope () =
+    let root = Path.Combine(Path.GetTempPath(), "jarvis-native-scope-" + Guid.NewGuid().ToString("N"))
+    Directory.CreateDirectory root |> ignore
+    try
+        let jobId = Guid.NewGuid().ToString("N")
+        let intent = ProcessOwnershipJournal.beginLaunchAt root jobId "project" "device"
+        let forged : LinuxJobScope.Identity =
+            { JobId = jobId; Directory = Path.GetTempPath()
+              BootId = Guid.NewGuid().ToString("D") }
+        Assert.Throws<IOException>(fun () ->
+            ProcessOwnershipJournal.recordNativeScopeAt root intent forged |> ignore)
+        |> ignore
+        let badStage = Path.Combine(root, jobId + ".native-scope.json")
+        let badContents =
+            System.Text.Json.JsonSerializer.Serialize(
+                {| SchemaVersion = 1; JobId = jobId
+                   IntentSha256 = String.replicate 64 "0"
+                   LinuxCgroupPath = "/sys/fs/cgroup/test"; LinuxBootId = Guid.NewGuid().ToString("D")
+                   RecordedUtc = DateTimeOffset.UtcNow.ToString("O") |})
+        File.WriteAllText(badStage, badContents)
+        match ProcessOwnershipJournal.inspectAt root jobId with
+        | Error _ -> ()
+        | Ok _ -> Assert.Fail("A forged native scope digest was accepted.")
+    finally
+        Directory.Delete(root, true)

@@ -31,10 +31,22 @@ module ProcessOwnershipJournal =
           LinuxStartTicks: string
           RecordedUtc: string }
 
+    // Kernel identity is a separate immutable pre-exec stage. The native
+    // cgroup must already exist before the requested executable may start.
+    [<CLIMutable>]
+    type NativeScope =
+        { SchemaVersion: int
+          JobId: string
+          IntentSha256: string
+          LinuxCgroupPath: string
+          LinuxBootId: string
+          RecordedUtc: string }
+
     [<CLIMutable>]
     type Evidence =
         { Intent: Intent
-          Launch: Launch option }
+          Launch: Launch option
+          NativeScope: NativeScope option }
 
     let private incarnationId = Guid.NewGuid().ToString("D")
     let private utf8 = UTF8Encoding(false, true)
@@ -142,6 +154,28 @@ module ProcessOwnershipJournal =
         writeNew directory (filePath directory jobId "intent") (JsonSerializer.Serialize intent)
         intent
 
+    let recordNativeScopeAt directory (intent: Intent) (scope: LinuxJobScope.Identity) =
+        let jobId = canonicalJobId intent.JobId
+        let persisted =
+            readRaw (filePath directory jobId "intent")
+            |> Option.defaultWith (fun () ->
+                raise (IOException("Process intent missing before native scope registration.")))
+        let loaded = JsonSerializer.Deserialize<Intent>(persisted) |> validateIntent jobId
+        if loaded <> intent || scope.JobId <> jobId
+           || String.IsNullOrWhiteSpace scope.Directory
+           || String.IsNullOrWhiteSpace scope.BootId then
+            raise (IOException("Native cgroup identity does not match immutable launch intent."))
+        match LinuxJobScope.inspect scope with
+        | LinuxJobScope.Unverified _ ->
+            raise (IOException("Native scope must exist on this kernel before journaling."))
+        | _ -> ()
+        let record =
+            { SchemaVersion = 1; JobId = jobId; IntentSha256 = digest persisted
+              LinuxCgroupPath = scope.Directory; LinuxBootId = scope.BootId
+              RecordedUtc = DateTimeOffset.UtcNow.ToString("O") }
+        writeNew directory (filePath directory jobId "native-scope") (JsonSerializer.Serialize record)
+        record
+
     let private linuxStartTicks pid =
         if not (OperatingSystem.IsLinux()) then "" else
             try
@@ -202,15 +236,31 @@ module ProcessOwnershipJournal =
                 | None -> Error "Process journal intent missing."
                 | Some raw ->
                     let intent = JsonSerializer.Deserialize<Intent>(raw) |> validateIntent jobId
-                    match readRaw(filePath directory jobId "launched") with
-                    | None -> Ok { Intent = intent; Launch = None }
-                    | Some second ->
-                        let launch = JsonSerializer.Deserialize<Launch>(second)
-                        if isNull (box launch)
-                           || launch.SchemaVersion <> 1 || launch.JobId <> jobId
-                           || launch.IntentSha256 <> digest raw || launch.ProcessId <= 0
-                           || String.IsNullOrWhiteSpace launch.RecordedUtc then
-                            Error "Process journal launch is incomplete, corrupt or mismatched."
-                        else
-                            Ok { Intent = intent; Launch = Some launch }
+                    let nativeScope =
+                        match readRaw(filePath directory jobId "native-scope") with
+                        | None -> Ok None
+                        | Some stage ->
+                            let scope = JsonSerializer.Deserialize<NativeScope>(stage)
+                            if isNull (box scope)
+                               || scope.SchemaVersion <> 1 || scope.JobId <> jobId
+                               || scope.IntentSha256 <> digest raw
+                               || String.IsNullOrWhiteSpace scope.LinuxCgroupPath
+                               || String.IsNullOrWhiteSpace scope.LinuxBootId
+                               || String.IsNullOrWhiteSpace scope.RecordedUtc then
+                                Error "Native StartJob scope evidence is incomplete or mismatched."
+                            else Ok(Some scope)
+                    match nativeScope with
+                    | Error failure -> Error failure
+                    | Ok nativeScope ->
+                        match readRaw(filePath directory jobId "launched") with
+                        | None -> Ok { Intent = intent; Launch = None; NativeScope = nativeScope }
+                        | Some second ->
+                            let launch = JsonSerializer.Deserialize<Launch>(second)
+                            if isNull (box launch)
+                               || launch.SchemaVersion <> 1 || launch.JobId <> jobId
+                               || launch.IntentSha256 <> digest raw || launch.ProcessId <= 0
+                               || String.IsNullOrWhiteSpace launch.RecordedUtc then
+                                Error "Process journal launch is incomplete, corrupt or mismatched."
+                            else
+                                Ok { Intent = intent; Launch = Some launch; NativeScope = nativeScope }
             with ex -> Error $"Process journal unavailable or corrupt: {ex.GetType().Name}"

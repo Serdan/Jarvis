@@ -4,6 +4,7 @@ open System
 open System.ComponentModel
 open System.Diagnostics
 open System.IO
+open System.IO.Pipes
 open System.Reflection
 open System.Runtime.InteropServices
 open System.Text
@@ -83,7 +84,11 @@ module internal Native =
     [<DllImport("libSystem.B.dylib", EntryPoint = "setsid", SetLastError = true)>]
     extern int private setsidMac()
 
+    [<DllImport("libc", EntryPoint = "setsid", SetLastError = true)>]
+    extern int private setsidLinux()
+
     let newMacSession () = setsidMac()
+    let newLinuxSession () = setsidLinux()
 
     let killUnixGroup pid =
         // libSystem is the guaranteed macOS system library; libc is Linux.
@@ -134,19 +139,28 @@ let internal groupHostFlag = "--jarvis-internal-process-group"
 let runInternalGroupHost (args: string array) =
     let windows = OperatingSystem.IsWindows()
     let mac = OperatingSystem.IsMacOS()
-    if not (windows || mac) || args.Length < (if windows then 2 else 1) then
+    let linux = OperatingSystem.IsLinux()
+    let gated = windows || linux
+    if not (windows || mac || linux) || args.Length < (if gated then 2 else 1) then
         eprintfn "Invalid internal process-group invocation."
         126
-    elif mac && Native.newMacSession() < 0 then
+    elif (mac && Native.newMacSession() < 0)
+         || (linux && Native.newLinuxSession() < 0) then
         eprintfn "Could not establish process session."
         126
     else
         try
-            let offset = if windows then 1 else 0
+            let offset = if gated then 1 else 0
             let allowed =
                 if windows then
                     use ready = EventWaitHandle.OpenExisting(args[0])
                     ready.WaitOne(TimeSpan.FromSeconds 15.)
+                elif linux then
+                    // The Linux helper cannot launch the requested executable
+                    // until the parent verifies its kernel cgroup membership.
+                    use ready = new NamedPipeClientStream(".", args[0], PipeDirection.In)
+                    ready.Connect(15000)
+                    ready.ReadByte() = 1
                 else true
 
             if not allowed then
@@ -276,8 +290,15 @@ let internal helperHostInvocation (hostPath: string) (assemblyPath: string) (arg
         hostPath, assemblyPath :: args
     else hostPath, args
 
-let internal groupProcessInvocation (executable: string) (args: string list) (windowsReadyName: string option) =
-    if OperatingSystem.IsLinux() then
+let internal groupProcessInvocation (executable: string) (args: string list) (readyName: string option) =
+    if OperatingSystem.IsLinux() && readyName.IsSome then
+        let host = Environment.ProcessPath
+        if String.IsNullOrWhiteSpace host then
+            raise (InvalidOperationException "Cannot locate the current Jarvis executable.")
+        let dll = Assembly.GetExecutingAssembly().Location
+        helperHostInvocation host dll
+            ([ groupHostFlag; Option.get readyName; executable ] @ args)
+    elif OperatingSystem.IsLinux() then
         let setsid =
             if File.Exists("/usr/bin/setsid") then "/usr/bin/setsid"
             elif File.Exists("/bin/setsid") then "/bin/setsid"
@@ -291,7 +312,7 @@ let internal groupProcessInvocation (executable: string) (args: string list) (wi
         let args =
             [ yield groupHostFlag
               if OperatingSystem.IsWindows() then
-                  yield windowsReadyName |> Option.defaultWith (fun () ->
+                  yield readyName |> Option.defaultWith (fun () ->
                       invalidOp "Windows process-group startup requires a readiness event.")
               yield executable
               yield! args ]

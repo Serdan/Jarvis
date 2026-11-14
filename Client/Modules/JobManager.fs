@@ -4,6 +4,7 @@ open System
 open System.Collections.Concurrent
 open System.Diagnostics
 open System.IO
+open System.IO.Pipes
 open System.Threading
 open System.Threading.Tasks
 open System.Text
@@ -166,11 +167,16 @@ module private Core =
                 let supervisorGate = obj()
                 let mutable windowsJob = 0n
                 let mutable readiness: EventWaitHandle option = None
+                let mutable nativeReadyPipe: NamedPipeServerStream option = None
+                let mutable nativeScope: LinuxJobScope.Identity option = None
                 let releaseSupervisor () =
                     lock supervisorGate (fun () ->
                         readiness |> Option.iter (fun ready ->
                             try ready.Dispose() with _ -> ())
                         readiness <- None
+                        nativeReadyPipe |> Option.iter (fun ready ->
+                            try ready.Dispose() with _ -> ())
+                        nativeReadyPipe <- None
                         if windowsJob <> 0n then
                             BoundedProcess.Native.CloseHandle(windowsJob) |> ignore
                             windowsJob <- 0n)
@@ -179,9 +185,21 @@ module private Core =
                         if windows then
                             if windowsJob <> 0n then
                                 BoundedProcess.Native.TerminateJobObject(windowsJob, 1u) |> ignore
+                        elif OperatingSystem.IsLinux() && nativeScope.IsSome then
+                            // cgroup.kill addresses the exact kernel scope rather
+                            // than a potentially reused process-group number.
+                            // This is cleanup, NOT an execution terminal receipt.
+                            match LinuxJobScope.tryKill (Option.get nativeScope) with
+                            | Ok () -> ()
+                            | Error failure ->
+                                // Do not fall back to killpg(proc.Id): the helper
+                                // may already have exited, and its process-group
+                                // number could have been reused by an unrelated
+                                // program. Propagate the failure to CancelJob
+                                // instead of returning a false cancellation ack.
+                                raise (IOException(
+                                    "Native StartJob scope termination is unverified: " + failure))
                         elif OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
-                            // Unlike Process.Kill(entireProcessTree), killpg
-                            // reaches children after the leader has exited.
                             BoundedProcess.Native.killUnixGroup proc.Id |> ignore)
                 // The launcher owns these handles until a successful StartJob
                 // transfers them to the process-exit callback. Setup errors
@@ -204,9 +222,15 @@ module private Core =
                     ProcessOwnershipJournal.beginLaunchAt ownershipDirectory jobId
                         (ProjectPaths.ProjectId.value projectName)
                         (DeviceIdentity.getOrCreate())
+                nativeScope <- LinuxJobScope.create jobId
+                nativeScope |> Option.iter (fun scope ->
+                    ProcessOwnershipJournal.recordNativeScopeAt
+                        ownershipDirectory launchIntent scope |> ignore)
                 let readyName =
                     if windows then
                         Some($"Local\\Jarvis.StartJob.{Guid.NewGuid():N}")
+                    elif nativeScope.IsSome then
+                        Some($"jarvis-startjob-cgroup-{jobId}")
                     else None
                 let hostedExecutable, hostedArgs =
                     try
@@ -214,6 +238,10 @@ module private Core =
                             windowsJob <- BoundedProcess.Native.newWindowsJob()
                             readiness <- Some(new EventWaitHandle(
                                 false, EventResetMode.ManualReset, Option.get readyName))
+                        elif nativeScope.IsSome then
+                            nativeReadyPipe <- Some(new NamedPipeServerStream(
+                                Option.get readyName, PipeDirection.Out, 1,
+                                PipeTransmissionMode.Byte, PipeOptions.Asynchronous))
                         BoundedProcess.groupProcessInvocation executable args readyName
                     with _ ->
                         releaseSupervisor()
@@ -305,11 +333,27 @@ module private Core =
                                         windowsJob, proc.Handle)) then
                                         raise (System.ComponentModel.Win32Exception(
                                             System.Runtime.InteropServices.Marshal.GetLastWin32Error()))
+                                nativeScope |> Option.iter (fun scope ->
+                                    // An arbitrary executable cannot run before the
+                                    // managed Linux helper has entered this cgroup.
+                                    let gate = Option.get nativeReadyPipe
+                                    let connected =
+                                        gate.WaitForConnectionAsync().Wait(TimeSpan.FromSeconds(20.))
+                                    if not connected then
+                                        raise (TimeoutException(
+                                            "Linux StartJob native-scope helper did not connect."))
+                                    LinuxJobScope.attachBeforeExec scope proc.Id)
                                 ProcessOwnershipJournal.recordLaunchedAt
                                     ownershipDirectory launchIntent proc |> ignore
                                 if windows then
                                     // All descendants inherit the assigned job.
                                     readiness |> Option.iter (fun ready -> ready.Set() |> ignore)
+                                elif nativeScope.IsSome then
+                                    // The immutable launch stage and kernel attach
+                                    // must BOTH exist before allowing exec.
+                                    let gate = Option.get nativeReadyPipe
+                                    gate.WriteByte(1uy)
+                                    gate.Flush()
                                 proc.BeginOutputReadLine()
                                 proc.BeginErrorReadLine()
                                 transferred <- true

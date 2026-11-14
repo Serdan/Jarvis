@@ -1110,3 +1110,44 @@ epoch, clear a Git-backed process witness, release a correction permit, or
 execute an administrative Working-to-Ready correction. All independent
 OS-backed descendant-reaping proof, pre-upgrade fleet drain and exact
 canonical Git outcome-reconciliation requirements remain open.
+
+
+### Experimental Linux cgroup-v2 StartJob scope (2026-11-14)
+
+A separate follow-up source branch, `feature/worker3-p1-native-scope`,
+prototypes a **strictly opt-in** Linux process-scope mechanism. The current
+reviewed/default StartJob behavior is unchanged. An operator testing an
+experimental client may set `JARVIS_STARTJOB_CGROUP_V2=1`, but this must
+**not** be enabled in production until independent native and rollback
+review is complete.
+
+Each opted-in launch requires a kernel cgroup-v2 scope with cgroup.kill,
+rejecting unsupported kernels before allowing any requested executable. It
+creates a unique kernel cgroup-v2 directory under the
+current delegated client cgroup and writes a new immutable `native-scope`
+journal stage tied to the prelaunch intent SHA-256. A managed Linux helper
+enters a new session and blocks on a private named-pipe gate. The parent
+attaches its live process to the kernel cgroup, verifies the PID appears in
+`cgroup.procs`, and durably records the launched PID/birth stage **before**
+releasing that gate. If scope creation, journaling, native attachment or
+handshake fails, no requested executable is released. Explicit `CancelJob`
+and observed leader exit attempt kernel `cgroup.kill`; a native-scope kill failure remains unresolved, is reported by CancelJob, and never
+signals a potentially recycled Unix process-group ID.
+
+The observation parser recognizes only a single exact `populated 0` or
+`populated 1` in kernel `cgroup.events`, checks the boot ID and scope
+path, and treats missing/changed/corrupt data as Unverified. Scope
+observation is always distinct from the historical `StartJob` wire
+result: even a currently empty kernel cgroup does not establish that
+arbitrary descendants never escaped into a sibling systemd scope, or that
+a restarted client's old native scope cannot have been recycled. It
+therefore **never** upgrades a server execution witness to Terminal,
+releases an administrative correction permit, or proves the legacy drain.
+This work provides an OS-backed containment primitive, not the missing
+cross-incarnation correction authorization certificate.
+
+Experimental empty scopes remain available for subsequent forensic
+reinspection rather than being deleted automatically. A durable
+receipt/reaping/cgroup garbage-collection protocol and an OS-backed
+cross-incarnation identity proof are follow-up requirements. Windows
+Job Object and macOS process group behavior are not modified.

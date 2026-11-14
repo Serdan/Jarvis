@@ -1,0 +1,11 @@
+# P2 — Confirmed source activation/effects disappear on forwarded notification transport failures
+
+**Frozen commit:** `cb36a17610ea308e3c78f9dc6f6340f61d292549`
+
+**Locations:** `Server/McpTools.fs:852-887`; `Server/Services/ClientService.fs:290-334`; `Client/SignalR/CommandDispatch.fs:14-29`; `Client/Program.fs:307-333`.
+
+A cross-project `NotifyAgent` first reads the source agent's inbox. That can commit Ready→Working and return a verified `AgentInboxActivation` plus `AgentStateChanges`. `McpTools.send` constructs `CrossProjectNotificationCommand` with these source facts, but then directly returns the destination `SendCommandToProject` result. If destination SignalR dispatch fails or times out after a possible write, `ClientService.SendCommandToUser` constructs a new `UncertainOutcome` with `AgentStateChanges=[]` and `InboxActivation=None` without merging source evidence. Similarly, the client-side unhandled `CommandDispatchRecovery.unexpectedResponse(commandJson)` reconstructs empty evidence even when the command envelope already contains confirmed source effects.
+
+The overall destination result is correctly *uncertain*, but **source-side effects are already known**, and their omission loses the activation receipt and available partial evidence. The new public `knownAgentStateChanges` metadata cannot communicate them. This is not cured by the separate best-effort broadcast of source invalidation, because the caller still cannot observe which activation was confirmed.
+
+**Required:** Carry the confirmed source subset and receipt through both server dispatch uncertainty and client unhandled fallback. Preserve the destination's `UncertainOutcome` (unknown completeness) while exposing the source changes as `knownAgentStateChanges` and the verified `agentInboxActivation`. Include a regression test: source Ready agent gets activated; destination command has an uncertain send/timeout after possible mutation; returned public evidence reports source as known, destination as unknown, with no replay. This should be separate from the already passing client-owned post-execution job exception test.

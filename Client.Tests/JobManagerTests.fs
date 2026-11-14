@@ -818,3 +818,87 @@ let cancelingQueuedForwardedNotificationPreservesCommittedSourceActivation () =
         for _, completion in blockers do
             completion.WaitAsync(TimeSpan.FromSeconds(6.)).GetAwaiter().GetResult() |> ignore
         Directory.Delete(root, true)
+
+[<Test>]
+let ``CancelJob records process cancellation only after exit callback`` () =
+    let root = createTempProject()
+    try
+        let project = Path.Combine(root, "Project1")
+        File.WriteAllText(
+            Path.Combine(project, "cancellation.fsx"),
+            """open System
+open System.Threading
+printfn "job-is-running"
+Console.Out.Flush()
+Thread.Sleep(TimeSpan.FromSeconds(45.0))
+            """)
+        let context = TestContext root
+        let start =
+            { ProjectName = "Project1"
+              Executable = "dotnet"
+              Args = [ "fsi"; "--exec"; "cancellation.fsx" ]
+              Reason = Some "Verify cancellation terminal transition"
+              WorkingDirectory = None
+              MaxOutputBytes = Some 8192 }
+        let jobId =
+            match startJob start context with
+            | Ok value -> value.JobId
+            | Error error -> failwithf "Cannot start cancellation fixture: %A" error
+        let inspect () =
+            getJobResult
+                { ProjectName = "Project1"; JobId = jobId; AfterSequence = Some 0L }
+                context
+            |> function
+               | Ok value -> value
+               | Error error -> failwithf "Cannot observe cancellation fixture: %A" error
+        let stopwatch = Stopwatch.StartNew()
+        let rec awaitRunning () =
+            let result = inspect()
+            if result.Events |> List.exists (fun e -> e.Text.Contains("job-is-running")) then
+                Assert.That(result.Status, Is.EqualTo(Running))
+            elif stopwatch.Elapsed > TimeSpan.FromSeconds(30.0) then
+                Assert.Fail("Cancellation fixture did not reach running phase.")
+            else
+                Thread.Sleep 30
+                awaitRunning ()
+        try
+            awaitRunning ()
+            cancelJob { ProjectName = "Project1"; JobId = jobId } context
+            |> shouldEqual (Ok ())
+            // Duplicate cancel requests are safe even when an Exited
+            // callback races the first request.
+            cancelJob { ProjectName = "Project1"; JobId = jobId } context
+            |> shouldEqual (Ok ())
+            let rec awaitTerminal () =
+                let result = inspect()
+                match result.Status with
+                | Running when stopwatch.Elapsed < TimeSpan.FromSeconds(35.0) ->
+                    let summary =
+                        listJobs
+                            { ProjectName = Some "Project1"; IncludeCompleted = true }
+                            context
+                        |> function
+                           | Ok jobs -> jobs.Jobs |> List.find (fun j -> j.JobId = jobId)
+                           | Error error -> failwithf "Cannot inspect active job: %A" error
+                    Assert.That(summary.CompletedAt.IsNone, Is.True,
+                                "A cancellation request cannot publish a terminal timestamp.")
+                    Thread.Sleep 25
+                    awaitTerminal ()
+                | Canceled ->
+                    let summary =
+                        listJobs
+                            { ProjectName = Some "Project1"; IncludeCompleted = true }
+                            context
+                        |> function
+                           | Ok jobs -> jobs.Jobs |> List.find (fun j -> j.JobId = jobId)
+                           | Error error -> failwithf "Cannot inspect canceled job: %A" error
+                    Assert.That(summary.CompletedAt.IsSome, Is.True,
+                                "Canceled must be an observed process exit, not just a kill request.")
+                | other ->
+                    Assert.Fail($"Cancellation did not resolve to an observed parent exit: {other}")
+            awaitTerminal ()
+        finally
+            cancelJob { ProjectName = "Project1"; JobId = jobId } context
+            |> ignore
+    finally
+        Directory.Delete(root, true)

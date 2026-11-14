@@ -266,15 +266,25 @@ module private Core =
                 match validateJobProject canonical job with
                 | Error error -> Error error
                 | Ok () ->
-                    if job.Status = Running then
-                        job.CancellationRequested <- true
+                    // Requesting cancellation is NOT a terminal process
+                    // observation: Kill(entireProcessTree) initiates shutdown
+                    // but does not prove the leader, let alone every
+                    // descendant, has exited. The Exited callback alone
+                    // changes Running to Canceled once the parent has exited.
+                    let shouldCancel =
+                        lock job.SyncRoot (fun () ->
+                            if job.Status = Running then
+                                job.CancellationRequested <- true
+                                true
+                            else false)
+                    if shouldCancel then
                         try
                             if not job.Process.HasExited then job.Process.Kill(entireProcessTree = true)
-                            job.Status <- Canceled
-                            job.CompletedAt <- Some DateTimeOffset.UtcNow
                             Ok()
                         with ex ->
-                            job.CancellationRequested <- false
+                            // A failed kill attempt does not revoke the
+                            // cancellation request; the caller may retry and
+                            // the eventual Exited event retains its history.
                             Error(ExceptionError ex)
                     else
                         Ok()

@@ -206,6 +206,10 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                 | null -> CancellationToken.None
                 | context -> context.RequestAborted
             requestAborted.ThrowIfCancellationRequested()
+            // A verified cross-project source activation precedes destination
+            // dispatch. It remains known if this transport later times out.
+            let sourceChanges, sourceActivation =
+                AgentCommandInfo.confirmedSourceEvidence command
             match users.GetSelectedSession(userId, conversationId, deviceId) with
             | ValueNone when deviceId.IsSome ->
                 let requested = deviceId.Value
@@ -305,7 +309,8 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                                                 { Message = $"{reason} Protocol {session.ProtocolVersion}, client {session.ClientVersion}, last seen {session.LastSeenAt:O}."
                                                   OperationId = AgentCommandInfo.recoveryOperationId command }
                                         )
-                                      Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+                                      Instructions = []; AgentStateChanges = sourceChanges
+                                      InboxActivation = sourceActivation; PendingJob = None }
                         with ex ->
                             match replyStartedAt with
                             | Some started when replyMs = 0.0 ->
@@ -331,7 +336,8 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                                         Some(UncertainOutcome
                                             { Message = reason
                                               OperationId = AgentCommandInfo.recoveryOperationId command })
-                                      Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+                                      Instructions = []; AgentStateChanges = sourceChanges
+                                      InboxActivation = sourceActivation; PendingJob = None }
         }
 
 

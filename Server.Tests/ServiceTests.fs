@@ -1793,7 +1793,8 @@ let pendingToolJobNeverAdvertisesAFalseEmptyMutationList () =
 
 // Exercise real ClientService routing through two registered SignalR clients
 // and its real response tracker, without starting a production transport.
-let private routedNotificationFixture (reply: string -> AgentCommand -> string -> AgentCommandResponse) =
+let private routedNotificationFixtureWithReceipt (sourceReceipt: AgentInboxActivation option)
+                                             (reply: string -> AgentCommand -> string -> AgentCommandResponse) =
     task {
         let users = UserService()
         let userId = "route-authenticated-user"
@@ -1856,12 +1857,15 @@ let private routedNotificationFixture (reply: string -> AgentCommand -> string -
             CrossProjectNotificationCommand
                 { Notification = notification
                   SourceStateChanges = [ { ProjectName = "Jarvis"; AgentId = actor } ]
-                  SourceInboxActivation = None }
+                  SourceInboxActivation = sourceReceipt }
         let! response =
             service.SendCommandToProject(userId, "Wayfold", cmd,
                                          conversationId = "route-test", agentId = actor)
         return response, calls.ToArray()
     }
+
+let private routedNotificationFixture reply =
+    routedNotificationFixtureWithReceipt None reply
 
 let private routeTerminalHealth : AgentCommandResponse =
     { Result = Some """{"VerifiedLedger":true}"""; Error = None
@@ -1883,6 +1887,66 @@ let private routeJobResult jobId status (terminal: AgentCommandResponse option) 
           Truncated = false; ToolResponse = terminal; OperationId = None }
     { Result = Some(JsonSerializer.Serialize result); Error = None
       Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+
+[<Test>]
+let forwardedTransportFailureKeepsVerifiedSourceWithUnknownDestination () = task {
+    let source = [ { ProjectName = "Jarvis"; AgentId = "Worker 1" } ]
+    let receipt : AgentInboxActivation =
+        { ProjectName = "Jarvis"; AgentId = "Worker 1"
+          ActivatedByThisCall = true; BeforeState = Some "Ready"
+          AfterState = Some "Working"; CommittedHead = Some(String('a', 40))
+          OperationId = Some(Guid.NewGuid().ToString("D")) }
+    let mutable operationId = ""
+    let mutable writes = 0
+    let respond (device: string) (command: AgentCommand) (actor: string) =
+        match device, command with
+        | "first", LedgerReadCommand _ -> routeTerminalHealth
+        | "first", CrossProjectNotificationCommand envelope ->
+            writes <- writes + 1
+            Assert.That(actor, Is.EqualTo("Worker 1"))
+            Assert.That(envelope.SourceStateChanges, Is.EqualTo(source :> obj))
+            Assert.That(envelope.SourceInboxActivation, Is.EqualTo(Some receipt))
+            operationId <- envelope.Notification.OperationId
+            // Transport faults after the write may have committed. It must
+            // not discard the independently confirmed source activation.
+            invalidOp "destination response lost after possible write"
+        | _ -> failwith $"Unexpected routing {device}/{AgentCommandInfo.name command}"
+    let! destination, calls =
+        routedNotificationFixtureWithReceipt (Some receipt) respond
+    Assert.That(writes, Is.EqualTo(1), "The mutation must not replay on another device.")
+    Assert.That(AgentStateEvidence.isUnknown destination, Is.True)
+    Assert.That(destination.AgentStateChanges, Is.EqualTo(source :> obj))
+    Assert.That(destination.InboxActivation, Is.EqualTo(Some receipt))
+    match destination.Error with
+    | Some(UncertainOutcome info) ->
+        Assert.That(info.OperationId, Is.EqualTo(Some operationId))
+        Assert.That(info.Message, Does.Contain("destination response lost"))
+    | other -> Assert.Fail($"Expected uncertain destination dispatch: {other}")
+    let sender : AgentCommandResponse =
+        { routeTerminalHealth with AgentStateChanges = source
+                                   InboxActivation = Some receipt }
+    let merged = McpToolHelpers.mergeStateEffects sender destination
+    Assert.That(AgentStateEvidence.isUnknown merged, Is.True)
+    Assert.That(merged.AgentStateChanges, Is.EqualTo(source :> obj))
+    Assert.That(merged.InboxActivation, Is.EqualTo(Some receipt))
+    let exposed =
+        merged |> McpToolHelpers.toCallToolResult
+        |> McpToolHelpers.attachStateEffects merged
+    Assert.That(exposed.Meta["jarvis/agent_state_changes_status"].GetValue<string>(),
+                Is.EqualTo("unknown"))
+    Assert.That(exposed.Meta["jarvis/recovery_operation_id"].GetValue<string>(),
+                Is.EqualTo(operationId))
+    Assert.That(exposed.Meta["jarvis/known_agent_state_changes"].ToJsonString(),
+                Does.Contain("Worker 1"))
+    Assert.That(exposed.Meta.ContainsKey("jarvis/agent_state_changes"), Is.False)
+    use body = JsonDocument.Parse((exposed.Content[1] :?> TextContentBlock).Text)
+    let activated =
+        body.RootElement.GetProperty("agentInboxActivation").GetProperty("ActivatedByThisCall").GetBoolean()
+    Assert.That(activated, Is.True)
+    Assert.That(calls |> Array.filter (fun (_, command, _) ->
+        match command with CrossProjectNotificationCommand _ -> true | _ -> false)
+        |> Array.length, Is.EqualTo(1))
+}
 
 [<Test>]
 let pendingHealthFailureRejectsFirstDeviceBeforeRoutedCrossProjectMutation () =

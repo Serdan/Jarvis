@@ -11,21 +11,24 @@ open Common
 /// executed command made no changes. Never replay a write after this error.
 module CommandDispatchRecovery =
     let unexpectedResponse (commandJson: string) : AgentCommandResponse =
-        let operationId =
-            try
-                JsonSerializer.Deserialize<AgentCommand>(commandJson)
-                |> AgentCommandInfo.recoveryOperationId
+        let parsed =
+            try Some(JsonSerializer.Deserialize<AgentCommand>(commandJson))
             with _ -> None
+        let operationId = parsed |> Option.bind AgentCommandInfo.recoveryOperationId
+        let sourceChanges, sourceActivation =
+            parsed
+            |> Option.map AgentCommandInfo.confirmedSourceEvidence
+            |> Option.defaultValue ([], None)
         { Result = None
           Error =
             Some(UncertainOutcome
                 { Message = "Jarvis client command terminated unexpectedly; the outcome may already be committed. Check the original operation ID before retrying."
                   OperationId = operationId })
           Instructions = []
-          // A zero-length list is only a known subset here, NOT confirmed zero.
-          // The typed UncertainOutcome controls public state-evidence metadata.
-          AgentStateChanges = []
-          InboxActivation = None; PendingJob = None }
+          // Only the forwarded source effects are confirmed. Destination
+          // effects remain UNKNOWN under the typed UncertainOutcome.
+          AgentStateChanges = sourceChanges
+          InboxActivation = sourceActivation; PendingJob = None }
 
 // A command must leave SignalR's receive callback before any local work
 // starts. Even Task-returning callbacks serialize subsequent notifications.

@@ -831,10 +831,22 @@ module AgentStateEvidence =
         | _ -> false
 
 module AgentCommandInfo =
+    /// A forwarded notification has already validated and possibly activated
+    /// its source agent. These are confirmed facts even when the destination
+    /// write later has an uncertain outcome.
+    let confirmedSourceEvidence = function
+        | CrossProjectNotificationCommand envelope ->
+            (if isNull (box envelope.SourceStateChanges) then [] else envelope.SourceStateChanges),
+            (envelope.SourceInboxActivation
+             |> Option.filter (fun receipt -> receipt.ActivatedByThisCall))
+        | _ -> [], None
+
     let recoveryOperationId command =
         let raw =
             match command with
             | TaskWriteCommand cmd -> cmd.OperationId
+            | CrossProjectNotificationCommand envelope -> envelope.Notification.OperationId
+            | ChallengeWriteCommand cmd -> cmd.OperationId
             | LedgerWriteCommand cmd -> cmd.OperationId
             | ReviewWriteCommand cmd -> cmd.OperationId
             | RetryPendingIntentCommand cmd -> cmd.OperationId
@@ -985,6 +997,7 @@ module AgentCommandInfo =
     let operationId = function
         | TaskWriteCommand cmd -> Some cmd.OperationId
         | CrossProjectNotificationCommand envelope -> Some envelope.Notification.OperationId
+        | ChallengeWriteCommand cmd -> Some cmd.OperationId
         | ReviewWriteCommand cmd -> Some cmd.OperationId
         | LedgerWriteCommand cmd when cmd.Action <> "AcknowledgePendingOperation" -> Some cmd.OperationId
         | RetryPendingIntentCommand cmd -> Some cmd.OperationId

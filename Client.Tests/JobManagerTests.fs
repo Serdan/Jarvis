@@ -587,6 +587,64 @@ let stableOperationIdDoesNotDispatchOriginalCommandTwice () =
 
 
 [<Test>]
+let challengeWriteUsesStableAutoJobAndRecoveryIdentity () =
+    let operationId = Guid.NewGuid().ToString("D")
+    let request : AgentCommand =
+        ChallengeWriteCommand
+            { ProjectName = "Project1"; ActorId = "Worker 1"
+              OperationId = operationId; Action = "Cancel"
+              ChallengeId = Guid.NewGuid().ToString("N"); ConditionId = ""
+              ExpectedVersion = 1; Title = ""; TaskId = ""; AttemptId = ""
+              DependencyChallengeIds = []; ExpectedTaskVersion = 0
+              ExpectedAttemptVersion = 0; ExpectedAgentVersion = 0
+              AssignmentGeneration = 0; Conditions = []
+              Evidence = ""; Reason = "test"; Outcome = ""
+              NewOwnerAgentId = ""; Subscribe = false }
+    Assert.That(AgentCommandInfo.operationId request, Is.EqualTo(Some operationId))
+    Assert.That(AgentCommandInfo.recoveryOperationId request, Is.EqualTo(Some operationId))
+    let recovery = CommandDispatchRecovery.unexpectedResponse (
+        System.Text.Json.JsonSerializer.Serialize request)
+    match recovery.Error with
+    | Some(UncertainOutcome info) ->
+        Assert.That(info.OperationId, Is.EqualTo(Some operationId))
+    | other -> Assert.Fail($"Challenge recovery lost original UUID: {other}")
+    let entered = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+    let release = TaskCompletionSource<AgentCommandResponse>(TaskCreationOptions.RunContinuationsAsynchronously)
+    let mutable calls = 0
+    let execute () : Task<AgentCommandResponse> = task {
+        calls <- calls + 1
+        entered.TrySetResult(()) |> ignore
+        return! release.Task
+    }
+    try
+        let start () =
+            startToolOperation jobProject (Some "Project1") "Worker 1"
+                "ChallengeWrite" (AgentCommandInfo.operationId request) operationId execute
+        let first =
+            match start () with
+            | Ok operation -> operation
+            | Error issue -> failwith $"Could not register Challenge write: {issue}"
+        entered.Task.WaitAsync(TimeSpan.FromSeconds 5.).GetAwaiter().GetResult()
+        let retry =
+            match start () with
+            | Ok operation -> operation
+            | Error issue -> failwith $"Could not recover Challenge write: {issue}"
+        Assert.That(fst retry, Is.EqualTo(fst first),
+                    "The same pending Challenge operation must resolve to one job.")
+        match (awaitToolOperation first (TimeSpan.FromMilliseconds 5.)).GetAwaiter().GetResult() with
+        | Choice2Of2 handle ->
+            Assert.That(handle.OperationId, Is.EqualTo(Some operationId))
+            Assert.That(handle.JobId, Is.EqualTo((fst retry).JobId))
+        | _ -> Assert.Fail("Blocked Challenge write should return a recoverable job handle.")
+        release.SetResult(completedToolResponse """{"ok":true}""")
+        let terminal = (snd first).WaitAsync(TimeSpan.FromSeconds 5.).GetAwaiter().GetResult()
+        Assert.That(terminal.Error.IsNone, Is.True)
+        Assert.That(calls, Is.EqualTo(1),
+                    "The same Challenge write must not execute twice while pending.")
+    finally
+        release.TrySetResult(completedToolResponse "{}") |> ignore
+
+[<Test>]
 let toolFailuresRemainUncertainWithOriginalOperationWithoutRestart () =
     let operationId = "failure-" + Guid.NewGuid().ToString("N")
     let calls = ref 0
@@ -693,6 +751,31 @@ let private activationFixture () : AgentInboxActivation =
       ActivatedByThisCall = true; BeforeState = Some "Ready"
       AfterState = Some "Working"; CommittedHead = Some(String('a', 40))
       OperationId = Some(Guid.NewGuid().ToString("D")) }
+
+[<Test>]
+let forwardedTransportRecoveryRetainsKnownSourceAndOriginalOperationId () =
+    let source = [ { ProjectName = "Jarvis"; AgentId = "Worker 1" } ]
+    let receipt = activationFixture ()
+    let envelope = notificationFixture source (Some receipt)
+    let request : AgentCommand = CrossProjectNotificationCommand envelope
+    let operationId = envelope.Notification.OperationId
+    Assert.That(AgentCommandInfo.recoveryOperationId request,
+                Is.EqualTo(Some operationId))
+    let response = CommandDispatchRecovery.unexpectedResponse (
+        System.Text.Json.JsonSerializer.Serialize request)
+    Assert.That(AgentStateEvidence.isUnknown response, Is.True)
+    match response.Error with
+    | Some(UncertainOutcome info) ->
+        Assert.That(info.OperationId, Is.EqualTo(Some operationId))
+    | other -> Assert.Fail($"Forwarded recovery lost original write ID: {other}")
+    Assert.That(response.AgentStateChanges, Is.EqualTo(source :> obj))
+    Assert.That(response.InboxActivation, Is.EqualTo(Some receipt))
+    let restored =
+        System.Text.Json.JsonSerializer.Deserialize<AgentCommandResponse>(
+            System.Text.Json.JsonSerializer.Serialize response)
+    Assert.That(AgentStateEvidence.isUnknown restored, Is.True)
+    Assert.That(restored.AgentStateChanges, Is.EqualTo(source :> obj))
+    Assert.That(restored.InboxActivation, Is.EqualTo(Some receipt))
 
 [<Test>]
 let forwardedNotificationJobKeepsSourceAndDestinationEvidenceThroughTerminalPolling () =

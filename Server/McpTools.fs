@@ -879,11 +879,17 @@ module McpToolHelpers =
                                                 { Notification = canonical
                                                   SourceStateChanges = sender.AgentStateChanges
                                                   SourceInboxActivation = sender.InboxActivation }
-                                        return! client.SendCommandToProject(
+                                        let! destination = client.SendCommandToProject(
                                             userId, notification.ProjectName, forwarded,
                                             ?conversationId = RequestDeviceRouting.session(),
                                             ?deviceId = RequestDeviceRouting.deviceOverride(),
                                                          ?agentId = RequestDeviceRouting.agentId())
+                                        // The source inbox may have committed an
+                                        // activation before destination dispatch.
+                                        // Merge known effects even on transport
+                                        // uncertainty; pending jobs remain unknown
+                                        // until their own terminal evidence arrives.
+                                        return mergeStateEffects sender destination
                                 | _ -> return sender
                             }
                         | _ ->

@@ -165,7 +165,7 @@ module AgentStateInvalidationRouting =
                 project, (changes |> List.map _.AgentId |> List.distinct |> List.toArray))
 
 
-type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserService, tracker: ClientResponseTracker, http: IHttpContextAccessor, logger: ILogger<ClientService>) =
+type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserService, tracker: ClientResponseTracker, http: IHttpContextAccessor, logger: ILogger<ClientService>, witnessStore: FeedbackStore) =
     member this.SendMessageToAll(message) = ctx.Clients.All.ReceiveMessage(message)
 
     // Typed, per-agent invalidation only reaches authenticated registered
@@ -198,7 +198,7 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
             TimeSpan.FromSeconds(float executionSeconds) + permissionMargin
         | _ -> TimeSpan.FromMinutes(10L)
 
-    member this.SendCommandToUser(userId: string, command: AgentCommand, ?conversationId: string, ?deviceId: string, ?agentId: string) =
+    member this.SendCommandToUser(userId: string, command: AgentCommand, ?conversationId: string, ?deviceId: string, ?agentId: string, ?activityRequestId: string) =
         task {
             let requestAcceptedAt = Stopwatch.GetTimestamp()
             let requestAborted =
@@ -248,7 +248,16 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                 | Registered, Some connectionId ->
                     let commandName = AgentCommandInfo.protocolName command
 
-                    if not (session.SupportedCommands |> List.contains commandName) then
+                    if activityRequestId.IsSome && session.ProtocolVersion <> AgentProtocol.version then
+                        // Old 3.63 clients may have undiscoverable in-flight
+                        // work from before the durable witness epoch. Never
+                        // route a newly admitted command through one.
+                        return { Result = None
+                                 Error = Some(ExecutionFailed(
+                                     $"Device {session.DeviceName} has protocol {session.ProtocolVersion}; " +
+                                     $"attributed commands require witness-capable protocol {AgentProtocol.version}."))
+                                 Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+                    elif not (session.SupportedCommands |> List.contains commandName) then
                         return
                             { Result = None
                               Error =
@@ -259,85 +268,122 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                               Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
                     else
                         let correlationId, trackingTask = tracker.Register(userId, connectionId, session.Generation, this.ResponseTimeout command)
-                        let client = ctx.Clients.Client(connectionId)
-                        let commandJson = JsonSerializer.Serialize<AgentCommand>(command)
-                        let routeMs = Stopwatch.GetElapsedTime(requestAcceptedAt).TotalMilliseconds
-                        let mutable sendMs = 0.0
-                        let mutable replyMs = 0.0
-                        let report outcome =
-                            let totalMs = Stopwatch.GetElapsedTime(requestAcceptedAt).TotalMilliseconds
-                            // Telemetry must never alter mutation semantics or hide
-                            // an actual response because a logging sink failed.
-                            try
-                                ServerDispatchTelemetry.record commandName outcome routeMs sendMs replyMs totalMs
-                                if totalMs >= 2000.0 || outcome <> "completed" then
-                                    logger.LogInformation(
-                                        "MCP dispatch {CorrelationId} {Command} {Outcome}: routeMs={RouteMs:F1} signalrSendMs={SendMs:F1} replyWaitMs={ReplyMs:F1} totalMs={TotalMs:F1}",
-                                        correlationId, commandName, outcome, routeMs, sendMs, replyMs, totalMs)
-                            with _ ->
-                                ()
-
-                        let mutable replyStartedAt = None
-                        let dispatchAt = Stopwatch.GetTimestamp()
-                        try
-                            do! client.ReceiveCommand(correlationId, commandJson, defaultArg agentId "").WaitAsync(requestAborted)
-                            sendMs <- Stopwatch.GetElapsedTime(dispatchAt).TotalMilliseconds
-                            users.RecordDispatchSuccess(userId, connectionId)
-
-                            let awaitReplyAt = Stopwatch.GetTimestamp()
-                            replyStartedAt <- Some awaitReplyAt
-                            try
-                                let! response = trackingTask.WaitAsync(requestAborted)
-                                replyMs <- Stopwatch.GetElapsedTime(awaitReplyAt).TotalMilliseconds
-                                report "completed"
-                                return response
-                            with :? TaskCanceledException when not requestAborted.IsCancellationRequested ->
-                                replyMs <- Stopwatch.GetElapsedTime(awaitReplyAt).TotalMilliseconds
-                                let outcome =
-                                    match users.GetSessionByConnection(connectionId) with
-                                    | ValueSome active when active.State = Registered && active.Generation = session.Generation -> "tracker-timeout"
-                                    | _ -> "disconnected"
-                                report outcome
-                                let reason =
-                                    $"Client response timeout for {session.DeviceName} generation {session.Generation}."
-                                users.RecordDispatchFailure(userId, connectionId, reason)
-                                return
-                                    { Result = None
-                                      Error =
-                                        Some(
-                                            UncertainOutcome
-                                                { Message = $"{reason} Protocol {session.ProtocolVersion}, client {session.ClientVersion}, last seen {session.LastSeenAt:O}."
-                                                  OperationId = AgentCommandInfo.recoveryOperationId command }
-                                        )
-                                      Instructions = []; AgentStateChanges = sourceChanges
-                                      InboxActivation = sourceActivation; PendingJob = None }
-                        with ex ->
-                            match replyStartedAt with
-                            | Some started when replyMs = 0.0 ->
-                                replyMs <- Stopwatch.GetElapsedTime(started).TotalMilliseconds
-                            | None ->
-                                sendMs <- Stopwatch.GetElapsedTime(dispatchAt).TotalMilliseconds
-                            | _ -> ()
+                        // A durable witness is bound to this exact authenticated
+                        // device generation before SignalR dispatch. The caller
+                        // cannot proceed when SQLite admission is unavailable.
+                        let route =
+                            match activityRequestId with
+                            | None -> Ok ()
+                            | Some _ when isNull (box witnessStore) ->
+                                Error "Durable agent activity store is unavailable."
+                            | Some id ->
+                                witnessStore.TryMarkAgentDispatched(
+                                    userId, id, session.DeviceId, connectionId,
+                                    session.Generation, correlationId)
+                        // A poll used to reconcile a pending execution needs
+                        // its own durable server-issued correlation before the
+                        // client can reply. An unrelated job poll is still valid.
+                        let routed =
+                            match route, command, agentId with
+                            | Ok (), GetJobResultCommand poll, Some actor
+                                when not (String.IsNullOrWhiteSpace actor)
+                                     && not (isNull (box witnessStore)) ->
+                                // Read-only status lookup can still be delivered
+                                // in unbound/client-only contexts. Without a
+                                // witness store it cannot prove terminal liveness
+                                // or release any administrative correction gate.
+                                witnessStore.TryRecordAgentToolJobPollDispatch(
+                                    userId, session.DeviceId, connectionId,
+                                    session.Generation, correlationId,
+                                    actor, poll.ProjectName, poll.JobId)
+                                |> Result.map ignore
+                            | _ -> route
+                        if routed.IsError then
                             tracker.Cancel(correlationId)
-                            if requestAborted.IsCancellationRequested then
-                                report "upstream-abort"
-                                // The caller is gone, not the device. Keep
-                                // the client session healthy and remove the
-                                // now-unobservable correlation promptly.
-                                return raise (OperationCanceledException(requestAborted))
-                            else
-                                report "signalr-send-failure"
-                                let reason =
-                                    $"Dispatch failed for {session.DeviceName} generation {session.Generation}: {ex.Message}"
-                                users.RecordDispatchFailure(userId, connectionId, reason)
-                                return
-                                    { Result = None
-                                      Error =
-                                        Some(UncertainOutcome
-                                            { Message = reason
-                                              OperationId = AgentCommandInfo.recoveryOperationId command })
-                                      Instructions = []; AgentStateChanges = sourceChanges
-                                      InboxActivation = sourceActivation; PendingJob = None }
+                            return { Result = None
+                                     Error = Some(ExecutionFailed(
+                                         "Cannot durably record the selected client dispatch: " +
+                                         (match routed with Error error -> error | Ok () -> "")))
+                                     Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+                        else
+                            let client = ctx.Clients.Client(connectionId)
+                            let commandJson = JsonSerializer.Serialize<AgentCommand>(command)
+                            let routeMs = Stopwatch.GetElapsedTime(requestAcceptedAt).TotalMilliseconds
+                            let mutable sendMs = 0.0
+                            let mutable replyMs = 0.0
+                            let report outcome =
+                                let totalMs = Stopwatch.GetElapsedTime(requestAcceptedAt).TotalMilliseconds
+                                // Telemetry must never alter mutation semantics or hide
+                                // an actual response because a logging sink failed.
+                                try
+                                    ServerDispatchTelemetry.record commandName outcome routeMs sendMs replyMs totalMs
+                                    if totalMs >= 2000.0 || outcome <> "completed" then
+                                        logger.LogInformation(
+                                            "MCP dispatch {CorrelationId} {Command} {Outcome}: routeMs={RouteMs:F1} signalrSendMs={SendMs:F1} replyWaitMs={ReplyMs:F1} totalMs={TotalMs:F1}",
+                                            correlationId, commandName, outcome, routeMs, sendMs, replyMs, totalMs)
+                                with _ ->
+                                    ()
+
+                            let mutable replyStartedAt = None
+                            let dispatchAt = Stopwatch.GetTimestamp()
+                            try
+                                do! client.ReceiveCommand(correlationId, commandJson, defaultArg agentId "").WaitAsync(requestAborted)
+                                sendMs <- Stopwatch.GetElapsedTime(dispatchAt).TotalMilliseconds
+                                users.RecordDispatchSuccess(userId, connectionId)
+                                let awaitReplyAt = Stopwatch.GetTimestamp()
+                                replyStartedAt <- Some awaitReplyAt
+                                try
+                                    let! response = trackingTask.WaitAsync(requestAborted)
+                                    replyMs <- Stopwatch.GetElapsedTime(awaitReplyAt).TotalMilliseconds
+                                    report "completed"
+                                    return response
+                                with :? TaskCanceledException when not requestAborted.IsCancellationRequested ->
+                                    replyMs <- Stopwatch.GetElapsedTime(awaitReplyAt).TotalMilliseconds
+                                    let outcome =
+                                        match users.GetSessionByConnection(connectionId) with
+                                        | ValueSome active when active.State = Registered && active.Generation = session.Generation -> "tracker-timeout"
+                                        | _ -> "disconnected"
+                                    report outcome
+                                    let reason =
+                                        $"Client response timeout for {session.DeviceName} generation {session.Generation}."
+                                    users.RecordDispatchFailure(userId, connectionId, reason)
+                                    return
+                                        { Result = None
+                                          Error =
+                                            Some(
+                                                UncertainOutcome
+                                                    { Message = $"{reason} Protocol {session.ProtocolVersion}, client {session.ClientVersion}, last seen {session.LastSeenAt:O}."
+                                                      OperationId = AgentCommandInfo.recoveryOperationId command }
+                                            )
+                                          Instructions = []; AgentStateChanges = sourceChanges
+                                          InboxActivation = sourceActivation; PendingJob = None }
+                            with ex ->
+                                match replyStartedAt with
+                                | Some started when replyMs = 0.0 ->
+                                    replyMs <- Stopwatch.GetElapsedTime(started).TotalMilliseconds
+                                | None ->
+                                    sendMs <- Stopwatch.GetElapsedTime(dispatchAt).TotalMilliseconds
+                                | _ -> ()
+                                tracker.Cancel(correlationId)
+                                if requestAborted.IsCancellationRequested then
+                                    report "upstream-abort"
+                                    // The caller is gone, not the device. Keep
+                                    // the client session healthy and remove the
+                                    // now-unobservable correlation promptly.
+                                    return raise (OperationCanceledException(requestAborted))
+                                else
+                                    report "signalr-send-failure"
+                                    let reason =
+                                        $"Dispatch failed for {session.DeviceName} generation {session.Generation}: {ex.Message}"
+                                    users.RecordDispatchFailure(userId, connectionId, reason)
+                                    return
+                                        { Result = None
+                                          Error =
+                                            Some(UncertainOutcome
+                                                { Message = reason
+                                                  OperationId = AgentCommandInfo.recoveryOperationId command })
+                                          Instructions = []; AgentStateChanges = sourceChanges
+                                          InboxActivation = sourceActivation; PendingJob = None }
         }
 
 
@@ -345,12 +391,14 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
     // destination's verified ledger binding instead of assuming the sender's
     // selected device has the destination project.
     member this.SendCommandToProject(userId: string, projectName: string, command: AgentCommand,
-                                     ?conversationId: string, ?deviceId: string, ?agentId: string) =
+                                     ?conversationId: string, ?deviceId: string, ?agentId: string,
+                                     ?activityRequestId: string) =
         task {
             let selected = users.GetSelectedSession(userId, conversationId, deviceId)
             let sessions = users.ListDevices(userId) |> Array.toList
             let commandName = AgentCommandInfo.protocolName command
             let requireCurrentProtocol =
+                activityRequestId.IsSome ||
                 match command with
                 | TaskWriteCommand write when write.Action = "NotifyAgent"
                       && not (String.IsNullOrWhiteSpace write.SourceRef) -> true
@@ -399,7 +447,8 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                             // committed mutation against another client.
                             let! destination =
                                 this.SendCommandToUser(userId, command,
-                                    ?conversationId = conversationId, deviceId = session.DeviceId, ?agentId = agentId)
+                                    ?conversationId = conversationId, deviceId = session.DeviceId,
+                                    ?agentId = agentId, ?activityRequestId = activityRequestId)
                             // Bind the pending handle to this verified device.
                             // A later poll MUST NOT fall back to the user's current default device.
                             return

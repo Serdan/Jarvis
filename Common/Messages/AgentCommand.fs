@@ -628,6 +628,29 @@ type GetJobResultCommand =
       JobId: string
       AfterSequence: int64 option }
 
+/// Read-only, device-local forensic evidence for a single native StartJob.
+/// An ordinary job-result lookup cannot recover process identity on restart.
+type GetProcessOwnershipEvidenceCommand =
+    { ProjectName: string
+      JobId: string }
+
+/// Never treat a launch observation or a parent PID as OS reaping proof.
+/// Stage is IntentOnly or Launched; ProcessTreeStatus is always Unverified.
+type GetProcessOwnershipEvidenceResult =
+    { JobId: string
+      ProjectId: string
+      DeviceId: string
+      ClientIncarnationId: string
+      IntentCreatedUtc: string
+      Stage: string
+      ProcessId: int option
+      ProcessStartUtc: string option
+      LinuxBootId: string option
+      LinuxStartTicks: string option
+      IntentSha256: string option
+      LaunchRecordedUtc: string option
+      ProcessTreeStatus: string }
+
 type CancelJobCommand = { ProjectName: string; JobId: string }
 
 type MessageCommand =
@@ -818,6 +841,7 @@ type AgentCommand =
     | StartJobCommand of StartJobCommand
     | ListJobsCommand of ListJobsCommand
     | GetJobResultCommand of GetJobResultCommand
+    | GetProcessOwnershipEvidenceCommand of GetProcessOwnershipEvidenceCommand
     | CancelJobCommand of CancelJobCommand
     | MessageCommand of MessageCommand
     | GetClientActivityCommand of GetClientActivityCommand
@@ -917,6 +941,7 @@ module AgentCommandInfo =
         | StartJobCommand _ -> "StartJobCommand"
         | ListJobsCommand _ -> "ListJobsCommand"
         | GetJobResultCommand _ -> "GetJobResultCommand"
+        | GetProcessOwnershipEvidenceCommand _ -> "GetProcessOwnershipEvidenceCommand"
         | CancelJobCommand _ -> "CancelJobCommand"
         | MessageCommand _ -> "MessageCommand"
         | GetClientActivityCommand _ -> "GetClientActivityCommand"
@@ -988,6 +1013,7 @@ module AgentCommandInfo =
         | StartJobCommand _ -> "StartJob"
         | ListJobsCommand _ -> "ListJobs"
         | GetJobResultCommand _ -> "GetJobResult"
+        | GetProcessOwnershipEvidenceCommand _ -> "GetProcessOwnershipEvidence"
         | CancelJobCommand _ -> "CancelJob"
         | MessageCommand _ -> "Message"
         | GetClientActivityCommand _ -> "GetClientActivity"
@@ -1019,6 +1045,7 @@ module AgentCommandInfo =
         | CreateProjectCommand _
         | UpdateClientCommand -> None
         | GetJobResultCommand cmd -> Some cmd.ProjectName
+        | GetProcessOwnershipEvidenceCommand cmd -> Some cmd.ProjectName
         | CancelJobCommand cmd -> Some cmd.ProjectName
         | MessageCommand cmd -> cmd.ProjectName
         | GetClientActivityCommand cmd -> cmd.ProjectName
@@ -1160,6 +1187,7 @@ module AgentCommandInfo =
         | GitCommitCommand cmd -> Some(compact cmd.Message)
         | StartJobCommand cmd -> Some(fullCommand cmd.Executable cmd.Args)
         | GetJobResultCommand cmd -> Some(compact cmd.JobId)
+        | GetProcessOwnershipEvidenceCommand cmd -> Some(compact cmd.JobId)
         | CancelJobCommand cmd -> Some(compact cmd.JobId)
         | MessageCommand cmd -> Some(compact cmd.Message)
         | GetClientActivityCommand _ -> None
@@ -1227,6 +1255,7 @@ module AgentCommandInfo =
         | GitCommitCommand cmd -> Some(quoted cmd.Message)
         | StartJobCommand cmd -> Some(commandPreview cmd.Executable cmd.Args)
         | GetJobResultCommand cmd -> Some(shortId cmd.JobId)
+        | GetProcessOwnershipEvidenceCommand cmd -> Some(shortId cmd.JobId)
         | CancelJobCommand cmd -> Some(shortId cmd.JobId)
         | MessageCommand cmd -> Some(truncate 64 cmd.Message)
         | GetClientActivityCommand _ -> None
@@ -1277,7 +1306,11 @@ module AgentCommandInfo =
         | None -> invocation command
 
 module AgentProtocol =
-    let version = "3.66"
+    // Witness-capable admission and deferred ToolOperation receipts retain
+    // process-return identity separately from proven process-tree quiescence.
+    // 3.67 adds a read-only historical StartJob ownership query, NEVER OS
+    // termination proof. Prior 3.65/3.66 legacy approvals cannot carry over.
+    let version = "3.67"
     let defaultPatchFuzzyContextLines = 3
     let maxResponseBytes = 900 * 1024
     let maxImageBytes = 8 * 1024 * 1024
@@ -1358,6 +1391,7 @@ module AgentProtocol =
           definition "StartJob" "Starts a long-running process." [ ProcessExecution ] true true false
           definition "ListJobs" "Lists known jobs." [ ReadOnly ] false false false
           definition "GetJobResult" "Reads buffered job output." [ ReadOnly ] false false false
+          definition "GetProcessOwnershipEvidence" "Reads device-local StartJob launch identity; never certifies descendant termination." [ ReadOnly ] false false false
           definition "CancelJob" "Cancels a running job." [ ProcessExecution ] true true false
           definition "Message" "Adds an informational message to client activity." [] true false false
           definition "GetClientActivity" "Reads recent in-memory Jarvis client activity, optionally filtered by project." [ ReadOnly ] false false false ]

@@ -73,7 +73,8 @@ type RoutingRetentionCounts =
       DefaultSelections: int
       ConnectedTransports: int }
 
-type UserService(clock: unit -> DateTimeOffset, retention: UserRetentionPolicy) =
+type UserService(clock: unit -> DateTimeOffset, retention: UserRetentionPolicy,
+                 ?generationAllocator: string -> ClientRegistration -> string -> int64) =
     let utcNow = clock
     let policy = UserRetentionPolicy.validate retention
     let gate = obj()
@@ -81,9 +82,18 @@ type UserService(clock: unit -> DateTimeOffset, retention: UserRetentionPolicy) 
     let defaults = Dictionary<string, string>(StringComparer.Ordinal)
     let conversationSelections = Dictionary<struct (string * string), ConversationSelection>()
     let connections = Dictionary<string, TransportConnectionStatus>(StringComparer.Ordinal)
-    // A process-local monotonically increasing generation avoids reusing an
-    // expired device's generation when it later re-registers. No tombstones.
+    // Standalone tests can still use the process-local sequence. Production
+    // MUST provide a durable SQLite allocator: resetting this counter after
+    // server restart could reuse a device generation held by an unresolved
+    // correction permit. A generation allocation failure must fail registration.
     let mutable nextGeneration = 0L
+    let mutable highestRegisteredGeneration = 0L
+    let allocateGeneration =
+        defaultArg generationAllocator (fun _ _ _ ->
+            if nextGeneration = Int64.MaxValue then
+                invalidOp "Device registration generation sequence exhausted."
+            nextGeneration <- nextGeneration + 1L
+            nextGeneration)
     let mutable nextSweep = DateTimeOffset.MinValue
 
     let tryGet key (dictionary: Dictionary<'key, 'a>) =
@@ -297,6 +307,13 @@ type UserService(clock: unit -> DateTimeOffset, retention: UserRetentionPolicy) 
             match tryGet connectionId connections with
             | ValueSome transport when transport.UserId = userId -> ()
             | _ -> invalidOp "Device registration requires its authenticated transport."
+            // Allocate BEFORE changing any session, default selection or
+            // transport ownership. Failed SQLite persistence must leave the
+            // old routing state intact, not partially disconnect an agent.
+            let generation = allocateGeneration userId registration connectionId
+            if generation <= highestRegisteredGeneration then
+                invalidOp "Device registration returned a reused or invalid durable generation."
+            highestRegisteredGeneration <- generation
             let key = struct (userId, registration.DeviceId)
             let previous = tryGet key sessions
 
@@ -313,11 +330,6 @@ type UserService(clock: unit -> DateTimeOffset, retention: UserRetentionPolicy) 
                     | _ -> ()
                 | _ -> ()
             | _ -> ()
-
-            // Generation remains unique even after a stale device record is
-            // pruned, with no unbounded tombstone dictionary.
-            nextGeneration <- nextGeneration + 1L
-            let generation = nextGeneration
 
             let connectionReason =
                 match previous with

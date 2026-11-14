@@ -23,6 +23,8 @@ type private JobRecord =
       WorkingDirectory: string option
       StartedAt: DateTimeOffset
       Process: Process
+      TerminateGroup: unit -> unit
+      LaunchGate: obj
       SyncRoot: obj
       Events: ResizeArray<JobOutputEvent>
       MaxOutputBytes: int
@@ -77,6 +79,40 @@ module private Core =
         | Some relativePath ->
             ProjectPaths.resolveSourcePath context relativePath >>= FileIO.parseFolder
 
+    // A group supervisor is itself always an available executable. Resolve
+    // the original program before returning a StartJob handle so an unknown
+    // executable still fails synchronously rather than as a ghost job.
+    let private executableAvailable (workingDirectory: string) (executable: string) =
+        let env name fallback =
+            match Environment.GetEnvironmentVariable name with
+            | null -> fallback
+            | value -> value
+        let suffixes =
+            if OperatingSystem.IsWindows() && String.IsNullOrEmpty(Path.GetExtension executable) then
+                let extensions =
+                    (env "PATHEXT" ".COM;.EXE;.BAT;.CMD").Split(
+                        ';', StringSplitOptions.RemoveEmptyEntries)
+                    |> Array.toList
+                "" :: extensions
+            else [ "" ]
+        let rooted = Path.IsPathRooted executable
+        let hasDirectory =
+            executable.IndexOfAny([| Path.DirectorySeparatorChar; Path.AltDirectorySeparatorChar |]) >= 0
+        let searchRoots =
+            if rooted then [ "" ]
+            elif hasDirectory then [ workingDirectory ]
+            else
+                (env "PATH" "").Split(Path.PathSeparator, StringSplitOptions.None)
+                |> Array.map (fun entry ->
+                    if String.IsNullOrWhiteSpace entry then workingDirectory
+                    elif Path.IsPathRooted entry then entry
+                    else Path.Combine(workingDirectory, entry))
+                |> Array.toList
+        searchRoots
+        |> List.exists (fun folder ->
+            suffixes |> List.exists (fun suffix ->
+                File.Exists(Path.Combine(folder, executable + suffix))))
+
     let private takeUtf8Prefix maxBytes (value: string) =
         let output = StringBuilder()
         let mutable bytes = 0
@@ -116,11 +152,75 @@ module private Core =
         try
             match validateExecutable executable with
             | Error error -> Error error
+            | Ok executable when not (executableAvailable workingDirectory executable) ->
+                Error(Client.NotFoundError $"Executable not found: {executable}")
             | Ok executable ->
                 let jobId = Guid.NewGuid().ToString("N")
                 let proc = new Process()
+                // StartJob must not launch into the Jarvis client's process
+                // group: its leader may exit while descendants continue.
+                // Reuse the same cross-platform containment used by bounded
+                // commands. The Windows helper cannot execute before its
+                // assignment to a kill-on-close Job Object is acknowledged.
+                let windows = OperatingSystem.IsWindows()
+                let supervisorGate = obj()
+                let mutable windowsJob = 0n
+                let mutable readiness: EventWaitHandle option = None
+                let releaseSupervisor () =
+                    lock supervisorGate (fun () ->
+                        readiness |> Option.iter (fun ready ->
+                            try ready.Dispose() with _ -> ())
+                        readiness <- None
+                        if windowsJob <> 0n then
+                            BoundedProcess.Native.CloseHandle(windowsJob) |> ignore
+                            windowsJob <- 0n)
+                let terminateGroup () =
+                    lock supervisorGate (fun () ->
+                        if windows then
+                            if windowsJob <> 0n then
+                                BoundedProcess.Native.TerminateJobObject(windowsJob, 1u) |> ignore
+                        elif OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
+                            // Unlike Process.Kill(entireProcessTree), killpg
+                            // reaches children after the leader has exited.
+                            BoundedProcess.Native.killUnixGroup proc.Id |> ignore)
+                // The launcher owns these handles until a successful StartJob
+                // transfers them to the process-exit callback. Setup errors
+                // must always close the Windows kill-on-close job, even before
+                // Process.Start and before registration in the jobs dictionary.
+                let mutable transferred = false
+                use launchGuard =
+                    { new IDisposable with
+                        member _.Dispose() =
+                            if not transferred then
+                                releaseSupervisor()
+                                try proc.Dispose() with _ -> () }
+                // This first append-only record is durably flushed BEFORE
+                // Process.Start. A crash during spawn leaves an unresolved
+                // intent rather than an invisible native process. The second
+                // record pins PID, boot and birth evidence before the
+                // StartJob handle can be returned. Neither is terminal proof.
+                let ownershipDirectory = ProcessOwnershipJournal.defaultDirectory()
+                let launchIntent =
+                    ProcessOwnershipJournal.beginLaunchAt ownershipDirectory jobId
+                        (ProjectPaths.ProjectId.value projectName)
+                        (DeviceIdentity.getOrCreate())
+                let readyName =
+                    if windows then
+                        Some($"Local\\Jarvis.StartJob.{Guid.NewGuid():N}")
+                    else None
+                let hostedExecutable, hostedArgs =
+                    try
+                        if windows then
+                            windowsJob <- BoundedProcess.Native.newWindowsJob()
+                            readiness <- Some(new EventWaitHandle(
+                                false, EventResetMode.ManualReset, Option.get readyName))
+                        BoundedProcess.groupProcessInvocation executable args readyName
+                    with _ ->
+                        releaseSupervisor()
+                        proc.Dispose()
+                        reraise()
 
-                proc.StartInfo.FileName <- executable
+                proc.StartInfo.FileName <- hostedExecutable
                 proc.StartInfo.WorkingDirectory <- workingDirectory
                 proc.StartInfo.RedirectStandardOutput <- true
                 proc.StartInfo.RedirectStandardError <- true
@@ -128,7 +228,7 @@ module private Core =
                 proc.StartInfo.CreateNoWindow <- true
                 ProcessEnvironment.apply proc.StartInfo
                 proc.EnableRaisingEvents <- true
-                args |> List.iter proc.StartInfo.ArgumentList.Add
+                hostedArgs |> List.iter proc.StartInfo.ArgumentList.Add
 
                 let job =
                     { JobId = jobId
@@ -139,6 +239,8 @@ module private Core =
                       WorkingDirectory = Some workingDirectory
                       StartedAt = DateTimeOffset.UtcNow
                       Process = proc
+                      TerminateGroup = terminateGroup
+                      LaunchGate = obj()
                       SyncRoot = obj()
                       Events = ResizeArray()
                       MaxOutputBytes = maxOutputBytes
@@ -155,38 +257,80 @@ module private Core =
                 proc.ErrorDataReceived.Add(fun event ->
                     appendEvent job JobOutputStream.StdErr event.Data)
 
-                proc.Exited.Add(fun _ ->
-                    try proc.WaitForExit()
-                    with _ -> ()
+                let mutable completedHandled = false
+                let completeObservedExit () =
+                    if transferred && not completedHandled then
+                        completedHandled <- true
+                        // Kill remaining group members BEFORE WaitForExit:
+                        // descendants may retain redirected pipes. This is
+                        // cleanup, NOT durable OS reaping attestation.
+                        try terminateGroup() with _ -> ()
+                        try proc.WaitForExit()
+                        with _ -> ()
 
-                    lock job.SyncRoot (fun () ->
-                        if job.CancellationRequested then
-                            job.Status <- Canceled
-                        else
-                            try job.Status <- Completed proc.ExitCode
-                            with _ -> job.Status <- FailedToStart "Process exited before an exit code was available."
-                        job.CompletedAt <- Some DateTimeOffset.UtcNow)
-                    pruneCompletedJobs())
+                        lock job.SyncRoot (fun () ->
+                            if job.CancellationRequested then
+                                job.Status <- Canceled
+                            else
+                                try job.Status <- Completed proc.ExitCode
+                                with _ -> job.Status <- FailedToStart "Process exited before an exit code was available."
+                            job.CompletedAt <- Some DateTimeOffset.UtcNow)
+                        releaseSupervisor()
+                        pruneCompletedJobs()
+
+                proc.Exited.Add(fun _ ->
+                    // Exited can be raised before launch handoff completes.
+                    // The launcher also checks HasExited after transferring
+                    // ownership, so an early one-shot event is not lost.
+                    lock job.LaunchGate completeObservedExit)
 
                 if not (jobs.TryAdd(jobId, job)) then
+                    releaseSupervisor()
                     proc.Dispose()
                     Error(Client.ContextError "Failed to register job.")
                 else
-                    try
-                        if not (proc.Start()) then
+                    // A job is inserted before Start to receive asynchronous
+                    // output. Hold its launch gate through OS assignment,
+                    // stream setup and ownership transfer. Both cancellation
+                    // and Exited wait for this handoff instead of racing it.
+                    lock job.LaunchGate (fun () ->
+                        try
+                            if not (proc.Start()) then
+                                let mutable removed = Unchecked.defaultof<JobRecord>
+                                jobs.TryRemove(jobId, &removed) |> ignore
+                                Error(Client.ContextError "Failed to start job.")
+                            else
+                                if windows then
+                                    if not (BoundedProcess.Native.AssignProcessToJobObject(
+                                        windowsJob, proc.Handle)) then
+                                        raise (System.ComponentModel.Win32Exception(
+                                            System.Runtime.InteropServices.Marshal.GetLastWin32Error()))
+                                ProcessOwnershipJournal.recordLaunchedAt
+                                    ownershipDirectory launchIntent proc |> ignore
+                                if windows then
+                                    // All descendants inherit the assigned job.
+                                    readiness |> Option.iter (fun ready -> ready.Set() |> ignore)
+                                proc.BeginOutputReadLine()
+                                proc.BeginErrorReadLine()
+                                transferred <- true
+                                // If Exited fired during initialization, its
+                                // callback could not finalize yet. Detect an
+                                // already-dead leader and finalize exactly once.
+                                if proc.HasExited then completeObservedExit()
+                                Ok { JobId = jobId; StartedAt = job.StartedAt }
+                        with ex ->
+                            try
+                                try terminateGroup() with _ -> ()
+                                if not proc.HasExited then proc.Kill(entireProcessTree = true)
+                            with _ -> ()
+                            // Process.WaitForExit and Dispose can both enter
+                            // the Exited callback while the Process monitor
+                            // is held. Never wait/dispose while holding
+                            // LaunchGate; launchGuard closes native resources
+                            // AFTER this critical section has been exited.
                             let mutable removed = Unchecked.defaultof<JobRecord>
                             jobs.TryRemove(jobId, &removed) |> ignore
-                            proc.Dispose()
-                            Error(Client.ContextError "Failed to start job.")
-                        else
-                            proc.BeginOutputReadLine()
-                            proc.BeginErrorReadLine()
-                            Ok { JobId = jobId; StartedAt = job.StartedAt }
-                    with ex ->
-                        let mutable removed = Unchecked.defaultof<JobRecord>
-                        jobs.TryRemove(jobId, &removed) |> ignore
-                        proc.Dispose()
-                        Error(ExceptionError ex)
+                            Error(ExceptionError ex))
         with ex ->
             Error(ExceptionError ex)
 
@@ -266,18 +410,37 @@ module private Core =
                 match validateJobProject canonical job with
                 | Error error -> Error error
                 | Ok () ->
-                    if job.Status = Running then
-                        job.CancellationRequested <- true
-                        try
-                            if not job.Process.HasExited then job.Process.Kill(entireProcessTree = true)
-                            job.Status <- Canceled
-                            job.CompletedAt <- Some DateTimeOffset.UtcNow
-                            Ok()
-                        with ex ->
-                            job.CancellationRequested <- false
-                            Error(ExceptionError ex)
-                    else
-                        Ok()
+                    // Requesting cancellation is NOT a terminal process
+                    // observation. Decide whether to cancel WHILE holding
+                    // the launch/exit gate: the Exited callback must not
+                    // complete a job and release its process-group identity
+                    // between our status check and kill request.
+                    lock job.LaunchGate (fun () ->
+                        // Process.HasExited may synchronously invoke Exited,
+                        // whose WaitForExit drains async output callbacks that
+                        // require SyncRoot. Never query it under SyncRoot.
+                        let alreadyExited = job.Process.HasExited
+                        let shouldCancel =
+                            lock job.SyncRoot (fun () ->
+                                // Skip an already-observed dead leader. A
+                                // subsequent exit may race the signal because
+                                // no pidfd/cgroup lifetime handle exists.
+                                if job.Status = Running && not alreadyExited then
+                                    job.CancellationRequested <- true
+                                    true
+                                else false)
+                        if shouldCancel then
+                            try
+                                job.TerminateGroup()
+                                if not job.Process.HasExited then
+                                    job.Process.Kill(entireProcessTree = true)
+                                Ok()
+                            with ex ->
+                                // A failed kill attempt does not revoke the
+                                // cancellation request. The caller may retry.
+                                Error(ExceptionError ex)
+                        else
+                            Ok())
 
 // Tool operations are intentionally separate from OS processes. Admission is
 // bounded before scheduling; the original task owns the one canonical result.
@@ -665,6 +828,57 @@ let getJobResult (cmd: GetJobResultCommand) =
         match optionalProjectId cmd.ProjectName with
         | Error error -> Error error
         | Ok canonical -> getJobResultForProject canonical cmd rt
+
+/// Read-only diagnostic for a server-pinned StartJob UUID. The caller must
+/// supply the logical project, and the record must belong to this device.
+/// No PID observation authorizes termination or correction.
+let getProcessOwnershipEvidenceForProject
+    (canonical: ProjectPaths.ProjectId option) (cmd: GetProcessOwnershipEvidenceCommand) =
+    fun _ ->
+        match canonical, projectId cmd.ProjectName with
+        | None, _ -> Error(ValidationError "Process ownership evidence requires an explicit project.")
+        | _, Error error -> Error error
+        | Some expected, Ok actual when actual <> expected ->
+            Error(ValidationError "Process evidence project does not match the authenticated route.")
+        | Some expected, Ok _ ->
+            try
+                match ProcessOwnershipJournal.inspectAt
+                          (ProcessOwnershipJournal.defaultDirectory()) cmd.JobId with
+                | Error failure -> Error(ContextError $"Process ownership remains unverified: {failure}")
+                | Ok evidence ->
+                    if evidence.Intent.ProjectId <> ProjectPaths.ProjectId.value expected then
+                        Error(ContextError "Process ownership project mismatch; evidence is unverified.")
+                    elif DeviceIdentity.tryReadExisting() <> Some evidence.Intent.DeviceId then
+                        Error(ContextError "Process ownership device mismatch or missing persisted identity; evidence is unverified.")
+                    else
+                        let launch = evidence.Launch
+                        let optionalText project =
+                            launch
+                            |> Option.map project
+                            |> Option.bind (fun value ->
+                                if String.IsNullOrWhiteSpace value then None else Some value)
+                        Ok
+                            { JobId = evidence.Intent.JobId
+                              ProjectId = evidence.Intent.ProjectId
+                              DeviceId = evidence.Intent.DeviceId
+                              ClientIncarnationId = evidence.Intent.ClientIncarnationId
+                              IntentCreatedUtc = evidence.Intent.CreatedUtc
+                              Stage = if launch.IsSome then "Launched" else "IntentOnly"
+                              ProcessId = launch |> Option.map (fun item -> item.ProcessId)
+                              ProcessStartUtc = optionalText (fun item -> item.ProcessStartUtc)
+                              LinuxBootId = optionalText (fun item -> item.LinuxBootId)
+                              LinuxStartTicks = optionalText (fun item -> item.LinuxStartTicks)
+                              IntentSha256 = optionalText (fun item -> item.IntentSha256)
+                              LaunchRecordedUtc = optionalText (fun item -> item.RecordedUtc)
+                              ProcessTreeStatus = "Unverified" }
+            with ex ->
+                Error(ContextError $"Process ownership remains unverified: {ex.GetType().Name}")
+
+let getProcessOwnershipEvidence (cmd: GetProcessOwnershipEvidenceCommand) =
+    fun rt ->
+        match projectId cmd.ProjectName with
+        | Error error -> Error error
+        | Ok expected -> getProcessOwnershipEvidenceForProject (Some expected) cmd rt
 
 let cancelJobForProjectAsAgent (canonical: ProjectPaths.ProjectId option) actor (cmd: CancelJobCommand) =
     fun rt ->

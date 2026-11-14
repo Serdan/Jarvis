@@ -45,6 +45,50 @@ let ``job lifecycle starts lists reads and cancels`` () =
             | Ok result -> result.JobId
             | Error error -> failwith $"Expected StartJob Ok, got {error}"
 
+        // StartJob persists an immutable intent before native execution and
+        // a process ID/birth observation before returning its job handle.
+        let journal =
+            ProcessOwnershipJournal.inspectAt
+                (ProcessOwnershipJournal.defaultDirectory()) jobId
+            |> function
+                | Ok value -> value
+                | Error message -> failwithf "Missing durable process evidence: %s" message
+        Assert.That(journal.Intent.JobId, Is.EqualTo(jobId))
+        Assert.That(journal.Intent.DeviceId, Is.Not.Empty)
+        Assert.That(journal.Intent.ClientIncarnationId, Is.Not.Empty)
+        Assert.That(journal.Launch.IsSome, Is.True)
+        Assert.That(journal.Launch.Value.ProcessId, Is.GreaterThan(0))
+
+        let read : GetProcessOwnershipEvidenceCommand = { ProjectName = "Project1"; JobId = jobId }
+        match getProcessOwnershipEvidence read context with
+        | Error error -> Assert.Fail($"Authenticated process evidence read failed: {error}")
+        | Ok evidence ->
+            evidence.JobId |> shouldEqual jobId
+            evidence.ProjectId |> shouldEqual "Project1"
+            evidence.DeviceId |> shouldEqual journal.Intent.DeviceId
+            evidence.ClientIncarnationId |> shouldEqual journal.Intent.ClientIncarnationId
+            evidence.Stage |> shouldEqual "Launched"
+            evidence.ProcessId |> shouldEqual (Some journal.Launch.Value.ProcessId)
+            evidence.ProcessTreeStatus |> shouldEqual "Unverified"
+            evidence.IntentSha256 |> shouldEqual (Some journal.Launch.Value.IntentSha256)
+            let serialized = System.Text.Json.JsonSerializer.Serialize(evidence)
+            Assert.That(serialized.Contains("\"ProcessTreeStatus\":\"Unverified\""), Is.True)
+
+        // A valid UUID cannot be read through another project route.
+        match getProcessOwnershipEvidence
+                  ({ ProjectName = "OtherProject"; JobId = jobId }: GetProcessOwnershipEvidenceCommand) context with
+        | Error _ -> ()
+        | Ok _ -> Assert.Fail("Another project was permitted to read process identity.")
+
+        // The caller's project selector cannot override the resolved route.
+        let target =
+            ProjectPaths.ProjectTarget.parse "OtherProject"
+            |> Result.map ProjectPaths.ProjectTarget.projectId
+            |> Result.defaultWith (fun e -> failwithf "Invalid test project: %A" e)
+        match getProcessOwnershipEvidenceForProject (Some target) read context with
+        | Error _ -> ()
+        | Ok _ -> Assert.Fail("Mismatched authenticated project target was accepted.")
+
         match listJobs { ProjectName = Some "Project1"; IncludeCompleted = true } context with
         | Ok result ->
             let job = result.Jobs |> List.find (fun job -> job.JobId = jobId)
@@ -971,4 +1015,440 @@ let cancelingQueuedForwardedNotificationPreservesCommittedSourceActivation () =
         wait.TrySetResult(completedToolResponse "{}") |> ignore
         for _, completion in blockers do
             completion.WaitAsync(TimeSpan.FromSeconds(6.)).GetAwaiter().GetResult() |> ignore
+        Directory.Delete(root, true)
+
+[<Test>]
+let ``CancelJob records process cancellation only after exit callback`` () =
+    let root = createTempProject()
+    try
+        let project = Path.Combine(root, "Project1")
+        File.WriteAllText(
+            Path.Combine(project, "cancellation.fsx"),
+            """open System
+open System.Threading
+printfn "job-is-running"
+Console.Out.Flush()
+Thread.Sleep(TimeSpan.FromSeconds(45.0))
+            """)
+        let context = TestContext root
+        let start =
+            { ProjectName = "Project1"
+              Executable = "dotnet"
+              Args = [ "fsi"; "--exec"; "cancellation.fsx" ]
+              Reason = Some "Verify cancellation terminal transition"
+              WorkingDirectory = None
+              MaxOutputBytes = Some 8192 }
+        let jobId =
+            match startJob start context with
+            | Ok value -> value.JobId
+            | Error error -> failwithf "Cannot start cancellation fixture: %A" error
+        let inspect () =
+            getJobResult
+                { ProjectName = "Project1"; JobId = jobId; AfterSequence = Some 0L }
+                context
+            |> function
+               | Ok value -> value
+               | Error error -> failwithf "Cannot observe cancellation fixture: %A" error
+        let stopwatch = Stopwatch.StartNew()
+        let rec awaitRunning () =
+            let result = inspect()
+            if result.Events |> List.exists (fun e -> e.Text.Contains("job-is-running")) then
+                Assert.That(result.Status, Is.EqualTo(Running))
+            elif stopwatch.Elapsed > TimeSpan.FromSeconds(30.0) then
+                Assert.Fail("Cancellation fixture did not reach running phase.")
+            else
+                Thread.Sleep 30
+                awaitRunning ()
+        try
+            awaitRunning ()
+            cancelJob { ProjectName = "Project1"; JobId = jobId } context
+            |> shouldEqual (Ok ())
+            // Duplicate cancel requests are safe even when an Exited
+            // callback races the first request.
+            cancelJob { ProjectName = "Project1"; JobId = jobId } context
+            |> shouldEqual (Ok ())
+            let rec awaitTerminal () =
+                let result = inspect()
+                match result.Status with
+                | Running when stopwatch.Elapsed < TimeSpan.FromSeconds(35.0) ->
+                    let summary =
+                        listJobs
+                            { ProjectName = Some "Project1"; IncludeCompleted = true }
+                            context
+                        |> function
+                           | Ok jobs -> jobs.Jobs |> List.find (fun j -> j.JobId = jobId)
+                           | Error error -> failwithf "Cannot inspect active job: %A" error
+                    // The first GetJobResult and this ListJobs snapshot are
+                    // separate observations: Exited may run between them.
+                    // Check the status and timestamp from ONE atomic summary.
+                    match summary.Status with
+                    | Running ->
+                        Assert.That(summary.CompletedAt.IsNone, Is.True,
+                                    "A cancellation request cannot publish a terminal timestamp.")
+                    | Canceled ->
+                        Assert.That(summary.CompletedAt.IsSome, Is.True)
+                    | other -> Assert.Fail($"Unexpected cancellation status: {other}")
+                    Thread.Sleep 25
+                    awaitTerminal ()
+                | Canceled ->
+                    let summary =
+                        listJobs
+                            { ProjectName = Some "Project1"; IncludeCompleted = true }
+                            context
+                        |> function
+                           | Ok jobs -> jobs.Jobs |> List.find (fun j -> j.JobId = jobId)
+                           | Error error -> failwithf "Cannot inspect canceled job: %A" error
+                    Assert.That(summary.CompletedAt.IsSome, Is.True,
+                                "Canceled must be an observed process exit, not just a kill request.")
+                | other ->
+                    Assert.Fail($"Cancellation did not resolve to an observed parent exit: {other}")
+            awaitTerminal ()
+        finally
+            cancelJob { ProjectName = "Project1"; JobId = jobId } context
+            |> ignore
+    finally
+        Directory.Delete(root, true)
+
+let private childIsExecuting pid =
+    try
+        use proc = Process.GetProcessById pid
+        if proc.HasExited then false
+        elif OperatingSystem.IsLinux() then
+            // A reparented zombie may exist in /proc briefly, but it cannot
+            // execute more work and must not make this test nondeterministic.
+            let stat = File.ReadAllText($"/proc/{pid}/stat")
+            let state = stat[stat.LastIndexOf(')') + 2]
+            state <> 'Z' && state <> 'X'
+        else true
+    with
+    | :? ArgumentException
+    | :? InvalidOperationException
+    | :? FileNotFoundException
+    | :? IOException -> false
+
+let private killTestChild pid =
+    try
+        use proc = Process.GetProcessById pid
+        if not proc.HasExited then proc.Kill(entireProcessTree = true)
+    with _ -> ()
+
+let private verifyStartJobDescendantContainment holdLeader =
+    let root = createTempProject()
+    let project = Path.Combine(root, "Project1")
+    let marker = Path.Combine(project, "spawned-child.pid")
+    let releaseMarker = Path.Combine(project, "allow-parent-exit")
+    let childScript = Path.Combine(project, "spawned-child.fsx")
+    let parentScript = Path.Combine(project, "spawning-parent.fsx")
+    let context = TestContext root
+    let mutable jobId = None
+    try
+        File.WriteAllText(childScript, $"""open System
+open System.IO
+open System.Threading
+File.WriteAllText(@"{marker}", string Environment.ProcessId)
+Thread.Sleep 30000
+        """)
+        let continuation =
+            if holdLeader then "Thread.Sleep 30000"
+            else $"while not (File.Exists(@\"{releaseMarker}\")) do Thread.Sleep 25"
+        File.WriteAllText(parentScript, $"""open System
+open System.Diagnostics
+open System.IO
+open System.Threading
+let child = ProcessStartInfo("dotnet")
+child.UseShellExecute <- false
+child.ArgumentList.Add("fsi")
+child.ArgumentList.Add("--exec")
+child.ArgumentList.Add(@"{childScript}")
+// Don't keep the outer job's redirected pipes open in the descendant.
+child.RedirectStandardOutput <- true
+child.RedirectStandardError <- true
+use process = Process.Start(child)
+let limit = DateTime.UtcNow.AddSeconds 15.0
+while not (File.Exists(@"{marker}")) && DateTime.UtcNow < limit do
+    Thread.Sleep 25
+if not (File.Exists(@"{marker}")) then failwith "Child failed to start."
+printfn "spawning parent active"
+Console.Out.Flush()
+{continuation}
+        """)
+        let start =
+            { ProjectName = "Project1"; Executable = "dotnet"
+              Args = [ "fsi"; "--exec"; "spawning-parent.fsx" ]
+              Reason = Some "Verify isolated StartJob descendants"
+              WorkingDirectory = None; MaxOutputBytes = Some 4096 }
+        let launched =
+            match startJob start context with
+            | Ok result -> result
+            | Error issue -> failwithf "StartJob failed: %A" issue
+        jobId <- Some launched.JobId
+        let deadline = DateTime.UtcNow.AddSeconds 30.0
+        while not (File.Exists marker) && DateTime.UtcNow < deadline do
+            Thread.Sleep 30
+        Assert.That(File.Exists marker, Is.True, "Child launch marker is required.")
+        let pid = int (File.ReadAllText marker)
+        Assert.That(childIsExecuting pid, Is.True,
+                    "The child must be genuinely alive before group cleanup.")
+        if holdLeader then
+            cancelJob { ProjectName = "Project1"; JobId = launched.JobId } context
+            |> shouldEqual (Ok ())
+        else
+            File.WriteAllText(releaseMarker, "exit")
+        let rec awaitTerminal () =
+            let response =
+                getJobResult
+                    { ProjectName = "Project1"; JobId = launched.JobId
+                      AfterSequence = Some 0L } context
+                |> function Ok value -> value
+                          | Error issue -> failwithf "GetJobResult failed: %A" issue
+            if response.Status = Running && DateTime.UtcNow < deadline then
+                Thread.Sleep 30
+                awaitTerminal ()
+            else response.Status
+        let status = awaitTerminal()
+        if holdLeader then status |> shouldEqual Canceled
+        else status |> shouldEqual (Completed 0)
+        let cleanupDeadline = DateTime.UtcNow.AddSeconds 4.0
+        while childIsExecuting pid && DateTime.UtcNow < cleanupDeadline do
+            Thread.Sleep 30
+        Assert.That(childIsExecuting pid, Is.False,
+                    "StartJob must tear down descendants, even after the leader exits.")
+    finally
+        jobId |> Option.iter (fun id ->
+            cancelJob { ProjectName = "Project1"; JobId = id } context |> ignore)
+        if File.Exists marker then
+            match Int32.TryParse(File.ReadAllText marker) with
+            | true, pid -> killTestChild pid
+            | _ -> ()
+        if Directory.Exists root then Directory.Delete(root, true)
+
+[<Test>]
+let startJobCleansUpProcessGroupAfterParentExit () =
+    verifyStartJobDescendantContainment false
+
+[<Test>]
+let cancelJobKillsSupervisedDescendants () =
+    verifyStartJobDescendantContainment true
+
+[<Test>]
+let rapidConcurrentStartJobsDoNotLoseLaunchOrExitHandoff () =
+    let root = createTempProject()
+    let context = TestContext root
+    let mutable started = Array.empty<string>
+    try
+        // Short-lived command completion can race Process.Start, the Windows
+        // readiness-gate assignment and async stdout reader initialization.
+        // Exercise multiple launchers so an Exited event must not dispose a
+        // shared supervisor before its launcher has transferred ownership.
+        let start =
+            { ProjectName = "Project1"
+              Executable = "dotnet"
+              Args = [ "--version" ]
+              Reason = Some "Exercise StartJob launch and exit handoff"
+              WorkingDirectory = None
+              MaxOutputBytes = Some 1024 }
+        let concurrent =
+            [| for _ in 1 .. 24 ->
+                Task.Run(fun () ->
+                    match startJob start context with
+                    | Ok result -> result.JobId
+                    | Error error -> failwithf "A fast StartJob launch was lost: %A" error) |]
+        Task.WaitAll(concurrent |> Array.map (fun task -> task :> Task))
+        started <- concurrent |> Array.map (fun task -> task.Result)
+        let deadline = Stopwatch.StartNew()
+        let getStatus jobId =
+            match getJobResult
+                { ProjectName = "Project1"; JobId = jobId; AfterSequence = None } context with
+            | Ok result -> result.Status
+            | Error error -> failwithf "Fast StartJob handle disappeared: %A" error
+        while started |> Array.exists (fun jobId -> getStatus jobId = Running)
+              && deadline.Elapsed < TimeSpan.FromSeconds(30.0) do
+            Thread.Sleep 25
+        for jobId in started do
+            Assert.That(getStatus jobId, Is.EqualTo(Completed 0),
+                        "The launch/exit handoff must preserve every fast job's terminal result.")
+            cancelJob { ProjectName = "Project1"; JobId = jobId } context
+            |> shouldEqual (Ok ())
+            Assert.That(getStatus jobId, Is.EqualTo(Completed 0),
+                        "Canceling after observed exit cannot rewrite Completed as Canceled.")
+    finally
+        for jobId in started do
+            cancelJob { ProjectName = "Project1"; JobId = jobId } context |> ignore
+        if Directory.Exists root then Directory.Delete(root, true)
+
+[<Test>]
+let cancellationRacingShortJobExitIsIdempotent () =
+    let root = createTempProject()
+    let context = TestContext root
+    let mutable started = Array.empty<string>
+    try
+        let command =
+            { ProjectName = "Project1"
+              Executable = "dotnet"
+              Args = [ "--version" ]
+              Reason = Some "Exercise cancellation vs observed exit"
+              WorkingDirectory = None
+              MaxOutputBytes = Some 1024 }
+        let cancellationTasks =
+            [| for _ in 1 .. 12 ->
+                Task.Run(fun () ->
+                    let jobId =
+                        match startJob command context with
+                        | Ok result -> result.JobId
+                        | Error error -> failwithf "Fast job failed to start: %A" error
+                    let first =
+                        cancelJob { ProjectName = "Project1"; JobId = jobId } context
+                    let second =
+                        cancelJob { ProjectName = "Project1"; JobId = jobId } context
+                    jobId, first, second) |]
+        Task.WaitAll(cancellationTasks |> Array.map (fun task -> task :> Task))
+        let results = cancellationTasks |> Array.map (fun task -> task.Result)
+        started <- results |> Array.map (fun (jobId, _, _) -> jobId)
+        for _, first, second in results do
+            first |> shouldEqual (Ok ())
+            second |> shouldEqual (Ok ())
+        let timer = Stopwatch.StartNew()
+        let status id =
+            match getJobResult
+                { ProjectName = "Project1"; JobId = id; AfterSequence = None } context with
+            | Ok result -> result.Status
+            | Error error -> failwithf "Unexpected lost job: %A" error
+        while (started |> Array.exists (fun jobId -> status jobId = Running))
+              && timer.Elapsed < TimeSpan.FromSeconds(30.0) do
+            Thread.Sleep 25
+        for id in started do
+            match status id with
+            | Completed 0 | Canceled -> ()
+            | unexpected -> Assert.Fail($"A racing cancellation must observe parent exit: {unexpected}")
+    finally
+        for id in started do
+            cancelJob { ProjectName = "Project1"; JobId = id } context |> ignore
+        if Directory.Exists root then Directory.Delete(root, true)
+
+[<Test>]
+let processOwnershipJournalSurvivesRestartStyleInspectionAndRejectsReusedStages () =
+    let root = Path.Combine(Path.GetTempPath(), "jarvis-process-proof-" + Guid.NewGuid().ToString("N"))
+    Directory.CreateDirectory(root) |> ignore
+    try
+        let id = Guid.NewGuid().ToString("N")
+        let intent = ProcessOwnershipJournal.beginLaunchAt root id "project-canonical" "device-verified"
+        let before = ProcessOwnershipJournal.inspectAt root id
+        match before with
+        | Ok evidence ->
+            evidence.Intent |> shouldEqual intent
+            evidence.Launch.IsNone |> shouldEqual true
+        | Error error -> Assert.Fail(error)
+
+        // An unknown spawn outcome after a client crash remains unresolved.
+        let replayRejected =
+            try
+                ProcessOwnershipJournal.beginLaunchAt root id "other-project" "device-verified" |> ignore
+                false
+            with :? IOException -> true
+        replayRejected |> shouldEqual true
+
+        use child = new Process()
+        child.StartInfo.FileName <- "dotnet"
+        child.StartInfo.ArgumentList.Add("--version")
+        child.StartInfo.UseShellExecute <- false
+        child.StartInfo.RedirectStandardOutput <- true
+        child.StartInfo.RedirectStandardError <- true
+        try
+            Assert.That(child.Start(), Is.True)
+            let recorded = ProcessOwnershipJournal.recordLaunchedAt root intent child
+            Assert.That(recorded.ProcessId, Is.EqualTo(child.Id))
+            Assert.That(recorded.JobId, Is.EqualTo(id))
+            Assert.That(recorded.IntentSha256, Has.Length.EqualTo(64))
+            match ProcessOwnershipJournal.inspectAt root id with
+            | Ok recovered ->
+                recovered.Intent |> shouldEqual intent
+                recovered.Launch |> shouldEqual (Some recorded)
+            | Error error -> Assert.Fail(error)
+            child.WaitForExit(10000) |> ignore
+            let secondLaunchRejected =
+                try
+                    ProcessOwnershipJournal.recordLaunchedAt root intent child |> ignore
+                    false
+                with :? IOException -> true
+            secondLaunchRejected |> shouldEqual true
+        finally
+            try if not child.HasExited then child.Kill(entireProcessTree = true)
+            with _ -> ()
+    finally
+        Directory.Delete(root, true)
+
+[<Test>]
+let processOwnershipJournalRejectsCorruptionAndSymlinkStage () =
+    let root = Path.Combine(Path.GetTempPath(), "jarvis-process-corrupt-" + Guid.NewGuid().ToString("N"))
+    Directory.CreateDirectory(root) |> ignore
+    try
+        let id = Guid.NewGuid().ToString("N")
+        let _intent = ProcessOwnershipJournal.beginLaunchAt root id "project" "device"
+        let intentPath = Path.Combine(root, id + ".intent.json")
+        let original = File.ReadAllText(intentPath)
+        File.WriteAllText(intentPath, "{")
+        match ProcessOwnershipJournal.inspectAt root id with
+        | Error _ -> ()
+        | Ok _ -> Assert.Fail("Torn process ownership intent was accepted.")
+        File.WriteAllText(intentPath, original)
+        let launchedPath = Path.Combine(root, id + ".launched.json")
+        File.WriteAllText(launchedPath, "{\"SchemaVersion\":1,\"JobId\":\"invalid\"}")
+        match ProcessOwnershipJournal.inspectAt root id with
+        | Error _ -> ()
+        | Ok _ -> Assert.Fail("Mismatched launched PID/intent evidence was accepted.")
+        File.Delete(launchedPath)
+        if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
+            File.CreateSymbolicLink(launchedPath, intentPath) |> ignore
+            match ProcessOwnershipJournal.inspectAt root id with
+            | Error _ -> ()
+            | Ok _ -> Assert.Fail("Symbolic-link evidence stage was accepted.")
+    finally
+        Directory.Delete(root, true)
+
+[<Test>]
+let processOwnershipEvidenceWireReadRejectsForeignDeviceAndPreservesUncertainty () =
+    let root = createTempProject()
+    let directory = ProcessOwnershipJournal.defaultDirectory()
+    let foreignId = Guid.NewGuid().ToString("N")
+    let unresolvedId = Guid.NewGuid().ToString("N")
+    try
+        // These are test-only immutable stages, removed by the test fixture.
+        // No OS process was started; neither stage can imply termination.
+        ProcessOwnershipJournal.beginLaunchAt directory foreignId "Project1" "foreign-device"
+        |> ignore
+        ProcessOwnershipJournal.beginLaunchAt directory unresolvedId "Project1" (DeviceIdentity.getOrCreate())
+        |> ignore
+        let context = TestContext root
+        let query jobId : GetProcessOwnershipEvidenceCommand =
+            { ProjectName = "Project1"; JobId = jobId }
+
+        match getProcessOwnershipEvidence (query foreignId) context with
+        | Error(ContextError reason) ->
+            Assert.That(reason, Does.Contain("device mismatch"))
+        | other -> Assert.Fail($"Foreign-device process identity leaked: {other}")
+
+        match getProcessOwnershipEvidence (query unresolvedId) context with
+        | Ok evidence ->
+            evidence.JobId |> shouldEqual unresolvedId
+            evidence.Stage |> shouldEqual "IntentOnly"
+            evidence.ProcessId |> shouldEqual None
+            evidence.ProcessStartUtc |> shouldEqual None
+            evidence.IntentSha256 |> shouldEqual None
+            evidence.ProcessTreeStatus |> shouldEqual "Unverified"
+        | Error error -> Assert.Fail($"Missing launched stage was incorrectly rejected: {error}")
+
+        for bad in [ Guid.NewGuid().ToString("N"); "not-a-job-uuid" ] do
+            match getProcessOwnershipEvidence (query bad) context with
+            | Error _ -> ()
+            | Ok _ -> Assert.Fail("Missing or malformed process identity was treated as available.")
+
+        match getProcessOwnershipEvidenceForProject None (query unresolvedId) context with
+        | Error _ -> ()
+        | Ok _ -> Assert.Fail("Unscoped local process evidence was disclosed.")
+    finally
+        // Only our unique test fixture UUID files; no production journal
+        // retention or cleanup policy is implied.
+        for id in [ foreignId; unresolvedId ] do
+            let file = Path.Combine(directory, id + ".intent.json")
+            if File.Exists file then File.Delete file
         Directory.Delete(root, true)

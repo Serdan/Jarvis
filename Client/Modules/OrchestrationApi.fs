@@ -1026,6 +1026,13 @@ module PendingIntentJournal =
                       "ExpectedAgentVersion", "expectedAgentVersion"; "Reason", "reason" ]
                 | "TaskWrite", "RecoverTasklessWork" ->
                     [ "ActorId", "agentId"; "ExpectedAgentVersion", "expectedAgentVersion"; "Reason", "reason" ]
+                | "TaskWrite", "CorrectAgentWorkingState" ->
+                    common @ [ "AttemptId", "attemptId"; "ActorId", "requestingAgentId"
+                               "OwnerId", "targetAgentId"
+                               "ExpectedTaskVersion", "expectedTaskVersion"
+                               "ExpectedVersion", "expectedAttemptVersion"
+                               "ExpectedAgentVersion", "expectedAgentVersion"
+                               "AssignmentGeneration", "generation"; "Reason", "reason" ]
                 | "TaskWrite", "ReissueQueuedAttempt"
                 | "TaskWrite", "RecoverAgentAssignment" ->
                     attempt @ [ "Reason", "reason" ]
@@ -1943,6 +1950,152 @@ module PendingIntentJournal =
                     Error(Client.LedgerFailureError issue)
             | other -> other)
 
+    [<CLIMutable>]
+    type CorrectionOperationPin =
+        { SchemaVersion: int
+          OperationId: string
+          ProjectName: string
+          ProjectRoot: string
+          ProjectId: string
+          LedgerId: string
+          Epoch: int
+          BindingSha256: string
+          CommandSha256: string
+          CreatedUtc: string }
+
+    // Unlike the checkout-local pending-intent journal, this audit anchor
+    // MUST be root-independent: a device can rebind a project name to
+    // another physical checkout without changing its SignalR generation.
+    let internal correctionPinPath (operationId: Guid) =
+        Path.Combine(
+            Path.GetDirectoryName(ClientConfig.configPath()),
+            "ledger-v2", "correction-operation-pins",
+            operationId.ToString("N") + ".json")
+
+    let internal pinCorrectionOperation
+        (binding: LedgerStore.LedgerBinding) (operationId: Guid)
+        (projectName: string) (commandJson: string) : Result<unit, EffectError> =
+        if operationId = Guid.Empty || String.IsNullOrWhiteSpace projectName
+           || String.IsNullOrWhiteSpace commandJson then
+            Error(Client.ValidationError "Correction requires a valid UUID, project and exact command.")
+        else
+            try
+                let path = correctionPinPath operationId
+                let directory = Path.GetDirectoryName path
+                let parent = Path.GetDirectoryName directory
+                Directory.CreateDirectory(parent) |> ignore
+                if DirectoryInfo(parent).Attributes.HasFlag(FileAttributes.ReparsePoint) then
+                    Error(Client.ValidationError "Correction pin parent must not be a symbolic link.")
+                else
+                    let directoryCreated = not (Directory.Exists directory)
+                    Directory.CreateDirectory(directory) |> ignore
+                    if DirectoryInfo(directory).Attributes.HasFlag(FileAttributes.ReparsePoint) then
+                        Error(Client.ValidationError "Correction pin directory must not be a symbolic link.")
+                    else
+                        if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
+                            File.SetUnixFileMode(directory,
+                                UnixFileMode.UserRead ||| UnixFileMode.UserWrite ||| UnixFileMode.UserExecute)
+                        // A newly created child directory also needs its
+                        // PARENT entry fsynced, or sudden power loss could
+                        // erase the complete first-use UUID pin directory.
+                        if directoryCreated then syncArchiveDirectory parent
+                        // Existing remote trust binds the exact repo root,
+                        // canonical ledger UUID, epoch, and approved URLs.
+                        // Hash URL material rather than storing credentials.
+                        let canonicalRoot = Path.GetFullPath binding.RepositoryPath
+                        let bindingHash =
+                            JsonSerializer.Serialize(
+                                {| root = canonicalRoot
+                                   project = binding.ProjectId.ToString("D")
+                                   ledger = binding.LedgerId.ToString("D")
+                                   epoch = binding.Epoch
+                                   remoteName = binding.RemoteName
+                                   fetchUrl = binding.ApprovedFetchUrl
+                                   pushUrl = binding.ApprovedPushUrl |})
+                            |> sha
+                        let expected =
+                            { SchemaVersion = 1
+                              OperationId = operationId.ToString("D")
+                              ProjectName = projectName
+                              ProjectRoot = canonicalRoot
+                              ProjectId = binding.ProjectId.ToString("D")
+                              LedgerId = binding.LedgerId.ToString("D")
+                              Epoch = binding.Epoch
+                              BindingSha256 = bindingHash
+                              CommandSha256 = sha commandJson
+                              CreatedUtc = DateTimeOffset.UtcNow.ToString("O") }
+                        let identical (actual: CorrectionOperationPin) =
+                            not (isNull (box actual))
+                            && actual.SchemaVersion = 1
+                            && actual.OperationId = expected.OperationId
+                            && actual.ProjectName = expected.ProjectName
+                            && actual.ProjectRoot = expected.ProjectRoot
+                            && actual.ProjectId = expected.ProjectId
+                            && actual.LedgerId = expected.LedgerId
+                            && actual.Epoch = expected.Epoch
+                            && actual.BindingSha256 = expected.BindingSha256
+                            && actual.CommandSha256 = expected.CommandSha256
+                            && not (String.IsNullOrWhiteSpace actual.CreatedUtc)
+                            && (match DateTimeOffset.TryParse actual.CreatedUtc with
+                                | true, _ -> true
+                                | _ -> false)
+                        let lockPath = path + ".lock"
+                        if File.Exists(lockPath)
+                           && File.GetAttributes(lockPath).HasFlag(FileAttributes.ReparsePoint) then
+                            Error(Client.ValidationError "Correction operation lock must not be a symbolic link.")
+                        else
+                            // All checkout roots for this client serialize the
+                            // SAME correction UUID before any Git write.
+                            let rec lockPin remaining =
+                                try
+                                    new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite,
+                                                   FileShare.None, 4096, FileOptions.None)
+                                with :? IOException when remaining > 0 ->
+                                    System.Threading.Thread.Sleep 40
+                                    lockPin (remaining - 1)
+                            use held = lockPin 250
+                            if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
+                                File.SetUnixFileMode(lockPath,
+                                    UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
+                            if File.Exists path then
+                                if File.GetAttributes(path).HasFlag(FileAttributes.ReparsePoint)
+                                   || FileInfo(path).Length > 4096L then
+                                    Error(Client.ValidationError "Correction pin is not a regular bounded file.")
+                                else
+                                    let stored = JsonSerializer.Deserialize<CorrectionOperationPin>(
+                                        File.ReadAllText(path))
+                                    if identical stored then Ok ()
+                                    else Error(Client.ValidationError
+                                        "Correction UUID was already pinned to a different project root, ledger binding or command.")
+                            else
+                                let temp = path + "." + Guid.NewGuid().ToString("N") + ".tmp"
+                                try
+                                    do
+                                        use file = new FileStream(temp, FileMode.CreateNew, FileAccess.Write,
+                                                                  FileShare.None, 4096, FileOptions.WriteThrough)
+                                        if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
+                                            File.SetUnixFileMode(temp,
+                                                UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
+                                        let bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(expected))
+                                        file.Write(bytes, 0, bytes.Length)
+                                        file.Flush(true)
+                                    // Durable before ANY possible remote Git write.
+                                    durableArchiveMove temp path directory
+                                    Ok ()
+                                finally
+                                    if File.Exists temp then File.Delete(temp)
+            with ex ->
+                Error(Client.ValidationError
+                    $"Cannot establish immutable correction ledger identity: {ex.Message}")
+
+    let executeCorrectionLedgerWrite (binding: LedgerStore.LedgerBinding) (operationId: Guid)
+                                      (command: TaskWriteCommand)
+                                      (apply: unit -> Result<LedgerStore.LedgerWrite, EffectError>) =
+        let json = JsonSerializer.Serialize(command)
+        pinCorrectionOperation binding operationId command.ProjectName json
+        |> Result.bind (fun () ->
+            executeLedgerWrite binding operationId "TaskWrite" command apply)
+
 module OperationResponse =
     // Keep canonical agent state effects available in the client transport
     // without extracting them from presentation JSON or exposing extra MCP fields.
@@ -2330,8 +2483,20 @@ module TaskApi =
                     let journalCommand =
                         if List.contains cmd.Action [ "BeginAttempt"; "ResumeAgent"; "YieldAgent"; "CheckpointAttempt"; "CompleteAgentWork" ] then cmd
                         else { cmd with SessionId = "" }
+                    // A correction UUID must not silently follow a project
+                    // selector onto another local root or canonical Git
+                    // ledger while its original device session stays live.
+                    // Persist the root-independent pin before the local
+                    // pending journal and before any possible remote push.
+                    let executeWrite apply =
+                        if cmd.Action = "CorrectAgentWorkingState" then
+                            PendingIntentJournal.executeCorrectionLedgerWrite
+                                binding operationId journalCommand apply
+                        else
+                            PendingIntentJournal.executeLedgerWrite
+                                binding operationId "TaskWrite" journalCommand apply
                     let result =
-                        PendingIntentJournal.executeLedgerWrite binding operationId "TaskWrite" journalCommand (fun () ->
+                        executeWrite (fun () ->
                             let withAdministrativeActor action =
                                 administrativeActor binding operationId cmd.SessionId |> Result.bind action
                             match cmd.Action with
@@ -2515,6 +2680,12 @@ module TaskApi =
                                 withAdministrativeActor (fun actor ->
                                     ReviewWorkflow.ReviewWorkflow.setAgentAdministrativeStateAs binding actor operationId
                                         cmd.ActorId cmd.Summary cmd.ExpectedAgentVersion cmd.Reason |> mapError)
+                            | "CorrectAgentWorkingState" ->
+                                withAdministrativeActor (fun actor ->
+                                    ReviewWorkflow.ReviewWorkflow.correctAgentWorkingStateAs binding actor operationId
+                                        cmd.ActorId cmd.OwnerId cmd.TaskId cmd.AttemptId cmd.ExpectedTaskVersion
+                                        cmd.ExpectedVersion cmd.ExpectedAgentVersion cmd.AssignmentGeneration cmd.Reason
+                                    |> mapError)
                             | "ReissueQueuedAttempt" ->
                                 withAdministrativeActor (fun actor ->
                                     ReviewWorkflow.ReviewWorkflow.reissueQueuedAttemptAs binding actor operationId

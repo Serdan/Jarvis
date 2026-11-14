@@ -143,3 +143,34 @@ let browserPortValidation () =
         match ClientConfig.updateKey "browser-port" value ClientConfig.empty with
         | Error _ -> ()
         | Ok _ -> Assert.Fail("Accepted invalid port: " + value)
+
+[<Test>]
+let readOnlyDeviceIdentityForensicsNeverCreatesOrRepairsIdentity () =
+    let folder = Path.Combine(Path.GetTempPath(), "jarvis-device-readonly-" + Guid.NewGuid().ToString("N"))
+    let identity = Path.Combine(folder, "device-id")
+    try
+        DeviceIdentity.tryReadExistingAt identity |> shouldEqual None
+        Directory.Exists folder |> shouldEqual false
+        Directory.CreateDirectory folder |> ignore
+
+        File.WriteAllText(identity, "not-a-guid")
+        let original = File.ReadAllText identity
+        DeviceIdentity.tryReadExistingAt identity |> shouldEqual None
+        File.ReadAllText(identity) |> shouldEqual original
+
+        let valid = Guid.NewGuid()
+        File.WriteAllText(identity, valid.ToString("B").ToUpperInvariant())
+        DeviceIdentity.tryReadExistingAt identity |> shouldEqual (Some(valid.ToString("D")))
+        File.ReadAllText(identity) |> shouldEqual (valid.ToString("B").ToUpperInvariant())
+
+        File.WriteAllText(identity, String('X', 129))
+        DeviceIdentity.tryReadExistingAt identity |> shouldEqual None
+        File.Delete identity
+
+        if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
+            let target = Path.Combine(folder, "actual-id")
+            File.WriteAllText(target, valid.ToString("D"))
+            File.CreateSymbolicLink(identity, target) |> ignore
+            DeviceIdentity.tryReadExistingAt identity |> shouldEqual None
+    finally
+        if Directory.Exists folder then Directory.Delete(folder, true)

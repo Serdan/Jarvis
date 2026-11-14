@@ -62,6 +62,7 @@
         <Compile Include="Modules\ProjectBrowser.fs"/>
         <Compile Include="Modules\ProcessEnvironment.fs"/>
         <Compile Include="Modules\ClientShell.fs"/>
+        <Compile Include="Modules\ProcessOwnershipJournal.fs"/>
         <Compile Include="Modules\JobManager.fs"/>
         <Compile Include="Modules\\Worktrees.fs"/>
         <Compile Include="Modules\BoundedFifoCache.fs"/>

@@ -4,6 +4,8 @@ open System
 open System.Collections.Generic
 open System.IO
 open System.Threading
+open System.Text.Json
+open Common
 open Microsoft.Data.Sqlite
 
 [<CLIMutable>]
@@ -56,6 +58,87 @@ type FeedbackInput =
 type OperationStart =
     { Id: string
       StartedAt: DateTimeOffset }
+
+// A typed projection of the schema-checked execution epoch. An empty or
+// freshly migrated witness table never constitutes proof of legacy quiescence.
+type AgentExecutionReadiness =
+    | LegacyDrainUnverified
+    | LegacyDrainVerified of operatorId: string * evidence: string * approvedAt: DateTimeOffset
+
+/// An explicit proof boundary for releasing a correction permit. A server
+/// timeout or an unreconciled dispatch must never be interpreted as terminal.
+type AgentExecutionResolution =
+    | NeverDispatched
+    | AuthenticatedClientFinished
+    | ExecutionUnresolved
+
+/// Read-only operator recovery evidence for a single authenticated user's
+/// registered device incarnation. Recording a device is not a terminal or
+/// legacy-drain attestation: these records are intentionally append-only.
+type DurableDeviceRegistration =
+    { Generation: int64
+      DeviceId: string
+      ConnectionId: string
+      ProtocolVersion: string
+      ClientVersion: string
+      RegisteredAt: DateTimeOffset }
+
+type DurableDeviceRegistrationPage =
+    { Registrations: DurableDeviceRegistration list
+      HasMore: bool }
+
+/// Read-only operator recovery evidence for a single authenticated user's
+/// target agent. This is NOT permission to release the durable exclusion.
+type AgentCorrectionPermitEvidence =
+    { TargetAgentId: string
+      PermitId: string
+      OperationId: string
+      CreatedAt: DateTimeOffset
+      ProjectName: string option
+      RequestingAgentId: string option
+      RequestFingerprint: string option
+      InitiatingRequestId: string option
+      DeviceId: string option
+      DeviceGeneration: int64 option }
+
+/// Bound server-side provenance for the entire immutable correction command.
+/// The witness is the server's durable pre-dispatch record for this invocation;
+/// the fingerprint is computed by the server from the COMPLETE command.
+type AgentCorrectionRequestBinding =
+    { ProjectName: string
+      RequestingAgentId: string
+      RequestFingerprint: string
+      InitiatingRequestId: string
+      DeviceId: string
+      DeviceGeneration: int64 }
+
+/// Read-only evidence for operator reconciliation. Missing fields remain
+/// optional, and a truncated page must never be mistaken for full quiescence.
+type UnresolvedAgentExecution =
+    { RequestId: string
+      ToolName: string option
+      ProjectName: string option
+      State: string
+      ClientResponseAt: DateTimeOffset option
+      ClientResponseSucceeded: bool option
+      RequiresIndependentProcessProof: bool
+      DeviceId: string option
+      ConnectionId: string option
+      DeviceGeneration: int64 option
+      CorrelationId: string option
+      ParentRequestId: string option
+      JobId: string option
+      JobStartedAt: DateTimeOffset option
+      JobReceiptAt: DateTimeOffset option
+      DeferredToolJobId: string option
+      DeferredToolJobOperationId: string option
+      DeferredToolJobStartedAt: DateTimeOffset option
+      DeferredToolJobReceiptAt: DateTimeOffset option
+      CreatedAt: DateTimeOffset }
+
+type UnresolvedAgentExecutionPage =
+    { Executions: UnresolvedAgentExecution list
+      HasMore: bool }
 
 [<CLIMutable>]
 type ConnectionEventEntry =
@@ -110,6 +193,43 @@ type FeedbackStore(databasePath: string, ?telemetryRetention: TimeSpan) =
         builder.Mode <- SqliteOpenMode.ReadWriteCreate
         builder.Cache <- SqliteCacheMode.Shared
         builder.ToString()
+
+    // Pending handles can be recorded for any known command, including a
+    // process runner; recording is NEVER equivalent to terminal proof.
+    let knownCommandTypes =
+        AgentProtocol.commandDefinitions
+        |> Seq.map (fun definition -> definition.Name)
+        |> Set.ofSeq
+        |> Set.add "NotifyAgent"
+        // MCP command definitions use GetGitStatus/GetGitDiff, but the
+        // authenticated wire classifier intentionally persists their native
+        // protocol names GitStatus/GitDiff. Both are known-but-process-backed.
+        // Recognition permits retaining the reply, NEVER terminal promotion.
+        |> Set.add "GitStatus"
+        |> Set.add "GitDiff"
+
+    // Transport completion and native-process quiescence are DIFFERENT facts.
+    // Permission metadata does not classify process spawning: even ReadOnly
+    // GetGitStatus, TaskRead and LedgerRead invoke BoundedProcess/git, which
+    // may start hooks, filters, ssh or other detached descendants. A successful
+    // parent response cannot certify those descendants have been reaped.
+    // Explicitly whitelist only locally synchronous non-process commands;
+    // any future command remains unresolved until its execution semantics
+    // receive a conscious safety classification. Synthetic NotifyAgent also
+    // uses Git in BOTH source and destination stages.
+    let terminalCommandTypes =
+        set [ "ListCommands"; "ListProjects"
+              "BrowserListWindows"; "BrowserListTabs"; "ListScheduledBrowserExecutions"
+              "ListDirectory"; "SearchFiles"; "SearchText"
+              "ReadFile"; "ReadFilePage"; "ReadFiles"; "GetAgentInstructions"
+              "ReadImage"; "WriteFile"; "PatchFile"
+              "ListConfiguredTasks"; "ListSkills"; "GetSkill"; "CreateSkill"
+              "ListJobs"; "GetJobResult"; "GetProcessOwnershipEvidence"
+              "Message"; "GetClientActivity" ]
+
+    do
+        if not (Set.isSubset terminalCommandTypes knownCommandTypes) then
+            invalidOp "An explicitly process-free terminal tool is missing from the active command catalog."
 
     let dbValue = function
         | Some value -> box value
@@ -208,8 +328,303 @@ CREATE TABLE IF NOT EXISTS connection_events (
 
 CREATE INDEX IF NOT EXISTS ix_connection_events_user_created
     ON connection_events(user_id, created_at DESC);
+
+-- A SignalR registration generation is durable protocol identity, not merely
+-- a process-local counter. Reusing generation 1 after a server restart would
+-- let a replacement client match an unresolved correction permit from an
+-- earlier server boot. Never prune, reset or infer this counter from the
+-- in-memory device/session registry.
+CREATE TABLE IF NOT EXISTS device_registration_sequence (
+    singleton_id INTEGER PRIMARY KEY CHECK(singleton_id = 1),
+    generation INTEGER NOT NULL CHECK(generation >= 0)
+);
+INSERT OR IGNORE INTO device_registration_sequence
+    (singleton_id, generation) VALUES (1, 0);
+
+-- Retain every authenticated client registration independently of disposable
+-- connection diagnostics. The generation and roster entry commit together.
+-- An empty roster after installing this schema is NOT proof that historical
+-- pre-roster clients or detached operations have ended.
+CREATE TABLE IF NOT EXISTS device_registration_roster (
+    generation INTEGER PRIMARY KEY CHECK(generation > 0),
+    user_id TEXT NOT NULL,
+    device_id TEXT NOT NULL,
+    connection_id TEXT NOT NULL,
+    protocol_version TEXT NOT NULL,
+    client_version TEXT NOT NULL,
+    registered_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_registration_roster_user
+    ON device_registration_roster(user_id, generation);
+
+-- Independent from 30-day operation telemetry retention: unresolved client
+-- executions are never pruned by age. The Git ledger remains task authority.
+CREATE TABLE IF NOT EXISTS agent_execution_witness (
+    request_id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
+    project_name TEXT NULL,
+    tool_name TEXT NULL,
+    state TEXT NOT NULL CHECK(state IN ('Admitted','Dispatched','Terminal','NotDispatched')),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    device_id TEXT NULL,
+    connection_id TEXT NULL,
+    device_generation INTEGER NULL,
+    correlation_id TEXT UNIQUE NULL,
+    terminal_at TEXT NULL,
+    client_response_at TEXT NULL,
+    client_response_succeeded INTEGER NULL CHECK(client_response_succeeded IN (0,1)),
+    parent_request_id TEXT NULL,
+    job_id TEXT NULL,
+    job_started_at TEXT NULL,
+    job_receipt_at TEXT NULL,
+    tool_job_id TEXT NULL,
+    tool_job_operation_id TEXT NULL,
+    tool_job_started_at TEXT NULL,
+    tool_job_receipt_at TEXT NULL,
+    expected_device_id TEXT NULL,
+    expected_device_generation INTEGER NULL
+);
+CREATE INDEX IF NOT EXISTS ix_agent_execution_witness_pending
+    ON agent_execution_witness(user_id, agent_id, state);
+
+-- Before sending GetJobResult, record the exact authenticated poll route
+-- against its original still-dispatched pending execution. An arbitrary
+-- response-shaped JSON value must never attest some other agent's job.
+-- Retain this across timeouts/restarts; no telemetry TTL applies.
+CREATE TABLE IF NOT EXISTS agent_tool_job_poll (
+    correlation_id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    device_id TEXT NOT NULL,
+    connection_id TEXT NOT NULL,
+    device_generation INTEGER NOT NULL,
+    agent_id TEXT NOT NULL,
+    project_name TEXT NOT NULL,
+    job_id TEXT NOT NULL,
+    original_request_id TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_agent_tool_job_poll_original
+    ON agent_tool_job_poll(user_id, original_request_id);
+
+-- The correction barrier must survive a server restart or lost HTTP result.
+-- It serializes with agent admission under a SQLite writer transaction.
+CREATE TABLE IF NOT EXISTS agent_correction_permit (
+    user_id TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
+    permit_id TEXT NOT NULL UNIQUE,
+    operation_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    project_name TEXT NULL,
+    requesting_agent_id TEXT NULL,
+    request_fingerprint TEXT NULL,
+    initiating_request_id TEXT NULL,
+    device_id TEXT NULL,
+    device_generation INTEGER NULL,
+    PRIMARY KEY(user_id, agent_id)
+);
+
+-- An exclusive permit is released when its outcome is resolved, but the
+-- correction command's UUID ownership must NEVER be released or repurposed.
+-- Otherwise the same user could replay a successful UUID on another agent
+-- or another Git ledger after the original target's permit is deleted.
+-- This is not telemetry and is intentionally never pruned.
+CREATE TABLE IF NOT EXISTS agent_correction_operation_identity (
+    user_id TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    target_agent_id TEXT NOT NULL,
+    project_name TEXT NOT NULL,
+    requesting_agent_id TEXT NOT NULL,
+    request_fingerprint TEXT NOT NULL,
+    device_id TEXT NOT NULL,
+    device_generation INTEGER NOT NULL CHECK(device_generation > 0),
+    initiating_request_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(user_id, operation_id)
+);
+
+-- A migration from pre-witness server protocols through 3.64 cannot infer
+-- safety from zero rows: an old MCP request may still execute on another device.
+-- Explicit authenticated drain proof is required before ANY correction.
+CREATE TABLE IF NOT EXISTS agent_execution_epoch (
+    epoch_id INTEGER PRIMARY KEY CHECK(epoch_id = 1),
+    state TEXT NOT NULL CHECK(state IN ('AwaitingLegacyDrain','Ready')),
+    operator_id TEXT NULL,
+    approval_operation_id TEXT UNIQUE NULL,
+    evidence TEXT NULL,
+    approved_at TEXT NULL,
+    protocol_version TEXT NULL,
+    approved_registration_generation INTEGER NULL
+);
+INSERT OR IGNORE INTO agent_execution_epoch
+    (epoch_id, state) VALUES (1, 'AwaitingLegacyDrain');
 """
         schema.ExecuteNonQuery() |> ignore
+
+        // A Ready approval from a prior protocol is not proof of the current
+        // execution contract. Add the epoch version without backfilling old
+        // approvals: they must be reverified with a fresh drain operation.
+        use epochInfo = connection.CreateCommand()
+        epochInfo.CommandText <- "PRAGMA table_info(agent_execution_epoch);"
+        use epochReader = epochInfo.ExecuteReader()
+        let epochColumns = HashSet<string>(StringComparer.Ordinal)
+        while epochReader.Read() do
+            epochColumns.Add(epochReader.GetString 1) |> ignore
+        epochReader.Close()
+        if not (epochColumns.Contains("protocol_version")) then
+            use epochMigration = connection.CreateCommand()
+            epochMigration.CommandText <-
+                "ALTER TABLE agent_execution_epoch ADD COLUMN protocol_version TEXT NULL;"
+            epochMigration.ExecuteNonQuery() |> ignore
+        if not (epochColumns.Contains("approved_registration_generation")) then
+            // Older Ready states cannot be silently trusted: without the
+            // registered-device cutover high-water mark, a later old client
+            // can reconnect undetected after the supposed legacy drain.
+            use epochMigration = connection.CreateCommand()
+            epochMigration.CommandText <-
+                "ALTER TABLE agent_execution_epoch ADD COLUMN approved_registration_generation INTEGER NULL;"
+            epochMigration.ExecuteNonQuery() |> ignore
+
+        // A permit created by an older server has NO authenticated command
+        // binding. Do not invent/backfill one: its retry is uncertain and
+        // cannot borrow the new protocol's proof of exact request identity.
+        use permitInfo = connection.CreateCommand()
+        permitInfo.CommandText <- "PRAGMA table_info(agent_correction_permit);"
+        use permitReader = permitInfo.ExecuteReader()
+        let permitColumns = HashSet<string>(StringComparer.Ordinal)
+        while permitReader.Read() do
+            permitColumns.Add(permitReader.GetString 1) |> ignore
+        permitReader.Close()
+        for column in
+            [ "project_name"; "requesting_agent_id"; "request_fingerprint"
+              "initiating_request_id"; "device_id" ] do
+            if not (permitColumns.Contains(column)) then
+                use migration = connection.CreateCommand()
+                migration.CommandText <-
+                    $"ALTER TABLE agent_correction_permit ADD COLUMN {column} TEXT NULL;"
+                migration.ExecuteNonQuery() |> ignore
+
+        if not (permitColumns.Contains("device_generation")) then
+            use migration = connection.CreateCommand()
+            migration.CommandText <-
+                "ALTER TABLE agent_correction_permit ADD COLUMN device_generation INTEGER NULL;"
+            migration.ExecuteNonQuery() |> ignore
+
+        // Retain compatibility with persisted pre-continuation witness data
+        // without reinitializing the audit epoch or discarding unknown rows.
+        use witnessInspect = connection.CreateCommand()
+        witnessInspect.CommandText <- "PRAGMA table_info(agent_execution_witness);"
+        use witnessReader = witnessInspect.ExecuteReader()
+        let witnessColumns = HashSet<string>(StringComparer.Ordinal)
+        while witnessReader.Read() do
+            witnessColumns.Add(witnessReader.GetString 1) |> ignore
+        witnessReader.Close()
+        for column, definition in
+            [ "parent_request_id", "TEXT NULL"
+              "tool_name", "TEXT NULL"
+              "job_id", "TEXT NULL"
+              "job_started_at", "TEXT NULL"
+              "job_receipt_at", "TEXT NULL"
+              "tool_job_id", "TEXT NULL"
+              "tool_job_operation_id", "TEXT NULL"
+              "tool_job_started_at", "TEXT NULL"
+              "tool_job_receipt_at", "TEXT NULL"
+              "client_response_at", "TEXT NULL"
+              "client_response_succeeded", "INTEGER NULL"
+              "expected_device_id", "TEXT NULL"
+              "expected_device_generation", "INTEGER NULL" ] do
+            if not (witnessColumns.Contains(column)) then
+                use witnessMigration = connection.CreateCommand()
+                witnessMigration.CommandText <-
+                    $"ALTER TABLE agent_execution_witness ADD COLUMN {column} {definition};"
+                witnessMigration.ExecuteNonQuery() |> ignore
+
+        // Telemetry is short-lived, but the execution classification must
+        // outlive it. Existing witnesses are backfilled while their telemetry
+        // still exists. A missing historical classification deliberately
+        // remains NULL and cannot be certified Terminal without recovery.
+        use backfill = connection.CreateCommand()
+        backfill.CommandText <-
+            """UPDATE agent_execution_witness
+               SET tool_name = (SELECT tool_name FROM operations
+                                WHERE operations.id = agent_execution_witness.request_id)
+               WHERE tool_name IS NULL AND request_id IN (SELECT id FROM operations);
+               UPDATE agent_execution_witness
+               SET tool_name = 'NotifyAgent'
+               WHERE tool_name IS NULL AND parent_request_id IS NOT NULL
+                 AND EXISTS (
+                     SELECT 1 FROM agent_execution_witness AS parent
+                     WHERE parent.request_id = agent_execution_witness.parent_request_id
+                       AND parent.user_id = agent_execution_witness.user_id
+                       AND parent.tool_name = 'NotifyAgent'
+                 );"""
+        backfill.ExecuteNonQuery() |> ignore
+        // Versions <= 3.65 treated a completed Git/bridge client call as
+        // proof of OS descendant quiescence. Such Terminal rows cannot be
+        // carried into this stricter contract. Keep their authenticated
+        // reply timestamp as an observation, but restore the unresolved
+        // state until independent process-tree proof can be supplied.
+        // This migration is monotonic/idempotent across repeated startups.
+        let locallySynchronous =
+            terminalCommandTypes
+            |> Set.toList
+            |> List.sort
+            |> List.map (fun name -> "'" + name + "'")
+            |> String.concat ", "
+        use migrateCompletion = connection.CreateCommand()
+        migrateCompletion.CommandText <-
+            $"""UPDATE agent_execution_witness
+                SET client_response_at = COALESCE(client_response_at, terminal_at),
+                    terminal_at = NULL, state = 'Dispatched'
+                WHERE state = 'Terminal'
+                  AND (tool_name IS NULL OR tool_name NOT IN ({locallySynchronous}));"""
+        migrateCompletion.ExecuteNonQuery() |> ignore
+        use childIndex = connection.CreateCommand()
+        childIndex.CommandText <-
+            """CREATE UNIQUE INDEX IF NOT EXISTS ix_agent_execution_child_parent
+               ON agent_execution_witness(parent_request_id)
+               WHERE parent_request_id IS NOT NULL;"""
+        childIndex.ExecuteNonQuery() |> ignore
+        // Job IDs belong to an authenticated client device, not a project or
+        // process-wide ephemeral job registry. Duplicate IDs on that device
+        // would make a later reconciliation ambiguous; fail the receipt.
+        use jobIndex = connection.CreateCommand()
+        jobIndex.CommandText <-
+            """CREATE UNIQUE INDEX IF NOT EXISTS ix_agent_execution_job_device
+               ON agent_execution_witness(user_id, device_id, job_id)
+               WHERE job_id IS NOT NULL;"""
+        jobIndex.ExecuteNonQuery() |> ignore
+        // Promoted MCP tool jobs share the same client registry as explicit
+        // StartJob process jobs. Reusing either ID on a device is ambiguous.
+        use deferredJobIndex = connection.CreateCommand()
+        deferredJobIndex.CommandText <-
+            """CREATE UNIQUE INDEX IF NOT EXISTS ix_agent_execution_any_job_device
+               ON agent_execution_witness(
+                   user_id, device_id, COALESCE(job_id, tool_job_id))
+               WHERE job_id IS NOT NULL OR tool_job_id IS NOT NULL;"""
+        deferredJobIndex.ExecuteNonQuery() |> ignore
+
+        // Upgrades from pre-allocator builds already have durable SignalR
+        // witness/permit generations. Never start at 1 if an unresolved
+        // permit or earlier device registration recorded a higher identity.
+        // The high-water mark survives telemetry pruning and server restart.
+        use generationFloor = connection.CreateCommand()
+        generationFloor.CommandText <-
+            """UPDATE device_registration_sequence
+               SET generation = MAX(
+                   generation,
+                   COALESCE((SELECT MAX(device_generation)
+                             FROM agent_execution_witness), 0),
+                   COALESCE((SELECT MAX(device_generation)
+                             FROM agent_correction_permit), 0),
+                   COALESCE((SELECT MAX(generation)
+                             FROM connection_events), 0),
+                   COALESCE((SELECT MAX(generation)
+                             FROM device_registration_roster), 0))
+               WHERE singleton_id = 1;"""
+        if generationFloor.ExecuteNonQuery() <> 1 then
+            invalidOp "Device registration generation allocator is missing."
 
         use inspect = connection.CreateCommand()
         inspect.CommandText <- "PRAGMA table_info(feedback);"
@@ -252,6 +667,83 @@ CREATE INDEX IF NOT EXISTS ix_connection_events_user_created
         member _.Dispose() = pruneTimer.Dispose()
 
     member _.DatabasePath = databasePath
+
+    /// Allocate a permanent SignalR device incarnation AND its immutable
+    /// authenticated registration record in ONE SQLite transaction. A failure
+    /// before commit rolls back both. Historical registrations are never
+    /// pruned and cannot themselves prove a device's execution has stopped.
+    member _.AllocateDeviceRegistrationGeneration(
+        userId: string, deviceId: string, connectionId: string,
+        protocolVersion: string, clientVersion: string
+    ) : int64 =
+        let bounded value =
+            String.IsNullOrWhiteSpace value || value.Length > 512
+        if [userId; deviceId; connectionId; protocolVersion; clientVersion]
+           |> List.exists bounded then
+            invalidArg "registration" "Authenticated bounded device registration identity is required."
+        use connection = openConnection()
+        use transaction = connection.BeginTransaction()
+        use command = connection.CreateCommand()
+        command.Transaction <- transaction
+        command.CommandText <-
+            """UPDATE device_registration_sequence
+               SET generation = generation + 1
+               WHERE singleton_id = 1 AND generation < 9223372036854775807
+               RETURNING generation;"""
+        let generation =
+            match command.ExecuteScalar() with
+            | :? int64 as value when value > 0L -> value
+            | _ -> invalidOp "Durable device generation is missing, corrupt or exhausted."
+        use insert = connection.CreateCommand()
+        insert.Transaction <- transaction
+        insert.CommandText <-
+            """INSERT INTO device_registration_roster
+               (generation, user_id, device_id, connection_id,
+                protocol_version, client_version, registered_at)
+               VALUES ($generation, $userId, $deviceId, $connectionId,
+                       $protocol, $client, $now);"""
+        addParameter insert "$generation" generation
+        addParameter insert "$userId" userId
+        addParameter insert "$deviceId" deviceId
+        addParameter insert "$connectionId" connectionId
+        addParameter insert "$protocol" protocolVersion
+        addParameter insert "$client" clientVersion
+        addParameter insert "$now" (DateTimeOffset.UtcNow.ToString("O"))
+        if insert.ExecuteNonQuery() <> 1 then
+            invalidOp "Cannot persist authenticated device registration."
+        transaction.Commit()
+        generation
+
+    /// User-scoped, bounded recovery inventory. Empty results do not prove
+    /// historic pre-roster devices have stopped executing.
+    member _.ListDurableDeviceRegistrations(userId: string, limit: int)
+        : Result<DurableDeviceRegistrationPage, string> =
+        if String.IsNullOrWhiteSpace userId || limit < 1 || limit > 500 then
+            Error "Authenticated user and registration page size 1..500 are required."
+        else
+            try
+                use connection = openConnection()
+                use command = connection.CreateCommand()
+                command.CommandText <-
+                    """SELECT generation, device_id, connection_id,
+                              protocol_version, client_version, registered_at
+                       FROM device_registration_roster WHERE user_id = $userId
+                       ORDER BY generation DESC LIMIT $limit;"""
+                addParameter command "$userId" userId
+                addParameter command "$limit" (limit + 1)
+                use reader = command.ExecuteReader()
+                let rows = ResizeArray<DurableDeviceRegistration>()
+                while reader.Read() do
+                    rows.Add
+                        { Generation = reader.GetInt64 0
+                          DeviceId = reader.GetString 1
+                          ConnectionId = reader.GetString 2
+                          ProtocolVersion = reader.GetString 3
+                          ClientVersion = reader.GetString 4
+                          RegisteredAt = DateTimeOffset.Parse(reader.GetString 5) }
+                Ok { Registrations = rows |> Seq.truncate limit |> Seq.toList
+                     HasMore = rows.Count > limit }
+            with ex -> Error $"Cannot inspect durable device registration roster: {ex.Message}"
 
     member _.AddConnectionEvent(
         userId: string,
@@ -372,6 +864,1300 @@ INSERT INTO operations (
         command.ExecuteNonQuery() |> ignore
 
         { Id = operationId; StartedAt = startedAt }
+
+    // A freshly deployed witness schema has no knowledge of MCP calls
+    // dispatched by the previous server. An empty witness table is therefore
+    // never sufficient evidence to permit correction.
+    // Both observation and exclusive correction admission use the SAME
+    // verified epoch predicate. A partially migrated/corrupt Ready marker
+    // must not authorize a state change.
+    member private _.ReadVerifiedExecutionEpoch(
+        connection: SqliteConnection, transaction: SqliteTransaction option
+    ) : Result<AgentExecutionReadiness, string> =
+        use command = connection.CreateCommand()
+        transaction |> Option.iter (fun current -> command.Transaction <- current)
+        command.CommandText <-
+            """SELECT state, operator_id, approval_operation_id, evidence,
+                      approved_at, protocol_version, approved_registration_generation
+               FROM agent_execution_epoch WHERE epoch_id = 1;"""
+        use reader = command.ExecuteReader()
+        if not (reader.Read()) then Error "Execution epoch record is missing."
+        else
+            match reader.GetString 0 with
+            | "AwaitingLegacyDrain" -> Ok LegacyDrainUnverified
+            | "Ready" when reader.IsDBNull 5
+                           || reader.GetString 5 <> AgentProtocol.version ->
+                // An old or missing protocol approval is not reusable.
+                Ok LegacyDrainUnverified
+            | "Ready" when reader.IsDBNull 6 ->
+                Error "Execution epoch lacks durable device registration cutover evidence."
+            | "Ready" when [1; 2; 3; 4] |> List.exists reader.IsDBNull ->
+                Error "Execution epoch approval evidence is incomplete."
+            | "Ready" ->
+                let operatorId = reader.GetString 1
+                let approvalId = reader.GetString 2
+                let evidence = reader.GetString 3
+                let approvedAt = reader.GetString 4
+                let approvedGeneration = reader.GetInt64 6
+                if String.IsNullOrWhiteSpace operatorId
+                   || String.IsNullOrWhiteSpace approvalId
+                   || String.IsNullOrWhiteSpace evidence
+                   || evidence.Trim().Length < 20
+                   || approvedGeneration < 0L then
+                    Error "Execution epoch approval evidence is invalid."
+                else
+                    match DateTimeOffset.TryParse approvedAt with
+                    | true, at ->
+                        // Registration and approval share the SQLite writer
+                        // domain. A new legacy protocol after the approved
+                        // generation invalidates the epoch for correction,
+                        // irrespective of timestamps or client disconnects.
+                        reader.Close()
+                        use counter = connection.CreateCommand()
+                        transaction |> Option.iter (fun current ->
+                            counter.Transaction <- current)
+                        counter.CommandText <-
+                            """SELECT 1 FROM device_registration_sequence
+                               WHERE singleton_id = 1
+                                 AND typeof(generation) = 'integer'
+                                 AND generation >= $cutover
+                               LIMIT 1;"""
+                        addParameter counter "$cutover" approvedGeneration
+                        use legacy = connection.CreateCommand()
+                        transaction |> Option.iter (fun current ->
+                            legacy.Transaction <- current)
+                        legacy.CommandText <-
+                            """SELECT 1 FROM device_registration_roster
+                               WHERE generation > $cutover
+                                 AND protocol_version <> $currentProtocol
+                               LIMIT 1;"""
+                        addParameter legacy "$cutover" approvedGeneration
+                        addParameter legacy "$currentProtocol" AgentProtocol.version
+                        if isNull (counter.ExecuteScalar()) then
+                            Error "Execution epoch registration high-water evidence is missing or inconsistent."
+                        elif not (isNull (legacy.ExecuteScalar())) then
+                            Error "An incompatible client protocol registered after legacy drain approval; a new audited drain is required."
+                        else
+                            Ok (LegacyDrainVerified(operatorId, evidence, at))
+                    | _ -> Error "Execution epoch approval timestamp is corrupt."
+            | _ -> Error "Execution epoch is not a verified protocol state."
+
+    member this.GetAgentExecutionReadiness() : Result<AgentExecutionReadiness, string> =
+        try
+            use connection = openConnection()
+            this.ReadVerifiedExecutionEpoch(connection, None)
+        with ex -> Error $"Cannot read execution protocol readiness: {ex.Message}"
+
+    // Caller must be the authenticated operator path after proving that ALL
+    // pre-witness requests and detached child jobs have exited across devices.
+    // This is intentionally not exposed through MCP until real device/process
+    // reconciliation can supply that proof. Never auto-ready on startup.
+    member this.TryAuthorizeLegacyDrain(
+        operatorId: string, operationId: string, evidence: string,
+        verifyLegacyQuiescence: unit -> Result<unit, string>
+    ) : Result<unit, string> =
+        if String.IsNullOrWhiteSpace operatorId
+           || String.IsNullOrWhiteSpace operationId
+           || String.IsNullOrWhiteSpace evidence
+           || evidence.Trim().Length < 20 then
+            Error "Protocol readiness requires an operator, stable operation ID and substantive drain evidence."
+        else
+            try
+                use connection = openConnection()
+                use transaction = connection.BeginTransaction()
+                use query = connection.CreateCommand()
+                query.Transaction <- transaction
+                query.CommandText <-
+                    """SELECT state, approval_operation_id, protocol_version
+                       FROM agent_execution_epoch WHERE epoch_id = 1;"""
+                use reader = query.ExecuteReader()
+                let epoch =
+                    if reader.Read() then
+                        Some(reader.GetString 0,
+                             (if reader.IsDBNull 1 then "" else reader.GetString 1),
+                             (if reader.IsDBNull 2 then None else Some(reader.GetString 2)))
+                    else None
+                reader.Close()
+                match epoch with
+                | Some("Ready", original, Some version)
+                    when version = AgentProtocol.version && original = operationId ->
+                    match this.ReadVerifiedExecutionEpoch(connection, Some transaction) with
+                    | Ok (LegacyDrainVerified(originalOperator, originalEvidence, _))
+                        when originalOperator = operatorId.Trim()
+                             && originalEvidence = evidence.Trim() ->
+                        Ok () // same verified command; no new approval or mutation
+                    | Ok (LegacyDrainVerified _) ->
+                        Error "Legacy drain approval operation ID was reused with different operator or evidence."
+                    | _ -> Error "Persisted legacy-drain approval is incomplete or corrupt."
+                | Some("Ready", _, Some version) when version = AgentProtocol.version ->
+                    Error "Protocol epoch was already approved by a different operation."
+                | Some("Ready", _, _) ->
+                    // No silent reuse or destructive overwrite of a prior
+                    // protocol's approval history. A new audited epoch is
+                    // required before the upgraded server can correct agents.
+                    Error "A prior protocol's legacy drain cannot authorize the current protocol epoch."
+                | Some("AwaitingLegacyDrain", _, _) ->
+                    // This SQLite writer transaction serializes the *final*
+                    // legacy-process verification with all new admissions.
+                    // No pre-witness client may dispatch on this server.
+                    let verified =
+                        try verifyLegacyQuiescence()
+                        with ex -> Error ex.Message
+                    match verified with
+                    | Error reason ->
+                        Error $"Legacy activity was not proven quiescent: {reason}"
+                    | Ok () ->
+                        use unknown = connection.CreateCommand()
+                        unknown.Transaction <- transaction
+                        unknown.CommandText <-
+                            """SELECT 1 FROM agent_execution_witness
+                               WHERE state NOT IN ('Terminal','NotDispatched') LIMIT 1;"""
+                        if not (isNull (unknown.ExecuteScalar())) then
+                            Error "Current tracked activity remains unresolved; epoch cannot become ready."
+                        else
+                            use update = connection.CreateCommand()
+                            update.Transaction <- transaction
+                            update.CommandText <-
+                                """UPDATE agent_execution_epoch SET
+                                       state = 'Ready', operator_id = $operator,
+                                       approval_operation_id = $operation,
+                                       evidence = $evidence, approved_at = $at,
+                                       protocol_version = $protocol,
+                                       approved_registration_generation =
+                                           (SELECT generation FROM device_registration_sequence
+                                            WHERE singleton_id = 1)
+                                   WHERE epoch_id = 1 AND state = 'AwaitingLegacyDrain'
+                                     AND EXISTS(
+                                         SELECT 1 FROM device_registration_sequence
+                                         WHERE singleton_id = 1
+                                           AND typeof(generation) = 'integer'
+                                           AND generation >= 0);"""
+                            addParameter update "$operator" (operatorId.Trim())
+                            addParameter update "$operation" (operationId.Trim())
+                            addParameter update "$evidence" (evidence.Trim())
+                            addParameter update "$at" (DateTimeOffset.UtcNow.ToString("O"))
+                            addParameter update "$protocol" AgentProtocol.version
+                            if update.ExecuteNonQuery() <> 1 then
+                                Error "Protocol readiness changed during verification."
+                            else
+                                transaction.Commit()
+                                Ok ()
+                | _ -> Error "Execution epoch is missing or corrupt."
+            with ex -> Error $"Cannot audit protocol drain approval: {ex.Message}"
+
+    // This is separate from best-effort telemetry BeginOperation: a genuine
+    // self-agent tool MUST have a durable witness before it can be dispatched.
+    // One SQLite writer transaction contains the telemetry row and activity
+    // admission. The rare correction permit checks the same SQLite database.
+    member _.TryBeginAgentOperation(
+        userId: string, agentId: string, toolName: string,
+        projectName: string option, serverVersion: string,
+        clientVersion: string option, protocolVersion: string option
+    ) : Result<OperationStart, string> =
+        if String.IsNullOrWhiteSpace userId || String.IsNullOrWhiteSpace agentId
+           || agentId.Length > 256 then
+            Error "The authenticated user and bounded initiating agent are required."
+        else
+            try
+                let normalized = agentId.ToUpperInvariant()
+                let startedAt = DateTimeOffset.UtcNow
+                let requestId = Guid.NewGuid().ToString("N")
+                use connection = openConnection()
+                // SQLite's default non-deferred transaction takes the writer
+                // reservation before reading the correction gate: no check/
+                // insertion race with an operator acquisition.
+                use transaction = connection.BeginTransaction()
+                use existing = connection.CreateCommand()
+                existing.Transaction <- transaction
+                existing.CommandText <-
+                    """SELECT 1 FROM agent_correction_permit
+                       WHERE user_id = $userId AND agent_id = $agentId LIMIT 1;"""
+                addParameter existing "$userId" userId
+                addParameter existing "$agentId" normalized
+                if not (isNull (existing.ExecuteScalar())) then
+                    Error "Administrative correction is currently excluding this agent's commands."
+                else
+                    use telemetry = connection.CreateCommand()
+                    telemetry.Transaction <- transaction
+                    telemetry.CommandText <-
+                        """INSERT INTO operations (
+                               id, created_at, user_id, project_name, tool_name,
+                               server_version, client_version, protocol_version
+                           ) VALUES (
+                               $id, $createdAt, $userId, $projectName, $toolName,
+                               $serverVersion, $clientVersion, $protocolVersion
+                           );"""
+                    addParameter telemetry "$id" requestId
+                    addParameter telemetry "$createdAt" (startedAt.ToString("O"))
+                    addParameter telemetry "$userId" userId
+                    addParameter telemetry "$projectName" (dbValue projectName)
+                    addParameter telemetry "$toolName" toolName
+                    addParameter telemetry "$serverVersion" serverVersion
+                    addParameter telemetry "$clientVersion" (dbValue clientVersion)
+                    addParameter telemetry "$protocolVersion" (dbValue protocolVersion)
+                    telemetry.ExecuteNonQuery() |> ignore
+                    use witness = connection.CreateCommand()
+                    witness.Transaction <- transaction
+                    witness.CommandText <-
+                        """INSERT INTO agent_execution_witness (
+                               request_id, user_id, agent_id, project_name,
+                               tool_name, state, created_at, updated_at
+                           ) VALUES (
+                               $id, $userId, $agentId, $projectName,
+                               $toolName, 'Admitted', $createdAt, $createdAt
+                           );"""
+                    addParameter witness "$id" requestId
+                    addParameter witness "$userId" userId
+                    addParameter witness "$agentId" normalized
+                    addParameter witness "$projectName" (dbValue projectName)
+                    addParameter witness "$toolName" toolName
+                    addParameter witness "$createdAt" (startedAt.ToString("O"))
+                    witness.ExecuteNonQuery() |> ignore
+                    transaction.Commit()
+                    Ok { Id = requestId; StartedAt = startedAt }
+            with ex ->
+                Error $"Cannot record durable agent admission: {ex.Message}"
+
+    // For a two-stage cross-project notification, the source AgentInbox
+    // validation is a genuine agent operation. Its exact client-terminal
+    // receipt must be persisted *before* a separate destination dispatch.
+    // Create one child witness without duplicating parent MCP telemetry.
+    // The same writer transaction excludes a concurrent correction of the
+    // source agent between the two independently correlated dispatches.
+    member _.TryBeginAgentContinuation(
+        userId: string, parentRequestId: string, destinationProject: string
+    ) : Result<string, string> =
+        if String.IsNullOrWhiteSpace userId
+           || String.IsNullOrWhiteSpace parentRequestId
+           || String.IsNullOrWhiteSpace destinationProject then
+            Error "An authenticated terminal parent and destination are required."
+        else
+            try
+                use connection = openConnection()
+                use transaction = connection.BeginTransaction()
+                use parent = connection.CreateCommand()
+                parent.Transaction <- transaction
+                parent.CommandText <-
+                    """SELECT agent_id, state, parent_request_id,
+                              tool_name, client_response_at, client_response_succeeded
+                       FROM agent_execution_witness
+                       WHERE user_id = $userId AND request_id = $parent LIMIT 1;"""
+                addParameter parent "$userId" userId
+                addParameter parent "$parent" parentRequestId
+                use parentReader = parent.ExecuteReader()
+                let root =
+                    if parentReader.Read() then
+                        Some(
+                            parentReader.GetString 0,
+                            parentReader.GetString 1,
+                            parentReader.IsDBNull 2,
+                            optionText parentReader 3,
+                            not (parentReader.IsDBNull 4),
+                            not (parentReader.IsDBNull 5) && parentReader.GetInt32 5 = 1)
+                    else None
+                parentReader.Close()
+                match root with
+                // Logical notification continuation only requires the
+                // authenticated source client reply. An OS descendant-tree
+                // quiescence certificate is needed separately for correction.
+                | Some(agent, state, true, Some "NotifyAgent", responded, succeeded)
+                    when responded && succeeded && (state = "Terminal" || state = "Dispatched") ->
+                    use correction = connection.CreateCommand()
+                    correction.Transaction <- transaction
+                    correction.CommandText <-
+                        """SELECT 1 FROM agent_correction_permit
+                           WHERE user_id = $userId AND agent_id = $agent LIMIT 1;"""
+                    addParameter correction "$userId" userId
+                    addParameter correction "$agent" agent
+                    if not (isNull (correction.ExecuteScalar())) then
+                        Error "Correction permit excludes the source agent's continuation."
+                    else
+                        let childId = Guid.NewGuid().ToString("N")
+                        let now = DateTimeOffset.UtcNow.ToString("O")
+                        use insert = connection.CreateCommand()
+                        insert.Transaction <- transaction
+                        insert.CommandText <-
+                            """INSERT INTO agent_execution_witness (
+                                   request_id, user_id, agent_id, project_name,
+                                   tool_name, state, created_at, updated_at, parent_request_id
+                               ) VALUES (
+                                   $childId, $userId, $agent, $project,
+                                   'NotifyAgent', 'Admitted', $now, $now, $parent
+                               );"""
+                        addParameter insert "$childId" childId
+                        addParameter insert "$userId" userId
+                        addParameter insert "$agent" agent
+                        addParameter insert "$project" destinationProject
+                        addParameter insert "$now" now
+                        addParameter insert "$parent" parentRequestId
+                        insert.ExecuteNonQuery() |> ignore
+                        transaction.Commit()
+                        Ok childId
+                | Some (_, "Admitted", _, _, _, _) | Some (_, "Dispatched", _, _, _, _) ->
+                    Error "Source validation has no authenticated successful completed reply."
+                | Some (_, "NotDispatched", _, _, _, _) ->
+                    Error "Source validation was not dispatched; continuation is forbidden."
+                | Some (_, "Terminal", false, _, _, _) ->
+                    Error "Cannot create a continuation from an already nested request."
+                | _ ->
+                    Error "Parent is not a root NotifyAgent with a witnessed client reply."
+            with ex ->
+                Error $"Cannot durably admit cross-project continuation: {ex.Message}"
+
+    // Claim the exclusive operator correction barrier in the same SQLite
+    // writer-serialization domain as TryBeginAgentOperation. A pending or
+    // dispatched request vetoes it, including after server restart.
+    member private this.AcquireAgentCorrectionCore(
+        userId: string, targetAgentId: string, operationId: string,
+        requestBinding: AgentCorrectionRequestBinding option
+    ) : Result<string, string> =
+        if String.IsNullOrWhiteSpace userId
+           || String.IsNullOrWhiteSpace targetAgentId
+           || targetAgentId.Length > 256
+           || String.IsNullOrWhiteSpace operationId
+           || (requestBinding |> Option.exists (fun request ->
+                  [ request.ProjectName; request.RequestingAgentId
+                    request.InitiatingRequestId; request.DeviceId ]
+                  |> List.exists String.IsNullOrWhiteSpace
+                  || request.DeviceGeneration < 1L
+                  || String.IsNullOrWhiteSpace request.RequestFingerprint
+                  || request.RequestFingerprint.Length <> 64
+                  || not (request.RequestFingerprint |> Seq.forall Uri.IsHexDigit)))
+           || (requestBinding.IsSome &&
+               (match Guid.TryParse operationId with
+                | true, parsed when parsed <> Guid.Empty -> false
+                | _ -> true)) then
+            Error "Correction requires authenticated, bounded, request-bound identities and operation fingerprint."
+        else
+            try
+                // Git indexes UUIDs as Guid values, not original text. The
+                // permanent server claim MUST use the same canonical key:
+                // "{UPPER}" and "lower" cannot claim the same UUID twice.
+                let operationId =
+                    if requestBinding.IsSome then Guid.Parse(operationId).ToString("D")
+                    else operationId // old internal unbound test fixture
+                let agent = targetAgentId.ToUpperInvariant()
+                use connection = openConnection()
+                use transaction = connection.BeginTransaction()
+                use current = connection.CreateCommand()
+                current.Transaction <- transaction
+                current.CommandText <-
+                    """SELECT permit_id, operation_id, project_name,
+                              requesting_agent_id, request_fingerprint,
+                              initiating_request_id, device_id,
+                              device_generation FROM agent_correction_permit
+                       WHERE user_id = $userId AND agent_id = $agentId LIMIT 1;"""
+                addParameter current "$userId" userId
+                addParameter current "$agentId" agent
+                use existing = current.ExecuteReader()
+                let prior =
+                    if existing.Read() then
+                        Some(existing.GetString 0, existing.GetString 1,
+                             optionText existing 2, optionText existing 3,
+                             optionText existing 4, optionText existing 5,
+                             optionText existing 6,
+                             (if existing.IsDBNull 7 then None else Some(existing.GetInt64 7)))
+                    else None
+                existing.Close()
+                // Ownership of a canonical correction UUID is permanent even
+                // after its short-lived target permit has been released.
+                // This query and the initial insert share the same SQLite
+                // writer transaction as agent admission and exclusion.
+                use owned = connection.CreateCommand()
+                owned.Transaction <- transaction
+                owned.CommandText <-
+                    """SELECT target_agent_id, project_name, requesting_agent_id,
+                              request_fingerprint, device_id, device_generation
+                       FROM agent_correction_operation_identity
+                       WHERE user_id = $userId AND operation_id = $operationId
+                       LIMIT 1;"""
+                addParameter owned "$userId" userId
+                addParameter owned "$operationId" operationId
+                use ownedReader = owned.ExecuteReader()
+                let permanentIdentity =
+                    if ownedReader.Read() then
+                        Some(ownedReader.GetString 0, ownedReader.GetString 1,
+                             ownedReader.GetString 2, ownedReader.GetString 3,
+                             ownedReader.GetString 4, ownedReader.GetInt64 5)
+                    else None
+                ownedReader.Close()
+                let identityMatches =
+                    match requestBinding, permanentIdentity with
+                    | None, None -> true // unbound internal test path
+                    | Some _, None -> true // first production claim
+                    | Some request, Some(target, project, actor, fingerprint, device, generation) ->
+                        target = agent
+                        && project = request.ProjectName
+                        && actor = request.RequestingAgentId
+                        && fingerprint = request.RequestFingerprint
+                        && device = request.DeviceId
+                        && generation = request.DeviceGeneration
+                    | _ -> false
+                // The initiator's own pre-dispatch witness must exist, be
+                // owned by the authenticated user and match the exact source
+                // agent/project before any target exclusion can be borrowed.
+                // A fresh retry has its own witness; the original witness ID
+                // remains immutable in the persisted permit for reconciliation.
+                let witnessMatches (requestId: string) (sourceAgent: string)
+                                   (sourceProject: string) (requiresAdmission: bool) =
+                    use witness = connection.CreateCommand()
+                    witness.Transaction <- transaction
+                    witness.CommandText <-
+                        """SELECT 1 FROM agent_execution_witness
+                           WHERE user_id = $userId AND request_id = $requestId
+                             AND agent_id = $actor AND project_name = $project
+                             AND tool_name = 'TaskWrite'
+                             AND ($admitted = 0 OR state = 'Admitted')
+                           LIMIT 1;"""
+                    addParameter witness "$userId" userId
+                    addParameter witness "$requestId" requestId
+                    addParameter witness "$actor" (sourceAgent.ToUpperInvariant())
+                    addParameter witness "$project" sourceProject
+                    addParameter witness "$admitted" (if requiresAdmission then 1 else 0)
+                    not (isNull (witness.ExecuteScalar()))
+                let requestAdmitted =
+                    match requestBinding with
+                    | None -> true // legacy internal test entrypoint only
+                    | Some request ->
+                        witnessMatches request.InitiatingRequestId
+                            request.RequestingAgentId request.ProjectName true
+                // Pin the selected device and registration generation while
+                // the same SQLite writer transaction holds the target permit.
+                let pinRoute () =
+                    match requestBinding with
+                    | None -> Ok ()
+                    | Some request ->
+                        use pin = connection.CreateCommand()
+                        pin.Transaction <- transaction
+                        pin.CommandText <-
+                            """UPDATE agent_execution_witness
+                               SET expected_device_id = $device,
+                                   expected_device_generation = $generation
+                               WHERE user_id = $userId AND request_id = $requestId
+                                 AND state = 'Admitted'
+                                 AND ((expected_device_id IS NULL
+                                       AND expected_device_generation IS NULL)
+                                      OR (expected_device_id = $device
+                                          AND expected_device_generation = $generation));"""
+                        addParameter pin "$userId" userId
+                        addParameter pin "$requestId" request.InitiatingRequestId
+                        addParameter pin "$device" request.DeviceId
+                        addParameter pin "$generation" request.DeviceGeneration
+                        if pin.ExecuteNonQuery() = 1 then Ok ()
+                        else Error "Correction route could not be pinned to the admitted initiating witness."
+                let matchesPrior priorProject priorActor priorFingerprint priorRequest priorDevice
+                                 (priorGeneration: int64 option) =
+                    match requestBinding with
+                    | None ->
+                        ([ priorProject; priorActor; priorFingerprint; priorRequest; priorDevice ]
+                         |> List.forall Option.isNone)
+                        && Option.isNone priorGeneration
+                    | Some request ->
+                        priorProject = Some request.ProjectName
+                        && priorActor = Some request.RequestingAgentId
+                        && priorFingerprint = Some request.RequestFingerprint
+                        && priorDevice = Some request.DeviceId
+                        && priorGeneration = Some request.DeviceGeneration
+                        // An old permit whose original witness was lost or
+                        // rewritten is never a valid source of replay proof.
+                        && (priorRequest |> Option.exists (fun original ->
+                            not (String.IsNullOrWhiteSpace original)
+                            && witnessMatches original request.RequestingAgentId
+                                request.ProjectName false))
+                let epochReady =
+                    match this.ReadVerifiedExecutionEpoch(connection, Some transaction) with
+                    | Ok (LegacyDrainVerified _) -> true
+                    | _ -> false
+                let registerPermanentIdentity () =
+                    match requestBinding, permanentIdentity with
+                    | Some request, None ->
+                        use record = connection.CreateCommand()
+                        record.Transaction <- transaction
+                        record.CommandText <-
+                            """INSERT INTO agent_correction_operation_identity
+                               (user_id, operation_id, target_agent_id,
+                                project_name, requesting_agent_id,
+                                request_fingerprint, device_id,
+                                device_generation, initiating_request_id, created_at)
+                               VALUES ($userId, $operationId, $target,
+                                       $project, $actor, $fingerprint, $device,
+                                       $generation, $requestId, $now);"""
+                        addParameter record "$userId" userId
+                        addParameter record "$operationId" operationId
+                        addParameter record "$target" agent
+                        addParameter record "$project" request.ProjectName
+                        addParameter record "$actor" request.RequestingAgentId
+                        addParameter record "$fingerprint" request.RequestFingerprint
+                        addParameter record "$device" request.DeviceId
+                        addParameter record "$generation" request.DeviceGeneration
+                        addParameter record "$requestId" request.InitiatingRequestId
+                        addParameter record "$now" (DateTimeOffset.UtcNow.ToString("O"))
+                        if record.ExecuteNonQuery() = 1 then Ok ()
+                        else Error "Cannot durably bind correction operation UUID."
+                    | Some _, Some _ -> Ok () // exact existing record, never altered
+                    | None, None -> Ok () // internal legacy test fixture only
+                    | None, Some _ ->
+                        Error "Unbound correction cannot borrow a registered operation UUID."
+                match prior with
+                | _ when not epochReady ->
+                    Error "Protocol epoch has not proven pre-witness legacy activity quiescent."
+                | _ when not requestAdmitted ->
+                    Error "Administrative correction has no matching durable initiating request witness."
+                | _ when not identityMatches ->
+                    Error "Correction operation UUID is permanently bound to another target, device or canonical request."
+                | Some _ when requestBinding.IsSome && permanentIdentity.IsNone ->
+                    // A bound permit from an older server has no trusted
+                    // immutable UUID history. Never silently backfill it.
+                    Error "Existing correction permit lacks permanent operation identity evidence."
+                | Some (permit, previousOperation, project, actor, fingerprint, requestId, device, generation)
+                    when previousOperation = operationId
+                         && matchesPrior project actor fingerprint requestId device generation ->
+                    match pinRoute() with
+                    | Error failure -> Error failure
+                    | Ok () ->
+                        transaction.Commit()
+                        Ok permit // exact command, immutable device and generation
+                | Some (_, previousOperation, _, _, _, _, _, _) when previousOperation = operationId ->
+                    Error "Correction operation ID was reused for a different project, actor or command."
+                | Some _ -> Error "Another administrative correction is unresolved."
+                | None ->
+                    use busy = connection.CreateCommand()
+                    busy.Transaction <- transaction
+                    busy.CommandText <-
+                        """SELECT 1 FROM agent_execution_witness
+                           WHERE user_id = $userId AND agent_id = $agentId
+                           AND state NOT IN ('Terminal', 'NotDispatched')
+                           LIMIT 1;"""
+                    addParameter busy "$userId" userId
+                    addParameter busy "$agentId" agent
+                    if not (isNull (busy.ExecuteScalar())) then
+                        Error "Cannot prove the agent is inactive: unresolved execution witness exists."
+                    else
+                        let permit = Guid.NewGuid().ToString("N")
+                        use insert = connection.CreateCommand()
+                        insert.Transaction <- transaction
+                        insert.CommandText <-
+                            """INSERT INTO agent_correction_permit
+                               (user_id, agent_id, permit_id, operation_id, created_at,
+                                project_name, requesting_agent_id, request_fingerprint,
+                                initiating_request_id, device_id, device_generation)
+                               VALUES ($userId, $agentId, $permit, $operationId, $now,
+                                       $project, $actor, $fingerprint, $requestId,
+                                       $device, $generation);"""
+                        addParameter insert "$userId" userId
+                        addParameter insert "$agentId" agent
+                        addParameter insert "$permit" permit
+                        addParameter insert "$operationId" operationId
+                        addParameter insert "$now" (DateTimeOffset.UtcNow.ToString("O"))
+                        addParameter insert "$project"
+                            (requestBinding |> Option.map _.ProjectName |> dbValue)
+                        addParameter insert "$actor"
+                            (requestBinding |> Option.map _.RequestingAgentId |> dbValue)
+                        addParameter insert "$fingerprint"
+                            (requestBinding |> Option.map _.RequestFingerprint |> dbValue)
+                        addParameter insert "$requestId"
+                            (requestBinding |> Option.map _.InitiatingRequestId |> dbValue)
+                        addParameter insert "$device"
+                            (requestBinding |> Option.map _.DeviceId |> dbValue)
+                        addParameter insert "$generation"
+                            (requestBinding |> Option.map _.DeviceGeneration |> dbValue)
+                        match pinRoute() with
+                        | Error failure -> Error failure
+                        | Ok () ->
+                            match registerPermanentIdentity() with
+                            | Error failure -> Error failure
+                            | Ok () ->
+                                insert.ExecuteNonQuery() |> ignore
+                                transaction.Commit()
+                                Ok permit
+            with ex ->
+                Error $"Cannot acquire durable correction barrier: {ex.Message}"
+
+    // Retain the existing internal test/legacy overload. It may not replay
+    // a fully bound production permit or authorize any unbound migrated row.
+    member this.TryAcquireAgentCorrection(userId, targetAgentId, operationId) =
+        this.AcquireAgentCorrectionCore(userId, targetAgentId, operationId, None)
+
+    member this.TryAcquireAgentCorrectionForRequest(
+        userId, targetAgentId, operationId, requestBinding: AgentCorrectionRequestBinding
+    ) =
+        this.AcquireAgentCorrectionCore(userId, targetAgentId, operationId, Some requestBinding)
+
+    // A correction gate does not disappear on timeout, network failure or
+    // server restart. The caller must first establish a definitive canonical
+    // Git operation result (or independently prove the operation did not run).
+    member _.TryReleaseAgentCorrection(
+        userId: string, targetAgentId: string, permitId: string,
+        canonicalOutcomeResolved: bool
+    ) : Result<unit, string> =
+        if not canonicalOutcomeResolved then
+            Error "Ambiguous canonical correction; exclusive gate remains held."
+        else
+            try
+                use connection = openConnection()
+                use command = connection.CreateCommand()
+                command.CommandText <-
+                    """DELETE FROM agent_correction_permit
+                       WHERE user_id = $userId AND agent_id = $agentId
+                       AND permit_id = $permit;"""
+                addParameter command "$userId" userId
+                addParameter command "$agentId" (targetAgentId.ToUpperInvariant())
+                addParameter command "$permit" permitId
+                if command.ExecuteNonQuery() = 1 then Ok ()
+                else Error "Unknown or stale correction permit."
+            with ex -> Error $"Cannot release correction barrier: {ex.Message}"
+
+    /// Inspect exactly one unresolved correction permit without admitting work,
+    /// changing its owner or clearing the gate. A missing permit is not proof
+    /// that an agent is inactive: also check execution witnesses and epoch.
+    member _.InspectAgentCorrectionPermit(
+        userId: string, targetAgentId: string
+    ) : Result<AgentCorrectionPermitEvidence option, string> =
+        if String.IsNullOrWhiteSpace userId
+           || String.IsNullOrWhiteSpace targetAgentId
+           || targetAgentId.Length > 256 then
+            Error "Authenticated user and bounded target agent are required."
+        else
+            try
+                use connection = openConnection()
+                use command = connection.CreateCommand()
+                command.CommandText <-
+                    """SELECT agent_id, permit_id, operation_id, created_at,
+                              project_name, requesting_agent_id,
+                              request_fingerprint, initiating_request_id,
+                              device_id, device_generation
+                       FROM agent_correction_permit
+                       WHERE user_id = $userId AND agent_id = $agentId LIMIT 1;"""
+                addParameter command "$userId" userId
+                addParameter command "$agentId" (targetAgentId.ToUpperInvariant())
+                use reader = command.ExecuteReader()
+                if not (reader.Read()) then Ok None
+                elif [0; 1; 2; 3] |> List.exists reader.IsDBNull then
+                    Error "Durable correction permit is incomplete."
+                else
+                    let agentId = reader.GetString 0
+                    let permitId = reader.GetString 1
+                    let operationId = reader.GetString 2
+                    let timestamp = reader.GetString 3
+                    if String.IsNullOrWhiteSpace agentId
+                       || String.IsNullOrWhiteSpace permitId
+                       || String.IsNullOrWhiteSpace operationId then
+                        Error "Durable correction permit identity is malformed."
+                    else
+                        match DateTimeOffset.TryParse timestamp with
+                        | true, at ->
+                            let project, actor, fingerprint, requestId =
+                                optionText reader 4, optionText reader 5,
+                                optionText reader 6, optionText reader 7
+                            let deviceId = optionText reader 8
+                            let generation =
+                                if reader.IsDBNull 9 then None else Some(reader.GetInt64 9)
+                            let bound = [ project; actor; fingerprint; requestId; deviceId ]
+                            if bound |> List.exists (Option.exists String.IsNullOrWhiteSpace)
+                               || (bound |> List.exists Option.isSome
+                                   && (bound |> List.exists Option.isNone
+                                       || generation.IsNone))
+                               || (generation |> Option.exists (fun value -> value < 1L))
+                               || (generation.IsSome && bound |> List.forall Option.isNone) then
+                                Error "Durable correction permit provenance is incomplete."
+                            else
+                                Ok(Some
+                                    { TargetAgentId = agentId; PermitId = permitId
+                                      OperationId = operationId; CreatedAt = at
+                                      ProjectName = project; RequestingAgentId = actor
+                                      RequestFingerprint = fingerprint; InitiatingRequestId = requestId
+                                      DeviceId = deviceId; DeviceGeneration = generation })
+                        | _ -> Error "Durable correction permit timestamp is malformed."
+            with ex -> Error $"Cannot inspect correction permit evidence: {ex.Message}"
+
+    // Bind the exact routed connection before SignalR dispatch is attempted.
+    // Once bound, an HTTP cancellation or server timeout leaves the witness
+    // Dispatched until authenticated client-terminal evidence arrives.
+    member _.TryMarkAgentDispatched(
+        userId: string, requestId: string,
+        deviceId: string, connectionId: string, generation: int64,
+        correlationId: string
+    ) : Result<unit, string> =
+        if [ userId; requestId; deviceId; connectionId; correlationId ]
+           |> List.exists String.IsNullOrWhiteSpace
+           || generation < 1L then
+            Error "Dispatch requires authenticated user, request, device, connection, generation and correlation."
+        else
+            try
+                use connection = openConnection()
+                use command = connection.CreateCommand()
+                command.CommandText <-
+                    """UPDATE agent_execution_witness
+                       SET state = 'Dispatched', device_id = $deviceId,
+                           connection_id = $connectionId,
+                           device_generation = $generation, correlation_id = $correlationId,
+                           updated_at = $now
+                       WHERE user_id = $userId AND request_id = $requestId
+                           AND state = 'Admitted'
+                           AND ((expected_device_id IS NULL AND expected_device_generation IS NULL)
+                                OR (expected_device_id = $deviceId
+                                    AND expected_device_generation = $generation));"""
+                addParameter command "$userId" userId
+                addParameter command "$requestId" requestId
+                addParameter command "$deviceId" deviceId
+                addParameter command "$connectionId" connectionId
+                addParameter command "$generation" generation
+                addParameter command "$correlationId" correlationId
+                addParameter command "$now" (DateTimeOffset.UtcNow.ToString("O"))
+                if command.ExecuteNonQuery() = 1 then Ok ()
+                else Error "Dispatch request is missing or already left the admitted state."
+            with ex -> Error $"Cannot persist exact agent dispatch: {ex.Message}"
+
+    // Only call when the request is *provably* not sent to the client.
+    // A SignalR timeout or exception after calling ReceiveCommand cannot
+    // prove this and must leave the witness unresolved.
+    member _.TryMarkAgentNotDispatched(userId: string, requestId: string) : Result<unit, string> =
+        try
+            use connection = openConnection()
+            use command = connection.CreateCommand()
+            command.CommandText <-
+                """UPDATE agent_execution_witness
+                   SET state = 'NotDispatched', updated_at = $now, terminal_at = $now
+                   WHERE user_id = $userId AND request_id = $requestId
+                       AND state = 'Admitted';"""
+            addParameter command "$userId" userId
+            addParameter command "$requestId" requestId
+            addParameter command "$now" (DateTimeOffset.UtcNow.ToString("O"))
+            if command.ExecuteNonQuery() = 1 then Ok ()
+            else Error "Cannot certify non-dispatch for this request."
+        with ex -> Error $"Cannot record proven non-dispatch: {ex.Message}"
+
+    // This query is part of the correction release proof. It may be called
+    // only after the client response is known, but does NOT itself certify
+    // that a Git operation committed. Missing/corrupt rows fail closed.
+    member _.GetAgentExecutionResolution(userId: string, requestId: string)
+        : Result<AgentExecutionResolution, string> =
+        if String.IsNullOrWhiteSpace userId || String.IsNullOrWhiteSpace requestId then
+            Error "Authenticated operation identity is required."
+        else
+            try
+                use connection = openConnection()
+                use command = connection.CreateCommand()
+                command.CommandText <-
+                    """SELECT state FROM agent_execution_witness
+                       WHERE user_id = $userId AND request_id = $requestId LIMIT 1;"""
+                addParameter command "$userId" userId
+                addParameter command "$requestId" requestId
+                match command.ExecuteScalar() with
+                | :? string as status ->
+                    match status with
+                    | "Terminal" -> Ok AuthenticatedClientFinished
+                    | "NotDispatched" -> Ok NeverDispatched
+                    | "Admitted" | "Dispatched" -> Ok ExecutionUnresolved
+                    | _ -> Error "Execution witness status is invalid."
+                | _ -> Error "Execution witness was not found for authenticated request."
+            with ex -> Error $"Cannot read exact execution witness: {ex.Message}"
+
+    /// Persist the exact server-issued GetJobResult route before dispatch.
+    /// The client reply cannot authoritatively finish any other job or actor.
+    /// Missing original evidence is normal for unrelated job polling and
+    /// cannot be treated as proof of completion.
+    member _.TryRecordAgentToolJobPollDispatch(
+        userId: string, deviceId: string, connectionId: string,
+        generation: int64, correlationId: string, agentId: string,
+        projectName: string, jobId: string
+    ) : Result<string option, string> =
+        let mutable parsed = Guid.Empty
+        if [userId; deviceId; connectionId; correlationId; agentId; projectName; jobId]
+           |> List.exists (fun value -> String.IsNullOrWhiteSpace value || value.Length > 512)
+           || generation < 1L
+           || not (Guid.TryParseExact(jobId, "N", &parsed))
+           || parsed = Guid.Empty
+           || jobId <> parsed.ToString("N") then
+            Error "Authenticated bounded GetJobResult dispatch route and canonical job identity are required."
+        else
+            try
+                use connection = openConnection()
+                use transaction = connection.BeginTransaction()
+                use lookup = connection.CreateCommand()
+                lookup.Transaction <- transaction
+                lookup.CommandText <-
+                    """SELECT request_id FROM agent_execution_witness
+                       WHERE user_id = $userId AND agent_id = $agentId
+                         AND device_id = $deviceId
+                         AND connection_id = $connectionId
+                         AND device_generation = $generation
+                         AND project_name = $projectName
+                         AND tool_job_id = $jobId
+                         AND state = 'Dispatched'
+                         AND tool_job_receipt_at IS NOT NULL
+                       LIMIT 1;"""
+                addParameter lookup "$userId" userId
+                addParameter lookup "$agentId" (agentId.ToUpperInvariant())
+                addParameter lookup "$deviceId" deviceId
+                addParameter lookup "$connectionId" connectionId
+                addParameter lookup "$generation" generation
+                addParameter lookup "$projectName" projectName
+                addParameter lookup "$jobId" jobId
+                match lookup.ExecuteScalar() with
+                | :? string as requestId ->
+                    use record = connection.CreateCommand()
+                    record.Transaction <- transaction
+                    record.CommandText <-
+                        """INSERT INTO agent_tool_job_poll
+                           (correlation_id, user_id, device_id, connection_id,
+                            device_generation, agent_id, project_name, job_id,
+                            original_request_id, created_at)
+                           VALUES ($correlation, $userId, $deviceId, $connectionId,
+                                   $generation, $agentId, $projectName, $jobId,
+                                   $requestId, $now);"""
+                    addParameter record "$correlation" correlationId
+                    addParameter record "$userId" userId
+                    addParameter record "$deviceId" deviceId
+                    addParameter record "$connectionId" connectionId
+                    addParameter record "$generation" generation
+                    addParameter record "$agentId" (agentId.ToUpperInvariant())
+                    addParameter record "$projectName" projectName
+                    addParameter record "$jobId" jobId
+                    addParameter record "$requestId" requestId
+                    addParameter record "$now" (DateTimeOffset.UtcNow.ToString("O"))
+                    record.ExecuteNonQuery() |> ignore
+                    transaction.Commit()
+                    Ok(Some requestId)
+                | _ -> Ok None
+            with ex ->
+                Error $"Cannot durably bind an authenticated tool-job poll: {ex.Message}"
+
+    // A promoted MCP ToolOperation has returned a handle while the original
+    // command is STILL RUNNING. Persist the handle on the exact routed witness,
+    // never advance its state to Terminal, and never infer completion from a
+    // subsequent polling response until a separate authenticated end-to-end
+    // completion protocol is available.
+    member _.TryRecordAgentDeferredToolJob(
+        userId: string, connectionId: string, generation: int64,
+        correlationId: string, actorId: string, commandName: string,
+        jobId: string, startedAt: DateTimeOffset,
+        ?operationId: string, ?projectName: string
+    ) : Result<string option, string> =
+        let mutable parsedId = Guid.Empty
+        if [userId; connectionId; correlationId; actorId; commandName; jobId]
+            |> List.exists String.IsNullOrWhiteSpace
+           || generation < 1L
+           || not (Guid.TryParseExact(jobId, "N", &parsedId))
+           || parsedId = Guid.Empty
+           || not (String.Equals(jobId, parsedId.ToString("N"), StringComparison.Ordinal))
+           || startedAt = DateTimeOffset.MinValue
+           || (operationId |> Option.exists (fun id ->
+                String.IsNullOrWhiteSpace id || id.Length > 256))
+           || (projectName |> Option.exists (fun project ->
+                String.IsNullOrWhiteSpace project || project.Length > 256)) then
+            Error "Deferred tool-job receipt requires authenticated bounded provenance and canonical GUID-N job identity."
+        else
+            try
+                use connection = openConnection()
+                use transaction = connection.BeginTransaction()
+                use lookup = connection.CreateCommand()
+                lookup.Transaction <- transaction
+                lookup.CommandText <-
+                    """SELECT request_id, agent_id, tool_name, state,
+                              project_name, parent_request_id
+                       FROM agent_execution_witness
+                       WHERE user_id = $userId AND connection_id = $connectionId
+                         AND device_generation = $generation AND correlation_id = $correlationId
+                       LIMIT 1;"""
+                addParameter lookup "$userId" userId
+                addParameter lookup "$connectionId" connectionId
+                addParameter lookup "$generation" generation
+                addParameter lookup "$correlationId" correlationId
+                use reader = lookup.ExecuteReader()
+                let found =
+                    if reader.Read() then
+                        Some (reader.GetString 0, reader.GetString 1,
+                              optionText reader 2, reader.GetString 3,
+                              optionText reader 4, optionText reader 5)
+                    else None
+                reader.Close()
+                match found with
+                | None -> Ok None
+                | Some (requestId, actor, Some tool, "Dispatched", witnessProject, parent)
+                    when actor = actorId.ToUpperInvariant()
+                         && knownCommandTypes.Contains tool
+                         && (projectName.IsNone || projectName = witnessProject)
+                         && (tool = commandName && tool <> "StartJob"
+                             // NotifyAgent is a logical two-stage command:
+                             // source is a TaskRead, and destination is a
+                             // TaskWrite. Both retain the original actor and
+                             // must match an exact authenticated route.
+                             || tool = "NotifyAgent"
+                                && (commandName = "TaskWrite"
+                                    || parent.IsNone && commandName = "TaskRead")) ->
+                    use record = connection.CreateCommand()
+                    record.Transaction <- transaction
+                    record.CommandText <-
+                        """UPDATE agent_execution_witness
+                           SET tool_job_id = $jobId,
+                               tool_job_operation_id = $operationId,
+                               tool_job_started_at = $startedAt,
+                               tool_job_receipt_at = COALESCE(tool_job_receipt_at, $now),
+                               updated_at = $now
+                           WHERE request_id = $requestId
+                             AND state = 'Dispatched' AND tool_name = $tool
+                             AND job_id IS NULL
+                             AND (tool_job_id IS NULL
+                                  OR (tool_job_id = $jobId
+                                      AND tool_job_started_at = $startedAt
+                                      AND tool_job_operation_id IS $operationId));"""
+                    addParameter record "$requestId" requestId
+                    addParameter record "$tool" tool
+                    addParameter record "$jobId" jobId
+                    addParameter record "$operationId" (dbValue operationId)
+                    addParameter record "$startedAt" (startedAt.ToString("O"))
+                    addParameter record "$now" (DateTimeOffset.UtcNow.ToString("O"))
+                    if record.ExecuteNonQuery() <> 1 then
+                        Error "Conflicting deferred tool-job receipt; execution remains unresolved."
+                    else
+                        transaction.Commit()
+                        Ok (Some requestId)
+                | Some _ ->
+                    Error "Deferred job does not match the admitted agent, command or unresolved route."
+            with ex ->
+                Error $"Cannot durably record deferred tool-job identity: {ex.Message}"
+
+    /// A tool-job result can close the original witness only when its
+    /// GetJobResult dispatch was durably bound to the exact authenticated
+    /// client route before the poll. A returned JSON body alone is not proof.
+    member _.TryRecordAgentToolJobPollTerminal(
+        userId: string, connectionId: string, generation: int64,
+        correlationId: string, clientResponse: AgentCommandResponse
+    ) : Result<string option, string> =
+        if [userId; connectionId; correlationId] |> List.exists String.IsNullOrWhiteSpace
+           || generation < 1L then
+            Error "Authenticated GetJobResult route is required."
+        else
+            try
+                use connection = openConnection()
+                use transaction = connection.BeginTransaction()
+                use lookup = connection.CreateCommand()
+                lookup.Transaction <- transaction
+                lookup.CommandText <-
+                    """SELECT original.request_id, original.state,
+                              original.tool_name, original.tool_job_id,
+                              original.tool_job_operation_id
+                       FROM agent_tool_job_poll AS poll
+                       JOIN agent_execution_witness AS original
+                         ON original.request_id = poll.original_request_id
+                         AND original.user_id = poll.user_id
+                         AND original.agent_id = poll.agent_id
+                         AND original.project_name = poll.project_name
+                         AND original.device_id = poll.device_id
+                         AND original.connection_id = poll.connection_id
+                         AND original.device_generation = poll.device_generation
+                         AND original.tool_job_id = poll.job_id
+                       WHERE poll.user_id = $userId
+                         AND poll.connection_id = $connectionId
+                         AND poll.device_generation = $generation
+                         AND poll.correlation_id = $correlationId
+                       LIMIT 1;"""
+                addParameter lookup "$userId" userId
+                addParameter lookup "$connectionId" connectionId
+                addParameter lookup "$generation" generation
+                addParameter lookup "$correlationId" correlationId
+                use reader = lookup.ExecuteReader()
+                let found =
+                    if reader.Read() then
+                        Some(reader.GetString 0, reader.GetString 1,
+                             optionText reader 2, reader.GetString 3,
+                             optionText reader 4)
+                    else None
+                reader.Close()
+                match found with
+                | None -> Ok None
+                | Some (requestId, "Terminal", _, _, _) ->
+                    Ok(Some requestId) // authenticated idempotent replay
+                | Some (requestId, "Dispatched", Some tool, jobId, operationId)
+                    when knownCommandTypes.Contains tool ->
+                    let verified =
+                        match clientResponse.Result, clientResponse.Error,
+                              clientResponse.PendingJob with
+                        | Some payload, None, None ->
+                            try
+                                let result = JsonSerializer.Deserialize<JobResult>(payload)
+                                if isNull (box result) || result.JobId <> jobId
+                                   || result.OperationId <> operationId then
+                                    Error "Job or original operation identity differs from authenticated poll."
+                                else
+                                    match result.Status, result.ToolResponse with
+                                    | ToolCompleted, Some final
+                                        when final.PendingJob.IsNone && final.Error.IsNone -> Ok(Some true)
+                                    | ToolFailed _, Some final
+                                        when final.PendingJob.IsNone && final.Error.IsSome -> Ok(Some false)
+                                    | Running, None -> Ok None // normal polling, not an error
+                                    | _ -> Error "Job result does not prove completed tool execution."
+                            with :? JsonException ->
+                                Error "Malformed typed job-result response."
+                        | _ -> Error "GetJobResult has no successful non-pending response."
+                    match verified with
+                    | Error reason -> Error reason
+                    | Ok None -> Ok None // no terminal change while still running
+                    | Ok (Some succeeded) ->
+                        // A typed ToolCompleted only proves the original
+                        // handler returned. A Git or OS-backed handler may
+                        // leave descendants alive: preserve the response
+                        // without marking its witness Terminal.
+                        let safe = terminalCommandTypes.Contains tool
+                        use update = connection.CreateCommand()
+                        update.Transaction <- transaction
+                        update.CommandText <-
+                            """UPDATE agent_execution_witness
+                               SET state = CASE WHEN $safe = 1 THEN 'Terminal'
+                                                ELSE 'Dispatched' END,
+                                   updated_at = $now,
+                                   client_response_at = COALESCE(client_response_at, $now),
+                                   client_response_succeeded = COALESCE(client_response_succeeded, $succeeded),
+                                   terminal_at = CASE WHEN $safe = 1 THEN $now ELSE NULL END
+                               WHERE request_id = $requestId AND state = 'Dispatched'
+                                 AND tool_job_id = $jobId
+                                 AND tool_job_operation_id IS $operationId;"""
+                        addParameter update "$requestId" requestId
+                        addParameter update "$jobId" jobId
+                        addParameter update "$operationId" (dbValue operationId)
+                        addParameter update "$safe" (if safe then 1 else 0)
+                        addParameter update "$succeeded" (if succeeded then 1 else 0)
+                        addParameter update "$now" (DateTimeOffset.UtcNow.ToString("O"))
+                        if update.ExecuteNonQuery() <> 1 then
+                            Error "Tool-job terminal proof raced conflicting execution evidence."
+                        else
+                            transaction.Commit()
+                            if safe then Ok(Some requestId)
+                            else Error $"Tool-job {tool} client completion witnessed; process-tree liveness is unverified."
+                | Some _ -> Error "Poll does not match unresolved dispatched execution."
+            with ex ->
+                Error $"Cannot attest authenticated tool-job termination: {ex.Message}"
+
+    // The transport server must verify the authenticated sender's active
+    // device registration before passing its connection/generation here.
+    // Match the persisted route exactly and accept a late response even if
+    // ClientResponseTracker already timed out and forgot its correlation.
+    member _.TryRecordAgentClientTerminal(
+        userId: string, connectionId: string, generation: int64, correlationId: string,
+        ?clientResponse: AgentCommandResponse
+    ) : Result<string option, string> =
+        if [ userId; connectionId; correlationId ] |> List.exists String.IsNullOrWhiteSpace
+           || generation < 1L then
+            Error "An authenticated routed client receipt is required."
+        else
+            try
+                use connection = openConnection()
+                use transaction = connection.BeginTransaction()
+                use command = connection.CreateCommand()
+                command.Transaction <- transaction
+                command.CommandText <-
+                    """SELECT witness.request_id, witness.state, witness.tool_name
+                       FROM agent_execution_witness AS witness
+                       WHERE witness.user_id = $userId AND witness.connection_id = $connectionId
+                         AND witness.device_generation = $generation AND witness.correlation_id = $correlationId
+                       LIMIT 1;"""
+                addParameter command "$userId" userId
+                addParameter command "$connectionId" connectionId
+                addParameter command "$generation" generation
+                addParameter command "$correlationId" correlationId
+                use reader = command.ExecuteReader()
+                let found =
+                    if reader.Read() then
+                        Some(
+                            reader.GetString 0,
+                            reader.GetString 1,
+                            if reader.IsDBNull 2 then None else Some(reader.GetString 2))
+                    else None
+                reader.Close()
+                match found with
+                | None -> Ok None // Untracked MCP replies do not carry an execution witness.
+                | Some (requestId, "Terminal", _) -> Ok(Some requestId) // idempotent late duplicate
+                | Some (_, "Dispatched", None) ->
+                    // Historical telemetry may already have been pruned before
+                    // migration. Without a durable command classification we
+                    // cannot rule out a detached job; fail closed.
+                    Error "The dispatched tool classification is unavailable; reconcile legacy execution before terminal proof."
+                | Some (requestId, "Dispatched", Some "StartJob") ->
+                    // The client reply is only a job handle. Persist its exact
+                    // identity under the authenticated route for later process
+                    // tree reconciliation, but NEVER mark this witness Terminal
+                    // or release a correction permit on a mere StartJob reply.
+                    let launch =
+                        match clientResponse with
+                        | Some { Result = Some payload; Error = None } ->
+                            try
+                                let result = JsonSerializer.Deserialize<StartJobResult>(payload)
+                                let mutable parsedJobId = Guid.Empty
+                                if isNull (box result)
+                                   || String.IsNullOrWhiteSpace result.JobId
+                                   || not (Guid.TryParseExact(result.JobId, "N", &parsedJobId))
+                                   || parsedJobId = Guid.Empty
+                                   || not (String.Equals(result.JobId, parsedJobId.ToString("N"), StringComparison.Ordinal))
+                                   || result.StartedAt = DateTimeOffset.MinValue then
+                                    // JobManager generates exactly Guid.NewGuid().ToString("N").
+                                    // A free-form string is not a reconcilable client identity.
+                                    Error "StartJob requires a canonical nonempty GUID-N job identity and start timestamp."
+                                else Ok result
+                            with :? JsonException ->
+                                Error "StartJob returned an invalid job identity payload."
+                        | _ ->
+                            Error "StartJob has no authenticated successful launch receipt; process liveness is unresolved."
+                    match launch with
+                    | Error failure -> Error failure
+                    | Ok job ->
+                        let launchedAt = job.StartedAt.ToString("O")
+                        use launchReceipt = connection.CreateCommand()
+                        launchReceipt.Transaction <- transaction
+                        launchReceipt.CommandText <-
+                            """UPDATE agent_execution_witness
+                               SET job_id = $jobId,
+                                   job_started_at = $jobStartedAt,
+                                   job_receipt_at = COALESCE(job_receipt_at, $now),
+                                   client_response_at = COALESCE(client_response_at, $now),
+                                   client_response_succeeded = COALESCE(client_response_succeeded, 1),
+                                   updated_at = $now
+                               WHERE request_id = $requestId
+                                 AND state = 'Dispatched' AND tool_name = 'StartJob'
+                                 AND (job_id IS NULL OR job_id = $jobId)
+                                 AND (job_started_at IS NULL OR job_started_at = $jobStartedAt);"""
+                        addParameter launchReceipt "$requestId" requestId
+                        addParameter launchReceipt "$jobId" job.JobId
+                        addParameter launchReceipt "$jobStartedAt" launchedAt
+                        addParameter launchReceipt "$now" (DateTimeOffset.UtcNow.ToString("O"))
+                        if launchReceipt.ExecuteNonQuery() <> 1 then
+                            Error "Conflicting StartJob launch receipts for one authenticated request."
+                        else
+                            transaction.Commit()
+                            Error "StartJob handle recorded; detached process-tree termination remains unverified."
+                | Some (requestId, "Dispatched", Some tool)
+                    when knownCommandTypes.Contains tool
+                         && not (terminalCommandTypes.Contains tool) ->
+                    // Git, remote ledger reads, browser scheduling and other
+                    // native-process commands may still own descendants.
+                    // Preserve the reply without promoting it to quiescence.
+                    let succeeded =
+                        match clientResponse with
+                        | Some { Result = Some _; Error = None; PendingJob = None } -> 1
+                        | _ -> 0
+                    use observed = connection.CreateCommand()
+                    observed.Transaction <- transaction
+                    observed.CommandText <-
+                        """UPDATE agent_execution_witness
+                           SET client_response_at = COALESCE(client_response_at, $now),
+                               client_response_succeeded = COALESCE(client_response_succeeded, $succeeded),
+                               updated_at = $now
+                           WHERE request_id = $requestId AND state = 'Dispatched'
+                             AND tool_name = $tool AND tool_job_id IS NULL;"""
+                    addParameter observed "$now" (DateTimeOffset.UtcNow.ToString("O"))
+                    addParameter observed "$succeeded" succeeded
+                    addParameter observed "$requestId" requestId
+                    addParameter observed "$tool" tool
+                    if observed.ExecuteNonQuery() <> 1 then
+                        Error "Client reply raced conflicting unresolved process evidence."
+                    else
+                        transaction.Commit()
+                        Error $"Authenticated {tool} reply observed; descendant/process liveness remains unverified."
+                | Some (_, "Dispatched", Some unknown)
+                    when not (terminalCommandTypes.Contains unknown) ->
+                    Error $"Unknown tool classification {unknown}; execution requires independent liveness reconciliation."
+                | Some (requestId, "Dispatched", Some _) ->
+                    let succeeded =
+                        match clientResponse with
+                        | Some { Result = Some _; Error = None; PendingJob = None } -> 1
+                        | _ -> 0
+                    use update = connection.CreateCommand()
+                    update.Transaction <- transaction
+                    update.CommandText <-
+                        """UPDATE agent_execution_witness
+                           SET state = 'Terminal', updated_at = $now, terminal_at = $now,
+                               client_response_at = COALESCE(client_response_at, $now),
+                               client_response_succeeded = COALESCE(client_response_succeeded, $succeeded)
+                           WHERE request_id = $requestId AND state = 'Dispatched'
+                             AND tool_job_id IS NULL;"""
+                    addParameter update "$now" (DateTimeOffset.UtcNow.ToString("O"))
+                    addParameter update "$succeeded" succeeded
+                    addParameter update "$requestId" requestId
+                    if update.ExecuteNonQuery() <> 1 then
+                        Error "Client terminal receipt raced another update."
+                    else
+                        transaction.Commit()
+                        Ok(Some requestId)
+                | Some _ -> Error "Receipt is inconsistent with non-dispatched activity."
+            with ex -> Error $"Cannot persist authenticated client terminal receipt: {ex.Message}"
+
+    member _.CountUnresolvedAgentExecutions(userId: string, agentId: string) =
+        use connection = openConnection()
+        use command = connection.CreateCommand()
+        command.CommandText <-
+            """SELECT COUNT(*) FROM agent_execution_witness
+               WHERE user_id = $userId AND agent_id = $agentId
+               AND state NOT IN ('Terminal', 'NotDispatched');"""
+        addParameter command "$userId" userId
+        addParameter command "$agentId" (agentId.ToUpperInvariant())
+        Convert.ToInt32(command.ExecuteScalar())
+
+    /// Bounded, read-only audit projection. It cannot certify quiescence:
+    /// HasMore means additional unresolved evidence exists, and even an
+    /// empty page cannot replace the verified legacy epoch or child-job gate.
+    member _.ListUnresolvedAgentExecutions(
+        userId: string, agentId: string, limit: int
+    ) : Result<UnresolvedAgentExecutionPage, string> =
+        if String.IsNullOrWhiteSpace userId
+           || String.IsNullOrWhiteSpace agentId
+           || agentId.Length > 256 || limit < 1 || limit > 500 then
+            Error "Authenticated user, bounded agent and page size 1..500 are required."
+        else
+            try
+                use connection = openConnection()
+                use command = connection.CreateCommand()
+                command.CommandText <-
+                    """SELECT request_id, tool_name, project_name, state,
+                              device_id, connection_id, device_generation,
+                              correlation_id, parent_request_id, created_at,
+                              job_id, job_started_at, job_receipt_at,
+                              tool_job_id, tool_job_started_at, tool_job_receipt_at,
+                              tool_job_operation_id, client_response_at, client_response_succeeded
+                       FROM agent_execution_witness
+                       WHERE user_id = $userId AND agent_id = $agentId
+                         AND state NOT IN ('Terminal', 'NotDispatched')
+                       ORDER BY created_at ASC, request_id ASC
+                       LIMIT $maxRows;"""
+                addParameter command "$userId" userId
+                addParameter command "$agentId" (agentId.ToUpperInvariant())
+                addParameter command "$maxRows" (limit + 1)
+                use reader = command.ExecuteReader()
+                let results = ResizeArray<UnresolvedAgentExecution>()
+                while reader.Read() do
+                    results.Add
+                        { RequestId = reader.GetString 0
+                          ToolName = optionText reader 1
+                          ProjectName = optionText reader 2
+                          State = reader.GetString 3
+                          ClientResponseAt =
+                              optionText reader 17 |> Option.map DateTimeOffset.Parse
+                          ClientResponseSucceeded =
+                              if reader.IsDBNull 18 then None
+                              else Some(reader.GetInt32 18 = 1)
+                          RequiresIndependentProcessProof =
+                              optionText reader 1 |> Option.forall (fun tool ->
+                                  not (terminalCommandTypes.Contains tool))
+                          DeviceId = optionText reader 4
+                          ConnectionId = optionText reader 5
+                          DeviceGeneration =
+                              if reader.IsDBNull 6 then None else Some(reader.GetInt64 6)
+                          CorrelationId = optionText reader 7
+                          ParentRequestId = optionText reader 8
+                          CreatedAt = DateTimeOffset.Parse(reader.GetString 9)
+                          JobId = optionText reader 10
+                          JobStartedAt =
+                              optionText reader 11 |> Option.map DateTimeOffset.Parse
+                          JobReceiptAt =
+                              optionText reader 12 |> Option.map DateTimeOffset.Parse
+                          DeferredToolJobId = optionText reader 13
+                          DeferredToolJobOperationId = optionText reader 16
+                          DeferredToolJobStartedAt =
+                              optionText reader 14 |> Option.map DateTimeOffset.Parse
+                          DeferredToolJobReceiptAt =
+                              optionText reader 15 |> Option.map DateTimeOffset.Parse }
+                Ok { Executions = results |> Seq.truncate limit |> Seq.toList
+                     HasMore = results.Count > limit }
+            with ex -> Error $"Cannot inspect unresolved agent execution evidence: {ex.Message}"
 
     member _.CompleteOperation(operationId: string, success: bool, errorCategory: string option, durationMs: int64) =
         use connection = openConnection()

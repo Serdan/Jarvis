@@ -1,6 +1,7 @@
 module Client.SignalR.Client
 
 open System
+open System.Collections.Concurrent
 open System.Diagnostics
 open System.IO
 open System.Runtime.CompilerServices
@@ -18,10 +19,172 @@ let receiveMessage (rt: Runtime) message =
     rt.Tui.Log message
     Task.CompletedTask
 
+// A reservation is a canonical *in-flight* veto, not an expiring activity
+// lease. Keep one per process/assignment across a burst of calls and release
+// only after the last call has finished and an idle period has elapsed.
+// Neither the client cache nor a failed timer may clear the canonical record.
+type private ReservationSlot =
+    { Sync: obj
+      mutable Assignment: (string * string) option
+      mutable ReservationId: Guid option
+      mutable BeginOperationId: Guid
+      mutable ReleaseOperationId: Guid
+      mutable Confirmed: bool
+      mutable Release: (Guid -> Guid -> Result<unit, string>) option
+      mutable ActiveCalls: int
+      mutable LastFinishedAt: DateTimeOffset
+      mutable TimerRunning: bool
+      mutable ReleaseFailure: string option }
+
+type internal CoalescedReservationManager(idleDelay: TimeSpan, report: string -> unit) =
+    let slots = ConcurrentDictionary<string, ReservationSlot>(StringComparer.Ordinal)
+
+    let releaseCanonical (slot: ReservationSlot) =
+        match slot.ReservationId, slot.Release with
+        | None, None -> Ok ()
+        | Some reservationId, Some release when slot.Confirmed ->
+            let outcome =
+                try release reservationId slot.ReleaseOperationId
+                with ex -> Error ex.Message
+            match outcome with
+            | Ok () ->
+                slot.Assignment <- None
+                slot.ReservationId <- None
+                slot.Release <- None
+                slot.Confirmed <- false
+                slot.ReleaseFailure <- None
+                Ok ()
+            | Error failure ->
+                slot.ReleaseFailure <- Some failure
+                report (
+                    $"In-flight reservation {reservationId:N} could not be released: {failure}. " +
+                    "The canonical correction veto remains until recovery.")
+                Error failure
+        | _ -> Error "The canonical reservation admission outcome is uncertain."
+
+    let scheduleIdleRelease (slot: ReservationSlot) =
+        if not slot.TimerRunning then
+            slot.TimerRunning <- true
+            let rec finishWhenIdle () =
+                task {
+                    do! Task.Delay(idleDelay)
+                    let finished =
+                        lock slot.Sync (fun () ->
+                            if slot.ActiveCalls > 0
+                               || DateTimeOffset.UtcNow - slot.LastFinishedAt < idleDelay then
+                                false
+                            else
+                                if slot.ReservationId.IsSome then
+                                    releaseCanonical slot |> ignore
+                                slot.TimerRunning <- false
+                                true)
+                    if not finished then return! finishWhenIdle ()
+                }
+            Task.Run(Func<Task>(fun () -> finishWhenIdle () :> Task)) |> ignore
+
+    // The operation ID of an uncertain begin/release is reused on retries.
+    // This permits idempotent recovery after a push succeeded but the response
+    // was lost. Never create a second reservation while the first is uncertain.
+    member _.Run<'T>(key: string, taskId: string, attemptId: string,
+                      reserve: Guid -> Guid ->
+                          Result<(Guid -> Guid -> Result<unit, string>), string>,
+                      work: unit -> Task<'T>) : Task<Result<'T, string>> =
+        task {
+            let slot =
+                slots.GetOrAdd(key, fun _ ->
+                    { Sync = obj(); Assignment = None; ReservationId = None
+                      BeginOperationId = Guid.Empty; ReleaseOperationId = Guid.Empty
+                      Confirmed = false; Release = None; ActiveCalls = 0
+                      LastFinishedAt = DateTimeOffset.MinValue
+                      TimerRunning = false; ReleaseFailure = None })
+            let acquireFresh () =
+                let reservationId = Guid.NewGuid()
+                let beginId = Guid.NewGuid()
+                slot.Assignment <- Some(taskId, attemptId)
+                slot.ReservationId <- Some reservationId
+                slot.BeginOperationId <- beginId
+                slot.ReleaseOperationId <- Guid.NewGuid()
+                slot.Confirmed <- false
+                let result =
+                    try reserve reservationId beginId
+                    with ex -> Error ex.Message
+                match result with
+                | Ok release ->
+                    slot.Release <- Some release
+                    slot.Confirmed <- true
+                    slot.ReleaseFailure <- None
+                    slot.ActiveCalls <- slot.ActiveCalls + 1
+                    Ok ()
+                | Error failure ->
+                    Error($"Reservation {reservationId:N} admission uncertain: {failure}. " +
+                          "Retry this operation after checking its canonical status.")
+            let admission =
+                lock slot.Sync (fun () ->
+                    match slot.Assignment, slot.ReservationId with
+                    | None, None -> acquireFresh ()
+                    | Some (oldTask, oldAttempt), Some reservationId ->
+                        if not slot.Confirmed then
+                            if oldTask <> taskId || oldAttempt <> attemptId then
+                                Error "An uncertain reservation belongs to a different assignment."
+                            else
+                                let result =
+                                    try reserve reservationId slot.BeginOperationId
+                                    with ex -> Error ex.Message
+                                match result with
+                                | Ok release ->
+                                    slot.Release <- Some release
+                                    slot.Confirmed <- true
+                                    slot.ReleaseFailure <- None
+                                    slot.ActiveCalls <- slot.ActiveCalls + 1
+                                    Ok ()
+                                | Error failure ->
+                                    Error($"Reservation {reservationId:N} admission remains uncertain: {failure}")
+                        elif slot.ActiveCalls > 0 && (oldTask <> taskId || oldAttempt <> attemptId) then
+                            Error "Another assignment still has active calls in this client."
+                        elif slot.ReleaseFailure.IsSome
+                             || oldTask <> taskId || oldAttempt <> attemptId then
+                            match releaseCanonical slot with
+                            | Ok () -> acquireFresh ()
+                            | Error failure ->
+                                Error($"Cannot resolve prior in-flight reservation: {failure}")
+                        else
+                            slot.ActiveCalls <- slot.ActiveCalls + 1
+                            Ok ()
+                    | _ -> Error "Corrupt in-process reservation state.")
+            match admission with
+            | Error error -> return Error error
+            | Ok () ->
+                try
+                    let! outcome = work()
+                    return Ok outcome
+                finally
+                    lock slot.Sync (fun () ->
+                        slot.ActiveCalls <- slot.ActiveCalls - 1
+                        slot.LastFinishedAt <- DateTimeOffset.UtcNow
+                        if slot.ActiveCalls = 0 then scheduleIdleRelease slot)
+        }
+
+    member _.Flush(key: string) =
+        match slots.TryGetValue key with
+        | false, _ -> Ok ()
+        | true, slot ->
+            lock slot.Sync (fun () ->
+                if slot.ActiveCalls <> 0 then
+                    Error "Cannot release a reservation while commands are in flight."
+                else releaseCanonical slot)
+
 // Explicit agent labels identify the current work slot. Cache canonical
 // Working state for ordinary calls to avoid one remote git fetch per tool.
 let private workingGuidanceCaches = ConditionalWeakTable<Runtime, WorkingTurnGuidance.AgentCache>()
+let private inFlightManagers = ConditionalWeakTable<Runtime, CoalescedReservationManager>()
 let private instructionDeliveryCaches = ConditionalWeakTable<Runtime, AgentInstructions.DeliveryCache>()
+
+let internal flushInFlightActivity (rt: Runtime) projectId (agentId: string) =
+    let manager =
+        inFlightManagers.GetValue(rt, fun _ ->
+            CoalescedReservationManager(TimeSpan.FromSeconds(30.), rt.Tui.Log))
+    manager.Flush((ProjectPaths.ProjectId.value projectId)
+                  + "::" + agentId.ToUpperInvariant())
 let invalidateAgentStates (rt: Runtime) (projectName: string) (agentIds: string array) =
     // Server notifications only carry the logical project identity. Worktree
     // selectors share the canonical ledger/assignment cache by ProjectId.
@@ -66,6 +229,22 @@ let private classifyProject command =
         | Some raw -> ProjectPaths.ProjectTarget.parse raw |> Result.map Checkout
 
 
+// A local approved binding means this checkout participates in canonical
+// agent-state correction. Failed Git/agent reads must not be interpreted as
+// "no active assignment" and silently skip a required in-flight fence.
+// Unbound source-only projects continue to work without ledger enrollment.
+let private hasCanonicalLedgerBinding (rt: Runtime) (project: string) =
+    match ProjectPaths.resolveProjectRoot project rt with
+    | Error _ -> true // A failed project lookup cannot prove the absence of a ledger.
+    | Ok (FolderPath root) ->
+        let path = OrchestrationApi.LedgerBindingConfig.pathForRoot root
+        try
+            File.GetAttributes(path) |> ignore
+            true
+        with
+        | :? FileNotFoundException | :? DirectoryNotFoundException -> false
+        | _ -> true
+
 let private loadAgentState (rt: Runtime) (project: string) (agentId: string) =
     match OrchestrationApi.LedgerBindingConfig.loadWithSnapshot project rt with
     | Error _ -> None
@@ -103,6 +282,19 @@ let private isLocalAgentActivity = function
                                 && cmd.SourceRef <> cmd.ProjectName -> false
     | LedgerReadCommand cmd when cmd.Action = "Health" -> false
     | ObserveAgentCommand _ -> false // Neither observer nor target is acting.
+    | _ -> true
+
+// An outstanding canonical reservation protects *every* admitted agent
+// command, including a read that takes longer than its former lease deadline.
+// Batched reservation scopes amortize the two Git writes across a burst, so
+// classifying by guessed command duration is unnecessary.
+let private requiresDurableActivityReservation agentId = function
+    | TaskWriteCommand cmd -> cmd.ActorId = agentId
+    | TaskReadCommand cmd -> String.IsNullOrWhiteSpace cmd.AgentId || cmd.AgentId = agentId
+    | LedgerWriteCommand _ | ReviewWriteCommand _
+    | RetryPendingIntentCommand _ | SupersedePendingIntentCommand _
+    | AbandonPendingIntentCommand _ | ObserveAgentCommand _ -> false
+    | LedgerReadCommand cmd when cmd.Action = "Health" -> false
     | _ -> true
 
 // An agent's first ordinary tool call starts its Ready assignment.
@@ -158,6 +350,18 @@ let private activateReadyOnActivity (rt: Runtime) (agentId: string)
             let current =
                 cache.Get(DateTimeOffset.UtcNow, projectId, agentId, fun () ->
                     loadAgentState rt project agentId)
+            let renewWorkingLease (assignment: ReviewWorkflow.AgentAssignment) =
+                match OrchestrationApi.LedgerBindingConfig.load project rt with
+                | Error error -> Error(Client.ValidationError($"Cannot renew Working activity lease: {error}"))
+                | Ok binding ->
+                    match ReviewWorkflow.ReviewWorkflow.recordWorkingActivity binding
+                              (Guid.NewGuid()) agentId assignment.TaskId assignment.AttemptId with
+                    | Ok _ ->
+                        cache.Invalidate(projectId, agentId)
+                        Ok ()
+                    | Error error ->
+                        cache.Invalidate(projectId, agentId)
+                        Error(Client.ValidationError($"Cannot renew Working activity lease: {error}. Reread your agent inbox."))
             match current with
             | Some agent when agent.State = "Ready"
                               && not (isNull (box agent.CurrentAssignment))
@@ -206,6 +410,39 @@ let private activateReadyOnActivity (rt: Runtime) (agentId: string)
                         | Error error ->
                             Error(Client.ValidationError($"Automatic agent activation failed: {error}"))
             | _ -> Ok ([], None)
+
+// Keep a canonical lease valid throughout long-running tools. An admitted
+// command can outlive its initial lease, so ingress-only renewal is not enough.
+// The interval is injectable for deterministic scheduling tests.
+let internal withActivityLeaseHeartbeat (interval: TimeSpan)
+                                        (renew: unit -> Result<unit, string>)
+                                        (work: unit -> Task<'t>) =
+    task {
+        use stop = new System.Threading.CancellationTokenSource()
+        let gate = obj()
+        let mutable renewalFailure : string option = None
+        let background =
+            Task.Run(System.Func<Task>(fun () ->
+                task {
+                    try
+                        while not stop.IsCancellationRequested do
+                            do! Task.Delay(interval, stop.Token)
+                            if not stop.IsCancellationRequested then
+                                match renew() with
+                                | Ok () -> ()
+                                | Error reason ->
+                                    lock gate (fun () -> renewalFailure <- Some reason)
+                                    stop.Cancel()
+                    with :? OperationCanceledException -> ()
+                } :> Task))
+        try
+            let! result = work()
+            stop.Cancel()
+            do! background
+            return result, lock gate (fun () -> renewalFailure)
+        finally
+            stop.Cancel()
+    }
 
 // Only the Working turn identifies a stable delivery scope. Ledger calls bootstrap
 // root guidance, while normal source operations discover deeper instructions.
@@ -756,6 +993,12 @@ let private dispatch (rt: Runtime) (target: ProjectPaths.ProjectTarget option)
         | Some validated ->
             rt |> JobManager.getJobResultForProjectAsAgent (Some(ProjectPaths.ProjectTarget.projectId validated)) (Some agentId) cmd |> serialize'
         | None -> rt |> JobManager.getJobResultForProjectAsAgent None (Some agentId) cmd |> serialize'
+    | GetProcessOwnershipEvidenceCommand cmd ->
+        // A read-only historical process identity query, never a reap claim.
+        match target with
+        | Some validated ->
+            rt |> JobManager.getProcessOwnershipEvidenceForProject (Some(ProjectPaths.ProjectTarget.projectId validated)) cmd |> serialize'
+        | None -> rt |> JobManager.getProcessOwnershipEvidence cmd |> serialize'
     | CancelJobCommand cmd ->
         match target with
         | Some validated ->
@@ -864,7 +1107,8 @@ let private receiveCommandWithTypedInstructions (rt: Runtime)
                                                 (target: ProjectPaths.ProjectTarget option) (agentId: string) command =
     task {
         match command with
-        | GetJobResultCommand _ | ListJobsCommand _ | CancelJobCommand _ ->
+        | GetJobResultCommand _ | GetProcessOwnershipEvidenceCommand _
+        | ListJobsCommand _ | CancelJobCommand _ ->
             // Cheap controls must bypass source instruction preparation and
             // remain responsive even while source/ledger commands are blocked.
             let! response = receiveCommandForTarget rt target None None agentId command
@@ -959,7 +1203,8 @@ let processIncomingCommand (rt: Runtime) (commandJson: string) (agentId: string)
                             // Preserve the transport actor separately for job
                             // authorization, including unknown/expired IDs.
                             match command with
-                            | GetJobResultCommand _ | ListJobsCommand _ | CancelJobCommand _ -> ""
+                            | GetJobResultCommand _ | GetProcessOwnershipEvidenceCommand _
+                            | ListJobsCommand _ | CancelJobCommand _ -> ""
                             | _ when isLocalAgentActivity command -> agentId
                             | _ -> ""
                         if not (String.IsNullOrWhiteSpace localAgentId) then
@@ -973,11 +1218,139 @@ let processIncomingCommand (rt: Runtime) (commandJson: string) (agentId: string)
                             | TaskReadCommand inbox, Some receipt when inbox.Action = "AgentInbox" ->
                                 inboxActivation <- Some receipt
                             | _ -> ()
-                            let! result, applicable, provenance =
-                                // Polling does not activate or record local
-                                // agent activity, but access checks still need
-                                // the initiating actor label from the transport.
-                                receiveCommandWithTypedInstructions rt target agentId command
+                            let work () = receiveCommandWithTypedInstructions rt target agentId command
+                            // The lease is renewed during long-running commands.
+                            // The canonical record (not local TUI last-seen)
+                            // determines whether administrative correction may run.
+                            let leaseContext, verifiedUnassigned =
+                                match target with
+                                | Some selected when not (String.IsNullOrWhiteSpace localAgentId)
+                                                     && activatesAgent localAgentId command ->
+                                    let projectId = ProjectPaths.ProjectTarget.projectId selected
+                                    let project = ProjectPaths.ProjectId.value projectId
+                                    let cache = workingGuidanceCaches.GetValue(rt, fun _ ->
+                                        WorkingTurnGuidance.AgentCache(TimeSpan.FromMinutes 2.))
+                                    match cache.Get(DateTimeOffset.UtcNow, projectId, localAgentId,
+                                                    fun () -> loadAgentState rt project localAgentId) with
+                                    | Some active when active.State = "Working"
+                                                       && not (isNull (box active.CurrentAssignment)) ->
+                                        Some (project, projectId, active.CurrentAssignment), false
+                                    | Some taskless when isNull (box taskless.CurrentAssignment)
+                                                         && taskless.State = "Working"
+                                                         && taskless.Execution = "Working" ->
+                                        // Explicit taskless work has no assignment to reserve.
+                                        // Its source command still has a durable server witness;
+                                        // only an assigned Working attempt can be corrected.
+                                        None, true
+                                    | Some inactive when isNull (box inactive.CurrentAssignment)
+                                                         && List.contains inactive.State [ "Parked"; "NeedsWork" ] ->
+                                        // A successfully decoded canonical unassigned agent
+                                        // can read their inbox without inventing Working activity.
+                                        None, true
+                                    | Some inactive when inactive.State = "Ready"
+                                                         && inactive.Execution = "Stopped"
+                                                         && not (isNull (box inactive.CurrentAssignment)) ->
+                                        // Closing a task retains the stopped owner's assignment
+                                        // for its final inbox and completion checkpoint. Only
+                                        // an exact, canonical closed-task self-inbox read can
+                                        // bypass the Working reservation; never a mutation or
+                                        // a stale Ready assignment that could still start.
+                                        match command with
+                                        | TaskReadCommand inbox when inbox.Action = "AgentInbox"
+                                                                      && inbox.AgentId = localAgentId ->
+                                            match OrchestrationApi.LedgerBindingConfig.load project rt with
+                                            | Ok binding ->
+                                                match ReviewWorkflow.ReviewWorkflow.isStoppedClosedAssignment
+                                                          binding localAgentId with
+                                                | Ok true -> None, true
+                                                | _ -> None, false
+                                            | Error _ -> None, false
+                                        | _ -> None, false
+                                    | _ -> None, false
+                                | _ -> None, false
+                            // A failed cache refresh must not silently
+                            // turn a bound Working-agent call into an
+                            // unreserved operation. Preserve source-only
+                            // behavior for checkouts with no approved ledger.
+                            let expectedFence =
+                                match target with
+                                | Some selected when not (String.IsNullOrWhiteSpace localAgentId)
+                                                     && activatesAgent localAgentId command ->
+                                    let project = selected |> ProjectPaths.ProjectTarget.projectId
+                                                           |> ProjectPaths.ProjectId.value
+                                    hasCanonicalLedgerBinding rt project
+                                | _ -> false
+                            let! (execution, renewalFailure) =
+                                match leaseContext with
+                                | None when expectedFence && not verifiedUnassigned ->
+                                    task {
+                                        return (Error(Client.ValidationError(
+                                            "Cannot verify canonical agent state for Working activity; the call was not executed.")),
+                                            [], AgentInstructions.RootBootstrapRequired), None
+                                    }
+                                | None ->
+                                    task {
+                                        let! outcome = work()
+                                        return outcome, None
+                                    }
+                                | Some (project, projectId, assignment)
+                                    when requiresDurableActivityReservation localAgentId command ->
+                                    // One canonical admission is reused throughout a
+                                    // continuous local burst. Concurrent calls share the
+                                    // same reservation, but can never release it while
+                                    // any source operation is still executing. The remote
+                                    // correction veto is not time-limited.
+                                    task {
+                                        let manager =
+                                            inFlightManagers.GetValue(rt, fun _ ->
+                                                CoalescedReservationManager(
+                                                    TimeSpan.FromSeconds(30.), rt.Tui.Log))
+                                        let key =
+                                            (ProjectPaths.ProjectId.value projectId)
+                                            + "::" + localAgentId.ToUpperInvariant()
+                                        let! admitted =
+                                            manager.Run(key, assignment.TaskId, assignment.AttemptId,
+                                                (fun reservationId beginOperationId ->
+                                                    match OrchestrationApi.LedgerBindingConfig.load project rt with
+                                                    | Error error -> Error(sprintf "Binding: %A" error)
+                                                    | Ok binding ->
+                                                        match ReviewWorkflow.ReviewWorkflow.beginInFlightAgentOperation
+                                                                  binding beginOperationId localAgentId
+                                                                  assignment.TaskId assignment.AttemptId reservationId with
+                                                        | Error error -> Error(sprintf "Admission: %A" error)
+                                                        | Ok _ ->
+                                                            Ok (fun id releaseOperationId ->
+                                                                match ReviewWorkflow.ReviewWorkflow.endInFlightAgentOperation
+                                                                          binding releaseOperationId localAgentId id with
+                                                                | Ok _ -> Ok ()
+                                                                | Error error -> Error(sprintf "%A" error))),
+                                                work)
+                                        match admitted with
+                                        | Ok outcome -> return outcome, None
+                                        | Error failure ->
+                                            return (Error(Client.ValidationError(
+                                                $"In-flight Working admission refused: {failure}")), [],
+                                                AgentInstructions.RootBootstrapRequired), None
+                                    }
+                                | Some (project, projectId, assignment) ->
+                                    withActivityLeaseHeartbeat (TimeSpan.FromMinutes(2.))
+                                        (fun () ->
+                                            match OrchestrationApi.LedgerBindingConfig.load project rt with
+                                            | Error error -> Error(sprintf "Lease binding unavailable: %A" error)
+                                            | Ok binding ->
+                                                match ReviewWorkflow.ReviewWorkflow.recordWorkingActivity
+                                                          binding (Guid.NewGuid()) localAgentId
+                                                          assignment.TaskId assignment.AttemptId with
+                                                | Ok _ ->
+                                                    let cache = workingGuidanceCaches.GetValue(rt, fun _ ->
+                                                        WorkingTurnGuidance.AgentCache(TimeSpan.FromMinutes 2.))
+                                                    cache.Invalidate(projectId, localAgentId)
+                                                    Ok ()
+                                                | Error error -> Error(sprintf "Lease renewal rejected: %A" error))
+                                        work
+                            let returned, applicable, provenance = execution
+                            // A completed command receipt remains authoritative.
+                            let result = returned
                             // A write may alter another agent's state, or none
                             // at all. Invalidate precisely the affected local
                             // cache entries before preparing turn guidance.
@@ -998,6 +1371,14 @@ let processIncomingCommand (rt: Runtime) (commandJson: string) (agentId: string)
                                 | _ ->
                                     incrementalInstructions rt localAgentId target provenance applicable
                                     @ checkWorkingGuidance rt localAgentId target command
+                            match renewalFailure with
+                            | Some warning ->
+                                rt.Tui.Log warning
+                                instructions <-
+                                    instructions @
+                                    [ { Scope = "activity-fence"; Path = "jarvis/activity-fence"
+                                        Sha256 = ""; Content = warning } ]
+                            | None -> ()
                             return result
                 with ex ->
                     unexpectedFailure <- true
@@ -1046,6 +1427,7 @@ let private shouldAutoPromote = function
     | StartJobCommand _ // Already returns its own OS process-job handle.
     | ListJobsCommand _
     | GetJobResultCommand _
+    | GetProcessOwnershipEvidenceCommand _
     | CancelJobCommand _
     | UpdateClientCommand
     | MessageCommand _

@@ -151,7 +151,7 @@ let write_tools_expose_optional_operation_ids () =
                 Some (methodInfo.Name, id)
             | _ -> None)
     // Preserve challenge-domain, taskless and recipient-notification writes.
-    Assert.That(writeMethods.Length, Is.EqualTo(54), String.concat ", " (writeMethods |> Array.map fst))
+    Assert.That(writeMethods.Length, Is.EqualTo(55), String.concat ", " (writeMethods |> Array.map fst))
     for newTool in [ "StartTasklessWork"; "YieldTasklessWork"; "RecoverTasklessWork" ] do
         Assert.That(writeMethods |> Array.exists (fun (name, _) -> name = newTool), Is.True,
                     $"Taskless lifecycle tool {newTool} missing from the public MCP surface.")
@@ -220,6 +220,18 @@ let public_agent_lifecycle_has_implicit_start_and_explicit_administrative_state 
     Assert.That((Enum.GetNames(state.ParameterType) = [| "NeedsWork"; "Parked" |]), Is.True)
     for name in [ "agentId"; "targetAgentId"; "reason"; "expectedAgentVersion" ] do
         Assert.That(admin.GetParameters() |> Array.exists (fun p -> p.Name = name), Is.True)
+
+
+[<Test>]
+let administrative_working_correction_has_separate_actor_target_and_exact_cas_inputs () =
+    let methodInfo = typeof<Server.JarvisMcpTools>.GetMethod("CorrectAgentWorkingState")
+    Assert.That(methodInfo, Is.Not.Null)
+    for name in [ "projectName"; "agentId"; "targetAgentId"; "taskId"; "attemptId";
+                  "expectedTaskVersion"; "expectedAttemptVersion"; "expectedAgentVersion";
+                  "assignmentGeneration"; "reason" ] do
+        let parameter = methodInfo.GetParameters() |> Array.find (fun p -> p.Name = name)
+        Assert.That(parameter.IsOptional, Is.False, name)
+    Assert.That(methodInfo.GetParameters() |> Array.exists (fun p -> p.Name = "operationId"), Is.True)
 
 [<Test>]
 let core_task_tools_have_one_public_operation_per_intention () =

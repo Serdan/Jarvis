@@ -340,7 +340,7 @@ let ``client service rejects commands not negotiated by the registered client`` 
 
         let client = ClientService(Unchecked.defaultof<_>, users, ClientResponseTracker(),
                                    Microsoft.AspNetCore.Http.HttpContextAccessor(),
-                                   Microsoft.Extensions.Logging.Abstractions.NullLogger<ClientService>.Instance)
+                                   Microsoft.Extensions.Logging.Abstractions.NullLogger<ClientService>.Instance, Unchecked.defaultof<FeedbackStore>)
         let command =
             WriteFileCommand
                 { ProjectName = "Jarvis"
@@ -493,7 +493,7 @@ let ``command catalog matches AgentCommand union and MCP tools`` () =
         |> Set.ofArray
 
     let serverLocalNames =
-        set [ "GetProfile"; "Feedback"; "ListFeedback"; "GetFeedback"; "UpdateFeedback"; "GetFeedbackSummary"; "GetConnectionDiagnostics"; "ListDevices"; "SelectDevice"; "UpdateServer"; "GetServerUpdateStatus" ]
+        set [ "GetProfile"; "Feedback"; "ListFeedback"; "GetFeedback"; "UpdateFeedback"; "GetFeedbackSummary"; "GetConnectionDiagnostics"; "GetAgentCorrectionEvidence"; "ListDevices"; "SelectDevice"; "UpdateServer"; "GetServerUpdateStatus" ]
 
     // Retired task commands must not be exposed by either the wire protocol or MCP.
     // The orphan Git branch is the sole supported orchestration API.
@@ -511,7 +511,7 @@ let ``command catalog matches AgentCommand union and MCP tools`` () =
               "CreateRole"; "UpdateRole"; "AttachRole"; "DetachRole"; "SetAgentInstructions"
               "SetAttemptSource"; "YieldAgent"; "CompleteAgentWork"
               "StartTasklessWork"; "YieldTasklessWork"; "RecoverTasklessWork"
-              "SetAgentState"; "ReissueQueuedAttempt"; "RecoverAgentAssignment"; "AcknowledgeReviewFeedback"; "DeferAttempt"; "ResumeAttempt"; "AbandonAttempt"; "CancelTask"; "TransferOwner"; "CloseTask"; "ReopenTask"; "ImportTaskSpec"; "ExportTaskSpec"
+              "SetAgentState"; "CorrectAgentWorkingState"; "ReissueQueuedAttempt"; "RecoverAgentAssignment"; "AcknowledgeReviewFeedback"; "DeferAttempt"; "ResumeAttempt"; "AbandonAttempt"; "CancelTask"; "TransferOwner"; "CloseTask"; "ReopenTask"; "ImportTaskSpec"; "ExportTaskSpec"
               "GetTask"; "TaskOverview"; "ReviewDetails"; "ReviewerInbox"; "ListReviewDocuments"; "ReadReviewDocument"
               "SubmitReview"; "ClaimReview"; "DecideReview"
               "ReleaseReview"; "WithdrawReview"; "PutReviewDocument"
@@ -605,7 +605,7 @@ let ``client-backed MCP tools expose an optional per-command deviceId`` () =
             |> Array.exists (fun parameter -> parameter.ParameterType = typeof<ClientService>))
     // Preserve role/instruction aliases, Challenges, taskless execution and
     // recipient-notification public methods, all with device routing.
-    clientMethods.Length |> shouldEqual (AgentProtocol.commandDefinitions.Length - 1 + 75)
+    clientMethods.Length |> shouldEqual (AgentProtocol.commandDefinitions.Length - 1 + 76)
     for methodInfo in clientMethods do
         let deviceParam = methodInfo.GetParameters() |> Array.tryFind (fun parameter -> parameter.Name = "deviceId")
         match deviceParam with
@@ -1072,7 +1072,7 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
                             "CreateRole"; "UpdateRole"; "AttachRole"; "DetachRole"; "SetAgentInstructions";
                             "SetAttemptSource"; "YieldAgent"; "CompleteAgentWork";
                             "StartTasklessWork"; "YieldTasklessWork"; "RecoverTasklessWork";
-                            "SetAgentState"; "ReissueQueuedAttempt"; "RecoverAgentAssignment"; "AcknowledgeReviewFeedback"; "DeferAttempt"; "ResumeAttempt"; "AbandonAttempt"; "CancelTask"; "TransferOwner"; "CloseTask"; "ReopenTask"; "ImportTaskSpec"; "ExportTaskSpec" ] -> name, taskWrite
+                            "SetAgentState"; "CorrectAgentWorkingState"; "ReissueQueuedAttempt"; "RecoverAgentAssignment"; "AcknowledgeReviewFeedback"; "DeferAttempt"; "ResumeAttempt"; "AbandonAttempt"; "CancelTask"; "TransferOwner"; "CloseTask"; "ReopenTask"; "ImportTaskSpec"; "ExportTaskSpec" ] -> name, taskWrite
               for name in [ "GetTask"; "TaskOverview"; "ReviewDetails"; "ReviewerInbox"; "ListReviewDocuments"; "ReadReviewDocument" ] ->
                   name, ledgerRead
               for name in [ "SubmitReview"; "ClaimReview"; "DecideReview"
@@ -1107,7 +1107,7 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
             | None ->
                 match methodInfo.Name with
                 | "Feedback" | "UpdateFeedback" | "SelectDevice" | "UpdateServer" -> false
-                | "ListFeedback" | "GetFeedback" | "GetFeedbackSummary" | "GetConnectionDiagnostics" | "ListDevices" | "GetServerUpdateStatus" -> true
+                | "ListFeedback" | "GetFeedback" | "GetFeedbackSummary" | "GetConnectionDiagnostics" | "GetAgentCorrectionEvidence" | "ListDevices" | "GetServerUpdateStatus" -> true
                 | name -> failwith $"Unexpected server-local MCP tool: {name}"
 
         attribute.ReadOnly |> shouldEqual readOnly
@@ -1595,7 +1595,7 @@ let client_request_abort_cancels_outstanding_device_correlation_without_faulting
         context.RequestAborted <- abort.Token
         let http = Microsoft.AspNetCore.Http.HttpContextAccessor()
         http.HttpContext <- context
-        let service = ClientService(hub, users, tracker, http, Microsoft.Extensions.Logging.Abstractions.NullLogger<ClientService>.Instance)
+        let service = ClientService(hub, users, tracker, http, Microsoft.Extensions.Logging.Abstractions.NullLogger<ClientService>.Instance, Unchecked.defaultof<FeedbackStore>)
         let pending = service.SendCommandToUser(user, ListProjectsCommand)
         let! correlationId = dispatched.Task.WaitAsync(TimeSpan.FromSeconds(4.))
         abort.Cancel()
@@ -1702,7 +1702,7 @@ let post_commit_uncertain_client_reply_remains_unknown_across_server_dispatch_an
         http.HttpContext <- Microsoft.AspNetCore.Http.DefaultHttpContext()
         let service =
             ClientService(hub, users, tracker, http,
-                Microsoft.Extensions.Logging.Abstractions.NullLogger<ClientService>.Instance)
+                Microsoft.Extensions.Logging.Abstractions.NullLogger<ClientService>.Instance, Unchecked.defaultof<FeedbackStore>)
         let! response = service.SendCommandToUser(user, request)
         Assert.That(working, Is.True, "The injected activation committed before the response error.")
         Assert.That(dispatches, Is.EqualTo(1), "The command must never be automatically replayed.")
@@ -1845,7 +1845,7 @@ let private routedNotificationFixtureWithReceipt (sourceReceipt: AgentInboxActiv
         let http = Microsoft.AspNetCore.Http.HttpContextAccessor()
         http.HttpContext <- Microsoft.AspNetCore.Http.DefaultHttpContext()
         let service = ClientService(hub, users, tracker, http,
-            Microsoft.Extensions.Logging.Abstractions.NullLogger<ClientService>.Instance)
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<ClientService>.Instance, Unchecked.defaultof<FeedbackStore>)
         let notification : TaskWriteCommand =
             { ProjectName = "Wayfold"; Action = "NotifyAgent"; OperationId = Guid.NewGuid().ToString("D")
               TaskId = "task-1"; AttemptId = ""; ActorId = actor; OwnerId = ""; Title = ""; Html = ""
@@ -2129,7 +2129,7 @@ let browser_dom_mcp_tools_route_only_when_all_required_oauth_scopes_are_present 
     context.RequestServices <- provider
     let accessor = Microsoft.AspNetCore.Http.HttpContextAccessor()
     accessor.HttpContext <- context
-    let client = ClientService(hub, users, tracker, accessor, Microsoft.Extensions.Logging.Abstractions.NullLogger<ClientService>.Instance)
+    let client = ClientService(hub, users, tracker, accessor, Microsoft.Extensions.Logging.Abstractions.NullLogger<ClientService>.Instance, Unchecked.defaultof<FeedbackStore>)
 
     let setScopes scopes =
         let identity =

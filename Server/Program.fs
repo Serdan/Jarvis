@@ -117,10 +117,21 @@ let configureServices (services: IServiceCollection) (configuration: IConfigurat
     |> ignore
 
     services
-        .AddSingleton<UserService>()
+        // Registration generations are protocol identities: a process-local
+        // counter would restart at 1 and could match an unresolved correction
+        // permit from a previous server boot. Allocate from durable SQLite.
+        .AddSingleton<FeedbackStore>(fun _ -> FeedbackStore(databasePath))
+        .AddSingleton<UserService>(fun provider ->
+            UserService(
+                (fun () -> DateTimeOffset.UtcNow),
+                UserRetentionPolicy.defaults,
+                generationAllocator = (fun userId registration connectionId ->
+                    provider.GetRequiredService<FeedbackStore>()
+                        .AllocateDeviceRegistrationGeneration(
+                            userId, registration.DeviceId, connectionId,
+                            registration.ProtocolVersion, registration.ClientVersion))))
         .AddSingleton<ClientResponseTracker>()
         .AddSingleton<ExportStore>(fun _ -> new ExportStore())
-        .AddSingleton<FeedbackStore>(fun _ -> FeedbackStore(databasePath))
         .AddScoped<ClientService>()
     |> ignore
 

@@ -113,6 +113,14 @@ submission is rejected. Historical Accepted reviews without a pinned
 `ReviewedHeadOid` / `SourceVersion` need a new independently frozen
 review before a managed integration can be requested.
 
+**One-time bootstrap:** this implementation's own review may have been
+published by the *pre-upgrade* Jarvis client and therefore has no pinned
+SHA fields in its ledger record. Accept that frozen review, integrate its
+exact verified SHA through the existing branch-based submission flow (which
+may require a one-time contributor-branch push), and only then deploy this
+change. Do not try to use the new integration API on that old record or
+weaken immutable-provenance checks to make the rollout self-hosting.
+
 Deploy the protocol-compatible client/service updates together, configure
 host protection and a dedicated service credential before enabling new
 submissions, and verify through two independent checkouts. This change

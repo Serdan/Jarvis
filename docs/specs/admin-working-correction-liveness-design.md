@@ -670,3 +670,40 @@ nor does registration imply the client process, agent or descendant
 jobs have terminated. No automatic legacy epoch transition or
 correction permit release is implemented. Independent, authenticated
 fleet-wide pre-roster drain and OS process-tree evidence remain required.
+
+### Registration-generation cutover protects legacy approval (2026-11-14)
+
+A successful legacy-drain approval previously recorded an operator, timestamp,
+evidence, operation UUID and protocol, but did not bind that approval to a
+device-registration frontier. An old 3.63/3.64 (or otherwise incompatible)
+client could register *after* an approved drain while the same Ready marker
+would still authorize administrative corrections.
+
+The epoch record now durably stores
+`approved_registration_generation`, read from the monotonic SQLite
+`device_registration_sequence` **inside the same writer transaction**
+that verifies the operator's drain proof and checks unresolved executions.
+`ReadVerifiedExecutionEpoch` uses that cutover as its compatibility fence:
+if ANY user has an append-only roster entry with a later generation and
+a non-current `AgentProtocol.version`, it refuses Ready. The same predicate
+is used for operator inspection, correction admission and exact approval
+replay; all are fail-closed across server restart. A later current-version
+registration cannot erase that incompatible historical evidence.
+
+The predicate also verifies the current durable allocator exists, is
+integer-valued and has a high-water at least as large as the approved
+generation. A missing, negative, malformed or future-valued cutover,
+or a rolled-back/deleted allocator, invalidates the Ready marker. A
+pre-upgrade Ready row gains a **NULL** cutover through migration and
+cannot borrow new validation evidence; existing approvals are never
+silently backfilled. Matching modern registrations after approval are
+allowed, as they use the 3.65 witnessed command protocol.
+
+This is a safety veto, **not** a fleet-wide drain verifier. Existing old
+registrations *before* the approval are still the independent authenticated
+verifier's responsibility, including any pre-roster devices, old server
+instances and detached process descendants. The production callback is
+still not wired/exposed, so the live epoch remains
+`AwaitingLegacyDrain`. A postapproval legacy registration requires a new
+independently audited drain epoch; there is intentionally no automatic
+reset or timeout-based recovery.

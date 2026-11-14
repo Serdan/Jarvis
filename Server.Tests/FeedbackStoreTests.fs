@@ -3291,3 +3291,99 @@ let ``failed device roster insert rolls back generation and live registration`` 
         restarted.AllocateDeviceRegistrationGeneration(
             "alice", "desktop", "third", Common.AgentProtocol.version, "test")
         |> shouldEqual (second + 1L))
+
+[<Test>]
+let ``postapproval legacy device registration invalidates execution epoch and correction permit`` () =
+    withStore (fun store ->
+        let register user connection protocol =
+            store.AllocateDeviceRegistrationGeneration(
+                user, "desktop", connection, protocol, "client-test")
+        // A real drain verifier would independently attest this historical
+        // legacy registration before approving. The test callback simulates it.
+        let historic = register "alice" "preapproval-legacy" "3.64"
+        approveTestEpoch store
+        match store.GetAgentExecutionReadiness() with
+        | Ok (LegacyDrainVerified _) -> ()
+        | other -> Assert.Fail($"Expected initially approved drain: {other}")
+        let current = register "bob" "modern-client" Common.AgentProtocol.version
+        Assert.That(current, Is.GreaterThan(historic))
+        match store.GetAgentExecutionReadiness() with
+        | Ok (LegacyDrainVerified _) -> ()
+        | other -> Assert.Fail($"Current-protocol registration unexpectedly invalidated epoch: {other}")
+        let firstPermit =
+            store.TryAcquireAgentCorrection("alice", "Worker 3", "before-new-legacy")
+            |> function Ok id -> id | Error reason -> failwith reason
+        store.TryReleaseAgentCorrection("alice", "Worker 3", firstPermit, true)
+        |> shouldEqual (Ok ())
+        let after = register "bob" "reconnected-legacy" "3.63"
+        Assert.That(after, Is.GreaterThan(current))
+        let invalidated = store.GetAgentExecutionReadiness()
+        match invalidated with
+        | Error message ->
+            Assert.That(message, Does.Contain("incompatible client protocol"))
+        | other -> Assert.Fail($"Old client registration bypassed ready-epoch fence: {other}")
+        // A fresh good-protocol registration cannot repair the breached
+        // readiness generation; no time-based expiry or disconnect shortcut.
+        register "alice" "another-modern-client" Common.AgentProtocol.version
+        |> ignore
+        Assert.That(store.TryAcquireAgentCorrection(
+            "alice", "Worker 3", "after-new-legacy").IsError, Is.True)
+        use restarted = new FeedbackStore(store.DatabasePath)
+        Assert.That(restarted.GetAgentExecutionReadiness().IsError, Is.True)
+        Assert.That(restarted.TryAcquireAgentCorrection(
+            "alice", "Worker 3", "after-restart").IsError, Is.True)
+        // Same operation ID replays cannot borrow the original approval
+        // while this post-approval incompatible registration remains.
+        let replay =
+            restarted.TryAuthorizeLegacyDrain(
+                "test-operator", "some-other-drain-operation",
+                "Old clients must be drained with independent process proof.",
+                fun () -> Ok ())
+        Assert.That(replay.IsError, Is.True))
+
+[<Test>]
+let ``epoch cutover generation is mandatory and detects missing inconsistent storage`` () =
+    withStore (fun store ->
+        let oldGeneration =
+            store.AllocateDeviceRegistrationGeneration(
+                "alice", "desktop", "original", "3.64", "legacy-test")
+        approveTestEpoch store
+        use sql = new SqliteConnection($"Data Source={store.DatabasePath}")
+        sql.Open()
+        use query = sql.CreateCommand()
+        query.CommandText <-
+            "SELECT approved_registration_generation FROM agent_execution_epoch WHERE epoch_id = 1;"
+        let original = query.ExecuteScalar() :?> int64
+        original |> shouldEqual oldGeneration
+        let corrupt value =
+            use update = sql.CreateCommand()
+            update.CommandText <-
+                "UPDATE agent_execution_epoch SET approved_registration_generation = $value WHERE epoch_id = 1;"
+            update.Parameters.AddWithValue("$value", value) |> ignore
+            update.ExecuteNonQuery() |> shouldEqual 1
+        for missingOrInvalid in
+            [ box DBNull.Value; box -1L; box Int64.MaxValue; box "garbled-cutover" ] do
+            corrupt missingOrInvalid
+            let readonlyStatus = store.GetAgentExecutionReadiness()
+            Assert.That(readonlyStatus.IsError, Is.True,
+                        $"Corrupt epoch registration cutoff was trusted: {readonlyStatus}")
+            Assert.That(store.TryAcquireAgentCorrection(
+                "alice", "Worker 3", "bad-cutover").IsError, Is.True)
+            use restarted = new FeedbackStore(store.DatabasePath)
+            Assert.That(restarted.GetAgentExecutionReadiness().IsError, Is.True)
+        corrupt (box original)
+        match store.GetAgentExecutionReadiness() with
+        | Ok (LegacyDrainVerified _) -> ()
+        | other -> Assert.Fail($"Valid restored epoch was not accepted: {other}")
+        // Losing or rolling back the monotonic registration allocator must
+        // also revoke the approval, even if no legacy roster row is newer.
+        use counter = sql.CreateCommand()
+        counter.CommandText <- "UPDATE device_registration_sequence SET generation = 0 WHERE singleton_id = 1;"
+        counter.ExecuteNonQuery() |> shouldEqual 1
+        Assert.That(store.GetAgentExecutionReadiness().IsError, Is.True)
+        Assert.That(store.TryAcquireAgentCorrection(
+            "alice", "Worker 3", "lost-counter").IsError, Is.True)
+        use recovered = new FeedbackStore(store.DatabasePath)
+        match recovered.GetAgentExecutionReadiness() with
+        | Ok (LegacyDrainVerified _) -> ()
+        | other -> Assert.Fail($"Rebuilt high-water from durable roster rejected valid epoch: {other}"))

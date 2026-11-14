@@ -419,7 +419,8 @@ CREATE TABLE IF NOT EXISTS agent_execution_epoch (
     approval_operation_id TEXT UNIQUE NULL,
     evidence TEXT NULL,
     approved_at TEXT NULL,
-    protocol_version TEXT NULL
+    protocol_version TEXT NULL,
+    approved_registration_generation INTEGER NULL
 );
 INSERT OR IGNORE INTO agent_execution_epoch
     (epoch_id, state) VALUES (1, 'AwaitingLegacyDrain');
@@ -440,6 +441,14 @@ INSERT OR IGNORE INTO agent_execution_epoch
             use epochMigration = connection.CreateCommand()
             epochMigration.CommandText <-
                 "ALTER TABLE agent_execution_epoch ADD COLUMN protocol_version TEXT NULL;"
+            epochMigration.ExecuteNonQuery() |> ignore
+        if not (epochColumns.Contains("approved_registration_generation")) then
+            // Older Ready states cannot be silently trusted: without the
+            // registered-device cutover high-water mark, a later old client
+            // can reconnect undetected after the supposed legacy drain.
+            use epochMigration = connection.CreateCommand()
+            epochMigration.CommandText <-
+                "ALTER TABLE agent_execution_epoch ADD COLUMN approved_registration_generation INTEGER NULL;"
             epochMigration.ExecuteNonQuery() |> ignore
 
         // A permit created by an older server has NO authenticated command
@@ -812,7 +821,7 @@ INSERT INTO operations (
         transaction |> Option.iter (fun current -> command.Transaction <- current)
         command.CommandText <-
             """SELECT state, operator_id, approval_operation_id, evidence,
-                      approved_at, protocol_version
+                      approved_at, protocol_version, approved_registration_generation
                FROM agent_execution_epoch WHERE epoch_id = 1;"""
         use reader = command.ExecuteReader()
         if not (reader.Read()) then Error "Execution epoch record is missing."
@@ -823,6 +832,8 @@ INSERT INTO operations (
                            || reader.GetString 5 <> AgentProtocol.version ->
                 // An old or missing protocol approval is not reusable.
                 Ok LegacyDrainUnverified
+            | "Ready" when reader.IsDBNull 6 ->
+                Error "Execution epoch lacks durable device registration cutover evidence."
             | "Ready" when [1; 2; 3; 4] |> List.exists reader.IsDBNull ->
                 Error "Execution epoch approval evidence is incomplete."
             | "Ready" ->
@@ -830,14 +841,47 @@ INSERT INTO operations (
                 let approvalId = reader.GetString 2
                 let evidence = reader.GetString 3
                 let approvedAt = reader.GetString 4
+                let approvedGeneration = reader.GetInt64 6
                 if String.IsNullOrWhiteSpace operatorId
                    || String.IsNullOrWhiteSpace approvalId
                    || String.IsNullOrWhiteSpace evidence
-                   || evidence.Trim().Length < 20 then
+                   || evidence.Trim().Length < 20
+                   || approvedGeneration < 0L then
                     Error "Execution epoch approval evidence is invalid."
                 else
                     match DateTimeOffset.TryParse approvedAt with
-                    | true, at -> Ok (LegacyDrainVerified(operatorId, evidence, at))
+                    | true, at ->
+                        // Registration and approval share the SQLite writer
+                        // domain. A new legacy protocol after the approved
+                        // generation invalidates the epoch for correction,
+                        // irrespective of timestamps or client disconnects.
+                        reader.Close()
+                        use counter = connection.CreateCommand()
+                        transaction |> Option.iter (fun current ->
+                            counter.Transaction <- current)
+                        counter.CommandText <-
+                            """SELECT 1 FROM device_registration_sequence
+                               WHERE singleton_id = 1
+                                 AND typeof(generation) = 'integer'
+                                 AND generation >= $cutover
+                               LIMIT 1;"""
+                        addParameter counter "$cutover" approvedGeneration
+                        use legacy = connection.CreateCommand()
+                        transaction |> Option.iter (fun current ->
+                            legacy.Transaction <- current)
+                        legacy.CommandText <-
+                            """SELECT 1 FROM device_registration_roster
+                               WHERE generation > $cutover
+                                 AND protocol_version <> $currentProtocol
+                               LIMIT 1;"""
+                        addParameter legacy "$cutover" approvedGeneration
+                        addParameter legacy "$currentProtocol" AgentProtocol.version
+                        if isNull (counter.ExecuteScalar()) then
+                            Error "Execution epoch registration high-water evidence is missing or inconsistent."
+                        elif not (isNull (legacy.ExecuteScalar())) then
+                            Error "An incompatible client protocol registered after legacy drain approval; a new audited drain is required."
+                        else
+                            Ok (LegacyDrainVerified(operatorId, evidence, at))
                     | _ -> Error "Execution epoch approval timestamp is corrupt."
             | _ -> Error "Execution epoch is not a verified protocol state."
 
@@ -921,8 +965,16 @@ INSERT INTO operations (
                                        state = 'Ready', operator_id = $operator,
                                        approval_operation_id = $operation,
                                        evidence = $evidence, approved_at = $at,
-                                       protocol_version = $protocol
-                                   WHERE epoch_id = 1 AND state = 'AwaitingLegacyDrain';"""
+                                       protocol_version = $protocol,
+                                       approved_registration_generation =
+                                           (SELECT generation FROM device_registration_sequence
+                                            WHERE singleton_id = 1)
+                                   WHERE epoch_id = 1 AND state = 'AwaitingLegacyDrain'
+                                     AND EXISTS(
+                                         SELECT 1 FROM device_registration_sequence
+                                         WHERE singleton_id = 1
+                                           AND typeof(generation) = 'integer'
+                                           AND generation >= 0);"""
                             addParameter update "$operator" (operatorId.Trim())
                             addParameter update "$operation" (operationId.Trim())
                             addParameter update "$evidence" (evidence.Trim())

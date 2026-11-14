@@ -21,6 +21,14 @@
 <li>When task information is ambiguous, resolve the ambiguity early using reasonable defaults or a targeted Challenge to Lead; do not infer expansive, unrelated guarantees and then spend substantial effort supporting that inference.</li>
 <li>Reviewer acceptance must establish both implementation correctness and fidelity to the clarified task. Repeated review of a technically impressive implementation must not launder a mistaken underlying premise into a requirement.</li>
 </ul>
+<h2>Optional experiment: Critical Senior Dev consult</h2>
+<p>For a worker's Challenge alleging that the task needs materially expanded scope, evaluate launching a separate <strong>Critical Senior Dev</strong> agent with a deliberately skeptical but constructive review posture. This is independent advice to Lead, not a new approval gate or an alternative owner of requirements. Use existing role/taskless agent and Challenge mechanisms where possible; do not implement new dispatch infrastructure for this experiment.</p>
+<ul>
+<li>First give the consultant the original objective, canonical task spec and acceptance criteria, <em>before</em> the worker's proposed solution or pile of supporting reviews, to reduce anchoring. Then provide the actual Challenge, concrete technical evidence and relevant constraints.</li>
+<li>Ask it to identify whether the concern actually falsifies a task acceptance criterion, whether the inferred guarantee was requested, what minimal correction would suffice, and whether to proceed unchanged, clarify the task, or open separate follow-up work. Require it also to identify circumstances under which the expansion <em>is</em> genuinely necessary; contrarianism alone is not success.</li>
+<li>Try contrasting short role prompts (for example, Critical Senior Dev versus a standard reviewer or pragmatic implementation lead) against the Worker 3 retrospective and one legitimately necessary scope expansion. Evaluate reasoning quality, independence from the worker's framing, token/latency overhead, and false positives, not just whether the consultant says 'no'.</li>
+<li>Lead retains autonomous decision authority and records the disposition in the canonical task/Challenge. Invoke the consultant selectively when a Challenge would materially change deliverables, architecture or proof obligations; no mandatory second opinion for every routine engineering decision.</li>
+</ul>
 <h2>Investigation</h2>
 <ul>
 <li>Reconstruct the sequence of task specs, checkpoints, reviews, instructions, changes and escalations. Identify the first material scope increase, who introduced it, how it was justified, and why it was not challenged or explicitly approved.</li>
@@ -43,7 +51,7 @@
 <li>Concise retrospective of the Worker 3 case with specific source/task/review milestones and at least one earlier intervention point that would have saved effort without sacrificing a real correctness guarantee.</li>
 <li>Two or more contrasting task examples demonstrate that the proposal catches unjustified expansion but does not suppress necessary fixes.</li>
 <li>Deliver concise, immediately usable persistent instruction wording for workers, reviewers and Lead embodying the three behaviors above. Include a short Challenge-to-Lead example, a task-to-implementation acceptance check, an example of justified expansion, and how Lead revises a canonical specification autonomously without permitting the implementer to redefine its own target.</li>
-<li>Test the proposed check retrospectively against the case and apply it to at least one current task in dry-run form. State false-positive/false-negative risks and expected coordination overhead.</li>
+<li>Test the proposed check retrospectively against the case and apply it to at least one current task in dry-run form. Include a bounded Critical Senior Dev consult comparison, noting whether it improves on Lead alone, along with false-positive/false-negative risks and token/coordination overhead.</li>
 <li>Present an explicit recommendation prioritizing role/AGENTS.md instructions over new tooling, and any operator decision required. No automatic bulk edits to agents, roles or project processes and no deployment without approval.</li>
 </ol>
 <p><strong>Constraints:</strong> Preserve autonomous project delivery and avoid introducing an operator approval bottleneck. The goal is better judgment and throughput, not weaker engineering standards. No Codex through Jarvis. Keep the investigation bounded and focus on preventing a repeat of the same failure mode.</p>

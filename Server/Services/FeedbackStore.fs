@@ -409,6 +409,25 @@ CREATE TABLE IF NOT EXISTS agent_correction_permit (
     PRIMARY KEY(user_id, agent_id)
 );
 
+-- An exclusive permit is released when its outcome is resolved, but the
+-- correction command's UUID ownership must NEVER be released or repurposed.
+-- Otherwise the same user could replay a successful UUID on another agent
+-- or another Git ledger after the original target's permit is deleted.
+-- This is not telemetry and is intentionally never pruned.
+CREATE TABLE IF NOT EXISTS agent_correction_operation_identity (
+    user_id TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    target_agent_id TEXT NOT NULL,
+    project_name TEXT NOT NULL,
+    requesting_agent_id TEXT NOT NULL,
+    request_fingerprint TEXT NOT NULL,
+    device_id TEXT NOT NULL,
+    device_generation INTEGER NOT NULL CHECK(device_generation > 0),
+    initiating_request_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(user_id, operation_id)
+);
+
 -- A migration from pre-witness server protocols through 3.64 cannot infer
 -- safety from zero rows: an old MCP request may still execute on another device.
 -- Explicit authenticated drain proof is required before ANY correction.
@@ -1184,6 +1203,40 @@ INSERT INTO operations (
                              (if existing.IsDBNull 7 then None else Some(existing.GetInt64 7)))
                     else None
                 existing.Close()
+                // Ownership of a canonical correction UUID is permanent even
+                // after its short-lived target permit has been released.
+                // This query and the initial insert share the same SQLite
+                // writer transaction as agent admission and exclusion.
+                use owned = connection.CreateCommand()
+                owned.Transaction <- transaction
+                owned.CommandText <-
+                    """SELECT target_agent_id, project_name, requesting_agent_id,
+                              request_fingerprint, device_id, device_generation
+                       FROM agent_correction_operation_identity
+                       WHERE user_id = $userId AND operation_id = $operationId
+                       LIMIT 1;"""
+                addParameter owned "$userId" userId
+                addParameter owned "$operationId" operationId
+                use ownedReader = owned.ExecuteReader()
+                let permanentIdentity =
+                    if ownedReader.Read() then
+                        Some(ownedReader.GetString 0, ownedReader.GetString 1,
+                             ownedReader.GetString 2, ownedReader.GetString 3,
+                             ownedReader.GetString 4, ownedReader.GetInt64 5)
+                    else None
+                ownedReader.Close()
+                let identityMatches =
+                    match requestBinding, permanentIdentity with
+                    | None, None -> true // unbound internal test path
+                    | Some _, None -> true // first production claim
+                    | Some request, Some(target, project, actor, fingerprint, device, generation) ->
+                        target = agent
+                        && project = request.ProjectName
+                        && actor = request.RequestingAgentId
+                        && fingerprint = request.RequestFingerprint
+                        && device = request.DeviceId
+                        && generation = request.DeviceGeneration
+                    | _ -> false
                 // The initiator's own pre-dispatch witness must exist, be
                 // owned by the authenticated user and match the exact source
                 // agent/project before any target exclusion can be borrowed.
@@ -1259,11 +1312,47 @@ INSERT INTO operations (
                     match this.ReadVerifiedExecutionEpoch(connection, Some transaction) with
                     | Ok (LegacyDrainVerified _) -> true
                     | _ -> false
+                let registerPermanentIdentity () =
+                    match requestBinding, permanentIdentity with
+                    | Some request, None ->
+                        use record = connection.CreateCommand()
+                        record.Transaction <- transaction
+                        record.CommandText <-
+                            """INSERT INTO agent_correction_operation_identity
+                               (user_id, operation_id, target_agent_id,
+                                project_name, requesting_agent_id,
+                                request_fingerprint, device_id,
+                                device_generation, initiating_request_id, created_at)
+                               VALUES ($userId, $operationId, $target,
+                                       $project, $actor, $fingerprint, $device,
+                                       $generation, $requestId, $now);"""
+                        addParameter record "$userId" userId
+                        addParameter record "$operationId" operationId
+                        addParameter record "$target" agent
+                        addParameter record "$project" request.ProjectName
+                        addParameter record "$actor" request.RequestingAgentId
+                        addParameter record "$fingerprint" request.RequestFingerprint
+                        addParameter record "$device" request.DeviceId
+                        addParameter record "$generation" request.DeviceGeneration
+                        addParameter record "$requestId" request.InitiatingRequestId
+                        addParameter record "$now" (DateTimeOffset.UtcNow.ToString("O"))
+                        if record.ExecuteNonQuery() = 1 then Ok ()
+                        else Error "Cannot durably bind correction operation UUID."
+                    | Some _, Some _ -> Ok () // exact existing record, never altered
+                    | None, None -> Ok () // internal legacy test fixture only
+                    | None, Some _ ->
+                        Error "Unbound correction cannot borrow a registered operation UUID."
                 match prior with
                 | _ when not epochReady ->
                     Error "Protocol epoch has not proven pre-witness legacy activity quiescent."
                 | _ when not requestAdmitted ->
                     Error "Administrative correction has no matching durable initiating request witness."
+                | _ when not identityMatches ->
+                    Error "Correction operation UUID is permanently bound to another target, device or canonical request."
+                | Some _ when requestBinding.IsSome && permanentIdentity.IsNone ->
+                    // A bound permit from an older server has no trusted
+                    // immutable UUID history. Never silently backfill it.
+                    Error "Existing correction permit lacks permanent operation identity evidence."
                 | Some (permit, previousOperation, project, actor, fingerprint, requestId, device, generation)
                     when previousOperation = operationId
                          && matchesPrior project actor fingerprint requestId device generation ->
@@ -1319,9 +1408,12 @@ INSERT INTO operations (
                         match pinRoute() with
                         | Error failure -> Error failure
                         | Ok () ->
-                            insert.ExecuteNonQuery() |> ignore
-                            transaction.Commit()
-                            Ok permit
+                            match registerPermanentIdentity() with
+                            | Error failure -> Error failure
+                            | Ok () ->
+                                insert.ExecuteNonQuery() |> ignore
+                                transaction.Commit()
+                                Ok permit
             with ex ->
                 Error $"Cannot acquire durable correction barrier: {ex.Message}"
 

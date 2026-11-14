@@ -3387,3 +3387,161 @@ let ``epoch cutover generation is mandatory and detects missing inconsistent sto
         match recovered.GetAgentExecutionReadiness() with
         | Ok (LegacyDrainVerified _) -> ()
         | other -> Assert.Fail($"Rebuilt high-water from durable roster rejected valid epoch: {other}"))
+
+[<Test>]
+let ``correction UUID identity survives permit release and rejects retargeted replay`` () =
+    withStore (fun store ->
+        approveTestEpoch store
+        let operationId = Guid.NewGuid().ToString("D")
+        let fingerprint = String.replicate 64 "A"
+        let request user actor project device generation hash =
+            let admitted =
+                store.TryBeginAgentOperation(
+                    user, actor, "TaskWrite", Some project,
+                    "server", None, Some Common.AgentProtocol.version)
+                |> function Ok value -> value | Error failure -> failwith failure
+            { ProjectName = project
+              RequestingAgentId = actor
+              RequestFingerprint = hash
+              InitiatingRequestId = admitted.Id
+              DeviceId = device
+              DeviceGeneration = generation } : AgentCorrectionRequestBinding
+        let user = "alice"
+        let original = request user "Admin 1" "Jarvis" "desktop" 100L fingerprint
+        let claim target binding =
+            store.TryAcquireAgentCorrectionForRequest(
+                user, target, operationId, binding)
+        let first =
+            claim "Worker 3" original
+            |> function Ok id -> id | Error failure -> failwith failure
+        // The mutex is short-lived; the UUID's command and route ownership
+        // must be permanent, including after SQLite restart and telemetry TTL.
+        store.TryReleaseAgentCorrection(user, "Worker 3", first, true)
+        |> shouldEqual (Ok ())
+        store.PruneTelemetry(DateTimeOffset.UtcNow.AddDays(45.0))
+        use restarted = new FeedbackStore(store.DatabasePath)
+        let second = request user "Admin 1" "Jarvis" "desktop" 100L fingerprint
+        let reissued =
+            restarted.TryAcquireAgentCorrectionForRequest(
+                user, "Worker 3", operationId, second)
+            |> function Ok id -> id | Error failure -> failwith failure
+        restarted.TryReleaseAgentCorrection(user, "Worker 3", reissued, true)
+        |> shouldEqual (Ok ())
+        let invalid =
+            [ "target changed", "Worker 4", "Admin 1", "Jarvis", "desktop", 100L, fingerprint
+              "project changed", "Worker 3", "Admin 1", "Wayfold", "desktop", 100L, fingerprint
+              "actor changed", "Worker 3", "Admin 2", "Jarvis", "desktop", 100L, fingerprint
+              "device changed", "Worker 3", "Admin 1", "Jarvis", "laptop", 100L, fingerprint
+              "generation changed", "Worker 3", "Admin 1", "Jarvis", "desktop", 101L, fingerprint
+              "command changed", "Worker 3", "Admin 1", "Jarvis", "desktop", 100L, String.replicate 64 "B" ]
+        for label, target, actor, project, device, generation, hash in invalid do
+            let changed = request user actor project device generation hash
+            Assert.That(
+                (restarted.TryAcquireAgentCorrectionForRequest(
+                    user, target, operationId, changed)).IsError,
+                Is.True, $"Resolved UUID was repurposed after permit release: {label}")
+            restarted.InspectAgentCorrectionPermit(user, target)
+            |> shouldEqual (Ok None)
+        Assert.That(restarted.TryAcquireAgentCorrection(
+            user, "Worker 3", operationId).IsError, Is.True,
+            "Unbound legacy caller cannot borrow a permanent production correction UUID.")
+        let exact = request user "Admin 1" "Jarvis" "desktop" 100L fingerprint
+        let permitted =
+            restarted.TryAcquireAgentCorrectionForRequest(
+                user, "Worker 3", operationId, exact)
+            |> function Ok id -> id | Error failure -> failwith failure
+        restarted.TryReleaseAgentCorrection(user, "Worker 3", permitted, true)
+        |> shouldEqual (Ok ())
+        // UUID namespaces are scoped to authenticated users, not all tenants.
+        let bob = request "bob" "Admin 1" "Jarvis" "desktop" 100L fingerprint
+        let otherUser =
+            restarted.TryAcquireAgentCorrectionForRequest(
+                "bob", "Worker 3", operationId, bob)
+            |> function Ok id -> id | Error failure -> failwith failure
+        restarted.TryReleaseAgentCorrection("bob", "Worker 3", otherUser, true)
+        |> shouldEqual (Ok ()))
+
+[<Test>]
+let ``missing correction UUID history cannot be backfilled from old held permit`` () =
+    withStore (fun store ->
+        approveTestEpoch store
+        let operationId = Guid.NewGuid().ToString("D")
+        let bound : AgentCorrectionRequestBinding =
+            let witness =
+                store.TryBeginAgentOperation(
+                    "alice", "Admin 1", "TaskWrite", Some "Jarvis",
+                    "server", None, Some Common.AgentProtocol.version)
+                |> function Ok v -> v | Error e -> failwith e
+            { ProjectName = "Jarvis"; RequestingAgentId = "Admin 1"
+              RequestFingerprint = String.replicate 64 "A"
+              InitiatingRequestId = witness.Id
+              DeviceId = "desktop"; DeviceGeneration = 200L }
+        let permit =
+            store.TryAcquireAgentCorrectionForRequest(
+                "alice", "Worker 3", operationId, bound)
+            |> function Ok v -> v | Error e -> failwith e
+        use sql = new SqliteConnection($"Data Source={store.DatabasePath}")
+        sql.Open()
+        use loseHistory = sql.CreateCommand()
+        loseHistory.CommandText <-
+            "DELETE FROM agent_correction_operation_identity WHERE user_id = 'alice';"
+        loseHistory.ExecuteNonQuery() |> shouldEqual 1
+        use restarted = new FeedbackStore(store.DatabasePath)
+        let fresh =
+            restarted.TryBeginAgentOperation(
+                "alice", "Admin 1", "TaskWrite", Some "Jarvis",
+                "server", None, Some Common.AgentProtocol.version)
+            |> function Ok v -> v | Error e -> failwith e
+        let replay = restarted.TryAcquireAgentCorrectionForRequest(
+            "alice", "Worker 3", operationId,
+            { bound with InitiatingRequestId = fresh.Id })
+        Assert.That(replay.IsError, Is.True,
+                    "A migrated bound permit without permanent UUID history must stay unresolved.")
+        let retained =
+            restarted.InspectAgentCorrectionPermit("alice", "Worker 3")
+            |> function Ok(Some p) -> p | other -> failwithf "Expected held permit: %A" other
+        retained.PermitId |> shouldEqual permit
+        restarted.TryReleaseAgentCorrection(
+            "alice", "Worker 3", permit, true) |> shouldEqual (Ok ()))
+
+[<Test>]
+let ``failed permanent correction identity insert rolls back permit and witness pin`` () =
+    withStore (fun store ->
+        approveTestEpoch store
+        let operationId = Guid.NewGuid().ToString("D")
+        let witness =
+            store.TryBeginAgentOperation(
+                "alice", "Admin 1", "TaskWrite", Some "Jarvis",
+                "server", None, Some Common.AgentProtocol.version)
+            |> function Ok v -> v | Error e -> failwith e
+        let bound : AgentCorrectionRequestBinding =
+            { ProjectName = "Jarvis"; RequestingAgentId = "Admin 1"
+              RequestFingerprint = String.replicate 64 "A"
+              InitiatingRequestId = witness.Id
+              DeviceId = "desktop"; DeviceGeneration = 100L }
+        use sql = new SqliteConnection($"Data Source={store.DatabasePath}")
+        sql.Open()
+        use fail = sql.CreateCommand()
+        fail.CommandText <-
+            """CREATE TRIGGER reject_identity BEFORE INSERT ON agent_correction_operation_identity
+               BEGIN SELECT RAISE(FAIL, 'test injected durable UUID failure'); END;"""
+        fail.ExecuteNonQuery() |> ignore
+        Assert.That(store.TryAcquireAgentCorrectionForRequest(
+            "alice", "Worker 3", operationId, bound).IsError, Is.True)
+        store.InspectAgentCorrectionPermit("alice", "Worker 3")
+        |> shouldEqual (Ok None)
+        use pins = sql.CreateCommand()
+        pins.CommandText <-
+            "SELECT expected_device_id FROM agent_execution_witness WHERE request_id = $id;"
+        pins.Parameters.AddWithValue("$id", witness.Id) |> ignore
+        Assert.That(pins.ExecuteScalar(), Is.EqualTo(DBNull.Value :> obj),
+                    "The request route pin must rollback with failed UUID history insert.")
+        use drop = sql.CreateCommand()
+        drop.CommandText <- "DROP TRIGGER reject_identity;"
+        drop.ExecuteNonQuery() |> ignore
+        let succeeded =
+            store.TryAcquireAgentCorrectionForRequest(
+                "alice", "Worker 3", operationId, bound)
+            |> function Ok id -> id | Error e -> failwith e
+        store.TryReleaseAgentCorrection(
+            "alice", "Worker 3", succeeded, true) |> shouldEqual (Ok ()))

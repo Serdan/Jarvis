@@ -1,0 +1,1 @@
+Durable CLI/browser once/every/idle scheduling, authenticated cross-device Manager activity hints, no-replay claims, OAuth permissions, API/list/get/cancel and migration. Release tests: Server.Tests 129/129 passed, Client BrowserSchedules 13/13 passed; full Client.Tests timed out at 180s without reported assertion failure. No merge or deployment.

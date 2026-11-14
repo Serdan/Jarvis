@@ -125,9 +125,11 @@ let configureServices (services: IServiceCollection) (configuration: IConfigurat
             UserService(
                 (fun () -> DateTimeOffset.UtcNow),
                 UserRetentionPolicy.defaults,
-                generationAllocator = (fun () ->
+                generationAllocator = (fun userId registration connectionId ->
                     provider.GetRequiredService<FeedbackStore>()
-                        .AllocateDeviceRegistrationGeneration())))
+                        .AllocateDeviceRegistrationGeneration(
+                            userId, registration.DeviceId, connectionId,
+                            registration.ProtocolVersion, registration.ClientVersion))))
         .AddSingleton<ClientResponseTracker>()
         .AddSingleton<ExportStore>(fun _ -> new ExportStore())
         .AddScoped<ClientService>()

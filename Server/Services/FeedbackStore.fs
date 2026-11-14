@@ -73,6 +73,21 @@ type AgentExecutionResolution =
     | ExecutionUnresolved
 
 /// Read-only operator recovery evidence for a single authenticated user's
+/// registered device incarnation. Recording a device is not a terminal or
+/// legacy-drain attestation: these records are intentionally append-only.
+type DurableDeviceRegistration =
+    { Generation: int64
+      DeviceId: string
+      ConnectionId: string
+      ProtocolVersion: string
+      ClientVersion: string
+      RegisteredAt: DateTimeOffset }
+
+type DurableDeviceRegistrationPage =
+    { Registrations: DurableDeviceRegistration list
+      HasMore: bool }
+
+/// Read-only operator recovery evidence for a single authenticated user's
 /// target agent. This is NOT permission to release the durable exclusion.
 type AgentCorrectionPermitEvidence =
     { TargetAgentId: string
@@ -312,6 +327,22 @@ CREATE TABLE IF NOT EXISTS device_registration_sequence (
 INSERT OR IGNORE INTO device_registration_sequence
     (singleton_id, generation) VALUES (1, 0);
 
+-- Retain every authenticated client registration independently of disposable
+-- connection diagnostics. The generation and roster entry commit together.
+-- An empty roster after installing this schema is NOT proof that historical
+-- pre-roster clients or detached operations have ended.
+CREATE TABLE IF NOT EXISTS device_registration_roster (
+    generation INTEGER PRIMARY KEY CHECK(generation > 0),
+    user_id TEXT NOT NULL,
+    device_id TEXT NOT NULL,
+    connection_id TEXT NOT NULL,
+    protocol_version TEXT NOT NULL,
+    client_version TEXT NOT NULL,
+    registered_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_registration_roster_user
+    ON device_registration_roster(user_id, generation);
+
 -- Independent from 30-day operation telemetry retention: unresolved client
 -- executions are never pruned by age. The Git ledger remains task authority.
 CREATE TABLE IF NOT EXISTS agent_execution_witness (
@@ -522,7 +553,9 @@ INSERT OR IGNORE INTO agent_execution_epoch
                    COALESCE((SELECT MAX(device_generation)
                              FROM agent_correction_permit), 0),
                    COALESCE((SELECT MAX(generation)
-                             FROM connection_events), 0))
+                             FROM connection_events), 0),
+                   COALESCE((SELECT MAX(generation)
+                             FROM device_registration_roster), 0))
                WHERE singleton_id = 1;"""
         if generationFloor.ExecuteNonQuery() <> 1 then
             invalidOp "Device registration generation allocator is missing."
@@ -569,11 +602,19 @@ INSERT OR IGNORE INTO agent_execution_epoch
 
     member _.DatabasePath = databasePath
 
-    /// Allocate one permanent, server-wide SignalR device incarnation ID.
-    /// SQLite's serialized UPDATE RETURNING never reissues an identity after
-    /// server restart, concurrent registration or disconnected-device pruning.
-    /// A missing/corrupt store or counter exhaustion must refuse registration.
-    member _.AllocateDeviceRegistrationGeneration() : int64 =
+    /// Allocate a permanent SignalR device incarnation AND its immutable
+    /// authenticated registration record in ONE SQLite transaction. A failure
+    /// before commit rolls back both. Historical registrations are never
+    /// pruned and cannot themselves prove a device's execution has stopped.
+    member _.AllocateDeviceRegistrationGeneration(
+        userId: string, deviceId: string, connectionId: string,
+        protocolVersion: string, clientVersion: string
+    ) : int64 =
+        let bounded value =
+            String.IsNullOrWhiteSpace value || value.Length > 512
+        if [userId; deviceId; connectionId; protocolVersion; clientVersion]
+           |> List.exists bounded then
+            invalidArg "registration" "Authenticated bounded device registration identity is required."
         use connection = openConnection()
         use transaction = connection.BeginTransaction()
         use command = connection.CreateCommand()
@@ -587,8 +628,56 @@ INSERT OR IGNORE INTO agent_execution_epoch
             match command.ExecuteScalar() with
             | :? int64 as value when value > 0L -> value
             | _ -> invalidOp "Durable device generation is missing, corrupt or exhausted."
+        use insert = connection.CreateCommand()
+        insert.Transaction <- transaction
+        insert.CommandText <-
+            """INSERT INTO device_registration_roster
+               (generation, user_id, device_id, connection_id,
+                protocol_version, client_version, registered_at)
+               VALUES ($generation, $userId, $deviceId, $connectionId,
+                       $protocol, $client, $now);"""
+        addParameter insert "$generation" generation
+        addParameter insert "$userId" userId
+        addParameter insert "$deviceId" deviceId
+        addParameter insert "$connectionId" connectionId
+        addParameter insert "$protocol" protocolVersion
+        addParameter insert "$client" clientVersion
+        addParameter insert "$now" (DateTimeOffset.UtcNow.ToString("O"))
+        if insert.ExecuteNonQuery() <> 1 then
+            invalidOp "Cannot persist authenticated device registration."
         transaction.Commit()
         generation
+
+    /// User-scoped, bounded recovery inventory. Empty results do not prove
+    /// historic pre-roster devices have stopped executing.
+    member _.ListDurableDeviceRegistrations(userId: string, limit: int)
+        : Result<DurableDeviceRegistrationPage, string> =
+        if String.IsNullOrWhiteSpace userId || limit < 1 || limit > 500 then
+            Error "Authenticated user and registration page size 1..500 are required."
+        else
+            try
+                use connection = openConnection()
+                use command = connection.CreateCommand()
+                command.CommandText <-
+                    """SELECT generation, device_id, connection_id,
+                              protocol_version, client_version, registered_at
+                       FROM device_registration_roster WHERE user_id = $userId
+                       ORDER BY generation DESC LIMIT $limit;"""
+                addParameter command "$userId" userId
+                addParameter command "$limit" (limit + 1)
+                use reader = command.ExecuteReader()
+                let rows = ResizeArray<DurableDeviceRegistration>()
+                while reader.Read() do
+                    rows.Add
+                        { Generation = reader.GetInt64 0
+                          DeviceId = reader.GetString 1
+                          ConnectionId = reader.GetString 2
+                          ProtocolVersion = reader.GetString 3
+                          ClientVersion = reader.GetString 4
+                          RegisteredAt = DateTimeOffset.Parse(reader.GetString 5) }
+                Ok { Registrations = rows |> Seq.truncate limit |> Seq.toList
+                     HasMore = rows.Count > limit }
+            with ex -> Error $"Cannot inspect durable device registration roster: {ex.Message}"
 
     member _.AddConnectionEvent(
         userId: string,

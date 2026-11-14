@@ -1441,8 +1441,9 @@ module McpToolHelpers =
                 | Ok target ->
                     match store.GetAgentExecutionReadiness(),
                           store.InspectAgentCorrectionPermit(userId, target),
-                          store.ListUnresolvedAgentExecutions(userId, target, maxRows) with
-                    | Ok protocol, Ok permit, Ok unresolved ->
+                          store.ListUnresolvedAgentExecutions(userId, target, maxRows),
+                          store.ListDurableDeviceRegistrations(userId, maxRows) with
+                    | Ok protocol, Ok permit, Ok unresolved, Ok registrations ->
                         let epochVerified =
                             match protocol with
                             | LegacyDrainVerified _ -> true
@@ -1453,12 +1454,16 @@ module McpToolHelpers =
                                unresolvedCorrectionPermit = permit
                                unresolvedExecutions = unresolved.Executions
                                hasMore = unresolved.HasMore
+                               durableDeviceRegistrations = registrations.Registrations
+                               deviceRegistrationsHasMore = registrations.HasMore
+                               rosterCanOmitPreUpgradeDevices = true
                                readOnlyNonAtomic = true
                                authorizesCorrection = false |}
                             |> jsonResult
-                    | Error problem, _, _
-                    | _, Error problem, _
-                    | _, _, Error problem ->
+                    | Error problem, _, _, _
+                    | _, Error problem, _, _
+                    | _, _, Error problem, _
+                    | _, _, _, Error problem ->
                         return errorResult (ExecutionFailed
                             ("Cannot verify durable correction evidence: " + problem))
         }

@@ -74,7 +74,7 @@ type RoutingRetentionCounts =
       ConnectedTransports: int }
 
 type UserService(clock: unit -> DateTimeOffset, retention: UserRetentionPolicy,
-                 ?generationAllocator: unit -> int64) =
+                 ?generationAllocator: string -> ClientRegistration -> string -> int64) =
     let utcNow = clock
     let policy = UserRetentionPolicy.validate retention
     let gate = obj()
@@ -89,7 +89,7 @@ type UserService(clock: unit -> DateTimeOffset, retention: UserRetentionPolicy,
     let mutable nextGeneration = 0L
     let mutable highestRegisteredGeneration = 0L
     let allocateGeneration =
-        defaultArg generationAllocator (fun () ->
+        defaultArg generationAllocator (fun _ _ _ ->
             if nextGeneration = Int64.MaxValue then
                 invalidOp "Device registration generation sequence exhausted."
             nextGeneration <- nextGeneration + 1L
@@ -310,7 +310,7 @@ type UserService(clock: unit -> DateTimeOffset, retention: UserRetentionPolicy,
             // Allocate BEFORE changing any session, default selection or
             // transport ownership. Failed SQLite persistence must leave the
             // old routing state intact, not partially disconnect an agent.
-            let generation = allocateGeneration()
+            let generation = allocateGeneration userId registration connectionId
             if generation <= highestRegisteredGeneration then
                 invalidOp "Device registration returned a reused or invalid durable generation."
             highestRegisteredGeneration <- generation

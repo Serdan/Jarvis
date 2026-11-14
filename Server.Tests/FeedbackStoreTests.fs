@@ -2926,8 +2926,10 @@ let ``durable device registration generations remain distinct across server rest
         let makeUsers (database: FeedbackStore) =
             UserService((fun () -> DateTimeOffset.UtcNow),
                         UserRetentionPolicy.defaults,
-                        generationAllocator = (fun () ->
-                            database.AllocateDeviceRegistrationGeneration()))
+                        generationAllocator = (fun userId registration connectionId ->
+                            database.AllocateDeviceRegistrationGeneration(
+                                userId, registration.DeviceId, connectionId,
+                                registration.ProtocolVersion, registration.ClientVersion)))
         let registration device : Common.SignalR.ClientRegistration =
             { DeviceId = device; DeviceName = device
               ClientVersion = "test"; ProtocolVersion = Common.AgentProtocol.version
@@ -2957,16 +2959,19 @@ let ``durable device registration generations remain distinct across server rest
         Assert.That(other.Generation, Is.GreaterThan(second.Generation),
                     "Generation identity must be unique across users, not just per device.")
         use third = new FeedbackStore(store.DatabasePath)
-        let later = third.AllocateDeviceRegistrationGeneration()
+        let later = third.AllocateDeviceRegistrationGeneration(
+            "alice", "manual", "manual-connection", Common.AgentProtocol.version, "test")
         Assert.That(later, Is.GreaterThan(other.Generation))
-        let parallel =
+        let allocations =
             [| for i in 1 .. 16 ->
                  Task.Run(fun () ->
-                     if i % 2 = 0 then store.AllocateDeviceRegistrationGeneration()
-                     else restarted.AllocateDeviceRegistrationGeneration()) |]
-        Task.WaitAll(parallel |> Array.map (fun task -> task :> Task))
-        let distinct = parallel |> Array.map _.Result |> Set.ofArray
-        Assert.That(distinct.Count, Is.EqualTo(parallel.Length),
+                     let allocator = if i % 2 = 0 then store else restarted
+                     allocator.AllocateDeviceRegistrationGeneration(
+                         "alice", "device", $"concurrent-{i}",
+                         Common.AgentProtocol.version, "test")) |]
+        Task.WaitAll(allocations |> Array.map (fun task -> task :> Task))
+        let distinct = allocations |> Array.map _.Result |> Set.ofArray
+        Assert.That(distinct.Count, Is.EqualTo(allocations.Length),
                     "Two server/store instances must not allocate the same generation.")
         Assert.That(distinct |> Seq.min, Is.GreaterThan(later)))
 
@@ -3004,7 +3009,8 @@ let ``new device allocator seeds above old execution witnesses and correction pe
         reset.CommandText <- "DROP TABLE device_registration_sequence;"
         reset.ExecuteNonQuery() |> ignore
         use upgraded = new FeedbackStore(store.DatabasePath)
-        let afterMigration = upgraded.AllocateDeviceRegistrationGeneration()
+        let afterMigration = upgraded.AllocateDeviceRegistrationGeneration(
+            "alice", "desktop", "new-connection", Common.AgentProtocol.version, "test")
         Assert.That(afterMigration, Is.GreaterThan(802L),
                     "The first upgraded server must exceed ALL persisted generations.")
         let stillHeld =
@@ -3026,8 +3032,10 @@ let ``device registration fails without durable generation and preserves prior r
     withStore (fun store ->
         let users = UserService((fun () -> DateTimeOffset.UtcNow),
                                 UserRetentionPolicy.defaults,
-                                generationAllocator = (fun () ->
-                                    store.AllocateDeviceRegistrationGeneration()))
+                                generationAllocator = (fun userId registration connectionId ->
+                                    store.AllocateDeviceRegistrationGeneration(
+                                        userId, registration.DeviceId, connectionId,
+                                        registration.ProtocolVersion, registration.ClientVersion)))
         let registration device : Common.SignalR.ClientRegistration =
             { DeviceId = device; DeviceName = device
               ClientVersion = "test"; ProtocolVersion = Common.AgentProtocol.version
@@ -3059,7 +3067,7 @@ let ``device registration fails without durable generation and preserves prior r
         let invalidUsers =
             UserService((fun () -> DateTimeOffset.UtcNow),
                         UserRetentionPolicy.defaults,
-                        generationAllocator = (fun () -> 0L))
+                        generationAllocator = (fun _ _ _ -> 0L))
         invalidUsers.TransportConnected("bob", "bad-connection")
         Assert.That(
             (fun () -> invalidUsers.Register(
@@ -3070,7 +3078,7 @@ let ``device registration fails without durable generation and preserves prior r
         let duplicateUsers =
             UserService((fun () -> DateTimeOffset.UtcNow),
                         UserRetentionPolicy.defaults,
-                        generationAllocator = (fun () -> 1L))
+                        generationAllocator = (fun _ _ _ -> 1L))
         duplicateUsers.TransportConnected("bob", "first")
         let first = duplicateUsers.Register("bob", registration "workstation", "first")
         duplicateUsers.TransportConnected("bob", "second")
@@ -3087,6 +3095,8 @@ let ``correction evidence MCP is read-only bounded and scoped to authenticated u
     withStore (fun store ->
         let user, target = "alice", "Worker 3"
         let ongoing = beginWitness store user target
+        let registered = store.AllocateDeviceRegistrationGeneration(
+            user, "laptop", "registered-client", "3.64", "legacy-test")
         let inspect userId agent limit =
             McpToolHelpers.getAgentCorrectionEvidence
                 store (authenticatedAccessor userId) agent (Nullable limit)
@@ -3105,11 +3115,19 @@ let ``correction evidence MCP is read-only bounded and scoped to authenticated u
         let unresolved = root.GetProperty("unresolvedExecutions")
         unresolved.GetArrayLength() |> shouldEqual 1
         unresolved[0].GetProperty("RequestId").GetString() |> shouldEqual ongoing.Id
+        root.GetProperty("rosterCanOmitPreUpgradeDevices").GetBoolean()
+        |> shouldEqual true
+        let roster = root.GetProperty("durableDeviceRegistrations")
+        roster.GetArrayLength() |> shouldEqual 1
+        roster[0].GetProperty("Generation").GetInt64() |> shouldEqual registered
+        roster[0].GetProperty("ProtocolVersion").GetString() |> shouldEqual "3.64"
         let otherUser = inspect "bob" target 10
         Assert.That(otherUser.IsError, Is.EqualTo(Nullable false))
         use otherJson = JsonDocument.Parse(
             (otherUser.Content[0] :?> ModelContextProtocol.Protocol.TextContentBlock).Text)
         otherJson.RootElement.GetProperty("unresolvedExecutions").GetArrayLength()
+        |> shouldEqual 0
+        otherJson.RootElement.GetProperty("durableDeviceRegistrations").GetArrayLength()
         |> shouldEqual 0
         for invalidTarget, invalidLimit in
             [ "", 10; String.replicate 257 "x", 10; target, 0; target, 51 ] do
@@ -3195,3 +3213,81 @@ let ``correction evidence reports held permits without clearing them`` () =
         attribute.Destructive |> shouldEqual false
         store.TryReleaseAgentCorrection(user, target, permit, true)
         |> shouldEqual (Ok ()))
+
+[<Test>]
+let ``device registration roster survives telemetry expiry and records legacy clients by user`` () =
+    withStore (fun store ->
+        let register user device connection protocol =
+            store.AllocateDeviceRegistrationGeneration(
+                user, device, connection, protocol, "client-test")
+        let first = register "alice" "desktop" "conn-old" "3.64"
+        let second = register "alice" "laptop" "conn-new" Common.AgentProtocol.version
+        let otherUser = register "bob" "desktop" "bob-conn" "3.63"
+        Assert.That(first, Is.LessThan(second))
+        Assert.That(second, Is.LessThan(otherUser))
+        store.PruneTelemetry(DateTimeOffset.UtcNow.AddDays(90.0))
+        use restarted = new FeedbackStore(store.DatabasePath)
+        let alice = restarted.ListDurableDeviceRegistrations("alice", 1)
+        match alice with
+        | Error failure -> Assert.Fail(failure)
+        | Ok page ->
+            page.Registrations.Length |> shouldEqual 1
+            page.HasMore |> shouldEqual true
+            page.Registrations[0].Generation |> shouldEqual second
+            page.Registrations[0].ProtocolVersion |> shouldEqual Common.AgentProtocol.version
+        let complete = restarted.ListDurableDeviceRegistrations("alice", 50)
+        match complete with
+        | Error failure -> Assert.Fail(failure)
+        | Ok page ->
+            page.HasMore |> shouldEqual false
+            page.Registrations.Length |> shouldEqual 2
+            page.Registrations[1].Generation |> shouldEqual first
+            page.Registrations[1].ProtocolVersion |> shouldEqual "3.64"
+            page.Registrations[1].ConnectionId |> shouldEqual "conn-old"
+        let bob = restarted.ListDurableDeviceRegistrations("bob", 50)
+        match bob with
+        | Error failure -> Assert.Fail(failure)
+        | Ok page ->
+            page.Registrations.Length |> shouldEqual 1
+            page.Registrations[0].Generation |> shouldEqual otherUser
+            page.Registrations[0].ProtocolVersion |> shouldEqual "3.63"
+        restarted.ListDurableDeviceRegistrations("charlie", 50)
+        |> shouldEqual (Ok { Registrations = []; HasMore = false })
+        Assert.That(restarted.ListDurableDeviceRegistrations("alice", 0).IsError, Is.True)
+        Assert.That(restarted.ListDurableDeviceRegistrations("alice", 501).IsError, Is.True)
+        // Historical entries are not interpreted as proof of legacy quiescence.
+        restarted.GetAgentExecutionReadiness() |> shouldEqual (Ok LegacyDrainUnverified))
+
+[<Test>]
+let ``failed device roster insert rolls back generation and live registration`` () =
+    withStore (fun store ->
+        let allocate device connection =
+            store.AllocateDeviceRegistrationGeneration(
+                "alice", device, connection, Common.AgentProtocol.version, "test")
+        let first = allocate "desktop" "initial"
+        use sql = new SqliteConnection($"Data Source={store.DatabasePath}")
+        sql.Open()
+        use trigger = sql.CreateCommand()
+        trigger.CommandText <-
+            """CREATE TRIGGER fail_roster_insert BEFORE INSERT ON device_registration_roster
+               BEGIN SELECT RAISE(FAIL, 'test injected device roster persistence failure'); END;"""
+        trigger.ExecuteNonQuery() |> ignore
+        Assert.That((fun () -> allocate "desktop" "replacement" |> ignore),
+                    Throws.Exception,
+                    "An unavailable registration roster must veto new client registration.")
+        use remove = sql.CreateCommand()
+        remove.CommandText <- "DROP TRIGGER fail_roster_insert;"
+        remove.ExecuteNonQuery() |> ignore
+        let second = allocate "desktop" "replacement"
+        second |> shouldEqual (first + 1L)
+        let page =
+            store.ListDurableDeviceRegistrations("alice", 25)
+            |> function Ok result -> result | Error failure -> failwith failure
+        page.Registrations.Length |> shouldEqual 2
+        page.Registrations[0].ConnectionId |> shouldEqual "replacement"
+        page.Registrations[1].ConnectionId |> shouldEqual "initial"
+        // Counter and roster cannot differ due to a failed partial commit.
+        use restarted = new FeedbackStore(store.DatabasePath)
+        restarted.AllocateDeviceRegistrationGeneration(
+            "alice", "desktop", "third", Common.AgentProtocol.version, "test")
+        |> shouldEqual (second + 1L))

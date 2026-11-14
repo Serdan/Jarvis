@@ -638,3 +638,35 @@ epoch still in `AwaitingLegacyDrain`, inspection with a durable held
 permit, and unchanged execution gates after the report. This is an
 operator recovery *observation* prerequisite; canonical Git receipt
 reconciliation and audited orphan-permit release remain outstanding.
+
+### Append-only device-registration roster (2026-11-14)
+
+Registration history in `connection_events` is deliberately pruned as
+telemetry and is therefore not a trustworthy long-lived legacy-device
+inventory. A fresh authenticated 3.63/3.64 client can also register even
+though the 3.65 server refuses to route new witnessed agent operations
+through its older protocol.
+
+The server now records each authenticated SignalR registration into
+`device_registration_roster`, including the exact user ID, device ID,
+connection ID, negotiated client-provided protocol/client versions,
+strictly monotonic registration generation and timestamp. **The roster
+insert and generation increment share a single SQLite transaction.**
+Failure, validation rejection or injected SQLite insert error cannot
+leave an allocated generation without a durable registration or expose
+the unrecorded client route; the `UserService.Register` call still
+performs this allocation before mutating any prior live session.
+Roster records survive disconnected-session eviction, connection-event
+telemetry pruning and server restart, and concurrent registrations
+across separate store instances serialize correctly.
+
+`ListDurableDeviceRegistrations(userId,limit)` provides a bounded,
+user-scoped, newest-first diagnostic page and explicit `HasMore`;
+`GetAgentCorrectionEvidence` now includes this evidence for the
+authenticated user and **`rosterCanOmitPreUpgradeDevices=true`**.
+Absence from the roster is *never* proof of device quiescence because
+clients active before this roster was first introduced may not appear;
+nor does registration imply the client process, agent or descendant
+jobs have terminated. No automatic legacy epoch transition or
+correction permit release is implemented. Independent, authenticated
+fleet-wide pre-roster drain and OS process-tree evidence remain required.

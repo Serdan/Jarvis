@@ -1491,6 +1491,90 @@ let ``unknown future command type cannot certify client-terminal liveness`` () =
         |> shouldEqual true)
 
 [<Test>]
+let ``correction refuses incomplete current-protocol drain evidence and replay`` () =
+    withStore (fun store ->
+        approveTestEpoch store
+        use connection = new SqliteConnection($"Data Source={store.DatabasePath}")
+        connection.Open()
+        let columns =
+            [| "operator_id"; "approval_operation_id"; "evidence"
+               "approved_at"; "protocol_version" |]
+        let original =
+            use snapshot = connection.CreateCommand()
+            snapshot.CommandText <-
+                """SELECT operator_id, approval_operation_id, evidence,
+                          approved_at, protocol_version
+                   FROM agent_execution_epoch WHERE epoch_id = 1;"""
+            use reader = snapshot.ExecuteReader()
+            if not (reader.Read()) then failwith "Missing test execution epoch"
+            [| for i in 0 .. 4 -> reader.GetValue(i) |]
+        let originalOperation = original[1] :?> string
+        let originalOperator = original[0] :?> string
+        let originalEvidence = original[2] :?> string
+        let mutate column (value: obj) =
+            use update = connection.CreateCommand()
+            update.CommandText <-
+                $"UPDATE agent_execution_epoch SET {column} = $value WHERE epoch_id = 1;"
+            update.Parameters.AddWithValue("$value", value) |> ignore
+            update.ExecuteNonQuery() |> shouldEqual 1
+        // Each corrupted field must veto a correction in the SAME SQLite
+        // writer transaction, not merely trigger a warning in a separate
+        // observer read. This includes a Ready row with the current protocol
+        // version but no actual approval operation.
+        let corruptions =
+            [ 0, box DBNull.Value
+              0, box " "
+              1, box DBNull.Value
+              1, box " "
+              2, box DBNull.Value
+              2, box "insufficient"
+              3, box DBNull.Value
+              3, box "invalid-time"
+              4, box DBNull.Value
+              4, box "3.64" ]
+        for i, corrupted in corruptions do
+            let column = columns[i]
+            mutate column corrupted
+            use restarted = new FeedbackStore(store.DatabasePath)
+            match restarted.GetAgentExecutionReadiness() with
+            | Ok (LegacyDrainVerified _) ->
+                Assert.Fail($"Corrupt field {column} was reported as verified.")
+            | _ -> ()
+            let attempted =
+                restarted.TryAcquireAgentCorrection(
+                    "alice", "Worker 3", $"corrupt-drain-{i}")
+            Assert.That(attempted.IsError, Is.True,
+                        $"Field {column} must veto correction: {attempted}")
+            let replay = restarted.TryAuthorizeLegacyDrain(
+                originalOperator, originalOperation, originalEvidence,
+                fun () -> Ok ())
+            Assert.That(replay.IsError, Is.True,
+                        $"Field {column} must veto approval replay: {replay}")
+            mutate column original[i]
+        use repaired = new FeedbackStore(store.DatabasePath)
+        match repaired.GetAgentExecutionReadiness() with
+        | Ok (LegacyDrainVerified _) -> ()
+        | other -> Assert.Fail($"Restored epoch is not ready: {other}")
+        repaired.TryAuthorizeLegacyDrain(
+            originalOperator, originalOperation, originalEvidence,
+            fun () -> Error "An exact replay must not invoke the verifier")
+        |> shouldEqual (Ok ())
+        repaired.TryAuthorizeLegacyDrain(
+            "different-operator", originalOperation, originalEvidence,
+            fun () -> Ok ()).IsError |> shouldEqual true
+        repaired.TryAuthorizeLegacyDrain(
+            originalOperator, originalOperation,
+            "Conflicting approval evidence on the same operation identifier.",
+            fun () -> Ok ()).IsError |> shouldEqual true
+        let permit = repaired.TryAcquireAgentCorrection(
+            "alice", "Worker 3", "after-epoch-repair")
+        Assert.That(permit.IsOk, Is.True, $"Valid epoch was rejected: {permit}")
+        match permit with
+        | Ok id -> repaired.TryReleaseAgentCorrection("alice", "Worker 3", id, true)
+                   |> shouldEqual (Ok ())
+        | Error _ -> ())
+
+[<Test>]
 let ``legacy drain approval cannot cross a protocol version boundary`` () =
     withStore (fun store ->
         approveTestEpoch store

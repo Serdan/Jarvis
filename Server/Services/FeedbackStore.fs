@@ -601,36 +601,56 @@ INSERT INTO operations (
     // A freshly deployed witness schema has no knowledge of MCP calls
     // dispatched by the previous server. An empty witness table is therefore
     // never sufficient evidence to permit correction.
-    member _.GetAgentExecutionReadiness() : Result<AgentExecutionReadiness, string> =
+    // Both observation and exclusive correction admission use the SAME
+    // verified epoch predicate. A partially migrated/corrupt Ready marker
+    // must not authorize a state change.
+    member private _.ReadVerifiedExecutionEpoch(
+        connection: SqliteConnection, transaction: SqliteTransaction option
+    ) : Result<AgentExecutionReadiness, string> =
+        use command = connection.CreateCommand()
+        transaction |> Option.iter (fun current -> command.Transaction <- current)
+        command.CommandText <-
+            """SELECT state, operator_id, approval_operation_id, evidence,
+                      approved_at, protocol_version
+               FROM agent_execution_epoch WHERE epoch_id = 1;"""
+        use reader = command.ExecuteReader()
+        if not (reader.Read()) then Error "Execution epoch record is missing."
+        else
+            match reader.GetString 0 with
+            | "AwaitingLegacyDrain" -> Ok LegacyDrainUnverified
+            | "Ready" when reader.IsDBNull 5
+                           || reader.GetString 5 <> AgentProtocol.version ->
+                // An old or missing protocol approval is not reusable.
+                Ok LegacyDrainUnverified
+            | "Ready" when [1; 2; 3; 4] |> List.exists reader.IsDBNull ->
+                Error "Execution epoch approval evidence is incomplete."
+            | "Ready" ->
+                let operatorId = reader.GetString 1
+                let approvalId = reader.GetString 2
+                let evidence = reader.GetString 3
+                let approvedAt = reader.GetString 4
+                if String.IsNullOrWhiteSpace operatorId
+                   || String.IsNullOrWhiteSpace approvalId
+                   || String.IsNullOrWhiteSpace evidence
+                   || evidence.Trim().Length < 20 then
+                    Error "Execution epoch approval evidence is invalid."
+                else
+                    match DateTimeOffset.TryParse approvedAt with
+                    | true, at -> Ok (LegacyDrainVerified(operatorId, evidence, at))
+                    | _ -> Error "Execution epoch approval timestamp is corrupt."
+            | _ -> Error "Execution epoch is not a verified protocol state."
+
+    member this.GetAgentExecutionReadiness() : Result<AgentExecutionReadiness, string> =
         try
             use connection = openConnection()
-            use command = connection.CreateCommand()
-            command.CommandText <-
-                """SELECT state, operator_id, evidence, approved_at, protocol_version
-                   FROM agent_execution_epoch WHERE epoch_id = 1;"""
-            use reader = command.ExecuteReader()
-            if not (reader.Read()) then Error "Execution epoch record is missing."
-            else
-                match reader.GetString 0 with
-                | "AwaitingLegacyDrain" -> Ok LegacyDrainUnverified
-                | "Ready" when reader.IsDBNull 4
-                               || reader.GetString 4 <> AgentProtocol.version ->
-                    // Approval applies only to its own authenticated protocol
-                    // generation. Upgrading cannot inherit older drain proof.
-                    Ok LegacyDrainUnverified
-                | "Ready" when not (reader.IsDBNull 1 || reader.IsDBNull 2 || reader.IsDBNull 3) ->
-                    match DateTimeOffset.TryParse(reader.GetString 3) with
-                    | true, at ->
-                        Ok (LegacyDrainVerified(reader.GetString 1, reader.GetString 2, at))
-                    | _ -> Error "Execution epoch approval timestamp is corrupt."
-                | _ -> Error "Execution epoch is not a verified protocol state."
+            this.ReadVerifiedExecutionEpoch(connection, None)
         with ex -> Error $"Cannot read execution protocol readiness: {ex.Message}"
 
     // Caller must be the authenticated operator path after proving that ALL
     // pre-witness requests and detached child jobs have exited across devices.
     // This is intentionally not exposed through MCP until real device/process
     // reconciliation can supply that proof. Never auto-ready on startup.
-    member _.TryAuthorizeLegacyDrain(
+    member this.TryAuthorizeLegacyDrain(
         operatorId: string, operationId: string, evidence: string,
         verifyLegacyQuiescence: unit -> Result<unit, string>
     ) : Result<unit, string> =
@@ -659,7 +679,14 @@ INSERT INTO operations (
                 match epoch with
                 | Some("Ready", original, Some version)
                     when version = AgentProtocol.version && original = operationId ->
-                    Ok () // idempotent replay of this exact witnessed protocol epoch
+                    match this.ReadVerifiedExecutionEpoch(connection, Some transaction) with
+                    | Ok (LegacyDrainVerified(originalOperator, originalEvidence, _))
+                        when originalOperator = operatorId.Trim()
+                             && originalEvidence = evidence.Trim() ->
+                        Ok () // same verified command; no new approval or mutation
+                    | Ok (LegacyDrainVerified _) ->
+                        Error "Legacy drain approval operation ID was reused with different operator or evidence."
+                    | _ -> Error "Persisted legacy-drain approval is incomplete or corrupt."
                 | Some("Ready", _, Some version) when version = AgentProtocol.version ->
                     Error "Protocol epoch was already approved by a different operation."
                 | Some("Ready", _, _) ->
@@ -862,7 +889,7 @@ INSERT INTO operations (
     // Claim the exclusive operator correction barrier in the same SQLite
     // writer-serialization domain as TryBeginAgentOperation. A pending or
     // dispatched request vetoes it, including after server restart.
-    member _.TryAcquireAgentCorrection(
+    member this.TryAcquireAgentCorrection(
         userId: string, targetAgentId: string, operationId: string
     ) : Result<string, string> =
         if String.IsNullOrWhiteSpace userId
@@ -887,14 +914,10 @@ INSERT INTO operations (
                     if existing.Read() then Some(existing.GetString 0, existing.GetString 1)
                     else None
                 existing.Close()
-                use readiness = connection.CreateCommand()
-                readiness.Transaction <- transaction
-                readiness.CommandText <-
-                    """SELECT 1 FROM agent_execution_epoch
-                       WHERE epoch_id = 1 AND state = 'Ready'
-                         AND protocol_version = $protocol LIMIT 1;"""
-                addParameter readiness "$protocol" AgentProtocol.version
-                let epochReady = not (isNull (readiness.ExecuteScalar()))
+                let epochReady =
+                    match this.ReadVerifiedExecutionEpoch(connection, Some transaction) with
+                    | Ok (LegacyDrainVerified _) -> true
+                    | _ -> false
                 match prior with
                 | _ when not epochReady ->
                     Error "Protocol epoch has not proven pre-witness legacy activity quiescent."

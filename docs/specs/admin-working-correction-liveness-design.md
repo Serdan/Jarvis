@@ -447,3 +447,25 @@ not a real network connection, client Git ledger operation or deployed
 end-to-end latency. It does not waive the legacy drain and process-tree
 terminal attestation requirements. An independent frozen review is still
 required before any integration.
+
+### Shared legacy-drain approval integrity gate (2026-11-14)
+
+The server now uses one verified execution-epoch predicate for both read-only
+readiness inspection and the SQLite-writer-serialized operator correction
+permit transaction. Merely finding `state=Ready` with the current protocol
+version is insufficient: the stored operator, original approval operation ID,
+substantive drain evidence and parseable approval timestamp must all be present.
+A missing, malformed or partial approval therefore vetoes correction, including
+after a server restart. No readiness state is inferred or repaired.
+
+An exact approval replay is idempotent only with the same operator, operation
+ID and evidence. Reusing an approval operation ID with different evidence or
+a different operator fails without mutation. Negative-space tests corrupt each
+persisted field, verify that both inspection and exclusive correction refuse
+the state, reject mismatched replays, restore the complete evidence and verify
+that valid correction admission still succeeds.
+
+This strengthens the fail-closed barrier but does **not** implement authenticated
+legacy-client/process/job quiescence attestation. The production epoch remains
+`AwaitingLegacyDrain` until independently witnessed and approved; no operator
+shortcut, integration or deployment is authorized by this change.

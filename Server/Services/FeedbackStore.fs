@@ -119,6 +119,9 @@ type UnresolvedAgentExecution =
       ToolName: string option
       ProjectName: string option
       State: string
+      ClientResponseAt: DateTimeOffset option
+      ClientResponseSucceeded: bool option
+      RequiresIndependentProcessProof: bool
       DeviceId: string option
       ConnectionId: string option
       DeviceGeneration: int64 option
@@ -198,24 +201,34 @@ type FeedbackStore(databasePath: string, ?telemetryRetention: TimeSpan) =
         |> Seq.map (fun definition -> definition.Name)
         |> Set.ofSeq
         |> Set.add "NotifyAgent"
+        // MCP command definitions use GetGitStatus/GetGitDiff, but the
+        // authenticated wire classifier intentionally persists their native
+        // protocol names GitStatus/GitDiff. Both are known-but-process-backed.
+        // Recognition permits retaining the reply, NEVER terminal promotion.
+        |> Set.add "GitStatus"
+        |> Set.add "GitDiff"
 
-    // A transport response cannot certify descendant-process quiescence.
-    // Commands capable of launching work that outlives the immediate client
-    // task require separate OS-backed terminal evidence. This is a conservative
-    // known-command whitelist: future variants never inherit terminal status.
-    // NotifyAgent is a synthetic second-stage witness, not an MCP tool name.
+    // Transport completion and native-process quiescence are DIFFERENT facts.
+    // Permission metadata does not classify process spawning: even ReadOnly
+    // GetGitStatus, TaskRead and LedgerRead invoke BoundedProcess/git, which
+    // may start hooks, filters, ssh or other detached descendants. A successful
+    // parent response cannot certify those descendants have been reaped.
+    // Explicitly whitelist only locally synchronous non-process commands;
+    // any future command remains unresolved until its execution semantics
+    // receive a conscious safety classification. Synthetic NotifyAgent also
+    // uses Git in BOTH source and destination stages.
     let terminalCommandTypes =
-        AgentProtocol.commandDefinitions
-        |> Seq.filter (fun definition ->
-            not (definition.Permissions |> List.contains ProcessExecution)
-            // Git commit hooks may leave detached children; scheduling creates
-            // future work after the initiating command has returned.
-            && not (List.contains definition.Name
-                [ "GitCommit"; "ScheduleBrowserExecution" ]))
-        |> Seq.map (fun definition -> definition.Name)
-        |> Set.ofSeq
-        |> Set.add "NotifyAgent"
-        |> Set.remove "StartJob"
+        set [ "ListCommands"; "ListProjects"
+              "BrowserListWindows"; "BrowserListTabs"; "ListScheduledBrowserExecutions"
+              "ListDirectory"; "SearchFiles"; "SearchText"
+              "ReadFile"; "ReadFilePage"; "ReadFiles"; "GetAgentInstructions"
+              "ReadImage"; "WriteFile"; "PatchFile"
+              "ListConfiguredTasks"; "ListSkills"; "GetSkill"; "CreateSkill"
+              "ListJobs"; "GetJobResult"; "Message"; "GetClientActivity" ]
+
+    do
+        if not (Set.isSubset terminalCommandTypes knownCommandTypes) then
+            invalidOp "An explicitly process-free terminal tool is missing from the active command catalog."
 
     let dbValue = function
         | Some value -> box value
@@ -359,6 +372,8 @@ CREATE TABLE IF NOT EXISTS agent_execution_witness (
     device_generation INTEGER NULL,
     correlation_id TEXT UNIQUE NULL,
     terminal_at TEXT NULL,
+    client_response_at TEXT NULL,
+    client_response_succeeded INTEGER NULL CHECK(client_response_succeeded IN (0,1)),
     parent_request_id TEXT NULL,
     job_id TEXT NULL,
     job_started_at TEXT NULL,
@@ -514,6 +529,8 @@ INSERT OR IGNORE INTO agent_execution_epoch
               "tool_job_operation_id", "TEXT NULL"
               "tool_job_started_at", "TEXT NULL"
               "tool_job_receipt_at", "TEXT NULL"
+              "client_response_at", "TEXT NULL"
+              "client_response_succeeded", "INTEGER NULL"
               "expected_device_id", "TEXT NULL"
               "expected_device_generation", "INTEGER NULL" ] do
             if not (witnessColumns.Contains(column)) then
@@ -542,6 +559,26 @@ INSERT OR IGNORE INTO agent_execution_epoch
                        AND parent.tool_name = 'NotifyAgent'
                  );"""
         backfill.ExecuteNonQuery() |> ignore
+        // Versions <= 3.65 treated a completed Git/bridge client call as
+        // proof of OS descendant quiescence. Such Terminal rows cannot be
+        // carried into this stricter contract. Keep their authenticated
+        // reply timestamp as an observation, but restore the unresolved
+        // state until independent process-tree proof can be supplied.
+        // This migration is monotonic/idempotent across repeated startups.
+        let locallySynchronous =
+            terminalCommandTypes
+            |> Set.toList
+            |> List.sort
+            |> List.map (fun name -> "'" + name + "'")
+            |> String.concat ", "
+        use migrateCompletion = connection.CreateCommand()
+        migrateCompletion.CommandText <-
+            $"""UPDATE agent_execution_witness
+                SET client_response_at = COALESCE(client_response_at, terminal_at),
+                    terminal_at = NULL, state = 'Dispatched'
+                WHERE state = 'Terminal'
+                  AND (tool_name IS NULL OR tool_name NOT IN ({locallySynchronous}));"""
+        migrateCompletion.ExecuteNonQuery() |> ignore
         use childIndex = connection.CreateCommand()
         childIndex.CommandText <-
             """CREATE UNIQUE INDEX IF NOT EXISTS ix_agent_execution_child_parent
@@ -1100,7 +1137,8 @@ INSERT INTO operations (
                 use parent = connection.CreateCommand()
                 parent.Transaction <- transaction
                 parent.CommandText <-
-                    """SELECT agent_id, state, parent_request_id
+                    """SELECT agent_id, state, parent_request_id,
+                              tool_name, client_response_at, client_response_succeeded
                        FROM agent_execution_witness
                        WHERE user_id = $userId AND request_id = $parent LIMIT 1;"""
                 addParameter parent "$userId" userId
@@ -1111,11 +1149,18 @@ INSERT INTO operations (
                         Some(
                             parentReader.GetString 0,
                             parentReader.GetString 1,
-                            parentReader.IsDBNull 2)
+                            parentReader.IsDBNull 2,
+                            optionText parentReader 3,
+                            not (parentReader.IsDBNull 4),
+                            not (parentReader.IsDBNull 5) && parentReader.GetInt32 5 = 1)
                     else None
                 parentReader.Close()
                 match root with
-                | Some(agent, "Terminal", true) ->
+                // Logical notification continuation only requires the
+                // authenticated source client reply. An OS descendant-tree
+                // quiescence certificate is needed separately for correction.
+                | Some(agent, state, true, Some "NotifyAgent", responded, succeeded)
+                    when responded && succeeded && (state = "Terminal" || state = "Dispatched") ->
                     use correction = connection.CreateCommand()
                     correction.Transaction <- transaction
                     correction.CommandText <-
@@ -1147,14 +1192,14 @@ INSERT INTO operations (
                         insert.ExecuteNonQuery() |> ignore
                         transaction.Commit()
                         Ok childId
-                | Some (_, "Admitted", _) | Some (_, "Dispatched", _) ->
-                    Error "Source validation is still running or its terminal receipt is unavailable."
-                | Some (_, "NotDispatched", _) ->
+                | Some (_, "Admitted", _, _, _, _) | Some (_, "Dispatched", _, _, _, _) ->
+                    Error "Source validation has no authenticated successful completed reply."
+                | Some (_, "NotDispatched", _, _, _, _) ->
                     Error "Source validation was not dispatched; continuation is forbidden."
-                | Some (_, "Terminal", false) ->
+                | Some (_, "Terminal", false, _, _, _) ->
                     Error "Cannot create a continuation from an already nested request."
                 | _ ->
-                    Error "Parent client terminal proof was not found."
+                    Error "Parent is not a root NotifyAgent with a witnessed client reply."
             with ex ->
                 Error $"Cannot durably admit cross-project continuation: {ex.Message}"
 
@@ -1823,10 +1868,8 @@ INSERT INTO operations (
                 | None -> Ok None
                 | Some (requestId, "Terminal", _, _, _) ->
                     Ok(Some requestId) // authenticated idempotent replay
-                | Some (_, "Dispatched", Some tool, _, _)
-                    when not (terminalCommandTypes.Contains tool) ->
-                    Error $"Tool {tool} still requires independent liveness evidence."
-                | Some (requestId, "Dispatched", Some _, jobId, operationId) ->
+                | Some (requestId, "Dispatched", Some tool, jobId, operationId)
+                    when knownCommandTypes.Contains tool ->
                     let verified =
                         match clientResponse.Result, clientResponse.Error,
                               clientResponse.PendingJob with
@@ -1839,36 +1882,48 @@ INSERT INTO operations (
                                 else
                                     match result.Status, result.ToolResponse with
                                     | ToolCompleted, Some final
-                                        when final.PendingJob.IsNone && final.Error.IsNone -> Ok true
+                                        when final.PendingJob.IsNone && final.Error.IsNone -> Ok(Some true)
                                     | ToolFailed _, Some final
-                                        when final.PendingJob.IsNone && final.Error.IsSome -> Ok true
-                                    | Running, None -> Ok false // normal polling, not an error
+                                        when final.PendingJob.IsNone && final.Error.IsSome -> Ok(Some false)
+                                    | Running, None -> Ok None // normal polling, not an error
                                     | _ -> Error "Job result does not prove completed tool execution."
                             with :? JsonException ->
                                 Error "Malformed typed job-result response."
                         | _ -> Error "GetJobResult has no successful non-pending response."
                     match verified with
                     | Error reason -> Error reason
-                    | Ok false -> Ok None // no terminal change while still running
-                    | Ok true ->
+                    | Ok None -> Ok None // no terminal change while still running
+                    | Ok (Some succeeded) ->
+                        // A typed ToolCompleted only proves the original
+                        // handler returned. A Git or OS-backed handler may
+                        // leave descendants alive: preserve the response
+                        // without marking its witness Terminal.
+                        let safe = terminalCommandTypes.Contains tool
                         use update = connection.CreateCommand()
                         update.Transaction <- transaction
                         update.CommandText <-
                             """UPDATE agent_execution_witness
-                               SET state = 'Terminal', updated_at = $now,
-                                   terminal_at = $now
+                               SET state = CASE WHEN $safe = 1 THEN 'Terminal'
+                                                ELSE 'Dispatched' END,
+                                   updated_at = $now,
+                                   client_response_at = COALESCE(client_response_at, $now),
+                                   client_response_succeeded = COALESCE(client_response_succeeded, $succeeded),
+                                   terminal_at = CASE WHEN $safe = 1 THEN $now ELSE NULL END
                                WHERE request_id = $requestId AND state = 'Dispatched'
                                  AND tool_job_id = $jobId
                                  AND tool_job_operation_id IS $operationId;"""
                         addParameter update "$requestId" requestId
                         addParameter update "$jobId" jobId
                         addParameter update "$operationId" (dbValue operationId)
+                        addParameter update "$safe" (if safe then 1 else 0)
+                        addParameter update "$succeeded" (if succeeded then 1 else 0)
                         addParameter update "$now" (DateTimeOffset.UtcNow.ToString("O"))
                         if update.ExecuteNonQuery() <> 1 then
                             Error "Tool-job terminal proof raced conflicting execution evidence."
                         else
                             transaction.Commit()
-                            Ok(Some requestId)
+                            if safe then Ok(Some requestId)
+                            else Error $"Tool-job {tool} client completion witnessed; process-tree liveness is unverified."
                 | Some _ -> Error "Poll does not match unresolved dispatched execution."
             with ex ->
                 Error $"Cannot attest authenticated tool-job termination: {ex.Message}"
@@ -1953,6 +2008,8 @@ INSERT INTO operations (
                                SET job_id = $jobId,
                                    job_started_at = $jobStartedAt,
                                    job_receipt_at = COALESCE(job_receipt_at, $now),
+                                   client_response_at = COALESCE(client_response_at, $now),
+                                   client_response_succeeded = COALESCE(client_response_succeeded, 1),
                                    updated_at = $now
                                WHERE request_id = $requestId
                                  AND state = 'Dispatched' AND tool_name = 'StartJob'
@@ -1967,20 +2024,53 @@ INSERT INTO operations (
                         else
                             transaction.Commit()
                             Error "StartJob handle recorded; detached process-tree termination remains unverified."
+                | Some (requestId, "Dispatched", Some tool)
+                    when knownCommandTypes.Contains tool
+                         && not (terminalCommandTypes.Contains tool) ->
+                    // Git, remote ledger reads, browser scheduling and other
+                    // native-process commands may still own descendants.
+                    // Preserve the reply without promoting it to quiescence.
+                    let succeeded =
+                        match clientResponse with
+                        | Some { Result = Some _; Error = None; PendingJob = None } -> 1
+                        | _ -> 0
+                    use observed = connection.CreateCommand()
+                    observed.Transaction <- transaction
+                    observed.CommandText <-
+                        """UPDATE agent_execution_witness
+                           SET client_response_at = COALESCE(client_response_at, $now),
+                               client_response_succeeded = COALESCE(client_response_succeeded, $succeeded),
+                               updated_at = $now
+                           WHERE request_id = $requestId AND state = 'Dispatched'
+                             AND tool_name = $tool AND tool_job_id IS NULL;"""
+                    addParameter observed "$now" (DateTimeOffset.UtcNow.ToString("O"))
+                    addParameter observed "$succeeded" succeeded
+                    addParameter observed "$requestId" requestId
+                    addParameter observed "$tool" tool
+                    if observed.ExecuteNonQuery() <> 1 then
+                        Error "Client reply raced conflicting unresolved process evidence."
+                    else
+                        transaction.Commit()
+                        Error $"Authenticated {tool} reply observed; descendant/process liveness remains unverified."
                 | Some (_, "Dispatched", Some unknown)
                     when not (terminalCommandTypes.Contains unknown) ->
-                    // New or unsupported command kinds may spawn work that
-                    // outlives their response. Never certify them by default.
                     Error $"Unknown tool classification {unknown}; execution requires independent liveness reconciliation."
                 | Some (requestId, "Dispatched", Some _) ->
+                    let succeeded =
+                        match clientResponse with
+                        | Some { Result = Some _; Error = None; PendingJob = None } -> 1
+                        | _ -> 0
                     use update = connection.CreateCommand()
                     update.Transaction <- transaction
                     update.CommandText <-
                         """UPDATE agent_execution_witness
-                           SET state = 'Terminal', updated_at = $now, terminal_at = $now
+                           SET state = 'Terminal', updated_at = $now, terminal_at = $now,
+                               client_response_at = COALESCE(client_response_at, $now),
+                               client_response_succeeded = COALESCE(client_response_succeeded, $succeeded)
                            WHERE request_id = $requestId AND state = 'Dispatched'
                              AND tool_job_id IS NULL;"""
                     addParameter update "$now" (DateTimeOffset.UtcNow.ToString("O"))
+                    addParameter update "$succeeded" succeeded
                     addParameter update "$requestId" requestId
                     if update.ExecuteNonQuery() <> 1 then
                         Error "Client terminal receipt raced another update."
@@ -2021,7 +2111,7 @@ INSERT INTO operations (
                               correlation_id, parent_request_id, created_at,
                               job_id, job_started_at, job_receipt_at,
                               tool_job_id, tool_job_started_at, tool_job_receipt_at,
-                              tool_job_operation_id
+                              tool_job_operation_id, client_response_at, client_response_succeeded
                        FROM agent_execution_witness
                        WHERE user_id = $userId AND agent_id = $agentId
                          AND state NOT IN ('Terminal', 'NotDispatched')
@@ -2038,6 +2128,14 @@ INSERT INTO operations (
                           ToolName = optionText reader 1
                           ProjectName = optionText reader 2
                           State = reader.GetString 3
+                          ClientResponseAt =
+                              optionText reader 17 |> Option.map DateTimeOffset.Parse
+                          ClientResponseSucceeded =
+                              if reader.IsDBNull 18 then None
+                              else Some(reader.GetInt32 18 = 1)
+                          RequiresIndependentProcessProof =
+                              optionText reader 1 |> Option.forall (fun tool ->
+                                  not (terminalCommandTypes.Contains tool))
                           DeviceId = optionText reader 4
                           ConnectionId = optionText reader 5
                           DeviceGeneration =

@@ -1355,10 +1355,12 @@ let ``promoted cross-project notification stages retain exact job operation and 
               ToolResponse = Some terminal; OperationId = None }
         store.TryRecordAgentToolJobPollTerminal(
             user, connection, generation, "source-job-poll",
-            { terminal with Result = Some(JsonSerializer.Serialize(sourceResult)) })
-        |> shouldEqual (Ok (Some source))
+            { terminal with Result = Some(JsonSerializer.Serialize(sourceResult)) }).IsError
+        |> shouldEqual true
         store.GetAgentExecutionResolution(user, source)
-        |> shouldEqual (Ok AuthenticatedClientFinished)
+        |> shouldEqual (Ok ExecutionUnresolved)
+        (read source).ClientResponseSucceeded |> shouldEqual (Some true)
+        (read source).RequiresIndependentProcessProof |> shouldEqual true
         let _reconciledSourceChild =
             store.TryBeginAgentContinuation(user, source, "Destination")
             |> function Ok id -> id | Error failure -> failwith failure
@@ -1366,8 +1368,10 @@ let ``promoted cross-project notification stages retain exact job operation and 
         // destination witness. The mainline envelope is a TaskWrite job.
         let finishedSource = beginSource "source-finished-correlation"
         store.TryRecordAgentClientTerminal(
-            user, connection, generation, "source-finished-correlation")
-        |> shouldEqual (Ok (Some finishedSource))
+            user, connection, generation, "source-finished-correlation",
+            clientResponse = terminal).IsError
+        |> shouldEqual true
+        (read finishedSource).ClientResponseSucceeded |> shouldEqual (Some true)
         let child =
             store.TryBeginAgentContinuation(user, finishedSource, "Destination")
             |> function Ok id -> id | Error failure -> failwith failure
@@ -1750,7 +1754,14 @@ let ``cross-project notification requires witnessed source completion before sep
     withStore (fun store ->
         approveTestEpoch store
         let user, agent = "alice", "Sender"
-        let parent = beginWitness store user agent
+        let parent =
+            store.TryBeginAgentOperation(
+                user, agent, "NotifyAgent", Some "Source",
+                "server", None, Some Common.AgentProtocol.version)
+            |> function Ok value -> value | Error error -> failwith error
+        let success: Common.AgentCommandResponse =
+            { Result = Some "{}"; Error = None; Instructions = []
+              AgentStateChanges = []; InboxActivation = None; PendingJob = None }
         let beginChild() = store.TryBeginAgentContinuation(user, parent.Id, "Destination")
         Assert.That(beginChild().IsError, Is.True,
                     "An admitted source health probe is not source terminal proof.")
@@ -1765,64 +1776,64 @@ let ``cross-project notification requires witnessed source completion before sep
             store.TryRecordAgentClientTerminal(user, "other-conn", 1L, "source-corr")
         spoofed |> shouldEqual (Ok None)
         Assert.That(beginChild().IsError, Is.True)
-        store.TryRecordAgentClientTerminal(user, "source-conn", 1L, "source-corr")
-        |> shouldEqual (Ok(Some parent.Id))
+        store.TryRecordAgentClientTerminal(
+            user, "source-conn", 1L, "source-corr", clientResponse = success).IsError
+        |> shouldEqual true
         let child =
             beginChild() |> function Ok id -> id | Error error -> failwith error
         Assert.That(child, Is.Not.EqualTo(parent.Id))
         Assert.That(beginChild().IsError, Is.True,
                     "The same source terminal can have at most one destination write.")
-        store.CountUnresolvedAgentExecutions(user, agent) |> shouldEqual 1
+        store.CountUnresolvedAgentExecutions(user, agent) |> shouldEqual 2
         Assert.That(
             store.TryAcquireAgentCorrection(user, agent, "operator-during-destination").IsError,
             Is.True, "A pending destination child blocks correction even after source terminal.")
         use restarted = new FeedbackStore(store.DatabasePath)
-        restarted.CountUnresolvedAgentExecutions(user, agent) |> shouldEqual 1
+        restarted.CountUnresolvedAgentExecutions(user, agent) |> shouldEqual 2
         restarted.TryMarkAgentDispatched(
             user, child, "destination-device", "destination-conn", 4L, "destination-corr")
         |> shouldEqual (Ok ())
         restarted.GetAgentExecutionResolution(user, child)
         |> shouldEqual (Ok ExecutionUnresolved)
-        restarted.TryRecordAgentClientTerminal(user, "destination-conn", 4L, "destination-corr")
-        |> shouldEqual (Ok(Some child))
+        restarted.TryRecordAgentClientTerminal(
+            user, "destination-conn", 4L, "destination-corr",
+            clientResponse = success).IsError
+        |> shouldEqual true
         restarted.GetAgentExecutionResolution(user, child)
-        |> shouldEqual (Ok AuthenticatedClientFinished)
-        restarted.CountUnresolvedAgentExecutions(user, agent) |> shouldEqual 0
-        let permit = restarted.TryAcquireAgentCorrection(user, agent, "operator-after-two-stage")
-        Assert.That(permit.IsOk, Is.True)
-        match permit with
-        | Ok id ->
-            restarted.TryReleaseAgentCorrection(user, agent, id, true)
-            |> shouldEqual (Ok ())
-        | Error _ -> ())
+        |> shouldEqual (Ok ExecutionUnresolved)
+        restarted.CountUnresolvedAgentExecutions(user, agent) |> shouldEqual 2
+        Assert.That(restarted.TryAcquireAgentCorrection(
+            user, agent, "operator-after-two-stage").IsError, Is.True))
 
 [<Test>]
-let ``correction excludes notification continuation between source and destination`` () =
+let ``notification source reply permits continuation but cannot permit correction`` () =
     withStore (fun store ->
         approveTestEpoch store
         let user, agent = "alice", "Sender"
-        let parent = beginWitness store user agent
+        let parent =
+            store.TryBeginAgentOperation(
+                user, agent, "NotifyAgent", Some "Source", "server",
+                None, Some Common.AgentProtocol.version)
+            |> function Ok value -> value | Error error -> failwith error
+        let success: Common.AgentCommandResponse =
+            { Result = Some "{}"; Error = None; Instructions = []
+              AgentStateChanges = []; InboxActivation = None; PendingJob = None }
         store.TryMarkAgentDispatched(user, parent.Id, "source", "conn", 1L, "corr")
         |> shouldEqual (Ok ())
-        store.TryRecordAgentClientTerminal(user, "conn", 1L, "corr")
-        |> shouldEqual (Ok(Some parent.Id))
-        let permit =
-            store.TryAcquireAgentCorrection(user, agent, "operator-between-steps")
-            |> function Ok id -> id | Error error -> failwith error
-        store.TryBeginAgentContinuation(user, parent.Id, "Destination").IsError
+        store.TryRecordAgentClientTerminal(
+            user, "conn", 1L, "corr", clientResponse = success).IsError
         |> shouldEqual true
+        Assert.That(store.TryAcquireAgentCorrection(
+            user, agent, "operator-between-steps").IsError, Is.True,
+            "Successful client reply is not proof of Git process quiescence.")
         use restarted = new FeedbackStore(store.DatabasePath)
-        restarted.TryBeginAgentContinuation(user, parent.Id, "Destination").IsError
-        |> shouldEqual true
-        restarted.TryReleaseAgentCorrection(user, agent, permit, false).IsError
-        |> shouldEqual true
-        restarted.TryReleaseAgentCorrection(user, agent, permit, true)
-        |> shouldEqual (Ok ())
         let child =
             restarted.TryBeginAgentContinuation(user, parent.Id, "Destination")
             |> function Ok id -> id | Error error -> failwith error
         restarted.TryMarkAgentNotDispatched(user, child) |> shouldEqual (Ok ())
-        restarted.CountUnresolvedAgentExecutions(user, agent) |> shouldEqual 0)
+        restarted.CountUnresolvedAgentExecutions(user, agent) |> shouldEqual 1
+        Assert.That(restarted.TryAcquireAgentCorrection(
+            user, agent, "operator-after-continuation").IsError, Is.True))
 
 [<Test>]
 let ``correction permit lifecycle requires durable terminal or proven non dispatch`` () =
@@ -1928,16 +1939,20 @@ let ``authenticated cross-project MCP notification independently witnesses sende
                 member _.InvalidateAgentStates(_, _) = Task.CompletedTask
                 member _.ReceiveCommand(correlationId, _, invokingAgentId) =
                     observedActors.Add(invokingAgentId)
-                    let witness =
-                        store.TryRecordAgentClientTerminal(
-                            userId, connectionId, registered.Generation, correlationId)
-                    Assert.That(witness.IsOk, Is.True, sprintf "Client witness persistence failed: %A" witness)
                     let response: Common.AgentCommandResponse =
                         { Result = Some "{}"
                           Error = None
                           Instructions = []
                           AgentStateChanges = []
                           InboxActivation = None; PendingJob = None }
+                    let witness =
+                        store.TryRecordAgentClientTerminal(
+                            userId, connectionId, registered.Generation, correlationId,
+                            clientResponse = response)
+                    match witness with
+                    | Ok _ -> ()
+                    | Error message when message.Contains("reply observed") -> ()
+                    | Error message -> Assert.Fail($"Client witness persistence failed: {message}")
                     Assert.That(
                         tracker.Complete(
                             correlationId, userId, connectionId, registered.Generation, response),
@@ -1989,7 +2004,7 @@ let ``authenticated cross-project MCP notification independently witnesses sende
         // but only the two actual work commands carry durable witness IDs.
         observedActors |> Seq.toList
         |> shouldEqual [ "Sender"; "Sender"; "Sender"; "Sender" ]
-        store.CountUnresolvedAgentExecutions(userId, "Sender") |> shouldEqual 0
+        store.CountUnresolvedAgentExecutions(userId, "Sender") |> shouldEqual 2
         store.CountUnresolvedAgentExecutions(userId, "Recipient") |> shouldEqual 0
         use database = new SqliteConnection($"Data Source={store.DatabasePath}")
         database.Open()
@@ -2014,8 +2029,8 @@ let ``authenticated cross-project MCP notification independently witnesses sende
         Assert.That(rootProject, Is.EqualTo("Source"))
         Assert.That(childProject, Is.EqualTo("Destination"))
         Assert.That(childParent, Is.EqualTo(Some rootId))
-        Assert.That(rootState, Is.EqualTo("Terminal"))
-        Assert.That(childState, Is.EqualTo("Terminal")))
+        Assert.That(rootState, Is.EqualTo("Dispatched"))
+        Assert.That(childState, Is.EqualTo("Dispatched")))
 
 [<Test>]
 let ``authenticated MCP correction releases exclusive permit after proven no route`` () =
@@ -3558,3 +3573,144 @@ let ``failed permanent correction identity insert rolls back permit and witness 
             |> function Ok id -> id | Error e -> failwith e
         store.TryReleaseAgentCorrection(
             "alice", "Worker 3", succeeded, true) |> shouldEqual (Ok ()))
+
+[<Test>]
+let ``Git-backed read and write replies never certify native process tree termination`` () =
+    withStore (fun store ->
+        approveTestEpoch store
+        let user, agent, connection, generation = "alice", "Worker 3", "native-git-connection", 12L
+        let successful: Common.AgentCommandResponse =
+            { Result = Some "{}"; Error = None
+              Instructions = []; AgentStateChanges = []
+              InboxActivation = None; PendingJob = None }
+        let tools =
+            [ "TaskRead"; "TaskWrite"; "LedgerRead"; "LedgerWrite"
+              "ReviewRead"; "ReviewWrite"; "GitStatus"; "GitDiff"
+              "GitCommit"; "NotifyAgent" ]
+        let requests =
+            tools
+            |> List.mapi (fun index tool ->
+                let witnessed =
+                    store.TryBeginAgentOperation(
+                        user, agent, tool, Some "Jarvis", "server",
+                        Some "client", Some Common.AgentProtocol.version)
+                    |> function Ok value -> value | Error reason -> failwith reason
+                let correlation = $"native-git-{index}"
+                store.TryMarkAgentDispatched(
+                    user, witnessed.Id, "device", connection, generation, correlation)
+                |> shouldEqual (Ok ())
+                Assert.That(store.TryRecordAgentClientTerminal(
+                    user, connection, generation, correlation, clientResponse = successful).IsError,
+                    Is.True, $"Git-backed {tool} reply was trusted as process-tree quiescence.")
+                let page =
+                    store.ListUnresolvedAgentExecutions(user, agent, 30)
+                    |> function Ok items -> items | Error reason -> failwith reason
+                let evidence = page.Executions |> List.find (fun item -> item.RequestId = witnessed.Id)
+                evidence.State |> shouldEqual "Dispatched"
+                evidence.ToolName |> shouldEqual (Some tool)
+                evidence.ClientResponseSucceeded |> shouldEqual (Some true)
+                Assert.That(evidence.ClientResponseAt.IsSome, Is.True)
+                Assert.That(evidence.RequiresIndependentProcessProof, Is.True)
+                witnessed.Id)
+        store.CountUnresolvedAgentExecutions(user, agent)
+        |> shouldEqual requests.Length
+        store.PruneTelemetry(DateTimeOffset.UtcNow.AddDays(40.0))
+        use restarted = new FeedbackStore(store.DatabasePath)
+        restarted.CountUnresolvedAgentExecutions(user, agent)
+        |> shouldEqual requests.Length
+        Assert.That(restarted.TryAcquireAgentCorrection(
+            user, agent, "operator-after-returned-git").IsError, Is.True,
+            "Successful Git RPC replies cannot release the correction gate."))
+
+[<Test>]
+let ``failed NotifyAgent response is never valid source continuation proof`` () =
+    withStore (fun store ->
+        approveTestEpoch store
+        let user, agent, connection, generation = "alice", "Sender", "negative-notify", 44L
+        let parent =
+            store.TryBeginAgentOperation(
+                user, agent, "NotifyAgent", Some "Source",
+                "server", None, Some Common.AgentProtocol.version)
+            |> function Ok value -> value | Error reason -> failwith reason
+        store.TryMarkAgentDispatched(
+            user, parent.Id, "device", connection, generation, "notify-response")
+        |> shouldEqual (Ok ())
+        let failed: Common.AgentCommandResponse =
+            { Result = None; Error = Some(Common.ExecutionFailed "Sender failed")
+              Instructions = []; AgentStateChanges = []
+              InboxActivation = None; PendingJob = None }
+        Assert.That(store.TryRecordAgentClientTerminal(
+            user, connection, generation, "notify-response",
+            clientResponse = failed).IsError, Is.True)
+        let observe (source: FeedbackStore) =
+            source.ListUnresolvedAgentExecutions(user, agent, 5)
+            |> function Ok page -> page.Executions |> List.exactlyOne
+                        | Error reason -> failwith reason
+        (observe store).ClientResponseSucceeded |> shouldEqual (Some false)
+        Assert.That((observe store).ClientResponseAt.IsSome, Is.True)
+        Assert.That(store.TryBeginAgentContinuation(
+            user, parent.Id, "Destination").IsError, Is.True,
+            "A failed NotifyAgent response cannot launch the destination stage.")
+        let successful: Common.AgentCommandResponse =
+            { failed with Result = Some "{}"; Error = None }
+        // A duplicate altered same-route reply may not overwrite the original
+        // immutable first outcome, even after restarting the server.
+        Assert.That(store.TryRecordAgentClientTerminal(
+            user, connection, generation, "notify-response",
+            clientResponse = successful).IsError, Is.True)
+        use restarted = new FeedbackStore(store.DatabasePath)
+        (observe restarted).ClientResponseSucceeded |> shouldEqual (Some false)
+        Assert.That(restarted.TryBeginAgentContinuation(
+            user, parent.Id, "Destination").IsError, Is.True)
+        Assert.That(restarted.TryAcquireAgentCorrection(
+            user, agent, "operator-after-failed-notify").IsError, Is.True))
+
+[<Test>]
+let ``migration revokes old Git Terminal evidence without inventing process completion`` () =
+    withStore (fun store ->
+        approveTestEpoch store
+        let user, agent, connection, generation = "alice", "Worker 3", "migration-conn", 5L
+        let beginOperation tool correlation =
+            let witness =
+                store.TryBeginAgentOperation(
+                    user, agent, tool, Some "Jarvis",
+                    "server", None, Some Common.AgentProtocol.version)
+                |> function Ok value -> value | Error reason -> failwith reason
+            store.TryMarkAgentDispatched(
+                user, witness.Id, "device", connection, generation, correlation)
+            |> shouldEqual (Ok ())
+            witness.Id
+        let oldGit = beginOperation "TaskRead" "old-git-read"
+        let safe = beginOperation "ReadFiles" "safe-local-read"
+        store.TryRecordAgentClientTerminal(
+            user, connection, generation, "safe-local-read")
+        |> shouldEqual (Ok(Some safe))
+        use sql = new SqliteConnection($"Data Source={store.DatabasePath}")
+        sql.Open()
+        use oldServer = sql.CreateCommand()
+        oldServer.CommandText <-
+            """UPDATE agent_execution_witness
+               SET state = 'Terminal', terminal_at = $at
+               WHERE request_id = $requestId;"""
+        oldServer.Parameters.AddWithValue("$at", DateTimeOffset.UtcNow.ToString("O"))
+        |> ignore
+        oldServer.Parameters.AddWithValue("$requestId", oldGit) |> ignore
+        oldServer.ExecuteNonQuery() |> shouldEqual 1
+        use migrated = new FeedbackStore(store.DatabasePath)
+        migrated.GetAgentExecutionResolution(user, oldGit)
+        |> shouldEqual (Ok ExecutionUnresolved)
+        migrated.GetAgentExecutionResolution(user, safe)
+        |> shouldEqual (Ok AuthenticatedClientFinished)
+        let evidence =
+            migrated.ListUnresolvedAgentExecutions(user, agent, 10)
+            |> function Ok page -> page.Executions |> List.exactlyOne
+                        | Error reason -> failwith reason
+        evidence.RequestId |> shouldEqual oldGit
+        evidence.State |> shouldEqual "Dispatched"
+        Assert.That(evidence.ClientResponseAt.IsSome, Is.True)
+        evidence.ClientResponseSucceeded |> shouldEqual None
+        Assert.That(evidence.RequiresIndependentProcessProof, Is.True)
+        use secondRestart = new FeedbackStore(store.DatabasePath)
+        secondRestart.CountUnresolvedAgentExecutions(user, agent) |> shouldEqual 1
+        Assert.That(secondRestart.TryAcquireAgentCorrection(
+            user, agent, "operator-after-migration").IsError, Is.True))

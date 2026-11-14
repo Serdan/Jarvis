@@ -769,8 +769,17 @@ module McpToolHelpers =
                                           && notification.SourceRef <> notification.ProjectName ->
                                         Some notification.SourceRef
                                     | _ -> AgentCommandInfo.projectName command
+                                // The source of a two-stage NotifyAgent is
+                                // dispatched on the TaskRead wire, but its
+                                // logical operation owns Git-backed work in
+                                // both projects. Persist the semantic type,
+                                // not the outer TaskWrite protocol envelope.
+                                let witnessedTool =
+                                    match command with
+                                    | TaskWriteCommand notify when notify.Action = "NotifyAgent" -> "NotifyAgent"
+                                    | _ -> toolName command
                                 match store.TryBeginAgentOperation(
-                                          userId, agent, toolName command,
+                                          userId, agent, witnessedTool,
                                           witnessProject,
                                           serverVersion, clientVersion, protocolVersion) with
                                 | Ok started -> Ok(Some(store, started), Some started.Id)

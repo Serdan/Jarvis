@@ -799,3 +799,64 @@ serialization. Internal pre-existing unbound migration fixtures retain
 their historical textual IDs but cannot claim or borrow a bound
 production UUID. Alternate-case/braced retargeting and non-GUID
 production inputs are explicitly rejected in regression tests.
+
+### Client completion is not native process-tree quiescence (protocol 3.66, 2026-11-14)
+
+The 3.65 terminal classifier used a negative `ProcessExecution` permission
+check. That is insufficient: many commands classified as read-only, including
+`TaskRead`, `LedgerRead`, `ReviewRead`, and `GitStatus`, execute Git
+through `BoundedProcess.run`. Even if the awaited Git parent exits, Git
+helpers, credential programs, hooks, filters, or detached descendants can
+continue executing. A single client handler reply therefore cannot prove
+OS descendant termination and must not authorize a Working-to-Ready
+administrative correction.
+
+Protocol 3.66 introduces an explicit small allowlist of truly synchronous,
+nonprocess commands. For **all other known** command kinds, an exact
+authenticated SignalR response is stored as `client_response_at` with a
+first-outcome `client_response_succeeded` bit, while the witness remains
+`Dispatched`. A typed `ToolCompleted` / `ToolFailed` poll on the exact
+original deferred job records the same distinction. An unknown command,
+missing historical tool classification, uncorrelated response, timeout,
+client reconnect, or absent response still cannot obtain terminal proof.
+The response observation is *not* a process-tree certificate, regardless
+of how long its handler has already been finished.
+
+`StartJob` continues to retain its exact job ID, start timestamp and
+client-return evidence without treating the handle or parent exit as full
+process-tree termination. The client-side `CancelJob` now records a
+cancellation *request* without marking the job `Canceled` or setting
+`CompletedAt` until its parent process Exited event is observed. Neither
+that event nor `Kill(entireProcessTree = true)` currently certifies the
+descendant tree is completely reaped, so server correction witnesses remain
+unresolved until independent OS-backed reaping proof is implemented.
+
+An authenticated, **successful** `NotifyAgent` source RPC may still
+continue to its distinct destination RPC without a quiescence certificate,
+since this is a logical continuation of the same operator-requested
+notification. The source witness is now classified by its actual
+`NotifyAgent` semantic operation, not merely the outer `TaskWrite`
+protocol envelope. The continuation validator requires the root
+`NotifyAgent` identity and a durable first successful source reply
+(`client_response_succeeded=1`); an error, absent result, duplicate
+conflicting reply or pre-migration row cannot satisfy it. Both source and
+destination Git-backed witnesses remain unresolved for administrative
+correction even after both replies are delivered.
+
+Existing 3.65 `Terminal` witnesses of Git-backed, process-capable or
+unknown commands are **monotonically demoted** on migration to
+`Dispatched`, retaining any original terminal timestamp only as
+`client_response_at` evidence. Their success bit is not backfilled:
+a historical response timestamp does not establish whether the original
+validation succeeded. This migration is restart-idempotent and intentionally
+fails closed for legacy execution. The protocol bump also invalidates any
+earlier-version legacy drain approval; no transition to Ready is made.
+The authenticated read-only correction evidence now distinguishes
+`clientResponseAt`, `clientResponseSucceeded` and
+`requiresIndependentProcessProof`, with no mutation or permit release.
+
+The remaining production gates are unchanged: attest every 3.63–3.65
+pre-witness client and obsolete server, prove OS-backed descendant reaping
+across every participating device/process incarnation, reconcile the exact
+canonical Git correction UUID outcome and review a frozen tested source.
+No production operator approval tool or automatic cleanup is exposed.

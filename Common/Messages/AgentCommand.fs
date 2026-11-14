@@ -1184,8 +1184,9 @@ module AgentCommandInfo =
 
 module AgentProtocol =
     // Witness-capable admission and deferred ToolOperation receipts require
-    // a newer end-to-end protocol than deployed mainline 3.64.
-    let version = "3.65"
+    // Process-return evidence now remains distinct from proved process-tree
+    // quiescence. Never reuse legacy approvals from protocol 3.65.
+    let version = "3.66"
     let defaultPatchFuzzyContextLines = 3
     let maxResponseBytes = 900 * 1024
     let maxImageBytes = 8 * 1024 * 1024

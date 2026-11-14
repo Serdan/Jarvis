@@ -1151,3 +1151,29 @@ reinspection rather than being deleted automatically. A durable
 receipt/reaping/cgroup garbage-collection protocol and an OS-backed
 cross-incarnation identity proof are follow-up requirements. Windows
 Job Object and macOS process group behavior are not modified.
+
+#### Confirmed cgroup escape: an empty scope is not all-descendant proof
+
+An adversarial live probe on the Linux development machine reproduced the
+escape boundary, rather than merely assuming it was possible. A Python child
+was first attached to a unique cgroup-v2 scope and then wrote its own PID to
+the still-writable parent `cgroup.procs`. The child remained executing in the
+parent cgroup while the original scope reported `populated 0`. Writing
+`1`to the original scope's `cgroup.kill`did not kill the escaped child.
+The test explicitly killed/reaped the probe and removed its empty test scope.
+
+Observed predicates (all true): `kernel_scope_empty`,
+`escaped_process_alive`, `escaped_process_visible_in_parent_cgroup`,
+`escaped_process_survived_scope_kill`.
+
+**Consequence:** writable same-UID delegation permits real escape, not
+merely hypothetical escape through systemd-run or other launchers. On this
+host, a cgroup empty/reaped observation cannot alone certify that a
+detached native StartJob process tree has finished. The experimental scope
+is a useful best-effort containment and recovery anchor only. A future
+authoritative descendant-termination design would need a demonstrated
+kernel-enforced migration/launch boundary (including indirect user-systemd
+launches) or a separate conservative operator-verified termination procedure.
+In particular, NEVER derive a server `Terminal`witness, corrected-agent
+`Ready`state, legacy drain approval, or permit release from `populated 0`,
+the successful return of `cgroup.kill`, or a process PID.

@@ -196,8 +196,9 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
             let project = if separator < 0 then projectName else projectName.Substring(0, separator)
             // Durable before best-effort SignalR hints. Failed hint delivery
             // cannot lose an activity update: the next verified query sees it.
-            if not (obj.ReferenceEquals(box store, null)) then
-                store.RecordAttributedAgentActivity(userId, project, agentId, observedAtUtc)
+            if obj.ReferenceEquals(box store, null) then
+                invalidOp "Attributed agent activity cannot be verified without durable persistence."
+            store.RecordAttributedAgentActivity(userId, project, agentId, observedAtUtc)
             users.ListDevices(userId)
             |> AgentStateInvalidationRouting.recipients
             |> Array.map (fun connectionId ->
@@ -307,6 +308,7 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                         // BEFORE the command can start executing on another
                         // device. Hints are best-effort; the SQLite watermark
                         // is what the Manager clock verifies before launch.
+                        let mutable activityPersistenceFailed = false
                         let activityHints =
                             match agentId, AgentCommandInfo.projectName command with
                             | Some actor, Some project
@@ -315,74 +317,88 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                                      AgentCommandInfo.isAgentActivity command ->
                                 try Some(this.RecordAgentActivityForUser(userId, project, actor, DateTimeOffset.UtcNow))
                                 with ex ->
-                                    logger.LogWarning(ex, "Unable to persist attributed agent activity before dispatch")
+                                    // No activity watermark means no safe Manager idle
+                                    // verification. Reject BEFORE any remote execution:
+                                    // an in-memory poison flag cannot survive restart.
+                                    logger.LogError(ex, "Attribution persistence failed; refusing command dispatch")
+                                    activityPersistenceFailed <- true
                                     None
                             | _ -> None
-                        try
-                            do! client.ReceiveCommand(correlationId, commandJson, defaultArg agentId "").WaitAsync(requestAborted)
-                            sendMs <- Stopwatch.GetElapsedTime(dispatchAt).TotalMilliseconds
-                            users.RecordDispatchSuccess(userId, connectionId)
-                            match activityHints with
-                            | Some hints ->
-                                try do! hints
-                                with ex ->
-                                    logger.LogWarning(ex, "Unable to publish cross-device agent activity hint")
-                            | None -> ()
-
-                            let awaitReplyAt = Stopwatch.GetTimestamp()
-                            replyStartedAt <- Some awaitReplyAt
-                            try
-                                let! response = trackingTask.WaitAsync(requestAborted)
-                                replyMs <- Stopwatch.GetElapsedTime(awaitReplyAt).TotalMilliseconds
-                                report "completed"
-                                return response
-                            with :? TaskCanceledException when not requestAborted.IsCancellationRequested ->
-                                replyMs <- Stopwatch.GetElapsedTime(awaitReplyAt).TotalMilliseconds
-                                let outcome =
-                                    match users.GetSessionByConnection(connectionId) with
-                                    | ValueSome active when active.State = Registered && active.Generation = session.Generation -> "tracker-timeout"
-                                    | _ -> "disconnected"
-                                report outcome
-                                let reason =
-                                    $"Client response timeout for {session.DeviceName} generation {session.Generation}."
-                                users.RecordDispatchFailure(userId, connectionId, reason)
-                                return
-                                    { Result = None
-                                      Error =
-                                        Some(
-                                            UncertainOutcome
-                                                { Message = $"{reason} Protocol {session.ProtocolVersion}, client {session.ClientVersion}, last seen {session.LastSeenAt:O}."
-                                                  OperationId = AgentCommandInfo.recoveryOperationId command }
-                                        )
-                                      Instructions = []; AgentStateChanges = sourceChanges
-                                      InboxActivation = sourceActivation; PendingJob = None }
-                        with ex ->
-                            match replyStartedAt with
-                            | Some started when replyMs = 0.0 ->
-                                replyMs <- Stopwatch.GetElapsedTime(started).TotalMilliseconds
-                            | None ->
-                                sendMs <- Stopwatch.GetElapsedTime(dispatchAt).TotalMilliseconds
-                            | _ -> ()
+                        if activityPersistenceFailed then
                             tracker.Cancel(correlationId)
-                            if requestAborted.IsCancellationRequested then
-                                report "upstream-abort"
-                                // The caller is gone, not the device. Keep
-                                // the client session healthy and remove the
-                                // now-unobservable correlation promptly.
-                                return raise (OperationCanceledException(requestAborted))
-                            else
-                                report "signalr-send-failure"
-                                let reason =
-                                    $"Dispatch failed for {session.DeviceName} generation {session.Generation}: {ex.Message}"
-                                users.RecordDispatchFailure(userId, connectionId, reason)
-                                return
-                                    { Result = None
-                                      Error =
-                                        Some(UncertainOutcome
-                                            { Message = reason
-                                              OperationId = AgentCommandInfo.recoveryOperationId command })
-                                      Instructions = []; AgentStateChanges = sourceChanges
-                                      InboxActivation = sourceActivation; PendingJob = None }
+                            report "activity-persistence-failed"
+                            return
+                                { Result = None
+                                  Error = Some(ExecutionFailed
+                                      "Attributed agent activity could not be persisted; command was not dispatched.")
+                                  Instructions = []; AgentStateChanges = sourceChanges
+                                  InboxActivation = sourceActivation; PendingJob = None }
+                        else
+                            try
+                                do! client.ReceiveCommand(correlationId, commandJson, defaultArg agentId "").WaitAsync(requestAborted)
+                                sendMs <- Stopwatch.GetElapsedTime(dispatchAt).TotalMilliseconds
+                                users.RecordDispatchSuccess(userId, connectionId)
+                                match activityHints with
+                                | Some hints ->
+                                    try do! hints
+                                    with ex ->
+                                        logger.LogWarning(ex, "Unable to publish cross-device agent activity hint")
+                                | None -> ()
+
+                                let awaitReplyAt = Stopwatch.GetTimestamp()
+                                replyStartedAt <- Some awaitReplyAt
+                                try
+                                    let! response = trackingTask.WaitAsync(requestAborted)
+                                    replyMs <- Stopwatch.GetElapsedTime(awaitReplyAt).TotalMilliseconds
+                                    report "completed"
+                                    return response
+                                with :? TaskCanceledException when not requestAborted.IsCancellationRequested ->
+                                    replyMs <- Stopwatch.GetElapsedTime(awaitReplyAt).TotalMilliseconds
+                                    let outcome =
+                                        match users.GetSessionByConnection(connectionId) with
+                                        | ValueSome active when active.State = Registered && active.Generation = session.Generation -> "tracker-timeout"
+                                        | _ -> "disconnected"
+                                    report outcome
+                                    let reason =
+                                        $"Client response timeout for {session.DeviceName} generation {session.Generation}."
+                                    users.RecordDispatchFailure(userId, connectionId, reason)
+                                    return
+                                        { Result = None
+                                          Error =
+                                            Some(
+                                                UncertainOutcome
+                                                    { Message = $"{reason} Protocol {session.ProtocolVersion}, client {session.ClientVersion}, last seen {session.LastSeenAt:O}."
+                                                      OperationId = AgentCommandInfo.recoveryOperationId command }
+                                            )
+                                          Instructions = []; AgentStateChanges = sourceChanges
+                                          InboxActivation = sourceActivation; PendingJob = None }
+                            with ex ->
+                                match replyStartedAt with
+                                | Some started when replyMs = 0.0 ->
+                                    replyMs <- Stopwatch.GetElapsedTime(started).TotalMilliseconds
+                                | None ->
+                                    sendMs <- Stopwatch.GetElapsedTime(dispatchAt).TotalMilliseconds
+                                | _ -> ()
+                                tracker.Cancel(correlationId)
+                                if requestAborted.IsCancellationRequested then
+                                    report "upstream-abort"
+                                    // The caller is gone, not the device. Keep
+                                    // the client session healthy and remove the
+                                    // now-unobservable correlation promptly.
+                                    return raise (OperationCanceledException(requestAborted))
+                                else
+                                    report "signalr-send-failure"
+                                    let reason =
+                                        $"Dispatch failed for {session.DeviceName} generation {session.Generation}: {ex.Message}"
+                                    users.RecordDispatchFailure(userId, connectionId, reason)
+                                    return
+                                        { Result = None
+                                          Error =
+                                            Some(UncertainOutcome
+                                                { Message = reason
+                                                  OperationId = AgentCommandInfo.recoveryOperationId command })
+                                          Instructions = []; AgentStateChanges = sourceChanges
+                                          InboxActivation = sourceActivation; PendingJob = None }
         }
 
 

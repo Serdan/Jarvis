@@ -261,9 +261,10 @@ let idleManagerResetsFromCrossClientActivityAndWaitsForFreshActivityToRearm () =
         clock <- clock.AddSeconds(831.)
         do! awaitStatus (fun () -> status store "manager" = "waitingActivity")
         Assert.That(calls, Is.EqualTo(1))
-        clock <- clock.AddHours(3.)
+        clock <- clock.AddMinutes(20.)
         do! Task.Delay(100)
-        Assert.That(calls, Is.EqualTo(1), "A finished Manager never self-recurses")
+        Assert.That(calls, Is.EqualTo(1),
+                    "A finished Manager does not self-recurse before the 30-minute silent cutoff.")
         lastSeen <- Some clock
         do! awaitStatus (fun () -> status store "manager" = "pending")
         Assert.That(getDue store "manager", Is.GreaterThan(clock))
@@ -498,6 +499,135 @@ let idleScheduleWithoutVerifiedProviderNeverDispatchesManager () = task {
         do! Task.Delay(200)
         Assert.That(calls, Is.Zero)
         Assert.That(store.List(), Does.Contain("ActivityVerificationUnavailable"))
+    finally
+        Directory.Delete(dir, true)
+}
+
+[<Test>]
+let replacingPendingIdleScheduleCannotReuseOlderAgentsVerifiedSnapshot () = task {
+    let dir,path = temp()
+    let mutable clock = DateTimeOffset.UtcNow
+    let verifierStarted = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+    let releaseOld = TaskCompletionSource<Result<DateTimeOffset option,string>>(TaskCreationOptions.RunContinuationsAsynchronously)
+    let mutable launches = 0
+    let mutable newVerifications = 0
+    let verify _ agent = task {
+        if agent = "Manager A" then
+            verifierStarted.TrySetResult(()) |> ignore
+            return! releaseOld.Task
+        else
+            System.Threading.Interlocked.Increment(&newVerifications) |> ignore
+            return Ok (Some clock)
+    }
+    let execute (_:BrowserSchedules.ScheduledAction) = task {
+        System.Threading.Interlocked.Increment(&launches) |> ignore
+        return Ok "submitted"
+    }
+    let config agent =
+        { commandSchedule "slot" "AfterAgentIdle" with
+            RunAfterSeconds = None; IdleAgentId = Some agent; IdleSeconds = Some 60 }
+    try
+        use store = new BrowserSchedules.Service(path, execute, now=(fun () -> clock),
+                                                 pollMs=25, verifyIdleActivity=verify)
+        Assert.That(store.ScheduleExecution(config "Manager A").IsOk, Is.True)
+        store.Start()
+        clock <- clock.AddSeconds(61.)
+        do! verifierStarted.Task.WaitAsync(TimeSpan.FromSeconds(5.))
+        Assert.That(store.ScheduleExecution(config "Manager B").IsOk, Is.True)
+        clock <- clock.AddSeconds(61.)
+        releaseOld.TrySetResult(Ok None) |> ignore
+        do! awaitStatus (fun () -> newVerifications > 0)
+        do! Task.Delay(100)
+        Assert.That(launches, Is.Zero,
+                    "A's verified snapshot must never authorize a replacement B launch.")
+        Assert.That(getDue store "slot", Is.GreaterThan(clock),
+                    "B must be verified independently and postponed by its current remote activity.")
+    finally
+        releaseOld.TrySetResult(Ok None) |> ignore
+        Directory.Delete(dir, true)
+}
+
+[<Test>]
+let replacingWaitingIdleScheduleCannotReuseOlderAgentsVerifiedSnapshot () = task {
+    let dir,path = temp()
+    let mutable clock = DateTimeOffset.UtcNow
+    let waitingVerificationStarted = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+    let releaseOld = TaskCompletionSource<Result<DateTimeOffset option,string>>(TaskCreationOptions.RunContinuationsAsynchronously)
+    let mutable oldVerifications = 0
+    let mutable newVerifications = 0
+    let mutable launches = 0
+    let verify _ agent = task {
+        if agent = "Manager A" then
+            let count = System.Threading.Interlocked.Increment(&oldVerifications)
+            if count = 1 then return Ok None
+            else
+                waitingVerificationStarted.TrySetResult(()) |> ignore
+                return! releaseOld.Task
+        else
+            System.Threading.Interlocked.Increment(&newVerifications) |> ignore
+            return Ok (Some clock)
+    }
+    let execute (_:BrowserSchedules.ScheduledAction) = task {
+        System.Threading.Interlocked.Increment(&launches) |> ignore
+        return Ok "submitted"
+    }
+    let config agent =
+        { commandSchedule "slot" "AfterAgentIdle" with
+            RunAfterSeconds = None; IdleAgentId = Some agent; IdleSeconds = Some 60 }
+    try
+        use store = new BrowserSchedules.Service(path, execute, now=(fun () -> clock),
+                                                 pollMs=25, verifyIdleActivity=verify)
+        Assert.That(store.ScheduleExecution(config "Manager A").IsOk, Is.True)
+        store.Start()
+        clock <- clock.AddSeconds(61.)
+        do! awaitStatus (fun () -> launches = 1 && status store "slot" = "waitingActivity")
+        do! waitingVerificationStarted.Task.WaitAsync(TimeSpan.FromSeconds(5.))
+        Assert.That(store.ScheduleExecution(config "Manager B").IsOk, Is.True)
+        clock <- clock.AddSeconds(61.)
+        releaseOld.TrySetResult(Ok None) |> ignore
+        do! awaitStatus (fun () -> newVerifications > 0)
+        do! Task.Delay(100)
+        Assert.That(launches, Is.EqualTo(1),
+                    "Replacing a waiting schedule must not inherit its previous Manager's verification.")
+        Assert.That(getDue store "slot", Is.GreaterThan(clock))
+    finally
+        releaseOld.TrySetResult(Ok None) |> ignore
+        Directory.Delete(dir, true)
+}
+
+[<Test>]
+let submittedManagerWithoutFirstToolCallRecoversAfterThirtyMinutesAcrossRestart () = task {
+    let dir,path = temp()
+    let mutable clock = DateTimeOffset.UtcNow
+    let mutable launches = 0
+    let execute (_:BrowserSchedules.ScheduledAction) = task {
+        System.Threading.Interlocked.Increment(&launches) |> ignore
+        return Ok "browser launch submitted, no activity observed"
+    }
+    try
+        let firstRun () = task {
+            use first = new BrowserSchedules.Service(path, execute, now=(fun () -> clock),
+                                                     pollMs=25, verifyIdleActivity=(fun _ _ -> Task.FromResult(Ok None)))
+            let cmd =
+                { commandSchedule "manager-silent" "AfterAgentIdle" with
+                    RunAfterSeconds = None; IdleAgentId = Some "Manager"; IdleSeconds = Some 60 }
+            Assert.That(first.ScheduleExecution(cmd).IsOk, Is.True)
+            first.Start()
+            clock <- clock.AddSeconds(61.)
+            do! awaitStatus (fun () -> launches = 1 && status first "manager-silent" = "waitingActivity")
+        }
+        do! firstRun()
+        clock <- clock.AddMinutes(29.)
+        use restored = new BrowserSchedules.Service(path, execute, now=(fun () -> clock),
+                                                     pollMs=25, verifyIdleActivity=(fun _ _ -> Task.FromResult(Ok None)))
+        restored.Start()
+        do! Task.Delay(150)
+        Assert.That(launches, Is.EqualTo(1), "No replacement before the silent-launch stale cutoff.")
+        clock <- clock.AddMinutes(2.)
+        do! awaitStatus (fun () -> launches = 2 && status restored "manager-silent" = "waitingActivity")
+        clock <- clock.AddMinutes(1.)
+        do! Task.Delay(150)
+        Assert.That(launches, Is.EqualTo(2), "Recovery is bounded by the next 30-minute stale cutoff.")
     finally
         Directory.Delete(dir, true)
 }

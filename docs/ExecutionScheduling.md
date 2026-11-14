@@ -18,7 +18,8 @@ schedule via `schedule_execution`, `list_scheduled_executions`,
   (60 seconds–30 days). The first deadline is last attributed activity or
   schedule creation, plus the interval. Any observed activity extends the
   deadline. After launch, the schedule waits for subsequent agent activity
-  before re-arming; it does not recursively launch itself.
+  before re-arming; if none arrives for 30 minutes, one replacement is
+  eligible only after fresh authoritative activity verification.
 
 An example Manager heartbeat is `triggerKind="AfterAgentIdle"`,
 `idleAgentId="Manager"`, `idleSeconds=900`, with the appropriate project
@@ -70,12 +71,18 @@ but does not kill its already running command.
 For Manager idle schedules, a running attempt without any activity for
 30 minutes can become stale and be relaunched; the status records uncertain
 outcome and the old attempt's eventual result cannot override the new one.
-The absence of any event after a completed Manager launch leaves the schedule
-waiting until the Manager is observed again.
+A submitted launch that has returned successfully but generated **no first
+tool call** also becomes eligible for one verified replacement after the
+30-minute cutoff, including across restarts. Every replacement has a fresh
+attempt ID and a new 30-minute grace period; late results never overwrite
+the current attempt. This is conservative recovery from an uncertain silent
+launch, not proof the old browser tab has exited.
 
 Actual agent-attributed tool invocations persist a monotonic
 user/project/agent activity watermark in the server's SQLite database
 before remote command dispatch, alongside best-effort SignalR hints.
+If that durable write fails, the attributed tool is **not dispatched**:
+an in-memory failure marker alone would not survive a server restart.
 The registered, authenticated client can query `GetAgentActivity`
 without activating or modifying the target agent. `observe_agent`,
 job polling and other read-only observations do not reset the Manager clock.
@@ -89,6 +96,9 @@ occurrence and an `AgentActivityUnverified` diagnostic. On reconnect,
 a fresh query reconciles missed remote activity and postpones the deadline.
 Waiting schedules also query for a new Manager activity episode, even if
 the notification hint was lost. The query never invokes the target's inbox.
+A verification result is bound to its immutable schedule revision and exact
+deadline snapshot. Replacing a pending or waiting schedule while the query
+is in flight invalidates that result; the replacement requires a new read.
 Separate idle schedules for the same project and Manager do not overlap
 while a previous occurrence is running within this store.
 

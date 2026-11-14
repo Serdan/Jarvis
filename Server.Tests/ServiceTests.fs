@@ -2215,6 +2215,7 @@ let attributed_tool_dispatch_reaches_both_user_devices_but_not_other_users_or_jo
                         "jarvis-dispatch-activity-" + Guid.NewGuid().ToString("N") + ".db")
     use activityStore = new FeedbackStore(activityDb)
     let mutable persistedBeforeRemoteExecution = false
+    let mutable deliveredCommands = 0
     let received = System.Collections.Concurrent.ConcurrentQueue<string * string * string * DateTimeOffset>()
     let expected = { Result = Some "ok"; Error = None; Instructions = []
                      AgentStateChanges = []; InboxActivation = None; PendingJob = None }
@@ -2222,6 +2223,7 @@ let attributed_tool_dispatch_reaches_both_user_devices_but_not_other_users_or_jo
         { new Common.SignalR.IClientService with
             member _.ReceiveMessage(_) = Task.CompletedTask
             member _.ReceiveCommand(correlationId, _, _) =
+                System.Threading.Interlocked.Increment(&deliveredCommands) |> ignore
                 persistedBeforeRemoteExecution <-
                     activityStore.GetAttributedAgentActivity("alice", "Jarvis", "Manager").IsSome
                 tracker.Complete(correlationId, "alice", connection, registrations[connection], expected)
@@ -2279,4 +2281,34 @@ let attributed_tool_dispatch_reaches_both_user_devices_but_not_other_users_or_jo
     Assert.That(received.Count, Is.EqualTo(2), "Job polling must not reset Manager idle clock")
     Assert.That(activityStore.GetAttributedAgentActivity("alice", "Jarvis", "Manager"),
                 Is.EqualTo(verified), "Job polling must not modify the durable activity watermark.")
+
+    // SQLite can reject a write after an old watermark was previously saved.
+    // Reject the invocation before ReceiveCommand: an in-memory poison marker
+    // alone would disappear after restart, making the old stamp unsafe.
+    use sqlite = new Microsoft.Data.Sqlite.SqliteConnection("Data Source=" + activityDb)
+    sqlite.Open()
+    use deny = sqlite.CreateCommand()
+    deny.CommandText <-
+        """CREATE TRIGGER fail_agent_write BEFORE INSERT ON attributed_agent_activity
+           BEGIN SELECT RAISE(ABORT, 'injected attributed activity persistence failure'); END;"""
+    deny.ExecuteNonQuery() |> ignore
+    let beforeFailure = deliveredCommands
+    let! blocked = service.SendCommandToUser("alice", run, deviceId = "desktop", agentId = "Manager")
+    match blocked.Error with
+    | Some (ExecutionFailed message) -> Assert.That(message, Does.Contain("not dispatched"))
+    | _ -> Assert.Fail("An attributed command must fail closed when SQLite refuses its watermark.")
+    Assert.That(deliveredCommands, Is.EqualTo(beforeFailure),
+                "No remote command may execute without a durable activity watermark.")
+
+    use restartedStore = new FeedbackStore(activityDb)
+    Assert.That(restartedStore.GetAttributedAgentActivity("alice", "Jarvis", "Manager"),
+                Is.EqualTo(verified),
+                "Restart can retain the old stamp only because the failed call never executed.")
+    let restartedService = ClientService(hub, users, tracker, accessor,
+        Microsoft.Extensions.Logging.Abstractions.NullLogger<ClientService>.Instance, restartedStore)
+    let! blockedAfterRestart =
+        restartedService.SendCommandToUser("alice", run, deviceId = "desktop", agentId = "Manager")
+    Assert.That(blockedAfterRestart.Error.IsSome, Is.True)
+    Assert.That(deliveredCommands, Is.EqualTo(beforeFailure),
+                "After restart, a failed activity write still cannot dispatch a Manager tool.")
 }

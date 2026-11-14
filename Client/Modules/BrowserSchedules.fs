@@ -29,6 +29,7 @@ type ScheduledAction =
       ConversationUrl: string
       Cleanup: string
       AttemptId: string
+      RevisionId: string
       Error: string
       UpdatedAtUtc: DateTimeOffset
       ActionKind: string
@@ -273,7 +274,13 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
                     JsonSerializer.Deserialize<ScheduledAction list>(root.GetProperty("actions").GetRawText())
                 actions <-
                     restored
-                    |> List.map (fun action ->
+                    |> List.map (fun loaded ->
+                        // Assign an immutable identity to pre-revision journal entries.
+                        // It changes only when an operator replaces a schedule.
+                        let action =
+                            if String.IsNullOrWhiteSpace(loaded.RevisionId) then
+                                { loaded with RevisionId = Guid.NewGuid().ToString("N") }
+                            else loaded
                         if action.Status = "running" then
                             if isIdle action then
                                 let now = clock()
@@ -363,7 +370,8 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
                                   CloseTabAfterExecution = closeAfter; RepeatEverySeconds = repeat
                                   Status = "pending"
                                   RegistrationId = ""; ConversationUrl = ""; Cleanup = ""
-                                  AttemptId = ""; Error = ""; UpdatedAtUtc = time
+                                  AttemptId = ""; RevisionId = Guid.NewGuid().ToString("N")
+                                  Error = ""; UpdatedAtUtc = time
                                   ActionKind = "BrowserScript"; TriggerKind = (if repeat > 0 then "Every" else "Once")
                                   Executable = ""; CommandArgs = []; WorkingDirectory = ""
                                   TimeoutSeconds = 0; MaxOutputBytes = 0
@@ -462,7 +470,8 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
                               CloseTabAfterExecution = cmd.CloseTabAfterExecution |> Option.defaultValue true
                               RepeatEverySeconds = if cmd.TriggerKind = "Every" then cmd.RepeatEverySeconds.Value else 0
                               Status = "pending"; RegistrationId = ""; ConversationUrl = ""; Cleanup = ""
-                              AttemptId = ""; Error = ""; UpdatedAtUtc = time
+                              AttemptId = ""; RevisionId = Guid.NewGuid().ToString("N")
+                              Error = ""; UpdatedAtUtc = time
                               ActionKind = cmd.ActionKind; TriggerKind = cmd.TriggerKind
                               Executable = required cmd.Executable; CommandArgs = cmd.Args
                               WorkingDirectory = required cmd.WorkingDirectory
@@ -529,6 +538,15 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
                                                     { a with LastActivityAtUtc = at
                                                              DueAtUtc = at.AddSeconds(float a.IdleSeconds)
                                                              Status = "pending"; UpdatedAtUtc = current }
+                                                | _ when a.Status = "waitingActivity" &&
+                                                         a.StartedAtUtc <> DateTimeOffset.MinValue &&
+                                                         current >= a.StartedAtUtc.AddMinutes(30.) ->
+                                                    // A submitted Manager may never make its first
+                                                    // tool call. The old attempt is now uncertain;
+                                                    // allow ONE verified replacement after 30m.
+                                                    { a with Status = "pending"; DueAtUtc = current
+                                                             Error = "outcomeUnknown: Manager launch had no tool activity for 30 minutes."
+                                                             UpdatedAtUtc = current }
                                                 | _ -> a
                                             | "running" ->
                                                 let activity = latest |> Option.defaultValue DateTimeOffset.MinValue
@@ -592,8 +610,12 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
                                     | Some prior ->
                                         match actions |> List.tryFind (fun a -> a.Id = prior.Id) with
                                         | None -> None
-                                        | Some currentEntry when currentEntry.Disabled ||
+                                        | Some currentEntry when currentEntry.RevisionId <> prior.RevisionId ||
+                                             currentEntry <> prior || currentEntry.Disabled ||
                                              (currentEntry.Status <> "pending" && currentEntry.Status <> "waitingActivity") ->
+                                            // Verification belongs to the exact immutable
+                                            // candidate. An operator replacement or updated
+                                            // deadline must obtain its own fresh server read.
                                             None
                                         | Some currentEntry ->
                                             let now = clock()

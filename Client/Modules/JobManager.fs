@@ -25,6 +25,7 @@ type private JobRecord =
       StartedAt: DateTimeOffset
       Process: Process
       TerminateGroup: unit -> unit
+      NativeScoped: bool
       LaunchGate: obj
       SyncRoot: obj
       Events: ResizeArray<JobOutputEvent>
@@ -51,7 +52,10 @@ module private Core =
 
     let private pruneCompletedJobs () =
         jobs.Values
-        |> Seq.filter (fun job -> job.Status <> Running)
+        |> Seq.filter (fun job ->
+            match job.Status with
+            | Running | CleanupUnverified _ -> false
+            | _ -> true)
         |> Seq.sortByDescending (fun job -> job.StartedAt)
         |> Seq.indexed
         |> Seq.choose (fun (index, job) ->
@@ -268,6 +272,7 @@ module private Core =
                       StartedAt = DateTimeOffset.UtcNow
                       Process = proc
                       TerminateGroup = terminateGroup
+                      NativeScoped = nativeScope.IsSome
                       LaunchGate = obj()
                       SyncRoot = obj()
                       Events = ResizeArray()
@@ -289,19 +294,33 @@ module private Core =
                 let completeObservedExit () =
                     if transferred && not completedHandled then
                         completedHandled <- true
-                        // Kill remaining group members BEFORE WaitForExit:
-                        // descendants may retain redirected pipes. This is
-                        // cleanup, NOT durable OS reaping attestation.
-                        try terminateGroup() with _ -> ()
-                        try proc.WaitForExit()
-                        with _ -> ()
-
-                        lock job.SyncRoot (fun () ->
-                            if job.CancellationRequested then
-                                job.Status <- Canceled
+                        // A native scope cleanup failure is a retryable,
+                        // visible state, NOT Completed/Canceled. An escaped or
+                        // unreaped descendant may still hold stdout/stderr
+                        // open, so never call unbounded WaitForExit while
+                        // holding LaunchGate for an opted-in native scope.
+                        let cleanupError =
+                            if job.NativeScoped then
+                                try
+                                    terminateGroup()
+                                    None
+                                with ex ->
+                                    Some($"Native scope termination unverified: {ex.Message}")
                             else
-                                try job.Status <- Completed proc.ExitCode
-                                with _ -> job.Status <- FailedToStart "Process exited before an exit code was available."
+                                try terminateGroup() with _ -> ()
+                                try proc.WaitForExit() with _ -> ()
+                                None
+                        lock job.SyncRoot (fun () ->
+                            match cleanupError with
+                            | Some issue -> job.Status <- CleanupUnverified issue
+                            | None ->
+                                if job.CancellationRequested then
+                                    job.Status <- Canceled
+                                else
+                                    try job.Status <- Completed proc.ExitCode
+                                    with _ ->
+                                        job.Status <- FailedToStart
+                                            "Process exited before an exit code was available."
                             job.CompletedAt <- Some DateTimeOffset.UtcNow)
                         releaseSupervisor()
                         pruneCompletedJobs()
@@ -417,7 +436,11 @@ module private Core =
         fun _ ->
             jobs.Values
             |> Seq.filter (fun job -> canonical |> Option.forall ((=) job.ProjectName))
-            |> Seq.filter (fun job -> cmd.IncludeCompleted || job.Status = Running)
+            |> Seq.filter (fun job ->
+                cmd.IncludeCompleted ||
+                match job.Status with
+                | Running | CleanupUnverified _ -> true
+                | _ -> false)
             |> Seq.sortBy (fun job -> job.StartedAt)
             |> Seq.map toSummary
             |> Seq.toList
@@ -464,27 +487,56 @@ module private Core =
                         // whose WaitForExit drains async output callbacks that
                         // require SyncRoot. Never query it under SyncRoot.
                         let alreadyExited = job.Process.HasExited
-                        let shouldCancel =
+                        let shouldCancel, retryCleanup =
                             lock job.SyncRoot (fun () ->
-                                // Skip an already-observed dead leader. A
-                                // subsequent exit may race the signal because
-                                // no pidfd/cgroup lifetime handle exists.
-                                if job.Status = Running && not alreadyExited then
+                                match job.Status with
+                                | Running when not alreadyExited ->
                                     job.CancellationRequested <- true
-                                    true
-                                else false)
-                        if shouldCancel then
+                                    true, false
+                                | CleanupUnverified _ when job.NativeScoped ->
+                                    // Retry the immutable native cgroup scope,
+                                    // never the potentially reused leader PID.
+                                    true, true
+                                | _ -> false, false)
+                        if not shouldCancel then Ok()
+                        else
                             try
                                 job.TerminateGroup()
-                                if not job.Process.HasExited then
+                                if not job.NativeScoped && not alreadyExited
+                                   && not job.Process.HasExited then
+                                    // Native scopes already issued exact cgroup.kill.
+                                    // Do not race a redundant PID/descendant-tree kill
+                                    // against an asynchronously exited helper.
                                     job.Process.Kill(entireProcessTree = true)
+                                if retryCleanup then
+                                    lock job.SyncRoot (fun () ->
+                                        if alreadyExited || job.Process.HasExited then
+                                            if job.CancellationRequested then
+                                                job.Status <- Canceled
+                                            else
+                                                try job.Status <- Completed job.Process.ExitCode
+                                                with _ ->
+                                                    job.Status <- FailedToStart
+                                                        "Process exited without an available exit code."
+                                            job.CompletedAt <- Some DateTimeOffset.UtcNow
+                                        else
+                                            // The Exited callback will finish
+                                            // the parent; a kernel kill request
+                                            // alone cannot prove its exit.
+                                            job.Status <- Running)
                                 Ok()
                             with ex ->
-                                // A failed kill attempt does not revoke the
-                                // cancellation request. The caller may retry.
-                                Error(ExceptionError ex)
-                        else
-                            Ok())
+                                // Retain a queryable, retryable cleanup failure.
+                                // A failed kernel kill is not a successful
+                                // cancellation and must never fall back to
+                                // signaling a historical process-group ID.
+                                if job.NativeScoped then
+                                    lock job.SyncRoot (fun () ->
+                                        job.Status <- CleanupUnverified
+                                            $"Native scope termination unverified: {ex.Message}"
+                                        if alreadyExited then
+                                            job.CompletedAt <- Some DateTimeOffset.UtcNow)
+                                Error(ExceptionError ex))
 
 // Tool operations are intentionally separate from OS processes. Admission is
 // bounded before scheduling; the original task owns the one canonical result.

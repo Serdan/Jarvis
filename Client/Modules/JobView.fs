@@ -9,12 +9,16 @@ type OutputLine =
       Stream: JobOutputStream
       Text: string }
 
-let isRunning (job: JobSummary) = job.Status = JobStatus.Running
+let isRunning (job: JobSummary) =
+    match job.Status with
+    | JobStatus.Running | JobStatus.CleanupUnverified _ -> true
+    | _ -> false
 
 let statusText = function
     | JobStatus.Running -> "Running"
     | JobStatus.Completed code -> $"Exited {code}"
     | JobStatus.Canceled -> "Canceled"
+    | JobStatus.CleanupUnverified message -> $"Cleanup unverified: {message}"
     | JobStatus.FailedToStart message -> $"Failed: {message}"
     | JobStatus.ToolCompleted -> "Completed"
     | JobStatus.ToolFailed message -> $"Failed: {message}"

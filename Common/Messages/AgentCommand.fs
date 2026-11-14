@@ -39,6 +39,7 @@ type JobStatus =
     | Completed of exitCode: int
     | FailedToStart of message: string
     | Canceled
+    | CleanupUnverified of message: string
     | ToolCompleted
     | ToolFailed of message: string
 
@@ -1308,9 +1309,10 @@ module AgentCommandInfo =
 module AgentProtocol =
     // Witness-capable admission and deferred ToolOperation receipts retain
     // process-return identity separately from proven process-tree quiescence.
+    // 3.68 adds the retryable native StartJob CleanupUnverified result.
     // 3.67 adds a read-only historical StartJob ownership query, NEVER OS
     // termination proof. Prior 3.65/3.66 legacy approvals cannot carry over.
-    let version = "3.67"
+    let version = "3.68"
     let defaultPatchFuzzyContextLines = 3
     let maxResponseBytes = 900 * 1024
     let maxImageBytes = 8 * 1024 * 1024

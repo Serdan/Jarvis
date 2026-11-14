@@ -1177,3 +1177,42 @@ launches) or a separate conservative operator-verified termination procedure.
 In particular, NEVER derive a server `Terminal`witness, corrected-agent
 `Ready`state, legacy drain approval, or permit release from `populated 0`,
 the successful return of `cgroup.kill`, or a process PID.
+
+
+### Native-scope cleanup retry and failure visibility (protocol 3.68, 2026-11-14)
+
+An independent frozen review of the first opt-in native-scope commit
+(44c854f4) requested changes for two failure modes. A kernel cgroup.kill
+error during the leader's Exited callback was swallowed, and the handler
+then performed unbounded Process.WaitForExit while descendants could still
+hold redirected output pipes open. Otherwise the job could falsely advance
+to Completed/Canceled despite failed cleanup; CancelJob could not retry if
+the helper had already exited. The cgroup.events parser also discarded
+malformed duplicate populated lines and could report Empty from ambiguous
+input.
+
+The follow-up introduces a distinct JobStatus.CleanupUnverified message
+(protocol **3.68**). The error is visible in GetJobResult and job lists,
+retained rather than pruned, and permitted to retry the original Linux
+scope identity through CancelJob even after the launch helper has exited.
+Native-scope Exited handling never performs an unbounded output-pipe wait.
+If a native kill fails, CancelJob returns an error and never falls back to
+signaling a stale Unix process group. A successful native kill is not
+followed by redundant PID-based Process.Kill. Existing non-native process
+job semantics remain separate.
+
+The cgroup.events parser now preserves all populated records, rejects
+malformed or duplicate keys, and tolerates unrelated kernel keys. Tests
+exercise valid-plus-malformed duplicates and Linux permission-fault
+injection by temporarily removing write permission from a unique test
+scope's cgroup.kill. The scenarios cover surviving descendants with and
+without inherited redirected output streams, as well as retry while
+the original launcher is still running. Every fixture restores the
+kernel mode and cleans up its unique test scope.
+
+CleanupUnverified is **not** all-descendant liveness proof. A subsequent
+successful cgroup.kill, an observed parent exit or populated=0 still cannot
+guarantee escaped descendants are dead; these states never authorize a
+server correction permit release or Terminal execution witness. This
+remains an experimental opt-in, undeployed feature pending independent
+frozen review and the documented fleet/drain/operator requirements.

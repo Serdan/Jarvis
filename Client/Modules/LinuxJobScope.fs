@@ -124,16 +124,22 @@ module LinuxJobScope =
         if String.IsNullOrWhiteSpace contents then Unverified "Missing cgroup.events."
         else
             let lines = contents.Split('\n', StringSplitOptions.RemoveEmptyEntries)
-            let parsed =
+            let populated =
                 lines
                 |> Array.choose (fun line ->
-                    let parts = line.Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries)
-                    if parts.Length = 2 && parts[0] = "populated" then Some parts[1]
+                    let parts =
+                        line.Trim().Split([| ' '; '\t'; '\r' |],
+                                          StringSplitOptions.RemoveEmptyEntries)
+                    // Preserve malformed records for rejection. Dropping them
+                    // would allow a valid line to mask a corrupt duplicate.
+                    if parts.Length > 0 && parts[0] = "populated" then Some parts
                     else None)
-            if parsed.Length <> 1 then Unverified "Missing or duplicated populated evidence."
-            elif parsed[0] = "0" then Empty
-            elif parsed[0] = "1" then Occupied
-            else Unverified "Malformed populated evidence."
+            match populated with
+            | [| [| "populated"; "0" |] |] -> Empty
+            | [| [| "populated"; "1" |] |] -> Occupied
+            | [| |] -> Unverified "Missing populated evidence."
+            | [| _ |] -> Unverified "Malformed populated evidence."
+            | _ -> Unverified "Duplicated or malformed populated evidence."
 
     let inspect (scope: Identity) =
         try

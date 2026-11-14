@@ -1462,7 +1462,11 @@ let linuxNativeJobScopeParsesOnlyExplicitKernelPopulation () =
                 Is.EqualTo(LinuxJobScope.Occupied))
     for invalid in [ ""; "frozen 0"; "populated 2"; "populated -1";
                      "populated 0\npopulated 0"; "populated 0\npopulated 1";
-                     "populated"; "populated 0 1" ] do
+                     "populated"; "populated 0 1";
+                     "populated 0\npopulated 1 extra";
+                     "populated 0\npopulated";
+                     "populated 1\npopulated -1";
+                     "populated 0\npopulated\t1 extra" ] do
         match LinuxJobScope.inspectEvents invalid with
         | LinuxJobScope.Unverified _ -> ()
         | result -> Assert.Fail($"Malformed kernel scope occupancy was accepted: {result}")
@@ -1657,3 +1661,224 @@ let nativeScopeJournalRejectsForgedDigestAndMissingKernelScope () =
         | Ok _ -> Assert.Fail("A forged native scope digest was accepted.")
     finally
         Directory.Delete(root, true)
+
+
+let private nativeScopedCleanupFailureIsVisibleAndRetryable inheritPipes =
+    if not (OperatingSystem.IsLinux()) then Assert.Ignore("Linux cgroup v2 only.")
+    if not (File.Exists "/usr/bin/python3") || not (File.Exists "/usr/bin/sleep") then
+        Assert.Ignore("Native Linux Python and sleep fixtures are required.")
+    let previous = Environment.GetEnvironmentVariable("JARVIS_STARTJOB_CGROUP_V2")
+    let root = createTempProject()
+    let context = TestContext root
+    let marker = Path.Combine(root, "Project1", "cleanup-child.pid")
+    let mutable jobId: string option = None
+    let mutable scope: LinuxJobScope.Identity option = None
+    let mutable killPath: string option = None
+    let mutable originalKillMode: UnixFileMode option = None
+    try
+        Environment.SetEnvironmentVariable("JARVIS_STARTJOB_CGROUP_V2", "1")
+        let probe =
+            try LinuxJobScope.create(Guid.NewGuid().ToString("N"))
+            with
+            | :? IOException
+            | :? UnauthorizedAccessException
+            | :? InvalidOperationException ->
+                Assert.Ignore("Writable cgroup-v2 delegation unavailable.")
+                None
+        probe |> Option.iter (fun item -> Directory.Delete item.Directory)
+        let spawned =
+            if inheritPipes then
+                "child=subprocess.Popen(['/usr/bin/sleep','25']); "
+            else
+                "child=subprocess.Popen(['/usr/bin/sleep','25'], " +
+                "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, " +
+                "stderr=subprocess.DEVNULL); "
+        let code =
+            "import subprocess,time,pathlib; " + spawned +
+            "pathlib.Path('cleanup-child.pid').write_text(str(child.pid)); " +
+            "time.sleep(4)"
+        let start =
+            { ProjectName = "Project1"; Executable = "/usr/bin/python3"
+              Args = [ "-c"; code ]
+              Reason = Some "Exercise retryable native cleanup failure"
+              WorkingDirectory = None; MaxOutputBytes = Some 4096 }
+        let started =
+            match startJob start context with
+            | Ok result -> result
+            | Error issue -> failwithf "Native StartJob failed: %A" issue
+        jobId <- Some started.JobId
+        let journal =
+            ProcessOwnershipJournal.inspectAt
+                (ProcessOwnershipJournal.defaultDirectory()) started.JobId
+            |> function
+               | Ok evidence -> evidence
+               | Error failure -> failwithf "Missing native launch journal: %s" failure
+        let native =
+            journal.NativeScope
+            |> Option.defaultWith (fun () -> failwith "Native scope stage missing.")
+        let identity: LinuxJobScope.Identity =
+            { JobId = started.JobId; Directory = native.LinuxCgroupPath
+              BootId = native.LinuxBootId }
+        scope <- Some identity
+        let deadline = DateTimeOffset.UtcNow.AddSeconds 15.
+        while not (File.Exists marker) && DateTimeOffset.UtcNow < deadline do
+            Thread.Sleep 30
+        Assert.That(File.Exists marker, Is.True, "Test child was never spawned.")
+        Assert.That(LinuxJobScope.inspect identity, Is.EqualTo(LinuxJobScope.Occupied))
+
+        let nativeKill = Path.Combine(identity.Directory, "cgroup.kill")
+        killPath <- Some nativeKill
+        let permission = File.GetUnixFileMode(nativeKill)
+        originalKillMode <- Some permission
+        File.SetUnixFileMode(nativeKill, UnixFileMode.UserRead)
+
+        let mutable status = JobStatus.Running
+        let finishDeadline = DateTimeOffset.UtcNow.AddSeconds 15.
+        let getStatus () =
+            match getJobResult
+                    { ProjectName = "Project1"; JobId = started.JobId; AfterSequence = None }
+                    context with
+            | Ok result -> result.Status
+            | Error issue -> failwithf "Native scoped job disappeared: %A" issue
+        while (match status with CleanupUnverified _ -> false | _ -> true)
+              && DateTimeOffset.UtcNow < finishDeadline do
+            Thread.Sleep 40
+            status <- getStatus ()
+        match status with
+        | CleanupUnverified message ->
+            Assert.That(message, Does.Contain("Native scope termination unverified"))
+        | other -> Assert.Fail($"Failed kernel cleanup was hidden as {other}.")
+        // A retained child with inherited pipes used to strand Exited forever.
+        Assert.That(LinuxJobScope.inspect identity, Is.EqualTo(LinuxJobScope.Occupied))
+        match cancelJob { ProjectName = "Project1"; JobId = started.JobId } context with
+        | Error _ -> ()
+        | Ok () -> Assert.Fail("Failed kernel cleanup retry falsely returned success.")
+        match getStatus () with
+        | CleanupUnverified _ -> ()
+        | other -> Assert.Fail($"Failed retry erased unresolved cleanup evidence: {other}.")
+
+        File.SetUnixFileMode(nativeKill, permission)
+        originalKillMode <- None
+        match cancelJob { ProjectName = "Project1"; JobId = started.JobId } context with
+        | Ok () -> ()
+        | Error issue -> Assert.Fail($"Exact native cleanup retry failed: {issue}")
+        match getStatus () with
+        | Completed 0 -> ()
+        | other -> Assert.Fail($"Successful retry did not restore exited-parent result: {other}")
+        let emptyDeadline = DateTimeOffset.UtcNow.AddSeconds 10.
+        while LinuxJobScope.inspect identity <> LinuxJobScope.Empty
+              && DateTimeOffset.UtcNow < emptyDeadline do
+            Thread.Sleep 50
+        Assert.That(LinuxJobScope.inspect identity, Is.EqualTo(LinuxJobScope.Empty))
+    finally
+        match killPath, originalKillMode with
+        | Some path, Some mode ->
+            try File.SetUnixFileMode(path, mode) with _ -> ()
+        | _ -> ()
+        scope |> Option.iter (fun value ->
+            try LinuxJobScope.tryKill value |> ignore with _ -> ()
+            // Remove only the unique test scope, never a production journal.
+            try Directory.Delete(value.Directory) with _ -> ())
+        jobId |> Option.iter (fun id ->
+            try cancelJob { ProjectName = "Project1"; JobId = id } context |> ignore
+            with _ -> ())
+        Environment.SetEnvironmentVariable("JARVIS_STARTJOB_CGROUP_V2", previous)
+        if Directory.Exists root then Directory.Delete(root, true)
+
+
+[<Test; NonParallelizable>]
+let nativeScopedCleanupFailureWithInheritedPipesIsVisibleAndRetryable () =
+    nativeScopedCleanupFailureIsVisibleAndRetryable true
+
+
+[<Test; NonParallelizable>]
+let nativeScopedCleanupFailureWithoutInheritedPipesIsVisibleAndRetryable () =
+    nativeScopedCleanupFailureIsVisibleAndRetryable false
+
+
+[<Test; NonParallelizable>]
+let nativeScopedCancelCanRetryFailedKernelKillBeforeParentExit () =
+    if not (OperatingSystem.IsLinux()) then Assert.Ignore("Linux cgroup-v2 only.")
+    let previous = Environment.GetEnvironmentVariable("JARVIS_STARTJOB_CGROUP_V2")
+    let root = createTempProject()
+    let context = TestContext root
+    let mutable jobId: string option = None
+    let mutable scope: LinuxJobScope.Identity option = None
+    let mutable nativeKill: string option = None
+    let mutable priorMode: UnixFileMode option = None
+    try
+        Environment.SetEnvironmentVariable("JARVIS_STARTJOB_CGROUP_V2", "1")
+        let probe =
+            try LinuxJobScope.create(Guid.NewGuid().ToString("N"))
+            with
+            | :? IOException
+            | :? UnauthorizedAccessException
+            | :? InvalidOperationException ->
+                Assert.Ignore("Writable cgroup v2 delegation unavailable.")
+                None
+        probe |> Option.iter (fun item -> Directory.Delete item.Directory)
+        let command =
+            { ProjectName = "Project1"; Executable = "/usr/bin/python3"
+              Args = [ "-c"; "import time; time.sleep(25)" ]
+              Reason = Some "Retry native kernel kill before leader exits"
+              WorkingDirectory = None; MaxOutputBytes = Some 1024 }
+        let started =
+            match startJob command context with
+            | Ok result -> result
+            | Error issue -> failwithf "Native StartJob failed: %A" issue
+        jobId <- Some started.JobId
+        let journal =
+            ProcessOwnershipJournal.inspectAt
+                (ProcessOwnershipJournal.defaultDirectory()) started.JobId
+            |> function
+               | Ok evidence -> evidence
+               | Error failure -> failwithf "Missing native journal: %s" failure
+        let native =
+            journal.NativeScope
+            |> Option.defaultWith (fun () -> failwith "Missing native scope identity.")
+        let identity: LinuxJobScope.Identity =
+            { JobId = started.JobId; Directory = native.LinuxCgroupPath
+              BootId = native.LinuxBootId }
+        scope <- Some identity
+        let path = Path.Combine(identity.Directory, "cgroup.kill")
+        nativeKill <- Some path
+        let mode = File.GetUnixFileMode path
+        priorMode <- Some mode
+        File.SetUnixFileMode(path, UnixFileMode.UserRead)
+        match cancelJob { ProjectName = "Project1"; JobId = started.JobId } context with
+        | Error _ -> ()
+        | Ok () -> Assert.Fail("A blocked native kill returned a successful cancellation.")
+        let getStatus () =
+            match getJobResult
+                    { ProjectName = "Project1"; JobId = started.JobId; AfterSequence = None }
+                    context with
+            | Ok result -> result.Status
+            | Error error -> failwithf "Cleanup evidence disappeared: %A" error
+        match getStatus () with
+        | CleanupUnverified _ -> ()
+        | status -> Assert.Fail($"Failed native cancellation was hidden: {status}")
+        File.SetUnixFileMode(path, mode)
+        priorMode <- None
+        match cancelJob { ProjectName = "Project1"; JobId = started.JobId } context with
+        | Ok () -> ()
+        | Error error -> Assert.Fail($"Native scope cancellation retry failed: {error}")
+        let deadline = DateTimeOffset.UtcNow.AddSeconds 15.
+        let mutable status = getStatus ()
+        while (match status with Canceled -> false | _ -> true)
+              && DateTimeOffset.UtcNow < deadline do
+            Thread.Sleep 40
+            status <- getStatus ()
+        Assert.That(status, Is.EqualTo(Canceled))
+        Assert.That(LinuxJobScope.inspect identity, Is.EqualTo(LinuxJobScope.Empty))
+    finally
+        match nativeKill, priorMode with
+        | Some path, Some mode -> try File.SetUnixFileMode(path, mode) with _ -> ()
+        | _ -> ()
+        scope |> Option.iter (fun item ->
+            try LinuxJobScope.tryKill item |> ignore with _ -> ()
+            try Directory.Delete(item.Directory) with _ -> ())
+        jobId |> Option.iter (fun id ->
+            try cancelJob { ProjectName = "Project1"; JobId = id } context |> ignore
+            with _ -> ())
+        Environment.SetEnvironmentVariable("JARVIS_STARTJOB_CGROUP_V2", previous)
+        if Directory.Exists root then Directory.Delete(root, true)

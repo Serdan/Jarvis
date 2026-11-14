@@ -1,0 +1,1 @@
+Fix cache key from checkout to project+agent while tracking first hierarchy scan per checkout. Preserves content-hash redelivery across differing worktrees and suppresses identical workspace guidance. .NET 11 Release: 35 client instruction/activation tests and 3 server rendering tests passed; git diff --check clean.

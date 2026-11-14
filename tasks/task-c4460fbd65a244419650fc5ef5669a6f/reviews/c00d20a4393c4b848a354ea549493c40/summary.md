@@ -3,3 +3,16 @@ Frozen e54eba2d-derived two-line test-only commit 63242918 adds <IsTestProject>t
 ## Owner full-client suite on frozen commit 63242918
 
 SDK 11.0.100 Release `dotnet test Client.Tests/Client.Tests.fsproj -c Release --no-build --no-restore -v minimal`, exact ToolOperation `f747ad55831547d18e47b04d42a0135c`, completed successfully (`ToolCompleted`, exit 0, `TimedOut=false`, `Truncated=false`), **720 passed, 0 failed, report Skipped 0**, 5m 8s. The output contains intentional activity-persistence failure-injection messages and a separately labeled opted-out benchmark. Combined with actual restored Server.Tests 186/186, the exact immutable head `63242918f59130c3f9d2936ca9be57cc3a456e59` has **906/906 actually executed .NET 11 Release tests passing**. This owner-only evidence does not substitute for independent reviewer judgment, does not certify process-tree termination, and implies no production approval or deployment.
+
+
+---
+
+## Reviewer 1 independent frozen review — Accepted (test metadata only)
+
+**Frozen head** `63242918f59130c3f9d2936ca9be57cc3a456e59`, parent `e54eba2d1512fe9f1d274fecbf2d6e3c8f91d1c5` (previously independently accepted test-only change). The exact commit adds **one line each** to `Client.Tests/Client.Tests.fsproj` and `Server.Tests/Server.Tests.fsproj`: `<IsTestProject>true</IsTestProject>`, retaining .NET `net11.0` and existing test configuration; no production code or runtime behavior changed. Inspected full `git show --unified=15` and `git diff --check` (exit 0).
+
+**Negative-space reproduction (independent, not relying on author):** Created clean frozen-head review worktree `reviewer1-test-project-metadata-63242918`, without `obj/project.assets.json`. Running `dotnet test Client.Tests/Client.Tests.fsproj -c Release --no-restore` exited **1**, explicitly reporting `NETSDK1004` for absent Client.Tests NuGet assets. Running the corresponding `dotnet test Server.Tests/Server.Tests.fsproj -c Release --no-restore` also exited **1**, `NETSDK1004` for absent Server.Tests assets. Thus the earlier false green zero-test behavior is replaced by a reliably observable failure under the exact supported workflow. No artifacts were restored in this isolated negative-test worktree.
+
+**Independent positive control (restored branch worktree):** `dotnet test Server.Tests/Server.Tests.fsproj -c Release --no-restore --logger console;verbosity=minimal` exited 0, **186 passed, 0 failed, 0 skipped**. `dotnet test Client.Tests/Client.Tests.fsproj -c Release --no-restore --filter FullyQualifiedName~nativeScoped --logger console;verbosity=minimal` exited 0, **5 passed, 0 failed, 0 skipped** (16 s). Source and isolated review worktrees both clean. Full unfiltered Client.Tests was **not** independently rerun; submitter attests parent 720/720 and 5/5 native focused on exact frozen metadata branch.
+
+**Verdict:** Accept the two-line, test-only fail-closed metadata correction. It prevents mistaking a missing restore in `dotnet test -c Release --no-restore` for a passing test run, without altering application behavior. This approval does **not** authorize integration/deployment, native cgroup feature activation, or release of unresolved safety gates (escaped descendants/cross-incarnation reaping, exact receipts, legacy fleet drain, explicit operator consent). Reviewer made no production edits, merge, deploy, or restart.

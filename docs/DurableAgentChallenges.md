@@ -63,6 +63,8 @@ Challenge records and events live on the existing verified orphan Git ledger bra
 - `records/challenge-index-owned/<base64url-agent-id>/<2-hex-id-prefix>.json`: atomically updated active assigned-challenge IDs for that owner.
 - `records/challenge-index-triage/<2-hex-id-prefix>.json`: atomically updated active unassigned-challenge IDs for subscribing dispatchers.
 - `records/challenge-index-recent/<base64url-issuer-id>.json`: bounded issuer current-outcome summaries with count; immutable events retain full history.
+- `records/challenge-index-operator-active/<2-hex-id-prefix>.json`: active challenge IDs with explicitly operator-owned Pending conditions; no agent-owned or unassigned conditions are inferred as operator work.
+- `records/challenge-index-operator-recent.json`: a rolling 36-item operator outcome locator projection and CAS-atomic active-challenge count; full text, identity, and response event provenance are fetched from the pinned canonical snapshot only for the active and recent locators.
 - Existing task, attempt, agent, assignment and lifecycle audit records are updated **atomically** when an attempt blocks, its final linked challenge automatically releases it, or an eligible wait reconciles on owner-slot release.
 
 Canonical state plus immutable events and the operation journal provide exactly-once durable mutation semantics despite duplicate requests, retries and multiple Git clients. An accepted transition and its event are one Git ledger transaction with expected blob OIDs. **No notification entity is part of this transaction**; recipient notification settings never affect CAS, challenge completion, or evidence persistence.

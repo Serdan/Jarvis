@@ -1029,6 +1029,8 @@ type ChallengeTests() =
                     let challengeId = Guid.NewGuid().ToString("N")
                     let conditionId = Guid.NewGuid().ToString("N")
                     let status = if number % 2 = 0 then "Cancelled" else "Satisfied"
+                    let ownerKind, ownerAgentId =
+                        if number % 3 = 0 then "Operator", "" else "Agent", "Lead"
                     let body =
                         System.Text.Json.JsonSerializer.Serialize(
                             {| schemaVersion = 2; challengeId = challengeId
@@ -1036,7 +1038,8 @@ type ChallengeTests() =
                                taskId = ""; version = 2; completionPolicy = "All"
                                status = status
                                conditions =
-                                   [ {| conditionId = conditionId; ownerAgentId = "Lead"
+                                   [ {| conditionId = conditionId; ownerKind = ownerKind
+                                        ownerAgentId = ownerAgentId
                                         suggestedAgentId = ""; description = "Archived work"
                                         status = "Satisfied"; evidence = "archived"
                                         reason = ""; updatedAtUtc = stamp |} ]
@@ -1060,6 +1063,33 @@ type ChallengeTests() =
             let paths = LedgerStore.listAt a snapshot "challenges" |> ok
             Assert.That(paths |> List.filter (fun p -> p.EndsWith("/challenge.json")) |> List.length,
                         Is.GreaterThan(4096))
+
+            let operatorCreated =
+                ChallengeWorkflow.create b (Guid.NewGuid()) "Agent 3" "Operator live work" ""
+                    [ { OwnerKind = "Operator"; OwnerAgentId = ""; SuggestedAgentId = ""
+                        Description = "Provide one-shot current feedback" } ] |> ok
+            let pendingOperator, operatorMetrics =
+                LedgerStore.measureGitReads (fun () ->
+                    ChallengeWorkflow.listOperator a "Jarvis" |> ok)
+            Assert.That(pendingOperator.Length, Is.EqualTo(1),
+                        "Archived and nonoperator challenges must not enter the operator queue.")
+            Assert.That(pendingOperator.Head.ChallengeId, Is.EqualTo(operatorCreated.ChallengeId))
+            Assert.That(Client.OperatorChallengePresentation.pendingCount pendingOperator, Is.EqualTo(1))
+            Assert.That(operatorMetrics.ProcessStarts, Is.LessThan(40),
+                        "Operator TUI polls must not scan 4,100 archived challenge blobs.")
+            Assert.That(operatorMetrics.IndividualBlobReads, Is.LessThan(10))
+
+            ChallengeWorkflow.respondOperator a (Guid.NewGuid()) "operator:human"
+                operatorCreated.ChallengeId operatorCreated.ConditionIds.Head 1 "Looks correct"
+                |> ok |> ignore
+            let recentOperator, recentMetrics =
+                LedgerStore.measureGitReads (fun () ->
+                    ChallengeWorkflow.listOperator b "Jarvis" |> ok)
+            Assert.That(recentOperator.Length, Is.EqualTo(1))
+            Assert.That(Client.OperatorChallengePresentation.pendingCount recentOperator, Is.Zero)
+            Assert.That(recentOperator.Head.RespondedBy, Is.EqualTo("operator:human"))
+            Assert.That(recentMetrics.ProcessStarts, Is.LessThan(40))
+            Assert.That(recentMetrics.IndividualBlobReads, Is.LessThan(10))
 
             // Explicit historical listing is paginated and uses bounded Git
             // batches too; the old 4096 hard cap cannot strand audit searches.
@@ -1318,4 +1348,78 @@ type ChallengeTests() =
             Assert.That(issuer.ChallengeRecent.Length, Is.EqualTo(1))
             Assert.That(issuer.ChallengeRecent.Head.ChallengeStatus, Is.EqualTo("Cancelled"))
             Assert.That(notices b, Is.Empty)
+        )
+    [<Test>]
+    member _.OperatorIndexCountDetectsOmittedActiveShardAndCannotExposeAgentWork() =
+        withFixture (fun a b ->
+            let operator =
+                ChallengeWorkflow.create a (Guid.NewGuid()) "Agent 3" "Human review" ""
+                    [ { OwnerKind = "Operator"; OwnerAgentId = ""; SuggestedAgentId = ""
+                        Description = "Provide operator feedback" } ] |> ok
+            ChallengeWorkflow.create a (Guid.NewGuid()) "Agent 3" "Agent review" ""
+                [ { OwnerKind = "Agent"; OwnerAgentId = "Lead"; SuggestedAgentId = ""
+                    Description = "Agent-owned work" }
+                  { OwnerKind = "Unassigned"; OwnerAgentId = ""; SuggestedAgentId = ""
+                    Description = "Triage work" } ] |> ok |> ignore
+            let visible = ChallengeWorkflow.listOperator b "Jarvis" |> ok
+            Assert.That(visible |> List.map _.ChallengeId, Is.EquivalentTo([ operator.ChallengeId ]))
+
+            // A structurally valid but incomplete shard must fail closed.
+            // The active count is a separate CAS-atomic index invariant.
+            let snapshot = LedgerStore.fetch a |> ok
+            let worktree = Path.Combine(Path.GetDirectoryName(a.RepositoryPath), "tamper-operator-index")
+            git a.RepositoryPath [ "worktree"; "add"; "--detach"; worktree; snapshot.Commit ] |> ignore
+            try
+                git worktree [ "config"; "user.name"; "Fixture" ] |> ignore
+                git worktree [ "config"; "user.email"; "fixture@example.test" ] |> ignore
+                let shard = Path.Combine(worktree, "records", "challenge-index-operator-active",
+                                         operator.ChallengeId.Substring(0, 2) + ".json")
+                File.WriteAllText(shard, """{"schemaVersion":2,"challengeIds":[]}""")
+                git worktree [ "add"; "records/challenge-index-operator-active" ] |> ignore
+                git worktree [ "commit"; "-m"; "Fixture omitted active operator index" ] |> ignore
+                git worktree [ "push"; "origin"; "HEAD:refs/heads/jarvis-orchestration" ] |> ignore
+            finally
+                git a.RepositoryPath [ "worktree"; "remove"; "--force"; worktree ] |> ignore
+            match ChallengeWorkflow.listOperator b "Jarvis" with
+            | Error(LedgerIntegrityError _) -> ()
+            | other -> Assert.Fail(sprintf "Expected fail-closed operator index: %A" other)
+        )
+
+    [<Test>]
+    member _.OperatorRecentOutcomesAreBoundedAndOldAuditRemainsOnDemand() =
+        withFixture (fun a b ->
+            let ids = ResizeArray<string>()
+            for n in 1 .. 40 do
+                let created =
+                    ChallengeWorkflow.create a (Guid.NewGuid()) "Agent 3"
+                        (sprintf "Operator question %d" n) ""
+                        [ { OwnerKind = "Operator"; OwnerAgentId = ""; SuggestedAgentId = ""
+                            Description = sprintf "Question %d" n } ] |> ok
+                ids.Add(created.ChallengeId)
+                if n % 2 = 0 then
+                    ChallengeWorkflow.respondOperator b (Guid.NewGuid()) "operator:human"
+                        created.ChallengeId created.ConditionIds.Head 1 (sprintf "Answer %d" n)
+                        |> ok |> ignore
+                else
+                    ChallengeWorkflow.cancel b (Guid.NewGuid()) "Agent 3"
+                        created.ChallengeId 1 "Superseded" |> ok |> ignore
+
+            let recent, metrics =
+                LedgerStore.measureGitReads (fun () ->
+                    ChallengeWorkflow.listOperator a "Jarvis" |> ok)
+            Assert.That(recent.Length, Is.EqualTo(36))
+            Assert.That(Client.OperatorChallengePresentation.pendingCount recent, Is.Zero)
+            Assert.That(recent |> List.forall (fun item ->
+                item.ChallengeStatus = "Cancelled" || item.ChallengeStatus = "Satisfied"), Is.True)
+            Assert.That(recent |> List.filter (fun item ->
+                item.ChallengeStatus = "Satisfied" && item.RespondedBy = "operator:human")
+                |> List.length, Is.EqualTo(18))
+            Assert.That(metrics.ProcessStarts, Is.LessThan(40),
+                        "Recent response provenance must be fetched in bounded Git batches.")
+            Assert.That(metrics.IndividualBlobReads, Is.LessThan(10))
+            Assert.That(recent |> List.exists (fun item ->
+                item.ChallengeId = ids[0]), Is.False)
+            let old = ChallengeWorkflow.getOperatorPage b ids[0] 16 0L "" |> ok
+            Assert.That(old.Challenge.Status, Is.EqualTo("Cancelled"))
+            Assert.That(old.History.Tail.Head.Action, Is.EqualTo("CancelChallenge"))
         )

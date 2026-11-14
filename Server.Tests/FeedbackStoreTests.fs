@@ -2846,6 +2846,23 @@ let ``bound correction permits reject cross project actor and payload replay aft
                     "An original witness retargeted to another project must veto replay.")
         changeOriginalProject project
         acquire restarted retry |> shouldEqual (Ok permit)
+        let changePermitGeneration value =
+            use update = db.CreateCommand()
+            update.CommandText <-
+                """UPDATE agent_correction_permit SET device_generation = $generation
+                   WHERE user_id = $userId AND agent_id = $agentId;"""
+            update.Parameters.AddWithValue("$generation", value) |> ignore
+            update.Parameters.AddWithValue("$userId", user) |> ignore
+            update.Parameters.AddWithValue("$agentId", target.ToUpperInvariant()) |> ignore
+            update.ExecuteNonQuery() |> shouldEqual 1
+        changePermitGeneration (box DBNull.Value)
+        Assert.That(restarted.InspectAgentCorrectionPermit(user, target).IsError, Is.True,
+                    "Partially missing device provenance must not appear as a verified permit.")
+        Assert.That((acquire restarted retry).IsError, Is.True,
+                    "Incomplete persisted generation must never authorize replay.")
+        changePermitGeneration (box 1L)
+        restarted.InspectAgentCorrectionPermit(user, target) |> shouldEqual (Ok(Some record))
+        acquire restarted retry |> shouldEqual (Ok permit)
         store.TryMarkAgentNotDispatched(user, second.Id) |> shouldEqual (Ok ())
         Assert.That((acquire restarted retry).IsError, Is.True,
                     "A terminated request witness cannot be recycled to re-enter the correction.")

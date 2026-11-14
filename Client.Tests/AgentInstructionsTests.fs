@@ -441,7 +441,26 @@ let registered_worktrees_resolve_distinct_instructions_from_actual_checkout_root
         let cache = DeliveryCache()
         Assert.That(cache.Filter(checkoutA, "Owner", "turn-1", HierarchyLoaded, check "Demo::tree-a", fun () -> Ok []).Length, Is.EqualTo(3))
         Assert.That(cache.Filter(checkoutA, "Owner", "turn-1", HierarchyLoaded, check "Demo::tree-a", fun () -> Ok []), Is.Empty)
-        Assert.That(cache.Filter(checkoutB, "Owner", "turn-1", HierarchyLoaded, check "Demo::tree-b", fun () -> Ok []).Length, Is.EqualTo(3))
+        // Both worktrees share the workspace root. Do not resend it merely
+        // because a different checkout is selected in the same agent turn.
+        let b = cache.Filter(checkoutB, "Owner", "turn-1", HierarchyLoaded, check "Demo::tree-b", fun () -> Ok [])
+        Assert.That(b |> List.map (fun doc -> doc.Path),
+                    Is.EqualTo([ "Demo/AGENTS.md"; "Demo/src/AGENTS.md" ] :> obj))
+        // Switching back restores checkout A's different project guidance.
+        let againA = cache.Filter(checkoutA, "Owner", "turn-1", HierarchyLoaded, check "Demo::tree-a", fun () -> Ok [])
+        Assert.That(againA |> List.map (fun doc -> doc.Path),
+                    Is.EqualTo([ "Demo/AGENTS.md"; "Demo/src/AGENTS.md" ] :> obj))
+        Assert.That(cache.Filter(checkoutA, "Owner", "turn-1", HierarchyLoaded, check "Demo::tree-a", fun () -> Ok []), Is.Empty)
+        // A ledger-only call still bootstraps each checkout when it has not
+        // been scanned, without redelivering unchanged shared instructions.
+        let bootstraps = DeliveryCache()
+        let initialA = bootstraps.Filter(checkoutA, "Owner", "turn-1", RootBootstrapRequired, [], fun () -> roots rt "Demo::tree-a")
+        Assert.That(initialA |> List.map (fun doc -> doc.Path),
+                    Is.EqualTo([ "AGENTS.md"; "Demo/AGENTS.md" ] :> obj))
+        let initialB = bootstraps.Filter(checkoutB, "Owner", "turn-1", RootBootstrapRequired, [], fun () -> roots rt "Demo::tree-b")
+        Assert.That(initialB |> List.map (fun doc -> doc.Path),
+                    Is.EqualTo([ "Demo/AGENTS.md" ] :> obj))
+        Assert.That(bootstraps.Filter(checkoutB, "Owner", "turn-1", RootBootstrapRequired, [], fun () -> roots rt "Demo::tree-b"), Is.Empty)
         match ProjectPaths.ProjectTarget.parse "Demo::tree-a::unexpected" with
         | Error _ -> ()
         | Ok _ -> Assert.Fail("Nested selectors must be rejected")

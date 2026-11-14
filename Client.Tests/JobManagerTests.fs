@@ -1953,3 +1953,122 @@ let nativeScopedTerminalIncludesBothStreamTails () =
             try Directory.Delete path with _ -> ())
         Environment.SetEnvironmentVariable("JARVIS_STARTJOB_CGROUP_V2", previous)
         if Directory.Exists root then Directory.Delete(root, true)
+
+
+[<Test; NonParallelizable>]
+let nativeScopedEscapedDescendantCannotMakeTerminalOutputLookComplete () =
+    if not (OperatingSystem.IsLinux()) then Assert.Ignore("Linux cgroup-v2 only.")
+    if not (File.Exists "/usr/bin/python3") then
+        Assert.Ignore("Python3 is required for the escaped-pipe fixture.")
+    let previous = Environment.GetEnvironmentVariable("JARVIS_STARTJOB_CGROUP_V2")
+    let root = createTempProject()
+    let context = TestContext root
+    let project = Path.Combine(root, "Project1")
+    let escapedMarker = Path.Combine(project, "escaped-pipe.pid")
+    let failedMarker = Path.Combine(project, "escaped-pipe.error")
+    let mutable jobId: string option = None
+    let mutable scopeDirectory: string option = None
+    try
+        Environment.SetEnvironmentVariable("JARVIS_STARTJOB_CGROUP_V2", "1")
+        let probe =
+            try LinuxJobScope.create(Guid.NewGuid().ToString("N"))
+            with
+            | :? IOException
+            | :? UnauthorizedAccessException
+            | :? InvalidOperationException ->
+                Assert.Ignore("Writable cgroup-v2 delegation unavailable.")
+                None
+        probe |> Option.iter (fun scope -> Directory.Delete scope.Directory)
+        // The exact same-UID migration already observed on this host.
+        // The child deliberately inherits BOTH redirected streams, escapes
+        // the delegated scope, and self-terminates after eight seconds.
+        // Never kill a historical PID or an unrelated system process.
+        let python = """
+import os, pathlib, sys, time
+from pathlib import Path
+if os.fork() == 0:
+    try:
+        membership = next(line for line in Path('/proc/self/cgroup').read_text().splitlines() if line.startswith('0::'))
+        relative = Path(membership.partition('::')[2].lstrip('/'))
+        parent_procs = Path('/sys/fs/cgroup') / relative.parent / 'cgroup.procs'
+        parent_procs.write_text(str(os.getpid()))
+        Path('escaped-pipe.pid').write_text(str(os.getpid()))
+        print('escaped-prefix', flush=True)
+        time.sleep(8)
+        print('escaped-late-tail', flush=True)
+    except Exception as exc:
+        Path('escaped-pipe.error').write_text(repr(exc))
+    finally:
+        os._exit(0)
+else:
+    for _ in range(200):
+        if Path('escaped-pipe.pid').exists() or Path('escaped-pipe.error').exists():
+            break
+        time.sleep(0.01)
+    print('leader-output-tail', flush=True)
+"""
+        let started =
+            match startJob
+                    { ProjectName = "Project1"; Executable = "/usr/bin/python3"
+                      Args = [ "-c"; python ]
+                      Reason = Some "Negative-space native escaped-pipe output proof"
+                      WorkingDirectory = None; MaxOutputBytes = Some 4096 } context with
+            | Ok result -> result
+            | Error issue -> failwithf "Native escaped-pipe job failed to launch: %A" issue
+        jobId <- Some started.JobId
+        let journal =
+            ProcessOwnershipJournal.inspectAt
+                (ProcessOwnershipJournal.defaultDirectory()) started.JobId
+            |> function
+               | Ok evidence -> evidence
+               | Error failure -> failwithf "Native escaped-pipe journal missing: %s" failure
+        scopeDirectory <- journal.NativeScope |> Option.map (fun scope -> scope.LinuxCgroupPath)
+
+        let admitted = DateTimeOffset.UtcNow.AddSeconds(10.)
+        while not (File.Exists escapedMarker || File.Exists failedMarker)
+              && DateTimeOffset.UtcNow < admitted do
+            Thread.Sleep 20
+        if File.Exists failedMarker then
+            Assert.Ignore("Host denies cgroup migration: " + File.ReadAllText failedMarker)
+        Assert.That(File.Exists escapedMarker, Is.True,
+            "The descendant did not move to the writable parent cgroup.")
+
+        let read () =
+            match getJobResult
+                    { ProjectName = "Project1"; JobId = started.JobId; AfterSequence = None }
+                    context with
+            | Ok result -> result
+            | Error issue -> failwithf "Native escaped-pipe job disappeared: %A" issue
+
+        // A wait on inherited pipes would reach the child lifetime, not the
+        // bounded terminal deadline. The known escaping child is still alive.
+        let terminalDeadline = DateTimeOffset.UtcNow.AddSeconds(5.)
+        let mutable result = read()
+        while result.Status = Running && DateTimeOffset.UtcNow < terminalDeadline do
+            Thread.Sleep 25
+            result <- read()
+        Assert.That(result.Status, Is.EqualTo(Completed 0),
+            "Successful native kernel-scope kill must complete boundedly.")
+        Assert.That(result.Truncated, Is.True,
+            "Escaped descendants holding redirected pipes must leave output unverified.")
+        Assert.That(
+            result.Events |> List.exists (fun item -> item.Text.Contains("leader-output-tail")),
+            Is.True, "Already observed leader output disappeared at termination.")
+    finally
+        // The escaped child is deliberately self-bounded. Its PID is only
+        // observed here; never send a signal to an unverified identity.
+        if File.Exists escapedMarker then
+            try
+                let childPid = Int32.Parse(File.ReadAllText escapedMarker)
+                let settle = DateTimeOffset.UtcNow.AddSeconds(12.)
+                while Directory.Exists($"/proc/{childPid}")
+                      && DateTimeOffset.UtcNow < settle do
+                    Thread.Sleep 50
+            with _ -> ()
+        jobId |> Option.iter (fun id ->
+            try cancelJob { ProjectName = "Project1"; JobId = id } context |> ignore
+            with _ -> ())
+        scopeDirectory |> Option.iter (fun path ->
+            try Directory.Delete path with _ -> ())
+        Environment.SetEnvironmentVariable("JARVIS_STARTJOB_CGROUP_V2", previous)
+        if Directory.Exists root then Directory.Delete(root, true)

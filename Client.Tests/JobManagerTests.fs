@@ -2042,15 +2042,31 @@ else:
 
         // A wait on inherited pipes would reach the child lifetime, not the
         // bounded terminal deadline. The known escaping child is still alive.
+        let terminalClock = Stopwatch.StartNew()
         let terminalDeadline = DateTimeOffset.UtcNow.AddSeconds(5.)
         let mutable result = read()
         while result.Status = Running && DateTimeOffset.UtcNow < terminalDeadline do
             Thread.Sleep 25
             result <- read()
+        // A blocking getJobResult can return terminal after the escaped child
+        // exits; merely exiting the polling loop would hide that regression.
+        Assert.That(terminalClock.Elapsed, Is.LessThan(TimeSpan.FromSeconds(5.)),
+            "Native terminal observation exceeded the five-second bound.")
         Assert.That(result.Status, Is.EqualTo(Completed 0),
             "Successful native kernel-scope kill must complete boundedly.")
         Assert.That(result.Truncated, Is.True,
             "Escaped descendants holding redirected pipes must leave output unverified.")
+        let escapedPid = Int32.Parse(File.ReadAllText escapedMarker)
+        Assert.That(Directory.Exists($"/proc/{escapedPid}"), Is.True,
+            "The escaped descendant must still be alive when terminal is reported.")
+        let nativeScope =
+            journal.NativeScope
+            |> Option.defaultWith (fun () -> failwith "Native kernel scope missing.")
+        let nativeIdentity : LinuxJobScope.Identity =
+            { JobId = started.JobId; Directory = nativeScope.LinuxCgroupPath
+              BootId = nativeScope.LinuxBootId }
+        Assert.That(LinuxJobScope.inspect nativeIdentity, Is.EqualTo(LinuxJobScope.Empty),
+            "An empty original cgroup does not prove the escaped descendant has exited.")
         Assert.That(
             result.Events |> List.exists (fun item -> item.Text.Contains("leader-output-tail")),
             Is.True, "Already observed leader output disappeared at termination.")

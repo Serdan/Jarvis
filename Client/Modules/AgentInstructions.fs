@@ -635,7 +635,9 @@ type private DeliveryFingerprint =
 type private DeliveryEntry =
     { Gate: obj
       mutable Turn: string
-      mutable Bootstrapped: bool
+      // Resolve each checkout independently, but deduplicate identical
+      // logical instruction paths across the project's worktrees.
+      mutable BootstrappedCheckouts: Set<ProjectPaths.ProjectTarget>
       mutable Observed: Map<string, DeliveryFingerprint> }
 
 // A completed source hierarchy lookup is authoritative even when no AGENTS.md
@@ -645,32 +647,32 @@ type BootstrapProvenance =
     | RootBootstrapRequired
 
 type DeliveryCache() =
-    let entries = ConcurrentDictionary<ProjectPaths.ProjectTarget * string, DeliveryEntry>()
+    let entries = ConcurrentDictionary<ProjectPaths.ProjectId * string, DeliveryEntry>()
 
     member _.Filter(checkout: ProjectPaths.ProjectTarget, agentId: string, turn: string,
                     provenance: BootstrapProvenance, documents: InstructionDocument list,
                     loadRoots: unit -> Client.Result<InstructionDocument list>) =
-        let key = checkout, agentId
+        let key = ProjectPaths.ProjectTarget.projectId checkout, agentId
         let entry =
             entries.GetOrAdd(key, fun _ ->
-                { Gate = obj(); Turn = turn; Bootstrapped = false; Observed = Map.empty })
+                { Gate = obj(); Turn = turn; BootstrappedCheckouts = Set.empty; Observed = Map.empty })
         lock entry.Gate (fun () ->
             if entry.Turn <> turn then
                 entry.Turn <- turn
-                entry.Bootstrapped <- false
+                entry.BootstrappedCheckouts <- Set.empty
                 entry.Observed <- Map.empty
             // A completed source lookup already checked all ancestors. Its
             // empty result is as conclusive as a non-empty one.
             let initial =
                 if provenance = HierarchyLoaded then
-                    entry.Bootstrapped <- true
+                    entry.BootstrappedCheckouts <- Set.add checkout entry.BootstrappedCheckouts
                     []
-                elif entry.Bootstrapped then
+                elif Set.contains checkout entry.BootstrappedCheckouts then
                     []
                 else
                     match loadRoots() with
                     | Ok roots ->
-                        entry.Bootstrapped <- true
+                        entry.BootstrappedCheckouts <- Set.add checkout entry.BootstrappedCheckouts
                         roots
                     | Error error ->
                         // A ledger status operation must remain usable, but an

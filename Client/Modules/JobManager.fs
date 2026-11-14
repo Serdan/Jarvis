@@ -194,6 +194,16 @@ module private Core =
                             if not transferred then
                                 releaseSupervisor()
                                 try proc.Dispose() with _ -> () }
+                // This first append-only record is durably flushed BEFORE
+                // Process.Start. A crash during spawn leaves an unresolved
+                // intent rather than an invisible native process. The second
+                // record pins PID, boot and birth evidence before the
+                // StartJob handle can be returned. Neither is terminal proof.
+                let ownershipDirectory = ProcessOwnershipJournal.defaultDirectory()
+                let launchIntent =
+                    ProcessOwnershipJournal.beginLaunchAt ownershipDirectory jobId
+                        (ProjectPaths.ProjectId.value projectName)
+                        (DeviceIdentity.getOrCreate())
                 let readyName =
                     if windows then
                         Some($"Local\\Jarvis.StartJob.{Guid.NewGuid():N}")
@@ -286,10 +296,8 @@ module private Core =
                     lock job.LaunchGate (fun () ->
                         try
                             if not (proc.Start()) then
-                                releaseSupervisor()
                                 let mutable removed = Unchecked.defaultof<JobRecord>
                                 jobs.TryRemove(jobId, &removed) |> ignore
-                                proc.Dispose()
                                 Error(Client.ContextError "Failed to start job.")
                             else
                                 if windows then
@@ -297,6 +305,9 @@ module private Core =
                                         windowsJob, proc.Handle)) then
                                         raise (System.ComponentModel.Win32Exception(
                                             System.Runtime.InteropServices.Marshal.GetLastWin32Error()))
+                                ProcessOwnershipJournal.recordLaunchedAt
+                                    ownershipDirectory launchIntent proc |> ignore
+                                if windows then
                                     // All descendants inherit the assigned job.
                                     readiness |> Option.iter (fun ready -> ready.Set() |> ignore)
                                 proc.BeginOutputReadLine()
@@ -312,11 +323,13 @@ module private Core =
                                 try terminateGroup() with _ -> ()
                                 if not proc.HasExited then proc.Kill(entireProcessTree = true)
                             with _ -> ()
-                            try proc.WaitForExit(250) |> ignore with _ -> ()
-                            releaseSupervisor()
+                            // Process.WaitForExit and Dispose can both enter
+                            // the Exited callback while the Process monitor
+                            // is held. Never wait/dispose while holding
+                            // LaunchGate; launchGuard closes native resources
+                            // AFTER this critical section has been exited.
                             let mutable removed = Unchecked.defaultof<JobRecord>
                             jobs.TryRemove(jobId, &removed) |> ignore
-                            proc.Dispose()
                             Error(ExceptionError ex))
         with ex ->
             Error(ExceptionError ex)

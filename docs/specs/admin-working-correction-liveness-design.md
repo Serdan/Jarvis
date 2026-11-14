@@ -947,3 +947,66 @@ If cancellation arrives after the leader has exited but before its callback reco
 This `HasExited` check is only a best-effort stale-signal avoidance, **not** a PID-reuse-safe kill primitive: a leader can exit between observation and `killpg`. Proving correct group identity and complete termination across that race requires an OS-backed lifetime handle (for example a scoped cgroup/job supervisor) and durable birth/boot identity. The server's unresolved process witnesses continue to veto correction regardless of these client statuses.
 
 Lock ordering is deliberately `LaunchGate` before `SyncRoot` across both cancellation and `Exited`. `Process.HasExited` can itself raise `Exited`, which may call `WaitForExit` and drain output-event callbacks requiring `SyncRoot`. A draft that queried `HasExited` while holding `SyncRoot` stalled the focused test host; the final version queries it under `LaunchGate` **before** taking `SyncRoot`. The 24-test focused .NET 11 Release suite then completed successfully. Windows Job Object lifetime behavior still requires execution on Windows for platform-specific assurance.
+
+### Device-local append-only StartJob ownership evidence (2026-11-14)
+
+The previous process-group work improved cleanup while the client was alive, but
+`JobManager` still retained the OS process identity only in its in-memory
+registry. A client restart could lose the exact PID and birth identity of a
+native process whose execution had been admitted by the server.
+
+`ProcessOwnershipJournal` now writes two **immutable, GUID-N keyed**
+device-local records under the user's Jarvis configuration directory
+(`process-ownership-v1`), independent of project checkout or worktree:
+
+- `<jobId>.intent.json` is created and flushed **before** calling
+  `Process.Start`. It pins the canonical logical project ID, existing
+  persisted device ID, new client-process incarnation UUID, job UUID, and
+  creation timestamp. A crash between this stage and an actual spawn leaves
+  an explicit unresolved intent, not an implied absence of work.
+- `<jobId>.launched.json` is created only after `Process.Start`, pinning the
+  original intent SHA-256, OS parent PID, UTC start-time observation, and on
+  Linux the kernel boot UUID and `/proc/<pid>/stat` start tick when
+  obtainable. The launch stage is written before `StartJob` returns its
+  handle; on Windows, the helper is already assigned to its kill-on-close
+  Job Object but remains behind its readiness event until this stage is
+  written. Failure to persist the launch stage causes the started native
+  process to be terminated best-effort and the API call to fail. The original
+  unresolved intent is **not** erased by that error.
+
+Both stages use create-new files with write-through, flushed file data and
+POSIX directory fsync; parent directory creation is synced before proceeding.
+The journal directory is made private to the local OS user on Unix. Neither
+stage is ever silently overwritten, deleted, or reclassified by cancellation,
+process exit, job status, or telemetry pruning. The journal deliberately
+excludes raw executable arguments, environment variables and process output.
+The read-only `inspectAt` rejects missing, corrupt, oversized, symlinked or
+SHA-mismatched evidence; an intent with no launch record remains explicitly
+uncertain. The conservative records may require eventual operator-audited
+retention management, not automatic TTL deletion.
+
+**These records are forensic anchors, not reaping receipts.** PID and kernel
+boot/birth identity help distinguish process incarnations, but they do not
+prove that the PID still belongs to a given execution after races, that
+descendants stayed in the process group, or that every descendant stopped
+after the client crashed. A short-lived process may exit before all optional
+birth metadata can be captured; empty metadata stays unknown rather than
+being synthesized. Windows power-loss directory durability and native Job
+Object lifetime require separate platform validation. Pre-upgrade clients
+have no retrospective journal entries. Nothing in this change turns
+server-side `Dispatched` into `Terminal`, releases a correction permit,
+approves the protocol-3.66 legacy drain, or exposes an operator force-Ready
+endpoint. Future authorization will still need authenticated provenance,
+independent OS-backed process-tree quiescence, full legacy fleet drain, and
+canonical Git outcome reconciliation.
+
+The targeted .NET 11 Release JobManager suite passed **26/26**, including
+real `StartJob` journal binding, durable launch reinspection, immutable UUID
+stage reuse rejection, incomplete crash-intent inspection, corruption and
+symlink rejection, and existing process lifecycle/concurrency cases. A
+previous development build exposed an F# JSON record-constructor limitation
+and a launch-error `Process.Dispose`/exit-callback lock inversion; both were
+corrected before acceptance. The eventual independent frozen review must
+include the error paths and both native-platform implementations.
+
+**Final full Release verification (2026-11-14):** Server 182/182 and Client 630/630 passed using .NET 11. The resulting branch remains isolated, unreviewed and undeployed; none of the outstanding production correction gates were relaxed.

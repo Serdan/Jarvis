@@ -45,6 +45,20 @@ let ``job lifecycle starts lists reads and cancels`` () =
             | Ok result -> result.JobId
             | Error error -> failwith $"Expected StartJob Ok, got {error}"
 
+        // StartJob persists an immutable intent before native execution and
+        // a process ID/birth observation before returning its job handle.
+        let journal =
+            ProcessOwnershipJournal.inspectAt
+                (ProcessOwnershipJournal.defaultDirectory()) jobId
+            |> function
+                | Ok value -> value
+                | Error message -> failwithf "Missing durable process evidence: %s" message
+        Assert.That(journal.Intent.JobId, Is.EqualTo(jobId))
+        Assert.That(journal.Intent.DeviceId, Is.Not.Empty)
+        Assert.That(journal.Intent.ClientIncarnationId, Is.Not.Empty)
+        Assert.That(journal.Launch.IsSome, Is.True)
+        Assert.That(journal.Launch.Value.ProcessId, Is.GreaterThan(0))
+
         match listJobs { ProjectName = Some "Project1"; IncludeCompleted = true } context with
         | Ok result ->
             let job = result.Jobs |> List.find (fun job -> job.JobId = jobId)
@@ -1126,3 +1140,83 @@ let cancellationRacingShortJobExitIsIdempotent () =
         for id in started do
             cancelJob { ProjectName = "Project1"; JobId = id } context |> ignore
         if Directory.Exists root then Directory.Delete(root, true)
+
+[<Test>]
+let processOwnershipJournalSurvivesRestartStyleInspectionAndRejectsReusedStages () =
+    let root = Path.Combine(Path.GetTempPath(), "jarvis-process-proof-" + Guid.NewGuid().ToString("N"))
+    Directory.CreateDirectory(root) |> ignore
+    try
+        let id = Guid.NewGuid().ToString("N")
+        let intent = ProcessOwnershipJournal.beginLaunchAt root id "project-canonical" "device-verified"
+        let before = ProcessOwnershipJournal.inspectAt root id
+        match before with
+        | Ok evidence ->
+            evidence.Intent |> shouldEqual intent
+            evidence.Launch.IsNone |> shouldEqual true
+        | Error error -> Assert.Fail(error)
+
+        // An unknown spawn outcome after a client crash remains unresolved.
+        let replayRejected =
+            try
+                ProcessOwnershipJournal.beginLaunchAt root id "other-project" "device-verified" |> ignore
+                false
+            with :? IOException -> true
+        replayRejected |> shouldEqual true
+
+        use child = new Process()
+        child.StartInfo.FileName <- "dotnet"
+        child.StartInfo.ArgumentList.Add("--version")
+        child.StartInfo.UseShellExecute <- false
+        child.StartInfo.RedirectStandardOutput <- true
+        child.StartInfo.RedirectStandardError <- true
+        try
+            Assert.That(child.Start(), Is.True)
+            let recorded = ProcessOwnershipJournal.recordLaunchedAt root intent child
+            Assert.That(recorded.ProcessId, Is.EqualTo(child.Id))
+            Assert.That(recorded.JobId, Is.EqualTo(id))
+            Assert.That(recorded.IntentSha256, Has.Length.EqualTo(64))
+            match ProcessOwnershipJournal.inspectAt root id with
+            | Ok recovered ->
+                recovered.Intent |> shouldEqual intent
+                recovered.Launch |> shouldEqual (Some recorded)
+            | Error error -> Assert.Fail(error)
+            child.WaitForExit(10000) |> ignore
+            let secondLaunchRejected =
+                try
+                    ProcessOwnershipJournal.recordLaunchedAt root intent child |> ignore
+                    false
+                with :? IOException -> true
+            secondLaunchRejected |> shouldEqual true
+        finally
+            try if not child.HasExited then child.Kill(entireProcessTree = true)
+            with _ -> ()
+    finally
+        Directory.Delete(root, true)
+
+[<Test>]
+let processOwnershipJournalRejectsCorruptionAndSymlinkStage () =
+    let root = Path.Combine(Path.GetTempPath(), "jarvis-process-corrupt-" + Guid.NewGuid().ToString("N"))
+    Directory.CreateDirectory(root) |> ignore
+    try
+        let id = Guid.NewGuid().ToString("N")
+        let _intent = ProcessOwnershipJournal.beginLaunchAt root id "project" "device"
+        let intentPath = Path.Combine(root, id + ".intent.json")
+        let original = File.ReadAllText(intentPath)
+        File.WriteAllText(intentPath, "{")
+        match ProcessOwnershipJournal.inspectAt root id with
+        | Error _ -> ()
+        | Ok _ -> Assert.Fail("Torn process ownership intent was accepted.")
+        File.WriteAllText(intentPath, original)
+        let launchedPath = Path.Combine(root, id + ".launched.json")
+        File.WriteAllText(launchedPath, "{\"SchemaVersion\":1,\"JobId\":\"invalid\"}")
+        match ProcessOwnershipJournal.inspectAt root id with
+        | Error _ -> ()
+        | Ok _ -> Assert.Fail("Mismatched launched PID/intent evidence was accepted.")
+        File.Delete(launchedPath)
+        if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
+            File.CreateSymbolicLink(launchedPath, intentPath) |> ignore
+            match ProcessOwnershipJournal.inspectAt root id with
+            | Error _ -> ()
+            | Ok _ -> Assert.Fail("Symbolic-link evidence stage was accepted.")
+    finally
+        Directory.Delete(root, true)

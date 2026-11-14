@@ -36,7 +36,7 @@ type Outcome =
       StdOutTruncated: bool
       StdErrTruncated: bool }
 
-module private Native =
+module internal Native =
     // JOBOBJECT_EXTENDED_LIMIT_INFORMATION (Win32). Typed field layout
     // avoids guessing native offsets or architecture-dependent padding.
     [<Struct; StructLayout(LayoutKind.Sequential)>]
@@ -276,13 +276,13 @@ let internal helperHostInvocation (hostPath: string) (assemblyPath: string) (arg
         hostPath, assemblyPath :: args
     else hostPath, args
 
-let private prepareCommand (command: Command) (windowsReadyName: string option) =
+let internal groupProcessInvocation (executable: string) (args: string list) (windowsReadyName: string option) =
     if OperatingSystem.IsLinux() then
         let setsid =
             if File.Exists("/usr/bin/setsid") then "/usr/bin/setsid"
             elif File.Exists("/bin/setsid") then "/bin/setsid"
             else raise (FileNotFoundException "Linux bounded commands require the system setsid utility.")
-        setsid, [ "--"; command.Executable ] @ command.Args
+        setsid, [ "--"; executable ] @ args
     elif OperatingSystem.IsMacOS() || OperatingSystem.IsWindows() then
         let host = Environment.ProcessPath
         if String.IsNullOrWhiteSpace host then
@@ -293,11 +293,14 @@ let private prepareCommand (command: Command) (windowsReadyName: string option) 
               if OperatingSystem.IsWindows() then
                   yield windowsReadyName |> Option.defaultWith (fun () ->
                       invalidOp "Windows process-group startup requires a readiness event.")
-              yield command.Executable
-              yield! command.Args ]
+              yield executable
+              yield! args ]
         helperHostInvocation host dll args
     else
-        command.Executable, command.Args
+        executable, args
+
+let private prepareCommand (command: Command) (windowsReadyName: string option) =
+    groupProcessInvocation command.Executable command.Args windowsReadyName
 
 let runWithCancellation (cancellation: CancellationToken) (command: Command) : Client.Result<Outcome> =
     if command.Timeout <= TimeSpan.Zero then

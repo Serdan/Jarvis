@@ -869,3 +869,41 @@ Warning, including exact deferred ToolOperation completion. Corrupt,
 unrecognized, conflicting, unauthenticated, or missing receipts remain
 warnings. Ordinary Git reads therefore do not flood the operator's
 diagnostic logs merely because their process-tree proof is still pending.
+
+### StartJob process-group ownership before OS receipt support (2026-11-14)
+
+Before this revision the long-running client `StartJob` runner executed directly
+inside the client's inherited OS process group and remembered only the leader's
+`Process` handle. On Linux and macOS, `CancelJob` could lose the entire
+descendant tree after the leader exited; `Process.Kill(entireProcessTree=true)`
+enumerates only descendants reachable from the still-living leader. On
+Windows, no kill-on-close Job Object enclosed the explicit StartJob tree.
+
+`StartJob` now reuses `BoundedProcess.groupProcessInvocation` rather than
+starting the original executable in the caller's process group. Linux uses
+the existing `setsid` session wrapper; macOS the managed `setsid` host; and
+Windows the managed group host gated on assignment to a kill-on-close Job
+Object. The client retains the Windows Job handle until the leader exits.
+Both `CancelJob` and the leader's `Exited` callback attempt group
+termination, and group termination precedes `WaitForExit` to avoid hanging
+when a descendant keeps inherited output streams open. This applies to
+normal leader completion as well as cancellation; no child is intentionally
+detached to continue after the job's leader completes.
+
+The original executable is checked for existence relative to the configured
+working directory and effective search `PATH` before launching the helper,
+so a missing program still produces a synchronous launch error rather than
+an apparently successful short-lived job handle. Command metadata retains
+the original executable and arguments, not the hidden group wrapper.
+
+Linux live-process regressions spawn a child that keeps running after its
+parent exits and another child while the parent is alive and canceled. Both
+verify cleanup and test the actual child PID. They do **not** establish that
+the OS has reaped every group member, certify a specific historical request
+after client restart, or prove cross-device quiescence. An interrupted
+client may leave Linux/macOS descendants executing before the next verified
+recovery cycle; a successful kill signal is itself not a reap receipt.
+No server `Dispatched` execution witness is promoted to `Terminal` by
+this change. Independent OS-backed per-incarnation termination certificates,
+crash-resilient reconciliation, and the global pre-witness legacy drain
+remain prerequisites for activating administrative correction.

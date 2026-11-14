@@ -902,3 +902,124 @@ Thread.Sleep(TimeSpan.FromSeconds(45.0))
             |> ignore
     finally
         Directory.Delete(root, true)
+
+let private childIsExecuting pid =
+    try
+        use proc = Process.GetProcessById pid
+        if proc.HasExited then false
+        elif OperatingSystem.IsLinux() then
+            // A reparented zombie may exist in /proc briefly, but it cannot
+            // execute more work and must not make this test nondeterministic.
+            let stat = File.ReadAllText($"/proc/{pid}/stat")
+            let state = stat[stat.LastIndexOf(')') + 2]
+            state <> 'Z' && state <> 'X'
+        else true
+    with
+    | :? ArgumentException
+    | :? InvalidOperationException
+    | :? FileNotFoundException
+    | :? IOException -> false
+
+let private killTestChild pid =
+    try
+        use proc = Process.GetProcessById pid
+        if not proc.HasExited then proc.Kill(entireProcessTree = true)
+    with _ -> ()
+
+let private verifyStartJobDescendantContainment holdLeader =
+    let root = createTempProject()
+    let project = Path.Combine(root, "Project1")
+    let marker = Path.Combine(project, "spawned-child.pid")
+    let releaseMarker = Path.Combine(project, "allow-parent-exit")
+    let childScript = Path.Combine(project, "spawned-child.fsx")
+    let parentScript = Path.Combine(project, "spawning-parent.fsx")
+    let context = TestContext root
+    let mutable jobId = None
+    try
+        File.WriteAllText(childScript, $"""open System
+open System.IO
+open System.Threading
+File.WriteAllText(@"{marker}", string Environment.ProcessId)
+Thread.Sleep 30000
+        """)
+        let continuation =
+            if holdLeader then "Thread.Sleep 30000"
+            else $"while not (File.Exists(@\"{releaseMarker}\")) do Thread.Sleep 25"
+        File.WriteAllText(parentScript, $"""open System
+open System.Diagnostics
+open System.IO
+open System.Threading
+let child = ProcessStartInfo("dotnet")
+child.UseShellExecute <- false
+child.ArgumentList.Add("fsi")
+child.ArgumentList.Add("--exec")
+child.ArgumentList.Add(@"{childScript}")
+// Don't keep the outer job's redirected pipes open in the descendant.
+child.RedirectStandardOutput <- true
+child.RedirectStandardError <- true
+use process = Process.Start(child)
+let limit = DateTime.UtcNow.AddSeconds 15.0
+while not (File.Exists(@"{marker}")) && DateTime.UtcNow < limit do
+    Thread.Sleep 25
+if not (File.Exists(@"{marker}")) then failwith "Child failed to start."
+printfn "spawning parent active"
+Console.Out.Flush()
+{continuation}
+        """)
+        let start =
+            { ProjectName = "Project1"; Executable = "dotnet"
+              Args = [ "fsi"; "--exec"; "spawning-parent.fsx" ]
+              Reason = Some "Verify isolated StartJob descendants"
+              WorkingDirectory = None; MaxOutputBytes = Some 4096 }
+        let launched =
+            match startJob start context with
+            | Ok result -> result
+            | Error issue -> failwithf "StartJob failed: %A" issue
+        jobId <- Some launched.JobId
+        let deadline = DateTime.UtcNow.AddSeconds 30.0
+        while not (File.Exists marker) && DateTime.UtcNow < deadline do
+            Thread.Sleep 30
+        Assert.That(File.Exists marker, Is.True, "Child launch marker is required.")
+        let pid = int (File.ReadAllText marker)
+        Assert.That(childIsExecuting pid, Is.True,
+                    "The child must be genuinely alive before group cleanup.")
+        if holdLeader then
+            cancelJob { ProjectName = "Project1"; JobId = launched.JobId } context
+            |> shouldEqual (Ok ())
+        else
+            File.WriteAllText(releaseMarker, "exit")
+        let rec awaitTerminal () =
+            let response =
+                getJobResult
+                    { ProjectName = "Project1"; JobId = launched.JobId
+                      AfterSequence = Some 0L } context
+                |> function Ok value -> value
+                          | Error issue -> failwithf "GetJobResult failed: %A" issue
+            if response.Status = Running && DateTime.UtcNow < deadline then
+                Thread.Sleep 30
+                awaitTerminal ()
+            else response.Status
+        let status = awaitTerminal()
+        if holdLeader then status |> shouldEqual Canceled
+        else status |> shouldEqual (Completed 0)
+        let cleanupDeadline = DateTime.UtcNow.AddSeconds 4.0
+        while childIsExecuting pid && DateTime.UtcNow < cleanupDeadline do
+            Thread.Sleep 30
+        Assert.That(childIsExecuting pid, Is.False,
+                    "StartJob must tear down descendants, even after the leader exits.")
+    finally
+        jobId |> Option.iter (fun id ->
+            cancelJob { ProjectName = "Project1"; JobId = id } context |> ignore)
+        if File.Exists marker then
+            match Int32.TryParse(File.ReadAllText marker) with
+            | true, pid -> killTestChild pid
+            | _ -> ()
+        if Directory.Exists root then Directory.Delete(root, true)
+
+[<Test>]
+let startJobCleansUpProcessGroupAfterParentExit () =
+    verifyStartJobDescendantContainment false
+
+[<Test>]
+let cancelJobKillsSupervisedDescendants () =
+    verifyStartJobDescendantContainment true

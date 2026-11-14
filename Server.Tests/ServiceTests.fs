@@ -1131,6 +1131,9 @@ let mcp_tool_oauth_metadata_matches_command_permissions () =
             // privileges, not merely the primary scope used in older tools.
             scopes.GetArrayLength() |> shouldEqual 2
             scopes[1].GetString() |> shouldEqual Auth.ProcessExecute
+        elif methodInfo.Name = "ScheduleExecution" then
+            scopes.GetArrayLength() |> shouldEqual 2
+            scopes[1].GetString() |> shouldEqual Auth.WorkspaceRead
         elif methodInfo.Name = "BrowserCaptureDom" then
             scopes.GetArrayLength() |> shouldEqual 1
 

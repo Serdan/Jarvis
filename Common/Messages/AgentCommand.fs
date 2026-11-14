@@ -1372,6 +1372,10 @@ module AgentProtocol =
           definition "ScheduleBrowserExecution" "Persist a one-shot or recurring action that runs a project JS file in a new tab in a registered window." [ ProcessExecution; NetworkAccess ] true true false
           definition "ListScheduledBrowserExecutions" "List queued, completed and failed local browser actions without disclosing scripts or arguments." [ ReadOnly ] false false false
           definition "CancelScheduledBrowserExecution" "Cancel a pending one-shot or recurring browser action." [ ProcessExecution ] true true false
+          definition "ScheduleExecution" "Create or replace durable one-off, interval, or agent-idle CLI/browser actions." [ ProcessExecution; ReadOnly ] true true false
+          definition "ListScheduledExecutions" "List schedule metadata, trigger, next due and status, without arguments." [ ReadOnly ] false false false
+          definition "GetScheduledExecution" "Inspect one local schedule without disclosing arguments." [ ReadOnly ] false false false
+          definition "CancelScheduledExecution" "Stop future occurrences of a durable schedule." [ ProcessExecution ] true true false
           definition "BrowserOpenTab" "Opens a new background tab in a user-registered window on an explicitly permitted site." [ ProcessExecution; NetworkAccess ] true true false
           definition "BrowserExecuteFile" "Executes JavaScript from a bounded project file in a registered tab." [ ProcessExecution; NetworkAccess ] true true false
           definition "BrowserExecuteJs" "Executes supplied JavaScript in a registered browser tab." [ ProcessExecution; NetworkAccess ] true true false

@@ -587,7 +587,7 @@ let stableOperationIdDoesNotDispatchOriginalCommandTwice () =
 
 
 [<Test>]
-let toolFailuresPreserveOriginalErrorWithoutRestart () =
+let toolFailuresRemainUncertainWithOriginalOperationWithoutRestart () =
     let operationId = "failure-" + Guid.NewGuid().ToString("N")
     let calls = ref 0
     let registered =
@@ -604,8 +604,11 @@ let toolFailuresPreserveOriginalErrorWithoutRestart () =
         | Choice2Of2 _ -> failwith "Faulting task should finish before the deadline."
     Assert.That(outcome.Error.IsSome, Is.True)
     match outcome.Error with
-    | Some(ExecutionFailed message) -> Assert.That(message, Does.Contain("synthetic command fault"))
-    | other -> Assert.Fail($"Expected typed execution failure: {other}")
+    | Some(UncertainOutcome info) ->
+        Assert.That(info.Message, Does.Contain("synthetic command fault"))
+        Assert.That(info.OperationId, Is.EqualTo(Some operationId))
+    | other -> Assert.Fail($"Expected typed uncertain outcome after execution began: {other}")
+    Assert.That(AgentStateEvidence.isUnknown outcome, Is.True)
     let handle, _ = registered
     let root = createTempProject ()
     try
@@ -762,6 +765,74 @@ let forwardedNotificationJobKeepsSourceAndDestinationEvidenceThroughTerminalPoll
                 Assert.That(calls.Value, Is.EqualTo(1),
                     "Polling and retrying a forwarded notification must not execute a duplicate destination mutation.")
     finally
+        Directory.Delete(root, true)
+
+[<Test>]
+let forwardedNotificationFaultAfterMutationRetainsUnknownStateAndOriginalOperation () =
+    let root = createTempProject ()
+    let context = TestContext root
+    let source = [ { ProjectName = "Jarvis"; AgentId = "Worker 1" } ]
+    let receipt = Some(activationFixture())
+    let envelope = notificationFixture source receipt
+    let merge = Client.SignalR.Client.combineCrossProjectNotification envelope
+    let entered = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+    let release = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+    let mutable sideEffects = 0
+    let execute () : Task<AgentCommandResponse> = task {
+        sideEffects <- sideEffects + 1
+        entered.TrySetResult(()) |> ignore
+        do! release.Task
+        return raise (InvalidOperationException("fault after destination write"))
+    }
+    try
+        let registered =
+            match startToolOperationWithCancelEvidence jobProject (Some "Project1") "Worker 1"
+                    "TaskWrite" (Some envelope.Notification.OperationId)
+                    envelope.Notification.OperationId execute merge with
+            | Ok operation -> operation
+            | Error error -> failwith $"Cannot start one-shot mutation fixture: {error}"
+        let handle, completion = registered
+        entered.Task.WaitAsync(TimeSpan.FromSeconds 5.).GetAwaiter().GetResult()
+        match (awaitToolOperation registered (TimeSpan.FromMilliseconds 5.)).GetAwaiter().GetResult() with
+        | Choice2Of2 pending -> Assert.That(pending.JobId, Is.EqualTo(handle.JobId))
+        | other -> Assert.Fail($"Gated, executing command must return pending handle: {other}")
+        let cmd = { ProjectName = "Project1"; JobId = handle.JobId; AfterSequence = None }
+        match getJobResultForProjectAsAgent jobProject (Some "Worker 1") cmd context with
+        | Ok pending ->
+            Assert.That(pending.Status, Is.EqualTo(JobStatus.Running))
+            Assert.That(pending.ToolResponse.IsNone, Is.True, "Pending effects must remain unknown.")
+        | Error issue -> Assert.Fail($"Cannot poll pending mutation: {issue}")
+        release.SetResult(())
+        let terminal = completion.WaitAsync(TimeSpan.FromSeconds 5.).GetAwaiter().GetResult()
+        Assert.That(sideEffects, Is.EqualTo(1))
+        match terminal.Error with
+        | Some(UncertainOutcome info) ->
+            Assert.That(info.OperationId, Is.EqualTo(Some envelope.Notification.OperationId))
+            Assert.That(info.Message, Does.Contain("fault after destination write"))
+        | other -> Assert.Fail($"Post-execution exception must be uncertain: {other}")
+        Assert.That(AgentStateEvidence.isUnknown terminal, Is.True)
+        Assert.That(terminal.AgentStateChanges, Is.EqualTo(source :> obj))
+        Assert.That(terminal.InboxActivation, Is.EqualTo(receipt))
+        let roundtrip =
+            System.Text.Json.JsonSerializer.Deserialize<AgentCommandResponse>(
+                System.Text.Json.JsonSerializer.Serialize terminal)
+        Assert.That(AgentStateEvidence.isUnknown roundtrip, Is.True)
+        for _ in 1 .. 2 do
+            match getJobResultForProjectAsAgent jobProject (Some "Worker 1") cmd context with
+            | Ok stored ->
+                match stored.Status with
+                | ToolFailed reason -> Assert.That(reason, Does.Contain("fault after destination write"))
+                | other -> Assert.Fail($"Unexpected terminal status: {other}")
+                Assert.That(stored.ToolResponse, Is.EqualTo(Some terminal))
+            | Error issue -> Assert.Fail($"Cannot recover uncertain job: {issue}")
+        match startToolOperationWithCancelEvidence jobProject (Some "Project1") "Worker 1"
+                "TaskWrite" (Some envelope.Notification.OperationId)
+                envelope.Notification.OperationId execute merge with
+        | Ok (same, _) -> Assert.That(same.JobId, Is.EqualTo(handle.JobId))
+        | Error issue -> Assert.Fail($"Original operation ID must recover its result: {issue}")
+        Assert.That(sideEffects, Is.EqualTo(1), "An uncertain mutation must not be executed twice.")
+    finally
+        release.TrySetResult(()) |> ignore
         Directory.Delete(root, true)
 
 [<Test>]

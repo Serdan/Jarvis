@@ -673,6 +673,12 @@ type LedgerFailureInfo =
       OperationId: string option
       VerifiedLedgerHead: string option }
 
+/// A command may have committed before its response was lost. OperationId
+/// refers to the ORIGINAL caller operation; never generate a replacement ID.
+type UncertainOperationInfo =
+    { Message: string
+      OperationId: string option }
+
 [<JsonConverter(typeof<UnionConverter<AgentError>>)>]
 type AgentError =
     | NotFound of string
@@ -681,6 +687,7 @@ type AgentError =
     | ValidationFailed of string
     | Conflict of string
     | ExecutionFailed of string
+    | UncertainOutcome of UncertainOperationInfo
     | OutputTruncated of string
     | LedgerFailure of LedgerFailureInfo
 
@@ -815,7 +822,29 @@ type AgentCommand =
     | MessageCommand of MessageCommand
     | GetClientActivityCommand of GetClientActivityCommand
 
+/// An empty list is definitive only for a confirmed response. After a
+/// transport/dispatch exception, the list can at most contain known changes.
+module AgentStateEvidence =
+    let isUnknown (response: AgentCommandResponse) =
+        match response.Error with
+        | Some(UncertainOutcome _) -> true
+        | _ -> false
+
 module AgentCommandInfo =
+    let recoveryOperationId command =
+        let raw =
+            match command with
+            | TaskWriteCommand cmd -> cmd.OperationId
+            | LedgerWriteCommand cmd -> cmd.OperationId
+            | ReviewWriteCommand cmd -> cmd.OperationId
+            | RetryPendingIntentCommand cmd -> cmd.OperationId
+            | SupersedePendingIntentCommand cmd -> cmd.OperationId
+            | AbandonPendingIntentCommand cmd -> cmd.OperationId
+            | _ -> ""
+        match Guid.TryParse raw with
+        | true, id -> Some(id.ToString("D"))
+        | _ -> None
+
     let name = function
         | ListCommandsCommand -> "ListCommandsCommand"
         | ListProjectsCommand -> "ListProjectsCommand"

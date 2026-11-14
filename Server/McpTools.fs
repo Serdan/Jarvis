@@ -222,6 +222,12 @@ module McpToolHelpers =
         | ValidationFailed message -> $"ValidationFailed: {message}"
         | Conflict message -> $"Conflict: {message}"
         | ExecutionFailed message -> $"ExecutionFailed: {message}"
+        | UncertainOutcome info ->
+            let recovery =
+                info.OperationId
+                |> Option.map (fun id -> $" Original operation ID: {id}.")
+                |> Option.defaultValue " Original operation ID unavailable."
+            $"UncertainOutcome: {info.Message}{recovery} Check the operation status before attempting any write again."
         | OutputTruncated message -> $"OutputTruncated: {message}"
         | LedgerFailure failure -> $"LedgerFailure({failure.Code}): {failure.Message}"
 
@@ -380,6 +386,7 @@ module McpToolHelpers =
         | ValidationFailed _ -> "ValidationFailed"
         | Conflict _ -> "Conflict"
         | ExecutionFailed _ -> "ExecutionFailed"
+        | UncertainOutcome _ -> "UncertainOutcome"
         | OutputTruncated _ -> "OutputTruncated"
         | LedgerFailure _ -> "LedgerFailure"
 
@@ -400,9 +407,9 @@ module McpToolHelpers =
                 errorResult (ExecutionFailed "Invalid Jarvis response: neither result nor error was set.")
         result
 
-    /// Every forwarded project tool result carries its canonical mutation
-    /// evidence. An empty array is explicit, not an omitted field. This stays
-    /// visible even when the requested command fails after a committed write.
+    /// Confirmed outcomes expose complete canonical mutation evidence. An
+    /// UncertainOutcome means the known list may be incomplete: it must NEVER
+    /// be misrepresented as authoritative zero state changes.
     /// The separate activation receipt is richer only when the ledger has
     /// actually confirmed the requesting agent's Ready -> Working transition.
     let attachStateEffects (response: AgentCommandResponse) (result: CallToolResult) =
@@ -411,9 +418,25 @@ module McpToolHelpers =
             let changes =
                 if isNull (box response.AgentStateChanges) then [] else response.AgentStateChanges
             let details = JsonObject()
-            details["agentStateChanges"] <- JsonSerializer.SerializeToNode changes
             let metadata = if isNull result.Meta then JsonObject() else result.Meta
-            metadata["jarvis/agent_state_changes"] <- JsonSerializer.SerializeToNode changes
+            match response.Error with
+            | Some(UncertainOutcome info) ->
+                details["agentStateChangesStatus"] <- JsonSerializer.SerializeToNode "unknown"
+                metadata["jarvis/agent_state_changes_status"] <- JsonSerializer.SerializeToNode "unknown"
+                // Known partial evidence, if present, is explicitly NOT complete.
+                if not changes.IsEmpty then
+                    details["knownAgentStateChanges"] <- JsonSerializer.SerializeToNode changes
+                    metadata["jarvis/known_agent_state_changes"] <- JsonSerializer.SerializeToNode changes
+                match info.OperationId with
+                | Some id ->
+                    details["originalOperationId"] <- JsonSerializer.SerializeToNode id
+                    metadata["jarvis/recovery_operation_id"] <- JsonSerializer.SerializeToNode id
+                | None -> ()
+            | _ ->
+                details["agentStateChanges"] <- JsonSerializer.SerializeToNode changes
+                metadata["jarvis/agent_state_changes"] <- JsonSerializer.SerializeToNode changes
+                details["agentStateChangesStatus"] <- JsonSerializer.SerializeToNode "confirmed"
+                metadata["jarvis/agent_state_changes_status"] <- JsonSerializer.SerializeToNode "confirmed"
             match response.InboxActivation with
             | None -> ()
             | Some activation ->
@@ -758,6 +781,17 @@ module McpToolHelpers =
                     // evidence, independently of command kind or success.
                     let publishChanges (response: AgentCommandResponse) =
                         task {
+                            if AgentStateEvidence.isUnknown response then
+                                try
+                                    do! client.InvalidateAllAgentStatesForUser(userId)
+                                with ex ->
+                                    // Only local cache hints are lost; never
+                                    // turn an uncertain outcome into a new
+                                    // client-side execution failure.
+                                    let factory = context.RequestServices.GetService<ILoggerFactory>()
+                                    if not (isNull factory) then
+                                        factory.CreateLogger("Jarvis.AgentStateInvalidation")
+                                            .LogWarning(ex, "Could not invalidate caches after an uncertain command.")
                             for project, agentIds in
                                 AgentStateInvalidationRouting.affectedByProject response.AgentStateChanges do
                                 try

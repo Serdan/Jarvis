@@ -348,6 +348,20 @@ module private ToolOperations =
           InboxActivation = None
           PendingJob = None }
 
+    // Once execution begins an exception cannot prove that a mutation did not
+    // commit. Preserve the stable operation ID for reconciliation and retain
+    // any independently confirmed source-side evidence as a known subset.
+    let private uncertainResponse (entry: ToolOperationRecord) (message: string) : AgentCommandResponse =
+        { Result = None
+          Error = Some(UncertainOutcome
+              { Message = message + " The outcome may have committed; reconcile the original operation ID before retrying."
+                OperationId = entry.Handle.OperationId })
+          Instructions = []
+          // The typed UncertainOutcome marks completeness UNKNOWN, never zero.
+          AgentStateChanges = []
+          InboxActivation = None
+          PendingJob = None }
+
     let private complete (entry: ToolOperationRecord) (response: AgentCommandResponse) =
         lock gate (fun () ->
             // The only other terminal path is cancellation BEFORE execution.
@@ -383,7 +397,9 @@ module private ToolOperations =
                             let! response =
                                 task {
                                     try return! execute ()
-                                    with ex -> return entry.PreserveEvidence (failedResponse ("Tool operation failed: " + ex.Message))
+                                    with ex ->
+                                        return entry.PreserveEvidence (
+                                            uncertainResponse entry ("Tool operation failed after execution began: " + ex.Message))
                                 }
                             complete entry response
                         else
@@ -392,7 +408,15 @@ module private ToolOperations =
                     finally
                         workerSlots.Release() |> ignore
                 with ex ->
-                    complete entry (entry.PreserveEvidence (failedResponse ("Tool operation dispatch failed: " + ex.Message)))
+                    let started = lock gate (fun () -> entry.StartedExecution)
+                    let response =
+                        if started then
+                            uncertainResponse entry ("Tool operation dispatch failed after execution began: " + ex.Message)
+                        else
+                            // Admission or semaphore failure before execute()
+                            // cannot have performed this job's command.
+                            failedResponse ("Tool operation dispatch failed before execution: " + ex.Message)
+                    complete entry (entry.PreserveEvidence response)
             } :> Task))
         |> ignore
 

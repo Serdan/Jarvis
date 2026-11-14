@@ -900,6 +900,7 @@ let receiveCommandWithInstructions (rt: Runtime) command =
 let processIncomingCommand (rt: Runtime) (commandJson: string) (agentId: string) =
     task {
         let mutable parsedCommand = None
+        let mutable unexpectedFailure = false
         let mutable instructions: InstructionDocument list = []
         let mutable implicitChanges: string list = []
         let mutable inboxActivation: AgentInboxActivation option = None
@@ -999,6 +1000,7 @@ let processIncomingCommand (rt: Runtime) (commandJson: string) (agentId: string)
                                     @ checkWorkingGuidance rt localAgentId target command
                             return result
                 with ex ->
+                    unexpectedFailure <- true
                     return Error(ExceptionError ex)
             }
         // The metadata is independent of the requested command outcome. A
@@ -1019,6 +1021,14 @@ let processIncomingCommand (rt: Runtime) (commandJson: string) (agentId: string)
             match parsedCommand with
             | Some command -> toAgentResponse command instructions changes inboxActivation response
             | None -> toAgentResponse ListCommandsCommand [] changes inboxActivation response
+        let agentResponse =
+            if unexpectedFailure then
+                // Even an exception caught by the command handler may occur
+                // after a ledger commit. Preserve any known activation and
+                // mark all remaining state effects as UNKNOWN.
+                { agentResponse with
+                    Error = (CommandDispatchRecovery.unexpectedResponse commandJson).Error }
+            else agentResponse
         return parsedCommand, (response |> Result.map (fun outcome -> outcome.Payload)), agentResponse
     }
 
@@ -1128,15 +1138,26 @@ let private executeOrPromote (rt: Runtime) (commandJson: string) (agentId: strin
             return merge outcome
     }
 
-let private receiveCommandAndReplyCore (connection: HubConnection) (rt: Runtime) (correlationId: string) (commandJson: string) (agentId: string) : Task =
+let private receiveCommandAndReplyCore (connection: HubConnection) (rt: Runtime) (correlationId: string) (commandJson: string) (agentId: string)
+    (report: string -> float -> float -> bool -> unit) : Task =
     task {
+        let commandStarted = Stopwatch.GetTimestamp()
         let! agentResponse = executeOrPromote rt commandJson agentId
+        let commandMilliseconds = Stopwatch.GetElapsedTime(commandStarted).TotalMilliseconds
+        let replyStarted = Stopwatch.GetTimestamp()
         let! sendResult =
             ResponseDelivery.sendWithReconnectRetry
                 (TimeSpan.FromMinutes 2.0)
                 (TimeSpan.FromMilliseconds 250.0)
                 (fun () -> connection.State)
                 (fun () -> connection.invokeAsync("SendClientResponse", correlationId, agentResponse))
+
+        let replyMilliseconds = Stopwatch.GetElapsedTime(replyStarted).TotalMilliseconds
+        try
+            report correlationId commandMilliseconds replyMilliseconds sendResult.IsOk
+        with _ ->
+            // Timing sinks must not affect command outcome or self-update.
+            ()
 
         match sendResult with
         | Ok() -> ()
@@ -1159,17 +1180,15 @@ let private receiveCommandAndReplyCore (connection: HubConnection) (rt: Runtime)
         | _ -> ()
     }
 
-let private commandIngress = ConditionalWeakTable<Runtime, BoundedResponseIngress>()
+// Program.fs owns the single bounded CommandDispatchQueue. Its worker must await
+// this full execution+reply Task; detaching the response to a second ingress
+// prematurely releases the outer worker and can lose correlated failures.
+let receiveCommandAndReplyWithTiming (connection: HubConnection) (rt: Runtime)
+    (correlationId: string) (commandJson: string) (agentId: string)
+    (report: string -> float -> float -> bool -> unit) : Task =
+    receiveCommandAndReplyCore connection rt correlationId commandJson agentId report
 
-/// Return to SignalR ingress immediately after bounded admission. The
-/// response task remains tracked until it is sent (or delivery fails), so
-/// concurrent cheap polling is not serialized behind a 3-second deadline.
-let receiveCommandAndReply (connection: HubConnection) (rt: Runtime) (correlationId: string) (commandJson: string) (agentId: string) : Task =
-    let ingress =
-        commandIngress.GetValue(rt, fun _ ->
-            BoundedResponseIngress(96, fun ex ->
-                rt.Tui.Log $"Client command response failed: {ex.Message}"))
-    match ingress.TryDispatch(correlationId, fun () ->
-        receiveCommandAndReplyCore connection rt correlationId commandJson agentId) with
-    | Ok _ -> Task.CompletedTask
-    | Error reason -> Task.FromException(InvalidOperationException reason)
+let receiveCommandAndReply (connection: HubConnection) (rt: Runtime)
+    (correlationId: string) (commandJson: string) (agentId: string) : Task =
+    receiveCommandAndReplyWithTiming connection rt correlationId commandJson agentId
+        (fun _ _ _ _ -> ())

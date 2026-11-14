@@ -16,6 +16,7 @@
         <Compile Include="ReconnectScheduleTests.fs"/>
         <Compile Include="ResponseDeliveryTests.fs"/>
         <Compile Include="FilterSelectorTests.fs"/>
+        <Compile Include="SignalRDispatchTests.fs"/>
         <Compile Include="ActivityFilterTests.fs"/>
         <Compile Include="ActivityLogTests.fs"/>
         <Compile Include="ActivityExportTests.fs"/>
@@ -59,6 +60,7 @@
     </ItemGroup>
 
     <ItemGroup>
+        <FrameworkReference Include="Microsoft.AspNetCore.App"/>
         <PackageReference Include="coverlet.collector" Version="6.0.3">
             <PrivateAssets>all</PrivateAssets>
             <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>

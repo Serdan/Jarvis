@@ -1176,10 +1176,20 @@ INSERT INTO operations (
                   || request.DeviceGeneration < 1L
                   || String.IsNullOrWhiteSpace request.RequestFingerprint
                   || request.RequestFingerprint.Length <> 64
-                  || not (request.RequestFingerprint |> Seq.forall Uri.IsHexDigit))) then
+                  || not (request.RequestFingerprint |> Seq.forall Uri.IsHexDigit)))
+           || (requestBinding.IsSome &&
+               (match Guid.TryParse operationId with
+                | true, parsed when parsed <> Guid.Empty -> false
+                | _ -> true)) then
             Error "Correction requires authenticated, bounded, request-bound identities and operation fingerprint."
         else
             try
+                // Git indexes UUIDs as Guid values, not original text. The
+                // permanent server claim MUST use the same canonical key:
+                // "{UPPER}" and "lower" cannot claim the same UUID twice.
+                let operationId =
+                    if requestBinding.IsSome then Guid.Parse(operationId).ToString("D")
+                    else operationId // old internal unbound test fixture
                 let agent = targetAgentId.ToUpperInvariant()
                 use connection = openConnection()
                 use transaction = connection.BeginTransaction()

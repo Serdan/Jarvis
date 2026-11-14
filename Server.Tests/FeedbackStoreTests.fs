@@ -2618,7 +2618,7 @@ let ``authenticated stale correction cannot release an unresolved permit`` () =
         let accessor = HttpContextAccessor()
         accessor.HttpContext <- context
         let service = new ClientService(hub, users, tracker, accessor, store)
-        let operationId = "auth-stale-correction"
+        let operationId = Guid.NewGuid().ToString("D")
         let result =
             JarvisMcpTools.CorrectAgentWorkingState(
                 "Jarvis", actor, target, "task-1", "attempt-1",
@@ -2748,7 +2748,7 @@ let ``bound correction permits reject cross project actor and payload replay aft
     withStore (fun store ->
         approveTestEpoch store
         let user, target, actor, project, operationId =
-            "alice", "Worker 3", "Admin 1", "Jarvis", "same-stable-operation"
+            "alice", "Worker 3", "Admin 1", "Jarvis", Guid.NewGuid().ToString("D")
         let fingerprint = String.replicate 64 "A"
         let beginSource name sourceProject sourceUser tool =
             store.TryBeginAgentOperation(
@@ -2999,7 +2999,7 @@ let ``new device allocator seeds above old execution witnesses and correction pe
               DeviceId = "desktop"; DeviceGeneration = 802L }
         let permit =
             store.TryAcquireAgentCorrectionForRequest(
-                "alice", "Worker 4", "correction-during-upgrade", bound)
+                "alice", "Worker 4", Guid.NewGuid().ToString("D"), bound)
             |> function Ok id -> id | Error error -> failwith error
         // Simulate installing the first allocator-capable server on an
         // existing database with no durable generation table at all.
@@ -3442,6 +3442,19 @@ let ``correction UUID identity survives permit release and rejects retargeted re
                 Is.True, $"Resolved UUID was repurposed after permit release: {label}")
             restarted.InspectAgentCorrectionPermit(user, target)
             |> shouldEqual (Ok None)
+        let formattedSameUuid = "{" + operationId.ToUpperInvariant() + "}"
+        let upperCaseReplay =
+            request user "Admin 1" "Jarvis" "desktop" 100L fingerprint
+        Assert.That(restarted.TryAcquireAgentCorrectionForRequest(
+            user, "Worker 4", formattedSameUuid, upperCaseReplay).IsError,
+            Is.True,
+            "Braces and uppercase spelling of an existing canonical Git UUID must not bypass its permanent target binding.")
+        let invalidUuidRequest =
+            request user "Admin 1" "Jarvis" "desktop" 100L fingerprint
+        Assert.That(restarted.TryAcquireAgentCorrectionForRequest(
+            user, "Worker 4", "not-a-valid-uuid", invalidUuidRequest).IsError,
+            Is.True,
+            "Bound production correction operations require a valid canonicalizable UUID.")
         Assert.That(restarted.TryAcquireAgentCorrection(
             user, "Worker 3", operationId).IsError, Is.True,
             "Unbound legacy caller cannot borrow a permanent production correction UUID.")

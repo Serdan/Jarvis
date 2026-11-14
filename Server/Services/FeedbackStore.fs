@@ -224,7 +224,8 @@ type FeedbackStore(databasePath: string, ?telemetryRetention: TimeSpan) =
               "ReadFile"; "ReadFilePage"; "ReadFiles"; "GetAgentInstructions"
               "ReadImage"; "WriteFile"; "PatchFile"
               "ListConfiguredTasks"; "ListSkills"; "GetSkill"; "CreateSkill"
-              "ListJobs"; "GetJobResult"; "Message"; "GetClientActivity" ]
+              "ListJobs"; "GetJobResult"; "GetProcessOwnershipEvidence"
+              "Message"; "GetClientActivity" ]
 
     do
         if not (Set.isSubset terminalCommandTypes knownCommandTypes) then

@@ -59,6 +59,36 @@ let ``job lifecycle starts lists reads and cancels`` () =
         Assert.That(journal.Launch.IsSome, Is.True)
         Assert.That(journal.Launch.Value.ProcessId, Is.GreaterThan(0))
 
+        let read : GetProcessOwnershipEvidenceCommand = { ProjectName = "Project1"; JobId = jobId }
+        match getProcessOwnershipEvidence read context with
+        | Error error -> Assert.Fail($"Authenticated process evidence read failed: {error}")
+        | Ok evidence ->
+            evidence.JobId |> shouldEqual jobId
+            evidence.ProjectId |> shouldEqual "Project1"
+            evidence.DeviceId |> shouldEqual journal.Intent.DeviceId
+            evidence.ClientIncarnationId |> shouldEqual journal.Intent.ClientIncarnationId
+            evidence.Stage |> shouldEqual "Launched"
+            evidence.ProcessId |> shouldEqual (Some journal.Launch.Value.ProcessId)
+            evidence.ProcessTreeStatus |> shouldEqual "Unverified"
+            evidence.IntentSha256 |> shouldEqual (Some journal.Launch.Value.IntentSha256)
+            let serialized = System.Text.Json.JsonSerializer.Serialize(evidence)
+            Assert.That(serialized.Contains("\"ProcessTreeStatus\":\"Unverified\""), Is.True)
+
+        // A valid UUID cannot be read through another project route.
+        match getProcessOwnershipEvidence
+                  ({ ProjectName = "OtherProject"; JobId = jobId }: GetProcessOwnershipEvidenceCommand) context with
+        | Error _ -> ()
+        | Ok _ -> Assert.Fail("Another project was permitted to read process identity.")
+
+        // The caller's project selector cannot override the resolved route.
+        let target =
+            ProjectPaths.ProjectTarget.parse "OtherProject"
+            |> Result.map ProjectPaths.ProjectTarget.projectId
+            |> Result.defaultWith (fun e -> failwithf "Invalid test project: %A" e)
+        match getProcessOwnershipEvidenceForProject (Some target) read context with
+        | Error _ -> ()
+        | Ok _ -> Assert.Fail("Mismatched authenticated project target was accepted.")
+
         match listJobs { ProjectName = Some "Project1"; IncludeCompleted = true } context with
         | Ok result ->
             let job = result.Jobs |> List.find (fun job -> job.JobId = jobId)
@@ -1219,4 +1249,52 @@ let processOwnershipJournalRejectsCorruptionAndSymlinkStage () =
             | Error _ -> ()
             | Ok _ -> Assert.Fail("Symbolic-link evidence stage was accepted.")
     finally
+        Directory.Delete(root, true)
+
+[<Test>]
+let processOwnershipEvidenceWireReadRejectsForeignDeviceAndPreservesUncertainty () =
+    let root = createTempProject()
+    let directory = ProcessOwnershipJournal.defaultDirectory()
+    let foreignId = Guid.NewGuid().ToString("N")
+    let unresolvedId = Guid.NewGuid().ToString("N")
+    try
+        // These are test-only immutable stages, removed by the test fixture.
+        // No OS process was started; neither stage can imply termination.
+        ProcessOwnershipJournal.beginLaunchAt directory foreignId "Project1" "foreign-device"
+        |> ignore
+        ProcessOwnershipJournal.beginLaunchAt directory unresolvedId "Project1" (DeviceIdentity.getOrCreate())
+        |> ignore
+        let context = TestContext root
+        let query jobId : GetProcessOwnershipEvidenceCommand =
+            { ProjectName = "Project1"; JobId = jobId }
+
+        match getProcessOwnershipEvidence (query foreignId) context with
+        | Error(ContextError reason) ->
+            Assert.That(reason, Does.Contain("device mismatch"))
+        | other -> Assert.Fail($"Foreign-device process identity leaked: {other}")
+
+        match getProcessOwnershipEvidence (query unresolvedId) context with
+        | Ok evidence ->
+            evidence.JobId |> shouldEqual unresolvedId
+            evidence.Stage |> shouldEqual "IntentOnly"
+            evidence.ProcessId |> shouldEqual None
+            evidence.ProcessStartUtc |> shouldEqual None
+            evidence.IntentSha256 |> shouldEqual None
+            evidence.ProcessTreeStatus |> shouldEqual "Unverified"
+        | Error error -> Assert.Fail($"Missing launched stage was incorrectly rejected: {error}")
+
+        for bad in [ Guid.NewGuid().ToString("N"); "not-a-job-uuid" ] do
+            match getProcessOwnershipEvidence (query bad) context with
+            | Error _ -> ()
+            | Ok _ -> Assert.Fail("Missing or malformed process identity was treated as available.")
+
+        match getProcessOwnershipEvidenceForProject None (query unresolvedId) context with
+        | Error _ -> ()
+        | Ok _ -> Assert.Fail("Unscoped local process evidence was disclosed.")
+    finally
+        // Only our unique test fixture UUID files; no production journal
+        // retention or cleanup policy is implied.
+        for id in [ foreignId; unresolvedId ] do
+            let file = Path.Combine(directory, id + ".intent.json")
+            if File.Exists file then File.Delete file
         Directory.Delete(root, true)

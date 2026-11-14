@@ -1010,3 +1010,71 @@ corrected before acceptance. The eventual independent frozen review must
 include the error paths and both native-platform implementations.
 
 **Final full Release verification (2026-11-14):** Server 182/182 and Client 630/630 passed using .NET 11. The resulting branch remains isolated, unreviewed and undeployed; none of the outstanding production correction gates were relaxed.
+
+### Read-only device-local launch recovery command (protocol 3.67, 2026-11-14)
+
+A verified `StartJob` response already pins the exact job GUID-N and launch
+timestamp under the server's authenticated `agent_execution_witness`
+connection/device-generation route. After a client restart, the in-memory
+`GetJobResult` registry may no longer exist, even though
+`process-ownership-v1/<jobId>.intent.json` and its optional immutable
+`launched` stage remain on disk. The server **must not infer missing process
+work from that in-memory lookup**.
+
+New `GetProcessOwnershipEvidence` is a standalone, **read-only** protocol
+command and public MCP tool, not a correction endpoint. It accepts only an
+explicit logical `projectName` and exact native `jobId`; normal authenticated
+device selection (including explicit MCP `deviceId` override) determines
+which connected client answers. Client routing parses the canonical project
+selector and binds the expected logical ID before reading its local journal.
+The client compares that ID with the persisted intent, and independently
+checks the intent's device ID against the current client's persisted device
+identity. A different project, different device, bad GUID, corrupt journal or
+missing intent fails closed instead of returning fabricated negative evidence.
+
+A successful, bounded response reports the original job UUID, canonical
+project ID, device and client-incarnation IDs, intent creation time, and one
+of exactly **`IntentOnly`** or **`Launched`**. For `Launched`, it includes the
+captured parent PID, available OS start/birth and boot observations, the
+intent SHA-256 binding and launch-record timestamp. Missing optional OS
+observations remain null, not manufactured. Every successful result has
+`ProcessTreeStatus = "Unverified"`; the command never probes, kills, waits
+for or reaps an OS process. It is non-activating and bypasses source instruction
+loading as a cheap job-control observer.
+
+This diagnostic tool uses OAuth `workspace:read`, the Client `ReadOnly`
+permission, and the explicit process-free server terminal allowlist.
+**Terminal for this read-only diagnostic is not Terminal for the historical
+`StartJob` execution witness.** The server does not consume this response to
+advance an old witness, authorize `Working -> Ready`, waive a correction
+permit, or accept an operator legacy-drain attestation. The authenticated
+device route makes the selected device auditable; a same-user local
+process that can edit its own journal remains outside any independently
+trusted OS quiescence proof. The server must compare request UUID, owner
+device and recorded launch GUID against its durable `StartJob` witness
+before using the answer as even diagnostic provenance.
+
+Adding a typed wire command advances the protocol to **3.67**. Protocol
+3.66, just like 3.65 and earlier, is now a legacy incarnation for this branch:
+no approvals or empty registries from prior protocol epochs may authorize a
+3.67 correction. The global pre-witness fleet drain, crash-stable
+OS process-tree proof (including detached children and PID reuse), exact
+canonical Git outcome reconciliation, independent frozen review and operator
+approval remain mandatory. This branch remains isolated and undeployed.
+
+The device comparison uses `DeviceIdentity.tryReadExisting`, **not**
+`getOrCreate`: a read-only forensic lookup must neither create a missing
+persistent device ID nor silently repair/replace a corrupt one. A missing,
+invalid, symlinked or mismatched identity fails closed as unverified.
+Tests confirm invalid identity bytes are left unchanged, no directory is
+created for a missing ID, and symlinked IDs are rejected.
+
+The server regression also submits a deliberately **forged** diagnostic
+response with `ProcessTreeStatus = "Terminated"`. The diagnostic may finish
+its own process-free read witness, but the server must keep the original
+`StartJob` witness `Dispatched`, retain the correction exclusion, and
+refuse Working-to-Ready until independent OS-backed verification. This
+negative-space test protects the distinction even if a future client
+regression or malicious source fabricates a positive-looking result.
+
+**Protocol 3.67 Release verification (2026-11-14):** Server 182/182, focused Client JobManager + ClientConfig 35/35, and full Client 632/632 passed with .NET 11. The immutable launch read remains diagnostic only, and the administrative correction epoch and endpoint remain disabled. No merge, push or deployment.

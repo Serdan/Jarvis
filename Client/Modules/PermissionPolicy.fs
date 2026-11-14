@@ -135,6 +135,7 @@ let private requiresConfirmation command =
     | GetGitDiffCommand _
     | ListJobsCommand _
     | GetJobResultCommand _
+    | GetProcessOwnershipEvidenceCommand _
     | MessageCommand _
     | GetClientActivityCommand _ -> readOnly
     | ScheduleBrowserExecutionCommand cmd ->

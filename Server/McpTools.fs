@@ -525,6 +525,7 @@ module McpToolHelpers =
         | GetGitDiffCommand _
         | ListJobsCommand _
         | GetJobResultCommand _
+        | GetProcessOwnershipEvidenceCommand _
         | MessageCommand _
         | GetClientActivityCommand _ -> [ Auth.WorkspaceRead ]
         | ImportFileCommand _
@@ -2466,6 +2467,12 @@ type JarvisMcpTools =
             ProjectName = projectName
             JobId = jobId
             AfterSequence = McpToolHelpers.optionOfNullableInt64 afterSequence })
+
+    [<McpServerTool(Title = "Get process ownership evidence", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read immutable device-local StartJob process identity by project and job UUID, including after client restart. Diagnostic evidence only: never proves descendant termination or authorizes agent correction.")>]
+    static member GetProcessOwnershipEvidence(projectName: string, agentId: string, jobId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http (GetProcessOwnershipEvidenceCommand {
+            ProjectName = projectName
+            JobId = jobId })
 
     [<McpServerTool(Title = "Cancel job", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["process:execute"]}]"""); Description("Stop a running Jarvis-managed development job. Requires client approval.")>]
     static member CancelJob(projectName: string, agentId: string, jobId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =

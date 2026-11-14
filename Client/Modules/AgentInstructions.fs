@@ -44,6 +44,7 @@ let private applicableTargets (rt: Runtime) command =
     | CreateProjectCommand _
     | UpdateClientCommand
     | GetJobResultCommand _
+    | GetProcessOwnershipEvidenceCommand _
     | GetAgentInstructionsCommand _
     | CancelJobCommand _
     | MessageCommand _

@@ -979,6 +979,12 @@ let private dispatch (rt: Runtime) (target: ProjectPaths.ProjectTarget option)
         | Some validated ->
             rt |> JobManager.getJobResultForProjectAsAgent (Some(ProjectPaths.ProjectTarget.projectId validated)) (Some agentId) cmd |> serialize'
         | None -> rt |> JobManager.getJobResultForProjectAsAgent None (Some agentId) cmd |> serialize'
+    | GetProcessOwnershipEvidenceCommand cmd ->
+        // A read-only historical process identity query, never a reap claim.
+        match target with
+        | Some validated ->
+            rt |> JobManager.getProcessOwnershipEvidenceForProject (Some(ProjectPaths.ProjectTarget.projectId validated)) cmd |> serialize'
+        | None -> rt |> JobManager.getProcessOwnershipEvidence cmd |> serialize'
     | CancelJobCommand cmd ->
         match target with
         | Some validated ->
@@ -1087,7 +1093,8 @@ let private receiveCommandWithTypedInstructions (rt: Runtime)
                                                 (target: ProjectPaths.ProjectTarget option) (agentId: string) command =
     task {
         match command with
-        | GetJobResultCommand _ | ListJobsCommand _ | CancelJobCommand _ ->
+        | GetJobResultCommand _ | GetProcessOwnershipEvidenceCommand _
+        | ListJobsCommand _ | CancelJobCommand _ ->
             // Cheap controls must bypass source instruction preparation and
             // remain responsive even while source/ledger commands are blocked.
             let! response = receiveCommandForTarget rt target None None agentId command
@@ -1164,7 +1171,8 @@ let processIncomingCommand (rt: Runtime) (commandJson: string) (agentId: string)
                             // Preserve the transport actor separately for job
                             // authorization, including unknown/expired IDs.
                             match command with
-                            | GetJobResultCommand _ | ListJobsCommand _ | CancelJobCommand _ -> ""
+                            | GetJobResultCommand _ | GetProcessOwnershipEvidenceCommand _
+                            | ListJobsCommand _ | CancelJobCommand _ -> ""
                             | _ when isLocalAgentActivity command -> agentId
                             | _ -> ""
                         if not (String.IsNullOrWhiteSpace localAgentId) then
@@ -1371,6 +1379,7 @@ let private shouldAutoPromote = function
     | StartJobCommand _ // Already returns its own OS process-job handle.
     | ListJobsCommand _
     | GetJobResultCommand _
+    | GetProcessOwnershipEvidenceCommand _
     | CancelJobCommand _
     | UpdateClientCommand
     | MessageCommand _

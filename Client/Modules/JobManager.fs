@@ -805,6 +805,57 @@ let getJobResult (cmd: GetJobResultCommand) =
         | Error error -> Error error
         | Ok canonical -> getJobResultForProject canonical cmd rt
 
+/// Read-only diagnostic for a server-pinned StartJob UUID. The caller must
+/// supply the logical project, and the record must belong to this device.
+/// No PID observation authorizes termination or correction.
+let getProcessOwnershipEvidenceForProject
+    (canonical: ProjectPaths.ProjectId option) (cmd: GetProcessOwnershipEvidenceCommand) =
+    fun _ ->
+        match canonical, projectId cmd.ProjectName with
+        | None, _ -> Error(ValidationError "Process ownership evidence requires an explicit project.")
+        | _, Error error -> Error error
+        | Some expected, Ok actual when actual <> expected ->
+            Error(ValidationError "Process evidence project does not match the authenticated route.")
+        | Some expected, Ok _ ->
+            try
+                match ProcessOwnershipJournal.inspectAt
+                          (ProcessOwnershipJournal.defaultDirectory()) cmd.JobId with
+                | Error failure -> Error(ContextError $"Process ownership remains unverified: {failure}")
+                | Ok evidence ->
+                    if evidence.Intent.ProjectId <> ProjectPaths.ProjectId.value expected then
+                        Error(ContextError "Process ownership project mismatch; evidence is unverified.")
+                    elif DeviceIdentity.tryReadExisting() <> Some evidence.Intent.DeviceId then
+                        Error(ContextError "Process ownership device mismatch or missing persisted identity; evidence is unverified.")
+                    else
+                        let launch = evidence.Launch
+                        let optionalText project =
+                            launch
+                            |> Option.map project
+                            |> Option.bind (fun value ->
+                                if String.IsNullOrWhiteSpace value then None else Some value)
+                        Ok
+                            { JobId = evidence.Intent.JobId
+                              ProjectId = evidence.Intent.ProjectId
+                              DeviceId = evidence.Intent.DeviceId
+                              ClientIncarnationId = evidence.Intent.ClientIncarnationId
+                              IntentCreatedUtc = evidence.Intent.CreatedUtc
+                              Stage = if launch.IsSome then "Launched" else "IntentOnly"
+                              ProcessId = launch |> Option.map (fun item -> item.ProcessId)
+                              ProcessStartUtc = optionalText (fun item -> item.ProcessStartUtc)
+                              LinuxBootId = optionalText (fun item -> item.LinuxBootId)
+                              LinuxStartTicks = optionalText (fun item -> item.LinuxStartTicks)
+                              IntentSha256 = optionalText (fun item -> item.IntentSha256)
+                              LaunchRecordedUtc = optionalText (fun item -> item.RecordedUtc)
+                              ProcessTreeStatus = "Unverified" }
+            with ex ->
+                Error(ContextError $"Process ownership remains unverified: {ex.GetType().Name}")
+
+let getProcessOwnershipEvidence (cmd: GetProcessOwnershipEvidenceCommand) =
+    fun rt ->
+        match projectId cmd.ProjectName with
+        | Error error -> Error error
+        | Ok expected -> getProcessOwnershipEvidenceForProject (Some expected) cmd rt
+
 let cancelJobForProjectAsAgent (canonical: ProjectPaths.ProjectId option) actor (cmd: CancelJobCommand) =
     fun rt ->
         match ToolOperations.cancel canonical actor cmd.JobId with

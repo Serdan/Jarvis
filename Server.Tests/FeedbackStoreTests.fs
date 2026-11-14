@@ -818,7 +818,7 @@ let ``authenticated StartJob client response does not prove child process exit``
                   DeviceName = "Workstation"
                   ProtocolVersion = Common.AgentProtocol.version
                   ClientVersion = "test"
-                  SupportedCommands = [ "StartJob"; "GetJobResult" ] },
+                  SupportedCommands = [ "StartJob"; "GetJobResult"; "GetProcessOwnershipEvidence" ] },
                 conn)
         let tracker = ClientResponseTracker()
         let correlation, expected =
@@ -883,6 +883,43 @@ let ``authenticated StartJob client response does not prove child process exit``
         |> shouldEqual (Ok(Some poll.Id))
         store.CountUnresolvedAgentExecutions(user, agent) |> shouldEqual 1
         store.TryAcquireAgentCorrection(user, agent, "operator-after-poll").IsError
+        |> shouldEqual true
+        // This independent read-only diagnostic can finish its OWN witness,
+        // but cannot close an earlier StartJob even if a compromised client
+        // reports a forged process-tree termination certificate.
+        let observer =
+            store.TryBeginAgentOperation(
+                user, agent, "GetProcessOwnershipEvidence", Some "Jarvis", "server",
+                Some "test", Some Common.AgentProtocol.version)
+            |> function Ok operation -> operation | Error error -> failwith error
+        store.TryMarkAgentDispatched(
+            user, observer.Id, "start-job-device", conn,
+            registered.Generation, "ownership-probe-correlation")
+        |> shouldEqual (Ok ())
+        let forged : Common.GetProcessOwnershipEvidenceResult =
+            { JobId = payload.JobId
+              ProjectId = "Jarvis"
+              DeviceId = "start-job-device"
+              ClientIncarnationId = Guid.NewGuid().ToString("D")
+              IntentCreatedUtc = DateTimeOffset.UtcNow.ToString("O")
+              Stage = "Launched"
+              ProcessId = Some 1234
+              ProcessStartUtc = None
+              LinuxBootId = None
+              LinuxStartTicks = None
+              IntentSha256 = Some(String('A', 64))
+              LaunchRecordedUtc = Some(DateTimeOffset.UtcNow.ToString("O"))
+              ProcessTreeStatus = "Terminated" }
+        let forgedResponse =
+            { response with Result = Some(JsonSerializer.Serialize(forged)) }
+        store.TryRecordAgentClientTerminal(
+            user, conn, registered.Generation,
+            "ownership-probe-correlation", clientResponse = forgedResponse)
+        |> shouldEqual (Ok(Some observer.Id))
+        store.GetAgentExecutionResolution(user, start.Id)
+        |> shouldEqual (Ok ExecutionUnresolved)
+        store.CountUnresolvedAgentExecutions(user, agent) |> shouldEqual 1
+        store.TryAcquireAgentCorrection(user, agent, "operator-after-forged-ownership-proof").IsError
         |> shouldEqual true)
 
 [<Test>]

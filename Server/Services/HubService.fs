@@ -121,6 +121,23 @@ type HubService(users: UserService, tracker: ClientResponseTracker, store: Feedb
         )
         Task.FromResult result
 
+    // Read-only self-user query. Never activates the target agent or counts as
+    // its activity. Requires a currently registered authenticated client.
+    member this.GetAgentActivity(projectName: string, agentId: string) =
+        match users.GetSessionByConnection(this.Context.ConnectionId) with
+        | ValueSome session when session.State = Registered
+                                 && session.ConnectionId = Some this.Context.ConnectionId ->
+            let project =
+                if isNull projectName then ""
+                else
+                    let marker = projectName.IndexOf("::", StringComparison.Ordinal)
+                    if marker < 0 then projectName else projectName.Substring(0, marker)
+            let seen = store.GetAttributedAgentActivity(this.UserId, project, agentId)
+            Task.FromResult({ LastSeenAtUtc = seen; ServerNowUtc = DateTimeOffset.UtcNow })
+        | _ ->
+            Task.FromException<AgentActivitySnapshot>(
+                UnauthorizedAccessException("A registered Jarvis client is required to verify Manager activity."))
+
     member this.SendClientResponse(correlationId: string, response: AgentCommandResponse) =
         users.TouchConnection(this.Context.ConnectionId)
         match users.GetSessionByConnection(this.Context.ConnectionId) with
@@ -133,5 +150,7 @@ type HubService(users: UserService, tracker: ClientResponseTracker, store: Feedb
 
     interface IHubService with
         member this.Connect(registration) = this.Connect(registration)
+
+        member this.GetAgentActivity(projectName, agentId) = this.GetAgentActivity(projectName, agentId)
 
         member this.SendClientResponse(correlationId, result) = this.SendClientResponse(correlationId, result)

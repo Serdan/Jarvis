@@ -165,7 +165,12 @@ module AgentStateInvalidationRouting =
                 project, (changes |> List.map _.AgentId |> List.distinct |> List.toArray))
 
 
-type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserService, tracker: ClientResponseTracker, http: IHttpContextAccessor, logger: ILogger<ClientService>) =
+type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserService, tracker: ClientResponseTracker, http: IHttpContextAccessor, logger: ILogger<ClientService>, store: FeedbackStore) =
+    // Preserve the test-only construction path; production DI chooses the
+    // longer constructor with a persistent activity store.
+    new(ctx, users, tracker, http, logger) =
+        ClientService(ctx, users, tracker, http, logger, Unchecked.defaultof<FeedbackStore>)
+
     member this.SendMessageToAll(message) = ctx.Clients.All.ReceiveMessage(message)
 
     // Typed, per-agent invalidation only reaches authenticated registered
@@ -189,6 +194,10 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
         else
             let separator = projectName.IndexOf("::", StringComparison.Ordinal)
             let project = if separator < 0 then projectName else projectName.Substring(0, separator)
+            // Durable before best-effort SignalR hints. Failed hint delivery
+            // cannot lose an activity update: the next verified query sees it.
+            if not (obj.ReferenceEquals(box store, null)) then
+                store.RecordAttributedAgentActivity(userId, project, agentId, observedAtUtc)
             users.ListDevices(userId)
             |> AgentStateInvalidationRouting.recipients
             |> Array.map (fun connectionId ->
@@ -294,23 +303,31 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
 
                         let mutable replyStartedAt = None
                         let dispatchAt = Stopwatch.GetTimestamp()
-                        try
-                            do! client.ReceiveCommand(correlationId, commandJson, defaultArg agentId "").WaitAsync(requestAborted)
-                            sendMs <- Stopwatch.GetElapsedTime(dispatchAt).TotalMilliseconds
-                            users.RecordDispatchSuccess(userId, connectionId)
-
-                            // Attribute only the original initiating actor, not a
-                            // different agent named by ObserveAgent or a job poll.
+                        // Persist the original attributed caller's activity
+                        // BEFORE the command can start executing on another
+                        // device. Hints are best-effort; the SQLite watermark
+                        // is what the Manager clock verifies before launch.
+                        let activityHints =
                             match agentId, AgentCommandInfo.projectName command with
                             | Some actor, Some project
                                 when not (String.IsNullOrWhiteSpace actor) &&
                                      not (String.IsNullOrWhiteSpace project) &&
                                      AgentCommandInfo.isAgentActivity command ->
-                                try
-                                    do! this.RecordAgentActivityForUser(userId, project, actor, DateTimeOffset.UtcNow)
+                                try Some(this.RecordAgentActivityForUser(userId, project, actor, DateTimeOffset.UtcNow))
+                                with ex ->
+                                    logger.LogWarning(ex, "Unable to persist attributed agent activity before dispatch")
+                                    None
+                            | _ -> None
+                        try
+                            do! client.ReceiveCommand(correlationId, commandJson, defaultArg agentId "").WaitAsync(requestAborted)
+                            sendMs <- Stopwatch.GetElapsedTime(dispatchAt).TotalMilliseconds
+                            users.RecordDispatchSuccess(userId, connectionId)
+                            match activityHints with
+                            | Some hints ->
+                                try do! hints
                                 with ex ->
                                     logger.LogWarning(ex, "Unable to publish cross-device agent activity hint")
-                            | _ -> ()
+                            | None -> ()
 
                             let awaitReplyAt = Stopwatch.GetTimestamp()
                             replyStartedAt <- Some awaitReplyAt

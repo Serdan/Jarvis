@@ -2,6 +2,7 @@ namespace Server.Services
 
 open System
 open System.Collections.Generic
+open System.Collections.Concurrent
 open System.IO
 open System.Threading
 open Microsoft.Data.Sqlite
@@ -115,6 +116,11 @@ type FeedbackStore(databasePath: string, ?telemetryRetention: TimeSpan) =
         | Some value -> box value
         | None -> box DBNull.Value
 
+    // Fail closed for an agent whose most recent accepted tool activity
+    // could not be persisted. A later successful write repairs the watermark.
+    // This is only a safety guard; the durable values remain in SQLite.
+    let unverifiedActivity = ConcurrentDictionary<struct (string * string * string), byte>()
+
     let optionText (reader: SqliteDataReader) ordinal =
         if reader.IsDBNull ordinal then None else Some(reader.GetString ordinal)
 
@@ -208,6 +214,17 @@ CREATE TABLE IF NOT EXISTS connection_events (
 
 CREATE INDEX IF NOT EXISTS ix_connection_events_user_created
     ON connection_events(user_id, created_at DESC);
+
+-- Authoritative, authenticated, user-scoped activity watermarks for
+-- AfterAgentIdle scheduling. Not canonical agent lifecycle state and never
+-- written by observer queries or another agent's read.
+CREATE TABLE IF NOT EXISTS attributed_agent_activity (
+    user_id TEXT NOT NULL,
+    project_name TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    PRIMARY KEY(user_id, project_name, agent_id)
+);
 """
         schema.ExecuteNonQuery() |> ignore
 
@@ -252,6 +269,55 @@ CREATE INDEX IF NOT EXISTS ix_connection_events_user_created
         member _.Dispose() = pruneTimer.Dispose()
 
     member _.DatabasePath = databasePath
+
+    member _.RecordAttributedAgentActivity(userId: string, projectName: string, agentId: string, observedAt: DateTimeOffset) =
+        if String.IsNullOrWhiteSpace userId || String.IsNullOrWhiteSpace projectName ||
+           String.IsNullOrWhiteSpace agentId ||
+           projectName.Length > 256 || agentId.Length > 128 then
+            invalidArg "projectName" "An authenticated user, bounded project and agent ID are required."
+        let key = struct (userId, projectName, agentId)
+        try
+            use connection = openConnection()
+            use command = connection.CreateCommand()
+            command.CommandText <-
+                """
+INSERT INTO attributed_agent_activity(user_id, project_name, agent_id, last_seen_at)
+VALUES ($user, $project, $agent, $observed)
+ON CONFLICT(user_id, project_name, agent_id) DO UPDATE SET
+    last_seen_at = MAX(attributed_agent_activity.last_seen_at, excluded.last_seen_at);
+"""
+            addParameter command "$user" userId
+            addParameter command "$project" projectName
+            addParameter command "$agent" agentId
+            addParameter command "$observed" (observedAt.ToUniversalTime().ToString("O"))
+            command.ExecuteNonQuery() |> ignore
+            let mutable removed = 0uy
+            unverifiedActivity.TryRemove(key, &removed) |> ignore
+        with _ ->
+            unverifiedActivity[key] <- 1uy
+            reraise()
+
+    member _.GetAttributedAgentActivity(userId: string, projectName: string, agentId: string) =
+        if String.IsNullOrWhiteSpace userId || String.IsNullOrWhiteSpace projectName ||
+           String.IsNullOrWhiteSpace agentId ||
+           projectName.Length > 256 || agentId.Length > 128 then
+            invalidArg "projectName" "An authenticated user, bounded project and agent ID are required."
+        if unverifiedActivity.ContainsKey(struct (userId, projectName, agentId)) then
+            invalidOp "Agent activity watermark could not be persisted; idle verification is unsafe."
+        use connection = openConnection()
+        use command = connection.CreateCommand()
+        command.CommandText <-
+            """
+SELECT last_seen_at FROM attributed_agent_activity
+WHERE user_id = $user AND project_name = $project AND agent_id = $agent;
+"""
+        addParameter command "$user" userId
+        addParameter command "$project" projectName
+        addParameter command "$agent" agentId
+        match command.ExecuteScalar() with
+        | null -> None
+        | :? string as value -> Some(DateTimeOffset.Parse(value, Globalization.CultureInfo.InvariantCulture))
+        | _ -> invalidOp "Unexpected attributed agent activity watermark."
 
     member _.AddConnectionEvent(
         userId: string,

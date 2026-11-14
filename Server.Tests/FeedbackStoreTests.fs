@@ -497,3 +497,61 @@ let ``explicit agent metadata is isolated between concurrent calls`` () =
         values[1] |> shouldEqual (Some "Agent B")
         RequestDeviceRouting.agentId() |> shouldEqual None
     }
+
+[<Test>]
+let ``attributed activity watermarks survive restart and isolate users`` () =
+    let directory = Path.Combine(Path.GetTempPath(), "jarvis-agent-activity-" + Guid.NewGuid().ToString("N"))
+    Directory.CreateDirectory(directory) |> ignore
+    let path = Path.Combine(directory, "jarvis.db")
+    let t0 = DateTimeOffset(2026, 11, 14, 11, 0, 0, TimeSpan.Zero)
+    try
+        do
+            use store = new FeedbackStore(path)
+            Assert.That(store.GetAttributedAgentActivity("alice", "Wayfold", "Manager"), Is.EqualTo(None))
+            store.RecordAttributedAgentActivity("alice", "Wayfold", "Manager", t0)
+            store.RecordAttributedAgentActivity("alice", "Wayfold", "Manager", t0.AddMinutes(-5.))
+            store.RecordAttributedAgentActivity("alice", "Wayfold", "Manager", t0.AddMinutes(5.))
+            store.RecordAttributedAgentActivity("alice", "Jarvis", "Manager", t0.AddMinutes(10.))
+            store.RecordAttributedAgentActivity("bob", "Wayfold", "Manager", t0.AddMinutes(15.))
+        use restarted = new FeedbackStore(path)
+        Assert.That(restarted.GetAttributedAgentActivity("alice", "Wayfold", "Manager"),
+                    Is.EqualTo(Some(t0.AddMinutes(5.))), "Watermark must be monotonic after restart.")
+        Assert.That(restarted.GetAttributedAgentActivity("alice", "Jarvis", "Manager"),
+                    Is.EqualTo(Some(t0.AddMinutes(10.))))
+        Assert.That(restarted.GetAttributedAgentActivity("bob", "Wayfold", "Manager"),
+                    Is.EqualTo(Some(t0.AddMinutes(15.))))
+        Assert.That(restarted.GetAttributedAgentActivity("alice", "Wayfold", "Worker 1"), Is.EqualTo(None))
+    finally
+        Directory.Delete(directory, true)
+
+[<Test>]
+let failedAgentActivityPersistencePoisonsVerificationUntilSuccessfulRepair () =
+    let directory = Path.Combine(Path.GetTempPath(), "jarvis-activity-fail-" + Guid.NewGuid().ToString("N"))
+    Directory.CreateDirectory(directory) |> ignore
+    let dbPath = Path.Combine(directory, "jarvis.db")
+    try
+        use store = new FeedbackStore(dbPath)
+        let first = DateTimeOffset(2026, 11, 14, 12, 0, 0, TimeSpan.Zero)
+        store.RecordAttributedAgentActivity("alice", "Jarvis", "Manager", first)
+        let runSql statement =
+            use connection = new SqliteConnection("Data Source=" + dbPath)
+            connection.Open()
+            use command = connection.CreateCommand()
+            command.CommandText <- statement
+            command.ExecuteNonQuery() |> ignore
+        runSql "DROP TABLE attributed_agent_activity"
+        Assert.Throws<SqliteException>(fun () ->
+            store.RecordAttributedAgentActivity("alice", "Jarvis", "Manager", first.AddMinutes(2.)))
+        |> ignore
+        Assert.Throws<InvalidOperationException>(fun () ->
+            store.GetAttributedAgentActivity("alice", "Jarvis", "Manager") |> ignore)
+        |> ignore
+        runSql """CREATE TABLE attributed_agent_activity (
+            user_id TEXT NOT NULL, project_name TEXT NOT NULL,
+            agent_id TEXT NOT NULL, last_seen_at TEXT NOT NULL,
+            PRIMARY KEY(user_id, project_name, agent_id))"""
+        store.RecordAttributedAgentActivity("alice", "Jarvis", "Manager", first.AddMinutes(4.))
+        Assert.That(store.GetAttributedAgentActivity("alice", "Jarvis", "Manager"),
+                    Is.EqualTo(Some(first.AddMinutes(4.))))
+    finally
+        Directory.Delete(directory, true)

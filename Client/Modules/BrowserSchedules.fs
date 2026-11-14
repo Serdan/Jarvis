@@ -1,7 +1,9 @@
 module Client.BrowserSchedules
 
 open System
+open System.Collections.Generic
 open System.IO
+open System.Runtime.InteropServices
 open System.Text
 open System.Text.Json
 open System.Threading
@@ -43,6 +45,43 @@ type ScheduledAction =
       Disabled: bool
       LastResult: string }
 
+// A claim must survive sudden power loss before any external side effect.
+// On Unix, the containing directory must be synced after the atomic rename.
+// On Windows, use MOVEFILE_WRITE_THROUGH with replace semantics.
+module private DurableRename =
+    [<DllImport("libc", EntryPoint = "open", SetLastError = true)>]
+    extern int OpenDirectory(string path, int flags)
+
+    [<DllImport("libc", EntryPoint = "fsync", SetLastError = true)>]
+    extern int Sync(int fd)
+
+    [<DllImport("libc", EntryPoint = "close", SetLastError = true)>]
+    extern int Close(int fd)
+
+    [<DllImport("kernel32.dll", EntryPoint = "MoveFileExW", CharSet = CharSet.Unicode, SetLastError = true)>]
+    extern bool MoveFileEx(string source, string destination, uint32 flags)
+
+module private DurableScheduleFile =
+    let private syncParentDirectory folder =
+        let flags = if OperatingSystem.IsMacOS() then 0x100000 else 0x10000
+        let fd = DurableRename.OpenDirectory(folder, flags)
+        if fd < 0 then
+            raise (IOException(sprintf "Cannot open schedule directory for fsync (errno=%d)." (Marshal.GetLastPInvokeError())))
+        try
+            if DurableRename.Sync(fd) <> 0 then
+                raise (IOException(sprintf "Schedule claim directory fsync failed (errno=%d)." (Marshal.GetLastPInvokeError())))
+        finally
+            DurableRename.Close(fd) |> ignore
+
+    let replace temp path =
+        if OperatingSystem.IsWindows() then
+            // MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH
+            if not (DurableRename.MoveFileEx(temp, path, 0x9u)) then
+                raise (IOException(sprintf "Durable schedule replace failed (win32=%d)." (Marshal.GetLastPInvokeError())))
+        else
+            File.Move(temp, path, true)
+            syncParentDirectory (Path.GetDirectoryName(Path.GetFullPath(path)))
+
 let private describe (a: ScheduledAction) =
     let origin =
         match Uri.TryCreate(a.Url, UriKind.Absolute) with
@@ -80,16 +119,41 @@ let private describe (a: ScheduledAction) =
        error = a.Error
        updatedAtUtc = a.UpdatedAtUtc |}
 
-type Service(path: string, execute: ScheduledAction -> Task<Result<string,string * string>>, ?now: unit -> DateTimeOffset, ?pollMs: int, ?agentLastSeen: string -> string -> DateTimeOffset option) =
+type Service(path: string, execute: ScheduledAction -> Task<Result<string,string * string>>, ?now: unit -> DateTimeOffset, ?pollMs: int, ?agentLastSeen: string -> string -> DateTimeOffset option, ?verifyIdleActivity: string -> string -> Task<Result<DateTimeOffset option,string>>) =
     let gate = obj()
+    // A process-wide exclusive lifetime lease, acquired BEFORE loading state.
+    // A second JarvisClient cannot read stale pending and race a claim. The
+    // kernel releases this lease when its owner crashes.
+    let ownership =
+        let absolute = Path.GetFullPath(path)
+        Directory.CreateDirectory(Path.GetDirectoryName(absolute)) |> ignore
+        let lockPath = absolute + ".owner.lock"
+        if File.Exists(lockPath) && File.GetAttributes(lockPath).HasFlag(FileAttributes.ReparsePoint) then
+            invalidOp "Execution scheduler ownership path must not be a symbolic link."
+        try
+            let stream = new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None)
+            if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
+                File.SetUnixFileMode(lockPath, UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
+            stream
+        with :? IOException as error ->
+            raise (IOException("Execution scheduler already owned by another JarvisClient process (exclusive schedule store lock).", error))
     let cancellation = new CancellationTokenSource()
     let clock = defaultArg now (fun () -> DateTimeOffset.UtcNow)
     let interval = defaultArg pollMs 1000
     let seen = defaultArg agentLastSeen (fun _ _ -> None)
+    // An unverified local hint is never sufficient to launch a Manager.
+    // Production uses an authenticated server-side SQLite-backed snapshot.
+    let verify = defaultArg verifyIdleActivity (fun _ _ ->
+        Task.FromResult(Error "ActivityVerificationUnavailable: authenticated server snapshot is required."))
     let isIdle (a: ScheduledAction) = a.TriggerKind = "AfterAgentIdle"
     let mutable actions: ScheduledAction list = []
     let mutable started = false
+    let mutable disposed = false
     let mutable worker: Task = Task.CompletedTask
+    // Idle waiting is long-lived; reconcile missed hints periodically rather
+    // than issuing a fresh server read every scheduling tick forever.
+    let nextWaitingCheck = Dictionary<string, DateTimeOffset>(StringComparer.Ordinal)
+    let waitingPoll = TimeSpan.FromMilliseconds(float (max 150 (interval * 15)))
 
     let persist items =
         let folder = Path.GetDirectoryName(Path.GetFullPath(path))
@@ -103,7 +167,7 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
             file.Write(bytes)
             file.Flush(true)
             file.Close()
-            File.Move(temp, path, true)
+            DurableScheduleFile.replace temp path
         finally
             if File.Exists(temp) then File.Delete(temp)
 
@@ -145,7 +209,8 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
                 (if state = "notSubmitted" then "failed" else status)
             with _ -> rawResult, "", "", status
         lock gate (fun () ->
-            match actions |> List.tryFind (fun a -> a.Id = id && a.AttemptId = attemptId && a.Status = "running") with
+            match actions |> List.tryFind (fun a ->
+                not disposed && a.Id = id && a.AttemptId = attemptId && a.Status = "running") with
             | None -> ()
             | Some _ ->
                 setActions (actions |> List.map (fun a ->
@@ -190,60 +255,65 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
                     else a)))
 
     do
-        if File.Exists(path) then
-            if File.GetAttributes(path).HasFlag(FileAttributes.ReparsePoint) then
-                invalidOp "Browser schedules must not use a symbolic-link state file."
-            if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
-                let mode = File.GetUnixFileMode(path)
-                if (mode &&& (UnixFileMode.GroupRead ||| UnixFileMode.OtherRead ||| UnixFileMode.GroupWrite ||| UnixFileMode.OtherWrite)) <> enum 0 then
-                    invalidOp "Browser schedules state file permissions are too broad."
-            use data = JsonDocument.Parse(File.ReadAllText(path))
-            let root = data.RootElement
-            if root.GetProperty("schemaVersion").GetInt32() <> 1 &&
-               root.GetProperty("schemaVersion").GetInt32() <> 2 &&
-               root.GetProperty("schemaVersion").GetInt32() <> 3 then
-                invalidOp "Unsupported browser schedules state schema."
-            let restored =
-                JsonSerializer.Deserialize<ScheduledAction list>(root.GetProperty("actions").GetRawText())
-            actions <-
-                restored
-                |> List.map (fun action ->
-                    if action.Status = "running" then
-                        if isIdle action then
-                            let now = clock()
-                            let stale = action.StartedAtUtc.AddMinutes(30.)
-                            { action with Status = "pending"
-                                          DueAtUtc = max now stale
-                                          Error = "outcomeUnknown: prior Manager launch interrupted; next attempt only after stale cutoff."
-                                          UpdatedAtUtc = now }
-                        elif action.RepeatEverySeconds > 0 then
+        try
+            if File.Exists(path) then
+                if File.GetAttributes(path).HasFlag(FileAttributes.ReparsePoint) then
+                    invalidOp "Browser schedules must not use a symbolic-link state file."
+                if OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() then
+                    let mode = File.GetUnixFileMode(path)
+                    if (mode &&& (UnixFileMode.GroupRead ||| UnixFileMode.OtherRead ||| UnixFileMode.GroupWrite ||| UnixFileMode.OtherWrite)) <> enum 0 then
+                        invalidOp "Browser schedules state file permissions are too broad."
+                use data = JsonDocument.Parse(File.ReadAllText(path))
+                let root = data.RootElement
+                if root.GetProperty("schemaVersion").GetInt32() <> 1 &&
+                   root.GetProperty("schemaVersion").GetInt32() <> 2 &&
+                   root.GetProperty("schemaVersion").GetInt32() <> 3 then
+                    invalidOp "Unsupported browser schedules state schema."
+                let restored =
+                    JsonSerializer.Deserialize<ScheduledAction list>(root.GetProperty("actions").GetRawText())
+                actions <-
+                    restored
+                    |> List.map (fun action ->
+                        if action.Status = "running" then
+                            if isIdle action then
+                                let now = clock()
+                                let stale = action.StartedAtUtc.AddMinutes(30.)
+                                { action with Status = "pending"
+                                              DueAtUtc = max now stale
+                                              Error = "outcomeUnknown: prior Manager launch interrupted; next attempt only after stale cutoff."
+                                              UpdatedAtUtc = now }
+                            elif action.RepeatEverySeconds > 0 then
+                                let now = clock()
+                                let seconds = float action.RepeatEverySeconds
+                                let elapsed = max 0.0 (now - action.DueAtUtc).TotalSeconds
+                                let skipped = floor(elapsed / seconds) + 1.0
+                                { action with Status = "pending"
+                                              DueAtUtc = action.DueAtUtc.AddSeconds(skipped * seconds)
+                                              Error = "outcomeUnknown: previous occurrence interrupted; never replayed."
+                                              UpdatedAtUtc = now }
+                            else
+                                { action with Status = "outcomeUnknown"
+                                              Error = "JarvisClient stopped after claiming this one-shot action; it was not replayed."
+                                              UpdatedAtUtc = clock() }
+                        elif action.Status = "pending" && action.RepeatEverySeconds > 0 &&
+                             action.DueAtUtc < clock() then
                             let now = clock()
                             let seconds = float action.RepeatEverySeconds
-                            let elapsed = max 0.0 (now - action.DueAtUtc).TotalSeconds
-                            let skipped = floor(elapsed / seconds) + 1.0
-                            { action with Status = "pending"
-                                          DueAtUtc = action.DueAtUtc.AddSeconds(skipped * seconds)
-                                          Error = "outcomeUnknown: previous occurrence interrupted; never replayed."
+                            let elapsed = (now - action.DueAtUtc).TotalSeconds
+                            { action with DueAtUtc = action.DueAtUtc.AddSeconds((floor(elapsed / seconds) + 1.0) * seconds)
                                           UpdatedAtUtc = now }
-                        else
-                            { action with Status = "outcomeUnknown"
-                                          Error = "JarvisClient stopped after claiming this one-shot action; it was not replayed."
+                        elif action.Status = "pending" &&
+                             (String.IsNullOrWhiteSpace(action.ActionKind) || action.ActionKind = "BrowserScript") &&
+                             String.IsNullOrWhiteSpace(action.WindowRegistration) then
+                            { action with Status = "failed"
+                                          Error = "WindowRegistrationRequired: reconfigure old browser schedule."
                                           UpdatedAtUtc = clock() }
-                    elif action.Status = "pending" && action.RepeatEverySeconds > 0 &&
-                         action.DueAtUtc < clock() then
-                        let now = clock()
-                        let seconds = float action.RepeatEverySeconds
-                        let elapsed = (now - action.DueAtUtc).TotalSeconds
-                        { action with DueAtUtc = action.DueAtUtc.AddSeconds((floor(elapsed / seconds) + 1.0) * seconds)
-                                      UpdatedAtUtc = now }
-                    elif action.Status = "pending" &&
-                         (String.IsNullOrWhiteSpace(action.ActionKind) || action.ActionKind = "BrowserScript") &&
-                         String.IsNullOrWhiteSpace(action.WindowRegistration) then
-                        { action with Status = "failed"
-                                      Error = "WindowRegistrationRequired: reconfigure old browser schedule."
-                                      UpdatedAtUtc = clock() }
-                    else action)
-            if restored <> actions then persist actions
+                        else action)
+                if restored <> actions then persist actions
+
+        with _ ->
+            ownership.Dispose()
+            reraise()
 
     member _.Schedule(id: string, seconds: int, url: string, project: string, script: string, alias: string, args: string, active: bool, ?windowRegistration: string, ?closeAfter: bool, ?repeatEverySeconds: int) =
         let window = defaultArg windowRegistration ""
@@ -441,11 +511,12 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
             worker <- task {
                 try
                     while not cancellation.IsCancellationRequested do
-                        let next =
+                        // Local notifications may postpone a deadline, but are
+                        // not proof that an idle agent has stopped sending tools.
+                        // Never hold the state lock across server verification.
+                        let candidate =
                             lock gate (fun () ->
                                 let current = clock()
-                                // Refresh observed activity before comparing idle deadlines.
-                                // A read-only observe_agent call is not an attributed activity source.
                                 let refreshed =
                                     actions |> List.map (fun a ->
                                         if not (isIdle a) || a.Disabled then a
@@ -463,36 +534,126 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
                                                 let activity = latest |> Option.defaultValue DateTimeOffset.MinValue
                                                 let lastProgress = max a.StartedAtUtc activity
                                                 if current >= lastProgress.AddMinutes(30.) then
-                                                    // An old attempt may still finish. The UUID check in update
-                                                    // prevents that late result from overwriting its replacement.
                                                     { a with Status = "pending"; DueAtUtc = current
                                                              Error = "outcomeUnknown: previous Manager launch stale after 30 minutes."
                                                              UpdatedAtUtc = current }
                                                 else a
                                             | _ -> a)
                                 if refreshed <> actions then setActions refreshed
-                                let inFlight =
-                                    actions |> List.filter (fun a -> a.Status = "running") |> List.length
+                                let running = actions |> List.filter (fun a -> a.Status = "running")
+                                let alreadyRunningManager entry =
+                                    isIdle entry && (running |> List.exists (fun a ->
+                                        isIdle a && a.ProjectName = entry.ProjectName
+                                        && a.IdleAgentId = entry.IdleAgentId))
                                 let due =
-                                    if inFlight >= 8 then None
+                                    if running.Length >= 8 then None
                                     else
                                         actions
-                                        |> List.filter (fun a -> a.Status = "pending" &&
-                                                                 not a.Disabled && a.DueAtUtc <= current)
+                                        |> List.filter (fun a ->
+                                            a.Status = "pending" && not a.Disabled
+                                            && a.DueAtUtc <= current && not (alreadyRunningManager a))
                                         |> List.sortBy (fun a -> a.DueAtUtc)
                                         |> List.tryHead
                                 match due with
-                                | None -> None
-                                | Some entry ->
-                                    let claimed =
-                                        { entry with Status = "running"
-                                                     AttemptId = Guid.NewGuid().ToString("N")
-                                                     StartedAtUtc = current
-                                                     UpdatedAtUtc = current }
-                                    // Atomic, fsync-backed claim before any side effects.
-                                    setActions (actions |> List.map (fun a ->
-                                        if a.Id = entry.Id then claimed else a))
-                                    Some claimed)
+                                | Some item -> Some item
+                                | None ->
+                                    // A finished Manager stays waiting until a fresh
+                                    // server watermark proves a new idle episode.
+                                    // Read slowly when nothing is due, unlike an active
+                                    // due deadline which is always freshly verified.
+                                    let waiting =
+                                        actions
+                                        |> List.tryFind (fun a ->
+                                            isIdle a && a.Status = "waitingActivity" && not a.Disabled
+                                            && (match nextWaitingCheck.TryGetValue a.Id with
+                                                | true, nextCheck -> DateTimeOffset.UtcNow >= nextCheck
+                                                | _ -> true))
+                                    waiting |> Option.iter (fun a ->
+                                        nextWaitingCheck[a.Id] <- DateTimeOffset.UtcNow.Add(waitingPoll))
+                                    waiting)
+
+                        let! verification =
+                            match candidate with
+                            | Some entry when isIdle entry ->
+                                task {
+                                    try
+                                        return! verify entry.ProjectName entry.IdleAgentId
+                                    with ex ->
+                                        return Error("ActivityVerificationUnavailable: " + ex.GetType().Name)
+                                }
+                            | _ -> Task.FromResult(Ok None)
+
+                        let next =
+                            lock gate (fun () ->
+                                if disposed || cancellation.IsCancellationRequested then None
+                                else
+                                    match candidate with
+                                    | None -> None
+                                    | Some prior ->
+                                        match actions |> List.tryFind (fun a -> a.Id = prior.Id) with
+                                        | None -> None
+                                        | Some currentEntry when currentEntry.Disabled ||
+                                             (currentEntry.Status <> "pending" && currentEntry.Status <> "waitingActivity") ->
+                                            None
+                                        | Some currentEntry ->
+                                            let now = clock()
+                                            let eligible () =
+                                                currentEntry.Status = "pending" && currentEntry.DueAtUtc <= now
+                                                && (actions |> List.filter (fun a -> a.Status = "running") |> List.length) < 8
+                                                && (not (isIdle currentEntry) ||
+                                                    not (actions |> List.exists (fun a ->
+                                                        isIdle a && a.Status = "running"
+                                                        && a.ProjectName = currentEntry.ProjectName
+                                                        && a.IdleAgentId = currentEntry.IdleAgentId)))
+                                            let claim () =
+                                                let claimed =
+                                                    { currentEntry with Status = "running"
+                                                                        AttemptId = Guid.NewGuid().ToString("N")
+                                                                        StartedAtUtc = now
+                                                                        UpdatedAtUtc = now }
+                                                // An fsync-backed claim is committed while
+                                                // holding this process's lifetime ownership lease.
+                                                setActions (actions |> List.map (fun a ->
+                                                    if a.Id = currentEntry.Id then claimed else a))
+                                                Some claimed
+                                            if not (isIdle currentEntry) then
+                                                if eligible() then claim() else None
+                                            else
+                                                match verification with
+                                                | Error reason ->
+                                                    // No verified snapshot means no Manager launch.
+                                                    // Persist one diagnostic transition, not a write per poll.
+                                                    let message = "AgentActivityUnverified: " + reason
+                                                    if currentEntry.Error <> message then
+                                                        setActions (actions |> List.map (fun a ->
+                                                            if a.Id = currentEntry.Id then
+                                                                { a with Error = message; UpdatedAtUtc = now }
+                                                            else a))
+                                                    None
+                                                | Ok remote ->
+                                                    let local = seen currentEntry.ProjectName currentEntry.IdleAgentId
+                                                    let latest =
+                                                        [remote; local]
+                                                        |> List.choose id
+                                                        |> List.sortDescending
+                                                        |> List.tryHead
+                                                    match latest with
+                                                    | Some at when at > currentEntry.LastActivityAtUtc ->
+                                                        let due = at.AddSeconds(float currentEntry.IdleSeconds)
+                                                        let due =
+                                                            if currentEntry.LastActivityAtUtc = DateTimeOffset.MinValue then
+                                                                max currentEntry.DueAtUtc due
+                                                            else due
+                                                        setActions (actions |> List.map (fun a ->
+                                                            if a.Id = currentEntry.Id then
+                                                                { a with LastActivityAtUtc = at; DueAtUtc = due
+                                                                         Status = "pending"; Error = ""
+                                                                         UpdatedAtUtc = now }
+                                                            else a))
+                                                        None
+                                                    | _ when currentEntry.Status = "waitingActivity" -> None
+                                                    | _ when eligible() -> claim()
+                                                    | _ -> None)
                         match next with
                         | None -> ()
                         | Some entry ->
@@ -512,7 +673,6 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
                                     update entry.Id entry.AttemptId "outcomeUnknown" ""
                                         ("Unexpected error: " + ex.GetType().Name)
                             }
-                            // Never let a long CLI command or browser request stop the scheduling clock.
                             Task.Run(Func<Task>(fun () -> run () :> Task)) |> ignore
                         do! Task.Delay(interval, cancellation.Token)
                 with :? OperationCanceledException -> ()
@@ -521,8 +681,13 @@ type Service(path: string, execute: ScheduledAction -> Task<Result<string,string
     interface IDisposable with
         member _.Dispose() =
             cancellation.Cancel()
-            // A running action stays marked as such until its callback completes.
-            // If the client process terminates, startup marks it outcomeUnknown.
+            // Do not release the cross-process lease while the tick loop can
+            // still persist a claim. Late async results must not write state.
+            try worker.Wait(TimeSpan.FromSeconds(10.)) |> ignore
+            with :? AggregateException as errors when
+                errors.InnerExceptions |> Seq.forall (fun e -> e :? OperationCanceledException) -> ()
+            lock gate (fun () -> disposed <- true)
+            ownership.Dispose()
             cancellation.Dispose()
 
 let defaultPath () =

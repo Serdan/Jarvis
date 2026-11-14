@@ -2211,6 +2211,10 @@ let attributed_tool_dispatch_reaches_both_user_devices_but_not_other_users_or_jo
     register "alice" "laptop" "laptop-connection"
     register "bob" "foreign" "foreign-connection"
     let tracker = ClientResponseTracker()
+    let activityDb = System.IO.Path.Combine(System.IO.Path.GetTempPath(),
+                        "jarvis-dispatch-activity-" + Guid.NewGuid().ToString("N") + ".db")
+    use activityStore = new FeedbackStore(activityDb)
+    let mutable persistedBeforeRemoteExecution = false
     let received = System.Collections.Concurrent.ConcurrentQueue<string * string * string * DateTimeOffset>()
     let expected = { Result = Some "ok"; Error = None; Instructions = []
                      AgentStateChanges = []; InboxActivation = None; PendingJob = None }
@@ -2218,6 +2222,8 @@ let attributed_tool_dispatch_reaches_both_user_devices_but_not_other_users_or_jo
         { new Common.SignalR.IClientService with
             member _.ReceiveMessage(_) = Task.CompletedTask
             member _.ReceiveCommand(correlationId, _, _) =
+                persistedBeforeRemoteExecution <-
+                    activityStore.GetAttributedAgentActivity("alice", "Jarvis", "Manager").IsSome
                 tracker.Complete(correlationId, "alice", connection, registrations[connection], expected)
                 |> ignore
                 Task.CompletedTask
@@ -2244,13 +2250,19 @@ let attributed_tool_dispatch_reaches_both_user_devices_but_not_other_users_or_jo
     let accessor = Microsoft.AspNetCore.Http.HttpContextAccessor()
     accessor.HttpContext <- Microsoft.AspNetCore.Http.DefaultHttpContext()
     let service = ClientService(hub, users, tracker, accessor,
-        Microsoft.Extensions.Logging.Abstractions.NullLogger<ClientService>.Instance)
+        Microsoft.Extensions.Logging.Abstractions.NullLogger<ClientService>.Instance, activityStore)
     let run =
         RunCommandCommand
             { ProjectName = "Jarvis::branch"; Executable = "dotnet"; Args = [ "--version" ]
               Reason = None; WorkingDirectory = None; TimeoutSeconds = None; MaxOutputBytes = None }
     let! result = service.SendCommandToUser("alice", run, deviceId = "desktop", agentId = "Manager")
     Assert.That(result.Result, Is.EqualTo(Some "ok"))
+    Assert.That(persistedBeforeRemoteExecution, Is.True,
+                "Authenticated caller activity must be durable before the client command begins.")
+    let verified =
+        activityStore.GetAttributedAgentActivity("alice", "Jarvis", "Manager")
+    Assert.That(verified.IsSome, Is.True)
+    Assert.That(activityStore.GetAttributedAgentActivity("bob", "Jarvis", "Manager"), Is.EqualTo(None))
     let notifications = received.ToArray()
     Assert.That(notifications.Length, Is.EqualTo(2))
     let observedDevices = notifications |> Array.map (fun (connection, _, _, _) -> connection) |> Set.ofArray
@@ -2265,4 +2277,6 @@ let attributed_tool_dispatch_reaches_both_user_devices_but_not_other_users_or_jo
     let! result2 = service.SendCommandToUser("alice", poll, deviceId = "desktop", agentId = "Manager")
     Assert.That(result2.Result, Is.EqualTo(Some "ok"))
     Assert.That(received.Count, Is.EqualTo(2), "Job polling must not reset Manager idle clock")
+    Assert.That(activityStore.GetAttributedAgentActivity("alice", "Jarvis", "Manager"),
+                Is.EqualTo(verified), "Job polling must not modify the durable activity watermark.")
 }

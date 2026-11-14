@@ -245,7 +245,8 @@ let idleManagerResetsFromCrossClientActivityAndWaitsForFreshActivityToRearm () =
     }
     try
         use store = new BrowserSchedules.Service(path, executor, now=(fun () -> clock), pollMs=25,
-                                                  agentLastSeen=observed)
+                                                  agentLastSeen=observed,
+                                                  verifyIdleActivity=(fun p a -> Task.FromResult(Ok(observed p a))))
         let config =
             { commandSchedule "manager" "AfterAgentIdle" with
                 RunAfterSeconds = None; IdleAgentId = Some "Manager"; IdleSeconds = Some 900 }
@@ -369,7 +370,8 @@ let staleManagerAttemptRequiresThirtyMinutesAndRejectsLateResult () = task {
         return Ok("attempt " + string index)
     }
     try
-        use store = new BrowserSchedules.Service(path, executor, now=(fun () -> clock), pollMs=25)
+        use store = new BrowserSchedules.Service(path, executor, now=(fun () -> clock), pollMs=25,
+                                                 verifyIdleActivity=(fun _ _ -> Task.FromResult(Ok None)))
         let config =
             { commandSchedule "manager-stale" "AfterAgentIdle" with
                 RunAfterSeconds = None; IdleAgentId = Some "Manager"; IdleSeconds = Some 60 }
@@ -389,5 +391,113 @@ let staleManagerAttemptRequiresThirtyMinutesAndRejectsLateResult () = task {
                     "A late first-attempt result cannot overwrite the replacement")
     finally
         firstGate.TrySetResult(()) |> ignore
+        Directory.Delete(dir, true)
+}
+
+[<Test>]
+let independentClientsCannotBothOwnOrDispatchSameOccurrence () = task {
+    let dir,path = temp()
+    let mutable clock = DateTimeOffset.UtcNow
+    let mutable executions = 0
+    let executor (_: BrowserSchedules.ScheduledAction) = task {
+        System.Threading.Interlocked.Increment(&executions) |> ignore
+        return Ok "success"
+    }
+    try
+        do! task {
+            use owner = new BrowserSchedules.Service(path, executor, now=(fun () -> clock), pollMs=25)
+            Assert.That(owner.ScheduleExecution(commandSchedule "once" "Once").IsOk, Is.True)
+            Assert.Throws<IOException>(fun () ->
+                use competitor = new BrowserSchedules.Service(path, executor, now=(fun () -> clock), pollMs=25)
+                competitor.Start()) |> ignore
+            // The second client cannot read/cas/overwrite a pending occurrence.
+            owner.Start()
+            clock <- clock.AddSeconds(601.)
+            do! awaitStatus (fun () -> status owner "once" = "completed")
+            Assert.That(executions, Is.EqualTo(1))
+        }
+        use afterOwnerStops = new BrowserSchedules.Service(path, executor, now=(fun () -> clock), pollMs=25)
+        Assert.That(status afterOwnerStops "once", Is.EqualTo("completed"))
+        afterOwnerStops.Start()
+        do! Task.Delay(100)
+        Assert.That(executions, Is.EqualTo(1), "No duplicate side effect on clean handoff.")
+    finally
+        Directory.Delete(dir, true)
+}
+
+[<Test>]
+let idleLaunchFailsClosedWhenDisconnectedAndReconcilesMissedOtherDeviceActivity () = task {
+    let dir,path = temp()
+    let mutable clock = DateTimeOffset.UtcNow
+    let createdAt = clock
+    let mutable remoteActivity: DateTimeOffset option = None
+    let mutable connected = true
+    let mutable launches = 0
+    let verify (project: string) (agent: string) = task {
+        Assert.That(project, Is.EqualTo("Scripts"))
+        Assert.That(agent, Is.EqualTo("Manager"))
+        if connected then return Ok remoteActivity
+        else return Error "Offline: cannot prove cross-device idle"
+    }
+    let execute (_: BrowserSchedules.ScheduledAction) = task {
+        System.Threading.Interlocked.Increment(&launches) |> ignore
+        return Ok "Manager queued"
+    }
+    try
+        use store = new BrowserSchedules.Service(path, execute, now=(fun () -> clock), pollMs=25,
+                                                 agentLastSeen=(fun _ _ -> None),
+                                                 verifyIdleActivity=verify)
+        let config =
+            { commandSchedule "manager-remote" "AfterAgentIdle" with
+                RunAfterSeconds = None; IdleAgentId = Some "Manager"; IdleSeconds = Some 900 }
+        Assert.That(store.ScheduleExecution(config).IsOk, Is.True)
+        store.Start()
+        // The remote Manager is active. The local TUI never receives any hint.
+        remoteActivity <- Some (createdAt.AddSeconds(800.))
+        clock <- createdAt.AddSeconds(910.)
+        do! awaitStatus (fun () -> getDue store "manager-remote" > createdAt.AddSeconds(1690.))
+        Assert.That(launches, Is.Zero)
+        // Another missed hint arrives while offline, when the old deadline expires.
+        connected <- false
+        remoteActivity <- Some (createdAt.AddSeconds(1600.))
+        clock <- createdAt.AddSeconds(1710.)
+        do! Task.Delay(150)
+        Assert.That(launches, Is.Zero, "Disconnected Manager clock must not launch on stale data.")
+        Assert.That(status store "manager-remote", Is.EqualTo("pending"))
+        // Reconnection pulls a fresh server watermark and postpones launch again.
+        connected <- true
+        do! awaitStatus (fun () -> getDue store "manager-remote" > createdAt.AddSeconds(2490.))
+        Assert.That(launches, Is.Zero)
+        clock <- createdAt.AddSeconds(2510.)
+        do! awaitStatus (fun () -> launches = 1 && status store "manager-remote" = "waitingActivity")
+        // No local hint; server-only attributed activity re-arms the next episode.
+        remoteActivity <- Some (createdAt.AddSeconds(2520.))
+        do! awaitStatus (fun () -> status store "manager-remote" = "pending")
+        Assert.That(getDue store "manager-remote", Is.GreaterThan(clock))
+    finally
+        Directory.Delete(dir, true)
+}
+
+[<Test>]
+let idleScheduleWithoutVerifiedProviderNeverDispatchesManager () = task {
+    let dir,path = temp()
+    let mutable clock = DateTimeOffset.UtcNow
+    let mutable calls = 0
+    let executor (_: BrowserSchedules.ScheduledAction) = task {
+        System.Threading.Interlocked.Increment(&calls) |> ignore
+        return Ok "unexpected"
+    }
+    try
+        use store = new BrowserSchedules.Service(path, executor, now=(fun () -> clock), pollMs=25)
+        let cmd =
+            { commandSchedule "unverified-manager" "AfterAgentIdle" with
+                RunAfterSeconds = None; IdleAgentId = Some "Manager"; IdleSeconds = Some 60 }
+        Assert.That(store.ScheduleExecution(cmd).IsOk, Is.True)
+        store.Start()
+        clock <- clock.AddSeconds(61.)
+        do! Task.Delay(200)
+        Assert.That(calls, Is.Zero)
+        Assert.That(store.List(), Does.Contain("ActivityVerificationUnavailable"))
+    finally
         Directory.Delete(dir, true)
 }

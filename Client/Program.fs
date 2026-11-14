@@ -271,15 +271,24 @@ let private runClient args =
                             return Error(registrationId, reason)
                         | Ok json -> return Ok json
     }
-    let scheduler = new BrowserSchedules.Service(BrowserSchedules.defaultPath(), executeScheduledAction,
-        agentLastSeen=(fun project agent ->
-            // Agent activity is canonical per project, not per checkout.
-            let checkout = project.IndexOf("::", StringComparison.Ordinal)
-            let canonical = if checkout < 0 then project else project.Substring(0, checkout)
-            tui.GetAgentLastSeen(canonical, agent)))
-    rt.BrowserScheduler <- Some scheduler
-    scheduler.Start()
-    tui.Log "Persistent execution scheduler enabled (CLI/browser; no replay of uncertain occurrences)."
+    // The runtime owns at most one local scheduler per private state file.
+    // A second JarvisClient can still connect, but never becomes a competing
+    // schedule writer/executor. Idle launches also require a *fresh* authenticated
+    // server roundtrip rather than local notification hints.
+    let mutable verifyIdleActivity: string -> string -> Task<Result<DateTimeOffset option, string>> =
+        fun _ _ -> Task.FromResult(Error "ActivityVerificationUnavailable: not connected.")
+    let scheduler =
+        try
+            Some(new BrowserSchedules.Service(BrowserSchedules.defaultPath(), executeScheduledAction,
+                agentLastSeen=(fun project agent ->
+                    let checkout = project.IndexOf("::", StringComparison.Ordinal)
+                    let canonical = if checkout < 0 then project else project.Substring(0, checkout)
+                    tui.GetAgentLastSeen(canonical, agent)),
+                verifyIdleActivity=(fun project agent -> verifyIdleActivity project agent)))
+        with :? IOException as error ->
+            tui.Log ("Execution scheduling inactive on this client: " + error.Message)
+            None
+    rt.BrowserScheduler <- scheduler
 
     let formatJobResult value = value |> Result.mapError (fun error -> sprintf "%A" error)
     tui.SetJobAccess
@@ -342,6 +351,28 @@ let private runClient args =
 
     connection.KeepAliveInterval <- TimeSpan.FromSeconds 10.0
     connection.ServerTimeout <- TimeSpan.FromSeconds 60.0
+
+    verifyIdleActivity <- (fun project agent -> task {
+        if not registered || connection.State <> HubConnectionState.Connected then
+            return Error "ActivityVerificationUnavailable: Jarvis connection is offline or unregistered."
+        else
+            try
+                let! current =
+                    HubConnectionExtensions.InvokeCoreAsync<AgentActivitySnapshot>(
+                        connection, "GetAgentActivity", [| box project; box agent |], CancellationToken.None)
+                        .WaitAsync(TimeSpan.FromSeconds(5.))
+                if not registered || connection.State <> HubConnectionState.Connected then
+                    return Error "ActivityVerificationUnavailable: connection changed during verification."
+                else
+                    // The server is the attributed activity authority across
+                    // every authenticated device and persists this watermark.
+                    return Ok current.LastSeenAtUtc
+            with ex ->
+                return Error("ActivityVerificationUnavailable: " + ex.GetType().Name)
+    })
+    scheduler |> Option.iter (fun service -> service.Start())
+    if scheduler.IsSome then
+        tui.Log "Persistent execution scheduler enabled; Manager idle launches require server verification."
 
     let dispatch =
         CommandDispatchQueue(
@@ -481,7 +512,7 @@ let private runClient args =
             do! dispatch.Complete().WaitAsync(TimeSpan.FromMinutes 2.0)
         with :? TimeoutException ->
             tui.Log "MCP dispatch shutdown exceeded two minutes; some command outcomes may be uncertain."
-        (scheduler :> IDisposable).Dispose()
+        scheduler |> Option.iter (fun service -> (service :> IDisposable).Dispose())
         browser |> Option.iter (fun bridge -> (bridge :> IDisposable).Dispose())
         do! connection.DisposeAsync()
 

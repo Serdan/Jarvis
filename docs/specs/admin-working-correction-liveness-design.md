@@ -613,3 +613,28 @@ tree terminated, or protect against restoration of an arbitrary stale
 SQLite backup while an older server/client process continues running.
 Those cases still require authenticated global legacy drain evidence and
 the separate correction exclusion; keep `AwaitingLegacyDrain` in effect.
+
+### Authenticated read-only correction recovery snapshot (2026-11-14)
+
+The server now exposes `GetAgentCorrectionEvidence(targetAgentId, limit)`
+under `workspace:read` as a server-local diagnostic MCP method. It reads
+the authenticated user's **durable** unresolved permit (including its
+original operation ID, full command fingerprint, source agent and pinned
+device/generation), a bounded page of still-unresolved agent execution
+witnesses with `HasMore`, and the schema-verified global protocol epoch.
+
+The tool does **not** invoke a client command, activate any agent, acquire
+or release a correction permit, approve the legacy drain, attest that
+children have exited, or issue any Git correction. It deliberately returns
+`readOnlyNonAtomic=true` and `authorizesCorrection=false`. The queries
+may race activity admitted immediately after inspection, so even an empty
+page with a verified epoch is not a correction authorization. A corrupt
+or unavailable SQLite/epoch read returns an error, never a guessed success.
+
+Coverage includes user isolation (the same agent label under another
+account cannot reveal another user's witness/permit), missing OAuth
+scope/identity, malformed or excessive target/page inputs, a protocol
+epoch still in `AwaitingLegacyDrain`, inspection with a durable held
+permit, and unchanged execution gates after the report. This is an
+operator recovery *observation* prerequisite; canonical Git receipt
+reconciliation and audited orphan-permit release remain outstanding.

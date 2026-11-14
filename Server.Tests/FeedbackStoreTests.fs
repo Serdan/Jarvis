@@ -3081,3 +3081,117 @@ let ``device registration fails without durable generation and preserves prior r
         match duplicateUsers.GetSessionByConnection("first") with
         | ValueSome prior -> prior.Generation |> shouldEqual first.Generation
         | ValueNone -> Assert.Fail("Duplicate generation replaced the original route."))
+
+[<Test>]
+let ``correction evidence MCP is read-only bounded and scoped to authenticated user`` () =
+    withStore (fun store ->
+        let user, target = "alice", "Worker 3"
+        let ongoing = beginWitness store user target
+        let inspect userId agent limit =
+            McpToolHelpers.getAgentCorrectionEvidence
+                store (authenticatedAccessor userId) agent (Nullable limit)
+            |> Async.AwaitTask |> Async.RunSynchronously
+        let first = inspect user target 10
+        Assert.That(first.IsError, Is.EqualTo(Nullable false))
+        let firstPayload =
+            (first.Content[0] :?> ModelContextProtocol.Protocol.TextContentBlock).Text
+        use firstJson = JsonDocument.Parse(firstPayload)
+        let root = firstJson.RootElement
+        root.GetProperty("targetAgentId").GetString() |> shouldEqual "WORKER 3"
+        root.GetProperty("protocolEpochVerified").GetBoolean() |> shouldEqual false
+        root.GetProperty("readOnlyNonAtomic").GetBoolean() |> shouldEqual true
+        root.GetProperty("authorizesCorrection").GetBoolean() |> shouldEqual false
+        root.GetProperty("hasMore").GetBoolean() |> shouldEqual false
+        let unresolved = root.GetProperty("unresolvedExecutions")
+        unresolved.GetArrayLength() |> shouldEqual 1
+        unresolved[0].GetProperty("RequestId").GetString() |> shouldEqual ongoing.Id
+        let otherUser = inspect "bob" target 10
+        Assert.That(otherUser.IsError, Is.EqualTo(Nullable false))
+        use otherJson = JsonDocument.Parse(
+            (otherUser.Content[0] :?> ModelContextProtocol.Protocol.TextContentBlock).Text)
+        otherJson.RootElement.GetProperty("unresolvedExecutions").GetArrayLength()
+        |> shouldEqual 0
+        for invalidTarget, invalidLimit in
+            [ "", 10; String.replicate 257 "x", 10; target, 0; target, 51 ] do
+            Assert.That((inspect user invalidTarget invalidLimit).IsError,
+                        Is.EqualTo(Nullable true),
+                        "Invalid agent names and unbounded pages must not be served.")
+        let authServices =
+            Microsoft.Extensions.DependencyInjection.ServiceCollection()
+            :> Microsoft.Extensions.DependencyInjection.IServiceCollection
+        Microsoft.Extensions.DependencyInjection.ServiceCollectionServiceExtensions.AddSingleton<
+            Microsoft.Extensions.Options.IOptions<JarvisOptions>>(
+                authServices,
+                Microsoft.Extensions.Options.Options.Create(
+                    { Auth0Domain = "auth.test"; Audience = "https://jarvis.test"
+                      OpenAIAppsChallenge = "" })) |> ignore
+        use authProvider =
+            Microsoft.Extensions.DependencyInjection.ServiceCollectionContainerBuilderExtensions.BuildServiceProvider(
+                authServices)
+        let noScopeContext = DefaultHttpContext()
+        noScopeContext.RequestServices <- authProvider
+        noScopeContext.User <-
+            ClaimsPrincipal(ClaimsIdentity([ Claim("sub", user) ], "test"))
+        let noScope = HttpContextAccessor()
+        noScope.HttpContext <- noScopeContext
+        let denied =
+            McpToolHelpers.getAgentCorrectionEvidence store noScope target (Nullable 10)
+            |> Async.AwaitTask |> Async.RunSynchronously
+        Assert.That(denied.IsError, Is.EqualTo(Nullable true))
+        let anonymous = HttpContextAccessor()
+        anonymous.HttpContext <- DefaultHttpContext()
+        anonymous.HttpContext.RequestServices <- authProvider
+        let noIdentity =
+            McpToolHelpers.getAgentCorrectionEvidence store anonymous target (Nullable 10)
+            |> Async.AwaitTask |> Async.RunSynchronously
+        Assert.That(noIdentity.IsError, Is.EqualTo(Nullable true))
+        // Reading the report must neither clear a witness nor change epoch
+        // readiness. Empty results for another account are NOT liveness proof.
+        store.CountUnresolvedAgentExecutions(user, target) |> shouldEqual 1
+        store.GetAgentExecutionReadiness() |> shouldEqual (Ok LegacyDrainUnverified))
+
+[<Test>]
+let ``correction evidence reports held permits without clearing them`` () =
+    withStore (fun store ->
+        approveTestEpoch store
+        let user, target, operation = "alice", "Worker 4", "unresolved-correction-uuid"
+        let permit =
+            store.TryAcquireAgentCorrection(user, target, operation)
+            |> function Ok value -> value | Error failure -> failwith failure
+        let report who =
+            McpToolHelpers.getAgentCorrectionEvidence
+                store (authenticatedAccessor who) target (Nullable 25)
+            |> Async.AwaitTask |> Async.RunSynchronously
+        let owner = report user
+        Assert.That(owner.IsError, Is.EqualTo(Nullable false))
+        let ownerText =
+            (owner.Content[0] :?> ModelContextProtocol.Protocol.TextContentBlock).Text
+        Assert.That(ownerText.Contains(operation, StringComparison.Ordinal), Is.True)
+        Assert.That(ownerText.Contains(permit, StringComparison.Ordinal), Is.True)
+        use ownerJson = JsonDocument.Parse(ownerText)
+        ownerJson.RootElement.GetProperty("protocolEpochVerified").GetBoolean()
+        |> shouldEqual true
+        ownerJson.RootElement.GetProperty("authorizesCorrection").GetBoolean()
+        |> shouldEqual false
+        let intruder = report "bob"
+        Assert.That(intruder.IsError, Is.EqualTo(Nullable false))
+        let intruderText =
+            (intruder.Content[0] :?> ModelContextProtocol.Protocol.TextContentBlock).Text
+        Assert.That(intruderText.Contains(operation, StringComparison.Ordinal), Is.False)
+        Assert.That(intruderText.Contains(permit, StringComparison.Ordinal), Is.False)
+        Assert.That(store.TryBeginAgentOperation(
+            user, target, "TaskRead", Some "Jarvis",
+            "server", None, None).IsError, Is.True,
+            "Read-only recovery must not release a correction permit.")
+        let metadata = typeof<JarvisMcpTools>.GetMethod("GetAgentCorrectionEvidence")
+        let attribute =
+            metadata.GetCustomAttributes(
+                typeof<ModelContextProtocol.Server.McpServerToolAttribute>, false)
+            |> Array.choose (function
+                | :? ModelContextProtocol.Server.McpServerToolAttribute as item -> Some item
+                | _ -> None)
+            |> Array.exactlyOne
+        attribute.ReadOnly |> shouldEqual true
+        attribute.Destructive |> shouldEqual false
+        store.TryReleaseAgentCorrection(user, target, permit, true)
+        |> shouldEqual (Ok ()))

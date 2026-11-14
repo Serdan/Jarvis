@@ -347,6 +347,11 @@ module McpToolHelpers =
                     "GetConnectionDiagnostics"
                     "Returns the current Jarvis client session and recent persisted connection lifecycle events."
                     [ ReadOnly ]
+                    false
+                serverLocalCapability
+                    "GetAgentCorrectionEvidence"
+                    "Read-only authenticated correction recovery evidence: protocol gate, unresolved permit and bounded execution witnesses; never authorizes a correction."
+                    [ ReadOnly ]
                     false ] }
 
     let private errorCategory = function
@@ -1414,6 +1419,50 @@ module McpToolHelpers =
                         |> jsonResult
         }
 
+    /// Operator recovery is intentionally read-only. These independent reads
+    /// are NOT one atomic liveness certification and may race new admission.
+    /// The actual mutation still requires its own serialized SQLite exclusion,
+    /// authenticated process/job termination and canonical Git CAS receipt.
+    let getAgentCorrectionEvidence
+        (store: FeedbackStore)
+        (http: IHttpContextAccessor)
+        (targetAgentId: string)
+        (limit: Nullable<int>)
+        =
+        task {
+            match authenticatedFeedbackContext http with
+            | Error result -> return result
+            | Ok(_, userId) ->
+                let maxRows = if limit.HasValue then limit.Value else 25
+                match validateText "targetAgentId" 256 targetAgentId with
+                | Error message -> return errorResult (ValidationFailed message)
+                | Ok target when maxRows < 1 || maxRows > 50 ->
+                    return errorResult (ValidationFailed "limit must be between 1 and 50.")
+                | Ok target ->
+                    match store.GetAgentExecutionReadiness(),
+                          store.InspectAgentCorrectionPermit(userId, target),
+                          store.ListUnresolvedAgentExecutions(userId, target, maxRows) with
+                    | Ok protocol, Ok permit, Ok unresolved ->
+                        let epochVerified =
+                            match protocol with
+                            | LegacyDrainVerified _ -> true
+                            | LegacyDrainUnverified -> false
+                        return
+                            {| targetAgentId = target.ToUpperInvariant()
+                               protocolEpochVerified = epochVerified
+                               unresolvedCorrectionPermit = permit
+                               unresolvedExecutions = unresolved.Executions
+                               hasMore = unresolved.HasMore
+                               readOnlyNonAtomic = true
+                               authorizesCorrection = false |}
+                            |> jsonResult
+                    | Error problem, _, _
+                    | _, Error problem, _
+                    | _, _, Error problem ->
+                        return errorResult (ExecutionFailed
+                            ("Cannot verify durable correction evidence: " + problem))
+        }
+
     let listMcpCommands (http: IHttpContextAccessor) =
         task {
             match authenticatedFeedbackContext http with
@@ -1513,6 +1562,16 @@ type JarvisMcpTools =
         http: IHttpContextAccessor
     ) =
         McpToolHelpers.getConnectionDiagnostics store users http (Nullable limit)
+
+    [<McpServerTool(Title = "Get agent correction evidence", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("Read-only recovery evidence for an agent: immutable correction permit, pending execution witnesses, and protocol-epoch readiness. User-scoped, bounded, not an authorization or proof of quiescence.")>]
+    static member GetAgentCorrectionEvidence(
+        targetAgentId: string,
+        [<Optional; DefaultParameterValue(25)>] limit: int,
+        store: FeedbackStore,
+        http: IHttpContextAccessor
+    ) =
+        McpToolHelpers.getAgentCorrectionEvidence
+            store http targetAgentId (Nullable limit)
 
     [<McpServerTool(Title = "List commands", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false); McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]"""); Description("List the complete public Jarvis MCP command catalog, including server-local tools.")>]
     static member ListCommands(http: IHttpContextAccessor) =

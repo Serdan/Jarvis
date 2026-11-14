@@ -2645,6 +2645,24 @@ let ``authenticated stale correction cannot release an unresolved permit`` () =
         Assert.That(changedRetry.IsError, Is.EqualTo(Nullable true))
         Assert.That(dispatches, Is.EqualTo(2),
                     "Mismatched canonical command must be rejected before routing.")
+        // A reconnect with the same device ID changes its authenticated
+        // generation. The old immutable correction must NOT borrow the new
+        // process or pretend it shares the original checked-out ledger.
+        users.TransportConnected(user, "replacement-conn")
+        let replacement = users.Register(user,
+            { DeviceId = "device"; DeviceName = "Replacement workstation"
+              ProtocolVersion = Common.AgentProtocol.version; ClientVersion = "test"
+              SupportedCommands = [ "TaskWrite" ] }, "replacement-conn")
+        Assert.That(replacement.Generation, Is.GreaterThan(1L))
+        let reconnectedRetry =
+            JarvisMcpTools.CorrectAgentWorkingState(
+                "Jarvis", actor, target, "task-1", "attempt-1",
+                1, 1, 1, 1, "Operator proved stale Working state",
+                operationId, "", service, accessor)
+            |> Async.AwaitTask |> Async.RunSynchronously
+        Assert.That(reconnectedRetry.IsError, Is.EqualTo(Nullable true))
+        Assert.That(dispatches, Is.EqualTo(2),
+                    "An authenticated replacement generation cannot route an unresolved correction.")
         // The authenticated client has ended, but the error category alone
         // cannot prove no earlier remote push took place during retries.
         let provenance =

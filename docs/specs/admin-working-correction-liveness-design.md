@@ -707,3 +707,95 @@ still not wired/exposed, so the live epoch remains
 `AwaitingLegacyDrain`. A postapproval legacy registration requires a new
 independently audited drain epoch; there is intentionally no automatic
 reset or timeout-based recovery.
+
+### Device-local immutable correction ledger identity (2026-11-14)
+
+The server's correction permit pins the full TaskWrite command fingerprint,
+the exact authenticated user/source/project and device registration
+generation, but that alone does not pin how a device resolves its
+`ProjectName` string to a **physical checkout**. The existing crash-safe
+`PendingIntentJournal` is keyed by each checkout root. If an unresolved
+correction is retried after the same device remaps its project selector to
+a *different* checkout root, the new root's local journal may contain no
+prior operation UUID, and could execute the same command against another
+ledger identity.
+
+A separate root-independent, permanent client-side
+`correction-operation-pins/<uuid>.json` record now anchors the first
+execution of `CorrectAgentWorkingState` to the selected full checkout
+root, canonical project ID, ledger ID and epoch, approved remote binding
+hash (including both approved fetch/push URLs), project selector and
+serialized **full command SHA-256**. It lives under the client's existing
+OS-account Jarvis configuration, not the physical checkout. Remote URLs
+may contain sensitive information; the pin retains their hash rather than
+plaintext. Its creation is guarded by a cross-process per-operation
+exclusive file lock, a flushed write-through temporary file, atomic
+no-overwrite move and durable parent-directory sync on supported platforms.
+All of this happens before the checkout-local pending-intent journal and
+**before any Git mutation**. Exact retries against the original identity
+are allowed; any changed root, ledger, remote, project or command is
+rejected, without calling the original ledger writer. A corrupt or
+oversized pin is an error, not an implicit invitation to create a new one.
+The pin is not deleted on command success because successful commands
+also must not be replayed against a new canonical identity with the same
+UUID.
+
+This closes the same-client, same-SignalR-generation **cross-root retry**
+hole. It does **not** attest that the device's *first* project selector
+was the canonical ledger the operator intended, cannot retroactively
+attest a pre-pin operation, and does not protect against deletion of
+the entire local configuration or restoring a stale backup. A server-held
+permit and exact canonical Git receipt reconciliation remain necessary.
+No reviewed production correction is enabled: legacy drain, OS-backed
+child-tree termination proof, and independent frozen review are still open.
+
+### Permanent correction UUID ownership after permit release (2026-11-14)
+
+A correction permit is intentionally deleted after independently attested
+successful canonical result or proven non-dispatch. That release must not
+also release the **operation UUID's immutable identity**. Otherwise a
+later request by the same authenticated user could reuse the successful
+UUID on another target agent or project, or from a different device
+generation, once the first target's exclusion was no longer present.
+
+`agent_correction_operation_identity` is now an append-only,
+user-scoped SQLite record keyed by `(user_id, operation_id)`, retaining
+the original target, project, requesting actor, complete TaskWrite SHA-256,
+pinned device ID/generation and first admitted request witness. Its first
+insert is atomic with acquisition of the target-agent correction permit
+and pinning of the original admitted request's expected route, in the
+same SQLite writer transaction as all other agent admissions. A failure
+to persist the immutable UUID ownership also rolls back the exclusive
+permit and route pin; no client dispatch is authorized.
+
+Every subsequent correction admission checks this record, **even after
+the target's previous permit was released**. An exact retry on the
+same target, project, actor, command and device generation may proceed
+through normal exclusion/liveness gates with a fresh initiating witness.
+Changed target, project, actor, command payload or device/generation is
+rejected. An unbound legacy internal correction entrypoint cannot borrow
+a bound production UUID. A pre-upgrade held bound permit with no matching
+permanent UUID history remains unresolved and cannot be silently
+backfilled. Other authenticated users have independent UUID namespaces.
+The operation identity is not subject to 30-day telemetry pruning and
+survives server restart.
+
+This does not independently prove the Git operation outcome or original
+execution quiescence. A durable identity record is a permanent
+**non-reuse fence**, not permission to release a permit. Uncertain Git
+outcomes remain blocked and must still be reconciled against exact
+canonical operation receipts. Production correction remains disabled
+behind the unverified legacy-drain epoch and OS-backed child-process
+proof gates.
+
+For **bound production corrections**, the server also validates a
+nonempty GUID and normalizes its SQLite identity key to the canonical
+lowercase `D` representation before looking up or inserting the
+permanent claim. The Git ledger indexes operations by parsed GUID, so
+different textual spellings such as braced uppercase and unbraced
+lowercase must never create independent operation identities. The full
+TaskWrite fingerprint remains tied to the original exact command
+serialization. Internal pre-existing unbound migration fixtures retain
+their historical textual IDs but cannot claim or borrow a bound
+production UUID. Alternate-case/braced retargeting and non-GUID
+production inputs are explicitly rejected in regression tests.

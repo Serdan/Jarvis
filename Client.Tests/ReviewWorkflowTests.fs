@@ -722,7 +722,11 @@ type ReviewWorkflowTests() =
             match Client.OrchestrationApi.TaskApi.write
                       { command with Reason = "Different payload for same operation" } ctx with
             | Error _ -> ()
-            | Ok _ -> Assert.Fail("A reused operation ID with different input must fail."))
+            | Ok _ -> Assert.Fail("A reused operation ID with different input must fail.")
+            let pinPath = Client.OrchestrationApi.PendingIntentJournal.correctionPinPath operationId
+            if File.Exists pinPath then File.Delete pinPath
+            if File.Exists(pinPath + ".lock") then
+                File.Delete(pinPath + ".lock"))
 
     [<Test>]
     member _.AdministrativeActorUsesAuthenticatedUserAndHistoricalReceipt() =
@@ -5821,3 +5825,123 @@ type ReviewWorkflowTests() =
             finally
                 if File.Exists(configPath) then File.Delete(configPath)
                 if File.Exists(configPath + ".lock") then File.Delete(configPath + ".lock"))
+
+    [<Test>]
+    member _.CorrectionUuidPinSurvivesRetriesAndRejectsProjectRootOrLedgerRebind() =
+        withFixture (fun _ _ first second _ _ _ _ ->
+            let operationId = Guid.NewGuid()
+            let path = Client.OrchestrationApi.PendingIntentJournal.correctionPinPath operationId
+            let pin binding projectName command =
+                Client.OrchestrationApi.PendingIntentJournal.pinCorrectionOperation
+                    binding operationId projectName command
+            let unchanged = """{"action":"CorrectAgentWorkingState","reason":"stale owner"}"""
+            try
+                pin first "owner" unchanged |> success |> ignore
+                pin first "owner" unchanged |> success |> ignore
+                Assert.That(File.Exists path, Is.True)
+                let original = File.ReadAllText path
+                let refuse label binding projectName command =
+                    match pin binding projectName command with
+                    | Error(Client.ValidationError _) -> ()
+                    | other -> Assert.Fail($"Correction UUID changed {label} without veto: {other}")
+                    Assert.That(File.ReadAllText path, Is.EqualTo(original),
+                                "Rejected correction replay must preserve the first immutable pin.")
+                // Both clones point at the same canonical Git ledger, but an
+                // unresolved correction may not switch physical local roots.
+                refuse "physical checkout" second "owner" unchanged
+                refuse "canonical ledger UUID"
+                    { first with LedgerId = Guid.NewGuid() } "owner" unchanged
+                refuse "canonical project UUID"
+                    { first with ProjectId = Guid.NewGuid() } "owner" unchanged
+                refuse "ledger epoch"
+                    { first with Epoch = first.Epoch + 1 } "owner" unchanged
+                refuse "approved push URL"
+                    { first with ApprovedPushUrl = first.ApprovedPushUrl + "?changed" }
+                    "owner" unchanged
+                refuse "approved fetch URL"
+                    { first with ApprovedFetchUrl = first.ApprovedFetchUrl + "?changed" }
+                    "owner" unchanged
+                refuse "remote name"
+                    { first with RemoteName = "mirror" } "owner" unchanged
+                refuse "project selector" first "other-project" unchanged
+                refuse "command payload" first "owner"
+                    """{"action":"CorrectAgentWorkingState","reason":"different"}"""
+                pin first "owner" unchanged |> success |> ignore
+                File.WriteAllText(path, "{corrupt-pin")
+                match pin first "owner" unchanged with
+                | Error(Client.ValidationError _) -> ()
+                | other -> Assert.Fail($"Corrupt durable pin was trusted: {other}")
+                Assert.That(File.ReadAllText path, Is.EqualTo("{corrupt-pin"),
+                            "A corrupt pin must not be silently recreated or overwritten.")
+            finally
+                if File.Exists path then File.Delete path
+                if File.Exists(path + ".lock") then File.Delete(path + ".lock"))
+
+    [<Test>]
+    member _.CorrectionUuidPinSerializesConcurrentCrossRootFirstUse() =
+        withFixture (fun _ _ first second _ _ _ _ ->
+            let operationId = Guid.NewGuid()
+            let path = Client.OrchestrationApi.PendingIntentJournal.correctionPinPath operationId
+            let pin binding =
+                Client.OrchestrationApi.PendingIntentJournal.pinCorrectionOperation
+                    binding operationId "owner" """{"action":"CorrectAgentWorkingState"}"""
+            try
+                let attempts =
+                    [| System.Threading.Tasks.Task.Run(fun () -> pin first)
+                       System.Threading.Tasks.Task.Run(fun () -> pin second) |]
+                System.Threading.Tasks.Task.WaitAll(
+                    attempts |> Array.map (fun task -> task :> System.Threading.Tasks.Task))
+                let successful = attempts |> Array.filter (fun task -> task.Result.IsOk)
+                Assert.That(successful.Length, Is.EqualTo(1),
+                            "Competing checkouts cannot each claim a correction UUID.")
+                let failed = attempts |> Array.filter (fun task -> task.Result.IsError)
+                Assert.That(failed.Length, Is.EqualTo(1))
+                Assert.That(File.Exists path, Is.True)
+                let winning = if attempts[0].Result.IsOk then first else second
+                pin winning |> success |> ignore
+            finally
+                if File.Exists path then File.Delete path
+                if File.Exists(path + ".lock") then File.Delete(path + ".lock"))
+
+    [<Test>]
+    member _.CorrectionRebindFailsBeforeAnySecondLedgerWriteCallback() =
+        withFixture (fun _ _ first second _ _ _ _ ->
+            let operationId = Guid.NewGuid()
+            let pinPath = Client.OrchestrationApi.PendingIntentJournal.correctionPinPath operationId
+            let command : Common.TaskWriteCommand =
+                { ProjectName = "owner"; Action = "CorrectAgentWorkingState"
+                  OperationId = operationId.ToString("D"); TaskId = "pinned-task"
+                  AttemptId = Guid.NewGuid().ToString("N")
+                  ActorId = "Lead"; OwnerId = "Worker 3"
+                  Title = ""; Html = ""; ExpectedVersion = 1
+                  ExpectedAgentVersion = 1; ExpectedTaskVersion = 1
+                  AssignmentGeneration = 1
+                  Summary = ""; NextAction = ""; Reason = "Audited operator correction"
+                  BaseOid = ""; TargetRef = ""; SourceRef = ""
+                  AllowDetached = false; AllowUncommitted = false
+                  DecisionSequence = 0L; Evidence = ""; SessionId = "" }
+            let mutable invoked = 0
+            let execute binding =
+                Client.OrchestrationApi.PendingIntentJournal.executeCorrectionLedgerWrite
+                    binding operationId command
+                    (fun () ->
+                        invoked <- invoked + 1
+                        Error(Client.GenericError "Simulated uncertain Git outcome"))
+            try
+                match execute first with
+                | Error(Client.GenericError _) -> ()
+                | other -> Assert.Fail($"Expected simulated uncertain correction: {other}")
+                Assert.That(invoked, Is.EqualTo(1))
+                match execute second with
+                | Error(Client.ValidationError _) -> ()
+                | other -> Assert.Fail($"Different checkout was allowed to repeat correction: {other}")
+                Assert.That(invoked, Is.EqualTo(1))
+                // Same pinned identity can recover the original pending
+                // operation; the root-independent pin does not forbid exact retry.
+                match execute first with
+                | Error(Client.GenericError _) -> ()
+                | other -> Assert.Fail($"Exact pending correction replay rejected: {other}")
+                Assert.That(invoked, Is.EqualTo(2))
+            finally
+                if File.Exists pinPath then File.Delete pinPath
+                if File.Exists(pinPath + ".lock") then File.Delete(pinPath + ".lock"))

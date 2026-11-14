@@ -191,11 +191,50 @@ let private runClient args =
             tui.Log $"Browser bridge listening on 127.0.0.1:{port}; registered windows and explicit tab registrations required."
             bridge)
 
-    // Persistent one-shot browser actions. The script always comes from an ordinary
-    // project file, re-resolved under the usual worktree/symlink restrictions at execution.
-    let scheduler =
-        browser |> Option.map (fun bridge ->
-            let executeAction (action: BrowserSchedules.ScheduledAction) = task {
+    // One persistent execution scheduler for CLI and browser actions.
+    // The browser bridge is optional; CLI scheduling works without an extension.
+    let executeScheduledAction (action: BrowserSchedules.ScheduledAction) = task {
+        let permission = rt :> PermissionIO
+        let prompt (cmd: AgentCommand) request = permission.PromptPermission cmd request
+        if action.ActionKind = "RunCommand" then
+            let cmd : RunCommandCommand =
+                { ProjectName = action.ProjectName
+                  Executable = action.Executable
+                  Args = action.CommandArgs
+                  Reason = Some("Scheduled execution " + action.Id)
+                  WorkingDirectory = if String.IsNullOrWhiteSpace(action.WorkingDirectory) then None
+                                     else Some action.WorkingDirectory
+                  TimeoutSeconds = Some action.TimeoutSeconds
+                  MaxOutputBytes = Some action.MaxOutputBytes }
+            // Preserve normal run_command permission prompts, TUI activity,
+            // source-path checks and audit rather than executing an untracked process.
+            let! commandResult = Client.receiveCommand rt (RunCommandCommand cmd)
+            match commandResult with
+            | Error error -> return Error("", sprintf "%A" error)
+            | Ok responseJson ->
+                try
+                    let result = JsonSerializer.Deserialize<RunCommandResult>(responseJson)
+                    let summary = JsonSerializer.Serialize(
+                        {| exitCode = result.ExitCode; timedOut = result.TimedOut
+                           truncated = result.Truncated |})
+                    if result.ExitCode = 0 && not result.TimedOut then
+                        return Ok summary
+                    else return Error(summary, "CommandFailed")
+                with :? JsonException ->
+                    // Process may have executed; no automatic replay.
+                    return Error("", "OutcomeUnknown: malformed run_command response")
+        else
+            let authCommand =
+                BrowserRunInNewTabCommand
+                    { ProjectName = action.ProjectName; WindowRegistration = action.WindowRegistration
+                      Url = action.Url; ScriptPath = action.ScriptPath
+                      ArgsJson = Some action.ArgsJson; Active = Some action.Active
+                      CloseTabAfterExecution = Some action.CloseTabAfterExecution
+                      TimeoutMs = Some 30000 }
+            let! allowed = PermissionPolicy.authorizeWithTrust permission.TrustLevel prompt authCommand
+            match allowed with
+            | Error error -> return Error("", "AuthorizationDenied: " + sprintf "%A" error)
+            | Ok() ->
                 let script =
                     match ProjectPaths.validateProjectRelativePath action.ScriptPath with
                     | Error e -> Error(sprintf "%A" e)
@@ -209,9 +248,10 @@ let private runClient args =
                                 if FileInfo(path).Length > int64 BrowserBridge.MaxScriptBytes then Error "InputTooLarge"
                                 else Ok(File.ReadAllText(path, UTF8Encoding(false, true)))
                             with e -> Error("ScriptUnavailable:" + e.GetType().Name)
-                match script with
-                | Error e -> return Error("", e)
-                | Ok source ->
+                match script, browser with
+                | Error e, _ -> return Error("", e)
+                | _, None -> return Error("", "BridgeDisabled")
+                | Ok source, Some bridge ->
                     let mutable connected = false
                     let mutable tries = 0
                     while not connected && tries < 60 do
@@ -230,12 +270,16 @@ let private runClient args =
                                 tui.Log $"Browser schedule '{action.Id}' suspended: {reason}; inspect tab {registrationId} and update provider script."
                             return Error(registrationId, reason)
                         | Ok json -> return Ok json
-            }
-            let store = BrowserSchedules.Service(BrowserSchedules.defaultPath(), executeAction)
-            rt.BrowserScheduler <- Some store
-            store.Start()
-            tui.Log "Persistent browser scheduler enabled (one-shot or recurring, no replay of uncertain occurrences)."
-            store)
+    }
+    let scheduler = new BrowserSchedules.Service(BrowserSchedules.defaultPath(), executeScheduledAction,
+        agentLastSeen=(fun project agent ->
+            // Agent activity is canonical per project, not per checkout.
+            let checkout = project.IndexOf("::", StringComparison.Ordinal)
+            let canonical = if checkout < 0 then project else project.Substring(0, checkout)
+            tui.GetAgentLastSeen(canonical, agent)))
+    rt.BrowserScheduler <- Some scheduler
+    scheduler.Start()
+    tui.Log "Persistent execution scheduler enabled (CLI/browser; no replay of uncertain occurrences)."
 
     let formatJobResult value = value |> Result.mapError (fun error -> sprintf "%A" error)
     tui.SetJobAccess
@@ -362,6 +406,10 @@ let private runClient args =
         connection.On("InvalidateAllAgentStates", Func<Task>(fun () ->
             Client.invalidateAllAgentStates rt
             Task.CompletedTask))
+        connection.On<string, string, DateTimeOffset>("RecordAgentActivity",
+            Func<string, string, DateTimeOffset, Task>(fun project agent seenAtUtc ->
+                tui.RecordAgentSeenAt(project, agent, seenAtUtc)
+                Task.CompletedTask))
     }
 
     connection.add_Closed(
@@ -433,7 +481,7 @@ let private runClient args =
             do! dispatch.Complete().WaitAsync(TimeSpan.FromMinutes 2.0)
         with :? TimeoutException ->
             tui.Log "MCP dispatch shutdown exceeded two minutes; some command outcomes may be uncertain."
-        scheduler |> Option.iter (fun store -> (store :> IDisposable).Dispose())
+        (scheduler :> IDisposable).Dispose()
         browser |> Option.iter (fun bridge -> (bridge :> IDisposable).Dispose())
         do! connection.DisposeAsync()
 

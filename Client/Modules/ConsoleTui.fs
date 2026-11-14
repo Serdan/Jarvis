@@ -1854,15 +1854,19 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
     member _.SetJobAccess(access: JobUiAccess) =
         lock syncRoot (fun () -> jobsAccess <- Some access)
 
-    member _.RecordAgentSeen(project: string, agentId: string) =
+    member _.RecordAgentSeenAt(project: string, agentId: string, observedAtUtc: DateTimeOffset) =
         if not (String.IsNullOrWhiteSpace project || String.IsNullOrWhiteSpace agentId) then
             lock syncRoot (fun () ->
-                let now = DateTimeOffset.UtcNow
+                // Out-of-order SignalR delivery must not turn back an idle deadline.
                 let key = project + "::" + agentId
-                agentSeen[key] <- now
+                let timestamp =
+                    match agentSeen.TryGetValue key with
+                    | true, previous when previous > observedAtUtc -> previous
+                    | _ -> observedAtUtc
+                agentSeen[key] <- timestamp
                 let persist =
                     match persistedAgentSeen.TryGetValue key with
-                    | true, previous -> now - previous >= TimeSpan.FromSeconds(10.)
+                    | true, previous -> timestamp - previous >= TimeSpan.FromSeconds(10.)
                     | _ -> true
                 if persist then
                     let saved =
@@ -1873,10 +1877,11 @@ type ConsoleTui(?activityLog: ActivityLog.Store) =
                                 store.SaveAgentSeen(agentSeen |> Seq.map (fun entry -> entry.Key, entry.Value))
                                 true
                             with :? System.IO.IOException -> false
-                    // A failed atomic snapshot must be retried on the next
-                    // attributed call, not treated as durably persisted.
-                    if saved then persistedAgentSeen[key] <- now
+                    if saved then persistedAgentSeen[key] <- timestamp
                 if mode = AgentsMode || mode = AgentFilterMode then renderUnsafe())
+
+    member this.RecordAgentSeen(project: string, agentId: string) =
+        this.RecordAgentSeenAt(project, agentId, DateTimeOffset.UtcNow)
 
     // A read-only observation of the local activity cache. This is not a
     // canonical ledger timestamp: another connected client may have seen

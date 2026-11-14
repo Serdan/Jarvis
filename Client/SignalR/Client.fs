@@ -97,13 +97,7 @@ let private checkWorkingGuidance (rt: Runtime) agentId (target: ProjectPaths.Pro
 // which is not an identity of an agent in the destination project. Routing
 // health probes likewise do not represent agent activity. Keep both out of
 // destination last-seen, turn-guidance and implicit-activation handling.
-let private isLocalAgentActivity = function
-    | TaskWriteCommand cmd when cmd.Action = "NotifyAgent"
-                                && not (String.IsNullOrWhiteSpace cmd.SourceRef)
-                                && cmd.SourceRef <> cmd.ProjectName -> false
-    | LedgerReadCommand cmd when cmd.Action = "Health" -> false
-    | ObserveAgentCommand _ -> false // Neither observer nor target is acting.
-    | _ -> true
+let private isLocalAgentActivity = AgentCommandInfo.isAgentActivity
 
 // An agent's first ordinary tool call starts its Ready assignment.
 // No new session identifier or explicit resume tool is needed. Never
@@ -318,6 +312,12 @@ let private auditDetails command =
     | UpdateClientCommand -> Some("UpdateClient", None, [ ProcessExecution; NetworkAccess; Destructive ], [], None, [])
     | ScheduleBrowserExecutionCommand cmd -> Some("ScheduleBrowserExecution", Some cmd.ProjectName, [ ProcessExecution; NetworkAccess ], [cmd.ScriptPath], None, [])
     | CancelScheduledBrowserExecutionCommand _ -> Some("CancelScheduledBrowserExecution", None, [ ProcessExecution ], [], None, [])
+    | ScheduleExecutionCommand cmd ->
+        let rights = if cmd.ActionKind = "BrowserScript" then [ ProcessExecution; NetworkAccess ] else [ ProcessExecution ]
+        Some("ScheduleExecution", Some cmd.ProjectName, rights,
+             cmd.ScriptPath |> Option.toList, cmd.Executable, cmd.Args)
+    | CancelScheduledExecutionCommand _ ->
+        Some("CancelScheduledExecution", None, [ ProcessExecution ], [], None, [])
     | BrowserOpenTabCommand _ -> Some("BrowserOpenTab", None, [ ProcessExecution; NetworkAccess ], [], None, [])
     | BrowserRunInNewTabCommand cmd -> Some("BrowserRunInNewTab", Some cmd.ProjectName, [ ProcessExecution; NetworkAccess ], [cmd.ScriptPath], None, [])
     | BrowserCloseTabCommand _ -> Some("BrowserCloseTab", None, [ ProcessExecution ], [], None, [])
@@ -478,6 +478,57 @@ let private dispatch (rt: Runtime) (target: ProjectPaths.ProjectTarget option)
             | Some bridge ->
                 let result = bridge.ListTabs() |> Result.mapError Client.ValidationError
                 ValueTask<Result<string,EffectError>>(result)
+        )
+    | ListScheduledExecutionsCommand ->
+        fromBrowser (
+            match rt.BrowserScheduler with
+            | None -> ValueTask<Result<string,EffectError>>(Error(Client.ValidationError "SchedulerUnavailable"))
+            | Some scheduler -> ValueTask<Result<string,EffectError>>(Ok(scheduler.List()))
+        )
+    | GetScheduledExecutionCommand cmd ->
+        fromBrowser (
+            match rt.BrowserScheduler with
+            | None -> ValueTask<Result<string,EffectError>>(Error(Client.ValidationError "SchedulerUnavailable"))
+            | Some scheduler ->
+                ValueTask<Result<string,EffectError>>(
+                    scheduler.Get(cmd.ScheduleId) |> Result.mapError Client.ValidationError)
+        )
+    | CancelScheduledExecutionCommand cmd ->
+        fromBrowser (
+            match rt.BrowserScheduler with
+            | None -> ValueTask<Result<string,EffectError>>(Error(Client.ValidationError "SchedulerUnavailable"))
+            | Some scheduler ->
+                ValueTask<Result<string,EffectError>>(
+                    scheduler.Cancel(cmd.ScheduleId)
+                    |> Result.map (fun () -> """{"canceled":true}""")
+                    |> Result.mapError Client.ValidationError)
+        )
+    | ScheduleExecutionCommand cmd ->
+        fromBrowser (
+            let result =
+                match rt.BrowserScheduler with
+                | None -> Error(Client.ValidationError "SchedulerUnavailable")
+                | Some scheduler ->
+                    let validateBrowser () =
+                        if cmd.ActionKind <> "BrowserScript" then Ok()
+                        else
+                            let path = cmd.ScriptPath |> Option.defaultValue ""
+                            match ProjectPaths.validateProjectRelativePath path with
+                            | Error e -> Error e
+                            | Ok _ when not (path.EndsWith(".js", StringComparison.OrdinalIgnoreCase)) ->
+                                Error(Client.ValidationError "Browser script must be a .js file.")
+                            | Ok _ ->
+                                match ProjectPaths.resolveProjectFile cmd.ProjectName path rt with
+                                | Error e -> Error e
+                                | Ok(FilePath filename) ->
+                                    if FileInfo(filename).Length > int64 BrowserBridge.MaxScriptBytes then
+                                        Error(Client.ValidationError "InputTooLarge: script exceeds 64 KiB.")
+                                    else Ok()
+                    validateBrowser()
+                    |> Result.bind (fun () -> scheduler.ScheduleExecution cmd |> Result.mapError Client.ValidationError)
+                    |> Result.map (fun due ->
+                        JsonSerializer.Serialize({| scheduleId = cmd.ScheduleId; dueAtUtc = due; status = "pending" |}))
+            ValueTask<Result<string,EffectError>>(result)
         )
     | ListScheduledBrowserExecutionsCommand ->
         fromBrowser (

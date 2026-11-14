@@ -86,6 +86,31 @@ type ScheduleBrowserExecutionCommand =
       RepeatEverySeconds: int option }
 type ListScheduledBrowserExecutionsCommand = struct end
 type CancelScheduledBrowserExecutionCommand = { ScheduleId: string }
+type ScheduleExecutionCommand =
+    { ScheduleId: string
+      ProjectName: string
+      TriggerKind: string
+      RunAfterSeconds: int option
+      RunAtUtc: DateTimeOffset option
+      RepeatEverySeconds: int option
+      IdleAgentId: string option
+      IdleSeconds: int option
+      ActionKind: string
+      Executable: string option
+      Args: string list
+      WorkingDirectory: string option
+      TimeoutSeconds: int option
+      MaxOutputBytes: int option
+      WindowRegistration: string option
+      Url: string option
+      ScriptPath: string option
+      ArgsJson: string option
+      Alias: string option
+      Active: bool option
+      CloseTabAfterExecution: bool option }
+type ListScheduledExecutionsCommand = struct end
+type GetScheduledExecutionCommand = { ScheduleId: string }
+type CancelScheduledExecutionCommand = { ScheduleId: string }
 
 type BrowserOpenTabCommand =
     { WindowRegistration: string
@@ -768,6 +793,10 @@ type AgentCommand =
     | ScheduleBrowserExecutionCommand of ScheduleBrowserExecutionCommand
     | ListScheduledBrowserExecutionsCommand
     | CancelScheduledBrowserExecutionCommand of CancelScheduledBrowserExecutionCommand
+    | ScheduleExecutionCommand of ScheduleExecutionCommand
+    | ListScheduledExecutionsCommand
+    | GetScheduledExecutionCommand of GetScheduledExecutionCommand
+    | CancelScheduledExecutionCommand of CancelScheduledExecutionCommand
     | BrowserOpenTabCommand of BrowserOpenTabCommand
     | BrowserExecuteFileCommand of BrowserExecuteFileCommand
     | BrowserExecuteJsCommand of BrowserExecuteJsCommand
@@ -867,6 +896,10 @@ module AgentCommandInfo =
         | ScheduleBrowserExecutionCommand _ -> "ScheduleBrowserExecutionCommand"
         | ListScheduledBrowserExecutionsCommand -> "ListScheduledBrowserExecutionsCommand"
         | CancelScheduledBrowserExecutionCommand _ -> "CancelScheduledBrowserExecutionCommand"
+        | ScheduleExecutionCommand _ -> "ScheduleExecutionCommand"
+        | ListScheduledExecutionsCommand -> "ListScheduledExecutionsCommand"
+        | GetScheduledExecutionCommand _ -> "GetScheduledExecutionCommand"
+        | CancelScheduledExecutionCommand _ -> "CancelScheduledExecutionCommand"
         | BrowserOpenTabCommand _ -> "BrowserOpenTabCommand"
         | BrowserExecuteFileCommand _ -> "BrowserExecuteFileCommand"
         | BrowserExecuteJsCommand _ -> "BrowserExecuteJsCommand"
@@ -921,6 +954,20 @@ module AgentCommandInfo =
         | MessageCommand _ -> "MessageCommand"
         | GetClientActivityCommand _ -> "GetClientActivityCommand"
 
+    /// A tool call attributed to its initiating agent (not a read of another
+    /// agent or a job-status poll). Used by clients and server activity hints.
+    let isAgentActivity = function
+        | ObserveAgentCommand _
+        | GetJobResultCommand _
+        | ListJobsCommand _
+        | GetClientActivityCommand _ -> false
+        | LedgerReadCommand cmd when cmd.Action = "Health" -> false
+        | TaskWriteCommand cmd when cmd.Action = "NotifyAgent" &&
+                                   not (String.IsNullOrWhiteSpace cmd.SourceRef) &&
+                                   cmd.SourceRef <> cmd.ProjectName -> false
+        | CrossProjectNotificationCommand _ -> false
+        | _ -> true
+
     let protocolName command =
         let commandName = name command
         if commandName.EndsWith("Command", StringComparison.Ordinal) then
@@ -938,6 +985,10 @@ module AgentCommandInfo =
         | ScheduleBrowserExecutionCommand _ -> "ScheduleBrowserExecution"
         | ListScheduledBrowserExecutionsCommand -> "ListScheduledBrowserExecutions"
         | CancelScheduledBrowserExecutionCommand _ -> "CancelScheduledBrowserExecution"
+        | ScheduleExecutionCommand _ -> "ScheduleExecution"
+        | ListScheduledExecutionsCommand -> "ListScheduledExecutions"
+        | GetScheduledExecutionCommand _ -> "GetScheduledExecution"
+        | CancelScheduledExecutionCommand _ -> "CancelScheduledExecution"
         | BrowserOpenTabCommand _ -> "BrowserOpenTab"
         | BrowserExecuteFileCommand _ -> "BrowserExecuteFile"
         | BrowserExecuteJsCommand _ -> "BrowserExecuteJs"
@@ -1013,6 +1064,9 @@ module AgentCommandInfo =
         | BrowserCloseTabCommand _
         | ListScheduledBrowserExecutionsCommand
         | CancelScheduledBrowserExecutionCommand _
+        | ListScheduledExecutionsCommand
+        | GetScheduledExecutionCommand _
+        | CancelScheduledExecutionCommand _
         | BrowserOpenTabCommand _
         | BrowserExecuteJsCommand _
         | BrowserCaptureDomCommand _
@@ -1023,6 +1077,7 @@ module AgentCommandInfo =
         | MessageCommand cmd -> cmd.ProjectName
         | GetClientActivityCommand cmd -> cmd.ProjectName
         | ScheduleBrowserExecutionCommand cmd -> Some cmd.ProjectName
+        | ScheduleExecutionCommand cmd -> Some cmd.ProjectName
         | BrowserRunInNewTabCommand cmd -> Some cmd.ProjectName
         | BrowserExecuteFileCommand cmd -> Some cmd.ProjectName
         | BrowserExportDomCommand cmd -> Some cmd.ProjectName
@@ -1108,6 +1163,10 @@ module AgentCommandInfo =
         | ScheduleBrowserExecutionCommand cmd -> Some($"schedule {cmd.ScheduleId}: {cmd.ProjectName}/{cmd.ScriptPath} in {cmd.RunAfterSeconds}s")
         | ListScheduledBrowserExecutionsCommand -> None
         | CancelScheduledBrowserExecutionCommand cmd -> Some cmd.ScheduleId
+        | ScheduleExecutionCommand cmd -> Some(sprintf "%s %s %s" cmd.ScheduleId cmd.TriggerKind cmd.ActionKind)
+        | ListScheduledExecutionsCommand -> None
+        | GetScheduledExecutionCommand cmd -> Some cmd.ScheduleId
+        | CancelScheduledExecutionCommand cmd -> Some cmd.ScheduleId
         | BrowserListTabsCommand -> None
         | BrowserListWindowsCommand -> None
         | BrowserCloseTabCommand cmd -> Some("agent-created tab " + cmd.TabRegistration)
@@ -1175,6 +1234,10 @@ module AgentCommandInfo =
         | ScheduleBrowserExecutionCommand cmd -> Some($"schedule {cmd.ScheduleId} in {cmd.RunAfterSeconds}s")
         | ListScheduledBrowserExecutionsCommand -> None
         | CancelScheduledBrowserExecutionCommand cmd -> Some cmd.ScheduleId
+        | ScheduleExecutionCommand cmd -> Some(sprintf "%s %s %s" cmd.ScheduleId cmd.TriggerKind cmd.ActionKind)
+        | ListScheduledExecutionsCommand -> None
+        | GetScheduledExecutionCommand cmd -> Some cmd.ScheduleId
+        | CancelScheduledExecutionCommand cmd -> Some cmd.ScheduleId
         | BrowserListTabsCommand
         | BrowserListWindowsCommand -> None
         | BrowserCloseTabCommand cmd -> Some("agent-created tab " + cmd.TabRegistration)

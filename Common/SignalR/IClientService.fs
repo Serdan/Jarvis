@@ -10,3 +10,5 @@ type IClientService =
     abstract InvalidateAgentStates: projectName: string * agentIds: string array -> Task
     /// The mutation scope is unknown: invalidate the complete local agent-state cache.
     abstract InvalidateAllAgentStates: unit -> Task
+    /// Authenticated cross-device activity hint; never a canonical agent-state mutation.
+    abstract RecordAgentActivity: projectName: string * agentId: string * observedAtUtc: System.DateTimeOffset -> Task

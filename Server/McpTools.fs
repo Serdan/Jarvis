@@ -543,6 +543,8 @@ module McpToolHelpers =
         | BrowserListTabsCommand
         | BrowserListWindowsCommand
         | ListScheduledBrowserExecutionsCommand
+        | ListScheduledExecutionsCommand
+        | GetScheduledExecutionCommand _
         | ListWorktreesCommand _
         | GetWorktreeCommand _
         | InspectWorktreeRemovalCommand _
@@ -577,6 +579,7 @@ module McpToolHelpers =
         | UpdateClientCommand -> [ Auth.ProcessExecute ]
         | ScheduleBrowserExecutionCommand _
         | CancelScheduledBrowserExecutionCommand _
+        | CancelScheduledExecutionCommand _
         | BrowserOpenTabCommand _
         | BrowserCloseTabCommand _
         | BrowserRunInNewTabCommand _
@@ -587,6 +590,7 @@ module McpToolHelpers =
         | RunProjectTaskCommand _
         | StartJobCommand _
         | CancelJobCommand _ -> [ Auth.ProcessExecute ]
+        | ScheduleExecutionCommand _ -> [ Auth.ProcessExecute; Auth.WorkspaceRead ]
         | GitCommitCommand _
         | CreateWorktreeCommand _
         | CreateProjectCommand _
@@ -2023,6 +2027,70 @@ type JarvisMcpTools =
       Description("Cancel a pending local browser schedule (including recurring); an in-progress occurrence cannot be undone.")>]
     static member CancelScheduledBrowserExecution(scheduleId: string, agentId: string, [<Optional; DefaultParameterValue("")>] deviceId: string, client: ClientService, http: IHttpContextAccessor) =
         McpToolHelpers.send client http (CancelScheduledBrowserExecutionCommand { ScheduleId = scheduleId })
+
+    [<McpServerTool(Title = "Schedule CLI or browser execution", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false);
+      McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["process:execute","workspace:read"]}]""");
+      Description("Create or replace a durable execution schedule. triggerKind: Once, Every, AfterAgentIdle; actionKind: RunCommand or BrowserScript. Optional UTC time or delay, recurrence interval, or project/agent idle timer. Only one active occurrence per schedule, no missed-interval replay.")>]
+    static member ScheduleExecution(scheduleId: string, projectName: string, agentId: string,
+                                   triggerKind: string, actionKind: string,
+                                   [<Optional; DefaultParameterValue("")>] worktreeName: string,
+                                   runAfterSeconds: Nullable<int>, runAtUtc: Nullable<DateTimeOffset>,
+                                   repeatEverySeconds: Nullable<int>,
+                                   [<Optional; DefaultParameterValue("")>] idleAgentId: string,
+                                   idleSeconds: Nullable<int>,
+                                   [<Optional; DefaultParameterValue("")>] executable: string,
+                                   args: string array,
+                                   [<Optional; DefaultParameterValue("")>] workingDirectory: string,
+                                   timeoutSeconds: Nullable<int>, maxOutputBytes: Nullable<int>,
+                                   [<Optional; DefaultParameterValue("")>] windowRegistration: string,
+                                   [<Optional; DefaultParameterValue("")>] url: string,
+                                   [<Optional; DefaultParameterValue("")>] scriptPath: string,
+                                   [<Optional; DefaultParameterValue("")>] argsJson: string,
+                                   [<Optional; DefaultParameterValue("")>] alias: string,
+                                   [<Optional; DefaultParameterValue(false)>] active: bool,
+                                   [<Optional; DefaultParameterValue(true)>] closeTabAfterExecution: bool,
+                                   [<Optional; DefaultParameterValue("")>] deviceId: string,
+                                   client: ClientService, http: IHttpContextAccessor) =
+        let projectName = McpToolHelpers.projectWithWorktreeName projectName worktreeName
+        McpToolHelpers.send client http (ScheduleExecutionCommand {
+            ScheduleId = scheduleId; ProjectName = projectName; TriggerKind = triggerKind
+            ActionKind = actionKind; RunAfterSeconds = McpToolHelpers.optionOfNullable runAfterSeconds
+            RunAtUtc = if runAtUtc.HasValue then Some runAtUtc.Value else None
+            RepeatEverySeconds = McpToolHelpers.optionOfNullable repeatEverySeconds
+            IdleAgentId = McpToolHelpers.optionOfString idleAgentId
+            IdleSeconds = McpToolHelpers.optionOfNullable idleSeconds
+            Executable = McpToolHelpers.optionOfString executable
+            Args = if isNull args then [] else args |> Array.toList
+            WorkingDirectory = McpToolHelpers.optionOfString workingDirectory
+            TimeoutSeconds = McpToolHelpers.optionOfNullable timeoutSeconds
+            MaxOutputBytes = McpToolHelpers.optionOfNullable maxOutputBytes
+            WindowRegistration = McpToolHelpers.optionOfString windowRegistration
+            Url = McpToolHelpers.optionOfString url
+            ScriptPath = McpToolHelpers.optionOfString scriptPath
+            ArgsJson = McpToolHelpers.optionOfString argsJson
+            Alias = McpToolHelpers.optionOfString alias; Active = Some active
+            CloseTabAfterExecution = Some closeTabAfterExecution })
+
+    [<McpServerTool(Title = "List all scheduled executions", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false);
+      McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]""");
+      Description("List persisted CLI and browser schedules with trigger/action, due time, last attempt, status and error; omits command arguments and script JSON.")>]
+    static member ListScheduledExecutions(agentId: string, [<Optional; DefaultParameterValue("")>] deviceId: string,
+                                          client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http ListScheduledExecutionsCommand
+
+    [<McpServerTool(Title = "Inspect scheduled execution", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false);
+      McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["workspace:read"]}]""");
+      Description("Read schedule trigger, action metadata, next due time, last attempt, status, and error by schedule ID. Never reveals arguments.")>]
+    static member GetScheduledExecution(scheduleId: string, agentId: string, [<Optional; DefaultParameterValue("")>] deviceId: string,
+                                        client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http (GetScheduledExecutionCommand { ScheduleId = scheduleId })
+
+    [<McpServerTool(Title = "Cancel scheduled execution", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false);
+      McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["process:execute"]}]""");
+      Description("Disable future executions of a schedule; an occurrence already started is not killed.")>]
+    static member CancelScheduledExecution(scheduleId: string, agentId: string, [<Optional; DefaultParameterValue("")>] deviceId: string,
+                                           client: ClientService, http: IHttpContextAccessor) =
+        McpToolHelpers.send client http (CancelScheduledExecutionCommand { ScheduleId = scheduleId })
 
     [<McpServerTool(Title = "Open browser tab", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false);
       McpMeta("securitySchemes", JsonValue = """[{"type":"oauth2","scopes":["process:execute"]}]""");

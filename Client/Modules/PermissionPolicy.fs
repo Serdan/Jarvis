@@ -111,6 +111,8 @@ let private requiresConfirmation command =
     | BrowserListTabsCommand
     | BrowserListWindowsCommand
     | ListScheduledBrowserExecutionsCommand
+    | ListScheduledExecutionsCommand
+    | GetScheduledExecutionCommand _
     | ListWorktreesCommand _
     | GetWorktreeCommand _
     | InspectWorktreeRemovalCommand _
@@ -143,6 +145,14 @@ let private requiresConfirmation command =
             [ cmd.ScriptPath ] None [] ("Schedule browser execution " + cmd.ScheduleId) false
     | CancelScheduledBrowserExecutionCommand cmd ->
         confirmation "CancelScheduledBrowserExecution" None [ ProcessExecution ] [] None [] ("Cancel scheduled browser action " + cmd.ScheduleId) false
+    | ScheduleExecutionCommand cmd ->
+        let network = if cmd.ActionKind = "BrowserScript" then [ NetworkAccess ] else []
+        confirmation "ScheduleExecution" (Some cmd.ProjectName) ([ ProcessExecution ] @ network)
+            (cmd.ScriptPath |> Option.toList) cmd.Executable cmd.Args
+            ("Schedule " + cmd.ActionKind + " execution " + cmd.ScheduleId) false
+    | CancelScheduledExecutionCommand cmd ->
+        confirmation "CancelScheduledExecution" None [ ProcessExecution ] [] None []
+            ("Cancel scheduled execution " + cmd.ScheduleId) false
     | BrowserOpenTabCommand cmd ->
         let origin =
             match Uri.TryCreate(cmd.Url, UriKind.Absolute) with
@@ -246,6 +256,8 @@ let private trustAllows trustLevel command =
     | FullTrust, _ -> true
     | PartialTrust, ScheduleBrowserExecutionCommand _
     | PartialTrust, CancelScheduledBrowserExecutionCommand _
+    | PartialTrust, ScheduleExecutionCommand _
+    | PartialTrust, CancelScheduledExecutionCommand _
     | PartialTrust, BrowserOpenTabCommand _
     | PartialTrust, BrowserCloseTabCommand _
     | PartialTrust, BrowserRunInNewTabCommand _

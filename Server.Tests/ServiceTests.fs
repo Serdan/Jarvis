@@ -1574,6 +1574,7 @@ let client_request_abort_cancels_outstanding_device_correlation_without_faulting
                         tracker.Complete(correlationId, user, connection, registered.Generation, expected) |> ignore
                     Task.CompletedTask
                 member _.InvalidateAgentStates(_, _) = Task.CompletedTask
+                member _.RecordAgentActivity(_, _, _) = Task.CompletedTask
                 member _.InvalidateAllAgentStates() = Task.CompletedTask }
         let clients =
             { new Microsoft.AspNetCore.SignalR.IHubClients<Common.SignalR.IClientService> with
@@ -1680,6 +1681,7 @@ let post_commit_uncertain_client_reply_remains_unknown_across_server_dispatch_an
                                          registered.Generation, uncertain) |> ignore
                     } :> Task
                 member _.InvalidateAgentStates(_, _) = Task.CompletedTask
+                member _.RecordAgentActivity(_, _, _) = Task.CompletedTask
                 member _.InvalidateAllAgentStates() =
                     System.Threading.Interlocked.Increment(&cacheInvalidations) |> ignore
                     Task.CompletedTask }
@@ -1816,6 +1818,7 @@ let private routedNotificationFixtureWithReceipt (sourceReceipt: AgentInboxActiv
             { new Common.SignalR.IClientService with
                 member _.ReceiveMessage(_) = Task.CompletedTask
                 member _.InvalidateAgentStates(_, _) = Task.CompletedTask
+                member _.RecordAgentActivity(_, _, _) = Task.CompletedTask
                 member _.InvalidateAllAgentStates() = Task.CompletedTask
                 member _.ReceiveCommand(correlationId, commandJson, senderActor) =
                     let device = connectionId.Replace("-connection", "", StringComparison.Ordinal)
@@ -2099,6 +2102,7 @@ let browser_dom_mcp_tools_route_only_when_all_required_oauth_scopes_are_present 
                       Error = None; Instructions = []; AgentStateChanges = []; InboxActivation = None; PendingJob = None }) |> ignore
                 Task.CompletedTask
             member _.InvalidateAgentStates(_, _) = Task.CompletedTask
+            member _.RecordAgentActivity(_, _, _) = Task.CompletedTask
             member _.InvalidateAllAgentStates() = Task.CompletedTask }
     let clients =
         { new Microsoft.AspNetCore.SignalR.IHubClients<Common.SignalR.IClientService> with
@@ -2186,4 +2190,76 @@ let browser_dom_mcp_tools_route_only_when_all_required_oauth_scopes_are_present 
     let! noProjectRead = export()
     assertDenied Auth.WorkspaceRead noProjectRead
     Assert.That(dispatchCount(), Is.EqualTo(2), "Denied requests must never reach ClientService.")
+}
+
+[<Test>]
+let attributed_tool_dispatch_reaches_both_user_devices_but_not_other_users_or_job_polls () = task {
+    let users = UserService()
+    let registrations = System.Collections.Generic.Dictionary<string, int64>()
+    let register user device connection =
+        users.TransportConnected(user, connection)
+        let receipt =
+            users.Register(user,
+                { DeviceId = device; DeviceName = device
+                  ProtocolVersion = AgentProtocol.version; ClientVersion = "test"
+                  SupportedCommands = [ "RunCommand"; "ListJobs" ] }, connection)
+        registrations[connection] <- receipt.Generation
+    register "alice" "desktop" "desktop-connection"
+    register "alice" "laptop" "laptop-connection"
+    register "bob" "foreign" "foreign-connection"
+    let tracker = ClientResponseTracker()
+    let received = System.Collections.Concurrent.ConcurrentQueue<string * string * string * DateTimeOffset>()
+    let expected = { Result = Some "ok"; Error = None; Instructions = []
+                     AgentStateChanges = []; InboxActivation = None; PendingJob = None }
+    let recipient connection =
+        { new Common.SignalR.IClientService with
+            member _.ReceiveMessage(_) = Task.CompletedTask
+            member _.ReceiveCommand(correlationId, _, _) =
+                tracker.Complete(correlationId, "alice", connection, registrations[connection], expected)
+                |> ignore
+                Task.CompletedTask
+            member _.InvalidateAgentStates(_, _) = Task.CompletedTask
+            member _.InvalidateAllAgentStates() = Task.CompletedTask
+            member _.RecordAgentActivity(project, agent, timestamp) =
+                received.Enqueue((connection, project, agent, timestamp))
+                Task.CompletedTask }
+    let clients =
+        { new Microsoft.AspNetCore.SignalR.IHubClients<Common.SignalR.IClientService> with
+            member _.All = recipient "desktop-connection"
+            member _.AllExcept(_) = recipient "desktop-connection"
+            member _.Client(connection) = recipient connection
+            member _.Clients(_) = recipient "desktop-connection"
+            member _.Group(_) = recipient "desktop-connection"
+            member _.GroupExcept(_, _) = recipient "desktop-connection"
+            member _.Groups(_) = recipient "desktop-connection"
+            member _.User(_) = recipient "desktop-connection"
+            member _.Users(_) = recipient "desktop-connection" }
+    let hub =
+        { new Microsoft.AspNetCore.SignalR.IHubContext<HubService, Common.SignalR.IClientService> with
+            member _.Clients = clients
+            member _.Groups = Unchecked.defaultof<_> }
+    let accessor = Microsoft.AspNetCore.Http.HttpContextAccessor()
+    accessor.HttpContext <- Microsoft.AspNetCore.Http.DefaultHttpContext()
+    let service = ClientService(hub, users, tracker, accessor,
+        Microsoft.Extensions.Logging.Abstractions.NullLogger<ClientService>.Instance)
+    let run =
+        RunCommandCommand
+            { ProjectName = "Jarvis::branch"; Executable = "dotnet"; Args = [ "--version" ]
+              Reason = None; WorkingDirectory = None; TimeoutSeconds = None; MaxOutputBytes = None }
+    let! result = service.SendCommandToUser("alice", run, deviceId = "desktop", agentId = "Manager")
+    Assert.That(result.Result, Is.EqualTo(Some "ok"))
+    let notifications = received.ToArray()
+    Assert.That(notifications.Length, Is.EqualTo(2))
+    let observedDevices = notifications |> Array.map (fun (connection, _, _, _) -> connection) |> Set.ofArray
+    Assert.That(observedDevices.Contains("desktop-connection"), Is.True)
+    Assert.That(observedDevices.Contains("laptop-connection"), Is.True)
+    Assert.That(observedDevices.Contains("foreign-connection"), Is.False)
+    for _, project, agent, timestamp in notifications do
+        Assert.That(project, Is.EqualTo("Jarvis"))
+        Assert.That(agent, Is.EqualTo("Manager"))
+        Assert.That(timestamp, Is.GreaterThan(DateTimeOffset.UtcNow.AddMinutes(-1.)))
+    let poll = ListJobsCommand { ProjectName = Some "Jarvis"; IncludeCompleted = true }
+    let! result2 = service.SendCommandToUser("alice", poll, deviceId = "desktop", agentId = "Manager")
+    Assert.That(result2.Result, Is.EqualTo(Some "ok"))
+    Assert.That(received.Count, Is.EqualTo(2), "Job polling must not reset Manager idle clock")
 }

@@ -180,6 +180,21 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                 ctx.Clients.Client(connectionId).InvalidateAgentStates(projectName, unique))
             |> Task.WhenAll
 
+    // Lightweight authenticated activity hints, not ledger writes. Deliver to
+    // every connected device of this user so idle deadlines share observation.
+    member _.RecordAgentActivityForUser(userId: string, projectName: string,
+                                        agentId: string, observedAtUtc: DateTimeOffset) : Task =
+        if String.IsNullOrWhiteSpace projectName || String.IsNullOrWhiteSpace agentId then
+            Task.CompletedTask
+        else
+            let separator = projectName.IndexOf("::", StringComparison.Ordinal)
+            let project = if separator < 0 then projectName else projectName.Substring(0, separator)
+            users.ListDevices(userId)
+            |> AgentStateInvalidationRouting.recipients
+            |> Array.map (fun connectionId ->
+                ctx.Clients.Client(connectionId).RecordAgentActivity(project, agentId, observedAtUtc))
+            |> Task.WhenAll
+
     // A client exception after a possible mutation cannot identify all
     // affected agents. Invalidate every cached agent for THIS authenticated
     // user's registered devices, rather than declaring zero changes.
@@ -283,6 +298,19 @@ type ClientService(ctx: IHubContext<HubService, IClientService>, users: UserServ
                             do! client.ReceiveCommand(correlationId, commandJson, defaultArg agentId "").WaitAsync(requestAborted)
                             sendMs <- Stopwatch.GetElapsedTime(dispatchAt).TotalMilliseconds
                             users.RecordDispatchSuccess(userId, connectionId)
+
+                            // Attribute only the original initiating actor, not a
+                            // different agent named by ObserveAgent or a job poll.
+                            match agentId, AgentCommandInfo.projectName command with
+                            | Some actor, Some project
+                                when not (String.IsNullOrWhiteSpace actor) &&
+                                     not (String.IsNullOrWhiteSpace project) &&
+                                     AgentCommandInfo.isAgentActivity command ->
+                                try
+                                    do! this.RecordAgentActivityForUser(userId, project, actor, DateTimeOffset.UtcNow)
+                                with ex ->
+                                    logger.LogWarning(ex, "Unable to publish cross-device agent activity hint")
+                            | _ -> ()
 
                             let awaitReplyAt = Stopwatch.GetTimestamp()
                             replyStartedAt <- Some awaitReplyAt

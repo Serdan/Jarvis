@@ -164,6 +164,7 @@ type ProjectTerminalRecord =
 
 type WorkMutation =
     | PublishStage of WorkStage
+    | ProduceEvent of QueueProducerEvent
     | PostMessage of SubjectMessage * WorkStage option
     | AdmitProject of Launch
     | AbortUnboundProjectAdmission of Launch * originalAdmissionOperationId: string
@@ -177,6 +178,7 @@ type WorkMutation =
     | ClaimAncillary of launchId: string * messageId: string
     | CompleteAncillary of launchId: string * messageId: string * handlerGeneration: int * replyId: string
     | SetHardPrerequisite of workId: string * prerequisite: string
+    | RemoveHardPrerequisite of workId: string * prerequisite: string
     | CancelUnclaimed of workId: string * reason: string
     | TerminalizeNoClaim of launchId: string
     | YieldReadOnly of launchId: string * workId: string * expectedClaimGeneration: int
@@ -915,15 +917,31 @@ module WorkQueueGitLedger =
                     Error(StaleEntityVersion "Stale WQ-02 project version.")
                 | Some state ->
                     let op = operationId.ToString("D")
+                    let unverifiedWq04Stage =
+                        state.Works
+                        |> Map.exists (fun id _ -> id.StartsWith("wq04-", StringComparison.Ordinal))
                     let transition =
                         match mutation with
                         | PublishStage stage ->
-                            if not (validInitialStage stage) then
+                            if stage.Id.StartsWith("wq04-", StringComparison.Ordinal) then
+                                Error(Rejection.IncompleteCoverage
+                                    "WQ-04 stages require canonical producer authority, not PublishStage")
+                            elif not (validInitialStage stage) then
                                 Error(Rejection.InvalidState "invalid published stage generation")
                             else
                                 Contracts.publishStage expectedVersion op (witnessNewStage state now stage) state
+                        | ProduceEvent _ ->
+                            // The caller supplies the purported event, SourceId,
+                            // verdict and high-water. No pinned canonical
+                            // task/review/challenge/message resolver exists here.
+                            // A successful project CAS would not authenticate it.
+                            Error(Rejection.IncompleteCoverage
+                                "WQ-04 canonical event/index authority missing; recovery blocked")
                         | PostMessage (message, roleWork) ->
-                            if not (validMessagePayload message)
+                            if roleWork |> Option.exists (fun stage ->
+                                stage.Id.StartsWith("wq04-", StringComparison.Ordinal)) then
+                                Error(Rejection.IncompleteCoverage "WQ-04 role message requires canonical source authority")
+                            elif not (validMessagePayload message)
                                || (roleWork |> Option.exists (validInitialStage >> not)) then
                                 Error(Rejection.InvalidState "invalid message or role stage payload")
                             else
@@ -932,7 +950,10 @@ module WorkQueueGitLedger =
                         | AdmitProject launch ->
                             // Account reservation is proven by the separate bridge before
                             // invoking this inert project-CAS adapter.
-                            if not (validInitialLaunch binding launch)
+                            if unverifiedWq04Stage then
+                                Error(Rejection.IncompleteCoverage
+                                    "cannot admit launch against unverified WQ-04 stages/role versions")
+                            elif not (validInitialLaunch binding launch)
                                || (state.Launches
                                    |> Map.exists (fun _ existing ->
                                        existing.AccountTokenId = launch.AccountTokenId)) then
@@ -955,7 +976,10 @@ module WorkQueueGitLedger =
                         | Heartbeat (launch, generation) -> Contracts.heartbeat expectedVersion op launch generation now state
                         | StopStalled (launch, generation, timeout) ->
                             Contracts.markStalled expectedVersion op launch generation now timeout state
-                        | ClaimNext launch -> Contracts.claimNext expectedVersion op launch state
+                        | ClaimNext launch ->
+                            if unverifiedWq04Stage then
+                                Error(Rejection.IncompleteCoverage "cannot claim unverified WQ-04 demand")
+                            else Contracts.claimNext expectedVersion op launch state
                         | CompleteOrdinary (launch, work) ->
                             match state.Works.TryFind work with
                             | Some stage when stage.Kind = WorkKind.Implementation
@@ -972,6 +996,8 @@ module WorkQueueGitLedger =
                             Contracts.completeAncillaryMessage expectedVersion op launch message generation reply now state
                         | SetHardPrerequisite (work, prerequisite) ->
                             Contracts.setHardPrerequisite expectedVersion op work prerequisite now state
+                        | RemoveHardPrerequisite (work, prerequisite) ->
+                            Contracts.removeHardPrerequisite expectedVersion op work prerequisite now state
                         | CancelUnclaimed (work, reason) ->
                             Contracts.cancelUnclaimedStage expectedVersion op work reason now state
                         | TerminalizeNoClaim _ ->
@@ -1032,6 +1058,11 @@ module WorkQueueGitLedger =
                                 match stage.Kind, stage.SourceLineage with
                                 | WorkKind.Implementation, Some lineage -> verifyInitialSource binding lineage
                                 | _ -> Ok()
+                            | ProduceEvent _ ->
+                                // A source lineage check is not event authority.
+                                // This second guard must not be bypassed if
+                                // the transition branch changes in future.
+                                Error(sourceReject "WQ-04 canonical source authority unavailable")
                             | YieldSource checkpoint ->
                                 match state.Works.TryFind checkpoint.WorkId with
                                 | Some prior ->

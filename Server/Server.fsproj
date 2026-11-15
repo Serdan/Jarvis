@@ -12,6 +12,7 @@
         <Content Include="Structure.md"/>
         <Compile Include="WorkQueueContracts.fs"/>
         <Compile Include="WorkQueueDependencyDiagnostics.fs"/>
+        <Compile Include="WorkQueueProducers.fs"/>
         <Compile Include="JarvisOptions.fs"/>
         <Compile Include="Auth.fs"/>
         <Compile Include="HttpRateLimitProtection.fs"/>

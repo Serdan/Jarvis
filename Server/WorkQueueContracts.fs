@@ -537,7 +537,6 @@ module Contracts =
                 let allSatisfied = hardDependenciesSatisfied current stage
                 if stage.State = WorkState.Blocked
                    && stage.Gate = GateState.Clear
-                   && not stage.Dependencies.IsEmpty
                    && allSatisfied then
                     let sequence = current.NextAvailability + 1L
                     let readyStage =
@@ -1171,6 +1170,30 @@ module Contracts =
                 let updated = { work with Dependencies = dependencies; Gate = gate; State = state }
                 { current with GraphVersion = nextGraph
                                Works = current.Works.Add(workId, updated) }
+                |> projectDependenciesChanged now) project
+
+    // Removing the final unsatisfied edge is a genuine wake with a fresh
+    // server-witnessed FIFO position. A previously gated live claim stays
+    // fenced: edge removal cannot revive an unsafe source writer or an
+    // in-flight integration push. Only explicit gate reconciliation can.
+    let removeHardPrerequisite expected op workId prerequisite now project =
+        projectCas expected op (fullInput "remove-hard-edge" (workId, prerequisite)) (fun current ->
+            match current.Works.TryFind workId with
+            | None -> Error(Rejection.InvalidState "unknown stage")
+            | Some work when work.State = WorkState.Completed || work.State = WorkState.Cancelled ->
+                Error Rejection.StageAlreadyTerminal
+            | Some work when work.Domain <> DomainState.Undecided ->
+                Error Rejection.DomainAlreadyFinalized
+            | Some work when not (work.Dependencies.Contains prerequisite) ->
+                Error(Rejection.InvalidState "hard prerequisite is absent")
+            | Some work ->
+                let changed =
+                    { work with
+                        Dependencies = work.Dependencies.Remove prerequisite
+                        WaivedDependencies = work.WaivedDependencies.Remove prerequisite }
+                { current with
+                    GraphVersion = current.GraphVersion + 1
+                    Works = current.Works.Add(workId, changed) }
                 |> projectDependenciesChanged now) project
 
     let private waiverMatches (work: WorkStage) (required: Set<string>) (receipt: VerifiedWaiverReceipt) =

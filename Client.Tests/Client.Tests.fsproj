@@ -37,6 +37,7 @@
         <Compile Include="WorktreeTests.fs"/>
         <Compile Include="LedgerStoreTests.fs"/>
         <Compile Include="WorkQueueGitLedgerTests.fs"/>
+        <Compile Include="WorkQueueProducerGitTests.fs"/>
         <Compile Include="SourceEffectJournalTests.fs"/>
         <Compile Include="SourceEffectRouteBridgeTests.fs"/>
         <Compile Include="AccountCapacityLedgerTests.fs"/>

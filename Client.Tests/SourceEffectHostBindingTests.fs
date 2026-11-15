@@ -17,11 +17,17 @@ open Client.WorkQueueGitLedger
 // The pure seam receives a canonical project for deterministic negative tests.
 // Production MUST call prepareHostFileEdit, which itself loads the verified
 // approved host binding and canonical Git-CAS snapshot, never caller input.
+let private openAtHostRoot root =
+    Client.SourceEffectJournal.openExistingAtHostRoot root (root + ".continuity.anchor")
+
 let private withHostJournal action =
     let root = Path.Combine(Path.GetTempPath(), "jarvis-wq03-bound-" + Guid.NewGuid().ToString("N"))
     let host = Path.Combine(root, "host-journal")
     Directory.CreateDirectory(host) |> ignore
     try
+        match provisionTrustedHostRoot host (host + ".continuity.anchor") with
+        | Error reason -> failwith reason
+        | Ok () -> ()
         match openAtHostRoot host with
         | Error error -> failwith error
         | Ok store -> action root host store
@@ -201,3 +207,184 @@ let same_original_uuid_cannot_be_rebound_to_other_ledger_or_request () =
         denied (run changedEnvelope changedRequest (fun () -> task { return (Ok 3 : Result<int,string>) }))
         let preflight = inspectForHandoff journal initial.TrustedScope [original]
         Assert.That(preflight.RecoveryBlocked, Is.True))
+let private boundOrFail binding project checkout command uuid store =
+    bound binding project checkout command uuid store
+    |> function Ok value -> value | Error reason -> failwith reason
+
+[<Test>]
+let journal_operational_open_requires_explicit_single_trusted_enrollment () =
+    let root = Path.Combine(Path.GetTempPath(), "jarvis-wq03-unenrolled-" + Guid.NewGuid().ToString("N"))
+    let anchor = root + ".continuity.anchor"
+    Directory.CreateDirectory(root) |> ignore
+    try
+        // Neither open nor a retry is permitted to invent an empty replay domain.
+        denied (openExistingAtHostRoot root anchor)
+        Assert.That(File.Exists(Path.Combine(root, "source-effects-v1.sqlite")), Is.False)
+        match provisionTrustedHostRoot root anchor with
+        | Error reason -> failwith reason
+        | Ok () -> ()
+        match openExistingAtHostRoot root anchor with
+        | Error reason -> failwith reason
+        | Ok _ -> ()
+        denied (provisionTrustedHostRoot root anchor)
+    finally
+        if Directory.Exists root then Directory.Delete(root, true)
+        if File.Exists anchor then File.Delete(anchor)
+
+[<Test>]
+let two_clients_after_successful_edit_missing_sqlite_never_redispatch () =
+    withHostJournal (fun root host first ->
+        let second = openAtHostRoot host |> function
+            | Ok value -> value | Error reason -> failwith reason
+        let binding, project, checkout, _, _, command = fixture root
+        let uuid = Guid.NewGuid()
+        let a = boundOrFail binding project checkout command uuid first
+        let b = boundOrFail binding project checkout command uuid second
+        let target = Path.Combine(root, "effect.txt")
+        let mutable edits = 0
+        let firstResult = run a command (fun () -> task {
+            edits <- edits + 1
+            File.WriteAllText(target, "A")
+            return (Ok () : Result<unit,string>)
+        })
+        Assert.That((firstResult = Ok(Ok ())), Is.True)
+        // Independent old anchor survives crash/restart even if all SQLite bytes vanish.
+        let db = Path.Combine(host, "source-effects-v1.sqlite")
+        File.Delete(db)
+        denied (openAtHostRoot host)
+        denied (provisionTrustedHostRoot host (host + ".continuity.anchor"))
+        let mutable secondCallback = false
+        denied (run b command (fun () -> task {
+            secondCallback <- true
+            File.WriteAllText(target, "B")
+            return (Ok () : Result<unit,string>)
+        }))
+        Assert.That(secondCallback, Is.False)
+        Assert.That(edits, Is.EqualTo 1)
+        Assert.That(File.ReadAllText(target), Is.EqualTo "A")
+        Assert.That(File.Exists db, Is.False)
+        // B cannot escape with a different payload, source or UUID after loss.
+        let changed =
+            match command with
+            | WriteFileCommand data -> WriteFileCommand {data with Content = "new payload"}
+            | _ -> failwith "fixture"
+        let bChanged = boundOrFail binding project checkout changed uuid second
+        denied (run bChanged changed (fun () -> task { return (Ok () : Result<unit,string>) }))
+        let otherUuid = boundOrFail binding project checkout command (Guid.NewGuid()) second
+        denied (run otherUuid command (fun () -> task { return (Ok () : Result<unit,string>) })))
+
+[<Test>]
+let two_clients_reject_sqlite_rollback_to_pre_uuid_snapshot () =
+    withHostJournal (fun root host first ->
+        let db = Path.Combine(host, "source-effects-v1.sqlite")
+        let snapshot = Path.Combine(root, "pre-uuid-snapshot.sqlite")
+        File.Copy(db, snapshot)
+        let second = openAtHostRoot host |> function
+            | Ok value -> value | Error reason -> failwith reason
+        let binding, project, checkout, _, _, command = fixture root
+        let uuid = Guid.NewGuid()
+        let a = boundOrFail binding project checkout command uuid first
+        let b = boundOrFail binding project checkout command uuid second
+        let mutable effects = 0
+        let runEdit invocation = run invocation command (fun () -> task {
+            effects <- effects + 1
+            return (Ok () : Result<unit,string>)
+        })
+        Assert.That((runEdit a = Ok(Ok ())), Is.True)
+        File.Copy(snapshot, db, true)
+        // Identical journal UUID/root is insufficient: independent original
+        // operation inventory detects an older otherwise-valid SQLite snapshot.
+        denied (openAtHostRoot host)
+        let attempts = [| first; second |]
+        Parallel.For(0, 2, fun n ->
+            let candidate = boundOrFail binding project checkout command uuid attempts.[n]
+            denied (runEdit candidate)) |> ignore
+        Assert.That(effects, Is.EqualTo 1)
+        Assert.That(File.Exists(host + ".continuity.anchor"), Is.True))
+
+[<Test>]
+let source_journal_root_switch_rejects_even_valid_sqlite_copy () =
+    withHostJournal (fun root host first ->
+        let other = Path.Combine(root, "switched-journal")
+        Directory.CreateDirectory(other) |> ignore
+        File.Copy(Path.Combine(host, "source-effects-v1.sqlite"),
+                  Path.Combine(other, "source-effects-v1.sqlite"))
+        // The anchor was enrolled for host, not for a caller-repointed root.
+        denied (openExistingAtHostRoot other (host + ".continuity.anchor"))
+        let binding, project, checkout, _, _, cmd = fixture root
+        let uuid = Guid.NewGuid()
+        let a = boundOrFail binding project checkout cmd uuid first
+        let mutable invoked = 0
+        Assert.That((run a cmd (fun () -> task {
+            invoked <- invoked + 1
+            return (Ok () : Result<unit,string>)
+        }) = Ok(Ok ())), Is.True)
+        denied (openExistingAtHostRoot other (host + ".continuity.anchor"))
+        Assert.That(invoked, Is.EqualTo 1))
+
+[<Test>]
+let lost_or_corrupt_host_anchor_is_sticky_recovery_blocked () =
+    withHostJournal (fun root host first ->
+        let second = openAtHostRoot host |> function
+            | Ok value -> value | Error reason -> failwith reason
+        let binding, project, checkout, _, _, cmd = fixture root
+        let uuid = Guid.NewGuid()
+        let a = boundOrFail binding project checkout cmd uuid first
+        let b = boundOrFail binding project checkout cmd uuid second
+        Assert.That((run a cmd (fun () -> task { return (Ok 1 : Result<int,string>) }) = Ok(Ok 1)), Is.True)
+        let anchor = host + ".continuity.anchor"
+        File.WriteAllText(anchor, "corrupted marker")
+        denied (openAtHostRoot host)
+        let mutable repeated = false
+        denied (run b cmd (fun () -> task {
+            repeated <- true
+            return (Ok 2 : Result<int,string>)
+        }))
+        Assert.That(repeated, Is.False)
+        denied (provisionTrustedHostRoot host anchor))
+[<Test>]
+let uncertain_original_uuid_then_db_loss_never_invokes_second_client () =
+    withHostJournal (fun root host first ->
+        let second = openAtHostRoot host |> function
+            | Ok value -> value | Error reason -> failwith reason
+        let binding, project, checkout, _, _, cmd = fixture root
+        let uuid = Guid.NewGuid()
+        let a = boundOrFail binding project checkout cmd uuid first
+        let b = boundOrFail binding project checkout cmd uuid second
+        Assert.That((beginBeforeDispatch first a.Intent = Ok FirstDispatch), Is.True)
+        match recordUncertain first a.Intent "A's original outcome is unknown" with
+        | Ok () -> ()
+        | Error reason -> failwith reason
+        File.Delete(Path.Combine(host, "source-effects-v1.sqlite"))
+        denied (openAtHostRoot host)
+        let mutable invoked = false
+        denied (run b cmd (fun () -> task {
+            invoked <- true
+            return (Ok 1 : Result<int,string>)
+        }))
+        Assert.That(invoked, Is.False))
+
+[<Test>]
+let malformed_journal_schema_blocks_open_and_cached_dispatch () =
+    withHostJournal (fun root host first ->
+        let second = openAtHostRoot host |> function
+            | Ok value -> value | Error reason -> failwith reason
+        let binding, project, checkout, _, _, cmd = fixture root
+        let uuid = Guid.NewGuid()
+        let a = boundOrFail binding project checkout cmd uuid first
+        let b = boundOrFail binding project checkout cmd uuid second
+        Assert.That((run a cmd (fun () -> task { return (Ok 1 : Result<int,string>) }) = Ok(Ok 1)), Is.True)
+        let db = Path.Combine(host, "source-effects-v1.sqlite")
+        use connection = new Microsoft.Data.Sqlite.SqliteConnection("Data Source=" + db)
+        connection.Open()
+        use change = connection.CreateCommand()
+        change.CommandText <- "DROP TABLE journal_identity;"
+        change.ExecuteNonQuery() |> ignore
+        connection.Close()
+        denied (openAtHostRoot host)
+        let mutable replayed = false
+        denied (run b cmd (fun () -> task {
+            replayed <- true
+            return (Ok 2 : Result<int,string>)
+        }))
+        Assert.That(replayed, Is.False))

@@ -17,6 +17,10 @@ function harness(options = {}) {
   let editorSelected = false;
   let mode = options.initialMode || "Chat";
   let chatClicks = 0;
+  let staleSendChecks = 0;
+  let staleSendObserved = 0;
+  let draftWasCleared = false;
+  let injectedTurn = false;
   const makeMode = name => ({
     textContent: name,
     getAttribute(attribute) {
@@ -73,6 +77,11 @@ function harness(options = {}) {
       if (command === "delete") {
         if (!editorSelected || options.clearFails) return false;
         content = options.clearLeavesText ? "residual draft" : "";
+        if (!content) {
+          draftWasCleared = true;
+          staleSendChecks = options.staleSendChecks || 0;
+          if (options.routeAfterClear) site.href = "https://chatgpt.com/c/unexpected";
+        }
         return true;
       }
       if (command !== "insertText") return false;
@@ -81,7 +90,16 @@ function harness(options = {}) {
     },
     querySelector(selector) {
       if (selector.includes('contenteditable="true"')) return options.noComposer ? null : editor;
-      if (selector.includes('aria-label="Send"')) return content && !options.noSend ? send : null;
+      if (selector.includes('aria-label="Send"')) {
+        if (options.noSend) return null;
+        if (content || options.sendAlwaysEnabled) return send;
+        if (staleSendChecks > 0) {
+          staleSendChecks--;
+          staleSendObserved++;
+          return send;
+        }
+        return null;
+      }
       if (selector.includes('Stop generating')) return null;
       return null;
     },
@@ -101,6 +119,11 @@ function harness(options = {}) {
       if (selector === '[data-user-message-bubble]') {
         return renderedBubble === null ? [] : [{ innerText: renderedBubble }];
       }
+      if (selector.includes('data-message-author-role="user"') &&
+          options.injectTurnAfterClear && draftWasCleared && !injectedTurn) {
+        userTurns++;
+        injectedTurn = true;
+      }
       return selector.includes('data-message-author-role="user"') && !options.noLegacyTurnMarkers
         ? Array(userTurns).fill({}) : [];
     }
@@ -112,7 +135,8 @@ function harness(options = {}) {
       prompt, timeoutMs: options.timeoutMs || 350, ...extra
     }) + ")", ctx);
   return { run, site, get clicks() { return clicks; }, get chatClicks() { return chatClicks; },
-    get mode() { return mode; }, get content() { return content; }, get lastSubmittedText() { return lastSubmittedText; } };
+    get mode() { return mode; }, get content() { return content; },
+    get staleSendObserved() { return staleSendObserved; }, get lastSubmittedText() { return lastSubmittedText; } };
 }
 
 test("inserts multiline prompt through editor and submits once", async () => {
@@ -128,9 +152,60 @@ test("replaces arbitrary restored draft with exact intended bootstrap once", asy
   const h = harness({ existingDraft: "Personal unsent text from another session" });
   const result = await h.run("Worker 2 bootstrap");
   assert.equal(result.status, "submitted");
+  assert.equal(result.safeToDisposeCreatedTab, undefined);
   assert.equal(h.lastSubmittedText, "Worker 2 bootstrap");
   assert.equal(h.clicks, 1);
   assert.equal(JSON.stringify(result).includes("Personal unsent text"), false);
+});
+
+test("waits for delayed React Send disable after clearing restored draft", async () => {
+  const h = harness({ existingDraft: "Worker 5 stale unsent draft", staleSendChecks: 3, timeoutMs: 900 });
+  const result = await h.run("Worker 4 new prompt");
+  assert.equal(result.status, "submitted");
+  assert.equal(h.staleSendObserved, 3);
+  assert.equal(h.lastSubmittedText, "Worker 4 new prompt");
+  assert.equal(h.clicks, 1);
+});
+
+test("never sends when restored-draft Send stays enabled beyond bounded stabilization", async () => {
+  const h = harness({ existingDraft: "Old prompt", sendAlwaysEnabled: true, timeoutMs: 300 });
+  const result = await h.run("New prompt");
+  assert.equal(result.status, "notSubmitted");
+  assert.equal(result.safeToDisposeCreatedTab, true);
+  assert.equal(result.reason, "UnexpectedSendState");
+  assert.equal(result.stage, "draftStabilization");
+  assert.equal(result.diagnostics.sendButtons, 1);
+  assert.equal(h.lastSubmittedText, null);
+  assert.equal(h.clicks, 0);
+  assert.equal(JSON.stringify(result).includes("Old prompt"), false);
+});
+
+test("unexpected enabled Send on an empty editor never permits insertion", async () => {
+  const h = harness({ sendAlwaysEnabled: true, timeoutMs: 250 });
+  const result = await h.run("New prompt");
+  assert.equal(result.status, "notSubmitted");
+  assert.equal(result.safeToDisposeCreatedTab, true);
+  assert.equal(result.reason, "UnexpectedSendState");
+  assert.equal(h.content, "");
+  assert.equal(h.clicks, 0);
+});
+
+test("a new user turn during restored-draft stabilization prevents submission", async () => {
+  const h = harness({ existingDraft: "Old prompt", injectTurnAfterClear: true });
+  const result = await h.run("New prompt");
+  assert.equal(result.status, "notSubmitted");
+  assert.equal(result.safeToDisposeCreatedTab, false);
+  assert.equal(result.reason, "ExistingConversation");
+  assert.equal(h.clicks, 0);
+});
+
+test("a route change during restored-draft stabilization prevents submission", async () => {
+  const h = harness({ existingDraft: "Old prompt", routeAfterClear: true });
+  const result = await h.run("New prompt");
+  assert.equal(result.status, "notSubmitted");
+  assert.equal(result.safeToDisposeCreatedTab, false);
+  assert.equal(result.reason, "UnexpectedStartUrl");
+  assert.equal(h.clicks, 0);
 });
 
 test("replaces an identical restored draft instead of refusing", async () => {
@@ -169,6 +244,7 @@ test("failed draft deletion never inserts or sends", async () => {
   const h = harness({ existingDraft: "Old bootstrap", clearFails: true });
   const result = await h.run("New bootstrap");
   assert.equal(result.status, "uiIncompatible");
+  assert.equal(result.safeToDisposeCreatedTab, true);
   assert.equal(result.reason, "DraftClearFailed");
   assert.equal(h.content, "Old bootstrap");
   assert.equal(h.clicks, 0);
@@ -196,6 +272,7 @@ test("existing conversation on a home-looking URL is not edited", async () => {
   const h = harness({ existingDraft: "A personal draft", initialUserTurns: 1, initialMode: "Work" });
   const result = await h.run("New bootstrap");
   assert.equal(result.status, "notSubmitted");
+  assert.equal(result.safeToDisposeCreatedTab, false);
   assert.equal(result.reason, "ExistingConversation");
   assert.equal(h.content, "A personal draft");
   assert.equal(h.chatClicks, 0);
@@ -216,6 +293,7 @@ test("after clicking, missing acknowledgement is uncertain and never resent", as
   const h = harness({ noAcknowledgement: true });
   const result = await h.run();
   assert.equal(result.status, "outcomeUnknown");
+  assert.equal(result.safeToDisposeCreatedTab, undefined);
   assert.equal(result.reason, "SubmissionUnconfirmed");
   assert.equal(h.clicks, 1);
 });
@@ -234,6 +312,7 @@ test("rejects an existing conversation rather than appending a bootstrap message
   const h = harness({ startUrl: "https://chatgpt.com/c/existing" });
   const result = await h.run();
   assert.equal(result.status, "notSubmitted");
+  assert.equal(result.safeToDisposeCreatedTab, false);
   assert.equal(result.reason, "UnexpectedStartUrl");
   assert.equal(h.clicks, 0);
 });

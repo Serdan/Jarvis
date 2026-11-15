@@ -371,7 +371,8 @@ type Service(port: int, pairingSecret: string) =
     }
 
     member _.CloseTab(tabRegistration: string, ?ownerConnectionId: string,
-                      ?expectedRegistrationGeneration: int) = task {
+                      ?expectedRegistrationGeneration: int,
+                      ?requireFreshHomeNoTurns: bool) = task {
         let resolved = lock sync (fun () ->
             match resolveRegistration ownerConnectionId false tabRegistration with
             | Error error -> Error error
@@ -403,7 +404,8 @@ type Service(port: int, pairingSecret: string) =
                         do! send conn (serialize
                             {| version = ProtocolVersion; kind = "closeTab"
                                requestId = requestId; connectionId = conn.Id
-                               registrationId = registrationId; registrationGeneration = generation |})
+                               registrationId = registrationId; registrationGeneration = generation
+                               requireFreshHomeNoTurns = defaultArg requireFreshHomeNoTurns false |})
                         let! response = completion.Task.WaitAsync(TimeSpan.FromSeconds(15.0))
                         let root = JsonNode.Parse(response)
                         if asString root "connectionId" <> conn.Id ||
@@ -743,6 +745,23 @@ let runInNewTab (bridge: Service) (windowRegistration: string) (url: string)
                 if String.IsNullOrWhiteSpace(registrationId) || createdGeneration < 1 || not agentCreated then
                     return Error(registrationId, "OutcomeUnknown: created tab identity or provenance was missing")
                 else
+                    // Definitive pre-submit failure owns a disposable tab even
+                    // when the caller opted to retain successful conversations.
+                    // Close only the pinned agent-created registration.
+                    let closeDefinitive () = task {
+                        match! bridge.CloseTab(registrationId, ownerConnectionId = ownerConnectionId,
+                                               expectedRegistrationGeneration = createdGeneration,
+                                               requireFreshHomeNoTurns = true) with
+                        | Ok _ -> return Ok "closed"
+                        // The extension rechecks fresh-home/zero-turn at disposal.
+                        // The earlier page result is not an enduring close authority.
+                        | Error "BrowserCloseTabError:CleanupSafetyChanged"
+                        | Error "BrowserCloseTabError:CleanupSafetyUnverified" ->
+                            return Ok "retained"
+                        | Error e ->
+                            let safe = if e.Length > 100 then e.Substring(0, 100) else e
+                            return Error("cleanupFailed:" + safe)
+                    }
                     // Readiness advertised by the extension is not atomic with
                     // Chrome's live tab status. A page can start another load
                     // between ListTabs and the extension's execute preflight.
@@ -750,16 +769,11 @@ let runInNewTab (bridge: Service) (windowRegistration: string) (url: string)
                     let withinReadinessBudget () =
                         Stopwatch.GetElapsedTime(readinessStarted) < TimeSpan.FromSeconds(30.0)
                     let cleanupNotReady () = task {
-                        // No user script was injected; cleanup cannot cancel a submission.
-                        if closeAfterExecution then
-                            match! bridge.CloseTab(registrationId, ownerConnectionId = ownerConnectionId,
-                                                   expectedRegistrationGeneration = createdGeneration) with
-                            | Ok _ -> return Error(registrationId, "TabNotReady; cleanup=closed")
-                            | Error e ->
-                                let safe = if e.Length > 100 then e.Substring(0, 100) else e
-                                return Error(registrationId, "TabNotReady; cleanupFailed:" + safe)
-                        else
-                            return Error(registrationId, "TabNotReady; cleanup=retained")
+                        // No user script was injected. The post-success preference
+                        // must not retain a definitive failed launch.
+                        match! closeDefinitive() with
+                        | Ok cleanup -> return Error(registrationId, "TabNotReady; cleanup=" + cleanup)
+                        | Error failure -> return Error(registrationId, "TabNotReady; " + failure)
                     }
                     let mutable ready = false
                     let mutable ownershipChanged = false
@@ -821,11 +835,32 @@ let runInNewTab (bridge: Service) (windowRegistration: string) (url: string)
                                     | true, x when x.ValueKind = JsonValueKind.String -> x.GetString()
                                     | _ -> "completed"
                                 | _ -> "completed"
+                            // Never equate "script did not click Send" with "no
+                            // conversation exists". Only explicitly asserted
+                            // fresh-home/zero-turn evidence permits disposal.
+                            let disposable =
+                                match payload.ValueKind with
+                                | JsonValueKind.Object ->
+                                    // Contradictory evidence must fail closed even
+                                    // if a script accidentally asserts disposal.
+                                    let conversationObserved =
+                                        match payload.TryGetProperty("reason") with
+                                        | true, reason when reason.ValueKind = JsonValueKind.String ->
+                                            reason.GetString() = "ExistingConversation" ||
+                                            reason.GetString() = "UnexpectedStartUrl"
+                                        | _ -> false
+                                    match payload.TryGetProperty("safeToDisposeCreatedTab") with
+                                    | true, proof -> proof.ValueKind = JsonValueKind.True && not conversationObserved
+                                    | _ -> false
+                                | _ -> false
+                            let disposeFailedLaunch () =
+                                if disposable then closeDefinitive()
+                                else task { return Ok "retained" }
                             if status = "outcomeUnknown" then
                                 return Error(registrationId, "OutcomeUnknown: page submission was not confirmed")
                             elif status = "uiIncompatible" then
                                 // Provider scripts supply a bounded, non-sensitive stage and
-                                // reason. Preserve the created tab for manual DOM inspection.
+                                // reason; cleanup does not discard these diagnostics.
                                 let safeField (name: string) =
                                     match payload.TryGetProperty(name) with
                                     | true, field when field.ValueKind = JsonValueKind.String ->
@@ -865,7 +900,20 @@ let runInNewTab (bridge: Service) (windowRegistration: string) (url: string)
                                     | _ -> ""
                                 let summary = "UiIncompatible:" + safeField "stage" + ":" + safeField "reason"
                                 let details = if diagnostics = "" then summary else summary + ";" + diagnostics
-                                return Error(registrationId, details)
+                                match! disposeFailedLaunch() with
+                                | Ok cleanup -> return Error(registrationId, details + ";cleanup=" + cleanup)
+                                | Error failure -> return Error(registrationId, details + ";" + failure)
+                            elif status = "notSubmitted" then
+                                // An unsent draft is disposable, but a new turn or
+                                // route is not, even if this script did not send.
+                                match! disposeFailedLaunch() with
+                                | Error failure -> return Error(registrationId, "NotSubmitted;" + failure)
+                                | Ok cleanup ->
+                                    return Ok(JsonSerializer.Serialize(
+                                        {| registrationId = registrationId
+                                           status = status
+                                           scriptResult = payload.Clone()
+                                           cleanup = cleanup |}))
                             else
                                 let mutable cleanup = "retained"
                                 if closeAfterExecution then

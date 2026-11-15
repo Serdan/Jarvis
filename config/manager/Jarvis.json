@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "projectName": "Jarvis",
+  "managerAgentId": "Manager",
+  "enabled": false,
+  "budgets": {
+    "worker": 5,
+    "reviewer": 3
+  },
+  "maxLaunchesPerTick": 8,
+  "workerIds": [
+    "Worker 1",
+    "Worker 2",
+    "Worker 3",
+    "Worker 4",
+    "Worker 5"
+  ],
+  "reviewerIds": [
+    "Reviewer 1",
+    "Reviewer 2",
+    "Reviewer 3"
+  ]
+}

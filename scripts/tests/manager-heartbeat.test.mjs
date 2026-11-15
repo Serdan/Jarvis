@@ -1,0 +1,329 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { decide, runCli } from "../manager-heartbeat.mjs";
+
+const NOW = "2026-11-15T02:00:00.000Z";
+const HEAD = "6ab793928fa7f998b9d5796061cf66d3c0b02e40";
+const SCRIPT = fileURLToPath(new URL("../manager-heartbeat.mjs", import.meta.url));
+const config = (projectName = "Jarvis") => ({
+  schemaVersion: 1, projectName, managerAgentId: "Manager",
+  enabled: true,
+  budgets: { worker: 2, reviewer: 2 }, maxLaunchesPerTick: 8,
+  workerIds: ["Worker 1", "Worker 2"],
+  reviewerIds: ["Reviewer 1", "Reviewer 2"]
+});
+function agent(agentId, kind, state, overrides = {}) {
+  return {
+    agentId, kind, state, execution: state === "Working" ? "Working" : "Stopped",
+    slotAvailable: state === "Free" || state === "NeedsWork", verified: true,
+    hasReadyAssignment: state === "Ready",
+    assignmentKey: kind === "worker" && state === "Ready" ? "task/gen1/" + agentId : null,
+    waitingOnChallenge: false,
+    lastAttributedActivityAtUtc: null,
+    ...overrides
+  };
+}
+function snapshot(projectName = "Jarvis") {
+  return {
+    projectName, complete: true, agentActivityVerified: true,
+    reviewQueueVerified: true, challengesVerified: true,
+    ledgerHead: HEAD, capturedAtUtc: NOW, unclaimedReviewCount: 2,
+    agents: [
+      agent("Manager", "manager", "Working"),
+      agent("Worker 1", "worker", "Ready"),
+      agent("Worker 2", "worker", "Ready"),
+      agent("Reviewer 1", "reviewer", "NeedsWork"),
+      agent("Reviewer 2", "reviewer", "NeedsWork")
+    ]
+  };
+}
+const journal = (projectName = "Jarvis") => ({
+  schemaVersion: 1, projectName, revision: 0, records: []
+});
+
+test("zero ready implementation and zero unclaimed reviews launch no one", () => {
+  const s = snapshot();
+  s.agents[1].state = s.agents[2].state = "Free";
+  s.agents[1].hasReadyAssignment = s.agents[2].hasReadyAssignment = false;
+  s.unclaimedReviewCount = 0;
+  assert.equal(decide(config(), s, journal(), NOW).reservations.length, 0);
+});
+
+test("under budget: implementation before shared frozen reviewers", () => {
+  const result = decide(config(), snapshot(), journal(), NOW);
+  assert.deepEqual(result.reservations.map(x => x.agentId),
+    ["Worker 1", "Worker 2", "Reviewer 1", "Reviewer 2"]);
+  assert.deepEqual(result.counts, { worker: 2, reviewer: 2 });
+});
+
+test("hard worker/reviewer budgets reject oversized per-project config", () => {
+  const c = config();
+  c.budgets.worker = 6;
+  assert.throws(() => decide(c, snapshot(), journal(), NOW), /hard limit/);
+});
+
+test("full budget counts existing live agents and unknown observations", () => {
+  const s = snapshot();
+  s.agents[1].state = "Working";
+  s.agents[2].state = "Unknown";
+  s.agents[3].state = s.agents[4].state = "Working";
+  assert.equal(decide(config(), s, journal(), NOW).reservations.length, 0);
+});
+
+test("extra unconfigured working agents consume the project budget", () => {
+  const s = snapshot();
+  s.agents.push(agent("Worker 3", "worker", "Working"));
+  assert.deepEqual(decide(config(), s, journal(), NOW).reservations
+    .filter(x => x.kind === "worker").map(x => x.agentId), ["Worker 1"]);
+});
+
+test("missing or unverified agent fails closed", () => {
+  const s = snapshot();
+  s.agents.pop();
+  assert.throws(() => decide(config(), s, journal(), NOW), /Missing verified agent/);
+  const unknown = snapshot();
+  unknown.agents[2].verified = false;
+  assert.throws(() => decide(config(), unknown, journal(), NOW), /unverified/);
+});
+
+test("stale, future or incomplete observation fails closed", () => {
+  const s = snapshot();
+  assert.throws(() => decide(config(), s, journal(), "2026-11-15T02:05:00Z"),
+    /stale/);
+  s.capturedAtUtc = "2026-11-15T02:10:00Z";
+  assert.throws(() => decide(config(), s, journal(), NOW), /future/);
+  s.capturedAtUtc = NOW; s.challengesVerified = false;
+  assert.throws(() => decide(config(), s, journal(), NOW), /authoritative/);
+});
+
+test("pending/uncertain launch prevents duplicate idle ticks", () => {
+  const j = journal();
+  const first = decide(config(), snapshot(), j, NOW);
+  assert.equal(first.reservations.length, 4);
+  j.records[0].status = "uncertain";
+  const second = decide(config(), snapshot(), j, NOW);
+  assert.equal(second.reservations.length, 0);
+  assert.equal(j.records[0].status, "uncertain");
+  assert.equal(j.records.length, 4);
+});
+
+test("new observed Jarvis activity releases reservation, not a successful UI send", () => {
+  const j = journal();
+  decide(config(), snapshot(), j, NOW);
+  const s = snapshot();
+  const later = "2026-11-15T02:01:00Z";
+  s.capturedAtUtc = later;
+  s.agents[1].lastAttributedActivityAtUtc = "2026-11-15T02:00:30Z";
+  s.agents[1].activityEvidence = "ExplicitAttributedToolCall";
+  s.agents[1].state = "Working";
+  s.agents[1].execution = "Working";
+  const r = decide(config(), s, j, later);
+  assert.equal(j.records[0].status, "observed");
+  assert.ok(!r.reservations.some(x => x.agentId === "Worker 1"));
+  assert.equal(r.counts.worker, 2);
+});
+
+test("challenge-blocked agent and no-review demand do not launch", () => {
+  const s = snapshot();
+  s.agents[1].waitingOnChallenge = true;
+  s.unclaimedReviewCount = 0;
+  const r = decide(config(), s, journal(), NOW);
+  assert.deepEqual(r.reservations.map(x => x.agentId), ["Worker 2"]);
+});
+
+test("disabled config is a stop switch independent of task state", () => {
+  const c = config();
+  c.enabled = false;
+  assert.equal(decide(c, snapshot(), journal(), NOW).reservations.length, 0);
+});
+
+test("dry-run never mutates a journal or creates a real launch id", () => {
+  const j = journal();
+  const r = decide(config(), snapshot(), j, NOW, true);
+  assert.equal(j.records.length, 0);
+  assert.ok(r.reservations.every(x => x.launchId.startsWith("dry-run-")));
+});
+
+test("journal refuses cross-project reuse", () => {
+  assert.throws(() => decide(config("Wayfold"), snapshot("Wayfold"),
+    journal("Jarvis"), NOW), /Journal mismatch/);
+});
+
+test("process restart retains reservations; explicit result and operator release are audited", () => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-manager-test-"));
+  try {
+    const conf = path.join(temp, "config.json");
+    const snap = path.join(temp, "snapshot.json");
+    const state = path.join(temp, "journal.json");
+    fs.writeFileSync(conf, JSON.stringify(config()));
+    // Actual UTC time; this is an isolated CLI persistence test.
+    const current = snapshot();
+    current.capturedAtUtc = new Date().toISOString();
+    fs.writeFileSync(snap, JSON.stringify(current));
+    const args = ["plan", "--config", conf, "--snapshot", snap,
+      "--journal", state];
+    const first = spawnSync(process.execPath, [SCRIPT, ...args], { encoding: "utf8" });
+    assert.equal(first.status, 0, first.stderr);
+    const firstDecisions = JSON.parse(first.stdout).reservations;
+    assert.equal(firstDecisions.length, 4);
+    const second = spawnSync(process.execPath, [SCRIPT, ...args], { encoding: "utf8" });
+    assert.equal(second.status, 0, second.stderr);
+    assert.equal(JSON.parse(second.stdout).reservations.length, 0);
+    const begun = runCli(["begin", "--config", conf, "--journal", state,
+      "--launch-id", firstDecisions[0].launchId]);
+    assert.equal(begun.status, "dispatching");
+    const marked = runCli(["mark", "--config", conf, "--journal", state,
+      "--launch-id", firstDecisions[0].launchId, "--result", "uncertain"]);
+    assert.equal(marked.status, "uncertain");
+    const released = runCli(["release", "--config", conf, "--journal", state,
+      "--launch-id", firstDecisions[0].launchId,
+      "--reason", "Operator confirmed no active browser launch"]);
+    assert.equal(released.status, "cleared");
+    const records = JSON.parse(fs.readFileSync(state, "utf8")).records;
+    assert.equal(records[0].recoveryReason,
+      "Operator confirmed no active browser launch");
+  } finally {
+    fs.rmSync(temp, { recursive: true, force: true });
+  }
+});
+
+test("leftover lock fails closed rather than stealing ownership", () => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-manager-lock-"));
+  try {
+    const conf = path.join(temp, "config.json");
+    const snap = path.join(temp, "snapshot.json");
+    const state = path.join(temp, "journal.json");
+    fs.writeFileSync(conf, JSON.stringify(config()));
+    const current = snapshot();
+    current.capturedAtUtc = new Date().toISOString();
+    fs.writeFileSync(snap, JSON.stringify(current));
+    fs.writeFileSync(state + ".lock", "crashed process");
+    assert.throws(() => runCli(["plan", "--config", conf, "--journal", state,
+      "--snapshot", snap]), /EEXIST/);
+    assert.equal(fs.existsSync(state), false);
+  } finally {
+    fs.rmSync(temp, { recursive: true, force: true });
+  }
+});
+
+test("a local last-seen cache cannot clear an uncertain launch", () => {
+  const j = journal();
+  decide(config(), snapshot(), j, NOW);
+  const s = snapshot();
+  s.capturedAtUtc = "2026-11-15T02:01:00Z";
+  s.agents[1].lastAttributedActivityAtUtc = "2026-11-15T02:00:30Z";
+  assert.throws(() => decide(config(), s, j, s.capturedAtUtc),
+    /Client-local last-seen/);
+  assert.equal(j.records[0].status, "reserved");
+});
+
+test("preflight refuses disabled, stale, or consumed reservations", () => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-manager-check-"));
+  try {
+    const conf = path.join(temp, "config.json");
+    const state = path.join(temp, "journal.json");
+    const c = config();
+    const j = journal();
+    const launchId = "preflight-id";
+    j.records.push({
+      launchId, agentId: "Worker 1", kind: "worker",
+      reservedAtUtc: new Date().toISOString(),
+      ledgerHead: HEAD, status: "reserved"
+    });
+    fs.writeFileSync(conf, JSON.stringify(c));
+    fs.writeFileSync(state, JSON.stringify(j));
+    const args = ["check", "--config", conf, "--journal", state,
+      "--launch-id", launchId];
+    assert.equal(runCli(args).eligible, true);
+    c.enabled = false;
+    fs.writeFileSync(conf, JSON.stringify(c));
+    assert.throws(() => runCli(args), /disabled/);
+    c.enabled = true;
+    fs.writeFileSync(conf, JSON.stringify(c));
+    j.records[0].reservedAtUtc = "2020-01-01T00:00:00Z";
+    fs.writeFileSync(state, JSON.stringify(j));
+    assert.throws(() => runCli(args), /stale/);
+    j.records[0].reservedAtUtc = new Date().toISOString();
+    j.records[0].status = "uncertain";
+    fs.writeFileSync(state, JSON.stringify(j));
+    assert.throws(() => runCli(args), /no longer a fresh reservation/);
+  } finally {
+    fs.rmSync(temp, { recursive: true, force: true });
+  }
+});
+
+test("canonical task priority rank wins over static worker label order", () => {
+  const c = config();
+  c.budgets.worker = 1;
+  c.budgets.reviewer = 0;
+  const s = snapshot();
+  s.agents[1].priorityRank = 10;
+  s.agents[2].priorityRank = 0;
+  const r = decide(c, s, journal(), NOW);
+  assert.deepEqual(r.reservations.map(x => x.agentId), ["Worker 2"]);
+});
+
+test("one global tick slot prioritizes a ready worker before an unclaimed review", () => {
+  const c = config();
+  c.maxLaunchesPerTick = 1;
+  const r = decide(c, snapshot(), journal(), NOW);
+  assert.deepEqual(r.reservations.map(x => x.agentId), ["Worker 1"]);
+});
+
+test("shared review demand bounds taskless reviewer launches", () => {
+  const c = config();
+  c.budgets.worker = 0;
+  const s = snapshot();
+  s.unclaimedReviewCount = 1;
+  const r = decide(c, s, journal(), NOW);
+  assert.deepEqual(r.reservations.map(x => x.agentId), ["Reviewer 1"]);
+});
+
+test("begin atomically consumes launch, never dispatches the same reservation twice", () => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-manager-begin-"));
+  try {
+    const conf = path.join(temp, "config.json");
+    const state = path.join(temp, "journal.json");
+    const j = journal();
+    j.records.push({ launchId: "abc", agentId: "Worker 1", kind: "worker",
+      assignmentKey: "task/gen1/Worker 1",
+      status: "reserved", reservedAtUtc: new Date().toISOString(),
+      ledgerHead: HEAD });
+    fs.writeFileSync(conf, JSON.stringify(config()));
+    fs.writeFileSync(state, JSON.stringify(j));
+    const args = ["begin", "--config", conf, "--journal", state,
+      "--launch-id", "abc"];
+    assert.equal(runCli(args).status, "dispatching");
+    assert.throws(() => runCli(args), /already dispatched/);
+    assert.throws(() => runCli(["mark", "--config", conf, "--journal", state,
+      "--launch-id", "abc", "--result", "blocked"]), /Conflicting result/);
+    const marked = runCli(["mark", "--config", conf, "--journal", state,
+      "--launch-id", "abc", "--result", "submitted"]);
+    assert.equal(marked.status, "submitted");
+  } finally {
+    fs.rmSync(temp, { recursive: true, force: true });
+  }
+});
+
+test("positive activity cannot relaunch same Ready assignment", () => {
+  const j = journal();
+  decide(config(), snapshot(), j, NOW);
+  const s = snapshot();
+  s.capturedAtUtc = "2026-11-15T02:01:00Z";
+  s.agents[1].lastAttributedActivityAtUtc = "2026-11-15T02:00:30Z";
+  s.agents[1].activityEvidence = "ExplicitAttributedToolCall";
+  const first = decide(config(), s, j, s.capturedAtUtc);
+  assert.ok(!first.reservations.some(x => x.agentId === "Worker 1"));
+  assert.equal(j.records[0].status, "observed");
+  const next = decide(config(), s, j, s.capturedAtUtc);
+  assert.ok(!next.reservations.some(x => x.agentId === "Worker 1"));
+  // A new canonical assignment is eligible in the next Manager pass.
+  s.agents[1].assignmentKey = "different-task/gen1/Worker 1";
+  const later = decide(config(), s, j, s.capturedAtUtc);
+  assert.ok(later.reservations.some(x => x.agentId === "Worker 1"));
+});

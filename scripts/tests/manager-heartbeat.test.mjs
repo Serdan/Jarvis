@@ -610,6 +610,129 @@ test("a terminal explicit yield cannot outlive newer reviewer activity across jo
     .reservations.length, 0);
 });
 
+test("post-yield activity without a claim suppresses duplicate across restart", () => {
+  const c = reviewerOnlyConfig();
+  c.budgets.reviewer = 1;
+  const j = journal();
+  const initial = snapshot();
+  initial.unclaimedReviewCount = 1;
+  assert.deepEqual(decide(c, initial, j, NOW).reservations.map(r => r.agentId),
+    ["Reviewer 1"]);
+
+  // The browser was observed but never claimed a review.
+  const observed = snapshot();
+  observed.capturedAtUtc = "2026-11-15T02:01:00Z";
+  observed.unclaimedReviewCount = 1;
+  reviewerObserved(observed);
+  decide(c, observed, j, observed.capturedAtUtc);
+  assert.equal(j.records[0].status, "observed");
+  assert.deepEqual(j.records[0].observedClaimIds, []);
+
+  const yielded = structuredClone(observed);
+  yielded.capturedAtUtc = "2026-11-15T02:04:00Z";
+  yielded.agents[3].reviewerYieldAtUtc = "2026-11-15T02:03:00Z";
+  yielded.agents[3].reviewerYieldEvidence = "ExplicitAttributedReviewerYield";
+  reviewerObserved(yielded, "2026-11-15T02:03:00Z");
+  decide({ ...c, enabled: false }, yielded, j, yielded.capturedAtUtc);
+  assert.equal(j.records[0].status, "review-finished");
+  assert.equal(j.records[0].completionEvidence, "ExplicitReviewerYield");
+
+  // The same tab resumes AFTER the recorded yield. No active claim exists
+  // to mask the missing session-level guard.
+  const restarted = JSON.parse(JSON.stringify(j));
+  const activeAgain = structuredClone(yielded);
+  activeAgain.capturedAtUtc = "2026-11-15T02:06:00Z";
+  reviewerObserved(activeAgain, "2026-11-15T02:05:00Z");
+  const blocked = decide(c, activeAgain, restarted, activeAgain.capturedAtUtc);
+  assert.equal(blocked.reservations.length, 0);
+  assert.equal(blocked.counts.reviewer, 1);
+  assert.equal(decide(c, activeAgain, restarted, activeAgain.capturedAtUtc)
+    .reservations.length, 0);
+
+  // That uncertainty consumes only one slot; a second reviewer can work.
+  const twoReviewers = { ...c, budgets: { ...c.budgets, reviewer: 2 } };
+  const remaining = decide(twoReviewers, activeAgain, structuredClone(j),
+    activeAgain.capturedAtUtc);
+  assert.deepEqual(remaining.reservations.map(r => r.agentId), ["Reviewer 2"]);
+  assert.equal(remaining.counts.reviewer, 2);
+
+  // Explicit operator recovery can clear a previously terminal session
+  // only after the operator confirms that the resumed old tab has ended.
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-reviewer-recovery-"));
+  try {
+    const conf = path.join(temp, "config.json");
+    const state = path.join(temp, "journal.json");
+    fs.writeFileSync(conf, JSON.stringify(c));
+    fs.writeFileSync(state, JSON.stringify(j));
+    const recovered = runCli(["release", "--config", conf, "--journal", state,
+      "--launch-id", j.records[0].launchId, "--reason",
+      "Operator verified the resumed reviewer tab has fully ended"]);
+    assert.equal(recovered.status, "cleared");
+    const persisted = JSON.parse(fs.readFileSync(state, "utf8"));
+    assert.equal(persisted.records[0].reviewerSessionCleared, true);
+    const afterRecovery = structuredClone(activeAgain);
+    afterRecovery.capturedAtUtc =
+      new Date(Date.parse(persisted.records[0].releasedAtUtc) + 1000).toISOString();
+    const rescheduled = decide(c, afterRecovery, persisted, afterRecovery.capturedAtUtc);
+    assert.deepEqual(rescheduled.reservations.map(r => r.reason),
+      ["UnclaimedFrozenReview"]);
+  } finally {
+    fs.rmSync(temp, { recursive: true, force: true });
+  }
+
+  // A newer actual yield restores relaunch eligibility.
+  const yieldedAgain = structuredClone(activeAgain);
+  yieldedAgain.capturedAtUtc = "2026-11-15T02:08:00Z";
+  yieldedAgain.agents[3].reviewerYieldAtUtc = "2026-11-15T02:07:00Z";
+  reviewerObserved(yieldedAgain, "2026-11-15T02:07:00Z");
+  const resumed = decide(c, yieldedAgain, restarted, yieldedAgain.capturedAtUtc);
+  assert.deepEqual(resumed.reservations.map(r => r.reason), ["UnclaimedFrozenReview"]);
+  assert.equal(decide(c, yieldedAgain, restarted, yieldedAgain.capturedAtUtc)
+    .reservations.length, 0);
+});
+
+test("activity after an already resolved review still blocks taskless duplicate", () => {
+  const c = reviewerOnlyConfig();
+  c.budgets.reviewer = 1;
+  const j = journal();
+  const initial = snapshot();
+  initial.unclaimedReviewCount = 1;
+  decide(c, initial, j, NOW);
+
+  const claimed = snapshot();
+  claimed.capturedAtUtc = "2026-11-15T02:01:00Z";
+  claimed.claimedReviews = [REVIEW];
+  claimed.unclaimedReviewCount = 1;
+  reviewerObserved(claimed);
+  decide(c, claimed, j, claimed.capturedAtUtc);
+
+  // Resolve the claim at a later authoritative head, without launching
+  // another reviewer before verifying whether the old tab stays stopped.
+  const resolved = structuredClone(claimed);
+  resolved.ledgerHead = NEXT_HEAD;
+  resolved.claimedReviews = [];
+  resolved.capturedAtUtc = "2026-11-15T02:03:00Z";
+  decide({ ...c, enabled: false }, resolved, j, resolved.capturedAtUtc);
+  assert.equal(j.records[0].status, "review-finished");
+  assert.equal(j.records[0].completionEvidence, "CanonicalReviewClaimResolved");
+
+  const restarted = JSON.parse(JSON.stringify(j));
+  const activeAgain = structuredClone(resolved);
+  activeAgain.capturedAtUtc = "2026-11-15T02:06:00Z";
+  reviewerObserved(activeAgain, "2026-11-15T02:05:00Z");
+  const blocked = decide(c, activeAgain, restarted, activeAgain.capturedAtUtc);
+  assert.equal(blocked.reservations.length, 0);
+  assert.equal(blocked.counts.reviewer, 1);
+
+  const yielded = structuredClone(activeAgain);
+  yielded.capturedAtUtc = "2026-11-15T02:08:00Z";
+  yielded.agents[3].reviewerYieldAtUtc = "2026-11-15T02:07:00Z";
+  yielded.agents[3].reviewerYieldEvidence = "ExplicitAttributedReviewerYield";
+  reviewerObserved(yielded, "2026-11-15T02:07:00Z");
+  assert.deepEqual(decide(c, yielded, restarted, yielded.capturedAtUtc)
+    .reservations.map(r => r.reason), ["UnclaimedFrozenReview"]);
+});
+
 test("operator reviewer recovery is invalidated by later attributed activity", () => {
   const c = reviewerOnlyConfig();
   c.budgets.reviewer = 1;

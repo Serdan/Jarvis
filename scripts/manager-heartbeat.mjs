@@ -173,7 +173,10 @@ export function validateJournal(journal, projectName) {
         validTime(rec.observedAtUtc, "observedAtUtc"),
         "Reviewer recovery cannot predate observed activity");
     }
-    if (rec.status === "review-finished") {
+    // Keep historical completion provenance valid after a later audited
+    // operator release moves a finished reviewer record to cleared.
+    if (rec.status === "review-finished" ||
+        (rec.status === "cleared" && rec.completionEvidence !== undefined)) {
       assert(rec.kind === "reviewer" &&
         ["CanonicalReviewClaimResolved", "ExplicitReviewerYield"].includes(rec.completionEvidence) &&
         /^[0-9a-f]{40,64}$/.test(rec.completionLedgerHead ?? ""),
@@ -186,7 +189,8 @@ export function validateJournal(journal, projectName) {
       }
     }
     if (rec.explicitYieldAtUtc !== undefined) {
-      assert(rec.status === "review-finished" &&
+      assert((rec.status === "review-finished" ||
+        (rec.status === "cleared" && rec.reviewerSessionCleared === true)) &&
         rec.completionEvidence === "ExplicitReviewerYield" &&
         validTime(rec.explicitYieldAtUtc, "explicitYieldAtUtc") >=
         validTime(rec.observedAtUtc, "observedAtUtc") &&
@@ -252,6 +256,30 @@ function reviewerPauseStillProven(rec, agent, snapshot, ended) {
     return clearedAt <= capturedAt && activityAt <= clearedAt;
   }
   return false;
+}
+
+// Terminal labels prove that a reviewer session ended only at a point in time.
+// Even with zero claims, a later attributed call can mean the old tab resumed.
+function reviewerSessionResumedAfterEnd(rec, agent, snapshot) {
+  if (rec.status !== "review-finished" && rec.reviewerSessionCleared !== true) return false;
+  if (agent?.lastAttributedActivityAtUtc == null) return false;
+  const activityAt = Date.parse(agent.lastAttributedActivityAtUtc);
+  const observedAt = Date.parse(rec.observedAtUtc);
+  if (activityAt <= observedAt) return false;
+  const capturedAt = Date.parse(snapshot.capturedAtUtc);
+  const endTimes = [];
+  if (rec.status === "review-finished") {
+    if (rec.completionEvidence === "ExplicitReviewerYield") endTimes.push(rec.explicitYieldAtUtc);
+    else if (rec.completionEvidence === "CanonicalReviewClaimResolved")
+      endTimes.push(rec.completedAtUtc);
+  }
+  if (rec.reviewerSessionCleared === true) endTimes.push(rec.releasedAtUtc);
+  endTimes.push(agent.reviewerYieldAtUtc);
+  // A later explicit yield can end resumed activity. Missing or old evidence
+  // never establishes an end merely because the agent reports Stopped.
+  return !endTimes.some(time => typeof time === "string" &&
+    Date.parse(time) >= observedAt && Date.parse(time) <= capturedAt &&
+    Date.parse(time) >= activityAt);
 }
 
 export function decide(config, snapshot, journal, nowUtc, dryRun = false) {
@@ -366,6 +394,9 @@ export function decide(config, snapshot, journal, nowUtc, dryRun = false) {
   // unresolved launch or any non-yield completion invalidates that pause.
   const pausedClaimReviewers = new Set();
   for (const [reviewerId, rec] of latestReviewerRecord) {
+    // Session-level uncertainty is independent of the current review queue.
+    if (reviewerSessionResumedAfterEnd(rec, agents.get(reviewerId), snapshot))
+      unresolvedReviewers.add(reviewerId);
     const ended = reviewerSessionEnds.get(rec.launchId) ??
       (rec.status === "review-finished" ? rec.completionEvidence : null);
     const claims = claimsByReviewer.get(reviewerId) ?? [];
@@ -575,9 +606,11 @@ export function runCli(argv) {
         assert(typeof opts.reason === "string" && opts.reason.trim().length >= 12,
           "Explicit operator recovery reason required");
         assert(LIVE_RECORDS.has(rec.status) ||
-          (rec.kind === "reviewer" && rec.status === "observed"),
-          "Only live reservations or observed reviewer sessions can be released");
-        if (rec.status === "observed" && rec.kind === "reviewer") {
+          (rec.kind === "reviewer" &&
+            (rec.status === "observed" || rec.status === "review-finished")),
+          "Only live reservations or observed/finished reviewer sessions can be released");
+        if (rec.kind === "reviewer" &&
+            (rec.status === "observed" || rec.status === "review-finished")) {
           rec.reviewerSessionCleared = true;
         }
         rec.status = "cleared";

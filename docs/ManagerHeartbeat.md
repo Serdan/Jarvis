@@ -158,7 +158,12 @@ review is claimed. A reviewer with a claimed review occupies reviewer
 capacity even if its task slot is free. An `observed` reviewer journal
 record also occupies capacity, even without a currently seen claim, until
 separate completion evidence is established. The journal retains claims
-seen across passes and process restarts.
+seen across passes and process restarts. A terminal review-finished or
+operator-cleared record is proof only at its recorded end boundary. If a
+later verified tool call occurs in that old browser session, count it as
+unresolved and suppress a duplicate launch even if zero reviews are claimed.
+A later explicitly attributed reviewer yield or audited operator recovery
+after positive verification of tab closure restores eligibility.
 
 After a claimed review is seen in a prior ledger snapshot, a **later,
 verified different ledger head** with that review no longer Claimed and no
@@ -176,8 +181,9 @@ reviewer-session yield** from a positively project/agent-attributed event,
 with `reviewerYieldEvidence: "ExplicitAttributedReviewerYield"`.
 This is not the generic last-attributed tool-call time, a browser send,
 or the local last-seen cache. It must be later than that session's
-reservation and no later than the latest attributed action. If the
-connected activity evidence does not expose a verifiable explicit
+reservation, no earlier than the latest attributed action, and no
+later than the snapshot capture. If the connected activity evidence does
+not expose a verifiable explicit
 reviewer yield, leave these fields absent and fail closed. Such an
 explicit yield allows a still-claimed review to be resumed by the same
 reviewer: the planner emits `ResumeVerifiedPausedReview`, even with zero

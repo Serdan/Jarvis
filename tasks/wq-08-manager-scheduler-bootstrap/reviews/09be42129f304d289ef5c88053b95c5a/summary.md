@@ -1,1 +1,7 @@
-Parents: current remote main 273e2eabbe01f3158185c949618d8c5de071a8ad and Reviewer4 Accepted WQ08 649880085891f0b446add1ab99f87b2c347dd934 (seq3822). Automatic conflict-free merge in isolated worktree, WQ08-only additions (5 files), diff --check clean, worktree clean, SDK 11.0.100 Release build passed, actual dotnet vstest Server.Tests 255/255 passed. No live Scheduler, hosted CI, activation, migration, deployment or main push.
+# Reviewer 4 — WQ08 integration audit (frozen head 380a6cab)
+
+**Independent recommendation: Accepted for inert source integration only.** First parent is current WQ05 main `273e2eabbe01f3158185c949618d8c5de071a8ad`; second parent is separately Accepted WQ08 correction `649880085891f0b446add1ab99f87b2c347dd934` (seq3822). Source/tests/notes are byte-identical to that Accepted parent. First-parent diff is exactly five WQ08-only files, `diff --check` clean, checkout clean, WQ04/WQ05 code untouched. Independent .NET11 Release `Server.Tests`: **255/255 passed**, no failures or skips. Normal runtime `InertScheduler.plan` retains the WQ04 `canDispatch=false` semantic guard; positive hypothetical planner is internal/friend-test-only; source grep found no live caller or Scheduler wiring. Four two-clone synthetic Git races and their explicit non-production limits were independently inspected.
+
+**Restrictions:** No actual Scheduler/Manager loop, browser journal/host effect, canonical producer/high-water, role/version or WQ05 source authority has been proved by this inert merge. No production Scheduler activation, migration, deployment, remote main push or hosted CI is approved.
+
+Full independent code/negative-space findings: `findings/reviewer4-wq08-after-wq05-integration.md`.

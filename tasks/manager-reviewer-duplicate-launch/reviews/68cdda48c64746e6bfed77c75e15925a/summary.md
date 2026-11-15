@@ -1,0 +1,1 @@
+Fix at 394f485d. Node Manager planner 45/45 passing; .NET 11 Release build succeeded (0 errors, one existing FS0760 warning), .NET Release test run underway. git diff --check clean. No Manager activation, browser launch, or deployment.

@@ -84,7 +84,10 @@ async function execute(args) {
     return { status: "notSubmitted", reason: "ExistingConversation" };
   }
   const normalizedPrompt = prompt.replace(/\r\n/g, "\n").replace(/\u00a0/g, " ").trim();
-  const composer = await until(() => document.querySelector(composerSelector));
+  const composer = await until(() => {
+    const editors = document.querySelectorAll(composerSelector);
+    return editors.length === 1 ? editors[0] : null;
+  });
   if (!composer) return incompatible("composer", "ComposerUnavailable");
   if (location.href !== startUrl) return { status: "notSubmitted", reason: "UnexpectedStartUrl" };
   const readEditor = () => composer.innerText.replace(/\r\n/g, "\n").replace(/\u00a0/g, " ");
@@ -104,8 +107,34 @@ async function execute(args) {
     selection.removeAllRanges();
     if (!removed || (composer.textContent || "").length > 0) return incompatible("composer", "DraftClearFailed");
   }
-  if (document.querySelector(sendSelector)) return { status: "notSubmitted", reason: "UnexpectedSendState" };
-  if (location.href !== startUrl) return { status: "notSubmitted", reason: "UnexpectedStartUrl" };
+  // ProseMirror can clear visible text before React disables Send. Wait for
+  // three empty/inactive observations rather than inserting into stale state.
+  // Never click Send to clear an unrelated restored draft.
+  const settleDeadline = Math.min(deadline, Date.now() + 1800);
+  let settledSamples = 0;
+  while (true) {
+    if (location.href !== startUrl) return { status: "notSubmitted", reason: "UnexpectedStartUrl" };
+    if (document.querySelectorAll('[data-message-author-role="user"]').length !== initialTurns ||
+        document.querySelectorAll('[data-user-message-bubble]').length !== initialBubbles) {
+      return { status: "notSubmitted", reason: "ExistingConversation" };
+    }
+    const editors = document.querySelectorAll(composerSelector);
+    if (editors.length !== 1 || editors[0] !== composer) {
+      return incompatible("draftStabilization", "ComposerChanged");
+    }
+    if ((composer.textContent || "").length !== 0 || readEditor().trim().length !== 0) {
+      return incompatible("draftStabilization", "DraftReappeared");
+    }
+    settledSamples = document.querySelector(sendSelector) ? 0 : settledSamples + 1;
+    if (settledSamples >= 3) break;
+    if (Date.now() >= settleDeadline) {
+      return {
+        status: "notSubmitted", stage: "draftStabilization", reason: "UnexpectedSendState",
+        diagnostics: { documentReadyState: document.readyState || "unknown", ...selectorCounts() }
+      };
+    }
+    await delay(Math.min(75, Math.max(1, settleDeadline - Date.now())));
+  }
 
   composer.focus();
   // ProseMirror must observe the editing operation. Setting textContent bypasses its state.
@@ -119,6 +148,10 @@ async function execute(args) {
     return incompatible("composer", "ComposerChanged");
   }
   if (location.href !== startUrl) return { status: "notSubmitted", reason: "UnexpectedStartUrl" };
+  if (document.querySelectorAll('[data-message-author-role="user"]').length !== initialTurns ||
+      document.querySelectorAll('[data-user-message-bubble]').length !== initialBubbles) {
+    return { status: "notSubmitted", reason: "ExistingConversation" };
+  }
   // Once this click is attempted the effect is non-idempotent. Never try again.
   try {
     sendAttempted = true;

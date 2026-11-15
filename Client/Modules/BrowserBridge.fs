@@ -743,6 +743,17 @@ let runInNewTab (bridge: Service) (windowRegistration: string) (url: string)
                 if String.IsNullOrWhiteSpace(registrationId) || createdGeneration < 1 || not agentCreated then
                     return Error(registrationId, "OutcomeUnknown: created tab identity or provenance was missing")
                 else
+                    // Definitive pre-submit failure owns a disposable tab even
+                    // when the caller opted to retain successful conversations.
+                    // Close only the pinned agent-created registration.
+                    let closeDefinitive () = task {
+                        match! bridge.CloseTab(registrationId, ownerConnectionId = ownerConnectionId,
+                                               expectedRegistrationGeneration = createdGeneration) with
+                        | Ok _ -> return Ok "closed"
+                        | Error e ->
+                            let safe = if e.Length > 100 then e.Substring(0, 100) else e
+                            return Error("cleanupFailed:" + safe)
+                    }
                     // Readiness advertised by the extension is not atomic with
                     // Chrome's live tab status. A page can start another load
                     // between ListTabs and the extension's execute preflight.
@@ -825,7 +836,7 @@ let runInNewTab (bridge: Service) (windowRegistration: string) (url: string)
                                 return Error(registrationId, "OutcomeUnknown: page submission was not confirmed")
                             elif status = "uiIncompatible" then
                                 // Provider scripts supply a bounded, non-sensitive stage and
-                                // reason. Preserve the created tab for manual DOM inspection.
+                                // reason; cleanup does not discard these diagnostics.
                                 let safeField (name: string) =
                                     match payload.TryGetProperty(name) with
                                     | true, field when field.ValueKind = JsonValueKind.String ->
@@ -865,7 +876,20 @@ let runInNewTab (bridge: Service) (windowRegistration: string) (url: string)
                                     | _ -> ""
                                 let summary = "UiIncompatible:" + safeField "stage" + ":" + safeField "reason"
                                 let details = if diagnostics = "" then summary else summary + ";" + diagnostics
-                                return Error(registrationId, details)
+                                match! closeDefinitive() with
+                                | Ok cleanup -> return Error(registrationId, details + ";cleanup=" + cleanup)
+                                | Error failure -> return Error(registrationId, details + ";" + failure)
+                            elif status = "notSubmitted" then
+                                // The page script guarantees it never attempted Send.
+                                // Do not strand old restored drafts in fresh tabs.
+                                match! closeDefinitive() with
+                                | Error failure -> return Error(registrationId, "NotSubmitted;" + failure)
+                                | Ok cleanup ->
+                                    return Ok(JsonSerializer.Serialize(
+                                        {| registrationId = registrationId
+                                           status = status
+                                           scriptResult = payload.Clone()
+                                           cleanup = cleanup |}))
                             else
                                 let mutable cleanup = "retained"
                                 if closeAfterExecution then

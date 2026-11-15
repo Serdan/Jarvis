@@ -1,0 +1,1 @@
+Exact unchanged frozen f1b0c527c52d67680c3cd75bcafdf79734bc126d on 8ed9671543f05073f7d453728b50772138dd87f2. Independently review core adapter and .NET11 Release; final integration dependency-gated on accepted WQ04/06 interfaces.

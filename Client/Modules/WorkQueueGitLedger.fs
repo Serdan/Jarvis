@@ -226,6 +226,35 @@ module WorkQueueGitLedger =
                     state.Launches.TryFind launchId
                     |> Option.exists (fun launch -> launch.AncillaryMessages.Contains id)
             subjectWork && handler && message.HandlerGeneration >= 0
+        let validLaunchPhase (launch: Launch) =
+            match launch.State with
+            | LaunchState.ReservedUnregistered ->
+                launch.Version = 0
+                && launch.DispatchCount = 0
+                && launch.Lease.IsNone
+                && not launch.EverClaimed
+                && launch.PrimaryWorkId.IsNone
+            | LaunchState.SubmittedUnregistered _ ->
+                launch.Version >= 1
+                && launch.DispatchCount = 1
+                && launch.Lease.IsNone
+                && not launch.EverClaimed
+                && launch.PrimaryWorkId.IsNone
+            | LaunchState.Registered (agentUuid, sessionKey) ->
+                launch.Version >= 2
+                && launch.DispatchCount = 1
+                && not (String.IsNullOrWhiteSpace agentUuid)
+                && not (String.IsNullOrWhiteSpace sessionKey)
+                && (launch.Lease
+                    |> Option.exists (fun lease -> lease.Generation > 0 && lease.LastSeenAt >= 0L))
+            | LaunchState.DemandInvalidatedPendingTerminal prior ->
+                match prior with
+                | LaunchState.ReservedUnregistered
+                | LaunchState.SubmittedUnregistered _
+                | LaunchState.Registered _ -> true
+                | _ -> false
+            | LaunchState.TerminalPendingRelease receipt ->
+                not (String.IsNullOrWhiteSpace receipt)
         state.Version >= 0
         && state.Version = state.Receipts.Count
         && state.GraphVersion >= 0
@@ -236,12 +265,18 @@ module WorkQueueGitLedger =
             && work.AvailableSequence >= 0L
             && work.AvailableSequence <= state.NextAvailability
             && work.Dependencies |> Set.forall state.Works.ContainsKey
+            // This frozen adapter has no authority-backed waiver mutation.
+            && work.WaivedDependencies.IsEmpty
             && workOwner id work)
         && state.Messages |> Map.forall (fun id message ->
             id = message.Id && validMessage id message)
         && state.Launches |> Map.forall (fun id launch ->
             id = launch.Id && launch.ProjectId = projectId
             && launch.Version >= 0 && launch.DispatchCount >= 0
+            && launch.RoleVersion > 0
+            && not (String.IsNullOrWhiteSpace launch.RoleId)
+            && not (String.IsNullOrWhiteSpace launch.AccountTokenId)
+            && validLaunchPhase launch
             && (launch.PrimaryWorkId
                 |> Option.forall state.Works.ContainsKey)
             && (launch.AncillaryMessages
@@ -273,6 +308,22 @@ module WorkQueueGitLedger =
         && stage.Domain = DomainState.Undecided
         && stage.Push.IsNone
         && not stage.IntegrationAuthorized
+        && stage.WaivedDependencies.IsEmpty
+
+    let private validInitialLaunch (binding: LedgerBinding) (launch: Launch) =
+        launch.ProjectId = binding.ProjectId.ToString("D")
+        && not (String.IsNullOrWhiteSpace launch.Id)
+        && not (String.IsNullOrWhiteSpace launch.RoleId)
+        && launch.RoleVersion > 0
+        && not (String.IsNullOrWhiteSpace launch.AccountTokenId)
+        && launch.State = LaunchState.ReservedUnregistered
+        && launch.Lease.IsNone
+        && launch.Version = 0
+        && launch.Credit.IsNone
+        && launch.PrimaryWorkId.IsNone
+        && not launch.EverClaimed
+        && launch.AncillaryMessages.IsEmpty
+        && launch.DispatchCount = 0
 
     let private readPinned (binding: LedgerBinding) (snapshot: LedgerSnapshot) =
         LedgerStore.readAt binding snapshot RecordPath
@@ -355,7 +406,16 @@ module WorkQueueGitLedger =
                             else
                                 Contracts.postMessage expectedVersion op message
                                     (roleWork |> Option.map (witnessNewStage state now)) state
-                        | AdmitProject launch -> Contracts.admitProject expectedVersion op launch state
+                        | AdmitProject launch ->
+                            // An account reservation is still a pre-activation gate;
+                            // this project mutation cannot accept a forged live launch.
+                            if not (validInitialLaunch binding launch)
+                               || (state.Launches
+                                   |> Map.exists (fun _ existing ->
+                                       existing.AccountTokenId = launch.AccountTokenId)) then
+                                Error(Rejection.InvalidState "invalid unverified launch admission")
+                            else
+                                Contracts.admitProject expectedVersion op launch state
                         | DispatchOnce (launch, outcome) -> Contracts.dispatchOnce expectedVersion op launch outcome state
                         | InitializeAgent (launch, sessionKey) ->
                             Contracts.initializeAgent expectedVersion op launch sessionKey (Guid.NewGuid().ToString("D")) now state
@@ -364,7 +424,13 @@ module WorkQueueGitLedger =
                             Contracts.markStalled expectedVersion op launch generation now timeout state
                         | ClaimNext launch -> Contracts.claimNext expectedVersion op launch state
                         | CompleteOrdinary (launch, work) ->
-                            Contracts.completeOrdinary expectedVersion op launch work now state
+                            match state.Works.TryFind work with
+                            | Some stage when stage.Kind = WorkKind.Implementation
+                                              || stage.Kind = WorkKind.Integration ->
+                                // Remote source ref/SHA and mutating-job proofs have no
+                                // verified completion transition in this foundation.
+                                Error Rejection.MissingProof
+                            | _ -> Contracts.completeOrdinary expectedVersion op launch work now state
                         | CompleteMessage (launch, work, message, generation, reply) ->
                             Contracts.completeMessageWork expectedVersion op launch work message generation reply now state
                         | ClaimAncillary (launch, message) ->
@@ -375,7 +441,10 @@ module WorkQueueGitLedger =
                             Contracts.setHardPrerequisite expectedVersion op work prerequisite now state
                         | CancelUnclaimed (work, reason) ->
                             Contracts.cancelUnclaimedStage expectedVersion op work reason now state
-                        | TerminalizeNoClaim launch -> Contracts.terminalizeNoClaim expectedVersion op launch state
+                        | TerminalizeNoClaim _ ->
+                            // A live or stopped lease is not authenticated session-terminal
+                            // and settled dispatch-journal proof of release eligibility.
+                            Error Rejection.MissingProof
                         | YieldReadOnly (launch, work, claimGeneration) ->
                             Contracts.yieldReadOnly expectedVersion op launch work claimGeneration now state
                         | CheckpointReadOnly (launch, work, claimGeneration, summarySha256) ->

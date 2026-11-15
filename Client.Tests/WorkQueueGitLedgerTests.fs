@@ -540,3 +540,260 @@ type WorkQueueGitLedgerTests() =
             match WorkQueueGitLedger.executeAt a "Worker" (Guid.NewGuid()) yielded.Version 1007L payload with
             | Error(InvalidBinding _) -> ()
             | unexpected -> Assert.Fail(sprintf "Stale read-only checkpoint generation must reject: %A" unexpected))
+
+    [<Test>]
+    member _.ForgedPublicationWaiversNeverBypassDependenciesAcrossClones() =
+        withClones (fun a b ->
+            let mutate client now mutation =
+                let _, prior = WorkQueueGitLedger.load client |> success
+                WorkQueueGitLedger.executeAt client "Worker" (Guid.NewGuid()) prior.Version now mutation
+                |> success |> ignore
+            let reject client now mutation =
+                let _, prior = WorkQueueGitLedger.load client |> success
+                match WorkQueueGitLedger.executeAt client "Attacker" (Guid.NewGuid()) prior.Version now mutation with
+                | Error(InvalidBinding _) -> ()
+                | other -> Assert.Fail(sprintf "Forged waiver was admitted: %A" other)
+                let _, unchanged = WorkQueueGitLedger.load b |> success
+                Assert.That(unchanged.Version, Is.EqualTo(prior.Version))
+            let id = a.ProjectId.ToString("D")
+            WorkQueueGitLedger.initialize a "Worker" (Guid.NewGuid())
+                (Map.ofList [ "Lead", set [ "planning" ] ])
+            |> success |> ignore
+            mutate a 1000L (PublishStage (plan id "B" []))
+            let forgedD =
+                { plan id "D" [ "B" ] with
+                    WaivedDependencies = Map.ofList [ "B", "not-an-account-approval" ] }
+            reject b 1001L (PublishStage forgedD)
+            let message, roleWork = roleMessage id "M" "R"
+            let forgedRoleWork =
+                { roleWork with
+                    Dependencies = Set.singleton "B"
+                    WaivedDependencies = Map.ofList [ "B", "not-an-account-approval" ] }
+            reject a 1002L (PostMessage (message, Some forgedRoleWork))
+            let _, before = WorkQueueGitLedger.load b |> success
+            Assert.That(before.Works.ContainsKey "D", Is.False)
+            Assert.That(before.Works.ContainsKey roleWork.Id, Is.False)
+            Assert.That(before.Messages.ContainsKey "M", Is.False)
+            mutate b 1003L (PublishStage (plan id "D" [ "B" ]))
+            mutate a 1004L (PostMessage (message, Some { roleWork with Dependencies = Set.singleton "B" }))
+            let _, blocked = WorkQueueGitLedger.load b |> success
+            Assert.That(blocked.Works.["D"].State, Is.EqualTo(WorkState.Blocked))
+            Assert.That(blocked.Works.[roleWork.Id].State, Is.EqualTo(WorkState.Blocked))
+            Assert.That(blocked.Works.["D"].WaivedDependencies, Is.Empty)
+            mutate a 1005L (AdmitProject (launch id "L" "Lead"))
+            mutate b 1006L (DispatchOnce ("L", DispatchState.Submitted))
+            mutate a 1007L (InitializeAgent ("L", "session"))
+            mutate b 1008L (ClaimNext "L")
+            let _, claimed = WorkQueueGitLedger.load a |> success
+            Assert.That(claimed.Launches.["L"].PrimaryWorkId, Is.EqualTo(Some "B"))
+            Assert.That(claimed.Works.["D"].State, Is.EqualTo(WorkState.Blocked))
+            mutate a 2000L (CompleteOrdinary ("L", "B"))
+            let _, woken = WorkQueueGitLedger.load b |> success
+            Assert.That(woken.Works.["B"].State, Is.EqualTo(WorkState.Completed))
+            Assert.That(woken.Works.["D"].State, Is.EqualTo(WorkState.Available))
+            Assert.That(woken.Works.[roleWork.Id].State, Is.EqualTo(WorkState.Available))
+            Assert.That(woken.Works.["D"].AvailableAt, Is.EqualTo(2000L))
+            Assert.That(woken.Works.[roleWork.Id].AvailableAt, Is.EqualTo(2000L)))
+
+    [<Test>]
+    member _.ForgedRegisteredSubmittedAndTerminalAdmissionsCannotClaim() =
+        withClones (fun a b ->
+            let mutate client now mutation =
+                let _, prior = WorkQueueGitLedger.load client |> success
+                WorkQueueGitLedger.executeAt client "Worker" (Guid.NewGuid()) prior.Version now mutation
+                |> success |> ignore
+            let id = a.ProjectId.ToString("D")
+            WorkQueueGitLedger.initialize a "Worker" (Guid.NewGuid())
+                (Map.ofList [ "Lead", set [ "planning" ] ])
+            |> success |> ignore
+            mutate a 1000L (PublishStage (plan id "P" []))
+            let reserved = launch id "L" "Lead"
+            let lease = { LastSeenAt = 1001L; Generation = 1; StopRequested = false }
+            let forged =
+                [ { reserved with State = LaunchState.Registered("forged-uuid", "forged-session")
+                                  Lease = Some lease; Version = 2; DispatchCount = 1 }
+                  { reserved with State = LaunchState.SubmittedUnregistered DispatchState.Submitted
+                                  Version = 1; DispatchCount = 1 }
+                  { reserved with State = LaunchState.TerminalPendingRelease "forged-release"
+                                  Version = 1 }
+                  { reserved with Lease = Some lease }
+                  { reserved with Credit = Some "P" }
+                  { reserved with EverClaimed = true; PrimaryWorkId = Some "P" }
+                  { reserved with AccountTokenId = "" } ]
+            for bad in forged do
+                let _, prior = WorkQueueGitLedger.load b |> success
+                match WorkQueueGitLedger.executeAt b "Attacker" (Guid.NewGuid()) prior.Version 1001L
+                        (AdmitProject bad) with
+                | Error(InvalidBinding _) -> ()
+                | other -> Assert.Fail(sprintf "Invalid initial launch was admitted: %A / %A" bad other)
+                let _, untouched = WorkQueueGitLedger.load a |> success
+                Assert.That(untouched.Version, Is.EqualTo(prior.Version))
+                Assert.That(untouched.Launches.ContainsKey "L", Is.False)
+            let _, noLaunch = WorkQueueGitLedger.load b |> success
+            match WorkQueueGitLedger.executeAt b "Attacker" (Guid.NewGuid()) noLaunch.Version 1002L
+                    (ClaimNext "L") with
+            | Error(InvalidBinding _) -> ()
+            | other -> Assert.Fail(sprintf "Forged launch obtained claim: %A" other)
+            mutate a 1003L (AdmitProject reserved)
+            mutate b 1004L (DispatchOnce ("L", DispatchState.Submitted))
+            mutate a 1005L (InitializeAgent ("L", "real-session"))
+            mutate b 1006L (ClaimNext "L")
+            let _, real = WorkQueueGitLedger.load a |> success
+            Assert.That(real.Launches.["L"].EverClaimed, Is.True)
+            Assert.That(real.Launches.["L"].PrimaryWorkId, Is.EqualTo(Some "P"))
+            Assert.That(real.Launches.["L"].DispatchCount, Is.EqualTo(1))
+            match real.Launches.["L"].State with
+            | LaunchState.Registered(_, "real-session") -> ()
+            | other -> Assert.Fail(sprintf "Legitimate registration failed: %A" other))
+
+    [<Test>]
+    member _.SourceWritingCompletionWithoutHandoffCannotWakeDependents() =
+        for useIncompleteLineage in [ false; true ] do
+            withClones (fun a b ->
+                let mutate client now mutation =
+                    let _, prior = WorkQueueGitLedger.load client |> success
+                    WorkQueueGitLedger.executeAt client "Worker" (Guid.NewGuid()) prior.Version now mutation
+                    |> success |> ignore
+                let id = a.ProjectId.ToString("D")
+                let lineage =
+                    if useIncompleteLineage then
+                        Some
+                            { RepositoryId = "source-repo"
+                              TaskId = "task-I"
+                              TargetRef = "refs/heads/main"
+                              LineageId = "mutable-I"
+                              PinnedBaseCommit = "pinned"
+                              ReachableRef = None
+                              ContinuationSha = None
+                              Generation = 1 }
+                    else None
+                let implementation =
+                    { plan id "I" [] with
+                        Kind = WorkKind.Implementation
+                        QueueId = "implementation"
+                        SourceLineage = lineage }
+                WorkQueueGitLedger.initialize a "Worker" (Guid.NewGuid())
+                    (Map.ofList [ "Lead", set [ "implementation" ] ])
+                |> success |> ignore
+                mutate a 1000L (PublishStage implementation)
+                mutate b 1001L (PublishStage (plan id "D" [ "I" ]))
+                mutate a 1002L (AdmitProject (launch id "L" "Lead"))
+                mutate b 1003L (DispatchOnce ("L", DispatchState.Submitted))
+                mutate a 1004L (InitializeAgent ("L", "real-session"))
+                mutate b 1005L (ClaimNext "L")
+                let _, claimed = WorkQueueGitLedger.load a |> success
+                Assert.That(claimed.Works.["I"].State, Is.EqualTo(WorkState.Claimed "L"))
+                Assert.That(claimed.Works.["D"].State, Is.EqualTo(WorkState.Blocked))
+                match WorkQueueGitLedger.executeAt b "Attacker" (Guid.NewGuid()) claimed.Version 2000L
+                        (CompleteOrdinary ("L", "I")) with
+                | Error(InvalidBinding _) -> ()
+                | other -> Assert.Fail(sprintf "Unproven source completion was accepted: %A" other)
+                let _, after = WorkQueueGitLedger.load b |> success
+                Assert.That(after.Version, Is.EqualTo(claimed.Version))
+                Assert.That(after.Works.["I"].State, Is.EqualTo(WorkState.Claimed "L"))
+                Assert.That(after.Works.["D"].State, Is.EqualTo(WorkState.Blocked))
+                Assert.That(after.NextAvailability, Is.EqualTo(claimed.NextAvailability))
+                match after.Launches.["L"].State with
+                | LaunchState.Registered _ -> ()
+                | other -> Assert.Fail(sprintf "Unverified completion minted terminal receipt: %A" other))
+
+    [<Test>]
+    member _.NoClaimTerminalNeedsProofAndCannotBeatLiveClaim() =
+        withClones (fun a b ->
+            let mutate client now mutation =
+                let _, prior = WorkQueueGitLedger.load client |> success
+                WorkQueueGitLedger.executeAt client "Worker" (Guid.NewGuid()) prior.Version now mutation
+                |> success |> ignore
+            let id = a.ProjectId.ToString("D")
+            WorkQueueGitLedger.initialize a "Worker" (Guid.NewGuid())
+                (Map.ofList [ "Lead", set [ "planning" ] ])
+            |> success |> ignore
+            mutate a 1000L (PublishStage (plan id "P" []))
+            mutate b 1001L (AdmitProject (launch id "L" "Lead"))
+            mutate a 1002L (DispatchOnce ("L", DispatchState.Submitted))
+            mutate b 1003L (InitializeAgent ("L", "live-session"))
+            let _, registered = WorkQueueGitLedger.load a |> success
+            match WorkQueueGitLedger.executeAt a "Attacker" (Guid.NewGuid()) registered.Version 1004L
+                    (TerminalizeNoClaim "L") with
+            | Error(InvalidBinding _) -> ()
+            | other -> Assert.Fail(sprintf "Live no-claim release was minted: %A" other)
+            let _, stillLive = WorkQueueGitLedger.load b |> success
+            Assert.That(stillLive.Version, Is.EqualTo(registered.Version))
+            match stillLive.Launches.["L"].State with
+            | LaunchState.Registered(_, "live-session") -> ()
+            | other -> Assert.Fail(sprintf "Live registration changed without proof: %A" other)
+            mutate b 1005L (ClaimNext "L")
+            let _, claimed = WorkQueueGitLedger.load a |> success
+            Assert.That(claimed.Launches.["L"].PrimaryWorkId, Is.EqualTo(Some "P"))
+            match WorkQueueGitLedger.executeAt a "Attacker" (Guid.NewGuid()) claimed.Version 1006L
+                    (TerminalizeNoClaim "L") with
+            | Error(InvalidBinding _) -> ()
+            | other -> Assert.Fail(sprintf "Already-claimed launch terminalized: %A" other)
+            let _, unchanged = WorkQueueGitLedger.load b |> success
+            Assert.That(unchanged.Version, Is.EqualTo(claimed.Version))
+            Assert.That(unchanged.Works.["P"].State, Is.EqualTo(WorkState.Claimed "L")))
+
+    [<Test>]
+    member _.StoppedLeaseWithoutJournalOrSessionProofCannotReleaseToken() =
+        withClones (fun a b ->
+            let mutate client now mutation =
+                let _, prior = WorkQueueGitLedger.load client |> success
+                WorkQueueGitLedger.executeAt client "Worker" (Guid.NewGuid()) prior.Version now mutation
+                |> success |> ignore
+            let id = a.ProjectId.ToString("D")
+            WorkQueueGitLedger.initialize a "Worker" (Guid.NewGuid())
+                (Map.ofList [ "Lead", set [ "planning" ] ])
+            |> success |> ignore
+            mutate a 1000L (PublishStage (plan id "P" []))
+            mutate b 1001L (AdmitProject (launch id "L" "Lead"))
+            mutate a 1002L (DispatchOnce ("L", DispatchState.Submitted))
+            mutate b 1003L (InitializeAgent ("L", "session"))
+            mutate a 2000L (StopStalled ("L", 1, 100L))
+            let _, stopped = WorkQueueGitLedger.load b |> success
+            let lease = stopped.Launches.["L"].Lease.Value
+            Assert.That(lease.StopRequested, Is.True)
+            Assert.That(lease.Generation, Is.EqualTo(2))
+            match WorkQueueGitLedger.executeAt b "Attacker" (Guid.NewGuid()) stopped.Version 2100L
+                    (TerminalizeNoClaim "L") with
+            | Error(InvalidBinding _) -> ()
+            | other -> Assert.Fail(sprintf "Stopped lease was treated as terminal proof: %A" other)
+            let _, after = WorkQueueGitLedger.load a |> success
+            Assert.That(after.Version, Is.EqualTo(stopped.Version))
+            Assert.That(after.Launches.["L"].EverClaimed, Is.False)
+            match after.Launches.["L"].State with
+            | LaunchState.Registered _ -> ()
+            | other -> Assert.Fail(sprintf "Stopped live lease minted release receipt: %A" other))
+
+    [<Test>]
+    member _.PoisonedHistoricalWaiverFailsClosedEvenWithMatchingHash() =
+        withClones (fun a b ->
+            WorkQueueGitLedger.initialize a "Worker" (Guid.NewGuid()) Map.empty |> success |> ignore
+            let id = a.ProjectId.ToString("D")
+            WorkQueueGitLedger.executeAt a "Worker" (Guid.NewGuid()) 0 1000L
+                (PublishStage (plan id "B" [])) |> success |> ignore
+            WorkQueueGitLedger.executeAt b "Worker" (Guid.NewGuid()) 1 1001L
+                (PublishStage (plan id "D" [ "B" ])) |> success |> ignore
+            let snapshot = LedgerStore.fetch a |> success
+            let payload, oid = LedgerStore.readAt a snapshot WorkQueueGitLedger.RecordPath |> success
+            let original = payload |> Option.defaultWith (fun () -> failwith "Missing work record")
+            let envelope = JsonNode.Parse(original)
+            let state = envelope.["State"]
+            state.["Works"].["D"].AsObject().["WaivedDependencies"] <-
+                JsonNode.Parse("""{"B":"forged-approval"}""")
+            let hash =
+                SHA256.HashData(Encoding.UTF8.GetBytes(state.ToJsonString()))
+                |> Convert.ToHexString |> fun value -> value.ToLowerInvariant()
+            envelope.AsObject().["StateHash"] <- JsonValue.Create(hash)
+            let poison =
+                { OperationId = Guid.NewGuid()
+                  Actor = "AdversarialFixture"
+                  Kind = "FixtureForgedWaiver"
+                  RequestJson = """{"case":"historical-waiver-poison"}""" }
+            LedgerStore.transact a poison (fun _ ->
+                Ok [ { Path = WorkQueueGitLedger.RecordPath
+                       ExpectedBlobOid = oid
+                       Content = envelope.ToJsonString() } ])
+            |> success |> ignore
+            match WorkQueueGitLedger.load b with
+            | Error(LedgerIntegrityError _) -> ()
+            | other -> Assert.Fail(sprintf "Unproven historical waiver was loaded: %A" other))

@@ -1,0 +1,17 @@
+# C01 — P1 — Global-first admission failure has no specified project terminal receipt
+
+**Frozen source:** `ef486f4617d211db0719924626ae3b05bc1f40ca`, `docs/specs/work-queues-and-ephemeral-executions.md`, §§4, 7–8, 12, especially lines 176–188 and 225–232; acceptance 7, 33–34.
+
+**Observation.** The new `TerminalizeLaunch` correctly covers taskless Manager and zero-claim `NoWork` **once a project launch exists**. The cross-ledger protocol, however, first reserves a global token and *then* attempts the project demand-credit reservation (line 228). It explicitly says to release the token when that project reservation definitely fails. A failed project Git CAS need not have created `work-launches/<launch-id>` or a project launch version. Yet `ReleaseGlobalAgentSlot` universally requires an independently verified **project terminal receipt**, and `TerminalizeLaunch` requires an expected project launch version/generation. Neither an abort-only project tombstone nor a narrowly specified account-global no-project-admission abort operation is defined.
+
+**Counterexample.** Project P has one remaining work generation. Manager A obtains account token T for child L. Manager B wins the P demand CAS, leaving A with a **definitive P reservation failure** and no P launch/credit record for L. A cannot supply the required project terminal receipt for T. If it waits, T leaks capacity; if it releases T using only a local failure flag, it bypasses the stated project-before-global release evidence contract and becomes unsafe for ambiguous/later-replayed P outcomes. The same boundary applies to scheduler-created taskless Manager launches if their project registration fails after global reserve.
+
+**Required contract.** Define a canonical terminal/abort path for the interval **global token reserved, project launch not yet durably created**. Either (a) persist a minimal project launch/abort record under a stable launch ID even on definite demand failure and obtain a project terminal receipt, or (b) define a distinct account-CAS `AbortUnboundGlobalAdmission` operation that requires a definitive, replay-safe project failure receipt tied to the original project operation ID and launch ID. A negative read at one head is *not* definitive proof an uncertain Git push cannot arrive later. Specify state versions, competing normal-reservation/abort behavior, exact IDs, and one-time capacity release. Reconcile ambiguous outcomes without changing launch ID or assuming failure.
+
+**Add negative-space tests:**
+1. Global reserve succeeds, project credit CAS definitely loses: no project launch exists; exactly one safe global release through the specified verified path.
+2. Project credit CAS might have committed but its reply was lost: abort/retry cannot release T until the original operation is conclusively reconciled.
+3. Two clients concurrently replay admission and abort for the same L; one canonical decision, no double release and no late launch without a token.
+4. Scheduler Manager preflight succeeds but project launch registration fails after G reserve; cleanup follows the same canonical rule.
+
+**Disposition:** Blocking architecture completeness finding; B01's ordinary `NoWork` / Manager terminal transition is otherwise materially corrected. Documentation only; no implementation or source modification requested.

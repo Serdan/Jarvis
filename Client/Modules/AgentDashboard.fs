@@ -108,12 +108,13 @@ let private agentConfigPath (agentId: string) =
 // Snapshot contents are immutable at a canonical Git commit. Reuse derived
 // rows when the remote head has not changed, including notification summaries.
 let private cachedProjects =
-    ConcurrentDictionary<string, string * (AgentView.AgentRow list * int)>(StringComparer.Ordinal)
+    ConcurrentDictionary<string, string * (AgentView.AgentRow list * int * int)>(StringComparer.Ordinal)
 
 type internal DashboardRead =
     { Identity: string
       Head: string
       Agents: AgentView.AgentRow list
+      UnclaimedReviews: int
       PendingReviews: int }
 
 type internal DashboardFailure =
@@ -142,8 +143,9 @@ let private projectSnapshot project identity binding snapshot =
     // across project aliases without retaining the originating checkout.
     let cacheKey = identity
     match cachedProjects.TryGetValue(cacheKey) with
-    | true, (head, (agents, reviews)) when head = snapshot.Commit ->
-        Ok { Identity = identity; Head = snapshot.Commit; Agents = agents; PendingReviews = reviews }
+    | true, (head, (agents, unclaimed, total)) when head = snapshot.Commit ->
+        Ok { Identity = identity; Head = snapshot.Commit; Agents = agents
+             UnclaimedReviews = unclaimed; PendingReviews = total }
     | _ ->
         match LedgerStore.readDashboardRecordsWithOidsAt binding snapshot with
         | Error error -> Error (string error)
@@ -231,11 +233,19 @@ let private projectSnapshot project identity binding snapshot =
                 match firstError rows with
                 | Some error -> Error error
                 | None ->
-                    let count =
-                        reviews |> List.filter (fun r -> r.Status = "Unclaimed" || r.Status = "Claimed") |> List.length
-                    let data = (rows |> List.choose (function Ok row -> Some row | _ -> None), count)
-                    cachedProjects[cacheKey] <- (snapshot.Commit, data)
-                    Ok { Identity = identity; Head = snapshot.Commit; Agents = fst data; PendingReviews = snd data }
+                    // Each canonical review.json is one current request, including
+                    // taskless requests in tasks/_reviews. Documents, snapshots,
+                    // and historical task events are not review records.
+                    let unclaimed, total =
+                        reviews |> List.fold (fun (u, t) review ->
+                            match review.Status with
+                            | "Unclaimed" -> u + 1, t + 1
+                            | "Claimed" -> u, t + 1
+                            | _ -> u, t) (0, 0)
+                    let agentRows = rows |> List.choose (function Ok row -> Some row | _ -> None)
+                    cachedProjects[cacheKey] <- (snapshot.Commit, (agentRows, unclaimed, total))
+                    Ok { Identity = identity; Head = snapshot.Commit; Agents = agentRows
+                         UnclaimedReviews = unclaimed; PendingReviews = total }
 /// Build one view from verified per-project records. Multiple configured
 /// project names may point at one ledger; only one set of counts is exposed.
 /// Mismatched heads for a shared identity are an inconsistency, not a reason
@@ -269,7 +279,7 @@ let internal snapshotFromResults (results: ProjectResult list) =
                         row.Agent, row.State, row.StateEnteredAt, row.StateReason,
                         row.Focus, row.PendingNotifications, row.LatestNotification)
                     |> List.sortBy (fun (agent, _, _, _, _, _, _) -> agent)
-                read.PendingReviews, agents
+                read.UnclaimedReviews, read.PendingReviews, agents
             let error =
                 if reads |> List.exists (fun read -> read.Head <> first.Head) then
                     Some ("Inconsistent canonical ledger heads for aliases of " + project
@@ -280,7 +290,7 @@ let internal snapshotFromResults (results: ProjectResult list) =
                 else None
             // Preserve the unknown-state distinction even when other aliases
             // returned counts: the same identity cannot report two valid heads.
-            let data = if error.IsSome then None else Some (first.Agents, first.PendingReviews)
+            let data = if error.IsSome then None else Some (first.Agents, first.UnclaimedReviews, first.PendingReviews)
             project, aliases, identity, data, error, (if error.IsSome then AgentView.Unavailable else AgentView.Fresh))
     let unavailable =
         results
@@ -314,7 +324,8 @@ let internal snapshotFromResults (results: ProjectResult list) =
             { Project = project
               Aliases = aliases
               Identity = identity
-              Counts = data |> Option.map (fun (agents, reviews) -> AgentView.projectCounts agents reviews)
+              Counts = data |> Option.map (fun (agents, unclaimed, total) ->
+                  AgentView.projectCountsWithReviews agents unclaimed total)
               Status = status
               Error = error })
     let labelsSnapshot : AgentView.Snapshot =
@@ -328,7 +339,7 @@ let internal snapshotFromResults (results: ProjectResult list) =
         |> List.collect (fun (project, aliases, identity, data, _, _) ->
             match data with
             | None -> []
-            | Some (agents, _) ->
+            | Some (agents, _, _) ->
                 let names = activityAliases identity aliases
                 let label = Map.find identity projectLabels
                 agents |> List.map (fun row ->

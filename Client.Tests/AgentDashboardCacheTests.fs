@@ -264,10 +264,14 @@ let private agentRow project name state unread =
        LatestNotification = None
        ActivityKeys = [project + "::" + name] } : AgentView.AgentRow)
 
-let private available project identity head agents reviews : AgentDashboard.ProjectResult =
+let private availableCounts project identity head agents unclaimed reviews : AgentDashboard.ProjectResult =
     { Project = project
       Aliases = [project]
-      Result = Ok { Identity = identity; Head = head; Agents = agents; PendingReviews = reviews } }
+      Result = Ok { Identity = identity; Head = head; Agents = agents
+                    UnclaimedReviews = unclaimed; PendingReviews = reviews } }
+
+let private available project identity head agents reviews =
+    availableCounts project identity head agents 0 reviews
 
 let private unavailable project reason : AgentDashboard.ProjectResult =
     { Project = project; Aliases = [project]; Result = Error (AgentDashboard.OtherDashboardFailure reason) }
@@ -277,10 +281,10 @@ let projectDashboardDeduplicatesSharedLedgersButNotSameNamedDistinctLedgers () =
     let shared = "project-a:ledger-11111111:1"
     let different = "project-b:ledger-22222222:1"
     let results =
-        [ available "Wayfold" shared "head-shared" [agentRow "Wayfold" "A" "Working" 3] 2
-          available "Wayfold copy" shared "head-shared" [agentRow "Wayfold copy" "A" "Working" 3] 2
-          available "Wayfold" different "head-different" [agentRow "Wayfold" "B" "Ready" 1] 1
-          available "Empty" "project-c:ledger-33333333:1" "head-empty" [] 0
+        [ availableCounts "Wayfold" shared "head-shared" [agentRow "Wayfold" "A" "Working" 3] 1 2
+          availableCounts "Wayfold copy" shared "head-shared" [agentRow "Wayfold copy" "A" "Working" 3] 1 2
+          availableCounts "Wayfold" different "head-different" [agentRow "Wayfold" "B" "Ready" 1] 1 1
+          availableCounts "Empty" "project-c:ledger-33333333:1" "head-empty" [] 0 0
           unavailable "Offline" "Failed to fetch canonical ledger" ]
     let data = AgentDashboard.snapshotFromResults results
     Assert.That(data.Agents.Length, Is.EqualTo(2))
@@ -296,6 +300,24 @@ let projectDashboardDeduplicatesSharedLedgersButNotSameNamedDistinctLedgers () =
     Assert.That(counts.Ready, Is.EqualTo(1))
     Assert.That(counts.Unread, Is.EqualTo(4))
     Assert.That(counts.PendingReviews, Is.EqualTo(3))
+    Assert.That(counts.UnclaimedReviews, Is.EqualTo(2))
+    let sameNamed = data.Projects |> List.filter (fun p -> p.Project = "Wayfold")
+    Assert.That(sameNamed |> List.map _.Identity, Is.EquivalentTo([shared; different]))
+    Assert.That(sameNamed |> List.map (fun p -> p.Counts.Value.UnclaimedReviews, p.Counts.Value.PendingReviews),
+                Is.EquivalentTo([(1, 2); (1, 1)]))
+    Assert.That(offline.Status, Is.EqualTo(AgentView.Unavailable))
+    Assert.That((AgentView.visibleProjects "#Wayfold" data).Length, Is.EqualTo(2))
+
+[<Test>]
+let reviewCountsOfAliasesMustMatchAtTheSameCanonicalHead () =
+    let identity = "project:shared-ledger:1"
+    let one = availableCounts "first" identity "same-head" [] 1 2
+    let two = availableCounts "second" identity "same-head" [] 2 2
+    let data = AgentDashboard.snapshotFromResults [one; two]
+    Assert.That(data.Projects.Length, Is.EqualTo(1))
+    Assert.That(data.Projects.Head.Counts, Is.EqualTo(None))
+    Assert.That(data.Projects.Head.Status, Is.EqualTo(AgentView.Unavailable))
+    Assert.That(data.Projects.Head.Error.Value, Does.Contain("Inconsistent canonical ledger contents"))
 
 [<Test>]
 let canonicalAgentKeysAndActivityAttributionDistinguishSameNamedLedgers () =
@@ -439,6 +461,7 @@ let transientDashboardContentionPreservesVerifiedRowsAsStaleThenRecoversFresh ()
     Assert.That(stale.Status, Is.EqualTo(AgentView.Stale))
     Assert.That(stale.Counts.Value.Tracked, Is.EqualTo(1))
     Assert.That(stale.Counts.Value.PendingReviews, Is.EqualTo(3))
+    Assert.That(stale.Counts.Value.UnclaimedReviews, Is.EqualTo(0))
     Assert.That(stale.Error.Value, Does.Contain("stale"))
     Assert.That(fresh.Status, Is.EqualTo(AgentView.Fresh))
     Assert.That(fresh.Counts.Value.Unread, Is.EqualTo(4))

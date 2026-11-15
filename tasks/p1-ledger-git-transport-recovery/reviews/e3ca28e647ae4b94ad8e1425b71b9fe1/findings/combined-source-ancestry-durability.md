@@ -28,6 +28,6 @@
 
 ## Boundaries
 
-Fault-injection proves deterministic failure-path behavior, not a physical power-cut recovery. First-write parent/rename fsync injection executes on Unix; the Windows write-through branch was not independently run. The **12 P1 + 35 WQ-02/WQ-07** selected tests are not a claim that the full Client.Tests or Server.Tests suites passed. No GitHub Actions, main push, production deployment, remote mutation or Codex were invoked.
+Fault-injection proves deterministic failure-path behavior, not a physical power-cut recovery. First-write parent/rename fsync injection executes on Unix; the Windows write-through branch was not independently run. The **12 P1 + 35 WQ-02/WQ-07** selected tests are not a claim that the full Client.Tests or Server.Tests suites passed. No GitHub Actions, main push, production deployment, source-branch modification or Codex were invoked.
 
 **Decision: Accepted for exact `797a9ebe3ca22075d574d0d5619c358ac74bc5c9`; Lead retains integration authority.**

@@ -1,1 +1,1 @@
-{"schemaVersion":2,"taskId":"wq-04-queue-producers-priority-roles","title":"[Planned P1][WQ-04] Blocking-first FIFO, dependency cycles and role producers","version":6,"lifecycle":"Open","specVersion":6,"attemptId":null}
+{"schemaVersion":2,"taskId":"wq-04-queue-producers-priority-roles","title":"[P1][WQ-04] Blocking-first FIFO, dependency cycles and role producers","version":7,"lifecycle":"Open","specVersion":7,"attemptId":null}

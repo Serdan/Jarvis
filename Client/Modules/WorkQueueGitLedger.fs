@@ -183,6 +183,35 @@ module WorkQueueGitLedger =
     let private content binding project =
         CanonicalCodec.encode (envelope binding project)
 
+    let private nonBlank (value: string) = not (String.IsNullOrWhiteSpace value)
+
+    let private validStagePayload (stage: WorkStage) =
+        nonBlank stage.Id
+        && nonBlank stage.ProjectId
+        && nonBlank stage.SubjectId
+        && nonBlank stage.QueueId
+        && (match stage.Kind with WorkKind.RoleMessage id -> nonBlank id | _ -> true)
+        && (stage.Dependencies |> Set.forall nonBlank)
+        && (stage.WaivedDependencies |> Map.forall (fun id receipt -> nonBlank id && nonBlank receipt))
+        && (stage.SourceLineage
+            |> Option.forall (fun lineage ->
+                nonBlank lineage.RepositoryId
+                && nonBlank lineage.TaskId
+                && nonBlank lineage.TargetRef
+                && nonBlank lineage.LineageId
+                && nonBlank lineage.PinnedBaseCommit
+                && lineage.Generation > 0
+                && (lineage.ReachableRef |> Option.forall nonBlank)
+                && (lineage.ContinuationSha |> Option.forall nonBlank)))
+
+    let private validMessagePayload (message: SubjectMessage) =
+        nonBlank message.Id
+        && nonBlank message.Body
+        && (match message.Subject with
+            | Subject.Task id | Subject.Role id -> nonBlank id)
+        && (message.WorkId |> Option.forall nonBlank)
+        && (match message.State with MessageState.Handled reply -> nonBlank reply | _ -> true)
+
     // The state is an authoritative *single-tree* projection of its own WQ-02
     // events; these checks do not replace verification of external producer
     // journals or account-global authority at production cutover.
@@ -225,7 +254,7 @@ module WorkQueueGitLedger =
                 | MessageState.ClaimedAncillary launchId ->
                     state.Launches.TryFind launchId
                     |> Option.exists (fun launch -> launch.AncillaryMessages.Contains id)
-            subjectWork && handler && message.HandlerGeneration >= 0
+            validMessagePayload message && subjectWork && handler && message.HandlerGeneration >= 0
         let validLaunchPhase (launch: Launch) =
             match launch.State with
             | LaunchState.ReservedUnregistered ->
@@ -260,7 +289,7 @@ module WorkQueueGitLedger =
         && state.GraphVersion >= 0
         && state.NextAvailability >= 0L
         && state.Works |> Map.forall (fun id work ->
-            id = work.Id && work.ProjectId = projectId
+            id = work.Id && work.ProjectId = projectId && validStagePayload work
             && work.StageGeneration > 0 && work.ClaimGeneration >= 0
             && work.AvailableSequence >= 0L
             && work.AvailableSequence <= state.NextAvailability
@@ -285,6 +314,36 @@ module WorkQueueGitLedger =
                     |> Option.exists (fun message ->
                         message.State = MessageState.ClaimedAncillary launch.Id))))
 
+    // Check the exact proposed Git bytes against their decoded projection
+    // before granting the CAS writer permission to publish them.
+    let private validatedContent binding (state: Project) =
+        try
+            if not (structurallyCoherent binding state) then
+                Error(InvalidBinding "WQ-02 canonical candidate is structurally incomplete.")
+            else
+                let raw = content binding state
+                let decoded = CanonicalCodec.decode<ProjectEnvelope> raw
+                if decoded.SchemaVersion <> 1
+                   || decoded.ProjectId <> (binding: LedgerBinding).ProjectId.ToString("D")
+                   || decoded.State <> state
+                   || decoded.StateHash <> CanonicalCodec.digest (CanonicalCodec.encode decoded.State)
+                   || CanonicalCodec.encode decoded <> raw
+                   || not (structurallyCoherent binding decoded.State) then
+                    Error(InvalidBinding "WQ-02 canonical candidate failed roundtrip validation.")
+                else Ok raw
+        with ex ->
+            Error(InvalidBinding ("WQ-02 malformed canonical candidate: " + ex.Message))
+
+    let private validateMutationPayload mutation =
+        try
+            let raw = CanonicalCodec.encode mutation
+            let decoded = CanonicalCodec.decode<WorkMutation> raw
+            if decoded <> mutation || CanonicalCodec.encode decoded <> raw then
+                Error(InvalidBinding "WQ-02 mutation payload failed canonical roundtrip.")
+            else Ok()
+        with ex ->
+            Error(InvalidBinding ("WQ-02 malformed mutation payload: " + ex.Message))
+
     let private witnessNewStage (state: Project) now (stage: WorkStage) =
         // Caller-supplied AvailableAt/Sequence are never scheduling authority.
         // A hard-edge-blocked stage receives its FIFO position only on wake.
@@ -301,7 +360,8 @@ module WorkQueueGitLedger =
             { stage with AvailableAt = 0L; AvailableSequence = 0L }
 
     let private validInitialStage (stage: WorkStage) =
-        (stage.State = WorkState.Available || stage.State = WorkState.Blocked)
+        validStagePayload stage
+        && (stage.State = WorkState.Available || stage.State = WorkState.Blocked)
         && stage.StageGeneration > 0
         && stage.ClaimGeneration = 0
         && stage.Gate = GateState.Clear
@@ -369,8 +429,10 @@ module WorkQueueGitLedger =
                 match previous with
                 | Some _ -> Error(InvalidBinding "WQ-02 ledger already exists.")
                 | None ->
-                    Ok [ { Path = RecordPath; ExpectedBlobOid = oid
-                           Content = content binding state } ]))
+                    validatedContent binding state
+                    |> Result.map (fun raw ->
+                        [ { Path = RecordPath; ExpectedBlobOid = oid
+                            Content = raw } ])))
 
     // All state and the complete original semantic command become a single
     // versioned project Git tree alongside LedgerStore's immutable operation receipt.
@@ -401,8 +463,9 @@ module WorkQueueGitLedger =
                             else
                                 Contracts.publishStage expectedVersion op (witnessNewStage state now stage) state
                         | PostMessage (message, roleWork) ->
-                            if roleWork |> Option.exists (validInitialStage >> not) then
-                                Error(Rejection.InvalidState "invalid role message stage generation")
+                            if not (validMessagePayload message)
+                               || (roleWork |> Option.exists (validInitialStage >> not)) then
+                                Error(Rejection.InvalidState "invalid message or role stage payload")
                             else
                                 Contracts.postMessage expectedVersion op message
                                     (roleWork |> Option.map (witnessNewStage state now)) state
@@ -485,18 +548,19 @@ module WorkQueueGitLedger =
                     transition
                     |> Result.mapError failure
                     |> Result.bind (fun changed ->
-                        if not (structurallyCoherent binding changed) then
-                            Error(LedgerIntegrityError "WQ-02 projection became incomplete or malformed.")
-                        else
-                            Ok [ { Path = RecordPath; ExpectedBlobOid = oid
-                                   Content = content binding changed } ])))
+                        validatedContent binding changed
+                        |> Result.map (fun raw ->
+                            [ { Path = RecordPath; ExpectedBlobOid = oid
+                                Content = raw } ]))))
 
     // The timestamp is captured within this trusted client call and committed
     // into the immutable payload; server clock witness must be added before live cutover.
     let execute binding actor operationId expectedVersion mutation =
         let now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
-        change binding actor operationId expectedVersion now mutation
+        validateMutationPayload mutation
+        |> Result.bind (fun () -> change binding actor operationId expectedVersion now mutation)
 
     // Deterministic tests can replay adversarial interleavings with virtual time.
     let internal executeAt binding actor operationId expectedVersion now mutation =
-        change binding actor operationId expectedVersion now mutation
+        validateMutationPayload mutation
+        |> Result.bind (fun () -> change binding actor operationId expectedVersion now mutation)

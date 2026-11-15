@@ -797,3 +797,104 @@ type WorkQueueGitLedgerTests() =
             match WorkQueueGitLedger.load b with
             | Error(LedgerIntegrityError _) -> ()
             | other -> Assert.Fail(sprintf "Unproven historical waiver was loaded: %A" other))
+
+    [<Test>]
+    member _.MalformedNestedStagePublicationCannotPoisonRemoteAndValidClaimRecovers() =
+        withClones (fun a b ->
+            WorkQueueGitLedger.initialize a "Worker" (Guid.NewGuid())
+                (Map.ofList [ "Lead", set [ "planning" ] ])
+            |> success |> ignore
+            let id = a.ProjectId.ToString("D")
+            let valid = plan id "P" []
+            let lineage =
+                { RepositoryId = "repository"; TaskId = "task-P"
+                  TargetRef = "refs/heads/main"; LineageId = "lineage-P"
+                  PinnedBaseCommit = "base-sha"; ReachableRef = None
+                  ContinuationSha = None; Generation = 1 }
+            let malformed =
+                [ { valid with QueueId = null }
+                  { valid with QueueId = "  " }
+                  { valid with SubjectId = null }
+                  { valid with Dependencies = Set.singleton null }
+                  { valid with SourceLineage = Some { lineage with TargetRef = null } } ]
+            let rejectedOp = Guid.NewGuid()
+            for index, bad in malformed |> List.indexed do
+                let snapshot, prior = WorkQueueGitLedger.load b |> success
+                let operationId = if index = 0 then rejectedOp else Guid.NewGuid()
+                match WorkQueueGitLedger.executeAt a "Attacker" operationId prior.Version (1000L + int64 index)
+                        (PublishStage bad) with
+                | Error(InvalidBinding _) -> ()
+                | other -> Assert.Fail(sprintf "Malformed nested stage %d was published: %A" index other)
+                let verified, unchanged = WorkQueueGitLedger.load b |> success
+                Assert.That(verified.Commit, Is.EqualTo(snapshot.Commit), "Rejected stage changed remote head")
+                Assert.That(unchanged.Version, Is.EqualTo(prior.Version))
+                Assert.That(unchanged.Receipts = prior.Receipts, Is.True)
+                Assert.That(unchanged.Works = prior.Works, Is.True)
+            // A rejected UUID has no operation receipt: valid corrected publication
+            // with the same UUID is not mistaken for a committed poison.
+            let published =
+                WorkQueueGitLedger.executeAt b "Worker" rejectedOp 0 2000L (PublishStage valid)
+                |> success
+            Assert.That(published.AlreadyApplied, Is.False)
+            let _, afterPublish = WorkQueueGitLedger.load a |> success
+            Assert.That(afterPublish.Works.["P"].QueueId, Is.EqualTo("planning"))
+            let mutate client now payload =
+                let _, current = WorkQueueGitLedger.load client |> success
+                WorkQueueGitLedger.executeAt client "Worker" (Guid.NewGuid()) current.Version now payload
+                |> success |> ignore
+            mutate a 2001L (AdmitProject (launch id "L" "Lead"))
+            mutate b 2002L (DispatchOnce ("L", DispatchState.Submitted))
+            mutate a 2003L (InitializeAgent ("L", "session"))
+            mutate b 2004L (ClaimNext "L")
+            let _, recovered = WorkQueueGitLedger.load a |> success
+            Assert.That(recovered.Launches.["L"].PrimaryWorkId, Is.EqualTo(Some "P"))
+            Assert.That(recovered.Works.["P"].State, Is.EqualTo(WorkState.Claimed "L"))
+            Assert.That(recovered.Receipts.Count, Is.EqualTo(recovered.Version)))
+
+    [<Test>]
+    member _.MalformedNestedTaskAndRoleMessagesCannotPoisonRemoteAndRoleClaimRecovers() =
+        withClones (fun a b ->
+            WorkQueueGitLedger.initialize a "Worker" (Guid.NewGuid())
+                (Map.ofList [ "R", set [ "role:R" ] ])
+            |> success |> ignore
+            let id = a.ProjectId.ToString("D")
+            let passive =
+                { Id = "T"; Subject = Subject.Task "task-T"; Body = "passive task"
+                  State = MessageState.Pending; HandlerGeneration = 0; WorkId = None }
+            let role, roleWork = roleMessage id "M" "R"
+            let malformed =
+                [ PostMessage ({ passive with Body = null }, None)
+                  PostMessage ({ passive with Body = "  " }, None)
+                  PostMessage ({ passive with Id = null }, None)
+                  PostMessage ({ passive with Subject = Subject.Task null }, None)
+                  PostMessage ({ role with Subject = Subject.Role null }, Some roleWork)
+                  PostMessage (role, Some { roleWork with QueueId = null })
+                  PostMessage (role, Some { roleWork with SubjectId = " " }) ]
+            for index, payload in malformed |> List.indexed do
+                let snapshot, prior = WorkQueueGitLedger.load a |> success
+                let client = if index % 2 = 0 then b else a
+                match WorkQueueGitLedger.executeAt client "Attacker" (Guid.NewGuid()) prior.Version
+                        (1000L + int64 index) payload with
+                | Error(InvalidBinding _) -> ()
+                | other -> Assert.Fail(sprintf "Malformed message %d was published: %A" index other)
+                let verified, unchanged = WorkQueueGitLedger.load b |> success
+                Assert.That(verified.Commit, Is.EqualTo(snapshot.Commit), "Rejected message changed remote head")
+                Assert.That(unchanged.Version, Is.EqualTo(prior.Version))
+                Assert.That(unchanged.Receipts = prior.Receipts, Is.True)
+                Assert.That(unchanged.Messages = prior.Messages, Is.True)
+                Assert.That(unchanged.Works = prior.Works, Is.True)
+            let mutate client now payload =
+                let _, current = WorkQueueGitLedger.load client |> success
+                WorkQueueGitLedger.executeAt client "Worker" (Guid.NewGuid()) current.Version now payload
+                |> success |> ignore
+            mutate a 2000L (PostMessage (passive, None))
+            mutate b 2001L (PostMessage (role, Some roleWork))
+            mutate a 2002L (AdmitProject (launch id "L" "R"))
+            mutate b 2003L (DispatchOnce ("L", DispatchState.Submitted))
+            mutate a 2004L (InitializeAgent ("L", "session"))
+            mutate b 2005L (ClaimNext "L")
+            let _, recovered = WorkQueueGitLedger.load a |> success
+            Assert.That(recovered.Messages.["T"].WorkId, Is.EqualTo(None))
+            Assert.That(recovered.Launches.["L"].PrimaryWorkId, Is.EqualTo(Some roleWork.Id))
+            Assert.That(recovered.Works.[roleWork.Id].State, Is.EqualTo(WorkState.Claimed "L"))
+            Assert.That(recovered.Receipts.Count, Is.EqualTo(recovered.Version)))

@@ -229,6 +229,15 @@ module private Wq05Fixture =
     let modelHead (client: LedgerBinding) =
         git client.RepositoryPath [ "rev-parse"; "HEAD" ]
 
+    // Synthetic event-model command, pinned to the originating project/queue
+    // high-water and exact downstream stage/claim generation. It is not a
+    // production WQ04 claim envelope or a WQ03 host-dispatch receipt.
+    let dClaimEvent op (p: Project) =
+        let d = p.Works.["downstream-D"]
+        sprintf "claim-D|%s|%d|%d|%d|%d|%d|%d"
+            op p.Version p.GraphVersion p.NextAvailability
+            d.StageGeneration d.ClaimGeneration d.AvailableSequence
+
 [<TestFixture>]
 type WorkQueueReviewIntegrationAdapterTests() =
     let success = Wq05Fixture.succeed
@@ -620,7 +629,7 @@ type WorkQueueReviewIntegrationAdapterTests() =
             let d = { Wq05Fixture.stage "project" "downstream-D" "planning" WorkKind.Planning
                       with Dependencies = Set.singleton workId }
             let seed = initial
-                       |> fun p -> Wq05Fixture.publish p (Wq05Fixture.stage "project" "B" "planning" WorkKind.Planning)
+                       |> fun p -> Wq05Fixture.publish p (Wq05Fixture.stage "project" "B" "review" WorkKind.FrozenReview)
                        |> fun p -> Wq05Fixture.publish p d
             let evidence : VerifiedRemoteEffect =
                 { OriginalPushOperationId = "one-original-push"
@@ -653,6 +662,31 @@ type WorkQueueReviewIntegrationAdapterTests() =
                                     "integration-launch" workId evidence 120L p |> success
                 | "waiver" -> Contracts.resolveIntegrationGateException p.Version
                                   "one-waiver-op" workId (Some waiver) 130L p |> success
+                | "prepare-D" ->
+                    // Model-only: demand for D is admitted after D becomes
+                    // ready. The other available B belongs to the review queue.
+                    let registered = Wq05Fixture.launch "project" "D-launch" "Lead"
+                    let p = Contracts.admitProject p.Version "D-admit" registered p |> success
+                    let p = Contracts.dispatchOnce p.Version "D-dispatch"
+                                "D-launch" DispatchState.Submitted p |> success
+                    Contracts.initializeAgent p.Version "D-register"
+                        "D-launch" "D-session" "D-uuid" 116L p |> success
+                | item when item.StartsWith("claim-D|", StringComparison.Ordinal) ->
+                    match item.Split('|') with
+                    | [| "claim-D"; op; expected; graph; queueHighWater; stageGen; claimGen; availability |] ->
+                        let d = p.Works.["downstream-D"]
+                        Assert.That(p.Version, Is.EqualTo(int expected), "stale project CAS generation")
+                        Assert.That(p.GraphVersion, Is.EqualTo(int graph), "stale hard-edge graph generation")
+                        Assert.That(p.NextAvailability, Is.EqualTo(int64 queueHighWater), "stale queue high-water")
+                        Assert.That(d.StageGeneration, Is.EqualTo(int stageGen), "stale D stage generation")
+                        Assert.That(d.ClaimGeneration, Is.EqualTo(int claimGen), "stale D claim generation")
+                        Assert.That(d.AvailableSequence, Is.EqualTo(int64 availability), "stale D FIFO position")
+                        Assert.That(d.State, Is.EqualTo(WorkState.Available), "D must be ready to claim")
+                        let claimed = Contracts.claimNext (int expected) op "D-launch" p |> success
+                        Assert.That(claimed.Works.["downstream-D"].State,
+                                    Is.EqualTo(WorkState.Claimed "D-launch"))
+                        claimed
+                    | _ -> failwithf "Invalid exact-generation D claim event: %s" item
                 | item -> failwithf "Unexpected model event: %s" item
             let load client : Project = Wq05Fixture.gateEvents client |> List.fold evolve seed
             Wq05Fixture.beginGateModel first second
@@ -691,11 +725,33 @@ type WorkQueueReviewIntegrationAdapterTests() =
             Wq05Fixture.appendGateEvent first "complete"
             let staleCompleted = load first
             Assert.That(staleCompleted.Works.["downstream-D"].State, Is.EqualTo(WorkState.Available))
-            // Local D eligibility after the stale completion is not remote CAS
-            // admission; its entire stale history loses to B's gate commit.
+            // Actually admit and claim D against the stale ungated generation,
+            // including a pinned queue/project high-water, before B wins Git CAS.
+            Wq05Fixture.appendGateEvent first "prepare-D"
+            let stalePrepared = load first
+            let staleDGeneration = stalePrepared.Works.["downstream-D"].StageGeneration
+            let staleHighWater = stalePrepared.NextAvailability
+            Wq05Fixture.appendGateEvent first (Wq05Fixture.dClaimEvent "D-claim-stale" stalePrepared)
+            let staleClaimed = load first
+            Assert.That(staleClaimed.Works.["downstream-D"].State,
+                        Is.EqualTo(WorkState.Claimed "D-launch"))
+            Assert.That(staleClaimed.Works.["downstream-D"].ClaimGeneration, Is.EqualTo(1))
+            Assert.That(staleClaimed.Launches.["D-launch"].PrimaryWorkId, Is.EqualTo(Some "downstream-D"))
+            Assert.That(staleClaimed.GraphVersion, Is.LessThan(gated.GraphVersion))
+            Assert.That(staleClaimed.NextAvailability, Is.EqualTo(staleHighWater))
+            // The stale claim and admission never reach the authoritative Git
+            // head. A readiness-only check would miss this CAS race.
             Assert.That(Wq05Fixture.pushGateModel first, Is.False)
             Wq05Fixture.refreshGateModel first
             Assert.That(load first, Is.EqualTo(gated))
+            Assert.That(gated.Works.["downstream-D"].State, Is.EqualTo(WorkState.Blocked))
+            Assert.That(gated.Works.["downstream-D"].StageGeneration, Is.EqualTo(staleDGeneration))
+            Assert.That(gated.Works.["downstream-D"].ClaimGeneration, Is.EqualTo(0))
+            Assert.That(gated.Launches.ContainsKey "D-launch", Is.False)
+            Assert.That(gated.ProducerCount, Is.EqualTo(0))
+            match Contracts.claimNext stalePrepared.Version "D-claim-stale" "D-launch" gated with
+            | Error Rejection.CasConflict -> ()
+            | other -> Assert.Fail(sprintf "Stale D claim passed post-B project CAS: %A" other)
             let unsafeJobs = { evidence with JobsReconciled = false }
             let unsafeAncestry = { evidence with AncestryVerified = false }
             let wrongUuid = { evidence with OriginalPushOperationId = "second-push" }
@@ -742,7 +798,44 @@ type WorkQueueReviewIntegrationAdapterTests() =
                                 "one-waiver-op" workId (Some waiver) 130L finalized |> success
             Assert.That(idempotent.ProducerCount, Is.EqualTo(1))
             Assert.That(idempotent, Is.EqualTo(finalized))
+            // Positive counterpart: after a verified synthetic waiver, D can
+            // be admitted, but two clients racing for the same current D
+            // generation still produce exactly one canonical claim.
+            Wq05Fixture.appendGateEvent first "prepare-D"
+            Assert.That(Wq05Fixture.pushGateModel first, Is.True)
+            Wq05Fixture.refreshGateModel second
+            let readyA, readyB = load first, load second
+            Assert.That(readyA, Is.EqualTo(readyB))
+            Assert.That(readyA.Works.["downstream-D"].StageGeneration, Is.EqualTo(staleDGeneration))
+            Assert.That(readyA.Works.["downstream-D"].ClaimGeneration, Is.EqualTo(0))
+            Assert.That(readyA.Works.["downstream-D"].State, Is.EqualTo(WorkState.Available))
+            Wq05Fixture.appendGateEvent first (Wq05Fixture.dClaimEvent "D-claim-fresh-A" readyA)
+            Wq05Fixture.appendGateEvent second (Wq05Fixture.dClaimEvent "D-claim-fresh-B" readyB)
+            Assert.That((load first).Works.["downstream-D"].ClaimGeneration, Is.EqualTo(1))
+            Assert.That((load second).Works.["downstream-D"].ClaimGeneration, Is.EqualTo(1))
+            Assert.That(Wq05Fixture.pushGateModel first, Is.True)
+            Assert.That(Wq05Fixture.pushGateModel second, Is.False)
+            Wq05Fixture.refreshGateModel second
+            let claimed = load second
+            Assert.That(claimed, Is.EqualTo(load first))
+            Assert.That(claimed.Version, Is.EqualTo(readyA.Version + 1))
+            Assert.That(claimed.GraphVersion, Is.EqualTo(readyA.GraphVersion))
+            Assert.That(claimed.NextAvailability, Is.EqualTo(readyA.NextAvailability))
+            Assert.That(claimed.Works.["downstream-D"].StageGeneration, Is.EqualTo(staleDGeneration))
+            Assert.That(claimed.Works.["downstream-D"].ClaimGeneration, Is.EqualTo(1))
+            Assert.That(claimed.Works.["downstream-D"].State,
+                        Is.EqualTo(WorkState.Claimed "D-launch"))
+            Assert.That(claimed.Launches.["D-launch"].PrimaryWorkId, Is.EqualTo(Some "downstream-D"))
+            Assert.That(claimed.Launches.["D-launch"].EverClaimed, Is.True)
+            Assert.That(claimed.ProducerCount, Is.EqualTo(1))
+            Assert.That(claimed.Works.[workId].Push.Value.OperationId, Is.EqualTo("one-original-push"))
+            let replayD = Contracts.claimNext readyA.Version "D-claim-fresh-A" "D-launch" claimed |> success
+            Assert.That(replayD, Is.EqualTo(claimed), "original D claim UUID must replay its only receipt")
+            match Contracts.claimNext readyB.Version "D-claim-fresh-B" "D-launch" claimed with
+            | Error Rejection.CasConflict -> ()
+            | other -> Assert.Fail(sprintf "Second stale D claim bypassed high-water: %A" other)
             Assert.That(WorkQueueReviewIntegrationAdapter.isAuthorizedIntegration finalized binding, Is.False)
+            Assert.That(WorkQueueReviewIntegrationAdapter.isAuthorizedIntegration claimed binding, Is.False)
         )
 
     [<Test>]
@@ -750,9 +843,12 @@ type WorkQueueReviewIntegrationAdapterTests() =
         Wq05Fixture.withTwoClients (fun first second ->
             let binding, initial = Wq05Fixture.activeIntegration()
             let workId = WorkQueueReviewIntegrationAdapter.integrationStageId binding
+            let d = { Wq05Fixture.stage "project" "downstream-D" "planning" WorkKind.Planning
+                      with Dependencies = Set.singleton workId }
             let seed =
                 Wq05Fixture.publish initial
-                    (Wq05Fixture.stage "project" "B" "planning" WorkKind.Planning)
+                    (Wq05Fixture.stage "project" "B" "review" WorkKind.FrozenReview)
+                |> fun p -> Wq05Fixture.publish p d
             let replay (p: Project) eventName =
                 match eventName with
                 | "edge" -> Contracts.setHardPrerequisite p.Version "gate-first"
@@ -782,5 +878,18 @@ type WorkQueueReviewIntegrationAdapterTests() =
             | other -> Assert.Fail(sprintf "Gate-first admitted original push: %A" other)
             Assert.That(fresh.Works.[workId].Push, Is.EqualTo(None))
             Assert.That(fresh.Works.[workId].IntegrationAuthorized, Is.False)
+            Assert.That(fresh.Works.["downstream-D"].State, Is.EqualTo(WorkState.Blocked))
+            Assert.That(fresh.Works.["downstream-D"].ClaimGeneration, Is.EqualTo(0))
+            Assert.That(fresh.Launches.ContainsKey "D-launch", Is.False)
+            Assert.That(fresh.ProducerCount, Is.EqualTo(0))
+            // With B's edge committed first there is no D demand admission at
+            // all; an earlier project generation cannot claim it either.
+            match Contracts.admitProject fresh.Version "gate-first-D-admit"
+                    (Wq05Fixture.launch "project" "D-launch" "Lead") fresh with
+            | Error Rejection.NoCompatibleMatching -> ()
+            | other -> Assert.Fail(sprintf "Gate-first admitted blocked D: %A" other)
+            match Contracts.claimNext old.Version "gate-first-stale-D-claim" "D-launch" fresh with
+            | Error Rejection.CasConflict -> ()
+            | other -> Assert.Fail(sprintf "Gate-first stale D claim escaped CAS: %A" other)
             Assert.That(WorkQueueReviewIntegrationAdapter.isAuthorizedIntegration fresh binding, Is.False)
         )

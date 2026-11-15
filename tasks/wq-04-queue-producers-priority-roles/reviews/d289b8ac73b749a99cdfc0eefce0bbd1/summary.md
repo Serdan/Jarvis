@@ -1,0 +1,1 @@
+Pin unchanged exact 6f068672 from current integrated main 8ed96715. Independent review must audit the exact same source and .NET11 Release tests; no activation or main push.

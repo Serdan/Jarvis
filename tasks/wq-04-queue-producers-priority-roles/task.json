@@ -1,1 +1,1 @@
-{"schemaVersion":2,"taskId":"wq-04-queue-producers-priority-roles","title":"[Planned P1][WQ-04] Deterministic queue producers, Lead priority and role config","version":2,"lifecycle":"Open","specVersion":2,"attemptId":null}
+{"schemaVersion":2,"taskId":"wq-04-queue-producers-priority-roles","title":"[Planned P1][WQ-04] Blocking-first FIFO, dependency cycles and role producers","version":3,"lifecycle":"Open","specVersion":3,"attemptId":null}

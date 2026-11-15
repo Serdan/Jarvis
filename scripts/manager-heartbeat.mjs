@@ -91,7 +91,9 @@ export function validateSnapshot(config, snapshot, nowUtc) {
       (Number.isInteger(agent.priorityRank) && agent.priorityRank >= 0 &&
        agent.priorityRank <= 100000), "Invalid canonical task priority rank");
     if (agent.lastAttributedActivityAtUtc !== null) {
-      validTime(agent.lastAttributedActivityAtUtc, "lastAttributedActivityAtUtc");
+      const attributedAt = validTime(agent.lastAttributedActivityAtUtc, "lastAttributedActivityAtUtc");
+      assert(attributedAt <= observed + 1000,
+        "Attributed activity is newer than the verified snapshot");
       assert(agent.activityEvidence === "ExplicitAttributedToolCall",
         "Client-local last-seen is not proof of agent activity");
     }
@@ -163,6 +165,13 @@ export function validateJournal(journal, projectName) {
         (rec.observedClaimIds.length === 0 ||
           /^[0-9a-f]{40,64}$/.test(rec.claimSeenLedgerHead ?? "")),
         "Invalid observed reviewer claims");
+    }
+    if (rec.claimObservedActivityAtUtc !== undefined) {
+      assert(rec.kind === "reviewer" && rec.observedClaimIds?.length > 0 &&
+        /^[0-9a-f]{40,64}$/.test(rec.claimSeenLedgerHead ?? "") &&
+        validTime(rec.claimObservedActivityAtUtc, "claimObservedActivityAtUtc") >=
+        validTime(rec.observedAtUtc, "observedAtUtc"),
+        "Invalid claim-present activity evidence");
     }
     if (rec.reviewerSessionCleared !== undefined) {
       assert(rec.reviewerSessionCleared === true && rec.kind === "reviewer" &&
@@ -262,16 +271,23 @@ function reviewerPauseStillProven(rec, agent, snapshot, ended) {
 // Even with zero claims, a later attributed call can mean the old tab resumed.
 function reviewerSessionResumedAfterEnd(rec, agent, snapshot) {
   if (rec.status !== "review-finished" && rec.reviewerSessionCleared !== true) return false;
-  if (agent?.lastAttributedActivityAtUtc == null) return false;
+  // Missing/regressed attribution cannot prove the old browser session ended.
+  if (agent?.lastAttributedActivityAtUtc == null) return true;
   const activityAt = Date.parse(agent.lastAttributedActivityAtUtc);
   const observedAt = Date.parse(rec.observedAtUtc);
+  if (activityAt < Date.parse(rec.claimObservedActivityAtUtc ?? rec.observedAtUtc)) return true;
   if (activityAt <= observedAt) return false;
   const capturedAt = Date.parse(snapshot.capturedAtUtc);
   const endTimes = [];
   if (rec.status === "review-finished") {
     if (rec.completionEvidence === "ExplicitReviewerYield") endTimes.push(rec.explicitYieldAtUtc);
-    else if (rec.completionEvidence === "CanonicalReviewClaimResolved")
-      endTimes.push(rec.completedAtUtc);
+    else if (rec.completionEvidence === "CanonicalReviewClaimResolved") {
+      // Claim disappearance is known only between ledger snapshots; the
+      // Manager's completedAtUtc is not an authoritative decision timestamp.
+      // Activity newly seen during that interval may be post-resolution.
+      // Legacy journals retain the original attributed-call lower bound.
+      endTimes.push(rec.claimObservedActivityAtUtc ?? rec.observedAtUtc);
+    }
   }
   if (rec.reviewerSessionCleared === true) endTimes.push(rec.releasedAtUtc);
   endTimes.push(agent.reviewerYieldAtUtc);
@@ -325,12 +341,29 @@ export function decide(config, snapshot, journal, nowUtc, dryRun = false) {
         observedClaimIds: [...new Set([...(rec.observedClaimIds ?? []), ...claims])],
         claimSeenLedgerHead: rec.claimSeenLedgerHead ?? (claims.length ? snapshot.ledgerHead : undefined)
       };
+      // Preserve the last attributed call seen with the claim still present.
+      const claimActivity = agent?.lastAttributedActivityAtUtc;
+      if (claims.length && claimActivity &&
+          (!updated.claimObservedActivityAtUtc ||
+            Date.parse(claimActivity) > Date.parse(updated.claimObservedActivityAtUtc))) {
+        updated.claimObservedActivityAtUtc = claimActivity;
+      }
       const ended = reviewerSessionEnd(updated, agent, claims, snapshot);
-      if (ended) reviewerSessionEnds.set(rec.launchId, ended);
-      else unresolvedReviewers.add(rec.agentId);
+      if (ended) {
+        reviewerSessionEnds.set(rec.launchId, ended);
+        // Make dry-run and normal planning enforce the same session boundary,
+        // including the first snapshot observing claim disappearance.
+        const completed = { ...updated, status: "review-finished",
+          completionEvidence: ended,
+          explicitYieldAtUtc: ended === "ExplicitReviewerYield" ? agent.reviewerYieldAtUtc : undefined };
+        if (reviewerSessionResumedAfterEnd(completed, agent, snapshot))
+          unresolvedReviewers.add(rec.agentId);
+      } else unresolvedReviewers.add(rec.agentId);
       if (!dryRun) {
         rec.observedClaimIds = updated.observedClaimIds;
         if (updated.claimSeenLedgerHead) rec.claimSeenLedgerHead = updated.claimSeenLedgerHead;
+        if (updated.claimObservedActivityAtUtc)
+          rec.claimObservedActivityAtUtc = updated.claimObservedActivityAtUtc;
         if (ended) {
           rec.status = "review-finished";
           rec.completionEvidence = ended;
@@ -367,6 +400,7 @@ export function decide(config, snapshot, journal, nowUtc, dryRun = false) {
         if (!dryRun) {
           rec.observedClaimIds = claims;
           if (claims.length) rec.claimSeenLedgerHead = snapshot.ledgerHead;
+          if (claims.length) rec.claimObservedActivityAtUtc = activity;
           rec.status = ended ? "review-finished" : "observed";
           rec.observedAtUtc = activity;
           if (ended) {

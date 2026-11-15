@@ -460,6 +460,13 @@ function reviewerObserved(s, at = "2026-11-15T02:00:30Z") {
   s.agents[3].activityEvidence = "ExplicitAttributedToolCall";
 }
 
+test("future attributed reviewer activity cannot prove claim-present quiescence", () => {
+  const s = snapshot();
+  reviewerObserved(s, "2026-11-15T02:00:20Z");
+  assert.throws(() => decide(reviewerOnlyConfig(), s, journal(), NOW),
+    /newer than the verified snapshot/);
+});
+
 test("taskless reviewer claim remains active across heartbeats and journal restart", () => {
   const c = reviewerOnlyConfig();
   const j = journal();
@@ -731,6 +738,132 @@ test("activity after an already resolved review still blocks taskless duplicate"
   reviewerObserved(yielded, "2026-11-15T02:07:00Z");
   assert.deepEqual(decide(c, yielded, restarted, yielded.capturedAtUtc)
     .reservations.map(r => r.reason), ["UnclaimedFrozenReview"]);
+});
+
+test("missing or regressed activity attribution after resolution remains uncertain", () => {
+  const c = reviewerOnlyConfig();
+  c.budgets.reviewer = 1;
+  const j = journal();
+  const initial = snapshot();
+  initial.unclaimedReviewCount = 1;
+  decide(c, initial, j, NOW);
+  const claimed = snapshot();
+  claimed.capturedAtUtc = "2026-11-15T02:01:00Z";
+  claimed.claimedReviews = [REVIEW];
+  claimed.unclaimedReviewCount = 1;
+  reviewerObserved(claimed);
+  decide(c, claimed, j, claimed.capturedAtUtc);
+
+  const resolved = structuredClone(claimed);
+  resolved.ledgerHead = NEXT_HEAD;
+  resolved.claimedReviews = [];
+  resolved.capturedAtUtc = "2026-11-15T02:03:00Z";
+  decide({ ...c, enabled: false }, resolved, j, resolved.capturedAtUtc);
+  assert.equal(j.records[0].status, "review-finished");
+
+  const missing = structuredClone(resolved);
+  missing.capturedAtUtc = "2026-11-15T02:04:00Z";
+  missing.agents[3].lastAttributedActivityAtUtc = null;
+  assert.equal(decide(c, missing, structuredClone(j), missing.capturedAtUtc)
+    .reservations.length, 0);
+
+  const regressed = structuredClone(missing);
+  reviewerObserved(regressed, "2026-11-15T02:00:15Z");
+  assert.equal(decide(c, regressed, structuredClone(j), regressed.capturedAtUtc)
+    .reservations.length, 0);
+
+  assert.deepEqual(decide(c, resolved, structuredClone(j), resolved.capturedAtUtc)
+    .reservations.map(r => r.agentId), ["Reviewer 1"]);
+});
+
+test("new attributed activity before first review-resolution observation blocks duplicate across restart", () => {
+  const c = reviewerOnlyConfig();
+  c.budgets.reviewer = 1;
+  const j = journal();
+  const initial = snapshot();
+  initial.unclaimedReviewCount = 1;
+  assert.deepEqual(decide(c, initial, j, NOW).reservations.map(r => r.agentId),
+    ["Reviewer 1"]);
+
+  const claimed = snapshot();
+  claimed.capturedAtUtc = "2026-11-15T02:01:00Z";
+  claimed.claimedReviews = [REVIEW];
+  claimed.unclaimedReviewCount = 1;
+  reviewerObserved(claimed);
+  decide(c, claimed, j, claimed.capturedAtUtc);
+  assert.equal(j.records[0].claimObservedActivityAtUtc, "2026-11-15T02:00:30Z");
+
+  // Canonical resolution occurred at 02:02:10, then the old browser session
+  // made a NEW tool call at 02:02:20 before Manager observed the changed head.
+  const resolved = structuredClone(claimed);
+  resolved.ledgerHead = NEXT_HEAD;
+  resolved.claimedReviews = [];
+  resolved.capturedAtUtc = "2026-11-15T02:03:00Z";
+  reviewerObserved(resolved, "2026-11-15T02:02:20Z");
+  const dryJournal = structuredClone(j);
+  assert.equal(decide(c, resolved, dryJournal, resolved.capturedAtUtc, true)
+    .reservations.length, 0);
+  assert.deepEqual(dryJournal, j);
+  const blocked = decide(c, resolved, j, resolved.capturedAtUtc);
+  assert.equal(j.records[0].status, "review-finished");
+  assert.equal(j.records[0].completionEvidence, "CanonicalReviewClaimResolved");
+  assert.equal(blocked.reservations.length, 0);
+  assert.equal(blocked.counts.reviewer, 1);
+
+  const restarted = JSON.parse(JSON.stringify(j));
+  assert.equal(decide(c, resolved, restarted, resolved.capturedAtUtc)
+    .reservations.length, 0);
+  const secondReviewerConfig = { ...c, budgets: { ...c.budgets, reviewer: 2 } };
+  assert.deepEqual(decide(secondReviewerConfig, resolved, structuredClone(j),
+    resolved.capturedAtUtc).reservations.map(r => r.agentId), ["Reviewer 2"]);
+
+  // Older journals without the new attribution field also fail closed.
+  const legacy = structuredClone(dryJournal);
+  delete legacy.records[0].claimObservedActivityAtUtc;
+  assert.equal(decide(c, resolved, legacy, resolved.capturedAtUtc)
+    .reservations.length, 0);
+
+  // Explicitly attributed yield AFTER the uncertain call is positive evidence
+  // that the old session has paused; a new unclaimed review can be launched.
+  const yielded = structuredClone(resolved);
+  yielded.capturedAtUtc = "2026-11-15T02:05:00Z";
+  yielded.agents[3].reviewerYieldAtUtc = "2026-11-15T02:04:00Z";
+  yielded.agents[3].reviewerYieldEvidence = "ExplicitAttributedReviewerYield";
+  reviewerObserved(yielded, "2026-11-15T02:04:00Z");
+  assert.deepEqual(decide(c, yielded, restarted, yielded.capturedAtUtc)
+    .reservations.map(r => r.reason), ["UnclaimedFrozenReview"]);
+});
+
+test("claim-present evidence for later activity preserves safe canonical relaunch", () => {
+  const c = reviewerOnlyConfig();
+  c.budgets.reviewer = 1;
+  const j = journal();
+  const initial = snapshot();
+  initial.unclaimedReviewCount = 1;
+  decide(c, initial, j, NOW);
+  const claimed = snapshot();
+  claimed.capturedAtUtc = "2026-11-15T02:01:00Z";
+  claimed.claimedReviews = [REVIEW];
+  claimed.unclaimedReviewCount = 1;
+  reviewerObserved(claimed);
+  decide(c, claimed, j, claimed.capturedAtUtc);
+
+  // A later Manager pass still positively observes the claim with newer
+  // attributed activity. Resolution and disappearance follow that pass.
+  const stillClaimed = structuredClone(claimed);
+  stillClaimed.capturedAtUtc = "2026-11-15T02:02:05Z";
+  reviewerObserved(stillClaimed, "2026-11-15T02:02:00Z");
+  assert.equal(decide(c, stillClaimed, j, stillClaimed.capturedAtUtc)
+    .reservations.length, 0);
+  assert.equal(j.records[0].claimObservedActivityAtUtc, "2026-11-15T02:02:00Z");
+
+  const resolved = structuredClone(stillClaimed);
+  resolved.ledgerHead = NEXT_HEAD;
+  resolved.claimedReviews = [];
+  resolved.capturedAtUtc = "2026-11-15T02:03:00Z";
+  const r = decide(c, resolved, j, resolved.capturedAtUtc);
+  assert.equal(j.records[0].status, "review-finished");
+  assert.deepEqual(r.reservations.map(x => x.agentId), ["Reviewer 1"]);
 });
 
 test("operator reviewer recovery is invalidated by later attributed activity", () => {

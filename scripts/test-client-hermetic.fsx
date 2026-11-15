@@ -158,20 +158,49 @@ try
     start.RedirectStandardOutput <- true
     start.RedirectStandardError <- true
     start.WorkingDirectory <- sourceRoot
-    start.ArgumentList.Add("test")
-    start.ArgumentList.Add("Client.Tests/Client.Tests.fsproj")
-    start.ArgumentList.Add("-c")
-    start.ArgumentList.Add("Release")
-    start.ArgumentList.Add("--no-restore")
-    start.ArgumentList.Add("--results-directory")
-    start.ArgumentList.Add(results)
-    start.ArgumentList.Add("--logger")
-    start.ArgumentList.Add("console;verbosity=normal")
-    // A hanging individual test should not consume the whole suite timeout.
-    start.ArgumentList.Add("--blame-hang-timeout")
-    start.ArgumentList.Add("75s")
-    for arg in forwarded do start.ArgumentList.Add(arg)
-    printfn "Hermetic Client.Tests: child executable %s; CLI command dotnet test Client.Tests/Client.Tests.fsproj -c Release --no-restore" dotnet
+    if OperatingSystem.IsWindows() then
+        // On Windows, dotnet test can silently exit 0 without test discovery
+        // after NuGet/MSBuild imports are isolated from ambient user caches.
+        // Execute the compiled .NET 11 Release assembly through VSTest
+        // directly, retaining a strict nonzero-executed-count assertion.
+        let binaryDirectory = Path.Combine(sourceRoot, "Client.Tests", "bin", "Release", "net11.0")
+        let assembly = Path.Combine(binaryDirectory, "Client.Tests.dll")
+        if not (File.Exists assembly) then
+            failwith "Windows hermetic VSTest requires a prebuilt .NET 11 Release Client.Tests.dll."
+        start.ArgumentList.Add("vstest")
+        start.ArgumentList.Add(assembly)
+        start.ArgumentList.Add("/Framework:net11.0")
+        start.ArgumentList.Add("/ResultsDirectory:" + results)
+        start.ArgumentList.Add("/Logger:console;verbosity=normal")
+        start.ArgumentList.Add("/TestAdapterPath:" + binaryDirectory)
+        let rec forward = function
+            | [] -> ()
+            | "--no-build" :: tail
+            | "--no-restore" :: tail -> forward tail
+            | "--filter" :: expression :: tail ->
+                start.ArgumentList.Add("/TestCaseFilter:" + expression)
+                forward tail
+            | "--list-tests" :: tail ->
+                start.ArgumentList.Add("/ListTests")
+                forward tail
+            | other :: _ -> failwith $"Unsupported Windows VSTest passthrough option: {other}."
+        forward forwarded
+        printfn "Hermetic Client.Tests: child executable %s; Windows CLI command dotnet vstest Client.Tests.dll (Release net11.0)" dotnet
+    else
+        start.ArgumentList.Add("test")
+        start.ArgumentList.Add("Client.Tests/Client.Tests.fsproj")
+        start.ArgumentList.Add("-c")
+        start.ArgumentList.Add("Release")
+        start.ArgumentList.Add("--no-restore")
+        start.ArgumentList.Add("--results-directory")
+        start.ArgumentList.Add(results)
+        start.ArgumentList.Add("--logger")
+        start.ArgumentList.Add("console;verbosity=normal")
+        // A hanging individual test should not consume the whole suite timeout.
+        start.ArgumentList.Add("--blame-hang-timeout")
+        start.ArgumentList.Add("75s")
+        for arg in forwarded do start.ArgumentList.Add(arg)
+        printfn "Hermetic Client.Tests: child executable %s; CLI command dotnet test Client.Tests/Client.Tests.fsproj -c Release --no-restore" dotnet
 
     // Exercise inherited-Git-identity failure with synthetic sentinels only.
     if injectGitIdentitySentinel then

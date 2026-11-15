@@ -316,12 +316,21 @@ type Service(port: int, pairingSecret: string) =
                         match window.TryGetProperty("availability") with
                         | true, value when value.ValueKind = JsonValueKind.String -> value.GetString()
                         | _ -> "unknown"
+                    let selectedId =
+                        match window.TryGetProperty("windowRegistration") with
+                        | true, value when value.ValueKind = JsonValueKind.String -> value.GetString()
+                        | _ -> ""
+                    let selectedGeneration =
+                        match window.TryGetProperty("registrationGeneration") with
+                        | true, value when value.ValueKind = JsonValueKind.Number -> value.GetInt32()
+                        | _ -> 0
                     if availability <> "ready" then Error ("WindowUnavailable:" + availability)
+                    elif String.IsNullOrWhiteSpace(selectedId) || selectedGeneration < 1 then Error "WindowRegistrationInvalid"
                     elif conn.Pending.Count >= 4 then Error "BridgeBusy"
-                    else Ok conn)
+                    else Ok(conn, selectedId, selectedGeneration))
             match connection with
             | Error error -> return Error error
-            | Ok conn ->
+            | Ok(conn, selectedWindowId, selectedGeneration) ->
                 let requestId = Guid.NewGuid().ToString("N")
                 let completion = TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously)
                 if not (conn.Pending.TryAdd(requestId, completion)) then
@@ -335,7 +344,8 @@ type Service(port: int, pairingSecret: string) =
                                                requestId = requestId
                                                connectionId = conn.Id
                                                url = url
-                                               windowRegistration = windowRegistration
+                                               windowRegistration = selectedWindowId
+                                               registrationGeneration = selectedGeneration
                                                alias = alias
                                                active = makeActive |}
                             do! send conn frame
@@ -360,7 +370,8 @@ type Service(port: int, pairingSecret: string) =
                         conn.Pending.TryRemove(requestId, &removed) |> ignore
     }
 
-    member _.CloseTab(tabRegistration: string, ?ownerConnectionId: string) = task {
+    member _.CloseTab(tabRegistration: string, ?ownerConnectionId: string,
+                      ?expectedRegistrationGeneration: int) = task {
         let resolved = lock sync (fun () ->
             match resolveRegistration ownerConnectionId false tabRegistration with
             | Error error -> Error error
@@ -369,7 +380,13 @@ type Service(port: int, pairingSecret: string) =
                     match tab.TryGetProperty("agentCreated") with
                     | true, value -> value.GetBoolean()
                     | _ -> false
-                if not agentCreated then Error "TabNotAgentCreated"
+                let generation =
+                    match tab.TryGetProperty("registrationGeneration") with
+                    | true, value when value.ValueKind = JsonValueKind.Number -> value.GetInt32()
+                    | _ -> 0
+                if expectedRegistrationGeneration |> Option.exists (fun expected -> expected <> generation) then
+                    Error "TabRegistrationChanged"
+                elif not agentCreated then Error "TabNotAgentCreated"
                 elif conn.Pending.Count >= 4 then Error "BridgeBusy"
                 else Ok(conn, tab))
         match resolved with
@@ -407,7 +424,8 @@ type Service(port: int, pairingSecret: string) =
     }
 
     member _.Execute(tabRegistration: string, source: string, argsJson: string, timeoutMs: int,
-                     isInline: bool, ?ownerConnectionId: string) = task {
+                     isInline: bool, ?ownerConnectionId: string,
+                     ?expectedRegistrationGeneration: int, ?requireAgentCreated: bool) = task {
         let sourceBytes = utf8.GetByteCount(source)
         if sourceBytes > MaxScriptBytes then return Error "InputTooLarge: script exceeds 64 KiB."
         elif utf8.GetByteCount(argsJson) > MaxArgumentsBytes then return Error "InputTooLarge: arguments exceed 64 KiB."
@@ -423,7 +441,18 @@ type Service(port: int, pairingSecret: string) =
                             match tab.TryGetProperty("availability") with
                             | true, x -> x.GetString()
                             | _ -> ""
-                        if state <> "ready" then Error ("TabUnavailable:" + state)
+                        let generation =
+                            match tab.TryGetProperty("registrationGeneration") with
+                            | true, value when value.ValueKind = JsonValueKind.Number -> value.GetInt32()
+                            | _ -> 0
+                        let agentCreated =
+                            match tab.TryGetProperty("agentCreated") with
+                            | true, value when value.ValueKind = JsonValueKind.True -> true
+                            | _ -> false
+                        if expectedRegistrationGeneration |> Option.exists (fun expected -> expected <> generation) then
+                            Error "TabRegistrationChanged"
+                        elif defaultArg requireAgentCreated false && not agentCreated then Error "TabNotAgentCreated"
+                        elif state <> "ready" then Error ("TabUnavailable:" + state)
                         elif conn.Pending.Count >= 4 then Error "BridgeBusy"
                         else Ok(conn, tab))
                 match resolved with
@@ -448,6 +477,7 @@ type Service(port: int, pairingSecret: string) =
                                                    connectionId = conn.Id
                                                    registrationId = registrationId
                                                    registrationGeneration = generation
+                                                   requireAgentCreated = defaultArg requireAgentCreated false
                                                    source = source
                                                    entrypoint = (if isInline then "expression" else "execute")
                                                    args = args
@@ -699,10 +729,19 @@ let runInNewTab (bridge: Service) (windowRegistration: string) (url: string)
             | Error e -> return Error("", e)
             | Ok response ->
                 use openDoc = JsonDocument.Parse(response)
-                registrationId <- openDoc.RootElement.GetProperty("tab").GetProperty("registrationId").GetString()
+                let createdTab = openDoc.RootElement.GetProperty("tab")
+                registrationId <- createdTab.GetProperty("registrationId").GetString()
                 let ownerConnectionId = openDoc.RootElement.GetProperty("connectionId").GetString()
-                if String.IsNullOrWhiteSpace(registrationId) then
-                    return Error("", "OutcomeUnknown: created tab response lacked registration ID")
+                let createdGeneration =
+                    match createdTab.TryGetProperty("registrationGeneration") with
+                    | true, value when value.ValueKind = JsonValueKind.Number -> value.GetInt32()
+                    | _ -> 0
+                let agentCreated =
+                    match createdTab.TryGetProperty("agentCreated") with
+                    | true, value when value.ValueKind = JsonValueKind.True -> true
+                    | _ -> false
+                if String.IsNullOrWhiteSpace(registrationId) || createdGeneration < 1 || not agentCreated then
+                    return Error(registrationId, "OutcomeUnknown: created tab identity or provenance was missing")
                 else
                     // Readiness advertised by the extension is not atomic with
                     // Chrome's live tab status. A page can start another load
@@ -713,7 +752,8 @@ let runInNewTab (bridge: Service) (windowRegistration: string) (url: string)
                     let cleanupNotReady () = task {
                         // No user script was injected; cleanup cannot cancel a submission.
                         if closeAfterExecution then
-                            match! bridge.CloseTab(registrationId, ownerConnectionId = ownerConnectionId) with
+                            match! bridge.CloseTab(registrationId, ownerConnectionId = ownerConnectionId,
+                                                   expectedRegistrationGeneration = createdGeneration) with
                             | Ok _ -> return Error(registrationId, "TabNotReady; cleanup=closed")
                             | Error e ->
                                 let safe = if e.Length > 100 then e.Substring(0, 100) else e
@@ -722,17 +762,32 @@ let runInNewTab (bridge: Service) (windowRegistration: string) (url: string)
                             return Error(registrationId, "TabNotReady; cleanup=retained")
                     }
                     let mutable ready = false
-                    while not ready && withinReadinessBudget() do
+                    let mutable ownershipChanged = false
+                    while not ready && not ownershipChanged && withinReadinessBudget() do
                         match bridge.ListTabs(ownerConnectionId = ownerConnectionId) with
                         | Ok listing ->
                             use listDoc = JsonDocument.Parse(listing)
-                            ready <- listDoc.RootElement.GetProperty("tabs").EnumerateArray()
-                                     |> Seq.exists (fun tab ->
-                                         tab.GetProperty("registrationId").GetString() = registrationId &&
-                                         tab.GetProperty("availability").GetString() = "ready")
+                            let matching = listDoc.RootElement.GetProperty("tabs").EnumerateArray()
+                                           |> Seq.tryFind (fun tab ->
+                                               tab.GetProperty("registrationId").GetString() = registrationId)
+                            match matching with
+                            | Some tab ->
+                                let generation =
+                                    match tab.TryGetProperty("registrationGeneration") with
+                                    | true, value when value.ValueKind = JsonValueKind.Number -> value.GetInt32()
+                                    | _ -> 0
+                                let created =
+                                    match tab.TryGetProperty("agentCreated") with
+                                    | true, value when value.ValueKind = JsonValueKind.True -> true
+                                    | _ -> false
+                                ownershipChanged <- generation <> createdGeneration || not created
+                                ready <- not ownershipChanged && tab.GetProperty("availability").GetString() = "ready"
+                            | None -> ()
                         | Error _ -> ()
-                        if not ready then do! Task.Delay(500)
-                    if not ready then
+                        if not ready && not ownershipChanged then do! Task.Delay(500)
+                    if ownershipChanged then
+                        return Error(registrationId, "TabRegistrationChanged; cleanup=retained")
+                    elif not ready then
                         return! cleanupNotReady()
                     else
                         // These two exact errors are emitted only BEFORE script
@@ -746,7 +801,9 @@ let runInNewTab (bridge: Service) (windowRegistration: string) (url: string)
                         let mutable execution : Result<string, string> option = None
                         while execution.IsNone && withinReadinessBudget() do
                             let! attempt = bridge.Execute(registrationId, source, argsJson, timeoutMs, false,
-                                                          ownerConnectionId = ownerConnectionId)
+                                                          ownerConnectionId = ownerConnectionId,
+                                                          expectedRegistrationGeneration = createdGeneration,
+                                                          requireAgentCreated = true)
                             match attempt with
                             | Error e when isLoadingPreflight e -> do! Task.Delay(500)
                             | _ -> execution <- Some attempt
@@ -812,7 +869,8 @@ let runInNewTab (bridge: Service) (windowRegistration: string) (url: string)
                             else
                                 let mutable cleanup = "retained"
                                 if closeAfterExecution then
-                                    let! closed = bridge.CloseTab(registrationId, ownerConnectionId = ownerConnectionId)
+                                    let! closed = bridge.CloseTab(registrationId, ownerConnectionId = ownerConnectionId,
+                                                                  expectedRegistrationGeneration = createdGeneration)
                                     cleanup <- match closed with
                                                | Ok _ -> "closed"
                                                | Error e -> "cleanupFailed:" + (if e.Length > 100 then e.Substring(0, 100) else e)

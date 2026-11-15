@@ -22,7 +22,9 @@ function createHarness(initialStorage = {}, initialSession = {}) {
   let nextCreatedId = 19;
   let hostPermissionGranted = true;
   let failNextPermissionQuery = false;
+  let permissionHook = null;
   let failNextTabQuery = false;
+  let nextTabQueryHook = null;
   let failNextRegistryWrite = false;
   let holdNextRegistryWrite = false;
   let releaseRegistryWrite = null;
@@ -84,6 +86,11 @@ function createHarness(initialStorage = {}, initialSession = {}) {
       },
       remove: async id => { tabs.delete(id); listeners.removed?.(id); },
       get: async id => {
+        if (nextTabQueryHook) {
+          const hook = nextTabQueryHook;
+          nextTabQueryHook = null;
+          await hook();
+        }
         if (failNextTabQuery) {
           failNextTabQuery = false;
           throw Error("Temporary tabs API failure");
@@ -95,11 +102,16 @@ function createHarness(initialStorage = {}, initialSession = {}) {
       onRemoved: { addListener: cb => { listeners.removed = cb; } }
     },
     windows: {
-      get: async id => { if (id !== 1) throw Error("Missing window"); return { id: 1, incognito: false }; },
+      get: async id => { if (![1, 2].includes(id)) throw Error("Missing window"); return { id, incognito: false }; },
       onRemoved: { addListener: cb => { listeners.windowRemoved = cb; } }
     },
     webNavigation: { onHistoryStateUpdated: { addListener: cb => { listeners.history = cb; } } },
     permissions: { contains: async () => {
+      if (permissionHook) {
+        const hook = permissionHook;
+        permissionHook = null;
+        await hook();
+      }
       if (failNextPermissionQuery) {
         failNextPermissionQuery = false;
         throw Error("Temporary permission API failure");
@@ -136,12 +148,21 @@ function createHarness(initialStorage = {}, initialSession = {}) {
   return { storage, session, tabs, createdTabs, sockets, calls, listeners, message, deliver,
     userScripts: chrome.userScripts,
     setHostPermissionGranted: granted => { hostPermissionGranted = granted; },
+    beforeNextPermissionCheck: fn => { permissionHook = fn; },
     failPermissionQueryOnce: () => { failNextPermissionQuery = true; },
     failTabQueryOnce: () => { failNextTabQuery = true; },
+    beforeNextTabQuery: fn => { nextTabQueryHook = fn; },
     failRegistryWriteOnce: () => { failNextRegistryWrite = true; },
     delayNextRegistryWrite: () => { holdNextRegistryWrite = true; },
     hasDelayedRegistryWrite: () => Boolean(releaseRegistryWrite),
     releaseDelayedRegistryWrite: () => releaseRegistryWrite?.() };
+}
+
+async function windowPin(h) {
+  const selected = (await h.message("getState")).windows.find(w => w.alias === "agents");
+  return selected
+    ? { windowRegistration: selected.windowRegistration, registrationGeneration: selected.registrationGeneration }
+    : { windowRegistration: "agents", registrationGeneration: 1 };
 }
 
 test("registration requires a user action and unregistered tabs stay private", async () => {
@@ -325,9 +346,9 @@ test("user-closing a Jarvis-created tab frees its alias for a new tab", async ()
   const ws = h.sockets[0];
   await h.deliver(ws, { kind: "challenge", nonce: "d".repeat(64) });
   await h.deliver(ws, { kind: "ready", connectionId: "epoch-1" });
-  const open = requestId => h.deliver(ws, {
+  const open = async requestId => h.deliver(ws, {
     kind: "openTab", requestId, connectionId: "epoch-1",
-    url: "https://example.test/new", windowRegistration: "agents", alias: "reusable"
+    url: "https://example.test/new", ...(await windowPin(h)), alias: "reusable"
   });
   await open("first");
   const first = ws.sent.find(m => m.requestId === "first" && m.kind === "tabOpened").tab;
@@ -352,8 +373,8 @@ test("opening tabs requires registered window and explicit opt-in", async () => 
   const ws = h.sockets[0];
   await h.deliver(ws, { kind: "challenge", nonce: "a".repeat(64) });
   await h.deliver(ws, { kind: "ready", connectionId: "epoch-1" });
-  const request = (requestId, url, alias = "") => h.deliver(ws, {
-    kind: "openTab", connectionId: "epoch-1", requestId, url, alias, windowRegistration: "agents", active: false
+  const request = async (requestId, url, alias = "") => h.deliver(ws, {
+    kind: "openTab", connectionId: "epoch-1", requestId, url, alias, ...(await windowPin(h)), active: false
   });
   await request("disabled", "https://example.test/chat/new");
   assert.equal(ws.sent.find(m => m.requestId === "disabled").error, "AgentCreatedTabsDisabled");
@@ -380,8 +401,8 @@ test("agent-created tab is registered and controllable across same-origin naviga
   const ws = h.sockets[0];
   await h.deliver(ws, { kind: "challenge", nonce: "b".repeat(64) });
   await h.deliver(ws, { kind: "ready", connectionId: "epoch-1" });
-  const requestOpen = (requestId, url, alias) => h.deliver(ws, {
-    kind: "openTab", connectionId: "epoch-1", requestId, url, alias, windowRegistration: "agents", active: false
+  const requestOpen = async (requestId, url, alias) => h.deliver(ws, {
+    kind: "openTab", connectionId: "epoch-1", requestId, url, alias, ...(await windowPin(h)), active: false
   });
   await requestOpen("new", "https://example.test/chat/new", "agent-new");
   await tick(); await tick();
@@ -443,7 +464,7 @@ test("disabling automatic tab creation revokes access to all agent-created tabs"
   await h.deliver(ws, { kind: "ready", connectionId: "epoch-1" });
   await h.deliver(ws, {
     kind: "openTab", requestId: "new", connectionId: "epoch-1",
-    url: "https://example.test/chat/new", alias: "agent-auto", windowRegistration: "agents", active: false
+    url: "https://example.test/chat/new", alias: "agent-auto", ...(await windowPin(h)), active: false
   });
   await tick(); await tick();
   const tab = ws.sent.find(m => m.requestId === "new").tab;
@@ -469,7 +490,7 @@ test("revoking registered window revokes created tab authority", async () => {
   await h.deliver(ws, { kind: "ready", connectionId: "epoch-1" });
   await h.deliver(ws, {
     kind: "openTab", requestId: "opened", connectionId: "epoch-1",
-    url: "https://example.test/chat/new", alias: "auto", windowRegistration: "agents", active: false
+    url: "https://example.test/chat/new", alias: "auto", ...(await windowPin(h)), active: false
   });
   await tick(); await tick();
   const opened = ws.sent.find(m => m.requestId === "opened" && m.kind === "tabOpened");
@@ -483,7 +504,7 @@ test("revoking registered window revokes created tab authority", async () => {
     "needsReauthorization");
   await h.deliver(ws, {
     kind: "openTab", requestId: "blocked", connectionId: "epoch-1",
-    url: "https://example.test/chat/another", alias: "another", windowRegistration: "agents", active: false
+    url: "https://example.test/chat/another", alias: "another", ...(await windowPin(h)), active: false
   });
   assert.equal(ws.sent.find(m => m.requestId === "blocked").error, "WindowNotRegistered");
   assert.equal(h.createdTabs.length, 1);
@@ -503,7 +524,7 @@ test("only agent-created tabs can be closed, preserving the window and manual ta
   await h.deliver(ws, { kind: "ready", connectionId: "epoch-1" });
   assert.equal(ws.sent.find(m => m.kind === "windows").windows[0].alias, "agents");
   await h.deliver(ws, { kind: "openTab", requestId: "open", connectionId: "epoch-1",
-    windowRegistration: "agents", url: "https://example.test/chat/new", active: false });
+    ...(await windowPin(h)), url: "https://example.test/chat/new", active: false });
   const created = ws.sent.find(m => m.requestId === "open").tab;
   const manual = (await h.message("getState")).registrations.find(r => r.alias === "manual");
   await h.deliver(ws, { kind: "closeTab", requestId: "not-ours", connectionId: "epoch-1",
@@ -531,7 +552,7 @@ async function createdTabForCloseRegression() {
   await h.deliver(ws, { kind: "ready", connectionId: "epoch-1" });
   await h.deliver(ws, {
     kind: "openTab", requestId: "owned-open", connectionId: "epoch-1",
-    url: "https://example.test/chat/new", alias: "owned", windowRegistration: "agents", active: false
+    url: "https://example.test/chat/new", alias: "owned", ...(await windowPin(h)), active: false
   });
   const registered = ws.sent.find(m => m.requestId === "owned-open" && m.kind === "tabOpened")?.tab;
   assert.ok(registered);
@@ -852,4 +873,123 @@ test("failed registry write does not poison later persistence", async () => {
   const next = await h.message("register", { tabId: 18, alias: "second" });
   assert.equal(next.ok, true);
   assert.deepEqual(h.storage.get("registrations").map(r => r.tabId), [17, 18]);
+});
+
+test("opaque window identity rejects alias reassignment to another registered window", async () => {
+  const h = createHarness();
+  await tick(); await tick();
+  await h.message("registerWindow", { windowId: 1, alias: "agents" });
+  await h.message("setAgentCreatedTabs", { allowed: true });
+  await h.message("pair", { port: 43822, secret: "b".repeat(64) });
+  await tick(); await tick();
+  const ws = h.sockets[0];
+  await h.deliver(ws, { kind: "challenge", nonce: "d".repeat(64) });
+  await h.deliver(ws, { kind: "ready", connectionId: "epoch-1" });
+  const original = await windowPin(h);
+  await h.message("registerWindow", { windowId: 1, alias: "old-agents" });
+  await h.message("registerWindow", { windowId: 2, alias: "agents" });
+  await h.deliver(ws, { kind: "openTab", requestId: "stale-alias", connectionId: "epoch-1",
+    url: "https://example.test/chat", alias: "test", ...original });
+  assert.equal(ws.sent.find(m => m.requestId === "stale-alias").error, "WindowRegistrationChanged");
+  assert.equal(h.createdTabs.length, 0, "An alias reassignment must never open in window B");
+});
+
+test("window generation change during async permission check cannot create tab", async () => {
+  const h = createHarness();
+  await tick(); await tick();
+  await h.message("registerWindow", { windowId: 1, alias: "agents" });
+  await h.message("setAgentCreatedTabs", { allowed: true });
+  await h.message("pair", { port: 43822, secret: "b".repeat(64) });
+  await tick(); await tick();
+  const ws = h.sockets[0];
+  await h.deliver(ws, { kind: "challenge", nonce: "d".repeat(64) });
+  await h.deliver(ws, { kind: "ready", connectionId: "epoch-1" });
+  const original = await windowPin(h);
+  h.beforeNextPermissionCheck(async () => {
+    await h.message("registerWindow", { windowId: 1, alias: "agents" });
+  });
+  await h.deliver(ws, { kind: "openTab", requestId: "permission-race", connectionId: "epoch-1",
+    url: "https://example.test/chat", alias: "test", ...original });
+  assert.equal(ws.sent.find(m => m.requestId === "permission-race").error, "WindowRegistrationChanged");
+  assert.equal(h.createdTabs.length, 0, "Generation must be rechecked after permission await");
+});
+
+test("manually re-registered created tab rejects pinned execution and retains user tab", async () => {
+  const h = createHarness();
+  await tick(); await tick();
+  await h.message("registerWindow", { windowId: 1, alias: "agents" });
+  await h.message("setAgentCreatedTabs", { allowed: true });
+  await h.message("pair", { port: 43822, secret: "b".repeat(64) });
+  await tick(); await tick();
+  const ws = h.sockets[0];
+  await h.deliver(ws, { kind: "challenge", nonce: "d".repeat(64) });
+  await h.deliver(ws, { kind: "ready", connectionId: "epoch-1" });
+  await h.deliver(ws, { kind: "openTab", requestId: "create", connectionId: "epoch-1",
+    url: "https://example.test/chat", alias: "owned", ...(await windowPin(h)) });
+  const created = ws.sent.find(m => m.requestId === "create" && m.kind === "tabOpened").tab;
+  const tab = h.createdTabs[0];
+  tab.url = "https://example.test/chat";
+  tab.status = "complete";
+  delete tab.pendingUrl;
+  const adopted = await h.message("register", { tabId: tab.id, alias: "user-tab" });
+  assert.equal(adopted.ok, true);
+  const current = (await h.message("getState")).registrations.find(r => r.registrationId === created.registrationId);
+  assert.equal(current.agentCreated, false);
+  assert.ok(current.registrationGeneration > created.registrationGeneration);
+  for (const [requestId, generation] of [["stale", created.registrationGeneration],
+                                          ["provenance", current.registrationGeneration]]) {
+    await h.deliver(ws, { kind: "executeJs", requestId, connectionId: "epoch-1",
+      registrationId: created.registrationId, registrationGeneration: generation,
+      requireAgentCreated: true, source: "document.title", entrypoint: "expression", args: {} });
+    assert.equal(ws.sent.find(m => m.requestId === requestId).error, "RegistrationStale");
+  }
+  await h.deliver(ws, { kind: "closeTab", requestId: "close-stale", connectionId: "epoch-1",
+    registrationId: created.registrationId, registrationGeneration: created.registrationGeneration });
+  assert.equal(ws.sent.find(m => m.requestId === "close-stale").error, "TabNotAgentCreated");
+  assert.equal(h.calls.length, 0, "A user-owned tab must never run the bootstrap");
+  assert.equal(h.tabs.has(tab.id), true, "Ownership change forbids cleanup");
+});
+
+test("ownership changed during close preflight never removes the adopted tab", async () => {
+  const { h, ws, tab, registered } = await createdTabForCloseRegression();
+  h.beforeNextTabQuery(async () => {
+    const result = await h.message("register", { tabId: tab.id, alias: "adopted" });
+    assert.equal(result.ok, true);
+  });
+  await h.deliver(ws, { kind: "closeTab", requestId: "close-race", connectionId: "epoch-1",
+    registrationId: registered.registrationId,
+    registrationGeneration: registered.registrationGeneration });
+  assert.equal(ws.sent.find(m => m.requestId === "close-race").error, "TabNotAgentCreated");
+  assert.equal(h.tabs.has(tab.id), true, "User-adopted tab must not be removed");
+  assert.equal(h.calls.length, 0);
+});
+
+test("adoption during execute permission checks fails before page injection", async () => {
+  const h = createHarness();
+  await tick(); await tick();
+  await h.message("registerWindow", { windowId: 1, alias: "agents" });
+  await h.message("setAgentCreatedTabs", { allowed: true });
+  await h.message("pair", { port: 43822, secret: "b".repeat(64) });
+  await tick(); await tick();
+  const ws = h.sockets[0];
+  await h.deliver(ws, { kind: "challenge", nonce: "d".repeat(64) });
+  await h.deliver(ws, { kind: "ready", connectionId: "epoch-1" });
+  await h.deliver(ws, { kind: "openTab", requestId: "create-execute", connectionId: "epoch-1",
+    url: "https://example.test/chat", alias: "owned", ...(await windowPin(h)) });
+  const opened = ws.sent.find(m => m.requestId === "create-execute" && m.kind === "tabOpened").tab;
+  const tab = h.createdTabs[0];
+  tab.url = "https://example.test/chat";
+  tab.status = "complete";
+  delete tab.pendingUrl;
+  h.beforeNextTabQuery(async () => {
+    const adopted = await h.message("register", { tabId: tab.id, alias: "operator-tab" });
+    assert.equal(adopted.ok, true);
+  });
+  await h.deliver(ws, { kind: "executeJs", requestId: "execute-race",
+    connectionId: "epoch-1", registrationId: opened.registrationId,
+    registrationGeneration: opened.registrationGeneration, requireAgentCreated: true,
+    source: "document.title", entrypoint: "expression", args: {} });
+  assert.equal(ws.sent.find(m => m.requestId === "execute-race").error, "RegistrationStale");
+  assert.equal(h.calls.length, 0, "Ownership mutation during assess must prevent injection");
+  assert.equal(h.tabs.has(tab.id), true);
 });

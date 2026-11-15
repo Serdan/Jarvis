@@ -280,11 +280,18 @@ async function execute(message) {
       bytes(JSON.stringify(args)) > 65536) return error("InputTooLarge");
   if (inflight >= 4) return error("BridgeBusy");
   const registration = registrations.find(r => r.registrationId === registrationId);
-  if (!registration || registration.registrationGeneration !== registrationGeneration) {
+  if (!registration || registration.registrationGeneration !== registrationGeneration ||
+      (message.requireAgentCreated === true && registration.agentCreated !== true)) {
     return error("RegistrationStale");
   }
   const state = await assess(registration);
   if (state !== "ready") return error("TabUnavailable:" + state);
+  // assess() awaits Chrome APIs. Registration may be reclaimed or revoked while
+  // it runs; re-check ownership before the irreversible page execution.
+  if (registrations.find(r => r.registrationId === registrationId) !== registration ||
+      registration.registrationGeneration !== registrationGeneration ||
+      (message.requireAgentCreated === true && registration.agentCreated !== true))
+    return error("RegistrationStale");
   let api;
   try { api = chrome.userScripts; } catch { return error("AllowUserScriptsDisabled"); }
   if (typeof api?.execute !== "function") return error("AllowUserScriptsDisabled");
@@ -603,14 +610,31 @@ async function openNewTab(message) {
   if (registrations.filter(r => r.agentCreated && !r.blocked && r.sessionEpoch === sessionEpoch).length >= MAX_AGENT_TABS) {
     return reject("AgentTabLimitReached");
   }
+  // The bridge resolves aliases to an immutable registration + generation before
+  // dispatch. Never re-resolve its original alias to another user window.
+  const expectedGeneration = message.registrationGeneration;
+  if (!Number.isInteger(expectedGeneration) || expectedGeneration < 1)
+    return reject("WindowRegistrationChanged");
   const window = await validWindow(message.windowRegistration);
   if (!window) return reject("WindowNotRegistered");
+  if (window.registrationId !== message.windowRegistration ||
+      window.generation !== expectedGeneration)
+    return reject("WindowRegistrationChanged");
   let tabCreated = false;
   try {
     const permission = await chrome.permissions.contains({ origins: [target.origin + "/*"] });
     if (!permission) return reject("BrowserPermissionMissing");
     if (socket !== requestSocket || !connected || connectionId !== requestConnection ||
-        !allowAgentCreatedTabs || !(await validWindow(window.registrationId))) return;
+        !allowAgentCreatedTabs) return;
+    // Permission queries await Chrome. A user might have re-registered or
+    // revoked the selected window in the interim. This is the last async check
+    // before tabs.create, and it must reject any identity/generation change.
+    const currentWindow = await validWindow(message.windowRegistration);
+    if (!currentWindow || currentWindow !== window ||
+        currentWindow.registrationId !== message.windowRegistration ||
+        currentWindow.generation !== expectedGeneration ||
+        currentWindow.windowId !== window.windowId)
+      return reject("WindowRegistrationChanged");
 
     // Creating the tab is the irreversible operation; a transport failure afterwards
     // is reported as indeterminate and must not be blindly retried by Jarvis.
@@ -661,9 +685,21 @@ async function closeCreatedTab(message) {
     return reject("RegistrationStale");
   const parent = await validWindow(reg.windowRegistration);
   if (!parent) return reject("WindowNotRegistered");
+  const parentGeneration = parent.generation;
   let tab;
   try { tab = await chrome.tabs.get(reg.tabId); } catch { return reject("TabMissing"); }
   if (tab.windowId !== parent.windowId) return reject("WindowMismatch");
+  // assess(), window lookup and tabs.get all await Chrome APIs. The operator
+  // may have adopted this created tab in the meantime. A cleanup request
+  // must never close that now user-owned registration.
+  const finalParent = await validWindow(reg.windowRegistration);
+  if (registrations.find(r => r.registrationId === registrationId) !== reg ||
+      !reg.agentCreated || reg.registrationGeneration !== registrationGeneration)
+    return reject("TabNotAgentCreated");
+  if (reg.blocked || reg.sessionEpoch !== sessionEpoch || !allowAgentCreatedTabs ||
+      !finalParent || finalParent !== parent || finalParent.generation !== parentGeneration ||
+      finalParent.windowId !== tab.windowId)
+    return reject("RegistrationStale");
   try {
     await chrome.tabs.remove(reg.tabId);
     registrations = registrations.filter(r => r !== reg);

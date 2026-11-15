@@ -224,14 +224,16 @@ let openTabUsesPairedExtensionAndReturnsRegistration () = task {
     let! request = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
     Assert.That(property request "kind", Is.EqualTo("openTab"))
     Assert.That(property request "url", Is.EqualTo("https://example.test/chat/new"))
-    Assert.That(property request "windowRegistration", Is.EqualTo("agents"))
+    Assert.That(property request "windowRegistration", Is.EqualTo("window-agents"))
+    use selectedWindow = JsonDocument.Parse(request)
+    Assert.That(selectedWindow.RootElement.GetProperty("registrationGeneration").GetInt32(), Is.EqualTo(1))
     Assert.That(property request "alias", Is.EqualTo("agent-new"))
     use requestDoc = JsonDocument.Parse(request)
     Assert.That(requestDoc.RootElement.GetProperty("active").GetBoolean(), Is.False)
     let response = JsonSerializer.Serialize({|
         version = 2; kind = "tabOpened"
         requestId = property request "requestId"; connectionId = connectionId
-        tab = {| registrationId = "created-id-01"; alias = "agent-new"; availability = "loading"; agentCreated = true |}
+        tab = {| registrationId = "created-id-01"; alias = "agent-new"; availability = "loading"; agentCreated = true; registrationGeneration = 1 |}
     |})
     do! send socket response
     let! result = opening
@@ -281,12 +283,12 @@ let immediateLaunchUsesRegisteredWindowAndClosesOnlyCreatedTab () = task {
                      "async function execute(args) { return {status:'submitted'}; }" """{"prompt":"Go"}""" 5000 true
     let! openedRequest = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
     Assert.That(property openedRequest "kind", Is.EqualTo("openTab"))
-    Assert.That(property openedRequest "windowRegistration", Is.EqualTo("agents"))
+    Assert.That(property openedRequest "windowRegistration", Is.EqualTo("window-01"))
     do! send socket """{"version":2,"kind":"registrations","tabs":[{"registrationId":"created-tab-01","alias":"agent-new","agentCreated":true,"availability":"ready","registrationGeneration":1}]}"""
     do! send socket (JsonSerializer.Serialize({|
         version = 2; kind = "tabOpened"; requestId = property openedRequest "requestId"
         connectionId = connectionId
-        tab = {| registrationId = "created-tab-01"; availability = "ready"; agentCreated = true |}
+        tab = {| registrationId = "created-tab-01"; availability = "ready"; agentCreated = true; registrationGeneration = 1 |}
     |}))
     let! executeFrame = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
     Assert.That(property executeFrame "kind", Is.EqualTo("executeJs"))
@@ -331,14 +333,14 @@ let compositeLaunchRetriesOnlyConfirmedPreInjectionLoadingFailures () = task {
 
     // New tab advertises loading before navigating; composite must not inject
     // until it observes ready, even if tabOpened was already acknowledged.
-    do! send socket """{"version":2,"kind":"registrations","tabs":[{"registrationId":"retry-tab","availability":"loading","registrationGeneration":1}]}"""
+    do! send socket """{"version":2,"kind":"registrations","tabs":[{"registrationId":"retry-tab","agentCreated":true,"availability":"loading","registrationGeneration":1}]}"""
     do! send socket (JsonSerializer.Serialize({|
         version = 2; kind = "tabOpened"; requestId = property opened "requestId"
         connectionId = connectionId
-        tab = {| registrationId = "retry-tab"; availability = "loading"; agentCreated = true |}
+        tab = {| registrationId = "retry-tab"; availability = "loading"; agentCreated = true; registrationGeneration = 1 |}
     |}))
     do! Task.Delay(80)
-    do! send socket """{"version":2,"kind":"registrations","tabs":[{"registrationId":"retry-tab","availability":"ready","registrationGeneration":1}]}"""
+    do! send socket """{"version":2,"kind":"registrations","tabs":[{"registrationId":"retry-tab","agentCreated":true,"availability":"ready","registrationGeneration":1}]}"""
     let! firstExecute = (receive socket).WaitAsync(TimeSpan.FromSeconds(4.0))
     Assert.That(property firstExecute "kind", Is.EqualTo("executeJs"))
     Assert.That(property firstExecute "registrationId", Is.EqualTo("retry-tab"))
@@ -383,11 +385,11 @@ let compositeLaunchNeverReplaysUncertainPostInjectionOutcome () = task {
     let launch = BrowserBridge.runInNewTab bridge "agents" "https://chatgpt.com/" "" false
                      "async function execute(args) { submitMessage(); return args; }" "{}" 5000 true
     let! opened = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
-    do! send socket """{"version":2,"kind":"registrations","tabs":[{"registrationId":"uncertain-tab","availability":"ready","registrationGeneration":1}]}"""
+    do! send socket """{"version":2,"kind":"registrations","tabs":[{"registrationId":"uncertain-tab","agentCreated":true,"availability":"ready","registrationGeneration":1}]}"""
     do! send socket (JsonSerializer.Serialize({|
         version = 2; kind = "tabOpened"; requestId = property opened "requestId"
         connectionId = connectionId
-        tab = {| registrationId = "uncertain-tab"; availability = "ready"; agentCreated = true |}
+        tab = {| registrationId = "uncertain-tab"; availability = "ready"; agentCreated = true; registrationGeneration = 1 |}
     |}))
     let! executed = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
     Assert.That(property executed "kind", Is.EqualTo("executeJs"))
@@ -446,7 +448,7 @@ let compositeLaunchKeepsUncertainTabButClosesDefinitiveFailure (scriptStatus: st
     do! send socket (JsonSerializer.Serialize({|
         version = 2; kind = "tabOpened"; requestId = property openFrame "requestId"
         connectionId = connectionId
-        tab = {| registrationId = "created-tab-02"; availability = "ready"; agentCreated = true |}
+        tab = {| registrationId = "created-tab-02"; availability = "ready"; agentCreated = true; registrationGeneration = 1 |}
     |}))
     let! executeFrame = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
     Assert.That(property executeFrame "kind", Is.EqualTo("executeJs"))
@@ -851,11 +853,11 @@ let twoExtensionsKeepIndependentRegistriesAndRouteByOwner () = task {
     let opening = bridge.OpenTab("agents", "https://example.test/new", "new", false)
     let! openFrame = (receive socketB).WaitAsync(TimeSpan.FromSeconds(3.0))
     Assert.That(property openFrame "kind", Is.EqualTo("openTab"))
-    Assert.That(property openFrame "windowRegistration", Is.EqualTo("agents"))
+    Assert.That(property openFrame "windowRegistration", Is.EqualTo("window-agents"))
     do! send socketB (JsonSerializer.Serialize({|
         version = 2; kind = "tabOpened"; requestId = property openFrame "requestId"
         connectionId = secondId
-        tab = {| registrationId = "tab-b-new"; agentCreated = true |}
+        tab = {| registrationId = "tab-b-new"; agentCreated = true; registrationGeneration = 1 |}
     |}))
     match! opening with
     | Ok value -> Assert.That(value, Does.Contain("tab-b-new"))
@@ -1024,4 +1026,45 @@ let compositeLaunchPinsOwnershipAcrossCollidingSecondExtension () = task {
     match! bridge.Execute("same-created-id", "document.title", "{}", 3000, true) with
     | Error error -> Assert.That(error, Is.EqualTo("AliasAmbiguous"))
     | Ok _ -> Assert.Fail("An unpinned call must reject duplicate registration IDs")
+}
+
+[<Test>]
+let compositeLaunchRejectsManualReRegistrationWithoutInjection () = task {
+    let port = findPort()
+    use bridge = new BrowserBridge.Service(port, "test-secret")
+    bridge.Start()
+    let! client, connectionId = handshake port "test-secret"
+    use socket = client
+    do! registerReadyAgentWindow socket bridge
+    let launch = BrowserBridge.runInNewTab bridge "agents" "https://chatgpt.com/" "" false
+                     "async function execute(args) { return {status:'submitted'}; }" "{}" 5000 true
+    let! openFrame = (receive socket).WaitAsync(TimeSpan.FromSeconds(3.0))
+    Assert.That(property openFrame "kind", Is.EqualTo("openTab"))
+    do! send socket """{"version":2,"kind":"registrations","tabs":[{"registrationId":"ownership-tab","alias":"owned","agentCreated":true,"availability":"loading","registrationGeneration":1}]}"""
+    do! send socket (JsonSerializer.Serialize({|
+        version = 2; kind = "tabOpened"; requestId = property openFrame "requestId"
+        connectionId = connectionId
+        tab = {| registrationId = "ownership-tab"; agentCreated = true
+                 registrationGeneration = 1; availability = "loading" |}
+    |}))
+    do! waitUntil (fun () ->
+        bridge.ListTabs() |> Result.exists (fun x -> x.Contains("ownership-tab")))
+    // Manual registration adopts the same tab ID but changes its generation
+    // and removes agent-created provenance. The composite must not execute or close it.
+    do! send socket """{"version":2,"kind":"registrations","tabs":[{"registrationId":"ownership-tab","alias":"user-owned","agentCreated":false,"availability":"ready","registrationGeneration":2}]}"""
+    match! launch.WaitAsync(TimeSpan.FromSeconds(3.0)) with
+    | Error (id, reason) ->
+        Assert.That(id, Is.EqualTo("ownership-tab"))
+        Assert.That(reason, Is.EqualTo("TabRegistrationChanged; cleanup=retained"))
+    | Ok _ -> Assert.Fail("Manually re-registered tab was accepted for bootstrap")
+
+    match! bridge.Execute("ownership-tab", "dangerousSubmit()", "{}", 1000, true,
+                          ownerConnectionId = connectionId,
+                          expectedRegistrationGeneration = 1, requireAgentCreated = true) with
+    | Error error -> Assert.That(error, Is.EqualTo("TabRegistrationChanged"))
+    | Ok _ -> Assert.Fail("Stale generation must be rejected before execute dispatch")
+    match! bridge.CloseTab("ownership-tab", ownerConnectionId = connectionId,
+                           expectedRegistrationGeneration = 1) with
+    | Error error -> Assert.That(error, Is.EqualTo("TabRegistrationChanged"))
+    | Ok _ -> Assert.Fail("Stale generation must never close a user-owned tab")
 }

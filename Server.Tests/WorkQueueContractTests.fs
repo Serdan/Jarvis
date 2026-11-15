@@ -178,7 +178,7 @@ let case_07_09_fifo_key_is_stable_when_blocker_tier_changes () =
     Assert.That(orderAvailable project |> success |> List.map (fun w -> w.Id), Is.EqualTo(box [ "A"; "B" ]))
     Assert.That(project.Works.["C"].State, Is.EqualTo(WorkState.Blocked))
     let withoutEdge =
-        waiveHardPrerequisite project.Version "waive-C-A" "C" "A" (waiver "C" ["A"]) project |> success
+        waiveHardPrerequisite project.Version "waive-C-A" "C" "A" (waiver "C" ["A"]) 10000L project |> success
     Assert.That(withoutEdge.Works.["A"].AvailableSequence, Is.EqualTo(2L))
     Assert.That(orderAvailable withoutEdge |> success |> List.map (fun w -> w.Id),
                 Is.EqualTo(box [ "A"; "B"; "C" ]))
@@ -284,10 +284,10 @@ let case_27_28_claim_nowork_and_one_primary_are_mutually_exclusive () =
     rejected Rejection.CasConflict (terminalizeNoClaim registered.Version "stale-no-work" "L" claimed)
     rejected (Rejection.InvalidState "primary claim already existed")
         (terminalizeNoClaim claimed.Version "no-work-after-claim" "L" claimed)
-    let doneWork = completeOrdinary claimed.Version "completed" "L" "A" claimed |> success
+    let doneWork = completeOrdinary claimed.Version "completed" "L" "A" 10000L claimed |> success
     rejected (Rejection.InvalidState "requires registered launch with no prior primary claim")
         (claimNext doneWork.Version "second-claim" "L" doneWork)
-    rejected Rejection.CasConflict (completeOrdinary claimed.Version "stale-complete" "L" "A" doneWork)
+    rejected Rejection.CasConflict (completeOrdinary claimed.Version "stale-complete" "L" "A" 10000L doneWork)
 
 [<Test>]
 let case_31_66_68_review_verdict_is_domain_final_without_releasing_claim () =
@@ -304,8 +304,8 @@ let case_31_66_68_review_verdict_is_domain_final_without_releasing_claim () =
     Assert.That(decided.Works.["R"].Domain,
                 Is.EqualTo(DomainState.FinalizedPendingTerminal "accepted:sha"))
     rejected Rejection.DomainAlreadyFinalized
-        (setHardPrerequisite decided.Version "new-edge" "R" "B" decided)
-    let terminal = completeOrdinary decided.Version "review-terminal" "L" "R" decided |> success
+        (setHardPrerequisite decided.Version "new-edge" "R" "B" 10000L decided)
+    let terminal = completeOrdinary decided.Version "review-terminal" "L" "R" 10000L decided |> success
     Assert.That(terminal.Works.["R"].State, Is.EqualTo(WorkState.Completed))
     Assert.That(terminal.ProducerCount, Is.EqualTo(1))
     Assert.That(decideReview decided.Version "verdict" "R" "accepted:sha" terminal |> success,
@@ -320,12 +320,12 @@ let case_34_44_50_51_dedicated_role_message_completion_is_atomic () =
     rejected (Rejection.InvalidState "primary claim already existed")
         (terminalizeNoClaim p.Version "naughty-no-work" "L" p)
     rejected Rejection.MissingProof (releaseGlobal account.Version "too-early" "L" p account)
-    let handled = completeMessageWork p.Version "reply-op" "L" workId "M1" "reply-1" p |> success
+    let handled = completeMessageWork p.Version "reply-op" "L" workId "M1" "reply-1" 10000L p |> success
     Assert.That(handled.Messages.["M1"].State, Is.EqualTo(MessageState.Handled "reply-1"))
     Assert.That(handled.Works.[workId].State, Is.EqualTo(WorkState.Completed))
     Assert.That(handled.Launches.["L"].State,
                 Is.EqualTo(LaunchState.TerminalPendingRelease "terminal:reply-op"))
-    Assert.That(completeMessageWork p.Version "reply-op" "L" workId "M1" "reply-1" handled |> success,
+    Assert.That(completeMessageWork p.Version "reply-op" "L" workId "M1" "reply-1" 10000L handled |> success,
                 Is.EqualTo(handled))
     let released = releaseGlobal account.Version "release:L" "L" handled account |> success
     Assert.That(released.Tokens.["L"], Is.True)
@@ -343,7 +343,7 @@ let case_52_53_dedicated_role_message_claims_exactly_one_message () =
         |> fun p -> claim p "L1"
     Assert.That(p.Launches.["L1"].PrimaryWorkId, Is.EqualTo(Some "role-msg:M1"))
     Assert.That(p.Messages.["M2"].State, Is.EqualTo(MessageState.Pending))
-    let handled = completeMessageWork p.Version "handled:M1" "L1" "role-msg:M1" "M1" "r1" p |> success
+    let handled = completeMessageWork p.Version "handled:M1" "L1" "role-msg:M1" "M1" "r1" 10000L p |> success
     Assert.That(handled.Works.["role-msg:M2"].State, Is.EqualTo(WorkState.Available))
     Assert.That(handled.Launches.["L2"].Credit, Is.EqualTo(Some "role-msg:M2"))
 
@@ -365,7 +365,7 @@ let case_36_54_64_ancillary_handler_never_completes_own_primary_claim () =
     let ancillary = claimAncillaryMessage withMore.Version "claim-ancillary" "Active" "M" withMore |> success
     Assert.That(ancillary.Launches.["Reserved"].Credit, Is.EqualTo(Some "Other"))
     let acknowledged =
-        completeAncillaryMessage ancillary.Version "ack-ancillary" "Active" "M" "reply" ancillary |> success
+        completeAncillaryMessage ancillary.Version "ack-ancillary" "Active" "M" "reply" 10000L ancillary |> success
     Assert.That(acknowledged.Works.["role-msg:M"].State, Is.EqualTo(WorkState.Completed))
     Assert.That(acknowledged.Works.["LeadPlan"].State, Is.EqualTo(WorkState.Claimed "Active"))
     Assert.That(acknowledged.Launches.["Active"].State,
@@ -373,7 +373,7 @@ let case_36_54_64_ancillary_handler_never_completes_own_primary_claim () =
 
 [<Test>]
 let case_38_55_56_task_messages_are_passive_when_task_has_no_eligible_actor () =
-    let blocked = { implementation "T" 1L [] with State = WorkState.Blocked }
+    let blocked = { implementation "T" 1L ["T"] with State = WorkState.Blocked }
     let p = empty () |> fun p -> publish p blocked
     let m = message "M" (Subject.Task "task-T")
     let p = postMessage p.Version "post-task" m None p |> success
@@ -397,27 +397,27 @@ let case_57_58_59_session_keys_are_per_provider_execution () =
 let case_60_61_dependency_gate_and_completion_commit_are_mutually_exclusive () =
     let p =
         empty ()
-        |> fun p -> publish p (implementation "B" 1L [])
+        |> fun p -> publish p (implementation "B" 3L [])
         |> fun p -> publish p (implementation "A" 2L [])
         |> fun p -> admit p "L" "Worker"
         |> fun p -> submit p "L"
         |> fun p -> initialize p "L"
     // B is older; use a separate fixture where only A is Available.
-    let p = { p with Works = p.Works.Add("B", { p.Works.["B"] with State = WorkState.Blocked }) } |> fun p -> claim p "L"
-    let gated = setHardPrerequisite p.Version "edge" "A" "B" p |> success
+    let p = claim p "L"
+    let gated = setHardPrerequisite p.Version "edge" "A" "B" 10000L p |> success
     Assert.That(gated.Works.["A"].Gate, Is.EqualTo(GateState.DependencyGatePending gated.GraphVersion))
-    rejected Rejection.CasConflict (completeOrdinary p.Version "race-complete" "L" "A" gated)
+    rejected Rejection.CasConflict (completeOrdinary p.Version "race-complete" "L" "A" 10000L gated)
     rejected Rejection.DependencyGatePending
-        (completeOrdinary gated.Version "try-complete" "L" "A" gated)
-    let completed = completeOrdinary p.Version "complete-first" "L" "A" p |> success
+        (completeOrdinary gated.Version "try-complete" "L" "A" 10000L gated)
+    let completed = completeOrdinary p.Version "complete-first" "L" "A" 10000L p |> success
     rejected Rejection.StageAlreadyTerminal
-        (setHardPrerequisite completed.Version "too-late" "A" "B" completed)
+        (setHardPrerequisite completed.Version "too-late" "A" "B" 10000L completed)
 
 [<Test>]
 let case_62_63_safe_dependency_gate_resolution_blocks_or_requeues_once () =
     let p = activated "L" "Worker" { implementation "A" 2L [] with SourceLineage = Some sourceLineage }
-    let p = publish p { implementation "B" 1L [] with State = WorkState.Blocked }
-    let gated = setHardPrerequisite p.Version "edge" "A" "B" p |> success
+    let p = publish p (implementation "B" 1L [])
+    let gated = setHardPrerequisite p.Version "edge" "A" "B" 10000L p |> success
     rejected Rejection.UnsafeExternalEffect
         (resolveDependencyGate gated.Version "unsafe" "L" "A" (SourceHandoffProof.Unsafe "unreconciled worktree") 10L gated)
     let proof = SourceHandoffProof.RemoteSnapshot(sourceProof gated.Works.["A"])
@@ -436,28 +436,28 @@ let case_62_63_safe_dependency_gate_resolution_blocks_or_requeues_once () =
 [<Test>]
 let case_66_67_73_verdict_and_new_hard_edge_are_version_fenced () =
     let p = activated "R" "Reviewer" (review "Frozen" 1L [])
-    let p = publish p { implementation "B" 2L [] with State = WorkState.Blocked }
-    let gated = setHardPrerequisite p.Version "edge-first" "Frozen" "B" p |> success
+    let p = publish p (implementation "B" 2L [])
+    let gated = setHardPrerequisite p.Version "edge-first" "Frozen" "B" 10000L p |> success
     rejected Rejection.DependencyGatePending
         (decideReview gated.Version "late-verdict" "Frozen" "accepted" gated)
     rejected Rejection.CasConflict
         (decideReview p.Version "losing-verdict" "Frozen" "accepted" gated)
     let decided = decideReview p.Version "verdict-first" "Frozen" "accepted" p |> success
     rejected Rejection.DomainAlreadyFinalized
-        (setHardPrerequisite decided.Version "losing-edge" "Frozen" "B" decided)
+        (setHardPrerequisite decided.Version "losing-edge" "Frozen" "B" 10000L decided)
 
 [<Test>]
 let case_69_70_integration_final_vs_gate () =
     let p = activated "I" "Integrator" (integration "Int" 1L [])
-    let p = publish p { implementation "B" 2L [] with State = WorkState.Blocked }
+    let p = publish p (implementation "B" 2L [])
     rejected Rejection.MissingProof
         (finalizeIntegration p.Version "early-without-remote" "Int" "canonical-result" p)
     let journaled = startOriginalPush p.Version "journal-before-final" "I" "Int" "push-original" "source-int-sha" "refs/heads/main" p |> success
     let observed = recordUngatedPushEffect journaled.Version "remote-proof" "Int" (verifiedPush "push-original" "source-int-sha" "refs/heads/main" "sha:remote") journaled |> success
     let complete = finalizeIntegration observed.Version "complete-integration" "Int" "canonical-result" observed |> success
     rejected Rejection.DomainAlreadyFinalized
-        (setHardPrerequisite complete.Version "edge-late" "Int" "B" complete)
-    let gated = setHardPrerequisite p.Version "edge-first" "Int" "B" p |> success
+        (setHardPrerequisite complete.Version "edge-late" "Int" "B" 10000L complete)
+    let gated = setHardPrerequisite p.Version "edge-first" "Int" "B" 10000L p |> success
     rejected Rejection.DependencyGatePending
         (finalizeIntegration gated.Version "late-final" "Int" "sha:remote" gated)
     Assert.That(gated.Works.["Int"].IntegrationAuthorized, Is.False)
@@ -466,46 +466,46 @@ let case_69_70_integration_final_vs_gate () =
 let case_74_75_78_79_external_push_is_fact_not_authorization () =
     let account = reserveGlobal 0 "reserve:I" "I" (emptyAccount 1) |> success
     let p = activated "I" "Integrator" (integration "W" 1L [])
-    let prerequisite = { implementation "B" 2L [] with State = WorkState.Blocked }
+    let prerequisite = (implementation "B" 2L [])
     let p = publish p prerequisite
     let intent = startOriginalPush p.Version "journal" "I" "W" "original-push" "accepted-source" "refs/heads/main" p |> success
-    let gated = setHardPrerequisite intent.Version "lead-gate" "W" "B" intent |> success
+    let gated = setHardPrerequisite intent.Version "lead-gate" "W" "B" 10000L intent |> success
     Assert.That(gated.Works.["W"].Gate,
                 Is.EqualTo(GateState.IntegrationGateHold(gated.GraphVersion, "original-push")))
     rejected Rejection.UnsafeExternalEffect
         (resolveDependencyGate gated.Version "unsafe-resolve" "I" "W" (SourceHandoffProof.ReadOnly "all-jobs-reconciled") 10L gated)
     let observed =
         reconcileExternalEffect gated.Version "reconcile" "I" "W"
-            (verifiedPush "original-push" "accepted-source" "refs/heads/main" "remote-commit") gated |> success
+            (verifiedPush "original-push" "accepted-source" "refs/heads/main" "remote-commit") 10000L gated |> success
     Assert.That(observed.Works.["W"].State, Is.EqualTo(WorkState.GateException))
     Assert.That(observed.Works.["W"].IntegrationAuthorized, Is.False)
     Assert.That(observed.ProducerCount, Is.EqualTo(0))
     rejected Rejection.MissingProof
-        (resolveIntegrationGateException observed.Version "premature" "W" None observed)
+        (resolveIntegrationGateException observed.Version "premature" "W" None 10000L observed)
     let released = releaseGlobal account.Version "release-I" "I" observed account |> success
     Assert.That(released.Tokens.["I"], Is.True)
     let authorized =
-        resolveIntegrationGateException observed.Version "waive" "W" (Some { waiver "W" ["B"] with ReceiptId = "lead-waiver:v1" }) observed |> success
+        resolveIntegrationGateException observed.Version "waive" "W" (Some { waiver "W" ["B"] with ReceiptId = "lead-waiver:v1" }) 10000L observed |> success
     Assert.That(authorized.Works.["W"].Domain, Is.EqualTo(DomainState.Integrated "remote-commit"))
     Assert.That(authorized.Works.["W"].IntegrationAuthorized, Is.True)
     Assert.That(authorized.ProducerCount, Is.EqualTo(1))
     Assert.That(authorized.Works.["W"].WaivedDependencies.["B"], Is.EqualTo("lead-waiver:v1"))
-    Assert.That(resolveIntegrationGateException observed.Version "waive" "W" (Some { waiver "W" ["B"] with ReceiptId = "lead-waiver:v1" }) authorized |> success,
+    Assert.That(resolveIntegrationGateException observed.Version "waive" "W" (Some { waiver "W" ["B"] with ReceiptId = "lead-waiver:v1" }) 10000L authorized |> success,
                 Is.EqualTo(authorized))
 
 [<Test>]
 let case_76_77_80_unknown_external_push_never_releases_token_or_downstream () =
     let account = reserveGlobal 0 "reserve:I" "I" (emptyAccount 1) |> success
     let p = activated "I" "Integrator" (integration "W" 1L [])
-    let p = publish p { implementation "B" 2L [] with State = WorkState.Blocked }
+    let p = publish p (implementation "B" 2L [])
     let intent = startOriginalPush p.Version "journal" "I" "W" "push" "accepted-source" "refs/heads/main" p |> success
-    let gated = setHardPrerequisite intent.Version "gate" "W" "B" intent |> success
+    let gated = setHardPrerequisite intent.Version "gate" "W" "B" 10000L intent |> success
     rejected Rejection.UnsafeExternalEffect
-        (reconcileExternalEffect gated.Version "uncertain" "I" "W" { (verifiedPush "push" "accepted-source" "refs/heads/main" "negative-read") with AncestryVerified = false } gated)
+        (reconcileExternalEffect gated.Version "uncertain" "I" "W" { (verifiedPush "push" "accepted-source" "refs/heads/main" "negative-read") with AncestryVerified = false } 10000L gated)
     rejected Rejection.MissingProof (releaseGlobal account.Version "release" "I" gated account)
     Assert.That(gated.Works.["W"].IntegrationAuthorized, Is.False)
     rejected Rejection.CasConflict
-        (reconcileExternalEffect intent.Version "stale-reconcile" "I" "W" (verifiedPush "push" "accepted-source" "refs/heads/main" "commit") gated)
+        (reconcileExternalEffect intent.Version "stale-reconcile" "I" "W" (verifiedPush "push" "accepted-source" "refs/heads/main" "commit") 10000L gated)
 
 [<Test>]
 let case_45_46_48_49_migration_epoch_requires_every_project_activated () =
@@ -597,7 +597,7 @@ let case_29_30_32_one_actionable_writer_per_explicit_source_lineage () =
 let case_31_decided_review_cannot_be_skipped_by_completing_work () =
     let claimed = activated "R" "Reviewer" (review "Frozen" 1L [])
     rejected (Rejection.InvalidState "review/integration requires immutable final domain receipt")
-        (completeOrdinary claimed.Version "skip-verdict" "R" "Frozen" claimed)
+        (completeOrdinary claimed.Version "skip-verdict" "R" "Frozen" 10000L claimed)
     Assert.That(claimed.Works.["Frozen"].State, Is.EqualTo(WorkState.Claimed "R"))
     Assert.That(claimed.ProducerCount, Is.Zero)
 
@@ -615,7 +615,7 @@ let case_37_54_unfinished_ancillary_handler_requeues_on_primary_terminal () =
     Assert.That(p.Launches.["L"].PrimaryWorkId, Is.EqualTo(Some "Plan"))
     let handling = claimAncillaryMessage p.Version "take-M" "L" "M" p |> success
     Assert.That(handling.Messages.["M"].State, Is.EqualTo(MessageState.ClaimedAncillary "L"))
-    let terminal = completeOrdinary handling.Version "finish-plan" "L" "Plan" handling |> success
+    let terminal = completeOrdinary handling.Version "finish-plan" "L" "Plan" 10000L handling |> success
     Assert.That(terminal.Messages.["M"].State, Is.EqualTo(MessageState.Pending))
     Assert.That(terminal.Works.["role-msg:M"].State, Is.EqualTo(WorkState.Available))
     Assert.That(terminal.Works.["role-msg:M"].AvailableSequence, Is.GreaterThan(2L))
@@ -652,11 +652,11 @@ let case_70_74_remote_source_target_proof_must_match_journal () =
 [<Test>]
 let case_71_76_definitive_no_effect_requires_terminal_job_proof () =
     let p = activated "I" "Integrator" (integration "W" 1L [])
-    let p = publish p { implementation "B" 2L [] with State = WorkState.Blocked }
+    let p = publish p (implementation "B" 2L [])
     let intent =
         startOriginalPush p.Version "push-intent" "I" "W"
             "original-op" "accepted-source" "refs/heads/main" p |> success
-    let held = setHardPrerequisite intent.Version "new-edge" "W" "B" intent |> success
+    let held = setHardPrerequisite intent.Version "new-edge" "W" "B" 10000L intent |> success
     let negativeOnly =
         { OriginalPushOperationId = "original-op"
           DispatchedOperationTerminal = false
@@ -678,19 +678,19 @@ let case_71_76_definitive_no_effect_requires_terminal_job_proof () =
 [<Test>]
 let case_78_79_satisfied_prerequisite_resolves_observed_hold_without_waiver () =
     let p = activated "I" "Integrator" (integration "W" 1L [])
-    let p = publish p { implementation "B" 2L [] with State = WorkState.Blocked }
+    let p = publish p (implementation "B" 2L [])
     let intent =
         startOriginalPush p.Version "push-intent" "I" "W"
             "original-op" "accepted-source" "refs/heads/main" p |> success
-    let gated = setHardPrerequisite intent.Version "new-edge" "W" "B" intent |> success
+    let gated = setHardPrerequisite intent.Version "new-edge" "W" "B" 10000L intent |> success
     let observed =
         reconcileExternalEffect gated.Version "original-effect" "I" "W"
-            (verifiedPush "original-op" "accepted-source" "refs/heads/main" "remote-sha") gated |> success
+            (verifiedPush "original-op" "accepted-source" "refs/heads/main" "remote-sha") 10000L gated |> success
     let satisfied =
         { observed with
             Works = observed.Works.Add("B", { observed.Works.["B"] with State = WorkState.Completed }) }
     let released =
-        resolveIntegrationGateException satisfied.Version "verified-dependency" "W" None satisfied |> success
+        resolveIntegrationGateException satisfied.Version "verified-dependency" "W" None 10000L satisfied |> success
     Assert.That(released.Works.["W"].State, Is.EqualTo(WorkState.Completed))
     Assert.That(released.Works.["W"].WaivedDependencies.IsEmpty, Is.True)
     Assert.That(released.ProducerCount, Is.EqualTo(1))
@@ -772,7 +772,7 @@ let wq01_blocked_prerequisite_completion_wakes_once_with_new_fifo_sequence () =
         empty ()
         |> fun p -> publish p (implementation "B" 1L [])
         |> fun p -> publish p (implementation "A" 2L [])
-    let blocked = setHardPrerequisite initial.Version "edge:A-B" "A" "B" initial |> success
+    let blocked = setHardPrerequisite initial.Version "edge:A-B" "A" "B" 10000L initial |> success
     Assert.That(blocked.Works.["A"].State, Is.EqualTo(WorkState.Blocked))
     let claimed =
         blocked |> fun p -> admit p "LB" "Worker"
@@ -780,15 +780,15 @@ let wq01_blocked_prerequisite_completion_wakes_once_with_new_fifo_sequence () =
                 |> fun p -> initialize p "LB"
                 |> fun p -> claim p "LB"
     Assert.That(claimed.Launches.["LB"].PrimaryWorkId, Is.EqualTo(Some "B"))
-    let woken = completeOrdinary claimed.Version "finish:B" "LB" "B" claimed |> success
+    let woken = completeOrdinary claimed.Version "finish:B" "LB" "B" 10000L claimed |> success
     let a = woken.Works.["A"]
     Assert.That(a.State, Is.EqualTo(WorkState.Available))
     Assert.That(a.AvailableSequence, Is.GreaterThan(2L))
     Assert.That(a.AvailableSequence, Is.EqualTo(woken.NextAvailability))
-    Assert.That(a.AvailableAt, Is.EqualTo(a.AvailableSequence))
-    let replay = completeOrdinary claimed.Version "finish:B" "LB" "B" woken |> success
+    Assert.That(a.AvailableAt, Is.EqualTo(10000L))
+    let replay = completeOrdinary claimed.Version "finish:B" "LB" "B" 10000L woken |> success
     Assert.That(replay, Is.EqualTo(woken))
-    rejected Rejection.CasConflict (completeOrdinary claimed.Version "stale:B" "LB" "B" woken)
+    rejected Rejection.CasConflict (completeOrdinary claimed.Version "stale:B" "LB" "B" 10000L woken)
     let initiallyBlocked =
         empty ()
         |> fun p -> publish p (implementation "B" 1L [])
@@ -797,7 +797,7 @@ let wq01_blocked_prerequisite_completion_wakes_once_with_new_fifo_sequence () =
         |> fun p -> submit p "LB"
         |> fun p -> initialize p "LB"
         |> fun p -> claim p "LB"
-    let initialWake = completeOrdinary initiallyBlocked.Version "finish:initial-B" "LB" "B" initiallyBlocked |> success
+    let initialWake = completeOrdinary initiallyBlocked.Version "finish:initial-B" "LB" "B" 10000L initiallyBlocked |> success
     Assert.That(initialWake.Works.["A"].State, Is.EqualTo(WorkState.Available))
 
 [<Test>]
@@ -806,24 +806,24 @@ let wq01_cancelled_prerequisite_requires_scope_verified_waiver_and_cycles_remain
         empty ()
         |> fun p -> publish p (implementation "B" 1L [])
         |> fun p -> publish p { implementation "A" 2L ["B"] with State = WorkState.Blocked }
-    let cancelled = cancelUnclaimedStage p.Version "cancel:B" "B" "no longer applicable" p |> success
+    let cancelled = cancelUnclaimedStage p.Version "cancel:B" "B" "no longer applicable" 10000L p |> success
     Assert.That(cancelled.Works.["A"].State, Is.EqualTo(WorkState.Blocked))
     rejected Rejection.MissingProof
         (waiveHardPrerequisite cancelled.Version "bad-waiver" "A" "B"
-            { waiver "A" ["B"] with CanonicallyVerified = false } cancelled)
+            { waiver "A" ["B"] with CanonicallyVerified = false } 10000L cancelled)
     rejected Rejection.MissingProof
         (waiveHardPrerequisite cancelled.Version "wrong-scope" "A" "B"
-            (waiver "unrelated" ["B"]) cancelled)
-    let unblocked = waiveHardPrerequisite cancelled.Version "valid-waiver" "A" "B" (waiver "A" ["B"]) cancelled |> success
+            (waiver "unrelated" ["B"]) 10000L cancelled)
+    let unblocked = waiveHardPrerequisite cancelled.Version "valid-waiver" "A" "B" (waiver "A" ["B"]) 10000L cancelled |> success
     Assert.That(unblocked.Works.["A"].State, Is.EqualTo(WorkState.Available))
-    Assert.That(waiveHardPrerequisite cancelled.Version "valid-waiver" "A" "B" (waiver "A" ["B"]) unblocked |> success,
+    Assert.That(waiveHardPrerequisite cancelled.Version "valid-waiver" "A" "B" (waiver "A" ["B"]) 10000L unblocked |> success,
                 Is.EqualTo(unblocked))
     let cycle =
         empty ()
         |> fun p -> publish p { implementation "X" 1L ["Y"] with State = WorkState.Blocked }
         |> fun p -> publish p { implementation "Y" 2L ["X"] with State = WorkState.Blocked }
     let unresolved = waiveHardPrerequisite cycle.Version "waive:X" "X" "Y"
-                         { waiver "X" ["Y"] with CanonicallyVerified = false } cycle
+                         { waiver "X" ["Y"] with CanonicallyVerified = false } 10000L cycle
     rejected Rejection.MissingProof unresolved
     Assert.That(orderAvailable cycle |> success, Is.Empty)
 
@@ -841,7 +841,7 @@ let wq01_eligibility_edit_invalidates_each_preclaim_launch_phase_until_terminal_
             elif phase = 1 then submit original "L"
             else initialize (submit original "L") "L"
         let oldState = original.Launches.["L"].State
-        let invalidated = setHardPrerequisite original.Version ("hard-edge-" + string phase) "A" "B" original |> success
+        let invalidated = setHardPrerequisite original.Version ("hard-edge-" + string phase) "A" "B" 10000L original |> success
         Assert.That(invalidated.Launches.["L"].State,
                     Is.EqualTo(LaunchState.DemandInvalidatedPendingTerminal oldState))
         Assert.That(invalidated.Launches.["L"].Credit, Is.EqualTo(None))
@@ -873,7 +873,7 @@ let wq01_credit_invalidation_maximum_rematch_is_injective_and_admission_is_fence
         |> fun p -> publish p { implementation "B" 3L ["B"] with State = WorkState.Blocked }
         |> fun p -> admit p "FlexibleLaunch" "Flexible"
         |> fun p -> admit p "WorkerLaunch" "Worker"
-    let changed = setHardPrerequisite start.Version "block-A" "A" "B" start |> success
+    let changed = setHardPrerequisite start.Version "block-A" "A" "B" 10000L start |> success
     Assert.That(changed.Launches.["FlexibleLaunch"].Credit, Is.EqualTo(Some "R"))
     Assert.That(changed.Launches.["WorkerLaunch"].State,
                 Is.EqualTo(LaunchState.DemandInvalidatedPendingTerminal LaunchState.ReservedUnregistered))
@@ -914,7 +914,7 @@ let wq01_handoff_rejects_unrelated_wip_and_pins_continuation_for_successor () =
     let initial =
         activated "L" "Worker" { implementation "A" 2L [] with SourceLineage = Some sourceLineage }
         |> fun p -> publish p { implementation "B" 1L ["B"] with State = WorkState.Blocked }
-    let gated = setHardPrerequisite initial.Version "new-hard-edge" "A" "B" initial |> success
+    let gated = setHardPrerequisite initial.Version "new-hard-edge" "A" "B" 10000L initial |> success
     let good = sourceProof gated.Works.["A"]
     let attempt evidence name =
         resolveDependencyGate gated.Version name "L" "A" (SourceHandoffProof.RemoteSnapshot evidence) 5L gated
@@ -935,7 +935,7 @@ let wq01_handoff_rejects_unrelated_wip_and_pins_continuation_for_successor () =
     Assert.That(blocked.Works.["A"].SourceLineage.Value.ContinuationSha, Is.EqualTo(Some good.ContinuationSha))
     Assert.That(blocked.Works.["A"].SourceLineage.Value.Generation, Is.EqualTo(2))
     let woken =
-        waiveHardPrerequisite blocked.Version "verified-waiver" "A" "B" (waiver "A" ["B"]) blocked |> success
+        waiveHardPrerequisite blocked.Version "verified-waiver" "A" "B" (waiver "A" ["B"]) 10000L blocked |> success
     let successor = woken |> fun p -> admit p "Next" "Worker"
                           |> fun p -> submit p "Next"
                           |> fun p -> initialize p "Next"
@@ -943,3 +943,93 @@ let wq01_handoff_rejects_unrelated_wip_and_pins_continuation_for_successor () =
     Assert.That(successor.Launches.["Next"].PrimaryWorkId, Is.EqualTo(Some "A"))
     Assert.That(successor.Works.["A"].SourceLineage.Value.ContinuationSha, Is.EqualTo(Some good.ContinuationSha))
     Assert.That(successor.Works.["A"].SourceLineage.Value.ReachableRef, Is.EqualTo(Some good.ContinuationRef))
+
+
+// Review #2 regressions: timestamp and FIFO sequence are distinct witnesses,
+// and the Phase A Blocked state has no authority without an unmet hard edge.
+[<Test>]
+let wq01_wake_time_does_not_overtake_older_ready_work_and_ties_use_sequence () =
+    let initial =
+        empty ()
+        |> fun p -> publish p { implementation "B" 1000L [] with AvailableSequence = 1L }
+        |> fun p -> publish p { implementation "C" 2000L [] with AvailableSequence = 2L }
+        |> fun p -> publish p { implementation "A" 1500L ["B"] with State = WorkState.Blocked; AvailableSequence = 3L }
+        |> fun p -> publish p { implementation "D" 1600L ["B"] with State = WorkState.Blocked; AvailableSequence = 4L }
+    let claimed =
+        initial
+        |> fun p -> admit p "LB" "Worker"
+        |> fun p -> submit p "LB"
+        |> fun p -> initialize p "LB"
+        |> fun p -> claim p "LB"
+    Assert.That(claimed.Launches.["LB"].PrimaryWorkId, Is.EqualTo(Some "B"))
+    let woken = completeOrdinary claimed.Version "finish:B/wake" "LB" "B" 3000L claimed |> success
+    Assert.That(woken.Works.["A"].AvailableAt, Is.EqualTo(3000L))
+    Assert.That(woken.Works.["D"].AvailableAt, Is.EqualTo(3000L))
+    Assert.That(woken.Works.["A"].AvailableSequence, Is.EqualTo(5L))
+    Assert.That(woken.Works.["D"].AvailableSequence, Is.EqualTo(6L))
+    Assert.That(woken.Works.["C"].AvailableAt, Is.EqualTo(2000L))
+    Assert.That(orderAvailable woken |> success |> List.map (fun x -> x.Id),
+                Is.EqualTo(box [ "C"; "A"; "D" ]))
+    Assert.That(
+        completeOrdinary claimed.Version "finish:B/wake" "LB" "B" 3000L woken |> success,
+        Is.EqualTo(woken))
+    rejected Rejection.OperationIdReused
+        (completeOrdinary claimed.Version "finish:B/wake" "LB" "B" 3001L woken)
+    rejected Rejection.CasConflict
+        (completeOrdinary claimed.Version "stale-other-client" "LB" "B" 3000L woken)
+
+[<Test>]
+let wq01_blocked_publication_requires_a_real_unmet_hard_edge () =
+    let emptyProject = empty ()
+    let invalid = { implementation "B" 1L [] with State = WorkState.Blocked }
+    rejected (Rejection.InvalidState "Blocked requires an unmet hard prerequisite")
+        (publishStage emptyProject.Version "invalid:stage" invalid emptyProject)
+    rejected (Rejection.InvalidState "Blocked requires an unmet hard prerequisite")
+        (postMessage emptyProject.Version "invalid:role"
+            (message "M" (Subject.Role "Lead"))
+            (Some { roleMessageWork "M" 2L with State = WorkState.Blocked }) emptyProject)
+    let completePrerequisite =
+        publish emptyProject { implementation "Done" 1L [] with State = WorkState.Completed }
+    rejected (Rejection.InvalidState "Blocked requires an unmet hard prerequisite")
+        (publishStage completePrerequisite.Version "invalid:already-satisfied"
+            { implementation "Late" 3L ["Done"] with State = WorkState.Blocked }
+            completePrerequisite)
+
+    // A self-cycle, its dependent and a Role-message generation cannot be
+    // awakened by editing/completing an unrelated stage.
+    let p = activated "L" "Worker" (implementation "Unrelated" 10L [])
+    let p = publish p { implementation "B" 20L ["B"] with State = WorkState.Blocked }
+    let p = publish p (implementation "A" 30L ["B"])
+    let p =
+        postMessage p.Version "post:valid-role"
+            (message "Valid" (Subject.Role "Lead"))
+            (Some { roleMessageWork "Valid" 35L with
+                        Dependencies = Set.singleton "B"
+                        State = WorkState.Blocked }) p |> success
+    let p = publish p (implementation "C" 40L [])
+    let changed = setHardPrerequisite p.Version "unrelated-edge" "C" "B" 1000L p |> success
+    for id in [ "A"; "B"; "role-msg:Valid" ] do
+        Assert.That(changed.Works.[id].State, Is.EqualTo(WorkState.Blocked))
+    let completed =
+        completeOrdinary changed.Version "complete:unrelated" "L" "Unrelated" 2000L changed |> success
+    for id in [ "A"; "B"; "role-msg:Valid" ] do
+        Assert.That(completed.Works.[id].State, Is.EqualTo(WorkState.Blocked))
+    Assert.That(completed.Messages.["Valid"].State, Is.EqualTo(MessageState.Pending))
+
+[<Test>]
+let wq01_role_message_initially_blocked_by_hard_edge_wakes_on_same_edge_completion () =
+    let p = empty () |> fun p -> publish p (implementation "B" 100L [])
+    let p =
+        postMessage p.Version "post:blocked-role" (message "M" (Subject.Role "Lead"))
+            (Some { roleMessageWork "M" 200L with
+                        Dependencies = Set.singleton "B"
+                        State = WorkState.Blocked }) p |> success
+    Assert.That(p.Works.["role-msg:M"].State, Is.EqualTo(WorkState.Blocked))
+    let claimed = p |> fun p -> admit p "LB" "Worker"
+                    |> fun p -> submit p "LB"
+                    |> fun p -> initialize p "LB"
+                    |> fun p -> claim p "LB"
+    let woken = completeOrdinary claimed.Version "complete:role-prereq" "LB" "B" 4000L claimed |> success
+    Assert.That(woken.Works.["role-msg:M"].State, Is.EqualTo(WorkState.Available))
+    Assert.That(woken.Works.["role-msg:M"].AvailableAt, Is.EqualTo(4000L))
+    Assert.That(woken.Messages.["M"].State, Is.EqualTo(MessageState.Pending))

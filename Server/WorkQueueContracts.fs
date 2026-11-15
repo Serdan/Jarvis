@@ -489,10 +489,10 @@ module Contracts =
                                         Credit = None
                                         Version = launch.Version + 1 }) })
 
-    // A blocked stage wakes only on a canonical dependency projection transition.
-    // The Git-CAS winner assigns a fresh FIFO sequence/time once; a replay
-    // reuses its operation receipt and a later projection sees no Blocked stage.
-    let private wakeBlockedStages (project: Project) =
+    // Phase A Blocked means unmet hard dependencies. The winning Git-CAS
+    // projects an independently witnessed time and a fresh FIFO sequence.
+    // Replayed operations reuse both via their original receipt.
+    let private wakeBlockedStages now (project: Project) =
         completeCoverage project
         |> Result.map (fun () ->
             (project, project.Works |> Map.toList |> List.map snd)
@@ -502,29 +502,37 @@ module Contracts =
                     |> Set.forall (fun prerequisite ->
                         stage.WaivedDependencies.ContainsKey prerequisite
                         || isSatisfied current prerequisite)
-                if stage.State = WorkState.Blocked && stage.Gate = GateState.Clear && allSatisfied then
+                if stage.State = WorkState.Blocked
+                   && stage.Gate = GateState.Clear
+                   && not stage.Dependencies.IsEmpty
+                   && allSatisfied then
                     let sequence = current.NextAvailability + 1L
                     let readyStage =
                         { stage with State = WorkState.Available
                                      AvailableSequence = sequence
-                                     AvailableAt = sequence }
+                                     AvailableAt = now }
                     { current with Works = current.Works.Add(stage.Id, readyStage)
                                    NextAvailability = sequence }
                 else current))
 
-    let private projectDependenciesChanged project =
-        wakeBlockedStages project |> Result.bind reconcileCredits
+    let private projectDependenciesChanged now project =
+        wakeBlockedStages now project |> Result.bind reconcileCredits
 
     // Only auxiliary Phase A transitions use this text key. Publish/Post/Admit
     // use a typed discriminated union with structural equality of every field.
     let private fullInput tag value = sprintf "%s|%A" tag value
 
+    // No untyped independent Blocked reason is admitted. Operator/recovery
+    // holds require a separate authority/gate model in a later phase.
     let private normalizePublishedStage (project: Project) (stage: WorkStage) =
-        if stage.State = WorkState.Available
-           && (stage.Dependencies |> Set.exists (fun id ->
-               not (stage.WaivedDependencies.ContainsKey id || isSatisfied project id))) then
-            { stage with State = WorkState.Blocked }
-        else stage
+        let unmet =
+            stage.Dependencies |> Set.exists (fun id ->
+                not (stage.WaivedDependencies.ContainsKey id || isSatisfied project id))
+        match stage.State with
+        | WorkState.Available when unmet -> Ok { stage with State = WorkState.Blocked }
+        | WorkState.Blocked when stage.Gate = GateState.Clear && not unmet ->
+            Error(Rejection.InvalidState "Blocked requires an unmet hard prerequisite")
+        | _ -> Ok stage
 
     let publishStage expected op (stage: WorkStage) project =
         publishCas expected op stage (fun current ->
@@ -549,9 +557,10 @@ module Contracts =
                 if writerCollision then
                     Error(Rejection.InvalidState "concurrent source writer lineage")
                 else
-                    let normalized = normalizePublishedStage current stage
-                    Ok { current with Works = current.Works.Add(stage.Id, normalized)
-                                      NextAvailability = max current.NextAvailability stage.AvailableSequence }) project
+                    normalizePublishedStage current stage
+                    |> Result.map (fun normalized ->
+                        { current with Works = current.Works.Add(stage.Id, normalized)
+                                       NextAvailability = max current.NextAvailability stage.AvailableSequence })) project
 
     let postMessage expected op (message: SubjectMessage) roleWork project =
         messageCas expected op message roleWork (fun current ->
@@ -563,11 +572,12 @@ module Contracts =
                 | Subject.Role roleId, Some work when work.Kind = WorkKind.RoleMessage message.Id
                                                      && work.QueueId = "role:" + roleId
                                                      && not (current.Works.ContainsKey work.Id) ->
-                    let normalized = normalizePublishedStage current work
-                    Ok { current with
+                    normalizePublishedStage current work
+                    |> Result.map (fun normalized ->
+                        { current with
                             Messages = current.Messages.Add(message.Id, { message with WorkId = Some work.Id })
                             Works = current.Works.Add(work.Id, normalized)
-                            NextAvailability = max current.NextAvailability work.AvailableSequence }
+                            NextAvailability = max current.NextAvailability work.AvailableSequence })
                 | _ -> Error(Rejection.InvalidState "Role message requires exactly one dedicated work generation")) project
 
     let reserveGlobal expected op launchId account =
@@ -761,7 +771,7 @@ module Contracts =
 
     // An ancillary message lease cannot survive its unrelated primary activation.
     // Release/requeue all unfinished handler responsibilities in the same terminal Git CAS.
-    let private releaseAncillaryOnTerminal (launch: Launch) (current: Project) =
+    let private releaseAncillaryOnTerminal now (launch: Launch) (current: Project) =
         let mutable state = current
         let mutable failure = None
         for messageId in launch.AncillaryMessages do
@@ -779,7 +789,7 @@ module Contracts =
                                 { work with State = WorkState.Available
                                             ClaimGeneration = work.ClaimGeneration + 1
                                             AvailableSequence = nextSequence
-                                            AvailableAt = nextSequence }
+                                            AvailableAt = now }
                             state <- { state with
                                         Works = state.Works.Add(workId, released)
                                         NextAvailability = nextSequence }
@@ -789,14 +799,14 @@ module Contracts =
         | Some e -> Error e
         | None -> Ok state
 
-    let private finishClaim op launchId workId (finishStage: WorkStage -> Result<WorkStage, Rejection>) (current: Project) =
+    let private finishClaim op launchId workId now (finishStage: WorkStage -> Result<WorkStage, Rejection>) (current: Project) =
         match current.Launches.TryFind launchId, current.Works.TryFind workId with
         | Some launch, Some stage when launch.PrimaryWorkId = Some workId
                                      && stage.State = WorkState.Claimed launchId ->
             match finishStage stage with
             | Error e -> Error e
             | Ok finished ->
-                releaseAncillaryOnTerminal launch current
+                releaseAncillaryOnTerminal now launch current
                 |> Result.map (fun cleaned ->
                     let terminal =
                         { launch with
@@ -808,9 +818,9 @@ module Contracts =
                         Launches = cleaned.Launches.Add(launchId, terminal) })
         | _ -> Error(Rejection.InvalidState "stale work claim/launch generation")
 
-    let completeOrdinary expected op launchId workId project =
-        projectCas expected op ("complete|" + launchId + "|" + workId) (fun current ->
-            finishClaim op launchId workId (fun stage ->
+    let completeOrdinary expected op launchId workId now project =
+        projectCas expected op (fullInput "complete" (launchId, workId, now)) (fun current ->
+            finishClaim op launchId workId now (fun stage ->
                 match stage.Kind, stage.Gate, stage.Domain with
                 | WorkKind.RoleMessage _, _, _ -> Error(Rejection.InvalidState "dedicated message needs atomic completion")
                 | _, GateState.Clear, _ when not (stage.Dependencies |> Set.forall (fun id ->
@@ -823,20 +833,20 @@ module Contracts =
                 | _, GateState.Clear, DomainState.FinalizedPendingTerminal _ ->
                     Ok { stage with State = WorkState.Completed }
                 | _ -> Error Rejection.DependencyGatePending) current
-            |> Result.bind projectDependenciesChanged) project
+            |> Result.bind (projectDependenciesChanged now)) project
 
-    let completeMessageWork expected op launchId workId messageId replyId project =
-        projectCas expected op ("complete-message|" + launchId + "|" + workId + "|" + messageId + "|" + replyId) (fun current ->
+    let completeMessageWork expected op launchId workId messageId replyId now project =
+        projectCas expected op (fullInput "complete-message" (launchId, workId, messageId, replyId, now)) (fun current ->
             match current.Messages.TryFind messageId with
             | Some message when message.WorkId = Some workId && message.State = MessageState.ClaimedPrimary launchId ->
-                finishClaim op launchId workId (fun stage ->
+                finishClaim op launchId workId now (fun stage ->
                     if stage.Kind = WorkKind.RoleMessage messageId && stage.Gate = GateState.Clear then
                         Ok { stage with State = WorkState.Completed }
                     else Error(Rejection.InvalidState "not the one claimed primary message")) current
                 |> Result.map (fun next ->
                     let handled = { message with State = MessageState.Handled replyId }
                     { next with Messages = next.Messages.Add(messageId, handled) })
-                |> Result.bind projectDependenciesChanged
+                |> Result.bind (projectDependenciesChanged now)
             | _ -> Error(Rejection.InvalidState "message handler does not own primary work")) project
 
     let claimAncillaryMessage expected op launchId messageId project =
@@ -885,8 +895,8 @@ module Contracts =
                             | _ -> Error(Rejection.InvalidState "role message work is not Available")
             | _ -> Error(Rejection.InvalidState "ancillary handler requires active unrelated primary claim")) project
 
-    let completeAncillaryMessage expected op launchId messageId replyId project =
-        projectCas expected op ("ancillary-complete|" + launchId + "|" + messageId + "|" + replyId) (fun current ->
+    let completeAncillaryMessage expected op launchId messageId replyId now project =
+        projectCas expected op (fullInput "ancillary-complete" (launchId, messageId, replyId, now)) (fun current ->
             match current.Launches.TryFind launchId, current.Messages.TryFind messageId with
             | Some launch, Some message when launch.AncillaryMessages.Contains messageId
                                              && message.State = MessageState.ClaimedAncillary launchId ->
@@ -903,7 +913,7 @@ module Contracts =
                         Error(Rejection.InvalidState "ancillary work lost its handler claim")
                     else
                         { updated with Works = updated.Works.Add(workId, { work with State = WorkState.Completed }) }
-                        |> projectDependenciesChanged
+                        |> projectDependenciesChanged now
             | _ -> Error(Rejection.InvalidState "no live ancillary message handler")) project
 
     let startOriginalPush expected op launchId workId pushOperation acceptedSourceSha targetRef project =
@@ -923,8 +933,8 @@ module Contracts =
                 Ok { current with Works = current.Works.Add(workId, { work with Push = Some journal }) }
             | _ -> Error(Rejection.InvalidState "push already dispatched or integration not safe")) project
 
-    let setHardPrerequisite expected op workId prerequisite project =
-        projectCas expected op ("hard-edge|" + workId + "|" + prerequisite) (fun current ->
+    let setHardPrerequisite expected op workId prerequisite now project =
+        projectCas expected op (fullInput "hard-edge" (workId, prerequisite, now)) (fun current ->
             match current.Works.TryFind workId with
             | None -> Error(Rejection.InvalidState "unknown stage")
             | Some work when not (current.Works.ContainsKey prerequisite) ->
@@ -950,7 +960,7 @@ module Contracts =
                 let updated = { work with Dependencies = dependencies; Gate = gate; State = state }
                 { current with GraphVersion = nextGraph
                                Works = current.Works.Add(workId, updated) }
-                |> projectDependenciesChanged) project
+                |> projectDependenciesChanged now) project
 
     let private waiverMatches (work: WorkStage) (required: Set<string>) (receipt: VerifiedWaiverReceipt) =
         receipt.CanonicallyVerified
@@ -962,16 +972,16 @@ module Contracts =
 
     // Cancellation does not satisfy other stages' hard edges: a dependent
     // remains Blocked until a separately verified waiver is committed.
-    let cancelUnclaimedStage expected op workId reason project =
-        projectCas expected op (fullInput "cancel-stage" (workId, reason)) (fun current ->
+    let cancelUnclaimedStage expected op workId reason now project =
+        projectCas expected op (fullInput "cancel-stage" (workId, reason, now)) (fun current ->
             match current.Works.TryFind workId with
             | Some work when work.State = WorkState.Available || work.State = WorkState.Blocked ->
                 { current with Works = current.Works.Add(workId, { work with State = WorkState.Cancelled }) }
-                |> projectDependenciesChanged
+                |> projectDependenciesChanged now
             | _ -> Error(Rejection.InvalidState "only unclaimed nonterminal work may be cancelled")) project
 
-    let waiveHardPrerequisite expected op workId prerequisite (receipt: VerifiedWaiverReceipt) project =
-        projectCas expected op (fullInput "waive-hard-edge" (workId, prerequisite, receipt)) (fun current ->
+    let waiveHardPrerequisite expected op workId prerequisite (receipt: VerifiedWaiverReceipt) now project =
+        projectCas expected op (fullInput "waive-hard-edge" (workId, prerequisite, receipt, now)) (fun current ->
             match current.Works.TryFind workId with
             | Some work when work.Dependencies.Contains prerequisite
                              && work.Domain = DomainState.Undecided
@@ -982,7 +992,7 @@ module Contracts =
                     let updated =
                         { work with WaivedDependencies = work.WaivedDependencies.Add(prerequisite, receipt.ReceiptId) }
                     { current with Works = current.Works.Add(workId, updated) }
-                    |> projectDependenciesChanged
+                    |> projectDependenciesChanged now
             | _ -> Error(Rejection.InvalidState "waiver needs an undecided live hard edge")) project
 
     let decideReview expected op workId decisionReceipt project =
@@ -1115,15 +1125,15 @@ module Contracts =
                                     SourceLineage = continuation
                                     AvailableAt = now
                                     AvailableSequence = current.NextAvailability + 1L }
-                        finishClaim op launchId workId (fun _ -> Ok newStage) current
+                        finishClaim op launchId workId now (fun _ -> Ok newStage) current
                         |> Result.map (fun next ->
                             { next with NextAvailability = max next.NextAvailability newStage.AvailableSequence })
-                        |> Result.bind projectDependenciesChanged
+                        |> Result.bind (projectDependenciesChanged now)
                 | _ -> Error Rejection.UnsafeExternalEffect
             | _ -> Error(Rejection.InvalidState "no gated active claim")) project
 
-    let reconcileExternalEffect expected op launchId workId (evidence: VerifiedRemoteEffect) project =
-        projectCas expected op ("observed-effect|" + workId + "|" + string evidence) (fun current ->
+    let reconcileExternalEffect expected op launchId workId (evidence: VerifiedRemoteEffect) now project =
+        projectCas expected op (fullInput "observed-effect" (launchId, workId, evidence, now)) (fun current ->
             match current.Works.TryFind workId with
             | Some work ->
                 match work.Gate, work.Push with
@@ -1141,12 +1151,12 @@ module Contracts =
                             State = WorkState.GateException
                             Gate = GateState.ExternalEffectObservedPendingGate(graph, pushId, evidence.RemoteCommitSha)
                             Push = Some { journal with Outcome = PushOutcome.Observed evidence.RemoteCommitSha } }
-                    finishClaim op launchId workId (fun _ -> Ok observed) current
+                    finishClaim op launchId workId now (fun _ -> Ok observed) current
                 | _ -> Error Rejection.UnsafeExternalEffect
             | None -> Error(Rejection.InvalidState "unknown integration stage")) project
 
-    let resolveIntegrationGateException expected op workId (waiverReceipt: VerifiedWaiverReceipt option) project =
-        projectCas expected op ("resolve-exception|" + workId + "|" + string waiverReceipt) (fun current ->
+    let resolveIntegrationGateException expected op workId (waiverReceipt: VerifiedWaiverReceipt option) now project =
+        projectCas expected op (fullInput "resolve-exception" (workId, waiverReceipt, now)) (fun current ->
             match current.Works.TryFind workId with
             | Some work when work.State = WorkState.GateException ->
                 match work.Gate with
@@ -1175,7 +1185,7 @@ module Contracts =
                         { current with
                             Works = current.Works.Add(workId, finalized)
                             ProducerCount = current.ProducerCount + 1 }
-                        |> projectDependenciesChanged
+                        |> projectDependenciesChanged now
                 | _ -> Error Rejection.MissingProof
             | _ -> Error(Rejection.InvalidState "no observed gate exception")) project
 

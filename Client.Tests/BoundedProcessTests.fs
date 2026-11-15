@@ -83,6 +83,10 @@ startInfo.UseShellExecute <- false
 startInfo.RedirectStandardOutput <- false
 startInfo.RedirectStandardError <- false
 use child = Process.Start(startInfo)
+let markerDeadline = DateTime.UtcNow.AddSeconds(15.)
+while not (System.IO.File.Exists(@"{marker}")) && DateTime.UtcNow < markerDeadline do
+    System.Threading.Thread.Sleep 20
+if not (System.IO.File.Exists(@"{marker}")) then failwith "Descendant did not start."
 printfn "parent exited"
 """
         File.WriteAllText(childFile, childScript)
@@ -93,9 +97,15 @@ printfn "parent exited"
         match result with
         | Error failure -> Assert.Fail($"Expected bounded timeout result, got {failure}")
         | Ok output ->
-            Assert.That(output.TimedOut, Is.True,
-                        "An immediate parent exit must not end the deadline while inherited pipes remain.")
-            Assert.That(output.ExitCode, Is.EqualTo(-1))
+            if OperatingSystem.IsWindows() then
+                // The Windows helper closes its nested job at the direct
+                // child boundary, reaping pipe holders before the deadline.
+                Assert.That(output.TimedOut, Is.False)
+                Assert.That(output.ExitCode, Is.EqualTo(0))
+            else
+                Assert.That(output.TimedOut, Is.True,
+                            "An immediate parent exit must not end the deadline while inherited pipes remain.")
+                Assert.That(output.ExitCode, Is.EqualTo(-1))
             Assert.That(watch.Elapsed, Is.LessThan(TimeSpan.FromSeconds 9.))
             Assert.That(output.StdOut, Does.Contain("parent exited"))
             Assert.That(File.Exists marker, Is.True, "Descendant must actually have started.")
@@ -369,7 +379,7 @@ let supplied_text_reaches_child_stdin_unmodified () =
     try
         let project = Path.Combine(root, "Project1")
         File.WriteAllText(Path.Combine(project, "echo-stdin.fsx"),
-                          "let input = System.Console.In.ReadToEnd()\nprintfn \"received:%s\" input\n")
+                          "System.Console.InputEncoding <- System.Text.Encoding.UTF8\nlet input = System.Console.In.ReadToEnd()\nprintfn \"received-hex:%s\" (System.Convert.ToHexString(System.Text.Encoding.UTF8.GetBytes(input)))\n")
         let command: BoundedProcess.Command =
             { Executable = "dotnet"
               Args = [ "fsi"; "--exec"; "echo-stdin.fsx" ]
@@ -383,7 +393,7 @@ let supplied_text_reaches_child_stdin_unmodified () =
         | Ok result ->
             Assert.That(result.TimedOut, Is.False)
             Assert.That(result.ExitCode, Is.EqualTo(0))
-            Assert.That(result.StdOut, Does.Contain("received:hello ø world"))
+            Assert.That(result.StdOut, Does.Contain("received-hex:" + Convert.ToHexString(Text.Encoding.UTF8.GetBytes("hello ø world"))))
         | Error error -> Assert.Fail($"Expected supplied UTF-8 stdin, got {error}")
     finally
         if Directory.Exists(root) then Directory.Delete(root, true)

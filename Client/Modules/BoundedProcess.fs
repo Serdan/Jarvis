@@ -153,6 +153,14 @@ let runInternalGroupHost (args: string array) =
                 eprintfn "Process-group assignment was not confirmed."
                 126
             else
+                // This helper remains in the outer job. A nested job owns
+                // its command and descendants, so successful completion does
+                // not wait for an orphan to release inherited pipes.
+                let childJob = if windows then Native.newWindowsJob() else 0n
+                use _closeChildJob =
+                    { new IDisposable with
+                        member _.Dispose() =
+                            if childJob <> 0n then Native.CloseHandle(childJob) |> ignore }
                 use child = new Process()
                 child.StartInfo.FileName <- args[offset]
                 child.StartInfo.WorkingDirectory <- Environment.CurrentDirectory
@@ -171,6 +179,8 @@ let runInternalGroupHost (args: string array) =
                 args |> Seq.skip (offset + 1) |> Seq.iter child.StartInfo.ArgumentList.Add
                 if not (child.Start()) then 127
                 else
+                    if windows && not (Native.AssignProcessToJobObject(childJob, child.Handle)) then
+                        raise (Win32Exception(Marshal.GetLastWin32Error()))
                     if windows then
                         let stdout = child.StandardOutput.BaseStream.CopyToAsync(Console.OpenStandardOutput())
                         let stderr = child.StandardError.BaseStream.CopyToAsync(Console.OpenStandardError())
@@ -190,15 +200,18 @@ let runInternalGroupHost (args: string array) =
                                 try child.StandardInput.Close() with _ -> ()
                             }
                         child.WaitForExit()
-                        // The exit code is not sufficient until both pipes
-                        // reach EOF. Descendants retaining them are bounded
-                        // by the outer job-object deadline.
+                        let exitCode = child.ExitCode
+                        // Kill descendants before waiting for the helper's
+                        // forwarded pipes to reach EOF. Keep the direct exit code.
+                        if not (Native.TerminateJobObject(childJob, 1u)) then
+                            raise (Win32Exception(Marshal.GetLastWin32Error()))
                         Task.WhenAll(stdout, stderr).GetAwaiter().GetResult()
+                        exitCode
                     else
                         // macOS already inherits its session helper's streams.
                         // Keep its existing behavior unchanged.
                         child.WaitForExit()
-                    child.ExitCode
+                        child.ExitCode
         with ex ->
             eprintfn "Could not launch process: %s" ex.Message
             127

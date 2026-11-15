@@ -94,6 +94,40 @@ let private verifiedPush originalId sourceSha targetRef remoteCommit : VerifiedR
       AncestryVerified = true
       JobsReconciled = true }
 
+let private sourceLineage =
+    { RepositoryId = "Jarvis"
+      TaskId = "task-A"
+      TargetRef = "refs/heads/main"
+      LineageId = "worker-source"
+      PinnedBaseCommit = "base-A"
+      ReachableRef = None
+      ContinuationSha = None
+      Generation = 1 }
+
+let private sourceProof (claimed: WorkStage) : RemoteSourceSnapshot =
+    let lineage = claimed.SourceLineage.Value
+    { RepositoryId = lineage.RepositoryId
+      TaskId = lineage.TaskId
+      LineageId = lineage.LineageId
+      StageId = claimed.Id
+      StageGeneration = claimed.StageGeneration
+      ClaimGeneration = claimed.ClaimGeneration
+      LineageGeneration = lineage.Generation
+      ExpectedRef = lineage.ReachableRef |> Option.defaultValue lineage.TargetRef
+      ExpectedSha = lineage.ContinuationSha |> Option.defaultValue lineage.PinnedBaseCommit
+      ContinuationRef = "refs/heads/worker-A"
+      ContinuationSha = "accepted-A"
+      ReachabilityVerified = true
+      JobsReconciled = true }
+
+let private waiver workId dependencies =
+    { ReceiptId = "canonical-approval:1"
+      WorkId = workId
+      Dependencies = Set.ofList dependencies
+      AccountApprovalVersion = 3
+      ApprovedByRole = "Lead"
+      CanonicallyVerified = true }
+
 let private roleMessageWork id timestamp : WorkStage =
     { stage ("role-msg:" + id) (WorkKind.RoleMessage id) "role:Lead"
         timestamp [] WorkState.Available with
@@ -142,8 +176,9 @@ let case_07_09_fifo_key_is_stable_when_blocker_tier_changes () =
     let project =
         empty () |> fun p -> publish p (implementation "B" 4L []) |> fun p -> publish p (implementation "A" 2L []) |> fun p -> publish p (implementation "C" 6L ["A"])
     Assert.That(orderAvailable project |> success |> List.map (fun w -> w.Id), Is.EqualTo(box [ "A"; "B" ]))
-    let updated = { project.Works.["C"] with Dependencies = Set.empty }
-    let withoutEdge = { project with Works = project.Works.Add("C", updated) }
+    Assert.That(project.Works.["C"].State, Is.EqualTo(WorkState.Blocked))
+    let withoutEdge =
+        waiveHardPrerequisite project.Version "waive-C-A" "C" "A" (waiver "C" ["A"]) project |> success
     Assert.That(withoutEdge.Works.["A"].AvailableSequence, Is.EqualTo(2L))
     Assert.That(orderAvailable withoutEdge |> success |> List.map (fun w -> w.Id),
                 Is.EqualTo(box [ "A"; "B"; "C" ]))
@@ -380,17 +415,20 @@ let case_60_61_dependency_gate_and_completion_commit_are_mutually_exclusive () =
 
 [<Test>]
 let case_62_63_safe_dependency_gate_resolution_blocks_or_requeues_once () =
-    let p = activated "L" "Worker" (implementation "A" 2L [])
+    let p = activated "L" "Worker" { implementation "A" 2L [] with SourceLineage = Some sourceLineage }
     let p = publish p { implementation "B" 1L [] with State = WorkState.Blocked }
     let gated = setHardPrerequisite p.Version "edge" "A" "B" p |> success
     rejected Rejection.UnsafeExternalEffect
         (resolveDependencyGate gated.Version "unsafe" "L" "A" (SourceHandoffProof.Unsafe "unreconciled worktree") 10L gated)
-    let blocked = resolveDependencyGate gated.Version "safe" "L" "A" (SourceHandoffProof.RemoteSnapshot("repo","refs/heads/wip/A","sha-A",true)) 10L gated |> success
+    let proof = SourceHandoffProof.RemoteSnapshot(sourceProof gated.Works.["A"])
+    let blocked = resolveDependencyGate gated.Version "safe" "L" "A" proof 10L gated |> success
+    Assert.That(blocked.Works.["A"].SourceLineage.Value.ReachableRef, Is.EqualTo(Some "refs/heads/worker-A"))
+    Assert.That(blocked.Works.["A"].SourceLineage.Value.ContinuationSha, Is.EqualTo(Some "accepted-A"))
     Assert.That(blocked.Works.["A"].State, Is.EqualTo(WorkState.Blocked))
     Assert.That(blocked.Launches.["L"].State,
                 Is.EqualTo(LaunchState.TerminalPendingRelease "terminal:safe"))
     let satisfied = { gated with Works = gated.Works.Add("B", { gated.Works.["B"] with State = WorkState.Completed }) }
-    let available = resolveDependencyGate satisfied.Version "safe-wake" "L" "A" (SourceHandoffProof.RemoteSnapshot("repo","refs/heads/wip/A","sha-A",true)) 11L satisfied |> success
+    let available = resolveDependencyGate satisfied.Version "safe-wake" "L" "A" proof 11L satisfied |> success
     Assert.That(available.Works.["A"].State, Is.EqualTo(WorkState.Available))
     Assert.That(available.Works.["A"].AvailableAt, Is.EqualTo(11L))
     Assert.That(available.Works.["A"].AvailableSequence, Is.GreaterThan(2L))
@@ -447,12 +485,12 @@ let case_74_75_78_79_external_push_is_fact_not_authorization () =
     let released = releaseGlobal account.Version "release-I" "I" observed account |> success
     Assert.That(released.Tokens.["I"], Is.True)
     let authorized =
-        resolveIntegrationGateException observed.Version "waive" "W" (Some "lead-waiver:v1") observed |> success
+        resolveIntegrationGateException observed.Version "waive" "W" (Some { waiver "W" ["B"] with ReceiptId = "lead-waiver:v1" }) observed |> success
     Assert.That(authorized.Works.["W"].Domain, Is.EqualTo(DomainState.Integrated "remote-commit"))
     Assert.That(authorized.Works.["W"].IntegrationAuthorized, Is.True)
     Assert.That(authorized.ProducerCount, Is.EqualTo(1))
     Assert.That(authorized.Works.["W"].WaivedDependencies.["B"], Is.EqualTo("lead-waiver:v1"))
-    Assert.That(resolveIntegrationGateException observed.Version "waive" "W" (Some "lead-waiver:v1") authorized |> success,
+    Assert.That(resolveIntegrationGateException observed.Version "waive" "W" (Some { waiver "W" ["B"] with ReceiptId = "lead-waiver:v1" }) authorized |> success,
                 Is.EqualTo(authorized))
 
 [<Test>]
@@ -724,3 +762,184 @@ let case_21_unregistered_dispatch_recovery_fences_late_initialize () =
         (initializeAgent reclaimed.Version "late-first-connect" "L" "new-provider" "uuid-new" 99L reclaimed)
     let released = releaseGlobal account.Version "release:L" "L" reclaimed account |> success
     Assert.That(released.Tokens.["L"], Is.True)
+
+
+// Review #1 regressions: all four P1 findings are exercised against the
+// pure CAS contract, including the stale-client and original-receipt paths.
+[<Test>]
+let wq01_blocked_prerequisite_completion_wakes_once_with_new_fifo_sequence () =
+    let initial =
+        empty ()
+        |> fun p -> publish p (implementation "B" 1L [])
+        |> fun p -> publish p (implementation "A" 2L [])
+    let blocked = setHardPrerequisite initial.Version "edge:A-B" "A" "B" initial |> success
+    Assert.That(blocked.Works.["A"].State, Is.EqualTo(WorkState.Blocked))
+    let claimed =
+        blocked |> fun p -> admit p "LB" "Worker"
+                |> fun p -> submit p "LB"
+                |> fun p -> initialize p "LB"
+                |> fun p -> claim p "LB"
+    Assert.That(claimed.Launches.["LB"].PrimaryWorkId, Is.EqualTo(Some "B"))
+    let woken = completeOrdinary claimed.Version "finish:B" "LB" "B" claimed |> success
+    let a = woken.Works.["A"]
+    Assert.That(a.State, Is.EqualTo(WorkState.Available))
+    Assert.That(a.AvailableSequence, Is.GreaterThan(2L))
+    Assert.That(a.AvailableSequence, Is.EqualTo(woken.NextAvailability))
+    Assert.That(a.AvailableAt, Is.EqualTo(a.AvailableSequence))
+    let replay = completeOrdinary claimed.Version "finish:B" "LB" "B" woken |> success
+    Assert.That(replay, Is.EqualTo(woken))
+    rejected Rejection.CasConflict (completeOrdinary claimed.Version "stale:B" "LB" "B" woken)
+    let initiallyBlocked =
+        empty ()
+        |> fun p -> publish p (implementation "B" 1L [])
+        |> fun p -> publish p { implementation "A" 2L ["B"] with State = WorkState.Blocked }
+        |> fun p -> admit p "LB" "Worker"
+        |> fun p -> submit p "LB"
+        |> fun p -> initialize p "LB"
+        |> fun p -> claim p "LB"
+    let initialWake = completeOrdinary initiallyBlocked.Version "finish:initial-B" "LB" "B" initiallyBlocked |> success
+    Assert.That(initialWake.Works.["A"].State, Is.EqualTo(WorkState.Available))
+
+[<Test>]
+let wq01_cancelled_prerequisite_requires_scope_verified_waiver_and_cycles_remain_blocked () =
+    let p =
+        empty ()
+        |> fun p -> publish p (implementation "B" 1L [])
+        |> fun p -> publish p { implementation "A" 2L ["B"] with State = WorkState.Blocked }
+    let cancelled = cancelUnclaimedStage p.Version "cancel:B" "B" "no longer applicable" p |> success
+    Assert.That(cancelled.Works.["A"].State, Is.EqualTo(WorkState.Blocked))
+    rejected Rejection.MissingProof
+        (waiveHardPrerequisite cancelled.Version "bad-waiver" "A" "B"
+            { waiver "A" ["B"] with CanonicallyVerified = false } cancelled)
+    rejected Rejection.MissingProof
+        (waiveHardPrerequisite cancelled.Version "wrong-scope" "A" "B"
+            (waiver "unrelated" ["B"]) cancelled)
+    let unblocked = waiveHardPrerequisite cancelled.Version "valid-waiver" "A" "B" (waiver "A" ["B"]) cancelled |> success
+    Assert.That(unblocked.Works.["A"].State, Is.EqualTo(WorkState.Available))
+    Assert.That(waiveHardPrerequisite cancelled.Version "valid-waiver" "A" "B" (waiver "A" ["B"]) unblocked |> success,
+                Is.EqualTo(unblocked))
+    let cycle =
+        empty ()
+        |> fun p -> publish p { implementation "X" 1L ["Y"] with State = WorkState.Blocked }
+        |> fun p -> publish p { implementation "Y" 2L ["X"] with State = WorkState.Blocked }
+    let unresolved = waiveHardPrerequisite cycle.Version "waive:X" "X" "Y"
+                         { waiver "X" ["Y"] with CanonicallyVerified = false } cycle
+    rejected Rejection.MissingProof unresolved
+    Assert.That(orderAvailable cycle |> success, Is.Empty)
+
+[<Test>]
+let wq01_eligibility_edit_invalidates_each_preclaim_launch_phase_until_terminal_proof () =
+    for phase in 0..2 do
+        let account = reserveGlobal 0 ("account-" + string phase) "L" (emptyAccount 1) |> success
+        let original =
+            empty ()
+            |> fun p -> publish p (implementation "A" 1L [])
+            |> fun p -> publish p { implementation "B" 2L ["B"] with State = WorkState.Blocked }
+            |> fun p -> admit p "L" "Worker"
+        let original =
+            if phase = 0 then original
+            elif phase = 1 then submit original "L"
+            else initialize (submit original "L") "L"
+        let oldState = original.Launches.["L"].State
+        let invalidated = setHardPrerequisite original.Version ("hard-edge-" + string phase) "A" "B" original |> success
+        Assert.That(invalidated.Launches.["L"].State,
+                    Is.EqualTo(LaunchState.DemandInvalidatedPendingTerminal oldState))
+        Assert.That(invalidated.Launches.["L"].Credit, Is.EqualTo(None))
+        rejected Rejection.MissingProof (releaseGlobal account.Version ("early-" + string phase) "L" invalidated account)
+        rejected Rejection.CasConflict (claimNext original.Version ("stale-claim-" + string phase) "L" invalidated)
+        rejected (Rejection.InvalidState "requires registered launch with no prior primary claim")
+            (claimNext invalidated.Version ("fenced-claim-" + string phase) "L" invalidated)
+        let noEvidence = { DispatchJournalSettled = false; SessionTerminalVerified = false }
+        if phase > 0 then
+            rejected Rejection.UnsafeExternalEffect
+                (finishInvalidatedLaunch invalidated.Version ("early-terminal-" + string phase) "L" noEvidence invalidated)
+        let journalEvidence = { noEvidence with DispatchJournalSettled = true }
+        if phase = 2 then
+            rejected Rejection.UnsafeExternalEffect
+                (finishInvalidatedLaunch invalidated.Version "registered-without-session" "L" journalEvidence invalidated)
+        let fullySettled = { DispatchJournalSettled = true; SessionTerminalVerified = true }
+        let terminal = finishInvalidatedLaunch invalidated.Version ("invalidated-terminal-" + string phase) "L" fullySettled invalidated |> success
+        let released = releaseGlobal account.Version ("release-" + string phase) "L" terminal account |> success
+        Assert.That(released.Tokens.["L"], Is.True)
+        Assert.That(finishInvalidatedLaunch invalidated.Version ("invalidated-terminal-" + string phase) "L" fullySettled terminal |> success,
+                    Is.EqualTo(terminal))
+
+[<Test>]
+let wq01_credit_invalidation_maximum_rematch_is_injective_and_admission_is_fenced () =
+    let start =
+        empty ()
+        |> fun p -> publish p (implementation "A" 1L [])
+        |> fun p -> publish p (review "R" 2L [])
+        |> fun p -> publish p { implementation "B" 3L ["B"] with State = WorkState.Blocked }
+        |> fun p -> admit p "FlexibleLaunch" "Flexible"
+        |> fun p -> admit p "WorkerLaunch" "Worker"
+    let changed = setHardPrerequisite start.Version "block-A" "A" "B" start |> success
+    Assert.That(changed.Launches.["FlexibleLaunch"].Credit, Is.EqualTo(Some "R"))
+    Assert.That(changed.Launches.["WorkerLaunch"].State,
+                Is.EqualTo(LaunchState.DemandInvalidatedPendingTerminal LaunchState.ReservedUnregistered))
+    Assert.That(changed.Launches.["WorkerLaunch"].Credit, Is.EqualTo(None))
+    rejected Rejection.CasConflict
+        (admitProject start.Version "competing-admission" (launch "Competing" "Flexible") changed)
+    rejected Rejection.NoCompatibleMatching
+        (admitProject changed.Version "fresh-admission" (launch "Competing" "Flexible") changed)
+
+[<Test>]
+let wq01_full_mutation_payload_receipts_reject_semantic_reuse () =
+    let p = empty () |> fun p -> publish p (implementation "B" 1L [])
+    let withA =
+        publishStage p.Version "same-publish-op" (implementation "A" 2L ["B"]) p |> success
+    rejected Rejection.OperationIdReused
+        (publishStage withA.Version "same-publish-op" (implementation "A" 2L []) withA)
+    rejected Rejection.OperationIdReused
+        (publishStage withA.Version "same-publish-op"
+            { implementation "A" 2L ["B"] with SourceLineage = Some sourceLineage } withA)
+    let m = message "M" (Subject.Role "Lead")
+    let work = roleMessageWork "M" 3L
+    let posted = postMessage withA.Version "same-message-op" m (Some work) withA |> success
+    rejected Rejection.OperationIdReused
+        (postMessage posted.Version "same-message-op" { m with Subject = Subject.Task "task-A" } (Some work) posted)
+    rejected Rejection.OperationIdReused
+        (postMessage posted.Version "same-message-op" m
+            (Some { work with QueueId = "role:another" }) posted)
+    let admitted = admitProject posted.Version "same-admit-op" (launch "L" "Worker") posted |> success
+    rejected Rejection.OperationIdReused
+        (admitProject admitted.Version "same-admit-op"
+            { launch "L" "Worker" with AccountTokenId = "token:different" } admitted)
+    rejected Rejection.OperationIdReused
+        (admitProject admitted.Version "same-admit-op"
+            { launch "L" "Worker" with RoleVersion = 2 } admitted)
+
+[<Test>]
+let wq01_handoff_rejects_unrelated_wip_and_pins_continuation_for_successor () =
+    let initial =
+        activated "L" "Worker" { implementation "A" 2L [] with SourceLineage = Some sourceLineage }
+        |> fun p -> publish p { implementation "B" 1L ["B"] with State = WorkState.Blocked }
+    let gated = setHardPrerequisite initial.Version "new-hard-edge" "A" "B" initial |> success
+    let good = sourceProof gated.Works.["A"]
+    let attempt evidence name =
+        resolveDependencyGate gated.Version name "L" "A" (SourceHandoffProof.RemoteSnapshot evidence) 5L gated
+    rejected Rejection.MissingProof (attempt { good with RepositoryId = "unrelated" } "wrong-repo")
+    rejected Rejection.MissingProof (attempt { good with TaskId = "another-task" } "wrong-task")
+    rejected Rejection.MissingProof (attempt { good with LineageId = "another-lineage" } "wrong-lineage")
+    rejected Rejection.MissingProof (attempt { good with ExpectedRef = "refs/heads/wrong" } "wrong-source-ref")
+    rejected Rejection.MissingProof (attempt { good with ExpectedSha = "wrong-baseline" } "wrong-source-sha")
+    rejected Rejection.MissingProof (attempt { good with ClaimGeneration = 99 } "wrong-activation")
+    rejected Rejection.MissingProof (attempt { good with ContinuationSha = "" } "missing-continuation")
+    rejected Rejection.MissingProof (attempt { good with ReachabilityVerified = false } "unverified-reachability")
+    rejected Rejection.MissingProof
+        (resolveDependencyGate gated.Version "wrong-readonly" "L" "A"
+            (SourceHandoffProof.ReadOnly "some-text") 5L gated)
+    let blocked = attempt good "verified-handoff" |> success
+    Assert.That(blocked.Works.["A"].State, Is.EqualTo(WorkState.Blocked))
+    Assert.That(blocked.Works.["A"].SourceLineage.Value.ReachableRef, Is.EqualTo(Some good.ContinuationRef))
+    Assert.That(blocked.Works.["A"].SourceLineage.Value.ContinuationSha, Is.EqualTo(Some good.ContinuationSha))
+    Assert.That(blocked.Works.["A"].SourceLineage.Value.Generation, Is.EqualTo(2))
+    let woken =
+        waiveHardPrerequisite blocked.Version "verified-waiver" "A" "B" (waiver "A" ["B"]) blocked |> success
+    let successor = woken |> fun p -> admit p "Next" "Worker"
+                          |> fun p -> submit p "Next"
+                          |> fun p -> initialize p "Next"
+                          |> fun p -> claim p "Next"
+    Assert.That(successor.Launches.["Next"].PrimaryWorkId, Is.EqualTo(Some "A"))
+    Assert.That(successor.Works.["A"].SourceLineage.Value.ContinuationSha, Is.EqualTo(Some good.ContinuationSha))
+    Assert.That(successor.Works.["A"].SourceLineage.Value.ReachableRef, Is.EqualTo(Some good.ContinuationRef))
